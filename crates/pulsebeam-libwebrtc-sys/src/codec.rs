@@ -3470,11 +3470,22 @@ mod tests {
     }
 
     #[test]
-    fn invalid_i420_buffers_are_rejected() {
+    fn i420_buffers_roundtrip_native_samples_and_reject_invalid_lengths() {
         assert_eq!(
             VideoFrameBuffer::i420(4, 4, vec![0; 23]),
             Err(CodecError::InvalidFrame)
         );
+        let data = (0u8..=255)
+            .cycle()
+            .take(i420_len(19, 11).unwrap())
+            .collect();
+        let original = VideoFrame::i420(19, 11, data, 12_345, 0xFEDC_BA98)
+            .unwrap()
+            .with_rotation(VideoRotation::Clockwise90);
+        let native = crate::RawVideoFrame::from_legacy(&original).unwrap();
+        let copied = native.to_legacy().unwrap();
+        drop(native);
+        assert_eq!(copied, original);
     }
 
     #[test]

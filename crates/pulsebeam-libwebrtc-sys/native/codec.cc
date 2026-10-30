@@ -948,12 +948,9 @@ std::optional<webrtc::Resolution> Resolution(bool present, std::uint32_t width,
 }
 
 rust::Vec<std::uint8_t> ToRust(const std::vector<std::uint8_t> &data) {
-  rust::Vec<std::uint8_t> result;
-  result.reserve(data.size());
-  for (std::uint8_t value : data) {
-    result.push_back(value);
-  }
-  return result;
+  // Copy in Rust so a frame does not make per-byte vector ABI calls.
+  return copy_native_bytes(
+      rust::Slice<const std::uint8_t>(data.data(), data.size()));
 }
 
 std::vector<std::uint8_t> CopyI420(const webrtc::VideoFrame &frame) {

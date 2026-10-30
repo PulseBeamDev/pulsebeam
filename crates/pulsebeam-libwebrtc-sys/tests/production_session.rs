@@ -832,39 +832,140 @@ fn migrated_temporal_actor_receives_native_dd_and_wakes_for_rejection() {
         }
     }
 
-    for selected in [false, true] {
+    for (simulcast, selected, negotiate_dd, initial) in [
+        (false, false, true, false),
+        (false, true, true, false),
+        (true, false, true, false),
+        (true, true, true, false),
+        (false, true, false, true),
+        (true, true, false, true),
+    ] {
         let format = VideoCodecFormat::new("H264")
             .with_parameter("level-asymmetry-allowed", "1")
             .with_parameter("packetization-mode", "1")
             .with_parameter("profile-level-id", "42e01f");
-        let mut session = ProductionSession::new_l1t3(
-            ProductionSessionConfig {
-                video_format: Some(format),
-            },
-            [64, 128, 255],
-        )
+        let builder = ProductionSession::builder(ProductionSessionConfig {
+            video_format: Some(format),
+        })
+        .l1t3_input([64, 128, 255]);
+        let mut session = if simulcast {
+            builder.h264_profiles([64, 128, 255])
+        } else {
+            builder
+        }
+        .build()
         .unwrap();
         let peers = [
             session.create_peer(PeerConfiguration::default()).unwrap(),
             session.create_peer(PeerConfiguration::default()).unwrap(),
         ];
-        let source = session.create_video_source().unwrap();
-        let outgoing = session
-            .publish_video(
-                peers[0],
-                source,
-                "temporal",
-                RtpTransceiverDirection::SendOnly,
-                &[],
-            )
-            .unwrap();
+        if !simulcast {
+            assert_eq!(
+                session
+                    .create_h264_source_with_profile(H264SourceProfile::SimulcastL1T3)
+                    .unwrap_err()
+                    .kind,
+                PeerErrorKind::UnsupportedParameter
+            );
+        }
+        let source = if simulcast {
+            session
+                .create_h264_source_with_profile(H264SourceProfile::SimulcastL1T3)
+                .unwrap()
+        } else {
+            session.create_video_source().unwrap()
+        };
+        let rids: Vec<String> = if simulcast {
+            vec!["q".into(), "h".into(), "f".into()]
+        } else {
+            vec![]
+        };
+        let outgoing = if initial {
+            let mut init = RtpTransceiverInit::default();
+            init.set_direction(RtpTransceiverDirectionValue::SendOnly);
+            let encodings: Vec<_> = (0..if simulcast { 3 } else { 1 })
+                .map(|index| {
+                    let mut encoding = RtpEncodingParameters::default();
+                    if simulcast {
+                        encoding.set_rid(rids[index].as_bytes());
+                    }
+                    encoding.set_scalability_mode(Some(b"L1T3"));
+                    encoding.set_num_temporal_layers(Some(3));
+                    encoding
+                })
+                .collect();
+            init.set_send_encodings(&encodings);
+            session
+                .publish_video_with_init(peers[0], source, "temporal", &init)
+                .unwrap()
+        } else {
+            session
+                .publish_video(
+                    peers[0],
+                    source,
+                    "temporal",
+                    RtpTransceiverDirection::SendOnly,
+                    &rids,
+                )
+                .unwrap()
+        };
+        let sender = session.sender(outgoing).unwrap();
+        let mut layered = session.sender_parameters(sender).unwrap();
+        for encoding in &mut layered.encodings {
+            encoding.scalability_mode = Some("L1T3".into());
+        }
+        assert_eq!(
+            session
+                .set_sender_parameters(sender, layered)
+                .unwrap_err()
+                .kind,
+            PeerErrorKind::UnsupportedParameter
+        );
+        if simulcast {
+            let mut wrong_count = session.sender_parameters(sender).unwrap();
+            wrong_count.encodings.pop();
+            assert_eq!(
+                session
+                    .set_sender_parameters(sender, wrong_count)
+                    .unwrap_err()
+                    .kind,
+                PeerErrorKind::UnsupportedParameter
+            );
+            let mut wrong_mode = session.sender_parameters(sender).unwrap();
+            wrong_mode.encodings[0].scalability_mode = Some("L1T1".into());
+            assert_eq!(
+                session
+                    .set_sender_parameters(sender, wrong_mode)
+                    .unwrap_err()
+                    .kind,
+                PeerErrorKind::UnsupportedParameter
+            );
+            let mut wrong_layers = session.get_sender_parameters(sender).unwrap();
+            let mut encodings = wrong_layers.encodings();
+            encodings[1].set_num_temporal_layers(Some(2));
+            wrong_layers.set_encodings(&encodings);
+            assert_eq!(
+                session
+                    .set_sender_parameters_value(sender, &wrong_layers)
+                    .unwrap_err()
+                    .kind,
+                PeerErrorKind::UnsupportedParameter
+            );
+            session
+                .set_peer_bitrate(peers[0], Some(3_000_000), Some(3_000_000), Some(4_000_000))
+                .unwrap();
+        }
         for transceiver in [outgoing] {
             let mut extensions = session.header_extensions_to_negotiate(transceiver).unwrap();
             extensions
                 .iter_mut()
                 .find(|extension| extension.uri() == DD)
                 .unwrap()
-                .direction = RtpHeaderExtensionDirection::SendReceive;
+                .direction = if negotiate_dd {
+                RtpHeaderExtensionDirection::SendReceive
+            } else {
+                RtpHeaderExtensionDirection::Stopped
+            };
             session
                 .set_header_extensions_to_negotiate(transceiver, &extensions)
                 .unwrap();
@@ -905,31 +1006,46 @@ fn migrated_temporal_actor_receives_native_dd_and_wakes_for_rejection() {
                 .iter_mut()
                 .find(|extension| extension.uri() == DD)
                 .unwrap()
-                .direction = RtpHeaderExtensionDirection::SendReceive;
+                .direction = if negotiate_dd {
+                RtpHeaderExtensionDirection::SendReceive
+            } else {
+                RtpHeaderExtensionDirection::Stopped
+            };
             session
                 .set_header_extensions_to_negotiate(incoming, &extensions)
                 .unwrap();
             let operation = session.create_answer(peers[1]).unwrap();
             let answer = finish(&mut session, peers[1], operation).unwrap();
-            let answer = set_local_and_gather(&mut session, peers[1], answer);
+            let mut answer = set_local_and_gather(&mut session, peers[1], answer);
+            if simulcast {
+                // Same sender-only SFU acceptance fixture as controlled_media.
+                // The stock receiver still observes only one native rung.
+                answer.sdp.push_str(
+                    "a=rid:q recv\r\na=rid:h recv\r\na=rid:f recv\r\na=simulcast:recv q;h;f\r\n",
+                );
+            }
             let operation = session.set_remote_description(peers[0], answer).unwrap();
             finish(&mut session, peers[0], operation);
             for transceiver in [outgoing, incoming] {
-                assert_eq!(
-                    session
-                        .negotiated_header_extensions(transceiver)
-                        .unwrap()
-                        .iter()
-                        .find(|extension| extension.uri() == DD)
-                        .unwrap()
-                        .direction,
-                    RtpHeaderExtensionDirection::SendReceive
-                );
+                let extensions = session.negotiated_header_extensions(transceiver).unwrap();
+                let dd = extensions.iter().find(|extension| extension.uri() == DD);
+                if negotiate_dd {
+                    assert_eq!(
+                        dd.unwrap().direction,
+                        RtpHeaderExtensionDirection::SendReceive
+                    );
+                } else {
+                    assert!(dd.is_none_or(
+                        |extension| extension.direction == RtpHeaderExtensionDirection::Stopped
+                    ));
+                }
             }
-            if selected {
+            if selected && negotiate_dd {
                 let sender = session.sender(outgoing).unwrap();
                 let mut parameters = session.sender_parameters(sender).unwrap();
-                parameters.encodings[0].scalability_mode = Some("L1T3".into());
+                for encoding in &mut parameters.encodings {
+                    encoding.scalability_mode = Some("L1T3".into());
+                }
                 session.set_sender_parameters(sender, parameters).unwrap();
             }
             assert_eq!(session.receiver(incoming).unwrap(), receiver);
@@ -963,7 +1079,132 @@ fn migrated_temporal_actor_receives_native_dd_and_wakes_for_rejection() {
                     end_of_picture: true,
                 },
             };
-            session.push_video(source, unit.clone()).unwrap();
+            if simulcast {
+                // Actual distinct spatial keyframes, all at T0. This exercises
+                // native 3xT3 configuration and base DD, not enhancement media.
+                let batch = [
+                    (
+                        320,
+                        180,
+                        include_bytes!("../../pulsebeam-testdata/src/quality_s0_180p.h264")
+                            .as_slice(),
+                    ),
+                    (
+                        640,
+                        360,
+                        include_bytes!("../../pulsebeam-testdata/src/quality_s0_360p.h264")
+                            .as_slice(),
+                    ),
+                    (
+                        1280,
+                        720,
+                        include_bytes!("../../pulsebeam-testdata/src/quality_s0_720p.h264")
+                            .as_slice(),
+                    ),
+                ]
+                .map(|(width, height, bytes)| {
+                    // These corpus streams delimit every access unit with AUD.
+                    let second_aud = bytes
+                        .windows(4)
+                        .enumerate()
+                        .filter(|(_, nal)| *nal == [0, 0, 1, 9])
+                        .nth(1)
+                        .unwrap()
+                        .0;
+                    let end = second_aud - usize::from(bytes[second_aud - 1] == 0);
+                    EncodedVideoAccessUnit {
+                        data: bytes[..end].to_vec(),
+                        width,
+                        height,
+                        ..unit.clone()
+                    }
+                });
+                let mut batch = batch;
+                for (index, frame) in batch.iter_mut().enumerate() {
+                    frame.metadata.simulcast_index = Some(index.try_into().unwrap());
+                }
+                assert!(session.push_video(source, unit.clone()).is_err());
+                for malformed in 0..5 {
+                    let mut invalid = batch.clone();
+                    match malformed {
+                        0 => invalid[1].metadata.temporal_index = None,
+                        1 => invalid[1].metadata.temporal_index = Some(2),
+                        2 => invalid[1].metadata.simulcast_index = Some(0),
+                        3 => invalid[1].timestamp_us += 1,
+                        _ => invalid[1].width = invalid[0].width,
+                    }
+                    assert_eq!(
+                        session
+                            .push_video_simulcast(source, invalid)
+                            .unwrap_err()
+                            .kind,
+                        PeerErrorKind::InvalidParameter
+                    );
+                }
+                if !negotiate_dd {
+                    assert_eq!(
+                        session
+                            .push_video_simulcast(source, batch)
+                            .unwrap_err()
+                            .kind,
+                        PeerErrorKind::InvalidParameter
+                    );
+                    return (session, None);
+                }
+                session.push_video_simulcast(source, batch).unwrap();
+            } else {
+                if !negotiate_dd {
+                    assert_eq!(
+                        session.push_video(source, unit).unwrap_err().kind,
+                        PeerErrorKind::InvalidParameter
+                    );
+                    return (session, None);
+                }
+                session.push_video(source, unit.clone()).unwrap();
+            }
+            if simulcast && selected {
+                // Sender publication only: the unmodified stock receiver does
+                // not negotiate simultaneous receipt of these three RIDs.
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let mut observed = HashSet::new();
+                while observed.len() < 3 {
+                    let operation = session.request_stats(peers[0]).unwrap();
+                    let mut complete = false;
+                    while !complete {
+                        while let Some(event) = session.try_peer_event(peers[0]).unwrap() {
+                            if let SessionEvent::Stats(snapshot) = event
+                                && snapshot.operation_id == operation
+                            {
+                                complete = true;
+                                for record in snapshot.records {
+                                    if let PeerStatsRecord::OutboundRtp(stats) = record
+                                        && stats.packets_sent.unwrap_or(0) > 0
+                                        && stats.frames_encoded.unwrap_or(0) > 0
+                                    {
+                                        observed.insert(stats.rid.unwrap());
+                                    }
+                                }
+                            }
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "native three-RID publication missing: {observed:?}"
+                        );
+                        if !complete {
+                            wait(&mut session);
+                        }
+                    }
+                }
+                assert_eq!(
+                    observed,
+                    HashSet::from([b"q".to_vec(), b"h".to_vec(), b"f".to_vec()])
+                );
+                let rates = session.video_feedback(source).unwrap().1.unwrap();
+                for row in &rates.layer_bitrates_bps[..3] {
+                    assert!(row[2].is_some());
+                }
+                return (session, None);
+            }
             let first = outcome(&mut session, peers, source, receiver);
             if !selected {
                 assert_eq!(first.unwrap_err(), CodecError::InvalidConfiguration);

@@ -1,5 +1,9 @@
 use super::*;
 
+fn copy_native_bytes(data: &[u8]) -> Vec<u8> {
+    data.to_vec()
+}
+
 // The fixed C++ ABI includes native-only entries and callback parameter lists.
 #[allow(dead_code, clippy::too_many_arguments)]
 #[cxx::bridge(namespace = "pulsebeam::webrtc_sys")]
@@ -2711,6 +2715,7 @@ pub(super) mod ffi {
         api_config_string: Vec<u8>,
     }
     extern "Rust" {
+        fn copy_native_bytes(data: &[u8]) -> Vec<u8>;
         type RustMixerProvider;
         fn mixer_provider_add(
             provider: &RustMixerProvider,

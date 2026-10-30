@@ -39,7 +39,7 @@ def runtime_tests(sources, support, fixtures):
             name = name,
             crate_root = source,
             srcs = [source] + support,
-            compile_data = fixtures + select({":asan_selected": ["@webrtc_upstream//:clang_tools", "@webrtc_upstream//:clang++"], "//conditions:default": []}),
+            compile_data = fixtures + (["//crates/pulsebeam-testdata:quality_zero_video_inputs"] if name == "production_session" else []) + select({":asan_selected": ["@webrtc_upstream//:clang_tools", "@webrtc_upstream//:clang++"], "//conditions:default": []}),
             edition = "2024",
             args = ["--test-threads=1"],
             tags = ["manual", "external-network"] if is_fixture else [],

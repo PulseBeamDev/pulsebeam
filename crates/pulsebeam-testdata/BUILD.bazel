@@ -5,6 +5,10 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_tes
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
 exports_files(["Cargo.toml"])
+filegroup(
+    name = "quality_zero_video_inputs",
+    srcs = ["src/quality_s0_180p.h264", "src/quality_s0_360p.h264", "src/quality_s0_720p.h264"],
+)
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
 
 cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")

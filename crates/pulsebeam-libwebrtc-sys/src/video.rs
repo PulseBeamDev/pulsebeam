@@ -1,4 +1,8 @@
-use std::{cell::Cell, fmt, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    fmt,
+    rc::{Rc, Weak},
+};
 
 use crate::{
     AudioCodecCapability, CodecError, VideoCodecFormat, VideoFrame, VideoResolution, ffi,
@@ -861,6 +865,8 @@ pub struct VideoSource {
 struct SourceInner {
     native: cxx::UniquePtr<ffi::NativeVideoSource>,
     _factory: Rc<FactoryInner>,
+    // Input admission must not keep an attached or retired RTC graph alive.
+    temporal_peers: RefCell<Vec<Weak<PeerInner>>>,
 }
 
 impl VideoSource {
@@ -872,8 +878,40 @@ impl VideoSource {
             inner: Rc::new(SourceInner {
                 native,
                 _factory: factory,
+                temporal_peers: RefCell::new(Vec::new()),
             }),
         }
+    }
+
+    pub(crate) fn admits_temporal_input(&self) -> bool {
+        let mut allowed = true;
+        self.inner.temporal_peers.borrow_mut().retain(|weak| {
+            let Some(peer) = weak.upgrade().filter(|peer| !peer.closed.get()) else {
+                return false;
+            };
+            let mut attached = false;
+            for sender in peer.sender_snapshot() {
+                let matches = sender.track_reference().is_some_and(|reference| {
+                    reference.local_video().is_some_and(|track| {
+                        track
+                            .inner
+                            ._source
+                            .as_ref()
+                            .is_some_and(|source| Rc::ptr_eq(source, &self.inner))
+                            && ffi::media_track_same_resource(
+                                reference.native(),
+                                &ffi::video_track_reference(track.native()),
+                            )
+                    })
+                });
+                if matches {
+                    attached = true;
+                    allowed &= sender.has_negotiated_dependency_descriptor();
+                }
+            }
+            attached
+        });
+        allowed
     }
 
     pub fn state(&self) -> VideoSourceState {
@@ -1192,10 +1230,20 @@ pub(crate) enum DirectEncodedVideo {
     H264,
     H264L1T3,
     H264Simulcast,
+    H264SimulcastL1T3,
     Vp8,
     Vp9,
     Av1,
     H265,
+}
+
+impl DirectEncodedVideo {
+    pub(crate) fn temporal(self) -> bool {
+        matches!(self, Self::H264L1T3 | Self::H264SimulcastL1T3)
+    }
+    pub(crate) fn simulcast(self) -> bool {
+        matches!(self, Self::H264Simulcast | Self::H264SimulcastL1T3)
+    }
 }
 
 struct TrackInner {
@@ -1453,16 +1501,36 @@ impl VideoTrack {
         self.inner.encoded_codec.set(Some(codec));
     }
 
+    pub(crate) fn register_encoded_sender(&self, peer: &Rc<PeerInner>) {
+        if !self.is_direct_l1t3() {
+            return;
+        }
+        if let Some(source) = &self.inner._source {
+            let mut peers = source.temporal_peers.borrow_mut();
+            peers.retain(|weak| weak.upgrade().is_some_and(|peer| !peer.closed.get()));
+            let weak = Rc::downgrade(peer);
+            if !peers.iter().any(|existing| existing.ptr_eq(&weak)) {
+                peers.push(weak);
+            }
+        }
+    }
+
     pub(crate) fn is_direct_encoded(&self) -> bool {
         self.inner.encoded_codec.get().is_some()
     }
 
     pub(crate) fn is_direct_l1t3(&self) -> bool {
-        self.inner.encoded_codec.get() == Some(DirectEncodedVideo::H264L1T3)
+        self.inner
+            .encoded_codec
+            .get()
+            .is_some_and(DirectEncodedVideo::temporal)
     }
 
     pub(crate) fn is_direct_simulcast(&self) -> bool {
-        self.inner.encoded_codec.get() == Some(DirectEncodedVideo::H264Simulcast)
+        self.inner
+            .encoded_codec
+            .get()
+            .is_some_and(DirectEncodedVideo::simulcast)
     }
 
     pub(crate) fn is_local_to(&self, factory: &Rc<FactoryInner>) -> bool {
@@ -2139,6 +2207,9 @@ impl RtpSender {
                 self.peer.stream_inputs.borrow_mut().remove(&key);
             }
         }
+        if let Some(video) = track.and_then(crate::MediaTrack::local_video) {
+            video.register_encoded_sender(&self.peer);
+        }
         self.peer.refresh_stream_inputs();
         Ok(true)
     }
@@ -2201,6 +2272,9 @@ impl RtpSender {
             }
         }
         drop(retained);
+        if let Some(track) = track {
+            track.register_encoded_sender(&self.peer);
+        }
         self.peer.refresh_stream_inputs();
         Ok(())
     }

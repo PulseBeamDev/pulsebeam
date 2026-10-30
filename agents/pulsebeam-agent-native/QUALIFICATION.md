@@ -20,8 +20,10 @@ Bazel owns the resulting libraries and native desktop runtime closure. Generated
 foreign bindings remain build outputs, not editable source.
 
 Local inputs are owned PCM/I420 or admitted encoded Opus/Annex-B H.264. H.264
-supports L1T1, single-encoding L1T3, and the documented three-encoding L1T1
-simulcast input. This is not an opaque encrypted-video or arbitrary-codec
+supports one encoding or three RID encodings with a uniform L1T1 or L1T3
+profile. Direct temporal input requires actual negotiated dependency descriptors
+on attached senders, including when temporal mode was supplied at initial
+transceiver creation. This is not an opaque encrypted-video or arbitrary-codec
 passthrough guarantee. Native validation and feedback remain authoritative;
 successful input admission does not promise encoding or remote delivery.
 
@@ -105,8 +107,20 @@ topic recovery. The stock production-native witness remains a separate boundary.
 The [Linux test-host prerequisites](../../crates/pulsebeam/docs/linux-only.md#ci)
 are mandatory in complete acceptance.
 
+The sys `production_session` owner also exercises direct three-RID L1T3
+configuration and actual native sent/encoded statistics for all three RIDs using
+distinct spatial keyframes at T0. It rejects malformed batches, wrong encoding
+counts/modes/layer counts, and temporal input with DD omitted from negotiation,
+including initially configured L1T3. Its sender-only SFU answer fixture does not
+claim simultaneous three-rung stock reception or enhancement decoding.
+
 The existing simulator replay owner also includes distinct focused scenarios:
 
+- `tests::bwe::clean_native_source_windows_respect_explicit_fixed_buffers_test`:
+  genuine precomputed three-rung T3 input with complete full-rate 720p native
+  output intervals at fixed zero and 120ms buffering, plus uniform, quiet and
+  explicit-update source behavior. This is not an all-rung pixel matrix or
+  joint spatial/temporal protection qualification under contention.
 - `tests::native_runtime::native_agents_prove_media_topics_reconnect_and_close`:
   real native media, topics, generation replacement and graceful retirement.
 - `tests::connectivity::a_tcp_connection_recovers_as_the_same_participant_test`:

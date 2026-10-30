@@ -21,6 +21,19 @@ pub struct NativeH264AccessUnit {
     pub base_layer_sync: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct NativeH264FixtureEncoding {
+    pub width: u16,
+    pub height: u16,
+    pub bitrate_kbps: u32,
+}
+
+const LEGACY_ENCODING: NativeH264FixtureEncoding = NativeH264FixtureEncoding {
+    width: 320,
+    height: 180,
+    bitrate_kbps: 500,
+};
+
 struct Capture(Arc<Mutex<Vec<NativeH264AccessUnit>>>);
 impl EncodedImageCallbackProvider for Capture {
     fn encoded(
@@ -63,9 +76,63 @@ pub fn stock_h264_fixture(
     temporal_layers: u8,
     frames: u32,
 ) -> FixtureResult<Vec<NativeH264AccessUnit>> {
+    encode_fixture(
+        world,
+        temporal_layers,
+        frames,
+        false,
+        LEGACY_ENCODING,
+        1_000,
+    )
+}
+
+/// Explicit test input configuration, not a product encoding profile. Actual
+/// access-unit bytes, not this encoder request, establish the supplied load.
+pub fn stock_h264_fixture_for_encoding(
+    world: &SimulationWorld,
+    encoding: NativeH264FixtureEncoding,
+    temporal_layers: u8,
+    frames: u32,
+) -> FixtureResult<Vec<NativeH264AccessUnit>> {
+    encode_fixture(
+        world,
+        temporal_layers,
+        frames,
+        false,
+        encoding,
+        encoding.bitrate_kbps,
+    )
+}
+
+/// Two independent solid-picture IDRs, constructed once for still/update inputs.
+pub fn stock_h264_solid_fixture(
+    world: &SimulationWorld,
+) -> FixtureResult<Vec<NativeH264AccessUnit>> {
+    encode_fixture(world, 1, 2, true, LEGACY_ENCODING, 1_000)
+}
+
+fn encode_fixture(
+    world: &SimulationWorld,
+    temporal_layers: u8,
+    frames: u32,
+    solid: bool,
+    encoding: NativeH264FixtureEncoding,
+    max_bitrate_kbps: u32,
+) -> FixtureResult<Vec<NativeH264AccessUnit>> {
     if !matches!(temporal_layers, 1..=3) || frames == 0 || frames > 120 {
         return Err(std::io::Error::other(
             "bounded H264 fixture needs 1..=3 layers and 1..=120 frames",
+        )
+        .into());
+    }
+    if !(16..=1280).contains(&encoding.width)
+        || !(16..=720).contains(&encoding.height)
+        || !encoding.width.is_multiple_of(2)
+        || !encoding.height.is_multiple_of(2)
+        || !(1..=1_000).contains(&encoding.bitrate_kbps)
+    {
+        return Err(std::io::Error::other(
+            "bounded H264 fixture needs even 16..=1280 by 16..=720 dimensions and 1..=1000 kbps",
         )
         .into());
     }
@@ -88,12 +155,12 @@ pub fn stock_h264_fixture(
     let mut codec = OwnedVideoCodec::default();
     let mut fields = codec.fields();
     fields.codec_type = VideoCodecType::H264;
-    fields.width = 320;
-    fields.height = 180;
+    fields.width = encoding.width;
+    fields.height = encoding.height;
     fields.max_framerate = 30;
-    fields.start_bitrate_kbps = 500;
-    fields.min_bitrate_kbps = 100;
-    fields.max_bitrate_kbps = 1_000;
+    fields.start_bitrate_kbps = encoding.bitrate_kbps;
+    fields.min_bitrate_kbps = encoding.bitrate_kbps.min(100);
+    fields.max_bitrate_kbps = max_bitrate_kbps;
     fields.codec_specific = Some(VideoCodecSpecificConfiguration::H264 {
         key_frame_interval: 120,
         temporal_layers,
@@ -113,24 +180,38 @@ pub fn stock_h264_fixture(
     )?;
     let mut allocation = OwnedVideoBitrateAllocation::default();
     for layer in 0..temporal_layers {
-        allocation.set_bitrate(0, usize::from(layer), 500_000 / u32::from(temporal_layers))?;
+        allocation.set_bitrate(
+            0,
+            usize::from(layer),
+            encoding.bitrate_kbps * 1_000 / u32::from(temporal_layers),
+        )?;
     }
     let rates = OwnedVideoRateControl::new(allocation.fields(), 30.0, None)?;
     encoder.set_rates(&rates);
+    let width = usize::from(encoding.width);
+    let height = usize::from(encoding.height);
     for index in 0..frames {
-        let mut pixels = vec![96; 320 * 180 * 3 / 2];
-        for y in 0..180 {
-            for x in 0..320 {
-                pixels[y * 320 + x] = if (x / 32 + y / 30 + usize::try_from(index / 8)?) % 2 == 0 {
+        let mut pixels = vec![96; width * height * 3 / 2];
+        for y in 0..height {
+            for x in 0..width {
+                pixels[y * width + x] = if (solid && index == 0)
+                    || (!solid && (x / 32 + y / 30 + usize::try_from(index / 8)?) % 2 == 0)
+                {
                     48
                 } else {
                     176
                 };
             }
         }
-        let legacy = VideoFrame::i420(320, 180, pixels, i64::from(index) * 33_333, index * 3_000)?;
+        let legacy = VideoFrame::i420(
+            u32::from(encoding.width),
+            u32::from(encoding.height),
+            pixels,
+            i64::from(index) * 33_333,
+            index * 3_000,
+        )?;
         let frame = RawVideoFrame::from_legacy(&legacy)?;
-        let kind = if index == 0 {
+        let kind = if index == 0 || solid {
             EncodedImageFrameType::Key
         } else {
             EncodedImageFrameType::Delta

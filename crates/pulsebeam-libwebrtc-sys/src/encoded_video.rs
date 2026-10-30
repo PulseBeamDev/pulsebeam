@@ -308,6 +308,7 @@ pub enum H264SourceProfile {
     L1T1,
     L1T3,
     SimulcastL1T1,
+    SimulcastL1T3,
 }
 
 #[derive(Clone)]
@@ -362,8 +363,9 @@ impl EncodedH264Input {
         Self::build(format, Some(fps), false)
     }
 
-    /// One installed factory supporting distinct L1T1, L1T3 and three-rung
-    /// sources. L1T3 sources share these declared cumulative FPS capabilities.
+    /// One installed factory supporting single-encoding and three-rung sources,
+    /// each with L1T1 or L1T3. Every T3 encoding shares these declared cumulative
+    /// FPS capabilities. Select the source profile explicitly before input.
     pub fn new_h264_profiles(fps: [u8; 3]) -> Result<Self, CodecError> {
         Self::new_h264_profiles_for_format(format(), fps)
     }
@@ -374,7 +376,7 @@ impl EncodedH264Input {
         let input = Self::new_l1t3_for_format(format, fps)?;
         Self::build(input.format, Some(fps), true)
     }
-    /// Direct three-rung H264 simulcast. Submit ordered, distinct rung batches.
+    /// Direct three-rung H264 L1T1 simulcast. Submit ordered, distinct rung batches.
     /// Native publication is not atomic. Stock receivers do not receive all
     /// simulcast rungs concurrently; native initialization must retain all three.
     pub fn new_simulcast() -> Result<Self, CodecError> {
@@ -478,6 +480,9 @@ impl EncodedH264Input {
             H264SourceProfile::L1T1 if self.format.name == "H264" => DirectEncodedVideo::H264,
             H264SourceProfile::L1T3 if self.temporal_fps.is_some() => DirectEncodedVideo::H264L1T3,
             H264SourceProfile::SimulcastL1T1 if self.simulcast => DirectEncodedVideo::H264Simulcast,
+            H264SourceProfile::SimulcastL1T3 if self.simulcast && self.temporal_fps.is_some() => {
+                DirectEncodedVideo::H264SimulcastL1T3
+            }
             _ => {
                 return Err(PeerError {
                     kind: PeerErrorKind::UnsupportedParameter,
@@ -595,7 +600,7 @@ impl EncodedH264Source {
     }
 
     pub fn push_encoded(&self, frame: EncodedVideoAccessUnit) -> Result<(), CodecError> {
-        if self.codec == crate::video::DirectEncodedVideo::H264Simulcast {
+        if self.codec.simulcast() {
             return Err(CodecError::InvalidConfiguration);
         }
         self.validate_unit(&frame, None)?;
@@ -606,11 +611,14 @@ impl EncodedH264Source {
     /// work. All units share capture time and have ordered native indexes 0..2.
     /// Native initialization must expose all three ordered streams; ambiguous
     /// single-encoder fallback returns `InvalidConfiguration` asynchronously.
+    /// L1T3 batches preserve each rung's explicit temporal index and base-layer
+    /// sync flag; keyframes must be T0. Attached temporal senders require actual
+    /// negotiated dependency descriptors before input admission.
     /// Native inactive/unallocated rungs may be dropped and are counted. Images
     /// are published separately; a later callback failure cannot retract an
     /// earlier image. Dimensions must match native sender configuration.
     pub fn push_simulcast(&self, frames: [EncodedVideoAccessUnit; 3]) -> Result<(), CodecError> {
-        if self.codec != crate::video::DirectEncodedVideo::H264Simulcast {
+        if !self.codec.simulcast() {
             return Err(CodecError::InvalidConfiguration);
         }
         let time = frames[0].timestamp_us;
@@ -662,7 +670,7 @@ impl EncodedH264Source {
             || !matching_codec
             || frame.metadata.simulcast_index != index
             || frame.metadata.spatial_index.is_some()
-            || if self.codec == crate::video::DirectEncodedVideo::H264L1T3 {
+            || if self.codec.temporal() {
                 !matches!(frame.metadata.temporal_index, Some(0..=2))
                     || (frame.key_frame && frame.metadata.temporal_index != Some(0))
             } else {
@@ -679,6 +687,9 @@ impl EncodedH264Source {
     }
 
     fn enqueue(&self, frames: Vec<EncodedVideoAccessUnit>) -> Result<(), CodecError> {
+        if self.codec.temporal() && !self.source.admits_temporal_input() {
+            return Err(CodecError::InvalidConfiguration);
+        }
         let largest = frames.last().ok_or(CodecError::InvalidFrame)?;
         let (width, height, time) = (largest.width, largest.height, largest.timestamp_us);
         let key_frame = frames.iter().all(|frame| frame.key_frame);
@@ -1007,13 +1018,23 @@ impl InputEncoder {
                 context.rtp_timestamp
             ),
         );
-        let temporal = self.configuration.as_ref().is_some_and(|settings| {
+        let settings = self
+            .configuration
+            .as_ref()
+            .ok_or_else(|| pending.reject(CodecError::InvalidConfiguration))?;
+        let simulcast = self.simulcast && settings.simulcast_streams.len() == 3;
+        let temporal = if simulcast {
+            settings
+                .simulcast_streams
+                .iter()
+                .all(|stream| stream.temporal_layers == 3)
+        } else {
             settings
                 .scalability_mode
                 .as_ref()
                 .map(crate::VideoScalabilityMode::as_str)
                 == Some("L1T3")
-        });
+        };
         if (temporal && self.temporal_fps.is_none())
             || pending
                 .frames
@@ -1023,36 +1044,25 @@ impl InputEncoder {
             return Err(pending.reject(CodecError::InvalidConfiguration));
         }
         if temporal
-            && !self.configuration.as_ref().is_some_and(|settings| {
-                settings
-                    .scalability_mode
-                    .as_ref()
-                    .map(crate::VideoScalabilityMode::as_str)
-                    == Some("L1T3")
-                    && settings.simulcast_temporal_layers == [3]
-                    && matches!(settings.h264_temporal_layers, Some(1..=3))
-            })
+            && (settings.simulcast_temporal_layers != vec![3; if simulcast { 3 } else { 1 }]
+                || !matches!(settings.h264_temporal_layers, Some(1..=3)))
         {
             return Err(pending.reject(CodecError::InvalidConfiguration));
         }
-        let settings = self
-            .configuration
-            .as_ref()
-            .ok_or_else(|| pending.reject(CodecError::InvalidConfiguration))?;
         let mut selected = vec![true; pending.frames.len()];
-        let simulcast = self.simulcast && settings.simulcast_streams.len() == 3;
         if self.simulcast && pending.frames.len() == 3 && !simulcast {
             return Err(pending.reject(CodecError::InvalidConfiguration));
         }
         if simulcast {
-            if pending.frames.len() != 3 || settings.h264_temporal_layers != Some(1) {
+            if pending.frames.len() != 3 || (!temporal && settings.h264_temporal_layers != Some(1))
+            {
                 return Err(pending.reject(CodecError::InvalidConfiguration));
             }
             match settings.simulcast_streams.len() {
                 3 => {
                     for (index, stream) in settings.simulcast_streams.iter().enumerate() {
                         let unit = &pending.frames[index];
-                        if stream.temporal_layers != 1
+                        if stream.temporal_layers != if temporal { 3 } else { 1 }
                             || (stream.active
                                 && (unit.width, unit.height) != (stream.width, stream.height))
                         {
@@ -1256,7 +1266,17 @@ impl VideoEncoder for InputEncoder {
                 .as_ref()
                 .is_some_and(|settings| settings.simulcast_streams.len() == 3)
             {
-                Some([vec![255], vec![255], vec![255], vec![], vec![]])
+                let fps = if self.configuration.as_ref().is_some_and(|settings| {
+                    settings
+                        .simulcast_streams
+                        .iter()
+                        .all(|stream| stream.temporal_layers == 3)
+                }) {
+                    self.temporal_fps.map_or_else(Vec::new, |fps| fps.to_vec())
+                } else {
+                    vec![255]
+                };
+                Some([fps.clone(), fps.clone(), fps, vec![], vec![]])
             } else if self.configuration.as_ref().is_some_and(|settings| {
                 settings
                     .scalability_mode

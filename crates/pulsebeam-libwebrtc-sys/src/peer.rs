@@ -2901,6 +2901,7 @@ impl PeerConnection {
             value.sender().resource_key(),
             SenderTrackLease::new(&value.sender(), track.clone()),
         );
+        track.register_encoded_sender(&self.inner);
         Ok(value)
     }
     pub fn add_video_transceiver(
@@ -2982,6 +2983,7 @@ impl PeerConnection {
                 sender.resource_key(),
                 SenderTrackLease::new(&sender, track.clone()),
             );
+            track.register_encoded_sender(&self.inner);
             Ok(transceiver)
         }
     }
@@ -3802,6 +3804,9 @@ impl PeerInner {
                 },
             );
             if let Some(source) = sources.iter().find(|source| source.same_resource(&actual)) {
+                if let Some(video) = source.local_video() {
+                    video.register_encoded_sender(self);
+                }
                 inputs.insert(
                     sender.resource_key(),
                     SenderTrackLease::new(&sender, source.clone()),

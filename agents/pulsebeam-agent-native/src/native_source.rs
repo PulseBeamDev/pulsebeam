@@ -48,15 +48,27 @@ pub(crate) fn encoding_values(
     {
         return Err(invalid("layered H264 requires dependency descriptors"));
     }
+    if config.encodings.len() > 1
+        && config
+            .encodings
+            .iter()
+            .any(|value| value.temporal_layers == 3)
+        && (config.encodings.len() != 3
+            || config
+                .encodings
+                .iter()
+                .any(|value| value.temporal_layers != 3))
+    {
+        return Err(invalid(
+            "layered H264 simulcast requires three L1T3 encodings",
+        ));
+    }
     config
         .encodings
         .iter()
         .map(|value| {
             if !matches!(value.temporal_layers, 1 | 3) {
                 return Err(invalid("H264 supports L1T1 or L1T3"));
-            }
-            if config.encodings.len() > 1 && value.temporal_layers != 1 {
-                return Err(invalid("H264 simulcast requires L1T1 per encoding"));
             }
             let mut encoding = rtc::RtpEncodingParameters::default();
             if let Some(rid) = &value.rid {
@@ -155,6 +167,9 @@ impl NativeSource {
                 let profile = match encodings {
                     [value] if value.temporal_layers == 1 => rtc::H264SourceProfile::L1T1,
                     [_] => rtc::H264SourceProfile::L1T3,
+                    [a, b, c] if [a, b, c].iter().all(|value| value.temporal_layers == 3) => {
+                        rtc::H264SourceProfile::SimulcastL1T3
+                    }
                     [_, _, _] => rtc::H264SourceProfile::SimulcastL1T1,
                     _ => {
                         return Err(invalid(
@@ -378,13 +393,16 @@ impl NativeSource {
                 let frames: [H264Frame; 3] = frames
                     .try_into()
                     .map_err(|_| invalid("simulcast requires three genuine access units"))?;
+                let [low, middle, high] = self.encodings.as_slice() else {
+                    return Err(invalid("simulcast requires three admitted encodings"));
+                };
                 let [a, b, c] = frames;
                 session.push_video_simulcast(
                     self.id,
                     [
-                        video_unit(a, Some(0), 1)?,
-                        video_unit(b, Some(1), 1)?,
-                        video_unit(c, Some(2), 1)?,
+                        video_unit(a, Some(0), low.temporal_layers)?,
+                        video_unit(b, Some(1), middle.temporal_layers)?,
+                        video_unit(c, Some(2), high.temporal_layers)?,
                     ],
                 )
             }
@@ -528,6 +546,17 @@ mod tests {
                     .collect(),
                 ..VideoSourceConfig::default()
             },
+            VideoSourceConfig {
+                encodings: ["low", "middle", "high"]
+                    .into_iter()
+                    .map(|rid| Encoding {
+                        rid: Some(rid.into()),
+                        temporal_layers: 3,
+                        ..Encoding::default()
+                    })
+                    .collect(),
+                ..VideoSourceConfig::default()
+            },
         ]
         .into_iter()
         .enumerate()
@@ -545,6 +574,13 @@ mod tests {
                 rtc::MediaType::Video
             );
             let before = source.encoding_state(&mut session).unwrap();
+            assert_eq!(before.len(), config.encodings.len());
+            for (actual, declared) in before.iter().zip(&config.encodings) {
+                assert_eq!(
+                    actual.temporal_layers,
+                    Some(i32::from(declared.temporal_layers))
+                );
+            }
             let invalid_limits = vec![
                 crate::EncodingLimits {
                     max_bitrate_bps: None,
@@ -643,16 +679,21 @@ mod tests {
 
     #[test]
     fn unsupported_shapes_are_not_silently_downgraded() {
-        assert!(
-            encoding_values(&VideoSourceConfig {
-                dependency_descriptor: false,
-                encodings: vec![Encoding {
-                    temporal_layers: 3,
-                    ..Encoding::default()
-                }],
-            })
-            .is_err()
-        );
+        for count in [1, 3] {
+            assert!(
+                encoding_values(&VideoSourceConfig {
+                    dependency_descriptor: false,
+                    encodings: vec![
+                        Encoding {
+                            temporal_layers: 3,
+                            ..Encoding::default()
+                        };
+                        count
+                    ],
+                })
+                .is_err()
+            );
+        }
         for encodings in [
             Vec::new(),
             vec![Encoding::default(); 4],
@@ -665,7 +706,15 @@ mod tests {
                     temporal_layers: 3,
                     ..Encoding::default()
                 };
-                3
+                2
+            ],
+            vec![
+                Encoding {
+                    temporal_layers: 3,
+                    ..Encoding::default()
+                },
+                Encoding::default(),
+                Encoding::default(),
             ],
         ] {
             assert!(
