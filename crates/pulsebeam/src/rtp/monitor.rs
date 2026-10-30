@@ -12,6 +12,9 @@ use tokio::time::Instant;
 use crate::entity::TrackKind;
 use crate::rtp::RtpPacket;
 
+mod target_rate;
+use target_rate::TargetRates;
+
 const SIMULCAST_LAYER_PAUSE_TIMEOUT: Duration = Duration::from_millis(1000);
 const SIMULCAST_LAYER_PAUSE_TIMEOUT_VLA: Duration = Duration::from_secs(10);
 const STREAM_DEAD_TIMEOUT: Duration = Duration::from_millis(3000);
@@ -141,6 +144,8 @@ pub struct StreamStats {
     /// Cumulative bitrate (kbps) per decode target, from the sender's
     /// per-temporal Video Layers Allocation. `0` = not declared.
     pub decode_target_kbps: [u32; MAX_LADDER_TARGETS],
+    /// Mature normalized-payload costs; zero retains the declared fallback.
+    pub measured_decode_target_bps: [u32; MAX_LADDER_TARGETS],
     /// Full frame rate (fps) from VLA. `0` = unknown.
     pub full_fps: u32,
 }
@@ -166,6 +171,7 @@ impl StreamStats {
             temporal_only: false,
             temporal_ladder_count: 0,
             decode_target_kbps: [0; MAX_LADDER_TARGETS],
+            measured_decode_target_bps: [0; MAX_LADDER_TARGETS],
             full_fps: 0,
         }
     }
@@ -213,8 +219,16 @@ impl StreamStats {
         }
     }
 
-    /// Cost (bps) of decode target `dt`, or `0` when the sender declared none.
+    /// Measured partial-target payload cost, falling back to the declared cost.
+    /// Full-rate cost remains declared: it is the denominator used to scale
+    /// partial costs against the stable full-encoding estimate.
     pub fn decode_target_bps(&self, dt: usize) -> u64 {
+        if dt.saturating_add(1) < usize::from(self.decode_target_count())
+            && let Some(measured) = self.measured_decode_target_bps.get(dt)
+            && *measured > 0
+        {
+            return u64::from(*measured);
+        }
         self.decode_target_kbps
             .get(dt)
             .map(|kbps| u64::from(*kbps).saturating_mul(1000))
@@ -322,6 +336,7 @@ pub struct StreamMonitor {
 
     cost_filter: RateFilter,
     stable_filter: RateFilter,
+    target_rates: TargetRates,
 
     current_quality: StreamQuality,
     quality_transition_since: Option<Instant>,
@@ -343,6 +358,7 @@ impl StreamMonitor {
         };
         let mut stats = stats;
         stats.quality = current_quality;
+        stats.measured_decode_target_bps = [0; MAX_LADDER_TARGETS];
         Self {
             stream_id,
             kind,
@@ -358,6 +374,7 @@ impl StreamMonitor {
             smoothed_loss_ratio: 0.0,
             bwe: BitrateEstimate::new(),
             cost_filter: RateFilter::new(),
+            target_rates: TargetRates::new(),
             stable_filter: RateFilter::with_taus(
                 RATE_RISE_TIME_CONSTANT,
                 STABLE_RATE_FALL_TIME_CONSTANT,
@@ -391,6 +408,7 @@ impl StreamMonitor {
             self.publish_health();
         }
         self.bwe.record(packet);
+        self.record_target_cost(packet);
 
         if was_inactive && may_activate {
             self.window_highest_seq = None;
@@ -410,6 +428,31 @@ impl StreamMonitor {
         self.window_actual_packets = self.window_actual_packets.saturating_add(1);
     }
 
+    fn record_target_cost(&mut self, packet: &RtpPacket) {
+        if self.vla_inactive || packet.payload.is_empty() {
+            return;
+        }
+        let count = usize::from(self.stats.decode_target_count());
+        if !(2..=MAX_LADDER_TARGETS).contains(&count) {
+            return;
+        }
+        if let Some(dd) = packet.ext_vals.dependency_descriptor()
+            && dd.frame_dependencies.dtis.len() >= count
+        {
+            let eligible = std::array::from_fn(|dt| {
+                dt < count && (dt.saturating_add(1) == count || dd.is_in_decode_target(dt))
+            });
+            self.target_rates.record(
+                packet.arrival_ts,
+                u64::try_from(packet.payload.len()).unwrap_or(u64::MAX),
+                eligible,
+            );
+            self.stats.measured_decode_target_bps = self.target_rates.costs;
+        } else {
+            self.reset_target_rates();
+        }
+    }
+
     /// This encoding's measurements, as one coherent value.
     pub fn stats(&self) -> StreamStats {
         self.stats
@@ -417,21 +460,39 @@ impl StreamMonitor {
 
     /// Record the decode-target count a scalable keyframe's structure taught.
     pub fn set_decode_target_count(&mut self, count: u8) {
+        if self.stats.decode_targets != count.max(1) {
+            self.reset_target_rates();
+        }
         self.stats.decode_targets = count.max(1);
     }
 
     pub fn set_decode_target_heights(&mut self, heights: [u16; MAX_LADDER_TARGETS]) {
+        if self.stats.decode_target_heights != heights {
+            self.reset_target_rates();
+        }
         self.stats.decode_target_heights = heights;
     }
 
     pub fn set_temporal_only(&mut self, temporal_only: bool) {
+        if self.stats.temporal_only != temporal_only {
+            self.reset_target_rates();
+        }
         self.stats.temporal_only = temporal_only;
+    }
+
+    fn reset_target_rates(&mut self) {
+        self.target_rates.reset();
+        self.stats.measured_decode_target_bps = [0; MAX_LADDER_TARGETS];
     }
 
     /// Record the sender's per-temporal cumulative bitrates and full frame rate
     /// from a Video Layers Allocation.
     pub fn set_temporal_ladder(&mut self, cumulative_kbps: &[u64], full_fps: u32) {
+        let old = self.stats.decode_target_count();
         self.stats.set_temporal_ladder(cumulative_kbps, full_fps);
+        if self.stats.decode_target_count() != old {
+            self.reset_target_rates();
+        }
     }
 
     /// Whether this encoding has produced a packet recently enough to count as a
@@ -451,6 +512,7 @@ impl StreamMonitor {
     }
 
     fn publish_inactive(&mut self) {
+        self.reset_target_rates();
         self.stats.healthy = false;
         self.stats.inactive = true;
         self.stats.bitrate_bps = 0;
@@ -558,6 +620,8 @@ impl StreamMonitor {
 
         self.stats.inactive = false;
         self.publish_health();
+        self.target_rates.poll(now);
+        self.stats.measured_decode_target_bps = self.target_rates.costs;
 
         // Resuming from any form of inactivity: reset the measurement window so that
         // stale seq numbers don't produce a phantom loss spike on the first window.
@@ -1460,6 +1524,107 @@ mod test {
             400_000.0,
             "after 1 rise-tau with VLA=1M, bitrate_bps should have risen substantially"
         );
+    }
+
+    fn target_packet(now: Instant, bytes: usize, base: bool) -> RtpPacket {
+        use pulsebeam_core::dd::{
+            DecodeTargetIndication, DependencyDescriptor, FrameDependencyTemplate,
+        };
+        let mut packet = make_packet(now, bytes);
+        let present = DecodeTargetIndication::Required;
+        let absent = DecodeTargetIndication::NotPresent;
+        packet.ext_vals.set_descriptor(DependencyDescriptor {
+            frame_dependencies: FrameDependencyTemplate {
+                dtis: if base {
+                    [present; 3]
+                } else {
+                    [absent, absent, present]
+                }
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        packet
+    }
+
+    #[test]
+    fn new_monitor_does_not_inherit_another_measurement_lifetime() {
+        let mut stats = StreamStats::new(false, 1_000_000, 720);
+        stats.decode_targets = 3;
+        stats.set_temporal_ladder(&[400, 600, 1000], 30);
+        stats.measured_decode_target_bps = [100, 200, 300];
+        let monitor = StreamMonitor::new(TrackKind::Video, "replacement".into(), stats);
+        assert_eq!(monitor.stats().decode_target_bps(1), 600_000);
+        assert_eq!(
+            monitor.stats().measured_decode_target_bps,
+            [0; MAX_LADDER_TARGETS]
+        );
+    }
+
+    #[test]
+    fn measured_target_cost_requires_complete_known_payload_evidence() {
+        let now = Instant::now();
+        let mut monitor =
+            StreamMonitor::new(TrackKind::Video, "targets".into(), StreamStats::default());
+        monitor.apply_vla(1_000_000, None);
+        monitor.set_decode_target_count(3);
+        monitor.set_temporal_only(true);
+        monitor.set_temporal_ladder(&[400, 600, 1000], 30);
+        monitor.process_packet(&target_packet(now, 200, true));
+        monitor.process_packet(&target_packet(now, 900, false));
+        assert_eq!(monitor.stats().decode_target_bps(1), 600_000);
+        monitor.poll(now + RATE_FALL_TIME_CONSTANT, false);
+        let measured = monitor.stats();
+        assert_eq!(measured.decode_target_bps(0), 533);
+        assert_eq!(measured.decode_target_bps(1), 533);
+        assert_eq!(measured.measured_decode_target_bps[2], 2933);
+        assert_eq!(measured.decode_target_bps(2), 1_000_000);
+        assert_eq!(measured.decode_target_kbps, [400, 600, 1000]);
+        assert_eq!(measured.bitrate_bps, 1_000_000);
+        monitor.process_packet(&make_packet(now + RATE_FALL_TIME_CONSTANT, 0));
+        assert_eq!(monitor.stats().decode_target_bps(1), 533);
+
+        // Unknown eligibility is not free traffic or continued measured proof.
+        monitor.process_packet(&make_packet(now + RATE_FALL_TIME_CONSTANT, 1200));
+        assert_eq!(monitor.stats().decode_target_bps(1), 600_000);
+        assert_eq!(
+            monitor.stats().measured_decode_target_bps,
+            [0; MAX_LADDER_TARGETS]
+        );
+    }
+
+    #[test]
+    fn target_cost_evidence_retires_with_structure_ladder_and_activity() {
+        let now = Instant::now();
+        let mut monitor =
+            StreamMonitor::new(TrackKind::Video, "targets".into(), StreamStats::default());
+        monitor.apply_vla(1_000_000, None);
+        monitor.set_decode_target_count(3);
+        monitor.set_temporal_only(true);
+        monitor.set_temporal_ladder(&[400, 600, 1000], 30);
+        for phase in 0..3 {
+            let start = now + RATE_FALL_TIME_CONSTANT * phase;
+            monitor.process_packet(&target_packet(start, 1200, true));
+            monitor.poll(start + RATE_FALL_TIME_CONSTANT, false);
+            assert!(monitor.stats().measured_decode_target_bps[1] > 0);
+            match phase {
+                0 => monitor.set_decode_target_heights([1, 1, 1]),
+                1 => {
+                    monitor.set_temporal_ladder(&[1000], 30);
+                    assert_eq!(monitor.stats().decode_target_bps(1), 0);
+                    monitor.set_temporal_ladder(&[400, 600, 1000], 30);
+                }
+                _ => {
+                    monitor.apply_vla(0, None);
+                }
+            }
+            assert_eq!(
+                monitor.stats().measured_decode_target_bps,
+                [0; MAX_LADDER_TARGETS]
+            );
+        }
     }
 
     #[test]

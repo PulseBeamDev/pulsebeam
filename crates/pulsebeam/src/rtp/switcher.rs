@@ -309,7 +309,7 @@ impl Switcher {
                             // the next frame onto it, and the subscriber would
                             // decode a truncated frame as a whole one. Leaving
                             // the gap keeps that damage visible.
-                            if !self.newest_frame_left_open() {
+                            if self.at_clean_frame_boundary() {
                                 // Renumbering takes the output slot each
                                 // outstanding hole below this point would have
                                 // filled, so those packets can no longer be
@@ -949,6 +949,63 @@ mod test {
             "egress stays contiguous across shed frames — no gap the subscriber reads as loss"
         );
         rtp::conformance::assert_decodable(&out, "subscribe + temporal shed to dt0");
+    }
+
+    #[test]
+    fn temporal_shedding_preserves_late_fragments_behind_an_early_marker() {
+        use pulsebeam_core::dd::temporal::TemporalDdGenerator;
+
+        for packets in [3, 4] {
+            let (q, _) = two_streams();
+            let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
+            let mut cache = TrackStreamCache::new();
+            let mut b = builder(1);
+            let mut dd = TemporalDdGenerator::new(3);
+            let mut out = Vec::new();
+            switcher.switch_to(q);
+            let mut key = b.keyframe(2);
+            stamp_generated_dd(&mut key, &dd.next(true));
+            ingest(&mut switcher, q, &mut cache, &key, &mut out);
+            switcher.set_decode_target(DecodeTargetSelection::Target(1));
+
+            let mut shed = b.delta_frame(1);
+            stamp_generated_dd(&mut shed, &dd.next(false));
+            ingest(&mut switcher, q, &mut cache, &shed, &mut out);
+            let mut frame = b.delta_frame(packets);
+            stamp_generated_dd(&mut frame, &dd.next(false));
+            ingest(&mut switcher, q, &mut cache, &frame[..1], &mut out);
+            let first = out.last().unwrap().clone();
+            ingest(
+                &mut switcher,
+                q,
+                &mut cache,
+                &frame[packets - 1..],
+                &mut out,
+            );
+            let mut shed = b.delta_frame(1);
+            stamp_generated_dd(&mut shed, &dd.next(false));
+            ingest(&mut switcher, q, &mut cache, &shed, &mut out);
+
+            let before = out.len();
+            ingest(&mut switcher, q, &mut cache, &frame[1..2], &mut out);
+            assert_eq!(out.len(), before + 1, "late genuine fragment was discarded");
+            assert_eq!(*out.last().unwrap().seq_no, (*first.seq_no).wrapping_add(1));
+            assert_eq!(out.last().unwrap().rtp_ts, first.rtp_ts);
+            ingest(&mut switcher, q, &mut cache, &frame[1..2], &mut out);
+            assert_eq!(out.len(), before + 1, "late fragment was emitted twice");
+
+            let mut next = b.delta_frame(1);
+            stamp_generated_dd(&mut next, &dd.next(false));
+            ingest(&mut switcher, q, &mut cache, &next, &mut out);
+            let sequences: BTreeSet<_> = out.iter().map(|packet| *packet.seq_no).collect();
+            assert_eq!(sequences.len(), out.len(), "output sequence collision");
+            if packets == 4 {
+                assert!(
+                    !sequences.contains(&(*first.seq_no).wrapping_add(2)),
+                    "real upstream loss was hidden"
+                );
+            }
+        }
     }
 
     #[test]
