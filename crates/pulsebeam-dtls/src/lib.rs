@@ -10,11 +10,6 @@ use std::{fmt, time::Instant};
 use aws_lc_rs::digest::{SHA256, digest};
 use dimpl::{Config, Dtls, DtlsCertificate};
 
-/// Maximum outgoing UDP payload, including DTLS framing.
-pub const MAX_WIRE_DATAGRAM: usize = 1150;
-/// Conservative application datagram limit, not an exact record-overhead formula.
-pub const MAX_APPLICATION_DATAGRAM: usize = 1024;
-
 /// Public SHA-256 fingerprint of the entire DER leaf certificate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Fingerprint([u8; 32]);
@@ -76,8 +71,6 @@ pub enum Error {
     PeerMismatch,
     #[error("application traffic requires a completed, pinned handshake")]
     NotConnected,
-    #[error("application datagram exceeds {MAX_APPLICATION_DATAGRAM} bytes")]
-    ApplicationTooLarge,
     #[error("caller time moved backwards")]
     TimeWentBackwards,
     #[error("unsupported DTLS output event")]
@@ -124,7 +117,7 @@ impl fmt::Debug for Output<'_> {
 /// One single-path DTLS 1.3 association. No protocol or provider selector exists.
 ///
 /// A protocol error, pin mismatch or premature inbound application data destroys
-/// the engine. Local send-size/readiness/time errors do not destroy it. Dropping
+/// the engine. Local readiness/time errors do not destroy it. Dropping
 /// or closing an association does not guarantee notification of the peer.
 pub struct Association {
     inner: Option<Dtls>,
@@ -147,13 +140,13 @@ impl fmt::Debug for Association {
     clippy::disallowed_types,
     reason = "dimpl requires Arc<Config>; this is immutable, cold-path configuration, not shared packet state."
 )]
-fn config() -> Result<std::sync::Arc<Config>, dimpl::Error> {
+fn config(mtu: usize) -> Result<std::sync::Arc<Config>, dimpl::Error> {
     Ok(std::sync::Arc::new(
         Config::builder()
             .with_crypto_provider(dimpl::crypto::aws_lc_rs::default_provider())
             .dtls12_cipher_suites(&[])
             .require_client_certificate(true)
-            .mtu(MAX_WIRE_DATAGRAM)
+            .mtu(mtu)
             .max_queue_rx(32)
             .max_queue_tx(32)
             .build()?,
@@ -161,14 +154,17 @@ fn config() -> Result<std::sync::Arc<Config>, dimpl::Error> {
 }
 
 impl Association {
+    /// Forward the caller-selected MTU to dimpl for packetization.
+    /// Application sizing and fragmentation remain the caller's responsibility.
     pub fn new(
         role: Role,
         local: &LocalIdentity,
         expected_peer: Fingerprint,
+        mtu: usize,
         now: Instant,
     ) -> Result<Self, Error> {
         // Only static certificate credentials are copied, never live traffic state.
-        let mut inner = Dtls::new_13(config()?, local.0.clone(), now);
+        let mut inner = Dtls::new_13(config(mtu)?, local.0.clone(), now);
         inner.set_active(role == Role::Client);
         Ok(Self {
             inner: Some(inner),
@@ -184,13 +180,12 @@ impl Association {
     }
 
     /// Feed a UDP payload from the selected peer after advancing time and draining.
-    /// Oversized wire datagrams are discarded without changing authentication.
     pub fn handle_packet(&mut self, datagram: &[u8]) -> Result<(), Error> {
-        let inner = self.inner.as_mut().ok_or(Error::Closed)?;
-        if datagram.len() > MAX_WIRE_DATAGRAM {
-            return Ok(());
-        }
-        let result = inner.handle_packet(datagram);
+        let result = self
+            .inner
+            .as_mut()
+            .ok_or(Error::Closed)?
+            .handle_packet(datagram);
         self.protocol_result(result)
     }
 
@@ -208,16 +203,14 @@ impl Association {
         self.protocol_result(result)
     }
 
-    /// Queue exactly one application datagram. Drain output before the next call.
+    /// Queue one caller-sized application datagram, without splitting or capping it.
+    /// Drain output before the next call; dimpl errors remain fatal.
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.inner.is_none() {
             return Err(Error::Closed);
         }
         if !self.is_connected() {
             return Err(Error::NotConnected);
-        }
-        if data.len() > MAX_APPLICATION_DATAGRAM {
-            return Err(Error::ApplicationTooLarge);
         }
         let result = self
             .inner
@@ -239,10 +232,6 @@ impl Association {
                 if !self.is_connected() {
                     self.close();
                     return Err(Error::NotConnected);
-                }
-                if bytes.len() > MAX_APPLICATION_DATAGRAM {
-                    self.close();
-                    return Err(Error::ApplicationTooLarge);
                 }
                 return Ok(Output::ApplicationData(bytes));
             }

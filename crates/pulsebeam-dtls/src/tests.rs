@@ -20,13 +20,10 @@ struct Trace {
 }
 
 fn drain(association: &mut Association, trace: &mut Trace) -> Result<(), Error> {
-    let mut buffer = [0; MAX_WIRE_DATAGRAM];
+    let mut buffer = vec![0; 4096];
     for _ in 0..128 {
         match association.poll_output(&mut buffer)? {
-            Output::Datagram(bytes) => {
-                assert!(bytes.len() <= MAX_WIRE_DATAGRAM);
-                trace.packets.push(bytes.to_vec());
-            }
+            Output::Datagram(bytes) => trace.packets.push(bytes.to_vec()),
             Output::ApplicationData(bytes) => trace.application.push(bytes.to_vec()),
             Output::Connected => trace.connected += 1,
             Output::Timeout(at) => {
@@ -35,7 +32,7 @@ fn drain(association: &mut Association, trace: &mut Trace) -> Result<(), Error> 
             }
             Output::Progress => {}
             Output::Closed => return Ok(()),
-            Output::BufferTooSmall { needed } => panic!("unexpected output size {needed}"),
+            Output::BufferTooSmall { needed } => buffer.resize(needed, 0),
         }
     }
     panic!("output did not quiesce");
@@ -101,12 +98,14 @@ fn public_associations_authenticate_retransmit_and_preserve_datagrams() -> Resul
         Role::Client,
         &client_identity,
         server_identity.fingerprint(),
+        4096,
         now,
     )?;
     let mut server = Association::new(
         Role::Server,
         &server_identity,
         client_identity.fingerprint(),
+        8192,
         now,
     )?;
     let (mut client_trace, mut server_trace) = (Trace::default(), Trace::default());
@@ -142,11 +141,7 @@ fn public_associations_authenticate_retransmit_and_preserve_datagrams() -> Resul
     assert_eq!((client_trace.connected, server_trace.connected), (1, 1));
     assert!(client_trace.application.is_empty() && server_trace.application.is_empty());
 
-    for payload in [
-        Vec::new(),
-        b"client payload".to_vec(),
-        vec![0xa5; MAX_APPLICATION_DATAGRAM],
-    ] {
+    for payload in [Vec::new(), b"client payload".to_vec(), vec![0xa5; 3072]] {
         client.send_application_data(&payload)?;
         drive(
             &mut client,
@@ -156,7 +151,7 @@ fn public_associations_authenticate_retransmit_and_preserve_datagrams() -> Resul
             &mut now,
         )?;
     }
-    server.send_application_data(b"server payload")?;
+    server.send_application_data(&[0x5a; 6144])?;
     drive(
         &mut client,
         &mut server,
@@ -166,17 +161,9 @@ fn public_associations_authenticate_retransmit_and_preserve_datagrams() -> Resul
     )?;
     assert_eq!(
         server_trace.application,
-        [
-            Vec::new(),
-            b"client payload".to_vec(),
-            vec![0xa5; MAX_APPLICATION_DATAGRAM]
-        ]
+        [Vec::new(), b"client payload".to_vec(), vec![0xa5; 3072]]
     );
-    assert_eq!(client_trace.application, [b"server payload".to_vec()]);
-    assert!(matches!(
-        client.send_application_data(&[0; MAX_APPLICATION_DATAGRAM + 1]),
-        Err(Error::ApplicationTooLarge)
-    ));
+    assert_eq!(client_trace.application, [vec![0x5a; 6144]]);
     assert!(matches!(
         client.handle_timeout(origin),
         Err(Error::TimeWentBackwards)
@@ -188,10 +175,7 @@ fn public_associations_authenticate_retransmit_and_preserve_datagrams() -> Resul
         client.send_application_data(b"closed"),
         Err(Error::Closed)
     ));
-    assert!(matches!(
-        client.poll_output(&mut [0; MAX_WIRE_DATAGRAM])?,
-        Output::Closed
-    ));
+    assert!(matches!(client.poll_output(&mut [])?, Output::Closed));
     Ok(())
 }
 
@@ -212,12 +196,14 @@ fn either_roles_wrong_pin_fails_closed_before_application_access() -> Result<(),
             Role::Client,
             &client_identity,
             Fingerprint::from_bytes(client_pin),
+            1500,
             now,
         )?;
         let mut server = Association::new(
             Role::Server,
             &server_identity,
             Fingerprint::from_bytes(server_pin),
+            1500,
             now,
         )?;
         let (mut client_trace, mut server_trace) = (Trace::default(), Trace::default());
@@ -250,22 +236,19 @@ fn either_roles_wrong_pin_fails_closed_before_application_access() -> Result<(),
             rejected.send_application_data(b"must not escape"),
             Err(Error::Closed)
         ));
-        assert!(matches!(
-            rejected.poll_output(&mut [0; MAX_WIRE_DATAGRAM])?,
-            Output::Closed
-        ));
+        assert!(matches!(rejected.poll_output(&mut [])?, Output::Closed));
     }
     Ok(())
 }
 
 fn drain_legacy(peer: &mut Dtls, packets: &mut Vec<Vec<u8>>) {
-    let mut buffer = [0; MAX_WIRE_DATAGRAM];
+    let mut buffer = vec![0; 4096];
     for _ in 0..128 {
         match peer.poll_output(&mut buffer) {
             dimpl::Output::Packet(bytes) => packets.push(bytes.to_vec()),
             dimpl::Output::Timeout(_) | dimpl::Output::CloseNotify => return,
             dimpl::Output::Connected => panic!("legacy peer negotiated a fallback"),
-            dimpl::Output::BufferTooSmall { needed } => panic!("unexpected legacy size {needed}"),
+            dimpl::Output::BufferTooSmall { needed } => buffer.resize(needed, 0),
             _ => {}
         }
     }
@@ -277,7 +260,13 @@ fn a_real_dtls12_peer_cannot_negotiate_a_fallback() -> Result<(), Error> {
     let local = LocalIdentity::generate()?;
     let legacy_identity = LocalIdentity::generate()?;
     let origin = test_start();
-    let mut server = Association::new(Role::Server, &local, legacy_identity.fingerprint(), origin)?;
+    let mut server = Association::new(
+        Role::Server,
+        &local,
+        legacy_identity.fingerprint(),
+        1500,
+        origin,
+    )?;
     #[allow(
         clippy::disallowed_types,
         reason = "The negative-test peer requires immutable Arc<Config> at construction."
