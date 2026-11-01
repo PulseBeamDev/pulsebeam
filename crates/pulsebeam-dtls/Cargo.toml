@@ -1,0 +1,18 @@
+[package]
+name = "pulsebeam-dtls"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-lc-rs = { version = "1.16", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+dimpl = { version = "=0.9.0", default-features = false, features = ["aws-lc-rs", "rcgen"] }
+thiserror.workspace = true
