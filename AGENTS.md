@@ -8,6 +8,7 @@
 
 ## Documentation and README changes
 
+* Do not edit the repository root `README.md` unless the user explicitly requests a README change in the current task.
 * When writing or editing `docs/**`, any `README.md`, or other developer-facing documentation, follow `docs/AGENTS.md` and any nearer local instructions. Apply VitePress-specific checks only to `docs/**`.
 
 ## Prefer executable truth
