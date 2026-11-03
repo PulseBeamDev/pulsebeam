@@ -167,30 +167,19 @@ fn automatic_audio_oracle_requires_every_uncontended_live_source() {
 }
 
 #[test]
-fn automatic_audio_oracle_allows_contended_choices_but_requires_full_slots_and_pins() {
-    let (mut model, mut client) = audio_fixture(2);
+fn automatic_audio_oracle_requires_all_sources_without_a_fixed_receiver_inventory() {
+    let (mut model, mut client) = audio_fixture(3);
+    client.audio_capacity = 1;
     let requested = [model.participants[0].id.as_str()];
     model
         .check_client(&model.participants[1], &client, &requested)
         .unwrap();
-    let first = client.snapshot.audio_mapping.get(&0).unwrap().clone();
-    let third = model
-        .participants
-        .last()
-        .unwrap()
-        .track_id(TrackKind::Audio, "audio")
-        .as_str();
-    client.snapshot.audio_mapping.insert(0, third);
-    model
-        .check_client(&model.participants[1], &client, &requested)
-        .unwrap();
-    let second = client.snapshot.audio_mapping.remove(&1).unwrap();
+    let first = client.snapshot.audio_mapping.remove(&0).unwrap();
     assert!(
         model
             .check_client(&model.participants[1], &client, &requested)
             .is_err()
     );
-    client.snapshot.audio_mapping.insert(1, second);
     model.participants[1].audio_pinned =
         vec![client.snapshot.publications[&first].participant_id.clone()];
     assert!(
@@ -198,7 +187,20 @@ fn automatic_audio_oracle_allows_contended_choices_but_requires_full_slots_and_p
             .check_client(&model.participants[1], &client, &requested)
             .is_err()
     );
-    client.snapshot.audio_mapping.insert(0, first);
+    client.snapshot.audio_mapping.insert(0, first.clone());
+    model
+        .check_client(&model.participants[1], &client, &requested)
+        .unwrap();
+    model.participants[1].automatic_audio = false;
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &requested)
+            .is_err()
+    );
+    client
+        .snapshot
+        .audio_mapping
+        .retain(|_, track| track == &first);
     model
         .check_client(&model.participants[1], &client, &requested)
         .unwrap();
@@ -225,6 +227,74 @@ fn transition_safety_allows_pending_withdrawal_but_rejects_invalid_assignments()
     assert!(ApplicationStateOracle::check_client_safety(&client, &allowed).is_err());
     let (_, client) = fixture();
     assert!(ApplicationStateOracle::check_client_safety(&client, &BTreeSet::new()).is_err());
+
+    use pulsebeam_agent_native::agent_core as core;
+    let mut agent = core::Agent::new(core::AgentConfig {
+        endpoint: "https://sfu.test/".into(),
+        token: "token".into(),
+        retry: Default::default(),
+        log_level: Default::default(),
+    })
+    .unwrap();
+    agent
+        .command(core::AgentCommand::ReplaceDesired(core::DesiredState {
+            revision: 1,
+            connected: true,
+            ..Default::default()
+        }))
+        .unwrap();
+    let core::Effect::Rtc(core::RtcEffect::CreateOffer { generation, .. }) =
+        agent.next_effect().unwrap()
+    else {
+        panic!("expected admission offer");
+    };
+    let (_, mut client) = fixture();
+    client.snapshot.generation = Some(generation);
+    let publication = client.snapshot.publications.pop_first().unwrap().1;
+    client
+        .owned_receivers
+        .push(super::super::client::OwnedReceiverEvidence {
+            track: pulsebeam_agent_native::RemoteTrack {
+                generation: generation.get(),
+                receiver: 1,
+                track_id: "native-receiver".into(),
+                mid: "v0".into(),
+                media_index: 0,
+            },
+            publication,
+        });
+    ApplicationStateOracle::check_client_safety(&client, &allowed).unwrap();
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &[])
+            .is_err()
+    );
+    let mutations: &[Mutation<ClientObservation>] = &[
+        ("retired receiver", |state| state.owned_receivers.clear()),
+        ("old generation", |state| {
+            state.owned_receivers[0].track.generation += 1;
+        }),
+        ("wrong receiver coordinate", |state| {
+            state.owned_receivers[0].track.media_index = 1;
+        }),
+        ("wrong source", |state| {
+            state.owned_receivers[0].publication.id = "unknown".into();
+        }),
+        ("wrong kind", |state| {
+            state.owned_receivers[0].publication.kind = MediaKind::Audio;
+        }),
+        ("foreign origin", |state| {
+            state.owned_receivers[0].publication.participant_id = "foreign".into();
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let mut invalid = client.clone();
+        mutate(&mut invalid);
+        assert!(
+            ApplicationStateOracle::check_client_safety(&invalid, &allowed).is_err(),
+            "accepted {name}"
+        );
+    }
 }
 
 #[test]

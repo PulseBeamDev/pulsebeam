@@ -25,7 +25,7 @@ cargo_build_script(
 rust_library(
     name = "pulsebeam-proto",
     crate_root = "src/lib.rs",
-    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**", "src/signaling.rs"]),
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
     compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
     edition = crate_edition(),
     crate_features = [],
@@ -40,7 +40,7 @@ rust_library(
     name = "pulsebeam-proto-json",
     crate_name = "pulsebeam_proto",
     crate_root = "src/lib.rs",
-    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**", "src/signaling.rs"]),
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
     compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
     edition = crate_edition(),
     crate_features = ["json"],

@@ -111,6 +111,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
             handle: None,
             enabled: false,
             opened: false,
+            reset_pending: false,
             retiring: false,
             preparation: Some(work),
             deadline: Some(deadline),
@@ -121,6 +122,22 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         .native_receivers
         .source_refs
         .insert((*id.as_bytes(), 1));
+    participant
+        .native_receivers
+        .receivers
+        .get_mut(&1)
+        .unwrap()
+        .reset_pending = true;
+    participant.native_data_closed(channel, &mut sink);
+    participant.native_receiver_opened(
+        1,
+        crate::participant::transport::native_data_config(channel, DataLane::Ordered),
+        &mut sink,
+    );
+    let pending = participant.native_receivers.receivers.get_mut(&1).unwrap();
+    assert!(!pending.opened && !pending.retiring && pending.preparation.is_some());
+    assert_eq!(pending.deadline, Some(deadline));
+    pending.reset_pending = false;
     participant.native_receiver_opened(
         1,
         crate::participant::transport::native_data_config(channel, DataLane::Ordered),

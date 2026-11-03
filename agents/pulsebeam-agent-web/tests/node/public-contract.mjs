@@ -9,7 +9,6 @@ export async function publicContract(pulsebeam) {
   const agent = createAgent({
     endpoint: "http://localhost",
     token: "public-smoke",
-    topology: { localVideos: 1, localAudios: 1 },
     logging: { level: "off" },
   });
   const closedDuringInitialization = createAgent({

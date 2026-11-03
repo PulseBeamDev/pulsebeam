@@ -298,11 +298,12 @@ class EncodedAudioCollector : public webrtc::FrameTransformerInterface {
     const auto data = frame->GetData();
     if (frame->GetDirection() !=
             webrtc::TransformableFrameInterface::Direction::kReceiver ||
-        frame->GetMimeType() != "audio/opus" || data.empty() ||
-        data.size() > 65536) {
+        frame->GetMimeType() != "audio/opus" || data.size() > 65536) {
       Lost();
       return;
     }
+    // Empty receive callbacks expose no encoded media or reason for its absence.
+    if (data.empty()) return;
     const auto samples = OpusSamples(data);
     if (!samples) {
       Lost();

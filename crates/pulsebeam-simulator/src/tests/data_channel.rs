@@ -1,4 +1,4 @@
-use super::common::{LinkProfile, LocalNodeSim, Loss, Participant, Reorder, Room, Step};
+use super::common::{LinkProfile, LocalNodeSim, Participant, Reorder, Room, Step};
 use pulsebeam_agent_native::agent_core::TopicMode;
 use std::time::Duration;
 

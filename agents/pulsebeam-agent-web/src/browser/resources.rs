@@ -152,7 +152,11 @@ pub(super) fn result(value: ResourceResult) -> JsValue {
         }
         ResourceResult::Event { event: None } => JsValue::NULL,
         ResourceResult::Event { event: Some(event) } => data_event(event),
-        ResourceResult::Updated => JsValue::UNDEFINED,
+        ResourceResult::Updated
+        | ResourceResult::Superseded
+        | ResourceResult::PublicationInput { .. }
+        | ResourceResult::PublicationInputState(_)
+        | ResourceResult::MediaObservation(_) => JsValue::UNDEFINED,
     }
 }
 
@@ -213,7 +217,8 @@ pub(super) fn error(error: AgentError) -> JsValue {
             TrackResourceError::NotConnected => "not-connected",
             TrackResourceError::AlreadyOwned | TrackResourceError::OwnerInUse => "ownership",
             TrackResourceError::OwnerSpaceExhausted => "owner-exhausted",
-            TrackResourceError::Capacity { .. } => "capacity",
+            TrackResourceError::SlotSpaceExhausted { .. } => "slot-exhausted",
+            TrackResourceError::InputOperationSpaceExhausted => "input-operation-exhausted",
             TrackResourceError::Released => "released",
             TrackResourceError::ReceiveOverflow => "receive-overflow",
             TrackResourceError::ReceiveChannelFailed(_) => "receive-channel-failed",

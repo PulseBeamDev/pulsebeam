@@ -85,6 +85,9 @@ pub enum DataChannelEvent {
     Closed {
         generation: Generation,
         channel: ChannelId,
+        /// Both reset directions completed on the original healthy association.
+        /// The backend settled sends and fenced old-lifetime delivery.
+        reset_complete: bool,
     },
     Message {
         generation: Generation,

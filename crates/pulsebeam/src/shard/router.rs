@@ -138,7 +138,7 @@ impl ShardRuntime {
             .filter(|descriptor| descriptor.kind == crate::entity::TrackKind::Video)
             .map(|descriptor| {
                 debug_assert!(descriptor.encodings.len() <= 3);
-                TrackStreamCache::new()
+                TrackStreamCache::with_encodings(&descriptor.encodings)
             });
         if let Some(handle) = self.track_handles.get(&track_id).copied() {
             let Some(runtime) = self.tracks.get_mut(handle) else {
@@ -177,15 +177,18 @@ impl ShardRuntime {
             debug_assert!(false, "an RTP packet must resolve to a live track");
             return;
         };
-        let rid = pkt.ext_vals.rid;
         let seq = pkt.seq_no;
         let too_old;
         let (packet, cache) = if let Some(track_cache) = runtime.cache.as_mut() {
-            too_old = track_cache.push(pkt);
-            let Some(packet) = too_old
-                .as_ref()
-                .or_else(|| track_cache.encoding(rid).and_then(|stream| stream.get(seq)))
-            else {
+            let Some(encoding) = track_cache.source(&pkt) else {
+                return;
+            };
+            too_old = track_cache.push_encoding(encoding, pkt);
+            let Some(packet) = too_old.as_ref().or_else(|| {
+                track_cache
+                    .encoding(encoding)
+                    .and_then(|stream| stream.get(seq))
+            }) else {
                 debug_assert!(false, "a cached packet must be readable");
                 return;
             };
@@ -334,7 +337,7 @@ mod tests {
         let descriptor = crate::shard_update::TrackDescriptor {
             origin: crate::entity::ParticipantId::new(),
             kind: crate::entity::TrackKind::Video,
-            encodings: vec![Some(crate::media::Rid::from("q"))],
+            encodings: vec![Some(crate::media::Rid::from("q")).into()],
         };
         let track_id = track_id(crate::entity::TrackKind::Video, "video");
         let key = runtime.install_track(track_id, Some(&descriptor), Some(origin_key), None);
@@ -342,7 +345,7 @@ mod tests {
         let descriptor = crate::shard_update::TrackDescriptor {
             origin: descriptor.origin,
             kind: crate::entity::TrackKind::Video,
-            encodings: vec![Some(crate::media::Rid::from("f"))],
+            encodings: vec![Some(crate::media::Rid::from("f")).into()],
         };
         assert_eq!(
             runtime.install_track(track_id, Some(&descriptor), Some(origin_key), None),

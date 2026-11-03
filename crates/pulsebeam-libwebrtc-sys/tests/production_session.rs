@@ -970,10 +970,21 @@ fn migrated_temporal_actor_receives_native_dd_and_wakes_for_rejection() {
                 .set_header_extensions_to_negotiate(transceiver, &extensions)
                 .unwrap();
         }
+        assert!(
+            session
+                .transceiver_applied_local_cname(outgoing)
+                .unwrap()
+                .is_none()
+        );
         let session = thread::spawn(move || {
-            let operation = session.create_offer(peers[0], false).unwrap();
-            let offer = finish(&mut session, peers[0], operation).unwrap();
-            let offer = set_local_and_gather(&mut session, peers[0], offer);
+            let offer = if initial {
+                let operation = session.set_local_description_auto(peers[0]).unwrap();
+                gather_local(&mut session, peers[0], operation)
+            } else {
+                let operation = session.create_offer(peers[0], false).unwrap();
+                let offer = finish(&mut session, peers[0], operation).unwrap();
+                set_local_and_gather(&mut session, peers[0], offer)
+            };
             let operation = session.set_remote_description(peers[1], offer).unwrap();
             let mut completed = false;
             let mut arrival = None;
@@ -1026,6 +1037,19 @@ fn migrated_temporal_actor_receives_native_dd_and_wakes_for_rejection() {
             }
             let operation = session.set_remote_description(peers[0], answer).unwrap();
             finish(&mut session, peers[0], operation);
+            if initial {
+                let cname = session
+                    .transceiver_applied_local_cname(outgoing)
+                    .unwrap()
+                    .unwrap();
+                assert!(!cname.is_empty());
+                let parameters = session
+                    .get_sender_parameters(sender)
+                    .unwrap()
+                    .rtcp()
+                    .cname_bytes();
+                assert!(parameters.is_empty() || parameters == cname);
+            }
             for transceiver in [outgoing, incoming] {
                 let extensions = session.negotiated_header_extensions(transceiver).unwrap();
                 let dd = extensions.iter().find(|extension| extension.uri() == DD);
@@ -1307,6 +1331,14 @@ fn set_local_and_gather(
     description: SessionDescription,
 ) -> SessionDescription {
     let operation = session.set_local_description(peer, description).unwrap();
+    gather_local(session, peer, operation)
+}
+
+fn gather_local(
+    session: &mut ProductionSession,
+    peer: SessionPeerId,
+    operation: OperationId,
+) -> SessionDescription {
     let mut complete = false;
     let mut gathered = false;
     while !complete || !gathered {
@@ -1462,8 +1494,14 @@ fn migrated_actor_preserves_native_signaling_choices() {
 #[test]
 fn migrated_actor_is_woken_for_real_reliable_channel_delivery() {
     let mut session = ProductionSession::new(ProductionSessionConfig::default()).unwrap();
-    let alice = session.create_peer(PeerConfiguration::default()).unwrap();
-    let bob = session.create_peer(PeerConfiguration::default()).unwrap();
+    let mut configuration = RtcConfiguration::default();
+    configuration.options.max_sctp_streams = 8;
+    let alice = session
+        .create_peer_with_configuration(configuration.clone())
+        .unwrap();
+    let bob = session
+        .create_peer_with_configuration(configuration)
+        .unwrap();
     let config = DataChannelConfiguration {
         negotiated: true,
         id: Some(0),
@@ -1639,6 +1677,37 @@ fn migrated_actor_is_woken_for_real_reliable_channel_delivery() {
             DataChannelState::Open
         );
         assert_eq!(session.channel_error(incoming).unwrap(), None);
+        let deliver = |session: &mut ProductionSession, outgoing, incoming, payload: [u8; 2]| {
+            let send = session
+                .send_async(outgoing, DataChannelMessage::binary(payload))
+                .unwrap();
+            let mut delivered = false;
+            let mut settled = false;
+            while !delivered || !settled {
+                for channel in [outgoing, incoming] {
+                    while let Some(event) = session.try_channel_event(channel).unwrap() {
+                        match event {
+                            DataChannelEvent::Message(message) => {
+                                assert_eq!(channel, incoming);
+                                assert_eq!(message.bytes, payload);
+                                assert!(!delivered);
+                                delivered = true;
+                            }
+                            DataChannelEvent::SendComplete(completion) => {
+                                assert_eq!(completion.send_id, send);
+                                assert_eq!(completion.result, Ok(()));
+                                assert!(!settled);
+                                settled = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !delivered || !settled {
+                    wait(session);
+                }
+            }
+        };
         let payload_config = DataChannelConfiguration {
             negotiated: true,
             id: Some(7),
@@ -1646,55 +1715,79 @@ fn migrated_actor_is_woken_for_real_reliable_channel_delivery() {
             max_retransmits: Some(0),
             ..DataChannelConfiguration::default()
         };
-        let payload_out = session
-            .create_channel(alice, "payload", payload_config.clone())
-            .unwrap();
-        let payload_in = session
-            .create_channel(bob, "payload", payload_config)
-            .unwrap();
-        let mut opened = HashSet::new();
-        while opened.len() != 2 {
+        let association = session.peer_sctp_transport(alice).unwrap().unwrap();
+        let information = session.sctp_information(association).unwrap();
+        assert_eq!(information.state, SctpTransportState::Connected);
+        assert_eq!(information.max_channels, Some(8));
+        let mut retired = HashSet::new();
+        for lifetime in 0..3u8 {
+            let payload_out = session
+                .create_channel(alice, "payload", payload_config.clone())
+                .unwrap();
+            let payload_in = session
+                .create_channel(bob, "payload", payload_config.clone())
+                .unwrap();
             for channel in [payload_out, payload_in] {
-                while let Some(event) = session.try_channel_event(channel).unwrap() {
-                    if event == DataChannelEvent::StateChanged(DataChannelState::Open) {
-                        opened.insert(channel);
+                assert!(!retired.contains(&channel));
+                assert_eq!(session.channel_configuration(channel).unwrap().id, Some(7));
+            }
+            let mut opened = HashSet::new();
+            while opened.len() != 2 {
+                for channel in [payload_out, payload_in] {
+                    while let Some(event) = session.try_channel_event(channel).unwrap() {
+                        if event == DataChannelEvent::StateChanged(DataChannelState::Open) {
+                            opened.insert(channel);
+                        }
                     }
                 }
-            }
-            if opened.len() != 2 {
-                wait(&mut session);
-            }
-        }
-        let send = session
-            .send_async(payload_out, DataChannelMessage::binary([7]))
-            .unwrap();
-        session.close_channel(payload_out).unwrap();
-        let mut closed = HashSet::new();
-        let mut settled = false;
-        while closed.len() != 2 || !settled {
-            for channel in [payload_out, payload_in] {
-                while let Some(event) = session.try_channel_event(channel).unwrap() {
-                    match event {
-                        DataChannelEvent::StateChanged(DataChannelState::Closed) => {
-                            closed.insert(channel);
-                        }
-                        DataChannelEvent::SendComplete(completion) => {
-                            assert_eq!(channel, payload_out);
-                            assert_eq!(completion.send_id, send);
-                            assert!(!settled);
-                            settled = true;
-                        }
-                        _ => {}
-                    }
+                if opened.len() != 2 {
+                    wait(&mut session);
                 }
             }
-            if closed.len() != 2 || !settled {
-                wait(&mut session);
+            deliver(&mut session, payload_out, payload_in, [7, lifetime]);
+            let send = session
+                .send_async(payload_out, DataChannelMessage::binary([7, lifetime, 0xff]))
+                .unwrap();
+            session.close_channel(payload_out).unwrap();
+            let mut closed = HashSet::new();
+            let mut settled = false;
+            while closed.len() != 2 || !settled {
+                for channel in [payload_out, payload_in] {
+                    while let Some(event) = session.try_channel_event(channel).unwrap() {
+                        match event {
+                            DataChannelEvent::StateChanged(DataChannelState::Closed) => {
+                                closed.insert(channel);
+                            }
+                            DataChannelEvent::SendComplete(completion) => {
+                                assert_eq!(channel, payload_out);
+                                assert_eq!(completion.send_id, send);
+                                assert!(!settled);
+                                settled = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if closed.len() != 2 || !settled {
+                    wait(&mut session);
+                }
             }
-        }
-        for channel in [payload_out, payload_in] {
-            session.release_channel(channel);
-            assert!(session.channel_configuration(channel).is_err());
+            assert_eq!(
+                session.peer_sctp_transport(alice).unwrap(),
+                Some(association)
+            );
+            assert_eq!(
+                session.sctp_information(association).unwrap().state,
+                SctpTransportState::Connected
+            );
+            for channel in [payload_out, payload_in] {
+                assert_eq!(session.channel_error(channel).unwrap(), None);
+                assert!(session.try_channel_event(channel).unwrap().is_none());
+                session.release_channel(channel);
+                assert!(session.channel_configuration(channel).is_err());
+                retired.insert(channel);
+            }
+            deliver(&mut session, outgoing, incoming, [0, lifetime]);
         }
         for channel in [outgoing, incoming] {
             assert_eq!(

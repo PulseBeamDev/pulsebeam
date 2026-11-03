@@ -9,13 +9,13 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, AudioSubscription, ConnectionState, DesiredState, MediaKind, MediaTopology,
-    PublicationIntent, ResourceCommand, ResourceResult, TopicMode, TopicNotification,
-    TopicPublisher, TopicSend, TopicSubscriber, TrackSpec, VideoSubscription,
+    AgentConfig, AudioSubscription, ConnectionState, DesiredState, MediaKind,
+    Publication as CatalogPublication, TopicMode, TopicNotification, TopicPublisher, TopicSend,
+    TopicSubscriber, TrackSelector, TrackSpec, VideoObservation, VideoSubscription,
 };
 use pulsebeam_agent_native::{
     Agent, AgentEvent, AsyncHttpClient, AudioInput, Config, Encoding, Host, InputFrame,
-    MediaConfig, VideoInput, VideoPublicationConfig, VideoSourceConfig,
+    MediaConfig, PublicationInput, VideoInput, VideoPublicationConfig, VideoSourceConfig,
 };
 use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
 use pulsebeam_core::net::{HttpError, HttpRequest, HttpResult};
@@ -43,7 +43,6 @@ pub struct SimClientBuilder {
     video_rx: Option<Arc<Mutex<VideoReceiveLog>>>,
     audio_rx: Option<Arc<Mutex<AudioReceiveLog>>>,
     publishes_video: bool,
-    owned_video_label: Option<String>,
     /// When set, publish with a variable-bitrate source instead of the constant-rate looper.
     vbr_profile: Option<VbrProfile>,
     solid_picture: Option<Arc<super::media::SolidVideoInput>>,
@@ -225,7 +224,6 @@ impl SimClientBuilder {
             video_rx: None,
             audio_rx: None,
             publishes_video: false,
-            owned_video_label: None,
             vbr_profile: None,
             solid_picture: None,
             native_video_fixture: None,
@@ -262,12 +260,6 @@ impl SimClientBuilder {
     pub fn publish_video(mut self, simulcast_layers: Option<Vec<FixtureEncoding>>) -> Self {
         self.video_layers = simulcast_layers;
         self.publishes_video = true;
-        self
-    }
-
-    pub fn publish_owned_video(mut self, label: &str) -> Self {
-        self.publishes_video = true;
-        self.owned_video_label = Some(label.into());
         self
     }
 
@@ -429,12 +421,6 @@ impl SimClientBuilder {
     }
 
     pub(crate) async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
-        let topology = MediaTopology {
-            local_video: u8::from(self.publishes_video),
-            local_audio: u8::from(self.audio_level_dbov.is_some()),
-            remote_video: u8::try_from(self.video_slots)?,
-            remote_audio: u8::try_from(self.audio_slots)?,
-        };
         let participant = match self.ip {
             IpAddr::V4(ip) => format!("sim-{}", u32::from(ip)),
             IpAddr::V6(ip) => format!("sim-{ip:032X}", ip = u128::from(ip)),
@@ -454,7 +440,6 @@ impl SimClientBuilder {
                 (participant).as_str(),
                 expires_at,
             )?,
-            topology,
             retry: Default::default(),
             log_level: Default::default(),
         };
@@ -704,48 +689,42 @@ impl SimClientBuilder {
         )?;
         let actor = tokio::task::spawn_local(actor);
         let events = NativeEventCollector::new(agent.events());
-        let owned_video = if let Some(label) = &self.owned_video_label {
-            let ResourceResult::Publication { owner, slot, .. } = agent
-                .resource(ResourceCommand::ClaimPublication {
-                    spec: TrackSpec::Video {
-                        label: label.clone(),
-                    },
-                })
-                .await?
-            else {
-                anyhow::bail!("owned video claim returned the wrong resource")
-            };
-            anyhow::ensure!(slot == "v0", "owned video did not receive v0");
-            agent
-                .resource(ResourceCommand::UpdatePublication {
-                    owner,
-                    present: true,
-                })
-                .await?;
-            Some(owner)
+        let video_publication = if self.publishes_video {
+            Some(
+                agent
+                    .publication(TrackSpec::Video {
+                        label: "video".into(),
+                    })
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let audio_publication = if self.audio_level_dbov.is_some() {
+            Some(
+                agent
+                    .publication(TrackSpec::Audio {
+                        label: "audio".into(),
+                    })
+                    .await?,
+            )
         } else {
             None
         };
         let desired = DesiredState {
             revision: 1,
             connected: true,
-            publications: (self.publishes_video && self.owned_video_label.is_none())
-                .then(|| PublicationIntent {
-                    slot: "v0".into(),
-                    label: "video".into(),
-                    active: true,
-                })
-                .into_iter()
-                .chain(self.audio_level_dbov.map(|_| PublicationIntent {
-                    slot: "a0".into(),
-                    label: "audio".into(),
-                    active: true,
-                }))
-                .collect(),
             topics: self.initial_topics,
+            audio: AudioSubscription {
+                automatic: self.audio_slots > 0,
+                ..Default::default()
+            },
             ..DesiredState::default()
         };
-        agent.replace_desired(desired.clone()).await?;
+        let audio_policy = agent.audio_policy(desired.audio.clone()).await?;
+        let mut declared = desired.clone();
+        declared.audio = AudioSubscription::default();
+        agent.replace_desired(declared).await?;
 
         let mut snapshots = agent.snapshots();
         while snapshots.borrow().participant_id.is_none()
@@ -806,6 +785,7 @@ impl SimClientBuilder {
             remote_tracks: HashMap::new(),
             topic_events: Vec::new(),
             media_kinds: HashMap::new(),
+            owned_receivers: Arc::default(),
             video_rx,
             audio_rx,
             quality_references: self.quality_references.clone(),
@@ -818,20 +798,23 @@ impl SimClientBuilder {
                 snapshots
             },
             events,
-            owned_video,
+            video_publication,
+            audio_publication,
+            audio_policy,
+            video_subscriptions: BTreeMap::new(),
         };
         let mut client = SimClient {
             ctx,
             join_set,
             actor: Some(actor),
             media_generation: None,
+            audio_observers: BTreeMap::new(),
+            video_observers: BTreeMap::new(),
             audio_pressure: None,
             video_source_incarnation: 0,
             video_feed: None,
             retired_video_sources: Vec::new(),
             media: ClientMediaPlan {
-                video_slots: self.video_slots,
-                audio_slots: self.audio_slots,
                 video_receive_mode: self.video_receive_mode,
                 audio_receive_mode: self.audio_receive_mode,
                 publishes_video: self.publishes_video,
@@ -1581,7 +1564,7 @@ impl QualityAudioLooper {
         self,
         input: AudioInput,
         mut snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
-        sender: pulsebeam_agent_native::LocalSource,
+        sender: PublicationInput,
         pressure: Option<tokio::sync::mpsc::Receiver<PressureInput>>,
     ) {
         while snapshots.borrow().connection != ConnectionState::Connected {
@@ -1659,7 +1642,7 @@ impl QualityAudioLooper {
 impl QualityAudioLooper {
     async fn run_pcm(
         self,
-        sender: pulsebeam_agent_native::LocalSource,
+        sender: PublicationInput,
         mut pressure: tokio::sync::mpsc::Receiver<PressureInput>,
     ) {
         let prepared = quality_audio_reference();
@@ -3114,7 +3097,7 @@ impl OpusReceiver {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RequestedVideo {
     pub participant_id: String,
-    pub publication: Option<String>,
+    pub label: Option<String>,
     pub height: u32,
     pub min_height: u32,
     pub min_fps: u32,
@@ -3340,10 +3323,79 @@ impl NativeTrafficStatistics {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct OwnedReceiverEvidence {
+    pub track: pulsebeam_agent_native::RemoteTrack,
+    pub publication: CatalogPublication,
+}
+
+type OwnedReceivers = Arc<Mutex<BTreeMap<(u64, u64), (Arc<()>, OwnedReceiverEvidence)>>>;
+
+struct ReceiverObservation {
+    receivers: OwnedReceivers,
+    key: (u64, u64),
+    token: Arc<()>,
+    publication: Option<CatalogPublication>,
+}
+
+impl ReceiverObservation {
+    fn new(
+        receivers: OwnedReceivers,
+        remote: &pulsebeam_agent_native::RemoteMedia,
+        snapshot: &pulsebeam_agent_native::agent_core::Snapshot,
+        kind: MediaKind,
+    ) -> Self {
+        let publication = remote
+            .source_track_id()
+            .and_then(|id| snapshot.publications.get(id))
+            .filter(|publication| publication.kind == kind)
+            .cloned();
+        Self {
+            receivers,
+            key: (remote.generation(), remote.receiver()),
+            token: Arc::new(()),
+            publication,
+        }
+    }
+
+    fn track(&self, track: pulsebeam_agent_native::RemoteTrack) {
+        assert_eq!((track.generation, track.receiver), self.key);
+        if let Some(publication) = &self.publication {
+            self.receivers.lock().unwrap().insert(
+                self.key,
+                (
+                    self.token.clone(),
+                    OwnedReceiverEvidence {
+                        track,
+                        publication: publication.clone(),
+                    },
+                ),
+            );
+        }
+    }
+
+    fn clear(&self) {
+        let mut receivers = self.receivers.lock().unwrap();
+        if receivers
+            .get(&self.key)
+            .is_some_and(|(token, _)| Arc::ptr_eq(token, &self.token))
+        {
+            receivers.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for ReceiverObservation {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ClientObservation {
     pub admission: Option<pulsebeam::entity::ConnectionId>,
     pub snapshot: pulsebeam_agent_native::agent_core::Snapshot,
+    pub owned_receivers: Vec<OwnedReceiverEvidence>,
     pub video_operation: u64,
     pub submitted: DesiredState,
     pub video_capacity: usize,
@@ -3384,6 +3436,12 @@ impl NativeEventCollector {
                             | TopicNotification::RecoveryGap { .. }),
                         ),
                     )) => log.topics.push(notification),
+                    pulsebeam_agent_native::StreamUpdate::Value(AgentEvent::Core(
+                        pulsebeam_agent_native::agent_core::Notification::ServerError(message),
+                    )) => {
+                        tracing::debug!(target: "pulsebeam_sim_recovery", %message,
+                            "native fixture Core resource error");
+                    }
                     pulsebeam_agent_native::StreamUpdate::Value(AgentEvent::RuntimeFailed(
                         message,
                     )) => {
@@ -3407,6 +3465,13 @@ impl NativeEventCollector {
     }
 }
 
+struct VideoInterest {
+    participant_id: String,
+    source: String,
+    observation: VideoObservation,
+    subscription: pulsebeam_agent_native::Subscription,
+}
+
 pub struct ClientContext {
     pub agent: Agent,
     admission: Arc<Mutex<AdmissionRecords>>,
@@ -3427,9 +3492,13 @@ pub struct ClientContext {
     pub remote_tracks: HashMap<String, String>,
     pub topic_events: Vec<TopicNotification>,
     pub media_kinds: HashMap<String, (bool, bool)>,
+    owned_receivers: OwnedReceivers,
     snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
     events: NativeEventCollector,
-    owned_video: Option<u64>,
+    video_publication: Option<pulsebeam_agent_native::Publication>,
+    audio_publication: Option<pulsebeam_agent_native::Publication>,
+    audio_policy: pulsebeam_agent_native::Subscription,
+    video_subscriptions: BTreeMap<TrackSelector, VideoInterest>,
 }
 
 impl ClientContext {
@@ -3447,6 +3516,13 @@ impl ClientContext {
         ClientObservation {
             admission,
             snapshot,
+            owned_receivers: self
+                .owned_receivers
+                .lock()
+                .unwrap()
+                .values()
+                .map(|(_, evidence)| evidence.clone())
+                .collect(),
             submitted: self.desired.clone(),
             video_operation: self.video_operation,
             video_capacity: self.video_capacity,
@@ -3561,30 +3637,12 @@ impl ClientContext {
     }
 
     async fn relabel_owned_video(&mut self, label: String) -> anyhow::Result<bool> {
-        let owner = self
-            .owned_video
+        let publication = self
+            .video_publication
             .take()
             .ok_or_else(|| anyhow::anyhow!("participant has no owned video"))?;
-        self.agent
-            .resource(ResourceCommand::Release { owner })
-            .await?;
-        let ResourceResult::Publication { owner, slot, .. } = self
-            .agent
-            .resource(ResourceCommand::ClaimPublication {
-                spec: TrackSpec::Video { label },
-            })
-            .await?
-        else {
-            anyhow::bail!("replacement video claim returned the wrong resource")
-        };
-        anyhow::ensure!(slot == "v0", "replacement video did not reuse v0");
-        self.agent
-            .resource(ResourceCommand::UpdatePublication {
-                owner,
-                present: true,
-            })
-            .await?;
-        self.owned_video = Some(owner);
+        publication.close().await?;
+        self.video_publication = Some(self.agent.publication(TrackSpec::Video { label }).await?);
         Ok(true)
     }
 
@@ -3605,61 +3663,149 @@ impl ClientContext {
     ) -> anyhow::Result<bool> {
         let mut requests = self.requested_video.clone().unwrap_or_default();
         if self.auto_subscribe {
-            let requested = requests
+            let requested: HashSet<_> = requests
                 .iter()
-                .map(|request| request.participant_id.as_str())
-                .collect::<HashSet<_>>();
-            let mut automatic = self
+                .map(|request| request.participant_id.clone())
+                .collect();
+            let mut automatic: Vec<_> = self
                 .discovered_tracks
                 .iter()
-                .filter(|participant| !requested.contains(participant.as_str()))
+                .filter(|participant| !requested.contains(*participant))
                 .cloned()
-                .collect::<Vec<_>>();
+                .collect();
             automatic.sort();
+            let absent: BTreeSet<_> = self
+                .video_subscriptions
+                .values()
+                .map(|interest| interest.participant_id.clone())
+                .filter(|participant| {
+                    !requested.contains(participant)
+                        && !self.discovered_tracks.contains(participant)
+                })
+                .collect();
+            automatic.extend(absent);
             requests.extend(automatic.into_iter().map(|participant_id| RequestedVideo {
                 participant_id,
-                publication: None,
-                height: 720,
+                height: 16_384,
                 ..Default::default()
             }));
         }
+        let mut wanted = BTreeMap::new();
         let mut resolved = Vec::with_capacity(requests.len());
         let mut all_resolved = true;
         for request in requests {
-            if resolved.len() == self.video_capacity {
-                break;
-            }
-            let track_id = snapshot
+            let current = snapshot
                 .publications
                 .values()
                 .find(|publication| {
                     publication.participant_id == request.participant_id
-                        && request
-                            .publication
-                            .as_ref()
-                            .is_none_or(|id| *id == publication.id)
                         && publication.kind == MediaKind::Video
+                        && request
+                            .label
+                            .as_ref()
+                            .is_none_or(|label| *label == publication.label)
                 })
-                .map(|publication| publication.id.clone());
-            let Some(track_id) = track_id else {
-                all_resolved = false;
-                continue;
+                .and_then(|publication| {
+                    let track = snapshot.remote_tracks.get(&publication.id)?;
+                    Some((
+                        TrackSelector {
+                            participant_external_id: track.participant_id.clone(),
+                            label: publication.label.clone(),
+                        },
+                        publication.id.clone(),
+                    ))
+                });
+            let (selector, source, visible) = match current {
+                Some((selector, source)) => {
+                    (selector, source, resolved.len() < self.video_capacity)
+                }
+                None => {
+                    all_resolved = false;
+                    let Some((selector, interest)) =
+                        self.video_subscriptions
+                            .iter()
+                            .find(|(selector, interest)| {
+                                interest.participant_id == request.participant_id
+                                    && request
+                                        .label
+                                        .as_ref()
+                                        .is_none_or(|label| *label == selector.label)
+                            })
+                    else {
+                        continue;
+                    };
+                    (selector.clone(), interest.source.clone(), false)
+                }
             };
-            resolved.push(VideoSubscription {
-                slot: u8::try_from(resolved.len())?,
-                track_id,
-                selector: None,
+            let visible =
+                visible && (request.height.max(request.min_height) > 0 || request.min_fps > 0);
+            let observation = VideoObservation {
+                visible,
                 height: request.height,
                 min_height: request.min_height,
                 min_fps: request.min_fps,
                 priority: request.priority,
                 playout_delay: request.playout_delay,
-            });
+            };
+            if visible {
+                resolved.push(VideoSubscription {
+                    slot: u32::try_from(resolved.len())?,
+                    track_id: source.clone(),
+                    selector: None,
+                    height: request.height,
+                    min_height: request.min_height,
+                    min_fps: request.min_fps,
+                    priority: request.priority,
+                    playout_delay: request.playout_delay,
+                });
+            }
+            anyhow::ensure!(
+                wanted
+                    .insert(selector, (request.participant_id, source, observation))
+                    .is_none(),
+                "duplicate named video request"
+            );
+        }
+        let obsolete: Vec<_> = self
+            .video_subscriptions
+            .keys()
+            .filter(|selector| !wanted.contains_key(*selector))
+            .cloned()
+            .collect();
+        for selector in obsolete {
+            if let Some(interest) = self.video_subscriptions.remove(&selector) {
+                interest.subscription.close().await?;
+            }
+        }
+        for (selector, (participant_id, source, observation)) in wanted {
+            if let Some(interest) = self.video_subscriptions.get_mut(&selector) {
+                if interest.observation != observation {
+                    interest
+                        .subscription
+                        .configure_video(observation.clone())
+                        .await?;
+                    interest.observation = observation;
+                }
+                interest.source = source;
+            } else {
+                let subscription = self
+                    .agent
+                    .video_subscription(selector.clone(), observation.clone())
+                    .await?;
+                self.video_subscriptions.insert(
+                    selector,
+                    VideoInterest {
+                        participant_id,
+                        source,
+                        observation,
+                        subscription,
+                    },
+                );
+            }
         }
         if self.desired.video != resolved {
-            let mut desired = self.desired.clone();
-            desired.video = resolved;
-            self.replace_desired(desired).await?;
+            self.desired.video = resolved;
+            self.desired.revision = self.desired.revision.saturating_add(1);
         }
         Ok(all_resolved)
     }
@@ -3709,9 +3855,11 @@ impl ClientContext {
             ..Default::default()
         };
         if self.desired.audio != audio {
-            let mut desired = self.desired.clone();
-            desired.audio = audio;
-            self.replace_desired(desired).await?;
+            self.audio_policy
+                .configure_audio_policy(audio.clone())
+                .await?;
+            self.desired.audio = audio;
+            self.desired.revision = self.desired.revision.saturating_add(1);
         }
         Ok(true)
     }
@@ -3792,7 +3940,10 @@ impl ClientContext {
 
     async fn replace_desired(&mut self, mut desired: DesiredState) -> anyhow::Result<()> {
         desired.revision = self.desired.revision.saturating_add(1);
-        self.agent.replace_desired(desired.clone()).await?;
+        let mut declared = desired.clone();
+        declared.audio = AudioSubscription::default();
+        declared.video.clear();
+        self.agent.replace_desired(declared).await?;
         self.desired = desired;
         Ok(())
     }
@@ -3801,8 +3952,6 @@ impl ClientContext {
 // Keep application recipes across reconnect, never generation-scoped native
 // sources, clocks or observer leases. Each replacement gets fresh public handles.
 struct ClientMediaPlan {
-    video_slots: usize,
-    audio_slots: usize,
     video_receive_mode: pulsebeam_agent_native::ReceiveMode,
     audio_receive_mode: pulsebeam_agent_native::ReceiveMode,
     publishes_video: bool,
@@ -3816,13 +3965,43 @@ struct ClientMediaPlan {
 }
 
 struct VideoFeed {
-    source: pulsebeam_agent_native::LocalSource,
+    source: PublicationInput,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for VideoFeed {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+async fn run_capture_generation(
+    mut snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
+    generation: u64,
+    capture: impl std::future::Future<Output = ()>,
+) {
+    let departed = async {
+        loop {
+            {
+                let snapshot = snapshots.borrow_and_update();
+                if snapshot.connection != ConnectionState::Connected
+                    || snapshot
+                        .generation
+                        .map(pulsebeam_agent_native::agent_core::Generation::get)
+                        != Some(generation)
+                {
+                    return;
+                }
+            }
+            if snapshots.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        () = departed => {}
+        () = capture => {}
     }
 }
 
@@ -3842,10 +4021,12 @@ pub struct SimClient {
     join_set: JoinSet<()>,
     actor: Option<tokio::task::JoinHandle<()>>,
     media_generation: Option<u64>,
+    audio_observers: BTreeMap<(u64, u32, String), tokio::task::AbortHandle>,
+    video_observers: BTreeMap<TrackSelector, tokio::task::AbortHandle>,
     audio_pressure: Option<tokio::sync::mpsc::Sender<PressureInput>>,
     video_source_incarnation: u64,
     video_feed: Option<VideoFeed>,
-    retired_video_sources: Vec<pulsebeam_agent_native::LocalSource>,
+    retired_video_sources: Vec<PublicationInput>,
     media: ClientMediaPlan,
 }
 
@@ -3859,85 +4040,337 @@ impl Drop for SimClient {
 
 impl SimClient {
     async fn rearm_media(&mut self) -> anyhow::Result<()> {
-        let generation = {
+        let (connected, generation) = {
             let snapshot = self.ctx.snapshots.borrow();
-            if snapshot.connection != ConnectionState::Connected {
-                return Ok(());
-            }
-            snapshot
-                .generation
-                .map(pulsebeam_agent_native::agent_core::Generation::get)
-                .ok_or_else(|| anyhow::anyhow!("connected native graph has no generation"))?
+            (
+                snapshot.connection == ConnectionState::Connected,
+                snapshot
+                    .generation
+                    .map(pulsebeam_agent_native::agent_core::Generation::get),
+            )
         };
-        if self.media_generation == Some(generation)
-            || self
-                .ctx
-                .current_admission
-                .is_none_or(|(current, _)| current != generation)
+        if self
+            .media_generation
+            .is_some_and(|current| !connected || generation != Some(current))
+        {
+            // Capture anchors belong to this application admission, not the
+            // logical input's future native targets.
+            if let Some(feed) = self.video_feed.take() {
+                feed.stop().await?;
+            }
+            self.join_set.abort_all();
+            while let Some(result) = self.join_set.join_next().await {
+                match result {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            self.audio_observers.clear();
+            self.video_observers.clear();
+            self.audio_pressure = None;
+            self.media_generation = None;
+        }
+        if !connected {
+            return Ok(());
+        }
+        let generation = generation
+            .ok_or_else(|| anyhow::anyhow!("connected native graph has no generation"))?;
+        if self
+            .ctx
+            .current_admission
+            .is_none_or(|(current, _)| current != generation)
         {
             return Ok(());
         }
-        // The actor owns retirement. Cancel only application feeds/observers;
-        // never carry an old handle or capture clock into its replacement.
-        if let Some(feed) = self.video_feed.take() {
-            feed.stop().await?;
-        }
-        self.join_set.abort_all();
-        while let Some(result) = self.join_set.join_next().await {
-            match result {
-                Ok(()) => {}
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => return Err(error.into()),
-            }
+        self.rearm_audio_observations(generation);
+        self.rearm_video_observations(generation);
+        if self.media_generation == Some(generation) {
+            return Ok(());
         }
         let ctx = &self.ctx;
         let agent = ctx.agent.clone();
         let plan = &self.media;
-        for slot in 0..plan.video_slots {
-            let remote = agent
-                .remote(
-                    pulsebeam_agent_native::agent_core::MediaSlot::RemoteVideo(u8::try_from(slot)?),
-                    plan.video_receive_mode,
-                )
+        self.audio_pressure = None;
+        if let Some(level) = plan.audio_level_dbov {
+            let requests = if plan.audio_input == AudioInput::Pcm {
+                let (pressure, requests) = tokio::sync::mpsc::channel(1);
+                self.audio_pressure = Some(pressure);
+                Some(requests)
+            } else {
+                None
+            };
+            let input = ctx
+                .audio_publication
+                .as_ref()
+                .expect("audio publication")
+                .input()
                 .await?;
-            spawn_video_receiver(
-                &mut self.join_set,
-                remote,
-                ctx,
-                agent.clone(),
-                plan.video_receive_mode,
-            );
+            input.ready().await?;
+            self.join_set.spawn(run_capture_generation(
+                agent.snapshots(),
+                generation,
+                QualityAudioLooper {
+                    level_dbov: level,
+                    phase_offset: plan.audio_phase_offset,
+                }
+                .run(plan.audio_input, agent.snapshots(), input, requests),
+            ));
         }
-        for slot in 0..plan.audio_slots {
-            let remote = agent
-                .remote(
-                    pulsebeam_agent_native::agent_core::MediaSlot::RemoteAudio(u8::try_from(slot)?),
-                    plan.audio_receive_mode,
-                )
-                .await?;
-            let log = ctx.audio_rx.clone();
-            if plan.audio_receive_mode == pulsebeam_agent_native::ReceiveMode::Encoded {
-                log.lock().unwrap().encoded_observers += 1;
+        self.attach_video_source().await?;
+        tracing::debug!(target: "pulsebeam_sim_recovery", generation, "application media attached to connected native generation");
+        self.media_generation = Some(generation);
+        Ok(())
+    }
+
+    pub async fn producer_pressure(&mut self) -> anyhow::Result<Option<(usize, usize)>> {
+        let generation = self
+            .ctx
+            .agent
+            .snapshot()
+            .generation
+            .map(pulsebeam_agent_native::agent_core::Generation::get);
+        if generation != self.media_generation {
+            return Ok(None);
+        }
+        let Some(input) = &self.audio_pressure else {
+            return Ok(None);
+        };
+        let (reply, result) = tokio::sync::oneshot::channel();
+        input
+            .send(reply)
+            .await
+            .context("PCM pressure producer closed")?;
+        Ok(Some(result.await.context("PCM pressure input canceled")??))
+    }
+
+    async fn attach_video_source(&mut self) -> anyhow::Result<()> {
+        let ctx = &self.ctx;
+        let plan = &self.media;
+        if plan.publishes_video {
+            let source_incarnation = self.video_source_incarnation;
+            self.video_source_incarnation = source_incarnation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("application video source incarnation overflow"))?;
+            let mut sources = plan
+                .video_sources
+                .iter()
+                .map(|(encoding, source)| (encoding.clone(), source.fresh()))
+                .collect::<Vec<_>>();
+            let mut vbr = plan.vbr_source.as_ref().map(VbrSource::fresh);
+            if !plan.opaque_payload {
+                let participant_id =
+                    ctx.snapshots
+                        .borrow()
+                        .participant_id
+                        .clone()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("connected source has no participant identity")
+                        })?;
+                let (_, admission) = ctx.current_admission.ok_or_else(|| {
+                    anyhow::anyhow!("connected source has no correlated active HTTP admission")
+                })?;
+                let origin = provenance::source_instance_key(
+                    &admission.to_string(),
+                    "v0",
+                    source_incarnation,
+                );
+                let period = sources
+                    .first()
+                    .map(|(_, source)| source.period())
+                    .unwrap_or_else(|| vbr.as_ref().expect("video source").period());
+                let ledger = Arc::new(Mutex::new(provenance::SourceLedger::new(&origin, period)));
+                let mut frames = BTreeSet::new();
+                for (_, source) in &mut sources {
+                    source.identify_as(&origin);
+                    source.record_in(ledger.clone());
+                    frames.extend(source.reference_coded_frames().map(<[u8]>::to_vec));
+                }
+                if let Some(source) = &mut vbr {
+                    source.identify_as(&origin);
+                    source.record_in(ledger.clone());
+                    frames.extend(source.reference_coded_frames().map(<[u8]>::to_vec));
+                }
+                // Rearm may reuse an admission, but not its source/capture namespace.
+                ctx.h264_publishers.lock().unwrap().insert(
+                    origin,
+                    FixturePublisher {
+                        participant_id,
+                        frames,
+                        ledger: Some(ledger),
+                    },
+                );
             }
-            let snapshots = agent.snapshots();
-            let corrupt = plan.corrupt_audio_payload;
-            let mode = plan.audio_receive_mode;
-            let agent = agent.clone();
-            self.join_set.spawn(async move {
-                let mut remote = remote;
+            let media = ctx
+                .video_publication
+                .as_ref()
+                .expect("video publication")
+                .input()
+                .await?;
+            media.ready().await?;
+            let generation = ctx
+                .snapshots
+                .borrow()
+                .generation
+                .expect("connected capture generation")
+                .get();
+            let input = media.clone();
+            let task = tokio::spawn(run_capture_generation(
+                ctx.agent.snapshots(),
+                generation,
+                async move {
+                    if let Some(source) = vbr {
+                        source.run(input).await;
+                    } else {
+                        VideoSource::run_batch(sources, input).await;
+                    }
+                },
+            ));
+            self.video_feed = Some(VideoFeed {
+                source: media,
+                task,
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn relabel_owned_video(&mut self, label: String) -> anyhow::Result<bool> {
+        if let Some(feed) = self.video_feed.take() {
+            feed.stop().await?;
+        }
+        let changed = self.ctx.relabel_owned_video(label).await?;
+        self.attach_video_source().await?;
+        Ok(changed)
+    }
+
+    pub async fn replace_video_source(&mut self) -> anyhow::Result<bool> {
+        if self.ctx.agent.snapshot().connection != ConnectionState::Connected
+            || self
+                .video_feed
+                .as_ref()
+                .is_none_or(|feed| feed.source.is_closed())
+        {
+            return Ok(false);
+        }
+        let feed = self.video_feed.take().expect("checked attached video feed");
+        self.retired_video_sources.push(feed.source.clone());
+        feed.stop().await?;
+        self.attach_video_source().await?;
+        Ok(true)
+    }
+
+    pub async fn release_replaced_video_source(&mut self) -> anyhow::Result<bool> {
+        let retired = self
+            .retired_video_sources
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("no replaced application video source"))?;
+        retired.close().await?;
+        anyhow::ensure!(
+            matches!(
+                retired.set_limits(Vec::new()).await,
+                Err(pulsebeam_agent_native::Error::Closed)
+            ),
+            "retired video source still accepts producer configuration"
+        );
+        anyhow::ensure!(
+            self.video_feed
+                .as_ref()
+                .is_some_and(|feed| !feed.source.is_closed()),
+            "closing retired source closed its replacement"
+        );
+        Ok(true)
+    }
+
+    fn rearm_video_observations(&mut self, generation: u64) {
+        self.video_observers.retain(|selector, task| {
+            if self.ctx.video_subscriptions.contains_key(selector) {
+                true
+            } else {
+                task.abort();
+                false
+            }
+        });
+        for (selector, interest) in &self.ctx.video_subscriptions {
+            if self
+                .video_observers
+                .get(selector)
+                .is_some_and(|task| !task.is_finished())
+            {
+                continue;
+            }
+            let task = spawn_video_receiver(
+                &mut self.join_set,
+                interest.subscription.clone(),
+                &self.ctx,
+                self.ctx.agent.clone(),
+                self.media.video_receive_mode,
+                generation,
+            );
+            self.video_observers.insert(selector.clone(), task);
+        }
+    }
+
+    fn rearm_audio_observations(&mut self, generation: u64) {
+        let wanted: BTreeSet<_> = self
+            .ctx
+            .snapshots
+            .borrow()
+            .audio_mapping
+            .iter()
+            .map(|(index, source)| (generation, *index, source.clone()))
+            .collect();
+        self.audio_observers.retain(|key, task| {
+            if wanted.contains(key) {
+                true
+            } else {
+                task.abort();
+                false
+            }
+        });
+        for key in wanted {
+            if self
+                .audio_observers
+                .get(&key)
+                .is_some_and(|task| !task.is_finished())
+            {
+                continue;
+            }
+            let (_, _, source) = &key;
+            let source = source.clone();
+            let policy = self.ctx.audio_policy.clone();
+            let log = self.ctx.audio_rx.clone();
+            let mode = self.media.audio_receive_mode;
+            let snapshots = self.ctx.agent.snapshots();
+            let corrupt = self.media.corrupt_audio_payload;
+            let receivers = self.ctx.owned_receivers.clone();
+            let task = self.join_set.spawn(async move {
+                let remote = match policy.observe_source(source.clone(), mode).await {
+                    Ok(remote) => remote,
+                    Err(pulsebeam_agent_native::Error::Closed) => return,
+                    Err(error) => panic!("native audio observation failed: {error}"),
+                };
+                assert_eq!(remote.source_track_id(), Some(source.as_str()));
+                if remote.generation() != generation {
+                    return;
+                }
+                if mode == pulsebeam_agent_native::ReceiveMode::Encoded {
+                    log.lock().unwrap().encoded_observers += 1;
+                }
+                let owned = ReceiverObservation::new(
+                    receivers,
+                    &remote,
+                    &snapshots.borrow(),
+                    MediaKind::Audio,
+                );
                 let mut decoders = HashMap::<NativeAudioStream, OpusReceiver>::new();
                 loop {
                     let frame = match remote.next().await {
                         pulsebeam_agent_native::MediaStreamUpdate::Frame { frame } => frame,
-                        pulsebeam_agent_native::MediaStreamUpdate::Track { .. } => continue,
-                        pulsebeam_agent_native::MediaStreamUpdate::Closed => {
-                            let Some(next) = reacquire_remote(&agent, &remote, mode).await else {
-                                break;
-                            };
-                            remote = next;
-                            decoders.clear();
+                        pulsebeam_agent_native::MediaStreamUpdate::Track { track } => {
+                            owned.track(track);
                             continue;
                         }
+                        pulsebeam_agent_native::MediaStreamUpdate::Closed => break,
                         other => panic!("native audio observer lost media: {other:?}"),
                     };
                     if snapshots
@@ -3996,181 +4429,8 @@ impl SimClient {
                         .decode_packet(&payload, &log, &stream);
                 }
             });
+            self.audio_observers.insert(key, task);
         }
-        self.audio_pressure = None;
-        if let Some(level) = plan.audio_level_dbov {
-            let requests = if plan.audio_input == AudioInput::Pcm {
-                let (pressure, requests) = tokio::sync::mpsc::channel(1);
-                self.audio_pressure = Some(pressure);
-                Some(requests)
-            } else {
-                None
-            };
-            self.join_set.spawn(
-                QualityAudioLooper {
-                    level_dbov: level,
-                    phase_offset: plan.audio_phase_offset,
-                }
-                .run(
-                    plan.audio_input,
-                    agent.snapshots(),
-                    agent
-                        .source(pulsebeam_agent_native::agent_core::MediaSlot::LocalAudio(
-                            "a0".into(),
-                        ))
-                        .await?,
-                    requests,
-                ),
-            );
-        }
-        self.attach_video_source().await?;
-        tracing::debug!(target: "pulsebeam_sim_recovery", generation, "application media attached to connected native generation");
-        self.media_generation = Some(generation);
-        Ok(())
-    }
-
-    pub async fn producer_pressure(&mut self) -> anyhow::Result<Option<(usize, usize)>> {
-        let generation = self
-            .ctx
-            .agent
-            .snapshot()
-            .generation
-            .map(pulsebeam_agent_native::agent_core::Generation::get);
-        if generation != self.media_generation {
-            return Ok(None);
-        }
-        let Some(input) = &self.audio_pressure else {
-            return Ok(None);
-        };
-        let (reply, result) = tokio::sync::oneshot::channel();
-        input
-            .send(reply)
-            .await
-            .context("PCM pressure producer closed")?;
-        Ok(Some(result.await.context("PCM pressure input canceled")??))
-    }
-
-    async fn attach_video_source(&mut self) -> anyhow::Result<()> {
-        let ctx = &self.ctx;
-        let agent = ctx.agent.clone();
-        let plan = &self.media;
-        if plan.publishes_video {
-            let source_incarnation = self.video_source_incarnation;
-            self.video_source_incarnation = source_incarnation
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("application video source incarnation overflow"))?;
-            let mut sources = plan
-                .video_sources
-                .iter()
-                .map(|(encoding, source)| (encoding.clone(), source.fresh()))
-                .collect::<Vec<_>>();
-            let mut vbr = plan.vbr_source.as_ref().map(VbrSource::fresh);
-            if !plan.opaque_payload {
-                let participant_id =
-                    ctx.snapshots
-                        .borrow()
-                        .participant_id
-                        .clone()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("connected source has no participant identity")
-                        })?;
-                let (_, admission) = ctx.current_admission.ok_or_else(|| {
-                    anyhow::anyhow!("connected source has no correlated active HTTP admission")
-                })?;
-                let origin = provenance::source_instance_key(
-                    &admission.to_string(),
-                    "v0",
-                    source_incarnation,
-                );
-                let period = sources
-                    .first()
-                    .map(|(_, source)| source.period())
-                    .unwrap_or_else(|| vbr.as_ref().expect("video source").period());
-                let ledger = Arc::new(Mutex::new(provenance::SourceLedger::new(&origin, period)));
-                let mut frames = BTreeSet::new();
-                for (_, source) in &mut sources {
-                    source.identify_as(&origin);
-                    source.record_in(ledger.clone());
-                    frames.extend(source.reference_coded_frames().map(<[u8]>::to_vec));
-                }
-                if let Some(source) = &mut vbr {
-                    source.identify_as(&origin);
-                    source.record_in(ledger.clone());
-                    frames.extend(source.reference_coded_frames().map(<[u8]>::to_vec));
-                }
-                // Rearm may reuse an admission, but not its source/capture namespace.
-                ctx.h264_publishers.lock().unwrap().insert(
-                    origin,
-                    FixturePublisher {
-                        participant_id,
-                        frames,
-                        ledger: Some(ledger),
-                    },
-                );
-            }
-            let media = agent
-                .source(pulsebeam_agent_native::agent_core::MediaSlot::LocalVideo(
-                    "v0".into(),
-                ))
-                .await?;
-            let task = if let Some(source) = vbr {
-                tokio::spawn(source.run(media.clone()))
-            } else {
-                tokio::spawn(VideoSource::run_batch(sources, media.clone()))
-            };
-            self.video_feed = Some(VideoFeed {
-                source: media,
-                task,
-            });
-        }
-        Ok(())
-    }
-
-    pub async fn relabel_owned_video(&mut self, label: String) -> anyhow::Result<bool> {
-        if let Some(feed) = self.video_feed.take() {
-            feed.stop().await?;
-        }
-        let changed = self.ctx.relabel_owned_video(label).await?;
-        self.attach_video_source().await?;
-        Ok(changed)
-    }
-
-    pub async fn replace_video_source(&mut self) -> anyhow::Result<bool> {
-        if self.ctx.agent.snapshot().connection != ConnectionState::Connected
-            || self
-                .video_feed
-                .as_ref()
-                .is_none_or(|feed| feed.source.is_closed())
-        {
-            return Ok(false);
-        }
-        let feed = self.video_feed.take().expect("checked attached video feed");
-        self.retired_video_sources.push(feed.source.clone());
-        feed.stop().await?;
-        self.attach_video_source().await?;
-        Ok(true)
-    }
-
-    pub async fn release_replaced_video_source(&mut self) -> anyhow::Result<bool> {
-        let retired = self
-            .retired_video_sources
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("no replaced application video source"))?;
-        retired.close().await?;
-        anyhow::ensure!(
-            matches!(
-                retired.set_enabled(false).await,
-                Err(pulsebeam_agent_native::Error::Closed)
-            ),
-            "retired video source still accepts producer configuration"
-        );
-        anyhow::ensure!(
-            self.video_feed
-                .as_ref()
-                .is_some_and(|feed| !feed.source.is_closed()),
-            "closing retired source closed its replacement"
-        );
-        Ok(true)
     }
 
     pub async fn tick(&mut self) -> anyhow::Result<()> {
@@ -4186,7 +4446,11 @@ impl SimClient {
                 .await?;
         }
         while let Some(result) = self.join_set.try_join_next() {
-            result?;
+            match result {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         if self
             .actor
@@ -4230,47 +4494,14 @@ impl SimClient {
     }
 }
 
-async fn reacquire_remote(
-    agent: &Agent,
-    retired: &pulsebeam_agent_native::RemoteMedia,
-    mode: pulsebeam_agent_native::ReceiveMode,
-) -> Option<pulsebeam_agent_native::RemoteMedia> {
-    let generation = retired.generation();
-    let snapshot = agent.snapshot();
-    if snapshot
-        .generation
-        .map(pulsebeam_agent_native::agent_core::Generation::get)
-        != Some(generation)
-        || snapshot.connection != ConnectionState::Connected
-    {
-        return None;
-    }
-    match agent.remote(retired.slot().clone(), mode).await {
-        Ok(remote) if remote.generation() == generation => Some(remote),
-        Ok(_) => None,
-        Err(error) => {
-            let snapshot = agent.snapshot();
-            if snapshot
-                .generation
-                .map(pulsebeam_agent_native::agent_core::Generation::get)
-                != Some(generation)
-                || snapshot.connection != ConnectionState::Connected
-                || agent.snapshots().has_changed().is_err()
-            {
-                return None;
-            }
-            panic!("native observer reacquisition failed: {error}");
-        }
-    }
-}
-
 fn spawn_video_receiver(
     join_set: &mut JoinSet<()>,
-    remote: pulsebeam_agent_native::RemoteMedia,
+    subscription: pulsebeam_agent_native::Subscription,
     ctx: &ClientContext,
     agent: Agent,
     mode: pulsebeam_agent_native::ReceiveMode,
-) {
+    generation: u64,
+) -> tokio::task::AbortHandle {
     let log = ctx.video_rx.clone();
     if mode == pulsebeam_agent_native::ReceiveMode::EncodedAndDecoded {
         log.lock().unwrap().native_origin_enabled = true;
@@ -4281,7 +4512,16 @@ fn spawn_video_receiver(
     let native_playback_only = log.lock().unwrap().native_playback_only;
     let recovery_probe = ctx.keyframe_recovery.clone();
     let snapshots = agent.snapshots();
+    let receivers = ctx.owned_receivers.clone();
     join_set.spawn(async move {
+        let remote = match subscription.observe(mode).await {
+            Ok(remote) => remote,
+            Err(pulsebeam_agent_native::Error::Closed) => return,
+            Err(error) => panic!("native video observation failed: {error}"),
+        };
+        if remote.generation() != generation { return; }
+        assert!(remote.source_track_id().is_some(), "video observation lacks Core source authority");
+        let mut owned = ReceiverObservation::new(receivers.clone(), &remote, &snapshots.borrow(), MediaKind::Video);
         let mut remote = Arc::new(remote);
         let mut one_shot = false;
         let mut streams = HashMap::<NativeVideoStream, VideoStreamReceiver>::new();
@@ -4320,12 +4560,23 @@ fn spawn_video_receiver(
             };
             let frame = match update {
                 pulsebeam_agent_native::MediaStreamUpdate::Frame { frame } => frame,
-                pulsebeam_agent_native::MediaStreamUpdate::Track { .. } => continue,
+                pulsebeam_agent_native::MediaStreamUpdate::Track { track } => {
+                    owned.track(track);
+                    continue;
+                }
                 pulsebeam_agent_native::MediaStreamUpdate::Closed => {
+                    owned.clear();
                     feedback = None;
                     feedback_context = None;
                     queued_one_shot = None;
-                    let Some(next) = reacquire_remote(&agent, &remote, mode).await else { break };
+                    let next = match subscription.observe(mode).await {
+                        Ok(next) => next,
+                        Err(pulsebeam_agent_native::Error::Closed) => break,
+                        Err(error) => panic!("native video observation failed: {error}"),
+                    };
+                    if next.generation() != generation { break; }
+                    assert!(next.source_track_id().is_some(), "fresh video observation lacks Core source authority");
+                    owned = ReceiverObservation::new(receivers.clone(), &next, &snapshots.borrow(), MediaKind::Video);
                     remote = Arc::new(next);
                     streams.clear();
                     continue;
@@ -4441,7 +4692,7 @@ fn spawn_video_receiver(
                 stream.last_keyframe_request = None;
             }
         }
-    });
+    })
 }
 
 fn record_video_drop(

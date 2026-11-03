@@ -1,7 +1,7 @@
 use super::*;
 use agent_core::{
     SlotBinding,
-    client_sdp::{Allocation, AllocationMode, ApplyOutcome, Bindings, Error, Preparation},
+    client_sdp::{Allocation, ApplyOutcome, Bindings, Error, Preparation},
 };
 
 #[derive(Default)]
@@ -12,7 +12,6 @@ struct MediaWork {
     slots: Vec<SlotBinding>,
     stopped: Vec<String>,
     allocating: bool,
-    retiring: bool,
     cleaning: bool,
     failure: Option<Error>,
 }
@@ -73,26 +72,8 @@ fn stop_media(
 fn create_media(
     peer: &mut Peer,
     allocations: &[Allocation],
-    mode: AllocationMode,
     work: &mut MediaWork,
 ) -> Result<(), Error> {
-    if mode == AllocationMode::RetargetReceiver {
-        for allocation in allocations {
-            let (_, transceiver) = peer
-                .transceivers
-                .iter()
-                .find(|(slot, _)| slot == &allocation.slot)
-                .ok_or(Error::Observation)?;
-            if allocation.slot.direction() != agent_core::MediaDirection::ReceiveOnly
-                || transceiver.mid().is_none()
-            {
-                return Err(Error::Observation);
-            }
-            work.targets
-                .push((allocation.slot.clone(), transceiver.clone()));
-        }
-        return Ok(());
-    }
     if allocations.iter().any(|request| {
         peer.transceivers
             .iter()
@@ -159,6 +140,17 @@ async fn apply_descriptions(
     }
     // WebIDL dictionaries have no runtime constructor to check.
     let offer: RtcSessionDescriptionInit = offered.unchecked_into();
+    if !work.cleaning {
+        let inner = weak.upgrade().ok_or(Error::CandidateState)?;
+        let mut peers = inner.peers.borrow_mut();
+        let executor = peers
+            .get_mut(&generation.get())
+            .and_then(|peer| peer.sdp.as_mut())
+            .ok_or(Error::CandidateState)?;
+        let prepared =
+            executor.prepare_local_offer(operation, &offer.get_sdp().ok_or(Error::Observation)?)?;
+        offer.set_sdp(&prepared);
+    }
     JsFuture::from(connection.set_local_description(&offer))
         .await
         .map_err(|error| failed("setLocalDescription", error))?;
@@ -175,50 +167,6 @@ async fn apply_descriptions(
 }
 
 impl RuntimeInner {
-    pub(super) fn observe_media(self: &Rc<Self>, generation: Generation) {
-        let connection = self
-            .peers
-            .borrow()
-            .get(&generation.get())
-            .and_then(|peer| peer.sdp.as_ref().map(|_| peer.connection.clone()));
-        let Some(connection) = connection else { return };
-        let weak = Rc::downgrade(self);
-        spawn_local(async move {
-            let report = JsFuture::from(connection.get_stats()).await;
-            let Some(inner) = weak.upgrade() else { return };
-            let Ok(report) = report else { return };
-            let observed = {
-                let mut peers = inner.peers.borrow_mut();
-                let Some(peer) = peers.get_mut(&generation.get()) else {
-                    return;
-                };
-                if !Object::is(peer.connection.as_ref(), connection.as_ref()) {
-                    return;
-                }
-                let Some(mut executor) = peer.sdp.take() else {
-                    return;
-                };
-                let observed = peer.observe_senders(executor.context_mut(), Some(&report));
-                peer.sdp = Some(executor);
-                observed
-            };
-            match observed {
-                Ok(bindings) => inner.send_event(HostEvent::Rtc(RtcEvent::MediaObserved {
-                    generation,
-                    bindings,
-                })),
-                Err(error) if error != Error::CandidateState => inner.logger.debug(
-                    LOG_TARGET,
-                    format!(
-                        "generation={} sender facts rejected: {error}",
-                        generation.get()
-                    ),
-                ),
-                Err(_) => {}
-            }
-        });
-    }
-
     pub(super) fn prepare_media(
         self: &Rc<Self>,
         generation: Generation,
@@ -248,7 +196,6 @@ impl RuntimeInner {
         generation: Generation,
         operation: OperationId,
         allocations: Vec<Allocation>,
-        mode: AllocationMode,
     ) {
         let result = self
             .peers
@@ -256,7 +203,7 @@ impl RuntimeInner {
             .get_mut(&generation.get())
             .and_then(|peer| peer.sdp.as_mut())
             .ok_or(Error::CandidateState)
-            .and_then(|executor| executor.enqueue_allocations(operation, allocations, mode));
+            .and_then(|executor| executor.enqueue_allocation(operation, allocations));
         match result {
             Ok(()) => self.start_media(generation),
             Err(error) => self.send_event(event(
@@ -341,7 +288,7 @@ impl RuntimeInner {
             .ok_or(Error::Observation)?
             .sdp();
         let executor = peer.sdp.as_mut().ok_or(Error::CandidateState)?;
-        let candidate = if work.cleaning {
+        let mut candidate = if work.cleaning {
             executor.prepare_abandoned_allocation(operation, &actual, &work.stopped)?
         } else if work.allocating {
             let mids = work
@@ -366,6 +313,40 @@ impl RuntimeInner {
         } else {
             executor.prepare(operation, &actual)?
         };
+        if !work.cleaning {
+            let mids = candidate
+                .bindings()
+                .publications
+                .iter()
+                .map(|binding| binding.mid.clone())
+                .collect::<Vec<_>>();
+            for mid in mids {
+                let transceiver = peer
+                    .transceivers
+                    .iter()
+                    .map(|(_, transceiver)| transceiver)
+                    .find(|transceiver| transceiver.mid().as_deref() == Some(mid.as_str()))
+                    .ok_or(Error::Observation)?;
+                let parameters = transceiver.sender().get_parameters();
+                let encodings = Reflect::get(parameters.as_ref(), &JsValue::from_str("encodings"))
+                    .map_err(|_| Error::Observation)?
+                    .dyn_into::<Array>()
+                    .map_err(|_| Error::Observation)?;
+                let modes = encodings
+                    .iter()
+                    .map(|encoding| {
+                        let mode = Reflect::get(&encoding, &JsValue::from_str("scalabilityMode"))
+                            .map_err(|_| Error::Observation)?;
+                        if mode.is_undefined() || mode.is_null() {
+                            Ok(None)
+                        } else {
+                            mode.as_string().map(Some).ok_or(Error::Observation)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                executor.prepare_sender_modes(operation, &mut candidate, &mid, &modes)?;
+            }
+        }
         Ok(candidate.answer().into())
     }
 
@@ -413,15 +394,17 @@ impl RuntimeInner {
                 peer.receiver_mids
                     .retain(|_, mid| !work.stopped.contains(mid));
             }
-            let observed = if applied && !work.retiring && !work.cleaning {
-                peer.observe_senders(executor.context_mut(), None)
-            } else {
-                executor
-                    .context_mut()
-                    .bindings()
-                    .cloned()
-                    .ok_or(Error::CandidateState)
-            };
+            let observed = executor
+                .context_mut()
+                .bindings()
+                .filter(|bindings| {
+                    bindings
+                        .publications
+                        .iter()
+                        .all(agent_core::client_sdp::Binding::complete)
+                })
+                .cloned()
+                .ok_or(Error::CandidateState);
             let preparation = finished.and_then(|outcome| {
                 if let Some(error) = work.failure {
                     return Err(error);
@@ -446,9 +429,6 @@ impl RuntimeInner {
             })
         };
         self.send_event(completion);
-        if applied {
-            self.observe_media(generation);
-        }
         self.start_media(generation);
     }
 
@@ -496,14 +476,15 @@ impl RuntimeInner {
             let mut work = MediaWork::default();
             let Some(inner) = weak.upgrade() else { return };
             // Hold source-slot permits until stopped senders leave the peer map.
+            let mut operations = Vec::new();
             let mut permits = Vec::new();
             let initialized = async {
-                for slot in local_slots? {
-                    let gate = inner
-                        .local_operation_gates
-                        .get(&slot)
-                        .ok_or(Error::Observation)?;
-                    permits.push(gate.enter().await);
+                operations = local_slots?
+                    .into_iter()
+                    .map(|slot| inner.local_operations(&slot))
+                    .collect();
+                for operations in &operations {
+                    permits.push(operations.gate.enter().await);
                 }
                 if inner.is_closed() {
                     return Err(Error::CandidateState);
@@ -515,11 +496,9 @@ impl RuntimeInner {
                 let executor = peer.sdp.as_ref().ok_or(Error::CandidateState)?;
                 let mids = executor.retirement_targets(operation)?.to_vec();
                 let allocations = executor.allocation_targets(operation)?.to_vec();
-                work.retiring = !mids.is_empty();
                 work.allocating = !allocations.is_empty();
                 work.retirements = stop_media(&peer.connection, &mids)?;
-                let mode = executor.allocation_mode(operation)?;
-                create_media(peer, &allocations, mode, &mut work)
+                create_media(peer, &allocations, &mut work)
             }
             .await;
             if let Err(error) = initialized {
@@ -536,7 +515,7 @@ impl RuntimeInner {
                         let Some(inner) = weak.upgrade() else {
                             return;
                         };
-                        let synchronized = inner.sync_local_slot(name).await;
+                        let synchronized = inner.sync_local_slot(name, None).await;
                         if synchronized.is_err() {
                             work.failure = Some(Error::Observation);
                             break;

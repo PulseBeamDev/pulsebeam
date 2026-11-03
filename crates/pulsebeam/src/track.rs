@@ -24,7 +24,39 @@ pub use data_track::*;
 pub use pulsebeam_core::simulcast::LayerQuality;
 use tokio::time::Instant;
 
-pub type StreamId = (TrackId, Option<Rid>);
+/// A prepared encoding selector, scoped to one track. SSRC lanes do not invent
+/// wire RIDs; the real optional RID remains transport metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SourceEncoding {
+    Rid(Option<Rid>),
+    Ssrc(Ssrc),
+}
+
+impl SourceEncoding {
+    pub fn matches(self, ssrc: Ssrc, rid: Option<Rid>) -> bool {
+        match self {
+            Self::Rid(expected) => expected == rid,
+            Self::Ssrc(expected) => expected == ssrc,
+        }
+    }
+}
+
+impl From<Option<Rid>> for SourceEncoding {
+    fn from(rid: Option<Rid>) -> Self {
+        Self::Rid(rid)
+    }
+}
+
+impl Display for SourceEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rid(rid) => f.write_str(rid.as_deref().unwrap_or("_")),
+            Self::Ssrc(ssrc) => write!(f, "ssrc:{ssrc}"),
+        }
+    }
+}
+
+pub type StreamId = (TrackId, SourceEncoding);
 
 pub struct ProcessedRtp {
     pub first: Option<RtpPacket>,
@@ -267,6 +299,7 @@ pub enum SelectionPolicy {
 pub struct UpstreamTrackLayer {
     pub mid: Mid,
     pub rid: Option<Rid>,
+    pub encoding: SourceEncoding,
     pub quality: LayerQuality,
     normalizer: StreamNormalizer,
     pub monitor: StreamMonitor,
@@ -274,7 +307,7 @@ pub struct UpstreamTrackLayer {
 
 impl PartialEq for UpstreamTrackLayer {
     fn eq(&self, other: &Self) -> bool {
-        self.mid == other.mid && self.rid == other.rid
+        self.mid == other.mid && self.rid == other.rid && self.encoding == other.encoding
     }
 }
 
@@ -504,7 +537,11 @@ impl TrackMonitor {
     }
 
     pub fn process(&mut self, rid: Option<&Rid>, packet: RtpPacket) -> ProcessedRtp {
-        let Some(index) = self.encodings.iter().position(|s| s.rid.as_ref() == rid) else {
+        let Some(index) = self
+            .encodings
+            .iter()
+            .position(|s| s.encoding.matches(packet.ssrc, rid.copied()))
+        else {
             return ProcessedRtp {
                 first: None,
                 remaining: Vec::new(),
@@ -566,13 +603,15 @@ impl TrackMonitor {
     }
 
     pub fn by_rid_mut(&mut self, rid: &Option<Rid>) -> Option<&mut UpstreamTrackLayer> {
-        self.encodings.iter_mut().find(|s| s.rid == *rid)
+        self.encodings
+            .iter_mut()
+            .find(|s| s.encoding == SourceEncoding::Rid(*rid))
     }
 
     pub fn layer_states(&self) -> TrackStates {
         self.encodings
             .iter()
-            .map(|e| (e.rid, e.monitor.stats()))
+            .map(|e| (e.encoding, e.monitor.stats()))
             .collect()
     }
 
@@ -649,7 +688,7 @@ pub struct DataTrack {
 
 #[derive(Debug, Clone, Default)]
 struct VideoStatsSnapshot {
-    layers: Vec<(Option<Rid>, StreamStats)>,
+    layers: TrackStates,
 }
 
 #[derive(Debug, Clone)]
@@ -662,7 +701,7 @@ impl VideoStats {
                 .iter()
                 .map(|layer| {
                     (
-                        layer.rid,
+                        layer.encoding,
                         StreamStats::new(
                             false,
                             layer.quality.seed_bitrate_bps(),
@@ -887,6 +926,7 @@ impl Track {
 pub struct TrackLayer {
     pub meta: TrackMeta,
     pub rid: Option<Rid>,
+    pub encoding: SourceEncoding,
     pub quality: LayerQuality,
 }
 
@@ -894,23 +934,26 @@ pub struct TrackLayer {
 ///
 /// Travels the media path only — participant to its shard, then shard to shard
 /// — never through the controller.
-pub type TrackStates = Vec<(Option<Rid>, StreamStats)>;
+pub type TrackStates = Vec<(SourceEncoding, StreamStats)>;
 
 impl Eq for TrackLayer {}
 
 impl PartialEq for TrackLayer {
     fn eq(&self, other: &Self) -> bool {
-        other.meta == self.meta && other.rid == self.rid && other.quality == self.quality
+        other.meta == self.meta
+            && other.rid == self.rid
+            && other.encoding == self.encoding
+            && other.quality == self.quality
     }
 }
 
 impl TrackLayer {
     pub fn stream_id(&self) -> StreamId {
-        (self.meta.id, self.rid)
+        (self.meta.id, self.encoding)
     }
 
     pub fn is(&self, stream_id: &StreamId) -> bool {
-        self.meta.id == stream_id.0 && self.rid == stream_id.1
+        self.meta.id == stream_id.0 && self.encoding == stream_id.1
     }
 
     pub fn request_keyframe(&self) {
@@ -938,6 +981,7 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
         monitor: TrackMonitor::new(vec![UpstreamTrackLayer {
             mid,
             rid: None,
+            encoding: SourceEncoding::Rid(None),
             quality: LayerQuality::Low,
             normalizer: StreamNormalizer::new(mid, None),
             monitor,
@@ -973,20 +1017,51 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
         layers.iter().map(|l| Some(l.rid)).collect()
     };
 
-    let mut senders = Vec::new();
-    let mut layers = Vec::with_capacity(simulcast_rids.len());
+    new_video_encodings(
+        mid,
+        meta,
+        simulcast_rids
+            .into_iter()
+            .map(|rid| (SourceEncoding::Rid(rid), rid))
+            .collect(),
+    )
+}
 
-    for &rid in &simulcast_rids {
+pub(crate) fn new_video_ssrcs(
+    mid: Mid,
+    meta: TrackMeta,
+    encodings: Vec<(Ssrc, Option<Rid>)>,
+) -> (UpstreamTrack, Track) {
+    new_video_encodings(
+        mid,
+        meta,
+        encodings
+            .into_iter()
+            .map(|(ssrc, rid)| (SourceEncoding::Ssrc(ssrc), rid))
+            .collect(),
+    )
+}
+
+fn new_video_encodings(
+    mid: Mid,
+    meta: TrackMeta,
+    encodings: Vec<(SourceEncoding, Option<Rid>)>,
+) -> (UpstreamTrack, Track) {
+    let mut senders = Vec::new();
+    let mut layers = Vec::with_capacity(encodings.len());
+
+    for (encoding, rid) in encodings {
         let quality = LayerQuality::from_rid(rid.as_deref());
         let bitrate = quality.seed_bitrate_bps();
         let fallback_height = quality.fallback_height();
         let stream_state = StreamStats::new(true, bitrate, fallback_height);
-        let stream_id = format!("{}:{}", meta.id, rid.as_deref().unwrap_or("_"));
+        let stream_id = format!("{}:{encoding}", meta.id);
         let monitor = StreamMonitor::new(meta.id.kind(), stream_id, stream_state);
 
         senders.push(UpstreamTrackLayer {
             mid,
             rid,
+            encoding,
             quality,
             normalizer: StreamNormalizer::new(mid, rid),
             monitor,
@@ -994,6 +1069,7 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
         layers.push(TrackLayer {
             meta: meta.clone(),
             rid,
+            encoding,
             quality,
         });
     }
@@ -1585,6 +1661,7 @@ mod dd_tests {
         UpstreamTrackLayer {
             mid: Mid::from("0"),
             rid: None,
+            encoding: SourceEncoding::Rid(None),
             quality: LayerQuality::High,
             normalizer: StreamNormalizer::new(Mid::from("0"), None),
             monitor: StreamMonitor::new(TrackKind::Video, "test".to_string(), state),
@@ -1835,11 +1912,23 @@ mod simulcast_pause_tests {
     }
 
     fn feed(upstream: &mut UpstreamTrack, rid: &str, at: Instant) {
-        let pkt = RtpPacket {
+        feed_source(upstream, SourceEncoding::Rid(Some(Rid::from(rid))), at);
+    }
+
+    fn feed_source(upstream: &mut UpstreamTrack, encoding: SourceEncoding, at: Instant) {
+        let mut pkt = RtpPacket {
             arrival_ts: at,
             ..Default::default()
         };
-        let _ = upstream.monitor.process(Some(&Rid::from(rid)), pkt);
+        let rid = match encoding {
+            SourceEncoding::Rid(rid) => rid,
+            SourceEncoding::Ssrc(ssrc) => {
+                pkt.ssrc = ssrc;
+                None
+            }
+        };
+        pkt.ext_vals.rid = rid;
+        let _ = upstream.monitor.process(rid.as_ref(), pkt);
     }
 
     fn inactive(upstream: &UpstreamTrack) -> Vec<bool> {
@@ -1896,29 +1985,35 @@ mod simulcast_pause_tests {
     /// longer dead timeout.
     #[test]
     fn a_layer_dropped_while_siblings_send_is_paused() {
-        let (mut upstream, start) = track();
-        for rid in ["q", "h", "f"] {
-            feed(&mut upstream, rid, start);
+        let (upstream, start) = track();
+        let (mut upstream, _) = new_video_ssrcs(
+            Mid::from("v"),
+            upstream.meta,
+            [1_u32, 2, 3].map(|ssrc| (ssrc.into(), None)).to_vec(),
+        );
+        for ssrc in [1_u32, 2, 3] {
+            feed_source(&mut upstream, SourceEncoding::Ssrc(ssrc.into()), start);
         }
 
-        // "f" goes quiet; "q" and "h" keep sending past the pause timeout.
+        // SSRC 3 goes quiet; the other two keep sending past the pause timeout.
         for tick in 1..=25u32 {
             let now = start + Duration::from_millis(100) * tick;
-            feed(&mut upstream, "q", now);
-            feed(&mut upstream, "h", now);
+            for ssrc in [1_u32, 2] {
+                feed_source(&mut upstream, SourceEncoding::Ssrc(ssrc.into()), now);
+            }
             upstream.poll_stats(now);
         }
 
         let states = upstream.monitor.layer_states();
-        let state_of = |rid: &str| {
+        let state_of = |ssrc: u32| {
             states
                 .iter()
-                .find(|(r, _)| r.as_deref() == Some(rid))
+                .find(|(encoding, _)| *encoding == SourceEncoding::Ssrc(ssrc.into()))
                 .map(|(_, s)| s.is_inactive())
                 .unwrap()
         };
-        assert!(state_of("f"), "the dropped layer must be paused");
-        assert!(!state_of("q"), "a sending layer must stay active");
-        assert!(!state_of("h"), "a sending layer must stay active");
+        assert!(state_of(3), "the dropped layer must be paused");
+        assert!(!state_of(1), "a sending layer must stay active");
+        assert!(!state_of(2), "a sending layer must stay active");
     }
 }

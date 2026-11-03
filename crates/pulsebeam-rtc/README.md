@@ -102,9 +102,10 @@ compatibility values, not configured or enforced admission ceilings.
 SCTP connects. Channel/configuration storage, reset state and future notices are
 funded immediately; no DCEP OPEN is sent. Activation rechecks the peer's actual
 stream capacity before `Opened` or message delivery. Notifications progress in
-bounded turns, and the first inbound DATA activates its declaration before
-queuing delivery, preserving `Opened` before `Message`. Pending declarations
-cannot send. Cancellation, reset-all and shutdown fence activation. A canceled
+bounded turns. DATA received before COOKIE ACK completes the association stays
+in dcSCTP's receive queue until negotiated stream facts are available. The first
+inbound DATA then activates its declaration before queuing delivery, preserving
+`Opened` before `Message`. Pending declarations cannot send. Cancellation, reset-all and shutdown fence activation. A canceled
 or unrepresentable never-opened declaration reports closure/reset failure and
 releases its full configuration, retaining only a funded non-reuse guard until
 teardown because no reset barrier completed. In-band and automatically assigned
@@ -172,7 +173,8 @@ admitted channel, before advancing its lifetime or sending DCEP. Closing consume
 that promise without needing free bytes. Both reset directions and the native
 receive-FIFO drain barrier must complete before the reservation is released;
 failed resets retain it until teardown. Unknown-SID resets reserve their own pair
-of payloads, and duplicates reuse that credit. If an unknown reset barrier cannot
+of payloads and one future reset-outcome notice, even without a local channel
+declaration. Duplicates reuse that credit. If an unknown reset barrier cannot
 be retained, the association stops rather than permitting unsafe SID reuse.
 Explicit abort releases all reset credit, even after stop.
 Channel-map key/value payloads and configuration-lease payloads also use this
@@ -229,8 +231,9 @@ stages nor an aggregate transport, provider-handshake or RSS bound.
 Closing a channel fences queued delivery immediately. `DataChannelEvent::Closed`
 is a cutoff notification, not permission to reuse its stream ID. Reuse requires
 `ResetComplete`: both reset directions have completed and the native receive
-queue has drained. `ResetFailed` keeps that stream unavailable until association
-teardown. Late queued events and send-completion accounting remain attached to
+queue has drained. An explicit open before that barrier returns `ResetPending`
+with the unchanged configuration; retry after `ResetComplete`. `ResetFailed` keeps
+that stream unavailable with `InvalidState` until association teardown. Late queued events and send-completion accounting remain attached to
 their original channel lifetime. Callers must also fence callbacks and messages
 already handed to their application before retiring its logical handle.
 
@@ -564,11 +567,16 @@ is not a network path-MTU guarantee.
 
 `ConnectionLimits::max_sent_history_bytes` defaults to 8 MiB and funds the fixed
 sent-packet/TWCC windows, actual controller feedback/synthetic vector capacities,
-missing-debt deque capacity (including stale IDs awaiting bounded service), source
-key/value and readiness-index payloads, and each source's allocated
+missing-debt deque capacity (including stale IDs awaiting bounded service) and its
+prepaid reorder-deadline keys, source key/value and readiness-index payloads, and each source's allocated
 RTP-index/SentPacketId capacity.
 Source lookup supports valid late sequence holes without assuming commit order.
 Index deletion retains its charge while the table backing remains allocated.
+Deadline peeks use the retained packet head and the shared readiness index, not
+packet or missing-debt scans. Path changes and reordering-window growth each
+visit at most the fixed 32,768-packet window, never the historical source map.
+Report clocks carry their path epoch so an unrepresented source resets its
+feedback anchors when it next commits on a replacement path.
 Each admitted source prepays one readiness key. Permanent omission schedules its
 physical sources for bounded idle cleanup at the existing five-second packet-age
 boundary, not five seconds after omission. Until then, committed flight and valid

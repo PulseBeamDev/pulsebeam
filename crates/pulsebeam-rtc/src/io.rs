@@ -248,6 +248,8 @@ pub enum WriteError {
     IndexExhausted,
     #[error("operation is invalid in the current state")]
     InvalidState,
+    #[error("data channel stream reset is still pending")]
+    ResetPending,
     #[error("data channel message is too large")]
     MessageTooLarge,
     #[error("connection has reached a configured buffer limit")]

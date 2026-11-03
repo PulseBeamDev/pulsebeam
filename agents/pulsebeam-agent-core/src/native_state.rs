@@ -752,6 +752,10 @@ impl NativeState {
         self.terminal
     }
 
+    pub(crate) fn reference(&self, resource: &Resource) -> Option<u64> {
+        self.targets.get(resource)?.reference
+    }
+
     pub(crate) fn confirmed(&self, resource: &Resource) -> Option<&wire::ConfirmedState> {
         let reference = self.targets.get(resource)?.reference?;
         self.owned.get(&reference)?.confirmed.as_ref()

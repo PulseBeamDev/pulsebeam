@@ -85,13 +85,11 @@ pub(super) async fn progress(
             let check = (|| -> Result<()> {
                 let observed =
                     observation(handle).context("audio viewer observation unavailable")?;
-                let capacity = crate::tests::histories::AUDIO_SLOTS;
                 let pinned = observed
                     .submitted
                     .audio
                     .pinned
                     .iter()
-                    .take(capacity)
                     .cloned()
                     .collect::<BTreeSet<_>>();
                 let mapped = observed
@@ -100,10 +98,7 @@ pub(super) async fn progress(
                     .values()
                     .cloned()
                     .collect::<BTreeSet<_>>();
-                ensure!(
-                    mapped.len() <= capacity && pinned.is_subset(&mapped),
-                    "audio preference/capacity not applied"
-                );
+                ensure!(pinned.is_subset(&mapped), "audio preference not applied");
                 if !observed.submitted.audio.automatic {
                     ensure!(
                         mapped == pinned,
@@ -157,7 +152,6 @@ pub(super) async fn progress(
                 } else {
                     None
                 };
-                // Capacity is not an obligation to keep unused native slots decoding.
                 // Every credited MID must join fresh PCM to its own decoder progress.
                 super::super::super::native_audio::require_decoder_receivers(
                     before,

@@ -220,6 +220,7 @@ proptest::proptest! {
             TwccStatus::NotReceived
         }).collect::<Vec<_>>();
         history.process_feedback(batch(now + Duration::from_millis(10), epoch, first));
+        history.assert_storage();
         let first_credit = history.inputs.feedback.iter().filter(|sample| sample.newly_acked).count();
         history.clear_controller_inputs();
         history.process_feedback(FeedbackBatch {
@@ -234,6 +235,7 @@ proptest::proptest! {
                 statuses: vec![TwccStatus::Received { delta_250us: 1 }; received.len()].into(),
             },
         });
+        history.assert_storage();
         let second_credit = history.inputs.feedback.iter().filter(|sample| sample.newly_acked).count();
         proptest::prop_assert_eq!(first_credit + second_credit, received.len());
         proptest::prop_assert_eq!(history.bytes_in_flight, 0);
@@ -890,6 +892,95 @@ fn rfc8888_source_keys_isolate_credit_and_report_timing() {
 }
 
 #[test]
+fn path_change_lazily_resets_unrepresented_source_clock() {
+    let now = Instant::now();
+    let epoch = PathEpoch::from_value(40);
+    let next_epoch = PathEpoch::from_value(41);
+    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
+    let receipt = |received_at, path_epoch, ssrc, begin_sequence, report_timestamp| FeedbackBatch {
+        received_at,
+        path_epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Rfc8888 {
+            reports: vec![crate::rtcp::Rfc8888Report {
+                ssrc,
+                begin_sequence,
+                report_count: 1,
+                statuses: vec![Rfc8888Status::Received {
+                    ecn: 0,
+                    arrival_offset: ArrivalOffset::Ticks(0),
+                }]
+                .into(),
+            }]
+            .into(),
+            report_timestamp,
+        },
+    };
+    history.path_changed(epoch, true);
+    history.commit(rfc_context(now, epoch, 1)).unwrap();
+    history.process_feedback(receipt(now + Duration::from_millis(10), epoch, 7, 1, 1_000));
+    history.clear_controller_inputs();
+    for sequence in 1..=SENT_HISTORY_CAPACITY {
+        let at = now + Duration::from_secs(sequence as u64 * 6);
+        let mut packet = rfc_context(at, epoch, u16::try_from(sequence).unwrap());
+        packet.rtp.as_mut().unwrap().ssrc = 8;
+        history.commit(packet).unwrap();
+        history.process_feedback(receipt(
+            at + Duration::from_millis(10),
+            epoch,
+            8,
+            u16::try_from(sequence).unwrap(),
+            u32::try_from(sequence).unwrap() + 1_000,
+        ));
+        assert_eq!(history.bytes_in_flight, 0);
+        history.clear_controller_inputs();
+    }
+    assert_eq!(history.oldest_sent_id, 1);
+    assert_eq!(
+        history.next_deadline(now),
+        Some(now + Duration::from_secs(6) + SENT_HISTORY_MAX_AGE)
+    );
+    let later = now + Duration::from_secs((SENT_HISTORY_CAPACITY as u64 + 1) * 6);
+    while history.oldest_sent_id < history.next_sent_id {
+        let work = history.expire(later, MAX_EXPIRATIONS_PER_POLL);
+        assert!(work > 0 && work <= MAX_EXPIRATIONS_PER_POLL);
+        history.clear_controller_inputs();
+    }
+    assert!(history.ssrcs[&7].by_sequence.is_empty());
+    assert_eq!(
+        history.ssrcs[&7].last_report_timestamp,
+        Some((epoch, 1_000))
+    );
+    assert_eq!(history.ssrcs[&7].highest_acked_sequence, Some(1));
+    assert_eq!(history.oldest_sent_id, history.next_sent_id);
+    assert_eq!(history.next_deadline(now), None);
+    history.path_changed(next_epoch, true);
+    assert_eq!(
+        history.ssrcs[&7].last_report_timestamp,
+        Some((epoch, 1_000))
+    );
+    history.commit(rfc_context(later, next_epoch, 1)).unwrap();
+    assert_eq!(history.ssrcs[&7].last_report_timestamp, None);
+    assert_eq!(history.ssrcs[&7].highest_acked_sequence, None);
+    assert_eq!(
+        history.next_deadline(later),
+        Some(later + SENT_HISTORY_MAX_AGE)
+    );
+    history.process_feedback(receipt(
+        later + Duration::from_millis(10),
+        next_epoch,
+        7,
+        1,
+        1,
+    ));
+    assert_eq!(history.bytes_in_flight, 0);
+    assert_eq!(history.inputs.feedback.len(), 1);
+    assert!(history.inputs.feedback[0].newly_acked);
+    assert!(history.inputs.fresh_network_feedback);
+    history.assert_storage();
+}
+
+#[test]
 fn all_missing_rfc8888_report_does_not_advance_either_ssrc() {
     let now = Instant::now();
     let epoch = PathEpoch::from_value(13);
@@ -1028,7 +1119,7 @@ fn missing_debt_is_funded_without_changing_credit_or_confirmation_work() {
         history.commit(context(now, epoch, sequence)).unwrap();
     }
     let fixed = history.assert_storage();
-    let stride = size_of::<SentPacketId>();
+    let stride = MISSING_SLOT_BYTES;
     history.max_backing_bytes = fixed.checked_add(stride).unwrap().checked_sub(1).unwrap();
     assert!(history.reserve_missing_slot().is_none());
     assert_eq!(history.backing_bytes(), Some(fixed));
@@ -1337,6 +1428,8 @@ fn all_missing_waits_for_higher_receipt_before_reorder_loss() {
         epoch,
         vec![TwccStatus::NotReceived, TwccStatus::NotReceived],
     ));
+    history.assert_storage();
+    assert_eq!(history.next_deadline(now), Some(now + SENT_HISTORY_MAX_AGE));
     assert_eq!(history.confirm_losses(now + Duration::from_secs(1), 256), 2);
     assert_eq!(history.counters.not_received, 0);
     history.process_feedback(batch(
@@ -1348,6 +1441,11 @@ fn all_missing_waits_for_higher_receipt_before_reorder_loss() {
             TwccStatus::Received { delta_250us: 1 },
         ],
     ));
+    history.assert_storage();
+    assert_eq!(
+        history.next_deadline(now),
+        Some(now + Duration::from_millis(130))
+    );
     assert_eq!(
         history.confirm_losses(now + Duration::from_millis(129), 256),
         2
@@ -1355,6 +1453,8 @@ fn all_missing_waits_for_higher_receipt_before_reorder_loss() {
     assert_eq!(history.counters.not_received, 0);
     history.confirm_losses(now + Duration::from_millis(130), 256);
     assert_eq!(history.counters.not_received, 2);
+    history.assert_storage();
+    assert_eq!(history.next_deadline(now), Some(now + SENT_HISTORY_MAX_AGE));
 }
 
 #[test]

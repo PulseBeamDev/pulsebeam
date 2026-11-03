@@ -4,12 +4,6 @@
     window.pulsebeam.createAgent({
       endpoint,
       token,
-      topology: {
-        localVideos: 0,
-        localAudios: 0,
-        remoteVideos: 1,
-        remoteAudios: 0,
-      },
     });
   const sender = create("__SENDER_TOKEN__");
   const receiver = create("__RECEIVER_TOKEN__");

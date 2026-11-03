@@ -49,8 +49,10 @@ Combined mode requires a decoding-capable factory, retains independent polling
 queues, and preserves the encoded observer's receiver-lifetime reservation.
 Changing or reattaching modes can therefore require a new receiver/generation.
 
-After generation replacement, reacquire source/remote handles and use current
-generation observations. Retired handles do not reattach automatically. Returned
+Named `PublicationInput` ports follow Core-authorized targets across generation
+replacement; wait for `ready` before producing again. Remote observation
+handles must be reacquired, using current generation
+observations. Retired physical handles do not reattach automatically. Returned
 owned frames remain valid after stream closure; closure does not keep the RTC
 graph alive. Observe native sink drops and application lag rather than treating
 missing observations as successful delivery.
@@ -138,13 +140,12 @@ The existing simulator replay owner also includes distinct focused scenarios:
 
 ## Acceptance and distribution limits
 
-This delivery is not full native MVP acceptance. Passing focused proofs or
-finishing unblocked delivery work does not mean `//:test`, full simulator
-acceptance, or every recovery/media scenario passed. The
-[ordered-recovery checkpoint](../pulsebeam-agent-core/ORDERED_RECOVERY_CHECKPOINT.md)
-retains its exact historical candidate and unresolved qualification boundary.
-The noncatalog continuation adds same-receiver admitted-origin/RTP correlation.
-Conference playback, publisher rejoin and slot replacement now assert actual
+Whole-workspace acceptance requires `./bazel test //:test` after final source,
+generated-output and documentation changes. Run the native flavor's simulator
+scenarios without excluding intent histories or ordered retention-gap recovery.
+Focused owner results do not replace those gates.
+
+Conference playback, publisher rejoin and slot replacement assert actual
 native I420, current source identity and bounded visibility/continuity instead
 of encoded polling completeness or arbitrary replacement byte totals. These
 scenarios retain authenticated encoded source samples, but do not independently
@@ -153,27 +154,13 @@ samples. Dedicated encoded-forwarding/codec scenarios retain their independent
 decoder assertions. The initial-ramp scenario retains its original two-second
 window and encoded quality checks in addition to native proof.
 
-After rebasing onto main's resource/catalog ownership changes, the latest
-scoped regression passes all 183 fast and 15 slow committed cases with only the
-two exclusions below, using the same pinned source/native pair. This includes
-owned-publication relabel through a fresh native wire session: protocol identity
-is checked against the actual receiver mapping/catalog, while successful source
-decodes are independently authenticated to the current admission. Native receiver
-track IDs are not treated as protocol publication IDs. Root checks, all
-non-simulator fast owners, controlled RTC interoperability and browser checks
-also pass. The original recovery roster and five-second
-publication setup cases pass without changing their deadlines or assertions.
-Established-stream TCP retransmission repairs the lost signaling request;
-BoringSSL DTLS retransmission now uses the controlled native clock. Playback
+Protocol publication identity comes from actual receiver mapping facts;
+native receiver track IDs are not protocol publication IDs. Successful source
+decodes are independently authenticated to the current admission. Playback
 source proof uses actual native callbacks rather than requiring complete encoded
-polling. The native lifecycle case also passes; earlier retained freeze traces
-have not been individually causally attributed by this renewal.
-
-These scoped witnesses are not a replacement for whole-workspace acceptance.
-The catalog-sensitive
-`tests::histories::required_intent_histories` and
-`tests::data_channel::ordered_recovery_reports_retention_gaps_without_replaying_late_history`
-remain excluded from that continuation, not fixed or qualified.
+polling. Simulator proofs exercise established-stream TCP retransmission;
+native DTLS retransmission uses the controlled clock. These proofs do not
+qualify general production TCP/TLS or TURN behavior.
 
 Static/dynamic library builds and foreign binding generation establish artifact
 compatibility only for the exercised toolchain. Generated Swift/Kotlin code does

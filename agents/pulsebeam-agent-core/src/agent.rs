@@ -111,6 +111,7 @@ struct Session {
     payloads: BTreeMap<ChannelId, native::PayloadChannel>,
     payload_resources: BTreeMap<crate::native_state::Resource, ChannelId>,
     next_stream: u32,
+    reusable_streams: BTreeSet<u16>,
     media_leases: BTreeMap<MediaSlot, native::MediaLease>,
     media_retirement: Option<native::MediaRetirement>,
     media_allocation: Option<native::MediaAllocation>,
@@ -210,7 +211,6 @@ pub struct Agent {
     desired: DesiredState,
     declared: DesiredState,
     resources: crate::TrackResources,
-    unmapped_video: BTreeSet<crate::TrackSelector>,
     local_bindings: BTreeMap<MediaSlot, String>,
     snapshot: Snapshot,
     ids: IdGenerator,
@@ -239,7 +239,6 @@ impl Agent {
             desired: DesiredState::default(),
             declared: DesiredState::default(),
             resources: crate::TrackResources::default(),
-            unmapped_video: BTreeSet::new(),
             local_bindings: BTreeMap::new(),
             snapshot: Snapshot::default(),
             ids: IdGenerator::new(),
@@ -381,12 +380,7 @@ impl Agent {
                     })
                     .collect();
                 let owner = self.resources.new_owner()?;
-                let slot = self.resources.claim_publication(
-                    owner,
-                    spec,
-                    &self.config.topology,
-                    &occupied,
-                )?;
+                let slot = self.resources.claim_publication(owner, spec, &occupied)?;
                 let after_generation = None;
                 ResourceResult::Publication {
                     owner: owner.id(),
@@ -402,6 +396,62 @@ impl Agent {
                     .ok_or(TrackResourceError::Released)?;
                 self.resources.update_publication(owner, &spec, present)?;
                 ResourceResult::Updated
+            }
+            ResourceCommand::BeginPublicationInput {
+                owner,
+                input,
+                present,
+                muted,
+            } => {
+                let (operation, state) = self.resources.begin_publication_input(
+                    TrackOwner(owner),
+                    input,
+                    present,
+                    muted.unwrap_or(self.resources.publication_muted(TrackOwner(owner))?),
+                )?;
+                ResourceResult::PublicationInput { operation, state }
+            }
+            ResourceCommand::AuthorizePublicationInput { operation } => {
+                return Ok(if self.resources.publication_input_current(&operation) {
+                    ResourceResult::Updated
+                } else {
+                    ResourceResult::Superseded
+                });
+            }
+            ResourceCommand::CompletePublicationInput {
+                operation,
+                succeeded,
+            } => {
+                match self
+                    .resources
+                    .complete_publication_input(&operation, succeeded)
+                {
+                    Some(state) => ResourceResult::PublicationInputState(state),
+                    None => return Ok(ResourceResult::Superseded),
+                }
+            }
+            ResourceCommand::CompletePublicationInputTarget { control, succeeded } => {
+                if control.target.is_none()
+                    || control.operation.input().is_none()
+                    || !self.publication_input_control_current(&control)
+                    || !self.resources.complete_input_control(&control)
+                {
+                    return Ok(ResourceResult::Superseded);
+                }
+                if succeeded {
+                    ResourceResult::Updated
+                } else {
+                    match self.resources.fail_publication_input(&control.operation) {
+                        Some(state) => ResourceResult::PublicationInputState(state),
+                        None => return Ok(ResourceResult::Superseded),
+                    }
+                }
+            }
+            ResourceCommand::SetPublicationMuted { owner, muted } => {
+                ResourceResult::PublicationInputState(
+                    self.resources
+                        .set_publication_muted(TrackOwner(owner), muted)?,
+                )
             }
             ResourceCommand::ClaimVideo { selector } => {
                 if !self.declared.video.is_empty() {
@@ -420,6 +470,66 @@ impl Agent {
                 let owner = self.resources.new_owner()?;
                 self.resources.claim_audio(owner)?;
                 ResourceResult::Owned { owner: owner.id() }
+            }
+            ResourceCommand::ClaimAudioSubscription { selector } => {
+                if self.declared.audio.has_demand() {
+                    return Err(TrackResourceError::AlreadyOwned.into());
+                }
+                let owner = self.resources.new_owner()?;
+                self.resources.claim_audio_subscription(owner, selector)?;
+                ResourceResult::Owned { owner: owner.id() }
+            }
+            ResourceCommand::ConfigureAudio {
+                owner,
+                playout_delay,
+            } => {
+                self.resources
+                    .configure_audio(TrackOwner(owner), playout_delay)?;
+                ResourceResult::Updated
+            }
+            ResourceCommand::ClaimAudioPolicy { policy } => {
+                if self.declared.audio.has_demand() {
+                    return Err(TrackResourceError::AlreadyOwned.into());
+                }
+                let owner = self.resources.new_owner()?;
+                self.resources.claim_audio_policy(owner, policy)?;
+                ResourceResult::Owned { owner: owner.id() }
+            }
+            ResourceCommand::ConfigureAudioPolicy { owner, policy } => {
+                self.resources
+                    .configure_audio_policy(TrackOwner(owner), policy)?;
+                ResourceResult::Updated
+            }
+            ResourceCommand::BeginMediaObservation { owner } => ResourceResult::MediaObservation(
+                self.resources.begin_media_observation(TrackOwner(owner))?,
+            ),
+            ResourceCommand::BeginAudioSourceObservation { owner, source } => {
+                ResourceResult::MediaObservation(
+                    self.resources
+                        .begin_audio_source_observation(TrackOwner(owner), source)?,
+                )
+            }
+            ResourceCommand::AuthorizeMediaObservation { control } => {
+                return Ok(if self.resources.observation_control_current(&control) {
+                    ResourceResult::Updated
+                } else {
+                    ResourceResult::Superseded
+                });
+            }
+            ResourceCommand::CompleteMediaObservation { control, succeeded } => {
+                if !self
+                    .resources
+                    .complete_observation_control(&control, succeeded)
+                {
+                    return Ok(ResourceResult::Superseded);
+                }
+                ResourceResult::Updated
+            }
+            ResourceCommand::EndMediaObservation { control } => {
+                if !self.resources.end_observation_control(&control) {
+                    return Ok(ResourceResult::Superseded);
+                }
+                ResourceResult::Updated
             }
             ResourceCommand::RetainProducer { spec } => {
                 if !self.desired.connected {
@@ -452,6 +562,17 @@ impl Agent {
                 });
             }
             ResourceCommand::Release { owner } => {
+                if let Some(mut control) = self.resources.release_input_control(TrackOwner(owner)) {
+                    control.effect = Some(self.ids.operation());
+                    self.effects.push_back(Effect::PublicationInput(control));
+                }
+                for mut control in self
+                    .resources
+                    .release_observation_controls(TrackOwner(owner))
+                {
+                    control.effect = Some(self.ids.operation());
+                    self.effects.push_back(Effect::MediaObservation(control));
+                }
                 self.resources.release(TrackOwner(owner));
                 ResourceResult::Updated
             }
@@ -475,19 +596,76 @@ impl Agent {
             MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name) => name,
             MediaSlot::RemoteVideo(_) | MediaSlot::RemoteAudio(_) => return false,
         };
-        self.config.topology.local_slot_kind(name) == Some(slot.kind())
-            && self
-                .desired
-                .publications
-                .iter()
-                .any(|publication| publication.slot == *name && publication.active)
+        self.desired.publications.iter().any(|publication| {
+            publication.slot == *name && publication.kind == slot.kind() && publication.active
+        })
     }
 
     pub fn next_notification(&mut self) -> Option<Notification> {
         self.published_notifications.pop_front()
     }
 
+    pub fn publication_input_control_current(
+        &self,
+        control: &crate::PublicationInputControl,
+    ) -> bool {
+        control.effect.is_some() && self.resources.input_control_current(control)
+    }
+
+    fn input_control(
+        &self,
+        mut control: crate::PublicationInputControl,
+    ) -> crate::PublicationInputControl {
+        if !self.desired.connected || control.operation.input().is_none() {
+            return control;
+        }
+        let slot = match self
+            .resources
+            .publication_spec(crate::TrackOwner(control.operation.owner()))
+            .and_then(|spec| spec.media_kind())
+        {
+            Some(crate::MediaKind::Video) => MediaSlot::LocalVideo(control.operation.slot().into()),
+            Some(crate::MediaKind::Audio) => MediaSlot::LocalAudio(control.operation.slot().into()),
+            None => return control,
+        };
+        // A replacement attempt owns a new graph, even while the old session drains.
+        let target = if let Some(attempt) = &self.attempt {
+            attempt
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.slots.iter().find(|binding| binding.slot == slot))
+                .map(|binding| crate::PublicationInputTarget {
+                    generation: attempt.generation,
+                    binding: binding.clone(),
+                })
+        } else {
+            self.active
+                .as_ref()
+                .filter(|_| self.source_preparation(&slot).readiness == SourceReadiness::Ready)
+                .and_then(|active| {
+                    active
+                        .coordinates
+                        .get(&slot)
+                        .and_then(Option::as_ref)
+                        .map(|binding| crate::PublicationInputTarget {
+                            generation: active.generation,
+                            binding: binding.clone(),
+                        })
+                })
+        };
+        control.target = target;
+        control
+    }
+
     fn flush_notifications(&mut self) -> Result<(), AgentError> {
+        let result = self.flush_topic_notifications();
+        // Failed notification processing must not retain stale input grants.
+        self.reconcile_input_controls();
+        self.reconcile_observation_controls();
+        result
+    }
+
+    fn flush_topic_notifications(&mut self) -> Result<(), AgentError> {
         self.topics.progress_data_sends(
             self.desired.connected,
             &mut self.ids,
@@ -513,6 +691,54 @@ impl Agent {
                 });
         }
         Ok(())
+    }
+
+    fn reconcile_input_controls(&mut self) {
+        let controls: Vec<_> = self
+            .resources
+            .publication_inputs()
+            .map(|control| self.input_control(control))
+            .collect();
+        for mut control in controls {
+            if self.resources.input_control_changed(&control) {
+                control.effect = Some(self.ids.operation());
+                self.resources.update_input_control(&control);
+                self.effects.push_back(Effect::PublicationInput(control));
+            }
+        }
+    }
+
+    fn reconcile_observation_controls(&mut self) {
+        for (id, slot) in self.resources.observation_requests() {
+            let source = self.resources.audio_observation_source(id);
+            let authorized =
+                source.is_none_or(|source| self.audio_source_authorized(id.owner(), source));
+            let target = if !authorized {
+                None
+            } else if let Some(source) = source {
+                self.audio_source_observation_target(source)
+            } else {
+                slot.as_ref()
+                    .and_then(|slot| self.media_observation_target(slot))
+                    .or_else(|| {
+                        self.resources
+                            .audio_observation_selector(id)
+                            .and_then(|selector| self.audio_observation_target(selector))
+                    })
+            };
+            let Some(mut control) = self.resources.observation_control(id, target) else {
+                continue;
+            };
+            if !authorized {
+                control.closed = true;
+                control.target = None;
+            }
+            if self.resources.observation_control_changed(&control) {
+                control.effect = Some(self.ids.operation());
+                self.resources.update_observation_control(&control);
+                self.effects.push_back(Effect::MediaObservation(control));
+            }
+        }
     }
 
     fn renew_authorization(&mut self, token: String) -> Result<(), AgentError> {
@@ -578,7 +804,7 @@ impl Agent {
 
     fn replace_desired(&mut self, mut desired: DesiredState) -> Result<(), AgentError> {
         desired.normalize();
-        desired.validate(&self.config.topology)?;
+        desired.validate()?;
         if desired.revision < self.declared.revision {
             return Err(AgentError::StaleDesiredRevision {
                 received: desired.revision,
@@ -594,36 +820,28 @@ impl Agent {
         }
         let owned_slots = self.resources.publication_slots();
         for publication in &desired.publications {
-            let spec = match self.config.topology.local_slot_kind(&publication.slot) {
-                Some(crate::MediaKind::Video) => crate::TrackSpec::Video {
+            let spec = match publication.kind {
+                crate::MediaKind::Video => crate::TrackSpec::Video {
                     label: publication.label.clone(),
                 },
-                Some(crate::MediaKind::Audio) => crate::TrackSpec::Audio {
+                crate::MediaKind::Audio => crate::TrackSpec::Audio {
                     label: publication.label.clone(),
                 },
-                None => {
-                    return Err(
-                        ValidationError::UnknownPublicationSlot(publication.slot.clone()).into(),
-                    );
-                }
             };
             if owned_slots.contains(&publication.slot) || self.resources.has_publication(&spec) {
                 return Err(crate::TrackResourceError::AlreadyOwned.into());
             }
         }
-        if !desired.video.is_empty() && self.resources.has_video() {
+        if !desired.video.is_empty() && self.resources.has_video()
+            || desired.audio.has_demand() && self.resources.has_audio_subscriptions()
+        {
             return Err(crate::TrackResourceError::AlreadyOwned.into());
         }
         let effective = self.effective_desired(&desired)?;
-        let local_slot = |name: &str| match self.config.topology.local_slot_kind(name) {
-            Some(crate::MediaKind::Video) => Ok(MediaSlot::LocalVideo(name.to_string())),
-            Some(crate::MediaKind::Audio) => Ok(MediaSlot::LocalAudio(name.to_string())),
-            None => Err(ValidationError::UnknownPublicationSlot(name.to_string())),
-        };
         self.local_bindings.clear();
         for publication in &desired.publications {
             self.local_bindings
-                .insert(local_slot(&publication.slot)?, publication.label.clone());
+                .insert(publication.media_slot(), publication.label.clone());
         }
         self.declared = desired;
         self.apply_desired(effective)
@@ -656,27 +874,14 @@ impl Agent {
         desired.topics.publishers.dedup();
         desired.topics.subscribers.dedup();
         if self.resources.has_video() {
-            let projection = self.resources.video_projection(
-                &self.snapshot.remote_tracks,
-                self.config.topology.remote_video,
-            );
-            let unmapped: BTreeSet<_> = projection.unmapped.into_iter().collect();
-            for selector in unmapped.difference(&self.unmapped_video) {
-                agent_log!(
-                    self,
-                    Warn,
-                    "remote video demand exceeds receiver capacity participant={} label={} capacity={}",
-                    selector.participant_external_id,
-                    selector.label,
-                    self.config.topology.remote_video
-                );
-            }
-            self.unmapped_video = unmapped;
-            desired.video = projection.subscriptions;
-        } else {
-            self.unmapped_video.clear();
+            desired.video = self
+                .resources
+                .video_projection(&self.snapshot.remote_tracks)?;
         }
-        desired.validate(&self.config.topology)?;
+        if self.resources.has_audio_subscriptions() {
+            desired.audio = self.resources.audio_projection();
+        }
+        desired.validate()?;
         Ok(desired)
     }
 
@@ -822,7 +1027,6 @@ impl Agent {
         }];
         self.effects.push_back(Effect::Rtc(RtcEffect::CreateOffer {
             generation,
-            topology: self.config.topology.clone(),
             data_channels,
         }));
         if mode == AttemptMode::Fresh && self.active.is_none() {
@@ -1054,12 +1258,7 @@ impl Agent {
         if attempt.generation != generation || attempt.stage != AttemptStage::Offering {
             return Ok(());
         }
-        validate_offer(
-            &offer,
-            &resources,
-            &self.config,
-            &attempt.topic_registrations,
-        )?;
+        validate_offer(&offer, &resources, &attempt.topic_registrations)?;
         let mode = attempt.mode;
         let operation = self.ids.operation();
         let request = self.create_request(&offer)?;
@@ -1316,9 +1515,9 @@ impl Agent {
                             if let Some(physical) = active
                                 .payloads
                                 .get_mut(&channel)
-                                .filter(|physical| !physical.terminal)
+                                .filter(|physical| physical.state == native::PayloadState::Active)
                             {
-                                physical.terminal = true;
+                                physical.state = native::PayloadState::Closing;
                                 active.state.stage(physical.resource.clone(), None)?;
                                 self.intent_dirty = true;
                                 self.topics.suspend_source(generation, channel);
@@ -1381,12 +1580,13 @@ impl Agent {
                             || active.payloads.contains_key(&channel)
                     })
                 {
-                    return Err(TopicError::UnknownChannel.into());
+                    return Ok(());
                 }
             }
             DataChannelEvent::Closed {
                 generation,
                 channel,
+                reset_complete,
             } => {
                 let native_payload = self.active.as_ref().is_some_and(|active| {
                     active.generation == generation && active.payloads.contains_key(&channel)
@@ -1408,11 +1608,18 @@ impl Agent {
                 {
                     active.data_preparations.remove(&channel);
                     if let Some(physical) = active.payloads.get_mut(&channel) {
-                        if !physical.terminal {
+                        if physical.state == native::PayloadState::Active {
                             physical.restart = !active.state.retaining(&physical.resource);
                         }
-                        physical.terminal = true;
-                        physical.closed = true;
+                        let previous_reset = matches!(
+                            physical.state,
+                            native::PayloadState::Closed {
+                                reset_complete: true
+                            }
+                        );
+                        physical.state = native::PayloadState::Closed {
+                            reset_complete: previous_reset || reset_complete,
+                        };
                         let resource = physical.resource.clone();
                         active.state.stage(resource, None)?;
                         self.intent_dirty = true;
@@ -1614,18 +1821,10 @@ impl Agent {
             debug_assert!(false, "ready attempt must have offer resources");
             return Ok(());
         };
-        let coordinates: BTreeMap<_, _> = self
-            .config
-            .topology
-            .slots()
+        let coordinates = resources
+            .slots
             .into_iter()
-            .map(|slot| (slot, None))
-            .chain(
-                resources
-                    .slots
-                    .into_iter()
-                    .map(|binding| (binding.slot.clone(), Some(binding))),
-            )
+            .map(|binding| (binding.slot.clone(), Some(binding)))
             .collect();
         let state = NativeState::new(
             native::STATE_MEMORY_BYTES,
@@ -1648,6 +1847,7 @@ impl Agent {
             payloads: BTreeMap::new(),
             payload_resources: BTreeMap::new(),
             next_stream: 1,
+            reusable_streams: BTreeSet::new(),
             media_leases: BTreeMap::new(),
             media_retirement: None,
             media_allocation: None,
@@ -1684,6 +1884,7 @@ impl Agent {
         );
         self.pending_signal = None;
         self.cancel_signal_retry();
+        self.clear_observed_state();
         self.intent_dirty = true;
         if let Some(active) = &self.active {
             self.snapshot.generation = Some(active.generation);
@@ -2166,14 +2367,12 @@ impl Failure {
 fn validate_offer(
     offer: &str,
     resources: &OfferResources,
-    config: &AgentConfig,
     _registrations: &crate::TopicRegistrations,
 ) -> Result<(), AgentError> {
     const MAX_SDP_BYTES: usize = 131_072;
     if offer.is_empty() || offer.len() > MAX_SDP_BYTES {
         return Err(AgentError::InvalidOffer("SDP offer is empty or too large"));
     }
-    let expected: BTreeSet<MediaSlot> = config.topology.slots().into_iter().collect();
     let mut actual = BTreeSet::new();
     let mut mids = BTreeSet::new();
     for SlotBinding { slot, mid, .. } in &resources.slots {
@@ -2190,11 +2389,6 @@ fn validate_offer(
         if !mids.insert(mid.as_str()) {
             return Err(AgentError::InvalidOffer("mid is mapped more than once"));
         }
-    }
-    if !actual.is_empty() && actual != expected {
-        return Err(AgentError::InvalidOffer(
-            "slot mapping does not match configured topology",
-        ));
     }
     let actual_bindings = crate::negotiated_slot_bindings(
         offer,
@@ -2437,6 +2631,7 @@ mod preparation_tests {
             .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
                 generation,
                 channel,
+                reset_complete: true,
             }))
             .unwrap();
         prepare(&mut agent, generation, channel, facts());

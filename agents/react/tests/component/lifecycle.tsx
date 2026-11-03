@@ -30,7 +30,7 @@ let setEnabled!: (enabled: boolean) => void;
 function Room() {
   const [token, setToken] = useState("first");
   const [endpoint, setEndpoint] = useState("http://localhost");
-  agent = useAgent({ endpoint, token, topology: { localVideos: 1 } });
+  agent = useAgent({ endpoint, token });
   capture = useUserMedia({ video: true, audio: true });
   devicesReady = useMediaDevices().state === "ready";
   updateToken = () => setToken("renewed");
@@ -138,8 +138,6 @@ HTMLMediaElement.prototype.play = async () => {
 await flush(() => playback!.retry());
 assert.equal(plays, 2, "retry reaches the attached element");
 
-const completion = deferred<void>();
-runtime.replaceCompletion = completion.promise;
 await flush(replaceSession!);
 assert.notEqual(agent!, first);
 assert.equal(
@@ -152,7 +150,6 @@ assert.equal(
   "live",
   "runtime does not own caller capture",
 );
-await flush(() => completion.resolve());
 assert.equal(first.connection, "disconnected");
 
 let older: Promise<unknown>;

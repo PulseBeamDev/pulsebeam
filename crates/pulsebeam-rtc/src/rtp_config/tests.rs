@@ -1307,12 +1307,12 @@ fn configured_ingress_admits_only_exact_primary_repair_mid_payload_and_rid() {
         }
         ingress.accept_rtp(
             now,
-            wire(primary, 96, 1, "v", Some("h"), b"primary-source"),
+            wire(primary, 96, 1, "v", None, b"primary-source"),
             None,
         );
         assert!(matches!(
             ingress.poll_event(),
-            Some(crate::Event::EncodingDiscovered(_))
+            Some(crate::Event::EncodingDiscovered(info)) if info.rid.as_deref() == Some("h")
         ));
         let Some(crate::Event::Rtp { mid, rid, packet }) = ingress.poll_event() else {
             panic!("configured primary")
@@ -1320,6 +1320,12 @@ fn configured_ingress_admits_only_exact_primary_repair_mid_payload_and_rid() {
         assert_eq!(mid.as_ref(), "v");
         assert_eq!(rid.as_deref(), Some("h"));
         assert_eq!(packet.payload.as_ref(), b"primary-source");
+        ingress.accept_rtp(
+            now,
+            wire(primary, 96, 2, "v", Some("l"), b"conflicting-rid"),
+            None,
+        );
+        assert!(ingress.poll_event().is_none());
         // RTX is normalized to the configured primary, not admitted as a new source.
         ingress.accept_rtp(
             now,
@@ -1371,10 +1377,15 @@ fn configured_ingress_admits_only_exact_primary_repair_mid_payload_and_rid() {
             .stage_configuration(&[(physical.clone(), true)], &[], false)
             .unwrap();
         ingress.commit_configuration(update);
-        ingress.accept_rtp(now, wire(primary, 96, 3, "v", None, b"re-admitted"), None);
-        let Some(crate::Event::Rtp { packet, .. }) = ingress.poll_event() else {
+        ingress.accept_rtp(
+            now,
+            wire(primary, 96, 3, "v", Some("h"), b"re-admitted"),
+            None,
+        );
+        let Some(crate::Event::Rtp { rid, packet, .. }) = ingress.poll_event() else {
             panic!("re-admitted primary without rediscovery")
         };
+        assert_eq!(rid.as_deref(), Some("h"));
         assert_eq!(packet.payload.as_ref(), b"re-admitted");
         assert_eq!(ingress.stats()[0].received_packets, 3);
         ingress.accept_rtp(now, wire(primary, 96, 4, "v", None, b"queued-old"), None);

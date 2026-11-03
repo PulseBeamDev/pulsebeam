@@ -50,12 +50,6 @@
     endpoint: "http://localhost",
     token: "late-owned-audio",
     logLevel: "off",
-    topology: {
-      localVideos: 0,
-      localAudios: 0,
-      remoteVideos: 0,
-      remoteAudios: 2,
-    },
   });
   owners.activate(runtime);
   let audioFailure;

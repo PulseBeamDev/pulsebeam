@@ -38,7 +38,7 @@ use crate::participant::{
 use crate::rtp::cache::TrackStreamCache;
 use crate::track::{
     self, DataLane, DataTopicChannel, DataTrackDirection, DataTrackIntent, DataTrackIntentError,
-    KEYFRAME_DEBOUNCE, StreamId, StreamWrite, StreamWriter, Track,
+    KEYFRAME_DEBOUNCE, SourceEncoding, StreamId, StreamWrite, StreamWriter, Track,
 };
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -159,8 +159,8 @@ pub struct Participant {
     pub(crate) participant_id: entity::ParticipantId,
     participant_external_id: entity::ParticipantExternalId,
     pub(crate) connection_id: entity::ConnectionId,
-    last_keyframe_request: HashMap<(Mid, Option<crate::media::Rid>), Instant>,
-    pending_keyframe_requests: HashSet<(Mid, Option<crate::media::Rid>)>,
+    last_keyframe_request: HashMap<(Mid, SourceEncoding), Instant>,
+    pending_keyframe_requests: HashSet<(Mid, SourceEncoding)>,
 
     /// The compiled stream a published channel forwards into, recorded by the
     /// shard once it has minted one. Keyed by channel so an arriving SCTP
@@ -636,7 +636,7 @@ impl Participant {
 
     fn on_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
         match packet.decode() {
-            Some(ReverseInput::Keyframe { rid, kind }) => {
+            Some(ReverseInput::Keyframe { encoding, kind }) => {
                 let Some(track_id) = (if self.profile == ConnectionProfile::Native {
                     self.native_rtp.track_for_fanout(stream)
                 } else {
@@ -648,7 +648,7 @@ impl Participant {
                     );
                     return;
                 };
-                self.enqueue_remote_keyframe((track_id, rid), kind);
+                self.enqueue_remote_keyframe((track_id, encoding), kind);
             }
             Some(ReverseInput::ReliableControl(bytes)) => {
                 if self.profile == ConnectionProfile::Native {
@@ -716,7 +716,7 @@ impl Participant {
         }
         if self.enqueue_fanout(TransportMutation::Keyframe {
             mid,
-            rid: stream_id.1,
+            encoding: stream_id.1,
             kind,
         }) {
             debug_assert!(self.pending_keyframe_requests.insert(key));
@@ -795,8 +795,8 @@ impl Participant {
                 AppliedMutation::RtpWritten if playout_delay.is_some() => {
                     self.downstream.record_playout_delay_stamp(mid, rid, seq_no);
                 }
-                AppliedMutation::KeyframeUnavailable { mid, rid } => {
-                    debug_assert!(self.pending_keyframe_requests.remove(&(mid, rid)));
+                AppliedMutation::KeyframeUnavailable { mid, encoding } => {
+                    debug_assert!(self.pending_keyframe_requests.remove(&(mid, encoding)));
                 }
                 AppliedMutation::KeyframeRequested { .. }
                 | AppliedMutation::Applied
@@ -819,12 +819,12 @@ impl Participant {
             Some(AppliedMutation::ControlNotWritten) => {
                 self.disconnect(DisconnectReason::SignalingOutput);
             }
-            Some(AppliedMutation::KeyframeRequested { mid, rid }) => {
-                debug_assert!(self.pending_keyframe_requests.remove(&(mid, rid)));
-                self.last_keyframe_request.insert((mid, rid), now);
+            Some(AppliedMutation::KeyframeRequested { mid, encoding }) => {
+                debug_assert!(self.pending_keyframe_requests.remove(&(mid, encoding)));
+                self.last_keyframe_request.insert((mid, encoding), now);
             }
-            Some(AppliedMutation::KeyframeUnavailable { mid, rid }) => {
-                debug_assert!(self.pending_keyframe_requests.remove(&(mid, rid)));
+            Some(AppliedMutation::KeyframeUnavailable { mid, encoding }) => {
+                debug_assert!(self.pending_keyframe_requests.remove(&(mid, encoding)));
             }
             _ => {}
         }
@@ -1058,7 +1058,7 @@ impl Participant {
                 {
                     events.request_reverse(
                         fanout,
-                        ReversePacket::keyframe(layer.rid, KeyframeRequestKind::Pli),
+                        ReversePacket::keyframe(layer.encoding, KeyframeRequestKind::Pli),
                     );
                 }
             }
@@ -1160,6 +1160,18 @@ impl Participant {
                         }
                     }
                 }
+            }
+            Event::DataChannel(DataChannelEvent::ResetComplete { channel })
+                if self.profile == ConnectionProfile::Native =>
+            {
+                self.native_data_reset(channel, true, events);
+                self.evaluate_native_preparations(events);
+            }
+            Event::DataChannel(DataChannelEvent::ResetFailed { channel })
+                if self.profile == ConnectionProfile::Native =>
+            {
+                self.native_data_reset(channel, false, events);
+                self.evaluate_native_preparations(events);
             }
             Event::DataChannel(DataChannelEvent::Closed { channel: cid }) => {
                 if Some(cid) == self.signaling.cid {
@@ -1521,7 +1533,10 @@ impl Participant {
             return;
         }
         if processed.request_keyframe {
-            self.enqueue_remote_keyframe((route.track_id, route.rid), KeyframeRequestKind::Pli);
+            self.enqueue_remote_keyframe(
+                (route.track_id, route.rid.into()),
+                KeyframeRequestKind::Pli,
+            );
         }
         if let Some(packet) = processed.first {
             events.publish_track_packet(route.fanout, TrackPacket::Rtp(packet));

@@ -7,17 +7,12 @@ use core::time::Duration;
 
 use crate::{Generation, TopicNotification, TopicRegistrations, TopicSnapshot};
 
-pub const MAX_LOCAL_VIDEO_SLOTS: usize = 32;
-pub const MAX_LOCAL_AUDIO_SLOTS: usize = 32;
-pub const MAX_REMOTE_VIDEO_SLOTS: u8 = 32;
-pub const MAX_REMOTE_AUDIO_SLOTS: u8 = 32;
 pub const MAX_MID_BYTES: usize = 16;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     pub endpoint: String,
     pub token: String,
-    pub topology: MediaTopology,
     pub retry: RetryPolicy,
     pub log_level: LogLevel,
 }
@@ -28,7 +23,6 @@ impl core::fmt::Debug for AgentConfig {
             .debug_struct("AgentConfig")
             .field("endpoint", &self.endpoint)
             .field("token", &"[REDACTED]")
-            .field("topology", &self.topology)
             .field("retry", &self.retry)
             .field("log_level", &self.log_level)
             .finish()
@@ -75,25 +69,6 @@ impl Default for RetryPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MediaTopology {
-    pub local_video: u8,
-    pub local_audio: u8,
-    pub remote_video: u8,
-    pub remote_audio: u8,
-}
-
-impl Default for MediaTopology {
-    fn default() -> Self {
-        Self {
-            local_video: 2,
-            local_audio: 2,
-            remote_video: 16,
-            remote_audio: 8,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DesiredState {
     pub revision: u64,
@@ -104,16 +79,18 @@ pub struct DesiredState {
     pub topics: TopicRegistrations,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicationIntent {
     pub slot: String,
+    pub kind: MediaKind,
     pub label: String,
     pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoSubscription {
-    pub slot: u8,
+    pub slot: u32,
     pub track_id: String,
     pub selector: Option<TrackSelector>,
     pub height: u32,
@@ -123,7 +100,7 @@ pub struct VideoSubscription {
     pub playout_delay: PlayoutDelay,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AudioSubscription {
     pub pinned: Vec<String>,
     pub selected: Vec<TrackSelector>,
@@ -132,15 +109,9 @@ pub struct AudioSubscription {
     pub selector_delays: BTreeMap<TrackSelector, PlayoutDelay>,
 }
 
-impl Default for AudioSubscription {
-    fn default() -> Self {
-        Self {
-            pinned: Vec::new(),
-            selected: Vec::new(),
-            automatic: true,
-            playout_delays: BTreeMap::new(),
-            selector_delays: BTreeMap::new(),
-        }
+impl AudioSubscription {
+    pub(crate) fn has_demand(&self) -> bool {
+        self.automatic || !self.pinned.is_empty() || !self.selected.is_empty()
     }
 }
 
@@ -164,8 +135,8 @@ pub enum PlayoutDelay {
 pub enum MediaSlot {
     LocalVideo(String),
     LocalAudio(String),
-    RemoteVideo(u8),
-    RemoteAudio(u8),
+    RemoteVideo(u32),
+    RemoteAudio(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,7 +148,8 @@ pub struct SlotBinding {
     pub direction: MediaDirection,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MediaKind {
     Video,
     Audio,
@@ -324,18 +296,8 @@ pub enum ValidationError {
     Identifier { field: &'static str },
     #[error("duplicate {field}: {value}")]
     Duplicate { field: &'static str, value: String },
-    #[error("{kind} slot count {actual} exceeds {maximum}")]
-    SlotLimit {
-        kind: &'static str,
-        actual: usize,
-        maximum: usize,
-    },
-    #[error("unknown local publication slot: {0}")]
-    UnknownPublicationSlot(String),
     #[error("local publication binding conflicts with a reserved slot or label: {0}")]
     PublicationBinding(String),
-    #[error("remote video slot {slot} is outside topology capacity {capacity}")]
-    UnknownVideoSlot { slot: u8, capacity: u8 },
     #[error("audio playout policy refers to an unpinned track: {0}")]
     UnknownAudioTrack(String),
     #[error("retry policy is invalid")]
@@ -373,7 +335,6 @@ impl AgentConfig {
         {
             return Err(ValidationError::Token);
         }
-        self.topology.validate()?;
         if self.retry.maximum_attempts == 0
             || self.retry.initial_delay > self.retry.maximum_delay
             || self.retry.maximum_delay == Duration::ZERO
@@ -384,59 +345,12 @@ impl AgentConfig {
     }
 }
 
-impl MediaTopology {
-    pub(crate) fn validate(&self) -> Result<(), ValidationError> {
-        validate_limit(
-            "local video",
-            usize::from(self.local_video),
-            MAX_LOCAL_VIDEO_SLOTS,
-        )?;
-        validate_limit(
-            "local audio",
-            usize::from(self.local_audio),
-            MAX_LOCAL_AUDIO_SLOTS,
-        )?;
-        validate_limit(
-            "remote video",
-            usize::from(self.remote_video),
-            usize::from(MAX_REMOTE_VIDEO_SLOTS),
-        )?;
-        validate_limit(
-            "remote audio",
-            usize::from(self.remote_audio),
-            usize::from(MAX_REMOTE_AUDIO_SLOTS),
-        )?;
-        Ok(())
-    }
-
-    pub fn local_slot_kind(&self, name: &str) -> Option<MediaKind> {
-        if let Some(index) = name
-            .strip_prefix('v')
-            .and_then(|index| index.parse::<u8>().ok())
-        {
-            return (index < self.local_video && name == alloc::format!("v{index}"))
-                .then_some(MediaKind::Video);
+impl PublicationIntent {
+    pub(crate) fn media_slot(&self) -> MediaSlot {
+        match self.kind {
+            MediaKind::Video => MediaSlot::LocalVideo(self.slot.clone()),
+            MediaKind::Audio => MediaSlot::LocalAudio(self.slot.clone()),
         }
-        let index = name.strip_prefix('a')?.parse::<u8>().ok()?;
-        (index < self.local_audio && name == alloc::format!("a{index}")).then_some(MediaKind::Audio)
-    }
-
-    pub(crate) fn slots(&self) -> Vec<MediaSlot> {
-        let mut slots = Vec::with_capacity(
-            usize::from(self.local_video)
-                .saturating_add(usize::from(self.local_audio))
-                .saturating_add(usize::from(self.remote_video))
-                .saturating_add(usize::from(self.remote_audio)),
-        );
-        slots.extend(
-            (0..self.local_video).map(|index| MediaSlot::LocalVideo(alloc::format!("v{index}"))),
-        );
-        slots.extend(
-            (0..self.local_audio).map(|index| MediaSlot::LocalAudio(alloc::format!("a{index}"))),
-        );
-        slots.extend((0..self.remote_video).map(MediaSlot::RemoteVideo));
-        slots.extend((0..self.remote_audio).map(MediaSlot::RemoteAudio));
-        slots
     }
 }
 
@@ -445,25 +359,23 @@ impl DesiredState {
         self.topics.normalize();
     }
 
-    pub(crate) fn validate(&self, topology: &MediaTopology) -> Result<(), ValidationError> {
+    pub(crate) fn validate(&self) -> Result<(), ValidationError> {
         let mut publications = BTreeSet::new();
         let mut labels = BTreeSet::new();
         for publication in &self.publications {
-            let kind = topology
-                .local_slot_kind(&publication.slot)
-                .ok_or_else(|| ValidationError::UnknownPublicationSlot(publication.slot.clone()))?;
+            validate_identifier("publication slot", &publication.slot, 256, false)?;
             if publication.label.is_empty() || publication.label.len() > 256 {
                 return Err(ValidationError::Identifier {
                     field: "publication label",
                 });
             }
-            if !publications.insert(publication.slot.clone()) {
+            if !publications.insert(publication.media_slot()) {
                 return Err(ValidationError::Duplicate {
                     field: "publication slot",
                     value: publication.slot.clone(),
                 });
             }
-            if !labels.insert((kind, publication.label.clone())) {
+            if !labels.insert((publication.kind, publication.label.clone())) {
                 return Err(ValidationError::Duplicate {
                     field: "publication label",
                     value: publication.label.clone(),
@@ -482,12 +394,6 @@ impl DesiredState {
                 selector.validate()?;
             } else {
                 validate_identifier("video track_id", &video.track_id, 256, true)?;
-            }
-            if video.slot >= topology.remote_video {
-                return Err(ValidationError::UnknownVideoSlot {
-                    slot: video.slot,
-                    capacity: topology.remote_video,
-                });
             }
             if !video_slots.insert(video.slot) {
                 return Err(ValidationError::Duplicate {
@@ -553,21 +459,6 @@ impl TrackSelector {
         )?;
         validate_identifier("track label", &self.label, 64, true)
     }
-}
-
-fn validate_limit(
-    kind: &'static str,
-    actual: usize,
-    maximum: usize,
-) -> Result<(), ValidationError> {
-    if actual > maximum {
-        return Err(ValidationError::SlotLimit {
-            kind,
-            actual,
-            maximum,
-        });
-    }
-    Ok(())
 }
 
 pub(crate) fn validate_identifier(

@@ -69,8 +69,11 @@ export async function stalePublicationClaim() {
   await flush(() => completion.resolve());
   assert.deepEqual([...runtime.claimedPublications], ["video:new"]);
   assert.deepEqual([...runtime.publicationOwners.keys()], [owner]);
+  assert.equal(runtime.ownedReplacements[0].replaceInput, true);
   assert.ok(
-    runtime.ownedReplacements.every((entry) => entry.owner === owner),
+    runtime.ownedReplacements.every(
+      (entry) => entry.owner === owner && entry.muted === false,
+    ),
     "retired claim cannot mutate the replacement publication",
   );
   await flush(() => root.unmount());

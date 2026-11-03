@@ -251,12 +251,6 @@ export async function topicContract(pulsebeam) {
     endpoint: "http://localhost",
     token: "controlled-admission",
     logging: { level: "off" },
-    topology: {
-      localVideos: 0,
-      localAudios: 0,
-      remoteVideos: 0,
-      remoteAudios: 0,
-    },
   });
   const topic = agent.topic("events", { mode: "ordered" });
   const iterator = topic.subscribe()[Symbol.asyncIterator]();
@@ -463,12 +457,6 @@ export async function topicContract(pulsebeam) {
       endpoint: "http://localhost",
       token: "owned-binary",
       logging: { level: "off" },
-      topology: {
-        localVideos: 0,
-        localAudios: 0,
-        remoteVideos: 0,
-        remoteAudios: 0,
-      },
     };
     const owned = pulsebeam.createAgent(ownedConfig);
     try {

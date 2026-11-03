@@ -2,9 +2,8 @@
 use super::*;
 use anyhow::{anyhow, bail, ensure};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, ConnectionState, DesiredState, Generation, MediaTopology, Notification,
-    TopicMessage, TopicMode, TopicNotification, TopicPublisher, TopicRegistrations, TopicSend,
-    TopicSubscriber,
+    AgentConfig, ConnectionState, DesiredState, Generation, Notification, TopicMessage, TopicMode,
+    TopicNotification, TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber,
 };
 use pulsebeam_agent_native::{
     Agent, AgentEvent, AsyncHttpClient, Config, Host, NativeStatistics, ObservationStream,
@@ -417,12 +416,6 @@ fn config(endpoint: &str, participant: &str) -> Result<Config> {
             participant,
             expiry,
         )?,
-        topology: MediaTopology {
-            local_video: 0,
-            local_audio: 0,
-            remote_video: 0,
-            remote_audio: 0,
-        },
         retry: Default::default(),
         log_level: Default::default(),
     };

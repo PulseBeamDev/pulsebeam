@@ -5806,6 +5806,20 @@ impl<R: SessionRuntime> Session<R> {
             .value
             .set_parameters(parameters)
     }
+    pub fn transceiver_applied_local_cname(
+        &mut self,
+        transceiver: SessionTransceiverId,
+    ) -> Result<Option<Vec<u8>>, PeerError> {
+        self.check_open()?;
+        Ok(self
+            .transceivers
+            .get(&transceiver)
+            .ok_or_else(missing)?
+            .value
+            .value
+            .applied_local_cname_bytes())
+    }
+
     pub fn header_extensions_to_negotiate(
         &mut self,
         transceiver: SessionTransceiverId,

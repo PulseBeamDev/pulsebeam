@@ -11,10 +11,16 @@ pub(super) struct PayloadChannel {
     pub resource: Resource,
     pub registration: crate::TopicChannel,
     pub stream: u16,
-    pub terminal: bool,
-    pub closed: bool,
+    pub state: PayloadState,
     pub restart: bool,
     wanted: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PayloadState {
+    Active,
+    Closing,
+    Closed { reset_complete: bool },
 }
 
 pub(super) struct MediaLease {
@@ -47,7 +53,6 @@ pub(super) struct MediaWant {
 
 pub(super) struct MediaAllocation {
     pub operation: OperationId,
-    mode: crate::client_sdp::AllocationMode,
     wanted: BTreeMap<MediaSlot, MediaWant>,
 }
 
@@ -115,6 +120,7 @@ fn selected<'a>(
                 state::confirmed_state::Value::Owned(live) => Some(live),
                 _ => None,
             })
+        && live.execution != state::ExecutionStatus::WaitingForSource as i32
         && let Some(track) = live.track.as_ref().filter(|track| matches(track))
     {
         return Some(&track.track_id);
@@ -123,8 +129,9 @@ fn selected<'a>(
         let retained = session
             .state
             .owned()
-            .filter(|(resource, _)| {
+            .filter(|(resource, live)| {
                 matches!(resource, Resource::Reception(MediaSlot::RemoteAudio(_)))
+                    && live.execution != state::ExecutionStatus::WaitingForSource as i32
             })
             .filter_map(|(_, live)| live.track.as_ref())
             .filter(|track| matches(track))
@@ -249,35 +256,6 @@ fn receiver_spec_available(
         })
 }
 
-fn receiver_compatible(session: &Session, slot: &MediaSlot, want: &MediaWant) -> bool {
-    session.media_preparation.as_ref().and_then(|cache| cache.as_ref().ok())
-        .and_then(|cache| cache.get(slot)).and_then(|value| value.as_ref().ok())
-        .is_some_and(|value| matches!(value.binding.transport.as_ref(), Some(state::track_binding::Transport::Rtp(parameters))
-            if matches!((parameters.codec.as_ref().and_then(|codec| codec.format.as_ref()), want.allocation.format.as_ref()), (Some(previous), Some(next)) if state::validation::formats_equivalent(previous, next))))
-}
-
-fn fresh_receiver_binding(previous: &state::TrackBinding, next: &state::TrackBinding) -> bool {
-    match (&previous.transport, &next.transport) {
-        (
-            Some(state::track_binding::Transport::Rtp(previous)),
-            Some(state::track_binding::Transport::Rtp(next)),
-        ) => {
-            previous.mid == next.mid
-                && next.encodings.iter().all(|next| {
-                    [next.ssrc, next.rtx_ssrc]
-                        .into_iter()
-                        .flatten()
-                        .all(|ssrc| {
-                            previous.encodings.iter().all(|previous| {
-                                previous.ssrc != Some(ssrc) && previous.rtx_ssrc != Some(ssrc)
-                            })
-                        })
-                })
-        }
-        _ => false,
-    }
-}
-
 fn settings(enabled: bool) -> state::ResourceSettings {
     state::ResourceSettings {
         enabled: Some(enabled),
@@ -344,7 +322,7 @@ fn payload(
     };
     let channel = if let Some(channel) = session.payload_resources.get(resource).copied() {
         let physical = session.payloads.get(&channel)?;
-        if physical.registration != registration || physical.terminal {
+        if physical.registration != registration || physical.state != PayloadState::Active {
             return None;
         }
         channel
@@ -355,11 +333,20 @@ fn payload(
             .as_ref()
             .ok()?
             .association_max_channels?;
-        if session.next_stream >= capacity || session.next_stream >= u32::from(u16::MAX) {
-            return None;
-        }
-        let stream = u16::try_from(session.next_stream).ok()?;
-        session.next_stream = session.next_stream.checked_add(1)?;
+        let stream = if session
+            .reusable_streams
+            .first()
+            .is_some_and(|stream| u32::from(*stream) < capacity)
+        {
+            session.reusable_streams.pop_first()?
+        } else {
+            if session.next_stream >= capacity || session.next_stream >= u32::from(u16::MAX) {
+                return None;
+            }
+            let stream = u16::try_from(session.next_stream).ok()?;
+            session.next_stream = session.next_stream.checked_add(1)?;
+            stream
+        };
         let channel = loop {
             let candidate = ids.channel();
             if candidate != session.signaling_channel && !session.payloads.contains_key(&candidate)
@@ -373,8 +360,7 @@ fn payload(
                 resource: resource.clone(),
                 registration,
                 stream,
-                terminal: false,
-                closed: false,
+                state: PayloadState::Active,
                 restart: false,
                 wanted: true,
             },
@@ -429,7 +415,7 @@ pub(super) fn prepared_payload(
     let Some(physical) = session
         .payloads
         .get(&channel)
-        .filter(|physical| physical.wanted && !physical.terminal)
+        .filter(|physical| physical.wanted && physical.state == PayloadState::Active)
     else {
         return Ok(());
     };
@@ -467,21 +453,8 @@ pub(super) fn reconcile(
     let mut wanted = BTreeMap::new();
     let mut media = BTreeMap::new();
     for value in &desired.publications {
-        let Some(kind) = session
-            .coordinates
-            .keys()
-            .find(|slot| match slot {
-                MediaSlot::LocalAudio(name) | MediaSlot::LocalVideo(name) => name == &value.slot,
-                _ => false,
-            })
-            .map(MediaSlot::kind)
-        else {
-            continue;
-        };
-        let slot = match kind {
-            crate::MediaKind::Audio => MediaSlot::LocalAudio(value.slot.clone()),
-            crate::MediaKind::Video => MediaSlot::LocalVideo(value.slot.clone()),
-        };
+        let kind = value.kind;
+        let slot = value.media_slot();
         let wire_kind = if kind == crate::MediaKind::Audio {
             state::TrackKind::Audio
         } else {
@@ -573,16 +546,39 @@ pub(super) fn reconcile(
         }
     }
     if desired.audio.automatic {
-        for track in session.state.tracks().values().filter(|track| {
-            kind(track) == state::TrackKind::Audio && track.participant_id != session.participant_id
-        }) {
+        for track in session
+            .state
+            .tracks()
+            .values()
+            .chain(session.state.owned().filter_map(|(resource, live)| {
+                (matches!(resource, Resource::Reception(MediaSlot::RemoteAudio(_)))
+                    && live.execution == state::ExecutionStatus::Installed as i32)
+                    .then_some(live.track.as_ref())
+                    .flatten()
+            }))
+            .filter(|track| {
+                kind(track) == state::TrackKind::Audio
+                    && track.participant_id != session.participant_id
+            })
+        {
             audio.entry(track.track_id.clone()).or_default();
         }
     }
     let mut occupied = BTreeSet::new();
     let mut assigned = Vec::new();
+    // Keep in-flight assignments stable before native and StateBatch confirmation.
+    for (slot, want) in &session.media_wanted {
+        if let MediaSlot::RemoteAudio(index) = slot
+            && let Some(source) = &want.source
+            && let Some(buffering) = audio.remove(source)
+        {
+            occupied.insert(*index);
+            assigned.push((*index, source.clone(), buffering));
+        }
+    }
     for (resource, live) in session.state.owned() {
         if let Resource::Reception(MediaSlot::RemoteAudio(index)) = resource
+            && !occupied.contains(index)
             && let Some(track) = live.track.as_ref()
             && let Some(buffering) = audio.remove(&track.track_id)
         {
@@ -591,18 +587,11 @@ pub(super) fn reconcile(
         }
     }
     for (id, buffering) in audio {
-        if let Some(index) = session
-            .coordinates
-            .keys()
-            .filter_map(|slot| match slot {
-                MediaSlot::RemoteAudio(index) if !occupied.contains(index) => Some(*index),
-                _ => None,
-            })
-            .next()
-        {
-            occupied.insert(index);
-            assigned.push((index, id, buffering));
-        }
+        let index = (0..=u32::MAX)
+            .find(|index| !occupied.contains(index))
+            .ok_or(SignalingError::Invalid("audio receiver coordinate space"))?;
+        occupied.insert(index);
+        assigned.push((index, id, buffering));
     }
     for (index, id, buffering) in assigned {
         let slot = MediaSlot::RemoteAudio(index);
@@ -683,7 +672,7 @@ pub(super) fn reconcile(
     for physical in session
         .payloads
         .values()
-        .filter(|physical| !physical.terminal)
+        .filter(|physical| physical.state == PayloadState::Active)
     {
         if let crate::TopicChannel::Subscriber(registration) = &physical.registration
             && subscribers.contains(registration)
@@ -712,21 +701,49 @@ pub(super) fn reconcile(
         let Some(physical) = session.payloads.get_mut(&channel) else {
             continue;
         };
-        if !physical.closed {
-            if !physical.terminal {
-                physical.terminal = true;
+        match physical.state {
+            PayloadState::Active => {
+                physical.state = PayloadState::Closing;
                 effects.push_back(Effect::Rtc(RtcEffect::CloseDataChannel {
                     generation: session.generation,
                     channel,
                 }));
+                continue;
             }
-            continue;
+            PayloadState::Closing => continue,
+            PayloadState::Closed { .. } => {}
         }
-        session.payload_resources.remove(&resource);
-        session.payloads.remove(&channel);
-        session.data_preparations.remove(&channel);
+        release_payload(session, &resource, channel);
     }
     let data_wanted = data.keys().cloned().collect::<BTreeSet<_>>();
+    let released = session
+        .payload_resources
+        .iter()
+        .filter(|(resource, _)| !data_wanted.contains(*resource))
+        .map(|(resource, channel)| (resource.clone(), *channel))
+        .collect::<Vec<_>>();
+    for (resource, channel) in released {
+        session.state.stage(resource.clone(), None)?;
+        if session.state.retaining(&resource) {
+            continue;
+        }
+        let Some(physical) = session.payloads.get_mut(&channel) else {
+            continue;
+        };
+        match physical.state {
+            PayloadState::Active => {
+                physical.state = PayloadState::Closing;
+                effects.push_back(Effect::Rtc(RtcEffect::CloseDataChannel {
+                    generation: session.generation,
+                    channel,
+                }));
+                continue;
+            }
+            PayloadState::Closing => continue,
+            PayloadState::Closed { .. } => {}
+        }
+        release_payload(session, &resource, channel);
+    }
     for (resource, registration) in data {
         if let Some(binding) = payload(session, &resource, registration.clone(), ids, effects) {
             let spec = match &registration {
@@ -750,23 +767,12 @@ pub(super) fn reconcile(
             .payload_resources
             .get(&resource)
             .and_then(|channel| session.payloads.get(channel))
-            .is_some_and(|physical| physical.terminal)
+            .is_some_and(|physical| physical.state != PayloadState::Active)
             && let Some(spec) = session.state.target_spec(&resource)
         {
             wanted.insert(resource, spec.clone());
         }
     }
-    let retained_receivers = session.media_leases.iter().filter_map(|(slot, lease)| {
-        if lease.retired || slot.direction() != crate::MediaDirection::ReceiveOnly {
-            return None;
-        }
-        let retained = if let Some(want) = media.get(slot) {
-            lease.resource == want.resource && (lease.source == want.source || receiver_compatible(session, slot, want))
-        } else {
-            matches!(slot, MediaSlot::RemoteVideo(index) if desired.video.iter().any(|video| video.slot == *index && (video.selector.is_some() || !video.track_id.is_empty())))
-        };
-        retained.then(|| slot.clone())
-    }).collect::<BTreeSet<_>>();
     let removed = session
         .state
         .resources()
@@ -781,16 +787,14 @@ pub(super) fn reconcile(
             );
         }
         session.state.stage(resource.clone(), None)?;
-        for (slot, lease) in &mut session.media_leases {
-            if lease.resource == resource && !retained_receivers.contains(slot) {
+        for lease in session.media_leases.values_mut() {
+            if lease.resource == resource {
                 lease.retired = true;
             }
         }
     }
-    // Parked receivers can outlive their last wire-state target.
     for (slot, lease) in &mut session.media_leases {
         if (lease.identity_pending || slot.direction() == crate::MediaDirection::ReceiveOnly)
-            && !retained_receivers.contains(slot)
             && !media.contains_key(slot)
             && !wanted.contains_key(&lease.resource)
         {
@@ -817,34 +821,6 @@ pub(super) fn reconcile(
             failure.get_or_insert(error);
         }
     }
-    let released = session
-        .payload_resources
-        .iter()
-        .filter(|(resource, _)| {
-            !data_wanted.contains(*resource)
-                && !session.state.retaining(resource)
-                && session.state.target_spec(resource).is_none()
-        })
-        .map(|(resource, channel)| (resource.clone(), *channel))
-        .collect::<Vec<_>>();
-    for (resource, channel) in released {
-        let Some(physical) = session.payloads.get_mut(&channel) else {
-            continue;
-        };
-        if !physical.closed {
-            if !physical.terminal {
-                physical.terminal = true;
-                effects.push_back(Effect::Rtc(RtcEffect::CloseDataChannel {
-                    generation: session.generation,
-                    channel,
-                }));
-            }
-            continue;
-        }
-        session.payload_resources.remove(&resource);
-        session.payloads.remove(&channel);
-        session.data_preparations.remove(&channel);
-    }
     session
         .media_blocked
         .retain(|slot, blocked| media.get(slot) == Some(blocked));
@@ -852,6 +828,19 @@ pub(super) fn reconcile(
     retire_media(session, ids, effects);
     allocate_media(session, ids, effects);
     failure.map_or(Ok(()), Err)
+}
+
+fn release_payload(session: &mut Session, resource: &Resource, channel: ChannelId) {
+    session.payload_resources.remove(resource);
+    if let Some(physical) = session.payloads.remove(&channel)
+        && physical.state
+            == (PayloadState::Closed {
+                reset_complete: true,
+            })
+    {
+        session.reusable_streams.insert(physical.stream);
+    }
+    session.data_preparations.remove(&channel);
 }
 
 fn retire_media(session: &mut Session, ids: &mut IdGenerator, effects: &mut VecDeque<Effect>) {
@@ -892,15 +881,8 @@ fn allocate_media(session: &mut Session, ids: &mut IdGenerator, effects: &mut Ve
         .media_wanted
         .iter()
         .filter(|(slot, want)| {
-            (match session.media_leases.get(*slot) {
-                None => true,
-                Some(lease) => {
-                    !lease.retired
-                        && (lease.source != want.source || lease.wire_retired)
-                        && session.state.target_spec(&want.resource).is_none()
-                        && !session.state.retaining(&want.resource)
-                }
-            }) && session.media_blocked.get(*slot) != Some(*want)
+            !session.media_leases.contains_key(*slot)
+                && session.media_blocked.get(*slot) != Some(*want)
         })
         .map(|(slot, want)| (slot.clone(), want.clone()))
         .take(1)
@@ -908,39 +890,120 @@ fn allocate_media(session: &mut Session, ids: &mut IdGenerator, effects: &mut Ve
     if wanted.is_empty() {
         return;
     }
-    let mode = if wanted
-        .keys()
-        .any(|slot| session.media_leases.contains_key(slot))
-    {
-        crate::client_sdp::AllocationMode::RetargetReceiver
-    } else {
-        crate::client_sdp::AllocationMode::Create
-    };
     let operation = ids.operation();
     effects.push_back(Effect::Rtc(RtcEffect::AllocateMedia {
         generation: session.generation,
         operation,
-        mode,
         allocations: wanted
             .values()
             .map(|want| want.allocation.clone())
             .collect(),
     }));
-    session.media_allocation = Some(MediaAllocation {
-        operation,
-        mode,
-        wanted,
-    });
+    session.media_allocation = Some(MediaAllocation { operation, wanted });
 }
 
 impl Agent {
+    pub(super) fn media_observation_target(
+        &self,
+        slot: &MediaSlot,
+    ) -> Option<crate::MediaObservationTarget> {
+        if !self.desired.connected || self.attempt.is_some() || self.closing.is_some() {
+            return None;
+        }
+        let active = self.active.as_ref()?;
+        let lease = active.media_leases.get(slot)?;
+        let wanted = active.media_wanted.get(slot)?;
+        if lease.retired || lease.identity_pending || lease.source != wanted.source {
+            return None;
+        }
+        let source = lease.source.as_ref()?;
+        let confirmed = active.state.confirmed(&lease.resource)?;
+        let state::confirmed_state::Value::Owned(live) = confirmed.value.as_ref()? else {
+            return None;
+        };
+        if live.execution != state::ExecutionStatus::Installed as i32
+            || live.track.as_ref()?.track_id != *source
+        {
+            return None;
+        }
+        let binding = active.coordinates.get(slot)?.as_ref()?;
+        if binding.mid != lease.mid || binding.direction != crate::MediaDirection::ReceiveOnly {
+            return None;
+        }
+        Some(crate::MediaObservationTarget {
+            generation: active.generation,
+            reference: active.state.reference(&lease.resource)?,
+            source: source.clone(),
+            binding: binding.clone(),
+        })
+    }
+
+    pub(super) fn audio_observation_target(
+        &self,
+        selector: &crate::TrackSelector,
+    ) -> Option<crate::MediaObservationTarget> {
+        let active = self.active.as_ref()?;
+        let source = selected(
+            active,
+            &Resource::Reception(MediaSlot::RemoteAudio(0)),
+            selector,
+            state::TrackKind::Audio,
+        )?;
+        self.audio_source_observation_target(source)
+    }
+
+    pub(super) fn audio_source_observation_target(
+        &self,
+        source: &str,
+    ) -> Option<crate::MediaObservationTarget> {
+        self.active
+            .as_ref()?
+            .media_leases
+            .keys()
+            .filter(|slot| matches!(slot, MediaSlot::RemoteAudio(_)))
+            .find_map(|slot| {
+                self.media_observation_target(slot)
+                    .filter(|target| target.source == source)
+            })
+    }
+
+    pub(super) fn audio_source_authorized(&self, owner: u64, source: &str) -> bool {
+        let active = self.active.as_ref();
+        let track = active.and_then(|active| {
+            active.state.tracks().get(source).or_else(|| {
+                active
+                    .state
+                    .owned()
+                    .filter_map(|(_, live)| live.track.as_ref())
+                    .find(|track| track.track_id == source)
+            })
+        });
+        if track.is_some_and(|track| {
+            kind(track) != state::TrackKind::Audio
+                || active.is_some_and(|active| track.participant_id == active.participant_id)
+        }) {
+            return false;
+        }
+        let selector = track.and_then(|track| {
+            let participant = active?.state.source_participant(&track.participant_id)?;
+            Some(crate::TrackSelector {
+                participant_external_id: participant.participant_external_id.clone(),
+                label: track.label.clone(),
+            })
+        });
+        self.resources
+            .audio_source_authorized(crate::TrackOwner(owner), source, selector.as_ref())
+    }
+
     pub fn source_preparation(&self, slot: &MediaSlot) -> SourcePreparation<'_> {
         let target = match slot {
             MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name) if self.desired.connected => {
                 self.desired
                     .publications
                     .iter()
-                    .find(|publication| publication.slot == *name)
+                    .find(|publication| {
+                        publication.slot == *name && publication.kind == slot.kind()
+                    })
                     .map(|publication| publication.label.as_str())
             }
             _ => None,
@@ -1157,33 +1220,18 @@ impl Agent {
                     "RTP allocation {operation:?} for {slot:?} facts rejected: {error:?}"
                 );
             }
-            let retargeting = pending.mode == crate::client_sdp::AllocationMode::RetargetReceiver;
-            let fresh = !retargeting
-                || assigned.is_some_and(|assigned| {
-                    active.coordinates.get(&slot).and_then(Option::as_ref) == Some(assigned)
-                }) && value.is_some_and(|value| {
-                    active
-                        .media_preparation
-                        .as_ref()
-                        .and_then(|cache| cache.as_ref().ok())
-                        .and_then(|cache| cache.get(&slot))
-                        .and_then(|previous| previous.as_ref().ok())
-                        .is_some_and(|previous| {
-                            fresh_receiver_binding(&previous.binding, &value.binding)
-                        })
-                });
-            let complete = fresh && value.is_some_and(|value| want.allocation.format.as_ref().is_none_or(|expected| {
+            let complete = value.is_some_and(|value| want.allocation.format.as_ref().is_none_or(|expected| {
                 matches!(&value.binding.transport, Some(state::track_binding::Transport::Rtp(parameters))
                     if parameters.codec.as_ref().and_then(|codec| codec.format.as_ref())
                         .is_some_and(|format| state::validation::formats_equivalent(expected, format)))
             }));
             let accepted = active.media_wanted.get(&slot) == Some(&want)
                 && (identity_pending && want.allocation.format.is_none() || complete);
-            if let Some(assigned) = assigned.filter(|_| !retargeting || complete) {
+            if let Some(assigned) = assigned {
                 active
                     .coordinates
                     .insert(slot.clone(), Some(assigned.clone()));
-                let lease = active
+                active
                     .media_leases
                     .entry(slot.clone())
                     .or_insert_with(|| MediaLease {
@@ -1195,19 +1243,8 @@ impl Agent {
                         wire_retired: false,
                         source: want.source.clone(),
                     });
-                if retargeting {
-                    lease.source.clone_from(&want.source);
-                    lease.wire_retired = false;
-                    lease.identity_pending = false;
-                }
             }
-            if retargeting
-                && !complete
-                && let Some(lease) = active.media_leases.get_mut(&slot)
-            {
-                lease.wire_retired = true;
-            }
-            if (accepted || retargeting && complete)
+            if accepted
                 && let Some(value) = prepared.as_ref().and_then(|prepared| prepared.get(&slot))
             {
                 let cache = active
@@ -1435,6 +1472,12 @@ impl Agent {
                             .iter_mut()
                             .filter(|(_, lease)| lease.resource == resource)
                         {
+                            if matches!(&confirmed.value, Some(state::confirmed_state::Value::Absent(absent))
+                                if absent.reason == state::AbsenceReason::SourceEnded as i32)
+                                && let Some(source) = lease.source.as_deref()
+                            {
+                                self.resources.end_audio_source_observations(source);
+                            }
                             if matches!(resource, Resource::Reception(_)) {
                                 if active
                                     .media_preparation
@@ -1455,6 +1498,11 @@ impl Agent {
                                 lease.retired = true;
                             }
                         }
+                        self.intent_dirty = true;
+                    } else if matches!(&resource, Resource::Reception(_))
+                        && matches!(confirmed.value.as_ref(), Some(state::confirmed_state::Value::Owned(live))
+                            if live.execution == state::ExecutionStatus::WaitingForSource as i32)
+                    {
                         self.intent_dirty = true;
                     }
                     if let Resource::Reception(slot) = &resource
@@ -1482,7 +1530,7 @@ impl Agent {
                                 active
                                     .payloads
                                     .get(&channel)
-                                    .filter(|physical| !physical.terminal),
+                                    .filter(|physical| physical.state == PayloadState::Active),
                             )
                         {
                             self.topics.install_source(
@@ -1530,7 +1578,6 @@ impl Agent {
                             &confirmed.value
                         {
                             if let Some(physical) = active.payloads.get_mut(&channel) {
-                                physical.terminal = true;
                                 let reason = absent.reason;
                                 physical.restart =
                                     matches!(
@@ -1539,7 +1586,8 @@ impl Agent {
                                             | state::AbsenceReason::Gone)
                                     ) || matches!(resource, Resource::Publication { .. })
                                         && reason == state::AbsenceReason::SourceEnded as i32;
-                                if !physical.closed {
+                                if physical.state == PayloadState::Active {
+                                    physical.state = PayloadState::Closing;
                                     self.effects.push_back(Effect::Rtc(
                                         RtcEffect::CloseDataChannel {
                                             generation: active.generation,

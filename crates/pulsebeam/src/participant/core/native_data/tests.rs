@@ -202,15 +202,30 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
             track,
             source_id: id.as_str(),
             fanout: None,
-            enabled: true,
-            opened: true,
-            published: true,
+            enabled: false,
+            opened: false,
+            reset_pending: true,
+            published: false,
             retiring: false,
             preparation: Some(work),
             deadline: None,
         },
     );
     let mut sink = MockParticipantSink::new();
+    participant.native_data_closed(channel, &mut sink);
+    participant.native_data_opened(
+        channel,
+        crate::participant::transport::native_data_config(channel, DataLane::Ordered),
+        &mut sink,
+    );
+    let pending = participant.native_data.publications.get_mut(&1).unwrap();
+    assert!(
+        !pending.opened && !pending.published && !pending.retiring && pending.preparation.is_some()
+    );
+    pending.reset_pending = false;
+    pending.enabled = true;
+    pending.opened = true;
+    pending.published = true;
     use pulsebeam_proto::prelude::Message;
     let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
     let handle = handles.insert(());

@@ -36,7 +36,6 @@ mod ordered_recovery;
 #[derive(Clone, Copy, Debug)]
 pub enum Role {
     Publisher,
-    OwnedPublisher,
     Subscriber,
     /// Data-channel-only participant: no video tracks added.
     DataOnly,
@@ -91,12 +90,6 @@ pub struct Participant {
 }
 
 impl Participant {
-    pub fn owned_publisher(name: &'static str) -> Self {
-        let mut participant = Self::single_publisher(name);
-        participant.role = Role::OwnedPublisher;
-        participant
-    }
-
     pub fn publisher(name: &'static str, rids: &[&'static str]) -> Self {
         Self {
             name,
@@ -157,14 +150,6 @@ impl Participant {
 
     pub fn quality_publisher(name: &'static str, source: QualityVideoSource) -> Self {
         Self::quality_publisher_at(name, source, QualityVideoLayer::P180)
-    }
-
-    /// Genuine distinct-content q/h/f inputs at their actual corpus dimensions.
-    pub fn quality_ladder_publisher(name: &'static str, source: QualityVideoSource) -> Self {
-        Self {
-            quality_video: Some((source, QualityVideoLayer::P720)),
-            ..Self::publisher(name, &["q", "h", "f"])
-        }
     }
 
     pub fn quality_publisher_at(
@@ -316,9 +301,8 @@ impl Participant {
 
     /// Reserve `slots` receive transceivers for audio.
     ///
-    /// Not a cap on who the SFU forwards: how many speakers are selected is a property of the
-    /// room, so a plan that wants contention needs more speakers than the room has slots, not a
-    /// listener asking for fewer.
+    /// Each coordinate can realize one named, source-bound receiver. Automatic discovery fills
+    /// available coordinates without ranking sources by loudness or sharing them across sources.
     pub fn hearing(mut self, slots: usize) -> Self {
         self.audio_slots = slots;
         self
@@ -326,8 +310,8 @@ impl Participant {
 
     /// Also publish audio, at the given loudness in negative dBov.
     ///
-    /// Around -30 is someone talking; below about -60 is a quiet room. The SFU ranks speakers by
-    /// this and forwards only the loudest few, so the value decides who gets heard.
+    /// Around -30 is someone talking; below about -60 is a quiet room. This controls fixture
+    /// signal amplitude, not subscription selection or inferred native RTP metadata.
     pub fn speaking_at(mut self, level_dbov: i8) -> Self {
         self.audio_level_dbov = Some(level_dbov);
         self
@@ -335,9 +319,7 @@ impl Participant {
 
     /// Talk in turn with another speaker rather than over them.
     ///
-    /// Two sources at the same loudness and the same phase talk simultaneously forever, so the
-    /// selector ranks them once and never switches. Offsetting one is what makes a slot change
-    /// hands, and slot stealing is where audio is hardest.
+    /// Offset the fixture speech cycle while keeping each source's receiver independent.
     pub fn taking_turns_after(mut self, packets: u64) -> Self {
         self.audio_phase_offset = packets;
         self
@@ -777,7 +759,7 @@ pub enum Step {
         participant: &'static str,
         publisher: &'static str,
         expected: PlaybackExpectation,
-        same_receiver: bool,
+        fresh_receiver: bool,
     },
 
     // ── Assertions ─────────────────────────────────────────────────────────
@@ -972,12 +954,11 @@ pub enum Step {
         participant: &'static str,
         corrupt: bool,
     },
-    /// Publicly observed source assignments and the actual encoded receiver stream bound.
-    CheckAudioSlotStreams {
+    /// Public source coverage and distinct actual encoded receivers/SSRCs, not PCM attribution.
+    CheckAudioSourceStreams {
         description: &'static str,
         participant: &'static str,
         expected_sources: &'static [&'static str],
-        max_streams: usize,
     },
     CheckAudioCatalogFrom {
         description: &'static str,
@@ -1158,24 +1139,26 @@ struct OperationQueue {
     sequence: u64,
     intent: PlanIntent,
     initial_topics: TopicRegistrations,
+    initial_automatic_audio: bool,
 }
 
 impl OperationQueue {
-    fn new(topics: TopicRegistrations) -> Self {
+    fn new(topics: TopicRegistrations, automatic_audio: bool) -> Self {
         Self {
             pending: Vec::new(),
             sequence: 0,
             intent: PlanIntent {
-                automatic_audio: true,
+                automatic_audio,
                 topics: topics.clone(),
                 ..Default::default()
             },
             initial_topics: topics,
+            initial_automatic_audio: automatic_audio,
         }
     }
 
     fn restart(&mut self) {
-        *self = Self::new(self.initial_topics.clone());
+        *self = Self::new(self.initial_topics.clone(), self.initial_automatic_audio);
     }
 
     fn push(&mut self, operation: PendingDriverOp) -> u64 {
@@ -1223,7 +1206,7 @@ impl OperationQueue {
 
 #[test]
 fn driver_restart_restores_initial_intent() {
-    let mut queue = OperationQueue::new(TopicRegistrations::default());
+    let mut queue = OperationQueue::new(TopicRegistrations::default(), true);
     queue.push(PendingDriverOp::SetAudioIntent(
         vec!["speaker".into()],
         false,
@@ -1314,6 +1297,7 @@ impl ParticipantShared {
         h264_publishers: Arc<Mutex<FixturePublishers>>,
         solid_picture: Option<Arc<super::media::SolidVideoInput>>,
         topics: TopicRegistrations,
+        automatic_audio: bool,
     ) -> Self {
         Self {
             bootstrap_hold: super::client::BootstrapHold::default(),
@@ -1333,7 +1317,7 @@ impl ParticipantShared {
             media_kinds: Mutex::new(HashMap::new()),
             incarnations: Mutex::new(Vec::new()),
             participant_id: Mutex::new(None),
-            pending_ops: Mutex::new(OperationQueue::new(topics)),
+            pending_ops: Mutex::new(OperationQueue::new(topics, automatic_audio)),
             topic_events: Mutex::new(HashMap::new()),
             discovered_tracks: Mutex::new(HashSet::new()),
             video_label: Mutex::new("video".into()),
@@ -1468,6 +1452,13 @@ impl ParticipantHandle {
         self.shared.participant_id.lock().unwrap().clone()
     }
 
+    fn may_remain_discovered(&self) -> bool {
+        self.present
+            || self
+                .retirement_deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
     /// Media payload the SFU forwarded *to this participant* in the current window.
     fn forwarded_media(&self) -> u64 {
         self.participant_id()
@@ -1540,7 +1531,7 @@ async fn run_participant(
     }
 
     loop {
-        if matches!(config.role, Role::OwnedPublisher) {
+        if matches!(config.role, Role::Publisher) {
             *shared.video_label.lock().unwrap() = "video".into();
         }
         let mut builder = if tcp_only {
@@ -1571,7 +1562,7 @@ async fn run_participant(
             builder = builder.without_dependency_descriptor();
         }
         match config.role {
-            Role::Publisher | Role::OwnedPublisher => {
+            Role::Publisher => {
                 let layers = (!config.rids.is_empty()).then(|| {
                     config
                         .rids
@@ -1579,11 +1570,7 @@ async fn run_participant(
                         .map(|rid| FixtureEncoding::new(*rid))
                         .collect()
                 });
-                builder = if matches!(config.role, Role::OwnedPublisher) {
-                    builder.publish_owned_video("video")
-                } else {
-                    builder.publish_video(layers)
-                };
+                builder = builder.publish_video(layers);
                 if let Some(fixture) = &config.native_video_fixture {
                     builder = builder.with_native_video_fixture(fixture.clone());
                 }
@@ -1841,7 +1828,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckEncodedAudio { .. } => "CheckEncodedAudio",
         Step::CheckEncodedAudioInterval { .. } => "CheckEncodedAudioInterval",
         Step::CheckAudioCatalogFrom { .. } => "CheckAudioCatalogFrom",
-        Step::CheckAudioSlotStreams { .. } => "CheckAudioSlotStreams",
+        Step::CheckAudioSourceStreams { .. } => "CheckAudioSourceStreams",
         Step::CheckTxBytes { .. } => "CheckTxBytes",
         Step::CheckRxBytesInterval { .. } => "CheckRxBytesInterval",
         Step::CheckMaxRxBytesInterval { .. } => "CheckMaxRxBytesInterval",
@@ -2770,7 +2757,7 @@ async fn execute_plan(
                     })?;
                     subs.push(VideoSubscription {
                         participant_id: id,
-                        publication: None,
+                        label: None,
                         height: *height,
                         ..Default::default()
                     });
@@ -2805,7 +2792,7 @@ async fn execute_plan(
                     })?;
                     subs.push(VideoSubscription {
                         participant_id: id,
-                        publication: None,
+                        label: None,
                         height: *height,
                         min_height: *min_height,
                         priority: *priority,
@@ -2887,7 +2874,7 @@ async fn execute_plan(
                     .enumerate()
                     .map(|(i, participant_id)| VideoSubscription {
                         participant_id: participant_id.clone(),
-                        publication: None,
+                        label: None,
                         height: heights_slice[i % heights_slice.len()],
                         ..Default::default()
                     })
@@ -3213,7 +3200,7 @@ async fn execute_plan(
                 participant,
                 publisher,
                 expected,
-                same_receiver,
+                fresh_receiver,
             } => {
                 let proof = native_source_proof(
                     handles,
@@ -3243,18 +3230,17 @@ async fn execute_plan(
                     handle.native_playback_started,
                     "native playback window was not started"
                 );
-                if *same_receiver {
+                if *fresh_receiver {
                     let previous = handle
                         .native_playback_track
                         .as_ref()
-                        .context("no previous slot playback")?;
+                        .context("no previous source playback")?;
                     anyhow::ensure!(
-                        previous.generation == proof.track.generation
-                            && previous.receiver == proof.track.receiver
-                            && previous.track_id == proof.track.track_id
-                            && previous.mid == proof.track.mid
-                            && previous.media_index == proof.track.media_index,
-                        "replacement did not reuse the original native receiver"
+                        previous.generation != proof.track.generation
+                            || (previous.receiver != proof.track.receiver
+                                && previous.track_id != proof.track.track_id
+                                && previous.mid != proof.track.mid),
+                        "replacement source reused the previous physical receiver or track"
                     );
                 }
                 handle
@@ -4317,11 +4303,10 @@ async fn execute_plan(
                 );
             }
 
-            Step::CheckAudioSlotStreams {
+            Step::CheckAudioSourceStreams {
                 description,
                 participant,
                 expected_sources,
-                max_streams,
             } => {
                 let want = audio_expected(handles, expected_sources)?;
                 let handle = get_handle(handles, participant, description)?;
@@ -4342,9 +4327,18 @@ async fn execute_plan(
                     .filter(|key| key.generation == generation)
                     .map(|key| key.ssrc)
                     .collect();
+                let receivers: BTreeSet<_> = audio
+                    .by_receiver
+                    .keys()
+                    .filter(|key| key.generation == generation)
+                    .map(|key| key.receiver)
+                    .collect();
                 anyhow::ensure!(
-                    !streams.is_empty() && streams.len() <= *max_streams,
-                    "{description}: expected 1..={max_streams} actual SSRC streams, got {streams:?}"
+                    !want.is_empty()
+                        && receivers.len() == want.len()
+                        && streams.len() == want.len(),
+                    "{description}: expected {} distinct native receivers and SSRC streams, got receivers={receivers:?}, SSRCs={streams:?}",
+                    want.len()
                 );
                 for (receiver, observed) in audio
                     .by_stream
@@ -4679,13 +4673,13 @@ async fn execute_plan(
     //
     // Sorted by name: `handles` is a HashMap, and unordered output would make two runs diff
     // against each other for no reason.
-    // Forwarded quality is recorded against the publisher's participant id, so resolve those
-    // back to plan names once rather than per report.
-    let quality_by_publisher: BTreeMap<&'static str, u8> = handles
+    // Selected encoding height is recorded against the publisher's participant id, so resolve
+    // those back to plan names once rather than per report.
+    let height_by_publisher: BTreeMap<&'static str, u32> = handles
         .iter()
         .filter_map(|(name, handle)| {
             let id = handle.participant_id()?;
-            Some((*name, pulsebeam::sim_metrics::forwarded_quality(&id)?))
+            Some((*name, pulsebeam::sim_metrics::forwarded_height(&id)?))
         })
         .collect();
 
@@ -4736,7 +4730,7 @@ async fn execute_plan(
                 (frames > 0).then_some((*name, frames))
             })
             .collect();
-        report.forwarded_quality = quality_by_publisher.clone();
+        report.forwarded_height = height_by_publisher.clone();
         report.quality_changes = changes_by_publisher.clone();
         report.quality_reversals = reversals_by_publisher.clone();
         reports
@@ -4795,11 +4789,7 @@ fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::Applic
     let media = observed_media(handles)?;
     let mut participants = Vec::new();
     for (name, handle) in handles {
-        let allowed = handle.present
-            || handle
-                .retirement_deadline
-                .is_some_and(|deadline| Instant::now() < deadline);
-        if !allowed {
+        if !handle.may_remain_discovered() {
             continue;
         }
         let Some(id) = handle.participant_id() else {
@@ -4865,18 +4855,20 @@ fn planned_video(
         })
         .map(|peer| peer.id.as_str())
         .collect::<BTreeSet<_>>();
+    let explicitly_requested = intent
+        .video
+        .iter()
+        .map(|request| request.participant_id.as_str())
+        .collect::<BTreeSet<_>>();
     let mut requested = intent
         .video
         .iter()
+        .filter(|request| request.height > 0 || request.min_height > 0 || request.min_fps > 0)
         .filter(|request| eligible.contains(&request.participant_id))
         .filter(|request| {
-            request.publication.as_ref().is_none_or(|id| {
+            request.label.as_ref().is_none_or(|label| {
                 participants.iter().any(|peer| {
-                    peer.id.as_str() == request.participant_id
-                        && peer
-                            .track_id(pulsebeam::entity::TrackKind::Video, &peer.video_label)
-                            .as_str()
-                            == *id
+                    peer.id.as_str() == request.participant_id && peer.video_label == *label
                 })
             })
         })
@@ -4885,7 +4877,7 @@ fn planned_video(
     if handle.auto_subscribe {
         let automatic = eligible
             .iter()
-            .filter(|id| !requested.contains(id))
+            .filter(|id| !explicitly_requested.contains(id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         requested.extend(automatic);
@@ -4895,17 +4887,13 @@ fn planned_video(
 }
 
 fn assert_room_state_consistent(handles: &PlanHandles, after: &str) {
-    let expected = expected_state(handles)
-        .unwrap_or_else(|error| panic!("room state after {after}: {error:#}"));
     for (name, handle) in handles.iter().filter(|(_, handle)| handle.present) {
-        let allowed = expected
-            .participants
-            .iter()
-            .filter(|peer| {
-                peer.room == handle.room_name
-                    && peer.id.as_str() != handle.participant_id().as_deref().unwrap_or_default()
-            })
-            .map(|peer| peer.id.as_str())
+        let own_id = handle.participant_id();
+        let allowed = handles
+            .values()
+            .filter(|peer| peer.room_name == handle.room_name && peer.may_remain_discovered())
+            .filter_map(ParticipantHandle::participant_id)
+            .filter(|id| Some(id) != own_id.as_ref())
             .collect::<BTreeSet<_>>();
         let known = handle.shared.discovered_tracks.lock().unwrap();
         assert!(
@@ -5381,13 +5369,13 @@ pub struct LinkReport {
     /// is the part that is never right, which makes it the figure a property can assert on across
     /// a whole run rather than only after everything has settled.
     pub quality_reversals: BTreeMap<&'static str, u64>,
-    /// Layer last forwarded from each publisher, by participant name. 0 means paused.
+    /// Last selected encoding height in pixels per publisher. 0 means paused or unknown.
     ///
     /// Keyed by the *publisher* rather than folded into the link's numbers, because contention is
     /// a claim about how several streams fared against each other. A viewer receiving plenty of
     /// bytes tells you nothing about whether one of its two streams was starved to pay for the
     /// other.
-    pub forwarded_quality: BTreeMap<&'static str, u8>,
+    pub forwarded_height: BTreeMap<&'static str, u32>,
 }
 
 impl LinkReport {
@@ -5504,7 +5492,7 @@ fn measure(handle: &ParticipantHandle, ip: IpAddr, window: Duration) -> LinkRepo
         delivered_packets: stats.delivered,
         congestion_drops: stats.dropped_overflow,
         link_loss_drops: stats.dropped_loss,
-        forwarded_quality: BTreeMap::new(),
+        forwarded_height: BTreeMap::new(),
         quality_changes: BTreeMap::new(),
         quality_reversals: BTreeMap::new(),
     }
@@ -6169,6 +6157,7 @@ impl LocalNodeSim {
                         .get(participant.name)
                         .cloned()
                         .unwrap_or_default(),
+                    participant.audio_slots > 0,
                 ));
                 let (cmd_tx, cmd_rx) = mpsc::channel::<ParticipantCmd>(16);
 
@@ -6188,11 +6177,8 @@ impl LocalNodeSim {
                         native_origin_interval: Instant::now(),
                         native_video_stats_timestamp: None,
                         native_video_decoder_frames: None,
-                        publishes_video: matches!(
-                            participant.role,
-                            Role::Publisher | Role::OwnedPublisher
-                        ) || participant.subscribes
-                            && !participant.rids.is_empty(),
+                        publishes_video: matches!(participant.role, Role::Publisher)
+                            || participant.subscribes && !participant.rids.is_empty(),
                         publishes_audio: participant.audio_level_dbov.is_some(),
                         quality_video: participant.quality_video,
                         observes_video: participant.slots > 0 || participant.subscribes,

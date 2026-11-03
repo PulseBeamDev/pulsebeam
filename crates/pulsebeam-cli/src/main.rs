@@ -12,12 +12,12 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, ConnectionState, DesiredState, MediaKind, MediaSlot, MediaTopology,
-    PublicationIntent, Snapshot, VideoSubscription,
+    AgentConfig, ConnectionState, DesiredState, MediaKind, Snapshot, TrackSelector, TrackSpec,
+    VideoObservation,
 };
 use pulsebeam_agent_native::{
-    Agent, Config, Encoding, H264Frame, Host, InputFrame, LocalSource, MediaStreamUpdate,
-    NativeStatistics, ReceiveMode, RemoteMedia, StreamUpdate, VideoInput, VideoPublicationConfig,
+    Agent, Config, Encoding, H264Frame, Host, InputFrame, MediaStreamUpdate, NativeStatistics,
+    PublicationInput, ReceiveMode, StreamUpdate, Subscription, VideoInput, VideoPublicationConfig,
     VideoSourceConfig,
 };
 use pulsebeam_core::auth::{
@@ -29,7 +29,7 @@ use pulsebeam_core::identity::{
     ProjectId, RoomExternalId, RoomId, VideoTrackId,
 };
 use std::{
-    collections::HashSet,
+    collections::BTreeSet,
     io::Read,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -144,7 +144,11 @@ impl VideoSource {
         }
     }
 
-    async fn run(mut self, media: LocalSource) {
+    async fn run(mut self, media: PublicationInput) {
+        if let Err(error) = media.ready().await {
+            tracing::warn!(%error, "bench input unavailable");
+            return;
+        }
         let capture_origin = match media.capture_time_us().await {
             Ok(time) => time,
             Err(error) => {
@@ -167,7 +171,9 @@ impl VideoSource {
                         if feedback.keyframe_requested || feedback.encoding_keyframes_requested.iter().any(|request| *request) { self.rewind(); }
                     }
                 },
-                capture = interval.tick() => {
+                _ = interval.tick() => {
+                    if media.ready().await.is_err() { return; }
+                    let capture = tokio::time::Instant::now();
                     let Some(timestamp_us) = i64::try_from(capture.duration_since(started).as_micros()).ok()
                         .and_then(|offset| capture_origin.checked_add(offset)) else {
                             tracing::warn!("native producer capture timestamp exhausted");
@@ -180,7 +186,7 @@ impl VideoSource {
                         _ => return,
                     };
                     if let Err(error) = media.submit(frame).await {
-                        if matches!(error, pulsebeam_agent_native::Error::Closed) { return; }
+                        if media.is_closed() { return; }
                         tracing::warn!(%error, "bench native input admission refused");
                     }
                     self.index = self.index.saturating_add(1);
@@ -584,29 +590,28 @@ async fn spawn_agent(
         source: benchmark_video_profile(simulcast),
     }];
     let agent = Agent::spawn(config, Host::new(Box::new(reqwest::Client::new()))).await?;
-    let mut desired = DesiredState {
+    let camera_owner = agent
+        .publication(TrackSpec::Video {
+            label: "camera".into(),
+        })
+        .await?;
+    let microphone_owner = agent
+        .publication(TrackSpec::Audio {
+            label: "microphone".into(),
+        })
+        .await?;
+    let camera = camera_owner.input().await?;
+    let _microphone = microphone_owner.input().await?;
+    let desired = DesiredState {
         revision: 1,
         connected: true,
-        publications: vec![
-            PublicationIntent {
-                slot: "v0".into(),
-                label: "camera".into(),
-                active: true,
-            },
-            PublicationIntent {
-                slot: "a0".into(),
-                label: "microphone".into(),
-                active: true,
-            },
-        ],
         ..Default::default()
     };
     let mut snapshots = agent.snapshots();
-    agent.replace_desired(desired.clone()).await?;
+    agent.replace_desired(desired).await?;
     wait_until_connected(&mut snapshots).await?;
 
     let mut media_tasks = JoinSet::new();
-    let camera = agent.source(MediaSlot::LocalVideo("v0".into())).await?;
     let assets = if simulcast {
         ["q", "h", "f"]
             .into_iter()
@@ -618,25 +623,16 @@ async fn spawn_agent(
     media_tasks.spawn(VideoSource::new(assets, pulsebeam_testdata::QUALITY_VIDEO_FPS).run(camera));
 
     let (received_video_tx, received_video) = watch::channel(false);
-    for slot in 0..REMOTE_VIDEO_SLOTS {
-        let remote = agent
-            .remote(MediaSlot::RemoteVideo(slot), ReceiveMode::Encoded)
-            .await?;
-        media_tasks.spawn(handle_receiving(
-            remote,
-            ctx.clone(),
-            received_video_tx.clone(),
-        ));
-    }
-    drop(received_video_tx);
-
-    let mut subscribed_participants = HashSet::new();
+    // Catalog absence does not cancel this benchmark's named interests.
+    let mut interests = BTreeSet::new();
     let initial_snapshot = snapshots.borrow().clone();
-    reconcile_video_subscriptions(
+    subscribe_remote_videos(
         &agent,
-        &mut desired,
         &initial_snapshot,
-        &mut subscribed_participants,
+        &mut interests,
+        &mut media_tasks,
+        &ctx,
+        &received_video_tx,
     )
     .await?;
     let statistics = agent.statistics();
@@ -674,11 +670,13 @@ async fn spawn_agent(
                         .map_or_else(|| "native agent failed".to_owned(), |failure| failure.message);
                     anyhow::bail!(failure);
                 }
-                reconcile_video_subscriptions(
+                subscribe_remote_videos(
                     &agent,
-                    &mut desired,
                     &snapshot,
-                    &mut subscribed_participants,
+                    &mut interests,
+                    &mut media_tasks,
+                    &ctx,
+                    &received_video_tx,
                 ).await?;
             }
         }
@@ -686,11 +684,11 @@ async fn spawn_agent(
 
     agent.close().await?;
     media_tasks.shutdown().await;
-    if !subscribed_participants.is_empty() && !*received_video.borrow() {
+    if !interests.is_empty() && !*received_video.borrow() {
         tracing::error!(
             room_id = ctx.room_id,
             agent_id = ctx.agent_id,
-            subscriptions = subscribed_participants.len(),
+            subscriptions = interests.len(),
             "bench agent received no remote video frames"
         );
     }
@@ -710,52 +708,57 @@ fn benchmark_agent_config(
     Ok(AgentConfig {
         endpoint: api_url.to_string(),
         token: mint_development_token(&room, &participant, exp)?,
-        topology: MediaTopology {
-            local_video: 1,
-            local_audio: 1,
-            remote_video: REMOTE_VIDEO_SLOTS,
-            remote_audio: REMOTE_AUDIO_SLOTS,
-        },
         retry: Default::default(),
         log_level: Default::default(),
     })
 }
 
 async fn handle_receiving(
-    media: RemoteMedia,
+    subscription: Subscription,
     ctx: AgentContext,
     received_video: watch::Sender<bool>,
 ) {
     let mut received = false;
     loop {
-        match media.next().await {
-            MediaStreamUpdate::Closed => return,
-            MediaStreamUpdate::Track { .. } => {}
-            MediaStreamUpdate::Lagged { skipped } => {
-                tracing::warn!(skipped, "bench media observer lagged");
-            }
-            MediaStreamUpdate::NativeDropped { skipped }
-            | MediaStreamUpdate::NativeDecodedDropped { skipped } => {
-                tracing::warn!(skipped, "native media sink dropped frames");
-            }
-            MediaStreamUpdate::Frame { .. } => {
-                if !received {
-                    received = true;
-                    received_video.send_replace(true);
-                    tracing::info!(
-                        room_id = ctx.room_id,
-                        agent_id = ctx.agent_id,
-                        "bench agent received native video; uncorrelated capture timestamps are not end-to-end latency"
-                    );
+        let media = match subscription.observe(ReceiveMode::Encoded).await {
+            Ok(media) => media,
+            Err(error) => {
+                if !subscription.is_closed() {
+                    tracing::warn!(%error, "bench video observation failed");
                 }
-                let _ = ctx.logger.latency.try_send(EventLatency {
-                    captured_at: Instant::now(),
-                    room_id: ctx.room_id,
-                    agent_id: ctx.agent_id,
-                    // Native capture metadata does not establish a common sender/
-                    // observer clock. Preserve observations without inventing latency.
-                    delay_us: None,
-                });
+                return;
+            }
+        };
+        loop {
+            match media.next().await {
+                MediaStreamUpdate::Closed => break,
+                MediaStreamUpdate::Track { .. } => {}
+                MediaStreamUpdate::Lagged { skipped } => {
+                    tracing::warn!(skipped, "bench media observer lagged");
+                }
+                MediaStreamUpdate::NativeDropped { skipped }
+                | MediaStreamUpdate::NativeDecodedDropped { skipped } => {
+                    tracing::warn!(skipped, "native media sink dropped frames");
+                }
+                MediaStreamUpdate::Frame { .. } => {
+                    if !received {
+                        received = true;
+                        received_video.send_replace(true);
+                        tracing::info!(
+                            room_id = ctx.room_id,
+                            agent_id = ctx.agent_id,
+                            "bench agent received native video; uncorrelated capture timestamps are not end-to-end latency"
+                        );
+                    }
+                    let _ = ctx.logger.latency.try_send(EventLatency {
+                        captured_at: Instant::now(),
+                        room_id: ctx.room_id,
+                        agent_id: ctx.agent_id,
+                        // Native capture metadata does not establish a common sender/
+                        // observer clock. Preserve observations without inventing latency.
+                        delay_us: None,
+                    });
+                }
             }
         }
     }
@@ -778,56 +781,66 @@ async fn wait_until_connected(snapshots: &mut watch::Receiver<Snapshot>) -> Resu
     }
 }
 
-async fn reconcile_video_subscriptions(
+async fn subscribe_remote_videos(
     agent: &Agent,
-    desired: &mut DesiredState,
     snapshot: &Snapshot,
-    subscribed_participants: &mut HashSet<String>,
+    interests: &mut BTreeSet<TrackSelector>,
+    tasks: &mut JoinSet<()>,
+    ctx: &AgentContext,
+    received_video: &watch::Sender<bool>,
 ) -> Result<()> {
-    let (video, participants) = video_subscriptions(snapshot);
-    subscribed_participants.extend(participants);
-    if desired.video == video {
-        return Ok(());
+    for selector in video_subscriptions(snapshot, interests) {
+        let subscription = agent
+            .video_subscription(
+                selector.clone(),
+                VideoObservation {
+                    visible: true,
+                    height: 720,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        interests.insert(selector);
+        tasks.spawn(handle_receiving(
+            subscription,
+            ctx.clone(),
+            received_video.clone(),
+        ));
     }
-    let mut replacement = desired.clone();
-    replacement.revision = desired.revision.saturating_add(1);
-    replacement.video = video;
-    agent.replace_desired(replacement.clone()).await?;
-    *desired = replacement;
     Ok(())
 }
 
-fn video_subscriptions(snapshot: &Snapshot) -> (Vec<VideoSubscription>, HashSet<String>) {
-    let mut participants = HashSet::new();
-    let mut subscriptions = Vec::with_capacity(usize::from(REMOTE_VIDEO_SLOTS));
+fn video_subscriptions(
+    snapshot: &Snapshot,
+    interests: &BTreeSet<TrackSelector>,
+) -> Vec<TrackSelector> {
+    let mut participants: BTreeSet<_> = interests
+        .iter()
+        .map(|selector| selector.participant_external_id.clone())
+        .collect();
+    let remaining = usize::from(REMOTE_VIDEO_SLOTS).saturating_sub(interests.len());
+    let mut subscriptions = Vec::new();
     for publication in snapshot.publications.values() {
+        if subscriptions.len() == remaining {
+            break;
+        }
         if publication.kind != MediaKind::Video
             || snapshot.participant_id.as_deref() == Some(&publication.participant_id)
-            || participants.contains(&publication.participant_id)
         {
             continue;
         }
-        if subscriptions.len() == usize::from(REMOTE_VIDEO_SLOTS) {
-            break;
-        }
-        let Ok(slot) = u8::try_from(subscriptions.len()) else {
-            debug_assert!(false, "video subscription index exceeded u8");
-            break;
+        let Some(participant) = snapshot.participants.get(&publication.participant_id) else {
+            continue;
         };
-        debug_assert!(slot < REMOTE_VIDEO_SLOTS);
-        subscriptions.push(VideoSubscription {
-            slot,
-            track_id: publication.id.clone(),
-            selector: None,
-            height: 720,
-            min_height: 0,
-            min_fps: 0,
-            priority: 0,
-            playout_delay: Default::default(),
+        if !participants.insert(participant.external_id.clone()) {
+            continue;
+        }
+        subscriptions.push(TrackSelector {
+            participant_external_id: participant.external_id.clone(),
+            label: publication.label.clone(),
         });
-        participants.insert(publication.participant_id.clone());
     }
-    (subscriptions, participants)
+    subscriptions
 }
 
 async fn latency_writer_task(
@@ -1395,6 +1408,18 @@ mod tests {
             participant_id: Some("self".into()),
             ..Default::default()
         };
+        for (id, external_id) in [
+            ("self", "self-external"),
+            ("remote-audio", "audio-external"),
+        ] {
+            snapshot.participants.insert(
+                id.into(),
+                pulsebeam_agent_native::agent_core::Participant {
+                    id: id.into(),
+                    external_id: external_id.into(),
+                },
+            );
+        }
         snapshot.publications.insert(
             "self-video".into(),
             Publication {
@@ -1414,6 +1439,13 @@ mod tests {
             },
         );
         for participant in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            snapshot.participants.insert(
+                participant.into(),
+                pulsebeam_agent_native::agent_core::Participant {
+                    id: participant.into(),
+                    external_id: format!("external-{participant}"),
+                },
+            );
             let track_id = format!("video-{participant}");
             snapshot.publications.insert(
                 track_id.clone(),
@@ -1426,12 +1458,30 @@ mod tests {
             );
         }
 
-        let (subscriptions, participants) = video_subscriptions(&snapshot);
-
+        let subscriptions = video_subscriptions(&snapshot, &BTreeSet::new());
         assert_eq!(subscriptions.len(), usize::from(REMOTE_VIDEO_SLOTS));
-        assert_eq!(participants.len(), usize::from(REMOTE_VIDEO_SLOTS));
         assert!(subscriptions.iter().all(|subscription| {
-            subscription.track_id != "self-video" && subscription.track_id != "remote-audio"
+            subscription.label == "camera"
+                && subscription
+                    .participant_external_id
+                    .starts_with("external-")
         }));
+        let interests: BTreeSet<_> = subscriptions.into_iter().collect();
+        assert_eq!(interests.len(), usize::from(REMOTE_VIDEO_SLOTS));
+        assert!(video_subscriptions(&snapshot, &interests).is_empty());
+        snapshot.publications.clear();
+        assert!(video_subscriptions(&snapshot, &interests).is_empty());
+        let first = interests.first().unwrap().clone();
+        snapshot.publications.insert(
+            "republished".into(),
+            Publication {
+                id: "republished".into(),
+                participant_id: "a".into(),
+                label: "renamed-camera".into(),
+                kind: MediaKind::Video,
+            },
+        );
+        assert_eq!(first.participant_external_id, "external-a");
+        assert!(video_subscriptions(&snapshot, &BTreeSet::from([first])).is_empty());
     }
 }

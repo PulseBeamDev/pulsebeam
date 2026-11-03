@@ -1,9 +1,3 @@
-import {
-  nativeCaptureTrack,
-  type CapturedAudioTrack,
-  type CapturedTrack,
-  type CapturedVideoTrack,
-} from "./capture-source.js";
 import { DataRegistry, type LocalDataTrack } from "./data.js";
 import type {
   AudioTrackSpec,
@@ -23,15 +17,11 @@ import type {
   LogLevel,
   LocalAudioTrack,
   LocalVideoTrack,
-  MediaTopology,
   MappingSnapshot,
   Participant,
   Publication,
-  PublicationIntent,
   RemoteTrack,
-  LocalMedia,
   RemoteMedia,
-  SenderConfig,
   Topic,
   TopicMode,
   TopicRegistration,
@@ -53,8 +43,6 @@ import {
   validatePlayoutDelay,
   type RuntimeConfig,
 } from "./agent-state.js";
-import { LocalTrackHandle, LocalTrackCapacityError } from "./local-track.js";
-export { LocalTrackCapacityError } from "./local-track.js";
 
 type Runtime = InstanceType<typeof BrowserRuntime>;
 
@@ -114,26 +102,6 @@ class AgentFacade implements Agent {
   #state: AgentState = copyState({ connected: false });
   #runtime: Runtime | undefined;
   #runtimeGeneration: bigint | null = null;
-  #localSourcePresent = new Map<string, boolean>();
-  #localMuted = new Map<string, boolean>();
-  #localVideoHandles = new Map<
-    string,
-    LocalTrackHandle<"video", CapturedVideoTrack>
-  >();
-  #localAudioHandles = new Map<
-    string,
-    LocalTrackHandle<"audio", CapturedAudioTrack>
-  >();
-  #reservedSlots = new Map<string, string>();
-  #localPublications = new Map<string, PublicationIntent>();
-  #relationships = new Set<object>();
-  #publicationOwners = new Map<
-    string,
-    { owner: object; handle: LocalVideoTrack | LocalAudioTrack; slot: string }
-  >();
-  #localConfigs = new Map<string, SenderConfig>();
-  #jsxMutation = false;
-  #localOperations = new Map<string, number>();
   readonly #data = new DataRegistry(this);
   readonly #resources = new ResourceOwners((error) => {
     if (
@@ -146,7 +114,6 @@ class AgentFacade implements Agent {
   readonly #remote: RemoteCatalog;
   readonly #topics: TopicRegistry;
   #managedTopics: readonly TopicRegistration[] = [];
-  readonly #topology: Required<MediaTopology>;
   #closed = false;
   #active = false;
   #activation = 0;
@@ -156,7 +123,6 @@ class AgentFacade implements Agent {
   constructor(config: AgentConfig, managed = false) {
     const runtimeConfig = copyConfig(config);
     this.#runtimeConfig = runtimeConfig;
-    this.#topology = runtimeConfig.topology;
     this.#remote = new RemoteCatalog(
       this,
       this.#data,
@@ -231,26 +197,6 @@ class AgentFacade implements Agent {
         runtime.set_snapshot_listener((snapshot: RuntimeSnapshot) => {
           if (active()) this.#runtimeSnapshot(runtime, snapshot);
         });
-        // A Strict Mode cleanup may have interrupted local-track operations.
-        // Reapply the currently desired captured sources to each fresh runtime.
-        for (const [slot, label] of this.#reservedSlots) {
-          const video = slot.startsWith("v");
-          const source = video
-            ? this.#localVideoHandles.get(label)?.source
-            : this.#localAudioHandles.get(label)?.source;
-          if (!source) continue;
-          this.#jsxMutation = true;
-          try {
-            void this.replaceLocalTrack(
-              slot,
-              nativeCaptureTrack(source, video ? "video" : "audio"),
-              this.#localConfigs.get(slot) ??
-                (video ? { contentHint: "motion" } : { contentHint: "speech" }),
-            ).catch(() => {});
-          } finally {
-            this.#jsxMutation = false;
-          }
-        }
         return runtime;
       });
     void this.#ready.catch(() => {});
@@ -276,11 +222,6 @@ class AgentFacade implements Agent {
     this.#remote.resetPlayback();
     this.#publish(emptySnapshot("disconnected"));
   }
-
-  readonly local: LocalMedia = Object.freeze({
-    video: (label: string) => this.#localVideoTrack(label),
-    audio: (label: string) => this.#localAudioTrack(label),
-  });
 
   get connection(): ConnectionState {
     return this.#snapshot.connection;
@@ -359,88 +300,6 @@ class AgentFacade implements Agent {
     };
   };
 
-  #localVideoTrack(label: string): LocalVideoTrack {
-    return this.#localHandle(
-      "video",
-      label,
-      this.#localVideoHandles,
-      this.#topology.localVideos,
-    );
-  }
-
-  #localAudioTrack(label: string): LocalAudioTrack {
-    return this.#localHandle(
-      "audio",
-      label,
-      this.#localAudioHandles,
-      this.#topology.localAudios,
-    );
-  }
-
-  #localHandle<K extends "video" | "audio", S extends CapturedTrack>(
-    kind: K,
-    label: string,
-    handles: Map<string, LocalTrackHandle<K, S>>,
-    capacity: number,
-  ): LocalTrackHandle<K, S> {
-    if (this.#closed) throw new Error("agent is closed");
-    if (
-      typeof label !== "string" ||
-      !label ||
-      new TextEncoder().encode(label).length > 64
-    )
-      throw new TypeError("invalid local track label");
-    const existing = handles.get(label);
-    if (existing) return existing;
-    if (!Number.isSafeInteger(capacity) || handles.size >= capacity) {
-      throw new LocalTrackCapacityError(kind, label, capacity);
-    }
-    const slot = `${kind === "video" ? "v" : "a"}${handles.size}`;
-    if (
-      this.#state.publications?.some((publication) => publication.slot === slot)
-    ) {
-      throw new TypeError(`reserved ${kind} slot ${slot} is already in use`);
-    }
-    const handle = new LocalTrackHandle<K, S>(
-      kind,
-      label,
-      (source) => {
-        this.#assertSlotWritable(slot);
-        this.#setLocalSource(kind, slot, label, source);
-      },
-      (enabled) => {
-        this.#assertSlotWritable(slot);
-        void this.setLocalMuted(slot, !enabled).catch(() => {});
-      },
-    );
-    handles.set(label, handle);
-    this.#reservedSlots.set(slot, label);
-    return handle;
-  }
-
-  #setLocalSource(
-    kind: "video" | "audio",
-    slot: string,
-    label: string,
-    source: CapturedTrack | null,
-  ): void {
-    if (this.#closed) throw new Error("agent is closed");
-    const candidate = source === null ? null : nativeCaptureTrack(source, kind);
-    const track = candidate?.readyState === "live" ? candidate : null;
-    if (track) this.#localPublications.set(slot, { slot, label, active: true });
-    else this.#localPublications.delete(slot);
-    this.#applyState(this.#state);
-    if (this.#active)
-      void this.replaceLocalTrack(
-        slot,
-        track,
-        this.#localConfigs.get(slot) ??
-          (kind === "video"
-            ? { contentHint: "motion" }
-            : { contentHint: "speech" }),
-      ).catch(() => {});
-  }
-
   connect(): void {
     if (this.#closed) throw new Error("agent is closed");
     if (this.#snapshot.connection === "terminal-failure" && !this.#runtime) {
@@ -460,19 +319,7 @@ class AgentFacade implements Agent {
 
   setState(state: AgentState): void {
     if (this.#closed) return;
-    if (this.#relationships.size)
-      throw new RelationshipOwnershipError(
-        "desired state is owned by committed JSX",
-      );
     validatePlayoutDelay(state);
-    for (const publication of state.publications ?? []) {
-      const reserved = this.#reservedSlots.get(publication.slot);
-      if (reserved !== undefined && reserved !== publication.label) {
-        throw new TypeError(
-          `slot ${publication.slot} is reserved for ${reserved}`,
-        );
-      }
-    }
     this.#applyState(copyState(state));
   }
 
@@ -492,12 +339,7 @@ class AgentFacade implements Agent {
     }
     return {
       ...state,
-      publications: [
-        ...(state.publications ?? []).filter(
-          ({ slot }) => !this.#reservedSlots.has(slot),
-        ),
-        ...this.#localPublications.values(),
-      ],
+      publications: state.publications ?? [],
       video: state.video ?? [],
       topics: [...topics.values()],
     };
@@ -524,43 +366,6 @@ class AgentFacade implements Agent {
         }),
       );
     }
-  }
-
-  replaceLocalTrack(
-    slot: string,
-    track: MediaStreamTrack | null,
-    config: SenderConfig,
-  ): Promise<void> {
-    if (this.#closed) return Promise.reject(new Error("agent is closed"));
-    this.#assertSlotWritable(slot);
-    const operation = (this.#localOperations.get(slot) ?? 0) + 1;
-    this.#localOperations.set(slot, operation);
-    const sender = Object.freeze({
-      contentHint: config.contentHint,
-      degradationPreference: config.degradationPreference,
-      encodings: Object.freeze(
-        (config.encodings ?? []).map((encoding) =>
-          Object.freeze({ ...encoding }),
-        ),
-      ),
-    });
-    this.#localSourcePresent.set(slot, track !== null);
-    return this.#runLocal(async (runtime) => {
-      if (this.#localOperations.get(slot) !== operation) return;
-      await runtime.set_local_muted(slot, this.#effectiveLocalMuted(slot));
-      if (this.#localOperations.get(slot) !== operation) return;
-      await runtime.replace_local_track(slot, track, sender);
-      this.#requireCurrentRuntime(runtime);
-    });
-  }
-
-  setLocalMuted(slot: string, muted: boolean): Promise<void> {
-    if (this.#closed) return Promise.reject(new Error("agent is closed"));
-    this.#assertSlotWritable(slot);
-    this.#localMuted.set(slot, muted);
-    return this.#runLocal(async (runtime) => {
-      await runtime.set_local_muted(slot, this.#effectiveLocalMuted(slot));
-    });
   }
 
   reconnect(): void {
@@ -611,160 +416,15 @@ class AgentFacade implements Agent {
     this.#topics.close();
     this.#remote.close();
     this.#state = copyState({ connected: false });
-    this.#localSourcePresent.clear();
-    this.#localMuted.clear();
-    for (const handle of this.#localVideoHandles.values()) handle.clear();
-    for (const handle of this.#localAudioHandles.values()) handle.clear();
-    this.#localVideoHandles.clear();
-    this.#localAudioHandles.clear();
-    this.#reservedSlots.clear();
-    this.#localPublications.clear();
     this.#publish(emptySnapshot("disconnected"));
     this.#listeners.clear();
     this.#eventListeners.clear();
-  }
-
-  claimRelationship(owner: object): () => void {
-    this.#relationships.add(owner);
-    return () => {
-      this.#relationships.delete(owner);
-    };
-  }
-
-  claimPublication(
-    owner: object,
-    kind: "video" | "audio",
-    label: string,
-  ): LocalVideoTrack | LocalAudioTrack {
-    const key = `${kind}:${label}`;
-    if (this.#publicationOwners.has(key)) {
-      const error = new RelationshipOwnershipError(
-        `duplicate ${kind} publication owner for ${label}`,
-      );
-      this.#emitFailure("validation", error.message);
-      throw error;
-    }
-    let handle: LocalVideoTrack | LocalAudioTrack;
-    try {
-      handle =
-        kind === "video" ? this.local.video(label) : this.local.audio(label);
-    } catch (error) {
-      this.#emitFailure("validation", message(error));
-      throw error;
-    }
-    const slot = [...this.#reservedSlots].find(
-      ([slot, value]) =>
-        value === label && slot.startsWith(kind === "video" ? "v" : "a"),
-    )![0];
-    this.#publicationOwners.set(key, { owner, handle, slot });
-    this.#relationships.add(owner);
-    return handle;
-  }
-
-  updatePublication(
-    owner: object,
-    kind: "video" | "audio",
-    label: string,
-    source: CapturedTrack | null,
-    enabled: boolean,
-    config: SenderConfig,
-  ): void {
-    const declaration = this.#publicationOwners.get(`${kind}:${label}`);
-    if (declaration?.owner !== owner) return;
-    const { handle, slot } = declaration;
-    const previousConfig = this.#localConfigs.get(slot);
-    this.#localConfigs.set(slot, config);
-    this.#jsxMutation = true;
-    try {
-      handle.setEnabled(enabled);
-      const changed = handle.source !== source;
-      if (kind === "video")
-        (handle as LocalVideoTrack).setSource(
-          source as CapturedVideoTrack | null,
-        );
-      else
-        (handle as LocalAudioTrack).setSource(
-          source as CapturedAudioTrack | null,
-        );
-      if (
-        !changed &&
-        source &&
-        JSON.stringify(previousConfig) !== JSON.stringify(config)
-      ) {
-        void this.replaceLocalTrack(
-          slot,
-          nativeCaptureTrack(source, kind),
-          config,
-        ).catch(() => {});
-      }
-    } finally {
-      this.#jsxMutation = false;
-    }
-  }
-
-  releasePublication(
-    owner: object,
-    kind: "video" | "audio",
-    label: string,
-  ): void {
-    const key = `${kind}:${label}`;
-    const declaration = this.#publicationOwners.get(key);
-    if (declaration?.owner !== owner) return;
-    this.#jsxMutation = true;
-    try {
-      declaration.handle.setSource(null);
-    } finally {
-      this.#jsxMutation = false;
-    }
-    this.#publicationOwners.delete(key);
-    this.#relationships.delete(owner);
-  }
-
-  #assertSlotWritable(slot: string): void {
-    if (
-      !this.#jsxMutation &&
-      [...this.#publicationOwners.values()].some((value) => value.slot === slot)
-    ) {
-      throw new RelationshipOwnershipError(
-        `slot ${slot} is owned by committed JSX`,
-      );
-    }
   }
 
   #requireRuntime(): Runtime {
     if (this.#closed) throw new Error("agent is closed");
     if (!this.#runtime) throw new Error("agent is still initializing");
     return this.#runtime;
-  }
-
-  #effectiveLocalMuted(slot: string): boolean {
-    return (
-      this.#localSourcePresent.get(slot) === false ||
-      (this.#localMuted.get(slot) ?? false)
-    );
-  }
-
-  #runLocal(operation: (runtime: Runtime) => Promise<void>): Promise<void> {
-    if (this.#closed) return Promise.reject(new Error("agent is closed"));
-    const ready = this.#ready;
-    if (!ready) return Promise.reject(new Error("agent is not active"));
-    const activation = this.#activation;
-    return ready
-      .then(async (runtime) => {
-        this.#requireCurrentRuntime(runtime);
-        await operation(runtime);
-        this.#requireCurrentRuntime(runtime);
-      })
-      .catch((error: unknown) => {
-        if (this.#closed) throw new Error("agent is closed");
-        if (
-          activation === this.#activation &&
-          this.#snapshot.failure === null
-        ) {
-          this.#emitFailure(localFailureClass(error), message(error));
-        }
-        throw error;
-      });
   }
 
   #publishTopic(
@@ -1021,13 +681,6 @@ class AgentFacade implements Agent {
 
   #emit(event: AgentEvent): void {
     for (const listener of [...this.#eventListeners]) listener(event);
-  }
-}
-
-export class RelationshipOwnershipError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "RelationshipOwnershipError";
   }
 }
 

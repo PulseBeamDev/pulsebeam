@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 
 use agent_core::{
     ChannelId, DataChannelBinding, DataChannelEffect, DataChannelReliability, DataChannelSpec,
-    Generation, HostEvent, MediaSlot, MediaTopology, OfferResources, RtcEvent,
+    Generation, HostEvent, MediaSlot, OfferResources, RtcEvent,
 };
 use pulsebeam_webrtc_sys as rtc;
 
@@ -25,12 +25,11 @@ const VLA: &str = "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-all
 
 #[derive(Clone, Copy, Debug)]
 enum Stage {
-    Creating(rtc::OperationId),
     SettingLocal(rtc::OperationId),
     Gathering,
     Offered,
     SettingRemote(rtc::OperationId),
-    MediaCreating(rtc::OperationId),
+    MediaCreatingOffer(rtc::OperationId),
     MediaSettingLocal(rtc::OperationId),
     MediaSettingRemote(rtc::OperationId),
     Ready,
@@ -60,6 +59,12 @@ pub(crate) struct Progress {
     pub more: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeChannel {
+    native: rtc::SessionChannelId,
+    association: Option<rtc::SessionSctpTransportId>,
+}
+
 pub(crate) struct NativePeer<R: rtc::SessionRuntime> {
     pub generation: Generation,
     session: rtc::Session<R>,
@@ -71,7 +76,7 @@ pub(crate) struct NativePeer<R: rtc::SessionRuntime> {
     media_config: MediaConfig,
     media_work: Option<preparation::MediaWork>,
     connection: rtc::ConnectionState,
-    channels: BTreeMap<ChannelId, rtc::SessionChannelId>,
+    channels: BTreeMap<ChannelId, NativeChannel>,
     closed_channels: BTreeSet<ChannelId>,
     signaling_channel: ChannelId,
     channel_bindings: Vec<DataChannelBinding>,
@@ -138,15 +143,6 @@ fn create_data_channel<R: rtc::SessionRuntime>(
     Ok(native)
 }
 
-pub(crate) fn slots(topology: &MediaTopology) -> Vec<MediaSlot> {
-    (0..topology.local_video)
-        .map(|i| MediaSlot::LocalVideo(format!("v{i}")))
-        .chain((0..topology.local_audio).map(|i| MediaSlot::LocalAudio(format!("a{i}"))))
-        .chain((0..topology.remote_video).map(MediaSlot::RemoteVideo))
-        .chain((0..topology.remote_audio).map(MediaSlot::RemoteAudio))
-        .collect()
-}
-
 fn codecs_and_extensions<R: rtc::SessionRuntime>(
     session: &mut rtc::Session<R>,
     transceiver: rtc::SessionTransceiverId,
@@ -195,19 +191,17 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         runtime: R,
         config: &MediaConfig,
         generation: Generation,
-        topology: &MediaTopology,
+        slots: &[MediaSlot],
         specs: &[DataChannelSpec],
     ) -> Result<Self, rtc::PeerError> {
         let mut profiles = HashMap::new();
-        let slots = slots(topology);
         for profile in &config.video_publications {
-            if !slots.contains(&MediaSlot::LocalVideo(profile.slot.clone()))
-                || profiles
-                    .insert(profile.slot.clone(), profile.source.clone())
-                    .is_some()
+            if profiles
+                .insert(profile.slot.clone(), profile.source.clone())
+                .is_some()
             {
                 return Err(error(
-                    "video profile names must identify distinct local publication slots",
+                    "video profiles must name distinct publication bindings",
                 ));
             }
         }
@@ -229,7 +223,13 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             let native = create_data_channel(&mut session, peer, spec)?;
             let channel = ChannelId::new(native.get())
                 .ok_or_else(|| error("zero native channel identity"))?;
-            channels.insert(channel, native);
+            channels.insert(
+                channel,
+                NativeChannel {
+                    native,
+                    association: None,
+                },
+            );
             if signaling_channel.is_none() {
                 signaling_channel = Some(channel);
             } else {
@@ -243,7 +243,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             signaling_channel.ok_or_else(|| error("core did not request a signaling channel"))?;
         let mut transceivers = BTreeMap::new();
         let mut sources = BTreeMap::new();
-        for slot in slots {
+        for slot in slots.iter().cloned() {
             let (kind, receiving) = match &slot {
                 MediaSlot::LocalAudio(_) => (rtc::MediaType::Audio, false),
                 MediaSlot::LocalVideo(_) => (rtc::MediaType::Video, false),
@@ -288,12 +288,12 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             codecs_and_extensions(&mut session, transceiver, receiving, dependency_descriptor)?;
             transceivers.insert(slot, transceiver);
         }
-        let operation = session.create_offer(peer, false)?;
+        let operation = session.set_local_description_auto(peer)?;
         let value = Self {
             generation,
             session,
             peer,
-            stage: Stage::Creating(operation),
+            stage: Stage::SettingLocal(operation),
             gathered: false,
             bootstrap_capabilities: None,
             sdp: None,
@@ -486,91 +486,9 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             .values()
             .map(|binding| (binding.slot.clone(), binding.mid.clone()))
             .collect::<Vec<_>>();
-        let preparation = agent_core::adopt_bootstrap_media(&mut context, &slots)
-            .and_then(|_| self.observe_senders(&mut context));
+        let preparation = agent_core::adopt_bootstrap_media(&mut context, &slots);
         self.sdp = Some(agent_core::client_sdp::Executor::new(context));
         Ok(preparation)
-    }
-
-    fn observe_senders(
-        &mut self,
-        context: &mut agent_core::client_sdp::Context,
-    ) -> Result<agent_core::client_sdp::Bindings, agent_core::client_sdp::Error> {
-        use agent_core::client_sdp::{Encoding, Error, RtcpParameters, RuntimeEncoding};
-        for (slot, transceiver) in &self.transceivers {
-            if !matches!(slot, MediaSlot::LocalAudio(_) | MediaSlot::LocalVideo(_)) {
-                continue;
-            }
-            let mid = &self.bindings.get(slot).ok_or(Error::Observation)?.mid;
-            let Some(binding) = context
-                .applied_bindings()
-                .publications
-                .iter()
-                .find(|binding| &binding.mid == mid)
-            else {
-                continue;
-            };
-            let sender = self
-                .session
-                .sender(*transceiver)
-                .map_err(|_| Error::Observation)?;
-            let parameters = self
-                .session
-                .get_sender_parameters(sender)
-                .map_err(|_| Error::Observation)?;
-            let encodings = parameters
-                .encodings()
-                .into_iter()
-                .map(|encoding| {
-                    let rid =
-                        String::from_utf8(encoding.rid_bytes()).map_err(|_| Error::Observation)?;
-                    let rid = (!rid.is_empty()).then_some(rid);
-                    let previous = binding
-                        .encodings
-                        .iter()
-                        .find(|previous| previous.rid == rid)
-                        .or_else(|| {
-                            if binding.encodings.len() == 1 && rid.is_none() {
-                                binding.encodings.first()
-                            } else {
-                                None
-                            }
-                        })
-                        .ok_or(Error::Observation)?;
-                    Ok(Encoding {
-                        rid,
-                        primary: encoding.ssrc(),
-                        repair: None,
-                        paused: previous.paused,
-                        runtime: RuntimeEncoding {
-                            active: Some(encoding.active()),
-                            max_bitrate: encoding
-                                .max_bitrate_bps()
-                                .map(u64::try_from)
-                                .transpose()
-                                .map_err(|_| Error::Observation)?,
-                            max_framerate: encoding.max_framerate(),
-                            scalability_mode: encoding
-                                .scalability_mode_bytes()
-                                .map(String::from_utf8)
-                                .transpose()
-                                .map_err(|_| Error::Observation)?,
-                        },
-                    })
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            let rtcp = parameters.rtcp();
-            let cname = String::from_utf8(rtcp.cname_bytes()).map_err(|_| Error::Observation)?;
-            context.observe_sender_facts(
-                mid,
-                &encodings,
-                &RtcpParameters {
-                    cname: (!cname.is_empty()).then_some(cname),
-                    reduced_size: rtcp.reduced_size(),
-                },
-            )?;
-        }
-        context.bindings().cloned().ok_or(Error::CandidateState)
     }
 
     pub(crate) fn create_data_channel(
@@ -589,8 +507,15 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         if self.channels.contains_key(&channel) {
             return Err(error("data channel identity is already owned"));
         }
+        let association = self.session.peer_sctp_transport(self.peer)?;
         let native = create_data_channel(&mut self.session, self.peer, specification)?;
-        self.channels.insert(channel, native);
+        self.channels.insert(
+            channel,
+            NativeChannel {
+                native,
+                association,
+            },
+        );
         Ok(())
     }
 
@@ -599,7 +524,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             return Ok(());
         }
         if let Some(native) = self.channels.get(&channel) {
-            self.session.close_channel(*native)?;
+            self.session.close_channel(native.native)?;
         }
         Ok(())
     }
@@ -692,7 +617,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         if self.pending_sends.len() >= PENDING_SENDS {
             return Some(failed("native send completion queue is full".into()));
         }
-        let Some(&native) = self.channels.get(&channel) else {
+        let Some(NativeChannel { native, .. }) = self.channels.get(&channel).copied() else {
             return Some(failed("unknown native data channel".into()));
         };
         let message = rtc::DataChannelMessage {
@@ -748,7 +673,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                         continue;
                     }
                     let media_operation = match self.stage {
-                        Stage::MediaCreating(operation)
+                        Stage::MediaCreatingOffer(operation)
                         | Stage::MediaSettingLocal(operation)
                         | Stage::MediaSettingRemote(operation) => Some(operation),
                         _ => None,
@@ -757,15 +682,8 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                         self.media_completed(done.result, &mut progress.events)?;
                         continue;
                     }
-                    let result = done.result?;
+                    done.result?;
                     match self.stage {
-                        Stage::Creating(operation) if operation == done.operation_id => {
-                            let offer = result.ok_or_else(|| {
-                                error("native CreateOffer returned no description")
-                            })?;
-                            let operation = self.session.set_local_description(self.peer, offer)?;
-                            self.stage = Stage::SettingLocal(operation);
-                        }
                         Stage::SettingLocal(operation) if operation == done.operation_id => {
                             self.stage = Stage::Gathering;
                         }
@@ -808,7 +726,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                     if matches!(
                         self.stage,
                         Stage::Ready
-                            | Stage::MediaCreating(_)
+                            | Stage::MediaCreatingOffer(_)
                             | Stage::MediaSettingLocal(_)
                             | Stage::MediaSettingRemote(_)
                     ) {
@@ -911,7 +829,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         let channels: Vec<_> = self
             .channels
             .iter()
-            .map(|(&id, &native)| (id, native))
+            .map(|(&id, native)| (id, native.native))
             .collect();
         let mut drained_closed = Vec::new();
         for (channel, native) in channels {
@@ -937,13 +855,16 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                         })
                     }
                     rtc::DataChannelEvent::StateChanged(rtc::DataChannelState::Closed) => {
-                        if channel != self.signaling_channel {
+                        if channel == self.signaling_channel {
+                            Some(agent_core::DataChannelEvent::Closed {
+                                generation: self.generation,
+                                channel,
+                                reset_complete: false,
+                            })
+                        } else {
                             self.closed_channels.insert(channel);
+                            None
                         }
-                        Some(agent_core::DataChannelEvent::Closed {
-                            generation: self.generation,
-                            channel,
-                        })
                     }
                     rtc::DataChannelEvent::Message(message) => {
                         Some(agent_core::DataChannelEvent::Message {
@@ -993,11 +914,11 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         }
         // Consume terminal native outcomes before admitting the next burst.
         progress.events.extend(self.dispatch_sends());
-        self.reclaim_closed_channels(&drained_closed);
+        self.reclaim_closed_channels(&drained_closed, &mut progress.events);
         Ok(progress)
     }
 
-    fn reclaim_closed_channels(&mut self, drained: &[ChannelId]) {
+    fn reclaim_closed_channels(&mut self, drained: &[ChannelId], events: &mut Vec<HostEvent>) {
         for channel in drained {
             if self
                 .pending_sends
@@ -1014,8 +935,28 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                 continue;
             }
             self.closed_channels.remove(channel);
-            if let Some(native) = self.channels.remove(channel) {
-                self.session.release_channel(native);
+            if let Some(binding) = self.channels.remove(channel) {
+                // An OK abrupt close can belong to a retired association. Only
+                // the retained original association can justify graceful reset.
+                let reset_complete = matches!(self.session.channel_error(binding.native), Ok(None))
+                    && binding.association.is_some_and(|association| {
+                        self.session.peer_sctp_transport(self.peer).ok().flatten()
+                            == Some(association)
+                            && self
+                                .session
+                                .sctp_information(association)
+                                .is_ok_and(|information| {
+                                    information.state == rtc::SctpTransportState::Connected
+                                })
+                    });
+                self.session.release_channel(binding.native);
+                events.push(HostEvent::DataChannel(
+                    agent_core::DataChannelEvent::Closed {
+                        generation: self.generation,
+                        channel: *channel,
+                        reset_complete,
+                    },
+                ));
             }
         }
     }
@@ -1176,17 +1117,6 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             .microseconds()
             .map_err(|value| error(format!("invalid native capture clock: {value}")))
     }
-    pub fn encoding_state(
-        &mut self,
-        slot: &MediaSlot,
-        identity: &SourceIdentity,
-    ) -> Result<Vec<crate::EncodingState>, rtc::PeerError> {
-        self.source(slot, identity)?;
-        self.sources
-            .get(slot)
-            .ok_or_else(|| error("unknown source"))?
-            .encoding_state(&mut self.session)
-    }
     pub fn set_limits(
         &mut self,
         slot: &MediaSlot,
@@ -1302,16 +1232,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn offer<R: rtc::SessionRuntime>(runtime: R, config: MediaConfig, mut drive: impl FnMut()) {
-        let topology = MediaTopology {
-            local_video: 1,
-            local_audio: 1,
-            remote_video: 1,
-            remote_audio: 1,
-        };
+        let slots = [
+            MediaSlot::LocalVideo("v0".into()),
+            MediaSlot::LocalAudio("a0".into()),
+            MediaSlot::RemoteVideo(0),
+            MediaSlot::RemoteAudio(0),
+        ];
         let mut core = agent_core::Agent::new(agent_core::AgentConfig {
             endpoint: "http://pulsebeam.test".into(),
             token: "token".into(),
-            topology,
             retry: agent_core::RetryPolicy::default(),
             log_level: agent_core::LogLevel::default(),
         })
@@ -1324,17 +1253,16 @@ mod tests {
             },
         ))
         .unwrap();
-        let (generation, topology, specs) = loop {
+        let (generation, specs) = loop {
             match core.next_effect().expect("core requested an offer") {
                 agent_core::Effect::Rtc(agent_core::RtcEffect::CreateOffer {
                     generation,
-                    topology,
                     data_channels,
-                }) => break (generation, topology, data_channels),
+                }) => break (generation, data_channels),
                 _ => continue,
             }
         };
-        let mut peer = NativePeer::new(runtime, &config, generation, &topology, &specs).unwrap();
+        let mut peer = NativePeer::new(runtime, &config, generation, &slots, &specs).unwrap();
         let resources = loop {
             let progress = peer.progress().unwrap();
             let mut found = None;
@@ -1377,7 +1305,7 @@ mod tests {
         };
         assert_eq!(resources.slots.len(), 4);
         let bootstrap_channels = peer.channels.clone();
-        let control = peer.channels[&peer.signaling_channel];
+        let control = peer.channels[&peer.signaling_channel].native;
         let state = peer.session.channel_state(control).unwrap();
         peer.close_data_channel(peer.signaling_channel).unwrap();
         assert_eq!(peer.session.channel_state(control).unwrap(), state);
@@ -1393,7 +1321,7 @@ mod tests {
                 reliability,
             };
             peer.create_data_channel(channel, &specification).unwrap();
-            let native = peer.channels[&channel];
+            let native = peer.channels[&channel].native;
             let actual = peer.session.channel_configuration(native).unwrap();
             assert_eq!(actual.id, Some(i32::from(stream)));
             assert!(actual.negotiated);
@@ -1403,7 +1331,7 @@ mod tests {
                 reliability == DataChannelReliability::Reliable
             );
             assert!(peer.create_data_channel(channel, &specification).is_err());
-            assert_eq!(peer.channels[&channel], native);
+            assert_eq!(peer.channels[&channel].native, native);
             assert!(
                 peer.create_data_channel(
                     ChannelId::new(channel.get() + 1).unwrap(),
@@ -1427,7 +1355,7 @@ mod tests {
                 );
             }
             peer.close_data_channel(channel).unwrap();
-            assert_eq!(peer.channels[&channel], native);
+            assert_eq!(peer.channels[&channel].native, native);
             assert!(!peer.closed_channels.contains(&channel));
         }
         for (channel, native) in bootstrap_channels {
@@ -1502,7 +1430,6 @@ mod tests {
         assert_eq!(refused.kind, rtc::PeerErrorKind::UnsupportedParameter);
         assert_eq!(peer.receivers.get(&remote).unwrap().mode, None);
         peer.close_source(&local, &current).unwrap();
-        assert!(peer.encoding_state(&local, &current).is_err());
         assert!(peer.capture_time_us(&local, &current).is_err());
         assert!(peer.source_identity(&local).is_none());
         let next = peer.replace_source(&local).unwrap();
@@ -1528,6 +1455,17 @@ mod tests {
         assert!(!peer.session.transceiver_stopping(untouched).unwrap());
         assert!(!peer.session.transceiver_stopped(untouched).unwrap());
         assert_eq!(peer.source_identity(&local).unwrap(), next);
+        peer.session.close_peer(peer.peer).unwrap();
+        while peer.session.channel_state(control).unwrap() != rtc::DataChannelState::Closed {
+            drive();
+        }
+        let progress = peer.progress().unwrap();
+        assert!(progress.events.iter().any(|event| matches!(event,
+            HostEvent::DataChannel(agent_core::DataChannelEvent::Closed {
+                generation: observed, channel, reset_complete: false,
+            }) if *observed == generation && *channel == peer.signaling_channel)));
+        assert_eq!(peer.channels[&peer.signaling_channel].native, control);
+        assert!(!peer.closed_channels.contains(&peer.signaling_channel));
         peer.shutdown().unwrap();
     }
 

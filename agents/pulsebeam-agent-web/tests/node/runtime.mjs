@@ -11,7 +11,6 @@ const bytes = await readFile(
 const config = {
   endpoint: "http://localhost",
   token: "node-lifecycle",
-  topology: { localVideos: 1 },
 };
 if (process.argv[2] === "initialization-failure") {
   let attempts = 0;
@@ -133,8 +132,11 @@ if (process.argv[2] === "initialization-failure") {
   runtime.close();
   assert.equal(runtime.diagnostics().closed, true);
   assert.throws(() => runtime.connect(), /closed/);
-  await assert.rejects(runtime.set_local_muted("v0", true), /closed/);
-  await assert.rejects(runtime.replace_local_track("v0", null, {}), /closed/);
+  assert.throws(() => runtime.set_owned_muted(1n, true), /closed/);
+  assert.throws(
+    () => runtime.replace_owned_track(1n, null, {}, false, true),
+    /closed/,
+  );
   runtime.abort();
   runtime.free();
   const { localOperationContract } = await import("./local-operations.mjs");

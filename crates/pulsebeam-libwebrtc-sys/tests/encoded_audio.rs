@@ -1,4 +1,12 @@
-use std::{net::Ipv4Addr, thread, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 #[path = "support/non_trickle.rs"]
 mod non_trickle;
@@ -28,6 +36,38 @@ fn finish(peer: &PeerConnection, id: OperationId) -> Option<SessionDescription> 
 fn encoded_opus_receiver_gets_packets_without_decoded_sink() {
     for include_level in [false, true] {
         received_audio_extension_profile(include_level);
+    }
+}
+
+#[derive(Default)]
+struct ReceiverPayload {
+    mode: AtomicU8,
+    empty: AtomicUsize,
+    malformed: AtomicUsize,
+}
+
+impl pulsebeam_webrtc_sys::FrameTransformerProvider for ReceiverPayload {
+    fn transform(
+        &self,
+        mut frame: pulsebeam_webrtc_sys::TransformableMediaFrame,
+        completion: pulsebeam_webrtc_sys::FrameTransformCompletion,
+    ) {
+        let mode = self.mode.load(Ordering::Acquire);
+        match mode {
+            0 => frame.set_data(&[]),
+            1 => frame.set_data(&[0xff]),
+            _ => {}
+        }
+        completion.complete(frame).unwrap();
+        match mode {
+            0 => {
+                self.empty.fetch_add(1, Ordering::Release);
+            }
+            1 => {
+                self.malformed.fetch_add(1, Ordering::Release);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -101,6 +141,11 @@ fn received_audio_extension_profile(include_level: bool) {
     sent_observer.register_observer(8).unwrap();
     received_observer.register_observer(8).unwrap();
     let mut sink = receivers[0].attach_encoded_audio_sink().unwrap();
+    let payload = Arc::new(ReceiverPayload::default());
+    let transformer = pulsebeam_webrtc_sys::FrameTransformer::from_shared(payload.clone(), 1);
+    receivers[0]
+        .set_frame_transformer(Some(&transformer))
+        .unwrap();
     assert_eq!(
         receivers[0].attach_audio_sink().err().unwrap().kind,
         PeerErrorKind::InvalidState
@@ -113,6 +158,8 @@ fn received_audio_extension_profile(include_level: bool) {
     let mut received = None;
     let mut first_sent = false;
     let mut first_received = false;
+    let mut checked_empty = false;
+    let mut checked_malformed = false;
     for tick in 0..100_000 {
         if tick % 10 == 0 {
             source.push_frame(&frame).unwrap();
@@ -122,7 +169,19 @@ fn received_audio_extension_profile(include_level: bool) {
         }
         while alice.try_next_event().is_some() {}
         while bob.try_next_event().is_some() {}
-        if received.is_none() {
+        if !checked_empty && payload.empty.load(Ordering::Acquire) > 0 {
+            assert!(sink.try_next_frame().is_none());
+            assert_eq!(sink.dropped_frames(), 0);
+            checked_empty = true;
+            payload.mode.store(1, Ordering::Release);
+        }
+        if !checked_malformed && payload.malformed.load(Ordering::Acquire) > 0 {
+            assert!(sink.try_next_frame().is_none());
+            assert!(sink.dropped_frames() > 0);
+            checked_malformed = true;
+            payload.mode.store(2, Ordering::Release);
+        }
+        if checked_malformed && received.is_none() {
             received = sink.try_next_frame();
         }
         while let Some(event) = sent_observer.take_event() {
@@ -143,6 +202,15 @@ fn received_audio_extension_profile(include_level: bool) {
         clock.advance(Duration::from_millis(1)).unwrap();
         thread::yield_now();
     }
+    assert!(
+        checked_empty,
+        "empty actual receiver callback was not exercised"
+    );
+    assert!(
+        checked_malformed,
+        "malformed actual receiver callback was not exercised"
+    );
+    receivers[0].set_frame_transformer(None).unwrap();
     assert!(
         first_sent && first_received,
         "actual SDK first-media notifications missing"

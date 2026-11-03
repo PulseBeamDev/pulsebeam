@@ -30,7 +30,7 @@ struct Samples {
     forwarded_media_bytes: HashMap<ParticipantId, u64>,
     /// Last forwarding rank per publisher, aggregated across subscribers for diagnostics.
     /// Zero is paused; other ranks use [`pulsebeam_core::simulcast::LayerQuality`].
-    forwarded_quality: HashMap<ParticipantId, u8>,
+    forwarded_height: HashMap<ParticipantId, u32>,
     /// How many times each origin's forwarded layer changed since the last reset.
     ///
     /// Switching layer is not free: the receiver needs a keyframe and the picture stutters. A
@@ -177,40 +177,39 @@ pub fn forwarded_media_bytes_for(subscriber: ParticipantId) -> u64 {
     })
 }
 
-/// Record the layer currently forwarded to a subscriber from `origin`'s track. `None` means the
-/// slot is paused. Called from every allocation pass, not only ones that change anything, so the
-/// last value always reflects the current steady state.
-pub fn record_forwarded_quality_for(origin: ParticipantId, quality: Option<u8>) {
-    let rank = quality.unwrap_or(0);
+/// Record the selected encoding's measured height in pixels for `origin`'s track.
+/// `None` means the slot is paused. Called on every allocation pass so the last
+/// value reflects the current steady state.
+pub fn record_forwarded_height_for(origin: ParticipantId, height: Option<u32>) {
+    let height = height.unwrap_or(0);
     SAMPLES.with_borrow_mut(|s| {
         // Count transitions, not passes: this is called every pass, changed or not.
-        if let Some(previous) = s.forwarded_quality.get(&origin).copied()
-            && previous != rank
+        if let Some(previous) = s.forwarded_height.get(&origin).copied()
+            && previous != height
         {
-            tracing::debug!(%origin, previous, rank, "forwarded quality transition");
+            tracing::debug!(%origin, previous, height, "forwarded quality transition");
             *s.quality_changes.entry(origin).or_default() += 1;
 
-            let up = rank > previous;
+            let up = height > previous;
             if let Some(was_up) = s.last_quality_direction.insert(origin, up)
                 && was_up != up
             {
                 *s.quality_reversals.entry(origin).or_default() += 1;
             }
         }
-        s.forwarded_quality.insert(origin, rank);
+        s.forwarded_height.insert(origin, height);
     });
 }
 
-/// Last-seen forwarded quality rank for `origin` since [`reset`]. `None` if nothing was ever
-/// recorded for that origin (never subscribed, or reset before the first pass); `Some(0)` means
-/// paused.
-pub fn forwarded_quality(origin: &str) -> Option<u8> {
+/// Last-seen selected encoding height for `origin` since [`reset`]. `None` if nothing was ever
+/// recorded for that origin; `Some(0)` means paused or no measured height.
+pub fn forwarded_height(origin: &str) -> Option<u32> {
     let origin = origin.parse().ok()?;
-    forwarded_quality_for(origin)
+    forwarded_height_for(origin)
 }
 
-pub fn forwarded_quality_for(origin: ParticipantId) -> Option<u8> {
-    SAMPLES.with_borrow(|s| s.forwarded_quality.get(&origin).copied())
+pub fn forwarded_height_for(origin: ParticipantId) -> Option<u32> {
+    SAMPLES.with_borrow(|s| s.forwarded_height.get(&origin).copied())
 }
 
 /// How many times `origin`'s forwarded layer changed since [`reset`].

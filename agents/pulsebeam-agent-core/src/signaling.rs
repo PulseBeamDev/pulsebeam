@@ -10,7 +10,7 @@ pub enum SignalingError {
     MissingPayload,
     #[error("signaling state contains an invalid {0}")]
     Invalid(&'static str),
-    #[error("media topology has no negotiated resource for {0:?}")]
+    #[error("media has no negotiated binding for {0:?}")]
     MissingCoordinate(MediaSlot),
     #[error("intent exceeds bounded signaling size")]
     Encode,

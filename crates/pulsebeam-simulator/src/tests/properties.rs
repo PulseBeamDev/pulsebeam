@@ -111,6 +111,7 @@ const LADDER_Q_BPS: u64 = 150_000;
 const LADDER_H_BPS: u64 = 400_000;
 const LADDER_F_BPS: u64 = 1_250_000;
 const SCREENSHARE_BPS: u64 = 2_500_000;
+const SCREENSHARE_HEIGHT: u32 = 1080;
 
 /// Capacities placed on the ladder's decision boundaries.
 ///
@@ -380,24 +381,39 @@ impl Demand {
         publisher + if self.contended { LADDER_Q_BPS } else { 0 }
     }
 
+    fn heights(screenshare: bool) -> &'static [u32] {
+        if screenshare {
+            // The captured screen has one 1056px encoding, not a camera ladder.
+            &[SCREENSHARE_HEIGHT]
+        } else {
+            &[180, 360, 720]
+        }
+    }
+
     fn any() -> impl Strategy<Value = Demand> {
-        (any::<bool>(), 0usize..3, any::<bool>()).prop_map(
-            |(screenshare, height_idx, contended)| Demand {
-                temporal: false,
-                screenshare,
-                target_height: [180, 360, 720][height_idx],
-                contended,
-            },
-        )
+        (any::<bool>(), any::<bool>()).prop_flat_map(|(screenshare, contended)| {
+            proptest::sample::select(Self::heights(screenshare)).prop_map(move |target_height| {
+                Demand {
+                    temporal: false,
+                    screenshare,
+                    target_height,
+                    contended,
+                }
+            })
+        })
     }
 
     /// A second stream competing for the same viewer's link.
     fn contended() -> impl Strategy<Value = Demand> {
-        (any::<bool>(), 0usize..3).prop_map(|(screenshare, height_idx)| Demand {
-            temporal: false,
-            screenshare,
-            target_height: [180, 360, 720][height_idx],
-            contended: true,
+        any::<bool>().prop_flat_map(|screenshare| {
+            proptest::sample::select(Self::heights(screenshare)).prop_map(move |target_height| {
+                Demand {
+                    temporal: false,
+                    screenshare,
+                    target_height,
+                    contended: true,
+                }
+            })
         })
     }
 
@@ -597,9 +613,13 @@ impl Scenario {
             match (self.demand.target_height, self.demand.contended) {
                 (180, false) => &[("publisher", 180)],
                 (360, false) => &[("publisher", 360)],
+                (SCREENSHARE_HEIGHT, false) => &[("publisher", SCREENSHARE_HEIGHT)],
                 (_, false) => &[("publisher", 720)],
                 (180, true) => &[("publisher", 180), ("cotenant", 180)],
                 (360, true) => &[("publisher", 360), ("cotenant", 180)],
+                (SCREENSHARE_HEIGHT, true) => {
+                    &[("publisher", SCREENSHARE_HEIGHT), ("cotenant", 180)]
+                }
                 (_, true) => &[("publisher", 720), ("cotenant", 180)],
             };
 
@@ -663,7 +683,11 @@ impl Scenario {
         } else {
             Participant::publisher("publisher", &["q", "h", "f"])
         };
-        const TARGETS: &[(&str, u32)] = &[("publisher", 720)];
+        let targets: &'static [(&str, u32)] = if self.demand.screenshare {
+            &[("publisher", SCREENSHARE_HEIGHT)]
+        } else {
+            &[("publisher", 720)]
+        };
         let plan = vec![
             Step::WaitForPublication {
                 description: "Establish connections and discover the track",
@@ -673,12 +697,12 @@ impl Scenario {
             Step::SubscribeTo {
                 description: "First viewer subscribes",
                 participant: "viewer",
-                targets: TARGETS,
+                targets,
             },
             Step::SubscribeTo {
                 description: "Second viewer subscribes",
                 participant: "viewer2",
-                targets: TARGETS,
+                targets,
             },
             Step::WaitForVideo {
                 description: "First viewer decodes its selected origin",
@@ -770,7 +794,7 @@ fn the_generated_space_is_small_enough_to_sample_and_large_enough_to_differ() {
     fn size(budget: Budget, faults: &[Fault]) -> usize {
         let mut total = 0usize;
         for screenshare in [false, true] {
-            for target_height in [180, 360, 720] {
+            for &target_height in Demand::heights(screenshare) {
                 for contended in [false, true] {
                     let demand = Demand {
                         temporal: false,
@@ -1050,7 +1074,7 @@ mod slow {
             demand: Demand {
                 temporal: false,
                 screenshare: true,
-                target_height: 360,
+                target_height: SCREENSHARE_HEIGHT,
                 contended: true,
             },
             path: Path::Cellular,
@@ -1188,15 +1212,15 @@ mod slow {
                 }
                 exercised.set(exercised.get() + 1);
 
-                let quality = report.forwarded_quality.get("cotenant").copied();
+                let height = report.forwarded_height.get("cotenant").copied();
                 prop_assert!(
-                    quality.is_some_and(|q| q > 0),
-                    "the co-tenant was left at {quality:?} (0 = paused) on a {} bps link that covers \
+                    height.is_some_and(|height| height > 0),
+                    "the co-tenant was left at {height:?} pixels (0 = paused) on a {} bps link that covers \
                  the full {} bps of demand, so nothing was priced out. The other stream ended at \
                  {:?}. ({scenario:?}, estimate {} bps, {:.2}% congestion loss)",
                     scenario.capacity_bps,
                     report.demand_last_bps,
-                    report.forwarded_quality.get("publisher"),
+                    report.forwarded_height.get("publisher"),
                     report.estimate_last_bps,
                     report.congestion_loss_percent(),
                 );
@@ -1235,14 +1259,20 @@ mod slow {
             |scenario| {
                 let report = scenario.run("no_inversion");
                 prop_assert!(
-                    report.samples > 0 && report.received_bytes.is_some_and(|bytes| bytes > 0),
+                    report.samples > 0
+                        && ["publisher", "cotenant"].into_iter().all(|publisher| {
+                            report
+                                .decoded_video
+                                .get(publisher)
+                                .is_some_and(|frames| *frames > 0)
+                        }),
                     "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
                 );
                 // Both must be running for their rungs to be comparable; a paused co-tenant is the
                 // separate claim asserted above.
                 let (Some(publisher), Some(cotenant)) = (
-                    report.forwarded_quality.get("publisher").copied(),
-                    report.forwarded_quality.get("cotenant").copied(),
+                    report.forwarded_height.get("publisher").copied(),
+                    report.forwarded_height.get("cotenant").copied(),
                 ) else {
                     return Err(TestCaseError::fail(format!(
                         "missing publisher or cotenant allocation ({scenario:?}, {report:?})"
@@ -1252,8 +1282,8 @@ mod slow {
 
                 prop_assert!(
                     publisher >= cotenant,
-                    "the publisher was asked for {}p and ended at layer {publisher}, below the \
-                 co-tenant asked for 180p and served at layer {cotenant}, on a {} bps link \
+                    "the publisher was asked for {}p and ended at {publisher}p, below the \
+                 co-tenant asked for 180p and served at {cotenant}p, on a {} bps link \
                  ({scenario:?})",
                     scenario.demand.target_height,
                     scenario.capacity_bps,

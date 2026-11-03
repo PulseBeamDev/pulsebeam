@@ -1,8 +1,9 @@
 syntax = "proto3";
 package topic;
 
-// All application modes share this envelope. Identity is allocated by the SFU
-// and discovered through Catalog; mode and topic belong to channel metadata.
+// All application modes share this envelope. The SFU allocates source identity
+// and announces it through StateBatch. The data track's label identifies the
+// topic; its delivery field selects the mode.
 message TopicMessage {
   string data_track_id = 1;
   uint64 sequence = 2;

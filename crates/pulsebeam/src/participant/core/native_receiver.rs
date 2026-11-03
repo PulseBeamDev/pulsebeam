@@ -36,6 +36,7 @@ pub(super) struct Receiver {
     handle: Option<TrackHandle>,
     enabled: bool,
     opened: bool,
+    reset_pending: bool,
     pub(super) retiring: bool,
     preparation: Option<Preparation>,
     deadline: Option<Instant>,
@@ -75,6 +76,12 @@ struct Source {
 }
 
 impl NativeReceivers {
+    pub(super) fn reset_pending(&self, reference: u64) -> bool {
+        self.receivers
+            .get(&reference)
+            .is_some_and(|receiver| receiver.reset_pending)
+    }
+
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.deadlines.first().map(|(deadline, _)| *deadline)
     }
@@ -462,11 +469,18 @@ impl Participant {
             ReceiveTransport::Sctp { channel, lane } => self
                 .transport
                 .open_native_data(*channel, *lane)
-                .map(|()| false),
-            ReceiveTransport::Rtp(rtp) => rtp.install(&mut self.transport, false).map(|()| true),
+                .map(|state| {
+                    (
+                        false,
+                        state == super::super::transport::NativeDataOpen::ResetPending,
+                    )
+                }),
+            ReceiveTransport::Rtp(rtp) => rtp
+                .install(&mut self.transport, false)
+                .map(|()| (true, false)),
         };
-        let opened = match opened {
-            Ok(opened) => opened,
+        let (opened, reset_pending) = match opened {
+            Ok(state) => state,
             Err(code) => {
                 let _ = self.signaling.reserve_execution(work.reference, 0);
                 self.complete_native_preparation(
@@ -534,6 +548,7 @@ impl Participant {
                 handle: None,
                 enabled: false,
                 opened,
+                reset_pending,
                 retiring: false,
                 preparation: Some(work),
                 deadline,
@@ -619,6 +634,48 @@ impl Participant {
         }
     }
 
+    pub(super) fn native_receiver_reset(
+        &mut self,
+        channel: crate::media::ChannelId,
+        success: bool,
+        _events: &mut impl ParticipantSink,
+    ) {
+        let Some(reference) = self.native_receivers.channels.get(&channel).copied() else {
+            return;
+        };
+        if !self.native_receivers.reset_pending(reference) {
+            return;
+        }
+        if !success {
+            self.fail_native_receiver(reference, wire::FailureCode::Incompatible);
+            return;
+        }
+        let Some(receiver) = self.native_receivers.receivers.get_mut(&reference) else {
+            return;
+        };
+        let Some((_, lane)) = receiver.transport.data() else {
+            return;
+        };
+        let Some(work) = receiver.preparation.take() else {
+            return;
+        };
+        let Some(work) = self.current_native_preparation(work) else {
+            self.fail_native_receiver(reference, wire::FailureCode::ResourceGone);
+            return;
+        };
+        let Some(receiver) = self.native_receivers.receivers.get_mut(&reference) else {
+            return;
+        };
+        receiver.preparation = Some(work);
+        match self.transport.open_native_data(channel, lane) {
+            Ok(state) => {
+                receiver.reset_pending =
+                    state == super::super::transport::NativeDataOpen::ResetPending;
+            }
+            Err(code) => self.fail_native_receiver(reference, code),
+        }
+    }
+
     pub(super) fn native_receiver_opened(
         &mut self,
         reference: u64,
@@ -628,6 +685,9 @@ impl Participant {
         let Some(receiver) = self.native_receivers.receivers.get_mut(&reference) else {
             return;
         };
+        if receiver.reset_pending {
+            return;
+        }
         let Some((channel, lane)) = receiver.transport.data() else {
             return;
         };

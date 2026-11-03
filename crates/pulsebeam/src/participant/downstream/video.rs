@@ -12,7 +12,7 @@ use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::frame_selector::DecodeTargetSelection;
 use crate::rtp::switcher::{LayerStates, Switcher};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexSet;
 use slotmap::{SecondaryMap, SlotMap};
 use std::cmp::Ordering;
 use std::ops::{Deref, DerefMut};
@@ -461,6 +461,7 @@ impl VideoAllocator {
                     priority: s.priority,
                     track,
                     current_quality,
+                    current_stream: s.switcher.active_stream(),
                     current_decode_target: s.switcher.decode_target(),
                     forwarding: !s.paused,
                 })
@@ -534,14 +535,14 @@ impl VideoAllocator {
                         decision = ?decisions.get(view.key),
                         "same-pass QoS inputs and decision");
                 }
-                let quality = match decisions.get(view.key) {
+                let height = match decisions.get(view.key) {
                     Some(
                         AllocationDecision::Forward(layer, _)
                         | AllocationDecision::ForwardTarget(layer, _, _),
-                    ) => Some(layer.quality as u8),
+                    ) => Some(engine.snap(layer).height),
                     _ => None,
                 };
-                crate::sim_metrics::record_forwarded_quality_for(view.track.meta().origin, quality);
+                crate::sim_metrics::record_forwarded_height_for(view.track.meta().origin, height);
             }
         }
 
@@ -844,8 +845,8 @@ fn track_states(track: &Track) -> LayerStates {
         .zip(track.layers())
         .map(|((rid, stats), layer)| {
             debug_assert_eq!(
-                *rid, layer.rid,
-                "a video layer snapshot must retain its RID"
+                *rid, layer.encoding,
+                "a video layer snapshot must retain its encoding"
             );
             (layer.stream_id(), *stats)
         })
@@ -1182,7 +1183,7 @@ impl Slot {
                 .desired
                 .as_ref()
                 .filter(|layer| layer.meta.id == track_id)
-            && let Some(encoding) = cache.encoding(desired.rid)
+            && let Some(encoding) = cache.encoding(desired.encoding)
             && let Some(replay) = encoding.replay()
             && replay
                 .iter()
@@ -1465,6 +1466,7 @@ pub struct SlotView<'a> {
     pub min_fps: u32,
     pub track: &'a Track,
     pub current_quality: LayerQuality,
+    pub current_stream: Option<StreamId>,
     pub current_decode_target: DecodeTargetSelection,
     /// Whether the slot is actually forwarding. A paused slot still reports a
     /// `current_quality` - the layer it is parked on for a quick resume - so this is what
@@ -1529,10 +1531,8 @@ impl AllocationChoice<'_> {
 
     fn retained_by(&self, slot: &SlotView<'_>) -> bool {
         slot.forwarding
-            && (self.layer.quality < slot.current_quality
-                || (self.layer.quality == slot.current_quality
-                    && Self::target_rank(self.target)
-                        <= Self::target_rank(slot.current_decode_target)))
+            && slot.current_stream == Some(self.layer.stream_id())
+            && Self::target_rank(self.target) <= Self::target_rank(slot.current_decode_target)
     }
 }
 
@@ -2276,6 +2276,9 @@ mod assignment_tests {
             min_fps: 0,
             priority: 0,
             track: &track,
+            current_stream: track
+                .by_quality(LayerQuality::Low)
+                .map(TrackLayer::stream_id),
             current_quality: LayerQuality::Low,
             current_decode_target: DecodeTargetSelection::Full,
             forwarding: true,
@@ -2292,6 +2295,25 @@ mod assignment_tests {
             1,
             "a non-scalable encoding is a single rung"
         );
+        let mut same_quality = scalable.clone();
+        same_quality.quality = plain.quality;
+        let mut choice = AllocationChoice {
+            layer: &same_quality,
+            target: DecodeTargetSelection::Full,
+            height: 360,
+            fps: 30,
+            cost: 1.0,
+        };
+        assert!(!choice.retained_by(&view));
+        let mut active = SlotView {
+            current_stream: Some(scalable.stream_id()),
+            ..view
+        };
+        assert!(choice.retained_by(&active));
+        active.current_decode_target = DecodeTargetSelection::Target(0);
+        assert!(!choice.retained_by(&active));
+        choice.target = DecodeTargetSelection::Target(0);
+        assert!(choice.retained_by(&active));
     }
 
     #[test]
@@ -2319,6 +2341,9 @@ mod assignment_tests {
             min_fps: 0,
             priority: 10,
             track: &track,
+            current_stream: track
+                .by_quality(LayerQuality::High)
+                .map(TrackLayer::stream_id),
             current_quality: LayerQuality::High,
             current_decode_target: DecodeTargetSelection::Full,
             forwarding: true,
@@ -2369,6 +2394,9 @@ mod assignment_tests {
                 min_fps: 0,
                 priority: 200,
                 track: &track,
+                current_stream: track
+                    .by_quality(LayerQuality::High)
+                    .map(TrackLayer::stream_id),
                 current_quality: LayerQuality::High,
                 current_decode_target: DecodeTargetSelection::Full,
                 forwarding: true,
@@ -2382,6 +2410,9 @@ mod assignment_tests {
                 min_fps: 0,
                 priority: 10,
                 track: &track,
+                current_stream: track
+                    .by_quality(LayerQuality::High)
+                    .map(TrackLayer::stream_id),
                 current_quality: LayerQuality::High,
                 current_decode_target: DecodeTargetSelection::Full,
                 forwarding: false,
@@ -2465,6 +2496,9 @@ mod assignment_tests {
                 min_fps: 0,
                 priority: 200,
                 track: &focus,
+                current_stream: focus
+                    .by_quality(LayerQuality::High)
+                    .map(TrackLayer::stream_id),
                 current_quality: LayerQuality::High,
                 current_decode_target: DecodeTargetSelection::Full,
                 forwarding: true,
@@ -2478,6 +2512,9 @@ mod assignment_tests {
                 min_fps: 0,
                 priority: 10,
                 track: &background,
+                current_stream: background
+                    .by_quality(LayerQuality::High)
+                    .map(TrackLayer::stream_id),
                 current_quality: LayerQuality::High,
                 current_decode_target: DecodeTargetSelection::Full,
                 forwarding: false,
@@ -2537,6 +2574,9 @@ mod assignment_tests {
             min_fps: 0,
             priority: 0,
             track: &track,
+            current_stream: track
+                .by_quality(LayerQuality::High)
+                .map(TrackLayer::stream_id),
             current_quality: LayerQuality::High,
             current_decode_target: DecodeTargetSelection::Full,
             forwarding: true,
@@ -2581,6 +2621,9 @@ mod assignment_tests {
             min_fps: 0,
             priority: 0,
             track: &track,
+            current_stream: track
+                .by_quality(LayerQuality::Low)
+                .map(TrackLayer::stream_id),
             current_quality: LayerQuality::Low,
             current_decode_target: DecodeTargetSelection::Full,
             forwarding: false,
@@ -3459,7 +3502,7 @@ mod slot_switch_tests {
     use crate::rtp::conformance::assert_decodable;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
 
-    use crate::track::{StreamWrite, StreamWriter};
+    use crate::track::{SourceEncoding, StreamWrite, StreamWriter};
 
     use crate::media::SimulcastLayer;
 
@@ -3509,13 +3552,12 @@ mod slot_switch_tests {
             }
         }
 
-        /// Mirrors `route_video`: stamp the encoding's rid (as ingress does),
-        /// push into the track cache, then hand the packet to the slot.
+        /// Mirrors `route_video` with the bound encoding and actual wire RID.
         fn ingest(&mut self, layer: &TrackLayer, pkt: &RtpPacket) -> bool {
             let track_id = layer.meta.id;
             let mut pkt = pkt.clone();
             pkt.ext_vals.rid = layer.rid;
-            self.cache.push(pkt.clone());
+            self.cache.push_encoding(layer.encoding, pkt.clone());
             let promoted = self.slot.on_rtp(
                 track_id,
                 pkt.arrival_ts,
@@ -3648,93 +3690,101 @@ mod slot_switch_tests {
 
     #[test]
     fn stable_receiver_retries_until_a_fresh_usable_keyframe_arrives() {
-        let t0 = Instant::now();
-        let mut fx = Fixture::new();
-        let (high, low) = (fx.high.clone(), fx.low.clone());
-        let mut hi = H264StreamBuilder::new(1, 300, 90_000, t0)
-            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
-        let mut lo = H264StreamBuilder::new(2, 40_000, 600_000, t0)
-            .with_parameter_sets(ParameterSetStyle::SeparatePacket);
-        fx.slot.switch_to(&high, false);
-        fx.ingest_all(&high, &hi.keyframe(3));
-        assert!(matches!(fx.slot.state(), SlotState::Stable));
+        for ssrc_bound in [false, true] {
+            let t0 = Instant::now();
+            let mut fx = Fixture::new();
+            if ssrc_bound {
+                fx.high.rid = None;
+                fx.high.encoding = SourceEncoding::Ssrc(1_u32.into());
+                fx.low.rid = None;
+                fx.low.encoding = SourceEncoding::Ssrc(2_u32.into());
+            }
+            let (high, low) = (fx.high.clone(), fx.low.clone());
+            let mut hi = H264StreamBuilder::new(1, 300, 90_000, t0)
+                .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+            let mut lo = H264StreamBuilder::new(2, 40_000, 600_000, t0)
+                .with_parameter_sets(ParameterSetStyle::SeparatePacket);
+            fx.slot.switch_to(&high, false);
+            fx.ingest_all(&high, &hi.keyframe(3));
+            assert!(matches!(fx.slot.state(), SlotState::Stable));
 
-        let requested_at = t0 + Duration::from_millis(1);
-        fx.slot.request_keyframe(requested_at);
-        let mut keys: SlotMap<TrackHandle, ()> = SlotMap::with_key();
-        let fanout = keys.insert(());
-        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
-        let retry = |slot: &mut Slot, now, sink: &mut _| {
-            slot.pli_retry(now, sink, |id| (id == high.meta.id).then_some(fanout));
-        };
-        retry(&mut fx.slot, requested_at, &mut sink);
-        assert!(sink.reverse_requests.is_empty(), "no immediate duplicate");
-        let first_retry = requested_at + KEYFRAME_FIRST_RETRY;
-        retry(&mut fx.slot, first_retry, &mut sink);
-        assert_eq!(sink.reverse_requests, [fanout]);
+            let requested_at = t0 + Duration::from_millis(1);
+            fx.slot.request_keyframe(requested_at);
+            let mut keys: SlotMap<TrackHandle, ()> = SlotMap::with_key();
+            let fanout = keys.insert(());
+            let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+            let retry = |slot: &mut Slot, now, sink: &mut _| {
+                slot.pli_retry(now, sink, |id| (id == high.meta.id).then_some(fanout));
+            };
+            retry(&mut fx.slot, requested_at, &mut sink);
+            assert!(sink.reverse_requests.is_empty(), "no immediate duplicate");
+            let first_retry = requested_at + KEYFRAME_FIRST_RETRY;
+            retry(&mut fx.slot, first_retry, &mut sink);
+            assert_eq!(sink.reverse_requests, [fanout]);
 
-        // Drop the first response entirely. A fresh keyframe on another RID
-        // and the old usable segment on the selected RID must not end recovery.
-        let _lost = hi.keyframe(3);
-        fx.ingest_all(&low, &lo.keyframe(3));
-        assert_eq!(fx.slot.recovery_requested_at, Some(requested_at));
-        fx.slot.request_keyframe(first_retry);
-        let second_retry = first_retry + KEYFRAME_FIRST_RETRY.saturating_mul(2);
-        let repeated_at = second_retry - Duration::from_millis(1);
-        fx.slot.request_keyframe(repeated_at);
-        retry(&mut fx.slot, second_retry, &mut sink);
-        assert_eq!(
-            sink.reverse_requests,
-            [fanout],
-            "a repeated receiver PLI defers the server retry without restarting recovery"
-        );
-        assert_eq!(fx.slot.recovery_requested_at, Some(requested_at));
-        let second_retry = repeated_at + KEYFRAME_FIRST_RETRY.saturating_mul(2);
-        retry(&mut fx.slot, second_retry, &mut sink);
-        assert_eq!(sink.reverse_requests, [fanout, fanout]);
-
-        let incomplete = hi.keyframe(3);
-        fx.ingest_all(&high, &incomplete[..incomplete.len().saturating_sub(1)]);
-        assert_eq!(fx.slot.recovery_requested_at, Some(requested_at));
-        let third_retry = second_retry + KEYFRAME_FIRST_RETRY.saturating_mul(4);
-        retry(&mut fx.slot, third_retry, &mut sink);
-        assert_eq!(sink.reverse_requests, [fanout, fanout, fanout]);
-        for packet in sink.reverse_packets {
-            assert!(
-                matches!(packet.decode(), Some(crate::participant::reverse::ReverseInput::Keyframe { rid, kind: crate::media::KeyframeRequestKind::Pli }) if rid == high.rid)
+            // Drop the first response entirely. Another encoding's fresh keyframe
+            // and the selected encoding's old segment must not end recovery.
+            let _lost = hi.keyframe(3);
+            fx.ingest_all(&low, &lo.keyframe(3));
+            assert_eq!(fx.slot.recovery_requested_at, Some(requested_at));
+            fx.slot.request_keyframe(first_retry);
+            let second_retry = first_retry + KEYFRAME_FIRST_RETRY.saturating_mul(2);
+            let repeated_at = second_retry - Duration::from_millis(1);
+            fx.slot.request_keyframe(repeated_at);
+            retry(&mut fx.slot, second_retry, &mut sink);
+            assert_eq!(
+                sink.reverse_requests,
+                [fanout],
+                "a repeated receiver PLI defers the server retry without restarting recovery"
             );
+            assert_eq!(fx.slot.recovery_requested_at, Some(requested_at));
+            let second_retry = repeated_at + KEYFRAME_FIRST_RETRY.saturating_mul(2);
+            retry(&mut fx.slot, second_retry, &mut sink);
+            assert_eq!(sink.reverse_requests, [fanout, fanout]);
+
+            let incomplete = hi.keyframe(3);
+            fx.ingest_all(&high, &incomplete[..incomplete.len().saturating_sub(1)]);
+            assert_eq!(fx.slot.recovery_requested_at, Some(requested_at));
+            let third_retry = second_retry + KEYFRAME_FIRST_RETRY.saturating_mul(4);
+            retry(&mut fx.slot, third_retry, &mut sink);
+            assert_eq!(sink.reverse_requests, [fanout, fanout, fanout]);
+            for packet in sink.reverse_packets {
+                assert!(
+                    matches!(packet.decode(), Some(crate::participant::reverse::ReverseInput::Keyframe { encoding, kind: crate::media::KeyframeRequestKind::Pli }) if encoding == high.encoding)
+                );
+            }
+
+            let before = fx.emitted.len();
+            fx.ingest_all(&high, &hi.keyframe(3));
+            fx.ingest_all(&high, &hi.delta_frame(3));
+            assert_eq!(fx.slot.recovery_requested_at, None);
+            assert_eq!(fx.slot.test_active(), Some(high.stream_id()));
+            assert_decodable(
+                &fx.emitted[before..],
+                "stable receiver recovery after lost and unusable responses",
+            );
+            let mut done = crate::participant::event::test_utils::MockParticipantSink::new();
+            retry(
+                &mut fx.slot,
+                third_retry + KEYFRAME_KEEPALIVE_INTERVAL,
+                &mut done,
+            );
+            assert!(done.reverse_requests.is_empty());
+
+            fx.slot.request_keyframe(third_retry);
+            fx.slot.switch_to(&low, false);
+            assert_eq!(
+                fx.slot.recovery_requested_at, None,
+                "retarget retires old recovery"
+            );
+            fx.slot.stop();
+            retry(
+                &mut fx.slot,
+                third_retry + KEYFRAME_KEEPALIVE_INTERVAL,
+                &mut done,
+            );
+            assert!(done.reverse_requests.is_empty(), "stopping retires retries");
         }
-
-        let before = fx.emitted.len();
-        fx.ingest_all(&high, &hi.keyframe(3));
-        fx.ingest_all(&high, &hi.delta_frame(3));
-        assert_eq!(fx.slot.recovery_requested_at, None);
-        assert_eq!(fx.slot.test_active(), Some(high.stream_id()));
-        assert_decodable(
-            &fx.emitted[before..],
-            "stable receiver recovery after lost and unusable responses",
-        );
-        let mut done = crate::participant::event::test_utils::MockParticipantSink::new();
-        retry(
-            &mut fx.slot,
-            third_retry + KEYFRAME_KEEPALIVE_INTERVAL,
-            &mut done,
-        );
-        assert!(done.reverse_requests.is_empty());
-
-        fx.slot.request_keyframe(third_retry);
-        fx.slot.switch_to(&low, false);
-        assert_eq!(
-            fx.slot.recovery_requested_at, None,
-            "retarget retires old recovery"
-        );
-        fx.slot.stop();
-        retry(
-            &mut fx.slot,
-            third_retry + KEYFRAME_KEEPALIVE_INTERVAL,
-            &mut done,
-        );
-        assert!(done.reverse_requests.is_empty(), "stopping retires retries");
     }
 
     #[test]
