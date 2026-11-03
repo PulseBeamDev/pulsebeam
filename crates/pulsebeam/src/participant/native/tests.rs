@@ -29,7 +29,7 @@ fn publication(label: &str, enabled: bool) -> wire::ResourceSpec {
     }
 }
 
-fn present(reference: u64, revision: u64, spec: wire::ResourceSpec) -> wire::StateRecord {
+fn present(reference: u64, revision: u64, spec: wire::ResourceSpec) -> wire::ClientStateRecord {
     desired(
         reference,
         revision,
@@ -37,7 +37,7 @@ fn present(reference: u64, revision: u64, spec: wire::ResourceSpec) -> wire::Sta
     )
 }
 
-fn absent(reference: u64, revision: u64) -> wire::StateRecord {
+fn absent(reference: u64, revision: u64) -> wire::ClientStateRecord {
     desired(
         reference,
         revision,
@@ -45,28 +45,25 @@ fn absent(reference: u64, revision: u64) -> wire::StateRecord {
     )
 }
 
-fn desired(reference: u64, revision: u64, value: wire::desired_state::Value) -> wire::StateRecord {
-    wire::StateRecord {
-        key: Some(Key::Owned(reference).wire()),
-        state: Some(wire::state_record::State::Desired(wire::DesiredState {
+fn desired(
+    reference: u64,
+    revision: u64,
+    value: wire::desired_state::Value,
+) -> wire::ClientStateRecord {
+    wire::ClientStateRecord {
+        owned: reference,
+        desired: Some(wire::DesiredState {
             revision,
             value: Some(value),
-        })),
+        }),
     }
 }
 
 fn input(
     session: &mut NativeSession,
-    records: Vec<wire::StateRecord>,
+    records: Vec<wire::ClientStateRecord>,
 ) -> Result<Vec<u64>, InputError> {
-    let bytes = codec::encode(
-        &wire::StateBatch {
-            records,
-            initial_complete: false,
-        },
-        validation::Direction::Client,
-    )
-    .unwrap();
+    let bytes = codec::encode_client(&wire::ClientStateBatch { records }).unwrap();
     session.apply_input(&bytes)
 }
 
@@ -110,14 +107,14 @@ fn admit(session: &mut NativeSession, reference: u64, spec: wire::ResourceSpec) 
     assert!(session.complete(work, Ok(value), 100).unwrap());
 }
 
-fn output(session: &mut NativeSession) -> Option<wire::StateBatch> {
+fn output(session: &mut NativeSession) -> Option<wire::ServerStateBatch> {
     session.poll().unwrap().map(|output| {
         assert!(output.bytes.len() <= codec::MAX_FRAME_SIZE);
-        codec::decode(&output.bytes, validation::Direction::Server).unwrap()
+        codec::decode_server(&output.bytes).unwrap()
     })
 }
 
-fn drain(session: &mut NativeSession) -> Vec<wire::StateBatch> {
+fn drain(session: &mut NativeSession) -> Vec<wire::ServerStateBatch> {
     let mut batches = Vec::new();
     for _ in 0..2048 {
         if !session.needs_poll() {
@@ -176,7 +173,7 @@ fn proposals_use_one_connection_counter_without_legacy_fallback() {
 }
 
 #[test]
-fn superseded_preparation_cannot_publish_and_latest_target_is_serialized() {
+fn evaluated_proposal_allows_the_next_target_without_waiting_for_output() {
     let mut session = session();
     input(
         &mut session,
@@ -185,13 +182,12 @@ fn superseded_preparation_cannot_publish_and_latest_target_is_serialized() {
     .unwrap();
     let old = session.take_preparation().unwrap().unwrap();
     let old_value = live(&old);
+    assert!(session.complete(old, Ok(old_value), 100).unwrap());
     input(
         &mut session,
         vec![present(1, 2, publication("topic", false))],
     )
     .unwrap();
-    assert!(session.take_preparation().unwrap().is_none());
-    assert!(!session.complete(old, Ok(old_value), 100).unwrap());
     let latest = session.take_preparation().unwrap().unwrap();
     assert_eq!(latest.revision, 2);
     let latest_value = live(&latest);
@@ -216,26 +212,49 @@ fn superseded_preparation_cannot_publish_and_latest_target_is_serialized() {
 }
 
 #[test]
-fn invalid_pending_declaration_terminates_creation_and_discards_old_work() {
+fn overlapping_proposals_cannot_replace_queued_or_active_targets() {
+    for start_preparation in [false, true] {
+        for next in [publication("topic", false), publication("relabel", true)] {
+            let mut session = session();
+            input(
+                &mut session,
+                vec![present(1, 1, publication("topic", true))],
+            )
+            .unwrap();
+            if start_preparation {
+                session.take_preparation().unwrap().unwrap();
+            }
+            assert!(matches!(
+                input(&mut session, vec![present(1, 2, next)]),
+                Err(InputError::Revision)
+            ));
+            let owned = session.rows[&Key::Owned(1)].owned.as_ref().unwrap();
+            assert_eq!(owned.target.revision, 1);
+            assert_eq!(owned.declaration, publication("topic", true));
+        }
+    }
+}
+
+#[test]
+fn retirement_cuts_off_unevaluated_work_without_waiting_for_preparation() {
     let mut session = session();
+    drain(&mut session);
     input(
         &mut session,
         vec![present(1, 1, publication("topic", true))],
     )
     .unwrap();
-    let old = session.take_preparation().unwrap().unwrap();
-    let old_value = live(&old);
-    input(
-        &mut session,
-        vec![present(1, 2, publication("relabel", true))],
-    )
-    .unwrap();
+    let work = session.take_preparation().unwrap().unwrap();
+    let value = live(&work);
+    assert_eq!(input(&mut session, vec![absent(1, 2)]).unwrap(), vec![1]);
+    assert!(output(&mut session).is_none());
+    session.cutoff_complete(1).unwrap();
+    assert!(!session.complete(work, Ok(value), 100).unwrap());
     assert_eq!(owned(&session, 1).evaluated_revision, 2);
-    assert_eq!(
-        owned(&session, 1).rejection.as_ref().unwrap().code,
-        wire::FailureCode::InvalidConfiguration as i32
-    );
-    assert!(!session.complete(old, Ok(old_value), 100).unwrap());
+    assert!(matches!(
+        owned(&session, 1).value,
+        Some(wire::confirmed_state::Value::Absent(_))
+    ));
     assert!(session.take_preparation().unwrap().is_none());
     drain(&mut session);
     assert!(!session.rows.contains_key(&Key::Owned(1)));
@@ -447,7 +466,7 @@ fn selected_output_is_frozen_and_commit_does_not_clear_newer_state() {
     session.commit_sent();
     let next = output(&mut session).unwrap();
     assert!(!next.initial_complete);
-    let Some(wire::state_record::State::Confirmed(value)) = &next.records[0].state else {
+    let Some(value) = &next.records[0].confirmed else {
         panic!("confirmed")
     };
     let Some(wire::confirmed_state::Value::Session(value)) = &value.value else {

@@ -158,7 +158,7 @@ impl WirePeer {
         while !result.initial_complete {
             if let Some(batch) = result.batch()? {
                 for record in batch.records {
-                    if let Some(wire::state_record::State::Confirmed(value)) = record.state
+                    if let Some(value) = record.confirmed
                         && let Some(wire::confirmed_state::Value::Session(session)) = value.value
                     {
                         anyhow::ensure!(session.closed.is_none(), "terminal initial Session");
@@ -282,14 +282,14 @@ impl WirePeer {
         }
     }
 
-    fn batch(&mut self) -> anyhow::Result<Option<wire::StateBatch>> {
+    fn batch(&mut self) -> anyhow::Result<Option<wire::ServerStateBatch>> {
         while let Some(event) = self.control.try_next_event() {
             if let DataChannelEvent::Message(message) = event {
                 anyhow::ensure!(
                     message.kind == DataChannelMessageKind::Binary,
                     "non-binary native control"
                 );
-                let batch = codec::decode(&message.bytes, validation::Direction::Server)
+                let batch = codec::decode_server(&message.bytes)
                     .map_err(|error| anyhow::anyhow!("StateBatch: {error:?}"))?;
                 self.initial_complete |= batch.initial_complete;
                 return Ok(Some(batch));
@@ -303,24 +303,18 @@ impl WirePeer {
     }
 
     fn desire(&self, reference: u64, revision: u64, spec: Option<wire::ResourceSpec>) {
-        let bytes = codec::encode(
-            &wire::StateBatch {
-                records: vec![wire::StateRecord {
-                    key: Some(wire::ResourceKey {
-                        key: Some(wire::resource_key::Key::Owned(reference)),
+        let bytes = codec::encode_client(&wire::ClientStateBatch {
+            records: vec![wire::ClientStateRecord {
+                owned: reference,
+                desired: Some(wire::DesiredState {
+                    revision,
+                    value: Some(match spec {
+                        Some(spec) => wire::desired_state::Value::Present(Box::new(spec)),
+                        None => wire::desired_state::Value::Absent(true),
                     }),
-                    state: Some(wire::state_record::State::Desired(wire::DesiredState {
-                        revision,
-                        value: Some(match spec {
-                            Some(spec) => wire::desired_state::Value::Present(Box::new(spec)),
-                            None => wire::desired_state::Value::Absent(true),
-                        }),
-                    })),
-                }],
-                initial_complete: false,
-            },
-            validation::Direction::Client,
-        )
+                }),
+            }],
+        })
         .unwrap();
         assert_eq!(
             self.control.send(DataChannelMessage::binary(bytes)),
@@ -338,7 +332,7 @@ impl WirePeer {
                 for record in batch.records {
                     if record.key.and_then(|key| key.key)
                         == Some(wire::resource_key::Key::Owned(reference))
-                        && let Some(wire::state_record::State::Confirmed(value)) = record.state
+                        && let Some(value) = record.confirmed
                         && value.evaluated_revision >= revision
                     {
                         anyhow::ensure!(

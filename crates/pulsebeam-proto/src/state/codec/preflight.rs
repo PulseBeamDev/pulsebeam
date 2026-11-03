@@ -31,8 +31,10 @@ macro_rules! shapes {
 }
 
 shapes! {
-    StateBatch { 1 => StateRecord },
-    StateRecord { 1 => ResourceKey, 2 => DesiredState, 3 => ConfirmedState },
+    ClientStateBatch { 1 => ClientStateRecord },
+    ClientStateRecord { 2 => DesiredState },
+    ServerStateBatch { 1 => ServerStateRecord },
+    ServerStateRecord { 1 => ResourceKey, 2 => ConfirmedState },
     ResourceKey {},
     DesiredState { 2 => ResourceSpec },
     ConfirmedState { 2 => Failure, 3 => LiveResource, 4 => AbsentState, 5 => SessionState, 6 => Participant, 7 => Track },
@@ -70,9 +72,12 @@ shapes! {
     Failure {},
 }
 
-pub(super) fn check(bytes: &[u8]) -> Result<(), DecodeError> {
-    let mut allocation = 0;
-    message(bytes, Some(Shape::StateBatch), 1, &mut allocation)
+pub(super) fn check_client(bytes: &[u8]) -> Result<(), DecodeError> {
+    message(bytes, Some(Shape::ClientStateBatch), 1, &mut 0)
+}
+
+pub(super) fn check_server(bytes: &[u8]) -> Result<(), DecodeError> {
+    message(bytes, Some(Shape::ServerStateBatch), 1, &mut 0)
 }
 
 fn message(
@@ -88,7 +93,11 @@ fn message(
     let mut records = 0usize;
     while !bytes.is_empty() {
         let (field, wire) = tag(&mut bytes)?;
-        if matches!(shape, Some(Shape::StateBatch)) && field == 1 {
+        if matches!(
+            shape,
+            Some(Shape::ClientStateBatch | Shape::ServerStateBatch)
+        ) && field == 1
+        {
             records = records.saturating_add(1);
             if records > super::MAX_RECORDS {
                 return Err(DecodeError::Structure);

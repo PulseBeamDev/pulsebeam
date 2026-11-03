@@ -26,10 +26,15 @@ receiver rejects fixed audio with `FailureCode::Unsupported`; it does not use a
 receiver-local minimum-delay setter as a substitute for the full
 `Fixed { min_ms, max_ms }` interval.
 
-Native StateBatch evaluates each resource independently. A rejected target does
-not replace its previously accepted resource or roll back unrelated resources.
-Application-owned desired state is not rewritten. Wire representation alone
-does not establish a backend's support for a receive policy.
+Native signaling evaluates each resource independently. At most one sent
+ordinary proposal per resource may remain unevaluated; newer unsent desire is
+coalesced until that evaluation arrives. Other resources progress independently,
+and retirement can bypass the gate. Evaluation does not wait for physical
+execution to become installed.
+
+A rejected target does not replace its previously accepted resource or roll back
+unrelated resources. Application-owned desired state is not rewritten. Wire
+representation alone does not establish a backend's support for a receive policy.
 
 ## RTC bootstrap
 
