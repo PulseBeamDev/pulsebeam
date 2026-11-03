@@ -22,6 +22,7 @@ fn byte_allowances_exceed_legacy_constants_but_preserve_native_buffer_widths() {
         max_retransmission_bytes: ConnectionLimits::HARD_MAX_RETRANSMISSION_BYTES,
         max_receive_runtime_bytes: usize::MAX,
         max_send_runtime_bytes: usize::MAX,
+        max_sent_history_bytes: usize::MAX,
         max_transport_output_bytes: usize::MAX,
         max_rtp_replay_state_bytes: usize::MAX,
         max_rtcp_replay_state_bytes: usize::MAX,

@@ -129,6 +129,14 @@ impl StreamWriter {
     pub fn discard(&mut self) {
         self.pending.clear();
     }
+
+    pub(crate) fn discard_mid(&mut self, mid: Mid) {
+        self.pending.retain(|write| match write {
+            StreamWrite::Audio { mid: pending, .. } | StreamWrite::Video { mid: pending, .. } => {
+                *pending != mid
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -209,7 +217,10 @@ impl TrackSelector {
         }
     }
 
-    #[allow(dead_code)]
+    pub(crate) fn data() -> Self {
+        Self::kind(TrackKind::Data)
+    }
+
     pub(crate) fn track(track: TrackId) -> Self {
         Self {
             track: Some(track),
@@ -309,6 +320,7 @@ impl UpstreamTrackLayer {
     /// learned stream index: the sender's declared target bitrate, resolution,
     /// and active/inactive state.
     fn apply_vla(&mut self, vla: &pulsebeam_core::vla::VideoLayersAllocation) {
+        self.normalizer.observe_vla(vla);
         let Some(idx) = self.normalizer.vla_index().map(usize::from) else {
             return;
         };
@@ -328,7 +340,8 @@ impl UpstreamTrackLayer {
                 mid = %self.mid,
                 rid = ?self.rid,
                 target_kbps = target_bps / 1000,
-                height = self.monitor.stats().height(),
+                reported_height = ?height,
+                allocation = ?vla,
                 "VLA: sender declared layer target bitrate; allocating on it"
             );
         }
@@ -613,12 +626,14 @@ pub enum Track {
 #[derive(Debug, Clone)]
 pub struct AudioTrack {
     pub meta: TrackMeta,
+    pub(crate) format: Option<pulsebeam_proto::state::CodecFormat>,
     pub reverse: Option<crate::route::NodeRouteAddress>,
 }
 
 #[derive(Debug, Clone)]
 pub struct VideoTrack {
     pub meta: TrackMeta,
+    pub(crate) format: Option<pulsebeam_proto::state::CodecFormat>,
     pub layers: Vec<TrackLayer>,
     stats: VideoStats,
     pub reverse: Option<crate::route::NodeRouteAddress>,
@@ -627,7 +642,7 @@ pub struct VideoTrack {
 #[derive(Debug, Clone)]
 pub struct DataTrack {
     pub meta: TrackMeta,
-    pub topic: crate::track::Topic,
+    pub topic: Option<crate::track::Topic>,
     pub lane: crate::track::DataLane,
     pub reverse: Option<crate::route::NodeRouteAddress>,
 }
@@ -697,7 +712,11 @@ impl NullStats {
 
 impl Track {
     pub fn audio(meta: TrackMeta, reverse: Option<crate::route::NodeRouteAddress>) -> Self {
-        Self::Audio(AudioTrack { meta, reverse })
+        Self::Audio(AudioTrack {
+            meta,
+            reverse,
+            format: None,
+        })
     }
 
     pub fn video(
@@ -707,6 +726,7 @@ impl Track {
     ) -> Self {
         Self::Video(VideoTrack {
             meta,
+            format: None,
             stats: VideoStats::new(&layers),
             layers,
             reverse,
@@ -721,9 +741,18 @@ impl Track {
     ) -> Self {
         Self::Data(DataTrack {
             meta,
-            topic,
+            topic: Some(topic),
             lane,
             reverse,
+        })
+    }
+
+    pub(crate) fn data_publication(meta: TrackMeta, lane: DataLane) -> Self {
+        Self::Data(DataTrack {
+            meta,
+            topic: None,
+            lane,
+            reverse: None,
         })
     }
 
@@ -769,7 +798,10 @@ impl Track {
 
     pub fn publication_label(&self) -> Option<String> {
         match self {
-            Self::Data(track) => Some(publication_label(track.lane, &track.topic)),
+            Self::Data(track) => track.topic.as_ref().map_or_else(
+                || track.meta.label.clone(),
+                |topic| Some(publication_label(track.lane, topic)),
+            ),
             Self::Audio(_) | Self::Video(_) => None,
         }
     }
@@ -972,6 +1004,7 @@ pub fn new_video(mid: Mid, meta: TrackMeta, layers: Vec<SimulcastLayer>) -> (Ups
     let stats = VideoStats::new(&layers);
     let track = Track::Video(VideoTrack {
         meta: meta.clone(),
+        format: None,
         layers,
         stats: stats.clone(),
         reverse: None,

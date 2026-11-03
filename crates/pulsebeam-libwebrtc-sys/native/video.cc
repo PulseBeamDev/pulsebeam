@@ -3484,7 +3484,11 @@ bool rtp_transceiver_set_audio_codec_preferences(
     return false;
   }
   const auto capabilities = factory.signaling_thread()->BlockingCall([&] {
-    return factory.factory()->GetRtpSenderCapabilities(webrtc::MediaType::AUDIO);
+    auto capabilities = factory.factory()->GetRtpSenderCapabilities(webrtc::MediaType::AUDIO);
+    const auto receiver = factory.factory()->GetRtpReceiverCapabilities(webrtc::MediaType::AUDIO);
+    capabilities.codecs.insert(capabilities.codecs.end(), receiver.codecs.begin(),
+                               receiver.codecs.end());
+    return capabilities;
   });
   std::vector<webrtc::RtpCodecCapability> selected;
   for (const auto& format : formats) {

@@ -908,6 +908,10 @@ impl VideoEncoderFactory for InputFactory {
         }
     }
     fn create(&self, format: &VideoCodecFormat) -> Result<Box<dyn VideoEncoder>, CodecError> {
+        trace_input(
+            "factory-create",
+            format_args!("requested={format:?} supported={:?}", self.format),
+        );
         if !same_codec_format(format, &self.format) {
             return Err(CodecError::UnsupportedFormat);
         }
@@ -927,10 +931,10 @@ impl VideoEncoderFactory for InputFactory {
 fn same_codec_format(a: &VideoCodecFormat, b: &VideoCodecFormat) -> bool {
     // Negotiated SDP formats do not carry the factory's capability mode list.
     // Native H.264 identity handles profile aliases, levels and packetization.
-    if a.name == "H264" && b.name == "H264" {
+    if a.name.eq_ignore_ascii_case("H264") && b.name.eq_ignore_ascii_case("H264") {
         SdpVideoFormat::from(a).is_same_codec(&SdpVideoFormat::from(b))
     } else {
-        a.name == b.name && a.parameters == b.parameters
+        a.name.eq_ignore_ascii_case(&b.name) && a.parameters == b.parameters
     }
 }
 
@@ -1179,6 +1183,10 @@ impl InputEncoder {
 
 impl VideoEncoder for InputEncoder {
     fn initialize(&mut self, settings: VideoEncoderSettings) -> Result<(), CodecError> {
+        trace_input(
+            "initialize",
+            format_args!("encoder={self:p} settings={settings:?}"),
+        );
         self.released = false;
         self.rates = None;
         self.active_feedback = Weak::new();
@@ -1200,7 +1208,9 @@ impl VideoEncoder for InputEncoder {
         types: Option<Vec<crate::EncodedImageFrameType>>,
         callback: EncodedImageCallback,
     ) -> Result<i32, CodecError> {
-        let context = InputFrameContext::from_native(&frame)?;
+        let context = InputFrameContext::from_native(&frame);
+        trace_input("native-encode", format_args!("context={context:?}"));
+        let context = context?;
         let types = types
             .unwrap_or_default()
             .into_iter()
@@ -1232,6 +1242,7 @@ impl VideoEncoder for InputEncoder {
         )
     }
     fn set_rates(&mut self, rates: VideoRateControl) -> Result<(), CodecError> {
+        trace_input("rates", format_args!("encoder={self:p} rates={rates:?}"));
         self.rates = Some(rates);
         // The native encoder is associated with a source by its most recent
         // presentation token. Later native rate callbacks update that source
@@ -1242,6 +1253,7 @@ impl VideoEncoder for InputEncoder {
         Ok(())
     }
     fn release(&mut self) -> Result<(), CodecError> {
+        trace_input("release", format_args!("encoder={self:p}"));
         self.released = true;
         Ok(())
     }
@@ -1755,6 +1767,26 @@ mod tests {
                 &format()
             ));
             assert!(EncodedH264Input::new_for_format(h264_format(profile_level_id)).is_err());
+        }
+        let factory = InputFactory {
+            broker: Arc::new(Mutex::new(Broker::default())),
+            format: format(),
+            temporal_fps: None,
+            simulcast: false,
+        };
+        for name in ["h264", "H264"] {
+            let mut requested = format();
+            requested.name = name.into();
+            assert!(factory.query_support(&requested, None, None).supported);
+            assert!(factory.create(&requested).is_ok());
+            requested
+                .parameters
+                .iter_mut()
+                .find(|parameter| parameter.key == "packetization-mode")
+                .unwrap()
+                .value = "0".into();
+            assert!(!factory.query_support(&requested, None, None).supported);
+            assert!(factory.create(&requested).is_err());
         }
         // SPS header validation is not a decoder proof. The genuine level-4.0
         // VBR corpus is exercised by the consuming application's SFU witness.

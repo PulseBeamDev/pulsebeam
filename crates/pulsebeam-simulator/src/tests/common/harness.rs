@@ -1664,7 +1664,7 @@ async fn run_participant(
                                 .set_video_subscriptions(subscriptions, sequence)
                                 .await?,
                             PendingDriverOp::RelabelOwnedVideo(label) => {
-                                let complete = client.ctx.relabel_owned_video(label.clone()).await?;
+                                let complete = client.relabel_owned_video(label.clone()).await?;
                                 if complete { *shared.video_label.lock().unwrap() = label; }
                                 complete
                             }
@@ -2021,6 +2021,11 @@ struct ServerControl {
     startup_notifications: mpsc::Receiver<()>,
 }
 
+struct RelabelBaseline {
+    publication: String,
+    receivers: BTreeSet<(u64, u64)>,
+}
+
 async fn execute_plan(
     plan: Vec<Step>,
     handles: &mut PlanHandles,
@@ -2035,6 +2040,7 @@ async fn execute_plan(
     let mut controller_stall_until = None;
     let mut disturbances = BTreeSet::new();
     let mut changed_paths = BTreeSet::new();
+    let mut relabel_baselines = BTreeMap::new();
 
     for (idx, step) in plan.iter().enumerate() {
         let n = idx + 1;
@@ -2709,6 +2715,33 @@ async fn execute_plan(
                 tracing::info!(
                     "[step {n}/{total}: {kind}] \"{description}\" ({participant}, label={label})"
                 );
+                let expected = expected_state(handles)?;
+                let id = handles[participant]
+                    .participant_id()
+                    .context("relabel publisher has no identity")?;
+                let publisher = expected
+                    .participants
+                    .iter()
+                    .find(|peer| peer.id.as_str() == id)
+                    .context("relabel publisher has no plan binding")?;
+                let publication = publisher
+                    .track_id(pulsebeam::entity::TrackKind::Video, &publisher.video_label)
+                    .as_str();
+                for (name, receiver) in handles.iter() {
+                    let receivers = receiver
+                        .video_rx()
+                        .by_receiver
+                        .keys()
+                        .map(|stream| (stream.generation, stream.receiver))
+                        .collect();
+                    relabel_baselines.insert(
+                        (*participant, *name),
+                        RelabelBaseline {
+                            publication: publication.clone(),
+                            receivers,
+                        },
+                    );
+                }
                 let handle = get_handle(handles, participant, description)?;
                 handle
                     .shared
@@ -3625,26 +3658,35 @@ async fn execute_plan(
                 publisher,
                 min_frames,
             } => {
-                let publisher = handles.get(publisher).ok_or_else(|| {
+                let expected = expected_state(handles)?;
+                let publisher_handle = handles.get(publisher).ok_or_else(|| {
                     anyhow::anyhow!("step \"{description}\": unknown publisher {publisher}")
                 })?;
-                let connection = publisher
-                    .shared
-                    .observation
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|observation| observation.admission)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("step \"{description}\": publisher has no admission")
-                    })?;
-                let label = publisher.shared.video_label.lock().unwrap().clone();
-                let source_inputs = publisher.shared.h264_publishers.clone();
-                let track_id = connection
-                    .derive_track_id(pulsebeam::entity::TrackKind::Video, &label)
+                let id = publisher_handle
+                    .participant_id()
+                    .context("publication publisher has no identity")?;
+                let publisher_binding = expected
+                    .participants
+                    .iter()
+                    .find(|peer| peer.id.as_str() == id)
+                    .context("publication publisher has no plan binding")?;
+                let connection = publisher_binding
+                    .connection
+                    .context("publication publisher has no admission")?;
+                let label = publisher_binding.video_label.as_str();
+                let source_inputs = publisher_handle.shared.h264_publishers.clone();
+                let track_id = publisher_binding
+                    .track_id(pulsebeam::entity::TrackKind::Video, label)
                     .as_str();
+                let baseline = relabel_baselines.get(&(*publisher, *participant));
+                if let Some(baseline) = baseline {
+                    anyhow::ensure!(
+                        baseline.publication != track_id,
+                        "{description}: relabel reused the retired publication ID"
+                    );
+                }
                 let receiver = get_handle(handles, participant, description)?;
-                {
+                let (generation, media_index) = {
                     let observation = receiver.shared.observation.lock().unwrap();
                     let snapshot = &observation
                         .as_ref()
@@ -3662,9 +3704,28 @@ async fn execute_plan(
                                 }),
                         "{description}: receiver is not bound to publication {track_id} ({label})"
                     );
-                }
-                // Native track IDs identify receiver bindings, not supplied pictures.
-                // Authenticate the caller's current source lifetime independently
+                    if let Some(baseline) = baseline {
+                        anyhow::ensure!(
+                            !snapshot.publications.contains_key(&baseline.publication),
+                            "{description}: retired publication remains visible"
+                        );
+                    }
+                    (
+                        snapshot
+                            .generation
+                            .context("publication receiver has no generation")?
+                            .get(),
+                        *snapshot
+                            .video_mapping
+                            .iter()
+                            .find(|(_, id)| *id == &track_id)
+                            .context("publication has no receiver")?
+                            .0,
+                    )
+                };
+                // Native track IDs identify receiver bindings, not publications.
+                // This fixture has one v0 source; authenticate its actual coded
+                // bytes and decode under the current admission independently
                 // of the separately checked catalog/mapping.
                 let origin = super::provenance::current_source_key(
                     &source_inputs.lock().unwrap(),
@@ -3672,12 +3733,36 @@ async fn execute_plan(
                     "v0",
                 )
                 .context("publication has no constructed fixture source")?;
-                receiver
-                    .video_rx()
-                    .require_decoded_from_incarnation(&origin, 0, *min_frames)
-                    .with_context(|| {
-                        format!("{description}: publication {track_id} ({label}) has no current-source decode")
-                    })?;
+                let received = receiver.video_rx();
+                received.require_decoded_from_incarnation(&origin, 0, *min_frames)
+                    .with_context(|| format!("{description}: publication {track_id} ({label}) has no current-source decode"))?;
+                let frames = received
+                    .by_receiver
+                    .iter()
+                    .filter(|(stream, timeline)| {
+                        stream.generation == generation
+                            && baseline.is_none_or(|baseline| {
+                                !baseline
+                                    .receivers
+                                    .contains(&(stream.generation, stream.receiver))
+                            })
+                            && timeline
+                                .track
+                                .as_ref()
+                                .is_some_and(|track| track.media_index == media_index)
+                    })
+                    .map(|(_, timeline)| {
+                        timeline
+                            .decoded_by_incarnation
+                            .get(&origin)
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .sum::<u64>();
+                anyhow::ensure!(
+                    frames >= *min_frames,
+                    "{description}: publication {track_id} has {frames} authenticated decodes on current fresh receivers, expected {min_frames}"
+                );
             }
 
             Step::CheckVideoDecodedFrom {
@@ -4684,7 +4769,30 @@ fn get_handle<'a>(
         .ok_or_else(|| anyhow::anyhow!("step \"{step_desc}\": unknown participant \"{name}\""))
 }
 
+fn observed_media(
+    handles: &PlanHandles,
+) -> anyhow::Result<Vec<pulsebeam_agent_native::agent_core::Publication>> {
+    let mut catalog = BTreeMap::new();
+    for handle in handles.values().filter(|handle| handle.present) {
+        let observation = handle.shared.observation.lock().unwrap();
+        let Some(observation) = observation.as_ref() else {
+            continue;
+        };
+        for descriptor in observation.snapshot.publications.values() {
+            if let Some(previous) = catalog.insert(descriptor.id.clone(), descriptor.clone()) {
+                anyhow::ensure!(
+                    previous == *descriptor,
+                    "conflicting public catalog descriptor: {}",
+                    descriptor.id
+                );
+            }
+        }
+    }
+    Ok(catalog.into_values().collect())
+}
+
 fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::ApplicationStateOracle> {
+    let media = observed_media(handles)?;
     let mut participants = Vec::new();
     for (name, handle) in handles {
         let allowed = handle.present
@@ -4706,7 +4814,7 @@ fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::Applic
             .clone()
             .ok_or_else(|| anyhow::anyhow!("{name} has no complete client observation"))?;
         let intent = handle.shared.pending_ops.lock().unwrap().intent.clone();
-        participants.push(super::oracle::ExpectedParticipant {
+        let mut participant = super::oracle::ExpectedParticipant {
             id: id.parse()?,
             room: handle.room_name,
             video: handle.publishes_video,
@@ -4716,8 +4824,22 @@ fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::Applic
             automatic_audio: intent.automatic_audio,
             required: handle.present,
             connection: observation.admission,
+            media: Vec::new(),
             topics: intent.topics,
+        };
+        let bound = participant.bind_media(&media)?;
+        let has_observer = handles.values().any(|other| {
+            other.present
+                && other.room_name == handle.room_name
+                && other
+                    .participant_id()
+                    .is_some_and(|other_id| other_id != id)
         });
+        anyhow::ensure!(
+            bound || !participant.required || !has_observer,
+            "{name} has no current publisher descriptor"
+        );
+        participants.push(participant);
     }
     Ok(super::oracle::ApplicationStateOracle { participants })
 }

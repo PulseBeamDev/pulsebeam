@@ -17,13 +17,45 @@ pub struct Observation {
 }
 
 #[derive(Default)]
+struct Observations {
+    extension: Option<u8>,
+    by_ssrc: HashMap<u32, Observation>,
+}
+
+impl Observations {
+    fn record(&mut self, packet: &[u8]) -> Result<(), &'static str> {
+        if let Some(extension) = self.extension
+            && let Some((ssrc, value)) = inspect_rtp(packet, extension)?
+        {
+            let observation = self.by_ssrc.entry(ssrc).or_default();
+            observation.packets = observation.packets.saturating_add(1);
+            if let Some(value) = value {
+                observation.with_extension = observation.with_extension.saturating_add(1);
+                observation
+                    .first_value
+                    .get_or_insert_with(|| value.to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    fn observation(&mut self, ssrc: u32, extension: u8) -> io::Result<Observation> {
+        if extension == 0 || self.extension.is_some_and(|current| current != extension) {
+            return Err(io::Error::other("invalid or changed relay extension"));
+        }
+        self.extension = Some(extension);
+        Ok(self.by_ssrc.get(&ssrc).cloned().unwrap_or_default())
+    }
+}
+
+#[derive(Default)]
 pub struct Relays {
     entries: Vec<Relay>,
 }
 
 struct Relay {
     task: JoinHandle<()>,
-    observations: Arc<Mutex<HashMap<u32, Observation>>>,
+    observations: Arc<Mutex<Observations>>,
     error: Arc<Mutex<Option<String>>>,
 }
 
@@ -34,17 +66,13 @@ impl Drop for Relay {
 }
 
 impl Relays {
-    pub async fn allocate(
-        &mut self,
-        destination: SocketAddr,
-        extension: u8,
-    ) -> io::Result<Vec<u8>> {
+    pub async fn allocate(&mut self, destination: SocketAddr) -> io::Result<Vec<u8>> {
         // Match the owned server's local interface: Chrome need not gather a
         // loopback candidate, and UDP replies must use the advertised source IP.
         let socket = UdpSocket::bind((destination.ip(), 0)).await?;
         let address = socket.local_addr()?;
         let port = address.port();
-        let observations = Arc::new(Mutex::new(HashMap::<u32, Observation>::new()));
+        let observations = Arc::new(Mutex::new(Observations::default()));
         let captured = Arc::clone(&observations);
         let error = Arc::new(Mutex::new(None));
         let failure = Arc::clone(&error);
@@ -59,20 +87,11 @@ impl Relays {
                         .ok_or_else(|| io::Error::other("oversized datagram"))?;
                     if source == destination {
                         if let Some(browser) = browser {
-                            if let Some((ssrc, value)) =
-                                inspect_rtp(packet, extension).map_err(io::Error::other)?
-                            {
-                                let mut captured = captured.lock().await;
-                                let observation = captured.entry(ssrc).or_default();
-                                observation.packets = observation.packets.saturating_add(1);
-                                if let Some(value) = value {
-                                    observation.with_extension =
-                                        observation.with_extension.saturating_add(1);
-                                    observation
-                                        .first_value
-                                        .get_or_insert_with(|| value.to_vec());
-                                }
-                            }
+                            captured
+                                .lock()
+                                .await
+                                .record(packet)
+                                .map_err(io::Error::other)?;
                             socket.send_to(packet, browser).await?;
                         }
                     } else if browser.is_none_or(|peer| peer == source) {
@@ -97,7 +116,7 @@ impl Relays {
         )?)
     }
 
-    pub async fn observation(&self, id: usize, ssrc: u32) -> io::Result<Vec<u8>> {
+    pub async fn observation(&self, id: usize, ssrc: u32, extension: u8) -> io::Result<Vec<u8>> {
         let relay = self
             .entries
             .get(id)
@@ -105,10 +124,12 @@ impl Relays {
         if let Some(error) = relay.error.lock().await.as_ref() {
             return Err(io::Error::other(error.clone()));
         }
-        let observations = relay.observations.lock().await;
-        Ok(serde_json::to_vec(
-            &observations.get(&ssrc).cloned().unwrap_or_default(),
-        )?)
+        let observation = relay
+            .observations
+            .lock()
+            .await
+            .observation(ssrc, extension)?;
+        Ok(serde_json::to_vec(&observation)?)
     }
 }
 
@@ -209,9 +230,7 @@ mod tests {
             .unwrap();
         let mut allocation = TcpStream::connect(&server.address).await.unwrap();
         allocation
-            .write_all(
-                b"GET /__test/rtp-relay?destination=127.0.0.1:9&extension=7 HTTP/1.1\r\n\r\n",
-            )
+            .write_all(b"GET /__test/rtp-relay?destination=127.0.0.1:9 HTTP/1.1\r\n\r\n")
             .await
             .unwrap();
         let mut response = String::new();
@@ -241,6 +260,17 @@ mod tests {
     fn rtp_relay_parses_both_extension_formats_and_absence() {
         let mut packet = vec![0x90, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 42];
         packet.extend([0xbe, 0xde, 0, 1, 0x72, 0, 0xa0, 10]);
+        let mut observations = super::Observations::default();
+        observations.record(&packet).unwrap();
+        assert!(observations.by_ssrc.is_empty());
+        assert_eq!(observations.observation(42, 7).unwrap().packets, 0);
+        observations.record(&packet).unwrap();
+        let measured = observations.observation(42, 7).unwrap();
+        assert_eq!(measured.packets, 1);
+        assert_eq!(measured.with_extension, 1);
+        assert_eq!(measured.first_value, Some(vec![0, 0xa0, 10]));
+        assert!(observations.observation(42, 8).is_err());
+        assert!(observations.observation(42, 0).is_err());
         assert_eq!(
             inspect_rtp(&packet, 7).unwrap(),
             Some((42, Some(&[0, 0xa0, 10][..])))

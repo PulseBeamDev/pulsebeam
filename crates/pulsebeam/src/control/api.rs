@@ -1,3 +1,5 @@
+mod native_json;
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::MAX_NATIVE_SDP_BYTES;
@@ -10,7 +12,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{MethodFilter, post},
 };
-use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, LOCATION, RETRY_AFTER, WWW_AUTHENTICATE};
+use hyper::header::{
+    ALLOW, AUTHORIZATION, CONTENT_TYPE, ETAG, IF_MATCH, LOCATION, RETRY_AFTER, WWW_AUTHENTICATE,
+};
 use pulsebeam_core::auth::{
     KeyRegistry, TokenError, VerifiedAuthorization, verify_participant_token,
 };
@@ -65,6 +69,8 @@ pub enum ApiError {
     BadUrl,
     #[error("resource not found")]
     NotFound,
+    #[error("authorization precondition required")]
+    PreconditionRequired,
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("{0}")]
@@ -98,6 +104,16 @@ impl IntoResponse for ApiError {
             | Self::JoinError(controller::ControllerError::OfferRejected(_))
             | Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "Bad Request"),
             Self::NotFound => (StatusCode::NOT_FOUND, "Not Found"),
+            Self::PreconditionRequired => {
+                (StatusCode::PRECONDITION_REQUIRED, "Precondition Required")
+            }
+            Self::JoinError(controller::ControllerError::GrantGone) => (StatusCode::GONE, "Gone"),
+            Self::JoinError(controller::ControllerError::AuthorizationRejected) => {
+                (StatusCode::FORBIDDEN, "Forbidden")
+            }
+            Self::JoinError(controller::ControllerError::AuthorizationPrecondition { .. }) => {
+                (StatusCode::PRECONDITION_FAILED, "Precondition Failed")
+            }
             Self::JoinError(controller::ControllerError::Superseded) => {
                 (StatusCode::CONFLICT, "Conflict")
             }
@@ -105,6 +121,15 @@ impl IntoResponse for ApiError {
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"),
             Self::JoinError(controller::ControllerError::ServiceUnavailable)
             | Self::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
+        };
+        let etag = match &self {
+            Self::JoinError(controller::ControllerError::AuthorizationPrecondition {
+                revision,
+            }) => match grant_etag(*revision) {
+                Ok(etag) => Some(etag),
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            },
+            _ => None,
         };
         let challenge = (status == StatusCode::UNAUTHORIZED).then(|| {
             if matches!(self, Self::AuthorizationRequired) {
@@ -131,6 +156,9 @@ impl IntoResponse for ApiError {
             .into_response();
         if let Some(challenge) = challenge {
             response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
+        }
+        if let Some(etag) = etag {
+            response.headers_mut().insert(ETAG, etag);
         }
         if matches!(
             status,
@@ -183,13 +211,30 @@ fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<St
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct NativeRequest {
+    #[schema(example = "pulsebeam.media.v1")]
+    profile: String,
     offer: String,
-    #[serde(default)]
-    manual: bool,
+}
+
+fn parse_native_request(body: &[u8]) -> Result<NativeRequest, ApiError> {
+    let invalid = || ApiError::BadRequest("invalid native JSON request".to_owned());
+    native_json::unique_keys(body).map_err(|_| invalid())?;
+    let request: NativeRequest = serde_json::from_slice(body).map_err(|_| invalid())?;
+    if request.profile != pulsebeam_proto::state::PROFILE {
+        return Err(ApiError::BadRequest(
+            "unsupported native profile".to_owned(),
+        ));
+    }
+    Ok(request)
 }
 
 #[derive(Serialize, ToSchema)]
 struct NativeResponse {
+    profile: &'static str,
+    #[schema(value_type = Object)]
+    rtp_capabilities: pulsebeam_proto::state::RtpCapabilities,
+    #[schema(value_type = Vec<String>)]
+    data_delivery: Vec<pulsebeam_proto::state::DataDelivery>,
     room_external_id: String,
     #[schema(value_type = String)]
     room_id: RoomId,
@@ -355,8 +400,7 @@ async fn create_native(
     let body = to_bytes(request.into_body(), MAX_NATIVE_BODY_BYTES)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
-    let request: NativeRequest = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::BadRequest("invalid native JSON request".to_owned()))?;
+    let request = parse_native_request(&body)?;
     if request.offer.len() > MAX_NATIVE_SDP_BYTES {
         return Err(ApiError::PayloadTooLarge);
     }
@@ -367,9 +411,11 @@ async fn create_native(
         wall_now,
         tokio::time::Instant::now(),
     )?;
+    lease.native_expiry()?;
     let connection_id = ConnectionId::new();
+    let rtp_capabilities = crate::participant::rtp::capabilities();
     let participant_state = ParticipantState {
-        manual_sub: request.manual,
+        manual_sub: true,
         room_id: authorization.room_id,
         participant_id: authorization.participant_id,
         participant_external_id: authorization.participant_external_id.clone(),
@@ -377,6 +423,7 @@ async fn create_native(
         old_connection_id: None,
         authorization: Some(lease),
         profile: ConnectionProfile::Native,
+        rtp_capabilities: Some(rtp_capabilities.clone()),
     };
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     state
@@ -408,6 +455,13 @@ async fn create_native(
         StatusCode::CREATED,
         [(LOCATION, location)],
         Json(NativeResponse {
+            profile: pulsebeam_proto::state::PROFILE,
+            rtp_capabilities,
+            data_delivery: vec![
+                pulsebeam_proto::state::DataDelivery::Latest,
+                pulsebeam_proto::state::DataDelivery::Lossy,
+                pulsebeam_proto::state::DataDelivery::Ordered,
+            ],
             room_external_id: authorization.room_external_id.as_str().to_owned(),
             room_id: authorization.room_id,
             participant_external_id: authorization.participant_external_id.as_str().to_owned(),
@@ -419,12 +473,101 @@ async fn create_native(
         .into_response())
 }
 
+fn grant_etag(revision: u64) -> Result<HeaderValue, ApiError> {
+    HeaderValue::from_str(&format!("\"auth-{revision}\""))
+        .map_err(|_| ApiError::Unknown("failed to construct grant precondition".to_owned()))
+}
+
+fn grant_precondition(headers: &HeaderMap) -> Result<u64, ApiError> {
+    let invalid = || ApiError::BadRequest("invalid authorization precondition".to_owned());
+    let mut values = headers.get_all(IF_MATCH).iter();
+    let value = values.next().ok_or(ApiError::PreconditionRequired)?;
+    if values.next().is_some() {
+        return Err(invalid());
+    }
+    let text = value
+        .to_str()
+        .map_err(|_| invalid())?
+        .trim_matches([' ', '\t']);
+    let digits = text
+        .strip_prefix("\"auth-")
+        .and_then(|s| s.strip_suffix('"'))
+        .ok_or_else(invalid)?;
+    if digits.is_empty()
+        || digits.len() > 20
+        || digits.starts_with('0')
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    digits.parse().map_err(|_| invalid())
+}
+
+#[utoipa::path(
+    patch,
+    path = "/native/{connection_id}",
+    params(
+        ("connection_id" = String, Path, description = "Canonical connection ID"),
+        ("If-Match" = String, Header, description = "Observed Session grant ETag, quoted auth-N")
+    ),
+    responses(
+        (status = 204, description = "Grant replaced; authority observation remains ordered on the control channel", headers(("ETag" = String))),
+        (status = 400, description = "Malformed precondition or nonempty body", body = Problem),
+        (status = 401, description = "Invalid bearer authorization", body = Problem),
+        (status = 403, description = "Credential cannot replace this grant", body = Problem),
+        (status = 410, description = "Connection grant is terminal", body = Problem),
+        (status = 412, description = "Stale precondition", body = Problem, headers(("ETag" = String))),
+        (status = 428, description = "Precondition required", body = Problem),
+        (status = 429, description = "Controller is busy", body = Problem),
+        (status = 503, description = "Service unavailable", body = Problem)
+    ),
+    security(("bearer_auth" = [])),
+    tag = "native"
+)]
+async fn patch_native(
+    State(state): State<AppState>,
+    Path(connection_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let headers = request.headers();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let authorization = verify_bearer(headers, &state.key_registry, now)?;
+    let expected_revision = grant_precondition(headers)?;
+    let connection_id = connection_id.parse().map_err(|_| ApiError::NotFound)?;
+    to_bytes(request.into_body(), 0).await.map_err(|_| {
+        ApiError::BadRequest("native grant replacement requires an empty body".to_owned())
+    })?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    state
+        .controller
+        .try_send(
+            (
+                controller::ReplaceAuthorization {
+                    authorization,
+                    connection_id,
+                    expected_revision,
+                },
+                send,
+            )
+                .into(),
+        )
+        .map_err(|error| match error {
+            TrySendError::Full(_) => ApiError::RateLimited,
+            TrySendError::Closed(_) => ApiError::ServiceUnavailable,
+        })?;
+    let revision: u64 = receive.await.map_err(|_| ApiError::ServiceUnavailable)??;
+    Ok((StatusCode::NO_CONTENT, [(ETAG, grant_etag(revision)?)]).into_response())
+}
+
 #[utoipa::path(
     delete,
     path = "/native/{connection_id}",
     params(("connection_id" = String, Path, description = "Canonical connection ID")),
     responses(
-        (status = 204, description = "Native connection deleted or already absent"),
+        (status = 204, description = "Native connection cutoff acknowledged, or already absent"),
         (status = 401, description = "Invalid bearer authorization", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "Malformed connection ID", body = Problem, content_type = "application/problem+json"),
         (status = 429, description = "Controller is busy", body = Problem, content_type = "application/problem+json"),
@@ -444,21 +587,24 @@ async fn delete_native(
         .as_secs();
     let authorization = verify_bearer(&headers, &state.key_registry, now)?;
     let connection_id = connection_id.parse().map_err(|_| ApiError::NotFound)?;
+    let (send, receive) = tokio::sync::oneshot::channel();
     state
         .controller
         .try_send(
-            controller::DeleteParticipant {
-                room_id: authorization.room_id,
-                participant_id: authorization.participant_id,
-                connection_id,
-                profile: ConnectionProfile::Native,
-            }
-            .into(),
+            (
+                controller::DeleteNative {
+                    authorization,
+                    connection_id,
+                },
+                send,
+            )
+                .into(),
         )
         .map_err(|error| match error {
             TrySendError::Full(_) => ApiError::RateLimited,
             TrySendError::Closed(_) => ApiError::ServiceUnavailable,
         })?;
+    receive.await.map_err(|_| ApiError::ServiceUnavailable)??;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -506,6 +652,7 @@ async fn create_sdp_profile(
                         old_connection_id: None,
                         authorization: Some(lease),
                         profile,
+                        rtp_capabilities: None,
                     },
                     offer,
                 },
@@ -808,6 +955,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
 #[openapi(
     paths(
         create_native,
+        patch_native,
         delete_native,
         create_whip,
         get_whip,
@@ -833,13 +981,35 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
 )]
 struct ApiDoc;
 
+pub(crate) fn cors() -> tower_http::cors::CorsLayer {
+    tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([
+            hyper::Method::GET,
+            hyper::Method::HEAD,
+            hyper::Method::POST,
+            hyper::Method::PATCH,
+            hyper::Method::DELETE,
+            hyper::Method::OPTIONS,
+        ])
+        .allow_headers([
+            AUTHORIZATION,
+            IF_MATCH,
+            CONTENT_TYPE,
+            hyper::header::CONTENT_ENCODING,
+            hyper::header::ACCEPT,
+        ])
+        .expose_headers([LOCATION, ETAG, RETRY_AFTER, ALLOW, ACCEPT_POST])
+        .max_age(std::time::Duration::from_secs(86400))
+}
+
 pub fn router(controller: ControllerSender, cfg: ApiConfig, key_registry: KeyRegistry) -> Router {
     let openapi = build_openapi(&cfg.base_path);
     let api = Router::new()
         .route("/native", post(create_native))
         .route(
             "/native/{connection_id}",
-            axum::routing::delete(delete_native),
+            axum::routing::delete(delete_native).patch(patch_native),
         )
         .route(
             "/whip",
@@ -909,7 +1079,6 @@ mod tests {
         media::{Direction, MediaKind},
     };
     use tower::ServiceExt;
-    use tower_http::cors::{Any, CorsLayer};
 
     fn auth_registry() -> KeyRegistry {
         KeyRegistry::new(
@@ -1000,10 +1169,26 @@ mod tests {
         let offer = valid_offer();
         let expected_offer = offer.clone();
         let body = serde_json::to_vec(&serde_json::json!({
-            "offer": offer.clone(),
-            "manual": true
+            "profile": "pulsebeam.media.v1",
+            "offer": offer.clone()
         }))
         .unwrap();
+        let unrepresentable = pulsebeam_server::sign_participant_token(
+            &pulsebeam_server::insecure_dev_api_key().unwrap(),
+            RoomExternalId::new("general").unwrap().as_str(),
+            ParticipantExternalId::new("alice").unwrap().as_str(),
+            u64::MAX,
+        )
+        .unwrap();
+        let rejected = tokio::select! {
+            response = app.clone().oneshot(native_post(&unrepresentable, body.clone())) => {
+                response.unwrap()
+            }
+            _ = commands.recv() => panic!("unrepresentable Native expiry reached the controller"),
+        };
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert!(commands.try_recv().is_err());
+
         let responder = tokio::spawn(async move {
             let controller::ControllerCommand::CreateParticipant(message, reply) =
                 commands.recv().await.unwrap()
@@ -1013,6 +1198,10 @@ mod tests {
             assert!(message.state.manual_sub);
             assert_eq!(message.state.profile, ConnectionProfile::Native);
             assert!(message.state.authorization.is_some());
+            assert_eq!(
+                message.state.rtp_capabilities,
+                Some(crate::participant::rtp::capabilities())
+            );
             assert_eq!(message.offer, expected_offer);
             let answer = message.offer;
             reply.send(Ok(CreateParticipantReply { answer })).unwrap();
@@ -1026,6 +1215,15 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["profile"], pulsebeam_proto::state::PROFILE);
+        assert_eq!(
+            body["data_delivery"],
+            serde_json::json!(["LATEST", "LOSSY", "ORDERED"])
+        );
+        assert_eq!(
+            body["rtp_capabilities"],
+            serde_json::to_value(crate::participant::rtp::capabilities()).unwrap()
+        );
         assert_eq!(body["room_external_id"], "general");
         assert_eq!(body["participant_external_id"], "alice");
         let room_id = RoomId::derive(
@@ -1048,7 +1246,10 @@ mod tests {
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let app = router(controller, cfg(), auth_registry());
         let offer = "not SDP\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
-        let body = serde_json::to_vec(&serde_json::json!({"offer": offer})).unwrap();
+        let body = serde_json::to_vec(
+            &serde_json::json!({"profile": "pulsebeam.media.v1", "offer": offer}),
+        )
+        .unwrap();
         let responder = tokio::spawn(async move {
             let controller::ControllerCommand::CreateParticipant(message, reply) =
                 commands.recv().await.unwrap()
@@ -1063,6 +1264,7 @@ mod tests {
                 message.offer,
                 crate::control::ufrag::test_credentials(),
                 pulsebeam_runtime::net::ReceiveTime::now(),
+                None,
             );
             let Err(error @ crate::control::negotiator::NegotiatorError::InvalidOffer(_)) = result
             else {
@@ -1089,13 +1291,13 @@ mod tests {
     async fn native_post_rejects_malformed_contract_before_controller_allocation() {
         let token = live_token();
         let cases = [
-            serde_json::to_vec(&serde_json::json!({"offer": valid_offer(), "unknown": true}))
+            serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": valid_offer(), "unknown": true}))
                 .unwrap(),
             b"{".to_vec(),
             vec![b' '; MAX_NATIVE_BODY_BYTES + 1],
-            serde_json::to_vec(&serde_json::json!({"offer": " ".repeat(MAX_NATIVE_SDP_BYTES + 1)})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": " ".repeat(MAX_NATIVE_SDP_BYTES + 1)})).unwrap(),
             br#"{"offer":"v=0","offer":"v=1"}"#.to_vec(),
-            serde_json::to_vec(&serde_json::json!({"offer": valid_offer(), ("diagnostic-secret-".repeat(32)): true})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": valid_offer(), ("diagnostic-secret-".repeat(32)): true})).unwrap(),
         ];
         for body in cases {
             let (controller, mut commands) =
@@ -1138,6 +1340,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_patch_requires_exact_precondition_and_empty_body() {
+        let (controller, mut commands) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
+        let app = router(controller, cfg(), auth_registry()).layer(cors());
+        let token = live_token();
+        let connection = ConnectionId::new();
+        for (tag, expected) in [
+            (None, StatusCode::PRECONDITION_REQUIRED),
+            (Some("*"), StatusCode::BAD_REQUEST),
+            (Some("W/\"auth-1\""), StatusCode::BAD_REQUEST),
+            (Some("\"auth-0\""), StatusCode::BAD_REQUEST),
+            (Some("\"auth-01\""), StatusCode::BAD_REQUEST),
+            (Some("\"auth-+1\""), StatusCode::BAD_REQUEST),
+            (
+                Some("\"auth-18446744073709551616\""),
+                StatusCode::BAD_REQUEST,
+            ),
+            (Some("\"auth-1\", \"auth-2\""), StatusCode::BAD_REQUEST),
+        ] {
+            let mut request = Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/native/{connection}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"));
+            if let Some(tag) = tag {
+                request = request.header(IF_MATCH, tag);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{tag:?}");
+        }
+        for (duplicate, body) in [
+            (true, Body::empty()),
+            (false, Body::from("not-a-grant-body")),
+        ] {
+            let mut request = Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/native/{connection}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header(IF_MATCH, "\"auth-1\"");
+            if duplicate {
+                request = request.header(IF_MATCH, "\"auth-1\"");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert!(commands.try_recv().is_err());
+        let observed = verify_bearer(
+            &authorization_headers(&token),
+            &auth_registry(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let responder = tokio::spawn(async move {
+            for result in [
+                Ok(2),
+                Err(controller::ControllerError::AuthorizationPrecondition { revision: 2 }),
+                Err(controller::ControllerError::GrantGone),
+            ] {
+                let controller::ControllerCommand::ReplaceAuthorization(message, reply) =
+                    commands.recv().await.unwrap()
+                else {
+                    panic!("expected grant replacement")
+                };
+                assert_eq!(message.connection_id, connection);
+                assert_eq!(message.expected_revision, 1);
+                assert_eq!(
+                    message.authorization.participant_id,
+                    observed.participant_id
+                );
+                assert_eq!(message.authorization.room_id, observed.room_id);
+                reply.send(result).unwrap();
+            }
+        });
+        for (status, tag) in [
+            (StatusCode::NO_CONTENT, Some("\"auth-2\"")),
+            (StatusCode::PRECONDITION_FAILED, Some("\"auth-2\"")),
+            (StatusCode::GONE, None),
+        ] {
+            let request = Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/native/{connection}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header(IF_MATCH, "\"auth-1\"")
+                .header("origin", "https://app.example")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), status);
+            assert!(
+                response.headers()["access-control-expose-headers"]
+                    .to_str()
+                    .unwrap()
+                    .split(',')
+                    .any(|header| header.trim().eq_ignore_ascii_case("etag"))
+            );
+            assert_eq!(
+                response.headers().get(ETAG).map(|v| v.to_str().unwrap()),
+                tag
+            );
+            let body = to_bytes(response.into_body(), MAX_NATIVE_BODY_BYTES)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains(&token));
+        }
+        responder.await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_MATCH, grant_etag(u64::MAX).unwrap());
+        assert_eq!(grant_precondition(&headers).unwrap(), u64::MAX);
+    }
+
+    #[tokio::test]
     async fn native_delete_uses_claim_identity_profile_and_path_connection() {
         let (controller, mut commands) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
@@ -1149,18 +1472,27 @@ mod tests {
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
-        let response = router(controller, cfg(), auth_registry())
-            .oneshot(request)
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let controller::ControllerCommand::DeleteParticipant(message) =
+        let app = router(controller, cfg(), auth_registry());
+        let response = app.oneshot(request);
+        tokio::pin!(response);
+        assert!(
+            futures_lite::future::poll_once(&mut response)
+                .await
+                .is_none()
+        );
+        let controller::ControllerCommand::DeleteNative(message, reply) =
             commands.recv().await.unwrap()
         else {
-            panic!("expected delete command")
+            panic!("expected native delete command")
         };
         assert_eq!(message.connection_id, connection_id);
-        assert_eq!(message.profile, ConnectionProfile::Native);
+        assert!(
+            futures_lite::future::poll_once(&mut response)
+                .await
+                .is_none()
+        );
+        reply.send(Ok(())).unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::NO_CONTENT);
 
         let (controller, _) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
@@ -1300,14 +1632,32 @@ mod tests {
     }
 
     #[test]
-    fn strict_request_defaults_manual_and_rejects_unknown_fields() {
-        let automatic: NativeRequest = serde_json::from_str(r#"{"offer":"v=0"}"#).unwrap();
-        assert!(!automatic.manual);
-        let manual: NativeRequest =
-            serde_json::from_str(r#"{"offer":"v=0","manual":true}"#).unwrap();
-        assert!(manual.manual);
+    fn strict_request_checks_profile_and_whole_document_keys() {
+        let native =
+            parse_native_request(br#"{"profile":"pulsebeam.media.v1","offer":"v=0"}"#).unwrap();
+        assert_eq!(native.profile, pulsebeam_proto::state::PROFILE);
+        for body in [
+            br#"{"offer":"v=0"}"#.as_slice(),
+            br#"{"profile":"old","offer":"v=0"}"#,
+            br#"{"profile":null,"offer":"v=0"}"#,
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","room":"other"}"#,
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","manual":true}"#,
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","rtp_capabilities":{}}"#,
+        ] {
+            assert!(parse_native_request(body).is_err());
+        }
+        for body in [
+            br#"{"offer":"v=0","offer":"v=1"}"#.as_slice(),
+            br#"{"rtp_capabilities":{"future":{"key":false,"key":true}}}"#,
+            br#"{"future":[{"key":0,"\u006bey":1}]}"#,
+        ] {
+            assert!(native_json::unique_keys(body).is_err());
+        }
         assert!(
-            serde_json::from_str::<NativeRequest>(r#"{"offer":"v=0","room":"other"}"#).is_err()
+            native_json::unique_keys(
+                br#"{"values":[null,true,false,-1,1.5,"x"],"nested":[{"key":0},{"key":1}]}"#
+            )
+            .is_ok()
         );
     }
 
@@ -1566,13 +1916,12 @@ mod tests {
             assert_eq!(post["security"][0]["bearer_auth"], serde_json::json!([]));
         }
         let json = serde_json::to_string(&document).unwrap();
-        for old in [
-            "/rooms",
-            "pb-participant-id",
-            "If-Match",
-            "ETag",
-            "\"patch\"",
-        ] {
+        assert!(document["paths"]["/native/{connection_id}"]["patch"].is_object());
+        assert!(document["paths"]["/native/{connection_id}"]["patch"]["responses"]["412"]["headers"]["ETag"].is_object());
+        for profile in ["whip", "whep"] {
+            assert!(document["paths"][format!("/{profile}/{{connection_id}}")]["patch"].is_null());
+        }
+        for old in ["/rooms", "pb-participant-id"] {
             assert!(
                 !json.contains(old),
                 "old contract remained in OpenAPI: {old}"
@@ -1660,26 +2009,36 @@ mod tests {
     async fn native_options_remains_available_through_cors() {
         let (controller, _) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
-        let app = router(controller, cfg(), auth_registry()).layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([hyper::Method::POST, hyper::Method::DELETE])
-                .allow_headers([AUTHORIZATION, CONTENT_TYPE]),
-        );
-        let request = Request::builder()
-            .method("OPTIONS")
-            .uri("/api/v1/native")
-            .header("origin", "https://app.example")
-            .header("access-control-request-method", "POST")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            response
-                .headers()
-                .contains_key("access-control-allow-methods")
-        );
+        let app = router(controller, cfg(), auth_registry()).layer(cors());
+        for (method, path) in [
+            ("POST", "/api/v1/native"),
+            ("PATCH", "/api/v1/native/opaque"),
+        ] {
+            let request = Request::builder()
+                .method("OPTIONS")
+                .uri(path)
+                .header("origin", "https://app.example")
+                .header("access-control-request-method", method)
+                .header("access-control-request-headers", "authorization,if-match")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.headers()["access-control-allow-methods"]
+                    .to_str()
+                    .unwrap()
+                    .split(',')
+                    .any(|value| value.trim() == method)
+            );
+            assert!(
+                response.headers()["access-control-allow-headers"]
+                    .to_str()
+                    .unwrap()
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case("if-match"))
+            );
+        }
     }
 
     #[test]

@@ -7,8 +7,9 @@ use pulsebeam_agent_native::agent_core::{
 use pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Application declarations bound to the producer's public admission. Expected
-/// media identities never come from a receiver or its decoded output.
+/// Admission and public catalog descriptors bind opaque identities. Kind,
+/// label, ownership and receive intent remain plan-derived; media origin is
+/// independently authenticated from actual encoded bytes.
 #[derive(Clone, Debug)]
 pub struct ExpectedParticipant {
     pub id: ParticipantId,
@@ -21,6 +22,7 @@ pub struct ExpectedParticipant {
     pub required: bool,
     pub connection: Option<ConnectionId>,
     pub topics: TopicRegistrations,
+    pub media: Vec<Publication>,
 }
 
 impl ExpectedParticipant {
@@ -31,30 +33,65 @@ impl ExpectedParticipant {
         ))
     }
 
-    pub fn track_id(&self, kind: TrackKind, label: &str) -> TrackId {
-        self.connection
-            .expect("admitted plan participant")
-            .derive_track_id(kind, label)
-    }
-
-    fn publications(&self) -> impl Iterator<Item = Publication> + '_ {
-        [
+    pub fn bind_media(&mut self, catalog: &[Publication]) -> Result<bool> {
+        self.media.clear();
+        for (enabled, kind, track_kind, label) in [
             (
                 self.video,
-                TrackKind::Video,
                 MediaKind::Video,
+                TrackKind::Video,
                 self.video_label.as_str(),
             ),
-            (self.audio, TrackKind::Audio, MediaKind::Audio, "audio"),
-        ]
-        .into_iter()
-        .filter(|(active, ..)| *active)
-        .map(|(_, kind, media, label)| Publication {
-            id: self.track_id(kind, label).as_str(),
-            participant_id: self.id.as_str(),
-            kind: media,
-            label: label.into(),
-        })
+            (self.audio, MediaKind::Audio, TrackKind::Audio, "audio"),
+        ] {
+            if !enabled {
+                continue;
+            }
+            let mut descriptors = catalog.iter().filter(|publication| {
+                publication.participant_id == self.id.as_str()
+                    && publication.kind == kind
+                    && publication.label == label
+            });
+            let Some(descriptor) = descriptors.next() else {
+                return Ok(false);
+            };
+            ensure!(
+                descriptors.next().is_none(),
+                "duplicate publisher descriptor for {kind:?}/{label}"
+            );
+            let id: TrackId = descriptor.id.parse()?;
+            ensure!(
+                id.kind() == track_kind,
+                "publisher descriptor has wrong ID kind"
+            );
+            self.media.push(Publication {
+                id: descriptor.id.clone(),
+                participant_id: self.id.as_str(),
+                kind,
+                label: label.into(),
+            });
+        }
+        Ok(true)
+    }
+
+    pub fn track_id(&self, kind: TrackKind, label: &str) -> TrackId {
+        self.media
+            .iter()
+            .find(|publication| {
+                publication.label == label
+                    && matches!(
+                        (kind, publication.kind),
+                        (TrackKind::Video, MediaKind::Video) | (TrackKind::Audio, MediaKind::Audio)
+                    )
+            })
+            .expect("bound publisher descriptor")
+            .id
+            .parse()
+            .expect("canonical publication")
+    }
+
+    pub fn publications(&self) -> impl Iterator<Item = Publication> + '_ {
+        self.media.iter().cloned()
     }
 }
 

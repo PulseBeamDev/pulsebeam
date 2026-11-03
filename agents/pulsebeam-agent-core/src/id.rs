@@ -62,6 +62,10 @@ impl IdGenerator {
         OperationId(self.next())
     }
 
+    pub(crate) fn channel(&mut self) -> ChannelId {
+        ChannelId(self.next())
+    }
+
     pub(crate) fn timer(&mut self) -> TimerId {
         TimerId(self.next())
     }

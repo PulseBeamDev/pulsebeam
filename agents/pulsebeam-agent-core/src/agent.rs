@@ -5,7 +5,8 @@ use alloc::{
     vec::Vec,
 };
 use core::time::Duration;
-use pulsebeam_proto::signaling_v1 as wire;
+
+use crate::native_state::NativeState;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -17,7 +18,6 @@ use crate::{
     TopicError, TopicSend, ValidationError,
     id::IdGenerator,
     signaling::{self, SignalingError},
-    signaling_v1::{self, CatalogState, ServerOutput},
     topic::Topics,
 };
 
@@ -33,6 +33,8 @@ macro_rules! agent_log {
         }
     };
 }
+
+mod native;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum AgentCommand {
@@ -82,7 +84,20 @@ pub enum AgentError {
     InvalidResource(#[from] crate::TrackResourceError),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceReadiness {
+    Ready,
+    Preparing,
+    Failed,
+}
+
+/// Producer acquisition waits only for physical changes to its own local slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourcePreparation<'a> {
+    pub target: Option<&'a str>,
+    pub readiness: SourceReadiness,
+}
+
 struct Session {
     generation: Generation,
     resource_uri: String,
@@ -91,16 +106,25 @@ struct Session {
     _room_id: RoomId,
     participant_external_id: String,
     _opaque_participant_id: ParticipantId,
-    coordinates: BTreeMap<MediaSlot, SlotBinding>,
-    observed: CatalogState,
-    intent_revision: u64,
-    publication_bindings: BTreeMap<String, String>,
+    coordinates: BTreeMap<MediaSlot, Option<SlotBinding>>,
+    state: NativeState,
+    payloads: BTreeMap<ChannelId, native::PayloadChannel>,
+    payload_resources: BTreeMap<crate::native_state::Resource, ChannelId>,
+    next_stream: u32,
+    media_leases: BTreeMap<MediaSlot, native::MediaLease>,
+    media_retirement: Option<native::MediaRetirement>,
+    media_allocation: Option<native::MediaAllocation>,
+    media_wanted: BTreeMap<MediaSlot, native::MediaWant>,
+    media_blocked: BTreeMap<MediaSlot, native::MediaWant>,
+
     authorization_expires_at: Option<i64>,
-    pending_renewal: Option<String>,
-    renewal_send: Option<OperationId>,
+    pending_renewal: Option<native::Renewal>,
     signaling_terminal: bool,
     signaling_channel: ChannelId,
-    seed_requests: VecDeque<wire::SubscriptionSeed>,
+    data_preparations: BTreeMap<ChannelId, Result<crate::PreparedDataChannel, String>>,
+    capabilities: crate::BootstrapCapabilities,
+    media_preparation:
+        Option<Result<crate::rtc_preparation::PreparedMedia, crate::client_sdp::Error>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +141,7 @@ enum AttemptStage {
 }
 
 struct Candidate {
+    capabilities: crate::BootstrapCapabilities,
     resource_uri: String,
     room_external_id: String,
     room_id: RoomId,
@@ -127,18 +152,19 @@ struct Candidate {
 
 #[derive(Serialize)]
 struct NativeRequest<'a> {
+    profile: &'static str,
     offer: &'a str,
-    manual: bool,
 }
 
 #[derive(Deserialize)]
 struct NativeResponse {
+    profile: String,
+    rtp_capabilities: pulsebeam_proto::state::RtpCapabilities,
+    data_delivery: Vec<pulsebeam_proto::state::DataDelivery>,
     room_external_id: String,
     room_id: String,
     participant_external_id: String,
     participant_id: String,
-    #[serde(rename = "connection_id")]
-    _canonical_connection_id: String,
     answer: String,
 }
 
@@ -155,6 +181,9 @@ struct Attempt {
     early_signaling: VecDeque<Vec<u8>>,
     topic_registrations: crate::TopicRegistrations,
     open_channels: BTreeSet<ChannelId>,
+    media_preparation:
+        Option<Result<crate::rtc_preparation::PreparedMedia, crate::client_sdp::Error>>,
+    data_preparations: BTreeMap<ChannelId, Result<crate::PreparedDataChannel, String>>,
 }
 
 struct Retry {
@@ -163,10 +192,11 @@ struct Retry {
 }
 
 struct PendingSignal {
-    seed: bool,
     operation: OperationId,
     generation: Generation,
     channel: ChannelId,
+    payload: Vec<u8>,
+    retrying: bool,
 }
 
 #[derive(Default)]
@@ -182,7 +212,6 @@ pub struct Agent {
     resources: crate::TrackResources,
     unmapped_video: BTreeSet<crate::TrackSelector>,
     local_bindings: BTreeMap<MediaSlot, String>,
-    retired_tracks: BTreeSet<String>,
     snapshot: Snapshot,
     ids: IdGenerator,
     effects: VecDeque<Effect>,
@@ -195,7 +224,6 @@ pub struct Agent {
     pending_signal: Option<PendingSignal>,
     signal_retry: Option<TimerId>,
     topic_probe: Option<TimerId>,
-    seed_timeout: Option<(TimerId, Generation)>,
     intent_dirty: bool,
     closing: Option<Closing>,
     orphaned_creates: BTreeSet<OperationId>,
@@ -213,7 +241,6 @@ impl Agent {
             resources: crate::TrackResources::default(),
             unmapped_video: BTreeSet::new(),
             local_bindings: BTreeMap::new(),
-            retired_tracks: BTreeSet::new(),
             snapshot: Snapshot::default(),
             ids: IdGenerator::new(),
             effects: VecDeque::new(),
@@ -226,7 +253,6 @@ impl Agent {
             pending_signal: None,
             signal_retry: None,
             topic_probe: None,
-            seed_timeout: None,
             intent_dirty: false,
             closing: None,
             orphaned_creates: BTreeSet::new(),
@@ -277,10 +303,9 @@ impl Agent {
             HostEvent::Timer(event) => self.handle_timer(event),
             HostEvent::DataChannel(event) => self.handle_data_channel(event),
         };
-        let refreshed = self.refresh_resources();
         self.send_intent_if_ready();
         let flushed = self.flush_notifications();
-        let result = result.and(refreshed).and(flushed);
+        let result = result.and(flushed);
         if let Err(error) = &result {
             agent_log!(self, Warn, "host event rejected: {error}");
         }
@@ -355,7 +380,6 @@ impl Agent {
                         _ => None,
                     })
                     .collect();
-                let label = spec.label().to_owned();
                 let owner = self.resources.new_owner()?;
                 let slot = self.resources.claim_publication(
                     owner,
@@ -363,16 +387,7 @@ impl Agent {
                     &self.config.topology,
                     &occupied,
                 )?;
-                let after_generation = self
-                    .active
-                    .as_ref()
-                    .filter(|session| {
-                        session
-                            .publication_bindings
-                            .get(&slot)
-                            .is_some_and(|bound| bound != &label)
-                    })
-                    .map(|session| session.generation);
+                let after_generation = None;
                 ResourceResult::Publication {
                     owner: owner.id(),
                     slot,
@@ -514,32 +529,50 @@ impl Agent {
         let active = self
             .active
             .as_mut()
-            .filter(|active| {
-                !active.signaling_terminal && active.authorization_expires_at.is_some()
-            })
+            .filter(|active| !active.signaling_terminal)
             .ok_or(AgentError::RenewalNotReady)?;
-        if active.pending_renewal.is_some() {
-            return Err(AgentError::RenewalBusy);
-        }
-        let payload = pulsebeam_proto::codec::encode_client(&wire::ClientMessage {
-            payload: Some(wire::client_message::Payload::RenewAuthorization(
-                wire::RenewAuthorization {
-                    token: token.clone(),
-                },
-            )),
-        })
-        .map_err(|_| SignalingError::Encode)?;
+        let expected_revision = if let Some(pending) = &active.pending_renewal {
+            if pending.token != token || pending.operation.is_some() || pending.accepted {
+                return Err(AgentError::RenewalBusy);
+            }
+            pending.expected_revision
+        } else {
+            active
+                .state
+                .session()
+                .and_then(|session| session.authorization.as_ref())
+                .and_then(|grant| grant.revision.checked_add(1))
+                .ok_or(AgentError::RenewalNotReady)?
+        };
         let operation = self.ids.operation();
-        active.pending_renewal = Some(token);
-        active.renewal_send = Some(operation);
-        self.effects
-            .push_back(Effect::DataChannel(DataChannelEffect::Send {
-                operation,
-                generation: active.generation,
-                channel: active.signaling_channel,
-                binary: true,
-                payload,
-            }));
+        let precondition = expected_revision
+            .checked_sub(1)
+            .ok_or(AgentError::RenewalNotReady)?;
+        self.effects.push_back(Effect::Http(HttpEffect::Request {
+            operation,
+            generation: Some(active.generation),
+            request: HttpRequest {
+                method: HttpMethod::Patch,
+                uri: active.resource_uri.clone(),
+                headers: vec![
+                    HttpHeader {
+                        name: "Authorization".into(),
+                        value: format!("Bearer {token}"),
+                    },
+                    HttpHeader {
+                        name: "If-Match".into(),
+                        value: format!("\"auth-{precondition}\""),
+                    },
+                ],
+                body: Vec::new(),
+            },
+        }));
+        active.pending_renewal = Some(native::Renewal {
+            token,
+            operation: Some(operation),
+            expected_revision,
+            accepted: false,
+        });
         Ok(())
     }
 
@@ -587,21 +620,7 @@ impl Agent {
             Some(crate::MediaKind::Audio) => Ok(MediaSlot::LocalAudio(name.to_string())),
             None => Err(ValidationError::UnknownPublicationSlot(name.to_string())),
         };
-        for publication in &desired.publications {
-            let slot = local_slot(&publication.slot)?;
-            if self
-                .local_bindings
-                .get(&slot)
-                .is_some_and(|label| label != &publication.label)
-                || self.local_bindings.iter().any(|(reserved_slot, label)| {
-                    reserved_slot.kind() == slot.kind()
-                        && label == &publication.label
-                        && reserved_slot != &slot
-                })
-            {
-                return Err(ValidationError::PublicationBinding(publication.label.clone()).into());
-            }
-        }
+        self.local_bindings.clear();
         for publication in &desired.publications {
             self.local_bindings
                 .insert(local_slot(&publication.slot)?, publication.label.clone());
@@ -673,25 +692,6 @@ impl Agent {
         if self.desired == desired {
             return Ok(());
         }
-        if let Some(active) = self.active.as_ref() {
-            for video in &desired.video {
-                if video.selector.is_none()
-                    && active.observed.tracks.contains_key(&video.track_id)
-                    && !self.desired.video.iter().any(|previous| {
-                        previous.selector.is_none() && previous.track_id == video.track_id
-                    })
-                {
-                    self.retired_tracks.remove(&video.track_id);
-                }
-            }
-            for id in &desired.audio.pinned {
-                if active.observed.tracks.contains_key(id)
-                    && !self.desired.audio.pinned.contains(id)
-                {
-                    self.retired_tracks.remove(id);
-                }
-            }
-        }
         let video_changed = self.desired.video != desired.video;
         let intent_changed = self.desired.publications != desired.publications
             || video_changed
@@ -727,12 +727,12 @@ impl Agent {
                 &mut self.notifications,
             );
             self.schedule_topic_probe();
-            if !self.topics.seeding() {
-                self.cancel_seed_timeout();
-            }
         }
-        if intent_changed {
+        if intent_changed || topics_changed {
             self.intent_dirty = true;
+        }
+        if topics_changed {
+            self.schedule_topic_probe();
         }
 
         if self.desired.connected {
@@ -741,8 +741,6 @@ impl Agent {
                     return Ok(());
                 } else if self.active.is_none() {
                     self.start_attempt(AttemptMode::Fresh);
-                } else if topics_changed {
-                    self.start_attempt(AttemptMode::Replace);
                 } else {
                     self.send_intent_if_ready();
                 }
@@ -811,16 +809,17 @@ impl Agent {
             transport_connected: false,
             signaling_open: false,
             early_signaling: VecDeque::new(),
-            topic_registrations: topic_registrations.clone(),
+            topic_registrations,
             open_channels: BTreeSet::new(),
+            media_preparation: None,
+            data_preparations: BTreeMap::new(),
         });
-        let mut data_channels = vec![DataChannelSpec {
+        let data_channels = vec![DataChannelSpec {
             label: signaling::SIGNALING_LABEL.to_string(),
             ordered: true,
             reliability: DataChannelReliability::Reliable,
             negotiated_id: Some(0),
         }];
-        data_channels.extend(Topics::channel_specs(&topic_registrations));
         self.effects.push_back(Effect::Rtc(RtcEffect::CreateOffer {
             generation,
             topology: self.config.topology.clone(),
@@ -841,6 +840,59 @@ impl Agent {
                 offer,
                 resources,
             } => self.offer_created(generation, offer, resources),
+            RtcEvent::BootstrapMediaPrepared {
+                generation,
+                preparation,
+            } => {
+                if let Some(attempt) = self.attempt.as_mut()
+                    && attempt.generation == generation
+                    && attempt.stage == AttemptStage::ApplyingAnswer
+                    && attempt.media_preparation.is_none()
+                {
+                    attempt.media_preparation = Some(preparation.and_then(|bindings| {
+                        let resources = attempt
+                            .resources
+                            .as_ref()
+                            .ok_or(crate::client_sdp::Error::Observation)?;
+                        let candidate = attempt
+                            .candidate
+                            .as_ref()
+                            .ok_or(crate::client_sdp::Error::Observation)?;
+                        crate::rtc_preparation::prepare_bootstrap_bindings(
+                            bindings,
+                            &resources.slots,
+                            &candidate.capabilities.rtp,
+                        )
+                    }));
+                }
+                Ok(())
+            }
+            RtcEvent::MediaPrepared {
+                generation,
+                operation,
+                slots,
+                outcome,
+                preparation,
+            } => {
+                if self
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.media_allocation.as_ref())
+                    .is_some_and(|pending| pending.operation == operation)
+                {
+                    self.media_allocated(generation, operation, slots, outcome, preparation);
+                } else {
+                    self.media_retired(generation, operation, outcome, preparation);
+                }
+                Ok(())
+            }
+            RtcEvent::MediaObserved {
+                generation,
+                bindings,
+            } => {
+                self.media_observed(generation, bindings);
+                Ok(())
+            }
             RtcEvent::AnswerApplied { generation } => {
                 if let Some(attempt) = self.attempt.as_mut()
                     && attempt.generation == generation
@@ -848,6 +900,19 @@ impl Agent {
                     attempt.answer_applied = true;
                     self.update_attempt_state();
                     self.try_activate()?;
+                }
+                Ok(())
+            }
+            RtcEvent::BootstrapRejected {
+                generation,
+                message,
+            } => {
+                if self
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.generation == generation)
+                {
+                    self.fail_attempt(Failure::protocol(message));
                 }
                 Ok(())
             }
@@ -921,8 +986,49 @@ impl Agent {
         }
     }
 
+    fn cancel_renewal(&mut self, generation: Generation) {
+        if let Some(renewal) = self
+            .active
+            .as_mut()
+            .filter(|active| active.generation == generation)
+            .and_then(|active| active.pending_renewal.take())
+            && let Some(operation) = renewal.operation
+        {
+            self.effects
+                .push_back(Effect::Http(HttpEffect::Cancel { operation }));
+        }
+    }
+
+    fn cancel_media(&mut self, generation: Generation) {
+        if let Some(pending) = self
+            .active
+            .as_mut()
+            .filter(|active| active.generation == generation)
+            .and_then(|active| active.media_allocation.take())
+        {
+            self.effects
+                .push_back(Effect::Rtc(RtcEffect::CancelMediaPreparation {
+                    generation,
+                    operation: pending.operation,
+                }));
+        }
+        if let Some(pending) = self
+            .active
+            .as_mut()
+            .filter(|active| active.generation == generation)
+            .and_then(|active| active.media_retirement.take())
+        {
+            self.effects
+                .push_back(Effect::Rtc(RtcEffect::CancelMediaPreparation {
+                    generation,
+                    operation: pending.operation,
+                }));
+        }
+    }
+
     fn fence_signaling(&mut self, generation: Generation) {
-        self.cancel_seed_timeout();
+        self.cancel_renewal(generation);
+        self.cancel_media(generation);
         if let Some(active) = self.active.as_mut() {
             active.signaling_terminal = true;
         }
@@ -987,6 +1093,16 @@ impl Agent {
                 response,
             } => self.http_response(operation, response),
             HttpEvent::Failed { operation, message } => {
+                if let Some(renewal) = self
+                    .active
+                    .as_mut()
+                    .and_then(|active| active.pending_renewal.as_mut())
+                    .filter(|renewal| renewal.operation == Some(operation))
+                {
+                    renewal.operation = None;
+                    self.notify_failure(Failure::transient(message));
+                    return Ok(());
+                }
                 if self.remove_delete(operation) {
                     return Ok(());
                 }
@@ -1010,6 +1126,33 @@ impl Agent {
         operation: OperationId,
         response: HttpResponse,
     ) -> Result<(), AgentError> {
+        if let Some(active) = self.active.as_mut()
+            && let Some(renewal) = active
+                .pending_renewal
+                .as_mut()
+                .filter(|renewal| renewal.operation == Some(operation))
+        {
+            renewal.operation = None;
+            let expected = format!("\"auth-{}\"", renewal.expected_revision);
+            if response.status == 204
+                && response.headers.iter().any(|header| {
+                    header.name.eq_ignore_ascii_case("etag") && header.value == expected
+                })
+            {
+                renewal.accepted = true;
+                self.commit_renewal();
+            } else if (400..500).contains(&response.status) && response.status != 408 {
+                active.pending_renewal = None;
+                self.notifications.push_back(Notification::ServerError(
+                    "authorization replacement rejected".into(),
+                ));
+            } else {
+                self.notifications.push_back(Notification::ServerError(
+                    "authorization replacement outcome is ambiguous".into(),
+                ));
+            }
+            return Ok(());
+        }
         if self.remove_delete(operation) {
             return Ok(());
         }
@@ -1053,13 +1196,17 @@ impl Agent {
                 return Ok(());
             }
         };
+        let capabilities = candidate.capabilities.clone();
         if let Some(attempt) = self.attempt.as_mut() {
             attempt.stage = AttemptStage::ApplyingAnswer;
             attempt.request = None;
             attempt.candidate = Some(candidate);
         }
-        self.effects
-            .push_back(Effect::Rtc(RtcEffect::ApplyAnswer { generation, answer }));
+        self.effects.push_back(Effect::Rtc(RtcEffect::ApplyAnswer {
+            generation,
+            answer,
+            capabilities,
+        }));
         self.update_attempt_state();
         Ok(())
     }
@@ -1080,16 +1227,6 @@ impl Agent {
                 } else if self.signal_retry == Some(timer) {
                     self.signal_retry = None;
                     self.send_intent_if_ready();
-                } else if let Some((pending, generation)) = self.seed_timeout
-                    && pending == timer
-                {
-                    self.seed_timeout = None;
-                    if self.topics.seeding() {
-                        self.handle_rtc(RtcEvent::Failed {
-                            generation,
-                            message: "subscription seed did not complete within 30 seconds".into(),
-                        })?;
-                    }
                 } else if self.topic_probe == Some(timer) {
                     self.topic_probe = None;
                     if self.active.is_some() && self.desired.connected {
@@ -1112,6 +1249,99 @@ impl Agent {
 
     fn handle_data_channel(&mut self, event: DataChannelEvent) -> Result<(), AgentError> {
         match event {
+            DataChannelEvent::Prepared {
+                generation,
+                channel,
+                preparation,
+            } => {
+                let preparation = preparation.and_then(|properties| {
+                    properties.validate().map_err(str::to_string)?;
+                    Ok(properties)
+                });
+                let preparations = if let Some(attempt) = self.attempt.as_mut()
+                    && attempt.generation == generation
+                    && attempt.resources.as_ref().is_some_and(|resources| {
+                        resources.signaling_channel == channel
+                            || resources
+                                .data_channels
+                                .iter()
+                                .any(|binding| binding.channel == channel)
+                    }) {
+                    Some(&mut attempt.data_preparations)
+                } else if let Some(active) = self.active.as_mut()
+                    && active.generation == generation
+                    && !active.signaling_terminal
+                    && (active.signaling_channel == channel
+                        || active.payloads.contains_key(&channel))
+                {
+                    Some(&mut active.data_preparations)
+                } else {
+                    None
+                };
+                if let Some(preparations) = preparations {
+                    let preparation = match (preparations.get(&channel), preparation) {
+                        (Some(Err(error)), _) => Err(error.clone()),
+                        (Some(Ok(old)), Ok(mut next)) => {
+                            if old.stream_id != next.stream_id
+                                || old.negotiated != next.negotiated
+                                || old.ordered != next.ordered
+                                || old.reliability != next.reliability
+                                || matches!((old.association_max_channels, next.association_max_channels), (Some(old), Some(next)) if next < old)
+                            {
+                                Err("prepared channel identity changed".to_string())
+                            } else {
+                                next.association_max_channels = next
+                                    .association_max_channels
+                                    .or(old.association_max_channels);
+                                Ok(next)
+                            }
+                        }
+                        (_, preparation) => preparation,
+                    };
+                    let changed = preparations.get(&channel) != Some(&preparation);
+                    preparations.insert(channel, preparation);
+                    if changed
+                        && let Some(active) = self.active.as_mut().filter(|active| {
+                            active.generation == generation && !active.signaling_terminal
+                        })
+                    {
+                        if active.signaling_channel == channel {
+                            self.intent_dirty = true;
+                        } else if let Some(error) = active
+                            .data_preparations
+                            .get(&channel)
+                            .and_then(|value| value.as_ref().err())
+                            .cloned()
+                        {
+                            if let Some(physical) = active
+                                .payloads
+                                .get_mut(&channel)
+                                .filter(|physical| !physical.terminal)
+                            {
+                                physical.terminal = true;
+                                active.state.stage(physical.resource.clone(), None)?;
+                                self.intent_dirty = true;
+                                self.topics.suspend_source(generation, channel);
+                                self.effects
+                                    .push_back(Effect::Rtc(RtcEffect::CloseDataChannel {
+                                        generation,
+                                        channel,
+                                    }));
+                                self.notifications
+                                    .push_back(Notification::ServerError(error));
+                            }
+                        } else if let Err(error) = native::prepared_payload(
+                            active,
+                            channel,
+                            &mut self.ids,
+                            &mut self.effects,
+                        ) {
+                            self.notifications
+                                .push_back(Notification::ServerError(error.to_string()));
+                        }
+                    }
+                }
+            }
             DataChannelEvent::Opened {
                 generation,
                 channel,
@@ -1148,7 +1378,7 @@ impl Agent {
                     .is_some_and(|active| active.generation == generation)
                     && !self.active.as_ref().is_some_and(|active| {
                         active.signaling_channel == channel
-                            || self.topics.has_channel(generation, channel)
+                            || active.payloads.contains_key(&channel)
                     })
                 {
                     return Err(TopicError::UnknownChannel.into());
@@ -1158,6 +1388,43 @@ impl Agent {
                 generation,
                 channel,
             } => {
+                let native_payload = self.active.as_ref().is_some_and(|active| {
+                    active.generation == generation && active.payloads.contains_key(&channel)
+                });
+                let signaling_closed = self.active.as_ref().is_some_and(|active| {
+                    active.generation == generation && active.signaling_channel == channel
+                });
+                if let Some(attempt) = self
+                    .attempt
+                    .as_mut()
+                    .filter(|attempt| attempt.generation == generation)
+                {
+                    attempt.data_preparations.remove(&channel);
+                }
+                if let Some(active) = self
+                    .active
+                    .as_mut()
+                    .filter(|active| active.generation == generation)
+                {
+                    active.data_preparations.remove(&channel);
+                    if let Some(physical) = active.payloads.get_mut(&channel) {
+                        if !physical.terminal {
+                            physical.restart = !active.state.retaining(&physical.resource);
+                        }
+                        physical.terminal = true;
+                        physical.closed = true;
+                        let resource = physical.resource.clone();
+                        active.state.stage(resource, None)?;
+                        self.intent_dirty = true;
+                    }
+                    if active.signaling_channel == channel {
+                        active.signaling_terminal = true;
+                    }
+                }
+                if signaling_closed {
+                    self.cancel_renewal(generation);
+                    self.cancel_media(generation);
+                }
                 let candidate_channel = self.attempt.as_ref().is_some_and(|attempt| {
                     attempt.generation == generation
                         && attempt.resources.as_ref().is_some_and(|resources| {
@@ -1172,9 +1439,8 @@ impl Agent {
                     self.fail_attempt(Failure::transient("candidate data channel closed"));
                     return Ok(());
                 }
-                if self.active.as_ref().is_some_and(|session| {
-                    session.generation == generation && session.signaling_channel == channel
-                }) && self.desired.connected
+                if signaling_closed
+                    && self.desired.connected
                     && self.attempt.is_none()
                     && self.retry.is_none()
                 {
@@ -1194,6 +1460,7 @@ impl Agent {
                         &mut self.notifications,
                     );
                     if topic_closed
+                        && !native_payload
                         && self.desired.connected
                         && self.attempt.is_none()
                         && self.retry.is_none()
@@ -1234,6 +1501,9 @@ impl Agent {
                     return Ok(());
                 }
                 if active.signaling_channel != channel {
+                    if !self.topics.has_channel(generation, channel) {
+                        return Ok(());
+                    }
                     let _ = self.topics.handle_message(
                         generation,
                         channel,
@@ -1248,164 +1518,9 @@ impl Agent {
                 if active.signaling_terminal {
                     return Ok(());
                 }
-                let resolved_before =
-                    signaling::resolved_selectors(&self.desired, &active.observed);
-                let tracks_before: BTreeSet<_> = active.observed.tracks.keys().cloned().collect();
-                let output = signaling_v1::decode_and_apply(
-                    &payload,
-                    &mut active.observed,
-                    &mut self.snapshot,
-                    &mut self.notifications,
-                    &active.coordinates,
-                    &active.participant_id,
-                    &active.participant_external_id,
-                );
-                let output = match output {
-                    Ok(output) => output,
-                    Err(error) => {
-                        self.fail_terminal(Failure::protocol(error.to_string()));
-                        return Err(error.into());
-                    }
-                };
-                match output {
-                    ServerOutput::StateChanged => {
-                        if active.intent_revision != 0
-                            && active.observed.intent_revision == active.intent_revision
-                        {
-                            self.retry_attempts = 0;
-                        }
-                        self.topics.sync_catalog(
-                            generation,
-                            &active.observed,
-                            &mut self.snapshot,
-                            &mut self.notifications,
-                            &mut self.ids,
-                            &mut self.effects,
-                        );
-                        self.topics
-                            .probe_remote_publishers(&mut self.ids, &mut self.effects);
-                        agent_log!(
-                            self,
-                            Debug,
-                            "applied signaling state generation={} participants={} publications={} video_bindings={} audio_bindings={}",
-                            generation.get(),
-                            self.snapshot.participants.len(),
-                            self.snapshot.publications.len(),
-                            self.snapshot.video_mapping.len(),
-                            self.snapshot.audio_mapping.len(),
-                        );
-                        let removed: Vec<_> = tracks_before
-                            .into_iter()
-                            .filter(|id| !active.observed.tracks.contains_key(id))
-                            .collect();
-                        let direct_removed = removed.iter().any(|id| {
-                            self.desired
-                                .video
-                                .iter()
-                                .any(|video| video.selector.is_none() && video.track_id == *id)
-                                || self.desired.audio.pinned.contains(id)
-                        });
-                        self.retired_tracks.extend(removed);
-                        if direct_removed
-                            || resolved_before
-                                != signaling::resolved_selectors(&self.desired, &active.observed)
-                        {
-                            self.intent_dirty = true;
-                        }
-                    }
-                    ServerOutput::SeedComplete(completion) => {
-                        if self
-                            .topics
-                            .complete_seed(generation, &completion, active.observed.revision)
-                            .is_err()
-                        {
-                            self.fail_terminal(Failure::protocol(
-                                "invalid subscription seed completion",
-                            ));
-                            return Err(
-                                SignalingError::Invalid("subscription seed completion").into()
-                            );
-                        }
-                        self.topics.sync_catalog(
-                            generation,
-                            &active.observed,
-                            &mut self.snapshot,
-                            &mut self.notifications,
-                            &mut self.ids,
-                            &mut self.effects,
-                        );
-                        self.topics
-                            .probe_remote_publishers(&mut self.ids, &mut self.effects);
-                        if !self.topics.seeding() {
-                            self.cancel_seed_timeout();
-                        }
-                    }
-                    ServerOutput::Authorization(expires_at) => {
-                        if active.pending_renewal.is_some()
-                            && active
-                                .authorization_expires_at
-                                .is_some_and(|previous| expires_at <= previous)
-                        {
-                            self.fail_terminal(Failure::protocol(
-                                "authorization renewal did not extend the lease",
-                            ));
-                            return Err(SignalingError::Invalid("renewal expiry").into());
-                        }
-                        active.authorization_expires_at = Some(expires_at);
-                        if let Some(token) = active.pending_renewal.take() {
-                            self.config.token = token;
-                            active.renewal_send = None;
-                        }
-                        self.snapshot.authorization_expires_at = Some(expires_at);
-                        self.snapshot.version = self.snapshot.version.saturating_add(1);
-                    }
-                    ServerOutput::ServerError(error) => {
-                        agent_log!(
-                            self,
-                            Warn,
-                            "server reported signaling error generation={} code={} fatal={}",
-                            generation.get(),
-                            error.code,
-                            error.fatal
-                        );
-                        if error.fatal {
-                            let class = if error.code
-                                == pulsebeam_proto::signaling_v1::ErrorCode::AuthorizationExpired
-                                    as i32
-                            {
-                                FailureClass::Authorization
-                            } else {
-                                FailureClass::Protocol
-                            };
-                            let failure = Failure {
-                                class,
-                                message: error.message,
-                            };
-                            self.fail_terminal(failure);
-                        } else {
-                            if error.code == wire::ErrorCode::AuthorizationRejected as i32 {
-                                active.pending_renewal = None;
-                                active.renewal_send = None;
-                            }
-                            self.notifications
-                                .push_back(Notification::ServerError(error.message));
-                        }
-                    }
-                    ServerOutput::Reconnect => {
-                        active.signaling_terminal = true;
-                        self.pending_signal = None;
-                        self.cancel_signal_retry();
-                        self.cancel_seed_timeout();
-                        if self.desired.connected && self.attempt.is_none() {
-                            self.topics.unbind_generation(
-                                generation,
-                                TopicDropReason::TransportReplaced,
-                                &mut self.snapshot,
-                                &mut self.notifications,
-                            );
-                            self.start_attempt(AttemptMode::Replace);
-                        }
-                    }
+                if let Err(error) = self.apply_native(&payload) {
+                    self.fail_terminal(Failure::protocol(error.to_string()));
+                    return Err(error);
                 }
             }
             DataChannelEvent::Sent {
@@ -1413,15 +1528,7 @@ impl Agent {
                 generation,
                 channel,
             } => {
-                if self.active.as_ref().is_some_and(|active| {
-                    active.generation == generation
-                        && active.signaling_channel == channel
-                        && active.renewal_send == Some(operation)
-                }) {
-                    if let Some(active) = self.active.as_mut() {
-                        active.renewal_send = None;
-                    }
-                } else if self.pending_signal.as_ref().is_some_and(|pending| {
+                if self.pending_signal.as_ref().is_some_and(|pending| {
                     pending.operation == operation
                         && pending.generation == generation
                         && pending.channel == channel
@@ -1429,20 +1536,12 @@ impl Agent {
                     agent_log!(
                         self,
                         Debug,
-                        "signaling intent sent generation={} operation={} channel={}",
+                        "native control sent generation={} operation={} channel={}",
                         generation.get(),
                         operation.get(),
                         channel.get(),
                     );
-                    let seed = self
-                        .pending_signal
-                        .take()
-                        .is_some_and(|pending| pending.seed);
-                    if let Some(active) = self.active.as_mut()
-                        && seed
-                    {
-                        active.seed_requests.pop_front();
-                    }
+                    self.pending_signal = None;
                     self.send_intent_if_ready();
                 } else {
                     let _ = self.topics.handle_sent(
@@ -1462,33 +1561,12 @@ impl Agent {
                 channel,
                 message,
             } => {
-                if self.active.as_ref().is_some_and(|active| {
-                    active.generation == generation
-                        && active.signaling_channel == channel
-                        && active.renewal_send == Some(operation)
-                }) {
-                    if let Some(active) = self.active.as_mut() {
-                        active.renewal_send = None;
-                        active.pending_renewal = None;
-                    }
-                    self.notify_failure(Failure::transient(
-                        "authorization renewal send failed".to_string(),
-                    ));
-                } else if self.pending_signal.as_ref().is_some_and(|pending| {
+                if let Some(pending) = self.pending_signal.as_mut().filter(|pending| {
                     pending.operation == operation
                         && pending.generation == generation
                         && pending.channel == channel
                 }) {
-                    agent_log!(
-                        self,
-                        Warn,
-                        "signaling send failed generation={} operation={} channel={}",
-                        generation.get(),
-                        operation.get(),
-                        channel.get(),
-                    );
-                    self.pending_signal = None;
-                    self.intent_dirty = true;
+                    pending.retrying = true;
                     self.notify_failure(Failure::transient(message));
                     self.schedule_signal_retry();
                 } else {
@@ -1536,12 +1614,26 @@ impl Agent {
             debug_assert!(false, "ready attempt must have offer resources");
             return Ok(());
         };
-        let topic_bindings = resources.data_channels.clone();
-        let coordinates: BTreeMap<_, _> = resources
-            .slots
+        let coordinates: BTreeMap<_, _> = self
+            .config
+            .topology
+            .slots()
             .into_iter()
-            .map(|binding| (binding.slot.clone(), binding))
+            .map(|slot| (slot, None))
+            .chain(
+                resources
+                    .slots
+                    .into_iter()
+                    .map(|binding| (binding.slot.clone(), Some(binding))),
+            )
             .collect();
+        let state = NativeState::new(
+            native::STATE_MEMORY_BYTES,
+            pulsebeam_proto::state::Participant {
+                participant_id: candidate.participant_id.clone(),
+                participant_external_id: candidate.participant_external_id.clone(),
+            },
+        )?;
         let previous_generation = self.active.as_ref().map(|session| session.generation);
         if let Some(previous) = self.active.replace(Session {
             generation: attempt.generation,
@@ -1552,17 +1644,33 @@ impl Agent {
             participant_external_id: candidate.participant_external_id,
             _opaque_participant_id: candidate.opaque_participant_id,
             coordinates,
-            observed: CatalogState::default(),
-            intent_revision: 0,
-            publication_bindings: BTreeMap::new(),
+            state,
+            payloads: BTreeMap::new(),
+            payload_resources: BTreeMap::new(),
+            next_stream: 1,
+            media_leases: BTreeMap::new(),
+            media_retirement: None,
+            media_allocation: None,
+            media_wanted: BTreeMap::new(),
+            media_blocked: BTreeMap::new(),
+
             authorization_expires_at: None,
             pending_renewal: None,
-            renewal_send: None,
             signaling_terminal: false,
             signaling_channel: resources.signaling_channel,
-            seed_requests: VecDeque::new(),
+            data_preparations: attempt.data_preparations,
+            capabilities: candidate.capabilities,
+            media_preparation: attempt.media_preparation,
         }) && previous.generation != attempt.generation
         {
+            if let Some(operation) = previous
+                .pending_renewal
+                .as_ref()
+                .and_then(|renewal| renewal.operation)
+            {
+                self.effects
+                    .push_back(Effect::Http(HttpEffect::Cancel { operation }));
+            }
             self.effects.push_back(Effect::Rtc(RtcEffect::Close {
                 generation: previous.generation,
             }));
@@ -1583,30 +1691,14 @@ impl Agent {
             self.snapshot.participant_external_id = Some(active.participant_external_id.clone());
             self.snapshot.room_external_id = Some(active.room_external_id.clone());
             self.snapshot.authorization_expires_at = None;
-            self.topics.bind(
+            self.topics.bind_native(
                 active.generation,
                 active.participant_id.clone(),
-                &attempt.topic_registrations,
-                topic_bindings,
-                &mut self.ids,
-                &mut self.effects,
                 &mut self.snapshot,
                 &mut self.notifications,
             );
             self.topics
                 .probe_remote_publishers(&mut self.ids, &mut self.effects);
-        }
-        if let Some(active) = self.active.as_mut() {
-            active.seed_requests = self.topics.seed_requests().into();
-        }
-        self.cancel_seed_timeout();
-        if self.topics.seeding() {
-            let timer = self.ids.timer();
-            self.seed_timeout = Some((timer, attempt.generation));
-            self.effects.push_back(Effect::Timer(TimerEffect::Schedule {
-                timer,
-                after: Duration::from_secs(30),
-            }));
         }
         self.set_connection_state(ConnectionState::Connected);
         for payload in attempt.early_signaling {
@@ -1619,9 +1711,6 @@ impl Agent {
         self.refresh_resources()?;
         self.send_intent_if_ready();
         self.schedule_topic_probe();
-        if attempt.topic_registrations != self.desired.topics {
-            self.start_attempt(AttemptMode::Replace);
-        }
         Ok(())
     }
 
@@ -1758,138 +1847,73 @@ impl Agent {
         });
     }
 
-    fn publication_handoff_required(&self) -> bool {
-        self.active.as_ref().is_some_and(|session| {
-            self.desired.publications.iter().any(|publication| {
-                session
-                    .publication_bindings
-                    .get(&publication.slot)
-                    .is_some_and(|label| label != &publication.label)
-            })
-        })
-    }
-
     fn send_intent_if_ready(&mut self) {
-        if self.publication_handoff_required() {
-            if self.desired.connected
-                && self.closing.is_none()
-                && self.attempt.is_none()
-                && self.retry.is_none()
-            {
-                self.start_attempt(AttemptMode::Replace);
-            }
+        if self.snapshot.terminal_failure.is_some() || self.closing.is_some() {
             return;
         }
-        if self.snapshot.terminal_failure.is_some()
-            || !self.intent_dirty
-            || self.pending_signal.is_some()
-            || self.signal_retry.is_some()
-        {
-            return;
-        }
-        let Some(active) = self.active.as_mut() else {
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| !active.signaling_terminal)
+        else {
             return;
         };
-        if active.signaling_terminal {
+        if self.intent_dirty {
+            self.intent_dirty = false;
+            if let Err(error) = native::reconcile(
+                active,
+                &self.desired,
+                &self.topics,
+                &mut self.ids,
+                &mut self.effects,
+            ) {
+                self.notifications
+                    .push_back(Notification::ServerError(error.to_string()));
+            }
+        }
+        if self.signal_retry.is_some() {
             return;
         }
-        if let Some(seed) = active.seed_requests.front() {
-            let message = wire::ClientMessage {
-                payload: Some(wire::client_message::Payload::SubscriptionSeed(
-                    seed.clone(),
-                )),
-            };
-            let Ok(payload) = pulsebeam_proto::codec::encode_client(&message) else {
-                self.fail_terminal(Failure::protocol(
-                    "subscription seed exceeds signaling limit",
-                ));
+        if let Some(pending) = self.pending_signal.as_mut() {
+            if !pending.retrying {
                 return;
-            };
-            let operation = self.ids.operation();
-            let generation = active.generation;
-            let channel = active.signaling_channel;
+            }
+            pending.operation = self.ids.operation();
+            pending.retrying = false;
             self.effects
                 .push_back(Effect::DataChannel(DataChannelEffect::Send {
-                    operation,
-                    generation,
-                    channel,
+                    operation: pending.operation,
+                    generation: pending.generation,
+                    channel: pending.channel,
                     binary: true,
-                    payload,
+                    payload: pending.payload.clone(),
                 }));
-            self.pending_signal = Some(PendingSignal {
-                seed: true,
-                operation,
-                generation,
-                channel,
-            });
             return;
         }
-        let Some(revision) = active.intent_revision.checked_add(1) else {
-            return;
-        };
-        let mut desired = self.desired.clone();
-        desired.video.retain(|video| {
-            video.selector.is_some() || !self.retired_tracks.contains(&video.track_id)
-        });
-        desired
-            .audio
-            .pinned
-            .retain(|id| !self.retired_tracks.contains(id));
-        let payload = match signaling::encode_v1_intent(
-            &desired,
-            &self.config.topology,
-            &active.coordinates,
-            &active.observed,
-            revision,
-        ) {
-            Ok(payload) => payload,
+        let payload = match active.state.next_frame() {
+            Ok(Some(payload)) => payload,
+            Ok(None) => return,
             Err(error) => {
-                let failure = Failure::protocol(error.to_string());
-                agent_log!(
-                    self,
-                    Error,
-                    "failed to encode desired signaling intent: {error}"
-                );
-                self.fail_terminal(failure);
+                self.fail_terminal(Failure::protocol(error.to_string()));
                 return;
             }
         };
-        // The SFU retains sender-index labels even when a later intent omits them.
-        active.publication_bindings.extend(
-            desired
-                .publications
-                .iter()
-                .map(|publication| (publication.slot.clone(), publication.label.clone())),
-        );
-        active.intent_revision = revision;
         let operation = self.ids.operation();
-        let generation = active.generation;
-        let channel = active.signaling_channel;
-        agent_log!(
-            self,
-            Debug,
-            "sending desired signaling intent revision={} generation={} operation={} channel={} bytes={}",
-            revision,
-            generation.get(),
-            operation.get(),
-            channel.get(),
-            payload.len(),
-        );
         self.effects
             .push_back(Effect::DataChannel(DataChannelEffect::Send {
                 operation,
-                generation,
-                channel,
+                generation: active.generation,
+                channel: active.signaling_channel,
                 binary: true,
-                payload,
+                payload: payload.clone(),
             }));
         self.pending_signal = Some(PendingSignal {
-            seed: false,
             operation,
-            generation,
-            channel,
+            generation: active.generation,
+            channel: active.signaling_channel,
+            payload,
+            retrying: false,
         });
-        self.intent_dirty = false;
     }
 
     fn schedule_signal_retry(&mut self) {
@@ -1928,13 +1952,6 @@ impl Agent {
         }));
     }
 
-    fn cancel_seed_timeout(&mut self) {
-        if let Some((timer, _)) = self.seed_timeout.take() {
-            self.effects
-                .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
-        }
-    }
-
     fn cancel_signal_retry(&mut self) {
         if let Some(timer) = self.signal_retry.take() {
             self.effects
@@ -1943,7 +1960,6 @@ impl Agent {
     }
 
     fn begin_close(&mut self) {
-        self.cancel_seed_timeout();
         if self.closing.is_some() {
             return;
         }
@@ -1993,6 +2009,14 @@ impl Agent {
             }
         }
         if let Some(active) = self.active.take() {
+            if let Some(operation) = active
+                .pending_renewal
+                .as_ref()
+                .and_then(|renewal| renewal.operation)
+            {
+                self.effects
+                    .push_back(Effect::Http(HttpEffect::Cancel { operation }));
+            }
             if closing.generations.insert(active.generation) {
                 self.effects.push_back(Effect::Rtc(RtcEffect::Close {
                     generation: active.generation,
@@ -2083,8 +2107,8 @@ impl Agent {
 
     fn create_request(&self, offer: &str) -> Result<HttpRequest, AgentError> {
         let body = serde_json::to_vec(&NativeRequest {
+            profile: pulsebeam_proto::state::PROFILE,
             offer,
-            manual: true,
         })
         .map_err(|_| AgentError::InvalidOffer("SDP offer could not be encoded"))?;
         if body.len() > 262_144 {
@@ -2143,7 +2167,7 @@ fn validate_offer(
     offer: &str,
     resources: &OfferResources,
     config: &AgentConfig,
-    registrations: &crate::TopicRegistrations,
+    _registrations: &crate::TopicRegistrations,
 ) -> Result<(), AgentError> {
     const MAX_SDP_BYTES: usize = 131_072;
     if offer.is_empty() || offer.len() > MAX_SDP_BYTES {
@@ -2167,7 +2191,7 @@ fn validate_offer(
             return Err(AgentError::InvalidOffer("mid is mapped more than once"));
         }
     }
-    if actual != expected {
+    if !actual.is_empty() && actual != expected {
         return Err(AgentError::InvalidOffer(
             "slot mapping does not match configured topology",
         ));
@@ -2193,7 +2217,7 @@ fn validate_offer(
             "negotiated media coordinates do not match the SDP offer",
         ));
     }
-    let expected_labels = Topics::expected_labels(registrations);
+    let expected_labels = BTreeSet::new();
     let mut actual_labels = BTreeSet::new();
     let mut channels = BTreeSet::new();
     let _ = channels.insert(resources.signaling_channel);
@@ -2269,9 +2293,27 @@ fn parse_create_response(response: &HttpResponse) -> Result<(Candidate, String),
     }
     let body: NativeResponse = serde_json::from_slice(&response.body)
         .map_err(|_| "create response contains invalid JSON".to_string())?;
+    if body.profile != pulsebeam_proto::state::PROFILE {
+        return Err("unsupported native profile".to_string());
+    }
+    pulsebeam_proto::state::validation::validate_capabilities(&body.rtp_capabilities)
+        .map_err(|_| "create response contains invalid RTP capabilities".to_string())?;
+    let mut delivery = BTreeSet::new();
+    if body.data_delivery.is_empty()
+        || body.data_delivery.iter().any(|mode| {
+            *mode == pulsebeam_proto::state::DataDelivery::Unspecified
+                || !delivery.insert(*mode as i32)
+        })
+    {
+        return Err("create response contains invalid data capabilities".to_string());
+    }
     validate_answer(&body.answer)?;
     Ok((
         Candidate {
+            capabilities: crate::BootstrapCapabilities {
+                rtp: body.rtp_capabilities,
+                data_delivery: body.data_delivery,
+            },
             resource_uri: resource_uri.to_string(),
             room_external_id: body.room_external_id,
             room_id: RoomId::from_server(body.room_id),
@@ -2321,6 +2363,132 @@ fn validate_resource_uri(uri: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    use crate::{DataChannelReliability, PreparedDataChannel};
+
+    fn facts() -> PreparedDataChannel {
+        PreparedDataChannel {
+            stream_id: 0,
+            negotiated: true,
+            ordered: true,
+            reliability: DataChannelReliability::Reliable,
+            association_max_channels: None,
+        }
+    }
+
+    fn prepare(
+        agent: &mut Agent,
+        generation: Generation,
+        channel: ChannelId,
+        facts: PreparedDataChannel,
+    ) {
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Prepared {
+                generation,
+                channel,
+                preparation: Ok(facts),
+            }))
+            .unwrap();
+    }
+
+    #[test]
+    fn preparation_is_generation_scoped_and_does_not_invent_capacity() {
+        let (mut agent, generation, channel) =
+            crate::tests::native_connection::connected(Default::default());
+        let stale = agent.ids.generation();
+        prepare(&mut agent, stale, channel, facts());
+        prepare(
+            &mut agent,
+            generation,
+            ChannelId::new(u64::MAX).unwrap(),
+            facts(),
+        );
+        assert!(agent.active.as_ref().unwrap().data_preparations.is_empty());
+        prepare(&mut agent, generation, channel, facts());
+        assert_eq!(
+            agent.active.as_ref().unwrap().data_preparations[&channel],
+            Ok(facts())
+        );
+        let mut known = facts();
+        known.association_max_channels = Some(128);
+        prepare(&mut agent, generation, channel, known.clone());
+        prepare(&mut agent, generation, channel, facts());
+        assert_eq!(
+            agent.active.as_ref().unwrap().data_preparations[&channel],
+            Ok(known)
+        );
+        assert!(agent.attempt.is_none());
+        assert!(agent.next_effect().is_none());
+    }
+
+    #[test]
+    fn changed_identity_is_latched_until_the_channel_is_retired() {
+        let (mut agent, generation, channel) =
+            crate::tests::native_connection::connected(Default::default());
+        prepare(&mut agent, generation, channel, facts());
+        let mut changed = facts();
+        changed.stream_id = 1;
+        prepare(&mut agent, generation, channel, changed);
+        prepare(&mut agent, generation, channel, facts());
+        assert!(agent.active.as_ref().unwrap().data_preparations[&channel].is_err());
+        assert!(agent.attempt.is_none());
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+                generation,
+                channel,
+            }))
+            .unwrap();
+        prepare(&mut agent, generation, channel, facts());
+        assert!(agent.active.as_ref().unwrap().data_preparations.is_empty());
+        assert!(agent.active.as_ref().unwrap().signaling_terminal);
+    }
+
+    #[test]
+    fn bootstrap_rtp_callbacks_cannot_retarget_an_active_or_future_generation() {
+        let (mut agent, generation, _) =
+            crate::tests::native_connection::connected(Default::default());
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::BootstrapMediaPrepared {
+                generation,
+                preparation: Ok(Default::default()),
+            }))
+            .unwrap();
+        assert!(agent.active.as_ref().unwrap().media_preparation.is_none());
+        agent.command(AgentCommand::Reconnect).unwrap();
+        let candidate = agent.attempt.as_ref().unwrap().generation;
+        for generation in [generation, candidate] {
+            agent
+                .handle(HostEvent::Rtc(RtcEvent::BootstrapMediaPrepared {
+                    generation,
+                    preparation: Err(crate::client_sdp::Error::Observation),
+                }))
+                .unwrap();
+        }
+        assert!(agent.attempt.as_ref().unwrap().media_preparation.is_none());
+        assert!(agent.active.as_ref().unwrap().media_preparation.is_none());
+    }
+
+    #[test]
+    fn prepared_streams_must_fit_actual_association_capacity() {
+        let mut prepared = facts();
+        for (stream_id, capacity, valid) in [
+            (0, None, true),
+            (0, Some(0), false),
+            (127, Some(128), true),
+            (128, Some(128), false),
+            (65_534, Some(65_536), true),
+            (65_535, Some(65_536), false),
+            (0, Some(65_537), false),
+        ] {
+            prepared.stream_id = stream_id;
+            prepared.association_max_channels = capacity;
+            assert_eq!(prepared.validate().is_ok(), valid);
+        }
+    }
+}
+
+#[cfg(test)]
 mod response_tests {
     use alloc::{string::ToString, vec};
 
@@ -2344,7 +2512,9 @@ mod response_tests {
             "room_id": "not canonical / room",
             "participant_external_id": "participant",
             "participant_id": "not canonical / participant",
-            "connection_id": "not canonical / connection",
+            "profile": "pulsebeam.media.v1",
+            "rtp_capabilities": {},
+            "data_delivery": ["LATEST", "LOSSY", "ORDERED"],
             "answer": "v=0\r\n",
             "future": {"ignored": true},
         });
@@ -2366,7 +2536,9 @@ mod response_tests {
             "room_id",
             "participant_external_id",
             "participant_id",
-            "connection_id",
+            "profile",
+            "rtp_capabilities",
+            "data_delivery",
             "answer",
         ] {
             let mut missing = complete.as_object().unwrap().clone();
@@ -2374,9 +2546,29 @@ mod response_tests {
             assert!(parse_create_response(&response(missing.into())).is_err());
         }
 
-        let mut wrong_type = complete.as_object().unwrap().clone();
-        wrong_type.insert("connection_id".to_string(), serde_json::Value::Bool(true));
-        assert!(parse_create_response(&response(wrong_type.into())).is_err());
+        for (field, value) in [
+            ("profile", serde_json::json!(true)),
+            ("profile", serde_json::json!("legacy")),
+            ("rtp_capabilities", serde_json::json!({"codecs": [{}]})),
+            (
+                "rtp_capabilities",
+                serde_json::json!({"rtcp_modes": ["RTCP_MODE_UNSPECIFIED"]}),
+            ),
+            ("data_delivery", serde_json::json!([])),
+            ("data_delivery", serde_json::json!(["LATEST", "LATEST"])),
+            (
+                "data_delivery",
+                serde_json::json!(["DATA_DELIVERY_UNSPECIFIED"]),
+            ),
+            ("data_delivery", serde_json::json!(["UNKNOWN"])),
+        ] {
+            let mut invalid = complete.as_object().unwrap().clone();
+            invalid.insert(field.to_string(), value);
+            assert!(
+                parse_create_response(&response(invalid.into())).is_err(),
+                "{field}"
+            );
+        }
 
         let mut missing_location = response(complete.clone());
         missing_location.headers.clear();

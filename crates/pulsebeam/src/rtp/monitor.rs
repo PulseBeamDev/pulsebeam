@@ -130,6 +130,8 @@ pub struct StreamStats {
     /// Slow-decay rate estimate (bps), never below `bitrate_bps`.
     pub stable_bitrate_bps: u32,
     pub height: u32,
+    /// Zero until dimensions are reported; `height` may be a quality hint.
+    pub observed_height: u32,
     pub quality: StreamQuality,
     /// Decode targets the encoding advertises (>= 1). `1` means no scalability
     /// structure has been seen, so the encoding is one indivisible rung.
@@ -165,6 +167,7 @@ impl StreamStats {
             bitrate_bps: bps,
             stable_bitrate_bps: bps,
             height,
+            observed_height: 0,
             quality: StreamQuality::Good,
             decode_targets: 1,
             decode_target_heights: [0; MAX_LADDER_TARGETS],
@@ -274,6 +277,7 @@ impl StreamStats {
     #[cfg(test)]
     pub fn set_height(&mut self, height: u32) -> &mut Self {
         self.height = height;
+        self.observed_height = height;
         self
     }
 
@@ -530,6 +534,7 @@ impl StreamMonitor {
         if let Some(height) = height {
             debug_assert_ne!(height, 0);
             self.stats.height = height;
+            self.stats.observed_height = height;
         }
         if self.vla_inactive {
             self.publish_inactive();

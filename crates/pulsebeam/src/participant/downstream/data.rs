@@ -31,10 +31,13 @@ impl DownstreamData {
         let Track::Data(data) = track else {
             return;
         };
+        let Some(topic) = &data.topic else {
+            return;
+        };
         self.publications.insert(key, data.meta.clone());
         let channel = channels.iter().find_map(|(cid, channel)| {
             (channel.direction == DataTrackDirection::Subscribe
-                && channel.topic == data.topic
+                && &channel.topic == topic
                 && channel.lane == data.lane)
                 .then_some(*cid)
         });

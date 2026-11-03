@@ -362,6 +362,44 @@ impl TrackLifecycle {
         self.reconcile_all(identities, registry, now)
     }
 
+    pub(crate) fn set_owned_subscription(
+        &mut self,
+        request: super::topology::OwnedSubscription,
+        registry: &RoomRegistry,
+        now: Instant,
+    ) -> Vec<TrackLifecycleOutcome> {
+        let identities = self
+            .topology
+            .matching_tracks(request.room_id, &TrackSelector::track(request.track));
+        if !self.topology.set_owned(
+            request.room_id,
+            request.subscriber,
+            request.reference,
+            request.track,
+            request.enabled,
+        ) {
+            return Vec::new();
+        }
+        self.reconcile_all(identities, registry, now)
+    }
+
+    pub(crate) fn unsubscribe_owned(
+        &mut self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        reference: u64,
+        registry: &RoomRegistry,
+        now: Instant,
+    ) -> Vec<TrackLifecycleOutcome> {
+        let Some(subscription) = self.topology.remove_owned(room_id, subscriber, reference) else {
+            return Vec::new();
+        };
+        let identities = self
+            .topology
+            .matching_tracks(room_id, &subscription.selector);
+        self.reconcile_all(identities, registry, now)
+    }
+
     pub(crate) fn subscribe_defaults(
         &mut self,
         room_id: RoomId,
@@ -658,6 +696,7 @@ impl TrackLifecycle {
                 stager,
                 ParticipantEffect::TrackCandidateRemoved {
                     track_id: identity.track_id,
+                    reason: crate::participant::effect::TrackRemoval::Withdrawn,
                 },
             );
         }
@@ -971,6 +1010,7 @@ impl TrackLifecycle {
                 stager,
                 ParticipantEffect::TrackCandidateRemoved {
                     track_id: identity.track_id,
+                    reason: crate::participant::effect::TrackRemoval::SourceEnded,
                 },
             );
         }

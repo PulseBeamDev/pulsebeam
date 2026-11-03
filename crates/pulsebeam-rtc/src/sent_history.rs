@@ -10,7 +10,8 @@
 )]
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    mem::{size_of, size_of_val},
     time::{Duration, Instant},
 };
 
@@ -19,7 +20,7 @@ use crate::{
     congestion::{EcnMark as ControllerEcnMark, FeedbackSample, LossOrigin},
     connection::TransmitCommitContext,
     rtcp::{ArrivalOffset, FeedbackBatch, FeedbackReport, Rfc8888Status, TwccStatus},
-    transport::{DatagramKind, PathEpoch, RtpService},
+    transport::{DatagramKind, PathEpoch, PreparedRtpIdentity, RtpService},
 };
 
 pub(crate) const SENT_HISTORY_CAPACITY: usize = 32_768;
@@ -153,13 +154,54 @@ struct TwccIndex {
 
 #[derive(Debug)]
 struct SsrcHistory {
-    ssrc: u32,
     first_sequence: u64,
     newest_sequence: u64,
     highest_acked_sequence: Option<u64>,
-    sent_ids: VecDeque<SentPacketId>,
+    by_sequence: HashMap<u64, SentPacketId>,
+    // Tombstones can reduce usable capacity without releasing table backing.
+    index_capacity: usize,
     last_report_timestamp: Option<i64>,
+    latest_commit_at: Option<Instant>,
+    terminal: bool,
 }
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SourceReadiness {
+    Retired {
+        deadline: Option<Instant>,
+        ssrc: u32,
+    },
+    Unscheduled(u32),
+}
+
+impl SsrcHistory {
+    fn readiness(&self, ssrc: u32) -> SourceReadiness {
+        if self.terminal {
+            match self.latest_commit_at {
+                None => {
+                    return SourceReadiness::Retired {
+                        deadline: None,
+                        ssrc,
+                    };
+                }
+                Some(at) => {
+                    if let Some(deadline) = at.checked_add(SENT_HISTORY_MAX_AGE) {
+                        return SourceReadiness::Retired {
+                            deadline: Some(deadline),
+                            ssrc,
+                        };
+                    }
+                    // An unrepresentable age deadline cannot establish quiescence.
+                }
+            }
+        }
+        SourceReadiness::Unscheduled(ssrc)
+    }
+}
+
+const SOURCE_PAYLOAD_BYTES: usize =
+    size_of::<u32>() + size_of::<SsrcHistory>() + size_of::<SourceReadiness>();
+const SOURCE_INDEX_ENTRY_BYTES: usize = size_of::<(u64, SentPacketId)>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HistoryError {
@@ -167,11 +209,85 @@ pub(crate) enum HistoryError {
     InvalidCommit,
 }
 
-pub(crate) struct SentHistory {
-    mode: Option<PacketFeedbackKind>,
+pub(crate) struct PreparedFeedbackProfile<'a> {
+    history: &'a mut SentHistory,
+    profile: PacketFeedbackKind,
+    storage: Option<FixedHistoryStorage>,
+}
+
+impl PreparedFeedbackProfile<'_> {
+    pub(crate) fn commit(self) {
+        if let Some(storage) = self.storage {
+            self.history.entries = storage.entries;
+            self.history.twcc_index = storage.twcc_index;
+            self.history.inputs.feedback = storage.feedback;
+            self.history.inputs.synthetic = storage.synthetic;
+        }
+        self.history.mode = Some(self.profile);
+    }
+}
+
+struct FixedHistoryStorage {
     entries: Box<[Option<SentEntry>]>,
     twcc_index: Box<[Option<TwccIndex>]>,
-    ssrcs: Vec<SsrcHistory>,
+    feedback: Vec<PacketFeedback>,
+    synthetic: Vec<PacketFeedback>,
+}
+
+impl FixedHistoryStorage {
+    fn bytes(feedback_capacity: usize, synthetic_capacity: usize) -> Option<usize> {
+        SENT_HISTORY_CAPACITY
+            .checked_mul(size_of::<Option<SentEntry>>())?
+            .checked_add(SENT_HISTORY_CAPACITY.checked_mul(size_of::<Option<TwccIndex>>())?)?
+            .checked_add(
+                feedback_capacity
+                    .checked_add(synthetic_capacity)?
+                    .checked_mul(size_of::<PacketFeedback>())?,
+            )
+    }
+
+    fn new(limit: usize) -> Result<Self, HistoryError> {
+        Self::bytes(MAX_FEEDBACK_STATUSES, MAX_EXPIRATIONS_PER_POLL)
+            .filter(|bytes| *bytes <= limit)
+            .ok_or(HistoryError::Exhausted)?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(SENT_HISTORY_CAPACITY)
+            .map_err(|_| HistoryError::Exhausted)?;
+        entries.resize(SENT_HISTORY_CAPACITY, None);
+        let mut twcc_index = Vec::new();
+        twcc_index
+            .try_reserve_exact(SENT_HISTORY_CAPACITY)
+            .map_err(|_| HistoryError::Exhausted)?;
+        twcc_index.resize(SENT_HISTORY_CAPACITY, None);
+        let mut feedback = Vec::new();
+        feedback
+            .try_reserve_exact(MAX_FEEDBACK_STATUSES)
+            .map_err(|_| HistoryError::Exhausted)?;
+        let mut synthetic = Vec::new();
+        synthetic
+            .try_reserve_exact(MAX_EXPIRATIONS_PER_POLL)
+            .map_err(|_| HistoryError::Exhausted)?;
+        Self::bytes(feedback.capacity(), synthetic.capacity())
+            .filter(|bytes| *bytes <= limit)
+            .ok_or(HistoryError::Exhausted)?;
+        Ok(Self {
+            entries: entries.into_boxed_slice(),
+            twcc_index: twcc_index.into_boxed_slice(),
+            feedback,
+            synthetic,
+        })
+    }
+}
+
+pub(crate) struct SentHistory {
+    mode: Option<PacketFeedbackKind>,
+    max_backing_bytes: usize,
+    entries: Box<[Option<SentEntry>]>,
+    twcc_index: Box<[Option<TwccIndex>]>,
+    ssrcs: BTreeMap<u32, SsrcHistory>,
+    source_backing_bytes: usize,
+    source_readiness: BTreeSet<SourceReadiness>,
     next_sent_id: u64,
     oldest_sent_id: u64,
     oldest_twcc: Option<u64>,
@@ -191,16 +307,27 @@ pub(crate) struct SentHistory {
 }
 
 impl SentHistory {
+    #[cfg(test)]
     pub(crate) fn new(mode: impl Into<Option<PacketFeedbackKind>>) -> Self {
-        Self {
-            mode: mode.into(),
-            entries: std::iter::repeat_with(|| None)
-                .take(SENT_HISTORY_CAPACITY)
-                .collect(),
-            twcc_index: std::iter::repeat_with(|| None)
-                .take(SENT_HISTORY_CAPACITY)
-                .collect(),
-            ssrcs: Vec::new(),
+        Self::with_limit(
+            mode,
+            crate::ConnectionLimits::DEFAULT_MAX_SENT_HISTORY_BYTES,
+        )
+        .expect("default sent-history backing allowance")
+    }
+
+    pub(crate) fn with_limit(
+        mode: impl Into<Option<PacketFeedbackKind>>,
+        max_backing_bytes: usize,
+    ) -> Result<Self, HistoryError> {
+        let mut history = Self {
+            mode: None,
+            max_backing_bytes,
+            entries: Box::new([]),
+            twcc_index: Box::new([]),
+            ssrcs: BTreeMap::new(),
+            source_backing_bytes: 0,
+            source_readiness: BTreeSet::new(),
             next_sent_id: 0,
             oldest_sent_id: 0,
             oldest_twcc: None,
@@ -210,22 +337,232 @@ impl SentHistory {
             twcc_feedback_count: None,
             active_epoch: None,
             last_path: None,
-            inputs: ControllerInputs {
-                feedback: Vec::with_capacity(MAX_FEEDBACK_STATUSES),
-                synthetic: Vec::with_capacity(MAX_EXPIRATIONS_PER_POLL),
-                ..ControllerInputs::default()
-            },
+            inputs: ControllerInputs::default(),
             counters: HistoryCounters::default(),
             bytes_in_flight: 0,
             reordering_window: INITIAL_REORDERING_WINDOW,
             observed_reordering_window: INITIAL_REORDERING_WINDOW,
             missing: VecDeque::new(),
             loss_work: 0,
+        };
+        if let Some(profile) = mode.into() {
+            history.prepare_feedback_profile(profile)?.commit();
         }
+        Ok(history)
     }
 
-    pub(crate) fn set_feedback_profile(&mut self, profile: PacketFeedbackKind) {
-        self.mode = Some(profile);
+    pub(crate) fn prepare_feedback_profile(
+        &mut self,
+        profile: PacketFeedbackKind,
+    ) -> Result<PreparedFeedbackProfile<'_>, HistoryError> {
+        let storage = match self.mode {
+            None => Some(FixedHistoryStorage::new(self.max_backing_bytes)?),
+            Some(current) if current == profile => None,
+            Some(_) => return Err(HistoryError::InvalidCommit),
+        };
+        Ok(PreparedFeedbackProfile {
+            history: self,
+            profile,
+            storage,
+        })
+    }
+
+    fn backing_bytes(&self) -> Option<usize> {
+        size_of_val(self.entries.as_ref())
+            .checked_add(size_of_val(self.twcc_index.as_ref()))?
+            .checked_add(
+                self.inputs
+                    .feedback
+                    .capacity()
+                    .checked_add(self.inputs.synthetic.capacity())?
+                    .checked_mul(size_of::<PacketFeedback>())?,
+            )?
+            .checked_add(
+                self.missing
+                    .capacity()
+                    .checked_mul(size_of::<SentPacketId>())?,
+            )?
+            .checked_add(self.source_backing_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_storage(&self) -> usize {
+        assert_eq!(self.source_readiness.len(), self.ssrcs.len());
+        let sources = self
+            .ssrcs
+            .iter()
+            .try_fold(0usize, |bytes, (&ssrc, source)| {
+                assert!(self.source_readiness.contains(&source.readiness(ssrc)));
+                assert!(source.by_sequence.capacity() <= source.index_capacity);
+                bytes.checked_add(SOURCE_PAYLOAD_BYTES)?.checked_add(
+                    source
+                        .index_capacity
+                        .checked_mul(SOURCE_INDEX_ENTRY_BYTES)?,
+                )
+            })
+            .unwrap();
+        assert_eq!(self.source_backing_bytes, sources);
+        let bytes = self.backing_bytes().unwrap();
+        assert!(bytes <= self.max_backing_bytes);
+        bytes
+    }
+
+    fn reserve_missing_slot(&mut self) -> Option<()> {
+        if self.missing.len() < self.missing.capacity() {
+            return Some(());
+        }
+        let stride = size_of::<SentPacketId>();
+        let base = self
+            .backing_bytes()?
+            .checked_sub(self.missing.capacity().checked_mul(stride)?)?;
+        let max_capacity = self.max_backing_bytes.checked_sub(base)? / stride;
+        let required = self.missing.len().checked_add(1)?;
+        if required > max_capacity {
+            return None;
+        }
+        let target = self
+            .missing
+            .capacity()
+            .checked_mul(2)
+            .unwrap_or(max_capacity)
+            .max(required)
+            .min(max_capacity);
+        let mut replacement = VecDeque::new();
+        replacement.try_reserve_exact(target).ok()?;
+        let bytes = base.checked_add(replacement.capacity().checked_mul(stride)?)?;
+        if bytes > self.max_backing_bytes {
+            return None;
+        }
+        replacement.extend(self.missing.drain(..));
+        self.missing = replacement;
+        Some(())
+    }
+
+    fn reserve_feedback_slot(&mut self) -> Option<()> {
+        if self.inputs.feedback.len() < self.inputs.feedback.capacity() {
+            return Some(());
+        }
+        let stride = size_of::<PacketFeedback>();
+        let base = self
+            .backing_bytes()?
+            .checked_sub(self.inputs.feedback.capacity().checked_mul(stride)?)?;
+        let max_capacity = self.max_backing_bytes.checked_sub(base)? / stride;
+        let required = self.inputs.feedback.len().checked_add(1)?;
+        if required > max_capacity {
+            return None;
+        }
+        let target = self
+            .inputs
+            .feedback
+            .capacity()
+            .checked_mul(2)
+            .unwrap_or(max_capacity)
+            .max(required)
+            .min(max_capacity);
+        let mut replacement = Vec::new();
+        replacement.try_reserve_exact(target).ok()?;
+        let bytes = base.checked_add(replacement.capacity().checked_mul(stride)?)?;
+        if bytes > self.max_backing_bytes {
+            return None;
+        }
+        replacement.extend(self.inputs.feedback.drain(..));
+        self.inputs.feedback = replacement;
+        Some(())
+    }
+
+    pub(crate) fn prepare_commit(
+        &mut self,
+        context: TransmitCommitContext,
+    ) -> Result<(), HistoryError> {
+        self.validate_commit(context)?;
+        let Some(rtp) = context.rtp.filter(|_| context.kind == DatagramKind::Rtp) else {
+            return Ok(());
+        };
+        // Removing an overwritten key may leave a tombstone, not insertion capacity.
+        let required = self
+            .ssrcs
+            .get(&rtp.ssrc)
+            .map_or(0, |state| state.by_sequence.len())
+            .checked_add(1)
+            .ok_or(HistoryError::Exhausted)?;
+        self.reserve_source_capacity(rtp, required)
+    }
+
+    fn reserve_source_capacity(
+        &mut self,
+        rtp: PreparedRtpIdentity,
+        required: usize,
+    ) -> Result<(), HistoryError> {
+        let state = self.ssrcs.get(&rtp.ssrc);
+        if state.is_some_and(|state| required <= state.by_sequence.capacity()) {
+            return Ok(());
+        }
+        let old_capacity = state.map_or(0, |state| state.index_capacity);
+        let reserve = || -> Option<(HashMap<u64, SentPacketId>, usize)> {
+            let stride = SOURCE_INDEX_ENTRY_BYTES;
+            let payload = if state.is_none() {
+                SOURCE_PAYLOAD_BYTES
+            } else {
+                0
+            };
+            let old_bytes = old_capacity.checked_mul(stride)?;
+            let base = self
+                .backing_bytes()?
+                .checked_sub(old_bytes)?
+                .checked_add(payload)?;
+            let max_capacity = self.max_backing_bytes.checked_sub(base)? / stride;
+            if required > max_capacity {
+                return None;
+            }
+            let target = if required <= old_capacity {
+                old_capacity
+            } else {
+                old_capacity.checked_mul(2).unwrap_or(max_capacity)
+            }
+            .max(required)
+            .min(max_capacity);
+            let mut replacement = HashMap::new();
+            replacement.try_reserve(target).ok()?;
+            if replacement.capacity() > max_capacity && target > required {
+                replacement = HashMap::new();
+                replacement.try_reserve(required).ok()?;
+            }
+            let bytes = replacement.capacity().checked_mul(stride)?;
+            if base.checked_add(bytes)? > self.max_backing_bytes {
+                return None;
+            }
+            let sources = self
+                .source_backing_bytes
+                .checked_sub(old_bytes)?
+                .checked_add(payload)?
+                .checked_add(bytes)?;
+            Some((replacement, sources))
+        };
+        let (mut replacement, sources) = reserve().ok_or(HistoryError::Exhausted)?;
+        let index_capacity = replacement.capacity();
+        if let Some(state) = self.ssrcs.get_mut(&rtp.ssrc) {
+            replacement.extend(state.by_sequence.drain());
+            state.by_sequence = replacement;
+            state.index_capacity = index_capacity;
+        } else {
+            self.ssrcs.insert(
+                rtp.ssrc,
+                SsrcHistory {
+                    first_sequence: rtp.index,
+                    newest_sequence: rtp.index,
+                    highest_acked_sequence: None,
+                    by_sequence: replacement,
+                    index_capacity,
+                    last_report_timestamp: None,
+                    latest_commit_at: None,
+                    terminal: false,
+                },
+            );
+            self.source_readiness
+                .insert(SourceReadiness::Unscheduled(rtp.ssrc));
+        }
+        self.source_backing_bytes = sources;
+        Ok(())
     }
 
     fn commit_context(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError> {
@@ -241,17 +578,24 @@ impl SentHistory {
         if let Some(previous) = self.entries[slot] {
             self.remove_indexes(previous);
         }
-        let ssrc_index = self.ssrc_index_or_insert(rtp.ssrc, rtp.sequence);
-        let empty_history = self.ssrcs[ssrc_index].sent_ids.is_empty();
         let rtp_sequence = rtp.index;
-        let state = &mut self.ssrcs[ssrc_index];
-        if empty_history {
+        let state = self
+            .ssrcs
+            .get_mut(&rtp.ssrc)
+            .ok_or(HistoryError::InvalidCommit)?;
+        if state.by_sequence.is_empty() {
             state.first_sequence = rtp_sequence;
             state.newest_sequence = rtp_sequence;
         } else {
             state.first_sequence = state.first_sequence.min(rtp_sequence);
             state.newest_sequence = state.newest_sequence.max(rtp_sequence);
         }
+        state.by_sequence.insert(rtp.index, sent_id);
+        state.latest_commit_at = Some(
+            state
+                .latest_commit_at
+                .map_or(context.at, |at| at.max(context.at)),
+        );
         let twcc_sequence = rtp.twcc_sequence.map(|sequence| {
             let unwrapped = self.newest_twcc.map_or_else(
                 || u64::from(sequence),
@@ -265,7 +609,6 @@ impl SentHistory {
             });
             unwrapped
         });
-        self.ssrcs[ssrc_index].sent_ids.push_back(sent_id);
         self.entries[slot] = Some(SentEntry {
             id: sent_id,
             committed_at: context.at,
@@ -295,6 +638,7 @@ impl SentHistory {
 
     #[cfg(test)]
     fn commit(&mut self, context: TransmitCommitContext) -> Result<(), HistoryError> {
+        self.prepare_commit(context)?;
         self.commit_context(context)
     }
 
@@ -302,6 +646,19 @@ impl SentHistory {
         &self,
         context: TransmitCommitContext,
     ) -> Result<(), HistoryError> {
+        self.validate_commit(context)?;
+        if let Some(rtp) = context.rtp.filter(|_| context.kind == DatagramKind::Rtp)
+            && self
+                .ssrcs
+                .get(&rtp.ssrc)
+                .is_none_or(|state| state.by_sequence.len() >= state.by_sequence.capacity())
+        {
+            return Err(HistoryError::Exhausted);
+        }
+        Ok(())
+    }
+
+    fn validate_commit(&self, context: TransmitCommitContext) -> Result<(), HistoryError> {
         if context.kind != DatagramKind::Rtp {
             return Ok(());
         }
@@ -309,6 +666,10 @@ impl SentHistory {
             return Err(HistoryError::InvalidCommit);
         };
         if self.active_epoch != Some(epoch)
+            || self
+                .ssrcs
+                .get(&rtp.ssrc)
+                .is_some_and(|source| source.terminal)
             || context.wire_len == 0
             || !matches!(
                 (self.mode, rtp.twcc_sequence),
@@ -331,6 +692,44 @@ impl SentHistory {
             return Err(HistoryError::Exhausted);
         }
         Ok(())
+    }
+
+    pub(crate) fn retire_source(&mut self, ssrc: u32) {
+        let Some(source) = self.ssrcs.get_mut(&ssrc) else {
+            return;
+        };
+        if source.terminal {
+            return;
+        }
+        let previous = source.readiness(ssrc);
+        source.terminal = true;
+        let next = source.readiness(ssrc);
+        if previous != next {
+            self.source_readiness.remove(&previous);
+            self.source_readiness.insert(next);
+        }
+    }
+
+    fn reclaim_sources(&mut self, now: Instant, limit: usize) -> usize {
+        let mut work = 0;
+        while work < limit && self.loss_work < MAX_EXPIRATIONS_PER_POLL {
+            let Some(SourceReadiness::Retired { deadline, ssrc }) =
+                self.source_readiness.first().copied()
+            else {
+                break;
+            };
+            if deadline.is_some_and(|deadline| now < deadline) {
+                break;
+            }
+            self.source_readiness.pop_first();
+            if let Some(source) = self.ssrcs.remove(&ssrc) {
+                self.source_backing_bytes -=
+                    SOURCE_PAYLOAD_BYTES + source.index_capacity * SOURCE_INDEX_ENTRY_BYTES;
+            }
+            work += 1;
+            self.loss_work += 1;
+        }
+        work
     }
 
     pub(crate) fn path_changed(&mut self, epoch: PathEpoch, available: bool) {
@@ -368,27 +767,11 @@ impl SentHistory {
         self.missing.clear();
         self.reordering_window = INITIAL_REORDERING_WINDOW;
         self.observed_reordering_window = INITIAL_REORDERING_WINDOW;
-        for ssrc in &mut self.ssrcs {
+        for ssrc in self.ssrcs.values_mut() {
             ssrc.last_report_timestamp = None;
             ssrc.highest_acked_sequence = None;
-            ssrc.sent_ids.clear();
+            ssrc.by_sequence.clear();
         }
-    }
-
-    fn ssrc_index_or_insert(&mut self, ssrc: u32, sequence: u16) -> usize {
-        if let Some(index) = self.ssrcs.iter().position(|state| state.ssrc == ssrc) {
-            return index;
-        }
-        let sequence = u64::from(sequence);
-        self.ssrcs.push(SsrcHistory {
-            ssrc,
-            first_sequence: sequence,
-            newest_sequence: sequence,
-            highest_acked_sequence: None,
-            sent_ids: VecDeque::new(),
-            last_report_timestamp: None,
-        });
-        self.ssrcs.len() - 1
     }
 
     fn remove_indexes(&mut self, entry: SentEntry) {
@@ -403,10 +786,10 @@ impl SentHistory {
                     .find(|&candidate| self.twcc_sent_id(candidate).is_some());
             }
         }
-        if let Some(state) = self.ssrcs.iter_mut().find(|state| state.ssrc == entry.ssrc)
-            && state.sent_ids.front() == Some(&entry.id)
+        if let Some(state) = self.ssrcs.get_mut(&entry.ssrc)
+            && state.by_sequence.get(&entry.rtp_sequence) == Some(&entry.id)
         {
-            state.sent_ids.pop_front();
+            state.by_sequence.remove(&entry.rtp_sequence);
         }
     }
 

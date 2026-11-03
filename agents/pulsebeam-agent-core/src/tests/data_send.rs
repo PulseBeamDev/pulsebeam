@@ -1,4 +1,5 @@
 use super::*;
+use pulsebeam_proto::state;
 
 fn spec(mode: TopicMode) -> TrackSpec {
     TrackSpec::Data {
@@ -35,14 +36,12 @@ fn finished(agent: &mut Agent) -> Vec<(OperationId, Option<DataSendFailure>)> {
 
 #[test]
 fn owned_sends_wait_for_host_acceptance_and_latest_supersession_is_explicit() {
-    let (mut agent, generation, _, channels) = connect_with_topics(TopicRegistrations {
-        publishers: vec![publisher("state", TopicMode::Latest)],
-        subscribers: vec![],
-    });
+    let (mut agent, generation, _, publication) =
+        native_connection::connected_publisher(TopicMode::Latest);
     let first = agent.send_data(spec(TopicMode::Latest), vec![]).unwrap();
     let first_timer = deadline(&mut agent);
     let (first_operation, channel, body) = dispatched(&mut agent, first_timer);
-    assert_eq!(channel, channels["v2/latest/pub/state"]);
+    assert_eq!(channel, publication.channel);
     let TopicBody::Message(message) = body else {
         panic!("binary message")
     };
@@ -102,40 +101,51 @@ fn owned_sends_wait_for_host_acceptance_and_latest_supersession_is_explicit() {
 }
 
 #[test]
-fn owned_send_waits_for_its_first_authoritative_catalog_binding() {
-    let registrations = TopicRegistrations {
+fn owned_send_waits_for_its_first_authoritative_owned_binding() {
+    let (mut agent, generation, signal) = native_connection::connected(TopicRegistrations {
         publishers: vec![publisher("state", TopicMode::Lossy)],
         subscribers: vec![],
-    };
-    let (mut agent, generation, signal, _) = connect_with_topics(registrations.clone());
-    inject_topic_catalog(
-        &mut agent,
-        generation,
-        signal,
-        &TopicRegistrations::default(),
-        2,
-        "absent",
-    );
+    });
     let ticket = agent.send_data(spec(TopicMode::Lossy), vec![255]).unwrap();
     let timer = deadline(&mut agent);
     assert!(agent.next_effect().is_none());
     assert!(finished(&mut agent).is_empty());
-    inject_topic_catalog(
+    let publication = native_connection::prepare_data(&mut agent, generation, signal);
+    native_connection::observe(
         &mut agent,
         generation,
         signal,
-        &registrations,
-        3,
-        "first-binding",
+        vec![native_connection::confirmed(
+            state::resource_key::Key::Track(native_connection::SOURCE.into()),
+            0,
+            state::confirmed_state::Value::Track(state::Track {
+                track_id: native_connection::SOURCE.into(),
+                participant_id: "p1".into(),
+                label: "state".into(),
+                kind: Some(state::track::Kind::Data(state::DataTrack {
+                    delivery: state::DataDelivery::Lossy as i32,
+                })),
+            }),
+        )],
+    );
+    assert!(
+        agent.next_effect().is_none(),
+        "discovery does not admit a publication"
+    );
+    assert!(finished(&mut agent).is_empty());
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        signal,
+        &publication,
+        native_connection::SOURCE,
     );
     let (operation, channel, body) = dispatched(&mut agent, timer);
     let TopicBody::Message(message) = body else {
         panic!("bound message")
     };
-    assert_eq!(
-        message.data_track_id,
-        data_id(true, "state", TopicMode::Lossy, "first-binding")
-    );
+    assert_eq!(channel, publication.channel);
+    assert_eq!(message.data_track_id, native_connection::SOURCE);
     assert_eq!(message.payload, [255]);
     acknowledge_send(&mut agent, generation, channel, operation);
     assert_eq!(finished(&mut agent), vec![(ticket, None)]);
@@ -220,10 +230,7 @@ fn owned_send_binding_wait_is_bounded_and_timeout_releases_only_its_admission() 
 
 #[test]
 fn queued_timeout_updates_observation_and_cannot_transmit_later() {
-    let (mut agent, generation, _, _) = connect_with_topics(TopicRegistrations {
-        publishers: vec![publisher("state", TopicMode::Lossy)],
-        subscribers: vec![],
-    });
+    let (mut agent, generation, _, _) = native_connection::connected_publisher(TopicMode::Lossy);
     let first = agent.send_data(spec(TopicMode::Lossy), vec![1]).unwrap();
     let first_timer = deadline(&mut agent);
     let (operation, channel, _) = dispatched(&mut agent, first_timer);
@@ -248,40 +255,58 @@ fn queued_timeout_updates_observation_and_cannot_transmit_later() {
 }
 
 #[test]
-fn owned_send_binding_replacement_rejects_in_flight_and_queued_bytes() {
-    let registrations = TopicRegistrations {
-        publishers: vec![publisher("state", TopicMode::Ordered)],
-        subscribers: vec![],
-    };
-    let (mut agent, generation, signal, _) = connect_with_topics(registrations.clone());
+fn owned_source_end_rejects_in_flight_and_queued_bytes() {
+    let (mut agent, generation, signal, publication) =
+        native_connection::connected_publisher(TopicMode::Ordered);
     let first = agent.send_data(spec(TopicMode::Ordered), vec![1]).unwrap();
     let timer = deadline(&mut agent);
     let (old_operation, channel, _) = dispatched(&mut agent, timer);
+    assert_eq!(channel, publication.channel);
     let second = agent.send_data(spec(TopicMode::Ordered), vec![2]).unwrap();
     deadline(&mut agent);
-    inject_topic_catalog(
+    native_connection::observe(
         &mut agent,
         generation,
         signal,
-        &registrations,
-        2,
-        "replacement",
+        vec![native_connection::confirmed(
+            state::resource_key::Key::Owned(publication.reference),
+            publication.revision,
+            state::confirmed_state::Value::Absent(state::AbsentState {
+                reason: state::AbsenceReason::SourceEnded as i32,
+            }),
+        )],
     );
     assert_eq!(
         finished(&mut agent),
         vec![
-            (first, Some(DataSendFailure::TransportReplaced)),
-            (second, Some(DataSendFailure::TransportReplaced))
+            (first, Some(DataSendFailure::ChannelFailed)),
+            (second, Some(DataSendFailure::ChannelFailed)),
         ]
     );
+    let mut closed = false;
     while let Some(effect) = agent.next_effect() {
-        assert!(matches!(effect, Effect::Timer(TimerEffect::Cancel { .. })));
+        match effect {
+            Effect::Timer(TimerEffect::Cancel { .. }) => {}
+            Effect::Rtc(RtcEffect::CloseDataChannel {
+                generation: actual,
+                channel: actual_channel,
+            }) => {
+                assert_eq!(actual, generation);
+                assert_eq!(actual_channel, channel);
+                assert!(!closed);
+                closed = true;
+            }
+            effect => panic!("source-local cutoff: {effect:?}"),
+        }
     }
+    assert!(closed);
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert!(agent.snapshot().terminal_failure.is_none());
     acknowledge_send(&mut agent, generation, channel, old_operation);
     assert!(finished(&mut agent).is_empty());
     assert!(
         agent.next_effect().is_none(),
-        "retired bytes cannot move to the replacement binding"
+        "retired bytes cannot move to a replacement"
     );
 }
 

@@ -1033,11 +1033,11 @@ public:
             std::make_shared<NativeEncodedImageCallback::State>())),
         failed_(!encoder_is_valid(*encoder_)) {
     callback_->state()->engine = info_invocation_->installed;
-    if (format.name == "H264") callback_->state()->codec_type = webrtc::kVideoCodecH264;
-    else if (format.name == "VP8") callback_->state()->codec_type = webrtc::kVideoCodecVP8;
-    else if (format.name == "VP9") callback_->state()->codec_type = webrtc::kVideoCodecVP9;
-    else if (format.name == "AV1") callback_->state()->codec_type = webrtc::kVideoCodecAV1;
-    else if (format.name == "H265") callback_->state()->codec_type = webrtc::kVideoCodecH265;
+    if (absl::EqualsIgnoreCase(format.name, "H264")) callback_->state()->codec_type = webrtc::kVideoCodecH264;
+    else if (absl::EqualsIgnoreCase(format.name, "VP8")) callback_->state()->codec_type = webrtc::kVideoCodecVP8;
+    else if (absl::EqualsIgnoreCase(format.name, "VP9")) callback_->state()->codec_type = webrtc::kVideoCodecVP9;
+    else if (absl::EqualsIgnoreCase(format.name, "AV1")) callback_->state()->codec_type = webrtc::kVideoCodecAV1;
+    else if (absl::EqualsIgnoreCase(format.name, "H265")) callback_->state()->codec_type = webrtc::kVideoCodecH265;
     const auto packetization_mode =
         format.parameters.find("packetization-mode");
     if (packetization_mode != format.parameters.end() &&

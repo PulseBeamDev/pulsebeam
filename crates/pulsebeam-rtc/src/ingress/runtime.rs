@@ -39,6 +39,7 @@ pub(super) fn facts_bytes(facts: &IngressMediaFacts) -> Option<usize> {
         size_of_val(facts.extensions.as_ref()),
     ]
     .into_iter()
+    .chain(facts.payloads.iter().map(|payload| payload.name.len()))
     .chain(facts.rids.iter().map(|rid| rid.len()))
     .chain(facts.extensions.iter().map(|(_, uri)| uri.len()))
     .try_fold(0usize, usize::checked_add)
@@ -363,7 +364,11 @@ mod tests {
             kind: crate::MediaKind::Video,
             rtcp: None,
             mid: "v".into(),
-            payloads: Box::new([(96, 90_000)]),
+            payloads: Box::new([crate::RtpPayloadInfo {
+                payload_type: 96,
+                name: "h264".into(),
+                clock_rate: 90_000,
+            }]),
             feedback_payloads: Box::new([96]),
             repairs: Box::new([]),
             nack_payloads: Box::new([96]),
@@ -377,9 +382,21 @@ mod tests {
             baseline,
             size_of::<(u64, IngressMediaFacts)>()
                 + 1
-                + size_of::<(u8, u32)>()
+                + size_of::<crate::RtpPayloadInfo>()
+                + "h264".len()
                 + 2
                 + size_of::<u32>()
+        );
+        let discovery = crate::Event::EncodingDiscovered(crate::EncodingInfo {
+            mid: facts.mid.as_ref().into(),
+            ssrc: 11,
+            kind: facts.kind,
+            rid: Some("h".into()),
+            payloads: facts.payloads.clone(),
+        });
+        assert_eq!(
+            events::owned_bytes(&discovery),
+            Some(2 + size_of::<crate::RtpPayloadInfo>() + "h264".len())
         );
         let owner = size_of::<(u32, u64)>();
         let groups = size_of::<(u64, BTreeSet<u32>)>()
@@ -444,8 +461,14 @@ mod tests {
         let changes: [(Change, usize, usize); 9] = [
             (|f| f.mid = "video".into(), 4, 0),
             (
-                |f| f.payloads = Box::new([(96, 90_000), (98, 90_000)]),
-                size_of::<(u8, u32)>(),
+                |f| {
+                    let mut payloads = f.payloads.to_vec();
+                    let mut extra = payloads.first().unwrap().clone();
+                    extra.payload_type = 98;
+                    payloads.push(extra);
+                    f.payloads = payloads.into_boxed_slice();
+                },
+                size_of::<crate::RtpPayloadInfo>() + "h264".len(),
                 0,
             ),
             (|f| f.feedback_payloads = Box::new([96, 98]), 1, 0),

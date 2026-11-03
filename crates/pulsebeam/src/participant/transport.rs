@@ -45,6 +45,26 @@ fn rtc_bytes(value: &[u8]) -> bytes::Bytes {
     bytes::Bytes::copy_from_slice(value)
 }
 
+pub(super) fn native_data_config(
+    cid: ChannelId,
+    lane: crate::track::DataLane,
+) -> pulsebeam_rtc::DataChannelConfig {
+    let ordered = lane == crate::track::DataLane::Ordered;
+    pulsebeam_rtc::DataChannelConfig {
+        id: Some(cid),
+        label: "".into(),
+        protocol: "".into(),
+        negotiated: true,
+        ordered,
+        reliability: if ordered {
+            pulsebeam_rtc::DataReliability::Reliable
+        } else {
+            pulsebeam_rtc::DataReliability::MaxRetransmits(0)
+        },
+        priority: pulsebeam_rtc::DataChannelPriority::MEDIUM,
+    }
+}
+
 fn tcp_frame_payload(frame: &[u8]) -> Option<&[u8]> {
     let length = u16::from_be_bytes(frame.get(..2)?.try_into().ok()?);
     let payload = frame.get(2..)?;
@@ -172,9 +192,15 @@ struct InputObservation {
     source_shard: crate::id::ShardId,
     tcp_flow: Option<TcpFlowId>,
 }
+struct InboundPayload {
+    payload_type: u8,
+    codec: RtpCodec,
+    frequency: Frequency,
+}
 struct Encoding {
     mid: Mid,
     rid: Option<Rid>,
+    payloads: Box<[InboundPayload]>,
     sequence: Option<u64>,
     timestamp: Option<u64>,
 }
@@ -382,13 +408,20 @@ impl Transport {
         self.pending_mutations.push_back(mutation);
         true
     }
-    pub(crate) fn apply_next_mutation(&mut self, _now: Instant) -> Option<AppliedMutation> {
+    pub(crate) fn apply_next_mutation(
+        &mut self,
+        _now: Instant,
+        allow_data: impl Fn(crate::media::ChannelId) -> bool,
+    ) -> Option<AppliedMutation> {
         Some(match self.pending_mutations.pop_front()? {
             TransportMutation::Data {
                 channel,
                 bytes,
                 required,
             } => {
+                if !allow_data(channel) {
+                    return Some(AppliedMutation::Applied);
+                }
                 // Best-effort payload must not build a stale FIFO behind a blocked
                 // SCTP send window. Required control keeps the bounded native queue.
                 let queued =
@@ -496,6 +529,104 @@ impl Transport {
             _ => TransportPollOutput::Pending,
         }
     }
+    pub(crate) fn open_native_data(
+        &mut self,
+        cid: ChannelId,
+        lane: crate::track::DataLane,
+    ) -> Result<(), pulsebeam_proto::state::FailureCode> {
+        use pulsebeam_proto::state::FailureCode;
+        let Some(capacity) = self.rtc.data_channel_capacity() else {
+            return Err(FailureCode::Incompatible);
+        };
+        if cid.value() == 0 || cid.value() >= capacity {
+            return Err(FailureCode::Incompatible);
+        }
+        let config = native_data_config(cid, lane);
+        self.rtc
+            .open_data_channel(self.rtc_clock.into(), config)
+            .map_err(|(reason, _)| match reason {
+                pulsebeam_rtc::WriteError::WouldBlock => FailureCode::CapacityExceeded,
+                _ => FailureCode::Incompatible,
+            })?;
+        self.rtc_needs_drain = true;
+        Ok(())
+    }
+
+    pub(crate) fn discard_mutations(&mut self) {
+        self.pending_mutations.clear();
+    }
+
+    pub(crate) fn discard_channel_mutations(&mut self, cid: ChannelId) {
+        self.pending_mutations.retain(|mutation| !matches!(mutation, TransportMutation::Data { channel, .. } if *channel == cid));
+    }
+
+    pub(crate) fn update_rtp(
+        &mut self,
+        patch: pulsebeam_rtc::RtpConfigurationPatch,
+    ) -> Result<(), pulsebeam_rtc::RtpConfigurationError> {
+        let mut outbound = Vec::with_capacity(patch.outbound.len());
+        for binding in &patch.outbound {
+            let [encoding] = binding.encodings.as_slice() else {
+                return Err(pulsebeam_rtc::RtpConfigurationError::Unsupported);
+            };
+            if encoding.rid.is_some() {
+                return Err(pulsebeam_rtc::RtpConfigurationError::Unsupported);
+            }
+            let mid = Mid::new(&binding.mid)
+                .map_err(|_| pulsebeam_rtc::RtpConfigurationError::Unsupported)?;
+            outbound.push((
+                mid,
+                Sender {
+                    ssrc: encoding.primary.into(),
+                    pt: binding.codec.payload_type.into(),
+                    sequence_origin: None,
+                    highest_accepted: None,
+                    highest_reported: None,
+                    source: None,
+                    descriptor_writer: Default::default(),
+                    extensions: binding
+                        .extensions
+                        .iter()
+                        .map(|extension| pulsebeam_rtc::RtpExtensionInfo {
+                            id: extension.id,
+                            uri: extension.uri.as_str().into(),
+                        })
+                        .collect(),
+                },
+            ));
+        }
+        let removed = patch.remove_encodings.clone();
+        self.rtc.update_rtp(patch)?;
+        self.senders
+            .retain(|_, sender| !removed.contains(&u32::from(sender.ssrc)));
+        for (mid, sender) in outbound {
+            if let Some(previous) = self.senders.get_mut(&mid)
+                && previous.ssrc == sender.ssrc
+                && previous.pt == sender.pt
+            {
+                previous.extensions = sender.extensions;
+            } else {
+                self.senders.insert(mid, sender);
+            }
+        }
+        self.rtc_needs_drain = true;
+        Ok(())
+    }
+
+    pub(crate) fn discard_rtp(&mut self, mid: Mid) -> bool {
+        self.rtc.discard_pending_rtp(mid.as_str()).is_ok()
+    }
+
+    pub(crate) fn discard_keyframes(&mut self, mid: Mid) {
+        self.pending_mutations.retain(|mutation| !matches!(mutation, TransportMutation::Keyframe { mid: pending, .. } if *pending == mid));
+    }
+
+    pub(crate) fn close_native_data(&mut self, cid: ChannelId) {
+        self.discard_channel_mutations(cid);
+        let _ = self.rtc.close_data_channel(self.rtc_clock.into(), cid);
+        self.rtc_needs_drain = true;
+    }
+
     pub(crate) fn write_channel(&mut self, cid: ChannelId, binary: bool, bytes: &[u8]) -> bool {
         let message = if binary {
             DataMessage::Binary(rtc_bytes(bytes))
@@ -535,15 +666,46 @@ impl Transport {
         &mut self,
         info: pulsebeam_rtc::EncodingInfo,
     ) -> Option<pulsebeam_rtc::SenderReport> {
-        let mid = Mid::new(&info.mid).ok()?;
-        let rid = info.rid.as_deref().map(Rid::new).transpose().ok()?;
         if self.encodings.len() >= MAX_ENCODINGS && !self.encodings.contains_key(&info.ssrc.into())
         {
+            return None;
+        }
+        self.register_owned_encoding(info)
+    }
+
+    // Native callers have already reserved per-resource execution credit and
+    // checked this SSRC against the admitted source's index.
+    pub(crate) fn register_owned_encoding(
+        &mut self,
+        info: pulsebeam_rtc::EncodingInfo,
+    ) -> Option<pulsebeam_rtc::SenderReport> {
+        let mid = Mid::new(&info.mid).ok()?;
+        let rid = info.rid.as_deref().map(Rid::new).transpose().ok()?;
+        let payloads: Box<[_]> = info
+            .payloads
+            .iter()
+            .filter_map(|payload| {
+                let codec = match (info.kind, payload.name.as_ref()) {
+                    (pulsebeam_rtc::MediaKind::Audio, "opus") => RtpCodec::Opus,
+                    (pulsebeam_rtc::MediaKind::Video, "h264") => RtpCodec::H264,
+                    _ => return None,
+                };
+                Some(InboundPayload {
+                    payload_type: payload.payload_type,
+                    codec,
+                    frequency: Frequency::from_nonzero(std::num::NonZeroU32::new(
+                        payload.clock_rate,
+                    )?),
+                })
+            })
+            .collect();
+        if payloads.is_empty() {
             return None;
         }
         self.encodings.entry(info.ssrc.into()).or_insert(Encoding {
             mid,
             rid,
+            payloads,
             sequence: None,
             timestamp: None,
         });
@@ -559,24 +721,16 @@ impl Transport {
         mid: Mid,
         rid: Option<Rid>,
     ) -> Option<RtpIngress> {
-        let media = self
-            .session
-            .inbound_media
-            .iter()
-            .find(|media| media.mid.as_ref() == mid.as_str())?;
-        let codec = media
-            .codecs
-            .iter()
-            .find(|codec| codec.payload_type == rtp.header.payload_type)?;
-        let frequency = Frequency::from_nonzero(std::num::NonZeroU32::new(codec.clock_rate)?);
-        let kind = match codec.profile {
-            pulsebeam_rtc::CodecProfile::Opus => RtpCodec::Opus,
-            pulsebeam_rtc::CodecProfile::H264 { .. } => RtpCodec::H264,
-        };
         let encoding = self.encodings.get_mut(&rtp.header.ssrc.into())?;
         if encoding.mid != mid || encoding.rid != rid {
             return None;
         }
+        let payload = encoding
+            .payloads
+            .iter()
+            .find(|payload| payload.payload_type == rtp.header.payload_type)?;
+        let frequency = payload.frequency;
+        let kind = payload.codec;
         let sequence = extend_serial(encoding.sequence, u64::from(rtp.header.sequence), 16);
         let timestamp = extend_serial(encoding.timestamp, u64::from(rtp.header.timestamp), 32);
         encoding.sequence = Some(encoding.sequence.unwrap_or(sequence).max(sequence));
@@ -600,13 +754,7 @@ impl Transport {
             self.pending_reports.insert(report.ssrc, report);
             return None;
         };
-        let media = self
-            .session
-            .inbound_media
-            .iter()
-            .find(|media| media.mid.as_ref() == encoding.mid.as_str())?;
-        let frequency =
-            Frequency::from_nonzero(std::num::NonZeroU32::new(media.codecs.first()?.clock_rate)?);
+        let frequency = encoding.payloads.first()?.frequency;
         let timestamp = extend_serial(encoding.timestamp, u64::from(report.rtp_timestamp), 32);
         encoding.timestamp = Some(encoding.timestamp.unwrap_or(timestamp).max(timestamp));
         Some((
@@ -952,6 +1100,83 @@ mod tests {
             assert!(transport.pending_ingress.is_empty());
             assert!(transport.tcp_flows.is_empty());
         });
+    }
+
+    #[test]
+    fn ingress_uses_accepted_encoding_formats_not_bootstrap_media() {
+        let accepted = crate::control::application_only_test_connection();
+        let mut transport = Transport::new(
+            accepted,
+            8,
+            Instant::now(),
+            #[cfg(feature = "sim")]
+            tracing::Span::none(),
+        );
+        assert!(transport.session.inbound_media.is_empty());
+        let mid = Mid::from("dynamic");
+        let info = |ssrc, payload_type, name: &str, kind| pulsebeam_rtc::EncodingInfo {
+            mid: mid.as_str().into(),
+            ssrc,
+            kind,
+            rid: None,
+            payloads: Box::new([pulsebeam_rtc::RtpPayloadInfo {
+                payload_type,
+                name: name.into(),
+                clock_rate: 48_000,
+            }]),
+        };
+        let report = pulsebeam_rtc::SenderReport {
+            arrival: std::time::Instant::now(),
+            ssrc: 0,
+            ntp_seconds: 1,
+            ntp_fraction: 0,
+            rtp_timestamp: 2000,
+        };
+        assert!(transport.sender_report(report).is_none());
+        assert_eq!(
+            transport.register_encoding(info(0, 111, "opus", MediaKind::Audio)),
+            Some(report)
+        );
+        let (report_mid, sender) = transport.sender_report(report).unwrap();
+        assert_eq!(report_mid, mid);
+        assert_eq!(
+            sender.rtp_time,
+            MediaTime::new((1u64 << 32) + 2000, Frequency::FORTY_EIGHT_KHZ)
+        );
+        let packet = pulsebeam_rtc::RtpPacket {
+            arrival: report.arrival,
+            header: pulsebeam_rtc::RtpHeader {
+                sequence: 65535,
+                timestamp: 2400,
+                ssrc: 0,
+                payload_type: 111,
+                marker: true,
+            },
+            payload: Bytes::from_static(&[0xf8, 0xff, 0xfe]),
+            extensions: vec![],
+        };
+        let ingress = transport.convert_rtp(packet.clone(), mid, None).unwrap();
+        assert_eq!(
+            ingress.packet.rtp_ts,
+            MediaTime::new((1u64 << 32) + 2400, Frequency::FORTY_EIGHT_KHZ)
+        );
+        assert!(
+            transport
+                .convert_rtp(packet.clone(), Mid::from("other"), None)
+                .is_none()
+        );
+        let mut wrong_pt = packet.clone();
+        wrong_pt.header.payload_type = 112;
+        assert!(transport.convert_rtp(wrong_pt, mid, None).is_none());
+        transport.retire_encoding(0);
+        transport.register_encoding(info(1, 112, "opus", MediaKind::Audio));
+        assert!(transport.convert_rtp(packet.clone(), mid, None).is_none());
+        let mut replacement = packet;
+        replacement.header.ssrc = 1;
+        replacement.header.payload_type = 112;
+        assert!(transport.convert_rtp(replacement, mid, None).is_some());
+        transport.register_encoding(info(2, 96, "vp8", MediaKind::Video));
+        assert!(!transport.encodings.contains_key(&2.into()));
     }
 
     fn extensions(

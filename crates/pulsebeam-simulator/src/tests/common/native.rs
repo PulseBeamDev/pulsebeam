@@ -209,6 +209,24 @@ impl NativeHost {
         Ok(Self(host))
     }
 
+    pub fn raw_peer_factory(
+        &self,
+    ) -> anyhow::Result<pulsebeam_rtc_simulation::PeerConnectionFactory> {
+        let services = self.0.io.services.borrow();
+        Ok(services
+            .bridge
+            .world
+            .controlled
+            .peer_factory_builder()?
+            .network_manager(self.0.interface.network_manager()?)
+            .packet_socket_factory(self.0.interface.packet_socket_factory()?)
+            .audio_encoder_factory(
+                pulsebeam_rtc_simulation::AudioEncoderFactory::with_opus_frames()?,
+            )
+            .audio_decoder_factory(pulsebeam_rtc_simulation::AudioDecoderFactory::builtin_opus()?)
+            .build()?)
+    }
+
     pub fn h264_fixture(
         &self,
         temporal_layers: u8,

@@ -1,9 +1,25 @@
 use std::mem::size_of;
 
-use super::{CurrentBinding, CurrentEncodingLocation, RtpEncoding, RtpExtensionMapping};
+use super::{
+    CurrentBinding, CurrentEncodingLocation, RtpCapabilities, RtpCodecCapability,
+    RtpCodecParameters, RtpEncoding, RtpExtensionMapping,
+};
 
 pub(super) fn identity_bytes(count: usize) -> Option<usize> {
     count.checked_mul(size_of::<(u32, bool)>())
+}
+
+pub(super) fn capability_bytes(capabilities: &RtpCapabilities) -> Option<usize> {
+    let mut size = PayloadSize(0);
+    size.array::<RtpCodecCapability>(capabilities.codecs.capacity())?;
+    for codec in &capabilities.codecs {
+        size.codec(&codec.parameters)?;
+    }
+    size.array::<String>(capabilities.extensions.len())?;
+    for extension in &capabilities.extensions {
+        size.add(extension.capacity())?;
+    }
+    Some(size.0)
 }
 
 pub(super) fn live_bytes(record: &CurrentBinding) -> Option<usize> {
@@ -25,23 +41,27 @@ pub(super) fn live_bytes(record: &CurrentBinding) -> Option<usize> {
             size.add(rid.capacity())?;
         }
     }
-    let codec = &binding.codec.parameters;
-    size.add(codec.name.capacity())?;
-    size.array::<(String, String)>(codec.fmtp.len())?;
-    for (key, value) in &codec.fmtp {
-        size.add(key.capacity())?;
-        size.add(value.capacity())?;
-    }
-    size.array::<String>(codec.feedback.len())?;
-    for feedback in &codec.feedback {
-        size.add(feedback.capacity())?;
-    }
+    size.codec(&binding.codec.parameters)?;
     Some(size.0)
 }
 
 struct PayloadSize(usize);
 
 impl PayloadSize {
+    fn codec(&mut self, codec: &RtpCodecParameters) -> Option<()> {
+        self.add(codec.name.capacity())?;
+        self.array::<(String, String)>(codec.fmtp.len())?;
+        for (key, value) in &codec.fmtp {
+            self.add(key.capacity())?;
+            self.add(value.capacity())?;
+        }
+        self.array::<String>(codec.feedback.len())?;
+        for feedback in &codec.feedback {
+            self.add(feedback.capacity())?;
+        }
+        Some(())
+    }
+
     fn add(&mut self, bytes: usize) -> Option<()> {
         self.0 = self.0.checked_add(bytes)?;
         Some(())

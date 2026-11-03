@@ -22,7 +22,7 @@ use pulsebeam_core::net::{HttpError, HttpRequest, HttpResult};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 // The process-wide shimmed clock, not tokio's: turmoil virtualises `tokio::time::Instant` per
 // host, so a timestamp taken here cannot be compared with one taken on the coordinator. See
@@ -441,13 +441,18 @@ impl SimClientBuilder {
         };
         let room = RoomExternalId::new(room)?;
         let participant = ParticipantExternalId::new(&participant)?;
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs()
+            .checked_add(86_400)
+            .ok_or_else(|| anyhow::anyhow!("fixture authorization expiry overflow"))?;
         let session = AgentConfig {
             endpoint: self.endpoint,
             token: pulsebeam_server::sign_participant_token(
                 &pulsebeam_server::insecure_dev_api_key().unwrap(),
                 (room).as_str(),
                 (participant).as_str(),
-                u64::MAX,
+                expires_at,
             )?,
             topology,
             retry: Default::default(),
@@ -927,6 +932,7 @@ impl From<&pulsebeam_agent_native::RemoteFrame> for NativeVideoStream {
 pub struct NativeVideoTimeline {
     pub track: Option<pulsebeam_agent_native::RemoteTrack>,
     pub decoded: DecodedVideoStream,
+    pub decoded_by_incarnation: BTreeMap<String, u64>,
     pub dd_frames: u64,
     pub temporal_indices: BTreeSet<i32>,
     last_ts: Option<u32>,
@@ -1993,16 +1999,24 @@ fn record_fixture_video_frame(
         Ok(observation) => {
             let mut log = log.lock().unwrap();
             let identity = reference.map(|(_, source, layer)| (source, layer));
-            log.by_receiver
+            let timeline = log
+                .by_receiver
                 .entry(NativeVideoStream::from(&frame))
-                .or_default()
-                .decoded
-                .record(
-                    observation.width,
-                    observation.height,
-                    observation.reference_error,
-                    identity,
-                );
+                .or_default();
+            timeline.decoded.record(
+                observation.width,
+                observation.height,
+                observation.reference_error,
+                identity,
+            );
+            if let Some(origin) = marker
+                && authenticated.is_some()
+            {
+                *timeline
+                    .decoded_by_incarnation
+                    .entry(origin.to_owned())
+                    .or_default() += 1;
+            }
             log.record_decoded(
                 publisher,
                 observation.width,
@@ -3546,7 +3560,7 @@ impl ClientContext {
         self.sync_video_desired(&snapshot).await.map(|_| ())
     }
 
-    pub async fn relabel_owned_video(&mut self, label: String) -> anyhow::Result<bool> {
+    async fn relabel_owned_video(&mut self, label: String) -> anyhow::Result<bool> {
         let owner = self
             .owned_video
             .take()
@@ -3907,13 +3921,23 @@ impl SimClient {
             }
             let snapshots = agent.snapshots();
             let corrupt = plan.corrupt_audio_payload;
+            let mode = plan.audio_receive_mode;
+            let agent = agent.clone();
             self.join_set.spawn(async move {
+                let mut remote = remote;
                 let mut decoders = HashMap::<NativeAudioStream, OpusReceiver>::new();
                 loop {
                     let frame = match remote.next().await {
                         pulsebeam_agent_native::MediaStreamUpdate::Frame { frame } => frame,
                         pulsebeam_agent_native::MediaStreamUpdate::Track { .. } => continue,
-                        pulsebeam_agent_native::MediaStreamUpdate::Closed => break,
+                        pulsebeam_agent_native::MediaStreamUpdate::Closed => {
+                            let Some(next) = reacquire_remote(&agent, &remote, mode).await else {
+                                break;
+                            };
+                            remote = next;
+                            decoders.clear();
+                            continue;
+                        }
                         other => panic!("native audio observer lost media: {other:?}"),
                     };
                     if snapshots
@@ -4102,6 +4126,15 @@ impl SimClient {
         Ok(())
     }
 
+    pub async fn relabel_owned_video(&mut self, label: String) -> anyhow::Result<bool> {
+        if let Some(feed) = self.video_feed.take() {
+            feed.stop().await?;
+        }
+        let changed = self.ctx.relabel_owned_video(label).await?;
+        self.attach_video_source().await?;
+        Ok(changed)
+    }
+
     pub async fn replace_video_source(&mut self) -> anyhow::Result<bool> {
         if self.ctx.agent.snapshot().connection != ConnectionState::Connected
             || self
@@ -4197,6 +4230,40 @@ impl SimClient {
     }
 }
 
+async fn reacquire_remote(
+    agent: &Agent,
+    retired: &pulsebeam_agent_native::RemoteMedia,
+    mode: pulsebeam_agent_native::ReceiveMode,
+) -> Option<pulsebeam_agent_native::RemoteMedia> {
+    let generation = retired.generation();
+    let snapshot = agent.snapshot();
+    if snapshot
+        .generation
+        .map(pulsebeam_agent_native::agent_core::Generation::get)
+        != Some(generation)
+        || snapshot.connection != ConnectionState::Connected
+    {
+        return None;
+    }
+    match agent.remote(retired.slot().clone(), mode).await {
+        Ok(remote) if remote.generation() == generation => Some(remote),
+        Ok(_) => None,
+        Err(error) => {
+            let snapshot = agent.snapshot();
+            if snapshot
+                .generation
+                .map(pulsebeam_agent_native::agent_core::Generation::get)
+                != Some(generation)
+                || snapshot.connection != ConnectionState::Connected
+                || agent.snapshots().has_changed().is_err()
+            {
+                return None;
+            }
+            panic!("native observer reacquisition failed: {error}");
+        }
+    }
+}
+
 fn spawn_video_receiver(
     join_set: &mut JoinSet<()>,
     remote: pulsebeam_agent_native::RemoteMedia,
@@ -4215,6 +4282,7 @@ fn spawn_video_receiver(
     let recovery_probe = ctx.keyframe_recovery.clone();
     let snapshots = agent.snapshots();
     join_set.spawn(async move {
+        let mut remote = Arc::new(remote);
         let mut one_shot = false;
         let mut streams = HashMap::<NativeVideoStream, VideoStreamReceiver>::new();
         type FeedbackRequest<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
@@ -4243,7 +4311,8 @@ fn spawn_video_receiver(
                     }
                     if let Some(identity) = queued_one_shot.take() {
                         feedback_context = Some((identity, tokio::time::Instant::now(), true));
-                        feedback = Some(Box::pin(async { remote.request_keyframe().await.is_ok() }));
+                        let target = remote.clone();
+                        feedback = Some(Box::pin(async move { target.request_keyframe().await.is_ok() }));
                     }
                     continue;
                 },
@@ -4252,7 +4321,15 @@ fn spawn_video_receiver(
             let frame = match update {
                 pulsebeam_agent_native::MediaStreamUpdate::Frame { frame } => frame,
                 pulsebeam_agent_native::MediaStreamUpdate::Track { .. } => continue,
-                pulsebeam_agent_native::MediaStreamUpdate::Closed => break,
+                pulsebeam_agent_native::MediaStreamUpdate::Closed => {
+                    feedback = None;
+                    feedback_context = None;
+                    queued_one_shot = None;
+                    let Some(next) = reacquire_remote(&agent, &remote, mode).await else { break };
+                    remote = Arc::new(next);
+                    streams.clear();
+                    continue;
+                },
                 pulsebeam_agent_native::MediaStreamUpdate::NativeDropped { skipped } => {
                     if mode == pulsebeam_agent_native::ReceiveMode::Decoded
                         && log.lock().unwrap().native_callback_enabled
@@ -4356,7 +4433,8 @@ fn spawn_video_receiver(
                     .or_else(|| (!one_shot && should_request).then_some((identity, false)));
                 if let Some((identity, once)) = request {
                     feedback_context = Some((identity, now, once));
-                    feedback = Some(Box::pin(async { remote.request_keyframe().await.is_ok() }));
+                    let target = remote.clone();
+                    feedback = Some(Box::pin(async move { target.request_keyframe().await.is_ok() }));
                 }
             }
             if stream.decoder_ready {

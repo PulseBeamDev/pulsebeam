@@ -7,6 +7,7 @@
     pumping,
     events,
     wait,
+    synchronize,
     previousGeneration,
   } = globalThis.__adapterRestart;
   try {
@@ -24,6 +25,7 @@
         snapshot.generation !== previousGeneration,
       "Web subscriber adapter rejoin",
     );
+    await synchronize();
     await publisher.send(new Uint8Array([2]));
     const deadline = Date.now() + 20000;
     while (!events.some((event) => event.payload.join(",") === "2")) {

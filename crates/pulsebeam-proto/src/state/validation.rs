@@ -346,6 +346,28 @@ fn validate_binding(binding: Option<&TrackBinding>, kind: TrackKind, publication
 }
 
 pub fn validate_rtp(rtp: &RtpParameters, kind: TrackKind, publication: bool) -> Result {
+    validate_rtp_envelope(rtp, kind, publication)?;
+    let repair = rtp
+        .codec
+        .as_ref()
+        .is_some_and(|codec| codec.rtx_payload_type.is_some());
+    if rtp
+        .encodings
+        .iter()
+        .any(|encoding| encoding.ssrc.is_none() || encoding.rtx_ssrc.is_some() != repair)
+        || rtp
+            .rtcp
+            .as_ref()
+            .is_none_or(|rtcp| !transport_text(&rtcp.cname, 256))
+    {
+        return Err(ValidationError::Binding);
+    }
+    Ok(())
+}
+
+/// Checks known RTP fields without granting admission for missing SSRCs or CNAME.
+/// Use `validate_rtp` before admitting a wire binding.
+pub fn validate_rtp_envelope(rtp: &RtpParameters, kind: TrackKind, publication: bool) -> Result {
     if !mid(&rtp.mid)
         || rtp.encodings.is_empty()
         || rtp.encodings.len() > if publication { 4 } else { 1 }
@@ -390,9 +412,8 @@ pub fn validate_rtp(rtp: &RtpParameters, kind: TrackKind, publication: bool) -> 
     let mut ssrcs = BTreeSet::new();
     let mut rids = BTreeSet::new();
     for encoding in &rtp.encodings {
-        let ssrc = encoding.ssrc.ok_or(ValidationError::Binding)?;
-        if !ssrcs.insert(ssrc)
-            || encoding.rtx_ssrc.is_some() != codec.rtx_payload_type.is_some()
+        if encoding.ssrc.is_some_and(|ssrc| !ssrcs.insert(ssrc))
+            || encoding.rtx_ssrc.is_some() && codec.rtx_payload_type.is_none()
             || encoding.rtx_ssrc.is_some_and(|ssrc| !ssrcs.insert(ssrc))
             || encoding
                 .scalability_mode
@@ -401,7 +422,7 @@ pub fn validate_rtp(rtp: &RtpParameters, kind: TrackKind, publication: bool) -> 
                 && (!rid(&encoding.rid)
                     || !rids.insert(&encoding.rid)
                     || !types.contains(&(RtpHeaderExtensionType::RtpHeaderExtensionRid as i32))
-                    || encoding.rtx_ssrc.is_some()
+                    || codec.rtx_payload_type.is_some()
                         && !types.contains(
                             &(RtpHeaderExtensionType::RtpHeaderExtensionRepairedRid as i32),
                         ))
@@ -410,15 +431,109 @@ pub fn validate_rtp(rtp: &RtpParameters, kind: TrackKind, publication: bool) -> 
         }
     }
     let rtcp = rtp.rtcp.as_ref().ok_or(ValidationError::Binding)?;
-    if !transport_text(&rtcp.cname, 256) {
+    if !rtcp.cname.is_empty() && !transport_text(&rtcp.cname, 256) {
         return Err(ValidationError::Binding);
     }
     Ok(())
 }
 
+/// Compare immutable declarations of validated specs, independently of settings.
+/// This is identity equality, never source/receiver codec compatibility.
+pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> bool {
+    use publication_spec::Kind;
+    use resource_spec::Declaration;
+    match (&left.declaration, &right.declaration) {
+        (Some(Declaration::Publication(left)), Some(Declaration::Publication(right))) => {
+            left.label == right.label
+                && match (&left.kind, &right.kind) {
+                    (Some(Kind::Audio(left)), Some(Kind::Audio(right))) => {
+                        bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())
+                    }
+                    (Some(Kind::Video(left)), Some(Kind::Video(right))) => {
+                        bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())
+                    }
+                    (Some(Kind::Data(left)), Some(Kind::Data(right))) => {
+                        left.delivery == right.delivery
+                            && bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())
+                    }
+                    _ => false,
+                }
+        }
+        (Some(Declaration::Subscription(left)), Some(Declaration::Subscription(right))) => {
+            left.track_id == right.track_id
+                && left.kind == right.kind
+                && bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())
+        }
+        _ => false,
+    }
+}
+
+/// Full mutable equality for validated settings, including documented defaults.
+/// Omitted playout bounds are not an explicit zero-delay request.
+pub fn settings_equivalent(left: &ResourceSettings, right: &ResourceSettings) -> bool {
+    use resource_settings::Receive;
+    left.enabled == right.enabled
+        && match (&left.receive, &right.receive) {
+            (Some(Receive::Video(left)), Some(Receive::Video(right))) => {
+                left.max_height == right.max_height
+                    && left.min_height == right.min_height
+                    && left.min_fps == right.min_fps
+                    && left.playout_delay == right.playout_delay
+                    && left.priority.unwrap_or(1) == right.priority.unwrap_or(1)
+            }
+            _ => left.receive == right.receive,
+        }
+}
+
+/// Identity equality of validated bindings, independently of mutable settings.
+pub fn bindings_equivalent(left: Option<&TrackBinding>, right: Option<&TrackBinding>) -> bool {
+    use track_binding::Transport;
+    match (
+        left.and_then(|v| v.transport.as_ref()),
+        right.and_then(|v| v.transport.as_ref()),
+    ) {
+        (Some(Transport::Sctp(left)), Some(Transport::Sctp(right))) => left == right,
+        (Some(Transport::Rtp(left)), Some(Transport::Rtp(right))) => {
+            left.mid == right.mid
+                && left.rtcp == right.rtcp
+                && left.encodings == right.encodings
+                && same_members(&left.header_extensions, &right.header_extensions)
+                && match (&left.codec, &right.codec) {
+                    (Some(left), Some(right)) => {
+                        left.payload_type == right.payload_type
+                            && left.rtx_payload_type == right.rtx_payload_type
+                            && same_members(&left.feedback, &right.feedback)
+                            && match (&left.format, &right.format) {
+                                (Some(left), Some(right)) => formats_equivalent(left, right),
+                                _ => false,
+                            }
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+fn same_members<T: PartialEq>(left: &[T], right: &[T]) -> bool {
+    left.len() == right.len() && left.iter().all(|value| right.contains(value))
+}
+
 /// Typed/default identity equality, not directional codec compatibility.
 pub fn formats_equivalent(left: &CodecFormat, right: &CodecFormat) -> bool {
     match (&left.codec, &right.codec) {
+        (Some(codec_format::Codec::Opus(left)), Some(codec_format::Codec::Opus(right))) => {
+            left.stereo == right.stereo
+                && left.source_stereo == right.source_stereo
+                && left.in_band_fec == right.in_band_fec
+                && left.dtx == right.dtx
+                && left.constant_bitrate == right.constant_bitrate
+                && left.max_average_bitrate_bps == right.max_average_bitrate_bps
+                // RFC 7587 section 6.1 supplies these two stable rate defaults.
+                && left.max_playback_rate_hz.unwrap_or(48000) == right.max_playback_rate_hz.unwrap_or(48000)
+                && left.max_capture_rate_hz.unwrap_or(48000) == right.max_capture_rate_hz.unwrap_or(48000)
+                && left.min_packet_time_ms == right.min_packet_time_ms
+        }
         (Some(codec_format::Codec::H264(left)), Some(codec_format::Codec::H264(right))) => {
             left.profile_level_id == right.profile_level_id
                 && left.level_asymmetry_allowed.unwrap_or(false)

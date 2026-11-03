@@ -85,15 +85,18 @@ export async function resourceContract(BrowserRuntime) {
     runtime.replace_desired({
       connected: false,
       topics: Array.from({ length: 64 }, (_, index) => ({
-        name: `legacy${index}`,
+        name: `declared${index}`,
         mode: "lossy",
         publish: true,
       })),
     });
-    await assert.rejects(resource({ op: "receiveData", spec }), {
-      pulsebeamCode: "capacity",
-    });
+    const additional = await resource({ op: "receiveData", spec });
+    const declared = runtime.snapshot().topics.publishers;
+    assert.equal(declared.length, 64);
+    assert.equal(runtime.snapshot().topics.subscribers.length, 1);
+    await resource({ op: "release", owner: additional.owner });
     assert.deepEqual(runtime.snapshot().topics.subscribers, []);
+    assert.deepEqual(runtime.snapshot().topics.publishers, declared);
     assert.equal(
       runtime.diagnostics().peers,
       0,

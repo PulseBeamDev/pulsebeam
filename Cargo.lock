@@ -3970,6 +3970,7 @@ dependencies = [
  "pulsebeam-agent-core",
  "pulsebeam-agent-native",
  "pulsebeam-core",
+ "pulsebeam-proto",
  "pulsebeam-rtc-simulation",
  "pulsebeam-runtime",
  "pulsebeam-server",

@@ -10,7 +10,11 @@ pub(super) fn owned_bytes(event: &Event) -> Option<usize> {
         Event::EncodingDiscovered(info) => info
             .mid
             .len()
-            .checked_add(info.rid.as_deref().map_or(0, str::len)),
+            .checked_add(info.rid.as_deref().map_or(0, str::len))?
+            .checked_add(std::mem::size_of_val(info.payloads.as_ref()))?
+            .checked_add(info.payloads.iter().try_fold(0usize, |bytes, payload| {
+                bytes.checked_add(payload.name.len())
+            })?),
         Event::Rtp { mid, rid, packet } => mid
             .len()
             .checked_add(rid.as_deref().map_or(0, str::len))?

@@ -76,11 +76,14 @@ struct CommitCounters {
 }
 
 impl CommitCoordinator {
-    fn new(feedback: impl Into<Option<PacketFeedbackKind>>) -> Self {
-        Self {
-            history: SentHistory::new(feedback),
+    fn new(
+        feedback: impl Into<Option<PacketFeedbackKind>>,
+        max_history_bytes: usize,
+    ) -> Result<Self, HistoryError> {
+        Ok(Self {
+            history: SentHistory::with_limit(feedback, max_history_bytes)?,
             counters: CommitCounters::default(),
-        }
+        })
     }
 
     fn commit_transport(
@@ -154,6 +157,7 @@ impl Connection {
     /// This selects the connection-wide feedback profile without rebuilding its
     /// transport, receive feedback or committed send history. Receipt-history
     /// storage must fit the receive-runtime budget even before an inbound binding;
+    /// fixed sent-history backing must also fit its independent allowance.
     /// Capacity leaves the existing profiles and capability state unchanged.
     pub fn set_rtp_capabilities(
         &mut self,
@@ -161,9 +165,14 @@ impl Connection {
     ) -> Result<(), crate::RtpConfigurationError> {
         use crate::RtpConfigurationError as Error;
         self.check_writable().map_err(|_| Error::ConnectionState)?;
-        capabilities.validate()?;
+        let configuration =
+            crate::rtp_config::RtpConfigurationState::with_capabilities(capabilities)?;
+        let capabilities = configuration
+            .capabilities
+            .as_ref()
+            .ok_or(Error::ConnectionState)?;
         if let Some(current) = &self.rtp_configuration.capabilities {
-            return if *current == capabilities {
+            return if current == capabilities {
                 Ok(())
             } else {
                 Err(Error::CapabilityState)
@@ -176,16 +185,22 @@ impl Connection {
         {
             return Err(Error::Unsupported);
         }
+        let sent_profile = self
+            .commit
+            .history
+            .prepare_feedback_profile(capabilities.feedback)
+            .map_err(|error| match error {
+                HistoryError::Exhausted => Error::Capacity,
+                HistoryError::InvalidCommit => Error::ConnectionState,
+            })?;
         self.ingress.set_feedback_profile(capabilities.feedback)?;
         self.session.set_feedback_profile(capabilities.feedback);
-        self.commit
-            .history
-            .set_feedback_profile(capabilities.feedback);
+        sent_profile.commit();
         if self.session.ingress_media().is_empty() && self.session.egress_senders().is_empty() {
             self.transport
                 .configure_rtp_mappings(Box::new([]), Box::new([]), []);
         }
-        self.rtp_configuration.capabilities = Some(capabilities);
+        self.rtp_configuration = configuration;
         Ok(())
     }
 
@@ -257,6 +272,9 @@ impl Connection {
         }
         let inbound = self.rtp_configuration.payload_types(&update, false);
         let outbound = self.rtp_configuration.payload_types(&update, true);
+        for ssrc in self.egress.retiring_ssrcs(&egress) {
+            self.commit.history.retire_source(ssrc);
+        }
         let retired = self.ingress.commit_configuration(ingress);
         debug_assert!(retired.iter().eq(retiring.iter()));
         self.transport.retire_inbound_ssrcs(retired);
@@ -651,10 +669,25 @@ impl Connection {
         }
 
         if matches!(self.lifecycle, Lifecycle::Open) {
-            match self
-                .egress
-                .prepare_one(at, bytes_in_flight, &mut self.transport, !sctp_ready)
-            {
+            let history = &mut self.commit.history;
+            let mut admission = |rtp, epoch, wire_len| {
+                history
+                    .prepare_commit(TransmitCommitContext {
+                        at,
+                        kind: DatagramKind::Rtp,
+                        wire_len,
+                        path_epoch: Some(epoch),
+                        rtp: Some(rtp),
+                    })
+                    .map_err(|_| TransportError::Admission)
+            };
+            match self.egress.prepare_one(
+                at,
+                bytes_in_flight,
+                &mut self.transport,
+                !sctp_ready,
+                &mut admission,
+            ) {
                 PrepareResult::Prepared => {
                     let Some(prepared) = self.transport.poll_prepared() else {
                         self.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
@@ -705,7 +738,7 @@ impl Connection {
                             }))
                         .then_some(at),
                         self.transport.next_deadline(),
-                        self.commit.history.next_deadline(),
+                        self.commit.history.next_deadline(at),
                         (matches!(self.lifecycle, Lifecycle::Open)
                             && self.transport.can_send_user_data())
                         .then(|| self.ingress.next_deadline())
@@ -926,7 +959,7 @@ impl Connection {
             .sctp()
             .map(|facts| Association::new(facts, config.limits, at))
             .transpose()?;
-        let connection = Self {
+        let mut connection = Self {
             session: negotiated.facts,
             rtp_configuration: crate::rtp_config::RtpConfigurationState::default(),
             time: MonotonicObserver::starting_at(at),
@@ -935,10 +968,20 @@ impl Connection {
             egress,
             sctp,
             service: ServiceArbiter::default(),
-            commit: CommitCoordinator::new(feedback),
+            commit: CommitCoordinator::new(feedback, config.limits.max_sent_history_bytes)
+                .map_err(|_| AcceptError::SessionLimitExceeded)?,
             lifecycle: Lifecycle::Open,
             _not_sync: PhantomData,
         };
+        if let Some(capabilities) = config.rtp_capabilities {
+            connection
+                .set_rtp_capabilities(capabilities)
+                .map_err(|error| match error {
+                    crate::RtpConfigurationError::Capacity => AcceptError::SessionLimitExceeded,
+                    crate::RtpConfigurationError::Unsupported => AcceptError::CapabilityConflict,
+                    _ => AcceptError::InvalidConfiguration,
+                })?;
+        }
         Ok(AcceptedConnection {
             connection,
             answer: negotiated.answer,
@@ -1646,6 +1689,12 @@ mod tests {
                     service: RtpService::Padding,
                 }),
             };
+            fixture
+                .connection
+                .commit
+                .history
+                .prepare_commit(context)
+                .expect("funded history preparation");
             fixture
                 .connection
                 .commit

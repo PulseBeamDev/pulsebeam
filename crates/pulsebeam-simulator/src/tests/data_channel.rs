@@ -191,11 +191,15 @@ fn ordered_data_channel_does_not_loop_back_to_publisher_test() {
         ]);
 }
 
-/// A full-length topic name is independent across modes and publisher tracks.
+/// Long per-mode labels retain independent same-label publisher tracks.
 #[test]
-fn all_topic_modes_share_a_name_without_cross_delivery_or_publisher_collapse() {
-    const TOPIC: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+fn all_topic_modes_preserve_same_label_fanin_without_cross_delivery() {
+    const LATEST_TOPIC: &str =
+        "latest-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const LOSSY_TOPIC: &str =
+        "lossy-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ORDERED_TOPIC: &str =
+        "ordered-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let mut room = Room::new("data-modes");
     for name in [
         "pub-a",
@@ -210,30 +214,33 @@ fn all_topic_modes_share_a_name_without_cross_delivery_or_publisher_collapse() {
     let modes = [
         (
             TopicMode::Latest,
+            LATEST_TOPIC,
             "latest-sub",
             b"latest-a".as_slice(),
             b"latest-b".as_slice(),
         ),
         (
             TopicMode::Lossy,
+            LOSSY_TOPIC,
             "lossy-sub",
             b"lossy-a".as_slice(),
             b"lossy-b".as_slice(),
         ),
         (
             TopicMode::Ordered,
+            ORDERED_TOPIC,
             "ordered-sub",
             b"ordered-a".as_slice(),
             b"ordered-b".as_slice(),
         ),
     ];
     let mut plan = Vec::new();
-    for (mode, subscriber, _, _) in modes {
+    for (mode, topic, subscriber, _, _) in modes {
         for publisher in ["pub-a", "pub-b"] {
             plan.push(Step::DeclarePublishTopic {
-                description: "same label, explicit independent mode",
+                description: "same per-mode label, independent publisher",
                 participant: publisher,
-                topic: TOPIC,
+                topic,
                 mode,
             });
         }
@@ -241,7 +248,7 @@ fn all_topic_modes_share_a_name_without_cross_delivery_or_publisher_collapse() {
             plan.push(Step::DeclareSubscribeTopic {
                 description: "mode-specific subscription",
                 participant,
-                topic: TOPIC,
+                topic,
                 mode,
             });
         }
@@ -250,12 +257,12 @@ fn all_topic_modes_share_a_name_without_cross_delivery_or_publisher_collapse() {
         description: "bind authoritative publications and ordered live frontiers",
         duration: Duration::from_secs(2),
     });
-    for (mode, _, first, second) in modes {
+    for (mode, topic, _, first, second) in modes {
         for (participant, data) in [("pub-a", first), ("pub-b", second)] {
             plan.push(Step::PublishData {
                 description: "each publisher retains its own track and sequence space",
                 participant,
-                topic: TOPIC,
+                topic,
                 mode,
                 data,
             });
@@ -268,7 +275,7 @@ fn all_topic_modes_share_a_name_without_cross_delivery_or_publisher_collapse() {
         plan.push(Step::PublishData {
             description: "lossy preserves each distinct admitted value",
             participant,
-            topic: TOPIC,
+            topic: LOSSY_TOPIC,
             mode: TopicMode::Lossy,
             data,
         });
@@ -277,12 +284,12 @@ fn all_topic_modes_share_a_name_without_cross_delivery_or_publisher_collapse() {
         description: "deliver all modes over production routes",
         duration: Duration::from_secs(1),
     });
-    for (mode, subscriber, first, second) in modes {
+    for (mode, topic, subscriber, first, second) in modes {
         for participant in [subscriber, "all-sub"] {
             plan.push(Step::CheckTopicIdentity {
                 description: "events carry external ownership and the exact authoritative track",
                 participant,
-                topic: TOPIC,
+                topic,
                 mode,
                 publishers: &["pub-a", "pub-b"],
                 gap: None,
@@ -291,24 +298,38 @@ fn all_topic_modes_share_a_name_without_cross_delivery_or_publisher_collapse() {
                 plan.push(Step::CheckDataReceived {
                     description: "both publishers reach the matching mode",
                     participant,
-                    topic: TOPIC,
+                    topic,
                     expected,
                 });
             }
+            if mode == TopicMode::Lossy {
+                for expected in [b"lossy-a-next".as_slice(), b"lossy-b-next".as_slice()] {
+                    plan.push(Step::CheckDataReceived {
+                        description: "each publisher's second lossy value remains distinct",
+                        participant,
+                        topic,
+                        expected,
+                    });
+                }
+            }
+            plan.push(Step::CheckDataCount {
+                description: "each mode retains every independent publisher stream",
+                participant,
+                topic,
+                expected: if mode == TopicMode::Lossy { 4 } else { 2 },
+            });
         }
-        plan.push(Step::CheckDataCount {
-            description: "same-name modes never cross-deliver",
-            participant: subscriber,
-            topic: TOPIC,
-            expected: if mode == TopicMode::Lossy { 4 } else { 2 },
-        });
+        for (_, other_topic, _, _, _) in modes {
+            if other_topic != topic {
+                plan.push(Step::CheckDataCount {
+                    description: "mode-specific subscribers receive no other label",
+                    participant: subscriber,
+                    topic: other_topic,
+                    expected: 0,
+                });
+            }
+        }
     }
-    plan.push(Step::CheckDataCount {
-        description: "all independent mode/publisher streams survive",
-        participant: "all-sub",
-        topic: TOPIC,
-        expected: 8,
-    });
     LocalNodeSim::new()
         .with_link(LinkProfile::fiber())
         .with_room(room)

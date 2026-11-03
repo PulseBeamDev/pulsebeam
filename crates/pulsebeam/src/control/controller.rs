@@ -41,6 +41,7 @@ pub struct ParticipantState {
     pub old_connection_id: Option<ConnectionId>,
     pub authorization: Option<AuthorizationLease>,
     pub profile: ConnectionProfile,
+    pub rtp_capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +57,7 @@ const AUTHORIZATION_TIMER_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 
 pub struct AuthorizationLease {
     expiry: AuthorizationExpiry,
     deadline: tokio::time::Instant,
+    revision: u64,
 }
 
 impl AuthorizationLease {
@@ -77,6 +79,7 @@ impl AuthorizationLease {
         Ok(Self {
             expiry,
             deadline: runtime_now.checked_add(delay).unwrap_or(runtime_now),
+            revision: 1,
         })
     }
 
@@ -92,11 +95,38 @@ impl AuthorizationLease {
         wall_now: SystemTime,
         runtime_now: tokio::time::Instant,
     ) -> Result<Self, TokenError> {
-        Self::from_expiry(self.expiry, wall_now, runtime_now)
+        let refreshed = Self::from_expiry(self.expiry, wall_now, runtime_now)?;
+        Ok(Self {
+            revision: self.revision,
+            ..refreshed
+        })
+    }
+
+    pub(crate) fn revision(self) -> u64 {
+        self.revision
+    }
+
+    fn replacing(
+        self,
+        expiry: AuthorizationExpiry,
+        wall_now: SystemTime,
+        runtime_now: tokio::time::Instant,
+    ) -> Result<Self, ControllerError> {
+        let mut next = Self::from_expiry(expiry, wall_now, runtime_now)
+            .map_err(|_| ControllerError::AuthorizationExpired)?;
+        next.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(ControllerError::ServiceUnavailable)?;
+        Ok(next)
     }
 
     pub(crate) fn deadline(self) -> tokio::time::Instant {
         self.deadline
+    }
+
+    pub(crate) fn native_expiry(self) -> Result<i64, TokenError> {
+        i64::try_from(self.expiry.unix_seconds()).map_err(|_| TokenError::Invalid)
     }
 
     pub(crate) fn expiry(self) -> AuthorizationExpiry {
@@ -118,6 +148,11 @@ pub enum ControllerCommand {
         oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
     ),
     DeleteParticipant(DeleteParticipant),
+    DeleteNative(DeleteNative, oneshot::Sender<Result<(), ControllerError>>),
+    ReplaceAuthorization(
+        ReplaceAuthorization,
+        oneshot::Sender<Result<u64, ControllerError>>,
+    ),
     PatchParticipant(
         PatchParticipant,
         oneshot::Sender<Result<PatchParticipantReply, ControllerError>>,
@@ -144,6 +179,19 @@ pub struct DeleteParticipant {
 }
 
 #[derive(Debug)]
+pub struct DeleteNative {
+    pub authorization: VerifiedAuthorization,
+    pub connection_id: ConnectionId,
+}
+
+#[derive(Debug)]
+pub struct ReplaceAuthorization {
+    pub authorization: VerifiedAuthorization,
+    pub connection_id: ConnectionId,
+    pub expected_revision: u64,
+}
+
+#[derive(Debug)]
 pub struct PatchParticipant {
     pub state: ParticipantState,
     pub offer: String,
@@ -164,6 +212,12 @@ pub enum ControllerError {
     Superseded,
     #[error("participant authorization expired")]
     AuthorizationExpired,
+    #[error("native connection grant is gone")]
+    GrantGone,
+    #[error("authorization cannot replace this connection grant")]
+    AuthorizationRejected,
+    #[error("authorization precondition does not match")]
+    AuthorizationPrecondition { revision: u64 },
     #[error("IO error: {0}")]
     IOError(#[from] io::Error),
     #[error("unknown error: {0}")]
@@ -175,6 +229,31 @@ const SHARD_EVENT_BUDGET: usize = 1_024;
 const API_COMMAND_BUDGET: usize = 16;
 const SHARD_COMMAND_EGRESS_BUDGET: usize = 64;
 const SHARD_UPDATE_EGRESS_BUDGET: usize = 64;
+const PENDING_NATIVE_DELETE_BYTES: usize = 64 * 1024;
+const NATIVE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum NativeDeleteReply {
+    Http(oneshot::Sender<Result<(), ControllerError>>),
+    Publication {
+        participant: ParticipantId,
+        connection_id: ConnectionId,
+        reference: u64,
+    },
+}
+
+#[derive(Debug)]
+struct PublicationCutoff {
+    participant: ParticipantId,
+    connection_id: ConnectionId,
+    reference: u64,
+    success: bool,
+}
+
+#[derive(Debug)]
+struct NativeDeletionCompletion {
+    bytes: usize,
+    publication: Option<PublicationCutoff>,
+}
 
 struct PendingMaterialization {
     shard: ShardId,
@@ -203,6 +282,7 @@ const MAX_PENDING_RENEWALS: usize = 32;
 struct RenewalResult {
     participant: ParticipantId,
     connection_id: ConnectionId,
+    expected_revision: u64,
     verified: Option<VerifiedAuthorization>,
 }
 
@@ -230,6 +310,9 @@ pub struct ControllerActor {
     renewal_tx: tokio::sync::mpsc::Sender<RenewalResult>,
     renewal_rx: tokio::sync::mpsc::Receiver<RenewalResult>,
     renewals_inflight: usize,
+    deletion_tx: tokio::sync::mpsc::Sender<NativeDeletionCompletion>,
+    deletion_rx: tokio::sync::mpsc::Receiver<NativeDeletionCompletion>,
+    deletion_bytes: usize,
     steering: Option<Box<dyn Steering>>,
 }
 
@@ -245,6 +328,7 @@ impl ControllerActor {
         let shard_count = shard_contexts.len();
         debug_assert_eq!(updates.len(), shard_count);
         let (renewal_tx, renewal_rx) = tokio::sync::mpsc::channel(MAX_PENDING_RENEWALS);
+        let (deletion_tx, deletion_rx) = tokio::sync::mpsc::channel(API_COMMAND_BUDGET);
         Self {
             router: crate::control::router::ShardRouter::new(shard_contexts),
             core: ControllerCore::with_shards(shard_count, room_partition_size, placement),
@@ -264,6 +348,9 @@ impl ControllerActor {
             renewal_tx,
             renewal_rx,
             renewals_inflight: 0,
+            deletion_tx,
+            deletion_rx,
+            deletion_bytes: 0,
             steering: None,
         }
     }
@@ -314,6 +401,10 @@ impl ControllerActor {
                         authorization_deadline.unwrap_or_else(tokio::time::Instant::now)
                     ), if authorization_deadline.is_some() => false,
                     true = shard_event_rx.readable() => false,
+                    Some(bytes) = self.deletion_rx.recv() => {
+                        self.release_deletion(bytes);
+                        false
+                    },
                     Some(result) = self.renewal_rx.recv() => {
                         self.finish_renewal(result);
                         false
@@ -340,6 +431,12 @@ impl ControllerActor {
         maintenance_due: bool,
     ) -> Option<RequiredAction> {
         let started = tokio::time::Instant::now();
+        for _ in 0..API_COMMAND_BUDGET {
+            let Ok(bytes) = self.deletion_rx.try_recv() else {
+                break;
+            };
+            self.release_deletion(bytes);
+        }
         self.expire_authorizations(started, SystemTime::now());
         let mut shard_events: usize = 0;
         for _ in 0..SHARD_EVENT_BUDGET {
@@ -401,6 +498,35 @@ impl ControllerActor {
                 {
                     self.remove_incarnation(message.participant_id, message.connection_id);
                 }
+                None
+            }
+            ControllerCommand::DeleteNative(message, reply) => {
+                match self.begin_native_delete(message, SystemTime::now()) {
+                    Ok((bytes, acks)) => {
+                        let completed = self.deletion_tx.clone();
+                        tokio::spawn(async move {
+                            complete_native_delete(
+                                acks,
+                                NativeDeleteReply::Http(reply),
+                                completed,
+                                bytes,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+                None
+            }
+            ControllerCommand::ReplaceAuthorization(message, reply) => {
+                let result = self.replace_authorization(
+                    message,
+                    SystemTime::now(),
+                    tokio::time::Instant::now(),
+                );
+                let _ = reply.send(result);
                 None
             }
             ControllerCommand::PatchParticipant(message, reply) => {
@@ -518,6 +644,9 @@ impl ControllerActor {
                     self.publish_track_lifecycle(outcome);
                 }
             }
+            ShardEvent::OwnedTrackUnpublished { meta, reference } => {
+                self.begin_owned_unpublish(meta, reference);
+            }
             ShardEvent::TrackUnpublished(meta) => {
                 if !self.current_incarnation(meta.origin, meta.connection_id) {
                     return;
@@ -531,6 +660,40 @@ impl ControllerActor {
                     self.apply_track_lifecycle(outcome);
                     self.publish_staged();
                 }
+            }
+            ShardEvent::OwnedSubscriptionSet {
+                connection_id,
+                request,
+            } => {
+                if request.reference == 0
+                    || !self
+                        .core
+                        .registry
+                        .get_participant(&request.subscriber)
+                        .is_some_and(|meta| {
+                            meta.connection_id == connection_id
+                                && meta.room_id == request.room_id
+                                && meta.profile == ConnectionProfile::Native
+                        })
+                {
+                    return;
+                }
+                let outcomes = self.lifecycle.set_owned_subscription(
+                    request,
+                    &self.core.registry,
+                    tokio::time::Instant::now(),
+                );
+                for outcome in outcomes {
+                    self.publish_track_lifecycle(outcome);
+                }
+            }
+            ShardEvent::OwnedSubscriptionRemoved {
+                room_id,
+                subscriber,
+                connection_id,
+                reference,
+            } => {
+                self.begin_owned_cutoff(subscriber, connection_id, reference, room_id, None);
             }
             ShardEvent::TrackSubscribed {
                 subscriber,
@@ -592,46 +755,6 @@ impl ControllerActor {
                     self.publish_track_lifecycle(outcome);
                 }
             }
-            ShardEvent::SubscriptionSeedRequested {
-                room_id,
-                subscriber,
-                connection_id,
-                selector,
-                seed_id,
-            } => {
-                if !self.current_incarnation(subscriber, connection_id) {
-                    return;
-                }
-                let outcomes = self.lifecycle.subscribe(
-                    room_id,
-                    subscriber,
-                    selector,
-                    SelectionPolicy::All,
-                    &self.core.registry,
-                    tokio::time::Instant::now(),
-                );
-                for outcome in outcomes {
-                    self.publish_track_lifecycle(outcome);
-                }
-                if let Some(shard) = self
-                    .core
-                    .registry
-                    .get_participant(&subscriber)
-                    .map(|meta| meta.shard_id)
-                {
-                    let generation = self.lifecycle.next_generation();
-                    self.stage_participant_at(
-                        shard,
-                        generation,
-                        subscriber,
-                        crate::participant::ParticipantEffect::SubscriptionSeedComplete {
-                            connection_id,
-                            seed_id,
-                        },
-                    );
-                    self.publish_staged();
-                }
-            }
             ShardEvent::TrackSubscriptionRemoved {
                 room_id,
                 subscriber,
@@ -685,6 +808,304 @@ impl ControllerActor {
         }
     }
 
+    fn release_deletion(&mut self, completed: NativeDeletionCompletion) {
+        self.deletion_bytes = self
+            .deletion_bytes
+            .checked_sub(completed.bytes)
+            .unwrap_or_else(|| pulsebeam_runtime::fatal!("native deletion credit released twice"));
+        if let Some(result) = completed.publication
+            && let Some(meta) = self.core.registry.get_participant(&result.participant)
+            && meta.connection_id == result.connection_id
+            && meta.profile == ConnectionProfile::Native
+        {
+            self.command_backlog.push_back((
+                meta.shard_id,
+                ShardCommand::PublicationCutoffResult {
+                    participant: result.participant,
+                    connection_id: result.connection_id,
+                    reference: result.reference,
+                    success: result.success,
+                },
+            ));
+        }
+    }
+
+    fn begin_owned_unpublish(&mut self, meta: crate::track::TrackMeta, reference: u64) {
+        self.begin_owned_cutoff(
+            meta.origin,
+            meta.connection_id,
+            reference,
+            meta.room_id,
+            Some(meta),
+        );
+    }
+
+    fn begin_owned_cutoff(
+        &mut self,
+        participant: ParticipantId,
+        connection_id: ConnectionId,
+        reference: u64,
+        room_id: RoomId,
+        publication: Option<crate::track::TrackMeta>,
+    ) {
+        let Some(shard) = self
+            .core
+            .registry
+            .get_participant(&participant)
+            .and_then(|current| {
+                (current.connection_id == connection_id
+                    && current.room_id == room_id
+                    && current.profile == ConnectionProfile::Native)
+                    .then_some(current.shard_id)
+            })
+        else {
+            return;
+        };
+        let bytes = self
+            .updates
+            .len()
+            .saturating_mul(
+                std::mem::size_of::<crate::shard_update::ShardUpdate>()
+                    .saturating_add(std::mem::size_of::<oneshot::Receiver<()>>())
+                    .saturating_add(std::mem::size_of::<bool>()),
+            )
+            .saturating_add(std::mem::size_of::<NativeDeletionCompletion>().saturating_mul(2))
+            .saturating_add(std::mem::size_of::<NativeDeleteReply>());
+        let mut acks = Vec::new();
+        let mut affected = Vec::new();
+        let admitted = reference != 0
+            && self.deletion_bytes.saturating_add(bytes) <= PENDING_NATIVE_DELETE_BYTES
+            && !self
+                .updates
+                .iter()
+                .any(crate::shard_update::ShardUpdateWriter::is_closed)
+            && acks.try_reserve_exact(self.updates.len()).is_ok()
+            && affected.try_reserve_exact(self.updates.len()).is_ok();
+        if admitted {
+            affected.resize(self.updates.len(), false);
+        }
+        self.publish_staged();
+        let outcomes = if let Some(meta) = publication {
+            self.lifecycle
+                .unpublish(
+                    meta.origin,
+                    meta.id,
+                    &self.core.registry,
+                    tokio::time::Instant::now(),
+                )
+                .into_iter()
+                .collect()
+        } else {
+            self.lifecycle.unsubscribe_owned(
+                room_id,
+                participant,
+                reference,
+                &self.core.registry,
+                tokio::time::Instant::now(),
+            )
+        };
+        let generation = outcomes
+            .last()
+            .map(|outcome| outcome.generation)
+            .unwrap_or_else(|| self.lifecycle.next_generation());
+        for outcome in outcomes {
+            if admitted {
+                for op in &outcome.operations {
+                    let target = match op {
+                        TrackLifecycleOperation::Update { shard, .. }
+                        | TrackLifecycleOperation::Plans { shard, .. }
+                        | TrackLifecycleOperation::ParticipantEffect { shard, .. } => *shard,
+                    };
+                    if let Some(touched) = affected.get_mut(target.index()) {
+                        *touched = true;
+                    }
+                }
+            }
+            self.apply_track_lifecycle(outcome);
+        }
+        if !admitted {
+            // Local execution is fenced; withdraw topology even if receipt credit is unavailable.
+            self.publish_staged();
+            self.release_deletion(NativeDeletionCompletion {
+                bytes: 0,
+                publication: Some(PublicationCutoff {
+                    participant,
+                    connection_id,
+                    reference,
+                    success: false,
+                }),
+            });
+            return;
+        }
+        // Cover previously staged local work even when this withdrawal is already satisfied.
+        if let Some(touched) = affected.get_mut(shard.index()) {
+            *touched = true;
+        }
+        for (index, touched) in affected.into_iter().enumerate() {
+            if touched && let Some(writer) = self.updates.get_mut(index) {
+                acks.push(writer.stage_cutoff(generation));
+                self.mark_update_touched(ShardId::new(index));
+            }
+        }
+        self.deletion_bytes = self.deletion_bytes.saturating_add(bytes);
+        self.publish_staged();
+        let completed = self.deletion_tx.clone();
+        tokio::spawn(complete_native_delete(
+            acks,
+            NativeDeleteReply::Publication {
+                participant,
+                connection_id,
+                reference,
+            },
+            completed,
+            bytes,
+        ));
+    }
+
+    fn begin_native_delete(
+        &mut self,
+        request: DeleteNative,
+        wall_now: SystemTime,
+    ) -> Result<(usize, Vec<oneshot::Receiver<()>>), ControllerError> {
+        let verified = request.authorization;
+        if verified.expiry.is_expired_at(
+            wall_now
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ) {
+            return Err(ControllerError::AuthorizationExpired);
+        }
+        let bytes = self
+            .updates
+            .len()
+            .saturating_mul(
+                std::mem::size_of::<crate::shard_update::ShardUpdate>()
+                    .saturating_add(std::mem::size_of::<oneshot::Receiver<()>>()),
+            )
+            .saturating_add(std::mem::size_of::<ControllerCommand>());
+        if self.deletion_bytes.saturating_add(bytes) > PENDING_NATIVE_DELETE_BYTES
+            || self
+                .updates
+                .iter()
+                .any(crate::shard_update::ShardUpdateWriter::is_closed)
+        {
+            return Err(ControllerError::ServiceUnavailable);
+        }
+        let mut acks = Vec::new();
+        acks.try_reserve_exact(self.updates.len())
+            .map_err(|_| ControllerError::ServiceUnavailable)?;
+        if self
+            .core
+            .registry
+            .get_participant(&verified.participant_id)
+            .is_some_and(|meta| {
+                meta.room_id == verified.room_id
+                    && meta.profile == ConnectionProfile::Native
+                    && meta.participant_external_id.as_ref()
+                        == Some(&verified.participant_external_id)
+            })
+        {
+            self.remove_incarnation(verified.participant_id, request.connection_id);
+        }
+        // Fence every writer: an old Location may already have teardown queued on a former shard.
+        let generation = self.lifecycle.next_generation();
+        for (index, writer) in self.updates.iter_mut().enumerate() {
+            acks.push(writer.stage_cutoff(generation));
+            if let Some(touched) = self.update_touched.get_mut(index) {
+                *touched = true;
+            }
+        }
+        self.deletion_bytes = self.deletion_bytes.saturating_add(bytes);
+        self.publish_staged();
+        Ok((bytes, acks))
+    }
+
+    fn replace_authorization(
+        &mut self,
+        request: ReplaceAuthorization,
+        wall_now: SystemTime,
+        runtime_now: tokio::time::Instant,
+    ) -> Result<u64, ControllerError> {
+        let verified = request.authorization;
+        let meta = self
+            .core
+            .registry
+            .get_participant(&verified.participant_id)
+            .ok_or(ControllerError::GrantGone)?;
+        if meta.connection_id != request.connection_id || meta.profile != ConnectionProfile::Native
+        {
+            return Err(ControllerError::GrantGone);
+        }
+        if meta.room_id != verified.room_id
+            || meta.participant_external_id.as_ref() != Some(&verified.participant_external_id)
+        {
+            return Err(ControllerError::AuthorizationRejected);
+        }
+        let previous = meta.authorization.ok_or(ControllerError::GrantGone)?;
+        if previous.is_expired_at(wall_now) {
+            self.remove_incarnation(verified.participant_id, request.connection_id);
+            return Err(ControllerError::GrantGone);
+        }
+        if previous.revision() != request.expected_revision {
+            return Err(ControllerError::AuthorizationPrecondition {
+                revision: previous.revision(),
+            });
+        }
+        let expiry = i64::try_from(verified.expiry.unix_seconds())
+            .map_err(|_| ControllerError::AuthorizationRejected)?;
+        // Bound queued imperative work, not live connections or grant lifetimes.
+        const GRANT_COMMAND_BACKLOG_BYTES: usize = 64 * 1024;
+        if self
+            .command_backlog
+            .len()
+            .saturating_add(1)
+            .saturating_mul(std::mem::size_of::<(ShardId, ShardCommand)>())
+            > GRANT_COMMAND_BACKLOG_BYTES
+        {
+            return Err(ControllerError::ServiceUnavailable);
+        }
+        let shard = meta.shard_id;
+        let lease = previous.replacing(verified.expiry, wall_now, runtime_now)?;
+        self.install_authorization(
+            verified.participant_id,
+            request.connection_id,
+            previous,
+            lease,
+        );
+        self.send_renewal_result(
+            shard,
+            verified.participant_id,
+            request.connection_id,
+            lease.revision(),
+            Some(expiry),
+        );
+        Ok(lease.revision())
+    }
+
+    fn install_authorization(
+        &mut self,
+        participant: ParticipantId,
+        connection_id: ConnectionId,
+        previous: AuthorizationLease,
+        lease: AuthorizationLease,
+    ) {
+        self.authorization_expiries
+            .remove(&AuthorizationExpiryWork {
+                deadline: previous.deadline(),
+                participant_id: participant,
+                connection_id,
+            });
+        self.core
+            .registry
+            .update_authorization(&participant, connection_id, lease);
+        self.authorization_expiries.insert(AuthorizationExpiryWork {
+            deadline: lease.deadline(),
+            participant_id: participant,
+            connection_id,
+        });
+    }
+
     fn begin_renewal(
         &mut self,
         shard: ShardId,
@@ -701,12 +1122,13 @@ impl ControllerActor {
         {
             return;
         }
+        let expected_revision = meta.authorization.map_or(0, AuthorizationLease::revision);
         let Some(registry) = self.key_registry.clone() else {
-            self.send_renewal_result(shard, participant, connection_id, None);
+            self.send_renewal_result(shard, participant, connection_id, expected_revision, None);
             return;
         };
         if token.len() > MAX_COMPACT_TOKEN_LEN || self.renewals_inflight >= MAX_PENDING_RENEWALS {
-            self.send_renewal_result(shard, participant, connection_id, None);
+            self.send_renewal_result(shard, participant, connection_id, expected_revision, None);
             return;
         }
         self.renewals_inflight = self.renewals_inflight.saturating_add(1);
@@ -720,6 +1142,7 @@ impl ControllerActor {
             let _ = tx.blocking_send(RenewalResult {
                 participant,
                 connection_id,
+                expected_revision,
                 verified,
             });
         });
@@ -741,40 +1164,26 @@ impl ControllerActor {
                 || verified.room_id != meta.room_id
                 || Some(verified.participant_external_id) != meta.participant_external_id
                 || previous.is_none_or(|lease| {
-                    lease.is_expired_at(wall_now)
+                    lease.revision() != result.expected_revision
+                        || lease.is_expired_at(wall_now)
                         || verified.expiry.unix_seconds() <= lease.expiry.unix_seconds()
                 })
             {
                 return None;
             }
             i64::try_from(verified.expiry.unix_seconds()).ok()?;
-            AuthorizationLease::from_expiry(verified.expiry, wall_now, tokio::time::Instant::now())
+            previous?
+                .replacing(verified.expiry, wall_now, tokio::time::Instant::now())
                 .ok()
         });
-        if let Some(lease) = expiry {
-            if let Some(previous) = previous {
-                self.authorization_expiries
-                    .remove(&AuthorizationExpiryWork {
-                        deadline: previous.deadline(),
-                        participant_id: result.participant,
-                        connection_id: result.connection_id,
-                    });
-            }
-            self.core.registry.update_authorization(
-                &result.participant,
-                result.connection_id,
-                lease,
-            );
-            self.authorization_expiries.insert(AuthorizationExpiryWork {
-                deadline: lease.deadline(),
-                participant_id: result.participant,
-                connection_id: result.connection_id,
-            });
+        if let (Some(lease), Some(previous)) = (expiry, previous) {
+            self.install_authorization(result.participant, result.connection_id, previous, lease);
         }
         self.send_renewal_result(
             shard,
             result.participant,
             result.connection_id,
+            expiry.map_or(result.expected_revision, AuthorizationLease::revision),
             expiry.and_then(|lease| i64::try_from(lease.expiry.unix_seconds()).ok()),
         );
     }
@@ -784,6 +1193,7 @@ impl ControllerActor {
         shard: ShardId,
         participant: ParticipantId,
         connection_id: ConnectionId,
+        revision: u64,
         expiry: Option<i64>,
     ) {
         self.command_backlog.push_back((
@@ -791,6 +1201,7 @@ impl ControllerActor {
             ShardCommand::AuthorizationResult {
                 participant,
                 connection_id,
+                revision,
                 expiry,
             },
         ));
@@ -1053,11 +1464,18 @@ impl ControllerActor {
 
     fn begin_create_participant(
         &mut self,
-        state: ParticipantState,
+        mut state: ParticipantState,
         offer: String,
     ) -> Result<PendingMaterialization, ControllerError> {
-        if state.profile == ConnectionProfile::Native && offer.len() > MAX_NATIVE_SDP_BYTES {
-            return Err(NegotiatorError::InvalidResources.into());
+        if state.profile == ConnectionProfile::Native {
+            if offer.len() > MAX_NATIVE_SDP_BYTES {
+                return Err(NegotiatorError::InvalidResources.into());
+            }
+            if let Some(lease) = state.authorization {
+                lease
+                    .native_expiry()
+                    .map_err(|_| ControllerError::AuthorizationRejected)?;
+            }
         }
         let participant_id = state.participant_id;
         let (slot, placement) = self
@@ -1092,19 +1510,60 @@ impl ControllerActor {
             .clock
             .observe_execution(pulsebeam_runtime::net::ReceiveTime::now());
         let now = at.monotonic;
+        let rtp_capabilities = if state.profile == ConnectionProfile::Native {
+            let capabilities = state
+                .rtp_capabilities
+                .as_ref()
+                .ok_or(NegotiatorError::InvalidResources)?;
+            Some(
+                crate::participant::rtp::transport_capabilities(capabilities)
+                    .map_err(|_| NegotiatorError::InvalidResources)?,
+            )
+        } else {
+            None
+        };
         let address = self.core.reserve_transport(shard, now);
         let creds = IceUfrag::new(self.cluster_id, self.node_id, address.route, address.epoch)
             .into_ice_creds();
-        let (mut rtc, answer, resources) = match self.negotiator.create_answer(offer, creds, at) {
-            Ok(value) => value,
-            Err(error) => {
-                self.core.release_transport(address, now);
-                return Err(error.into());
-            }
-        };
+        let (mut rtc, answer, mut resources) =
+            match self
+                .negotiator
+                .create_answer(offer, creds, at, rtp_capabilities)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    self.core.release_transport(address, now);
+                    return Err(error.into());
+                }
+            };
         if state.profile == ConnectionProfile::Native && answer.len() > MAX_NATIVE_SDP_BYTES {
             self.core.release_transport(address, now);
             return Err(NegotiatorError::InvalidResources.into());
+        }
+        if state.profile == ConnectionProfile::Native {
+            let initialized = state
+                .rtp_capabilities
+                .take()
+                .ok_or(pulsebeam_rtc::RtpConfigurationError::Invalid)
+                .and_then(|capabilities| {
+                    rtc.connection
+                        .update_rtp(pulsebeam_rtc::RtpConfigurationPatch::default())?;
+                    resources.native_rtp_capabilities = Some(capabilities);
+                    Ok(())
+                });
+            if let Err(error) = initialized {
+                self.core.release_transport(address, now);
+                return Err(match error {
+                    pulsebeam_rtc::RtpConfigurationError::Capacity => {
+                        ControllerError::ServiceUnavailable
+                    }
+                    pulsebeam_rtc::RtpConfigurationError::CapabilityState
+                    | pulsebeam_rtc::RtpConfigurationError::ConnectionState => {
+                        ControllerError::Unknown("native RTP initialization failed".to_owned())
+                    }
+                    _ => NegotiatorError::InvalidResources.into(),
+                });
+            }
         }
         if state.profile == ConnectionProfile::Native
             && let Err((reason, _)) = rtc
@@ -1188,13 +1647,22 @@ impl ControllerActor {
             );
         }
         self.publish_staged();
+        let defaults = if pending.profile == ConnectionProfile::Native {
+            vec![
+                (TrackSelector::audio(), SelectionPolicy::Allocated),
+                (TrackSelector::video(), SelectionPolicy::Allocated),
+                (TrackSelector::data(), SelectionPolicy::Allocated),
+            ]
+        } else {
+            vec![
+                (TrackSelector::audio(), SelectionPolicy::All),
+                (TrackSelector::video(), SelectionPolicy::Allocated),
+            ]
+        };
         let outcomes = self.lifecycle.subscribe_defaults(
             room_id,
             participant_id,
-            [
-                (TrackSelector::audio(), SelectionPolicy::All),
-                (TrackSelector::video(), SelectionPolicy::Allocated),
-            ],
+            defaults,
             &self.core.registry,
             tokio::time::Instant::now(),
         );
@@ -1223,6 +1691,13 @@ impl ControllerActor {
     ) -> Result<Option<crate::control::registry::ParticipantMeta>, ControllerError> {
         if authorization.is_some_and(|lease| lease.is_expired_at(wall_now)) {
             return Err(ControllerError::AuthorizationExpired);
+        }
+        if profile == ConnectionProfile::Native
+            && let Some(lease) = authorization
+        {
+            lease
+                .native_expiry()
+                .map_err(|_| ControllerError::AuthorizationRejected)?;
         }
         // A timeout can remove the last participant while materialization is
         // in flight. Never commit a prepared connection to a retired slot.
@@ -1410,6 +1885,57 @@ fn describe_controller_metrics() {
     );
 }
 
+async fn drain_cutoffs(acks: &mut Vec<oneshot::Receiver<()>>) -> bool {
+    let mut success = true;
+    while let Some(ack) = acks.last_mut() {
+        success &= ack.await.is_ok();
+        acks.pop();
+    }
+    success
+}
+
+async fn complete_native_delete(
+    mut acks: Vec<oneshot::Receiver<()>>,
+    reply: NativeDeleteReply,
+    completed: tokio::sync::mpsc::Sender<NativeDeletionCompletion>,
+    bytes: usize,
+) {
+    let success = tokio::time::timeout(NATIVE_DELETE_TIMEOUT, drain_cutoffs(&mut acks)).await;
+    match reply {
+        NativeDeleteReply::Http(reply) => {
+            let _ = reply.send(match success {
+                Ok(true) => Ok(()),
+                _ => Err(ControllerError::ServiceUnavailable),
+            });
+        }
+        NativeDeleteReply::Publication {
+            participant,
+            connection_id,
+            reference,
+        } => {
+            let _ = completed
+                .send(NativeDeletionCompletion {
+                    bytes: 0,
+                    publication: Some(PublicationCutoff {
+                        participant,
+                        connection_id,
+                        reference,
+                        success: matches!(success, Ok(true)),
+                    }),
+                })
+                .await;
+        }
+    }
+    // A timed-out caller does not free the credit for fences still retained in shard lanes.
+    drain_cutoffs(&mut acks).await;
+    let _ = completed
+        .send(NativeDeletionCompletion {
+            bytes,
+            publication: None,
+        })
+        .await;
+}
+
 pub type ControllerSender = mailbox::Sender<ControllerCommand>;
 
 #[cfg(test)]
@@ -1430,6 +1956,7 @@ mod replacement_tests {
     )]
     fn actor_with_shards(shard_count: usize) -> ControllerActor {
         let (renewal_tx, renewal_rx) = tokio::sync::mpsc::channel(MAX_PENDING_RENEWALS);
+        let (deletion_tx, deletion_rx) = tokio::sync::mpsc::channel(API_COMMAND_BUDGET);
         let mut contexts = Vec::new();
         let mut updates = Vec::new();
         for index in 0..shard_count {
@@ -1461,6 +1988,9 @@ mod replacement_tests {
             renewal_tx,
             renewal_rx,
             renewals_inflight: 0,
+            deletion_tx,
+            deletion_rx,
+            deletion_bytes: 0,
             steering: None,
         }
     }
@@ -1534,6 +2064,454 @@ mod replacement_tests {
             runtime_now,
         )
         .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_delete_fences_former_owners_without_touching_the_replacement() {
+        let mut actor = actor();
+        let (writer, mut current_rx) = new_shard_update(ShardId::new(0));
+        let (former_writer, mut former_rx) = new_shard_update(ShardId::new(1));
+        actor.updates = vec![writer, former_writer];
+        actor.update_touched = vec![false; 2];
+        actor.update_queued = vec![false; 2];
+        let room_external_id = RoomExternalId::new("delete").unwrap();
+        let room_id = RoomId::from_external(&room_external_id);
+        let participant_id = ParticipantId::new();
+        let participant_external_id = crate::entity::ParticipantExternalId::new("alice").unwrap();
+        let transport = actor
+            .core
+            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+        actor
+            .commit_candidate(
+                participant_id,
+                room_id,
+                ShardId::new(0),
+                0,
+                transport,
+                connection_id(2),
+                Some(authorization_lease(
+                    100,
+                    UNIX_EPOCH,
+                    tokio::time::Instant::now(),
+                )),
+                ConnectionProfile::Native,
+                participant_external_id.clone(),
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        let authorization = VerifiedAuthorization {
+            project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+            room_external_id,
+            room_id,
+            participant_external_id,
+            participant_id,
+            expiry: AuthorizationExpiry::from_unix_seconds(100),
+        };
+        let request = || DeleteNative {
+            authorization: authorization.clone(),
+            connection_id: connection_id(1),
+        };
+        assert!(matches!(
+            actor.begin_native_delete(request(), UNIX_EPOCH + Duration::from_secs(100)),
+            Err(ControllerError::AuthorizationExpired)
+        ));
+        actor.deletion_bytes = PENDING_NATIVE_DELETE_BYTES;
+        assert!(matches!(
+            actor.begin_native_delete(request(), UNIX_EPOCH),
+            Err(ControllerError::ServiceUnavailable)
+        ));
+        actor.deletion_bytes = 0;
+        let old_generation = actor.lifecycle.next_generation();
+        let old_address = crate::route::NodeTransportAddress::new(
+            crate::route::TransportRoute::new(ShardId::new(1), 8),
+            1,
+        );
+        actor.updates[1].stage(
+            old_generation,
+            crate::shard_update::ShardUpdateOp::RetireTransport {
+                address: old_address,
+            },
+        );
+        actor.mark_update_touched(ShardId::new(1));
+        actor.publish_staged();
+        let (bytes, acks) = actor.begin_native_delete(request(), UNIX_EPOCH).unwrap();
+        assert_eq!(acks.len(), 2);
+        let mut current = current_rx.try_recv().unwrap();
+        let old = former_rx.try_recv().unwrap();
+        assert!(
+            matches!(old.lifecycle.as_slice(), [crate::shard_update::ShardUpdateOp::RetireTransport { address }] if *address == old_address)
+        );
+        let mut former = former_rx.try_recv().unwrap();
+        assert!(former.generation > old.generation);
+        let (reply, mut response) = oneshot::channel();
+        let task = tokio::spawn(complete_native_delete(
+            acks,
+            NativeDeleteReply::Http(reply),
+            actor.deletion_tx.clone(),
+            bytes,
+        ));
+        current.cutoff_ack.take().unwrap().send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            actor
+                .replace_authorization(
+                    ReplaceAuthorization {
+                        authorization: authorization.clone(),
+                        connection_id: connection_id(2),
+                        expected_revision: 1,
+                    },
+                    UNIX_EPOCH,
+                    tokio::time::Instant::now()
+                )
+                .unwrap(),
+            2
+        );
+        former.cutoff_ack.take().unwrap().send(()).unwrap();
+        assert!(response.await.unwrap().is_ok());
+        task.await.unwrap();
+        let released = actor.deletion_rx.recv().await.unwrap();
+        actor.release_deletion(released);
+        assert_eq!(actor.deletion_bytes, 0);
+        assert!(actor.current_incarnation(participant_id, connection_id(2)));
+
+        let (_, acks) = actor
+            .begin_native_delete(
+                DeleteNative {
+                    authorization,
+                    connection_id: connection_id(2),
+                },
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        assert!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .is_none()
+        );
+        assert_eq!(acks.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_delete_failure_never_acknowledges_cutoff_or_releases_retained_work() {
+        let (done, mut completed) = tokio::sync::mpsc::channel(1);
+        let (ack, pending) = oneshot::channel();
+        let (reply, response) = oneshot::channel();
+        drop(ack);
+        complete_native_delete(
+            vec![pending],
+            NativeDeleteReply::Http(reply),
+            done.clone(),
+            7,
+        )
+        .await;
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ControllerError::ServiceUnavailable)
+        ));
+        assert_eq!(completed.recv().await.unwrap().bytes, 7);
+
+        let (ack, pending) = oneshot::channel();
+        let (reply, response) = oneshot::channel();
+        let task = tokio::spawn(complete_native_delete(
+            vec![pending],
+            NativeDeleteReply::Http(reply),
+            done,
+            11,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(NATIVE_DELETE_TIMEOUT).await;
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(ControllerError::ServiceUnavailable)
+        ));
+        assert!(matches!(
+            completed.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        ack.send(()).unwrap();
+        assert_eq!(completed.recv().await.unwrap().bytes, 11);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owned_publication_cutoff_waits_for_only_affected_shards_and_fences_replacements() {
+        let mut actor = actor();
+        actor.core = ControllerCore::with_shards(3, 1, RoomPartitionPlacement::Hashed);
+        actor.lifecycle = TrackLifecycle::new(3);
+        actor.updates.clear();
+        actor.update_touched = vec![false; 3];
+        actor.update_queued = vec![false; 3];
+        let mut receivers = Vec::new();
+        for index in 0..3 {
+            let (writer, receiver) = new_shard_update(ShardId::new(index));
+            actor.updates.push(writer);
+            receivers.push(receiver);
+        }
+        let room_id = RoomId::from_external(&RoomExternalId::new("owned-cutoff").unwrap());
+        let publisher = ParticipantId::new();
+        let subscriber = ParticipantId::new();
+        for (participant, shard) in [(publisher, 0), (subscriber, 1)] {
+            let address = actor
+                .core
+                .reserve_transport(ShardId::new(shard), tokio::time::Instant::now());
+            actor
+                .core
+                .registry
+                .commit_candidate(
+                    participant,
+                    room_id,
+                    ShardId::new(shard),
+                    shard,
+                    address,
+                    connection_id(1),
+                    ConnectionProfile::Native,
+                    None,
+                )
+                .unwrap();
+            actor.core.registry.mark_materialized(&participant);
+        }
+        let make_track = |reference| {
+            crate::track::Track::data(
+                crate::track::TrackMeta {
+                    room_id,
+                    shard_id: ShardId::new(0),
+                    id: connection_id(1).derive_publication_track_id(
+                        crate::entity::TrackKind::Data,
+                        "topic",
+                        std::num::NonZeroU64::new(reference).unwrap(),
+                    ),
+                    origin: publisher,
+                    connection_id: connection_id(1),
+                    label: Some("topic".into()),
+                },
+                crate::track::Topic::for_test("topic"),
+                crate::track::DataLane::Ordered,
+                None,
+            )
+        };
+        let first = make_track(1);
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::TrackSubscriptionAdded {
+                room_id,
+                subscriber,
+                connection_id: connection_id(1),
+                selector: TrackSelector::track(first.id()),
+                selection: SelectionPolicy::All,
+            },
+        ));
+        actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(first.clone())));
+        for receiver in &mut receivers {
+            while receiver.try_recv().is_ok() {}
+        }
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::OwnedTrackUnpublished {
+                meta: first.meta().clone(),
+                reference: 1,
+            },
+        ));
+        assert!(actor.deletion_bytes > 0);
+        let mut origin = receivers[0].try_recv().unwrap();
+        let mut destination = receivers[1].try_recv().unwrap();
+        assert!(receivers[2].try_recv().is_err());
+        assert_eq!(origin.generation, destination.generation);
+        tokio::task::yield_now().await;
+        assert!(actor.deletion_rx.try_recv().is_err());
+        origin.cutoff_ack.take().unwrap().send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(actor.deletion_rx.try_recv().is_err());
+        destination.cutoff_ack.take().unwrap().send(()).unwrap();
+        let completed = actor.deletion_rx.recv().await.unwrap();
+        actor.release_deletion(completed);
+        assert!(
+            matches!(actor.command_backlog.pop_front(), Some((shard, ShardCommand::PublicationCutoffResult { participant, connection_id: connection, reference: 1, success: true })) if shard == ShardId::new(0) && participant == publisher && connection == connection_id(1))
+        );
+        let released = actor.deletion_rx.recv().await.unwrap();
+        actor.release_deletion(released);
+        assert_eq!(actor.deletion_bytes, 0);
+
+        let received = make_track(2);
+        actor.handle_shard_event((
+            ShardId::new(1),
+            ShardEvent::OwnedSubscriptionSet {
+                connection_id: connection_id(1),
+                request: super::super::topology::OwnedSubscription {
+                    room_id,
+                    subscriber,
+                    reference: 2,
+                    track: received.id(),
+                    enabled: true,
+                },
+            },
+        ));
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::TrackPublished(received.clone()),
+        ));
+        for receiver in &mut receivers {
+            while receiver.try_recv().is_ok() {}
+        }
+        actor.handle_shard_event((
+            ShardId::new(1),
+            ShardEvent::OwnedSubscriptionRemoved {
+                room_id,
+                subscriber,
+                connection_id: connection_id(1),
+                reference: 2,
+            },
+        ));
+        let mut origin = receivers[0].try_recv().unwrap();
+        let mut destination = receivers[1].try_recv().unwrap();
+        assert!(receivers[2].try_recv().is_err());
+        origin.cutoff_ack.take().unwrap().send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(actor.deletion_rx.try_recv().is_err());
+        destination.cutoff_ack.take().unwrap().send(()).unwrap();
+        for _ in 0..2 {
+            let completed = actor.deletion_rx.recv().await.unwrap();
+            actor.release_deletion(completed);
+        }
+        assert!(
+            matches!(actor.command_backlog.pop_front(), Some((shard, ShardCommand::PublicationCutoffResult { participant, reference: 2, success: true, .. })) if participant == subscriber && shard == ShardId::new(1))
+        );
+        assert_eq!(actor.deletion_bytes, 0);
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::TrackUnpublished(received.meta().clone()),
+        ));
+        for receiver in &mut receivers {
+            while receiver.try_recv().is_ok() {}
+        }
+
+        let rejected = make_track(3);
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::TrackPublished(rejected.clone()),
+        ));
+        actor.deletion_bytes = PENDING_NATIVE_DELETE_BYTES;
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::OwnedTrackUnpublished {
+                meta: rejected.meta().clone(),
+                reference: 3,
+            },
+        ));
+        assert_eq!(actor.deletion_bytes, PENDING_NATIVE_DELETE_BYTES);
+        assert!(matches!(
+            actor.command_backlog.pop_front(),
+            Some((
+                _,
+                ShardCommand::PublicationCutoffResult {
+                    reference: 3,
+                    success: false,
+                    ..
+                }
+            ))
+        ));
+        assert!(
+            actor
+                .lifecycle
+                .unpublish(
+                    publisher,
+                    rejected.id(),
+                    &actor.core.registry,
+                    tokio::time::Instant::now()
+                )
+                .is_none()
+        );
+        actor.deletion_bytes = 0;
+        for receiver in &mut receivers {
+            while receiver.try_recv().is_ok() {}
+        }
+
+        let second = make_track(5);
+        actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(second.clone())));
+        for receiver in &mut receivers {
+            while receiver.try_recv().is_ok() {}
+        }
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::OwnedTrackUnpublished {
+                meta: second.meta().clone(),
+                reference: 5,
+            },
+        ));
+        let address = actor
+            .core
+            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+        actor
+            .core
+            .registry
+            .commit_candidate(
+                publisher,
+                room_id,
+                ShardId::new(0),
+                0,
+                address,
+                connection_id(2),
+                ConnectionProfile::Native,
+                None,
+            )
+            .unwrap();
+        for receiver in &mut receivers {
+            while let Ok(mut update) = receiver.try_recv() {
+                if let Some(ack) = update.cutoff_ack.take() {
+                    ack.send(()).unwrap();
+                }
+            }
+        }
+        for _ in 0..2 {
+            let completed = actor.deletion_rx.recv().await.unwrap();
+            actor.release_deletion(completed);
+        }
+        assert!(actor.command_backlog.is_empty());
+        assert_eq!(actor.deletion_bytes, 0);
+        actor.handle_shard_event((
+            ShardId::new(0),
+            ShardEvent::OwnedTrackUnpublished {
+                meta: second.meta().clone(),
+                reference: 5,
+            },
+        ));
+        assert_eq!(actor.deletion_bytes, 0);
+        assert!(actor.command_backlog.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owned_publication_timeout_reports_failure_but_retains_fence_credit() {
+        let (ack, pending) = oneshot::channel();
+        let (completed, mut results) = tokio::sync::mpsc::channel(2);
+        let participant = ParticipantId::new();
+        let task = tokio::spawn(complete_native_delete(
+            vec![pending],
+            NativeDeleteReply::Publication {
+                participant,
+                connection_id: connection_id(1),
+                reference: 9,
+            },
+            completed,
+            123,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(NATIVE_DELETE_TIMEOUT).await;
+        let failure = results.recv().await.unwrap();
+        assert_eq!(failure.bytes, 0);
+        assert!(
+            matches!(failure.publication, Some(PublicationCutoff { participant: current, reference: 9, success: false, .. }) if current == participant)
+        );
+        assert!(results.try_recv().is_err());
+        ack.send(()).unwrap();
+        let released = results.recv().await.unwrap();
+        assert_eq!(released.bytes, 123);
+        assert!(released.publication.is_none());
+        task.await.unwrap();
     }
 
     #[test]
@@ -1654,6 +2632,7 @@ mod replacement_tests {
         actor.finish_renewal(RenewalResult {
             participant: participant_id,
             connection_id: connection,
+            expected_revision: 1,
             verified: Some(wrong_identity),
         });
         let mut shorter = verified.clone();
@@ -1661,6 +2640,7 @@ mod replacement_tests {
         actor.finish_renewal(RenewalResult {
             participant: participant_id,
             connection_id: connection,
+            expected_revision: 1,
             verified: Some(shorter),
         });
         assert_eq!(
@@ -1683,7 +2663,8 @@ mod replacement_tests {
         actor.finish_renewal(RenewalResult {
             participant: participant_id,
             connection_id: connection,
-            verified: Some(verified),
+            expected_revision: 1,
+            verified: Some(verified.clone()),
         });
         assert_eq!(
             actor
@@ -1705,13 +2686,129 @@ mod replacement_tests {
                 ..
             }
         ));
+        let mut narrowed = verified.clone();
+        narrowed.expiry = AuthorizationExpiry::from_unix_seconds(unix_now + 30);
+        let request = || ReplaceAuthorization {
+            authorization: narrowed.clone(),
+            connection_id: connection,
+            expected_revision: 2,
+        };
+        assert_eq!(
+            actor
+                .replace_authorization(request(), now, tokio::time::Instant::now())
+                .unwrap(),
+            3
+        );
+        let current = actor
+            .core
+            .registry
+            .get_participant(&participant_id)
+            .unwrap()
+            .authorization
+            .unwrap();
+        assert_eq!(current.revision(), 3);
+        assert_eq!(current.expiry(), narrowed.expiry);
+        assert_eq!(
+            current
+                .refresh_at(now, tokio::time::Instant::now())
+                .unwrap()
+                .revision(),
+            3
+        );
+        assert_eq!(actor.authorization_expiries.len(), 1);
+        assert!(matches!(&actor.command_backlog.back().unwrap().1,
+            ShardCommand::AuthorizationResult { revision: 3, expiry: Some(expiry), .. }
+                if *expiry == i64::try_from(unix_now + 30).unwrap()));
         let delivered = actor.command_backlog.len();
+        assert!(matches!(
+            actor.replace_authorization(request(), now, tokio::time::Instant::now()),
+            Err(ControllerError::AuthorizationPrecondition { revision: 3 })
+        ));
+        actor.finish_renewal(RenewalResult {
+            participant: participant_id,
+            connection_id: connection,
+            expected_revision: 1,
+            verified: Some(verified),
+        });
+        assert_eq!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .unwrap()
+                .authorization,
+            Some(current)
+        );
+        assert!(matches!(
+            &actor.command_backlog.back().unwrap().1,
+            ShardCommand::AuthorizationResult {
+                revision: 1,
+                expiry: None,
+                ..
+            }
+        ));
+        assert_eq!(actor.command_backlog.len(), delivered + 1);
+        let mut unrepresentable = request();
+        unrepresentable.expected_revision = 3;
+        unrepresentable.authorization.expiry = AuthorizationExpiry::from_unix_seconds(u64::MAX);
+        let queued = actor.command_backlog.len();
+        assert!(matches!(
+            actor.replace_authorization(unrepresentable, now, tokio::time::Instant::now()),
+            Err(ControllerError::AuthorizationRejected)
+        ));
+        assert_eq!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .unwrap()
+                .authorization,
+            Some(current)
+        );
+        assert_eq!(actor.command_backlog.len(), queued);
+        let mut wrong = request();
+        wrong.expected_revision = 3;
+        wrong.authorization.room_id =
+            RoomId::from_external(&RoomExternalId::new("other-room").unwrap());
+        assert!(matches!(
+            actor.replace_authorization(wrong, now, tokio::time::Instant::now()),
+            Err(ControllerError::AuthorizationRejected)
+        ));
+        let mut expired = request();
+        expired.expected_revision = 3;
+        expired.authorization.expiry = AuthorizationExpiry::from_unix_seconds(unix_now);
+        assert!(matches!(
+            actor.replace_authorization(expired, now, tokio::time::Instant::now()),
+            Err(ControllerError::AuthorizationExpired)
+        ));
+        let mut exhausted = current;
+        exhausted.revision = u64::MAX;
+        assert!(matches!(
+            exhausted.replacing(narrowed.expiry, now, tokio::time::Instant::now()),
+            Err(ControllerError::ServiceUnavailable)
+        ));
+        let mut stale = request();
+        stale.connection_id = connection_id(2);
+        assert!(matches!(
+            actor.replace_authorization(stale, now, tokio::time::Instant::now()),
+            Err(ControllerError::GrantGone)
+        ));
         actor.finish_renewal(RenewalResult {
             participant: participant_id,
             connection_id: connection_id(2),
+            expected_revision: 1,
             verified: None,
         });
-        assert_eq!(actor.command_backlog.len(), delivered);
+        assert_eq!(actor.command_backlog.len(), delivered + 1);
+        assert_eq!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .unwrap()
+                .authorization,
+            Some(current)
+        );
     }
 
     #[tokio::test]
@@ -1885,7 +2982,7 @@ mod replacement_tests {
 
         for sequence in 1..=100 {
             let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
-            let lease = authorization_lease(u64::MAX, UNIX_EPOCH, runtime_now);
+            let lease = authorization_lease(i64::MAX.unsigned_abs(), UNIX_EPOCH, runtime_now);
             let previous = actor
                 .commit_candidate(
                     participant_id,
@@ -1911,7 +3008,58 @@ mod replacement_tests {
             .get_participant(&participant_id)
             .unwrap();
         assert_eq!(current.connection_id, connection_id(100));
-        assert!(current.authorization.is_some());
+        let current_lease = current.authorization.unwrap();
+        assert_eq!(current_lease.native_expiry(), Ok(i64::MAX));
+        assert_eq!(actor.authorization_expiries.len(), 1);
+
+        let unrepresentable = authorization_lease(u64::MAX, UNIX_EPOCH, runtime_now);
+        assert_eq!(unrepresentable.expiry().unix_seconds(), u64::MAX);
+        assert!(matches!(
+            unrepresentable.native_expiry(),
+            Err(TokenError::Invalid)
+        ));
+        let participant_external_id = crate::entity::ParticipantExternalId::new("alice").unwrap();
+        assert!(matches!(
+            actor.begin_create_participant(
+                ParticipantState {
+                    manual_sub: true,
+                    room_id,
+                    participant_id,
+                    participant_external_id: participant_external_id.clone(),
+                    connection_id: connection_id(101),
+                    old_connection_id: None,
+                    authorization: Some(unrepresentable),
+                    profile: ConnectionProfile::Native,
+                    rtp_capabilities: Some(crate::participant::rtp::capabilities()),
+                },
+                String::new(),
+            ),
+            Err(ControllerError::AuthorizationRejected)
+        ));
+        let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
+        assert!(matches!(
+            actor.commit_candidate(
+                participant_id,
+                room_id,
+                ShardId::new(0),
+                0,
+                transport,
+                connection_id(101),
+                Some(unrepresentable),
+                ConnectionProfile::Native,
+                participant_external_id,
+                UNIX_EPOCH,
+            ),
+            Err(ControllerError::AuthorizationRejected)
+        ));
+        actor.core.release_transport(transport, runtime_now);
+        let current = actor
+            .core
+            .registry
+            .get_participant(&participant_id)
+            .unwrap();
+        assert_eq!(current.connection_id, connection_id(100));
+        assert_eq!(current.authorization, Some(current_lease));
         assert_eq!(actor.authorization_expiries.len(), 1);
     }
 

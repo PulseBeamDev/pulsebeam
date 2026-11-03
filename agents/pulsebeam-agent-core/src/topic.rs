@@ -7,7 +7,6 @@ use alloc::{
 
 use pulsebeam_proto::{
     prelude::Message,
-    signaling_v1 as wire,
     topic::{
         TopicFloor, TopicFrame, TopicFrontier, TopicMessage as WireMessage, TopicNack, TopicProbe,
         topic_frame::Body,
@@ -15,9 +14,8 @@ use pulsebeam_proto::{
 };
 
 use crate::{
-    ChannelId, DataChannelBinding, DataChannelEffect, DataChannelReliability, DataChannelSpec,
-    Effect, Generation, LogLevel, Notification, OperationId, Snapshot, ValidationError,
-    id::IdGenerator,
+    ChannelId, DataChannelEffect, DataChannelReliability, DataChannelSpec, Effect, Generation,
+    LogLevel, Notification, OperationId, Snapshot, ValidationError, id::IdGenerator,
 };
 
 mod admission;
@@ -38,12 +36,22 @@ pub enum TopicMode {
 }
 
 impl TopicMode {
-    fn from_wire(mode: i32) -> Option<Self> {
-        match wire::TopicMode::try_from(mode).ok()? {
-            wire::TopicMode::Latest => Some(Self::Latest),
-            wire::TopicMode::Lossy => Some(Self::Lossy),
-            wire::TopicMode::Ordered => Some(Self::Ordered),
-            wire::TopicMode::Unspecified => None,
+    pub(crate) fn from_delivery(value: i32) -> Option<Self> {
+        use pulsebeam_proto::state::DataDelivery;
+        Some(match DataDelivery::try_from(value).ok()? {
+            DataDelivery::Latest => Self::Latest,
+            DataDelivery::Lossy => Self::Lossy,
+            DataDelivery::Ordered => Self::Ordered,
+            DataDelivery::Unspecified => return None,
+        })
+    }
+
+    pub(crate) fn delivery(self) -> pulsebeam_proto::state::DataDelivery {
+        use pulsebeam_proto::state::DataDelivery;
+        match self {
+            Self::Latest => DataDelivery::Latest,
+            Self::Lossy => DataDelivery::Lossy,
+            Self::Ordered => DataDelivery::Ordered,
         }
     }
 
@@ -192,16 +200,19 @@ enum ChannelRegistration {
     Subscriber(TopicSubscriber),
 }
 
-struct SubscriptionSeedState {
-    token: u64,
-    completed_revision: Option<u64>,
+pub(crate) struct TopicSource<'a> {
+    pub channel: ChannelId,
+    pub registration: TopicChannel,
+    pub track: &'a pulsebeam_proto::state::Track,
+    pub participant: &'a pulsebeam_proto::state::Participant,
 }
 
 struct ActiveTopics {
-    seeds: BTreeMap<TopicSubscriber, SubscriptionSeedState>,
     generation: Generation,
     canonical_participant_id: String,
     channels: BTreeMap<ChannelId, ChannelRegistration>,
+    channel_sources: BTreeMap<ChannelId, String>,
+    suspended: BTreeSet<ChannelId>,
 }
 
 struct PendingSend {
@@ -274,17 +285,10 @@ impl TopicRegistrations {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ValidationError> {
-        let total = self.publishers.len().saturating_add(self.subscribers.len());
-        if total > MAX_TOPIC_CHANNELS {
-            return Err(ValidationError::TopicChannelLimit {
-                actual: total,
-                maximum: MAX_TOPIC_CHANNELS,
-            });
-        }
         let mut publishers = BTreeSet::new();
         for publisher in &self.publishers {
             validate_topic(&publisher.topic)?;
-            if !publishers.insert(publisher) {
+            if !publishers.insert(&publisher.topic) {
                 return Err(ValidationError::Duplicate {
                     field: "topic publisher",
                     value: publisher_label(publisher),
@@ -325,57 +329,36 @@ impl Topics {
         self.unbind(TopicDropReason::ChannelClosed, snapshot, notifications);
     }
 
-    pub(crate) fn seed_requests(&self) -> Vec<wire::SubscriptionSeed> {
-        self.active
-            .as_ref()
-            .into_iter()
-            .flat_map(|active| {
-                active
-                    .seeds
-                    .iter()
-                    .map(|(subscriber, seed)| wire::SubscriptionSeed {
-                        seed_id: seed.token,
-                        topic: subscriber.topic.clone(),
-                        mode: wire::TopicMode::Ordered as i32,
-                    })
+    pub(crate) fn recovery_sources(&self) -> impl Iterator<Item = (&TopicSubscriber, &str)> {
+        self.subscribers
+            .iter()
+            .filter(|(subscriber, _)| subscriber.mode == TopicMode::Ordered)
+            .flat_map(|(subscriber, state)| {
+                state.ordered.iter().filter_map(move |(source, delivery)| {
+                    delivery
+                        .next_sequence
+                        .map(|_| (subscriber, source.as_str()))
+                })
             })
-            .collect()
     }
 
-    pub(crate) fn seeding(&self) -> bool {
-        self.active.as_ref().is_some_and(|active| {
-            active.seeds.iter().any(|(subscriber, seed)| {
-                self.subscribers.contains_key(subscriber) && seed.completed_revision.is_none()
-            })
-        })
-    }
-
-    pub(crate) fn complete_seed(
+    pub(crate) fn bind_native(
         &mut self,
         generation: Generation,
-        completion: &wire::SubscriptionSeedComplete,
-        catalog_revision: u64,
-    ) -> Result<(), TopicError> {
-        let active = self
-            .active
-            .as_mut()
-            .filter(|active| active.generation == generation)
-            .ok_or(TopicError::InvalidControl)?;
-        let seed = active
-            .seeds
-            .values_mut()
-            .find(|seed| seed.token == completion.seed_id)
-            .ok_or(TopicError::InvalidControl)?;
-        if completion.catalog_revision == 0
-            || completion.catalog_revision > catalog_revision
-            || seed
-                .completed_revision
-                .is_some_and(|revision| revision != completion.catalog_revision)
-        {
-            return Err(TopicError::InvalidControl);
-        }
-        seed.completed_revision = Some(completion.catalog_revision);
-        Ok(())
+        canonical_participant_id: String,
+        snapshot: &mut Snapshot,
+        notifications: &mut VecDeque<Notification>,
+    ) {
+        self.unbind(TopicDropReason::TransportReplaced, snapshot, notifications);
+        // Native channels become routable only through an eligible owned confirmation.
+        self.active = Some(ActiveTopics {
+            generation,
+            canonical_participant_id,
+            channels: BTreeMap::new(),
+            channel_sources: BTreeMap::new(),
+            suspended: BTreeSet::new(),
+        });
+        self.refresh_snapshot(snapshot);
     }
 
     pub(crate) fn has_ordered_subscriptions(&self) -> bool {
@@ -384,10 +367,10 @@ impl Topics {
             .any(|subscriber| subscriber.mode == TopicMode::Ordered)
     }
 
-    pub(crate) fn sync_catalog(
+    pub(crate) fn install_source(
         &mut self,
         generation: Generation,
-        catalog: &crate::signaling_v1::CatalogState,
+        source: TopicSource<'_>,
         snapshot: &mut Snapshot,
         notifications: &mut VecDeque<Notification>,
         ids: &mut IdGenerator,
@@ -395,81 +378,141 @@ impl Topics {
     ) {
         let Some(active) = self
             .active
-            .as_ref()
+            .as_mut()
             .filter(|active| active.generation == generation)
         else {
             return;
         };
-        self.catalog = catalog
-            .tracks
-            .iter()
-            .filter_map(|(id, track)| {
-                if track.kind != wire::TrackKind::Data as i32 {
-                    return None;
+        let Some(pulsebeam_proto::state::track::Kind::Data(format)) = source.track.kind.as_ref()
+        else {
+            return;
+        };
+        let Some(mode) = TopicMode::from_delivery(format.delivery) else {
+            return;
+        };
+        let registration = match &source.registration {
+            TopicChannel::Publisher(value) => ChannelRegistration::Publisher(value.clone()),
+            TopicChannel::Subscriber(value) => ChannelRegistration::Subscriber(value.clone()),
+        };
+        let newly_ready = active.suspended.remove(&source.channel)
+            || !active.channels.contains_key(&source.channel);
+        active.channels.insert(source.channel, registration);
+        active
+            .channel_sources
+            .insert(source.channel, source.track.track_id.clone());
+        self.catalog.insert(
+            source.track.track_id.clone(),
+            CatalogBinding {
+                topic: source.track.label.clone(),
+                mode,
+                participant_id: source.participant.participant_external_id.clone(),
+                local: source.track.participant_id == active.canonical_participant_id,
+            },
+        );
+        match source.registration {
+            TopicChannel::Publisher(publisher) => {
+                let state = self.publishers.entry(publisher.clone()).or_default();
+                if state.data_track_id.as_ref() != Some(&source.track.track_id) {
+                    state.history.clear();
+                    state.next_sequence = 0;
+                    state.data_track_id = Some(source.track.track_id.clone());
                 }
-                let owner = catalog.participants.get(&track.participant_id)?;
-                Some((
-                    id.clone(),
-                    CatalogBinding {
-                        topic: track.label.clone(),
-                        mode: TopicMode::from_wire(track.mode)?,
-                        participant_id: owner.participant_external_id.clone(),
-                        local: track.participant_id == active.canonical_participant_id,
-                    },
-                ))
-            })
-            .collect();
-        for (publisher, state) in &mut self.publishers {
-            let binding = self.catalog.iter().find_map(|(id, binding)| {
-                (binding.local
-                    && binding.topic == publisher.topic
-                    && binding.mode == publisher.mode)
-                    .then(|| id.clone())
-            });
-            if state.data_track_id != binding {
-                let dropped = state
-                    .queue
-                    .len()
-                    .saturating_add(usize::from(state.pending.take().is_some()));
-                state.queue.clear();
-                state.history.clear();
-                state.next_sequence = 0;
-                state.data_track_id = binding;
-                for _ in 0..dropped {
-                    self.dropped_sends = self.dropped_sends.saturating_add(1);
-                    notifications.push_back(Notification::Topic(TopicNotification::SendDropped {
-                        publisher: publisher.clone(),
-                        reason: TopicDropReason::TransportReplaced,
-                    }));
-                }
+                self.dispatch_publisher(&publisher, ids, effects);
             }
-        }
-        for (subscriber, state) in &mut self.subscribers {
-            state.latest.retain(|id, _| {
-                self.catalog
-                    .get(id)
-                    .is_some_and(|binding| binding.matches(subscriber))
-            });
-            state.lossy.retain(|id, _| {
-                self.catalog
-                    .get(id)
-                    .is_some_and(|binding| binding.matches(subscriber))
-            });
-            if active
-                .seeds
-                .get(subscriber)
-                .is_none_or(|seed| seed.completed_revision.is_some())
-            {
-                state.ordered.retain(|id, _| {
-                    self.catalog
-                        .get(id)
-                        .is_some_and(|binding| binding.matches(subscriber))
+            TopicChannel::Subscriber(subscriber) if newly_ready && mode == TopicMode::Ordered => {
+                let cursor = self.subscribers.get_mut(&subscriber).and_then(|state| {
+                    state
+                        .ordered
+                        .entry(source.track.track_id.clone())
+                        .or_default()
+                        .next_sequence
                 });
+                self.emit_auxiliary(
+                    generation,
+                    source.channel,
+                    TopicChannel::Subscriber(subscriber),
+                    Body::Probe(TopicProbe {
+                        data_track_id: source.track.track_id.clone(),
+                        from_sequence: cursor.unwrap_or(0),
+                        live: cursor.is_none(),
+                    }),
+                    ids,
+                    effects,
+                );
+            }
+            TopicChannel::Subscriber(_) => {}
+        }
+        self.refresh_snapshot(snapshot);
+        let _ = notifications;
+    }
+
+    pub(crate) fn end_source(&mut self, subscriber: &TopicSubscriber, source: &str) {
+        if let Some(state) = self.subscribers.get_mut(subscriber) {
+            state.latest.remove(source);
+            state.lossy.remove(source);
+            state.ordered.remove(source);
+        }
+    }
+
+    pub(crate) fn suspend_source(&mut self, generation: Generation, channel: ChannelId) {
+        if let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| active.generation == generation)
+        {
+            active.suspended.insert(channel);
+        }
+    }
+
+    pub(crate) fn detach_source(
+        &mut self,
+        generation: Generation,
+        channel: ChannelId,
+        source_ended: bool,
+        snapshot: &mut Snapshot,
+        notifications: &mut VecDeque<Notification>,
+        effects: &mut VecDeque<Effect>,
+    ) {
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| active.generation == generation)
+        else {
+            return;
+        };
+        active.suspended.remove(&channel);
+        let registration = active.channels.remove(&channel);
+        let source = active.channel_sources.remove(&channel);
+        if let Some(source) = source {
+            self.catalog.remove(&source);
+            if let Some(ChannelRegistration::Subscriber(subscriber)) = &registration
+                && let Some(state) = self.subscribers.get_mut(subscriber)
+            {
+                state.latest.remove(&source);
+                state.lossy.remove(&source);
+                if source_ended {
+                    state.ordered.remove(&source);
+                } else if let Some(delivery) = state.ordered.get_mut(&source) {
+                    delivery.pending.clear();
+                }
             }
         }
-        let publishers = self.publishers.keys().cloned().collect::<Vec<_>>();
-        for publisher in publishers {
-            self.dispatch_publisher(&publisher, ids, effects);
+        if let Some(ChannelRegistration::Publisher(publisher)) = registration
+            && let Some(state) = self.publishers.remove(&publisher)
+        {
+            self.fail_publisher_sends(
+                &publisher,
+                DataSendFailure::ChannelFailed,
+                effects,
+                notifications,
+            );
+            self.drop_state(
+                &publisher,
+                state,
+                TopicDropReason::ChannelClosed,
+                notifications,
+            );
+            self.publishers.insert(publisher, PublisherState::default());
         }
         self.refresh_snapshot(snapshot);
     }
@@ -485,19 +528,22 @@ impl Topics {
         let generation = active.generation;
         let mut probes = Vec::new();
         for (channel, registration) in &active.channels {
+            if active.suspended.contains(channel) {
+                continue;
+            }
             let ChannelRegistration::Subscriber(subscriber) = registration else {
                 continue;
             };
-            if subscriber.mode != TopicMode::Ordered
-                || active
-                    .seeds
-                    .get(subscriber)
-                    .is_some_and(|seed| seed.completed_revision.is_none())
-            {
+            if subscriber.mode != TopicMode::Ordered {
                 continue;
             }
             for (id, binding) in &self.catalog {
-                if !binding.matches(subscriber) {
+                if active
+                    .channel_sources
+                    .get(channel)
+                    .is_some_and(|source| source != id)
+                    || !binding.matches(subscriber)
+                {
                     continue;
                 }
                 let cursor = self
@@ -530,7 +576,9 @@ impl Topics {
 
     pub(crate) fn has_channel(&self, generation: Generation, channel: ChannelId) -> bool {
         self.active.as_ref().is_some_and(|active| {
-            active.generation == generation && active.channels.contains_key(&channel)
+            active.generation == generation
+                && active.channels.contains_key(&channel)
+                && !active.suspended.contains(&channel)
         })
     }
 
@@ -610,63 +658,6 @@ impl Topics {
             .into_iter()
             .map(|spec| spec.label)
             .collect()
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "session binding updates owned protocol outputs atomically"
-    )]
-    pub(crate) fn bind(
-        &mut self,
-        generation: Generation,
-        canonical_participant_id: String,
-        registrations: &TopicRegistrations,
-        bindings: Vec<DataChannelBinding>,
-        ids: &mut IdGenerator,
-        _effects: &mut VecDeque<Effect>,
-        snapshot: &mut Snapshot,
-        notifications: &mut VecDeque<Notification>,
-    ) {
-        self.unbind(TopicDropReason::TransportReplaced, snapshot, notifications);
-        let by_label = bindings
-            .into_iter()
-            .map(|binding| (binding.label, binding.channel))
-            .collect::<BTreeMap<_, _>>();
-        let mut channels = BTreeMap::new();
-        for publisher in &registrations.publishers {
-            if let Some(channel) = by_label.get(&publisher_label(publisher)) {
-                channels.insert(*channel, ChannelRegistration::Publisher(publisher.clone()));
-            }
-        }
-        for subscriber in &registrations.subscribers {
-            if let Some(channel) = by_label.get(&subscriber_label(subscriber)) {
-                channels.insert(
-                    *channel,
-                    ChannelRegistration::Subscriber(subscriber.clone()),
-                );
-            }
-        }
-        let seeds = registrations
-            .subscribers
-            .iter()
-            .filter(|subscriber| subscriber.mode == TopicMode::Ordered)
-            .map(|subscriber| {
-                (
-                    subscriber.clone(),
-                    SubscriptionSeedState {
-                        token: ids.operation().get(),
-                        completed_revision: None,
-                    },
-                )
-            })
-            .collect();
-        self.active = Some(ActiveTopics {
-            seeds,
-            generation,
-            canonical_participant_id,
-            channels,
-        });
-        self.refresh_snapshot(snapshot);
     }
 
     pub(crate) fn unbind_generation(
@@ -926,6 +917,13 @@ impl Topics {
             .data_track_id()
             .ok_or(TopicError::MalformedMessage)?
             .to_string();
+        if active
+            .channel_sources
+            .get(&channel)
+            .is_some_and(|source| source != &id)
+        {
+            return Err(TopicError::InvalidControl);
+        }
         match registration {
             ChannelRegistration::Publisher(publisher) => {
                 let Some(state) = self.publishers.get(&publisher) else {
@@ -958,15 +956,6 @@ impl Topics {
                 }
             }
             ChannelRegistration::Subscriber(subscriber) => {
-                if active
-                    .seeds
-                    .get(&subscriber)
-                    .is_some_and(|seed| seed.completed_revision.is_none())
-                {
-                    // Probes after completion recover bounded history, including gaps.
-                    // Incomplete generations cannot advance the established frontier.
-                    return Ok(true);
-                }
                 // Unknown/retired identities are never guessed or buffered. Once
                 // established, ordered cursors survive this loss and probes recover it.
                 let Some(binding) = self
@@ -1075,12 +1064,35 @@ impl Topics {
     ) -> bool {
         let Some(registration) = self
             .active
-            .as_mut()
+            .as_ref()
             .filter(|active| active.generation == generation)
-            .and_then(|active| active.channels.remove(&channel))
+            .and_then(|active| active.channels.get(&channel))
+            .cloned()
         else {
             return false;
         };
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.channel_sources.contains_key(&channel))
+        {
+            self.detach_source(generation, channel, false, snapshot, notifications, effects);
+            let failed = match registration {
+                ChannelRegistration::Publisher(value) => TopicChannel::Publisher(value),
+                ChannelRegistration::Subscriber(value) => TopicChannel::Subscriber(value),
+            };
+            self.record_channel_failure(
+                failed,
+                "data channel closed".to_string(),
+                effects,
+                notifications,
+            );
+            self.refresh_snapshot(snapshot);
+            return true;
+        }
+        if let Some(active) = self.active.as_mut() {
+            active.channels.remove(&channel);
+        }
         let failed = match registration {
             ChannelRegistration::Publisher(publisher) => {
                 if let Some(state) = self.publishers.remove(&publisher) {
@@ -1393,11 +1405,13 @@ impl Topics {
     }
 
     fn channel_for_publisher(&self, publisher: &TopicPublisher) -> Option<ChannelId> {
-        self.active.as_ref()?.channels.iter().find_map(|(channel, registration)| matches!(registration, ChannelRegistration::Publisher(candidate) if candidate == publisher).then_some(*channel))
+        let active = self.active.as_ref()?;
+        active.channels.iter().filter(|(channel, _)| !active.suspended.contains(channel)).find_map(|(channel, registration)| matches!(registration, ChannelRegistration::Publisher(candidate) if candidate == publisher).then_some(*channel))
     }
 
     fn channel_for_subscriber(&self, subscriber: &TopicSubscriber) -> Option<ChannelId> {
-        self.active.as_ref()?.channels.iter().find_map(|(channel, registration)| matches!(registration, ChannelRegistration::Subscriber(candidate) if candidate == subscriber).then_some(*channel))
+        let active = self.active.as_ref()?;
+        active.channels.iter().filter(|(channel, _)| !active.suspended.contains(channel)).find_map(|(channel, registration)| matches!(registration, ChannelRegistration::Subscriber(candidate) if candidate == subscriber).then_some(*channel))
     }
 }
 
@@ -1480,12 +1494,7 @@ impl OrderedDelivery {
 }
 
 fn validate_topic(topic: &str) -> Result<(), ValidationError> {
-    if topic.is_empty()
-        || topic.len() > 85
-        || !topic
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
+    if topic.is_empty() || topic.len() > 256 {
         return Err(ValidationError::Topic(topic.to_string()));
     }
     Ok(())
@@ -1529,9 +1538,10 @@ mod tests {
         let channel = ChannelId::new(1).unwrap();
         let mut topics = Topics {
             active: Some(ActiveTopics {
-                seeds: BTreeMap::new(),
                 generation,
                 canonical_participant_id: "local".into(),
+                channel_sources: BTreeMap::new(),
+                suspended: BTreeSet::new(),
                 channels: BTreeMap::from([(
                     channel,
                     ChannelRegistration::Subscriber(subscriber.clone()),
@@ -1568,23 +1578,23 @@ mod tests {
     fn ordered_cursor_survives_transport_rebind_and_probes_for_recovery() {
         let mut ids = IdGenerator::new();
         let (mut topics, subscriber, generation) = ordered_topics(&mut ids);
-        let catalog = topics.catalog.clone();
         let mut snapshot = Snapshot::default();
         let mut notifications = VecDeque::new();
         let mut effects = VecDeque::new();
-        topics.unbind_generation(
-            generation,
-            TopicDropReason::TransportReplaced,
+        let replacement = ids.generation();
+        topics.bind_native(
+            replacement,
+            "local".into(),
             &mut snapshot,
             &mut notifications,
         );
-        assert!(topics.active.is_none());
         assert!(topics.catalog.is_empty());
         assert_eq!(
-            topics.subscribers[&subscriber]
-                .ordered
-                .get("authoritative")
-                .and_then(|delivery| delivery.next_sequence),
+            topics.recovery_sources().collect::<Vec<_>>(),
+            vec![(&subscriber, "authoritative")]
+        );
+        assert_eq!(
+            topics.subscribers[&subscriber].ordered["authoritative"].next_sequence,
             Some(4)
         );
         assert!(
@@ -1592,90 +1602,61 @@ mod tests {
                 .pending
                 .is_empty()
         );
-        let replacement = ids.generation();
-        let channel = ChannelId::new(2).unwrap();
-        topics.bind(
-            replacement,
-            "local".into(),
-            &TopicRegistrations {
-                subscribers: alloc::vec![subscriber.clone()],
-                ..TopicRegistrations::default()
-            },
-            alloc::vec![DataChannelBinding {
-                label: subscriber_label(&subscriber),
-                channel,
-            }],
-            &mut ids,
-            &mut effects,
-            &mut snapshot,
-            &mut notifications,
-        );
-        // A late close from the retired graph cannot fence the replacement.
         topics.unbind_generation(
             generation,
             TopicDropReason::ChannelClosed,
             &mut snapshot,
             &mut notifications,
         );
-        topics.sync_catalog(
-            replacement,
-            &crate::signaling_v1::CatalogState::default(),
-            &mut snapshot,
-            &mut notifications,
-            &mut ids,
-            &mut effects,
-        );
-        assert_eq!(
-            topics.subscribers[&subscriber].ordered["authoritative"].next_sequence,
-            Some(4)
-        );
         topics.probe_remote_publishers(&mut ids, &mut effects);
-        assert!(effects.is_empty(), "DCEP open does not complete the seed");
-        let seed_id = topics.seed_requests()[0].seed_id;
-        let completion = wire::SubscriptionSeedComplete {
-            seed_id,
-            catalog_revision: 1,
+        assert!(effects.is_empty(), "retained desire is not a ready binding");
+
+        let channel = ChannelId::new(2).unwrap();
+        let track = pulsebeam_proto::state::Track {
+            track_id: "authoritative".into(),
+            participant_id: "remote-owner".into(),
+            label: subscriber.topic.clone(),
+            kind: Some(pulsebeam_proto::state::track::Kind::Data(
+                pulsebeam_proto::state::DataTrack {
+                    delivery: subscriber.mode.delivery() as i32,
+                },
+            )),
         };
-        assert!(topics.complete_seed(generation, &completion, 1).is_err());
-        assert!(topics.complete_seed(replacement, &completion, 0).is_err());
-        assert!(
-            topics
-                .complete_seed(
-                    replacement,
-                    &wire::SubscriptionSeedComplete {
-                        seed_id: 0,
-                        catalog_revision: 1,
-                    },
-                    1
-                )
-                .is_err()
-        );
-        assert!(
-            topics
-                .complete_seed(
-                    replacement,
-                    &wire::SubscriptionSeedComplete {
-                        seed_id,
-                        catalog_revision: 0,
-                    },
-                    1
-                )
-                .is_err()
-        );
-        topics.complete_seed(replacement, &completion, 1).unwrap();
-        topics.complete_seed(replacement, &completion, 1).unwrap();
-        topics.catalog = catalog;
-        topics.probe_remote_publishers(&mut ids, &mut effects);
+        let participant = pulsebeam_proto::state::Participant {
+            participant_id: track.participant_id.clone(),
+            participant_external_id: "remote-app".into(),
+        };
+        for current in [generation, replacement] {
+            topics.install_source(
+                current,
+                TopicSource {
+                    channel,
+                    registration: TopicChannel::Subscriber(subscriber.clone()),
+                    track: &track,
+                    participant: &participant,
+                },
+                &mut snapshot,
+                &mut notifications,
+                &mut ids,
+                &mut effects,
+            );
+            if current == generation {
+                assert!(
+                    effects.is_empty(),
+                    "old confirmation cannot reopen a channel"
+                );
+            }
+        }
         let Some(Effect::DataChannel(DataChannelEffect::Send {
-            generation,
+            generation: actual_generation,
             channel: actual_channel,
             payload,
             ..
         })) = effects.pop_front()
         else {
-            panic!("replacement must probe the retained ordered cursor");
+            panic!("current owned source must probe the retained ordered cursor");
         };
-        assert_eq!(generation, replacement);
+        assert_eq!(actual_generation, replacement);
         assert_eq!(actual_channel, channel);
         let frame = TopicFrame::decode_bounded(&payload).unwrap();
         let Some(Body::Probe(probe)) = frame.body else {
@@ -1684,25 +1665,32 @@ mod tests {
         assert_eq!(probe.data_track_id, "authoritative");
         assert_eq!(probe.from_sequence, 4);
         assert!(!probe.live, "reconnect is not a new live-only subscription");
+        topics.detach_source(
+            replacement,
+            channel,
+            false,
+            &mut snapshot,
+            &mut notifications,
+            &mut effects,
+        );
+        assert_eq!(
+            topics.recovery_sources().collect::<Vec<_>>(),
+            vec![(&subscriber, "authoritative")]
+        );
+        topics.end_source(&subscriber, "authoritative");
+        assert!(topics.recovery_sources().next().is_none());
     }
 
     #[test]
-    fn ordered_cursor_is_fenced_by_close_catalog_removal_or_unsubscribe() {
+    fn ordered_cursor_is_fenced_by_close_explicit_source_end_or_unsubscribe() {
         for boundary in 0..3 {
             let mut ids = IdGenerator::new();
-            let (mut topics, subscriber, generation) = ordered_topics(&mut ids);
+            let (mut topics, subscriber, _) = ordered_topics(&mut ids);
             let mut snapshot = Snapshot::default();
             let mut notifications = VecDeque::new();
             match boundary {
                 0 => topics.end_session(&mut snapshot, &mut notifications),
-                1 => topics.sync_catalog(
-                    generation,
-                    &crate::signaling_v1::CatalogState::default(),
-                    &mut snapshot,
-                    &mut notifications,
-                    &mut ids,
-                    &mut VecDeque::new(),
-                ),
+                1 => topics.end_source(&subscriber, "authoritative"),
                 _ => topics.reconcile(
                     &TopicRegistrations::default(),
                     &mut snapshot,
@@ -1717,103 +1705,6 @@ mod tests {
                 "boundary {boundary} must discard the old publication cursor"
             );
         }
-    }
-
-    #[test]
-    fn incomplete_seeds_never_accumulate_frontiers_and_unsubscribe_fences_completion() {
-        let mut ids = IdGenerator::new();
-        let (mut topics, subscriber, _) = ordered_topics(&mut ids);
-        let mut snapshot = Snapshot::default();
-        let mut notifications = VecDeque::new();
-        let mut effects = VecDeque::new();
-        let mut previous = None;
-        for _ in 0..8 {
-            let generation = ids.generation();
-            topics.bind(
-                generation,
-                "local".into(),
-                &TopicRegistrations {
-                    subscribers: alloc::vec![subscriber.clone()],
-                    ..TopicRegistrations::default()
-                },
-                alloc::vec![DataChannelBinding {
-                    label: subscriber_label(&subscriber),
-                    channel: ChannelId::new(2).unwrap()
-                }],
-                &mut ids,
-                &mut effects,
-                &mut snapshot,
-                &mut notifications,
-            );
-            let seed_id = topics.seed_requests()[0].seed_id;
-            topics.sync_catalog(
-                generation,
-                &crate::signaling_v1::CatalogState::default(),
-                &mut snapshot,
-                &mut notifications,
-                &mut ids,
-                &mut effects,
-            );
-            assert_eq!(topics.subscribers[&subscriber].ordered.len(), 1);
-            assert_eq!(
-                topics.subscribers[&subscriber].ordered["authoritative"].next_sequence,
-                Some(4)
-            );
-            if let Some((old_generation, old_seed)) = previous {
-                assert!(
-                    topics
-                        .complete_seed(
-                            old_generation,
-                            &wire::SubscriptionSeedComplete {
-                                seed_id: old_seed,
-                                catalog_revision: 1,
-                            },
-                            1
-                        )
-                        .is_err()
-                );
-                assert!(
-                    topics
-                        .complete_seed(
-                            generation,
-                            &wire::SubscriptionSeedComplete {
-                                seed_id: old_seed,
-                                catalog_revision: 1,
-                            },
-                            1
-                        )
-                        .is_err()
-                );
-            }
-            previous = Some((generation, seed_id));
-        }
-        let (generation, seed_id) = previous.unwrap();
-        topics.reconcile(
-            &TopicRegistrations::default(),
-            &mut snapshot,
-            &mut notifications,
-        );
-        assert!(
-            topics.subscribers.is_empty(),
-            "unsubscribe releases the frontier immediately"
-        );
-        assert!(!topics.seeding());
-        topics
-            .complete_seed(
-                generation,
-                &wire::SubscriptionSeedComplete {
-                    seed_id,
-                    catalog_revision: 1,
-                },
-                1,
-            )
-            .unwrap();
-        assert!(
-            topics.subscribers.is_empty(),
-            "late completion cannot recreate an owner"
-        );
-        topics.probe_remote_publishers(&mut ids, &mut effects);
-        assert!(effects.is_empty());
     }
 
     #[test]
@@ -1875,9 +1766,10 @@ mod tests {
             let channel = ChannelId::new(1).unwrap();
             let mut topics = Topics {
                 active: Some(ActiveTopics {
-                    seeds: BTreeMap::new(),
                     generation,
                     canonical_participant_id: "local".into(),
+                    channel_sources: BTreeMap::new(),
+                    suspended: BTreeSet::new(),
                     channels: BTreeMap::from([(
                         channel,
                         ChannelRegistration::Publisher(publisher.clone()),
@@ -1939,27 +1831,32 @@ mod tests {
     }
 
     #[test]
-    fn all_modes_are_explicit_and_topic_limit_does_not_use_media_labels() {
+    fn delivery_modes_are_explicit_and_publication_labels_are_unique() {
+        let mut registrations = TopicRegistrations::default();
         for mode in [TopicMode::Latest, TopicMode::Lossy, TopicMode::Ordered] {
-            let publisher = TopicPublisher {
-                topic: "x".repeat(85),
+            assert_eq!(TopicMode::from_delivery(mode.delivery() as i32), Some(mode));
+            registrations.subscribers.push(TopicSubscriber {
+                topic: "literal/Δ label".into(),
                 mode,
-            };
-            let registrations = TopicRegistrations {
-                subscribers: alloc::vec![TopicSubscriber {
-                    topic: publisher.topic.clone(),
-                    mode
-                }],
-                publishers: alloc::vec![publisher],
-            };
-            registrations.validate().unwrap();
-            let specs = Topics::channel_specs(&registrations);
-            for spec in specs {
-                assert!(spec.label.starts_with("v2/"));
-                assert!(!spec.ordered);
-                assert_eq!(spec.reliability, DataChannelReliability::MaxRetransmits(0));
-            }
+            });
         }
-        assert!(validate_topic(&"x".repeat(86)).is_err());
+        registrations.publishers.push(TopicPublisher {
+            topic: "literal/Δ label".into(),
+            mode: TopicMode::Latest,
+        });
+        registrations.validate().unwrap();
+        registrations.publishers.push(TopicPublisher {
+            topic: "literal/Δ label".into(),
+            mode: TopicMode::Ordered,
+        });
+        assert!(matches!(
+            registrations.validate(),
+            Err(ValidationError::Duplicate {
+                field: "topic publisher",
+                ..
+            })
+        ));
+        assert_eq!(TopicMode::from_delivery(0), None);
+        assert_eq!(TopicMode::from_delivery(i32::MAX), None);
     }
 }

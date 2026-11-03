@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{ChannelId, Generation, HttpResponse, OfferResources, OperationId, TimerId};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HostEvent {
     Rtc(RtcEvent),
     Http(HttpEvent),
@@ -10,15 +10,34 @@ pub enum HostEvent {
     DataChannel(DataChannelEvent),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RtcEvent {
     OfferCreated {
         generation: Generation,
         offer: String,
         resources: OfferResources,
     },
+    BootstrapMediaPrepared {
+        generation: Generation,
+        preparation: Result<crate::client_sdp::Bindings, crate::client_sdp::Error>,
+    },
+    MediaPrepared {
+        generation: Generation,
+        operation: OperationId,
+        slots: Vec<crate::SlotBinding>,
+        outcome: crate::client_sdp::ApplyOutcome,
+        preparation: Result<crate::client_sdp::Bindings, crate::client_sdp::Error>,
+    },
+    MediaObserved {
+        generation: Generation,
+        bindings: crate::client_sdp::Bindings,
+    },
     AnswerApplied {
         generation: Generation,
+    },
+    BootstrapRejected {
+        generation: Generation,
+        message: String,
     },
     Connected {
         generation: Generation,
@@ -54,6 +73,11 @@ pub enum TimerEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DataChannelEvent {
+    Prepared {
+        generation: Generation,
+        channel: ChannelId,
+        preparation: Result<crate::PreparedDataChannel, String>,
+    },
     Opened {
         generation: Generation,
         channel: ChannelId,

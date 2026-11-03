@@ -2136,6 +2136,12 @@ impl<R: SessionRuntime> Session<R> {
         DataChannel::send_queue_capacity()
     }
 
+    /// Release the owned wrapper and its observations. Settle outstanding sends
+    /// before release; any unconsumed events are discarded with the wrapper.
+    pub fn release_channel(&mut self, channel: SessionChannelId) {
+        self.channels.remove(&channel);
+    }
+
     pub fn close_channel(&mut self, channel: SessionChannelId) -> Result<(), PeerError> {
         self.channels.get(&channel).ok_or_else(missing)?;
         self.factory.check_control_call()?;

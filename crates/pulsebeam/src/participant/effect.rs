@@ -7,12 +7,14 @@ pub struct RoomPeer {
 }
 use crate::track::Track;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackRemoval {
+    Withdrawn,
+    SourceEnded,
+}
+
 #[derive(Debug, Clone)]
 pub enum ParticipantEffect {
-    SubscriptionSeedComplete {
-        connection_id: crate::entity::ConnectionId,
-        seed_id: u64,
-    },
     ParticipantsChanged {
         added: Vec<RoomPeer>,
         removed: Vec<ParticipantId>,
@@ -22,6 +24,7 @@ pub enum ParticipantEffect {
     },
     TrackCandidateRemoved {
         track_id: crate::entity::TrackId,
+        reason: TrackRemoval,
     },
     TrackSubscribed {
         track_id: crate::entity::TrackId,
@@ -40,9 +43,9 @@ pub enum ParticipantEffect {
 impl ParticipantEffect {
     pub(crate) fn track_id(&self) -> Option<crate::entity::TrackId> {
         match self {
-            Self::ParticipantsChanged { .. } | Self::SubscriptionSeedComplete { .. } => None,
+            Self::ParticipantsChanged { .. } => None,
             Self::TrackCandidateAdded { track } => Some(track.id()),
-            Self::TrackCandidateRemoved { track_id }
+            Self::TrackCandidateRemoved { track_id, .. }
             | Self::TrackSubscribed { track_id }
             | Self::TrackUnsubscribed { track_id }
             | Self::TrackPublished { track_id }

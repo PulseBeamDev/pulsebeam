@@ -17,8 +17,9 @@ mod http;
 mod id;
 mod identity;
 mod model;
+mod native_state;
+mod rtc_preparation;
 mod signaling;
-mod signaling_v1;
 mod topic;
 mod track;
 
@@ -34,6 +35,7 @@ pub use http::*;
 pub use id::*;
 pub use identity::*;
 pub use model::*;
+pub use rtc_preparation::adopt_bootstrap_media;
 pub use signaling::SignalingError;
 pub use topic::*;
 pub use track::*;

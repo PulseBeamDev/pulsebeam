@@ -6,7 +6,7 @@ use crate::{
     OperationId, SlotBinding, TimerId,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
     Rtc(RtcEffect),
     Http(HttpEffect),
@@ -14,7 +14,31 @@ pub enum Effect {
     DataChannel(DataChannelEffect),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BootstrapCapabilities {
+    pub rtp: pulsebeam_proto::state::RtpCapabilities,
+    pub data_delivery: Vec<pulsebeam_proto::state::DataDelivery>,
+}
+
+impl BootstrapCapabilities {
+    pub fn applied_context(
+        &self,
+        offer: &str,
+        answer: &str,
+        generation: Generation,
+    ) -> Result<crate::client_sdp::Context, crate::client_sdp::Error> {
+        let [a, b, c, d, _, _, _, _] = generation.get().to_le_bytes();
+        crate::client_sdp::Context::new(
+            offer,
+            answer,
+            crate::client_sdp::Capabilities::from_wire(&self.rtp)?,
+            u32::from_le_bytes([a, b, c, d]),
+            crate::client_sdp::Limits::default(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum RtcEffect {
     CreateOffer {
         generation: Generation,
@@ -24,6 +48,36 @@ pub enum RtcEffect {
     ApplyAnswer {
         generation: Generation,
         answer: String,
+        capabilities: BootstrapCapabilities,
+    },
+    CreateDataChannel {
+        generation: Generation,
+        channel: ChannelId,
+        specification: DataChannelSpec,
+    },
+    CloseDataChannel {
+        generation: Generation,
+        channel: ChannelId,
+    },
+    PrepareMedia {
+        generation: Generation,
+        operation: OperationId,
+        requests: Vec<crate::client_sdp::Preparation>,
+    },
+    AllocateMedia {
+        generation: Generation,
+        operation: OperationId,
+        mode: crate::client_sdp::AllocationMode,
+        allocations: Vec<crate::client_sdp::Allocation>,
+    },
+    RetireMedia {
+        generation: Generation,
+        operation: OperationId,
+        mids: Vec<String>,
+    },
+    CancelMediaPreparation {
+        generation: Generation,
+        operation: OperationId,
     },
     Close {
         generation: Generation,
@@ -87,6 +141,28 @@ pub struct DataChannelSpec {
     pub reliability: DataChannelReliability,
     /// Physical SCTP stream for external negotiation, not a callback ChannelId.
     pub negotiated_id: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedDataChannel {
+    pub stream_id: u16,
+    pub negotiated: bool,
+    pub ordered: bool,
+    pub reliability: DataChannelReliability,
+    pub association_max_channels: Option<u32>,
+}
+
+impl PreparedDataChannel {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.stream_id == u16::MAX
+            || self.association_max_channels.is_some_and(|capacity| {
+                capacity == 0 || capacity > 65_536 || u32::from(self.stream_id) >= capacity
+            })
+        {
+            return Err("invalid prepared SCTP stream");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

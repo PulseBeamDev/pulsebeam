@@ -86,7 +86,8 @@ pub struct RtpConfigurationPatch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RtpConfigurationLimits {
-    /// Live typed declaration backing storage and MID/encoding index payloads.
+    /// Retained capability backing/payloads, live typed declaration backing
+    /// storage, and MID/encoding index payloads.
     /// Excludes allocator/tree-node overhead, shared format indexes, staging
     /// copies, and media runtime storage; not a process-RSS bound.
     pub max_live_metadata_bytes: usize,
@@ -104,13 +105,19 @@ impl Default for RtpConfigurationLimits {
     }
 }
 
+/// One exact format envelope, including format-scoped repair support.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RtpCodecCapability {
+    pub parameters: RtpCodecParameters,
+    pub repair: bool,
+}
+
 /// Set once, independent of the bootstrap SDP's media sections. Values are
 /// supported exact format envelopes, not an instruction to run a negotiator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RtpCapabilities {
-    pub codecs: Vec<RtpCodecParameters>,
+    pub codecs: Vec<RtpCodecCapability>,
     pub extensions: BTreeSet<String>,
-    pub repair: bool,
     pub feedback: PacketFeedbackKind,
     pub limits: RtpConfigurationLimits,
 }
@@ -160,7 +167,12 @@ impl PhysicalBinding {
             kind: binding.kind,
             rtcp: Some(binding.rtcp.clone()),
             mid: binding.mid.clone().into_boxed_str(),
-            payloads: vec![(codec.payload_type, codec.parameters.clock_rate)].into_boxed_slice(),
+            payloads: vec![crate::RtpPayloadInfo {
+                payload_type: codec.payload_type,
+                name: codec.parameters.name.to_ascii_lowercase().into_boxed_str(),
+                clock_rate: codec.parameters.clock_rate,
+            }]
+            .into_boxed_slice(),
             feedback_payloads: vec![codec.payload_type].into_boxed_slice(),
             repairs: codec
                 .repair_payload_type
@@ -216,13 +228,7 @@ impl PhysicalBinding {
                 .binding
                 .extensions
                 .iter()
-                .filter(|e| {
-                    ![MID_EXTENSION, RID_EXTENSION, REPAIRED_RID_EXTENSION]
-                        .contains(&e.uri.as_str())
-                        && !crate::negotiation::TWCC_URIS.contains(&e.uri.as_str())
-                        && !crate::negotiation::DEPENDENCY_URIS.contains(&e.uri.as_str())
-                        && e.uri != "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
-                })
+                .filter(|e| crate::negotiation::forward_extension(&e.uri))
                 .map(|e| (e.id, e.uri.clone().into_boxed_str()))
                 .collect(),
         }
@@ -283,20 +289,20 @@ pub(crate) struct RtpConfigurationUpdate {
 }
 
 impl RtpCapabilities {
-    pub(crate) fn validate(&self) -> Result<(), RtpConfigurationError> {
-        if self.codecs.is_empty() || self.codecs.len() > 128 || self.extensions.len() > 256 {
-            return Err(RtpConfigurationError::Capacity);
-        }
+    pub(crate) fn validate(&self) -> Result<usize, RtpConfigurationError> {
+        let bytes = storage::capability_bytes(self)
+            .filter(|bytes| *bytes <= self.limits.max_live_metadata_bytes)
+            .ok_or(RtpConfigurationError::Capacity)?;
         if self.feedback != PacketFeedbackKind::TransportWide {
             return Err(RtpConfigurationError::Unsupported);
         }
         for codec in &self.codecs {
-            validate_codec(codec)?;
+            validate_codec(&codec.parameters)?;
         }
         if self.extensions.iter().any(|s| !attribute_value(s)) {
             return Err(RtpConfigurationError::Invalid);
         }
-        Ok(())
+        Ok(bytes)
     }
 }
 
@@ -319,6 +325,17 @@ impl From<bool> for ConfigurationScope {
 }
 
 impl RtpConfigurationState {
+    pub(crate) fn with_capabilities(
+        capabilities: RtpCapabilities,
+    ) -> Result<Self, RtpConfigurationError> {
+        let live_metadata_bytes = capabilities.validate()?;
+        Ok(Self {
+            capabilities: Some(capabilities),
+            live_metadata_bytes,
+            ..Self::default()
+        })
+    }
+
     pub(crate) fn stage(
         &self,
         configuration: RtpConfiguration,
@@ -781,19 +798,20 @@ fn validate_binding(
     }
     validate_codec(&binding.codec.parameters)?;
     if !caps.codecs.iter().any(|supported| {
-        supported
+        let parameters = &supported.parameters;
+        parameters
             .name
             .eq_ignore_ascii_case(&binding.codec.parameters.name)
-            && supported.clock_rate == binding.codec.parameters.clock_rate
-            && supported.channels == binding.codec.parameters.channels
-            && supported.fmtp == binding.codec.parameters.fmtp
+            && parameters.clock_rate == binding.codec.parameters.clock_rate
+            && parameters.channels == binding.codec.parameters.channels
+            && parameters.fmtp == binding.codec.parameters.fmtp
             && binding
                 .codec
                 .parameters
                 .feedback
-                .is_subset(&supported.feedback)
-    }) || binding.codec.repair_payload_type.is_some() && !caps.repair
-    {
+                .is_subset(&parameters.feedback)
+            && (binding.codec.repair_payload_type.is_none() || supported.repair)
+    }) {
         return Err(Error::Unsupported);
     }
     if binding.codec.parameters.name.eq_ignore_ascii_case("opus")

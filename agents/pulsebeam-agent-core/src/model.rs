@@ -452,7 +452,11 @@ impl DesiredState {
             let kind = topology
                 .local_slot_kind(&publication.slot)
                 .ok_or_else(|| ValidationError::UnknownPublicationSlot(publication.slot.clone()))?;
-            validate_identifier("publication label", &publication.label, 64, false)?;
+            if publication.label.is_empty() || publication.label.len() > 256 {
+                return Err(ValidationError::Identifier {
+                    field: "publication label",
+                });
+            }
             if !publications.insert(publication.slot.clone()) {
                 return Err(ValidationError::Duplicate {
                     field: "publication slot",

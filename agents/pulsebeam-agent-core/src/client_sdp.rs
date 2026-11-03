@@ -1,12 +1,16 @@
 //! Local-offerer SDP reconciliation. The host applies candidates and reports the
 //! actual result; this module never performs I/O or negotiates with a server.
 
+mod capabilities;
 mod context;
+mod executor;
+mod identity_history;
 mod sdp;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use context::{ApplyOutcome, Candidate, CandidateId, Context};
+pub use executor::Executor;
 
 pub const MAX_SDP_BYTES: usize = 1024 * 1024;
 
@@ -98,6 +102,12 @@ pub struct Encoding {
     pub runtime: RuntimeEncoding,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum RtcpMode {
+    Compound,
+    ReducedSize,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RtcpParameters {
     pub cname: Option<String>,
@@ -133,6 +143,16 @@ pub struct Binding {
 }
 
 impl Binding {
+    pub(crate) fn identities_pending(&self) -> bool {
+        !self.encodings.is_empty()
+            && self.rtcp.cname.as_deref().is_none_or(sdp::cname)
+            && (self.rtcp.cname.is_none()
+                || self.encodings.iter().any(|encoding| {
+                    encoding.primary.is_none()
+                        || self.codec.repair.is_some() && encoding.repair.is_none()
+                }))
+    }
+
     /// Missing sender identities or RTCP CNAME cannot grant media admission.
     pub fn complete(&self) -> bool {
         self.rtcp.cname.as_deref().is_some_and(sdp::cname)
@@ -150,13 +170,60 @@ pub struct Bindings {
     pub receptions: Vec<Binding>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaOwner {
     pub key: MediaKey,
     pub group: Option<MediaKey>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AllocationMode {
+    #[default]
+    Create,
+    /// Retain a live receive-only transceiver and prepare fresh RTP identities.
+    RetargetReceiver,
+}
+
+/// Logical allocation intent. MID and payload type come from the actual local
+/// description of the created or retained physical transceiver.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Allocation {
+    pub slot: crate::MediaSlot,
+    pub format: Option<pulsebeam_proto::state::CodecFormat>,
+}
+
+// CodecFormat contains only scalar-valued variants.
+impl Eq for Allocation {}
+
+impl Allocation {
+    fn owner(&self) -> MediaOwner {
+        MediaOwner {
+            key: crate::rtc_preparation::bootstrap_media_key(&self.slot),
+            group: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        use crate::{MediaDirection, MediaKind, MediaSlot};
+        if let MediaSlot::LocalAudio(name) | MediaSlot::LocalVideo(name) = &self.slot
+            && (name.is_empty() || self.owner().key.0.len() > 256)
+        {
+            return Err(Error::Identifier);
+        }
+        if let Some(format) = &self.format {
+            let audio = pulsebeam_proto::state::validation::validate_format(format)
+                .map_err(|_| Error::Identifier)?;
+            if audio != (self.slot.kind() == MediaKind::Audio) {
+                return Err(Error::Identifier);
+            }
+        } else if self.slot.direction() == MediaDirection::ReceiveOnly {
+            return Err(Error::Identifier);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preparation {
     pub mid: String,
     pub payload_type: u8,
@@ -164,27 +231,32 @@ pub struct Preparation {
     pub reception: Option<MediaOwner>,
 }
 
-/// Explicit server support, including when bootstrap contains only SCTP.
-#[derive(Clone, Debug)]
-pub struct Capabilities {
-    pub codecs: Vec<CodecParameters>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodecCapability {
+    pub parameters: CodecParameters,
     pub repair: bool,
+}
+
+/// Explicit server support, including when bootstrap contains only SCTP.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Capabilities {
+    pub codecs: Vec<CodecCapability>,
     pub extensions: BTreeSet<String>,
+    pub rtcp_modes: BTreeSet<RtcpMode>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    pub max_sections: usize,
-    pub max_encodings: usize,
-    pub max_identity_history: usize,
+    /// Issued/retired guard and sender MID/RID/role payloads, including owned
+    /// string capacity. Excludes allocator/tree-node overhead and staging;
+    /// not a total-memory or process-RSS bound.
+    pub max_identity_bytes: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_sections: 256,
-            max_encodings: 256,
-            max_identity_history: 8192,
+            max_identity_bytes: 1024 * 1024,
         }
     }
 }
@@ -209,11 +281,58 @@ pub enum Error {
     CandidateState,
     #[error("runtime encoding observations do not match the accepted envelope")]
     Observation,
+    #[error("actual sender RTP identities are not yet available")]
+    IdentityPending,
+}
+
+/// Resolve only newly allocated slots from actual peer MID getters. Older active
+/// and stopped sections are not new allocations.
+pub fn assigned_slot_bindings(
+    offer: &str,
+    slots: impl IntoIterator<Item = (crate::MediaSlot, String)>,
+) -> Result<Vec<crate::SlotBinding>, Error> {
+    let sections = inspect(offer)?;
+    let mut seen_slots = BTreeSet::new();
+    let mut seen_mids = BTreeSet::new();
+    let mut bindings = Vec::new();
+    for (slot, mid) in slots {
+        if bindings.len() >= sections.len() {
+            return Err(Error::Capacity);
+        }
+        if !seen_slots.insert(slot.clone()) || !seen_mids.insert(mid.clone()) {
+            return Err(Error::Identifier);
+        }
+        let (index, section) = sections
+            .iter()
+            .enumerate()
+            .find(|(_, section)| section.mid == mid)
+            .ok_or_else(|| Error::Envelope(mid.clone()))?;
+        let kind = match slot.kind() {
+            crate::MediaKind::Audio => Kind::Audio,
+            crate::MediaKind::Video => Kind::Video,
+        };
+        let sending = slot.direction() == crate::MediaDirection::SendOnly;
+        if section.stopped
+            || section.kind != kind
+            || section.direction.sends() != sending
+            || section.direction.receives() == sending
+        {
+            return Err(Error::Envelope(mid));
+        }
+        bindings.push(crate::SlotBinding {
+            kind: slot.kind(),
+            direction: slot.direction(),
+            slot,
+            mid,
+            media_index: u32::try_from(index).map_err(|_| Error::Capacity)?,
+        });
+    }
+    Ok(bindings)
 }
 
 /// Inspect facts from an actual local offer without retaining parallel MID maps.
 pub fn inspect(offer: &str) -> Result<Vec<Section>, Error> {
-    Ok(sdp::Document::parse(offer, Limits::default())?
+    Ok(sdp::Document::parse(offer)?
         .media
         .into_iter()
         .map(|m| m.section)

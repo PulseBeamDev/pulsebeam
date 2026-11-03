@@ -8,7 +8,7 @@
 )]
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
     time::Instant,
 };
@@ -79,7 +79,7 @@ pub(crate) struct IngressMediaFacts {
     pub(crate) kind: crate::MediaKind,
     pub(crate) rtcp: Option<crate::RtcpParameters>,
     pub(crate) mid: Box<str>,
-    pub(crate) payloads: Box<[(u8, u32)]>,
+    pub(crate) payloads: Box<[crate::RtpPayloadInfo]>,
     pub(crate) feedback_payloads: Box<[u8]>,
     pub(crate) repairs: Box<[(u8, u8)]>,
     pub(crate) nack_payloads: Box<[u8]>,
@@ -155,7 +155,15 @@ impl NegotiatedSessionFacts {
                     payloads: section
                         .codecs
                         .iter()
-                        .map(|codec| (codec.payload_type, codec.clock_rate))
+                        .map(|codec| crate::RtpPayloadInfo {
+                            payload_type: codec.payload_type,
+                            name: match codec.profile {
+                                crate::CodecProfile::Opus => "opus",
+                                crate::CodecProfile::H264 { .. } => "h264",
+                            }
+                            .into(),
+                            clock_rate: codec.clock_rate,
+                        })
                         .collect(),
                     feedback_payloads: section
                         .codecs
@@ -371,6 +379,7 @@ struct NegotiatedMediaSection {
 struct SectionBuild {
     facts: NegotiatedMediaSection,
     accepted_payloads: Vec<u8>,
+    explicit_capabilities: bool,
     twcc: bool,
     rfc8888: bool,
 }
@@ -461,13 +470,27 @@ fn negotiate_inner(
         .enumerate()
     {
         let media_index = u32::try_from(index).map_err(|_| NegotiationError::limit())?;
-        builds.push(parse_section(line, section, mid, media_index, allow_mixed)?);
+        builds.push(parse_section(
+            line,
+            section,
+            mid,
+            media_index,
+            allow_mixed,
+            config.rtp_capabilities.as_ref(),
+        )?);
     }
     for section in &mut builds {
         section.facts.extensions = std::mem::take(&mut section.facts.extensions)
             .into_vec()
             .into_iter()
             .filter_map(|mut extension| {
+                if config
+                    .rtp_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| !capabilities.extensions.contains(&extension.uri))
+                {
+                    return None;
+                }
                 let known = supported_extension(&extension.uri);
                 if !known && config.unknown_extension_policy == crate::UnknownExtensionPolicy::Drop
                 {
@@ -869,6 +892,7 @@ fn parse_section(
     mid: &str,
     media_index: u32,
     allow_mixed: bool,
+    capabilities: Option<&crate::RtpCapabilities>,
 ) -> Result<SectionBuild, NegotiationError> {
     let disabled = line.disabled && !raw.iter().any(|value| value == "a=bundle-only");
     let kind = match line.typ {
@@ -914,7 +938,7 @@ fn parse_section(
     let (codecs, accepted_payloads) = if disabled || kind == SectionKind::Application {
         (Vec::new(), Vec::new())
     } else {
-        parse_codecs(line, raw, kind)?
+        parse_codecs(line, raw, kind, capabilities)?
     };
     let extensions = if disabled || kind == SectionKind::Application {
         Vec::new()
@@ -954,6 +978,7 @@ fn parse_section(
             sctp,
         },
         accepted_payloads,
+        explicit_capabilities: capabilities.is_some(),
         twcc,
         rfc8888,
     })
@@ -963,6 +988,7 @@ fn parse_codecs(
     line: &str0m::sdp::MediaLine,
     raw: &[String],
     kind: SectionKind,
+    capabilities: Option<&crate::RtpCapabilities>,
 ) -> Result<(Vec<crate::CodecInfo>, Vec<u8>), NegotiationError> {
     let params = line
         .rtp_params()
@@ -974,6 +1000,7 @@ fn parse_codecs(
     }
     let mut codecs = Vec::new();
     let mut payloads = Vec::new();
+    let mut repairable = BTreeSet::new();
     for parameter in &params {
         let clock_rate = u32::from(std::num::NonZeroU32::from(parameter.spec.clock_rate));
         let supported = match kind {
@@ -990,6 +1017,32 @@ fn parse_codecs(
             SectionKind::Application => false,
         };
         if supported {
+            let capability = if let Some(capabilities) = capabilities {
+                let fmtp = codec_fmtp(raw, *parameter.pt)?;
+                let name = if kind == SectionKind::Audio {
+                    "opus"
+                } else {
+                    "h264"
+                };
+                let Some(capability) = capabilities.codecs.iter().find(|capability| {
+                    let parameters = &capability.parameters;
+                    parameters.name.eq_ignore_ascii_case(name)
+                        && parameters.clock_rate == clock_rate
+                        && parameters.channels == parameter.spec.channels.map(u16::from)
+                        && parameters.fmtp == fmtp
+                }) else {
+                    continue;
+                };
+                Some(capability)
+            } else {
+                None
+            };
+            let allows_feedback = |name: &str| {
+                capability.is_none_or(|capability| capability.parameters.feedback.contains(name))
+            };
+            if capability.is_none_or(|capability| capability.repair) {
+                repairable.insert(*parameter.pt);
+            }
             let profile = parse_codec_profile(raw, *parameter.pt, kind)?;
             payloads.push(*parameter.pt);
             codecs.push(crate::CodecInfo {
@@ -998,11 +1051,12 @@ fn parse_codecs(
                 clock_rate,
                 channels: parameter.spec.channels,
                 retransmission_payload_type: None,
-                nack: codec_feedback(raw, *parameter.pt, "nack"),
-                twcc: codec_feedback(raw, *parameter.pt, "transport-cc"),
-                rfc8888: codec_feedback(raw, *parameter.pt, "ccfb"),
-                pli: codec_feedback(raw, *parameter.pt, "nack pli"),
-                fir: codec_feedback(raw, *parameter.pt, "ccm fir"),
+                nack: allows_feedback("nack") && codec_feedback(raw, *parameter.pt, "nack"),
+                twcc: allows_feedback("transport-cc")
+                    && codec_feedback(raw, *parameter.pt, "transport-cc"),
+                rfc8888: allows_feedback("ccfb") && codec_feedback(raw, *parameter.pt, "ccfb"),
+                pli: allows_feedback("nack pli") && codec_feedback(raw, *parameter.pt, "nack pli"),
+                fir: allows_feedback("ccm fir") && codec_feedback(raw, *parameter.pt, "ccm fir"),
             });
         }
     }
@@ -1029,6 +1083,9 @@ fn parse_codecs(
             continue;
         };
         if let Some(primary) = codecs.iter_mut().find(|codec| codec.payload_type == apt) {
+            if !repairable.contains(&apt) {
+                continue;
+            }
             if primary.retransmission_payload_type.is_some() {
                 return Err(NegotiationError::conflict());
             }
@@ -1037,6 +1094,31 @@ fn parse_codecs(
         }
     }
     Ok((codecs, payloads))
+}
+
+fn codec_fmtp(raw: &[String], payload: u8) -> Result<BTreeMap<String, String>, NegotiationError> {
+    let mut fmtp = BTreeMap::new();
+    for value in raw.iter().filter_map(|line| line.strip_prefix("a=fmtp:")) {
+        let Some((pt, parameters)) = value.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if pt.parse::<u8>() != Ok(payload) {
+            continue;
+        }
+        for parameter in parameters.split(';') {
+            let Some((key, value)) = parameter.trim().split_once('=') else {
+                return Err(NegotiationError::invalid());
+            };
+            let value = value.trim().to_owned();
+            if fmtp
+                .insert(key.trim().to_ascii_lowercase(), value.clone())
+                .is_some_and(|old| old != value)
+            {
+                return Err(NegotiationError::conflict());
+            }
+        }
+    }
+    Ok(fmtp)
 }
 
 fn codec_feedback(raw: &[String], payload: u8, feedback: &str) -> bool {
@@ -1202,7 +1284,7 @@ fn supported_extension(uri: &str) -> bool {
         || uri == PLAYOUT_DELAY_URI
 }
 
-fn forward_extension(uri: &str) -> bool {
+pub(crate) fn forward_extension(uri: &str) -> bool {
     !matches!(
         uri,
         "urn:ietf:params:rtp-hdrext:sdes:mid"
@@ -1698,31 +1780,32 @@ fn format_answer_section(
             .and_then(|value| value.split_whitespace().next())
             .and_then(|value| value.parse::<u8>().ok())
             .is_some_and(|payload| payloads.contains(&payload));
-        let keep_feedback = line.strip_prefix("a=rtcp-fb:").is_some_and(|value| {
-            let mut fields = value.split_whitespace();
-            let payload = fields.next().unwrap_or_default();
-            let applies = payload == "*"
-                || payload
-                    .parse::<u8>()
-                    .is_ok_and(|payload| section.accepted_payloads.contains(&payload));
-            let name = fields.next().unwrap_or_default();
-            applies
-                && match name {
-                    "transport-cc" => {
-                        (section.facts.direction.allows_send()
-                            && feedback[0] == Some(PacketFeedbackKind::TransportWide))
-                            || (section.facts.direction.allows_receive()
-                                && feedback[1] == Some(PacketFeedbackKind::TransportWide))
+        let keep_feedback = !section.explicit_capabilities
+            && line.strip_prefix("a=rtcp-fb:").is_some_and(|value| {
+                let mut fields = value.split_whitespace();
+                let payload = fields.next().unwrap_or_default();
+                let applies = payload == "*"
+                    || payload
+                        .parse::<u8>()
+                        .is_ok_and(|payload| section.accepted_payloads.contains(&payload));
+                let name = fields.next().unwrap_or_default();
+                applies
+                    && match name {
+                        "transport-cc" => {
+                            (section.facts.direction.allows_send()
+                                && feedback[0] == Some(PacketFeedbackKind::TransportWide))
+                                || (section.facts.direction.allows_receive()
+                                    && feedback[1] == Some(PacketFeedbackKind::TransportWide))
+                        }
+                        "ccfb" => {
+                            (section.facts.direction.allows_send()
+                                && feedback[0] == Some(PacketFeedbackKind::Rfc8888))
+                                || (section.facts.direction.allows_receive()
+                                    && feedback[1] == Some(PacketFeedbackKind::Rfc8888))
+                        }
+                        _ => true,
                     }
-                    "ccfb" => {
-                        (section.facts.direction.allows_send()
-                            && feedback[0] == Some(PacketFeedbackKind::Rfc8888))
-                            || (section.facts.direction.allows_receive()
-                                && feedback[1] == Some(PacketFeedbackKind::Rfc8888))
-                    }
-                    _ => true,
-                }
-        });
+            });
         let keep_extension = line
             .strip_prefix("a=extmap:")
             .and_then(|value| value.split_whitespace().nth(1))
@@ -1762,6 +1845,28 @@ fn format_answer_section(
             };
             output.push_str(&copied);
             output.push_str("\r\n");
+        }
+    }
+    if section.explicit_capabilities && !disabled {
+        for codec in &section.facts.codecs {
+            let selected = |kind| feedback.contains(&Some(kind));
+            for (allowed, name) in [
+                (codec.nack, "nack"),
+                (codec.pli, "nack pli"),
+                (codec.fir, "ccm fir"),
+                (
+                    codec.twcc && selected(PacketFeedbackKind::TransportWide),
+                    "transport-cc",
+                ),
+                (
+                    codec.rfc8888 && selected(PacketFeedbackKind::Rfc8888),
+                    "ccfb",
+                ),
+            ] {
+                if allowed {
+                    output.push_str(&format!("a=rtcp-fb:{} {name}\r\n", codec.payload_type));
+                }
+            }
         }
     }
     output.push_str(&format!(
@@ -1931,6 +2036,96 @@ mod tests {
         );
         assert!(result.answer.as_str().contains("a=rtpmap:121 rtx/90000"));
         assert!(result.answer.as_str().contains("a=fmtp:121 apt=102"));
+        assert!(result.answer.as_str().contains("a=rtcp-fb:102 nack"));
+
+        let mixed = offer.as_str()
+            .replace("m=video 9 UDP/TLS/RTP/SAVPF 102 121", "m=video 9 UDP/TLS/RTP/SAVPF 108 109 102 121")
+            .replace("a=rtpmap:102 H264/90000", concat!(
+                "a=rtpmap:108 H264/90000\n",
+                "a=fmtp:108 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\n",
+                "a=rtpmap:109 rtx/90000\n",
+                "a=fmtp:109 apt=108\n",
+                "a=rtcp-fb:108 transport-cc\n",
+                "a=rtpmap:102 H264/90000",
+            ));
+        let capabilities = crate::RtpCapabilities {
+            codecs: vec![
+                crate::RtpCodecCapability {
+                    parameters: crate::RtpCodecParameters {
+                        name: "opus".into(),
+                        clock_rate: 48000,
+                        channels: Some(2),
+                        fmtp: BTreeMap::new(),
+                        feedback: ["transport-cc".into()].into(),
+                    },
+                    repair: false,
+                },
+                crate::RtpCodecCapability {
+                    parameters: crate::RtpCodecParameters {
+                        name: "h264".into(),
+                        clock_rate: 90000,
+                        channels: None,
+                        fmtp: [
+                            ("level-asymmetry-allowed".into(), "1".into()),
+                            ("packetization-mode".into(), "1".into()),
+                            ("profile-level-id".into(), "42e01f".into()),
+                        ]
+                        .into(),
+                        feedback: ["transport-cc".into()].into(),
+                    },
+                    repair: true,
+                },
+            ],
+            extensions: [
+                "urn:ietf:params:rtp-hdrext:sdes:mid",
+                TWCC_URIS[0],
+                TWCC_URIS[1],
+            ]
+            .map(str::to_owned)
+            .into(),
+            feedback: PacketFeedbackKind::TransportWide,
+            limits: crate::RtpConfigurationLimits::default(),
+        };
+        for repair in [false, true] {
+            let mut capabilities = capabilities.clone();
+            capabilities.codecs[1].repair = repair;
+            let mut accepted = Connection::accept(
+                ConnectionConfig {
+                    rtp_capabilities: Some(capabilities.clone()),
+                    ..config()
+                },
+                SdpOffer::new(mixed.clone()),
+                at(),
+                std::time::UNIX_EPOCH,
+                ConnectionEntropy::new([8; 32]),
+            )
+            .expect("typed bootstrap envelope");
+            let answer = accepted.answer.as_str();
+            assert!(answer.contains(if repair {
+                "m=video 9 UDP/TLS/RTP/SAVPF 102 121\r\n"
+            } else {
+                "m=video 9 UDP/TLS/RTP/SAVPF 102\r\n"
+            }));
+            assert!(!answer.contains("a=rtpmap:108"));
+            assert!(!answer.contains("a=fmtp:108"));
+            assert!(!answer.contains("a=rtpmap:109"));
+            assert_eq!(answer.contains("a=rtpmap:121 rtx/90000"), repair);
+            assert_eq!(answer.contains("a=fmtp:121 apt=102"), repair);
+            assert!(!answer.contains("a=rtcp-fb:102 nack"));
+            assert!(answer.contains("a=rtcp-fb:102 transport-cc"));
+            assert!(!answer.contains("abs-capture-time"));
+            assert!(!answer.contains("video-dependency-descriptor"));
+            assert!(answer.contains("a=simulcast:recv q;h;f"));
+            accepted
+                .connection
+                .set_rtp_capabilities(capabilities.clone())
+                .unwrap();
+            capabilities.codecs[1].repair = !repair;
+            assert_eq!(
+                accepted.connection.set_rtp_capabilities(capabilities),
+                Err(crate::RtpConfigurationError::CapabilityState)
+            );
+        }
     }
 
     #[test]

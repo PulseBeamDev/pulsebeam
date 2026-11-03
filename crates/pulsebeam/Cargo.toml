@@ -39,7 +39,7 @@ pprof = { version = "0.15.0", features = [
 pulsebeam-core = { path = "../pulsebeam-core" }
 pulsebeam-queue = { path = "../pulsebeam-queue" }
 pulsebeam-rtc = { path = "../pulsebeam-rtc" }
-pulsebeam-proto = { path = "../pulsebeam-proto" }
+pulsebeam-proto = { path = "../pulsebeam-proto", features = ["json"] }
 pulsebeam-steer = { path = "../pulsebeam-steer" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime" }
 pulsebeam-tcp = { path = "../pulsebeam-tcp" }
