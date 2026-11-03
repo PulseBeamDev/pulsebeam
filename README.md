@@ -1,144 +1,190 @@
-[Documentation](https://docs.pulsebeam.dev) | [Issues](https://github.com/PulseBeamDev/pulsebeam/issues) | [Discord](https://discord.com/invite/Bhd3t9afuB)
+<h1><img src="https://pulsebeam.dev/favicon.svg" alt="" width="36" align="absmiddle"> PulseBeam</h1>
 
-# PulseBeam
+**The open-source realtime stack for audio, video, and data.**  
+**Built to stay out of your way.**
 
-<img align="right" src="https://pulsebeam.dev/favicon.svg" height="64px" alt="PulseBeam Logo: Open Source WebRTC SFU for browsers, mobile, and IoT">
+PulseBeam is a Rust media server and SDK stack for browser and native applications. Web and React SDKs are available today; native SDKs are in development.
 
-PulseBeam is an open source, general-purpose WebRTC SFU server for connecting browsers, mobile, and IoT clients. We believe real-time application development shouldn't be complicated, nor should it rely on heavy architectures with many moving parts. PulseBeam reduces this friction by adhering to these core design goals:
+Participants publish named audio, video, and data tracks into a room. Each participant can both send and receive tracks. We'd rather improve a default than add another knob.
 
-- Support all WebRTC clients.
-- Keep the architecture simple, but not simpler.
-- Natively support vertical and horizontal scaling.
-- Provide client SDKs strictly for convenience, not necessity.
-- Require minimal configuration.
+[Get started](#local-development-demo) · [Documentation](https://docs.pulsebeam.dev) · [Meet example](https://github.com/PulseBeamDev/pulsebeam/tree/main/apps/meet) · [Discord](https://discord.com/invite/Bhd3t9afuB)
 
-If your client device speaks WebRTC, it can communicate with PulseBeam.
+## The model
 
-To add a room to your application, start with the
-[React SDK quickstart](docs/react/quickstart.md). It uses the published SDK and
-shows how to connect two participants in your own app. For other browser UIs,
-use the [Web SDK](agents/pulsebeam-agent-web/README.md).
+- **Room:** A namespace for discovering participants and tracks. It does not own your application's lifecycle.
+- **Participant:** An identity in a room. It can represent a person, agent, device, or service.
+- **Track:** Named audio, video, or application data published by a participant.
+- **Agent:** The bidirectional SDK handle for one participant: publish local tracks, discover and receive remote tracks, send and receive data, and observe connection state.
 
-## Technical Targets
+<img src="./assets/boundaries.svg" alt="Your backend issues participant tokens. Inside a room, two bidirectional Agents connect through PulseBeam. Each participant publishes local named tracks and receives remote named tracks." width="900">
 
-- CPU induced p99 jitter: <2ms
+Your backend owns authentication, authorization, application state, persistence, and APIs. PulseBeam owns the realtime path.
 
-## Compatibility
+## Work with tracks
 
-PulseBeam is opinionated about media handling to prioritize battery efficiency, hardware support, and predictable performance:
+React today:
 
-- **Video:** H.264 Baseline profile up to Level 4.1
-- **Audio:** Opus
-- **Data channels:** Native SDK signaling supports explicit `latest` state, `lossy` events, and `ordered` events with bounded recovery and inline gaps. Topic identity comes from Catalog data tracks. WHIP publishing is media-only.
+```tsx
+const capture = useCapture("device", { video: true, audio: true })
+const agent = useAgent({ endpoint, token })
 
-## Development
+const videos = agent.remote.participants.flatMap(({ tracks }) =>
+  tracks.filter(
+    (track): track is RemoteVideoTrack => track.kind === "video",
+  ),
+)
 
-Bazel owns compilation, provisioning, generated bindings, and tests. Start with
-[build and development](docs/build.md)
-[editor setup](docs/ide.md)
-[distribution](docs/releasing.md).
+return (
+  <>
+    <button onClick={() => void capture.request()}>
+      Enable camera & mic
+    </button>
+    <button onClick={() => agent.connect()}>
+      Connect
+    </button>
+
+    <Publish track={agent.video("camera")} source={capture.video} />
+    <Publish track={agent.audio("microphone")} source={capture.audio} />
+
+    {videos.map((video) => (
+      <Video
+        key={`${video.participantId}:${video.label}`}
+        source={video}
+        style={{ width: 320, height: 240 }}
+      />
+    ))}
+
+    <Audio agent={agent} />
+  </>
+)
+```
+
+`Publish` is a [renderless component](https://kyleshevlin.com/renderless-components/): mount it to own publication; capture stays independent.
+
+### Video demand follows the UI
+
+`Video` is more than playback. A visible, nonzero-sized video creates receive demand, and the runtime adapts what it requests as layout and bandwidth change.
+
+Use `receive` when application intent matters:
+
+```tsx
+<Video
+  source={video}
+  receive={{
+    priority: pinned ? 200 : 10,
+    minFps: 15,
+    playoutDelay: { minMs: 100, maxMs: 200 },
+  }}
+/>
+```
+
+So the default path follows the UI automatically, while pinned tiles, latency-sensitive views, or other application-specific cases can override policy.
+
+### Data is a track, too
+
+```tsx
+const cursor = agent.data("cursor", "latest")
+const reactions = agent.data("reactions", "lossy")
+const messages = agent.data("messages", "ordered")
+```
+
+| Mode | Semantics |
+| --- | --- |
+| `latest` | Only the newest state matters |
+| `lossy` | Missing events are not recovered |
+| `ordered` | Preserve order with bounded recovery |
+
+Payloads are bytes. `ordered` reports a gap when recovery history is no longer available. Data is live delivery, not durable storage.
+
+[Data delivery and recovery](https://github.com/PulseBeamDev/pulsebeam/blob/main/docs/react/guides.md#data-tracks)
+
+<a id="local-development-demo"></a>
 
 ## Local development demo
 
-See video forwarded through a local server using [PulseBeam Meet](apps/meet/README.md).
-Both browser tabs publish their camera and receive the other participant's video.
+The source development setup currently targets Linux x86_64. Start from a checkout with the [host prerequisites](https://github.com/PulseBeamDev/pulsebeam/blob/main/docs/build.md#host-prerequisites).
 
-Use a Linux x86_64 checkout with the [host prerequisites](docs/build.md#host-prerequisites)
-installed. Run commands from the repository root. You need a browser and working
-camera and microphone capture; Meet requires both even when joining to view media.
+Start the server:
 
-### 1. Start the server
-
-Keep this command running in its own terminal:
-
-```bash
+```sh
 ./bazel run --config=dev //:server -- --dev
 ```
 
-Development mode uses fixed, public development credentials and unprivileged
-WebRTC ports. Use it only for local testing, not an internet-facing deployment.
+Start Meet:
 
-| Port | Purpose | Access |
-| --- | --- | --- |
-| TCP/7070 | HTTP signaling | Local clients in this quickstart |
-| UDP/3478 | WebRTC traffic | Local clients in this quickstart |
-| TCP/3478 | WebRTC over TCP fallback | Local clients in this quickstart |
-| TCP/6060 | Internal metrics, health checks, and CPU profiling | Private only; never add to the public firewall allowlist |
-
-Without `--dev`, WebRTC uses UDP/TCP 443 and the server requires a public `key-registry.json` for its single project. Development mode does not restrict listener access to loopback; keep
-these services protected by your host firewall.
-
-### 2. Start Meet and mint two tokens
-
-In a second terminal, keep the Meet development server running:
-
-```bash
+```sh
 ./bazel run //:meet_dev -- --port 3000
 ```
 
-When Next.js reports that it is ready, open <http://localhost:3000>. Use this
-localhost origin so the browser can capture media without a separate HTTPS setup.
+Create two participant tokens:
 
-In a third terminal, mint tokens for two distinct participants in the same room:
+```sh
+./bazel run //:cli -- token \
+  --room demo \
+  --participant alice
 
-```bash
-./bazel run //:cli -- token --room demo --participant alice
-./bazel run //:cli -- token --room demo --participant bob
+./bazel run //:cli -- token \
+  --room demo \
+  --participant bob
 ```
 
-These tokens expire after one hour. Generate new ones if they expire; do not use
-the CLI's development tokens for production.
+Open `http://localhost:3000` in two tabs. Use a different token in each tab, set the server URL to `http://localhost:7070`, allow camera and microphone access, and join.
 
-### 3. Publish and view
+Each tab should discover the other participant. Select the remote video tile to view its camera. Mute both microphones to avoid feedback.
 
-1. In the first Meet tab, allow camera and microphone access and confirm that
-   the camera preview appears.
-2. Paste Alice's token into **Bearer token**, set **Server URL** to
-   `http://localhost:7070`, and select **Join room**.
-3. Open <http://localhost:3000> in a second tab. Repeat with Bob's token and the
-   same server URL. Mute the microphones in both tabs to avoid audio feedback.
-4. Each tab should show its own participant identity, `Room demo`, a `connected`
-   status, and a remote video tile in addition to its local camera. Select the
-   remote tile to view the other participant's video. Send a message through
-   **Chat** to try an ordered topic with bounded recovery.
+Development mode uses public credentials. Do not expose a `--dev` server to the internet. The local server uses TCP `7070` for signaling and TCP/UDP `3478` for WebRTC.
 
-If **Join room** stays disabled, enable camera and microphone permissions and
-select **Retry** after a capture error. If admission fails, check that the server
-is running in `--dev` mode, the server URL is correct, and both tokens are fresh.
+## How we test
 
-### 4. Clean up
+We run the server and native SDK together in a [deterministic simulator](https://github.com/PulseBeamDev/pulsebeam/tree/main/crates/pulsebeam-simulator), using real signaling and media code over a controlled network. We check what arrives, whether video decodes, and whether clients recover after failures.
 
-Select **Leave** in each tab, then close the tabs. Leave disconnects the client
-and stops its captured media, but returning to the lobby requests capture again.
-Close the tabs to release the devices, then stop Meet and the server with Ctrl+C
-in their terminals.
+Virtual time lets us run many repeatable network scenarios, sometimes faster than real time. It does not reproduce every browser or operating system behavior, so we also test in browsers and against real network sockets.
 
-For your own client, start with the [Web SDK](agents/pulsebeam-agent-web/README.md)
-or [React SDK](agents/react/README.md). For packaged server artifacts, see
-[distribution](docs/releasing.md).
+The native SDK uses libwebrtc. The Web and native SDKs share the same Rust core for connection state and recovery, and the simulator exercises that core through the native SDK.
 
-## Profiling & Metrics
+We also [check the checks](https://github.com/PulseBeamDev/pulsebeam/tree/main/crates/pulsebeam-simulator#calibrate-public-contract-detectors) by injecting faults and verifying that the test suite catches them. The [testing guide](https://github.com/PulseBeamDev/pulsebeam/blob/main/docs/build.md#client-qa-boundaries) explains the current QA boundaries.
 
-PulseBeam exposes an internal debug HTTP server on **`http://localhost:6060`**.
-Keep port 6060 private; the server does not restrict its listener to loopback.
-Use local or trusted administrative access, never a public endpoint.
+## WebRTC
 
-- **Metrics (Prometheus):** `http://localhost:6060/metrics`
-- **CPU profile (pprof):** `http://localhost:6060/debug/pprof/profile?seconds=30`
-- **CPU flamegraph:** `http://localhost:6060/debug/pprof/profile?seconds=30&flamegraph=true`
+WebRTC is our transport today: boring, battle-tested.
 
-Memory profiling is currently disabled; `/debug/pprof/allocs` is not available.
+PulseBeam keeps SDP, ICE candidates, transceivers, and renegotiation below the participant-and-track API.
 
-> CPU profiling measures **CPU usage**, not wall time. For meaningful results, profile while the server is under load.
+## Where things stand
 
-View CPU profiles with:
+PulseBeam is under active development.
 
-```bash
-./bazel run @rules_go//go -- tool pprof -http=:8080 cpu.pprof
+| Component | Status |
+| --- | --- |
+| Server | Self-hostable |
+| Web SDK | Available |
+| React SDK | Available |
+| Native SDKs | In development, not yet published |
+| Audio | Opus |
+| Video | H.264 Baseline |
+| Transport | WebRTC |
+
+If something breaks or does not fit what you are building, [open an issue](https://github.com/PulseBeamDev/pulsebeam/issues) or [talk with us on Discord](https://discord.com/invite/Bhd3t9afuB).
+
+<details>
+<summary>Metrics and profiling</summary>
+
+Prometheus metrics:
+
+```text
+http://localhost:6060/metrics
 ```
 
-Or view as a flamegraph on a browser by specifying `flamegraph=true` to the URL query.
+CPU profiles:
 
-## Roadmap
+```text
+http://localhost:6060/debug/pprof/profile?seconds=30
+```
 
-You can view the full roadmap [here](https://github.com/orgs/PulseBeamDev/projects/2/views/4).
+Keep port `6060` private.
+
+</details>
+
+[Build and development](https://github.com/PulseBeamDev/pulsebeam/blob/main/docs/build.md) · [Roadmap](https://github.com/orgs/PulseBeamDev/projects/2/views/4) · [Benchmark write-up](https://pulsebeam.dev/blog/moving-to-thread-per-core)
+
+**License:** [Server: AGPL-3.0](https://github.com/PulseBeamDev/pulsebeam/blob/main/LICENSE) · [Client SDKs: Apache-2.0](https://github.com/PulseBeamDev/pulsebeam/blob/main/agents/pulsebeam-agent-web/LICENSE)
