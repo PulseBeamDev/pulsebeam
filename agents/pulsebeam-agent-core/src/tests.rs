@@ -622,7 +622,7 @@ fn disconnected_credential_update_is_used_for_next_http_admission() {
 
 #[test]
 fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
-    use pulsebeam_proto::state::{self, codec, validation};
+    use pulsebeam_proto::state::{self, codec};
 
     for valid in [true, false] {
         let (mut agent, generation, channel, accepted) =
@@ -651,7 +651,7 @@ fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
                 reason: state::AbsenceReason::CreateRejected as i32,
             }),
         );
-        let Some(state::state_record::State::Confirmed(confirmation)) = &mut record.state else {
+        let Some(confirmation) = &mut record.confirmed else {
             panic!("confirmation")
         };
         confirmation.rejection = Some(state::Failure {
@@ -661,13 +661,10 @@ fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
         let event = HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel,
-            payload: codec::encode(
-                &state::StateBatch {
-                    records: vec![record],
-                    initial_complete: false,
-                },
-                validation::Direction::Server,
-            )
+            payload: codec::encode_server(&state::ServerStateBatch {
+                records: vec![record],
+                initial_complete: false,
+            })
             .unwrap(),
         });
         let result = agent.handle(event.clone());
@@ -1960,7 +1957,7 @@ fn authorization_is_latched_across_incidental_updates_until_explicit_reconnect()
 #[test]
 fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
     use native_connection::{confirmed, grant};
-    use pulsebeam_proto::state::{self, codec, validation};
+    use pulsebeam_proto::state::{self, codec};
     let (mut agent, generation, signal) = native_connection::joining(Default::default());
     agent
         .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
@@ -1975,39 +1972,36 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: signal,
-            payload: codec::encode(
-                &state::StateBatch {
-                    initial_complete: true,
-                    records: vec![
-                        grant(1),
-                        confirmed(
-                            state::resource_key::Key::Participant("publisher".into()),
-                            0,
-                            state::confirmed_state::Value::Participant(state::Participant {
-                                participant_id: "publisher".into(),
-                                participant_external_id: "publisher-external".into(),
-                            }),
-                        ),
-                        confirmed(
-                            state::resource_key::Key::Track("video-track".into()),
-                            0,
-                            state::confirmed_state::Value::Track(state::Track {
-                                track_id: "video-track".into(),
-                                participant_id: "publisher".into(),
-                                label: "camera".into(),
-                                kind: Some(state::track::Kind::Video(state::VideoTrack {
-                                    format: Some(state::CodecFormat {
-                                        codec: Some(state::codec_format::Codec::Vp8(
-                                            state::Vp8Parameters {},
-                                        )),
-                                    }),
-                                })),
-                            }),
-                        ),
-                    ],
-                },
-                validation::Direction::Server,
-            )
+            payload: codec::encode_server(&state::ServerStateBatch {
+                initial_complete: true,
+                records: vec![
+                    grant(1),
+                    confirmed(
+                        state::resource_key::Key::Participant("publisher".into()),
+                        0,
+                        state::confirmed_state::Value::Participant(state::Participant {
+                            participant_id: "publisher".into(),
+                            participant_external_id: "publisher-external".into(),
+                        }),
+                    ),
+                    confirmed(
+                        state::resource_key::Key::Track("video-track".into()),
+                        0,
+                        state::confirmed_state::Value::Track(state::Track {
+                            track_id: "video-track".into(),
+                            participant_id: "publisher".into(),
+                            label: "camera".into(),
+                            kind: Some(state::track::Kind::Video(state::VideoTrack {
+                                format: Some(state::CodecFormat {
+                                    codec: Some(state::codec_format::Codec::Vp8(
+                                        state::Vp8Parameters {},
+                                    )),
+                                }),
+                            })),
+                        }),
+                    ),
+                ],
+            })
             .unwrap(),
         }))
         .unwrap();
@@ -2372,7 +2366,7 @@ fn partial_native_observations_preserve_other_receivers_and_declared_desire() {
         .unwrap();
     let installed = video.installed(participant, tracks[0].clone());
     let mut waiting = installed.clone();
-    let Some(state::state_record::State::Confirmed(confirmation)) = &mut waiting.state else {
+    let Some(confirmation) = &mut waiting.confirmed else {
         panic!("confirmation")
     };
     let Some(state::confirmed_state::Value::Owned(live)) = &mut confirmation.value else {
@@ -2811,7 +2805,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             );
         }
         let mut waiting = video.receiver_installed(&participant, &tracks);
-        let Some(state::state_record::State::Confirmed(confirmation)) = &mut waiting.state else {
+        let Some(confirmation) = &mut waiting.confirmed else {
             panic!("confirmation")
         };
         let Some(state::confirmed_state::Value::Owned(live)) = &mut confirmation.value else {
@@ -3014,7 +3008,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             "catalog replacement alone does not retire installed audio"
         );
         let mut waiting = audio.receiver_installed(&participant, &tracks);
-        let Some(state::state_record::State::Confirmed(confirmation)) = &mut waiting.state else {
+        let Some(confirmation) = &mut waiting.confirmed else {
             panic!("audio confirmation")
         };
         let Some(state::confirmed_state::Value::Owned(live)) = &mut confirmation.value else {
@@ -3178,7 +3172,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
     let before = agent.snapshot().clone();
     assert_eq!(before.participants.len(), 1);
     assert_eq!(before.publications.len(), 1);
-    let malformed = state::StateBatch {
+    let malformed = state::ServerStateBatch {
         records: ["first", "second"]
             .into_iter()
             .map(|external| {
@@ -3201,7 +3195,9 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
             channel: control,
             payload: malformed,
         })),
-        Err(AgentError::InvalidSignaling(SignalingError::Malformed))
+        Err(AgentError::InvalidSignaling(SignalingError::Invalid(
+            "participant identity"
+        )))
     ));
     assert_eq!(agent.snapshot().participants, before.participants);
     assert_eq!(agent.snapshot().publications, before.publications);
@@ -3416,6 +3412,16 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
     use pulsebeam_proto::state;
 
     let (mut agent, generation, channel, targets) = native_media::connected();
+    let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        targets
+            .iter()
+            .map(|target| target.receiver_installed(&participant, &tracks))
+            .collect(),
+    );
     let mut per_track = desired(2);
     per_track.video[0].playout_delay = PlayoutDelay::Fixed {
         min_ms: 20,
@@ -3468,6 +3474,19 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
     agent
         .command(AgentCommand::ReplaceDesired(desired(3)))
         .unwrap();
+    assert!(
+        agent.next_effect().is_none(),
+        "settings wait for the preceding evaluation"
+    );
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        fixed
+            .iter()
+            .map(|target| target.receiver_installed(&participant, &tracks))
+            .collect(),
+    );
     let adaptive = native_media::next(&mut agent, generation, channel);
     assert_eq!(adaptive.len(), 2);
     for target in &adaptive {
@@ -3539,7 +3558,7 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
 
 #[test]
 fn pending_control_fences_completion_before_a_replacement_lifetime() {
-    use pulsebeam_proto::state::{self, codec, validation};
+    use pulsebeam_proto::state::{self, codec};
     let registrations = TopicRegistrations {
         publishers: vec![publisher("state", TopicMode::Latest)],
         subscribers: vec![],
@@ -3564,15 +3583,12 @@ fn pending_control_fences_completion_before_a_replacement_lifetime() {
     else {
         panic!("queued retirement")
     };
-    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let batch = codec::decode_client(&payload).unwrap();
     let [record] = batch.records.as_slice() else {
         panic!("one retirement")
     };
-    assert_eq!(
-        record.key.as_ref().unwrap().key,
-        Some(state::resource_key::Key::Owned(first.reference))
-    );
-    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+    assert_eq!(record.owned, first.reference);
+    let Some(desired) = &record.desired else {
         panic!("desired")
     };
     assert!(matches!(
@@ -3630,7 +3646,7 @@ fn pending_control_fences_completion_before_a_replacement_lifetime() {
 
 #[test]
 fn failed_control_send_retries_its_frame_before_coalesced_successors() {
-    use pulsebeam_proto::state::{self, codec, validation};
+    use pulsebeam_proto::state::{self, codec};
     let initial = publisher("state", TopicMode::Latest);
     let (mut agent, generation, control) = native_connection::connected(TopicRegistrations {
         publishers: vec![initial.clone()],
@@ -3721,16 +3737,12 @@ fn failed_control_send_retries_its_frame_before_coalesced_successors() {
         panic!("coalesced successor")
     };
     assert_eq!(channel, control);
-    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let batch = codec::decode_client(&payload).unwrap();
     let [record] = batch.records.as_slice() else {
         panic!("only final target is serialized")
     };
-    let Some(state::resource_key::Key::Owned(reference)) =
-        record.key.as_ref().and_then(|key| key.key.as_ref())
-    else {
-        panic!("owned")
-    };
-    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+    let reference = &record.owned;
+    let Some(desired) = &record.desired else {
         panic!("desired")
     };
     assert_eq!(*reference, first.reference + 1);
@@ -3755,7 +3767,7 @@ fn failed_control_send_retries_its_frame_before_coalesced_successors() {
 #[test]
 fn topic_registrations_validate_and_retire_only_omitted_sources() {
     use alloc::collections::BTreeSet;
-    use pulsebeam_proto::state::{self, codec, validation};
+    use pulsebeam_proto::state::{self, codec};
     let (mut agent, generation, control) =
         native_connection::connected(TopicRegistrations::default());
     let mut registrations = TopicRegistrations::default();
@@ -3857,20 +3869,16 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
         panic!("owned retirements")
     };
     assert_eq!(channel, control);
-    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let batch = codec::decode_client(&payload).unwrap();
     assert_eq!(batch.records.len(), 4);
     let mut refs = BTreeSet::new();
     let confirmed = batch
         .records
         .iter()
         .map(|record| {
-            let Some(state::resource_key::Key::Owned(reference)) =
-                record.key.as_ref().and_then(|key| key.key.as_ref())
-            else {
-                panic!("owned")
-            };
+            let reference = &record.owned;
             refs.insert(*reference);
-            let Some(state::state_record::State::Desired(desired)) = &record.state else {
+            let Some(desired) = &record.desired else {
                 panic!("desired")
             };
             assert!(matches!(
@@ -3968,7 +3976,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
 
 #[test]
 fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
-    use pulsebeam_proto::state::{codec, validation};
+    use pulsebeam_proto::state::codec;
 
     for discovery_complete in [false, true] {
         let subscriber = subscriber("events", TopicMode::Ordered);
@@ -3997,13 +4005,10 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
                 .handle(HostEvent::DataChannel(DataChannelEvent::Message {
                     generation,
                     channel,
-                    payload: codec::encode(
-                        &pulsebeam_proto::state::StateBatch {
-                            records: Vec::new(),
-                            initial_complete: true,
-                        },
-                        validation::Direction::Server,
-                    )
+                    payload: codec::encode_server(&pulsebeam_proto::state::ServerStateBatch {
+                        records: Vec::new(),
+                        initial_complete: true,
+                    })
                     .unwrap(),
                 }))
                 .unwrap();
@@ -4452,7 +4457,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
 
 #[test]
 fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifetime() {
-    use pulsebeam_proto::state::{self, codec, validation};
+    use pulsebeam_proto::state::{self, codec};
     let registrations = TopicRegistrations {
         publishers: vec![],
         subscribers: vec![subscriber("events", TopicMode::Lossy)],
@@ -4551,15 +4556,12 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         panic!("owned retirement")
     };
     assert_eq!(channel, control);
-    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let batch = codec::decode_client(&payload).unwrap();
     let [record] = batch.records.as_slice() else {
         panic!("one source retirement")
     };
-    assert_eq!(
-        record.key.as_ref().unwrap().key,
-        Some(state::resource_key::Key::Owned(receiving.reference))
-    );
-    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+    assert_eq!(record.owned, receiving.reference);
+    let Some(desired) = &record.desired else {
         panic!("desired")
     };
     assert!(matches!(
@@ -5012,7 +5014,7 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
 
 #[test]
 fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
-    use pulsebeam_proto::state::{self, codec, validation};
+    use pulsebeam_proto::state::{self, codec};
     for mode in [TopicMode::Lossy, TopicMode::Ordered] {
         for cutoff_first in [false, true] {
             let (mut agent, generation, control, old) =
@@ -5094,15 +5096,12 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
                     panic!("retirement frame")
                 };
                 assert_eq!(output, control);
-                let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+                let batch = codec::decode_client(&payload).unwrap();
                 let [record] = batch.records.as_slice() else {
                     panic!("one retirement")
                 };
-                assert_eq!(
-                    record.key.as_ref().unwrap().key,
-                    Some(state::resource_key::Key::Owned(old.reference))
-                );
-                let Some(state::state_record::State::Desired(desired)) = &record.state else {
+                assert_eq!(record.owned, old.reference);
+                let Some(desired) = &record.desired else {
                     panic!("desired retirement")
                 };
                 assert!(matches!(
@@ -5322,15 +5321,12 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
         panic!("scoped retirement")
     };
     assert_eq!(channel, control);
-    let batch = state::codec::decode(&payload, state::validation::Direction::Client).unwrap();
+    let batch = state::codec::decode_client(&payload).unwrap();
     let [record] = batch.records.as_slice() else {
         panic!("one retirement")
     };
-    assert_eq!(
-        record.key.as_ref().unwrap().key,
-        Some(state::resource_key::Key::Owned(left.reference))
-    );
-    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+    assert_eq!(record.owned, left.reference);
+    let Some(desired) = &record.desired else {
         panic!("desired")
     };
     assert!(matches!(
@@ -5836,7 +5832,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
 
 #[test]
 fn reconnect_starts_fresh_publications_without_old_history_or_generation_output() {
-    use pulsebeam_proto::state::{self, codec, validation};
+    use pulsebeam_proto::state::{self, codec};
     let registrations = TopicRegistrations {
         publishers: vec![publisher("chat", TopicMode::Ordered)],
         subscribers: vec![subscriber("chat", TopicMode::Ordered)],
@@ -5931,13 +5927,10 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: signal,
-            payload: codec::encode(
-                &state::StateBatch {
-                    records: vec![native_connection::grant(1)],
-                    initial_complete: true,
-                },
-                validation::Direction::Server,
-            )
+            payload: codec::encode_server(&state::ServerStateBatch {
+                records: vec![native_connection::grant(1)],
+                initial_complete: true,
+            })
             .unwrap(),
         }))
         .unwrap();

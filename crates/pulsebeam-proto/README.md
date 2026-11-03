@@ -7,12 +7,13 @@ and stable signaling topic names.
 Edit the files in `proto/`, not generated output in `OUT_DIR`. Wire changes
 must account for every producer and consumer before switching endpoints.
 
-`state` defines typed desired/confirmed resource records, prepared transport
-facts and capabilities. `state::codec` accepts raw protobuf or one independent
-raw LZ4 block with an encoding byte and little-endian decoded-length prefix.
-It enforces 4,096 decoded bytes, 4,101 framed bytes and at most 16 records,
-with structural preflight before generated decoding and exact input/output
-consumption. Callers select client or server direction explicitly.
+HTTP bootstrap selects `pulsebeam.media.v1` once. Each binary message on
+negotiated channel 0 is one raw protobuf `ClientStateBatch` or `ServerStateBatch`,
+with no encoding prefix or compression. `state::codec` enforces 1..4,096 bytes
+and at most 16 resource records, with structural preflight before generated
+decoding. Use `encode_client`/`decode_client` for owned desired proposals and
+`encode_server`/`decode_server` for authoritative observations. Their record
+types share resource values, not an envelope that permits either direction.
 `state::validation::validate_spec` checks resource configuration separately:
 a valid desired envelope with an invalid configuration requires a scoped
 rejection, not a malformed-frame failure. Connection owners enforce revision
@@ -26,9 +27,12 @@ values retain presence. This feature requires `std`; default builds retain the
 The owner unit suite checks both configurations using the existing capability
 fixture. JSON parsing does not replace capability validation or the HTTP owner's
 body limits and whole-document duplicate-key enforcement. There is no JSON
-StateBatch codec.
+state-batch codec.
 
-Native signaling uses only StateBatch framing. There is no Catalog/Intent/Mapping
+This pre-release cutover retains `pulsebeam.media.v1` and requires coordinated
+endpoint updates. Unsupported profiles are rejected during HTTP bootstrap.
+Future compression requires an explicitly supported profile, not per-message
+negotiation. There is no Catalog/Intent/Mapping
 schema, legacy codec export or fallback decoder. The signaling data-channel label
 is unchanged; it does not select a different wire protocol.
 
@@ -53,7 +57,7 @@ semantics are unchanged.
 
 ## Unsupported receive settings
 
-StateBatch evaluates each resource independently. An unsupported configuration
+The server evaluates each resource independently. An unsupported configuration
 rejects that resource's evaluated target without replacing its accepted value,
 rewriting client desire or rolling back unrelated resources. Rejection does not
 settle a newer target and is distinct from malformed-wire or fatal transport

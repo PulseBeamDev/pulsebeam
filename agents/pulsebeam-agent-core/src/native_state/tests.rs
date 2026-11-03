@@ -40,23 +40,20 @@ fn spec(enabled: bool, stream: u32) -> wire::ResourceSpec {
     }
 }
 
-fn frame(records: Vec<wire::StateRecord>, initial_complete: bool) -> Vec<u8> {
-    codec::encode(
-        &wire::StateBatch {
-            records,
-            initial_complete,
-        },
-        validation::Direction::Server,
-    )
+fn frame(records: Vec<wire::ServerStateRecord>, initial_complete: bool) -> Vec<u8> {
+    codec::encode_server(&wire::ServerStateBatch {
+        records,
+        initial_complete,
+    })
     .unwrap()
 }
 
-fn record(reference: u64, state: wire::ConfirmedState) -> wire::StateRecord {
-    wire::StateRecord {
+fn record(reference: u64, state: wire::ConfirmedState) -> wire::ServerStateRecord {
+    wire::ServerStateRecord {
         key: Some(wire::ResourceKey {
             key: Some(wire::resource_key::Key::Owned(reference)),
         }),
-        state: Some(wire::state_record::State::Confirmed(state)),
+        confirmed: Some(state),
     }
 }
 
@@ -99,12 +96,16 @@ fn absent(revision: u64) -> wire::ConfirmedState {
     }
 }
 
-fn session(revision: u64, expires: i64, closed: Option<wire::CloseReason>) -> wire::StateRecord {
-    wire::StateRecord {
+fn session(
+    revision: u64,
+    expires: i64,
+    closed: Option<wire::CloseReason>,
+) -> wire::ServerStateRecord {
+    wire::ServerStateRecord {
         key: Some(wire::ResourceKey {
             key: Some(wire::resource_key::Key::Session(true)),
         }),
-        state: Some(wire::state_record::State::Confirmed(wire::ConfirmedState {
+        confirmed: Some(wire::ConfirmedState {
             evaluated_revision: 0,
             rejection: None,
             value: Some(wire::confirmed_state::Value::Session(wire::SessionState {
@@ -115,28 +116,17 @@ fn session(revision: u64, expires: i64, closed: Option<wire::CloseReason>) -> wi
                 closed: closed.map(|reason| reason as i32),
                 diagnostic: String::new(),
             })),
-        })),
+        }),
     }
 }
 
 fn next(client: &mut NativeState) -> Vec<(u64, wire::DesiredState)> {
-    codec::decode(
-        &client.next_frame().unwrap().unwrap(),
-        validation::Direction::Client,
-    )
-    .unwrap()
-    .records
-    .into_iter()
-    .map(|record| {
-        let Some(wire::resource_key::Key::Owned(reference)) = record.key.unwrap().key else {
-            panic!("owned key")
-        };
-        let Some(wire::state_record::State::Desired(state)) = record.state else {
-            panic!("desired value")
-        };
-        (reference, state)
-    })
-    .collect()
+    codec::decode_client(&client.next_frame().unwrap().unwrap())
+        .unwrap()
+        .records
+        .into_iter()
+        .map(|record| (record.owned, record.desired.unwrap()))
+        .collect()
 }
 
 #[test]
@@ -157,6 +147,55 @@ fn coalescing_allocates_only_serialized_revisions_and_cancellation_retains_no_wi
     client.stage(resource(), Some(spec(true, 1))).unwrap();
     assert!(client.next_frame().unwrap().is_none());
     assert_eq!(client.revision, 1);
+}
+
+#[test]
+fn pending_resource_coalesces_without_blocking_other_resources_or_retirement() {
+    let mut client = NativeState::new(1024 * 1024, participant()).unwrap();
+    client.stage(resource(), Some(spec(true, 1))).unwrap();
+    assert_eq!(next(&mut client)[0].1.revision, 1);
+    client.stage(resource(), Some(spec(false, 1))).unwrap();
+    assert!(client.next_frame().unwrap().is_none());
+    client.retry(&resource());
+    assert!(client.next_frame().unwrap().is_none());
+
+    let other = Resource::Publication {
+        kind: wire::TrackKind::Data,
+        label: "other".into(),
+    };
+    let mut other_spec = spec(true, 2);
+    let Some(wire::resource_spec::Declaration::Publication(publication)) =
+        &mut other_spec.declaration
+    else {
+        panic!("publication")
+    };
+    publication.label = "other".into();
+    client.stage(other, Some(other_spec)).unwrap();
+    let records = next(&mut client);
+    assert_eq!((records[0].0, records[0].1.revision), (2, 2));
+
+    client.stage(resource(), Some(spec(true, 1))).unwrap();
+    client.stage(resource(), Some(spec(false, 1))).unwrap();
+    assert!(client.next_frame().unwrap().is_none());
+    client
+        .apply(&frame(
+            alloc::vec![record(1, live(1, spec(true, 1)))],
+            false,
+        ))
+        .unwrap();
+    let records = next(&mut client);
+    assert_eq!((records[0].0, records[0].1.revision), (1, 3));
+    let Some(wire::desired_state::Value::Present(latest)) = &records[0].1.value else {
+        panic!("present")
+    };
+    assert_eq!(latest.settings.as_ref().unwrap().enabled, Some(false));
+    client.stage(resource(), None).unwrap();
+    let retirement = next(&mut client);
+    assert_eq!((retirement[0].0, retirement[0].1.revision), (1, 4));
+    assert_eq!(
+        retirement[0].1.value,
+        Some(wire::desired_state::Value::Absent(true))
+    );
 }
 
 #[test]
@@ -183,15 +222,25 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
     assert!(client.eligible(&resource()).is_none());
     assert_eq!(next(&mut client)[0].1.revision, 2);
     client.stage(resource(), Some(spec(true, 1))).unwrap();
-    assert_eq!(next(&mut client)[0].1.revision, 3);
+    assert!(client.next_frame().unwrap().is_none());
     client
         .apply(&frame(
             alloc::vec![record(1, live(1, spec(true, 1)))],
             false,
         ))
         .unwrap();
+    assert!(client.next_frame().unwrap().is_none());
     assert!(client.eligible(&resource()).is_none());
     assert!(!client.converged(&resource()));
+    let mut rejected_disable = live(2, spec(true, 1));
+    rejected_disable.rejection = Some(wire::Failure {
+        code: wire::FailureCode::InternalFailure as i32,
+        diagnostic: String::new(),
+    });
+    client
+        .apply(&frame(alloc::vec![record(1, rejected_disable)], false))
+        .unwrap();
+    assert_eq!(next(&mut client)[0].1.revision, 3);
     let mut rejected = live(3, spec(true, 1));
     rejected.rejection = Some(wire::Failure {
         code: wire::FailureCode::CapacityExceeded as i32,

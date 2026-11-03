@@ -1,6 +1,6 @@
 use super::*;
 use alloc::boxed::Box;
-use state::{codec, validation};
+use state::codec;
 
 use crate::tests::native_connection::{confirmed, connected, grant, observe};
 
@@ -642,14 +642,10 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         panic!("StateBatch")
     };
     assert_eq!(sent_channel, control);
-    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let batch = codec::decode_client(&payload).unwrap();
     let record = &batch.records[0];
-    let state::resource_key::Key::Owned(reference) =
-        record.key.as_ref().unwrap().key.as_ref().unwrap()
-    else {
-        panic!("owned ref")
-    };
-    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+    let reference = &record.owned;
+    let Some(desired) = &record.desired else {
         panic!("desired")
     };
     let Some(state::desired_state::Value::Present(spec)) = &desired.value else {
@@ -705,13 +701,10 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     else {
         panic!("serialized retirement")
     };
-    let retired = codec::decode(&retirement, validation::Direction::Client).unwrap();
-    assert_eq!(
-        retired.records[0].key.as_ref().unwrap().key,
-        Some(state::resource_key::Key::Owned(*reference))
-    );
+    let retired = codec::decode_client(&retirement).unwrap();
+    assert_eq!(retired.records[0].owned, *reference);
     assert!(
-        matches!(&retired.records[0].state, Some(state::state_record::State::Desired(value)) if matches!(value.value, Some(state::desired_state::Value::Absent(true))))
+        matches!(&retired.records[0].desired, Some(value) if matches!(value.value, Some(state::desired_state::Value::Absent(true))))
     );
     observe(
         &mut agent,
@@ -760,7 +753,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         agent.next_effect().is_none(),
         "reset completion cannot release a stream retained by the server"
     );
-    let Some(state::state_record::State::Desired(absent)) = &retired.records[0].state else {
+    let Some(absent) = &retired.records[0].desired else {
         panic!("retirement desired state")
     };
     observe(

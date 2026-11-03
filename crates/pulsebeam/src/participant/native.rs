@@ -29,7 +29,7 @@ impl Key {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InputError {
-    #[error("invalid StateBatch frame: {0:?}")]
+    #[error("invalid ClientStateBatch message: {0:?}")]
     Decode(codec::DecodeError),
     #[error("invalid connection revision order")]
     Revision,
@@ -39,7 +39,7 @@ pub(crate) enum InputError {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OutputError {
-    #[error("unrepresentable StateBatch value: {0:?}")]
+    #[error("unrepresentable ServerStateBatch value: {0:?}")]
     Encode(codec::EncodeError),
     #[error("required source or execution facts are unavailable")]
     InvalidObservation,
@@ -140,17 +140,14 @@ impl NativeSession {
     }
 
     fn put(&mut self, key: Key, value: wire::ConfirmedState) -> Result<(), OutputError> {
-        let record = wire::StateRecord {
+        let record = wire::ServerStateRecord {
             key: Some(key.wire()),
-            state: Some(wire::state_record::State::Confirmed(value.clone())),
+            confirmed: Some(value.clone()),
         };
-        codec::encode(
-            &wire::StateBatch {
-                records: vec![record],
-                initial_complete: false,
-            },
-            validation::Direction::Server,
-        )
+        codec::encode_server(&wire::ServerStateBatch {
+            records: vec![record],
+            initial_complete: false,
+        })
         .map_err(OutputError::Encode)?;
         if self.rows.get(&key).is_some_and(|row| row.value == value) {
             return Ok(());
@@ -380,18 +377,11 @@ impl NativeSession {
     }
 
     pub(crate) fn apply_input(&mut self, bytes: &[u8]) -> Result<Vec<u64>, InputError> {
-        let batch =
-            codec::decode(bytes, validation::Direction::Client).map_err(InputError::Decode)?;
+        let batch = codec::decode_client(bytes).map_err(InputError::Decode)?;
         let mut cutoffs = Vec::new();
         for record in batch.records {
-            let Some(wire::resource_key::Key::Owned(reference)) =
-                record.key.and_then(|key| key.key)
-            else {
-                return Err(InputError::Revision);
-            };
-            let Some(wire::state_record::State::Desired(target)) = record.state else {
-                return Err(InputError::Revision);
-            };
+            let reference = record.owned;
+            let target = record.desired.ok_or(InputError::Revision)?;
             if self.closed || target.revision <= self.last_revision {
                 return Err(InputError::Revision);
             }
@@ -427,6 +417,13 @@ impl NativeSession {
             let Some(wire::desired_state::Value::Present(spec)) = target.value.as_ref() else {
                 return Err(InputError::Revision);
             };
+            if self.rows.get(&key).is_some_and(|row| {
+                row.owned.as_ref().is_some_and(|owned| {
+                    !owned.retired && row.value.evaluated_revision < owned.target.revision
+                })
+            }) {
+                return Err(InputError::Revision);
+            }
             let existing = self.rows.get(&key).and_then(|row| row.owned.as_ref());
             if reference < target.revision && existing.is_none_or(|owned| owned.retired) {
                 self.put(
@@ -927,7 +924,7 @@ impl NativeSession {
                 }
             }
         }
-        let mut batch = wire::StateBatch::default();
+        let mut batch = wire::ServerStateBatch::default();
         let mut selected = Vec::new();
         let mut selected_cursor = cursor;
         for key in keys {
@@ -944,15 +941,15 @@ impl NativeSession {
                 self.requeue(&key);
                 continue;
             }
-            let record = wire::StateRecord {
+            let record = wire::ServerStateRecord {
                 key: Some(key.wire()),
-                state: Some(wire::state_record::State::Confirmed(row.value.clone())),
+                confirmed: Some(row.value.clone()),
             };
             let candidate_len = batch
                 .encoded_len()
                 .saturating_add(record.encoded_len())
                 .saturating_add(3);
-            if candidate_len > codec::MAX_DECODED_SIZE {
+            if candidate_len > codec::MAX_FRAME_SIZE {
                 self.requeue(&key);
                 continue;
             }
@@ -992,15 +989,14 @@ impl NativeSession {
         }
         batch.initial_complete =
             self.unavailable == 0 && !self.initial_complete && selected_cursor == end;
-        if batch.encoded_len() > codec::MAX_DECODED_SIZE {
+        if batch.encoded_len() > codec::MAX_FRAME_SIZE {
             batch.initial_complete = false;
         }
         if batch.records.is_empty() && !batch.initial_complete {
             self.initial_cursor = selected_cursor;
             return Ok(None);
         }
-        let bytes =
-            codec::encode(&batch, validation::Direction::Server).map_err(OutputError::Encode)?;
+        let bytes = codec::encode_server(&batch).map_err(OutputError::Encode)?;
         self.pending = Some(Pending {
             output: NativeOutput { cid, bytes },
             selected,
@@ -1143,9 +1139,9 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
         code: wire::FailureCode::InternalFailure as i32,
         diagnostic,
     };
-    let record = wire::StateRecord {
+    let record = wire::ServerStateRecord {
         key: Some(Key::Owned(u64::MAX).wire()),
-        state: Some(wire::state_record::State::Confirmed(wire::ConfirmedState {
+        confirmed: Some(wire::ConfirmedState {
             evaluated_revision: u64::MAX,
             rejection: Some(failure.clone()),
             value: Some(wire::confirmed_state::Value::Owned(Box::new(
@@ -1158,14 +1154,14 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
                     activity: Some(wire::MediaActivity::Active as i32),
                 },
             ))),
-        })),
+        }),
     };
-    wire::StateBatch {
+    wire::ServerStateBatch {
         records: vec![record],
         initial_complete: true,
     }
     .encoded_len()
-        <= codec::MAX_DECODED_SIZE
+        <= codec::MAX_FRAME_SIZE
 }
 
 fn confirmed(value: wire::confirmed_state::Value) -> wire::ConfirmedState {

@@ -23,7 +23,6 @@ WASM_DEPS = {
         "@wasm_crates//:uniffi"
     ],
     "crates/pulsebeam-proto": [
-        "@wasm_crates//:lz4_flex",
         "@wasm_crates//:prost",
         "@wasm_crates//:prost-types",
         "@wasm_crates//:pbjson",

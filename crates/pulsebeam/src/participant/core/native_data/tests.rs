@@ -1,6 +1,6 @@
 use super::*;
 use crate::participant::event::test_utils::MockParticipantSink;
-use pulsebeam_proto::state::{codec, validation};
+use pulsebeam_proto::state::codec;
 
 pub(in crate::participant::core) fn participant() -> Participant {
     participant_with_expiry(unix_now() + 60)
@@ -78,21 +78,15 @@ pub(in crate::participant::core) fn frame_for(
     revision: u64,
     value: wire::desired_state::Value,
 ) -> Vec<u8> {
-    codec::encode(
-        &wire::StateBatch {
-            records: vec![wire::StateRecord {
-                key: Some(wire::ResourceKey {
-                    key: Some(wire::resource_key::Key::Owned(reference)),
-                }),
-                state: Some(wire::state_record::State::Desired(wire::DesiredState {
-                    revision,
-                    value: Some(value),
-                })),
-            }],
-            initial_complete: false,
-        },
-        validation::Direction::Client,
-    )
+    codec::encode_client(&wire::ClientStateBatch {
+        records: vec![wire::ClientStateRecord {
+            owned: reference,
+            desired: Some(wire::DesiredState {
+                revision,
+                value: Some(value),
+            }),
+        }],
+    })
     .unwrap()
 }
 
@@ -112,11 +106,11 @@ pub(in crate::participant::core) fn confirmations_for(
             return values;
         }
         if let Some(output) = participant.signaling.poll().unwrap() {
-            let batch = codec::decode(&output.bytes, validation::Direction::Server).unwrap();
+            let batch = codec::decode_server(&output.bytes).unwrap();
             for record in batch.records {
                 if record.key.and_then(|key| key.key)
                     == Some(wire::resource_key::Key::Owned(reference))
-                    && let Some(wire::state_record::State::Confirmed(value)) = record.state
+                    && let Some(value) = record.confirmed
                 {
                     values.push(value);
                 }

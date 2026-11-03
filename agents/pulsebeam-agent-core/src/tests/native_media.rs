@@ -1,6 +1,6 @@
 use super::*;
 use crate::{client_sdp, rtc_preparation};
-use pulsebeam_proto::state::{self, codec, validation};
+use pulsebeam_proto::state::{self, codec};
 
 pub(super) struct Target {
     pub reference: u64,
@@ -19,7 +19,7 @@ impl Target {
         &self,
         participant: &state::Participant,
         tracks: &[state::Track],
-    ) -> state::StateRecord {
+    ) -> state::ServerStateRecord {
         let Some(state::resource_spec::Declaration::Subscription(subscription)) =
             &self.spec().declaration
         else {
@@ -36,7 +36,7 @@ impl Target {
         &self,
         participant: state::Participant,
         track: state::Track,
-    ) -> state::StateRecord {
+    ) -> state::ServerStateRecord {
         native_connection::confirmed(
             state::resource_key::Key::Owned(self.reference),
             self.desired.revision,
@@ -124,18 +124,14 @@ pub(super) fn next(agent: &mut Agent, generation: Generation, channel: ChannelId
         panic!("native resource frame")
     };
     assert_eq!((actual_generation, actual_channel), (generation, channel));
-    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let batch = codec::decode_client(&payload).unwrap();
     acknowledge_send(agent, generation, channel, operation);
     batch
         .records
         .into_iter()
         .map(|record| {
-            let Some(state::resource_key::Key::Owned(reference)) =
-                record.key.and_then(|key| key.key)
-            else {
-                panic!("owned key")
-            };
-            let Some(state::state_record::State::Desired(desired)) = record.state else {
+            let reference = record.owned;
+            let Some(desired) = record.desired else {
                 panic!("desired resource")
             };
             Target { reference, desired }

@@ -5,20 +5,17 @@
     clippy::unwrap_used
 )]
 
-use alloc::{string::String, vec, vec::Vec};
-use lz4_flex::block::compress;
+use alloc::{string::String, vec};
 
 use super::*;
 use crate::state::*;
-use validation::{Direction::*, ValidationError};
+use validation::ValidationError;
 
-fn publication(revision: u64) -> StateBatch {
-    StateBatch {
-        records: vec![StateRecord {
-            key: Some(ResourceKey {
-                key: Some(resource_key::Key::Owned(revision)),
-            }),
-            state: Some(state_record::State::Desired(DesiredState {
+fn publication(revision: u64) -> ClientStateBatch {
+    ClientStateBatch {
+        records: vec![ClientStateRecord {
+            owned: revision,
+            desired: Some(DesiredState {
                 revision,
                 value: Some(desired_state::Value::Present(
                     ResourceSpec {
@@ -42,41 +39,22 @@ fn publication(revision: u64) -> StateBatch {
                     }
                     .into(),
                 )),
-            })),
+            }),
         }],
-        initial_complete: false,
     }
 }
 
-fn raw(bytes: &[u8], encoding: u8, length: usize) -> Vec<u8> {
-    let mut frame = vec![encoding];
-    frame.extend_from_slice(&u32::try_from(length).unwrap().to_le_bytes());
-    frame.extend_from_slice(bytes);
-    frame
-}
-
-fn desired(batch: &mut StateBatch) -> &mut DesiredState {
-    let Some(state_record::State::Desired(desired)) = &mut batch.records[0].state else {
-        panic!("desired fixture")
-    };
-    desired
+fn desired(batch: &mut ClientStateBatch) -> &mut DesiredState {
+    batch.records[0].desired.as_mut().unwrap()
 }
 
 #[test]
-fn both_encodings_preserve_exact_revision_and_explicit_false() {
+fn raw_protobuf_preserves_exact_revision_and_explicit_false() {
     for revision in [1, (1 << 53) + 1, u64::MAX] {
         let mut batch = publication(revision);
         let protobuf = batch.encode_to_vec();
-        for (encoding, payload) in [(0, protobuf.clone()), (1, compress(&protobuf))] {
-            assert_eq!(
-                decode(&raw(&payload, encoding, protobuf.len()), Client),
-                Ok(batch.clone())
-            );
-        }
-        assert_eq!(
-            decode(&encode(&batch, Client).unwrap(), Client),
-            Ok(batch.clone())
-        );
+        assert_eq!(encode_client(&batch), Ok(protobuf.clone()));
+        assert_eq!(decode_client(&protobuf), Ok(batch.clone()));
         let Some(desired_state::Value::Present(spec)) = &desired(&mut batch).value else {
             panic!("present")
         };
@@ -86,171 +64,136 @@ fn both_encodings_preserve_exact_revision_and_explicit_false() {
 }
 
 #[test]
-fn server_marker_is_not_a_client_message_or_an_empty_ordinary_batch() {
-    let marker = StateBatch {
+fn server_marker_and_records_cannot_be_client_proposals() {
+    let marker = ServerStateBatch {
         initial_complete: true,
         records: vec![],
     };
-    assert_eq!(encode(&marker, Server), Ok(vec![0, 2, 0, 0, 0, 0x10, 1]));
+    assert_eq!(encode_server(&marker), Ok(vec![0x10, 1]));
+    assert_eq!(decode_server(&[0x10, 1]), Ok(marker));
     assert_eq!(
-        decode(&encode(&marker, Server).unwrap(), Server),
-        Ok(marker.clone())
+        decode_client(&[0x10, 1]),
+        Err(DecodeError::Validation(ValidationError::Batch))
     );
     assert_eq!(
-        encode(&marker, Client),
+        encode_server(&ServerStateBatch::default()),
         Err(EncodeError::Validation(ValidationError::Batch))
     );
     assert_eq!(
-        encode(&StateBatch::default(), Server),
+        encode_client(&ClientStateBatch::default()),
         Err(EncodeError::Validation(ValidationError::Batch))
     );
-    assert_eq!(
-        encode(&publication(1), Server),
-        Err(EncodeError::Validation(ValidationError::Direction))
-    );
+    let observation = ServerStateBatch {
+        initial_complete: false,
+        records: vec![ServerStateRecord {
+            key: Some(ResourceKey {
+                key: Some(resource_key::Key::Owned(1)),
+            }),
+            confirmed: Some(ConfirmedState {
+                evaluated_revision: 1,
+                value: Some(confirmed_state::Value::Absent(AbsentState {
+                    reason: AbsenceReason::Removed as i32,
+                })),
+                ..Default::default()
+            }),
+        }],
+    };
+    assert!(decode_client(&encode_server(&observation).unwrap()).is_err());
+    assert!(decode_server(&encode_client(&publication(1)).unwrap()).is_err());
 }
 
 #[test]
 fn desired_envelopes_reject_illegal_refs_and_record_order_but_not_invalid_specs() {
     let mut batch = publication(1);
-    batch.records[0].key.as_mut().unwrap().key = Some(resource_key::Key::Owned(0));
+    batch.records[0].owned = 0;
     assert_eq!(
-        encode(&batch, Client),
+        encode_client(&batch),
         Err(EncodeError::Validation(ValidationError::Key))
     );
-    batch.records[0].key.as_mut().unwrap().key = Some(resource_key::Key::Owned(2));
+    batch.records[0].owned = 2;
     assert_eq!(
-        encode(&batch, Client),
+        encode_client(&batch),
         Err(EncodeError::Validation(ValidationError::Desired))
     );
-    batch.records[0].key.as_mut().unwrap().key = Some(resource_key::Key::Owned(1));
+    batch.records[0].owned = 1;
     desired(&mut batch).value = Some(desired_state::Value::Absent(true));
     assert_eq!(
-        encode(&batch, Client),
+        encode_client(&batch),
         Err(EncodeError::Validation(ValidationError::Desired))
     );
     desired(&mut batch).revision = 3;
-    assert!(encode(&batch, Client).is_ok());
+    assert!(encode_client(&batch).is_ok());
     desired(&mut batch).value = Some(desired_state::Value::Absent(false));
     assert_eq!(
-        encode(&batch, Client),
+        encode_client(&batch),
         Err(EncodeError::Validation(ValidationError::Desired))
     );
     desired(&mut batch).value = Some(desired_state::Value::Present(
         ResourceSpec::default().into(),
     ));
-    assert!(encode(&batch, Client).is_ok());
+    assert!(encode_client(&batch).is_ok());
     assert_eq!(
         validation::validate_spec(&ResourceSpec::default()),
         Err(ValidationError::Settings)
     );
     batch.records.push(publication(2).records.remove(0));
     assert_eq!(
-        encode(&batch, Client),
+        encode_client(&batch),
         Err(EncodeError::Validation(ValidationError::Desired))
     );
 }
 
 #[test]
-fn frame_and_lz4_lengths_are_exact_and_all_input_is_consumed() {
-    let batch = publication(1);
-    let protobuf = batch.encode_to_vec();
-    for encoding in [0, 1] {
-        let payload = if encoding == 0 {
-            protobuf.clone()
-        } else {
-            compress(&protobuf)
-        };
-        for length in [
-            0,
-            protobuf.len() - 1,
-            protobuf.len() + 1,
-            MAX_DECODED_SIZE + 1,
-        ] {
-            assert!(decode(&raw(&payload, encoding, length), Client).is_err());
-        }
-        let mut trailing = raw(&payload, encoding, protobuf.len());
-        trailing.push(0);
-        assert!(decode(&trailing, Client).is_err());
-        for end in 0..payload.len() {
-            assert!(decode(&raw(&payload[..end], encoding, protobuf.len()), Client).is_err());
-        }
+fn raw_messages_reject_truncation_trailing_garbage_and_legacy_framing() {
+    let protobuf = encode_client(&publication(1)).unwrap();
+    for end in 0..protobuf.len() {
+        assert!(decode_client(&protobuf[..end]).is_err());
     }
+    let mut trailing = protobuf.clone();
+    trailing.push(0);
+    assert!(decode_client(&trailing).is_err());
+    let mut legacy = vec![0];
+    legacy.extend_from_slice(&u32::try_from(protobuf.len()).unwrap().to_le_bytes());
+    legacy.extend_from_slice(&protobuf);
+    assert!(decode_client(&legacy).is_err());
     assert_eq!(
-        decode(&raw(&protobuf, 2, protobuf.len()), Client),
-        Err(DecodeError::Encoding)
-    );
-    assert_eq!(
-        decode(&vec![0; MAX_FRAME_SIZE + 1], Client),
+        decode_client(&vec![0; MAX_FRAME_SIZE + 1]),
         Err(DecodeError::FrameSize)
     );
-    // Valid overlapping copy followed by terminal literals.
-    assert_eq!(
-        decode_lz4(
-            &[0x1f, b'a', 1, 0, 2, 0x50, b'b', b'b', b'b', b'b', b'b'],
-            27
-        ),
-        Ok([vec![b'a'; 22], vec![b'b'; 5]].concat())
-    );
-    // A safe decoder must still reject blocks violating LZ4's terminal
-    // literal and last-match boundaries, even if they expand to exact length.
-    assert_eq!(
-        decode_lz4(&[0x10, b'a', 1, 0, 0], 5),
-        Err(DecodeError::InvalidBlock)
-    );
-    assert_eq!(
-        decode_lz4(&[0x10, b'a', 1, 0, 0x50, b'b', b'b', b'b', b'b', b'b'], 10),
-        Err(DecodeError::InvalidBlock)
-    );
-    for block in [&[0, 0, 0][..], &[0, 1, 0], &[0xf0], &[0x10, b'a', 1, 0]] {
-        assert!(decode_lz4(block, 32).is_err());
-    }
 }
 
 #[test]
-fn exact_raw_ceiling_and_compressible_oversize_do_not_bypass_admission() {
+fn exact_raw_ceiling_and_oversize_have_no_alternative_encoding() {
     let batch = publication(1);
     let mut protobuf = batch.encode_to_vec();
-    // Unknown descriptive field 31 with bytes payload. Its wire representation
-    // is valid and ignored; raw representability still bounds the whole batch.
-    let padding = MAX_DECODED_SIZE - protobuf.len() - 4;
+    // Unknown descriptive field 31 is ignored, but still counts toward admission.
+    let padding = MAX_FRAME_SIZE - protobuf.len() - 4;
     protobuf.extend_from_slice(&[
         0xfa,
         1,
         u8::try_from((padding & 127) | 128).unwrap(),
         u8::try_from(padding >> 7).unwrap(),
     ]);
-    protobuf.resize(MAX_DECODED_SIZE, b'x');
-    let frame = raw(&protobuf, 0, protobuf.len());
-    assert_eq!(frame.len(), MAX_FRAME_SIZE);
-    assert_eq!(decode(&frame, Client), Ok(batch));
+    protobuf.resize(MAX_FRAME_SIZE, b'x');
+    assert_eq!(decode_client(&protobuf), Ok(batch));
     protobuf.push(b'x');
-    assert_eq!(
-        decode(&raw(&compress(&protobuf), 1, protobuf.len()), Client),
-        Err(DecodeError::DecodedSize)
-    );
+    assert_eq!(decode_client(&protobuf), Err(DecodeError::FrameSize));
 }
 
 #[test]
 fn structural_preflight_bounds_repeated_empty_messages_groups_and_bad_varints() {
-    let full = StateBatch {
-        initial_complete: false,
+    let full = ClientStateBatch {
         records: (1..=u64::try_from(MAX_RECORDS).unwrap())
             .map(|r| publication(r).records.remove(0))
             .collect(),
     };
-    assert_eq!(decode(&encode(&full, Client).unwrap(), Client), Ok(full));
+    assert_eq!(decode_client(&encode_client(&full).unwrap()), Ok(full));
     let records = [0x0a, 0].repeat(MAX_RECORDS + 1);
-    assert_eq!(
-        decode(&raw(&records, 0, records.len()), Client),
-        Err(DecodeError::Structure)
-    );
+    assert_eq!(decode_client(&records), Err(DecodeError::Structure));
+    assert_eq!(decode_server(&records), Err(DecodeError::Structure));
     let mut nested = vec![0x0b; 17];
     nested.extend_from_slice(&[0x0c; 17]);
-    assert_eq!(
-        decode(&raw(&nested, 0, nested.len()), Server),
-        Err(DecodeError::Structure)
-    );
+    assert_eq!(decode_server(&nested), Err(DecodeError::Structure));
     for bytes in [
         &[0][..],
         &[0x80],
@@ -259,52 +202,23 @@ fn structural_preflight_bounds_repeated_empty_messages_groups_and_bad_varints() 
         ],
         &[0x0b, 0x14],
     ] {
-        assert_eq!(
-            decode(&raw(bytes, 0, bytes.len()), Server),
-            Err(DecodeError::InvalidProtobuf)
-        );
+        assert_eq!(decode_server(bytes), Err(DecodeError::InvalidProtobuf));
     }
-    // Unknown groups and duplicate singular messages retain protobuf merge
-    // semantics rather than requiring a canonical encoding/field order.
+    // Unknown groups and duplicate singular messages retain protobuf merge semantics.
     let bytes = [0xfb, 1, 8, 1, 0xfc, 1, 0x10, 1];
     assert_eq!(
-        decode(&raw(&bytes, 0, bytes.len()), Server),
-        Ok(StateBatch {
+        decode_server(&bytes),
+        Ok(ServerStateBatch {
             initial_complete: true,
             records: vec![]
         })
     );
     let batch = publication(1);
     let mut record = batch.records[0].encode_to_vec();
-    record.extend_from_slice(&[0x0a, 0]);
+    record.extend_from_slice(&[0x12, 0]);
     let mut duplicate = vec![0x0a, u8::try_from(record.len()).unwrap()];
     duplicate.extend_from_slice(&record);
-    assert_eq!(
-        decode(&raw(&duplicate, 0, duplicate.len()), Client),
-        Ok(batch)
-    );
-}
-
-#[test]
-fn independent_lz4_blocks_cover_long_literals_matches_and_overlap() {
-    for length in [1, 15, 16, 255, 256, 1024, MAX_DECODED_SIZE] {
-        let mut state = 7u32;
-        let random: Vec<_> = (0..length)
-            .map(|_| {
-                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                u8::try_from(state >> 24).unwrap()
-            })
-            .collect();
-        for bytes in [
-            vec![b'x'; length],
-            (0..length)
-                .map(|i| u8::try_from(i % 251).unwrap())
-                .collect(),
-            random,
-        ] {
-            assert_eq!(decode_lz4(&compress(&bytes), length), Ok(bytes));
-        }
-    }
+    assert_eq!(decode_client(&duplicate), Ok(batch));
 }
 
 fn rtp() -> RtpParameters {
@@ -350,7 +264,7 @@ fn rtp_presence_and_source_coordinates_are_not_conflated_with_zero() {
             }),
         })),
     }));
-    assert_eq!(decode(&encode(&batch, Client).unwrap(), Client), Ok(batch));
+    assert_eq!(decode_client(&encode_client(&batch).unwrap()), Ok(batch));
     assert_eq!(
         validation::validate_rtp(&binding, TrackKind::Audio, true),
         Ok(())
@@ -509,18 +423,18 @@ fn owned_confirmation_is_self_contained_and_execution_failure_is_not_rejection()
         }),
         value: Some(confirmed_state::Value::Owned(live.clone().into())),
     };
-    let batch = |confirmed| StateBatch {
+    let batch = |confirmed| ServerStateBatch {
         initial_complete: false,
-        records: vec![StateRecord {
+        records: vec![ServerStateRecord {
             key: Some(ResourceKey {
                 key: Some(resource_key::Key::Owned(1)),
             }),
-            state: Some(state_record::State::Confirmed(confirmed)),
+            confirmed: Some(confirmed),
         }],
     };
     let accepted = batch(confirmed.clone());
     assert_eq!(
-        decode(&encode(&accepted, Server).unwrap(), Server),
+        decode_server(&encode_server(&accepted).unwrap()),
         Ok(accepted)
     );
     let Some(confirmed_state::Value::Owned(current)) = confirmed.value.as_mut() else {
@@ -891,11 +805,11 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
 
 #[test]
 fn session_and_owned_absence_have_distinct_failure_and_direction_rules() {
-    let confirmed = |key, state| StateBatch {
+    let confirmed = |key, state| ServerStateBatch {
         initial_complete: false,
-        records: vec![StateRecord {
+        records: vec![ServerStateRecord {
             key: Some(ResourceKey { key: Some(key) }),
-            state: Some(state_record::State::Confirmed(state)),
+            confirmed: Some(state),
         }],
     };
     let grant = SessionState {
@@ -911,18 +825,15 @@ fn session_and_owned_absence_have_distinct_failure_and_direction_rules() {
         ..ConfirmedState::default()
     };
     assert!(
-        encode(
-            &confirmed(resource_key::Key::Session(true), session.clone()),
-            Server
-        )
+        encode_server(&confirmed(
+            resource_key::Key::Session(true),
+            session.clone()
+        ))
         .is_ok()
     );
     session.evaluated_revision = 1;
     assert_eq!(
-        encode(
-            &confirmed(resource_key::Key::Session(true), session),
-            Server
-        ),
+        encode_server(&confirmed(resource_key::Key::Session(true), session)),
         Err(EncodeError::Validation(ValidationError::Confirmed))
     );
     let mut absent = ConfirmedState {
@@ -931,19 +842,13 @@ fn session_and_owned_absence_have_distinct_failure_and_direction_rules() {
         })),
         ..ConfirmedState::default()
     };
-    assert!(
-        encode(
-            &confirmed(resource_key::Key::Owned(1), absent.clone()),
-            Server
-        )
-        .is_err()
-    );
+    assert!(encode_server(&confirmed(resource_key::Key::Owned(1), absent.clone())).is_err());
     absent.rejection = Some(Failure {
         code: FailureCode::InvalidConfiguration as i32,
         diagnostic: String::new(),
     });
     let batch = confirmed(resource_key::Key::Owned(1), absent);
-    assert_eq!(decode(&encode(&batch, Server).unwrap(), Server), Ok(batch));
+    assert_eq!(decode_server(&encode_server(&batch).unwrap()), Ok(batch));
     let terminal = ConfirmedState {
         value: Some(confirmed_state::Value::Session(SessionState {
             closed: Some(CloseReason::AuthorizationRevoked as i32),
@@ -953,5 +858,5 @@ fn session_and_owned_absence_have_distinct_failure_and_direction_rules() {
         ..ConfirmedState::default()
     };
     let batch = confirmed(resource_key::Key::Session(true), terminal);
-    assert_eq!(decode(&encode(&batch, Server).unwrap(), Server), Ok(batch));
+    assert_eq!(decode_server(&encode_server(&batch).unwrap()), Ok(batch));
 }

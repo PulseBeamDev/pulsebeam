@@ -5,12 +5,13 @@ package pulsebeam.media.v1;
 // Native signaling: complete desired/confirmed values for one resource map.
 //
 // Channel 0 is negotiated, reliable, ordered and scoped by its authenticated
-// PeerConnection. Each binary message is one framed StateBatch in either
-// direction. Payload channels start at 1. No additional connection identity,
-// Start/Ready exchange, server sequence or application retransmission exists.
+// PeerConnection. HTTP bootstrap selects pulsebeam.media.v1: each binary message
+// is one raw ClientStateBatch or ServerStateBatch according to its direction.
+// Payload channels start at 1. No encoding prefix, compression, additional
+// connection identity, Start/Ready exchange, server sequence or application
+// retransmission exists. A different encoding requires an explicit HTTP profile.
 //
-// Frame: u8 encoding + u32_le decoded_length + raw protobuf / independent LZ4.
-// Decoded size 1..4096, complete frame <=4101, at most 16 records per batch.
+// Each message is 1..4096 bytes with at most 16 resource records.
 // The SDK stages desire separately from its authoritative confirmed mirror.
 // Read-only observations are never writable drift-correction targets.
 //
@@ -21,22 +22,35 @@ package pulsebeam.media.v1;
 
 
 // ============================================================================
-// 1. Bounded resource batches — the same encoding in both directions
+// 1. Bounded directional resource batches
 // ============================================================================
 
 // Complete values applied individually in reliable stream order, not a map-wide
 // transaction. Send promptly; coalesce unsent updates by key. No batch ACK/cursor.
-message StateBatch {
-  // 1..16 records, or zero only for the server's initial_complete marker.
-  // Entire decoded batch also must fit 4096 bytes. Exactly one direction of
-  // state is allowed: client desired records or server confirmed records.
-  repeated StateRecord records = 1;
+message ClientStateBatch {
+  // 1..16 proposals. The entire raw protobuf message must fit 4096 bytes.
+  repeated ClientStateRecord records = 1;
+}
 
-  // Server-only, true exactly once after every initially visible key has been
-  // represented by a current value/absence. Apply records before observing it.
-  // Later changes continue normally; this is enumeration completeness, not an
-  // atomic snapshot, catch-up barrier, acknowledgment or application convergence.
-  // Client always sends false/omitted; empty ordinary batches are invalid.
+message ClientStateRecord {
+  // Nonzero connection-local owned lifetime, shared by publications/subscriptions.
+  // Equal to the first present proposal's revision; never reused. Read-only
+  // discovery and session keys cannot be proposed by a client.
+  uint64 owned = 1;
+
+  // Required complete desired value for this lifetime.
+  DesiredState desired = 2;
+}
+
+message ServerStateBatch {
+  // 1..16 observations, or zero only with initial_complete=true.
+  // The entire raw protobuf message must fit 4096 bytes.
+  repeated ServerStateRecord records = 1;
+
+  // True exactly once after every initially visible key has been represented
+  // by a current value/absence. Apply records before observing it. Later changes
+  // continue normally; this is enumeration completeness, not an atomic snapshot,
+  // catch-up barrier, acknowledgment or application convergence.
   bool initial_complete = 2;
 }
 
@@ -61,21 +75,21 @@ message ResourceKey {
   }
 }
 
-// Shared record envelope. Current value replaces the previous value of its key.
-// Never infer a desired deletion from an omitted key or initial_complete marker.
-message StateRecord {
-  // Required known key. Read-only keys cannot appear in client proposals.
+// Complete authoritative replacement for one key, not a whole-map snapshot.
+// Never infer deletion from an omitted key or initial_complete marker.
+message ServerStateRecord {
+  // Required known key.
   ResourceKey key = 1;
 
-  // Exactly one. Client may send desired only; server confirmed only.
-  oneof state {
-    DesiredState desired = 2;
-    ConfirmedState confirmed = 3;
-  }
+  // Required complete authoritative value matching the key.
+  ConfirmedState confirmed = 2;
 }
 
 // Latest application target for one owned lifetime, not a queued command.
-// A newer received proposal can supersede an older uncommitted preparation.
+// Only one sent present proposal per resource may remain unevaluated. Coalesce
+// newer unsent desire until confirmation evaluates the preceding proposal.
+// Another present before evaluation is a protocol error. Absence bypasses this
+// gate to cut off pending work promptly; other resources progress independently.
 message DesiredState {
   // Nonzero; strictly increases across all serialized client proposals. Gaps
   // are valid. Allocate after coalescing; never reuse/wrap. The server echoes
@@ -99,7 +113,7 @@ message DesiredState {
 // Spontaneous observations preserve the last evaluation and its rejection.
 message ConfirmedState {
   // For owned keys: latest evaluated desired revision, not merely received.
-  // May skip superseded targets; never regresses while the lifetime is live.
+  // Retirement may terminate an unevaluated target; never regresses while live.
   // Nonzero for a live owned resource. Terminal absence may carry zero when
   // initial creation was canceled before evaluation. Read-only keys require 0.
   uint64 evaluated_revision = 1;

@@ -1291,6 +1291,7 @@ mod tests {
     async fn native_post_rejects_malformed_contract_before_controller_allocation() {
         let token = live_token();
         let cases = [
+            serde_json::to_vec(&serde_json::json!({"profile": "unsupported", "offer": valid_offer()})).unwrap(),
             serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": valid_offer(), "unknown": true}))
                 .unwrap(),
             b"{".to_vec(),

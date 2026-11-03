@@ -1,23 +1,20 @@
 use super::*;
-use pulsebeam_proto::state::{self, codec, validation};
+use pulsebeam_proto::state::{self, codec};
 
 pub(crate) fn observe(
     agent: &mut Agent,
     generation: Generation,
     channel: ChannelId,
-    records: Vec<state::StateRecord>,
+    records: Vec<state::ServerStateRecord>,
 ) {
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel,
-            payload: codec::encode(
-                &state::StateBatch {
-                    records,
-                    initial_complete: false,
-                },
-                validation::Direction::Server,
-            )
+            payload: codec::encode_server(&state::ServerStateBatch {
+                records,
+                initial_complete: false,
+            })
             .unwrap(),
         }))
         .unwrap();
@@ -27,20 +24,18 @@ pub(crate) fn confirmed(
     key: state::resource_key::Key,
     revision: u64,
     value: state::confirmed_state::Value,
-) -> state::StateRecord {
-    state::StateRecord {
+) -> state::ServerStateRecord {
+    state::ServerStateRecord {
         key: Some(state::ResourceKey { key: Some(key) }),
-        state: Some(state::state_record::State::Confirmed(
-            state::ConfirmedState {
-                evaluated_revision: revision,
-                rejection: None,
-                value: Some(value),
-            },
-        )),
+        confirmed: Some(state::ConfirmedState {
+            evaluated_revision: revision,
+            rejection: None,
+            value: Some(value),
+        }),
     }
 }
 
-pub(crate) fn grant(revision: u64) -> state::StateRecord {
+pub(crate) fn grant(revision: u64) -> state::ServerStateRecord {
     confirmed(
         state::resource_key::Key::Session(true),
         0,
@@ -135,13 +130,10 @@ pub(crate) fn connected(topics: crate::TopicRegistrations) -> (Agent, Generation
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel,
-            payload: codec::encode(
-                &state::StateBatch {
-                    records: Vec::new(),
-                    initial_complete: true,
-                },
-                validation::Direction::Server,
-            )
+            payload: codec::encode_server(&state::ServerStateBatch {
+                records: Vec::new(),
+                initial_complete: true,
+            })
             .unwrap(),
         }))
         .unwrap();
@@ -227,15 +219,11 @@ pub(crate) fn prepare_data_pending(
         panic!("StateBatch")
     };
     assert_eq!(output, control);
-    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let batch = codec::decode_client(&payload).unwrap();
     assert_eq!(batch.records.len(), 1);
     let record = &batch.records[0];
-    let Some(state::resource_key::Key::Owned(reference)) =
-        record.key.as_ref().and_then(|key| key.key.as_ref())
-    else {
-        panic!("owned reference")
-    };
-    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+    let reference = &record.owned;
+    let Some(desired) = &record.desired else {
         panic!("desired")
     };
     let Some(state::desired_state::Value::Present(spec)) = &desired.value else {

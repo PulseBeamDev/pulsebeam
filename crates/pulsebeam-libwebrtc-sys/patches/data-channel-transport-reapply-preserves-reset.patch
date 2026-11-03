@@ -1,0 +1,15 @@
+diff --git a/pc/data_channel_controller.cc b/pc/data_channel_controller.cc
+--- a/pc/data_channel_controller.cc
++++ b/pc/data_channel_controller.cc
+@@ -525,6 +525,11 @@ void DataChannelController::OnSctpDataChannelClosed(SctpDataChannel* channel) {
+ void DataChannelController::set_data_channel_transport(
+     DataChannelTransportInterface* transport) {
+   RTC_DCHECK_RUN_ON(network_thread());
++  // Reapplying SDP on the same association must preserve in-flight SID resets.
++  // Reopening those streams clears their closing state in DcSctpTransport.
++  if (data_channel_transport_ == transport) {
++    return;
++  }
+ 
+   if (data_channel_transport_)
+     data_channel_transport_->SetDataSink(nullptr);

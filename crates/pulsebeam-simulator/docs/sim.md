@@ -95,8 +95,10 @@ It replaces the former Catalog/Intent/Mapping protocol:
   change creates a new publication lifetime. Visibility is not ownership.
 - Failed writes preserve current unsent state; stale queued work cannot replace
   a newer accepted source or bypass retirement.
-- Native clients use bounded protobuf/raw-LZ4 StateBatch framing. WHIP/WHEP
-  retain their HTTP/SDP lifecycle and never require these messages.
+- Native HTTP bootstrap selects `pulsebeam.media.v1`. Each channel-0 message is
+  one bounded raw protobuf `ClientStateBatch` or `ServerStateBatch`, without a
+  prefix or compression. WHIP/WHEP retain their HTTP/SDP lifecycle and never
+  require these messages.
 
 The shared Core lifecycle refactor targets permanently source-bound physical
 receivers, not a receiver pool or Top-N audio selection. Compatible consumers

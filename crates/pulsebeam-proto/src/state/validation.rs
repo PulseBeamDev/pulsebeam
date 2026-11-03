@@ -6,15 +6,8 @@ use alloc::collections::BTreeSet;
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Direction {
-    Client,
-    Server,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationError {
     Batch,
-    Direction,
     Key,
     Desired,
     Confirmed,
@@ -28,42 +21,48 @@ pub enum ValidationError {
 
 type Result<T = ()> = core::result::Result<T, ValidationError>;
 
-pub fn validate_batch(batch: &StateBatch, direction: Direction) -> Result {
-    if batch.records.len() > codec::MAX_RECORDS
-        || batch.records.is_empty() && !batch.initial_complete
-        || direction == Direction::Client && batch.initial_complete
-    {
+pub fn validate_client_batch(batch: &ClientStateBatch) -> Result {
+    if batch.records.is_empty() || batch.records.len() > codec::MAX_RECORDS {
         return Err(ValidationError::Batch);
     }
     let mut previous = 0;
     for record in &batch.records {
+        if record.owned == 0 {
+            return Err(ValidationError::Key);
+        }
+        let desired = record.desired.as_ref().ok_or(ValidationError::Desired)?;
+        if desired.revision <= previous
+            || record.owned > desired.revision
+            || !matches!(&desired.value, Some(desired_state::Value::Present(_)))
+                && !matches!(&desired.value, Some(desired_state::Value::Absent(true)) if record.owned < desired.revision)
+        {
+            return Err(ValidationError::Desired);
+        }
+        previous = desired.revision;
+        // Invalid configuration gets a scoped evaluation rejection, not a
+        // malformed-envelope failure.
+    }
+    Ok(())
+}
+
+pub fn validate_server_batch(batch: &ServerStateBatch) -> Result {
+    if batch.records.len() > codec::MAX_RECORDS
+        || batch.records.is_empty() && !batch.initial_complete
+    {
+        return Err(ValidationError::Batch);
+    }
+    for record in &batch.records {
         let key = record
             .key
             .as_ref()
-            .and_then(|k| k.key.as_ref())
+            .and_then(|key| key.key.as_ref())
             .ok_or(ValidationError::Key)?;
         validate_key(key)?;
-        match (direction, &record.state) {
-            (Direction::Client, Some(state_record::State::Desired(desired))) => {
-                let resource_key::Key::Owned(owned) = key else {
-                    return Err(ValidationError::Direction);
-                };
-                if desired.revision <= previous
-                    || *owned > desired.revision
-                    || !matches!(&desired.value, Some(desired_state::Value::Present(_)))
-                        && !matches!(&desired.value, Some(desired_state::Value::Absent(true)) if *owned < desired.revision)
-                {
-                    return Err(ValidationError::Desired);
-                }
-                previous = desired.revision;
-                // A well-formed envelope with an invalid spec gets a scoped
-                // evaluation rejection, not a codec/connection failure.
-            }
-            (Direction::Server, Some(state_record::State::Confirmed(confirmed))) => {
-                validate_confirmed(key, confirmed)?;
-            }
-            _ => return Err(ValidationError::Direction),
-        }
+        let confirmed = record
+            .confirmed
+            .as_ref()
+            .ok_or(ValidationError::Confirmed)?;
+        validate_confirmed(key, confirmed)?;
     }
     Ok(())
 }

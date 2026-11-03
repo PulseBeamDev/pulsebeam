@@ -98,6 +98,12 @@ struct Owned {
 }
 
 impl Owned {
+    fn awaiting_evaluation(&self) -> bool {
+        self.confirmed
+            .as_ref()
+            .is_none_or(|state| state.evaluated_revision < self.sent_revision)
+    }
+
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()
             .saturating_add(ROW_INDEX_BYTES)
@@ -187,13 +193,9 @@ impl NativeState {
                 return Err(SignalingError::Invalid("resource correlation"));
             }
             // Reserve representability with the largest revision/ref encodings.
-            codec::encode(
-                &wire::StateBatch {
-                    records: alloc::vec![desired_record(u64::MAX, u64::MAX, Some(spec.clone()))],
-                    initial_complete: false,
-                },
-                validation::Direction::Client,
-            )
+            codec::encode_client(&wire::ClientStateBatch {
+                records: alloc::vec![desired_record(u64::MAX, u64::MAX, Some(spec.clone()))],
+            })
             .map_err(|_| SignalingError::Encode)?;
         }
         let old = self.targets.get(&resource);
@@ -281,7 +283,7 @@ impl NativeState {
         if self.terminal {
             return Ok(None);
         }
-        let mut batch = wire::StateBatch::default();
+        let mut batch = wire::ClientStateBatch::default();
         while batch.records.len() < codec::MAX_RECORDS {
             let resource = self
                 .cursor
@@ -312,7 +314,12 @@ impl NativeState {
                     self.dirty.remove(&resource);
                     continue;
                 };
-                if target.blocked {
+                if target.blocked
+                    || target
+                        .reference
+                        .and_then(|reference| self.owned.get(&reference))
+                        .is_some_and(Owned::awaiting_evaluation)
+                {
                     self.dirty.remove(&resource);
                     continue;
                 }
@@ -328,7 +335,7 @@ impl NativeState {
             batch
                 .records
                 .push(desired_record(reference, revision, spec.clone()));
-            if batch.encoded_len() > codec::MAX_DECODED_SIZE {
+            if batch.encoded_len() > codec::MAX_FRAME_SIZE {
                 batch.records.pop();
                 if batch.records.is_empty() {
                     return Err(SignalingError::Encode);
@@ -370,7 +377,7 @@ impl NativeState {
         if batch.records.is_empty() {
             return Ok(None);
         }
-        codec::encode(&batch, validation::Direction::Client)
+        codec::encode_client(&batch)
             .map(Some)
             .map_err(|_| SignalingError::Encode)
     }
@@ -379,8 +386,7 @@ impl NativeState {
         if self.terminal {
             return Ok(Vec::new());
         }
-        let batch = codec::decode(frame, validation::Direction::Server)
-            .map_err(|_| SignalingError::Malformed)?;
+        let batch = codec::decode_server(frame).map_err(|_| SignalingError::Malformed)?;
         let mut changes = Vec::new();
         for record in batch.records {
             if self.terminal {
@@ -390,9 +396,7 @@ impl NativeState {
                 .key
                 .and_then(|key| key.key)
                 .ok_or(SignalingError::MissingPayload)?;
-            let Some(wire::state_record::State::Confirmed(state)) = record.state else {
-                return Err(SignalingError::Invalid("record direction"));
-            };
+            let state = record.confirmed.ok_or(SignalingError::MissingPayload)?;
             match key {
                 wire::resource_key::Key::Owned(reference) => {
                     if let Some(change) = self.apply_owned(reference, state)? {
@@ -624,6 +628,17 @@ impl NativeState {
             }
         } else if let Some(owned) = self.owned.get_mut(&reference) {
             owned.confirmed = Some(state.clone());
+            if !owned.retiring
+                && !owned.awaiting_evaluation()
+                && self.targets.get(&resource).is_some_and(|target| {
+                    target.reference == Some(reference)
+                        && target.waiting_for.is_none()
+                        && !target.blocked
+                        && !specs_equal(&owned.sent, &target.spec)
+                })
+            {
+                self.dirty.insert(resource.clone());
+            }
         }
         Ok(Some(Change::Owned {
             resource,
@@ -824,18 +839,16 @@ fn desired_record(
     reference: u64,
     revision: u64,
     spec: Option<wire::ResourceSpec>,
-) -> wire::StateRecord {
-    wire::StateRecord {
-        key: Some(wire::ResourceKey {
-            key: Some(wire::resource_key::Key::Owned(reference)),
-        }),
-        state: Some(wire::state_record::State::Desired(wire::DesiredState {
+) -> wire::ClientStateRecord {
+    wire::ClientStateRecord {
+        owned: reference,
+        desired: Some(wire::DesiredState {
             revision,
             value: Some(match spec {
                 Some(spec) => wire::desired_state::Value::Present(Box::new(spec)),
                 None => wire::desired_state::Value::Absent(true),
             }),
-        })),
+        }),
     }
 }
 
