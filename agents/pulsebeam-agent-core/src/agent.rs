@@ -161,7 +161,7 @@ struct NativeRequest<'a> {
 struct NativeResponse {
     profile: String,
     rtp_capabilities: pulsebeam_proto::state::RtpCapabilities,
-    data_delivery: Vec<pulsebeam_proto::state::DataDelivery>,
+    data_delivery: Vec<serde_json::Value>,
     room_external_id: String,
     room_id: String,
     participant_external_id: String,
@@ -2492,21 +2492,13 @@ fn parse_create_response(response: &HttpResponse) -> Result<(Candidate, String),
     }
     pulsebeam_proto::state::validation::validate_capabilities(&body.rtp_capabilities)
         .map_err(|_| "create response contains invalid RTP capabilities".to_string())?;
-    let mut delivery = BTreeSet::new();
-    if body.data_delivery.is_empty()
-        || body.data_delivery.iter().any(|mode| {
-            *mode == pulsebeam_proto::state::DataDelivery::Unspecified
-                || !delivery.insert(*mode as i32)
-        })
-    {
-        return Err("create response contains invalid data capabilities".to_string());
-    }
+    let data_delivery = supported_data_delivery(&body.data_delivery)?;
     validate_answer(&body.answer)?;
     Ok((
         Candidate {
             capabilities: crate::BootstrapCapabilities {
                 rtp: body.rtp_capabilities,
-                data_delivery: body.data_delivery,
+                data_delivery,
             },
             resource_uri: resource_uri.to_string(),
             room_external_id: body.room_external_id,
@@ -2517,6 +2509,44 @@ fn parse_create_response(response: &HttpResponse) -> Result<(Candidate, String),
         },
         body.answer,
     ))
+}
+
+fn supported_data_delivery(
+    advertised: &[serde_json::Value],
+) -> Result<Vec<pulsebeam_proto::state::DataDelivery>, String> {
+    use pulsebeam_proto::state::DataDelivery;
+    let invalid = || "create response contains invalid data capabilities".to_string();
+    if advertised.is_empty() || advertised.len() > 32 {
+        return Err(invalid());
+    }
+    let mut seen = BTreeSet::new();
+    let mut supported = Vec::new();
+    for value in advertised {
+        let mode = match value {
+            serde_json::Value::String(name)
+                if !name.is_empty()
+                    && name.len() <= 64
+                    && !name.chars().any(|c| c.is_whitespace() || c.is_control()) =>
+            {
+                DataDelivery::from_str_name(name)
+            }
+            serde_json::Value::Number(number) => {
+                let number = number
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(invalid)?;
+                DataDelivery::try_from(number).ok()
+            }
+            _ => return Err(invalid()),
+        };
+        if let Some(mode) = mode {
+            if mode == DataDelivery::Unspecified || !seen.insert(mode as i32) {
+                return Err(invalid());
+            }
+            supported.push(mode);
+        }
+    }
+    Ok(supported)
 }
 
 fn validate_answer(answer: &str) -> Result<(), String> {
@@ -2745,17 +2775,17 @@ mod response_tests {
             ("profile", serde_json::json!(true)),
             ("profile", serde_json::json!("legacy")),
             ("rtp_capabilities", serde_json::json!({"codecs": [{}]})),
-            (
-                "rtp_capabilities",
-                serde_json::json!({"rtcp_modes": ["RTCP_MODE_UNSPECIFIED"]}),
-            ),
+            ("rtp_capabilities", serde_json::json!({"rtcp_modes": [""]})),
             ("data_delivery", serde_json::json!([])),
             ("data_delivery", serde_json::json!(["LATEST", "LATEST"])),
             (
                 "data_delivery",
                 serde_json::json!(["DATA_DELIVERY_UNSPECIFIED"]),
             ),
-            ("data_delivery", serde_json::json!(["UNKNOWN"])),
+            ("data_delivery", serde_json::json!([true])),
+            ("data_delivery", serde_json::json!([""])),
+            ("data_delivery", serde_json::json!([1.5])),
+            ("data_delivery", serde_json::json!(["LATEST", 1])),
         ] {
             let mut invalid = complete.as_object().unwrap().clone();
             invalid.insert(field.to_string(), value);
@@ -2765,6 +2795,18 @@ mod response_tests {
             );
         }
 
+        for (modes, supported) in [
+            (
+                serde_json::json!(["LATEST", "FUTURE_MODE", 99]),
+                vec![pulsebeam_proto::state::DataDelivery::Latest],
+            ),
+            (serde_json::json!(["FUTURE_MODE"]), vec![]),
+        ] {
+            let mut future = complete.as_object().unwrap().clone();
+            future.insert("data_delivery".to_string(), modes);
+            let (candidate, _) = parse_create_response(&response(future.into())).unwrap();
+            assert_eq!(candidate.capabilities.data_delivery, supported);
+        }
         let mut missing_location = response(complete.clone());
         missing_location.headers.clear();
         assert!(parse_create_response(&missing_location).is_err());

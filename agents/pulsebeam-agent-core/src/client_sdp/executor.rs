@@ -52,6 +52,19 @@ impl Request {
                     {
                         bytes = bytes.saturating_add(name.capacity());
                     }
+                    if let Some(format) = &allocation.format {
+                        bytes =
+                            bytes
+                                .saturating_add(format.mime_type.capacity())
+                                .saturating_add(format.parameters.capacity().saturating_mul(
+                                    size_of::<pulsebeam_proto::state::CodecParameter>(),
+                                ));
+                        for parameter in &format.parameters {
+                            bytes = bytes
+                                .saturating_add(parameter.name.capacity())
+                                .saturating_add(parameter.value.capacity());
+                        }
+                    }
                 }
             }
             Self::Retire(mids) => {

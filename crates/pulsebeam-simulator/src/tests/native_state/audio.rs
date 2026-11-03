@@ -51,49 +51,35 @@ fn parameters(binding: &client::Binding) -> anyhow::Result<wire::RtpParameters> 
     );
     anyhow::ensure!(codec.repair.is_none(), "unexpected audio RTX");
     let format = wire::CodecFormat {
-        codec: Some(wire::codec_format::Codec::Opus(wire::OpusParameters {
-            min_packet_time_ms: codec
-                .parameters
-                .fmtp
-                .get("minptime")
-                .map(|value| value.parse())
-                .transpose()?,
-            in_band_fec: codec
-                .parameters
-                .fmtp
-                .get("useinbandfec")
-                .map(|value| match value.as_str() {
-                    "1" => Ok(true),
-                    "0" => Ok(false),
-                    _ => Err(anyhow::anyhow!("invalid prepared FEC")),
-                })
-                .transpose()?,
-            ..Default::default()
-        })),
+        mime_type: "audio/opus".into(),
+        clock_rate: codec.parameters.clock_rate,
+        channels: codec.parameters.channels.map(u32::from),
+        parameters: codec
+            .parameters
+            .fmtp
+            .iter()
+            .map(|(name, value)| wire::CodecParameter {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
     };
     let rtp = wire::RtpParameters {
         mid: binding.mid.clone(),
         codec: Some(wire::RtpCodecParameters {
             payload_type: Some(u32::from(codec.payload_type)),
             rtx_payload_type: None,
-            feedback: vec![wire::RtcpFeedback::TransportCc as i32],
+            feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()],
             format: Some(format),
         }),
         header_extensions: binding
             .extensions
             .iter()
-            .map(|extension| {
-                Ok(wire::RtpHeaderExtensionParameters {
-                    id: u32::from(extension.id),
-                    r#type: match extension.uri.as_str() {
-                        MID => wire::RtpHeaderExtensionType::RtpHeaderExtensionMid,
-                        TWCC => wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01,
-                        AUDIO_LEVEL => wire::RtpHeaderExtensionType::RtpHeaderExtensionAudioLevel,
-                        _ => anyhow::bail!("unexpected prepared extension {}", extension.uri),
-                    } as i32,
-                })
+            .map(|extension| wire::RtpHeaderExtensionParameters {
+                id: u32::from(extension.id),
+                uri: extension.uri.clone(),
             })
-            .collect::<anyhow::Result<_>>()?,
+            .collect(),
         encodings: binding
             .encodings
             .iter()

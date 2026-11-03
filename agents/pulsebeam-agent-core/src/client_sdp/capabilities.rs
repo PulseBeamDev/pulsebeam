@@ -9,48 +9,32 @@ impl Capabilities {
         let codecs = capabilities
             .codecs
             .iter()
-            .map(|capability| {
-                let format = capability.format.as_ref().ok_or(Error::Identifier)?;
-                let parameters = sdp::codec_parameters(format).map_err(|_| Error::Identifier)?;
-                let feedback = capability
-                    .feedback
-                    .iter()
-                    .map(|feedback| {
-                        sdp::feedback_name(*feedback)
-                            .map(str::to_owned)
-                            .map_err(|_| Error::Identifier)
-                    })
-                    .collect::<Result<_, _>>()?;
-                Ok(CodecCapability {
+            .filter_map(|capability| {
+                let format = capability.format.as_ref()?;
+                // A valid future description may exceed this adapter's channel representation.
+                let parameters = sdp::codec_parameters(format).ok()?;
+                Some(CodecCapability {
                     parameters: CodecParameters {
-                        name: parameters.name.into(),
+                        name: parameters.name,
                         clock_rate: parameters.clock_rate,
                         channels: parameters.channels,
                         fmtp: parameters.fmtp,
-                        feedback,
+                        feedback: capability.feedback.iter().cloned().collect(),
                     },
                     repair: capability.rtx_supported,
                 })
             })
-            .collect::<Result<_, Error>>()?;
-        let extensions = capabilities
-            .header_extensions
-            .iter()
-            .map(|extension| {
-                sdp::extension_uri(*extension)
-                    .map(str::to_owned)
-                    .map_err(|_| Error::Identifier)
-            })
-            .collect::<Result<_, _>>()?;
+            .collect();
+        let extensions = capabilities.header_extensions.iter().cloned().collect();
         let rtcp_modes = capabilities
             .rtcp_modes
             .iter()
-            .map(|mode| match wire::RtcpMode::try_from(*mode) {
-                Ok(wire::RtcpMode::Compound) => Ok(RtcpMode::Compound),
-                Ok(wire::RtcpMode::ReducedSize) => Ok(RtcpMode::ReducedSize),
-                _ => Err(Error::Identifier),
+            .filter_map(|mode| match wire::RtcpMode::try_from(mode.as_str()) {
+                Ok(wire::RtcpMode::Compound) => Some(RtcpMode::Compound),
+                Ok(wire::RtcpMode::ReducedSize) => Some(RtcpMode::ReducedSize),
+                _ => None,
             })
-            .collect::<Result<_, _>>()?;
+            .collect();
         Ok(Self {
             codecs,
             extensions,

@@ -239,6 +239,39 @@ fn executor_bounds_unfinished_work_and_reclaims_cancelled_queue_credit() {
         Err(Error::Capacity)
     );
     assert!(!executor.ready());
+    for field in 0..4 {
+        use pulsebeam_proto::state::{CodecFormat, CodecParameter, Vp8Parameters, codec_format};
+        let mut format = CodecFormat::from(codec_format::Codec::Vp8(Vp8Parameters {}));
+        if field == 0 {
+            format.mime_type.reserve(2 * MAX_SDP_BYTES);
+        } else if field == 1 {
+            format
+                .parameters
+                .reserve(2 * MAX_SDP_BYTES / size_of::<CodecParameter>() + 1);
+        } else {
+            let mut parameter = CodecParameter {
+                name: "hint".into(),
+                value: "1".into(),
+            };
+            if field == 2 {
+                parameter.name.reserve(2 * MAX_SDP_BYTES);
+            } else {
+                parameter.value.reserve(2 * MAX_SDP_BYTES);
+            }
+            format.parameters.push(parameter);
+        }
+        assert_eq!(
+            executor.enqueue_allocation(
+                ids.operation(),
+                vec![Allocation {
+                    slot: crate::MediaSlot::RemoteVideo(0),
+                    format: Some(format),
+                }]
+            ),
+            Err(Error::Capacity)
+        );
+        assert!(!executor.ready());
+    }
     let mut preparation = request("v", true, false);
     preparation.mid.reserve(2 * MAX_SDP_BYTES);
     assert_eq!(
@@ -290,9 +323,9 @@ fn allocation_lowers_only_actual_sections_and_reconciles_cancelled_physical_hist
     };
     let reception = Allocation {
         slot: MediaSlot::RemoteVideo(7),
-        format: Some(CodecFormat {
-            codec: Some(codec_format::Codec::Vp8(Default::default())),
-        }),
+        format: Some(CodecFormat::from(codec_format::Codec::Vp8(
+            Default::default(),
+        ))),
     };
     let requests = vec![publication.clone(), reception.clone()];
     let send = offer(
@@ -524,10 +557,10 @@ fn allocation_lowers_only_actual_sections_and_reconciles_cancelled_physical_hist
 fn bootstrap_capabilities_preserve_per_codec_repair_and_rtcp_modes() {
     use pulsebeam_proto::state::{self as wire, codec_format};
     let capability = |codec, repair| wire::RtpCodecCapability {
-        format: Some(wire::CodecFormat { codec: Some(codec) }),
+        format: Some(wire::CodecFormat::from(codec)),
         feedback: vec![
-            wire::RtcpFeedback::Nack as i32,
-            wire::RtcpFeedback::TransportCc as i32,
+            wire::RtcpFeedback::Nack.as_str().into(),
+            wire::RtcpFeedback::TransportCc.as_str().into(),
         ],
         rtx_supported: repair,
         ..Default::default()
@@ -537,9 +570,42 @@ fn bootstrap_capabilities_preserve_per_codec_repair_and_rtcp_modes() {
             capability(codec_format::Codec::Vp8(Default::default()), true),
             capability(codec_format::Codec::Vp9(Default::default()), false),
         ],
-        header_extensions: vec![wire::RtpHeaderExtensionType::RtpHeaderExtensionMid as i32],
-        rtcp_modes: vec![wire::RtcpMode::Compound as i32],
+        header_extensions: vec![
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionMid
+                .as_str()
+                .into(),
+        ],
+        rtcp_modes: vec![wire::RtcpMode::Compound.as_str().into()],
     };
+    envelope.codecs.push(wire::RtpCodecCapability {
+        format: Some(wire::CodecFormat {
+            mime_type: "video/future-codec".into(),
+            clock_rate: 90000,
+            parameters: vec![wire::CodecParameter {
+                name: "future-hint".into(),
+                value: "1".into(),
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    envelope
+        .header_extensions
+        .push("urn:future:extension".into());
+    envelope.codecs.push(wire::RtpCodecCapability {
+        format: Some(wire::CodecFormat {
+            mime_type: "audio/future-codec".into(),
+            clock_rate: u32::MAX,
+            channels: Some(u32::MAX),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert_eq!(Capabilities::from_wire(&envelope).unwrap().codecs.len(), 3);
+    envelope.rtcp_modes.push("future-rtcp-mode".into());
+    for capability in &mut envelope.codecs {
+        capability.feedback.push("future-feedback".into());
+    }
     for (index, (name, repair)) in [("VP8", true), ("VP9", false)].into_iter().enumerate() {
         let ctx = Context::new(
             &bootstrap(),
@@ -582,12 +648,23 @@ fn bootstrap_capabilities_preserve_per_codec_repair_and_rtcp_modes() {
         let candidate = executor
             .prepare_allocated(operation, &actual, &assigned)
             .unwrap();
-        assert_eq!(
-            candidate.bindings().receptions[0].codec.repair.is_some(),
-            repair
+        let selected = &candidate.bindings().receptions[0];
+        assert_eq!(selected.codec.repair.is_some(), repair);
+        assert!(
+            !selected
+                .codec
+                .parameters
+                .feedback
+                .contains("future-feedback")
+        );
+        assert!(
+            selected
+                .extensions
+                .iter()
+                .all(|extension| extension.uri != "urn:future:extension")
         );
     }
-    envelope.rtcp_modes = vec![wire::RtcpMode::ReducedSize as i32];
+    envelope.rtcp_modes = vec![wire::RtcpMode::ReducedSize.as_str().into()];
     let mut ctx = Context::new(
         &bootstrap(),
         &remote(),

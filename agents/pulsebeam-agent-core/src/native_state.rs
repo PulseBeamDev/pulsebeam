@@ -119,7 +119,7 @@ pub(crate) enum Change {
         resource: Resource,
         reference: u64,
         retired_binding: Option<Box<wire::TrackBinding>>,
-        state: wire::ConfirmedState,
+        state: Box<wire::ConfirmedState>,
         new_evaluation: bool,
     },
     Participant(String),
@@ -644,7 +644,7 @@ impl NativeState {
             resource,
             reference,
             retired_binding,
-            state,
+            state: Box::new(state),
             new_evaluation,
         }))
     }

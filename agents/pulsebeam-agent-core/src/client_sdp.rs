@@ -184,7 +184,7 @@ pub struct Allocation {
     pub format: Option<pulsebeam_proto::state::CodecFormat>,
 }
 
-// CodecFormat contains only scalar-valued variants.
+// The wire format has no floating-point fields.
 impl Eq for Allocation {}
 
 impl Allocation {

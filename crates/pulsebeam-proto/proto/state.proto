@@ -474,190 +474,69 @@ message RtpCodecParameters {
   // and a distinct rtx_ssrc on every encoding are required.
   optional uint32 rtx_payload_type = 2;
 
-  // <=4 unique known entries supported by this format/preparation. Baseline
-  // RTP requires TRANSPORT_CC; feedback MUST target only the admitted source.
-  repeated RtcpFeedback feedback = 3;
+  // Negotiated feedback spellings. Baseline RTP requires transport-cc.
+  repeated string feedback = 3;
 
-  // REQUIRED typed primary format; replaces MIME/FMTP strings and codec registries.
+  // Required admitted primary format.
   CodecFormat format = 4;
 }
 
 
 // ============================================================================
-// 7. Codec formats and capabilities — typed, directional compatibility
+// 7. Extensible media descriptions and capabilities
 // ============================================================================
 
-// Self-contained codec envelope. A subscription intersects source format, HTTP
-// capabilities, and local decoder support; compatibility is not byte equality.
-// No transcoding or hidden codec registry is implied. Missing discovery format
-// is invalid; a present format without a recognized variant is unreceivable.
-// Desired bindings require a recognized supported format; never guess behavior.
+// Transport description, not an application identity or a promise of support.
+// Unknown codecs remain describable but cannot be selected without common
+// support. Codec-specific safety and directional matching live in the adapters.
 message CodecFormat {
-  // Exactly one codec; Opus is audio, H.264/VP8/VP9 are video.
-  oneof codec {
-    OpusParameters opus = 1;
-    H264Parameters h264 = 2;
-    Vp8Parameters vp8 = 3;
-    Vp9Parameters vp9 = 4;
-  }
+  // Lowercase media MIME type, e.g. audio/opus or video/h264.
+  string mime_type = 1;
+  uint32 clock_rate = 2;
+  optional uint32 channels = 3;
+
+  // Unique lowercase names. Preserve optional transport parameters; do not
+  // reinterpret unknown parameters as permission to enable a feature.
+  repeated CodecParameter parameters = 4;
 }
 
-// Required HTTP bootstrap rtp_capabilities, even for a data-only connection.
-// Encoded as ProtoJSON with snake_case field names and enum names. Describes this
-// connection's supported transport envelope in both directions, not room formats
-// or authorization. SDP and capabilities MUST agree; local preparation is still
-// required. Unsupported optional future capabilities may be filtered.
+message CodecParameter {
+  string name = 1;
+  string value = 2;
+}
+
+// Required even for a data-only bootstrap. Unknown optional entries do not
+// prevent negotiation of the supported intersection. This is transport support,
+// not authorization or a statement that an individual resource is installed.
 message RtpCapabilities {
-  // <=32 unique codec entries. Disabled audio/video may have no matching entries.
   repeated RtpCodecCapability codecs = 1;
-
-  // <=16 unique known extension types available for actual preparation.
-  repeated RtpHeaderExtensionType header_extensions = 2;
-
-  // <=2 unique known modes. Every prepared binding MUST select an advertised mode.
-  repeated RtcpMode rtcp_modes = 3;
+  repeated string header_extensions = 2;
+  repeated string rtcp_modes = 3;
 }
 
-// One supported format envelope and its admissible optional features.
 message RtpCodecCapability {
-  // Required format with resolved parameters where the codec requires them.
   CodecFormat format = 1;
-
-  // <=4 unique known codec-appropriate feedback entries.
-  repeated RtcpFeedback feedback = 2;
-
-  // True permits associated RTX when actually prepared; false grants no RTX.
+  repeated string feedback = 2;
   bool rtx_supported = 3;
-
-  // <=3 unique known modes; only these may be selected on an encoding.
-  repeated RtpScalabilityMode scalability_modes = 4;
+  repeated string scalability_modes = 4;
 }
 
-// RTCP choices reflected by RtcpParameters.reduced_size.
-enum RtcpMode {
-  RTCP_MODE_UNSPECIFIED = 0; // Never advertised or selected.
-  RTCP_MODE_COMPOUND = 1;    // reduced_size=false.
-  RTCP_MODE_REDUCED_SIZE = 2; // reduced_size=true, subject to RFC 5506.
-}
-
-// Opus: fixed RTP clock 48000 and RTP channel declaration 2; mono application
-// audio remains valid. Optional booleans retain explicit false; omission uses
-// codec defaults. Apply RFC 7587 sections 6-7 directional receive limits/sender
-// hints, not whole-record equality. Unsupported declared constraints reject.
-message OpusParameters {
-  // FMTP stereo receive preference; absent uses the codec default.
-  optional bool stereo = 1;
-
-  // FMTP sprop-stereo source hint; distinct from the receiver's stereo preference.
-  optional bool source_stereo = 2;
-
-  // FMTP useinbandfec preference; explicit false remains present.
-  optional bool in_band_fec = 3;
-
-  // FMTP usedtx preference; omission is distinct from explicitly disabling it.
-  optional bool dtx = 4;
-
-  // FMTP cbr preference; does not promise an exact network bitrate.
-  optional bool constant_bitrate = 5;
-
-  // FMTP maxaveragebitrate, 6000..510000 bits/second when present.
-  optional uint32 max_average_bitrate_bps = 6;
-
-  // FMTP maxplaybackrate, 8000..48000 Hz when present.
-  optional uint32 max_playback_rate_hz = 7;
-
-  // FMTP sprop-maxcapturerate, 8000..48000 Hz when present.
-  optional uint32 max_capture_rate_hz = 8;
-
-  // Deployed minptime hint, 3..120 ms when supported; absent means no declared
-  // hint. Not an RFC 7587 codec-identity parameter.
-  optional uint32 min_packet_time_ms = 9;
-}
-
-// H.264: fixed RTP clock 90000 and packetization-mode=1.
-// Compatibility follows RFC 6184 section 8.2.2: equivalent profiles/constraints,
-// level-1b ordering, and directional level ceilings, not integer comparison.
-// Unrepresented packetization/parameter-set/receive-level constraints MUST NOT
-// be silently assumed. In-band parameter sets and decodable boundaries are
-// runtime requirements; this message alone does not establish decoder readiness.
-message H264Parameters {
-  // Presence REQUIRED; resolved 24-bit profile-level-id; upper byte MUST be zero.
-  optional uint32 profile_level_id = 1;
-
-  // Absent means false. True permits asymmetry only when both established peers
-  // agreed; this bit cannot grant it independently of SDP/preparation.
-  optional bool level_asymmetry_allowed = 2;
-}
-
-// VP8: fixed RTP clock 90000; the present empty variant selects this format.
-message Vp8Parameters {}
-
-// VP9: fixed RTP clock 90000. Source and receiver profiles MUST match and be
-// supported by both endpoints; no implicit profile conversion is provided.
-message Vp9Parameters {
-  // Absent normalizes to 0. Only explicit values 0 and 2 are supported.
-  optional uint32 profile_id = 1;
-}
-
-// Typed RTCP feedback capabilities; adapters map these to negotiated SDP values.
-enum RtcpFeedback {
-  RTCP_FEEDBACK_UNSPECIFIED = 0; // Invalid in a selected/advertised list.
-  RTCP_FEEDBACK_NACK = 1;        // Generic NACK.
-  RTCP_FEEDBACK_NACK_PLI = 2;    // Picture loss indication.
-  RTCP_FEEDBACK_CCM_FIR = 3;     // Full intra request.
-  RTCP_FEEDBACK_TRANSPORT_CC = 4; // Transport-wide congestion feedback.
-}
-
-// Actual prepared mapping. Extension-ID-to-type mappings MUST be consistent
-// within the same RTP session/direction; each binding has unique IDs and types.
+// Actual prepared URI-to-ID mapping, consistent within one RTP direction.
 message RtpHeaderExtensionParameters {
-  // Required known extension type supported by the capability/preparation.
-  RtpHeaderExtensionType type = 1;
+  string uri = 1;
 
-  // 1..255. IDs>=15 require negotiated two-byte or mixed extmap support;
-  // 15 is reserved only in the one-byte form. Zero is invalid.
+  // 1..255. IDs>=15 require negotiated two-byte or mixed extmap support.
   uint32 id = 2;
 }
 
-// Typed extension identifiers; adapters own URI/SDP conversion at their boundary.
-enum RtpHeaderExtensionType {
-  RTP_HEADER_EXTENSION_UNSPECIFIED = 0; // Invalid in a mapping/capability list.
-  RTP_HEADER_EXTENSION_MID = 1;
-  RTP_HEADER_EXTENSION_RID = 2;
-  RTP_HEADER_EXTENSION_REPAIRED_RID = 3;
-  RTP_HEADER_EXTENSION_TRANSPORT_CC_DRAFT_01 = 4;
-  RTP_HEADER_EXTENSION_PLAYOUT_DELAY = 5;
-  RTP_HEADER_EXTENSION_DEPENDENCY_DESCRIPTOR = 6;
-  RTP_HEADER_EXTENSION_AUDIO_LEVEL = 7;
-  RTP_HEADER_EXTENSION_VIDEO_LAYERS_ALLOCATION = 8;
-}
-
-// One prepared encoding; immutable coordinates within the resource's binding.
-// Layer switching preserves receiver packet indices, compatible format, RTCP
-// attribution, and decodable-frame boundaries rather than changing identity.
+// Actual prepared encoding. An omitted identity never grants admission.
 message RtpEncodingParameters {
-  // Presence REQUIRED; zero is a real SSRC. Unique in connection/direction scope.
   optional fixed32 ssrc = 1;
-
-  // Required for each encoding when RTX is selected, otherwise absent. Distinct
-  // from all primary/repair SSRCs in the same reservation scope.
   optional fixed32 rtx_ssrc = 2;
-
-  // Actual prepared RID when used, <=16 UTF-8 bytes; uniqueness is per
-  // MID. Empty means no RID declaration, not permission to invent one.
   string rid = 3;
 
-  // If present, a known mode advertised for this format and actually prepared.
-  // Omission does not invent scalable-layer support.
-  optional RtpScalabilityMode scalability_mode = 4;
-}
-
-// Advertised single-spatial-layer modes with one, two, or three temporal layers.
-enum RtpScalabilityMode {
-  RTP_SCALABILITY_MODE_UNSPECIFIED = 0; // Invalid when selected/advertised.
-  RTP_SCALABILITY_MODE_L1T1 = 1;
-  RTP_SCALABILITY_MODE_L1T2 = 2;
-  RTP_SCALABILITY_MODE_L1T3 = 3;
+  // Negotiated spelling, e.g. L1T1. Unknown modes are not selected.
+  optional string scalability_mode = 4;
 }
 
 // Prepared RTCP facts. Preserve publisher synchronization groups at a receiver,

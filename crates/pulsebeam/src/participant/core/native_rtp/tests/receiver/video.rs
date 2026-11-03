@@ -8,9 +8,12 @@ fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, fixed: bool) -> wire::Res
         .codecs
         .into_iter()
         .find_map(|codec| {
-            codec
-                .format
-                .filter(|format| matches!(format.codec, Some(wire::codec_format::Codec::H264(_))))
+            codec.format.filter(|format| {
+                matches!(
+                    format.known_codec(),
+                    Some(wire::codec_format::Codec::H264(_))
+                )
+            })
         })
         .unwrap();
     wire::ResourceSpec {
@@ -19,10 +22,10 @@ fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, fixed: bool) -> wire::Res
             kind: wire::TrackKind::Video as i32,
             binding: Some(wire::TrackBinding { transport: Some(wire::track_binding::Transport::Rtp(wire::RtpParameters {
                 mid: mid.into(),
-                codec: Some(wire::RtpCodecParameters { payload_type: Some(96), format: Some(format), feedback: vec![wire::RtcpFeedback::TransportCc as i32], ..Default::default() }),
+                codec: Some(wire::RtpCodecParameters { payload_type: Some(96), format: Some(format), feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()], ..Default::default() }),
                 encodings: vec![wire::RtpEncodingParameters { ssrc: Some(ssrc), ..Default::default() }],
                 rtcp: Some(wire::RtcpParameters { cname: "component-video-receiver".into(), reduced_size: false }),
-                header_extensions: vec![wire::RtpHeaderExtensionParameters { id: 1, r#type: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid as i32 }, wire::RtpHeaderExtensionParameters { id: 2, r#type: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01 as i32 }, wire::RtpHeaderExtensionParameters { id: 3, r#type: wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay as i32 }],
+                header_extensions: vec![wire::RtpHeaderExtensionParameters { id: 1, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str().into() }, wire::RtpHeaderExtensionParameters { id: 2, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str().into() }, wire::RtpHeaderExtensionParameters { id: 3, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay.as_str().into() }],
             })) }),
         })),
         settings: Some(wire::ResourceSettings { enabled: Some(true), receive: Some(wire::resource_settings::Receive::Video(wire::VideoReceiveOptions { min_height: Some(1), min_fps: Some(1), playout_delay: fixed.then_some(wire::PlayoutDelay { min_ms: 100, max_ms: 100 }), ..Default::default() })) }),
@@ -124,7 +127,10 @@ pub(super) fn check(
     let Track::Video(source) = &mut video else {
         unreachable!()
     };
-    source.format = parameters.codec.as_ref().and_then(|codec| codec.format);
+    source.format = parameters
+        .codec
+        .as_ref()
+        .and_then(|codec| codec.format.clone());
     let handle = handles.insert(id);
     participant.add_track_candidate(handle, video);
     for (reference, spec) in [
