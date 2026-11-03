@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="330" viewBox="0 0 900 330" role="img" aria-labelledby="title desc">
+<title id="title">PulseBeam application model</title>
+<desc id="desc">Your backend issues participant tokens. Inside a room, two bidirectional Agents connect through PulseBeam. Each participant publishes local named tracks and receives remote named tracks.</desc>
+<style>
+  .bg { fill: #fff; }
+  .room { fill: none; stroke: #d0d7de; stroke-width: 1.5; }
+  .card { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; }
+  .server { fill: #eef6ff; stroke: #0969da; stroke-width: 1.8; }
+  .ink { fill: #1f2328; }
+  .muted { fill: #57606a; }
+  .line { fill: none; stroke: #8c959f; stroke-width: 1.6; }
+  .flow { fill: none; stroke: #0969da; stroke-width: 2; }
+  .head { font: 600 17px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  .sub { font: 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  .tiny { font: 600 11px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; letter-spacing: .05em; }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #0d1117; }
+    .room { stroke: #30363d; }
+    .card { fill: #161b22; stroke: #30363d; }
+    .server { fill: #10243f; stroke: #58a6ff; }
+    .ink { fill: #e6edf3; }
+    .muted { fill: #9da7b1; }
+    .line { stroke: #6e7681; }
+    .flow { stroke: #58a6ff; }
+  }
+</style>
+
+<rect class="bg" width="900" height="330"/>
+
+<defs>
+  <marker id="grayArrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <path d="M0,0 L10,5 L0,10 Z" fill="#8c959f"/>
+  </marker>
+  <marker id="blueArrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 Z" fill="#0969da"/>
+  </marker>
+</defs>
+
+<text x="450" y="28" text-anchor="middle" class="muted tiny">YOUR BACKEND</text>
+<text x="450" y="51" text-anchor="middle" class="ink sub">auth · authorization · participant tokens</text>
+
+<path d="M405 64 C340 78 270 90 215 112" class="line" marker-end="url(#grayArrow)"/>
+<path d="M495 64 C560 78 630 90 685 112" class="line" marker-end="url(#grayArrow)"/>
+
+<rect x="28" y="92" width="844" height="208" rx="14" class="room"/>
+<rect x="52" y="80" width="128" height="24" rx="12" class="bg"/>
+<text x="116" y="96" text-anchor="middle" class="muted tiny">ROOM = NAMESPACE</text>
+
+<rect x="60" y="126" width="240" height="132" rx="12" class="card"/>
+<text x="180" y="158" text-anchor="middle" class="ink head">Participant A</text>
+<text x="180" y="181" text-anchor="middle" class="muted sub">Agent</text>
+<text x="92" y="213" class="muted sub">publish</text>
+<text x="145" y="213" class="ink sub">camera · mic · data</text>
+<text x="92" y="238" class="muted sub">receive</text>
+<text x="145" y="238" class="ink sub">remote tracks</text>
+
+<rect x="350" y="145" width="200" height="94" rx="12" class="server"/>
+<text x="450" y="180" text-anchor="middle" class="ink head">PulseBeam</text>
+<text x="450" y="205" text-anchor="middle" class="muted sub">discovery + routing</text>
+
+<rect x="600" y="126" width="240" height="132" rx="12" class="card"/>
+<text x="720" y="158" text-anchor="middle" class="ink head">Participant B</text>
+<text x="720" y="181" text-anchor="middle" class="muted sub">Agent</text>
+<text x="632" y="213" class="muted sub">publish</text>
+<text x="685" y="213" class="ink sub">camera · mic · data</text>
+<text x="632" y="238" class="muted sub">receive</text>
+<text x="685" y="238" class="ink sub">remote tracks</text>
+
+<path d="M306 192 H344" class="flow" marker-start="url(#blueArrow)" marker-end="url(#blueArrow)"/>
+<path d="M556 192 H594" class="flow" marker-start="url(#blueArrow)" marker-end="url(#blueArrow)"/>
+<text x="325" y="174" text-anchor="middle" class="muted tiny">TRACKS</text>
+<text x="575" y="174" text-anchor="middle" class="muted tiny">TRACKS</text>
+
+<text x="450" y="286" text-anchor="middle" class="muted sub">named audio · video · data</text>
+</svg>
