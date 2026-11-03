@@ -894,7 +894,7 @@ impl TrackLifecycle {
                             .track
                             .layers()
                             .iter()
-                            .map(|layer| layer.rid)
+                            .map(|layer| layer.encoding)
                             .collect(),
                     }),
                     ..Default::default()

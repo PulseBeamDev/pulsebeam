@@ -101,7 +101,7 @@ fn owned_publication_relabel_uses_a_fresh_wire_session() {
     LocalNodeSim::new()
         .with_room(
             Room::new("owned-relabel")
-                .with_participant(Participant::owned_publisher("alice"))
+                .with_participant(Participant::single_publisher("alice"))
                 .with_participant(Participant::subscriber("bob")),
         )
         .run(vec![
@@ -991,7 +991,7 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
                     min_frames: 50,
                     min_resolution: (180, 180),
                 },
-                same_receiver: false,
+                fresh_receiver: false,
             },
             Step::Disconnect {
                 description: "Alice drops out",
@@ -1023,7 +1023,7 @@ fn a_rejoining_publisher_is_shown_to_an_existing_viewer_test() {
                     min_frames: 50,
                     min_resolution: (180, 180),
                 },
-                same_receiver: false,
+                fresh_receiver: true,
             },
         ]);
 }

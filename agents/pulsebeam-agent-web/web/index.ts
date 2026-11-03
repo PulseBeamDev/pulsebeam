@@ -49,7 +49,6 @@ export type {
   LocalAudioTrack,
   LocalVideoTrack,
   MediaKind,
-  MediaTopology,
   PlaybackFailure,
   ReceiveOptions,
   RemoteAudioTrack,

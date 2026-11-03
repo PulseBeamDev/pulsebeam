@@ -51,12 +51,6 @@ export function Room({
   const agent = useAgent({
     endpoint,
     token,
-    topology: {
-      localVideos: 2,
-      localAudios: 1,
-      remoteVideos: 7,
-      remoteAudios: 3,
-    },
     logging: { level: "debug" },
   });
   const { capture, devices, cameraOn, micOn, setCameraOn, setMicOn } =

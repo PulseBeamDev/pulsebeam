@@ -1,8 +1,6 @@
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 
-use super::{
-    Allocation, AllocationMode, ApplyOutcome, Candidate, CandidateId, Context, Error, Preparation,
-};
+use super::{Allocation, ApplyOutcome, Candidate, CandidateId, Context, Error, Preparation};
 use crate::OperationId;
 
 const MAX_PENDING: usize = 32;
@@ -10,7 +8,7 @@ const MAX_RETAINED_BYTES: usize = 2 * super::MAX_SDP_BYTES;
 
 enum Request {
     Prepare(Vec<Preparation>),
-    Allocate(Vec<Allocation>, AllocationMode),
+    Allocate(Vec<Allocation>),
     Retire(Vec<String>),
 }
 
@@ -24,7 +22,7 @@ impl Request {
     fn retained_bytes(&self) -> Result<usize, Error> {
         let backing = match self {
             Self::Prepare(requests) => requests.capacity().saturating_mul(size_of::<Preparation>()),
-            Self::Allocate(allocations, _) => allocations
+            Self::Allocate(allocations) => allocations
                 .capacity()
                 .saturating_mul(size_of::<Allocation>()),
             Self::Retire(mids) => mids.capacity().saturating_mul(size_of::<String>()),
@@ -47,7 +45,7 @@ impl Request {
                     }
                 }
             }
-            Self::Allocate(allocations, _) => {
+            Self::Allocate(allocations) => {
                 for allocation in allocations {
                     if let crate::MediaSlot::LocalAudio(name) | crate::MediaSlot::LocalVideo(name) =
                         &allocation.slot
@@ -79,7 +77,7 @@ impl Request {
                     return Err(Error::Identifier);
                 }
             }
-            Self::Allocate(allocations, _) => {
+            Self::Allocate(allocations) => {
                 if allocations.is_empty()
                     || allocations
                         .iter()
@@ -159,16 +157,7 @@ impl Executor {
         operation: OperationId,
         allocations: Vec<Allocation>,
     ) -> Result<(), Error> {
-        self.enqueue_allocations(operation, allocations, AllocationMode::Create)
-    }
-
-    pub fn enqueue_allocations(
-        &mut self,
-        operation: OperationId,
-        allocations: Vec<Allocation>,
-        mode: AllocationMode,
-    ) -> Result<(), Error> {
-        self.enqueue_work(operation, Request::Allocate(allocations, mode))
+        self.enqueue_work(operation, Request::Allocate(allocations))
     }
 
     fn enqueue_work(&mut self, operation: OperationId, request: Request) -> Result<(), Error> {
@@ -209,7 +198,7 @@ impl Executor {
             .filter(|running| running.work.operation == operation && !running.cancelled)
             .ok_or(Error::CandidateState)?;
         match &running.work.request {
-            Request::Prepare(_) | Request::Allocate(_, _) => Ok(&[]),
+            Request::Prepare(_) | Request::Allocate(_) => Ok(&[]),
             Request::Retire(mids) => {
                 self.context.validate_retirements(mids)?;
                 Ok(mids)
@@ -224,24 +213,12 @@ impl Executor {
             .filter(|running| running.work.operation == operation && !running.cancelled)
             .ok_or(Error::CandidateState)?;
         match &running.work.request {
-            Request::Allocate(allocations, mode) => {
-                self.context.validate_allocations(allocations, *mode)?;
+            Request::Allocate(allocations) => {
+                self.context.validate_allocations(allocations)?;
                 Ok(allocations)
             }
             Request::Prepare(_) | Request::Retire(_) => Ok(&[]),
         }
-    }
-
-    pub fn allocation_mode(&self, operation: OperationId) -> Result<AllocationMode, Error> {
-        let running = self
-            .running
-            .as_ref()
-            .filter(|running| running.work.operation == operation)
-            .ok_or(Error::CandidateState)?;
-        Ok(match &running.work.request {
-            Request::Allocate(_, mode) => *mode,
-            _ => AllocationMode::Create,
-        })
     }
 
     pub fn ready(&self) -> bool {
@@ -300,6 +277,42 @@ impl Executor {
             .is_some_and(Running::should_abort)
     }
 
+    /// Establish sender identities in the offer before the host applies it.
+    /// Declaration still requires the normal applied prepare/finish boundary.
+    pub fn prepare_local_offer(
+        &mut self,
+        operation: OperationId,
+        offer: &str,
+    ) -> Result<String, Error> {
+        if !self.running.as_ref().is_some_and(|running| {
+            running.work.operation == operation
+                && running.candidate.is_none()
+                && !running.should_abort()
+        }) {
+            return Err(Error::CandidateState);
+        }
+        self.context.prepare_local_offer(offer)
+    }
+
+    /// Capture configured modes in the current transaction before applying its
+    /// answer. SDP identities are unchanged; modes are not represented in SDP.
+    pub fn prepare_sender_modes(
+        &mut self,
+        operation: OperationId,
+        candidate: &mut Candidate,
+        mid: &str,
+        modes: &[Option<String>],
+    ) -> Result<(), Error> {
+        if !self.running.as_ref().is_some_and(|running| {
+            running.work.operation == operation
+                && running.candidate == Some(candidate.id())
+                && !running.should_abort()
+        }) {
+            return Err(Error::CandidateState);
+        }
+        self.context.prepare_sender_modes(candidate, mid, modes)
+    }
+
     pub fn prepare(
         &mut self,
         operation: OperationId,
@@ -315,7 +328,7 @@ impl Executor {
         }
         let candidate = match &running.work.request {
             Request::Prepare(requests) => self.context.prepare(actual_offer, requests)?,
-            Request::Allocate(_, _) => return Err(Error::CandidateState),
+            Request::Allocate(_) => return Err(Error::CandidateState),
             Request::Retire(mids) => self.context.prepare_retirement(actual_offer, mids)?,
         };
         running.candidate = Some(candidate.id());
@@ -333,12 +346,12 @@ impl Executor {
             .as_mut()
             .filter(|running| running.work.operation == operation && running.candidate.is_none())
             .ok_or(Error::CandidateState)?;
-        let Request::Allocate(allocations, mode) = &running.work.request else {
+        let Request::Allocate(allocations) = &running.work.request else {
             return Err(Error::CandidateState);
         };
         let candidate = self
             .context
-            .prepare_allocation(actual_offer, allocations, slots, *mode)?;
+            .prepare_allocation(actual_offer, allocations, slots)?;
         running.candidate = Some(candidate.id());
         Ok(candidate)
     }
@@ -354,7 +367,7 @@ impl Executor {
             .as_mut()
             .filter(|running| running.work.operation == operation)
             .ok_or(Error::CandidateState)?;
-        if !matches!(&running.work.request, Request::Allocate(_, _)) {
+        if !matches!(&running.work.request, Request::Allocate(_)) {
             return Err(Error::CandidateState);
         }
         if let Some(candidate) = running.candidate.take() {

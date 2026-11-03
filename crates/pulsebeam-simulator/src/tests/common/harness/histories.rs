@@ -28,7 +28,6 @@ struct Transition {
     holds: BTreeMap<u8, Instant>,
     desired: Vec<String>,
     desired_tracks: Vec<String>,
-    continuing_logical: bool,
     admitting: BTreeSet<&'static str>,
     unresolved: BTreeSet<(&'static str, String)>,
     unresolved_publications: BTreeSet<(&'static str, String, String)>,
@@ -325,7 +324,23 @@ impl Transition {
             }
         })
         .await
-        .context("admission did not complete")??;
+        .with_context(|| {
+            format!(
+                "admission did not complete for {who}: connected={} observed={:?} bindings={:?} media={:?}",
+                handles[who].connected(),
+                observation(&handles[who]).map(|o| (
+                    o.admission,
+                    o.snapshot.participant_id,
+                    o.snapshot.connection,
+                    o.snapshot.terminal_failure,
+                )),
+                self.bindings
+                    .iter()
+                    .map(|binding| (binding.name, binding.expected.connection))
+                    .collect::<Vec<_>>(),
+                observed_media(handles),
+            )
+        })??;
         self.bind(handles)
     }
 
@@ -370,13 +385,9 @@ impl Transition {
                 .push(PendingDriverOp::SetSubscriptions(
                     targets
                         .iter()
-                        .zip(&tracks)
-                        .map(|(id, track)| VideoSubscription {
+                        .map(|id| VideoSubscription {
                             participant_id: id.clone(),
-                            // The continuing call follows its logical publisher across
-                            // legitimate transport replacement. Viewer requests pin lifetimes.
-                            publication: (who != "continuing" || !self.continuing_logical)
-                                .then(|| track.clone()),
+                            label: Some("video".into()),
                             height: 180,
                             ..Default::default()
                         })
@@ -460,10 +471,6 @@ async fn execute_inner(
         holds: BTreeMap::new(),
         desired: Vec::new(),
         desired_tracks: Vec::new(),
-        continuing_logical: history
-            .ops
-            .iter()
-            .any(|op| matches!(op, Op::DeclareData(_))),
         admitting: BTreeSet::new(),
         unresolved: BTreeSet::new(),
         unresolved_publications: BTreeSet::new(),
@@ -1021,19 +1028,17 @@ async fn recover(state: &mut Transition, handles: &PlanHandles, final_check: boo
                 .map_or(0, |decoded| decoded.frames)
         })
         .collect::<Vec<_>>();
-    let expected_tracks = state
-        .desired_tracks
+    // Named intent survives readmission; exact tracks come from its current admission.
+    let expected_tracks = current
         .iter()
-        .filter(|track| {
-            current.iter().any(|binding| {
-                binding.video
-                    && binding
-                        .track_id(pulsebeam::entity::TrackKind::Video, "video")
-                        .as_str()
-                        == **track
-            })
+        .filter(|binding| {
+            binding.video && state.desired.iter().any(|id| binding.id.as_str() == *id)
         })
-        .cloned()
+        .map(|binding| {
+            binding
+                .track_id(pulsebeam::entity::TrackKind::Video, "video")
+                .as_str()
+        })
         .collect::<BTreeSet<_>>();
     let mut last = None;
     let budget = if final_check {

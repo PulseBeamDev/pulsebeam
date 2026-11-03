@@ -1,11 +1,11 @@
 //! One production constructor/HTTP/kernel-socket witness, not a media matrix.
 use anyhow::{Result, anyhow, bail, ensure};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, ConnectionState, DesiredState, Generation, MediaKind, MediaSlot, MediaTopology,
-    PublicationIntent, VideoSubscription,
+    AgentConfig, ConnectionState, DesiredState, Generation, TrackSelector, TrackSpec,
+    VideoObservation,
 };
 use pulsebeam_agent_native::{
-    Agent, Config, Host, I420Frame, InputFrame, LocalSource, MediaStreamUpdate, OutputFrame,
+    Agent, Config, Host, I420Frame, InputFrame, MediaStreamUpdate, OutputFrame, PublicationInput,
     ReceiveMode,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,7 +22,7 @@ const HEIGHT: u32 = 96;
 const LUMA: usize = 160 * 96;
 const CHROMA: usize = 80 * 48;
 
-fn config(endpoint: &str, participant: &str, publisher: bool) -> Result<Config> {
+fn config(endpoint: &str, participant: &str) -> Result<Config> {
     let expiry = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs()
@@ -35,12 +35,6 @@ fn config(endpoint: &str, participant: &str, publisher: bool) -> Result<Config> 
             participant,
             expiry,
         )?,
-        topology: MediaTopology {
-            local_video: u8::from(publisher),
-            local_audio: 0,
-            remote_video: u8::from(!publisher),
-            remote_audio: 0,
-        },
         retry: Default::default(),
         log_level: Default::default(),
     }))
@@ -61,7 +55,7 @@ async fn connected(agent: &Agent) -> Result<()> {
     }
 }
 
-async fn produce_i420(camera: LocalSource) -> Result<()> {
+async fn produce_i420(camera: PublicationInput) -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     loop {
         tick.tick().await;
@@ -95,24 +89,39 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
     // This constructor selects ThreadedRuntime, production reqwest and native
     // Linux sockets. No ControlledWorld or simulator clock is present.
     let publisher = Agent::spawn(
-        config(&endpoint, "publisher", true)?,
+        config(&endpoint, "publisher")?,
         Host::new(Box::new(reqwest::Client::new())),
     )
     .await?;
     let subscriber = Agent::spawn(
-        config(&endpoint, "subscriber", false)?,
+        config(&endpoint, "subscriber")?,
         Host::new(Box::new(reqwest::Client::new())),
     )
     .await?;
+    let publication = publisher
+        .publication(TrackSpec::Video {
+            label: "production-camera".into(),
+        })
+        .await?;
+    let camera = publication.input().await?;
+    let subscription = subscriber
+        .video_subscription(
+            TrackSelector {
+                participant_external_id: "publisher".into(),
+                label: "production-camera".into(),
+            },
+            VideoObservation {
+                visible: true,
+                height: HEIGHT,
+                priority: 1,
+                ..Default::default()
+            },
+        )
+        .await?;
     publisher
         .replace_desired(DesiredState {
             revision: 1,
             connected: true,
-            publications: vec![PublicationIntent {
-                slot: "v0".into(),
-                label: "production-camera".into(),
-                active: true,
-            }],
             ..Default::default()
         })
         .await?;
@@ -129,40 +138,12 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
     })
     .await??;
 
-    let camera = publisher.source(MediaSlot::LocalVideo("v0".into())).await?;
-    let remote = subscriber
-        .remote(MediaSlot::RemoteVideo(0), ReceiveMode::Decoded)
-        .await?;
+    camera.ready().await?;
     let mut producer = tokio::spawn(produce_i420(camera));
+    let mut observation = None;
     let media = tokio::time::timeout(Duration::from_secs(20), async {
-        let mut snapshots = subscriber.snapshots();
-        let track_id = loop {
-            let snapshot = snapshots.borrow().clone();
-            if let Some(publication) = snapshot.publications.values().find(|publication| {
-                publication.kind == MediaKind::Video
-                    && snapshot.participant_id.as_deref() != Some(&publication.participant_id)
-            }) {
-                break publication.id.clone();
-            }
-            snapshots.changed().await?;
-        };
-        subscriber
-            .replace_desired(DesiredState {
-                revision: 2,
-                connected: true,
-                video: vec![VideoSubscription {
-                    slot: 0,
-                    track_id,
-                    selector: None,
-                    height: HEIGHT,
-                    min_height: 0,
-                    min_fps: 0,
-                    priority: 1,
-                    playout_delay: Default::default(),
-                }],
-                ..Default::default()
-            })
-            .await?;
+        let remote = observation.insert(subscription.observe(ReceiveMode::Decoded).await?);
+        ensure!(remote.source_track_id().is_some_and(|id| subscriber.snapshot().publications.get(id).is_some_and(|source| source.label == "production-camera" && Some(source.participant_id.as_str()) == publisher.snapshot().participant_id.as_deref())), "observation is not bound to the actual remote publication ID");
         loop {
             tokio::select! {
                 result = &mut producer => bail!("production input stopped: {result:?}"),
@@ -200,6 +181,20 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
     }
     let pixels = media??;
     close??;
+    let observation = observation.ok_or_else(|| anyhow!("missing production observation"))?;
+    ensure!(
+        matches!(observation.next().await, MediaStreamUpdate::Closed),
+        "retired physical observation remained open"
+    );
+    ensure!(
+        !subscription.is_closed(),
+        "disconnect retired the named subscription"
+    );
+    subscription.close().await?;
+    ensure!(
+        subscription.is_closed(),
+        "named subscription release did not close its owner"
+    );
     for agent in [&publisher, &subscriber] {
         ensure!(
             agent.snapshot().connection == ConnectionState::Disconnected,
@@ -219,7 +214,7 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
     );
     // The same bounded server also proves the emitted Python API and cdylib,
     // without adding a second server fixture or claiming another media matrix.
-    let foreign = config(&endpoint, "foreign", true)?;
+    let foreign = config(&endpoint, "foreign")?;
     let mut command = tokio::process::Command::new(std::env::var("PULSEBEAM_FOREIGN_SMOKE")?);
     command
         .arg(&endpoint)

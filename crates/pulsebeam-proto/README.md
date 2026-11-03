@@ -46,10 +46,8 @@ discovery to infer retirement. Probes need current owned confirmation and source
 facts; an unknown-source timeout or internal failure is not authoritative source
 termination.
 
-Retained-source replay and the owned-source probe gate have focused owner and
-public recovery evidence, not full-profile runtime qualification. See
-[Core ordered recovery](../../agents/pulsebeam-agent-core/README.md#ordered-subscription-recovery)
-for current limitations. New source IDs start live; explicit unsubscribe and
+See [Core ordered recovery](../../agents/pulsebeam-agent-core/README.md#ordered-subscription-recovery)
+for frontier ownership. New source IDs start live; explicit unsubscribe and
 session close release frontiers. TopicFrame payload and bounded ordered-gap
 semantics are unchanged.
 
@@ -64,8 +62,7 @@ failure.
 Stock native and browser audio do not negotiate RTP playout-delay, so use
 adaptive audio. The native resource receiver rejects fixed audio with
 `FailureCode::Unsupported` before changing accepted receive state. A local
-minimum-delay setter does not implement the full min/max interval. Wire support
-does not establish full-profile runtime qualification, which remains in progress.
+minimum-delay setter does not implement the full min/max interval.
 
 Run `./bazel test //crates/pulsebeam-proto:unit_tests` for focused verification,
 then the root `./bazel test //:check` and `./bazel test //:test` gates.

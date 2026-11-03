@@ -406,6 +406,8 @@ impl Connection {
     /// Reserve an explicitly identified negotiated channel even before SCTP connects.
     /// `Opened` reports activation after peer stream-capacity checks; admission alone
     /// does not permit sending. In-band channels still require connected SCTP.
+    /// A retiring SID returns `ResetPending` with the unchanged configuration.
+    /// Retry after `ResetComplete`; a failed reset remains `InvalidState` until teardown.
     pub fn open_data_channel(
         &mut self,
         at: Instant,

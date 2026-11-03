@@ -5,7 +5,6 @@ export async function mediaResourceContract(pulsebeam) {
   const agent = pulsebeam.createAgent({
     endpoint: "http://localhost",
     token: "media-resource-contract",
-    topology: { localVideos: 1, localAudios: 0 },
     logging: { level: "off" },
   });
   const beforeLookup = agent.getSnapshot().desiredRevision;
@@ -15,7 +14,6 @@ export async function mediaResourceContract(pulsebeam) {
   const other = pulsebeam.createAgent({
     endpoint: "http://localhost",
     token: "other-media-resource-contract",
-    topology: { localVideos: 1, localAudios: 0 },
     logging: { level: "off" },
   });
   assert.notEqual(other.track(descriptor), local);

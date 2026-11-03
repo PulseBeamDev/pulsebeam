@@ -176,16 +176,8 @@ pub struct MediaOwner {
     pub group: Option<MediaKey>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum AllocationMode {
-    #[default]
-    Create,
-    /// Retain a live receive-only transceiver and prepare fresh RTP identities.
-    RetargetReceiver,
-}
-
 /// Logical allocation intent. MID and payload type come from the actual local
-/// description of the created or retained physical transceiver.
+/// description of the newly created physical transceiver.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Allocation {
     pub slot: crate::MediaSlot,

@@ -6,10 +6,13 @@ use alloc::{
 };
 
 use crate::{
-    MediaKind, MediaTopology, PlayoutDelay, PublicationIntent, TopicChannel, TopicMode,
-    TopicNotification, TopicPublisher, TopicRegistrations, TopicSubscriber, TrackSelector,
-    ValidationError, VideoSubscription, model::validate_identifier,
+    MediaKind, PlayoutDelay, PublicationIntent, TopicChannel, TopicMode, TopicNotification,
+    TopicPublisher, TopicRegistrations, TopicSubscriber, TrackSelector, ValidationError,
+    VideoSubscription, model::validate_identifier,
 };
+
+mod observation;
+pub use observation::{MediaObservationControl, MediaObservationId, MediaObservationTarget};
 
 pub const DATA_RECEIVE_CAPACITY: usize = 256;
 
@@ -113,8 +116,10 @@ pub enum TrackResourceError {
     OwnerInUse,
     #[error("resource owner identity space exhausted")]
     OwnerSpaceExhausted,
-    #[error("local {kind:?} capacity exhausted")]
-    Capacity { kind: MediaKind },
+    #[error("publication input operation identity space exhausted")]
+    InputOperationSpaceExhausted,
+    #[error("{kind:?} physical coordinate space exhausted")]
+    SlotSpaceExhausted { kind: MediaKind },
     #[error("owner no longer owns this resource")]
     Released,
     #[error("playout delay minimum exceeds maximum")]
@@ -187,10 +192,25 @@ struct VideoView {
     observation: VideoObservation,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct VideoProjection {
-    pub subscriptions: Vec<VideoSubscription>,
-    pub unmapped: Vec<TrackSelector>,
+enum AudioView {
+    Named {
+        selector: TrackSelector,
+        playout_delay: PlayoutDelay,
+    },
+    Policy(crate::AudioSubscription),
+}
+
+impl AudioView {
+    fn has_fixed_delay(&self) -> bool {
+        match self {
+            Self::Named { playout_delay, .. } => *playout_delay != PlayoutDelay::Adaptive,
+            Self::Policy(policy) => policy
+                .playout_delays
+                .values()
+                .chain(policy.selector_delays.values())
+                .any(|delay| *delay != PlayoutDelay::Adaptive),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -199,10 +219,105 @@ pub struct ReceiveUpdate {
     pub registrations_changed: bool,
 }
 
+/// A logical input lifetime, independent of registration work and RTP bindings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationInputId {
+    owner: TrackOwner,
+    id: TrackOwner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationInputIntent {
+    Replace,
+    ConfigureCurrent,
+    Retain(PublicationInputId),
+}
+
+/// Core-issued registration work. Reconfiguration preserves the input lifetime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationInputOperation {
+    owner: TrackOwner,
+    input: Option<PublicationInputId>,
+    revision: u64,
+    slot: String,
+    present: bool,
+}
+
+impl PublicationInputOperation {
+    pub const fn owner(&self) -> u64 {
+        self.owner.id()
+    }
+
+    pub fn slot(&self) -> &str {
+        &self.slot
+    }
+
+    pub const fn input(&self) -> Option<PublicationInputId> {
+        self.input
+    }
+}
+
+/// Apply to the owner's registered input, not to a borrowed capture device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationInputState {
+    pub owner: u64,
+    pub input: Option<PublicationInputId>,
+    pub slot: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationInputTarget {
+    pub generation: crate::Generation,
+    pub binding: crate::SlotBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationInputControl {
+    pub(crate) effect: Option<crate::OperationId>,
+    pub operation: PublicationInputOperation,
+    pub enabled: bool,
+    pub target: Option<PublicationInputTarget>,
+}
+
+impl PublicationInputControl {
+    pub fn state(&self) -> PublicationInputState {
+        PublicationInputState {
+            owner: self.operation.owner(),
+            input: self.operation.input(),
+            slot: self.operation.slot().into(),
+            enabled: self.enabled,
+        }
+    }
+}
+
 struct PublicationOwner {
     owner: TrackOwner,
     slot: String,
-    present: bool,
+    input: Option<PublicationInputId>,
+    input_revision: u64,
+    pending_input: bool,
+    muted: bool,
+    last_control: Option<PublicationInputControl>,
+    control_completed: bool,
+    // None defers declaration until the first input. Once declared, input loss
+    // disables the stream; only owner release ends its lifetime.
+    present: Option<bool>,
+}
+
+impl PublicationOwner {
+    fn input_enabled(&self) -> bool {
+        self.present == Some(true) && !self.muted && !self.pending_input
+    }
+
+    fn input_state(&self) -> PublicationInputState {
+        PublicationInputState {
+            owner: self.owner.id(),
+            input: self.input,
+            slot: self.slot.clone(),
+            enabled: self.input_enabled(),
+        }
+    }
 }
 
 struct DataReceiver {
@@ -289,6 +404,27 @@ pub enum ResourceCommand {
         owner: u64,
         present: bool,
     },
+    BeginPublicationInput {
+        owner: u64,
+        input: PublicationInputIntent,
+        present: bool,
+        muted: Option<bool>,
+    },
+    AuthorizePublicationInput {
+        operation: PublicationInputOperation,
+    },
+    CompletePublicationInput {
+        operation: PublicationInputOperation,
+        succeeded: bool,
+    },
+    CompletePublicationInputTarget {
+        control: PublicationInputControl,
+        succeeded: bool,
+    },
+    SetPublicationMuted {
+        owner: u64,
+        muted: bool,
+    },
     ClaimVideo {
         selector: TrackSelector,
     },
@@ -297,6 +433,37 @@ pub enum ResourceCommand {
         observation: VideoObservation,
     },
     ClaimAudio,
+    ClaimAudioSubscription {
+        selector: TrackSelector,
+    },
+    ConfigureAudio {
+        owner: u64,
+        playout_delay: PlayoutDelay,
+    },
+    ClaimAudioPolicy {
+        policy: crate::AudioSubscription,
+    },
+    ConfigureAudioPolicy {
+        owner: u64,
+        policy: crate::AudioSubscription,
+    },
+    BeginMediaObservation {
+        owner: u64,
+    },
+    BeginAudioSourceObservation {
+        owner: u64,
+        source: String,
+    },
+    AuthorizeMediaObservation {
+        control: MediaObservationControl,
+    },
+    CompleteMediaObservation {
+        control: MediaObservationControl,
+        succeeded: bool,
+    },
+    EndMediaObservation {
+        control: MediaObservationControl,
+    },
     RetainProducer {
         spec: TrackSpec,
     },
@@ -320,6 +487,13 @@ pub enum ResourceResult {
         /// Earlier sessions retain an incompatible wire binding for this slot.
         after_generation: Option<crate::Generation>,
     },
+    PublicationInput {
+        operation: PublicationInputOperation,
+        state: PublicationInputState,
+    },
+    PublicationInputState(PublicationInputState),
+    MediaObservation(MediaObservationId),
+    Superseded,
     Owned {
         owner: u64,
     },
@@ -335,8 +509,10 @@ pub struct TrackResources {
     next_owner: u64,
     publications: BTreeMap<TrackSpec, PublicationOwner>,
     audio: Option<TrackOwner>,
+    audio_views: BTreeMap<TrackOwner, AudioView>,
     video: BTreeMap<TrackOwner, VideoView>,
-    video_slots: BTreeMap<TrackSelector, u8>,
+    video_slots: BTreeMap<TrackSelector, u32>,
+    observations: BTreeMap<MediaObservationId, observation::MediaObservation>,
     producers: BTreeSet<TopicPublisher>,
     receivers: BTreeMap<TrackOwner, DataReceiver>,
 }
@@ -354,7 +530,6 @@ impl TrackResources {
         &mut self,
         owner: TrackOwner,
         spec: TrackSpec,
-        topology: &MediaTopology,
         occupied: &BTreeSet<String>,
     ) -> Result<String, TrackResourceError> {
         spec.validate()?;
@@ -369,23 +544,29 @@ impl TrackResources {
         if self.publications.values().any(|entry| entry.owner == owner) {
             return Err(TrackResourceError::OwnerInUse);
         }
-        let (prefix, capacity) = match kind {
-            MediaKind::Video => ('v', topology.local_video),
-            MediaKind::Audio => ('a', topology.local_audio),
+        let prefix = match kind {
+            MediaKind::Video => 'v',
+            MediaKind::Audio => 'a',
         };
-        let slot = (0..capacity)
+        let slot = (0..=u64::MAX)
             .map(|index| format!("{prefix}{index}"))
             .find(|slot| {
                 !occupied.contains(slot)
                     && !self.publications.values().any(|entry| &entry.slot == slot)
             })
-            .ok_or(TrackResourceError::Capacity { kind })?;
+            .ok_or(TrackResourceError::SlotSpaceExhausted { kind })?;
         self.publications.insert(
             spec,
             PublicationOwner {
                 owner,
                 slot: slot.clone(),
-                present: false,
+                input: None,
+                input_revision: 0,
+                pending_input: false,
+                last_control: None,
+                control_completed: false,
+                muted: false,
+                present: None,
             },
         );
         Ok(slot)
@@ -402,8 +583,216 @@ impl TrackResources {
             .get_mut(spec)
             .filter(|entry| entry.owner == owner)
             .ok_or(TrackResourceError::Released)?;
-        entry.present = present;
+        entry.input_revision = entry
+            .input_revision
+            .checked_add(1)
+            .ok_or(TrackResourceError::InputOperationSpaceExhausted)?;
+        entry.input = None;
+        entry.pending_input = false;
+        if present || entry.present.is_some() {
+            entry.present = Some(present);
+        }
         Ok(())
+    }
+
+    pub(crate) fn begin_publication_input(
+        &mut self,
+        owner: TrackOwner,
+        input: PublicationInputIntent,
+        present: bool,
+        muted: bool,
+    ) -> Result<(PublicationInputOperation, PublicationInputState), TrackResourceError> {
+        let entry = self
+            .publications
+            .values()
+            .find(|entry| entry.owner == owner)
+            .ok_or(TrackResourceError::Released)?;
+        let revision = entry
+            .input_revision
+            .checked_add(1)
+            .ok_or(TrackResourceError::InputOperationSpaceExhausted)?;
+        let retained = match input {
+            PublicationInputIntent::Replace => None,
+            PublicationInputIntent::ConfigureCurrent => entry.input,
+            PublicationInputIntent::Retain(input) => {
+                if input.owner != owner || entry.input != Some(input) {
+                    return Err(TrackResourceError::Released);
+                }
+                Some(input)
+            }
+        };
+        let input = if present {
+            Some(match retained {
+                Some(input) => input,
+                None => PublicationInputId {
+                    owner,
+                    id: self.new_owner()?,
+                },
+            })
+        } else {
+            None
+        };
+        let entry = self
+            .publications
+            .values_mut()
+            .find(|entry| entry.owner == owner)
+            .ok_or(TrackResourceError::Released)?;
+        entry.input = input;
+        entry.input_revision = revision;
+        entry.pending_input = true;
+        entry.muted = muted;
+        entry.present = entry.present.map(|_| false);
+        let operation = PublicationInputOperation {
+            owner,
+            input,
+            revision,
+            slot: entry.slot.clone(),
+            present,
+        };
+        Ok((operation, entry.input_state()))
+    }
+
+    pub(crate) fn publication_muted(&self, owner: TrackOwner) -> Result<bool, TrackResourceError> {
+        self.publications
+            .values()
+            .find(|entry| entry.owner == owner)
+            .map(|entry| entry.muted)
+            .ok_or(TrackResourceError::Released)
+    }
+
+    pub(crate) fn publication_input_current(&self, operation: &PublicationInputOperation) -> bool {
+        self.publications.values().any(|entry| {
+            entry.owner == operation.owner
+                && entry.input == operation.input
+                && entry.input_revision == operation.revision
+        })
+    }
+
+    pub(crate) fn complete_publication_input(
+        &mut self,
+        operation: &PublicationInputOperation,
+        succeeded: bool,
+    ) -> Option<PublicationInputState> {
+        let entry = self.publications.values_mut().find(|entry| {
+            entry.owner == operation.owner
+                && entry.input == operation.input
+                && entry.input_revision == operation.revision
+                && entry.pending_input
+        })?;
+        entry.pending_input = false;
+        let present = succeeded && operation.present;
+        if present || entry.present.is_some() {
+            entry.present = Some(present);
+        }
+        Some(entry.input_state())
+    }
+
+    pub(crate) fn publication_inputs(&self) -> impl Iterator<Item = PublicationInputControl> + '_ {
+        self.publications
+            .values()
+            .filter(|entry| {
+                entry.input.is_some() || entry.pending_input || entry.last_control.is_some()
+            })
+            .map(|entry| PublicationInputControl {
+                effect: entry
+                    .last_control
+                    .as_ref()
+                    .and_then(|control| control.effect),
+                operation: PublicationInputOperation {
+                    owner: entry.owner,
+                    input: entry.input,
+                    revision: entry.input_revision,
+                    slot: entry.slot.clone(),
+                    present: entry.input.is_some(),
+                },
+                enabled: entry.input_enabled(),
+                target: None,
+            })
+    }
+
+    pub(crate) fn input_control_current(&self, control: &PublicationInputControl) -> bool {
+        self.publications
+            .values()
+            .find(|entry| entry.owner.id() == control.operation.owner())
+            .map_or_else(
+                || {
+                    control.operation.input().is_none()
+                        && !control.enabled
+                        && control.target.is_none()
+                },
+                |entry| entry.last_control.as_ref() == Some(control),
+            )
+    }
+
+    pub(crate) fn input_control_changed(&self, control: &PublicationInputControl) -> bool {
+        self.publications
+            .values()
+            .find(|entry| entry.owner.id() == control.operation.owner())
+            .is_some_and(|entry| entry.last_control.as_ref() != Some(control))
+    }
+
+    pub(crate) fn update_input_control(&mut self, control: &PublicationInputControl) {
+        if let Some(entry) = self
+            .publications
+            .values_mut()
+            .find(|entry| entry.owner.id() == control.operation.owner())
+        {
+            entry.last_control = Some(control.clone());
+            entry.control_completed = false;
+        }
+    }
+
+    pub(crate) fn complete_input_control(&mut self, control: &PublicationInputControl) -> bool {
+        let Some(entry) = self
+            .publications
+            .values_mut()
+            .find(|entry| entry.last_control.as_ref() == Some(control) && !entry.control_completed)
+        else {
+            return false;
+        };
+        entry.control_completed = true;
+        true
+    }
+
+    pub(crate) fn release_input_control(
+        &self,
+        owner: TrackOwner,
+    ) -> Option<PublicationInputControl> {
+        let mut control = self
+            .publication_inputs()
+            .find(|control| control.operation.owner == owner)?;
+        control.operation.input = None;
+        control.operation.present = false;
+        control.enabled = false;
+        Some(control)
+    }
+
+    pub(crate) fn fail_publication_input(
+        &mut self,
+        operation: &PublicationInputOperation,
+    ) -> Option<PublicationInputState> {
+        let entry = self.publications.values_mut().find(|entry| {
+            entry.owner == operation.owner
+                && entry.input == operation.input
+                && entry.input_revision == operation.revision
+        })?;
+        entry.present = Some(false);
+        entry.pending_input = false;
+        Some(entry.input_state())
+    }
+
+    pub(crate) fn set_publication_muted(
+        &mut self,
+        owner: TrackOwner,
+        muted: bool,
+    ) -> Result<PublicationInputState, TrackResourceError> {
+        let entry = self
+            .publications
+            .values_mut()
+            .find(|entry| entry.owner == owner)
+            .ok_or(TrackResourceError::Released)?;
+        entry.muted = muted;
+        Ok(entry.input_state())
     }
 
     pub fn release_publication(&mut self, owner: TrackOwner, spec: &TrackSpec) -> Option<String> {
@@ -432,8 +821,13 @@ impl TrackResources {
         !self.video.is_empty()
     }
 
+    pub(crate) fn has_audio_subscriptions(&self) -> bool {
+        !self.audio_views.is_empty()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.publications.is_empty()
+            && self.audio_views.is_empty()
             && self.audio.is_none()
             && self.video.is_empty()
             && self.producers.is_empty()
@@ -450,6 +844,7 @@ impl TrackResources {
     pub(crate) fn release(&mut self, owner: TrackOwner) {
         self.publications.retain(|_, entry| entry.owner != owner);
         self.release_audio(owner);
+        self.audio_views.remove(&owner);
         self.release_video(owner);
         self.release_receiver(owner);
     }
@@ -457,11 +852,14 @@ impl TrackResources {
     pub fn publications(&self) -> Vec<PublicationIntent> {
         self.publications
             .iter()
-            .filter(|(_, entry)| entry.present)
-            .map(|(spec, entry)| PublicationIntent {
-                slot: entry.slot.clone(),
-                label: spec.label().into(),
-                active: true,
+            .filter_map(|(spec, entry)| {
+                let kind = spec.media_kind()?;
+                entry.present.map(|active| PublicationIntent {
+                    slot: entry.slot.clone(),
+                    kind,
+                    label: spec.label().into(),
+                    active,
+                })
             })
             .collect()
     }
@@ -480,6 +878,200 @@ impl TrackResources {
         }
         self.audio = None;
         true
+    }
+
+    pub(crate) fn claim_audio_subscription(
+        &mut self,
+        owner: TrackOwner,
+        selector: TrackSelector,
+    ) -> Result<(), TrackResourceError> {
+        validate_identifier(
+            "participant external id",
+            &selector.participant_external_id,
+            256,
+            true,
+        )?;
+        TrackSpec::Audio {
+            label: selector.label.clone(),
+        }
+        .validate()?;
+        if self.audio_views.contains_key(&owner) {
+            return Err(TrackResourceError::OwnerInUse);
+        }
+        if self.audio_views.values().any(|view| match view {
+            AudioView::Named {
+                selector: other,
+                playout_delay,
+            } => *other == selector && *playout_delay != PlayoutDelay::Adaptive,
+            AudioView::Policy(_) => view.has_fixed_delay(),
+        }) {
+            return Err(TrackResourceError::AlreadyOwned);
+        }
+        self.audio_views.insert(
+            owner,
+            AudioView::Named {
+                selector,
+                playout_delay: PlayoutDelay::Adaptive,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn configure_audio(
+        &mut self,
+        owner: TrackOwner,
+        playout_delay: PlayoutDelay,
+    ) -> Result<(), TrackResourceError> {
+        if self.video.contains_key(&owner) {
+            return Err(TrackResourceError::WrongKind);
+        }
+        if matches!(playout_delay, PlayoutDelay::Fixed { min_ms, max_ms } if min_ms > max_ms) {
+            return Err(TrackResourceError::InvalidPlayoutDelay);
+        }
+        let AudioView::Named { selector, .. } = self
+            .audio_views
+            .get(&owner)
+            .ok_or(TrackResourceError::Released)?
+        else {
+            return Err(TrackResourceError::WrongKind);
+        };
+        if self.audio_views.iter().any(|(other, view)| {
+            *other != owner
+                && match view {
+                    AudioView::Named {
+                        selector: candidate,
+                        playout_delay: delay,
+                    } => candidate == selector && *delay != playout_delay,
+                    AudioView::Policy(_) => {
+                        playout_delay != PlayoutDelay::Adaptive || view.has_fixed_delay()
+                    }
+                }
+        }) {
+            return Err(TrackResourceError::AlreadyOwned);
+        }
+        if let Some(AudioView::Named {
+            playout_delay: delay,
+            ..
+        }) = self.audio_views.get_mut(&owner)
+        {
+            *delay = playout_delay;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn claim_audio_policy(
+        &mut self,
+        owner: TrackOwner,
+        policy: crate::AudioSubscription,
+    ) -> Result<(), TrackResourceError> {
+        if self.audio_views.contains_key(&owner) {
+            return Err(TrackResourceError::OwnerInUse);
+        }
+        self.validate_audio_policy(owner, &policy)?;
+        self.audio_views.insert(owner, AudioView::Policy(policy));
+        Ok(())
+    }
+
+    pub(crate) fn configure_audio_policy(
+        &mut self,
+        owner: TrackOwner,
+        policy: crate::AudioSubscription,
+    ) -> Result<(), TrackResourceError> {
+        match self.audio_views.get(&owner) {
+            Some(AudioView::Policy(_)) => {}
+            Some(AudioView::Named { .. }) => return Err(TrackResourceError::WrongKind),
+            None => return Err(TrackResourceError::Released),
+        }
+        self.validate_audio_policy(owner, &policy)?;
+        self.audio_views.insert(owner, AudioView::Policy(policy));
+        Ok(())
+    }
+
+    fn validate_audio_policy(
+        &self,
+        owner: TrackOwner,
+        policy: &crate::AudioSubscription,
+    ) -> Result<(), TrackResourceError> {
+        crate::DesiredState {
+            audio: policy.clone(),
+            ..Default::default()
+        }
+        .validate()?;
+        if policy
+            .playout_delays
+            .values()
+            .chain(policy.selector_delays.values())
+            .any(|delay| matches!(delay, PlayoutDelay::Fixed { min_ms, max_ms } if min_ms > max_ms))
+        {
+            return Err(TrackResourceError::InvalidPlayoutDelay);
+        }
+        let fixed = policy
+            .playout_delays
+            .values()
+            .chain(policy.selector_delays.values())
+            .any(|delay| *delay != PlayoutDelay::Adaptive);
+        // Policy matching can overlap named or opaque-ID demand after discovery.
+        // Fixed policy delay therefore requires exclusive audio ownership.
+        if self
+            .audio_views
+            .iter()
+            .any(|(other, view)| *other != owner && (fixed || view.has_fixed_delay()))
+        {
+            return Err(TrackResourceError::AlreadyOwned);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn audio_source_authorized(
+        &self,
+        owner: TrackOwner,
+        source: &str,
+        selector: Option<&TrackSelector>,
+    ) -> bool {
+        match self.audio_views.get(&owner) {
+            Some(AudioView::Named {
+                selector: selected, ..
+            }) => selector == Some(selected),
+            Some(AudioView::Policy(policy)) => {
+                policy.automatic
+                    || policy.pinned.iter().any(|id| id == source)
+                    || selector.is_some_and(|selector| policy.selected.contains(selector))
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn audio_projection(&self) -> crate::AudioSubscription {
+        let mut projection = crate::AudioSubscription::default();
+        for view in self.audio_views.values() {
+            match view {
+                AudioView::Named {
+                    selector,
+                    playout_delay,
+                } => {
+                    projection.selected.push(selector.clone());
+                    projection
+                        .selector_delays
+                        .insert(selector.clone(), *playout_delay);
+                }
+                AudioView::Policy(policy) => {
+                    projection.automatic |= policy.automatic;
+                    projection.pinned.extend(policy.pinned.iter().cloned());
+                    projection.selected.extend(policy.selected.iter().cloned());
+                    projection
+                        .playout_delays
+                        .extend(policy.playout_delays.clone());
+                    projection
+                        .selector_delays
+                        .extend(policy.selector_delays.clone());
+                }
+            }
+        }
+        projection.pinned.sort();
+        projection.pinned.dedup();
+        projection.selected.sort();
+        projection.selected.dedup();
+        projection
     }
 
     pub fn claim_video(
@@ -515,6 +1107,9 @@ impl TrackResources {
         owner: TrackOwner,
         observation: VideoObservation,
     ) -> Result<(), TrackResourceError> {
+        if self.audio_views.contains_key(&owner) {
+            return Err(TrackResourceError::WrongKind);
+        }
         if matches!(observation.playout_delay, PlayoutDelay::Fixed { min_ms, max_ms } if min_ms > max_ms)
         {
             return Err(TrackResourceError::InvalidPlayoutDelay);
@@ -534,13 +1129,18 @@ impl TrackResources {
     pub fn video_projection(
         &mut self,
         tracks: &BTreeMap<String, RemoteTrack>,
-        capacity: u8,
-    ) -> VideoProjection {
+    ) -> Result<Vec<VideoSubscription>, TrackResourceError> {
         let mut grouped: BTreeMap<TrackSelector, VideoObservation> = BTreeMap::new();
         for view in self.video.values().filter(|view| view.observation.visible) {
             let observation = &view.observation;
-            let aggregate = grouped.entry(view.selector.clone()).or_default();
-            aggregate.height = aggregate.height.max(observation.height);
+            let aggregate = grouped
+                .entry(view.selector.clone())
+                .or_insert_with(|| observation.clone());
+            aggregate.height = if aggregate.height == 0 || observation.height == 0 {
+                0
+            } else {
+                aggregate.height.max(observation.height)
+            };
             aggregate.min_height = aggregate.min_height.max(observation.min_height);
             aggregate.min_fps = aggregate.min_fps.max(observation.min_fps);
             aggregate.priority = aggregate.priority.max(observation.priority);
@@ -558,34 +1158,32 @@ impl TrackResources {
                 (PlayoutDelay::Adaptive, delay) | (delay, PlayoutDelay::Adaptive) => delay,
             };
         }
-        grouped.retain(|selector, observation| {
-            observation.height > 0
-                && (self.video_slots.contains_key(selector)
-                    || tracks.values().any(|track| {
-                        track.participant_id == selector.participant_external_id
-                            && track.spec
-                                == (TrackSpec::Video {
-                                    label: selector.label.clone(),
-                                })
-                    }))
+        grouped.retain(|selector, _| {
+            self.video_slots.contains_key(selector)
+                || tracks.values().any(|track| {
+                    track.participant_id == selector.participant_external_id
+                        && track.spec
+                            == (TrackSpec::Video {
+                                label: selector.label.clone(),
+                            })
+                })
         });
         self.video_slots
-            .retain(|selector, slot| grouped.contains_key(selector) && *slot < capacity);
+            .retain(|selector, _| grouped.contains_key(selector));
         let mut occupied: BTreeSet<_> = self.video_slots.values().copied().collect();
-        let mut projection = VideoProjection::default();
+        let mut projection = Vec::new();
         for (selector, observation) in grouped {
             let slot = self
                 .video_slots
                 .get(&selector)
                 .copied()
-                .or_else(|| (0..capacity).find(|slot| !occupied.contains(slot)));
-            let Some(slot) = slot else {
-                projection.unmapped.push(selector);
-                continue;
-            };
+                .or_else(|| (0..=u32::MAX).find(|slot| !occupied.contains(slot)))
+                .ok_or(TrackResourceError::SlotSpaceExhausted {
+                    kind: MediaKind::Video,
+                })?;
             occupied.insert(slot);
             self.video_slots.insert(selector.clone(), slot);
-            projection.subscriptions.push(VideoSubscription {
+            projection.push(VideoSubscription {
                 slot,
                 track_id: String::new(),
                 selector: Some(selector),
@@ -596,10 +1194,8 @@ impl TrackResources {
                 playout_delay: observation.playout_delay,
             });
         }
-        projection
-            .subscriptions
-            .sort_by_key(|subscription| subscription.slot);
-        projection
+        projection.sort_by_key(|subscription| subscription.slot);
+        Ok(projection)
     }
 
     pub fn retain_producer(&mut self, spec: &TrackSpec) -> Result<(), TrackResourceError> {

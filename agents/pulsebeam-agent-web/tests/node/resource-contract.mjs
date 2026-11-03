@@ -5,12 +5,6 @@ export async function resourceContract(BrowserRuntime) {
     endpoint: "http://localhost",
     token: "resource-ownership",
     logLevel: "off",
-    topology: {
-      localVideos: 1,
-      localAudios: 0,
-      remoteVideos: 1,
-      remoteAudios: 0,
-    },
   });
   const resource = (command) => runtime.resource(command);
   const camera = { kind: "video", label: "camera" };
@@ -22,9 +16,19 @@ export async function resourceContract(BrowserRuntime) {
     await assert.rejects(resource({ op: "claimPublication", spec: camera }), {
       pulsebeamCode: "ownership",
     });
-    await assert.rejects(resource({ op: "claimPublication", spec: screen }), {
-      pulsebeamCode: "capacity",
+    const concurrentVideo = await resource({
+      op: "claimPublication",
+      spec: screen,
     });
+    assert.equal(concurrentVideo.slot, "v1");
+    assert.notEqual(concurrentVideo.owner, first.owner);
+    const microphone = await resource({
+      op: "claimPublication",
+      spec: { kind: "audio", label: "microphone" },
+    });
+    assert.equal(microphone.slot, "a0");
+    await resource({ op: "release", owner: microphone.owner });
+    await resource({ op: "release", owner: concurrentVideo.owner });
     await resource({
       op: "updatePublication",
       owner: first.owner,

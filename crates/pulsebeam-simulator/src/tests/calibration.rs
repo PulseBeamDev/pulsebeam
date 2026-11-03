@@ -77,14 +77,8 @@ async fn peer(ip: IpAddr, server: IpAddr, name: &str, publishes: bool) -> anyhow
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
             "calibration",
             name,
-            u64::MAX,
+            u64::try_from(i64::MAX)?,
         )?,
-        topology: pulsebeam_agent_core::MediaTopology {
-            local_video: 0,
-            local_audio: 0,
-            remote_video: 0,
-            remote_audio: 0,
-        },
         retry: pulsebeam_agent_core::RetryPolicy::default(),
         log_level: pulsebeam_agent_core::LogLevel::default(),
     };

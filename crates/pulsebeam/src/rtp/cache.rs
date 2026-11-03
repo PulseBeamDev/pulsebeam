@@ -5,9 +5,10 @@
 //! would replay the wrong window and hand the decoder a segment that does not
 //! start at a keyframe.
 
-use crate::media::{Rid, SeqNo};
+use crate::media::SeqNo;
 use crate::rtp::MediaTime;
 use crate::rtp::RtpPacket;
+use crate::track::SourceEncoding;
 
 /// No packet in this slot.
 ///
@@ -320,7 +321,11 @@ impl StreamCache {
             return None;
         }
 
-        if !segment.last().is_some_and(|p| p.marker) {
+        if !segment.last().is_some_and(|p| p.marker)
+            || segment
+                .windows(2)
+                .any(|pair| matches!(pair, [a, b] if a.rtp_ts != b.rtp_ts && !a.marker))
+        {
             return None;
         }
 
@@ -546,14 +551,14 @@ impl StreamCache {
     }
 }
 
-/// One track's worth of cache: a `StreamCache` per simulcast encoding, keyed by
-/// `rid`. The track is the routing unit; the encoding a packet belongs to is read
-/// from `pkt.ext_vals.rid`. A downstream forwarder holds the whole thing so it can
+/// One track's worth of cache: a `StreamCache` per prepared encoding. The track
+/// is the routing unit; an encoding matches its real RID or bound primary SSRC.
+/// A downstream forwarder holds the whole thing so it can
 /// replay a target encoding's keyframe segment while still forwarding the current
 /// one.
 #[derive(Debug, Default)]
 pub struct TrackStreamCache {
-    encodings: Vec<(Option<Rid>, StreamCache)>,
+    encodings: Vec<(SourceEncoding, StreamCache)>,
 }
 
 impl TrackStreamCache {
@@ -563,30 +568,55 @@ impl TrackStreamCache {
         }
     }
 
+    pub(crate) fn with_encodings(encodings: &[SourceEncoding]) -> Self {
+        Self {
+            encodings: encodings
+                .iter()
+                .map(|encoding| (*encoding, StreamCache::default()))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn source(&self, packet: &RtpPacket) -> Option<SourceEncoding> {
+        self.encodings
+            .iter()
+            .map(|(encoding, _)| *encoding)
+            .find(|encoding| encoding.matches(packet.ssrc, packet.ext_vals.rid))
+    }
+
+    pub(crate) fn push_encoding(
+        &mut self,
+        encoding: SourceEncoding,
+        packet: RtpPacket,
+    ) -> Option<RtpPacket> {
+        self.encoding_mut(encoding).push(packet)
+    }
+
     /// Route `pkt` into its encoding's cache, reading the encoding from the
     /// packet's `rid` (absent for non-simulcast tracks).
     /// Returns the packet only when it was too old to store; otherwise the
-    /// cache owns it and the caller reads it back with [`Self::get`].
+    /// cache owns it and the caller reads it back through [`Self::encoding`].
     pub fn push(&mut self, pkt: RtpPacket) -> Option<RtpPacket> {
-        self.encoding_mut(pkt.ext_vals.rid).push(pkt)
+        self.push_encoding(SourceEncoding::Rid(pkt.ext_vals.rid), pkt)
     }
 
-    pub fn encoding(&self, rid: Option<Rid>) -> Option<&StreamCache> {
+    pub fn encoding(&self, encoding: impl Into<SourceEncoding>) -> Option<&StreamCache> {
+        let encoding = encoding.into();
         self.encodings
             .iter()
-            .find(|(r, _)| *r == rid)
+            .find(|(key, _)| *key == encoding)
             .map(|(_, c)| c)
     }
 
-    fn encoding_mut(&mut self, rid: Option<Rid>) -> &mut StreamCache {
-        let pos = match self.encodings.iter().position(|(r, _)| *r == rid) {
+    fn encoding_mut(&mut self, encoding: SourceEncoding) -> &mut StreamCache {
+        let pos = match self.encodings.iter().position(|(key, _)| *key == encoding) {
             Some(pos) => pos,
             None => {
                 debug_assert!(
                     self.encodings.len() < MAX_SIMULCAST_ENCODINGS,
                     "a track should never carry more than {MAX_SIMULCAST_ENCODINGS} encodings"
                 );
-                self.encodings.push((rid, StreamCache::default()));
+                self.encodings.push((encoding, StreamCache::default()));
                 self.encodings.len().saturating_sub(1)
             }
         };
@@ -1252,6 +1282,31 @@ mod test {
         let replay = cache.replay().expect("replayable");
         assert!(replay.windows(2).all(|w| *w[0].seq_no < *w[1].seq_no));
         assert_eq!(replay.len(), kf.len());
+    }
+
+    #[test]
+    fn replay_refuses_an_abandoned_frame_without_a_wire_sequence_gap() {
+        let mut b = builder(ParameterSetStyle::SeparatePacket);
+        let mut cache = StreamCache::new();
+        for packet in b.keyframe(2) {
+            cache.push(packet);
+        }
+        let partial = b.delta_frame(3);
+        for packet in &partial[..2] {
+            cache.push(packet.clone());
+        }
+        let mut next = b.delta_frame(2);
+        for packet in &mut next {
+            packet.seq_no = packet.seq_no.saturating_sub(1).into();
+            cache.push(packet.clone());
+        }
+        assert!(cache.replay().is_none());
+
+        for mut packet in b.keyframe(2) {
+            packet.seq_no = packet.seq_no.saturating_sub(1).into();
+            cache.push(packet);
+        }
+        assert!(cache.replay().is_some(), "a fresh keyframe restores replay");
     }
 
     #[test]

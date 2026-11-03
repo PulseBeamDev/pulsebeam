@@ -92,6 +92,7 @@ pub(super) struct Media {
     pub msids: Vec<String>,
     pub signaled: BTreeMap<u32, Option<u32>>,
     pub cnames: BTreeMap<u32, String>,
+    pub extmap_allow_mixed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +210,7 @@ impl Document {
                 inherited_direction,
                 &inherited_extensions,
             )?;
+            m.extmap_allow_mixed |= session.contains(&"a=extmap-allow-mixed");
             if !mids.insert(m.section.mid.clone()) {
                 return Err(Error::Identifier);
             }
@@ -368,6 +370,7 @@ fn parse_media(
     let mut primaries = BTreeSet::new();
     let mut cnames = BTreeMap::new();
     let mut repairs = BTreeMap::new();
+    let mut sim = Vec::new();
     let mut rids = BTreeSet::new();
     let mut simulcast = Vec::new();
     let mut sctp = Vec::new();
@@ -457,9 +460,9 @@ fn parse_media(
                         return Err(Error::Malformed("FID"));
                     }
                 }
-                Some("SIM") => {
+                Some("SIM") if fields.len() >= 3 && sim.is_empty() => {
                     for id in fields.iter().skip(1) {
-                        ssrc(id)?;
+                        sim.push(ssrc(id)?);
                     }
                 }
                 _ => return Err(Error::Malformed("ssrc-group")),
@@ -581,6 +584,13 @@ fn parse_media(
     for repair in repairs.values() {
         primaries.remove(repair);
     }
+    if !sim.is_empty()
+        && (sim.len() != primaries.len()
+            || sim.iter().collect::<BTreeSet<_>>().len() != sim.len()
+            || sim.iter().any(|id| !primaries.contains(id)))
+    {
+        return Err(Error::Malformed("SIM"));
+    }
     let signaled = primaries
         .iter()
         .map(|primary| (*primary, repairs.get(primary).copied()))
@@ -611,7 +621,12 @@ fn parse_media(
         if !simulcast.is_empty() {
             return Err(Error::Malformed("simulcast"));
         }
-        for primary in primaries {
+        let ordered = if sim.is_empty() {
+            primaries.into_iter().collect()
+        } else {
+            sim
+        };
+        for primary in ordered {
             encodings.push(Encoding {
                 rid: None,
                 primary: Some(primary),
@@ -622,6 +637,7 @@ fn parse_media(
         }
     }
     Ok(Media {
+        extmap_allow_mixed: lines.contains(&"a=extmap-allow-mixed"),
         section: Section {
             mid,
             kind,

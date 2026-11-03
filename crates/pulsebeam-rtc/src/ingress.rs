@@ -595,6 +595,13 @@ impl IngressOwner {
             return;
         }
         let facts = &self.media[&media];
+        // Typed facts bind one primary SSRC to its RID. SDP RID lists do not.
+        let rid = rid.or_else(
+            || match (self.strict, facts.ssrcs.as_ref(), facts.rids.as_ref()) {
+                (true, [ssrc], [rid]) if *ssrc == packet.ssrc() => Some(rid.as_ref()),
+                _ => None,
+            },
+        );
         let primary_type = facts
             .repairs
             .iter()
@@ -843,10 +850,14 @@ impl IngressOwner {
             self.drop();
             return;
         }
-        let learned_rid = state.rid.is_none() && rid.is_some();
+        let learned_rid = state
+            .rid
+            .is_none()
+            .then(|| rid.map(Box::<str>::from))
+            .flatten();
         state.ssrc = Some(packet.ssrc());
-        if state.rid.is_none() {
-            state.rid = rid.map(Box::<str>::from);
+        if let Some(rid) = &learned_rid {
+            state.rid = Some(rid.clone());
         }
         if let Some(repair) = &repair {
             state.repair_ssrc = Some(repair.ssrc);
@@ -860,11 +871,11 @@ impl IngressOwner {
                 .insert(index);
             self.media_by_ssrc.insert(packet.ssrc(), media);
         }
-        if learned_rid && let Some(rid) = rid {
+        if let Some(rid) = learned_rid {
             self.encoding_by_rid
                 .entry(media)
                 .or_default()
-                .insert(rid.into(), index);
+                .insert(rid, index);
         }
         if let Some(repair) = repair {
             self.repair_by_ssrc.insert(repair.ssrc, index);
@@ -1493,6 +1504,8 @@ mod tests {
     fn established_ssrc_retains_rid_when_sdes_headers_are_omitted() {
         let now = Instant::now();
         let mut ingress = rid_ingress(now);
+        ingress.accept_rtp(now, rid_packet(11, 0, None), None);
+        assert_eq!(received_rids(&mut ingress), [(11, None)]);
         ingress.accept_rtp(now, rid_packet(11, 1, Some(b'q')), None);
         ingress.accept_rtp(now, rid_packet(22, 100, Some(b'h')), None);
         assert_eq!(

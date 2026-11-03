@@ -114,11 +114,14 @@ fn video_spec(
                                         ..Default::default()
                                     }),
                                     header_extensions,
-                                    encodings: vec![wire::RtpEncodingParameters {
-                                        ssrc: Some(ssrc),
-                                        scalability_mode: Some(mode as i32),
-                                        ..Default::default()
-                                    }],
+                                    encodings: [ssrc, ssrc + 2, ssrc + 4]
+                                        .into_iter()
+                                        .map(|ssrc| wire::RtpEncodingParameters {
+                                            ssrc: Some(ssrc),
+                                            scalability_mode: Some(mode as i32),
+                                            ..Default::default()
+                                        })
+                                        .collect(),
                                     rtcp: Some(wire::RtcpParameters {
                                         cname: "component-video-source".into(),
                                         reduced_size: false,
@@ -310,6 +313,116 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         ))
     );
     let video_id = participant.native_rtp.publications[&7].track.id();
+    let encodings = participant.native_rtp.publications[&7]
+        .track
+        .layers()
+        .iter()
+        .map(|layer| {
+            assert!(layer.rid.is_none());
+            layer.encoding
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        encodings,
+        [77, 79, 81].map(|ssrc| track::SourceEncoding::Ssrc(ssrc.into()))
+    );
+    let mut handles = slotmap::SlotMap::<TrackHandle, TrackId>::with_key();
+    let fanout = handles.insert(video_id);
+    participant.native_rtp.bind_source(video_id, fanout);
+    participant.native_rtp_demand(video_id, true);
+    let mut cache = crate::rtp::cache::TrackStreamCache::with_encodings(&encodings);
+    let now = Instant::now();
+    for ssrc in [81, 77, 79] {
+        // The RTC emits this notice before its first authenticated packet. Use
+        // the committed binding, not bootstrap SDP or guessed source facts.
+        let binding = &participant.native_rtp.publications[&7].binding;
+        let info = pulsebeam_rtc::EncodingInfo {
+            mid: binding.mid.as_str().into(),
+            ssrc,
+            kind: binding.kind,
+            rid: None,
+            payloads: Box::new([pulsebeam_rtc::RtpPayloadInfo {
+                payload_type: binding.codec.payload_type,
+                name: binding.codec.parameters.name.as_str().into(),
+                clock_rate: binding.codec.parameters.clock_rate,
+            }]),
+        };
+        participant.handle_event(now, Event::EncodingDiscovered(info), &mut sink);
+        let published_before = sink.publish_track_packet_calls.len();
+        let mut builder = crate::rtp::test_utils::H264StreamBuilder::new(ssrc, 1000, 90_000, now);
+        let encoding = track::SourceEncoding::Ssrc(ssrc.into());
+        assert_eq!(
+            participant.native_rtp.keyframe_mid(video_id, encoding),
+            Some(Mid::from("camera"))
+        );
+        for packet in builder.keyframe(2) {
+            assert!(packet.ext_vals.rid.is_none());
+            assert_eq!(cache.source(&packet), Some(encoding));
+            let incoming = pulsebeam_rtc::RtpPacket {
+                arrival: packet.arrival_ts.into(),
+                header: pulsebeam_rtc::RtpHeader {
+                    sequence: u16::try_from(*packet.seq_no).unwrap(),
+                    timestamp: u32::try_from(packet.rtp_ts.numer()).unwrap(),
+                    ssrc,
+                    payload_type: 96,
+                    marker: packet.marker,
+                },
+                payload: bytes::Bytes::copy_from_slice(&packet.payload),
+                extensions: Vec::new(),
+            };
+            participant.handle_native_rtp(incoming, Mid::from("camera"), None, &mut sink);
+            cache.push_encoding(encoding, packet);
+        }
+        assert!(
+            sink.publish_track_packet_calls.len() > published_before,
+            "source {ssrc} must publish real processed packets"
+        );
+        participant.enqueue_remote_keyframe((video_id, encoding), KeyframeRequestKind::Pli);
+    }
+    let source = participant.native_rtp.publications.get_mut(&7).unwrap();
+    source
+        .upstream
+        .poll_stats(now + std::time::Duration::from_millis(50));
+    let states = source.upstream.monitor.layer_states();
+    assert_eq!(states.len(), 3);
+    for encoding in &encodings {
+        assert!(
+            !states
+                .iter()
+                .find(|(key, _)| key == encoding)
+                .unwrap()
+                .1
+                .is_inactive()
+        );
+        let packet = cache.encoding(*encoding).unwrap().get(1000.into()).unwrap();
+        assert!(encoding.matches(packet.ssrc, packet.ext_vals.rid));
+        assert!(packet.ext_vals.rid.is_none());
+        assert!(
+            participant
+                .pending_keyframe_requests
+                .contains(&(Mid::from("camera"), *encoding))
+        );
+    }
+    assert_eq!(participant.pending_keyframe_requests.len(), 3);
+    assert!(cache.source(&crate::rtp::RtpPacket::default()).is_none());
+    assert_eq!(
+        participant
+            .native_rtp
+            .keyframe_mid(video_id, track::SourceEncoding::Ssrc(999.into())),
+        None
+    );
+    assert_eq!(
+        participant
+            .native_rtp
+            .keyframe_mid(video_id, track::SourceEncoding::Rid(None)),
+        None
+    );
+    assert!(
+        sink.publish_track_packet_calls
+            .iter()
+            .all(|handle| *handle == fanout)
+    );
+    assert!(!sink.publish_track_packet_calls.is_empty());
     let video_binding = participant.native_rtp.publications[&7].binding.clone();
     assert_eq!(sink.publish_track_calls, vec![id, video_id]);
     participant.handle_native_signaling(
@@ -345,5 +458,7 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     );
     participant.complete_native_resource_cutoff(7, true);
     assert!(participant.native_rtp.publications.is_empty());
+    assert!(participant.pending_keyframe_requests.is_empty());
+    assert!(participant.last_keyframe_request.is_empty());
     assert!(participant.disconnect_reason.is_none());
 }

@@ -111,6 +111,7 @@ pub(super) fn discover_receivers(
     (participant, tracks)
 }
 
+#[track_caller]
 pub(super) fn next(agent: &mut Agent, generation: Generation, channel: ChannelId) -> Vec<Target> {
     let Effect::DataChannel(DataChannelEffect::Send {
         operation,
@@ -142,12 +143,22 @@ pub(super) fn next(agent: &mut Agent, generation: Generation, channel: ChannelId
         .collect()
 }
 
+fn current_bindings(updated: &[SlotBinding]) -> client_sdp::Bindings {
+    let mut resources = resources(channel(9));
+    resources
+        .slots
+        .retain(|binding| !updated.iter().any(|current| current.slot == binding.slot));
+    resources.slots.extend_from_slice(updated);
+    prepared_media(&resources).0
+}
+
 pub(super) fn finish_retirements(
     agent: &mut Agent,
     generation: Generation,
     expected: &[&str],
+    updated: &[SlotBinding],
 ) -> Vec<OperationId> {
-    let (mut bindings, _) = prepared_media(&resources(channel(9)));
+    let mut bindings = current_bindings(updated);
     let mut retired = Vec::new();
     let mut operations = Vec::new();
     for _ in expected {
@@ -192,45 +203,17 @@ pub(super) fn finish_allocation(
     generation: Generation,
     assigned: SlotBinding,
     retired: &[&str],
-) {
-    finish_media_change(
-        agent,
-        generation,
-        assigned,
-        retired,
-        client_sdp::AllocationMode::Create,
-    );
-}
-
-pub(super) fn finish_retarget(agent: &mut Agent, generation: Generation, assigned: SlotBinding) {
-    let mid = assigned.mid.clone();
-    finish_media_change(
-        agent,
-        generation,
-        assigned,
-        &[&mid],
-        client_sdp::AllocationMode::RetargetReceiver,
-    );
-}
-
-fn finish_media_change(
-    agent: &mut Agent,
-    generation: Generation,
-    assigned: SlotBinding,
-    retired: &[&str],
-    expected_mode: client_sdp::AllocationMode,
+    updated: &[SlotBinding],
 ) {
     let Effect::Rtc(RtcEffect::AllocateMedia {
         operation,
         generation: actual,
         allocations,
-        mode,
     }) = next_effect(agent)
     else {
         panic!("media allocation")
     };
     assert_eq!(actual, generation);
-    assert_eq!(mode, expected_mode);
     assert_eq!(
         allocations,
         [client_sdp::Allocation {
@@ -240,7 +223,7 @@ fn finish_media_change(
         }]
     );
     let mut resources = resources(channel(9));
-    let (mut bindings, _) = prepared_media(&resources);
+    let mut bindings = current_bindings(updated);
     bindings
         .publications
         .retain(|binding| !retired.contains(&binding.mid.as_str()));
@@ -248,16 +231,7 @@ fn finish_media_change(
         .receptions
         .retain(|binding| !retired.contains(&binding.mid.as_str()));
     resources.slots = vec![assigned.clone()];
-    let (mut fresh, _) = prepared_media(&resources);
-    if mode == client_sdp::AllocationMode::RetargetReceiver {
-        let primary = 10_000 + u32::try_from(operation.get()).unwrap() * 2;
-        for binding in &mut fresh.receptions {
-            binding.encodings[0].primary = Some(primary);
-            if binding.encodings[0].repair.is_some() {
-                binding.encodings[0].repair = Some(primary + 1);
-            }
-        }
-    }
+    let (fresh, _) = prepared_media(&resources);
     bindings.publications.extend(fresh.publications);
     bindings.receptions.extend(fresh.receptions);
     agent

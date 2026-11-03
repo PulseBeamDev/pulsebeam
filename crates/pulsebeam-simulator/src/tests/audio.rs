@@ -1,4 +1,4 @@
-//! Audio forwarding and speaker selection.
+//! Source-bound audio subscriptions and native media output.
 //!
 //! Libwebrtc owns encoding, transport, receive buffering, decoding and playout. These plans
 //! observe its actual outputs. Public assignments identify selection separately from output,
@@ -11,8 +11,8 @@ use std::time::Duration;
 
 /// Audio published by a participant reaches the people in the room.
 ///
-/// Native PCM encoding supplies RFC 6464 levels for the SFU selector. A decoded listener proves
-/// actual native playout; an explicit encoded listener separately observes stream identity and
+/// A decoded listener proves actual native PCM encoding and playout; an explicit encoded
+/// listener separately observes receiver identity and
 /// payloads. Sequence holes may include native padding the SFU does not forward, not missing audio.
 #[test]
 fn audio_reaches_the_room_test() {
@@ -39,11 +39,10 @@ fn audio_reaches_the_room_test() {
                 participant: "packet-listener",
                 corrupt: false,
             },
-            Step::CheckAudioSlotStreams {
-                description: "Native encoded observations use one stable slot stream",
+            Step::CheckAudioSourceStreams {
+                description: "The named speaker has one actual native receiver and SSRC stream",
                 participant: "packet-listener",
                 expected_sources: &["speaker"],
-                max_streams: 3,
             },
             Step::CheckNativeAudioDecoded {
                 description: "Actual native PCM cadence and SDK decode progress across the measured scenario",
@@ -163,6 +162,12 @@ fn native_pcm_recovers_after_encoder_dtx_test() {
                 duration: Duration::from_secs(2),
             },
             Step::SetAudioIntent {
+                description: "Keep the DTX recovery observation bound to the speaker",
+                participant: "listener",
+                pinned: &["speaker"],
+                auto: false,
+            },
+            Step::SetAudioIntent {
                 description: "Explicitly request quiet media instead of selecting a loud speaker",
                 participant: "quiet-listener",
                 pinned: &["quiet-speaker"],
@@ -245,32 +250,12 @@ fn audio_does_not_loop_back_to_speaker_test() {
         ]);
 }
 
-/// The loudest speakers are the ones forwarded.
+/// Automatic discovery includes quiet named sources rather than ranking them by loudness.
 ///
-/// The SFU forwards a fixed number of speakers at a time, so a room with more voices than slots
-/// puts `TopNAudioSelector` in charge of who is heard. Until audio ran in simulation at all, that
-/// code had only ever been exercised by its own unit tests - never against a real participant, a
-/// real negotiation, or a real link.
-///
-/// Four speakers and three slots. Three are talking; the fourth is present and unmuted but quiet,
-/// as a listener in a room is. The quiet one must be the one left out - a selector that forwarded
-/// whoever arrived first would pass a byte count and fail this.
-///
-/// Note the four speakers. The count that decides this is `MAX_SEND_AUDIO_SLOTS`, the audio mid
-/// count negotiated for one client - a property of the *listener*. The selector holding those
-/// slots lives on the shard and is shared by every room on it, so asking to hear fewer does not
-/// create contention, and neither does being in a different room. See
-/// `tests::room_isolation::audio_selection_does_not_cross_rooms_test`.
-///
-/// An earlier version of this plan had two speakers and a listener asking for one slot, and
-/// passed only because the second audio mid had no send stream declared on it and silently
-/// dropped everything.
-///
-/// For a long time this could not pass at all: the SFU chose who filled a subscriber's audio slots
-/// and never said who they were, so packets arrived at the agent with nothing to deliver them to.
-/// `AudioAssignment` is what closed that, and removing it puts `heard from: {}` back.
+/// Four sources require four independent receivers. Public assignments include the quiet source;
+/// the three louder sources must still produce actual nontrivial native PCM and decode progress.
 #[test]
-fn the_loudest_speakers_are_the_ones_forwarded_test() {
+fn automatic_audio_keeps_quiet_named_sources_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
@@ -278,17 +263,17 @@ fn the_loudest_speakers_are_the_ones_forwarded_test() {
                 .with_participant(Participant::data_participant("louder").speaking_at(-20))
                 .with_participant(Participant::data_participant("loudest").speaking_at(-15))
                 .with_participant(Participant::data_participant("faint").speaking_at(-75))
-                .with_participant(Participant::subscriber("listener").hearing(3)),
+                .with_participant(Participant::subscriber("listener").hearing(4)),
         )
         .run(vec![
             Step::Run {
-                description: "Three talk over each other; there are three slots",
+                description: "Three talk over each other while a quiet source remains subscribed",
                 duration: Duration::from_secs(10),
             },
             Step::CheckAudioCatalogFrom {
-                description: "The talkers got the slots, and the quiet one did not",
+                description: "All four named sources have public assignments regardless of volume",
                 participant: "listener",
-                expected: &["loud", "louder", "loudest"],
+                expected: &["loud", "louder", "loudest", "faint"],
             },
             Step::CheckNativeAudioDecoded {
                 description: "Actual native PCM and SDK decode progress, without per-block source attribution",
@@ -302,13 +287,8 @@ fn the_loudest_speakers_are_the_ones_forwarded_test() {
 
 /// The listener is told who it is hearing.
 ///
-/// Audio slots are shared and stolen: the mid and the SSRC carrying a voice stay put across a
-/// switch, so nothing in the media says the speaker changed. Without the assignment an
-/// application can play the audio and still not know whose face to light up - which is the
-/// difference between a conference call and a noise.
-///
-/// Two speakers and two slots, so both must be heard and assigned to negotiated receivers.
-/// Receiver indices are stable coordinates, not loudness ranks.
+/// Two named speakers get two independent receivers. Public assignments identify those bindings;
+/// they do not attribute buffered decoded PCM to a publisher or rank speakers by loudness.
 #[test]
 fn the_listener_is_told_who_it_is_hearing_test() {
     LocalNodeSim::new()
@@ -338,29 +318,17 @@ fn the_listener_is_told_who_it_is_hearing_test() {
         ]);
 }
 
-/// A slot carries many speakers on one stream, and the stream stays whole.
+/// Taking turns does not pool or retarget the sources' native receivers.
 ///
-/// Four people taking turns and three slots, so the selector has to steal one back and forth. The
-/// slot keeps its SSRC through every steal, deliberately.
-///
-/// A browser cannot use a per-speaker SSRC: it has one `MediaStreamTrack` per transceiver and
-/// routes by mid. Worse, libwebrtc binds a receiver's sink to the SSRC the SDP declared, so media
-/// arriving on any other one is decoded and thrown away - and where no SSRC was declared, each new
-/// one builds a whole receive stream with a cold NetEq, four kept per m-line, oldest destroyed.
-/// Who is speaking travels in the assignment instead, which a browser can act on.
-///
-/// What the SFU owes in exchange is a stream that does not tear. Every speaker is rewritten onto
-/// the slot's timeline, so the splice has to be seamless. When the SSRC briefly followed the
-/// speaker instead, a returning voice resumed hundreds of packets ahead of where it left off, and
-/// put seven seconds of apparent loss inside one stream.
+/// The same four sources keep separate actual receivers and SSRC streams throughout the original
+/// speech schedule. Native PCM and independent Opus decoding separately qualify media health.
 #[test]
-fn a_slot_carries_many_speakers_without_tearing_test() {
+fn taking_turns_keeps_native_audio_receivers_source_bound_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::data_participant("alice").speaking_at(-25))
-                // Staggered around the 150-packet speech cycle so somebody is always arriving to a
-                // room whose slots are full, which is the only way a slot is stolen.
+                // Stagger the original 150-packet speech cycle across independent sources.
                 .with_participant(
                     Participant::data_participant("bob")
                         .speaking_at(-25)
@@ -376,19 +344,25 @@ fn a_slot_carries_many_speakers_without_tearing_test() {
                         .speaking_at(-25)
                         .taking_turns_after(120),
                 )
-                .with_participant(Participant::subscriber("listener").hearing(3))
-                .with_participant(Participant::subscriber("packet-listener").hearing(3).with_encoded_audio()),
+                .with_participant(Participant::subscriber("listener").hearing(4))
+                .with_participant(Participant::subscriber("packet-listener").hearing(4).with_encoded_audio()),
         )
         .run(vec![
             Step::Run {
-                description: "They take turns; three slots cannot hold four voices",
+                description: "Four named sources take turns on their own native receivers",
                 duration: Duration::from_secs(20),
             },
-            Step::CheckAudioSlotStreams {
-                description: "Four publicly assigned speakers share at most three actual native SSRC streams",
+            Step::CheckAudioSourceStreams {
+                description: "Four public sources have four distinct actual receivers and SSRC streams",
                 participant: "packet-listener",
                 expected_sources: &["alice", "bob", "carol", "dave"],
-                max_streams: 3,
+            },
+            Step::CheckNativeAudioDecoded {
+                description: "All four independent native receivers produce nontrivial PCM and decode progress",
+                participant: "listener",
+                min_samples: 4_800,
+                min_receivers: 4,
+                max_silence: None,
             },
             Step::CheckNativeAudioDecoded {
                 description: "Actual native PCM cadence and SDK decode progress across the measured scenario",
@@ -398,7 +372,7 @@ fn a_slot_carries_many_speakers_without_tearing_test() {
                 max_silence: Some(Duration::from_millis(1_500)),
             },
             Step::CheckEncodedAudio {
-                description: "Every actual encoded receiver stream independently decodes across source switching",
+                description: "Every independent encoded receiver decodes across its source's speech periods",
                 participant: "packet-listener",
                 corrupt: false,
             },

@@ -6,9 +6,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     Agent as RuntimeAgent, AgentEvent as RuntimeEvent, Config, EncodingLimits, EncodingState,
-    Error as RuntimeError, Host, InputFrame, LocalSource as RuntimeSource, MediaConfig,
-    MediaStreamUpdate, NativeStatistics, ObservationStream, ProducerFeedback, ReceiveMode,
-    RemoteMedia, SourceIdentity, StreamUpdate,
+    Error as RuntimeError, Host, InputFrame, MediaConfig, MediaStreamUpdate, NativeStatistics,
+    ObservationStream, ProducerFeedback, Publication as RuntimePublication,
+    PublicationInput as RuntimePublicationInput, ReceiveMode, RemoteMedia, SourceIdentity,
+    StreamUpdate, Subscription as RuntimeSubscription,
 };
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -152,30 +153,45 @@ impl Agent {
             .await
             .map_err(Into::into)
     }
-    /// Acquires a new owned source, replacing/detaching any previous source in
-    /// the slot. Profile selection remains fixed in NativeAgentConfig.
-    pub async fn local_video(&self, slot: String) -> Result<Arc<LocalSource>, NativeError> {
-        self.source(agent_core::MediaSlot::LocalVideo(slot)).await
-    }
-    pub async fn local_audio(&self, slot: String) -> Result<Arc<LocalSource>, NativeError> {
-        self.source(agent_core::MediaSlot::LocalAudio(slot)).await
-    }
-    pub async fn remote_video(
+    pub async fn publication(
         &self,
-        slot: u8,
-        mode: ReceiveMode,
-    ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
-        self.remote(agent_core::MediaSlot::RemoteVideo(slot), mode)
-            .await
+        spec: core_ffi::TrackSpec,
+    ) -> Result<Arc<Publication>, NativeError> {
+        Ok(Arc::new(Publication {
+            runtime: self.runtime.publication(spec.into()).await?,
+        }))
     }
-    pub async fn remote_audio(
+    pub async fn video_subscription(
         &self,
-        slot: u8,
-        mode: ReceiveMode,
-    ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
-        self.remote(agent_core::MediaSlot::RemoteAudio(slot), mode)
-            .await
+        selector: core_ffi::TrackSelector,
+        observation: core_ffi::VideoObservation,
+    ) -> Result<Arc<Subscription>, NativeError> {
+        Ok(Arc::new(Subscription {
+            runtime: self
+                .runtime
+                .video_subscription(selector.into(), observation.into())
+                .await?,
+        }))
     }
+
+    pub async fn audio_subscription(
+        &self,
+        selector: core_ffi::TrackSelector,
+    ) -> Result<Arc<Subscription>, NativeError> {
+        Ok(Arc::new(Subscription {
+            runtime: self.runtime.audio_subscription(selector.into()).await?,
+        }))
+    }
+
+    pub async fn audio_policy(
+        &self,
+        policy: core_ffi::AudioDemand,
+    ) -> Result<Arc<Subscription>, NativeError> {
+        Ok(Arc::new(Subscription {
+            runtime: self.runtime.audio_policy(policy.into()).await?,
+        }))
+    }
+
     pub fn snapshot(&self) -> core_ffi::Snapshot {
         (&self.runtime.snapshot()).into()
     }
@@ -209,34 +225,43 @@ impl Agent {
     pub fn from_runtime(runtime: RuntimeAgent) -> Arc<Self> {
         Arc::new(Self { runtime })
     }
-    async fn source(&self, slot: agent_core::MediaSlot) -> Result<Arc<LocalSource>, NativeError> {
-        Ok(Arc::new(LocalSource {
-            runtime: self.runtime.source(slot).await?,
+}
+
+#[derive(uniffi::Object)]
+pub struct Publication {
+    runtime: RuntimePublication,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl Publication {
+    pub fn is_closed(&self) -> bool {
+        self.runtime.is_closed()
+    }
+    pub async fn input(&self) -> Result<Arc<PublicationInput>, NativeError> {
+        Ok(Arc::new(PublicationInput {
+            runtime: self.runtime.input().await?,
         }))
     }
-    async fn remote(
-        &self,
-        slot: agent_core::MediaSlot,
-        mode: ReceiveMode,
-    ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
-        Ok(Arc::new(RemoteMediaReceiver {
-            runtime: self.runtime.remote(slot, mode).await?,
-        }))
+    pub async fn set_muted(&self, muted: bool) -> Result<(), NativeError> {
+        self.runtime.set_muted(muted).await.map_err(Into::into)
+    }
+    pub async fn close(&self) -> Result<(), NativeError> {
+        self.runtime.close().await.map_err(Into::into)
     }
 }
 
 #[derive(uniffi::Object)]
-pub struct LocalSource {
-    runtime: RuntimeSource,
+pub struct PublicationInput {
+    runtime: RuntimePublicationInput,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
-impl LocalSource {
-    pub fn identity(&self) -> SourceIdentity {
-        self.runtime.identity()
-    }
+impl PublicationInput {
     pub fn is_closed(&self) -> bool {
         self.runtime.is_closed()
+    }
+    pub async fn ready(&self) -> Result<(), NativeError> {
+        self.runtime.ready().await.map_err(Into::into)
     }
     /// Ok acknowledges native input admission, not encode or remote delivery.
     pub async fn submit(&self, frame: InputFrame) -> Result<(), NativeError> {
@@ -245,15 +270,8 @@ impl LocalSource {
     pub async fn close(&self) -> Result<(), NativeError> {
         self.runtime.close().await.map_err(Into::into)
     }
-    pub async fn set_enabled(&self, enabled: bool) -> Result<bool, NativeError> {
-        self.runtime.set_enabled(enabled).await.map_err(Into::into)
-    }
-    /// Actual native capture clock for this live source generation, in microseconds.
     pub async fn capture_time_us(&self) -> Result<i64, NativeError> {
         self.runtime.capture_time_us().await.map_err(Into::into)
-    }
-    pub async fn encoding_state(&self) -> Result<Vec<EncodingState>, NativeError> {
-        self.runtime.encoding_state().await.map_err(Into::into)
     }
     pub async fn set_limits(
         &self,
@@ -269,12 +287,74 @@ impl LocalSource {
 }
 
 #[derive(uniffi::Object)]
+pub struct Subscription {
+    runtime: RuntimeSubscription,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl Subscription {
+    pub fn is_closed(&self) -> bool {
+        self.runtime.is_closed()
+    }
+    pub async fn observe(
+        &self,
+        mode: ReceiveMode,
+    ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
+        Ok(Arc::new(RemoteMediaReceiver {
+            runtime: self.runtime.observe(mode).await?,
+        }))
+    }
+    pub async fn observe_source(
+        &self,
+        source: String,
+        mode: ReceiveMode,
+    ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
+        Ok(Arc::new(RemoteMediaReceiver {
+            runtime: self.runtime.observe_source(source, mode).await?,
+        }))
+    }
+    pub async fn configure_audio_policy(
+        &self,
+        policy: core_ffi::AudioDemand,
+    ) -> Result<(), NativeError> {
+        self.runtime
+            .configure_audio_policy(policy.into())
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn configure_video(
+        &self,
+        observation: core_ffi::VideoObservation,
+    ) -> Result<(), NativeError> {
+        self.runtime
+            .configure_video(observation.into())
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn configure_audio(
+        &self,
+        playout_delay: core_ffi::PlayoutDelay,
+    ) -> Result<(), NativeError> {
+        self.runtime
+            .configure_audio(playout_delay.into())
+            .await
+            .map_err(Into::into)
+    }
+    pub async fn close(&self) -> Result<(), NativeError> {
+        self.runtime.close().await.map_err(Into::into)
+    }
+}
+
+#[derive(uniffi::Object)]
 pub struct RemoteMediaReceiver {
     runtime: RemoteMedia,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
 impl RemoteMediaReceiver {
+    pub fn source_track_id(&self) -> Option<String> {
+        self.runtime.source_track_id().map(str::to_owned)
+    }
     pub fn generation(&self) -> u64 {
         self.runtime.generation()
     }
@@ -388,12 +468,6 @@ mod tests {
         let session = agent_core::AgentConfig {
             endpoint: "http://pulsebeam.test".into(),
             token: "token".into(),
-            topology: agent_core::MediaTopology {
-                local_video: 1,
-                local_audio: 1,
-                remote_video: 1,
-                remote_audio: 1,
-            },
             retry: agent_core::RetryPolicy::default(),
             log_level: agent_core::LogLevel::default(),
         };
@@ -406,9 +480,10 @@ mod tests {
         .unwrap();
         let mut desired = core_ffi::DesiredState::from(agent_core::DesiredState::default());
         desired.publications.push(core_ffi::PublicationIntent {
-            slot: "unknown".into(),
+            slot: "publication".into(),
+            kind: core_ffi::MediaKind::Video,
             active: true,
-            label: "test".into(),
+            label: String::new(),
         });
         assert!(matches!(
             agent.replace_desired(desired).await,
@@ -427,7 +502,11 @@ mod tests {
         assert!(matches!(events.next().await, EventUpdate::Closed));
         assert!(matches!(snapshots.next().await, SnapshotUpdate::Closed));
         assert!(matches!(
-            agent.local_audio("a0".into()).await,
+            agent
+                .publication(core_ffi::TrackSpec::Audio {
+                    label: "microphone".into()
+                })
+                .await,
             Err(NativeError::Closed)
         ));
     }

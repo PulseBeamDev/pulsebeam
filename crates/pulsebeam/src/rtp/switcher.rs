@@ -321,6 +321,18 @@ impl Switcher {
                             }
                         }
                         FrameDecision::Forward => {
+                            // A sender can discard a queued frame tail before
+                            // assigning wire sequence numbers. Preserve its
+                            // truncation even when the next frame is contiguous.
+                            if self.newest_frame_left_open()
+                                && self.max_output_ts.is_some_and(|ts| output_ts > ts)
+                                && self
+                                    .last_output
+                                    .is_some_and(|last| output_seq == last.wrapping_add(1))
+                            {
+                                self.active_input_holes.clear();
+                                self.timeline.skip_live_sequence(1);
+                            }
                             let mut out = pkt.clone();
                             self.timeline.rewrite(&mut out);
                             self.note_emitted(out.seq_no, out.marker, out.rtp_ts.numer());
@@ -640,7 +652,10 @@ mod test {
     /// Two distinct streams (two simulcast layers of one track) to switch between.
     fn two_streams() -> (StreamId, StreamId) {
         let track = crate::entity::ConnectionId::new().derive_track_id(TrackKind::Video, "v");
-        ((track, Some(Rid::from("q"))), (track, Some(Rid::from("h"))))
+        (
+            (track, Some(Rid::from("q")).into()),
+            (track, Some(Rid::from("h")).into()),
+        )
     }
 
     fn builder(ssrc: u32) -> H264StreamBuilder {
@@ -660,9 +675,15 @@ mod test {
     ) {
         for p in packets {
             let mut p = p.clone();
-            p.ext_vals.rid = stream.1;
+            p.ext_vals.rid = match stream.1 {
+                crate::track::SourceEncoding::Rid(rid) => rid,
+                crate::track::SourceEncoding::Ssrc(ssrc) => {
+                    p.ssrc = ssrc;
+                    None
+                }
+            };
             let now = p.arrival_ts;
-            cache.push(p);
+            cache.push_encoding(stream.1, p);
             switcher.feed(stream.0, cache, now, &mut |o| out.push(o));
         }
     }
@@ -694,6 +715,47 @@ mod test {
         ingest(&mut switcher, q, &mut cache, &delta, &mut out);
         let live_first = *out[out.len() - delta.len()].seq_no;
         assert_eq!(live_first, burst_last + 1, "live continues from the burst");
+    }
+
+    #[test]
+    fn a_live_frame_abandoned_before_wire_sequencing_leaves_an_output_gap() {
+        let (q, _) = two_streams();
+        let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
+        let mut cache = TrackStreamCache::new();
+        let mut b = builder(1);
+        let mut out = Vec::new();
+        switcher.switch_to(q);
+        ingest(&mut switcher, q, &mut cache, &b.keyframe(3), &mut out);
+
+        let partial = b.delta_frame(4);
+        ingest(&mut switcher, q, &mut cache, &partial[..1], &mut out);
+        ingest(&mut switcher, q, &mut cache, &partial[2..3], &mut out);
+        let truncated_last = *out.last().unwrap().seq_no;
+        assert!(!switcher.active_input_holes.is_empty());
+
+        // The missing tail never received a wire sequence number; the inner
+        // hole is an ordinary reordered packet from the abandoned frame.
+        let mut next = b.delta_frame(2);
+        for packet in &mut next {
+            packet.seq_no = packet.seq_no.saturating_sub(1).into();
+        }
+        let start = out.len();
+        ingest(&mut switcher, q, &mut cache, &next, &mut out);
+        assert_eq!(*out[start].seq_no, truncated_last + 2);
+        assert_eq!(*out[start + 1].seq_no, truncated_last + 3);
+        assert!(switcher.active_input_holes.is_empty());
+
+        let count = out.len();
+        ingest(&mut switcher, q, &mut cache, &partial[1..2], &mut out);
+        assert_eq!(out.len(), count, "old holes cannot use the new translation");
+
+        let mut following = b.delta_frame(2);
+        for packet in &mut following {
+            packet.seq_no = packet.seq_no.saturating_sub(1).into();
+        }
+        ingest(&mut switcher, q, &mut cache, &following, &mut out);
+        assert_eq!(*out[count].seq_no, truncated_last + 4);
+        assert_eq!(*out[count + 1].seq_no, truncated_last + 5);
     }
 
     #[test]
@@ -823,8 +885,10 @@ mod test {
     #[test]
     fn switching_layers_stays_contiguous_and_decodable() {
         let (q, h) = two_streams();
+        let q = (q.0, crate::track::SourceEncoding::Ssrc(1.into()));
+        let h = (h.0, crate::track::SourceEncoding::Ssrc(2.into()));
         let mut switcher = Switcher::new(rtp::VIDEO_FREQUENCY);
-        let mut cache = TrackStreamCache::new();
+        let mut cache = TrackStreamCache::with_encodings(&[q.1, h.1]);
         let mut bq = builder(1);
         let mut bh = builder(2);
         let mut out = Vec::new();
@@ -842,6 +906,9 @@ mod test {
 
         // Live h follows.
         ingest(&mut switcher, h, &mut cache, &bh.delta_frame(2), &mut out);
+        assert!(out.iter().all(|packet| packet.ext_vals.rid.is_none()));
+        assert!(out.iter().any(|packet| packet.ssrc == 1.into()));
+        assert!(out.iter().any(|packet| packet.ssrc == 2.into()));
 
         assert!(
             out.windows(2).all(|w| *w[1].seq_no > *w[0].seq_no),

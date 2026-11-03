@@ -124,13 +124,15 @@ impl ApplicationStateOracle {
             &snapshot.video_mapping,
             &snapshot.publications,
             MediaKind::Video,
-            observation.video_capacity,
+            Some(observation.video_capacity),
+            Some((observation, allowed_origins)),
         )?;
         check_mapping(
             &snapshot.audio_mapping,
             &snapshot.publications,
             MediaKind::Audio,
-            observation.audio_capacity,
+            None,
+            Some((observation, allowed_origins)),
         )?;
         Ok(())
     }
@@ -210,7 +212,8 @@ impl ApplicationStateOracle {
             &snapshot.video_mapping,
             &snapshot.publications,
             MediaKind::Video,
-            observation.video_capacity,
+            Some(observation.video_capacity),
+            None,
         )?;
         ensure!(
             snapshot
@@ -225,7 +228,8 @@ impl ApplicationStateOracle {
             &snapshot.audio_mapping,
             &snapshot.publications,
             MediaKind::Audio,
-            observation.audio_capacity,
+            None,
+            None,
         )?;
         let audio = snapshot
             .audio_mapping
@@ -249,10 +253,7 @@ impl ApplicationStateOracle {
             .map(|peer| peer.track_id(TrackKind::Audio, "audio").as_str())
             .filter(|id| available_audio.contains(id))
             .collect::<BTreeSet<_>>();
-        ensure!(
-            pinned.len() <= observation.audio_capacity && pinned.is_subset(&audio),
-            "pinned audio assignment missing"
-        );
+        ensure!(pinned.is_subset(&audio), "pinned audio assignment missing");
         if observer.automatic_audio {
             let expected_automatic = peers
                 .iter()
@@ -260,12 +261,9 @@ impl ApplicationStateOracle {
                 .map(|peer| peer.track_id(TrackKind::Audio, "audio").as_str())
                 .filter(|track| !pinned.contains(track))
                 .collect::<BTreeSet<_>>();
-            let automatic_capacity = observation.audio_capacity - pinned.len();
-            // Timing chooses the contended subset, not whether available slots are filled.
             ensure!(
-                audio.intersection(&expected_automatic).count()
-                    == expected_automatic.len().min(automatic_capacity),
-                "automatic audio assignments do not cover live plan sources and available slots"
+                expected_automatic.is_subset(&audio),
+                "automatic audio assignments do not cover every live plan source"
             );
         } else {
             ensure!(
@@ -346,17 +344,32 @@ fn check_mapping(
     mapping: &BTreeMap<u32, String>,
     catalog: &BTreeMap<String, Publication>,
     kind: MediaKind,
-    capacity: usize,
+    capacity: Option<usize>,
+    live: Option<(&ClientObservation, &BTreeSet<String>)>,
 ) -> Result<()> {
     ensure!(
-        mapping.len() <= capacity,
+        capacity.is_none_or(|capacity| mapping.len() <= capacity),
         "receiver exceeds requested capacity"
     );
     let mut tracks = BTreeSet::new();
-    for id in mapping.values() {
+    for (index, id) in mapping {
         ensure!(tracks.insert(id), "duplicate media assignment");
         let publication = catalog
             .get(id)
+            .or_else(|| {
+                let (observation, allowed) = live?;
+                let generation = observation.snapshot.generation?.get();
+                observation
+                    .owned_receivers
+                    .iter()
+                    .find(|evidence| {
+                        evidence.track.generation == generation
+                            && evidence.track.media_index == *index
+                            && evidence.publication.id == *id
+                            && allowed.contains(&evidence.publication.participant_id)
+                    })
+                    .map(|evidence| &evidence.publication)
+            })
             .ok_or_else(|| anyhow::anyhow!("assignment references missing publication {id}"))?;
         ensure!(publication.kind == kind, "assignment has wrong media kind");
     }

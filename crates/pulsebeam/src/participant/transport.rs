@@ -18,6 +18,7 @@ use crate::media::{
 };
 use crate::participant::batcher::{NetworkEgress, OwnedPacketQueue};
 use crate::rtp::{Codec as RtpCodec, Frequency, MediaTime, RtpExtensions, RtpPacket};
+use crate::track::SourceEncoding;
 
 pub(crate) const MAX_PENDING_INGRESS: usize = 256;
 pub(crate) const MAX_PENDING_FANOUT: usize = 256;
@@ -43,6 +44,12 @@ fn extend_serial(previous: Option<u64>, value: u64, bits: u32) -> u64 {
 )]
 fn rtc_bytes(value: &[u8]) -> bytes::Bytes {
     bytes::Bytes::copy_from_slice(value)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeDataOpen {
+    Opening,
+    ResetPending,
 }
 
 pub(super) fn native_data_config(
@@ -150,7 +157,7 @@ pub(crate) enum TransportMutation {
     },
     Keyframe {
         mid: Mid,
-        rid: Option<Rid>,
+        encoding: SourceEncoding,
         kind: KeyframeRequestKind,
     },
 }
@@ -177,8 +184,8 @@ pub(crate) enum AppliedMutation {
     Applied,
     ControlNotWritten,
     DataNotWritten,
-    KeyframeUnavailable { mid: Mid, rid: Option<Rid> },
-    KeyframeRequested { mid: Mid, rid: Option<Rid> },
+    KeyframeUnavailable { mid: Mid, encoding: SourceEncoding },
+    KeyframeRequested { mid: Mid, encoding: SourceEncoding },
     RtpNotWritten,
     RtpWritten,
 }
@@ -441,11 +448,15 @@ impl Transport {
                     AppliedMutation::DataNotWritten
                 }
             }
-            TransportMutation::Keyframe { mid, rid, kind } => {
-                if self.request_keyframe(KeyframeRequest { mid, rid, kind }) {
-                    AppliedMutation::KeyframeRequested { mid, rid }
+            TransportMutation::Keyframe {
+                mid,
+                encoding,
+                kind,
+            } => {
+                if self.request_encoding_keyframe(mid, encoding, kind) {
+                    AppliedMutation::KeyframeRequested { mid, encoding }
                 } else {
-                    AppliedMutation::KeyframeUnavailable { mid, rid }
+                    AppliedMutation::KeyframeUnavailable { mid, encoding }
                 }
             }
         })
@@ -529,27 +540,39 @@ impl Transport {
             _ => TransportPollOutput::Pending,
         }
     }
-    pub(crate) fn open_native_data(
+    pub(super) fn open_native_data(
         &mut self,
         cid: ChannelId,
         lane: crate::track::DataLane,
-    ) -> Result<(), pulsebeam_proto::state::FailureCode> {
+    ) -> Result<NativeDataOpen, pulsebeam_proto::state::FailureCode> {
         use pulsebeam_proto::state::FailureCode;
         let Some(capacity) = self.rtc.data_channel_capacity() else {
+            tracing::debug!(?cid, "native data association capacity unavailable");
             return Err(FailureCode::Incompatible);
         };
         if cid.value() == 0 || cid.value() >= capacity {
+            tracing::debug!(
+                ?cid,
+                capacity,
+                "native data stream outside association capacity"
+            );
             return Err(FailureCode::Incompatible);
         }
         let config = native_data_config(cid, lane);
-        self.rtc
-            .open_data_channel(self.rtc_clock.into(), config)
-            .map_err(|(reason, _)| match reason {
-                pulsebeam_rtc::WriteError::WouldBlock => FailureCode::CapacityExceeded,
-                _ => FailureCode::Incompatible,
-            })?;
-        self.rtc_needs_drain = true;
-        Ok(())
+        match self.rtc.open_data_channel(self.rtc_clock.into(), config) {
+            Ok(()) => {
+                self.rtc_needs_drain = true;
+                Ok(NativeDataOpen::Opening)
+            }
+            Err((pulsebeam_rtc::WriteError::ResetPending, _)) => Ok(NativeDataOpen::ResetPending),
+            Err((reason, _)) => {
+                tracing::debug!(?cid, ?reason, "native data RTC open rejected");
+                Err(match reason {
+                    pulsebeam_rtc::WriteError::WouldBlock => FailureCode::CapacityExceeded,
+                    _ => FailureCode::Incompatible,
+                })
+            }
+        }
     }
 
     pub(crate) fn discard_mutations(&mut self) {
@@ -837,6 +860,26 @@ impl Transport {
     pub(crate) fn is_exited(&self) -> bool {
         self.exited
     }
+    fn request_encoding_keyframe(
+        &mut self,
+        mid: Mid,
+        encoding: SourceEncoding,
+        kind: KeyframeRequestKind,
+    ) -> bool {
+        match encoding {
+            SourceEncoding::Rid(rid) => self.request_keyframe(KeyframeRequest { mid, rid, kind }),
+            SourceEncoding::Ssrc(ssrc) => {
+                let accepted = self
+                    .encodings
+                    .get(&ssrc)
+                    .is_some_and(|encoding| encoding.mid == mid)
+                    && self.rtc.request_keyframe(*ssrc).is_ok();
+                self.rtc_needs_drain |= accepted;
+                accepted
+            }
+        }
+    }
+
     pub(crate) fn request_keyframe(&mut self, request: KeyframeRequest) -> bool {
         let known = self
             .encodings

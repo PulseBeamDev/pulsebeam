@@ -154,9 +154,16 @@ pub(crate) trait Host {
     fn execute_effect(&self, effect: Effect);
     fn host_failed(&self, failure: &Failure);
     fn shutdown(&self);
-    fn publication_claimed(&self, _owner: u64, _slot: &str, _after_generation: Option<Generation>) {
+    fn publication_claimed(
+        &self,
+        _owner: u64,
+        _slot: &str,
+        _kind: agent_core::MediaKind,
+        _after_generation: Option<Generation>,
+    ) {
     }
     fn resource_released(&self, _owner: u64) {}
+    fn publication_input_state(&self, _state: &agent_core::PublicationInputState) {}
 }
 
 pub(crate) enum PublicCommand {
@@ -533,15 +540,29 @@ impl<H: Host> Actor<H> {
                     agent_core::ResourceCommand::Release { owner } => Some(*owner),
                     _ => None,
                 };
+                let publication_kind = match &command {
+                    agent_core::ResourceCommand::ClaimPublication { spec } => spec.media_kind(),
+                    _ => None,
+                };
                 let (result, turn) = self.driver.resource(command);
-                if let Ok(agent_core::ResourceResult::Publication {
-                    owner,
-                    slot,
-                    after_generation,
-                }) = &result
+                if let (
+                    Some(kind),
+                    Ok(agent_core::ResourceResult::Publication {
+                        owner,
+                        slot,
+                        after_generation,
+                    }),
+                ) = (publication_kind, &result)
                 {
                     self.host
-                        .publication_claimed(*owner, slot, *after_generation);
+                        .publication_claimed(*owner, slot, kind, *after_generation);
+                }
+                if let Ok(
+                    agent_core::ResourceResult::PublicationInput { state, .. }
+                    | agent_core::ResourceResult::PublicationInputState(state),
+                ) = &result
+                {
+                    self.host.publication_input_state(state);
                 }
                 if let Some(owner) = release {
                     self.host.resource_released(owner);
@@ -688,12 +709,6 @@ mod tests {
         agent_core::AgentConfig {
             endpoint: "https://example.com".into(),
             token: "token".into(),
-            topology: agent_core::MediaTopology {
-                local_video: 1,
-                local_audio: 1,
-                remote_video: 1,
-                remote_audio: 1,
-            },
             retry: agent_core::RetryPolicy::default(),
             log_level: agent_core::LogLevel::default(),
         }

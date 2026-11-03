@@ -13,8 +13,6 @@ export class BrowserRuntime {
   sent: { name: string; mode: string; payload: Uint8Array }[] = [];
   sendCompletion: Promise<void> = Promise.resolve();
   tracks = new Map<number, MediaStreamTrack>();
-  replacements: { slot: string; track: MediaStreamTrack | null }[] = [];
-  replaceCompletion: Promise<void> = Promise.resolve();
   nextOwner = 1n;
   videoOwners = new Map<bigint, { selector: any; observation?: any }>();
   videoSlots = new Map<string, number>();
@@ -25,6 +23,8 @@ export class BrowserRuntime {
     owner: bigint;
     track: MediaStreamTrack | null;
     config: any;
+    muted: boolean;
+    replaceInput: boolean;
   }[] = [];
   ownedMuted = new Map<bigint, boolean>();
   audioOwner?: bigint;
@@ -182,20 +182,18 @@ export class BrowserRuntime {
     this.config = { ...this.config, token };
   }
   set_log_level() {}
-  async set_local_muted() {}
   async replace_owned_track(
     owner: bigint,
     track: MediaStreamTrack | null,
     config: any,
+    muted: boolean,
+    replaceInput: boolean,
   ) {
-    this.ownedReplacements.push({ owner, track, config });
+    this.ownedReplacements.push({ owner, track, config, muted, replaceInput });
+    this.ownedMuted.set(owner, muted);
   }
   async set_owned_muted(owner: bigint, muted: boolean) {
     this.ownedMuted.set(owner, muted);
-  }
-  async replace_local_track(slot: string, track: MediaStreamTrack | null) {
-    await this.replaceCompletion;
-    this.replacements.push({ slot, track });
   }
   remote_track(index: number) {
     return this.tracks.get(index);

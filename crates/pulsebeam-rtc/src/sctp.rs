@@ -150,6 +150,7 @@ struct ResetState {
     incoming: bool,
     outgoing: bool,
     failed: bool,
+    notification_reserved: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -272,6 +273,13 @@ impl Association {
                         .is_none_or(|capacity| stream.0 >= capacity))
             {
                 return Err(WriteError::InvalidState);
+            }
+            if self
+                .resetting
+                .get(&stream)
+                .is_some_and(|reset| !reset.failed)
+            {
+                return Err(WriteError::ResetPending);
             }
             if self.channels.contains_key(&stream) || self.resetting.contains_key(&stream) {
                 return Err(WriteError::InvalidState);
@@ -577,7 +585,13 @@ impl Association {
         }
         self.clear_channels();
         self.lifecycles.clear();
+        self.future_events -= self
+            .resetting
+            .values()
+            .filter(|reset| reset.notification_reserved)
+            .count();
         self.resetting.clear();
+        self.release_idle_events();
         self.ready_resets.clear();
         self.reset_all_cursor = None;
         self.reset_runtime_bytes = 0;
@@ -773,7 +787,15 @@ impl Association {
                     }
                 }
             }
-            if let Some(message) = self.socket.get_next_message() {
+            // CookieEchoed can reassemble DATA before COOKIE ACK supplies stream facts.
+            // Keep that DATA in the native receive FIFO until declarations can activate.
+            let connecting = self.socket.state() == SocketState::Connecting;
+            let message = if connecting {
+                None
+            } else {
+                self.socket.get_next_message()
+            };
+            if let Some(message) = message {
                 self.handle_message(message);
             } else if !progressed {
                 if self.reset_all_cursor.is_some()
@@ -782,7 +804,9 @@ impl Association {
                 {
                     continue;
                 }
-                self.complete_resets();
+                if !connecting {
+                    self.complete_resets();
+                }
                 return;
             }
         }
@@ -951,15 +975,19 @@ impl Association {
             self.reject_declared(stream);
             return Err(WriteError::InvalidState);
         }
-        if let Some(channel) = self.channel_mut(stream) {
+        let notification_reserved = if let Some(channel) = self.channel_mut(stream) {
             channel.state = ChannelState::Closing;
+            false
         } else {
-            if !self.runtime_fits(RESET_BYTES) {
+            let Some(events) = self.prepare_events(RESET_BYTES, 1) else {
                 self.abort_association();
                 return Err(WriteError::WouldBlock);
-            }
+            };
+            events.commit(&mut self.events);
+            self.future_events += 1;
             self.reset_runtime_bytes += RESET_BYTES;
-        }
+            true
+        };
         self.emit_closed(stream);
         if self.stopped {
             return Err(WriteError::InvalidState);
@@ -968,6 +996,7 @@ impl Association {
             stream,
             ResetState {
                 incoming: self.reset_all_cursor.is_some(),
+                notification_reserved,
                 ..ResetState::default()
             },
         );
@@ -1020,14 +1049,32 @@ impl Association {
             }
             reset.failed = true;
             self.ready_resets.remove(&stream);
-            if let Some(channel) = self.channel(stream) {
-                self.push_event(
-                    DataChannelEvent::ResetFailed {
-                        channel: channel.id,
-                    },
-                    0,
-                );
-            }
+            self.push_reset_outcome(stream, false);
+        }
+    }
+
+    fn push_reset_outcome(&mut self, stream: StreamId, success: bool) {
+        let channel = DataChannelId::from_value(stream.0);
+        let event = if success {
+            DataChannelEvent::ResetComplete { channel }
+        } else {
+            DataChannelEvent::ResetFailed { channel }
+        };
+        if self.channels.contains_key(&stream) {
+            self.push_event(event, 0);
+        } else if let Some(reset) = self.resetting.get_mut(&stream)
+            && reset.notification_reserved
+        {
+            reset.notification_reserved = false;
+            self.future_events -= 1;
+            // Zero is never an admitted lifetime. A later channel suppresses this
+            // unknown-stream notice; otherwise it wakes a reset-blocked opener.
+            self.events.push_back(QueuedEvent {
+                lifetime: 0,
+                event,
+                retained_payload_bytes: 0,
+                config_lease: None,
+            });
         }
     }
 
@@ -1048,14 +1095,7 @@ impl Association {
             let Some(stream) = self.ready_resets.pop_first() else {
                 return;
             };
-            if let Some(channel) = self.channel(stream) {
-                self.push_event(
-                    DataChannelEvent::ResetComplete {
-                        channel: channel.id,
-                    },
-                    0,
-                );
-            }
+            self.push_reset_outcome(stream, true);
             if let Some(channel) = self.channels.remove(&stream) {
                 self.future_events -= usize::from(channel.reserved_events);
                 self.release_config(channel.config_lease);
@@ -1244,6 +1284,11 @@ impl Association {
                 .values()
                 .map(|channel| usize::from(channel.reserved_events))
                 .sum::<usize>()
+                + self
+                    .resetting
+                    .values()
+                    .filter(|reset| reset.notification_reserved)
+                    .count()
         );
         assert!(self.events.capacity() >= self.events.len() + self.future_events);
         assert_eq!(self.runtime_bytes(), Some(bytes));
@@ -1696,7 +1741,38 @@ mod tests {
             Some(u32::MAX.to_be_bytes().as_slice()),
             "native INIT advertises the exact full-width receive window without allocating its capacity"
         );
-        right.connect(now);
+        let init = left.poll_packet().expect("INIT");
+        right.handle_input(now, &init);
+        let init_ack = right.poll_packet().expect("INIT ACK");
+        left.handle_input(now, &init_ack);
+        let cookie_echo = left.poll_packet().expect("COOKIE ECHO");
+        right.handle_input(now, &cookie_echo);
+        let cookie_ack = right.poll_packet().expect("COOKIE ACK");
+        assert_eq!(cookie_ack[12], 11);
+        assert_eq!(left.socket.state(), SocketState::Connecting);
+        assert_eq!(right.socket.state(), SocketState::Connected);
+        right
+            .send(
+                now,
+                zero,
+                DataMessage::Binary(Bytes::from_static(b"first control")),
+            )
+            .expect("peer DATA before COOKIE ACK");
+        let data = right.poll_packet().expect("first peer DATA");
+        left.handle_input(now, &data);
+        assert_eq!(left.socket.state(), SocketState::Connecting);
+        assert_eq!(left.stream_capacity(), None);
+        while let Some(event) = left.poll_event(now) {
+            assert!(!matches!(
+                event,
+                Event::DataChannel(
+                    DataChannelEvent::Opened { .. } | DataChannelEvent::Message { .. }
+                )
+            ));
+            left_events.push(event);
+        }
+        assert_eq!(left.queued_inbound_payload_bytes, 0);
+        left.handle_input(now, &cookie_ack);
         drive(
             &mut left,
             &mut right,
@@ -1714,21 +1790,6 @@ mod tests {
                 .is_some_and(|reset| reset.failed)
         );
         assert!(!left_events.iter().any(|event| matches!(event, Event::DataChannel(DataChannelEvent::Opened { channel, .. }) if *channel != zero)));
-        right
-            .send(
-                now,
-                zero,
-                DataMessage::Binary(Bytes::from_static(b"first control")),
-            )
-            .expect("first peer DATA");
-        drive(
-            &mut left,
-            &mut right,
-            &mut now,
-            start,
-            &mut left_events,
-            &mut right_events,
-        );
         let opened = left_events.iter().position(|event| matches!(event, Event::DataChannel(DataChannelEvent::Opened { channel, .. }) if *channel == zero)).unwrap();
         let message = left_events.iter().position(|event| matches!(event, Event::DataChannel(DataChannelEvent::Message { channel, message: DataMessage::Binary(bytes) }) if *channel == zero && bytes.as_ref() == b"first control")).unwrap();
         assert!(opened < message);
@@ -2189,11 +2250,18 @@ mod tests {
                 .map_err(|(error, _)| error),
             Err(WriteError::InvalidState)
         );
-        assert!(left.open(now, channel.clone()).is_err());
+        assert_eq!(
+            left.open(now, channel.clone()),
+            Err((WriteError::ResetPending, channel.clone()))
+        );
         // Outgoing reset completion is not an incoming reset barrier.
         left.resetting.get_mut(&stream).unwrap().outgoing = true;
         left.queue_reset_completion(stream);
         assert!(left.ready_resets.is_empty());
+        assert_eq!(
+            left.open(now, channel.clone()),
+            Err((WriteError::ResetPending, channel.clone()))
+        );
         assert_eq!(left.test_reset_runtime_bytes(), RESET_BYTES);
         let mut left_events = Vec::new();
         let mut right_events = Vec::new();
@@ -2269,6 +2337,34 @@ mod tests {
         )));
         assert!(left_events.iter().all(|event| !matches!(event, Event::DataChannel(DataChannelEvent::Message { message: DataMessage::Binary(bytes), .. }) if bytes.as_ref() == b"stale")));
         assert_eq!(left.queued_inbound_payload_bytes, 0);
+        let unknown = DataChannelId::from_value(4);
+        let mut unpublished = config(DataReliability::Reliable, true);
+        unpublished.id = Some(unknown);
+        unpublished.negotiated = true;
+        right.open(now, unpublished.clone()).unwrap();
+        right.close_channel(now, unknown).unwrap();
+        left.max_runtime_bytes += RESET_BYTES + 4 * EVENT_BYTES;
+        while let Some(packet) = right.poll_packet() {
+            left.handle_input(now, &packet);
+        }
+        assert!(!left.channels.contains_key(&StreamId(unknown.value())));
+        assert_eq!(
+            left.open(now, unpublished.clone()),
+            Err((WriteError::ResetPending, unpublished))
+        );
+        left_events.clear();
+        drive(
+            &mut left,
+            &mut right,
+            &mut now,
+            start,
+            &mut left_events,
+            &mut right_events,
+        );
+        assert!(!left.resetting.contains_key(&StreamId(unknown.value())));
+        assert!(left_events.iter().any(|event| matches!(event, Event::DataChannel(DataChannelEvent::ResetComplete { channel }) if *channel == unknown)));
+        assert!(left.channels[&stream].state == ChannelState::Open);
+        assert_eq!(left.test_reset_runtime_bytes(), RESET_BYTES);
     }
 
     #[test]
@@ -2311,7 +2407,10 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(left.resetting.get(&stream).unwrap().failed);
-        assert!(left.open(now, channel).is_err());
+        assert_eq!(
+            left.open(now, channel.clone()),
+            Err((WriteError::InvalidState, channel))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             Event::DataChannel(DataChannelEvent::ResetFailed { .. })
@@ -2437,12 +2536,24 @@ mod tests {
         right.test_runtime_bytes();
         assert_eq!(left.test_reset_runtime_bytes(), RESET_BYTES);
         let unknown = StreamId(4);
-        left.max_runtime_bytes = left.test_runtime_bytes() + RESET_BYTES;
+        left.max_runtime_bytes = left.test_runtime_bytes() + RESET_BYTES + 4 * EVENT_BYTES;
         left.incoming_reset(unknown);
         assert!(!left.channels.contains_key(&unknown));
         assert!(left.resetting[&unknown].incoming);
         assert_eq!(left.test_reset_runtime_bytes(), 2 * RESET_BYTES);
+        let credited = left.test_runtime_bytes();
         left.incoming_reset(unknown);
+        assert_eq!(left.test_reset_runtime_bytes(), 2 * RESET_BYTES);
+        assert_eq!(left.test_runtime_bytes(), credited);
+        left.fail_reset(unknown);
+        let mut failed = Vec::new();
+        while let Some(event) = left.poll_event(now) {
+            failed.push(event);
+        }
+        assert_eq!(failed.iter().filter(|event| matches!(event, Event::DataChannel(DataChannelEvent::ResetFailed { channel }) if channel.value() == unknown.0)).count(), 1);
+        left.fail_reset(unknown);
+        assert!(left.poll_event(now).is_none());
+        assert!(left.resetting[&unknown].failed);
         assert_eq!(left.test_reset_runtime_bytes(), 2 * RESET_BYTES);
         left.max_runtime_bytes = left.test_runtime_bytes();
         left.incoming_reset(StreamId(6));
@@ -2471,6 +2582,9 @@ mod tests {
             left.allocate_channel_lifetime(),
             Err(WriteError::WouldBlock)
         );
+        right.incoming_reset(StreamId(8));
+        assert!(right.resetting[&StreamId(8)].notification_reserved);
+        right.test_reset_runtime_bytes();
         right.abort();
         assert_eq!(right.future_events, 0);
         assert_eq!(right.events.capacity(), 0);

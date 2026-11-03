@@ -29,6 +29,8 @@ export interface MediaRuntime extends ResourceRuntime {
     owner: bigint,
     source: MediaStreamTrack | null,
     config: SenderConfig,
+    muted: boolean,
+    replaceInput: boolean,
   ): Promise<void>;
   set_owned_muted(owner: bigint, muted: boolean): Promise<void>;
 }
@@ -145,7 +147,6 @@ class Attachment<S extends CapturedTrack> implements LocalMediaAttachment<S> {
   #source: S | null;
   #enabled: boolean;
   #config: SenderConfig;
-  #revision = 0;
   #closed = false;
   #ended: (() => void) | undefined;
 
@@ -169,7 +170,7 @@ class Attachment<S extends CapturedTrack> implements LocalMediaAttachment<S> {
       {
         bind: (binding) => {
           this.#binding = binding;
-          this.#reconcile();
+          this.#reconcile(true);
         },
         unbind: () => {
           this.#binding = undefined;
@@ -187,7 +188,7 @@ class Attachment<S extends CapturedTrack> implements LocalMediaAttachment<S> {
     this.#unwatchSource();
     this.#source = source;
     this.#watchSource();
-    this.#reconcile();
+    this.#reconcile(true);
   }
   setEnabled(enabled: boolean): void {
     if (this.#closed || enabled === this.#enabled) return;
@@ -204,45 +205,25 @@ class Attachment<S extends CapturedTrack> implements LocalMediaAttachment<S> {
   setConfig(config: SenderConfig): void {
     if (this.#closed) return;
     this.#config = config;
-    this.#reconcile();
+    this.#reconcile(false);
   }
-  #reconcile(): void {
+  #reconcile(replaceInput: boolean): void {
     const binding = this.#binding;
     if (!binding || !this.#resource.current(binding)) return;
-    const revision = ++this.#revision;
     const runtime = binding.runtime as MediaRuntime;
     const source = this.#source;
     const present =
       source !== null &&
       nativeCaptureTrack(source, this.handle.kind).readyState === "live";
-    const apply = async () => {
-      if (!present)
-        await runtime.resource({
-          op: "updatePublication",
-          owner: binding.owner,
-          present: false,
-        });
-      await runtime.replace_owned_track(
+    void runtime
+      .replace_owned_track(
         binding.owner,
         present ? nativeCaptureTrack(source, this.handle.kind) : null,
         this.#config,
-      );
-      if (!this.#resource.current(binding) || revision !== this.#revision)
-        return;
-      await runtime.set_owned_muted(binding.owner, !this.#enabled);
-      if (
-        present &&
-        this.#resource.current(binding) &&
-        revision === this.#revision
-      ) {
-        await runtime.resource({
-          op: "updatePublication",
-          owner: binding.owner,
-          present: true,
-        });
-      }
-    };
-    void apply().catch((error) => this.#fail(binding, error));
+        !this.#enabled,
+        replaceInput,
+      )
+      .catch((error) => this.#fail(binding, error));
   }
   #fail(binding: ResourceBinding, error: unknown): void {
     if (this.#resource.current(binding)) this.#resource.fail(error);
@@ -264,7 +245,6 @@ class Attachment<S extends CapturedTrack> implements LocalMediaAttachment<S> {
   close(): Promise<void> {
     if (this.#closed) return this.#resource.close();
     this.#closed = true;
-    ++this.#revision;
     this.#unwatchSource();
     this.#binding = undefined;
     return this.#resource.close();

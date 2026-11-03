@@ -32,12 +32,6 @@ import { useMediaDevices } from "@pulsebeam/react";
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   token: "opaque-token",
-  topology: {
-    localVideos: 2,
-    localAudios: 1,
-    remoteVideos: 9,
-    remoteAudios: 9,
-  },
   logging: { level: "info" },
 };
 const agent: Agent = useAgent(config);

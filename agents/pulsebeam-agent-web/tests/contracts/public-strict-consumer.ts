@@ -14,6 +14,8 @@ import {
   type RemoteVideoTrack,
 } from "../../web/index.js";
 
+// @ts-expect-error Media is demand-driven, not configured as a fixed inventory.
+import type { MediaTopology } from "../../web/index.js";
 // @ts-expect-error Managed activation is internal, not public construction.
 import { createManagedAgent } from "../../web/index.js";
 // @ts-expect-error Managed lifecycle types are not public.

@@ -228,12 +228,8 @@ impl NativeSource {
                 message: "source is detached".into(),
             })?;
         let result = (|| {
-            if !session.set_media_track_enabled(track, enabled)? {
-                return Err(rtc::PeerError {
-                    kind: rtc::PeerErrorKind::Operation,
-                    message: "native track refused enable/mute".into(),
-                });
-            }
+            // The setter reports state change, not success.
+            session.set_media_track_enabled(track, enabled)?;
             session.media_track_enabled(track)
         })();
         let released = session.release_media_track_reference(track);
@@ -531,7 +527,10 @@ mod tests {
                 )
                 .unwrap();
         }
+        assert!(audio_source.set_enabled(&mut session, true).unwrap());
         assert!(!audio_source.set_enabled(&mut session, false).unwrap());
+        assert!(!audio_source.set_enabled(&mut session, false).unwrap());
+        assert!(audio_source.set_enabled(&mut session, true).unwrap());
         assert!(audio_source.set_enabled(&mut session, true).unwrap());
         let old_source = audio_source.id;
         audio_source

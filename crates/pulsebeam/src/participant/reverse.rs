@@ -1,4 +1,5 @@
 use crate::media::{KeyframeRequestKind, Rid};
+use crate::track::SourceEncoding;
 use sha3::{Digest, Sha3_256};
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ const PLI: u8 = 1;
 const FIR: u8 = 2;
 const RID_ABSENT: u8 = 0;
 const RID_PRESENT: u8 = 1;
+const SSRC_PRESENT: u8 = 2;
 
 const KEYFRAME_DEDUP_WINDOW: Duration = crate::track::KEYFRAME_DEBOUNCE;
 const RELIABLE_CONTROL_DEDUP_WINDOW: Duration = Duration::from_millis(100);
@@ -36,22 +38,22 @@ pub(crate) struct ReversePacket {
 
 pub(crate) enum ReverseInput {
     Keyframe {
-        rid: Option<Rid>,
+        encoding: SourceEncoding,
         kind: KeyframeRequestKind,
     },
     ReliableControl(Vec<u8>),
 }
 
 impl ReversePacket {
-    pub(crate) fn keyframe(rid: Option<Rid>, kind: KeyframeRequestKind) -> Self {
+    pub(crate) fn keyframe(encoding: impl Into<SourceEncoding>, kind: KeyframeRequestKind) -> Self {
         let mut payload = Vec::with_capacity(11);
         payload.push(KEYFRAME);
         payload.push(match kind {
             KeyframeRequestKind::Pli => PLI,
             KeyframeRequestKind::Fir => FIR,
         });
-        match rid {
-            Some(rid) => {
+        match encoding.into() {
+            SourceEncoding::Rid(Some(rid)) => {
                 let bytes = rid.as_bytes();
                 let Ok(len) = u8::try_from(bytes.len()) else {
                     debug_assert!(false, "a RID must fit in its reverse envelope");
@@ -61,7 +63,11 @@ impl ReversePacket {
                 payload.push(len);
                 payload.extend_from_slice(bytes);
             }
-            None => payload.push(RID_ABSENT),
+            SourceEncoding::Rid(None) => payload.push(RID_ABSENT),
+            SourceEncoding::Ssrc(ssrc) => {
+                payload.push(SSRC_PRESENT);
+                payload.extend_from_slice(&u32::from(ssrc).to_be_bytes());
+            }
         }
         Self::new(payload, KEYFRAME_DEDUP_WINDOW)
     }
@@ -104,8 +110,9 @@ impl ReversePacket {
             _ => return None,
         };
         let (&rid_state, body) = body.split_first()?;
-        let rid = match rid_state {
-            RID_ABSENT if body.is_empty() => None,
+        let encoding = match rid_state {
+            RID_ABSENT if body.is_empty() => SourceEncoding::Rid(None),
+            SSRC_PRESENT => SourceEncoding::Ssrc(u32::from_be_bytes(body.try_into().ok()?).into()),
             RID_PRESENT => {
                 let (&len, body) = body.split_first()?;
                 let len = usize::from(len);
@@ -116,11 +123,11 @@ impl ReversePacket {
                 {
                     return None;
                 }
-                Some(Rid::new(std::str::from_utf8(bytes).ok()?).ok()?)
+                SourceEncoding::Rid(Some(Rid::new(std::str::from_utf8(bytes).ok()?).ok()?))
             }
             _ => return None,
         };
-        Some(ReverseInput::Keyframe { rid, kind })
+        Some(ReverseInput::Keyframe { encoding, kind })
     }
 }
 
@@ -134,10 +141,27 @@ mod tests {
         assert!(matches!(
             packet.decode(),
             Some(ReverseInput::Keyframe {
-                rid: Some(rid),
+                encoding: SourceEncoding::Rid(Some(rid)),
                 kind: KeyframeRequestKind::Fir,
             }) if rid == Rid::from("f")
         ));
+        let ridless = ReversePacket::keyframe(None, KeyframeRequestKind::Pli)
+            .dedup()
+            .key();
+        for ssrc in [0, u32::MAX] {
+            let encoding = SourceEncoding::Ssrc(ssrc.into());
+            let packet = ReversePacket::keyframe(encoding, KeyframeRequestKind::Pli);
+            assert_ne!(packet.dedup().key(), ridless);
+            assert!(
+                matches!(packet.decode(), Some(ReverseInput::Keyframe { encoding: actual, kind: KeyframeRequestKind::Pli }) if actual == encoding)
+            );
+            let mut packet = ReversePacket::keyframe(encoding, KeyframeRequestKind::Pli);
+            packet.payload.push(0);
+            assert!(packet.decode().is_none());
+            let mut packet = ReversePacket::keyframe(encoding, KeyframeRequestKind::Pli);
+            packet.payload.pop();
+            assert!(packet.decode().is_none());
+        }
     }
 
     #[test]

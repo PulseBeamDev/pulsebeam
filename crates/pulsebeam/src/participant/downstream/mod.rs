@@ -18,7 +18,7 @@ pub use crate::participant::intent::AudioIntent;
 use crate::rtp::MediaTime;
 use crate::rtp::RtpPacket;
 use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use ahash::{HashMap, HashMapExt};
 pub use audio::DownstreamAudio;
 pub(crate) use data::DownstreamData;
 use indexmap::IndexMap;

@@ -1,34 +1,29 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import {
-  LocalTrackHandle,
-  LocalTrackCapacityError,
-} from "../../unit-javascript/local-track.js";
+import { createCaptureSource } from "../../unit-javascript/capture-source.js";
+import { LocalMediaRegistry } from "../../unit-javascript/media.js";
+import { ResourceOwners } from "../../unit-javascript/resources.js";
+import { track } from "../../unit-javascript/track.js";
 
-test("local handle applies source and enablement atomically, and release is terminal", () => {
-  const source = { kind: "video" };
-  let applied, enabled;
-  const handle = new LocalTrackHandle(
-    "video",
-    "camera",
-    (next) => {
-      if (next?.invalid) throw new TypeError("invalid capture");
-      applied = next;
-    },
-    (next) => {
-      enabled = next;
-    },
-  );
+test("local handle changes source and enablement atomically, without owning capture", () => {
+  const native = Object.assign(new EventTarget(), {
+    kind: "video",
+    readyState: "live",
+  });
+  const source = createCaptureSource(native, "video");
+  const registry = new LocalMediaRegistry(new ResourceOwners(() => {}));
+  const handle = registry.track(track.video("camera"));
   const observed = [];
   const unsubscribe = handle.subscribe(() =>
     observed.push([handle.source, handle.enabled]),
   );
   handle.setEnabled(false);
   handle.setSource(source);
-  assert.equal(applied, source);
-  assert.equal(enabled, false);
   assert.deepEqual(observed.at(-1), [source, false]);
-  assert.throws(() => handle.setSource({ invalid: true }), TypeError);
+  assert.throws(
+    () => handle.setSource(createCaptureSource({ kind: "audio" }, "audio")),
+    TypeError,
+  );
   assert.equal(handle.source, source);
   handle.setSource(null);
   handle.setEnabled(true);
@@ -36,19 +31,10 @@ test("local handle applies source and enablement atomically, and release is term
   unsubscribe();
   unsubscribe();
   const before = observed.slice();
-  handle.clear();
+  registry.close();
   assert.deepEqual(observed, before);
   assert.equal(handle.source, null);
   assert.throws(() => handle.setSource(source), /closed/);
   assert.throws(() => handle.setEnabled(false), /closed/);
-  assert.equal(source.kind, "video");
-});
-
-test("capacity errors preserve public diagnostic fields", () => {
-  const error = new LocalTrackCapacityError("video", "screen", 1);
-  assert.ok(error instanceof RangeError);
-  assert.deepEqual(
-    [error.name, error.kind, error.label, error.capacity],
-    ["LocalTrackCapacityError", "video", "screen", 1],
-  );
+  assert.equal(native.readyState, "live");
 });

@@ -2,8 +2,8 @@ use alloc::{string::String, vec::Vec};
 use core::time::Duration;
 
 use crate::{
-    ChannelId, Generation, HttpRequest, MediaDirection, MediaKind, MediaSlot, MediaTopology,
-    OperationId, SlotBinding, TimerId,
+    ChannelId, Generation, HttpRequest, MediaDirection, MediaKind, MediaSlot, OperationId,
+    SlotBinding, TimerId,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -12,6 +12,8 @@ pub enum Effect {
     Http(HttpEffect),
     Timer(TimerEffect),
     DataChannel(DataChannelEffect),
+    PublicationInput(crate::PublicationInputControl),
+    MediaObservation(crate::MediaObservationControl),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,7 +44,6 @@ impl BootstrapCapabilities {
 pub enum RtcEffect {
     CreateOffer {
         generation: Generation,
-        topology: MediaTopology,
         data_channels: Vec<DataChannelSpec>,
     },
     ApplyAnswer {
@@ -67,7 +68,6 @@ pub enum RtcEffect {
     AllocateMedia {
         generation: Generation,
         operation: OperationId,
-        mode: crate::client_sdp::AllocationMode,
         allocations: Vec<crate::client_sdp::Allocation>,
     },
     RetireMedia {

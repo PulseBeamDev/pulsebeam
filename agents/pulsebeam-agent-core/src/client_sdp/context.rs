@@ -1,10 +1,12 @@
 use super::identity_history::IdentityHistory;
 use super::sdp::{self, Document, Transport};
 use super::{
-    Allocation, AllocationMode, Binding, Bindings, Capabilities, Codec, Encoding, Error, Kind,
-    Limits, MediaOwner, Preparation, RtcpMode, RtcpParameters, RuntimeEncoding,
+    Allocation, Binding, Bindings, Capabilities, Codec, Encoding, Error, Kind, Limits, MediaOwner,
+    Preparation, RtcpMode, RtcpParameters, RuntimeEncoding,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+mod sender;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CandidateId(u64);
@@ -345,16 +347,11 @@ impl Context {
         offer: &str,
         allocations: &[Allocation],
         slots: &[crate::SlotBinding],
-        mode: AllocationMode,
     ) -> Result<Candidate, Error> {
-        self.prepare_inner(offer, &[], &[], Some((allocations, slots, mode)))
+        self.prepare_inner(offer, &[], &[], Some((allocations, slots)))
     }
 
-    pub(super) fn validate_allocations(
-        &self,
-        allocations: &[Allocation],
-        mode: AllocationMode,
-    ) -> Result<(), Error> {
+    pub(super) fn validate_allocations(&self, allocations: &[Allocation]) -> Result<(), Error> {
         for allocation in allocations {
             allocation.validate()?;
             let owner = allocation.owner();
@@ -365,25 +362,8 @@ impl Context {
                 .iter()
                 .chain(&self.accepted.retained.receptions)
                 .find(|binding| binding.key == owner.key);
-            match mode {
-                AllocationMode::Create => {
-                    if let Some(binding) = binding {
-                        return Err(Error::Envelope(binding.mid.clone()));
-                    }
-                }
-                AllocationMode::RetargetReceiver => {
-                    if allocation.slot.direction() != crate::MediaDirection::ReceiveOnly
-                        || allocation.format.is_none()
-                        || !self
-                            .accepted
-                            .retained
-                            .receptions
-                            .iter()
-                            .any(|binding| binding.key == owner.key)
-                    {
-                        return Err(Error::Identifier);
-                    }
-                }
+            if let Some(binding) = binding {
+                return Err(Error::Envelope(binding.mid.clone()));
             }
         }
         Ok(())
@@ -394,12 +374,11 @@ impl Context {
         offered: &Document,
         allocations: &[Allocation],
         slots: &[crate::SlotBinding],
-        mode: AllocationMode,
     ) -> Result<Vec<Preparation>, Error> {
         if allocations.len() > offered.media.len() || slots.len() > offered.media.len() {
             return Err(Error::Capacity);
         }
-        self.validate_allocations(allocations, mode)?;
+        self.validate_allocations(allocations)?;
         if allocations.is_empty()
             || allocations.len() != slots.len()
             || slots
@@ -444,29 +423,14 @@ impl Context {
                 return Err(Error::Envelope(slot.mid.clone()));
             }
             let owner = allocation.owner();
-            match mode {
-                AllocationMode::Create => {
-                    if self
-                        .accepted
-                        .local
-                        .media
-                        .iter()
-                        .any(|old| old.section.mid == media.mid && !old.section.stopped)
-                    {
-                        return Err(Error::Envelope(media.mid.clone()));
-                    }
-                }
-                AllocationMode::RetargetReceiver => {
-                    if !self
-                        .accepted
-                        .retained
-                        .receptions
-                        .iter()
-                        .any(|binding| binding.key == owner.key && binding.mid == media.mid)
-                    {
-                        return Err(Error::Envelope(media.mid.clone()));
-                    }
-                }
+            if self
+                .accepted
+                .local
+                .media
+                .iter()
+                .any(|old| old.section.mid == media.mid && !old.section.stopped)
+            {
+                return Err(Error::Envelope(media.mid.clone()));
             }
             let expected = allocation
                 .format
@@ -503,7 +467,7 @@ impl Context {
         offer: &str,
         requests: &[Preparation],
         retirements: &[String],
-        allocations: Option<(&[Allocation], &[crate::SlotBinding], AllocationMode)>,
+        allocations: Option<(&[Allocation], &[crate::SlotBinding])>,
     ) -> Result<Candidate, Error> {
         if self.pending.is_some() {
             return Err(Error::CandidateState);
@@ -546,19 +510,8 @@ impl Context {
             }
         }
         let lowered = allocations
-            .map(|(allocations, slots, mode)| {
-                self.lower_allocations(&offered, allocations, slots, mode)
-            })
+            .map(|(allocations, slots)| self.lower_allocations(&offered, allocations, slots))
             .transpose()?;
-        let retargeted = allocations
-            .filter(|(_, _, mode)| *mode == AllocationMode::RetargetReceiver)
-            .map(|(_, slots, _)| {
-                slots
-                    .iter()
-                    .map(|slot| slot.mid.as_str())
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
         let requests = lowered.as_deref().unwrap_or(requests);
         let mut requested = BTreeMap::new();
         for request in requests {
@@ -827,10 +780,7 @@ impl Context {
                 });
             }
             if let Some(owner) = reception_owner.filter(|_| offered_direction.receives()) {
-                let encodings = if let Some(old) = reception_prior
-                    .as_ref()
-                    .filter(|_| !retargeted.contains(mid.as_str()))
-                {
+                let encodings = if let Some(old) = reception_prior.as_ref() {
                     old.encodings.clone()
                 } else {
                     vec![Encoding {
@@ -1419,6 +1369,10 @@ fn render(document: &Document, bindings: &Bindings) -> Result<String, Error> {
             continue;
         }
         lines.push(format!("a={}", section.direction.token()));
+        if media.extmap_allow_mixed {
+            // DD structures can exceed the one-byte extension value limit.
+            lines.push("a=extmap-allow-mixed".into());
+        }
         lines.push("a=rtcp-mux".into());
         if section.rtcp.reduced_size {
             lines.push("a=rtcp-rsize".into());

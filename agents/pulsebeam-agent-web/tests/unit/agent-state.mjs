@@ -8,22 +8,17 @@ import {
   validatePlayoutDelay,
 } from "../../unit-javascript/agent-state.js";
 
-test("configuration owns immutable capacities and preserves explicit zero", () => {
-  const input = {
+test("configuration owns immutable connection and logging inputs", () => {
+  const input = { endpoint: "https://example.test", token: "credential" };
+  const config = copyConfig(input);
+  input.endpoint = "https://other.test";
+  input.token = "changed";
+  assert.deepEqual(config, {
     endpoint: "https://example.test",
     token: "credential",
-    topology: { localVideos: 0 },
-  };
-  const config = copyConfig(input);
-  input.topology.localVideos = 8;
-  assert.deepEqual(config.topology, {
-    localVideos: 0,
-    localAudios: 2,
-    remoteVideos: 16,
-    remoteAudios: 8,
+    logLevel: "warn",
   });
-  assert.equal(config.logLevel, "warn");
-  assert.ok(Object.isFrozen(config) && Object.isFrozen(config.topology));
+  assert.ok(Object.isFrozen(config));
   assert.equal(
     copyConfig({ ...input, logging: { level: "off" } }).logLevel,
     "off",
@@ -33,7 +28,9 @@ test("configuration owns immutable capacities and preserves explicit zero", () =
 test("desired revisions copy nested policy and omission withdraws complete intent", () => {
   const input = {
     connected: true,
-    publications: [{ slot: "v0", label: "camera", active: true }],
+    publications: [
+      { slot: "v0", kind: "video", label: "camera", active: true },
+    ],
     video: [
       {
         slot: 0,
@@ -59,6 +56,7 @@ test("desired revisions copy nested policy and omission withdraws complete inten
   assert.equal(state.video[0].playoutDelay.minMs, 10);
   assert.deepEqual(state.audio.pinned, ["voice"]);
   assert.equal(state.publications[0].active, true);
+  assert.equal(state.publications[0].kind, "video");
   assert.equal(state.topics[0].publish, true);
   assert.ok(Object.isFrozen(state.video[0].selector));
   const withdrawn = copyState({ connected: false });

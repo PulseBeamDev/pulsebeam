@@ -237,6 +237,12 @@ impl Timeline {
         self.max_output = (*self.max_output).wrapping_add(n).into();
     }
 
+    /// Reserve loss on the live stream without erasing subsequent input gaps.
+    pub fn skip_live_sequence(&mut self, n: u64) {
+        self.skip_output_sequence(n);
+        self.seq_base = self.seq_base.wrapping_add(n).into();
+    }
+
     /// After a burst rewritten with `rewrite_sequential`, realign the sequence
     /// offset so the stream's next live packet (`last_input_seq + 1`) continues
     /// from where the burst stopped.

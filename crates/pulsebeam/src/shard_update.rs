@@ -5,7 +5,6 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::entity::{ParticipantId, TrackId};
 use crate::id::ShardId;
-use crate::media::Rid;
 use crate::route::{NodeRouteAddress, NodeTransportAddress};
 use pulsebeam_queue as mailbox;
 
@@ -84,7 +83,7 @@ impl TrackRouteAction {
 pub(crate) struct TrackDescriptor {
     pub origin: ParticipantId,
     pub kind: crate::entity::TrackKind,
-    pub encodings: Vec<Option<Rid>>,
+    pub encodings: Vec<crate::track::SourceEncoding>,
 }
 
 #[derive(Debug, Clone, Default)]

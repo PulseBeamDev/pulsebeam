@@ -177,7 +177,7 @@ pub struct I420Frame {
     pub width: u32,
     pub height: u32,
     /// Native monotonic capture microseconds. Anchor relative producer offsets
-    /// with `LocalSource::capture_time_us`, not an unrelated epoch or PTS zero.
+    /// with `PublicationInput::capture_time_us`, not an unrelated epoch or PTS zero.
     pub timestamp_us: i64,
     /// Tightly packed Y, U and V planes, with rounded-up chroma dimensions.
     pub data: Vec<u8>,
@@ -197,7 +197,7 @@ pub struct OpusFrame {
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct H264Frame {
     /// Native monotonic capture microseconds. Anchor relative producer offsets
-    /// with `LocalSource::capture_time_us`; strictly increase within this source.
+    /// with `PublicationInput::capture_time_us`; strictly increase within this source.
     pub timestamp_us: i64,
     pub width: u16,
     pub height: u16,
@@ -389,17 +389,49 @@ pub(crate) fn h264_format() -> rtc::VideoCodecFormat {
         .with_parameter("profile-level-id", "42e01f")
 }
 
+#[derive(Clone)]
+struct ReceiverFieldTrials(rtc::FieldTrialsSnapshot);
+
+impl rtc::FieldTrialsView for ReceiverFieldTrials {
+    fn lookup(&self, key: &str) -> String {
+        if key == "WebRTC-SpsPpsIdrIsH264Keyframe" {
+            "Enabled".into()
+        } else {
+            self.0.lookup(key)
+        }
+    }
+
+    fn create_copy(&self) -> std::sync::Arc<dyn rtc::FieldTrialsView> {
+        std::sync::Arc::new(self.clone())
+    }
+}
+
 pub(crate) fn session<R: rtc::SessionRuntime>(
     runtime: R,
     audio: AudioInput,
     video: VideoInput,
 ) -> Result<rtc::Session<R>, rtc::PeerError> {
+    // A forwarded H264 lane can change SPS/PPS under the same SSRC. Do not
+    // release an IDR ahead of reordered parameter sets using the previous lane.
+    let configure_error = |error: rtc::BuildEnvironmentError| rtc::PeerError {
+        kind: rtc::PeerErrorKind::NativeConstruction,
+        message: error.to_string(),
+    };
+    let mut environment = runtime.environment_factory().map_err(configure_error)?;
+    let inherited = runtime
+        .create_environment(&environment)
+        .map_err(configure_error)?
+        .field_trials();
+    environment
+        .set_field_trials(ReceiverFieldTrials(inherited))
+        .map_err(configure_error)?;
     let mut builder = rtc::Session::with_runtime(
         runtime,
         rtc::SessionConfig {
             video_format: (video == VideoInput::EncodedH264).then(h264_format),
         },
-    );
+    )
+    .environment_factory(&environment);
     if matches!(audio, AudioInput::EncodedOpus { .. }) {
         builder = builder.encoded_audio();
     }

@@ -40,25 +40,17 @@ export interface AgentLogging {
   readonly level?: LogLevel;
 }
 
-export interface MediaTopology {
-  readonly localVideos?: number;
-  readonly localAudios?: number;
-  readonly remoteVideos?: number;
-  readonly remoteAudios?: number;
-}
-
 export interface AgentConfig {
   /** Absolute HTTP(S) server endpoint. Core appends `/api/v1`. */
   readonly endpoint: string;
   /** Opaque bearer token issued by the application backend. */
   readonly token: string;
-  /** Optional fixed media capacity. Omitted fields use SDK defaults. */
-  readonly topology?: MediaTopology;
   readonly logging?: AgentLogging;
 }
 
 export interface PublicationIntent {
   readonly slot: string;
+  readonly kind: MediaKind;
   readonly label: string;
   readonly active: boolean;
 }
@@ -204,11 +196,6 @@ export interface RemoteAudioTrack {
   readonly participantId: string;
   readonly label: string;
   subscribe(listener: () => void): () => void;
-}
-
-export interface LocalMedia {
-  video(label: string): LocalVideoTrack;
-  audio(label: string): LocalAudioTrack;
 }
 
 export type RemotePublishedTrack =

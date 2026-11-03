@@ -6,124 +6,197 @@ use crate::tests::native_connection::{confirmed, connected, grant, observe};
 
 #[test]
 fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
-    use crate::client_sdp::{
-        Allocation, ApplyOutcome, Binding, Bindings, Codec, CodecParameters, Encoding, Kind,
-        RtcpParameters,
-    };
-    let (mut agent, generation, _) = connected(crate::TopicRegistrations::default());
-    let slot = MediaSlot::LocalVideo("v0".into());
-    let want = |label: &str| MediaWant {
-        resource: Resource::Publication {
-            kind: state::TrackKind::Video,
-            label: label.into(),
-        },
-        source: None,
-        allocation: Allocation {
-            slot: slot.clone(),
-            format: None,
-        },
-    };
-    let capabilities = state::RtpCapabilities {
-        codecs: vec![state::RtpCodecCapability {
-            format: Some(state::CodecFormat {
-                codec: Some(state::codec_format::Codec::Vp8(Default::default())),
-            }),
-            feedback: vec![state::RtcpFeedback::TransportCc as i32],
-            ..Default::default()
-        }],
-        header_extensions: vec![
-            state::RtpHeaderExtensionType::RtpHeaderExtensionMid as i32,
-            state::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01 as i32,
-        ],
-        rtcp_modes: vec![state::RtcpMode::Compound as i32],
-        ..Default::default()
-    };
-    let assigned = SlotBinding {
-        slot: slot.clone(),
-        mid: "actual".into(),
-        media_index: 1,
-        kind: crate::MediaKind::Video,
-        direction: crate::MediaDirection::SendOnly,
-    };
-    let bindings = Bindings {
-        publications: vec![Binding {
-            key: crate::rtc_preparation::bootstrap_media_key(&slot),
-            group: None,
-            mid: assigned.mid.clone(),
-            kind: Kind::Video,
-            codec: Codec {
-                payload_type: 120,
-                repair: None,
-                parameters: CodecParameters {
-                    name: "VP8".into(),
-                    clock_rate: 90000,
-                    channels: None,
-                    fmtp: BTreeMap::new(),
-                    feedback: ["transport-cc".into()].into(),
-                },
-            },
-            extensions: vec![
-                crate::client_sdp::Extension {
-                    id: 1,
-                    uri: "urn:ietf:params:rtp-hdrext:sdes:mid".into(),
-                    direction: crate::client_sdp::Direction::SendRecv,
-                },
-                crate::client_sdp::Extension {
-                    id: 3,
-                    uri:
-                        "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
-                            .into(),
-                    direction: crate::client_sdp::Direction::SendRecv,
-                },
-            ],
-            encodings: vec![Encoding {
-                rid: None,
-                primary: Some(7),
-                repair: None,
-                paused: false,
-                runtime: Default::default(),
-            }],
-            rtcp: RtcpParameters {
-                cname: Some("native".into()),
-                reduced_size: false,
-            },
-        }],
-        receptions: Vec::new(),
-    };
-    assert!(
-        crate::rtc_preparation::prepare_bootstrap_bindings(
-            bindings.clone(),
-            &[assigned.clone()],
-            &capabilities
-        )
-        .unwrap()[&slot]
-            .is_ok()
-    );
-    for preparation in [
-        None,
-        Some(Ok(BTreeMap::new())),
-        Some(Ok(BTreeMap::from([(
-            slot.clone(),
-            Err(crate::client_sdp::Error::Observation),
-        )]))),
+    use crate::client_sdp::{Allocation, ApplyOutcome, Bindings};
+    for slot in [
+        MediaSlot::LocalVideo("caller-coordinate".into()),
+        MediaSlot::LocalAudio("caller-coordinate".into()),
+        MediaSlot::RemoteVideo(256),
+        MediaSlot::RemoteAudio(256),
     ] {
-        let resource = want("camera").resource;
+        let (mut agent, generation, _) = connected(crate::TopicRegistrations::default());
+        let format = state::CodecFormat {
+            codec: Some(match slot.kind() {
+                crate::MediaKind::Video => state::codec_format::Codec::Vp8(Default::default()),
+                crate::MediaKind::Audio => state::codec_format::Codec::Opus(Default::default()),
+            }),
+        };
+        let receiving = slot.direction() == crate::MediaDirection::ReceiveOnly;
+        let requested_format = receiving.then_some(format.clone());
+        let want = |label: &str| MediaWant {
+            resource: if receiving {
+                Resource::Reception(slot.clone())
+            } else {
+                Resource::Publication {
+                    kind: if slot.kind() == crate::MediaKind::Video {
+                        state::TrackKind::Video
+                    } else {
+                        state::TrackKind::Audio
+                    },
+                    label: label.into(),
+                }
+            },
+            source: receiving.then(|| label.into()),
+            allocation: Allocation {
+                slot: slot.clone(),
+                format: requested_format.clone(),
+            },
+        };
+        let assigned = SlotBinding {
+            slot: slot.clone(),
+            mid: "actual".into(),
+            media_index: 1,
+            kind: slot.kind(),
+            direction: slot.direction(),
+        };
+        let (mut binding, capabilities) = crate::rtc_preparation::binding_fixture(format);
+        binding.key = crate::rtc_preparation::bootstrap_media_key(&slot);
+        binding.mid = assigned.mid.clone();
+        let bindings = if receiving {
+            Bindings {
+                publications: Vec::new(),
+                receptions: vec![binding],
+            }
+        } else {
+            Bindings {
+                publications: vec![binding],
+                receptions: Vec::new(),
+            }
+        };
+        assert!(
+            crate::rtc_preparation::prepare_bootstrap_bindings(
+                bindings.clone(),
+                &[assigned.clone()],
+                &capabilities
+            )
+            .unwrap()[&slot]
+                .is_ok()
+        );
+        for preparation in [
+            None,
+            Some(Ok(BTreeMap::new())),
+            Some(Ok(BTreeMap::from([(
+                slot.clone(),
+                Err(crate::client_sdp::Error::Observation),
+            )]))),
+        ] {
+            let resource = want("camera").resource;
+            let active = agent.active.as_mut().unwrap();
+            active
+                .coordinates
+                .insert(slot.clone(), Some(assigned.clone()));
+            active.media_preparation = preparation;
+            assert!(rtp(active, &resource, &slot, None).is_none());
+            assert!(active.media_leases[&slot].retired);
+            assert_eq!(active.media_leases[&slot].mid, assigned.mid);
+            retire_media(active, &mut agent.ids, &mut agent.effects);
+            let Some(Effect::Rtc(RtcEffect::RetireMedia {
+                operation, mids, ..
+            })) = agent.next_effect()
+            else {
+                panic!("incomplete bootstrap retirement");
+            };
+            assert_eq!(mids, [assigned.mid.clone()]);
+            agent
+                .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
+                    generation,
+                    operation,
+                    slots: Vec::new(),
+                    outcome: ApplyOutcome::Applied,
+                    preparation: Ok(Bindings::default()),
+                }))
+                .unwrap();
+            let active = agent.active.as_mut().unwrap();
+            assert!(active.coordinates.contains_key(&slot));
+            assert!(active.coordinates[&slot].is_none());
+            assert!(!active.media_leases.contains_key(&slot));
+            assert!(rtp(active, &resource, &slot, None).is_none());
+            assert!(!active.media_leases.contains_key(&slot));
+            assert!(agent.next_effect().is_none());
+        }
         let active = agent.active.as_mut().unwrap();
-        active
-            .coordinates
-            .insert(slot.clone(), Some(assigned.clone()));
-        active.media_preparation = preparation;
-        assert!(rtp(active, &resource, &slot, None).is_none());
-        assert!(active.media_leases[&slot].retired);
-        assert_eq!(active.media_leases[&slot].mid, assigned.mid);
-        retire_media(active, &mut agent.ids, &mut agent.effects);
+        active.capabilities.rtp = capabilities;
+        active.media_wanted.insert(slot.clone(), want("camera"));
+        allocate_media(active, &mut agent.ids, &mut agent.effects);
+        let Some(Effect::Rtc(RtcEffect::AllocateMedia {
+            operation,
+            allocations,
+            ..
+        })) = agent.next_effect()
+        else {
+            panic!("allocation")
+        };
+        assert_eq!(
+            agent.source_preparation(&slot).readiness,
+            SourceReadiness::Preparing
+        );
+        assert_eq!(
+            agent
+                .source_preparation(&MediaSlot::LocalAudio("a0".into()))
+                .readiness,
+            SourceReadiness::Ready
+        );
+        assert_eq!(
+            allocations,
+            [Allocation {
+                slot: slot.clone(),
+                format: requested_format.clone()
+            }]
+        );
+        let stale_generation = agent.ids.generation();
+        for (callback_generation, callback_operation) in [
+            (stale_generation, operation),
+            (generation, agent.ids.operation()),
+        ] {
+            agent
+                .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
+                    generation: callback_generation,
+                    operation: callback_operation,
+                    slots: vec![assigned.clone()],
+                    outcome: ApplyOutcome::Applied,
+                    preparation: Ok(bindings.clone()),
+                }))
+                .unwrap();
+            assert!(agent.active.as_ref().unwrap().media_allocation.is_some());
+            assert_eq!(
+                agent.source_preparation(&slot).readiness,
+                SourceReadiness::Preparing
+            );
+            assert!(agent.next_effect().is_none());
+        }
+        agent
+            .active
+            .as_mut()
+            .unwrap()
+            .media_wanted
+            .insert(slot.clone(), want("screen"));
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
+                generation,
+                operation,
+                slots: vec![assigned],
+                outcome: ApplyOutcome::Applied,
+                preparation: Ok(bindings),
+            }))
+            .unwrap();
+        let active = agent.active.as_ref().unwrap();
+        assert!(active.media_allocation.is_none());
+        assert!(
+            active
+                .media_preparation
+                .as_ref()
+                .is_none_or(|cache| cache.as_ref().is_ok_and(|cache| !cache.contains_key(&slot)))
+        );
+        let lease = &active.media_leases[&slot];
+        assert!(lease.retired);
+        assert_eq!(lease.resource, want("camera").resource);
         let Some(Effect::Rtc(RtcEffect::RetireMedia {
             operation, mids, ..
         })) = agent.next_effect()
         else {
-            panic!("incomplete bootstrap retirement");
+            panic!("orphan retirement")
         };
-        assert_eq!(mids, [assigned.mid.clone()]);
+        assert_eq!(mids, ["actual"]);
+        assert!(agent.next_effect().is_none());
         agent
             .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
                 generation,
@@ -133,114 +206,84 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                 preparation: Ok(Bindings::default()),
             }))
             .unwrap();
-        let active = agent.active.as_mut().unwrap();
-        assert!(active.coordinates.contains_key(&slot));
-        assert!(active.coordinates[&slot].is_none());
-        assert!(!active.media_leases.contains_key(&slot));
-        assert!(rtp(active, &resource, &slot, None).is_none());
-        assert!(!active.media_leases.contains_key(&slot));
+        assert!(
+            !agent
+                .active
+                .as_ref()
+                .unwrap()
+                .media_leases
+                .contains_key(&slot)
+        );
         assert!(agent.next_effect().is_none());
     }
-    let active = agent.active.as_mut().unwrap();
-    active.capabilities.rtp = capabilities;
-    active.media_wanted.insert(slot.clone(), want("camera"));
-    allocate_media(active, &mut agent.ids, &mut agent.effects);
+
+    let (mut agent, generation, channel) = connected(crate::TopicRegistrations::default());
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        ["a-source", "z-source"]
+            .into_iter()
+            .map(|id| {
+                confirmed(
+                    state::resource_key::Key::Track(id.into()),
+                    0,
+                    state::confirmed_state::Value::Track(state::Track {
+                        track_id: id.into(),
+                        participant_id: "remote".into(),
+                        label: "voice".into(),
+                        kind: Some(state::track::Kind::Audio(state::AudioTrack {
+                            format: Some(state::CodecFormat {
+                                codec: Some(state::codec_format::Codec::Opus(Default::default())),
+                            }),
+                        })),
+                    }),
+                )
+            })
+            .collect(),
+    );
+    let mut desired = DesiredState {
+        revision: agent.declared.revision + 1,
+        connected: true,
+        audio: crate::AudioSubscription {
+            pinned: vec!["z-source".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    agent
+        .command(AgentCommand::ReplaceDesired(desired.clone()))
+        .unwrap();
     let Some(Effect::Rtc(RtcEffect::AllocateMedia {
         operation,
         allocations,
         ..
     })) = agent.next_effect()
     else {
-        panic!("allocation")
+        panic!("audio allocation")
     };
-    assert_eq!(
-        agent.source_preparation(&slot).readiness,
-        SourceReadiness::Preparing
-    );
-    assert_eq!(
-        agent
-            .source_preparation(&MediaSlot::LocalAudio("a0".into()))
-            .readiness,
-        SourceReadiness::Ready
-    );
-    assert_eq!(
-        allocations,
-        [Allocation {
-            slot: slot.clone(),
-            format: None
-        }]
-    );
-    let stale_generation = agent.ids.generation();
-    for (callback_generation, callback_operation) in [
-        (stale_generation, operation),
-        (generation, agent.ids.operation()),
-    ] {
-        agent
-            .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
-                generation: callback_generation,
-                operation: callback_operation,
-                slots: vec![assigned.clone()],
-                outcome: ApplyOutcome::Applied,
-                preparation: Ok(bindings.clone()),
-            }))
-            .unwrap();
-        assert!(agent.active.as_ref().unwrap().media_allocation.is_some());
-        assert_eq!(
-            agent.source_preparation(&slot).readiness,
-            SourceReadiness::Preparing
-        );
-        assert!(agent.next_effect().is_none());
-    }
+    assert_eq!(allocations[0].slot, MediaSlot::RemoteAudio(0));
+    desired.revision += 1;
+    desired.audio.pinned.push("a-source".into());
     agent
-        .active
-        .as_mut()
-        .unwrap()
-        .media_wanted
-        .insert(slot.clone(), want("screen"));
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
-            generation,
-            operation,
-            slots: vec![assigned],
-            outcome: ApplyOutcome::Applied,
-            preparation: Ok(bindings),
-        }))
+        .command(AgentCommand::ReplaceDesired(desired))
         .unwrap();
     let active = agent.active.as_ref().unwrap();
-    assert!(active.media_allocation.is_none());
-    assert!(
-        active
-            .media_preparation
-            .as_ref()
-            .is_none_or(|cache| cache.as_ref().is_ok_and(|cache| !cache.contains_key(&slot)))
+    assert_eq!(
+        active.media_allocation.as_ref().unwrap().operation,
+        operation
     );
-    let lease = &active.media_leases[&slot];
-    assert!(lease.retired);
-    assert_eq!(lease.resource, want("camera").resource);
-    let Some(Effect::Rtc(RtcEffect::RetireMedia {
-        operation, mids, ..
-    })) = agent.next_effect()
-    else {
-        panic!("orphan retirement")
-    };
-    assert_eq!(mids, ["actual"]);
-    assert!(agent.next_effect().is_none());
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
-            generation,
-            operation,
-            slots: Vec::new(),
-            outcome: ApplyOutcome::Applied,
-            preparation: Ok(Bindings::default()),
-        }))
-        .unwrap();
-    assert!(
-        !agent
-            .active
-            .as_ref()
-            .unwrap()
-            .media_leases
-            .contains_key(&slot)
+    assert_eq!(
+        active.media_wanted[&MediaSlot::RemoteAudio(0)]
+            .source
+            .as_deref(),
+        Some("z-source")
+    );
+    assert_eq!(
+        active.media_wanted[&MediaSlot::RemoteAudio(1)]
+            .source
+            .as_deref(),
+        Some("a-source")
     );
     assert!(agent.next_effect().is_none());
 }
@@ -493,7 +536,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
                 negotiated: true,
                 ordered: true,
                 reliability: DataChannelReliability::Reliable,
-                association_max_channels: Some(8),
+                association_max_channels: Some(2),
             }),
         }))
         .unwrap();
@@ -518,7 +561,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
                 negotiated: true,
                 ordered: false,
                 reliability: DataChannelReliability::MaxRetransmits(0),
-                association_max_channels: Some(8),
+                association_max_channels: Some(2),
             }),
         }))
         .unwrap();
@@ -535,6 +578,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
             generation,
             channel,
+            reset_complete: true,
         }))
         .unwrap();
     let Some(Effect::Rtc(RtcEffect::CreateDataChannel {
@@ -547,7 +591,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     };
     assert_eq!(actual, generation);
     assert_ne!(replacement, channel);
-    assert_eq!(specification.negotiated_id, Some(2));
+    assert_eq!(specification.negotiated_id, Some(1));
     assert!(specification.ordered);
     assert_eq!(specification.reliability, DataChannelReliability::Reliable);
     assert_eq!(agent.snapshot().generation, Some(generation));
@@ -565,7 +609,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
                 negotiated: true,
                 ordered: true,
                 reliability: DataChannelReliability::Reliable,
-                association_max_channels: Some(8),
+                association_max_channels: Some(2),
             }),
         }))
         .unwrap();
@@ -580,11 +624,11 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
             generation,
             channel,
             preparation: Ok(crate::PreparedDataChannel {
-                stream_id: 2,
+                stream_id: 1,
                 negotiated: true,
                 ordered: true,
                 reliability: DataChannelReliability::Reliable,
-                association_max_channels: Some(8),
+                association_max_channels: Some(2),
             }),
         }))
         .unwrap();
@@ -685,7 +729,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
                 track: Some(state::Track {
                     track_id: "server-canonical-source".into(),
                     participant_id: "p1".into(),
-                    label: publisher.topic,
+                    label: publisher.topic.clone(),
                     kind: Some(state::track::Kind::Data(state::DataTrack {
                         delivery: state::DataDelivery::Ordered as i32,
                     })),
@@ -698,6 +742,92 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     );
     assert!(!agent.topics.has_channel(generation, channel));
     assert!(agent.snapshot.terminal_failure.is_none());
+    assert!(agent.next_effect().is_none());
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+            generation,
+            channel,
+            reset_complete: true,
+        }))
+        .unwrap();
+    let mut successor = agent.desired.clone();
+    successor.revision += 1;
+    successor.topics.publishers = vec![publisher];
+    agent
+        .command(AgentCommand::ReplaceDesired(successor))
+        .unwrap();
+    assert!(
+        agent.next_effect().is_none(),
+        "reset completion cannot release a stream retained by the server"
+    );
+    let Some(state::state_record::State::Desired(absent)) = &retired.records[0].state else {
+        panic!("retirement desired state")
+    };
+    observe(
+        &mut agent,
+        generation,
+        control,
+        vec![confirmed(
+            state::resource_key::Key::Owned(*reference),
+            absent.revision,
+            state::confirmed_state::Value::Absent(state::AbsentState {
+                reason: state::AbsenceReason::Removed as i32,
+            }),
+        )],
+    );
+    let Some(Effect::Rtc(RtcEffect::CreateDataChannel {
+        generation: actual,
+        channel: fresh,
+        specification,
+    })) = agent.next_effect()
+    else {
+        panic!("reuse after both reset and authoritative cutoff")
+    };
+    assert_eq!(actual, generation);
+    assert_ne!(fresh, channel);
+    assert_eq!(specification.negotiated_id, Some(1));
+    let before = agent.snapshot().clone();
+    for event in [
+        DataChannelEvent::Opened {
+            generation,
+            channel,
+        },
+        DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: vec![0xff],
+        },
+        DataChannelEvent::Sent {
+            operation,
+            generation,
+            channel,
+        },
+        DataChannelEvent::Closed {
+            generation,
+            channel,
+            reset_complete: true,
+        },
+    ] {
+        agent.handle(HostEvent::DataChannel(event)).unwrap();
+        assert_eq!(agent.snapshot(), &before);
+        assert!(agent.next_effect().is_none());
+    }
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+            generation,
+            channel: fresh,
+            reset_complete: false,
+        }))
+        .unwrap();
+    assert!(
+        agent.next_effect().is_none(),
+        "generic closure without a reset barrier quarantines the only payload SID"
+    );
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert_eq!(
+        agent.snapshot().connection,
+        crate::ConnectionState::Connected
+    );
 }
 
 #[test]
@@ -863,5 +993,57 @@ fn selectors_do_not_choose_a_source_from_ambiguous_labels() {
             state::TrackKind::Video
         ),
         Some(other.track_id.as_str())
+    );
+    let mut renamed = other.clone();
+    renamed.track_id = "source-renamed".into();
+    renamed.label = "screen".into();
+    observe(
+        &mut agent,
+        generation,
+        control,
+        vec![
+            confirmed(
+                state::resource_key::Key::Track(other.track_id.clone()),
+                0,
+                state::confirmed_state::Value::Absent(state::AbsentState {
+                    reason: state::AbsenceReason::Removed as i32,
+                }),
+            ),
+            confirmed(
+                state::resource_key::Key::Track(renamed.track_id.clone()),
+                0,
+                state::confirmed_state::Value::Track(renamed),
+            ),
+        ],
+    );
+    assert_eq!(
+        selected(
+            agent.active.as_ref().unwrap(),
+            &resource,
+            &selector,
+            state::TrackKind::Video
+        ),
+        None
+    );
+    let mut republished = other;
+    republished.track_id = "source-republished".into();
+    observe(
+        &mut agent,
+        generation,
+        control,
+        vec![confirmed(
+            state::resource_key::Key::Track(republished.track_id.clone()),
+            0,
+            state::confirmed_state::Value::Track(republished.clone()),
+        )],
+    );
+    assert_eq!(
+        selected(
+            agent.active.as_ref().unwrap(),
+            &resource,
+            &selector,
+            state::TrackKind::Video
+        ),
+        Some(republished.track_id.as_str())
     );
 }

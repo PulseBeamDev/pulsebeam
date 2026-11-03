@@ -62,12 +62,6 @@ pub(crate) fn joining(topics: crate::TopicRegistrations) -> (Agent, Generation, 
     let mut agent = Agent::new(AgentConfig {
         endpoint: "https://sfu.test/".into(),
         token: "private-token".into(),
-        topology: crate::MediaTopology {
-            local_video: 0,
-            local_audio: 0,
-            remote_video: 0,
-            remote_audio: 0,
-        },
         retry: Default::default(),
         log_level: Default::default(),
     })

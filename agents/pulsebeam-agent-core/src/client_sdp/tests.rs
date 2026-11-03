@@ -69,8 +69,20 @@ fn executor_serializes_real_context_history_and_reports_cancellation_truthfully(
     executor.enqueue(third, vec![]).unwrap();
     assert_eq!(executor.start(), Some(first));
     assert_eq!(executor.start(), None);
-    let applied = executor.prepare(first, &bootstrap()).unwrap();
+    let mut applied = executor.prepare(first, &bootstrap()).unwrap();
+    assert_eq!(
+        executor.prepare_sender_modes(second, &mut applied, "v", &[]),
+        Err(Error::CandidateState)
+    );
+    assert_eq!(
+        executor.prepare_sender_modes(first, &mut applied, "v", &[]),
+        Err(Error::Observation)
+    );
     assert!(!executor.cancel(first));
+    assert_eq!(
+        executor.prepare_sender_modes(first, &mut applied, "v", &[]),
+        Err(Error::CandidateState)
+    );
     assert!(executor.cancelled(first));
     assert_eq!(executor.finish(second, true), Err(Error::CandidateState));
     assert_eq!(
@@ -358,7 +370,6 @@ fn allocation_lowers_only_actual_sections_and_reconciles_cancelled_physical_hist
     assert!(p.complete() && r.complete());
     let old_receive_identity = r.encodings[0].primary;
     let old_receive_repair = r.encodings[0].repair;
-    let old_receive_rtcp = r.rtcp.clone();
     let old_msids = candidate
         .answer()
         .lines()
@@ -387,42 +398,16 @@ fn allocation_lowers_only_actual_sections_and_reconciles_cancelled_physical_hist
     executor.finish(occupied, false).unwrap();
     assert!(executor.context_mut().bindings().is_none());
 
-    let retarget = ids.operation();
+    let occupied_receiver = ids.operation();
     executor
-        .enqueue_allocations(
-            retarget,
-            vec![reception.clone()],
-            AllocationMode::RetargetReceiver,
-        )
+        .enqueue_allocation(occupied_receiver, vec![reception.clone()])
         .unwrap();
     executor.start().unwrap();
-    let received = slots
-        .iter()
-        .filter(|slot| slot.slot == reception.slot)
-        .cloned()
-        .collect::<Vec<_>>();
-    let candidate = executor
-        .prepare_allocated(retarget, &actual, &received)
-        .unwrap();
-    let replacement = &candidate.bindings().receptions[0];
-    assert_eq!(replacement.mid, "physical-recv");
-    assert_ne!(replacement.encodings[0].primary, old_receive_identity);
-    assert_ne!(replacement.encodings[0].repair, old_receive_repair);
-    assert_eq!(replacement.rtcp, old_receive_rtcp);
     assert_eq!(
-        candidate
-            .answer()
-            .lines()
-            .filter(|line| line.starts_with("a=msid:"))
-            .map(str::to_owned)
-            .collect::<Vec<_>>(),
-        old_msids
+        executor.allocation_targets(occupied_receiver).unwrap_err(),
+        Error::Envelope("physical-recv".into())
     );
-    executor.finish(retarget, true).unwrap();
-    assert_eq!(
-        executor.context_mut().bindings().unwrap().publications[0].encodings[0].primary,
-        Some(0)
-    );
+    executor.finish(occupied_receiver, false).unwrap();
 
     let retirement = ids.operation();
     executor
@@ -462,6 +447,15 @@ fn allocation_lowers_only_actual_sections_and_reconciles_cancelled_physical_hist
     assert_eq!(r.mid, "physical-replacement");
     assert_eq!(r.codec.payload_type, 96);
     assert_ne!(r.encodings[0].primary, old_receive_identity);
+    assert_ne!(r.encodings[0].repair, old_receive_repair);
+    assert_ne!(
+        next.answer()
+            .lines()
+            .filter(|line| line.starts_with("a=msid:"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        old_msids
+    );
     assert!(r.complete());
     executor.finish(replacement, true).unwrap();
     assert_eq!(
@@ -917,6 +911,114 @@ fn bootstrap_slots_correlate_actual_bindings_without_changing_the_applied_answer
     assert_eq!(bindings.publications[0].encodings[0].primary, Some(0));
     assert_eq!(bindings.publications[0].encodings[0].repair, Some(1));
     assert!(bindings.publications[0].complete());
+}
+
+#[test]
+fn local_sender_preparation_commits_exact_identities_without_runtime_observation() {
+    let mut ctx = Context::new(
+        &bootstrap(),
+        &remote(),
+        caps(),
+        u32::MAX - 1,
+        Limits::default(),
+    )
+    .unwrap();
+    let actual = offer(
+        "v",
+        "sendrecv",
+        "a=extmap-allow-mixed\r\na=rid:high send\r\na=rid:low send\r\na=simulcast:send high;~low\r\n",
+    );
+    let unoffered = actual.replace("a=extmap-allow-mixed\r\n", "");
+    assert!(!sdp::Document::parse(&unoffered).unwrap().media[1].extmap_allow_mixed);
+    let inherited = unoffered.replace("t=0 0\r\n", "t=0 0\r\na=extmap-allow-mixed\r\n");
+    assert!(sdp::Document::parse(&inherited).unwrap().media[1].extmap_allow_mixed);
+    let mut full = actual.clone();
+    let filler = format!("a=x:{}\r\n", "x".repeat(8000));
+    while full.len().saturating_add(filler.len()).saturating_add(6) <= MAX_SDP_BYTES {
+        full.push_str(&filler);
+    }
+    full.push_str("a=x:");
+    full.extend(std::iter::repeat_n(
+        'x',
+        MAX_SDP_BYTES.saturating_sub(full.len()).saturating_sub(2),
+    ));
+    full.push_str("\r\n");
+    assert_eq!(full.len(), MAX_SDP_BYTES);
+    assert_eq!(ctx.prepare_local_offer(&full), Err(Error::Capacity));
+    let prepared = ctx.prepare_local_offer(&actual).unwrap();
+    assert!(prepared.contains("a=extmap-allow-mixed\r\n"));
+    let sections = inspect(&prepared).unwrap();
+    let video = sections.iter().find(|section| section.mid == "v").unwrap();
+    assert_eq!(video.encodings.len(), 2);
+    assert_eq!(video.encodings[0].primary, Some(u32::MAX));
+    assert_eq!(video.encodings[0].repair, Some(1));
+    assert_eq!(video.encodings[1].primary, Some(2));
+    assert_eq!(video.encodings[1].repair, Some(3));
+    assert!(
+        video
+            .encodings
+            .iter()
+            .all(|encoding| encoding.rid.is_none())
+    );
+    assert!(ctx.bindings().is_none());
+    let candidate = ctx.prepare(&prepared, &[request("v", true, true)]).unwrap();
+    assert!(candidate.answer().contains("a=extmap-allow-mixed\r\n"));
+    assert!(candidate.bindings().publications[0].complete());
+    let abandoned = candidate.bindings().clone();
+    ctx.finish(candidate.id(), ApplyOutcome::NotApplied)
+        .unwrap();
+    assert!(ctx.bindings().is_none());
+
+    let prepared = ctx.prepare_local_offer(&actual).unwrap();
+    let mut candidate = ctx.prepare(&prepared, &[request("v", true, true)]).unwrap();
+    let before_modes = candidate.bindings().clone();
+    assert_eq!(
+        ctx.prepare_sender_modes(&mut candidate, "v", &[Some("bad mode".into()), None]),
+        Err(Error::Observation)
+    );
+    assert_eq!(candidate.bindings(), &before_modes);
+    let modes = [Some("L1T1".into()), Some("L1T3".into())];
+    ctx.prepare_sender_modes(&mut candidate, "v", &modes)
+        .unwrap();
+    assert!(ctx.bindings().is_none());
+    assert_eq!(
+        candidate.bindings().publications[0]
+            .encodings
+            .iter()
+            .map(|encoding| encoding.runtime.scalability_mode.clone())
+            .collect::<Vec<_>>(),
+        modes
+    );
+    let next = candidate.bindings().clone();
+    let identities = |bindings: &Bindings| {
+        bindings
+            .publications
+            .iter()
+            .chain(&bindings.receptions)
+            .flat_map(|binding| &binding.encodings)
+            .flat_map(|encoding| [encoding.primary, encoding.repair])
+            .flatten()
+            .collect::<BTreeSet<_>>()
+    };
+    assert!(identities(&abandoned).is_disjoint(&identities(&next)));
+    assert!(next.publications[0].complete());
+    assert!(next.receptions[0].complete());
+    ctx.finish(candidate.id(), ApplyOutcome::Applied).unwrap();
+    assert_eq!(ctx.bindings(), Some(&next));
+    let continuing = ctx.prepare_local_offer(&actual).unwrap();
+    let candidate = ctx.prepare(&continuing, &[]).unwrap();
+    assert_eq!(candidate.bindings(), &next);
+    ctx.finish(candidate.id(), ApplyOutcome::Applied).unwrap();
+    let expanded = offer(
+        "v",
+        "sendrecv",
+        "a=rid:high send\r\na=rid:medium send\r\na=rid:low send\r\na=simulcast:send high;medium;low\r\n",
+    );
+    assert_eq!(
+        ctx.prepare_local_offer(&expanded),
+        Err(Error::Envelope("v".into()))
+    );
+    assert_eq!(ctx.bindings(), Some(&next));
 }
 
 #[test]

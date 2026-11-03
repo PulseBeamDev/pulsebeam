@@ -18,12 +18,6 @@ function App() {
         setConfig({
           endpoint: String(fields.get("endpoint")),
           token: String(fields.get("token")),
-          topology: {
-            localVideos: 1,
-            localAudios: 1,
-            remoteVideos: 2,
-            remoteAudios: 2,
-          },
         });
       }}
     >

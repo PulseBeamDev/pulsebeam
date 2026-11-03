@@ -16,6 +16,7 @@ struct DataPublication {
     fanout: Option<TrackHandle>,
     enabled: bool,
     opened: bool,
+    reset_pending: bool,
     published: bool,
     retiring: bool,
     preparation: Option<Preparation>,
@@ -213,11 +214,14 @@ impl Participant {
             );
             return;
         }
-        if let Err(code) = self.transport.open_native_data(channel, lane) {
-            let _ = self.signaling.reserve_execution(work.reference, 0);
-            self.complete_native_preparation(work, Err(failure(code)));
-            return;
-        }
+        let reset_pending = match self.transport.open_native_data(channel, lane) {
+            Ok(state) => state == super::super::transport::NativeDataOpen::ResetPending,
+            Err(code) => {
+                let _ = self.signaling.reserve_execution(work.reference, 0);
+                self.complete_native_preparation(work, Err(failure(code)));
+                return;
+            }
+        };
         let id =
             self.connection_id
                 .derive_publication_track_id(TrackKind::Data, label, incarnation);
@@ -247,6 +251,7 @@ impl Participant {
                 fanout: None,
                 enabled: false,
                 opened: false,
+                reset_pending,
                 published: false,
                 retiring: false,
                 preparation: Some(work),
@@ -278,6 +283,9 @@ impl Participant {
         let Some(publication) = self.native_data.publications.get_mut(&reference) else {
             return;
         };
+        if publication.reset_pending {
+            return;
+        }
         let Track::Data(data) = &publication.track else {
             return;
         };
@@ -477,11 +485,70 @@ impl Participant {
         else {
             return;
         };
+        // Reset-pending replacements do not own the previous lifetime's notices.
+        if self
+            .native_data
+            .publications
+            .get(&reference)
+            .is_some_and(|publication| publication.reset_pending)
+            || self.native_receivers.reset_pending(reference)
+        {
+            return;
+        }
         if self.signaling.source_ended(reference).is_err() {
             self.disconnect(DisconnectReason::SignalingOutput);
             return;
         }
         self.retire_native_data(reference, events);
+    }
+
+    pub(super) fn native_data_reset(
+        &mut self,
+        channel: crate::media::ChannelId,
+        success: bool,
+        events: &mut impl ParticipantSink,
+    ) {
+        let Some(reference) = self.native_data.channels.get(&channel).copied() else {
+            self.native_receiver_reset(channel, success, events);
+            return;
+        };
+        if !self
+            .native_data
+            .publications
+            .get(&reference)
+            .is_some_and(|publication| publication.reset_pending)
+        {
+            return;
+        }
+        if !success {
+            self.fail_native_data(reference, wire::FailureCode::Incompatible);
+            return;
+        }
+        let Some(publication) = self.native_data.publications.get_mut(&reference) else {
+            return;
+        };
+        let Track::Data(data) = &publication.track else {
+            return;
+        };
+        let lane = data.lane;
+        let Some(work) = publication.preparation.take() else {
+            return;
+        };
+        let Some(work) = self.current_native_preparation(work) else {
+            self.fail_native_data(reference, wire::FailureCode::ResourceGone);
+            return;
+        };
+        let Some(publication) = self.native_data.publications.get_mut(&reference) else {
+            return;
+        };
+        publication.preparation = Some(work);
+        match self.transport.open_native_data(channel, lane) {
+            Ok(state) => {
+                publication.reset_pending =
+                    state == super::super::transport::NativeDataOpen::ResetPending;
+            }
+            Err(code) => self.fail_native_data(reference, code),
+        }
     }
 
     pub(super) fn expire_native_data(&mut self, now: Instant, events: &mut impl ParticipantSink) {

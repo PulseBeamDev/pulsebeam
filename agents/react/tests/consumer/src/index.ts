@@ -14,7 +14,6 @@ import {
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   token: "opaque-token",
-  topology: { localVideos: 1, localAudios: 1 },
 };
 const agent: Agent = useAgent(config);
 const capture = useCapture("device", { video: true, audio: false });

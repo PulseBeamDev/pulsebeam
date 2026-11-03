@@ -127,7 +127,7 @@ fn one_slot_track_replacement_keeps_media_flow_test() {
                     min_frames: 2,
                     min_resolution: (180, 180),
                 },
-                same_receiver: false,
+                fresh_receiver: false,
             },
             Step::Disconnect {
                 description: "Remove the publisher occupying the only slot",
@@ -141,16 +141,16 @@ fn one_slot_track_replacement_keeps_media_flow_test() {
                 timeout: Duration::from_secs(10),
             },
             Step::BeginNativePlayback {
-                description: "Measure playback after the explicitly bounded replacement",
+                description: "Measure fresh-receiver cadence after the bounded source discontinuity",
                 participant: "sub",
-                after_pause: false,
+                after_pause: true,
             },
             Step::Run {
                 description: "Replacement video keeps playing",
                 duration: Duration::from_secs(5),
             },
             Step::CheckNativePlayback {
-                description: "The remaining publisher keeps playing through the original receiver",
+                description: "The remaining publisher plays through a fresh source-bound receiver",
                 participant: "sub",
                 publisher: "pub2",
                 expected: PlaybackExpectation {
@@ -158,7 +158,7 @@ fn one_slot_track_replacement_keeps_media_flow_test() {
                     min_frames: 2,
                     min_resolution: (180, 180),
                 },
-                same_receiver: true,
+                fresh_receiver: true,
             },
         ]);
 }

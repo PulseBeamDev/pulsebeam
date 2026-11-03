@@ -49,6 +49,9 @@ fn view<'a>(track: &'a Track, key: DownstreamSlotKey, mid: &str, priority: u32) 
         min_fps: 0,
         priority,
         track,
+        current_stream: track
+            .by_quality(LayerQuality::High)
+            .map(TrackLayer::stream_id),
         current_quality: LayerQuality::High,
         current_decode_target: DecodeTargetSelection::Full,
         forwarding: true,
@@ -131,6 +134,13 @@ fn gallery_upgrades_only_after_all_minimums_and_headroom_fit() {
         .enumerate()
         .map(|(index, mid)| SlotView {
             max_height: if index == 0 { 720 } else { 180 },
+            current_stream: track
+                .by_quality(if index == 0 {
+                    LayerQuality::Medium
+                } else {
+                    LayerQuality::Low
+                })
+                .map(TrackLayer::stream_id),
             current_quality: if index == 0 {
                 LayerQuality::Medium
             } else {
@@ -431,6 +441,7 @@ fn upgrades_need_headroom_and_downgrades_do_not_oscillate_at_the_boundary() {
         (LayerQuality::Medium, 1_400_000, LayerQuality::High),
     ] {
         let views = [SlotView {
+            current_stream: track.by_quality(current).map(TrackLayer::stream_id),
             current_quality: current,
             ..view(&track, key, "a", 10)
         }];
@@ -476,6 +487,7 @@ fn equal_priority_congestion_serves_every_peer(min_height: u32) {
             if let Some(quality) = quality {
                 served.insert(v.mid);
                 v.current_quality = quality;
+                v.current_stream = v.track.by_quality(quality).map(TrackLayer::stream_id);
                 gates.insert(v.key, ResumeGate::default());
             } else if v.forwarding {
                 gates.insert(v.key, ResumeGate { required: true });

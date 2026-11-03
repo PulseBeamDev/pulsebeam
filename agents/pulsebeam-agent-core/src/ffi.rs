@@ -25,25 +25,10 @@ impl Default for RetryPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct MediaTopology {
-    pub local_videos: u8,
-    pub local_audios: u8,
-    pub remote_videos: u8,
-    pub remote_audios: u8,
-}
-
-impl Default for MediaTopology {
-    fn default() -> Self {
-        model::MediaTopology::default().into()
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AgentConfig {
     pub endpoint: String,
     pub token: String,
-    pub topology: MediaTopology,
     pub retry: RetryPolicy,
     pub log_level: LogLevel,
 }
@@ -54,7 +39,6 @@ impl core::fmt::Debug for AgentConfig {
             .debug_struct("AgentConfig")
             .field("endpoint", &self.endpoint)
             .field("token", &"[REDACTED]")
-            .field("topology", &self.topology)
             .field("retry", &self.retry)
             .field("log_level", &self.log_level)
             .finish()
@@ -75,15 +59,26 @@ pub enum LogLevel {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct PublicationIntent {
     pub slot: String,
+    pub kind: MediaKind,
     pub label: String,
     pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct VideoDemand {
-    pub slot: u8,
+    pub slot: u32,
     pub publication_id: String,
     pub selector: Option<TrackSelector>,
+    pub height: u32,
+    pub min_height: u32,
+    pub min_fps: u32,
+    pub priority: u32,
+    pub playout_delay: PlayoutDelay,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct VideoObservation {
+    pub visible: bool,
     pub height: u32,
     pub min_height: u32,
     pub min_fps: u32,
@@ -443,7 +438,6 @@ impl AgentConfig {
         let mut config = model::AgentConfig {
             endpoint: self.endpoint,
             token: self.token,
-            topology: self.topology.into(),
             retry: self.retry.into(),
             log_level: self.log_level.into(),
         };
@@ -456,11 +450,7 @@ impl AgentConfig {
 }
 
 impl DesiredState {
-    pub fn into_core(
-        self,
-        revision: u64,
-        topology: &model::MediaTopology,
-    ) -> Result<model::DesiredState, AgentError> {
+    pub fn into_core(self, revision: u64) -> Result<model::DesiredState, AgentError> {
         let mut desired = model::DesiredState {
             revision,
             connected: self.connected,
@@ -473,7 +463,7 @@ impl DesiredState {
             },
         };
         desired.normalize();
-        desired.validate(topology).map_err(|error| AgentError {
+        desired.validate().map_err(|error| AgentError {
             code: ErrorCode::InvalidDesiredState,
             message: error.to_string(),
         })?;
@@ -524,34 +514,11 @@ impl From<model::RetryPolicy> for RetryPolicy {
     }
 }
 
-impl From<MediaTopology> for model::MediaTopology {
-    fn from(value: MediaTopology) -> Self {
-        Self {
-            local_video: value.local_videos,
-            local_audio: value.local_audios,
-            remote_video: value.remote_videos,
-            remote_audio: value.remote_audios,
-        }
-    }
-}
-
-impl From<model::MediaTopology> for MediaTopology {
-    fn from(value: model::MediaTopology) -> Self {
-        Self {
-            local_videos: value.local_video,
-            local_audios: value.local_audio,
-            remote_videos: value.remote_video,
-            remote_audios: value.remote_audio,
-        }
-    }
-}
-
 impl From<model::AgentConfig> for AgentConfig {
     fn from(value: model::AgentConfig) -> Self {
         Self {
             endpoint: value.endpoint,
             token: value.token,
-            topology: value.topology.into(),
             retry: value.retry.into(),
             log_level: value.log_level.into(),
         }
@@ -588,6 +555,7 @@ impl From<PublicationIntent> for model::PublicationIntent {
     fn from(value: PublicationIntent) -> Self {
         Self {
             slot: value.slot,
+            kind: value.kind.into(),
             label: value.label,
             active: value.active,
         }
@@ -598,6 +566,7 @@ impl From<model::PublicationIntent> for PublicationIntent {
     fn from(value: model::PublicationIntent) -> Self {
         Self {
             slot: value.slot,
+            kind: value.kind.into(),
             label: value.label,
             active: value.active,
         }
@@ -625,6 +594,32 @@ impl From<model::VideoSubscription> for VideoDemand {
             slot: value.slot,
             publication_id: value.track_id,
             selector: value.selector.map(Into::into),
+            height: value.height,
+            min_height: value.min_height,
+            min_fps: value.min_fps,
+            priority: value.priority,
+            playout_delay: value.playout_delay.into(),
+        }
+    }
+}
+
+impl From<VideoObservation> for crate::VideoObservation {
+    fn from(value: VideoObservation) -> Self {
+        Self {
+            visible: value.visible,
+            height: value.height,
+            min_height: value.min_height,
+            min_fps: value.min_fps,
+            priority: value.priority,
+            playout_delay: value.playout_delay.into(),
+        }
+    }
+}
+
+impl From<crate::VideoObservation> for VideoObservation {
+    fn from(value: crate::VideoObservation) -> Self {
+        Self {
+            visible: value.visible,
             height: value.height,
             min_height: value.min_height,
             min_fps: value.min_fps,
@@ -768,6 +763,15 @@ impl From<model::TopicSubscriber> for TopicSubscriber {
         Self {
             name: value.topic,
             mode: value.mode.into(),
+        }
+    }
+}
+
+impl From<MediaKind> for model::MediaKind {
+    fn from(value: MediaKind) -> Self {
+        match value {
+            MediaKind::Video => Self::Video,
+            MediaKind::Audio => Self::Audio,
         }
     }
 }
@@ -1079,12 +1083,6 @@ mod tests {
         AgentConfig {
             endpoint: "https://sfu.example.com/".to_string(),
             token: "private".to_string(),
-            topology: MediaTopology {
-                local_videos: 1,
-                local_audios: 1,
-                remote_videos: 2,
-                remote_audios: 1,
-            },
             retry: RetryPolicy::default(),
             log_level: LogLevel::default(),
         }
@@ -1112,11 +1110,10 @@ mod tests {
             .expect_err("relative endpoint must fail");
         assert_eq!(error.code, ErrorCode::InvalidConfiguration);
 
-        let topology = config().into_core().expect("valid config").topology;
         let desired = DesiredState {
             video: vec![VideoDemand {
-                slot: 3,
-                publication_id: "participant/video".to_string(),
+                slot: u32::MAX,
+                publication_id: String::new(),
                 selector: None,
                 height: 720,
                 min_height: 180,
@@ -1127,18 +1124,18 @@ mod tests {
             ..DesiredState::default()
         };
         let error = desired
-            .into_core(1, &topology)
-            .expect_err("out-of-range receive slot must fail");
+            .into_core(1)
+            .expect_err("empty source identity must fail");
         assert_eq!(error.code, ErrorCode::InvalidDesiredState);
     }
 
     #[test]
     fn desired_conversion_normalizes_complete_state() {
-        let topology = config().into_core().expect("valid config").topology;
         let desired = DesiredState {
             connected: true,
             publications: vec![PublicationIntent {
                 slot: "v0".to_string(),
+                kind: MediaKind::Video,
                 label: "camera".to_string(),
                 active: true,
             }],
@@ -1154,9 +1151,7 @@ mod tests {
             ],
             ..DesiredState::default()
         };
-        let converted = desired
-            .into_core(7, &topology)
-            .expect("valid desired state");
+        let converted = desired.into_core(7).expect("valid desired state");
         assert_eq!(converted.revision, 7);
         assert_eq!(converted.topics.publishers[0].topic, "a");
         assert_eq!(converted.topics.publishers[1].topic, "z");
@@ -1317,10 +1312,10 @@ mod tests {
         };
 
         assert_ffi_round_trip(RetryPolicy::default());
-        assert_ffi_round_trip(config().topology);
         assert_ffi_round_trip(config());
         assert_ffi_round_trip(PublicationIntent {
             slot: "v0".to_string(),
+            kind: MediaKind::Video,
             label: "camera".to_string(),
             active: true,
         });
@@ -1337,6 +1332,38 @@ mod tests {
                 max_ms: 160,
             },
         });
+        let observation = VideoObservation {
+            visible: true,
+            height: 720,
+            min_height: 180,
+            min_fps: 15,
+            priority: 2,
+            playout_delay: PlayoutDelay::Fixed {
+                min_ms: 80,
+                max_ms: 160,
+            },
+        };
+        assert_ffi_round_trip(observation.clone());
+        let model = crate::VideoObservation::from(observation.clone());
+        assert_eq!(
+            model,
+            crate::VideoObservation {
+                visible: true,
+                height: 720,
+                min_height: 180,
+                min_fps: 15,
+                priority: 2,
+                playout_delay: model::PlayoutDelay::Fixed {
+                    min_ms: 80,
+                    max_ms: 160
+                }
+            }
+        );
+        assert_eq!(VideoObservation::from(model), observation);
+        assert_eq!(
+            crate::VideoObservation::from(VideoObservation::default()),
+            crate::VideoObservation::default()
+        );
         let selector = TrackSelector {
             participant_id: "web-sender".to_string(),
             label: "camera".to_string(),
@@ -1368,6 +1395,7 @@ mod tests {
             connected: true,
             publications: vec![PublicationIntent {
                 slot: "v0".to_string(),
+                kind: MediaKind::Video,
                 label: "camera".to_string(),
                 active: true,
             }],

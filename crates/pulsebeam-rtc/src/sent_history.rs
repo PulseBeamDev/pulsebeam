@@ -146,6 +146,28 @@ struct SentEntry {
     in_flight: bool,
 }
 
+impl SentEntry {
+    fn reorder_deadline(&self, window: Duration) -> Option<Instant> {
+        match self.acknowledgment {
+            Acknowledgment::Missing {
+                higher_received_at: Some(anchor),
+                ..
+            } => self
+                .frozen_reorder_deadline
+                .or_else(|| anchor.checked_add(window)),
+            _ => None,
+        }
+    }
+
+    fn readiness(&self, window: Duration) -> Option<Readiness> {
+        self.reorder_deadline(window)
+            .map(|deadline| Readiness::Missing {
+                deadline,
+                sent_id: self.id,
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TwccIndex {
     sequence: u64,
@@ -160,33 +182,37 @@ struct SsrcHistory {
     by_sequence: HashMap<u64, SentPacketId>,
     // Tombstones can reduce usable capacity without releasing table backing.
     index_capacity: usize,
-    last_report_timestamp: Option<i64>,
+    last_report_timestamp: Option<(PathEpoch, i64)>,
     latest_commit_at: Option<Instant>,
     terminal: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum SourceReadiness {
+enum Readiness {
     Retired {
         deadline: Option<Instant>,
         ssrc: u32,
     },
     Unscheduled(u32),
+    Missing {
+        deadline: Instant,
+        sent_id: SentPacketId,
+    },
 }
 
 impl SsrcHistory {
-    fn readiness(&self, ssrc: u32) -> SourceReadiness {
+    fn readiness(&self, ssrc: u32) -> Readiness {
         if self.terminal {
             match self.latest_commit_at {
                 None => {
-                    return SourceReadiness::Retired {
+                    return Readiness::Retired {
                         deadline: None,
                         ssrc,
                     };
                 }
                 Some(at) => {
                     if let Some(deadline) = at.checked_add(SENT_HISTORY_MAX_AGE) {
-                        return SourceReadiness::Retired {
+                        return Readiness::Retired {
                             deadline: Some(deadline),
                             ssrc,
                         };
@@ -195,12 +221,14 @@ impl SsrcHistory {
                 }
             }
         }
-        SourceReadiness::Unscheduled(ssrc)
+        Readiness::Unscheduled(ssrc)
     }
 }
 
 const SOURCE_PAYLOAD_BYTES: usize =
-    size_of::<u32>() + size_of::<SsrcHistory>() + size_of::<SourceReadiness>();
+    size_of::<u32>() + size_of::<SsrcHistory>() + size_of::<Readiness>();
+// Each queue slot prepays its optional reorder-deadline key.
+const MISSING_SLOT_BYTES: usize = size_of::<SentPacketId>() + size_of::<Readiness>();
 const SOURCE_INDEX_ENTRY_BYTES: usize = size_of::<(u64, SentPacketId)>();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,7 +315,7 @@ pub(crate) struct SentHistory {
     twcc_index: Box<[Option<TwccIndex>]>,
     ssrcs: BTreeMap<u32, SsrcHistory>,
     source_backing_bytes: usize,
-    source_readiness: BTreeSet<SourceReadiness>,
+    readiness: BTreeSet<Readiness>,
     next_sent_id: u64,
     oldest_sent_id: u64,
     oldest_twcc: Option<u64>,
@@ -327,7 +355,7 @@ impl SentHistory {
             twcc_index: Box::new([]),
             ssrcs: BTreeMap::new(),
             source_backing_bytes: 0,
-            source_readiness: BTreeSet::new(),
+            readiness: BTreeSet::new(),
             next_sent_id: 0,
             oldest_sent_id: 0,
             oldest_twcc: None,
@@ -377,22 +405,29 @@ impl SentHistory {
                     .checked_add(self.inputs.synthetic.capacity())?
                     .checked_mul(size_of::<PacketFeedback>())?,
             )?
-            .checked_add(
-                self.missing
-                    .capacity()
-                    .checked_mul(size_of::<SentPacketId>())?,
-            )?
+            .checked_add(self.missing.capacity().checked_mul(MISSING_SLOT_BYTES)?)?
             .checked_add(self.source_backing_bytes)
     }
 
     #[cfg(test)]
     pub(crate) fn assert_storage(&self) -> usize {
-        assert_eq!(self.source_readiness.len(), self.ssrcs.len());
+        let missing = self
+            .missing
+            .iter()
+            .filter_map(|id| self.entry(*id))
+            .filter_map(|entry| {
+                let key = entry.readiness(self.reordering_window)?;
+                assert!(self.readiness.contains(&key));
+                Some(key)
+            })
+            .count();
+        assert!(missing <= self.missing.len());
+        assert_eq!(self.readiness.len(), self.ssrcs.len() + missing);
         let sources = self
             .ssrcs
             .iter()
             .try_fold(0usize, |bytes, (&ssrc, source)| {
-                assert!(self.source_readiness.contains(&source.readiness(ssrc)));
+                assert!(self.readiness.contains(&source.readiness(ssrc)));
                 assert!(source.by_sequence.capacity() <= source.index_capacity);
                 bytes.checked_add(SOURCE_PAYLOAD_BYTES)?.checked_add(
                     source
@@ -411,7 +446,7 @@ impl SentHistory {
         if self.missing.len() < self.missing.capacity() {
             return Some(());
         }
-        let stride = size_of::<SentPacketId>();
+        let stride = MISSING_SLOT_BYTES;
         let base = self
             .backing_bytes()?
             .checked_sub(self.missing.capacity().checked_mul(stride)?)?;
@@ -558,8 +593,7 @@ impl SentHistory {
                     terminal: false,
                 },
             );
-            self.source_readiness
-                .insert(SourceReadiness::Unscheduled(rtp.ssrc));
+            self.readiness.insert(Readiness::Unscheduled(rtp.ssrc));
         }
         self.source_backing_bytes = sources;
         Ok(())
@@ -583,6 +617,13 @@ impl SentHistory {
             .ssrcs
             .get_mut(&rtp.ssrc)
             .ok_or(HistoryError::InvalidCommit)?;
+        if state
+            .last_report_timestamp
+            .is_some_and(|(path, _)| path != epoch)
+        {
+            state.last_report_timestamp = None;
+            state.highest_acked_sequence = None;
+        }
         if state.by_sequence.is_empty() {
             state.first_sequence = rtp_sequence;
             state.newest_sequence = rtp_sequence;
@@ -628,6 +669,10 @@ impl SentHistory {
             .next_sent_id
             .checked_add(1)
             .ok_or(HistoryError::Exhausted)?;
+        self.oldest_sent_id = self.oldest_sent_id.max(
+            self.next_sent_id
+                .saturating_sub(SENT_HISTORY_CAPACITY as u64),
+        );
         self.bytes_in_flight = self
             .bytes_in_flight
             .checked_add(context.wire_len as u64)
@@ -705,23 +750,22 @@ impl SentHistory {
         source.terminal = true;
         let next = source.readiness(ssrc);
         if previous != next {
-            self.source_readiness.remove(&previous);
-            self.source_readiness.insert(next);
+            self.readiness.remove(&previous);
+            self.readiness.insert(next);
         }
     }
 
     fn reclaim_sources(&mut self, now: Instant, limit: usize) -> usize {
         let mut work = 0;
         while work < limit && self.loss_work < MAX_EXPIRATIONS_PER_POLL {
-            let Some(SourceReadiness::Retired { deadline, ssrc }) =
-                self.source_readiness.first().copied()
+            let Some(Readiness::Retired { deadline, ssrc }) = self.readiness.first().copied()
             else {
                 break;
             };
             if deadline.is_some_and(|deadline| now < deadline) {
                 break;
             }
-            self.source_readiness.pop_first();
+            self.readiness.pop_first();
             if let Some(source) = self.ssrcs.remove(&ssrc) {
                 self.source_backing_bytes -=
                     SOURCE_PAYLOAD_BYTES + source.index_capacity * SOURCE_INDEX_ENTRY_BYTES;
@@ -740,7 +784,16 @@ impl SentHistory {
         }
         self.last_path = Some((epoch, available));
         self.active_epoch = available.then_some(epoch);
+        // Report anchors and sequence-index members belong only to retained packets.
         for entry in self.entries.iter_mut().flatten() {
+            if let Some(key) = entry.readiness(self.reordering_window) {
+                self.readiness.remove(&key);
+            }
+            if let Some(source) = self.ssrcs.get_mut(&entry.ssrc) {
+                source.last_report_timestamp = None;
+                source.highest_acked_sequence = None;
+                source.by_sequence.remove(&entry.rtp_sequence);
+            }
             if !entry.acknowledgment.is_terminal() && self.active_epoch != Some(entry.path_epoch) {
                 entry.acknowledgment = Acknowledgment::Retired;
                 if entry.in_flight {
@@ -767,14 +820,12 @@ impl SentHistory {
         self.missing.clear();
         self.reordering_window = INITIAL_REORDERING_WINDOW;
         self.observed_reordering_window = INITIAL_REORDERING_WINDOW;
-        for ssrc in self.ssrcs.values_mut() {
-            ssrc.last_report_timestamp = None;
-            ssrc.highest_acked_sequence = None;
-            ssrc.by_sequence.clear();
-        }
     }
 
     fn remove_indexes(&mut self, entry: SentEntry) {
+        if let Some(key) = entry.readiness(self.reordering_window) {
+            self.readiness.remove(&key);
+        }
         if let Some(sequence) = entry.twcc_sequence {
             let slot = ring_index(sequence);
             if self.twcc_index[slot].is_some_and(|index| index.sent_id == entry.id) {

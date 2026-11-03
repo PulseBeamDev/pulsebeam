@@ -8,7 +8,7 @@ For source builds, generated library outputs, and crates.io release requirements
 
 ## Configure and connect
 
-Rust callers supply a core `AgentConfig`, native `MediaConfig`, and an HTTP `Host`, then call `Agent::spawn`. This selects `ThreadedRuntime` with normal native sockets. Submit a complete core `DesiredState` to connect and publish/subscribe; core remains the owner of topology, authorization, topics and recovery policy.
+Rust callers supply a core `AgentConfig`, native `MediaConfig`, and an HTTP `Host`, then call `Agent::spawn`. This selects `ThreadedRuntime` with normal native sockets. Submit a complete core `DesiredState` for connection and topic intent; use owned publications and subscriptions for media. Core remains the owner of topology, authorization, topics and recovery policy.
 
 Swift, Kotlin and Python use the generated named async constructor `ffi::Agent::create(NativeAgentConfig)` (Python: `await Agent.create(config)`). It creates the same actor with a production HTTP client. Native configuration contains `session` and `media`, not application-owned UDP/TCP sockets. Foreign `replace_desired` accepts a complete core-owned desired state; the shared actor assigns its revision in control-command order, including close and Rust-originated changes.
 
@@ -25,17 +25,133 @@ Factory input choices are independent for audio and video:
 
 ## Own sources and observations
 
-- `Agent::source(MediaSlot)` acquires/replaces the producer in a local slot. If that slot is being retired or reallocated, acquisition waits for its current preparation; unrelated slots do not wait. Cancellation, a changed publication target or generation retirement cannot install the waiting producer into a replacement lifetime. Foreign callers use async `local_video`/`local_audio`. Retain the returned `LocalSource` while producing.
-- `LocalSource::submit(InputFrame)` takes owned PCM, I420, Opus or H.264 data. Encoded simulcast takes three genuine encoding-specific access units in declared RID order, with equal capture timestamps and ascending dimensions, not duplicated payload labeled as different rungs. Temporal indices may differ between rungs of an L1T3 batch.
-- Successful submission acknowledges native input admission, not encode completion or remote delivery. The pending media-command queue has four entries and an aggregate 16 MiB payload limit per submission; admission reports `Backpressure`, invalid input, native refusal, or closure explicitly.
-- Source `close` detaches the producer. Producer replacement, physical slot retirement and generation retirement invalidate old source identities. Stop the old producer task before releasing its publication, then acquire a fresh source for its replacement. Observe snapshot generation changes and reacquire sources and remote streams for the replacement generation; retaining a handle does not rebind it. Dropping the final source handle schedules detachment; handles contain no engine pointer and do not keep a closed native generation alive.
-- `set_enabled` returns native track readback. `encoding_state` and `set_limits` expose native sender parameter readback; `feedback` reports native keyframe requests, encoding-specific requests, rate control and encoder errors.
-- `Agent::remote(MediaSlot, ReceiveMode)` selects an encoded, decoded, or video-only `EncodedAndDecoded` observation. Foreign callers use `remote_video`/`remote_audio` with the same explicit mode. Combined video observes native I420 and ordered encoded AUs on the same receiver without replacing its decoder. Native receiver-lifetime restrictions are surfaced as refusals; changing or reattaching modes may require a new generation.
+### Named publications
+
+Claim `Agent::publication(TrackSpec::Audio { label })` or
+`TrackSpec::Video { label }`, then register a caller-fed input with
+`Publication::input`. Generated Swift, Kotlin and Python APIs expose the same
+operations using the shared core `TrackSpec`. Keep the `Publication` handle alive while publishing.
+Calling `input` again replaces the previous logical input; it preserves the
+publication's mute setting. Use `Publication::set_muted` to change that setting.
+
+The returned `PublicationInput` is a logical submission port, not a native engine
+source identity. It follows Core-authorized targets across reconnects without
+reacquisition. `submit(InputFrame)` forwards the owned frame unchanged through
+the existing bounded media queue. It returns `NotReady` while muted, disconnected,
+or waiting for a physical target. Registration does not wait for that target;
+use `ready().await` before starting a producer. Readiness means an authorized
+native target is enabled, not that a frame has been admitted or received remotely.
+`set_limits` returns the current target's native encoding readback. Queued
+submissions captured for an earlier target are rejected, never redirected to its
+replacement. `capture_time_us` reads the current native target's clock;
+`feedback` remains open across physical target changes.
+
+Closing or dropping the final input handle detaches that input and disables the
+named publication without ending its lifetime. Closing or dropping the final
+publication handle ends the publication and closes its input. A replaced or
+closed input returns `Closed`; a new publication requires a new claim. A stale
+queued submission can also return `Closed` while the logical port remains open:
+discard that frame and wait for the current target before submitting fresh input.
+
+The generated APIs no longer expose `local_video`, `local_audio` or `LocalSource`.
+Keep the publication and its input alive separately; disconnecting retires the
+native target, not these logical owners.
+
+Successful `PublicationInput::submit` acknowledges native input admission, not
+encode completion or remote delivery. The pending media-command queue has four
+entries and an aggregate 16 MiB payload limit per submission. Admission reports
+backpressure, invalid input, native refusal or closure explicitly. Encoded
+simulcast takes three genuine encoding-specific access units in declared RID
+order, with equal capture timestamps and ascending dimensions, not duplicated
+payload labeled as different rungs. Temporal indices may differ between rungs
+of an L1T3 batch.
+
+### Remote observations
+
+Retain a named subscription instead of selecting a receiver slot. With a spawned `agent`, subscribe to the publisher's external participant
+ID and immutable publication label:
+
+```rust
+use pulsebeam_agent_native::{
+    agent_core::{TrackSelector, VideoObservation}, ReceiveMode,
+};
+
+let subscription = agent.video_subscription(
+    TrackSelector { participant_external_id: "publisher".into(), label: "camera".into() },
+    VideoObservation { visible: true, height: 720, ..Default::default() },
+).await?;
+let observation = subscription.observe(ReceiveMode::Decoded).await?;
+// Consume owned updates with observation.next().await.
+observation.close().await;
+subscription.close().await?;
+```
+
+For audio, use the same imports and spawned agent:
+
+```rust
+let subscription = agent.audio_subscription(TrackSelector {
+    participant_external_id: "publisher".into(), label: "microphone".into(),
+}).await?;
+let observation = subscription.observe(ReceiveMode::Decoded).await?;
+// Consume owned PCM updates from this exact native receiver track.
+observation.close().await;
+subscription.close().await?;
+```
+
+No audio is received implicitly by default. Encoded audio uses the same parent
+with `ReceiveMode::Encoded` and retains the native Opus-only, exclusive-mode
+restrictions.
+
+Keep the subscription alive while using its observations. It can wait for an
+absent publication and survives connection reconstruction. Each returned
+`RemoteMedia` is a terminal physical observation: after closure, call
+`subscription.observe` again for the next matching incarnation. A renamed
+publication does not match the old subscription. `configure_video` updates video
+demand; `configure_audio` sets audio playout delay. Neither renames the interest,
+and using the wrong media kind is refused. Shared audio interests use adaptive
+playout; changing to a non-adaptive delay requires exclusive ownership. The
+stock native profile rejects fixed audio delay; adaptive is the default. Closing the subscription ends its pending and active
+observations. Do not mix owned subscriptions with raw desired state for the
+same media kind.
+
+For explicit collection audio reception, retain `Agent::audio_policy` with the
+shared Core `AudioSubscription` policy. Set `automatic: true` to receive all
+remote audio; use its pinned IDs, named selections and delay maps for narrower
+policies. `Subscription::configure_audio_policy` replaces that owner's policy.
+It can coexist with named adaptive subscriptions through the same Core receive
+reconciler. Non-adaptive policy delays require exclusive audio ownership.
+Reception still requires actual negotiated receiver facts.
+
+Use `Subscription::observe_source(source_id, mode)` for an exact opaque source ID
+from installed `Snapshot.audio_mapping` entries. This observes existing policy
+demand; it does not pin the source or create receive demand. Each returned
+observation ends permanently on source or receiver retirement. A fresh matching
+physical receiver requires a fresh observation, never a different source under
+the old handle. Removing a source from the policy ends that owner's observations
+without disturbing another owner's demand. Use `observe(mode)` only with a
+named parent; a collection policy does not identify one implicit source.
+
+Foreign callers use `video_subscription(core.TrackSelector,
+core.VideoObservation)` or `audio_subscription(core.TrackSelector)` and the
+returned `Subscription.observe(mode)`. Video preferences contain only display
+demand, not a receiver slot or publication ID. Explicitly visible video with
+height zero has no height ceiling; set `visible: false` to withdraw display demand. The selector's `participant_id`
+field is the publisher's external participant ID. Foreign subscriptions expose
+the same `configure_video`, `configure_audio` and `close` operations. Collection
+audio uses `audio_policy(core.AudioDemand)`, `configure_audio_policy` and
+`observe_source` with the same ownership and source-safety rules.
+
+### Media delivery and retirement
+
+The raw `Agent::remote` and foreign `remote_video`/`remote_audio` methods are
+removed. Acquire observations through an owned subscription instead.
+
+- Video-only `ReceiveMode::EncodedAndDecoded` observes native I420 and ordered encoded AUs on the same receiver without replacing its decoder. Native receiver-lifetime restrictions are surfaced as refusals; changing or reattaching modes may require a new generation.
 - Select `ReceiveMode::Decoded` for native receive buffering, built-in decoding and playout output. Encoded video passively observes native-ordered complete access units and forwards originals unchanged; those observations alone do not establish built-in decoding or UI presentation.
 - Rust-only `Config::decoded_video_observer` optionally observes synchronous owned I420/error facts before the unchanged polling retention queue. Do not block or synchronously control the SDK in this callback. Its native generation/receiver identity, host callback time and SDK global native callback microseconds are observational facts, not display completion. Map clock domains explicitly; polling loss and callback failure are separate. Default and generated-language configuration is unchanged. See [qualification scope](QUALIFICATION.md).
-- `RemoteMedia::next` returns owned track/frame updates, native sink drops, observer lag or terminal closure. Physical receiver retirement closes its observations even when the session generation is unchanged. To keep observing the same logical slot, acquire a fresh remote stream after closure; acquisition waits for an available native receiver in the connected generation and does not cross generation replacement. A source retarget that keeps the physical receiver does not close its observations. Each receiver has at most 32 observers, with four queued updates per observation channel. Closing a stream invalidates and releases queued observations; values already returned remain owned and valid.
+- `RemoteMedia::next` returns owned track/frame updates, native sink drops, observer lag or terminal closure. Physical receiver retirement closes its observations even when the session generation is unchanged. Use the retained named subscription to acquire a fresh observation; Core owns readiness across reconstruction. Each physical receiver remains bound to one exact source incarnation. A replacement source requires a fresh physical receiver and observation. Each receiver has at most 32 observers, with four queued updates per observation channel. Closing a stream invalidates and releases queued observations; values already returned remain owned and valid.
 
-Remote frame identity describes the native generation, receiver, track and transceiver MID/media index. Catalog publication/selector state is a separate core snapshot. In particular, decoded PCM does not claim per-block publication, SSRC or RTP timestamp attribution. Optional frame metadata is populated only when the native callback supplies it.
+Remote frame identity describes the native generation, receiver, RTC track and transceiver MID/media index. `RemoteMedia::source_track_id` returns the Core-authorized opaque publication ID for an owned observation; it is not the RTC track ID. Catalog publication/selector state is a separate core snapshot. An owned PCM observation associates its exact receiver track with that publication; individual PCM blocks do not carry invented publication, SSRC or RTP timestamp fields. Optional frame metadata is populated only when the native callback supplies it.
 
 Snapshot, event and producer-feedback observations are bounded and report `Lagged`/`Closed` explicitly. Native statistics are owned SDK report JSON plus its generation and native timestamp, not synthetic transport counters.
 

@@ -60,7 +60,7 @@ impl NativeRtp {
     pub(super) fn keyframe_mid(
         &self,
         track: TrackId,
-        rid: Option<crate::media::Rid>,
+        encoding: crate::track::SourceEncoding,
     ) -> Option<Mid> {
         let source = self.publications.get(self.tracks.get(track.as_bytes())?)?;
         if !source.enabled
@@ -70,7 +70,7 @@ impl NativeRtp {
                 .binding
                 .encodings
                 .iter()
-                .any(|encoding| encoding.rid.as_deref() == rid.as_deref())
+                .any(|bound| matches!(encoding, crate::track::SourceEncoding::Ssrc(ssrc) if bound.primary == *ssrc))
         {
             return None;
         }
@@ -270,15 +270,19 @@ impl Participant {
         let (upstream, mut track) = if kind == wire::TrackKind::Audio {
             track::new_audio(mid, meta)
         } else {
-            let layers = binding
+            let encodings = binding
                 .encodings
                 .iter()
-                .filter_map(|encoding| encoding.rid.as_deref())
-                .map(|rid| {
-                    crate::media::Rid::new(rid).map(|rid| crate::media::SimulcastLayer { rid })
+                .map(|encoding| {
+                    encoding
+                        .rid
+                        .as_deref()
+                        .map(crate::media::Rid::new)
+                        .transpose()
+                        .map(|rid| (encoding.primary.into(), rid))
                 })
                 .collect::<Result<Vec<_>, _>>();
-            let Ok(layers) = layers else {
+            let Ok(encodings) = encodings else {
                 let _ = self.signaling.reserve_execution(reference, 0);
                 self.complete_native_preparation(
                     work,
@@ -286,7 +290,7 @@ impl Participant {
                 );
                 return;
             };
-            track::new_video(mid, meta, layers)
+            track::new_video_ssrcs(mid, meta, encodings)
         };
         let format = declaration(&work.spec)
             .and_then(|(_, _, parameters)| parameters.codec.as_ref()?.format);
@@ -383,11 +387,6 @@ impl Participant {
                         .encodings
                         .iter()
                         .any(|encoding| encoding.rid.is_some()))
-            || binding.encodings.len() > 1
-                && binding
-                    .encodings
-                    .iter()
-                    .any(|encoding| encoding.rid.is_none())
             || parameters.encodings.iter().any(|encoding| {
                 encoding.scalability_mode.is_some_and(|mode| {
                     mode != wire::RtpScalabilityMode::L1t1 as i32
@@ -498,11 +497,12 @@ impl Participant {
         let Some(source) = self.native_rtp.publications.get_mut(&reference) else {
             return;
         };
+        let encoding = crate::track::SourceEncoding::Ssrc(incoming.packet.ssrc);
         let processed = source.upstream.process(rid.as_ref(), incoming.packet, None);
         let fanout = source.fanout;
         let track = source.track.id();
         if processed.request_keyframe {
-            self.enqueue_remote_keyframe((track, rid), KeyframeRequestKind::Pli);
+            self.enqueue_remote_keyframe((track, encoding), KeyframeRequestKind::Pli);
         }
         if let Some(packet) = processed.first {
             events.publish_track_packet(fanout, TrackPacket::Rtp(packet));
@@ -521,16 +521,9 @@ impl Participant {
         };
         self.transport.discard_keyframes(mid);
         for encoding in &source.binding.encodings {
-            let Ok(rid) = encoding
-                .rid
-                .as_deref()
-                .map(crate::media::Rid::new)
-                .transpose()
-            else {
-                continue;
-            };
-            self.last_keyframe_request.remove(&(mid, rid));
-            self.pending_keyframe_requests.remove(&(mid, rid));
+            let encoding = crate::track::SourceEncoding::Ssrc(encoding.primary.into());
+            self.last_keyframe_request.remove(&(mid, encoding));
+            self.pending_keyframe_requests.remove(&(mid, encoding));
         }
     }
 

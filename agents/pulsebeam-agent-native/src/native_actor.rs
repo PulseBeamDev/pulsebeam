@@ -21,6 +21,13 @@ use tokio::time::Instant;
 use crate::native_media::*;
 use crate::native_peer::{NativePeer, Observation};
 
+mod publication;
+pub use publication::{Publication, PublicationInput};
+use publication::{PublicationLease, RegisteredInput};
+mod subscription;
+pub use subscription::Subscription;
+use subscription::{ObservationIo, SubscriptionLease};
+
 const COMMANDS: usize = 64;
 const MEDIA_COMMANDS: usize = 4;
 const EVENTS: usize = 64;
@@ -99,7 +106,7 @@ pub enum Error {
     Rtc(String),
     #[error("agent or media resource is closed")]
     Closed,
-    #[error("native receiver is not available yet")]
+    #[error("native media target is not available yet")]
     NotReady,
     #[error("bounded admission queue is full")]
     Backpressure,
@@ -225,23 +232,8 @@ enum Command {
         command: AgentCommand,
         response: oneshot::Sender<Result<(), Error>>,
     },
-    Source {
-        slot: MediaSlot,
-        generation: Option<agent_core::Generation>,
-        response: oneshot::Sender<Result<LocalSource, Error>>,
-    },
-    CloseSource {
-        slot: MediaSlot,
-        identity: SourceIdentity,
-        response: oneshot::Sender<Result<(), Error>>,
-    },
-    Enable {
-        slot: MediaSlot,
-        identity: SourceIdentity,
-        enabled: bool,
-        response: oneshot::Sender<Result<bool, Error>>,
-    },
     Limits {
+        control: Arc<agent_core::PublicationInputControl>,
         slot: MediaSlot,
         identity: SourceIdentity,
         limits: Vec<EncodingLimits>,
@@ -252,17 +244,6 @@ enum Command {
         identity: SourceIdentity,
         response: oneshot::Sender<Result<i64, Error>>,
     },
-    EncodingState {
-        slot: MediaSlot,
-        identity: SourceIdentity,
-        response: oneshot::Sender<Result<Vec<EncodingState>, Error>>,
-    },
-    Observe {
-        slot: MediaSlot,
-        generation: Option<agent_core::Generation>,
-        mode: ReceiveMode,
-        response: oneshot::Sender<Result<RemoteMedia, Error>>,
-    },
     Keyframe {
         slot: MediaSlot,
         generation: u64,
@@ -272,13 +253,44 @@ enum Command {
     Close {
         response: oneshot::Sender<Result<(), Error>>,
     },
-    #[cfg(feature = "sim")]
+    Publication {
+        spec: agent_core::TrackSpec,
+        response: oneshot::Sender<Result<Publication, Error>>,
+    },
+    VideoSubscription {
+        selector: agent_core::TrackSelector,
+        observation: agent_core::VideoObservation,
+        response: oneshot::Sender<Result<Subscription, Error>>,
+    },
+    AudioSubscription {
+        selector: agent_core::TrackSelector,
+        response: oneshot::Sender<Result<Subscription, Error>>,
+    },
+    AudioPolicy {
+        policy: agent_core::AudioSubscription,
+        response: oneshot::Sender<Result<Subscription, Error>>,
+    },
+    ObserveSubscription {
+        owner: u64,
+        source: Option<String>,
+        mode: ReceiveMode,
+        response: oneshot::Sender<Result<RemoteMedia, Error>>,
+    },
+    PublicationInput {
+        owner: u64,
+        response: oneshot::Sender<Result<PublicationInput, Error>>,
+    },
+    ClosePublicationInput {
+        operation: agent_core::PublicationInputOperation,
+        response: oneshot::Sender<Result<(), Error>>,
+    },
     Resource {
         command: agent_core::ResourceCommand,
         response: oneshot::Sender<Result<agent_core::ResourceResult, Error>>,
     },
 }
 struct Submission {
+    control: Arc<agent_core::PublicationInputControl>,
     slot: MediaSlot,
     identity: SourceIdentity,
     frame: InputFrame,
@@ -288,10 +300,8 @@ struct Submission {
 #[derive(Clone)]
 pub struct Agent {
     commands: mpsc::Sender<Command>,
-    topology: agent_core::MediaTopology,
     snapshot: watch::Receiver<Snapshot>,
     snapshot_events: broadcast::Sender<Snapshot>,
-    receivers_changed: Arc<Notify>,
     statistics: watch::Receiver<Option<NativeStatistics>>,
     events: broadcast::Sender<AgentEvent>,
     lease: Arc<AgentLease>,
@@ -353,13 +363,10 @@ impl Agent {
         let abort = Arc::new(Signal::default());
         let finished = Arc::new(Signal::default());
         let (http_tx, http_rx) = mpsc::channel(COMMANDS);
-        let receivers_changed = Arc::new(Notify::new());
         let agent = Self {
             commands: commands.clone(),
-            topology: config.session.topology.clone(),
             snapshot,
             snapshot_events: snapshot_events.clone(),
-            receivers_changed: receivers_changed.clone(),
             statistics,
             events: events.clone(),
             lease: Arc::new(AgentLease {
@@ -380,14 +387,16 @@ impl Agent {
             media_tx: media,
             snapshot: snapshot_tx,
             snapshot_events,
-            receivers_changed,
             statistics: statistics_tx,
             events,
             abort,
             finished,
             leases_changed: Arc::new(Notify::new()),
             sources: BTreeMap::new(),
-            source_requests: BTreeMap::new(),
+            publications: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            inputs: BTreeMap::new(),
             streams: BTreeMap::new(),
             http_tasks: BTreeMap::new(),
             http_tx,
@@ -426,6 +435,56 @@ impl Agent {
         result.await.map_err(|_| closed())?
     }
 
+    pub async fn video_subscription(
+        &self,
+        selector: agent_core::TrackSelector,
+        observation: agent_core::VideoObservation,
+    ) -> Result<Subscription, Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::VideoSubscription {
+                selector,
+                observation,
+                response,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
+    pub async fn audio_subscription(
+        &self,
+        selector: agent_core::TrackSelector,
+    ) -> Result<Subscription, Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::AudioSubscription { selector, response })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
+    pub async fn audio_policy(
+        &self,
+        policy: agent_core::AudioSubscription,
+    ) -> Result<Subscription, Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::AudioPolicy { policy, response })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
+    pub async fn publication(&self, spec: agent_core::TrackSpec) -> Result<Publication, Error> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(Command::Publication { spec, response })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
     #[cfg(feature = "sim")]
     pub async fn resource(
         &self,
@@ -454,9 +513,6 @@ impl Agent {
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.borrow().clone()
     }
-    pub fn topology(&self) -> &agent_core::MediaTopology {
-        &self.topology
-    }
     pub fn snapshots(&self) -> watch::Receiver<Snapshot> {
         self.snapshot.clone()
     }
@@ -478,69 +534,6 @@ impl Agent {
     }
     pub fn statistics(&self) -> watch::Receiver<Option<NativeStatistics>> {
         self.statistics.clone()
-    }
-    pub async fn source(&self, slot: MediaSlot) -> Result<LocalSource, Error> {
-        let generation = self.snapshot.borrow().generation;
-        let (response, result) = oneshot::channel();
-        self.commands
-            .send(Command::Source {
-                slot,
-                generation,
-                response,
-            })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-    pub async fn remote(&self, slot: MediaSlot, mode: ReceiveMode) -> Result<RemoteMedia, Error> {
-        let valid = match &slot {
-            MediaSlot::RemoteVideo(index) => *index < self.topology.remote_video,
-            MediaSlot::RemoteAudio(index) => *index < self.topology.remote_audio,
-            _ => false,
-        };
-        if !valid {
-            return Err(Error::UnknownSlot(slot));
-        }
-        let generation = self.snapshot.borrow().generation;
-        loop {
-            if generation.is_some() && self.snapshot.borrow().generation != generation {
-                return Err(Error::Closed);
-            }
-            // Register before requesting: receiver creation may precede its reply.
-            let available = self.receivers_changed.notified();
-            tokio::pin!(available);
-            let _ = available.as_mut().enable();
-            let (response, result) = oneshot::channel();
-            self.commands
-                .send(Command::Observe {
-                    slot: slot.clone(),
-                    generation,
-                    mode,
-                    response,
-                })
-                .await
-                .map_err(|_| Error::Closed)?;
-            match result.await.map_err(|_| Error::Closed)? {
-                Ok(remote)
-                    if generation
-                        .is_some_and(|generation| generation.get() != remote.generation()) =>
-                {
-                    return Err(Error::Closed);
-                }
-                Err(Error::NotReady) => {
-                    let current = {
-                        let snapshot = self.snapshot.borrow();
-                        snapshot.generation == generation
-                            && snapshot.connection == agent_core::ConnectionState::Connected
-                    };
-                    if !current {
-                        return Err(Error::NotReady);
-                    }
-                    available.await;
-                }
-                result => return result,
-            }
-        }
     }
     pub async fn close(&self) -> Result<(), Error> {
         self.begin_close().await?.await.map_err(|_| Error::Closed)?
@@ -567,7 +560,6 @@ struct SourceLease {
     leases_changed: Arc<Notify>,
     commands: mpsc::Sender<Command>,
     media: mpsc::Sender<Submission>,
-    feedback: broadcast::Sender<ProducerFeedback>,
 }
 impl Drop for SourceLease {
     fn drop(&mut self) {
@@ -576,26 +568,24 @@ impl Drop for SourceLease {
     }
 }
 #[derive(Clone)]
-pub struct LocalSource {
+struct PhysicalSource {
     inner: Arc<SourceLease>,
 }
-impl LocalSource {
-    pub fn identity(&self) -> SourceIdentity {
+impl PhysicalSource {
+    fn identity(&self) -> SourceIdentity {
         self.inner.identity.clone()
     }
-    pub fn slot(&self) -> &MediaSlot {
+    fn slot(&self) -> &MediaSlot {
         &self.inner.slot
     }
-    pub fn feedback(&self) -> ObservationStream<ProducerFeedback> {
-        ObservationStream {
-            receiver: Mutex::new(self.inner.feedback.subscribe()),
-            closed: self.inner.closed.clone(),
-        }
-    }
-    pub fn is_closed(&self) -> bool {
+    fn is_closed(&self) -> bool {
         self.inner.closed.is_closed()
     }
-    pub async fn submit(&self, frame: InputFrame) -> Result<(), Error> {
+    async fn submit(
+        &self,
+        frame: InputFrame,
+        control: Arc<agent_core::PublicationInputControl>,
+    ) -> Result<(), Error> {
         if self.is_closed() {
             return Err(Error::Closed);
         }
@@ -622,6 +612,7 @@ impl LocalSource {
         self.inner
             .media
             .try_send(Submission {
+                control,
                 slot: self.inner.slot.clone(),
                 identity: self.identity(),
                 frame,
@@ -633,42 +624,10 @@ impl LocalSource {
             })?;
         result.await.map_err(|_| Error::Closed)?
     }
-    pub async fn close(&self) -> Result<(), Error> {
-        if self.is_closed() {
-            return Ok(());
-        }
-        let (response, result) = oneshot::channel();
-        self.inner
-            .commands
-            .send(Command::CloseSource {
-                slot: self.inner.slot.clone(),
-                identity: self.identity(),
-                response,
-            })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-    pub async fn set_enabled(&self, enabled: bool) -> Result<bool, Error> {
-        if self.is_closed() {
-            return Err(Error::Closed);
-        }
-        let (response, result) = oneshot::channel();
-        self.inner
-            .commands
-            .send(Command::Enable {
-                slot: self.inner.slot.clone(),
-                identity: self.identity(),
-                enabled,
-                response,
-            })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-    pub async fn set_limits(
+    async fn set_limits(
         &self,
         limits: Vec<EncodingLimits>,
+        control: Arc<agent_core::PublicationInputControl>,
     ) -> Result<Vec<EncodingState>, Error> {
         if self.is_closed() {
             return Err(Error::Closed);
@@ -680,6 +639,7 @@ impl LocalSource {
         self.inner
             .commands
             .send(Command::Limits {
+                control,
                 slot: self.inner.slot.clone(),
                 identity: self.identity(),
                 limits,
@@ -692,7 +652,7 @@ impl LocalSource {
     /// Read the owning graph's actual native capture clock. Anchor a relative
     /// video timeline here once, then add its strictly increasing capture offsets.
     /// Replaced or retired source handles cannot read a newer graph's clock.
-    pub async fn capture_time_us(&self) -> Result<i64, Error> {
+    async fn capture_time_us(&self) -> Result<i64, Error> {
         if self.is_closed() {
             return Err(Error::Closed);
         }
@@ -700,22 +660,6 @@ impl LocalSource {
         self.inner
             .commands
             .send(Command::CaptureTime {
-                slot: self.inner.slot.clone(),
-                identity: self.identity(),
-                response,
-            })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-    pub async fn encoding_state(&self) -> Result<Vec<EncodingState>, Error> {
-        if self.is_closed() {
-            return Err(Error::Closed);
-        }
-        let (response, result) = oneshot::channel();
-        self.inner
-            .commands
-            .send(Command::EncodingState {
                 slot: self.inner.slot.clone(),
                 identity: self.identity(),
                 response,
@@ -745,6 +689,7 @@ impl Drop for StreamLease {
     }
 }
 pub struct RemoteMedia {
+    observation: Option<agent_core::MediaObservationControl>,
     slot: MediaSlot,
     generation: u64,
     receiver: u64,
@@ -752,6 +697,14 @@ pub struct RemoteMedia {
     commands: mpsc::Sender<Command>,
 }
 impl RemoteMedia {
+    pub fn source_track_id(&self) -> Option<&str> {
+        self.observation
+            .as_ref()?
+            .target
+            .as_ref()
+            .map(|target| target.source.as_str())
+    }
+
     pub fn slot(&self) -> &MediaSlot {
         &self.slot
     }
@@ -807,12 +760,6 @@ impl RemoteMedia {
     }
 }
 
-struct SourceRequest {
-    generation: Option<agent_core::Generation>,
-    target: Option<String>,
-    response: oneshot::Sender<Result<LocalSource, Error>>,
-}
-
 struct SourceObservation {
     lease: Weak<SourceLease>,
     identity: SourceIdentity,
@@ -851,14 +798,16 @@ where
     media_tx: mpsc::Sender<Submission>,
     snapshot: watch::Sender<Snapshot>,
     snapshot_events: broadcast::Sender<Snapshot>,
-    receivers_changed: Arc<Notify>,
     statistics: watch::Sender<Option<NativeStatistics>>,
     events: broadcast::Sender<AgentEvent>,
     abort: Arc<Signal>,
     finished: Arc<Signal>,
     leases_changed: Arc<Notify>,
     sources: BTreeMap<MediaSlot, SourceObservation>,
-    source_requests: BTreeMap<MediaSlot, SourceRequest>,
+    publications: BTreeMap<u64, Weak<PublicationLease>>,
+    inputs: BTreeMap<u64, RegisteredInput>,
+    subscriptions: BTreeMap<u64, Weak<SubscriptionLease>>,
+    observations: BTreeMap<agent_core::MediaObservationId, ObservationIo>,
     streams: BTreeMap<MediaSlot, StreamObservation>,
     http_tasks: BTreeMap<OperationId, JoinHandle<()>>,
     http_tx: mpsc::Sender<HttpCompletion>,
@@ -890,7 +839,8 @@ where
             self.drain_effects();
             let more = self.progress_peer();
             self.drain_effects();
-            self.progress_source_requests();
+            self.progress_observations();
+            self.drain_effects();
             self.publish().await;
             if more {
                 tokio::task::yield_now().await;
@@ -903,7 +853,11 @@ where
                 _ = std::future::poll_fn(|cx| match self.peer.as_mut() { Some(peer) => peer.poll_ready(cx), None => std::task::Poll::Pending }) => {},
                 command = self.commands.recv() => match command { Some(command) => self.command(command), None => break },
                 submission = self.media.recv() => if let Some(submission) = submission {
-                    let result = self.peer.as_mut().ok_or(Error::Closed).and_then(|peer| peer.submit(&submission.slot, &submission.identity, submission.frame).map_err(Error::from));
+                    let result = if !self.input_submission_current(&submission.control) {
+                        Err(Error::Closed)
+                    } else {
+                        self.peer.as_mut().ok_or(Error::Closed).and_then(|peer| peer.submit(&submission.slot, &submission.identity, submission.frame).map_err(Error::from))
+                    };
                     let _ = submission.response.send(result);
                 },
                 completion = self.http_rx.recv() => if let Some(completion) = completion {
@@ -954,12 +908,8 @@ where
             tracing::debug!(target: "pulsebeam_sim_recovery", ?generation, kind,
                 "native core RTC input");
         }
-        let media_completed = matches!(&event, HostEvent::Rtc(RtcEvent::MediaPrepared { .. }));
         if let Err(error) = self.core.handle(event) {
             self.fail(Error::Core(error));
-        }
-        if media_completed {
-            self.receivers_changed.notify_waiters();
         }
     }
     fn fail(&self, error: Error) {
@@ -993,7 +943,7 @@ where
                         code: agent_core::ffi::ErrorCode::InvalidDesiredState,
                         message: "desired revision space exhausted".into(),
                     })
-                    .and_then(|revision| desired.into_core(revision, &self.config.session.topology))
+                    .and_then(|revision| desired.into_core(revision))
                     .and_then(|desired| {
                         self.core
                             .command(AgentCommand::ReplaceDesired(desired))
@@ -1004,51 +954,21 @@ where
             Command::Core { command, response } => {
                 let _ = response.send(self.core.command(command).map_err(Error::Core));
             }
-            Command::Source {
-                slot,
-                generation,
-                response,
-            } => {
-                if generation.is_some() && generation != self.core.snapshot().generation {
-                    let _ = response.send(Err(Error::Closed));
-                } else {
-                    self.acquire_source(slot, response);
-                }
-            }
-            Command::CloseSource {
-                slot,
-                identity,
-                response,
-            } => {
-                let result = self
-                    .peer_mut()
-                    .and_then(|peer| peer.close_source(&slot, &identity).map_err(Error::from));
-                if result.is_ok() {
-                    self.close_source_observation(&slot);
-                }
-                let _ = response.send(result);
-            }
-            Command::Enable {
-                slot,
-                identity,
-                enabled,
-                response,
-            } => {
-                let result = self
-                    .peer_mut()
-                    .and_then(|peer| peer.enable(&slot, &identity, enabled).map_err(Error::from));
-                let _ = response.send(result);
-            }
             Command::Limits {
+                control,
                 slot,
                 identity,
                 limits,
                 response,
             } => {
-                let result = self.peer_mut().and_then(|peer| {
-                    peer.set_limits(&slot, &identity, &limits)
-                        .map_err(Error::from)
-                });
+                let result = if !self.input_submission_current(&control) {
+                    Err(Error::Closed)
+                } else {
+                    self.peer_mut().and_then(|peer| {
+                        peer.set_limits(&slot, &identity, &limits)
+                            .map_err(Error::from)
+                    })
+                };
                 let _ = response.send(result);
             }
             Command::CaptureTime {
@@ -1059,30 +979,6 @@ where
                 let result = self
                     .peer_mut()
                     .and_then(|peer| peer.capture_time_us(&slot, &identity).map_err(Error::from));
-                let _ = response.send(result);
-            }
-            Command::EncodingState {
-                slot,
-                identity,
-                response,
-            } => {
-                let result = self
-                    .peer_mut()
-                    .and_then(|peer| peer.encoding_state(&slot, &identity).map_err(Error::from));
-                let _ = response.send(result);
-            }
-            Command::Observe {
-                slot,
-                generation,
-                mode,
-                response,
-            } => {
-                let result =
-                    if generation.is_some() && generation != self.core.snapshot().generation {
-                        Err(Error::Closed)
-                    } else {
-                        self.observe(slot, mode)
-                    };
                 let _ = response.send(result);
             }
             Command::Keyframe {
@@ -1122,89 +1018,87 @@ where
                     }
                 }
             }
-            #[cfg(feature = "sim")]
+            Command::Publication { spec, response } => {
+                if !response.is_closed() {
+                    let result = self.claim_publication(spec);
+                    let _ = response.send(result);
+                }
+            }
+            Command::VideoSubscription {
+                selector,
+                observation,
+                response,
+            } => {
+                if !response.is_closed() {
+                    let result = self.claim_subscription(selector, observation);
+                    let _ = response.send(result);
+                }
+            }
+            Command::AudioSubscription { selector, response } => {
+                if !response.is_closed() {
+                    let result = self.claim_audio_subscription(selector);
+                    let _ = response.send(result);
+                }
+            }
+            Command::AudioPolicy { policy, response } => {
+                if !response.is_closed() {
+                    let result = self.claim_audio_policy(policy);
+                    let _ = response.send(result);
+                }
+            }
+            Command::ObserveSubscription {
+                owner,
+                source,
+                mode,
+                response,
+            } => {
+                self.observe_subscription(owner, source, mode, response);
+            }
+            Command::PublicationInput { owner, response } => {
+                if !response.is_closed() {
+                    let result = self.register_input(owner);
+                    let _ = response.send(result);
+                }
+            }
+            Command::ClosePublicationInput {
+                operation,
+                response,
+            } => {
+                let result = self.close_input(operation);
+                let _ = response.send(result);
+            }
             Command::Resource { command, response } => {
+                let release = match &command {
+                    agent_core::ResourceCommand::Release { owner } => Some(*owner),
+                    _ => None,
+                };
                 let result = self.core.resource(command).map_err(Error::Core);
+                if result.is_ok() {
+                    if let Some(lease) = release
+                        .and_then(|owner| self.publications.get(&owner))
+                        .and_then(Weak::upgrade)
+                    {
+                        lease.closed.close();
+                    }
+                }
+                if result.is_ok()
+                    && let Some(lease) = release
+                        .and_then(|owner| self.subscriptions.get(&owner))
+                        .and_then(Weak::upgrade)
+                {
+                    lease.closed.close();
+                }
                 let _ = response.send(result);
             }
         }
     }
 
-    fn acquire_source(
-        &mut self,
-        slot: MediaSlot,
-        response: oneshot::Sender<Result<LocalSource, Error>>,
-    ) {
-        if response.is_closed() {
-            return;
-        }
-        if !matches!(slot, MediaSlot::LocalAudio(_) | MediaSlot::LocalVideo(_)) {
-            let _ = response.send(Err(Error::UnknownSlot(slot)));
-            return;
-        }
-        if let Some(previous) = self.source_requests.remove(&slot) {
-            let _ = previous.response.send(Err(Error::Closed));
-        }
-        let preparation = self.core.source_preparation(&slot);
-        if preparation.readiness == SourceReadiness::Preparing {
-            // Only existing changing slots can retain an acquisition, one per slot.
-            self.source_requests.insert(
-                slot,
-                SourceRequest {
-                    generation: self.core.snapshot().generation,
-                    target: preparation.target.map(str::to_owned),
-                    response,
-                },
-            );
-        } else {
-            let result = self.new_source(slot);
-            let _ = response.send(result);
-        }
-    }
-
-    fn progress_source_requests(&mut self) {
-        let completed = self
-            .source_requests
-            .iter()
-            .filter_map(|(slot, request)| {
-                let preparation = self.core.source_preparation(slot);
-                let cancelled = request.response.is_closed()
-                    || request.generation != self.core.snapshot().generation
-                    || request.target.as_deref() != preparation.target;
-                if cancelled || preparation.readiness != SourceReadiness::Preparing {
-                    Some((slot.clone(), cancelled))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        for (slot, cancelled) in completed {
-            let Some(request) = self.source_requests.remove(&slot) else {
-                continue;
-            };
-            let result = if cancelled {
-                Err(Error::Closed)
-            } else {
-                self.new_source(slot)
-            };
-            let _ = request.response.send(result);
-        }
-    }
-
-    fn new_source(&mut self, slot: MediaSlot) -> Result<LocalSource, Error> {
-        match self.core.source_preparation(&slot).readiness {
-            SourceReadiness::Preparing => return Err(Error::NotReady),
-            SourceReadiness::Failed => {
-                return Err(Error::Rtc("local source preparation failed".into()));
-            }
-            SourceReadiness::Ready => {}
-        }
+    fn create_source(&mut self, slot: MediaSlot) -> Result<PhysicalSource, Error> {
         if !matches!(slot, MediaSlot::LocalAudio(_) | MediaSlot::LocalVideo(_)) {
             return Err(Error::UnknownSlot(slot));
         }
         let identity = self.peer_mut()?.replace_source(&slot)?;
         self.close_source_observation(&slot);
-        let (feedback, _) = broadcast::channel(EVENTS);
         let inner = Arc::new(SourceLease {
             slot: slot.clone(),
             identity: identity.clone(),
@@ -1212,7 +1106,6 @@ where
             leases_changed: self.leases_changed.clone(),
             commands: self.command_tx.clone(),
             media: self.media_tx.clone(),
-            feedback,
         });
         self.sources.insert(
             slot,
@@ -1236,7 +1129,7 @@ where
                     && std::ptr::eq(source.lease.as_ptr(), Arc::as_ptr(&inner))
             }));
         }
-        Ok(LocalSource { inner })
+        Ok(PhysicalSource { inner })
     }
     fn close_source_observation(&mut self, slot: &MediaSlot) {
         if let Some(source) = self.sources.remove(slot)
@@ -1316,6 +1209,7 @@ where
             self.next_playout = self.later(PLAYOUT);
         }
         Ok(RemoteMedia {
+            observation: None,
             slot,
             generation,
             receiver,
@@ -1325,6 +1219,8 @@ where
     }
 
     fn retire_dropped(&mut self) {
+        self.retire_publications();
+        self.retire_subscriptions();
         let dropped: Vec<_> = self
             .sources
             .iter()
@@ -1365,10 +1261,11 @@ where
     fn drain_effects(&mut self) {
         while let Some(effect) = self.core.next_effect() {
             match effect {
+                Effect::PublicationInput(control) => self.input_control(control),
+                Effect::MediaObservation(control) => self.observation_control(control),
                 Effect::Rtc(effect) => match effect {
                     RtcEffect::CreateOffer {
                         generation,
-                        topology,
                         data_channels,
                     } => {
                         #[cfg(feature = "sim")]
@@ -1383,7 +1280,7 @@ where
                                 runtime,
                                 &self.config.media,
                                 generation,
-                                &topology,
+                                &[],
                                 &data_channels,
                             )
                             .map(|peer| (peer, owner))
@@ -1497,19 +1394,15 @@ where
                         generation,
                         operation,
                         allocations,
-                        mode,
                     } => {
                         let event = match self
                             .peer
                             .as_mut()
                             .filter(|peer| peer.generation == generation)
                         {
-                            Some(peer) => peer.allocate_media(
-                                operation,
-                                allocations,
-                                mode,
-                                &self.config.media,
-                            ),
+                            Some(peer) => {
+                                peer.allocate_media(operation, allocations, &self.config.media)
+                            }
                             None => Some(HostEvent::Rtc(RtcEvent::MediaPrepared {
                                 generation,
                                 operation,
@@ -1630,14 +1523,12 @@ where
         for observation in progress.observations {
             match observation {
                 Observation::Track { slot, track } => {
-                    self.receivers_changed.notify_waiters();
                     if let Some(stream) = self.streams.get(&slot) {
                         let _ = stream.sender.send(MediaStreamUpdate::Track { track });
                     }
                 }
                 Observation::TrackRemoved { slot } => {
                     self.close_stream(&slot);
-                    self.receivers_changed.notify_waiters();
                 }
                 Observation::Statistics(stats) => {
                     self.statistics.send_replace(Some(stats));
@@ -1715,6 +1606,7 @@ where
                 && drops > stream.native_dropped
             {
                 let skipped = drops.saturating_sub(stream.native_dropped);
+                tracing::warn!(?slot, mode = ?stream.mode, skipped, drops, "native receive sink dropped media");
                 stream.native_dropped = drops;
                 let _ = stream
                     .sender
@@ -1764,8 +1656,17 @@ where
                 || feedback.rates != source.last_rates;
             source.last_rates.clone_from(&feedback.rates);
             if changed {
-                if let Some(lease) = source.lease.upgrade() {
-                    let _ = lease.feedback.send(feedback.clone());
+                for input in self.inputs.values() {
+                    if input
+                        .target
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|target| target.source.identity() == source.identity)
+                    {
+                        if let Some(lease) = input.lease.upgrade() {
+                            let _ = lease.feedback.send(feedback.clone());
+                        }
+                    }
                 }
                 let _ = self.events.send(AgentEvent::ProducerFeedback {
                     slot: slot.clone(),
@@ -1833,10 +1734,6 @@ where
         }
     }
     fn retire_peer(&mut self) {
-        self.receivers_changed.notify_waiters();
-        for (_, request) in std::mem::take(&mut self.source_requests) {
-            let _ = request.response.send(Err(Error::Closed));
-        }
         let slots: Vec<_> = self.sources.keys().cloned().collect();
         for slot in slots {
             self.close_source_observation(&slot);
@@ -1944,6 +1841,18 @@ where
         }
     }
     fn shutdown(&mut self) {
+        self.close_subscription_handles();
+        for lease in self.publications.values().filter_map(Weak::upgrade) {
+            lease.closed.close();
+        }
+        for input in self.inputs.values() {
+            if let Some(lease) = input.lease.upgrade() {
+                lease.closed.close();
+            }
+            input.target.send_replace(None);
+        }
+        self.inputs.clear();
+        self.publications.clear();
         for (_, task) in std::mem::take(&mut self.http_tasks) {
             task.abort();
         }
@@ -2032,12 +1941,6 @@ mod tests {
         Config::new(agent_core::AgentConfig {
             endpoint: "http://pulsebeam.test".into(),
             token: "token".into(),
-            topology: agent_core::MediaTopology {
-                local_video: 1,
-                local_audio: 1,
-                remote_video: 1,
-                remote_audio: 1,
-            },
             retry: agent_core::RetryPolicy::default(),
             log_level: agent_core::LogLevel::default(),
         })
@@ -2052,21 +1955,64 @@ mod tests {
             .unwrap();
         let events = agent.events();
         let (_, snapshots) = agent.snapshot_events();
+        let publication = agent
+            .publication(agent_core::TrackSpec::Video {
+                label: "camera".into(),
+            })
+            .await
+            .unwrap();
+        let input = publication.input().await.unwrap();
+        let subscription = agent
+            .video_subscription(
+                agent_core::TrackSelector {
+                    participant_external_id: "remote".into(),
+                    label: "camera".into(),
+                },
+                agent_core::VideoObservation {
+                    visible: true,
+                    height: 720,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut pending = Box::pin(subscription.observe(ReceiveMode::Encoded));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(pending.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        subscription.close().await.unwrap();
+        assert!(pending.await.is_err());
+        assert!(subscription.is_closed());
+        let audio = agent
+            .audio_subscription(agent_core::TrackSelector {
+                participant_external_id: "remote".into(),
+                label: "microphone".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            audio
+                .configure_video(agent_core::VideoObservation::default())
+                .await
+                .is_err()
+        );
+        let mut audio_pending = Box::pin(audio.observe(ReceiveMode::Decoded));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(audio_pending.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        audio.close().await.unwrap();
+        assert!(audio_pending.await.is_err());
+        assert!(audio.is_closed());
+        assert!(!input.is_closed());
         assert!(matches!(
-            agent.source(MediaSlot::LocalVideo("v0".into())).await,
+            input.capture_time_us().await,
             Err(Error::NotReady)
-        ));
-        assert!(matches!(
-            agent
-                .remote(MediaSlot::RemoteVideo(0), ReceiveMode::Encoded)
-                .await,
-            Err(Error::NotReady)
-        ));
-        assert!(matches!(
-            agent
-                .remote(MediaSlot::RemoteVideo(1), ReceiveMode::Encoded)
-                .await,
-            Err(Error::UnknownSlot(_))
         ));
         agent.close().await.unwrap();
         agent.close().await.unwrap();
@@ -2074,6 +2020,13 @@ mod tests {
             agent.snapshot().connection,
             agent_core::ConnectionState::Disconnected
         );
+        assert!(!input.is_closed());
+        assert!(matches!(
+            input.capture_time_us().await,
+            Err(Error::NotReady)
+        ));
+        publication.close().await.unwrap();
+        assert!(input.is_closed());
         agent.abort().await.unwrap();
         agent.abort().await.unwrap();
         assert!(matches!(events.try_next(), Some(StreamUpdate::Closed)));
@@ -2083,82 +2036,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_source_requests_fence_target_generation_and_retirement() {
-        let (_agent, mut actor) = Agent::parts(
-            config(),
-            Host::new(Box::new(reqwest::Client::new())),
-            || -> Result<(rtc::ManagedRuntime, ()), Error> {
-                panic!("source cancellation cannot construct a native graph")
-            },
-        )
-        .unwrap();
-        actor
-            .core
-            .command(AgentCommand::ReplaceDesired(DesiredState {
-                revision: 1,
-                connected: true,
-                publications: vec![agent_core::PublicationIntent {
-                    slot: "v0".into(),
-                    label: "camera".into(),
-                    active: true,
-                }],
-                ..DesiredState::default()
-            }))
-            .unwrap();
-        let slot = MediaSlot::LocalVideo("v0".into());
-        let generation = actor.core.snapshot().generation;
-        assert!(generation.is_some());
-        assert_eq!(actor.core.source_preparation(&slot).target, Some("camera"));
-        for (generation, target) in [(None, "camera"), (generation, "retired")] {
-            let (response, mut result) = oneshot::channel();
-            actor.source_requests.insert(
-                slot.clone(),
-                SourceRequest {
-                    generation,
-                    target: Some(target.into()),
-                    response,
-                },
-            );
-            actor.progress_source_requests();
-            assert!(matches!(result.try_recv(), Ok(Err(Error::Closed))));
-            assert!(actor.source_requests.is_empty());
-        }
-        let (response, result) = oneshot::channel();
-        actor.source_requests.insert(
-            slot.clone(),
-            SourceRequest {
-                generation,
-                target: Some("camera".into()),
-                response,
-            },
-        );
-        drop(result);
-        actor.progress_source_requests();
-        assert!(actor.source_requests.is_empty());
-        let (response, mut result) = oneshot::channel();
-        actor.source_requests.insert(
-            slot.clone(),
-            SourceRequest {
-                generation,
-                target: Some("camera".into()),
-                response,
-            },
-        );
-        let (cancelled, receiver) = oneshot::channel();
-        drop(receiver);
-        actor.acquire_source(slot, cancelled);
-        assert_eq!(actor.source_requests.len(), 1);
-        assert!(matches!(
-            result.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        actor.retire_peer();
-        assert!(matches!(result.try_recv(), Ok(Err(Error::Closed))));
-        assert!(actor.source_requests.is_empty());
-    }
-
-    #[test]
-    fn runtime_services_retire_with_actual_native_graphs_and_sources() {
+    fn runtime_services_retire_with_unadmitted_native_graphs() {
         use std::{cell::Cell, rc::Rc, time::Duration};
 
         let _serial = crate::native_media::NATIVE_TEST_SERIAL.lock().unwrap();
@@ -2184,7 +2062,7 @@ mod tests {
         runtime.block_on(tokio::task::LocalSet::new().run_until(async {
             let (agent, actor) = Agent::managed_with_services(
                 config(),
-                Host::new(Box::new(reqwest::Client::new())),
+                Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
                 {
                     let world = world.clone();
                     let created = created.clone();
@@ -2198,6 +2076,17 @@ mod tests {
             )
             .unwrap();
             let actor = tokio::task::spawn_local(actor);
+            let events = agent.events();
+            let publication = agent
+                .publication(agent_core::TrackSpec::Audio {
+                    label: "microphone".into(),
+                })
+                .await
+                .unwrap();
+            publication.set_muted(true).await.unwrap();
+            let input = publication.input().await.unwrap();
+            let feedback = input.feedback();
+            assert!(matches!(input.submit(pcm()).await, Err(Error::NotReady)));
             for round in 1..=2 {
                 agent
                     .replace_desired(DesiredState {
@@ -2207,29 +2096,93 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                let source = agent
-                    .source(MediaSlot::LocalAudio("a0".into()))
-                    .await
-                    .unwrap();
-                assert!(!source.is_closed());
+                if round == 1 {
+                    publication.set_muted(false).await.unwrap();
+                }
+                for turn in 0..4096 {
+                    if agent.snapshot().connection == agent_core::ConnectionState::Joining {
+                        break;
+                    }
+                    assert!(
+                        turn < 4095,
+                        "round {round}: native offer did not reach HTTP admission; snapshot {:?}; events {:?}",
+                        agent.snapshot(),
+                        std::iter::from_fn(|| events.try_next()).collect::<Vec<_>>()
+                    );
+                    let progress = world.pump(64);
+                    assert!(!progress.blocked);
+                    if progress.dispatched == 0 {
+                        if let Some(next) = world.next_deadline() {
+                            world.advance(next.saturating_sub(world.now())).unwrap();
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(matches!(input.target(), Err(Error::NotReady)));
+                assert!(matches!(input.capture_time_us().await, Err(Error::NotReady)));
+                assert!(matches!(input.submit(pcm()).await, Err(Error::NotReady)));
+                assert!(!input.is_closed());
                 assert_eq!(created.get(), round);
                 assert_eq!(retired.get(), round - 1);
                 agent.close().await.unwrap();
-                assert!(source.is_closed());
+                assert!(!input.is_closed());
+                assert!(matches!(input.capture_time_us().await, Err(Error::NotReady)));
+                assert!(feedback.try_next().is_none());
                 assert_eq!(retired.get(), round);
             }
+            publication.close().await.unwrap();
+            assert!(input.is_closed());
+            assert!(matches!(feedback.try_next(), Some(StreamUpdate::Closed)));
             agent.abort().await.unwrap();
             actor.await.unwrap();
             assert_eq!(retired.get(), 2);
         }));
     }
 
-    fn source_fixture() -> (LocalSource, mpsc::Receiver<Submission>) {
+    fn source_fixture() -> (
+        PhysicalSource,
+        Arc<agent_core::PublicationInputControl>,
+        mpsc::Receiver<Submission>,
+    ) {
+        // Queue ownership only, not native admission or target readiness.
+        let mut core = agent_core::Agent::new(config().session).unwrap();
+        let agent_core::ResourceResult::Publication { owner, .. } = core
+            .resource(agent_core::ResourceCommand::ClaimPublication {
+                spec: agent_core::TrackSpec::Audio {
+                    label: "microphone".into(),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("publication");
+        };
+        let agent_core::ResourceResult::PublicationInput { operation, .. } = core
+            .resource(agent_core::ResourceCommand::BeginPublicationInput {
+                owner,
+                input: agent_core::PublicationInputIntent::Replace,
+                present: true,
+                muted: None,
+            })
+            .unwrap()
+        else {
+            panic!("input");
+        };
+        core.resource(agent_core::ResourceCommand::CompletePublicationInput {
+            operation,
+            succeeded: true,
+        })
+        .unwrap();
+        let control = std::iter::from_fn(|| core.next_effect())
+            .filter_map(|effect| match effect {
+                Effect::PublicationInput(control) => Some(control),
+                _ => None,
+            })
+            .last()
+            .unwrap();
         let (commands, _) = mpsc::channel(COMMANDS);
         let (media, receiver) = mpsc::channel(MEDIA_COMMANDS);
-        let (feedback, _) = broadcast::channel(EVENTS);
         (
-            LocalSource {
+            PhysicalSource {
                 inner: Arc::new(SourceLease {
                     slot: MediaSlot::LocalAudio("a0".into()),
                     identity: SourceIdentity {
@@ -2240,9 +2193,9 @@ mod tests {
                     leases_changed: Arc::new(Notify::new()),
                     commands,
                     media,
-                    feedback,
                 }),
             },
+            Arc::new(control),
             receiver,
         )
     }
@@ -2259,7 +2212,7 @@ mod tests {
 
     #[tokio::test]
     async fn owned_submission_has_explicit_byte_capacity_backpressure_and_closed_outcomes() {
-        let (source, mut receiver) = source_fixture();
+        let (source, control, mut receiver) = source_fixture();
         let oversized = InputFrame::I420 {
             frame: I420Frame {
                 width: 1,
@@ -2270,7 +2223,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            source.submit(oversized).await,
+            source.submit(oversized, control.clone()).await,
             Err(Error::InvalidInput(_))
         ));
         assert!(matches!(
@@ -2283,6 +2236,7 @@ mod tests {
                 .inner
                 .media
                 .try_send(Submission {
+                    control: control.clone(),
                     slot: source.inner.slot.clone(),
                     identity: source.identity(),
                     frame: pcm(),
@@ -2291,16 +2245,96 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            source.submit(pcm()).await,
+            source.submit(pcm(), control.clone()).await,
             Err(Error::Backpressure)
         ));
-        let feedback = source.feedback();
+        // Native admission currency only, not peer or source preparation.
+        let (_agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+            || Ok((rtc::ThreadedRuntime, ())),
+        )
+        .unwrap();
+        let publication = actor
+            .claim_publication(agent_core::TrackSpec::Audio {
+                label: "microphone".into(),
+            })
+            .unwrap();
+        let owner = *actor.publications.keys().next().unwrap();
+        let input = actor.register_input(owner).unwrap();
+        let feedback = input.feedback();
+        let latest_control = |core: &mut agent_core::Agent| {
+            Arc::new(
+                std::iter::from_fn(|| core.next_effect())
+                    .filter_map(|effect| match effect {
+                        Effect::PublicationInput(control) => Some(control),
+                        _ => None,
+                    })
+                    .last()
+                    .unwrap(),
+            )
+        };
+        let original = latest_control(&mut actor.core);
+        assert!(actor.input_submission_current(&original));
+        for muted in [true, false] {
+            actor
+                .core
+                .resource(agent_core::ResourceCommand::SetPublicationMuted { owner, muted })
+                .unwrap();
+        }
+        let resumed = latest_control(&mut actor.core);
+        assert_ne!(original, resumed);
+        assert!(actor.input_submission_current(&resumed));
+        let (response, _) = oneshot::channel();
+        let mut forged = Submission {
+            control: original,
+            slot: source.slot().clone(),
+            identity: source.identity(),
+            frame: pcm(),
+            response,
+        };
+        assert!(!actor.input_submission_current(&forged.control));
+        forged.control = resumed.clone();
+        assert!(actor.input_submission_current(&forged.control));
+
+        let replacement = actor.register_input(owner).unwrap();
+        let replacement_control = latest_control(&mut actor.core);
+        assert!(input.is_closed());
+        assert!(matches!(feedback.try_next(), Some(StreamUpdate::Closed)));
+        assert_ne!(
+            resumed.operation.input(),
+            replacement_control.operation.input()
+        );
+        assert!(!actor.input_submission_current(&forged.control));
+        forged.control = replacement_control.clone();
+        assert!(actor.input_submission_current(&forged.control));
+        actor.inputs[&owner].lease.upgrade().unwrap().closed.close();
+        assert!(
+            actor
+                .core
+                .publication_input_control_current(&replacement_control)
+        );
+        assert!(!actor.input_submission_current(&forged.control));
+
+        let current = actor.register_input(owner).unwrap();
+        forged.control = latest_control(&mut actor.core);
+        assert!(actor.input_submission_current(&forged.control));
+        actor.publications[&owner].upgrade().unwrap().closed.close();
+        assert!(
+            actor
+                .core
+                .publication_input_control_current(&forged.control)
+        );
+        assert!(!actor.input_submission_current(&forged.control));
+        assert!(publication.is_closed());
+        assert!(!current.is_closed());
+
         source.inner.closed.close();
-        assert!(matches!(source.submit(pcm()).await, Err(Error::Closed)));
-        assert!(matches!(source.encoding_state().await, Err(Error::Closed)));
+        assert!(matches!(
+            source.submit(pcm(), control).await,
+            Err(Error::Closed)
+        ));
         assert!(matches!(source.capture_time_us().await, Err(Error::Closed)));
-        assert!(matches!(feedback.next().await, StreamUpdate::Closed));
-        source.close().await.unwrap();
     }
 
     #[test]
@@ -2373,6 +2407,7 @@ mod tests {
             receiver: Mutex::new(receiver),
         });
         let stream = RemoteMedia {
+            observation: None,
             slot: MediaSlot::RemoteAudio(0),
             generation: 1,
             receiver: 7,
@@ -2425,7 +2460,8 @@ mod tests {
     fn public_handles_are_send_and_sync_without_moving_a_managed_engine() {
         fn handles<T: Send + Sync>() {}
         handles::<Agent>();
-        handles::<LocalSource>();
+        handles::<Publication>();
+        handles::<PublicationInput>();
         handles::<RemoteMedia>();
     }
 }

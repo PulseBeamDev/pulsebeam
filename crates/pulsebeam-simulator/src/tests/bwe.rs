@@ -121,18 +121,9 @@ fn subscriber_reaches_top_layer_on_fast_link_test() {
         ]);
 }
 
-/// A height request must be satisfied by rounding *up* the simulcast ladder, not down.
-///
-/// This is the "stream never reaches 720p" report. The viewer asks for 540p from a ladder of
-/// f=720 / h=360 / q=180. No layer is exactly 540, so the request sits between two tiers.
-///
-/// Spatial gating admitted only layers at or below the request, so the viewer was handed h=360 -
-/// visibly softer than it asked for - while f=720 sat unused on a link with ample room for it.
-///
-/// The ladder has no exact 540p tier, so the spatial assertion specifically guards the choice to
-/// round up to the smallest layer that satisfies the request.
+/// A hard height ceiling retains decoding when only smaller spatial layers fit.
 #[test]
-fn height_request_rounds_up_the_ladder_test() {
+fn height_ceiling_keeps_a_smaller_layer_decodable_test() {
     LocalNodeSim::new()
         .with_room(
             Room::new("room1")
@@ -146,15 +137,15 @@ fn height_request_rounds_up_the_ladder_test() {
                 timeout: Duration::from_secs(5),
             },
             Step::SubscribeTo {
-                description: "Viewer asks for 540p, which no layer matches exactly",
+                description: "Viewer sets a 540p ceiling between the 360p and 720p layers",
                 participant: "viewer",
                 targets: &[("camera", 540)],
             },
             Step::WaitForVideoAtResolution {
-                description: "Viewer decodes the rounded-up layer",
+                description: "Viewer decodes the largest ceiling-compatible layer",
                 participant: "viewer",
                 publishers: &["camera"],
-                min_resolution: (1, 720),
+                min_resolution: (1, 360),
                 timeout: Duration::from_secs(30),
             },
             Step::Run {
@@ -162,11 +153,11 @@ fn height_request_rounds_up_the_ladder_test() {
                 duration: Duration::from_secs(30),
             },
             Step::CheckVideoDecodedFromInterval {
-                description: "Viewer independently decodes the supplied 720p representation",
+                description: "Viewer independently decodes the supplied 360p representation",
                 participant: "viewer",
                 publisher: "camera",
                 min_frames: 1,
-                min_resolution: (1, 720),
+                min_resolution: (1, 360),
             },
         ]);
 }
@@ -200,7 +191,7 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
             Step::SubscribeToQos {
                 description: "Viewer starts both streams at low priority and height",
                 participant: "viewer",
-                targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
+                targets: &[("camera", 180, 90, 10), ("screen", 1080, 90, 10)],
             },
             Step::Run {
                 description: "Let the screen share become the retained co-tenant",
@@ -209,7 +200,7 @@ fn high_priority_camera_reclaims_bandwidth_from_screenshare_test() {
             Step::SubscribeToQos {
                 description: "Viewer protects the camera and makes the background screen optional",
                 participant: "viewer",
-                targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
+                targets: &[("camera", 720, 360, 200), ("screen", 1080, 0, 10)],
             },
             Step::WaitForVideoAtResolution {
                 description: "Viewer decodes the reclaimed camera target",
@@ -380,7 +371,7 @@ mod slow {
                 Step::SubscribeToQos {
                     description: "Viewer adds the screen share at equal low priority",
                     participant: "viewer",
-                    targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
+                    targets: &[("camera", 180, 90, 10), ("screen", 1080, 90, 10)],
                 },
                 Step::Run {
                     description: "Let both subscriptions settle before reconfiguration",
@@ -389,7 +380,7 @@ mod slow {
                 Step::SubscribeToQos {
                     description: "Viewer protects the focused camera and removes screen protection",
                     participant: "viewer",
-                    targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
+                    targets: &[("camera", 720, 360, 200), ("screen", 1080, 0, 10)],
                 },
                 Step::Run {
                     description: "Require the focused camera to reach top quality after reconfiguration",
@@ -438,7 +429,7 @@ mod slow {
                 Step::SubscribeToQos {
                     description: "Focused camera (720p, high priority); droppable background screen",
                     participant: "viewer",
-                    targets: &[("camera", 720, 360, 200), ("screen", 180, 0, 10)],
+                    targets: &[("camera", 720, 360, 200), ("screen", 1080, 0, 10)],
                 },
                 Step::Run {
                     description: "Let the allocator resolve the contention",
@@ -681,7 +672,7 @@ fn priority_swap_reaches_every_requested_top_layer_on_fast_link_test() {
             Step::SubscribeToQos {
                 description: "Viewer transfers priority to the camera",
                 participant: "viewer",
-                targets: &[("camera", 1080, 360, 200), ("screen", 180, 90, 10)],
+                targets: &[("camera", 1080, 360, 200), ("screen", 1080, 90, 10)],
             },
             Step::Run {
                 description: "Allow BWE to satisfy the new allocation",
@@ -729,7 +720,7 @@ fn screenshare_recovers_after_competing_camera_pause_test() {
             Step::SubscribeToQos {
                 description: "Viewer asks for the camera and one-layer screen share",
                 participant: "viewer",
-                targets: &[("camera", 180, 90, 10), ("screen", 180, 90, 10)],
+                targets: &[("camera", 180, 90, 10), ("screen", 1080, 90, 10)],
             },
             Step::Run {
                 description: "Warmup with enough capacity for both streams",
@@ -806,9 +797,9 @@ fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
                 timeout: Duration::from_secs(5),
             },
             Step::SubscribeTo {
-                description: "Viewer asks for both streams at 720p",
+                description: "Viewer allows the full-size camera and single-layer screen",
                 participant: "viewer",
-                targets: &[("camera", 720), ("screen", 720)],
+                targets: &[("camera", 720), ("screen", 1080)],
             },
             Step::WaitForVideoAtResolution {
                 description: "Viewer decodes both full-size streams before resizing",
@@ -820,7 +811,7 @@ fn resizing_camera_keeps_single_layer_screenshare_rendering_test() {
             Step::SubscribeTo {
                 description: "Viewer resizes only the camera to 360p",
                 participant: "viewer",
-                targets: &[("camera", 360), ("screen", 720)],
+                targets: &[("camera", 360), ("screen", 1080)],
             },
             Step::Run {
                 description: "Render both streams after the resize",
@@ -901,7 +892,7 @@ fn screenshare_and_camera_conference_test() {
             Step::SubscribeAll {
                 description: "Camera subscribes to the screen share at full quality",
                 participant: "camera",
-                heights: &[720],
+                heights: &[1080],
             },
             Step::Run {
                 description: "Warmup: let BWE settle on both connections",
@@ -1263,7 +1254,7 @@ fn conference_plan(link: LinkProfile, camera_min_frames: u64) {
             Step::SubscribeAll {
                 description: "Camera subscribes to the screen share at full quality",
                 participant: "camera",
-                heights: &[720],
+                heights: &[1080],
             },
             Step::Run {
                 description: "Warmup: let BWE settle on both connections",
@@ -1287,7 +1278,7 @@ fn conference_plan(link: LinkProfile, camera_min_frames: u64) {
                     min_frames: camera_min_frames,
                     min_resolution: (1280, 720),
                 },
-                same_receiver: false,
+                fresh_receiver: false,
             },
             Step::CheckNativePlayback {
                 description: "The actual desktop produces full-size updates, including after quiet periods",
@@ -1298,7 +1289,7 @@ fn conference_plan(link: LinkProfile, camera_min_frames: u64) {
                     min_frames: 2,
                     min_resolution: (1280, 720),
                 },
-                same_receiver: false,
+                fresh_receiver: false,
             },
         ]);
 }
@@ -1312,7 +1303,10 @@ fn screen_source_decodes_across_static_and_active_periods_test() {
             Room::new("room1")
                 .with_participant(Participant::screensharer("presenter"))
                 .with_participant(Participant::publisher("camera", &["q", "h", "f"]))
-                .with_participant(Participant::multi_subscriber("viewer", 2)),
+                .with_participant(
+                    Participant::manual_subscriber("viewer", 2)
+                        .with_encoded_and_native_decoded_video(),
+                ),
         )
         .run(vec![
             Step::Run {
@@ -1320,29 +1314,74 @@ fn screen_source_decodes_across_static_and_active_periods_test() {
                 duration: Duration::from_secs(5),
             },
             Step::SubscribeTo {
-                description: "Viewer watches only the screen share",
+                description: "Viewer watches only the full captured screen share",
                 participant: "viewer",
-                targets: &[("presenter", 720)],
+                // The fixture is 1056 pixels tall and has no smaller spatial layer.
+                targets: &[("presenter", 1080)],
             },
             Step::Run {
                 description: "Warmup while the screen share is still active",
                 duration: Duration::from_secs(15),
             },
+            Step::BeginNativePlayback {
+                description: "Start the first captured screen observation window",
+                participant: "viewer",
+                after_pause: false,
+            },
             Step::Run {
-                description: "Soak across captured static and active screen periods",
-                duration: Duration::from_secs(48),
+                description: "Observe the first half of the sparse captured screen schedule",
+                duration: Duration::from_secs(24),
             },
             Step::CheckVideoDecodedFromInterval {
-                description: "viewer decodes fresh presenter source output in this phase",
+                description: "Independent decoding progresses on the presenter in the first window",
                 participant: "viewer",
                 publisher: "presenter",
-                min_frames: 1,
+                min_frames: 2,
                 min_resolution: (1, 720),
             },
-            Step::CheckVideoQuality {
-                description: "Viewer renders the screen share cleanly throughout",
+            Step::CheckNativePlayback {
+                description: "The first window has fresh, changing, source-authenticated screen pixels",
                 participant: "viewer",
-                quality: VideoQuality::min_frames(100).allow_gaps(6),
+                publisher: "presenter",
+                expected: PlaybackExpectation {
+                    content: Playback::DesktopUpdates,
+                    min_frames: 2,
+                    min_resolution: (1, 720),
+                },
+                fresh_receiver: false,
+            },
+            Step::BeginNativePlayback {
+                description: "Retire the first window's progress before observing later screen updates",
+                participant: "viewer",
+                after_pause: false,
+            },
+            Step::Run {
+                description: "Observe later updates across the remaining sparse screen schedule",
+                duration: Duration::from_secs(24),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Earlier output cannot satisfy independent presenter decoding in the later window",
+                participant: "viewer",
+                publisher: "presenter",
+                min_frames: 2,
+                min_resolution: (1, 720),
+            },
+            Step::CheckNativePlayback {
+                description: "Later screen pixels remain fresh, changing and source-authenticated",
+                participant: "viewer",
+                publisher: "presenter",
+                expected: PlaybackExpectation {
+                    content: Playback::DesktopUpdates,
+                    min_frames: 2,
+                    min_resolution: (1, 720),
+                },
+                fresh_receiver: false,
+            },
+            Step::CheckVideoQuality {
+                description: "Captured screen output preserves decoder and sequence integrity throughout",
+                participant: "viewer",
+                // Sparse progress is required independently in both windows above.
+                quality: VideoQuality::min_frames(2).min_keyframes(1).allow_gaps(6),
             },
         ]);
 }
@@ -1394,7 +1433,7 @@ fn both_requested_sources_keep_decoding_during_soak_test() {
             Step::SubscribeAll {
                 description: "Viewer watches the screen share and the camera at full quality",
                 participant: "viewer",
-                heights: &[720, 720],
+                heights: &[1080, 1080],
             },
             Step::WaitForVideoAtResolution {
                 description: "Viewer decodes both full-size streams before the soak",
@@ -1480,7 +1519,7 @@ fn late_video_subscription_is_delivered_test() {
             Step::SubscribeTo {
                 description: "Viewer watches only the screen share",
                 participant: "viewer",
-                targets: &[("presenter", 720)],
+                targets: &[("presenter", 1080)],
             },
             Step::Run {
                 description: "Long stretch with only the presenter subscribed",
@@ -1489,7 +1528,7 @@ fn late_video_subscription_is_delivered_test() {
             Step::SubscribeTo {
                 description: "Viewer now also wants the camera",
                 participant: "viewer",
-                targets: &[("presenter", 720), ("camera", 720)],
+                targets: &[("presenter", 1080), ("camera", 720)],
             },
             Step::Run {
                 description: "Allow the allocator to take up the camera",
@@ -1597,7 +1636,7 @@ fn screenshare_recovers_full_quality_after_going_still_test() {
             Step::SubscribeTo {
                 description: "Viewer watches the screen share at full quality",
                 participant: "viewer",
-                targets: &[("presenter", 720)],
+                targets: &[("presenter", 1080)],
             },
             Step::Run {
                 description: "Warmup across a full replay, including the silence",
@@ -1645,7 +1684,7 @@ fn requested_streams_recover_when_downstream_capacity_returns_test() {
             Step::SubscribeToQos {
                 description: "Subscribe to both streams with the camera preferred",
                 participant: "viewer",
-                targets: &[("camera", 720, 0, 100), ("screen", 720, 0, 10)],
+                targets: &[("camera", 720, 0, 100), ("screen", 1080, 0, 10)],
             },
             Step::Run {
                 description: "Run both requested sources under constrained capacity",
@@ -1662,10 +1701,28 @@ fn requested_streams_recover_when_downstream_capacity_returns_test() {
                 publishers: &["camera", "screen"],
                 timeout: Duration::from_secs(120),
             },
-            Step::CheckVideoQuality {
+            Step::Run {
+                description: "Measure sustained delivery after both sources recover",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckVideoQualityInterval {
                 description: "Recovered video remains decodable after the constrained phase",
                 participant: "viewer",
                 quality: VideoQuality::min_frames(120).allow_gaps(12),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "The camera keeps decoding throughout the recovered interval",
+                participant: "viewer",
+                publisher: "camera",
+                min_frames: 1,
+                min_resolution: (1, 1),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "The screenshare keeps decoding throughout the recovered interval",
+                participant: "viewer",
+                publisher: "screen",
+                min_frames: 1,
+                min_resolution: (1, 1),
             },
         ]);
 }
@@ -2105,7 +2162,7 @@ fn still_screenshare_does_not_talk_down_a_healthy_link_test() {
             Step::SubscribeTo {
                 description: "Viewer asks for the screen share",
                 participant: "viewer",
-                targets: &[("presenter", 720)],
+                targets: &[("presenter", 1080)],
             },
             Step::Run {
                 description: "Warmup: let the estimate find the link",

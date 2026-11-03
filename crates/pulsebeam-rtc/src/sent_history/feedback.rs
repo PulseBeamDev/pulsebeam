@@ -92,24 +92,24 @@ impl SentHistory {
     }
 
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        let scan_end = self
-            .oldest_sent_id
-            .saturating_add(SENT_HISTORY_CAPACITY as u64)
-            .min(self.next_sent_id);
-        let sent = (self.oldest_sent_id..scan_end).find_map(|id| {
-            self.entry(SentPacketId(id))
-                .and_then(|entry| entry.committed_at.checked_add(SENT_HISTORY_MAX_AGE))
-        });
+        let sent = (self.oldest_sent_id < self.next_sent_id)
+            .then(|| self.entry(SentPacketId(self.oldest_sent_id)))
+            .flatten()
+            .and_then(|entry| entry.committed_at.checked_add(SENT_HISTORY_MAX_AGE));
+        // Variant order partitions the source keys from the deadline-ordered missing keys.
         let missing = self
-            .missing
-            .iter()
-            .filter_map(|id| {
-                let entry = self.entry(*id)?;
-                self.reorder_deadline(entry)
-            })
-            .min();
-        let source = match self.source_readiness.first() {
-            Some(SourceReadiness::Retired { deadline, .. }) => Some(deadline.unwrap_or(now)),
+            .readiness
+            .range((
+                std::ops::Bound::Excluded(Readiness::Unscheduled(u32::MAX)),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .and_then(|key| match key {
+                Readiness::Missing { deadline, .. } => Some(*deadline),
+                _ => None,
+            });
+        let source = match self.readiness.first() {
+            Some(Readiness::Retired { deadline, .. }) => Some(deadline.unwrap_or(now)),
             _ => None,
         };
         [sent, missing, source].into_iter().flatten().min()
@@ -135,32 +135,31 @@ impl SentHistory {
     }
 
     fn reorder_deadline(&self, entry: &SentEntry) -> Option<Instant> {
-        match entry.acknowledgment {
-            Acknowledgment::Missing {
-                higher_received_at: Some(anchor),
-                ..
-            } => entry
-                .frozen_reorder_deadline
-                .or_else(|| anchor.checked_add(self.reordering_window)),
-            _ => None,
-        }
+        entry.reorder_deadline(self.reordering_window)
     }
 
     pub(super) fn apply_reordering_window(&mut self, now: Instant) {
         if self.observed_reordering_window <= self.reordering_window {
             return;
         }
-        // Once per report, preserve elapsed deadlines without consuming deferred loss work.
+        // A window transition visits at most the fixed sent window, once per report.
+        // Freeze elapsed deadlines before rekeying, without consuming deferred loss work.
         for entry in self.entries.iter_mut().flatten() {
+            let previous = entry.readiness(self.reordering_window);
             if entry.frozen_reorder_deadline.is_none()
-                && let Acknowledgment::Missing {
-                    higher_received_at: Some(anchor),
-                    ..
-                } = entry.acknowledgment
-                && let Some(deadline) = anchor.checked_add(self.reordering_window)
+                && let Some(deadline) = entry.reorder_deadline(self.reordering_window)
                 && deadline <= now
             {
                 entry.frozen_reorder_deadline = Some(deadline);
+            }
+            let next = entry.readiness(self.observed_reordering_window);
+            if previous != next {
+                if let Some(key) = previous {
+                    self.readiness.remove(&key);
+                }
+                if let Some(key) = next {
+                    self.readiness.insert(key);
+                }
             }
         }
         self.reordering_window = self.observed_reordering_window;
@@ -405,7 +404,10 @@ impl SentHistory {
             let ssrc = report.ssrc;
             let floor = state.first_sequence;
             let newest = state.newest_sequence;
-            let previous_timestamp = state.last_report_timestamp;
+            let previous_timestamp = state
+                .last_report_timestamp
+                .filter(|(path, _)| *path == epoch)
+                .map(|(_, timestamp)| timestamp);
             let old_edge = state.highest_acked_sequence;
             let Some(base) = unwrap_near(u64::from(report.begin_sequence), newest, 1 << 16) else {
                 self.add_unknown(report.statuses.len());
@@ -561,9 +563,9 @@ impl SentHistory {
             if let Some(state) = self.ssrcs.get_mut(&ssrc)
                 && state
                     .last_report_timestamp
-                    .is_none_or(|previous| timestamp >= previous)
+                    .is_none_or(|(path, previous)| path != epoch || timestamp >= previous)
             {
-                state.last_report_timestamp = Some(timestamp);
+                state.last_report_timestamp = Some((epoch, timestamp));
             }
             for (offset, (received, arrival, ecn, _)) in normalized.iter().copied().enumerate() {
                 let sequence = base.saturating_add(offset as u64);
@@ -614,8 +616,12 @@ impl SentHistory {
                 && let Acknowledgment::Missing {
                     higher_received_at, ..
                 } = &mut entry.acknowledgment
+                && higher_received_at.is_none()
             {
-                higher_received_at.get_or_insert(received_at);
+                *higher_received_at = Some(received_at);
+                if let Some(key) = entry.readiness(self.reordering_window) {
+                    self.readiness.insert(key);
+                }
             }
         }
     }
@@ -793,6 +799,7 @@ impl SentHistory {
         ecn: Option<EcnMark>,
         received_at: Instant,
     ) {
+        let window = self.reordering_window;
         let Some(entry) = self.entry_mut(sent_id) else {
             return;
         };
@@ -802,11 +809,15 @@ impl SentHistory {
             self.counters.duplicate_feedback = self.counters.duplicate_feedback.saturating_add(1);
             return;
         }
+        let previous = entry.readiness(window);
         let terminal_loss = entry.acknowledgment == Acknowledgment::Lost;
         if !terminal_loss {
             entry.acknowledgment = Acknowledgment::Received;
         }
         entry.missing_since = None;
+        if let Some(key) = previous {
+            self.readiness.remove(&key);
+        }
         if !terminal_loss {
             self.counters.received = self.counters.received.saturating_add(1);
         }
@@ -903,13 +914,18 @@ impl SentHistory {
                 origin = LossOrigin::Reordering;
             }
         }
+        let window = self.reordering_window;
         let Some(entry) = self.entry_mut(sent_id) else {
             return;
         };
         if entry.acknowledgment.is_terminal() {
             return;
         }
+        let previous = entry.readiness(window);
         entry.acknowledgment = Acknowledgment::Lost;
+        if let Some(key) = previous {
+            self.readiness.remove(&key);
+        }
         self.counters.not_received = self.counters.not_received.saturating_add(1);
         self.emit(sent_id, false, false, Some(origin), None, None);
     }

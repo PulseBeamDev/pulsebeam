@@ -15,7 +15,6 @@ export type {
   Delivery,
   FailureClass,
   LogLevel,
-  MediaTopology,
   PlaybackFailure,
   ReceiveOptions,
 } from "@pulsebeam/web";

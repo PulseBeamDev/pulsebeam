@@ -4,6 +4,16 @@
   const peers = new Set();
   const appliedAnswers = new WeakMap();
   const warnings = [];
+  const mediaDiagnostics = [];
+  const originalDebug = console.debug;
+  console.debug = (...args) => {
+    const message = args.map(String).join(" ");
+    if (/Native |RTP allocation/.test(message)) {
+      mediaDiagnostics.push(message.slice(0, 4096));
+      if (mediaDiagnostics.length > 256) mediaDiagnostics.shift();
+    }
+    originalDebug.apply(console, args);
+  };
   const originalWarn = console.warn;
   console.warn = (...args) => {
     warnings.push(args.map(String).join(" ").slice(0, 600));
@@ -52,10 +62,17 @@
       rtcp: transceiver.sender.getParameters().rtcp,
     }));
   const controlConfigurations = [];
+  const payloadChannels = [];
+  const originalGetStats = RTCPeerConnection.prototype.getStats;
+  RTCPeerConnection.prototype.getStats = () =>
+    Promise.reject(new Error("connection statistics unavailable"));
   const originalCreateDataChannel =
     RTCPeerConnection.prototype.createDataChannel;
   RTCPeerConnection.prototype.createDataChannel = function (...args) {
     const channel = originalCreateDataChannel.apply(this, args);
+    if (channel.label.startsWith("native/payload/")) {
+      payloadChannels.push({ peer: this, channel });
+    }
     if (channel.label === "v1/sys/signaling") {
       controlConfigurations.push({
         id: channel.id,
@@ -205,22 +222,10 @@
   const sender = createAgent({
     endpoint,
     token: "__SENDER_TOKEN__",
-    topology: {
-      localVideos: 1,
-      localAudios: 1,
-      remoteVideos: 0,
-      remoteAudios: 0,
-    },
   });
   const receiver = createAgent({
     endpoint,
     token: "__RECEIVER_TOKEN__",
-    topology: {
-      localVideos: 0,
-      localAudios: 0,
-      remoteVideos: 1,
-      remoteAudios: 1,
-    },
   });
   const assert = (condition, label) => {
     if (!condition) throw new Error(label);
@@ -230,19 +235,20 @@
     while (!(await predicate())) {
       if (Date.now() > deadline) {
         const agents = [sender, receiver].map((agent) => {
-          const { connection, generation, failure, catalog, mapping } =
+          const { connection, generation, failure, catalog, mapping, topics } =
             agent.getSnapshot();
-          return { connection, generation, failure, catalog, mapping };
+          return { connection, generation, failure, catalog, mapping, topics };
         });
         const physical = await Promise.all(
           [...peers].map(async (peer) => ({
             connection: peer.connectionState,
             signaling: peer.signalingState,
             sctp: peer.sctp?.state,
-            channels: [...(await peer.getStats()).values()].filter(
+            channels: [...(await originalGetStats.call(peer)).values()].filter(
               (entry) =>
                 entry.type === "data-channel" ||
                 entry.type === "outbound-rtp" ||
+                entry.type === "inbound-rtp" ||
                 entry.type === "media-source" ||
                 (entry.type === "candidate-pair" && entry.nominated) ||
                 entry.type === "codec",
@@ -261,7 +267,21 @@
           })),
         );
         throw new Error(
-          `live media: ${label}; relay failures: ${relayFailures}; state: ${JSON.stringify({ agents, warnings, physical })}`,
+          `live media: ${label}; relay failures: ${relayFailures}; state: ${JSON.stringify(
+            {
+              agents,
+              warnings,
+              mediaDiagnostics,
+              render: {
+                width: video.videoWidth,
+                height: video.videoHeight,
+                paused: video.paused,
+              },
+              physical,
+            },
+            (_key, value) =>
+              typeof value === "bigint" ? value.toString() : value,
+          )}`,
         );
       }
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -309,6 +329,8 @@
   let videoPublication;
   let audioPublication;
   let replacementVideoTrack;
+  let steadyIterator;
+  let cyclingIterator;
   try {
     await source.resume();
     const audioPlayback = pulsebeam.attachRemoteAudio(receiver);
@@ -334,6 +356,170 @@
       "admission identity",
     );
     assert(receiver.roomId === "public-web-contract", "room identity");
+    const senderGeneration = sender.getSnapshot().generation;
+    const receiverGeneration = receiver.getSnapshot().generation;
+    const receiveValue = async (iterator, expected) => {
+      let received;
+      let failure;
+      const reading = (async () => {
+        while (true) {
+          const update = await iterator.next();
+          assert(
+            !update.done && update.value.type === "message",
+            "ordered data stays live without gaps",
+          );
+          assert(
+            update.value.data.length === 1 && update.value.data[0] <= expected,
+            "data from a future lifetime",
+          );
+          if (update.value.data[0] === expected) {
+            received = update.value;
+            return;
+          }
+        }
+      })().catch((error) => {
+        failure = error;
+      });
+      await until(() => {
+        if (failure) throw failure;
+        return received;
+      }, "current ordered payload delivery");
+      await reading;
+    };
+    const dataReady = async (name) => {
+      await until(
+        () =>
+          sender
+            .getSnapshot()
+            .topics.publishers.some(
+              (publisher) =>
+                publisher.name === name &&
+                publisher.mode === "ordered" &&
+                publisher.connected &&
+                publisher.dataTrackId !== null,
+            ) &&
+          receiver
+            .getSnapshot()
+            .topics.subscribers.some(
+              (subscriber) =>
+                subscriber.name === name &&
+                subscriber.mode === "ordered" &&
+                subscriber.connected &&
+                subscriber.publishers > 0,
+            ),
+        "accepted named-data bindings",
+      );
+    };
+    const warmOrdered = async (publisher, iterator, value, name) => {
+      let received = false;
+      let failure;
+      const delivery = receiveValue(iterator, value).then(
+        () => {
+          received = true;
+        },
+        (error) => {
+          failure = error;
+        },
+      );
+      // Connected bindings can precede the initial live frontier. Only the warmup
+      // is retried; the assertion payload below is sent once on a witnessed route.
+      await until(async () => {
+        if (failure) throw failure;
+        if (!received) await publisher.send(Uint8Array.of(value));
+        return received;
+      }, "ordered live-frontier rendezvous");
+      await delivery;
+      await dataReady(name);
+    };
+    const steadySpec = track.data("reuse-steady", "ordered");
+    const cyclingSpec = track.data("reuse-cycle", "ordered");
+    const steadyPublisher = sender.track(steadySpec);
+    const cyclingPublisher = sender.track(cyclingSpec);
+    steadyIterator = receiver.remote
+      .participant("web-sender")
+      .track(steadySpec)
+      .events();
+    await warmOrdered(steadyPublisher, steadyIterator, 0, "reuse-steady");
+    await steadyPublisher.send(Uint8Array.of(1));
+    await receiveValue(steadyIterator, 1);
+    const steadyChannels = payloadChannels.filter(
+      ({ channel }) => channel.readyState === "open",
+    );
+    assert(
+      steadyChannels.length === 2,
+      "one continuing data route on the two peers",
+    );
+    let retiredPayload;
+    for (let lifetime = 0; lifetime < 3; lifetime++) {
+      cyclingIterator = receiver.remote
+        .participant("web-sender")
+        .track(cyclingSpec)
+        .events();
+      // Earlier retained values on a fresh subscription are legitimate replay.
+      await warmOrdered(
+        cyclingPublisher,
+        cyclingIterator,
+        lifetime * 2,
+        "reuse-cycle",
+      );
+      await cyclingPublisher.send(Uint8Array.of(lifetime * 2 + 1));
+      await receiveValue(cyclingIterator, lifetime * 2 + 1);
+      const live = payloadChannels.filter(
+        ({ channel }) => channel.readyState === "open",
+      );
+      assert(live.length === 4, "only two live payload channels per peer");
+      if (retiredPayload) {
+        const replacement = live.filter(
+          ({ peer, channel }) =>
+            peer === retiredPayload.peer &&
+            channel.id === retiredPayload.channel.id,
+        );
+        assert(
+          replacement.length === 1 &&
+            replacement[0].channel !== retiredPayload.channel,
+          "same SID has a fresh real browser channel object",
+        );
+        assert(
+          retiredPayload.peer.sctp === retiredPayload.association &&
+            retiredPayload.association.state === "connected",
+          "reuse keeps the original connected SCTP association",
+        );
+      }
+      await cyclingIterator.return();
+      await until(
+        () =>
+          live.filter(({ channel }) => channel.readyState === "closed")
+            .length === 1,
+        "authoritative subscription cutoff and real browser close",
+      );
+      const ended = live.find(({ channel }) => channel.readyState === "closed");
+      retiredPayload = { ...ended, association: ended.peer.sctp };
+      await until(
+        () =>
+          ended.channel.onmessage === null &&
+          ended.channel.onopen === null &&
+          ended.channel.onclose === null,
+        "retired browser callbacks detached",
+      );
+      assert(
+        live
+          .filter(({ channel }) => channel !== ended.channel)
+          .every(({ channel }) => channel.readyState === "open"),
+        "unrelated real payload channels survive retirement",
+      );
+      assert(
+        steadyChannels.every(({ channel }) => channel.readyState === "open"),
+        "continuing ordered bindings are not replaced",
+      );
+      assert(
+        sender.getSnapshot().generation === senderGeneration &&
+          receiver.getSnapshot().generation === receiverGeneration,
+        "payload reuse does not reconnect either peer",
+      );
+      await steadyPublisher.send(Uint8Array.of(lifetime + 2));
+      await receiveValue(steadyIterator, lifetime + 2);
+    }
+    await steadyIterator.return();
     await until(
       () =>
         receiver
@@ -483,6 +669,12 @@
           rtpSender.track.readyState === "live",
       );
     assert(allocatedSender?.track, "connected publication has a native sender");
+    const publishingPeer = [...peers].find((peer) =>
+      peer.getSenders().includes(allocatedSender),
+    );
+    const previousVideoTransceiver = fixedPeer
+      .getTransceivers()
+      .find((transceiver) => transceiver.receiver.track === current);
     const previousOwnedTrack = allocatedSender.track;
     let pendingTrack;
     MediaStreamTrack.prototype.clone = function () {
@@ -553,6 +745,92 @@
       "fresh owner installs its capture after the stale native completion",
     );
     MediaStreamTrack.prototype.clone = originalClone;
+    const previousAudio = receiver
+      .getSnapshot()
+      .catalog.publications.find((publication) => publication.kind === "audio");
+    const previousAudioTrack =
+      receiver.getSnapshot().tracks[previousAudio.id].media;
+    const previousAudioTransceiver = fixedPeer
+      .getTransceivers()
+      .find((transceiver) => transceiver.receiver.track === previousAudioTrack);
+    await audioPublication.close();
+    await until(
+      () =>
+        !receiver
+          .getSnapshot()
+          .catalog.publications.some(
+            (publication) => publication.id === previousAudio.id,
+          ) &&
+        previousAudioTrack.readyState === "ended" &&
+        previousAudioTransceiver.mid === null &&
+        outputRoutes.size === 0,
+      "retired audio source ends its receiver and owned playback route",
+    );
+    audioPublication = attachLocalTrack(sender.track(track.audio("voice")), {
+      source: createCaptureSource(audioTrack, "audio"),
+    });
+    await audioPublication.ready;
+    await until(() => {
+      const snapshot = receiver.getSnapshot();
+      const fresh = (kind, oldId) => {
+        const publication = snapshot.catalog.publications.find(
+          (publication) =>
+            publication.kind === kind && publication.id !== oldId,
+        );
+        return (
+          publication &&
+          snapshot.tracks[publication.id]?.media.readyState === "live"
+        );
+      };
+      return fresh("video", publication.id) && fresh("audio", previousAudio.id);
+    }, "both re-added named publications have fresh actual receivers");
+    const readded = receiver.getSnapshot();
+    const freshVideo = readded.catalog.publications.find(
+      (publication) => publication.kind === "video",
+    );
+    const freshAudio = readded.catalog.publications.find(
+      (publication) => publication.kind === "audio",
+    );
+    const freshVideoTrack = readded.tracks[freshVideo.id].media;
+    const freshAudioTrack = readded.tracks[freshAudio.id].media;
+    assert(
+      freshVideoTrack !== current &&
+        freshAudioTrack !== previousAudioTrack &&
+        peerForTrack(freshVideoTrack) === fixedPeer &&
+        peerForTrack(freshAudioTrack) === fixedPeer &&
+        [...peers].find((peer) =>
+          peer.getSenders().some((sender) => sender.track === handoffClones[1]),
+        ) === publishingPeer &&
+        peers.size === 2 &&
+        sender.getSnapshot().generation === senderGeneration &&
+        receiver.getSnapshot().generation === receiverGeneration,
+      "publication churn creates fresh source-bound objects on the same two actual peers",
+    );
+    const freshReceiver = fixedPeer
+      .getReceivers()
+      .find((receiver) => receiver.track === freshVideoTrack);
+    const freshFrames = await decoded(freshReceiver);
+    await until(
+      async () =>
+        (await decoded(freshReceiver)) > freshFrames + 1 &&
+        audible() &&
+        video.srcObject?.getVideoTracks()[0] === freshVideoTrack &&
+        video.videoWidth > 0 &&
+        !video.paused,
+      "re-added sources deliver fresh decoded/renderable video and real decoded tone",
+    );
+    const freshRtp = await packetEvidence(fixedPeer, freshReceiver);
+    assert(
+      freshRtp.relay === defaultRtp.relay &&
+        freshRtp.ssrc !== defaultRtp.ssrc &&
+        current.readyState === "ended" &&
+        previousVideoTransceiver.mid === null &&
+        previousAudioTrack.readyState === "ended" &&
+        previousAudioTransceiver.mid === null &&
+        video.srcObject.getVideoTracks()[0] !== current &&
+        outputRoutes.size === 1,
+      "old source observations remain terminal while replacement media flows",
+    );
     for (const observedPeer of peers) {
       const offers = localOffers.get(observedPeer);
       const initial = offers?.[0];
@@ -601,6 +879,8 @@
     );
     return true;
   } finally {
+    void steadyIterator?.return();
+    void cyclingIterator?.return();
     attachment?.close();
     void videoPublication?.close();
     void audioPublication?.close();
@@ -616,6 +896,8 @@
     audioTrack.stop();
     await source.close();
     console.warn = originalWarn;
+    console.debug = originalDebug;
+    RTCPeerConnection.prototype.getStats = originalGetStats;
     RTCPeerConnection.prototype.createDataChannel = originalCreateDataChannel;
     RTCPeerConnection.prototype.addTransceiver = originalAddTransceiver;
     RTCPeerConnection.prototype.setRemoteDescription =
