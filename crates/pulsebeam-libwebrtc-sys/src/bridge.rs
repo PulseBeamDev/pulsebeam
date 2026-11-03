@@ -9129,6 +9129,11 @@ pub(super) mod ffi {
             enabled: &mut bool,
         ) -> bool;
         fn rtp_transceiver_mid(transceiver: &NativeRtpTransceiver, mid: &mut String) -> bool;
+        fn peer_rtp_transceiver_applied_local_cname(
+            peer: &NativePeerConnection,
+            transceiver: &NativeRtpTransceiver,
+            cname: &mut Vec<u8>,
+        ) -> bool;
         fn rtp_transceiver_set_video_codec_preferences(
             transceiver: &NativeRtpTransceiver,
             factory: &NativePeerConnectionFactory,

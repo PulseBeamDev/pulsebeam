@@ -13,16 +13,17 @@
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    Connection, ConnectionConfig, ConnectionEntropy, ConnectionLimits, DataChannelEvent,
-    DataChannelId, DataMessage, Event as ConnectionEvent, LocalCandidate, MediaPayloadBitrate,
-    NetworkInput, Output as ConnectionOutput, RejectedRtp, RtpPacket, RtpWrite, SdpOffer,
-    TransmitTarget, WriteError,
+    Connection, ConnectionConfig, ConnectionEntropy, ConnectionLimits, DataChannelConfig,
+    DataChannelEvent, DataChannelId, DataChannelPriority, DataMessage, DataReliability,
+    Event as ConnectionEvent, LocalCandidate, MediaPayloadBitrate, NetworkInput,
+    Output as ConnectionOutput, RejectedRtp, RtpPacket, RtpWrite, SdpOffer, TransmitTarget,
+    WriteError,
 };
 use pulsebeam_rtc_simulation::*;
 
@@ -65,9 +66,6 @@ pub struct PeerFixture<M = MediaFixture> {
     drop_source_after: Option<usize>,
     lost_source: Option<(u32, u16, u8)>,
     pub source_repair_packets: usize,
-    pub publisher_reports: usize,
-    pub publisher_nacks: usize,
-    pub publisher_feedback: usize,
     pub receiver_report: Option<pulsebeam_rtc::ReceiverReport>,
     network: DeterministicNetwork,
     native_target: Option<fn(&Connection) -> Duration>,
@@ -316,7 +314,11 @@ impl PeerFixture<()> {
         let mut fixture = Self::build(
             FixtureTransport::Udp,
             None,
-            true,
+            Some(DataChannelConfiguration {
+                negotiated: true,
+                id: Some(0),
+                ..DataChannelConfiguration::default()
+            }),
             0,
             MediaKind::Audio,
             PeerFixture::default_start(),
@@ -440,7 +442,7 @@ impl PeerFixture {
         let mut fixture = Self::build(
             FixtureTransport::Udp,
             None,
-            false,
+            None,
             1,
             MediaKind::VideoDd,
             Self::default_start(),
@@ -543,7 +545,7 @@ impl PeerFixture {
         Self::build(
             transport,
             limits,
-            datachannels,
+            datachannels.then(DataChannelConfiguration::default),
             sender_count,
             media,
             start,
@@ -561,14 +563,14 @@ impl<M> PeerFixture<M> {
     fn build(
         transport: FixtureTransport,
         limits: Option<ConnectionLimits>,
-        datachannels: bool,
+        datachannels: Option<DataChannelConfiguration>,
         sender_count: usize,
         media: MediaKind,
         start: Instant,
         media_state: impl FnOnce(&[pulsebeam_rtc::SenderInfo]) -> M,
     ) -> Self {
         assert!(sender_count <= 128);
-        assert!(sender_count != 0 || datachannels);
+        assert!(sender_count != 0 || datachannels.is_some());
         let world = SimulationWorld::acquire();
         world.bind_clock(start);
         let network = world
@@ -621,7 +623,7 @@ impl<M> PeerFixture<M> {
             .expect("controlled native factory");
         let peer = factory
             .create_peer_connection(PeerConfiguration {
-                always_negotiate_data_channels: datachannels,
+                always_negotiate_data_channels: datachannels.is_some(),
                 ..PeerConfiguration::default()
             })
             .expect("controlled native peer");
@@ -712,8 +714,8 @@ impl<M> PeerFixture<M> {
             };
             transceivers.push(transceiver);
         }
-        let peer_channel = datachannels.then(|| {
-            peer.create_data_channel("peer-opened", DataChannelConfiguration::default())
+        let peer_channel = datachannels.as_ref().map(|config| {
+            peer.create_data_channel("peer-opened", config.clone())
                 .expect("native DataChannel")
         });
         let offer = complete_operation(
@@ -766,7 +768,7 @@ impl<M> PeerFixture<M> {
             config.limits = limits;
         }
         let now = world.monotonic_now();
-        let accepted = Connection::accept(
+        let mut accepted = Connection::accept(
             config,
             SdpOffer::new(offer.sdp),
             now,
@@ -774,6 +776,28 @@ impl<M> PeerFixture<M> {
             ConnectionEntropy::new([11; 32]),
         )
         .expect("RTC accepts actual native offer");
+        if let Some(config) = datachannels.filter(|config| config.negotiated) {
+            assert_eq!(config.id, Some(0));
+            assert!(config.ordered);
+            assert_eq!(config.max_retransmits, None);
+            assert_eq!(config.max_retransmit_time_ms, None);
+            assert_eq!(accepted.connection.data_channel_capacity(), None);
+            accepted
+                .connection
+                .open_data_channel(
+                    now,
+                    DataChannelConfig {
+                        id: Some(DataChannelId::from_value(0)),
+                        label: Arc::from("peer-opened"),
+                        protocol: Arc::from(""),
+                        ordered: true,
+                        reliability: DataReliability::Reliable,
+                        priority: DataChannelPriority::MEDIUM,
+                        negotiated: true,
+                    },
+                )
+                .expect("reserve negotiated channel zero before transport readiness");
+        }
         let senders = accepted
             .session
             .senders
@@ -879,9 +903,6 @@ impl<M> PeerFixture<M> {
             drop_source_after: None,
             lost_source: None,
             source_repair_packets: 0,
-            publisher_reports: 0,
-            publisher_nacks: 0,
-            publisher_feedback: 0,
             receiver_report: None,
             network: DeterministicNetwork::default(),
             native_target: None,
@@ -1030,6 +1051,30 @@ impl<M> PeerFixture<M> {
         (ssrc, sequence)
     }
 
+    pub fn publisher_stats(&self) -> RtcStatsReport {
+        let sender = self
+            .peer
+            .video_senders()
+            .expect("native publisher senders")
+            .into_iter()
+            .next()
+            .expect("native video publisher");
+        let request = self
+            .peer
+            .request_sender_stats(&sender)
+            .expect("native publisher stats request");
+        for _ in 0..2_000 {
+            self.world.pump();
+            while let Some(event) = self.peer.try_next_event() {
+                if let PeerConnectionEvent::Stats(snapshot) = event {
+                    assert_eq!(snapshot.operation_id, request);
+                    return snapshot.report;
+                }
+            }
+        }
+        panic!("native publisher stats stalled");
+    }
+
     pub fn receive_source_sequence(&mut self, sequence: u16) -> RtpPacket {
         for _ in 0..2_000 {
             if let Some(PeerEvent::Inbound(packet)) = self.step()
@@ -1039,10 +1084,8 @@ impl<M> PeerFixture<M> {
             }
         }
         panic!(
-            "source sequence {sequence} was not recovered: nacks={}, rtx={}, reports={}, elapsed={:?}, stats={:?}",
-            self.publisher_nacks,
+            "source sequence {sequence} was not recovered: rtx={}, elapsed={:?}, stats={:?}",
             self.source_repair_packets,
-            self.publisher_reports,
             self.now.duration_since(self.start),
             self.connection.stats()
         );
@@ -1379,18 +1422,6 @@ impl<M> PeerFixture<M> {
                     queue_sample,
                     ..
                 } => {
-                    if payload.first().is_some_and(|byte| byte >> 6 == 2) {
-                        if payload.get(1) == Some(&201) {
-                            self.publisher_reports += 1;
-                        }
-                        if payload.get(1) == Some(&205) {
-                            match payload[0] & 31 {
-                                1 => self.publisher_nacks += 1,
-                                11 | 15 => self.publisher_feedback += 1,
-                                _ => {}
-                            }
-                        }
-                    }
                     if self.network.bottleneck_bps.is_some() {
                         self.network.delivered_bytes =
                             self.network.delivered_bytes.saturating_add(rtp_bytes);

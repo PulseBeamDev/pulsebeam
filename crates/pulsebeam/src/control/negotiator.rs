@@ -117,10 +117,6 @@ impl Negotiator {
             ConnectionConfig {
                 local_candidates: self.candidates.clone(),
                 local_ice_credentials: Some(credentials),
-                limits: pulsebeam_rtc::ConnectionLimits {
-                    max_unsignaled_encodings: 128,
-                    ..Default::default()
-                },
                 ..Default::default()
             },
             pulsebeam_rtc::SdpOffer::new(offer),

@@ -1,0 +1,700 @@
+syntax = "proto3";
+
+package pulsebeam.media.v1;
+
+// Native signaling: complete desired/confirmed values for one resource map.
+//
+// Channel 0 is negotiated, reliable, ordered and scoped by its authenticated
+// PeerConnection. Each binary message is one framed StateBatch in either
+// direction. Payload channels start at 1. No additional connection identity,
+// Start/Ready exchange, server sequence or application retransmission exists.
+//
+// Frame: u8 encoding + u32_le decoded_length + raw protobuf / independent LZ4.
+// Decoded size 1..4096, complete frame <=4101, at most 16 records per batch.
+// The SDK stages desire separately from its authoritative confirmed mirror.
+// Read-only observations are never writable drift-correction targets.
+//
+// uint64 values remain exact (JavaScript bigint). optional preserves required
+// presence and meaningful zero/false. Required variants/enums must be recognized.
+// Unknown descriptive fields may be skipped within bounds; mandatory behavior
+// cannot be introduced through ignored fields. Application payloads are separate.
+
+
+// ============================================================================
+// 1. Bounded resource batches — the same encoding in both directions
+// ============================================================================
+
+// Complete values applied individually in reliable stream order, not a map-wide
+// transaction. Send promptly; coalesce unsent updates by key. No batch ACK/cursor.
+message StateBatch {
+  // 1..16 records, or zero only for the server's initial_complete marker.
+  // Entire decoded batch also must fit 4096 bytes. Exactly one direction of
+  // state is allowed: client desired records or server confirmed records.
+  repeated StateRecord records = 1;
+
+  // Server-only, true exactly once after every initially visible key has been
+  // represented by a current value/absence. Apply records before observing it.
+  // Later changes continue normally; this is enumeration completeness, not an
+  // atomic snapshot, catch-up barrier, acknowledgment or application convergence.
+  // Client always sends false/omitted; empty ordinary batches are invalid.
+  bool initial_complete = 2;
+}
+
+// Keys are connection-scoped typed identities, never generic writable paths.
+// A record's payload must match its key kind; IDs are opaque, not credentials.
+message ResourceKey {
+  oneof key {
+    // Nonzero connection-local ref, shared by publication/subscription.
+    // This is not a canonical PulseBeam entity ID.
+    // Ref equals the client proposal revision of its first present proposal.
+    // Later proposals retain this ref; no second allocation counter or reuse.
+    uint64 owned = 1;
+
+    // Nonempty opaque canonical string, <=128 UTF-8 bytes; matches participant_id.
+    string participant = 2;
+
+    // Nonempty opaque canonical string, <=128 UTF-8 bytes; matches track_id.
+    string track = 3;
+
+    // Must be true. Selects the single read-only SessionState record.
+    bool session = 4;
+  }
+}
+
+// Shared record envelope. Current value replaces the previous value of its key.
+// Never infer a desired deletion from an omitted key or initial_complete marker.
+message StateRecord {
+  // Required known key. Read-only keys cannot appear in client proposals.
+  ResourceKey key = 1;
+
+  // Exactly one. Client may send desired only; server confirmed only.
+  oneof state {
+    DesiredState desired = 2;
+    ConfirmedState confirmed = 3;
+  }
+}
+
+// Latest application target for one owned lifetime, not a queued command.
+// A newer received proposal can supersede an older uncommitted preparation.
+message DesiredState {
+  // Nonzero; strictly increases across all serialized client proposals. Gaps
+  // are valid. Allocate after coalescing; never reuse/wrap. The server echoes
+  // evaluation of this target. It is independent of batch position/size.
+  uint64 revision = 1;
+
+  oneof value {
+    // Complete spec. owned ref == revision declares a new lifetime. An older
+    // live/pending ref updates after immutable equality checks. An absent older
+    // ref rejects RESOURCE_GONE; a ref above revision is a protocol error.
+    ResourceSpec present = 2;
+
+    // Must be true with owned ref < revision. Permanent retirement; an absent
+    // older ref is already satisfied. Never send present after sending absence
+    // for that ref. Unsent staged creation can be canceled entirely locally.
+    bool absent = 3;
+  }
+}
+
+// Complete authoritative current value. No preceding Result/event is needed.
+// Spontaneous observations preserve the last evaluation and its rejection.
+message ConfirmedState {
+  // For owned keys: latest evaluated desired revision, not merely received.
+  // May skip superseded targets; never regresses while the lifetime is live.
+  // Nonzero for a live owned resource. Terminal absence may carry zero when
+  // initial creation was canceled before evaluation. Read-only keys require 0.
+  uint64 evaluated_revision = 1;
+
+  // Present iff the evaluated client target rejected. Accepted spec remains
+  // independently authoritative. Read-only keys forbid this field.
+  // A spontaneous execution failure uses LiveResource.execution_failure instead.
+  Failure rejection = 2;
+
+  // Exactly one complete value, matching ResourceKey. Absence is idempotent;
+  // after applying terminal owned absence, do not resurrect that owned ref.
+  oneof value {
+    LiveResource owned = 3;
+    AbsentState absent = 4;
+    SessionState session = 5;
+    Participant participant = 6;
+    Track track = 7;
+  }
+}
+
+// Current absence. Its historical cause need not be retained after sending.
+// For owned keys, absence terminates every pending proposal for this lifetime.
+// Session absence is forbidden: terminate the connection instead.
+message AbsentState {
+  // Known cause. Read-only removal uses REMOVED; a forgotten cause uses GONE.
+  AbsenceReason reason = 1;
+}
+
+enum AbsenceReason {
+  ABSENCE_REASON_UNSPECIFIED = 0; // Invalid in a confirmed absence.
+  REMOVED = 1;                   // Desired retirement or read-only withdrawal.
+  CREATE_REJECTED = 2;           // No accepted lifetime; rejection required.
+  SOURCE_ENDED = 3;              // Exact source permanently retired.
+  PERMISSION_REVOKED = 4;        // Rights fenced before reporting absence.
+  GONE = 5;                     // Already absent; no historical cause retained.
+}
+
+
+// ============================================================================
+// 2. Read-only resources — ordinary members of the same mirrored map
+// ============================================================================
+
+// Server-owned singleton. Bootstrap supplies canonical self identity; this
+// record carries the current grant and optional terminal session state. Queue
+// its initial value as ordinary urgent work; do not wait for discovery to finish.
+message SessionState {
+  // Required current grant observation, including on terminal records.
+  // HTTP owns credential validation/replacement; no token is mirrored here.
+  Authorization authorization = 1;
+
+  // Absent while live. Present known reason makes this connection terminal.
+  // Owner fences before publishing; delivery is best effort. If output cannot
+  // progress, transport closes without requiring this final record to arrive.
+  optional CloseReason closed = 2;
+
+  // Optional non-secret text <=256 UTF-8 bytes; only with closed present.
+  string diagnostic = 3;
+}
+
+message Authorization {
+  // Current server grant deadline, Unix seconds. Local clocks cannot extend it.
+  int64 expires_at_unix_seconds = 1;
+
+  // Nonzero monotonic HTTP grant revision, initially 1; ETag is auth-N.
+  // Authority is enforced at owner commit/cutoff, before notification delivery.
+  uint64 revision = 2;
+}
+
+// Immutable participant descriptor during its canonical identity lifetime.
+message Participant {
+  // Nonempty opaque canonical string, <=128 UTF-8 bytes; equal to its map key.
+  string participant_id = 1;
+
+  // Nonempty exact-case UTF-8, <=256 bytes. No normalization or case folding.
+  string participant_external_id = 2;
+}
+
+// Immutable publication descriptor. Visibility is observation, not authorization.
+// Also embedded in LiveResource so binding correctness never awaits other keys.
+message Track {
+  // Nonempty opaque canonical string, <=128 UTF-8 bytes, assigned by the server
+  // identity implementation for one publication lifetime. SDK never derives it.
+  string track_id = 1;
+
+  // Opaque canonical owner string, <=128 UTF-8 bytes. Discovery is independent.
+  string participant_id = 2;
+
+  // Nonempty literal label, <=256 UTF-8 bytes; not a transport routing authority.
+  string label = 3;
+
+  oneof kind {
+    AudioTrack audio = 4;
+    VideoTrack video = 5;
+    DataTrack data = 6;
+  }
+}
+
+message AudioTrack {
+  // Required admitted audio codec envelope; excludes publisher demux coordinates.
+  CodecFormat format = 1;
+}
+
+message VideoTrack {
+  // Required admitted video codec envelope; excludes publisher demux coordinates.
+  CodecFormat format = 1;
+}
+
+message DataTrack {
+  // Required transport delivery mode. No application message format is implied.
+  DataDelivery delivery = 1;
+}
+
+enum DataDelivery {
+  DATA_DELIVERY_UNSPECIFIED = 0; // Invalid in an admitted data track.
+  LATEST = 1;                   // Unordered, maxRetransmits=0 transport binding.
+  LOSSY = 2;                    // Unordered, maxRetransmits=0 transport binding.
+  ORDERED = 3;                  // Ordered transport, no retransmission limit.
+}
+
+enum TrackKind {
+  TRACK_KIND_UNSPECIFIED = 0; // Invalid in a subscription declaration.
+  AUDIO = 1;
+  VIDEO = 2;
+  DATA = 3;
+}
+
+
+// ============================================================================
+// 3. Writable specs — immutable declarations plus full mutable settings
+// ============================================================================
+
+// Full client-owned value. Accepted copies use this exact typed representation.
+message ResourceSpec {
+  // Required complete mutable block; omitted options reset documented defaults.
+  ResourceSettings settings = 1;
+
+  // Exactly one immutable declaration, fixed by the first proposal, including
+  // while preparation is pending. Changing it requires a new lifetime.
+  oneof declaration {
+    PublicationSpec publication = 2;
+    SubscriptionSpec subscription = 3;
+  }
+}
+
+// Publication/data-subscription settings contain no receive variant.
+// Audio/video subscriptions require their matching variant, even when empty.
+message ResourceSettings {
+  // Presence REQUIRED, including false. Pause does not retire the resource.
+  optional bool enabled = 1;
+
+  oneof receive {
+    AudioReceiveOptions audio = 2;
+    VideoReceiveOptions video = 3;
+  }
+}
+
+// Immutable publication declaration; the server assigns TrackId on admission.
+// At most one live/pending publication per connection/(kind, label).
+message PublicationSpec {
+  // Nonempty literal UTF-8, <=256 bytes.
+  string label = 1;
+
+  oneof kind {
+    AudioPublication audio = 2;
+    VideoPublication video = 3;
+    DataPublication data = 4;
+  }
+}
+
+message AudioPublication {
+  // Required actual prepared RTP binding, audio codec only.
+  TrackBinding binding = 1;
+}
+
+message VideoPublication {
+  // Required actual prepared RTP binding, video codec only.
+  TrackBinding binding = 1;
+}
+
+// Transport declaration only. Application payload protocols are independent.
+message DataPublication {
+  // Known nonzero mode; the prepared channel properties must agree.
+  DataDelivery delivery = 1;
+
+  // Required prepared SCTP payload channel, never a reserved control ID.
+  TrackBinding binding = 2;
+}
+
+// Exact source and independently prepared receiver binding for one lifetime.
+message SubscriptionSpec {
+  // Nonempty opaque canonical TrackId string, <=128 UTF-8 bytes. Owner
+  // revalidates source eligibility/authority; SDK never parses its encoding.
+  string track_id = 1;
+
+  // Required expected kind, matching the exact source.
+  TrackKind kind = 2;
+
+  // Required receiving RTP/SCTP facts. Never copy publisher demux coordinates.
+  TrackBinding binding = 3;
+}
+
+
+// ============================================================================
+// 4. Owned confirmed state — sufficient even after intermediate coalescing
+// ============================================================================
+
+// Complete accepted configuration, identity and current observations.
+// Whole enclosing record/frame, including worst-case bounded failures, must fit
+// the raw size ceiling. Reserve this representability before admitting creation.
+message LiveResource {
+  // Required accepted writable spec; never the application's newer unsent desire.
+  ResourceSpec spec = 1;
+
+  // Required canonical source owner. Self for a publication; source for receive.
+  Participant participant = 2;
+
+  // Required exact publication/source metadata. Owner ID must match participant.
+  // This embedded copy does not insert/update the standalone discovery record.
+  Track track = 3;
+
+  // Required known current execution of the accepted spec.
+  ExecutionStatus execution = 4;
+
+  // Required only for FAILED; absent in all other statuses. Not target rejection.
+  Failure execution_failure = 5;
+
+  // Required ACTIVE/IDLE for audio/video publications, absent for other kinds.
+  optional MediaActivity activity = 6;
+}
+
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNSPECIFIED = 0; // Invalid for a live resource.
+  DISABLED = 1;                    // Accepted enabled=false; execution gated.
+  WAITING_FOR_SOURCE = 2;          // Enabled receive; exact route unavailable.
+  INSTALLED = 3;                   // Enabled admitted plan; no payload guarantee.
+  FAILED = 4;                      // Requires execution_failure; gates closed.
+}
+
+enum MediaActivity {
+  MEDIA_ACTIVITY_UNSPECIFIED = 0; // Invalid when activity is present.
+  ACTIVE = 1;                    // Current authorized demand requires source work.
+  IDLE = 2;                      // No such demand; identity remains present.
+}
+
+
+// ============================================================================
+// 5. Receive options — full replacement with explicit defaults
+// ============================================================================
+
+// Mutable audio subscription policy; an empty message requests defaults.
+message AudioReceiveOptions {
+  // Absent resets to runtime-default buffering; present supplies explicit bounds.
+  PlayoutDelay playout_delay = 1;
+}
+
+// Receiver buffering policy in milliseconds: 0<=min<=max<=4095. [0,0] requests minimum available buffering, not zero end-to-end
+// latency. Invalid values reject; they MUST NOT be clamped into acceptance.
+//
+// RTP extension encoding uses floor(min/10) and ceil(max/10) in 10-ms units.
+// Keep application intent in milliseconds. Unsupported feature rejects
+// UNSUPPORTED; inability to apply/reset supported bounds rejects INCOMPATIBLE.
+message PlayoutDelay {
+  // Inclusive requested minimum buffering; omitted scalar defaults to zero.
+  uint32 min_ms = 1;
+
+  // Inclusive requested maximum, >=min_ms; omitted scalar defaults to zero.
+  uint32 max_ms = 2;
+}
+
+// Mutable video subscription policy; omission restores each documented default.
+// These preferences do not confer admission, reserve bandwidth or request transcoding.
+// Present values MUST be positive and within the documented limits. When both heights
+// are present, min_height<=max_height. Omission resets each field independently.
+//
+// Per receiving connection, preserve admitted audio's budget first, then allocate
+// video bandwidth by weighted max-min fairness with priority as weight. Prefer
+// layers meeting both floors when budget permits. A floor never overrides the
+// ceiling or available budget. Only identical effective options may share a wire
+// subscription; logical SDK consumers retain independent local gates/queues.
+message VideoReceiveOptions {
+  // Hard layer-height ceiling in physical pixels, <=16384. Absent means no ceiling. If no layer fits, withhold video while
+  // retaining the installed subscription; never send a higher layer to meet a floor.
+  optional uint32 max_height = 1;
+
+  // Best-effort height floor, <=16384. Absent means no spatial floor.
+  optional uint32 min_height = 2;
+
+  // Best-effort frame-rate floor, <=240. Absent means
+  // no temporal floor; this field is independent of min_height.
+  optional uint32 min_fps = 3;
+
+  // Contention weight, 1..255; absent defaults to 1.
+  // Does not create subscriptions or evict another resource owner.
+  optional uint32 priority = 4;
+  // Absent restores default buffering; present requests explicit bounds.
+  PlayoutDelay playout_delay = 5;
+}
+
+
+// ============================================================================
+// 6. Prepared transport facts — immutable for the resource lifetime
+// ============================================================================
+
+// Actual prepared local transport coordinates within the established SDP.
+// Preparation grants no rights. Continuing resources preserve physical identity,
+// packet indices, replay state and RTCP attribution. Terminal replacements use
+// fresh RTP identities or reset-gated SCTP channels, never source relabeling.
+message TrackBinding {
+  // Exactly one transport: RTP for audio/video, SCTP for data.
+  oneof transport {
+    RtpParameters rtp = 1;
+    SctpParameters sctp = 2;
+  }
+}
+
+// One client-allocated negotiated payload channel, independent of DTLS role.
+// Reuse requires completed protocol reset at both endpoints and fencing of old
+// messages/channel callbacks. Close notification or confirmed absence alone is
+// not a reset barrier. Actual association capacity must be known first.
+message SctpParameters {
+  // Presence REQUIRED; 1..65534 and below the actual usable association ceiling.
+  // Channel reliability/ordering MUST agree with the immutable DataDelivery.
+  optional uint32 stream_id = 1;
+}
+
+// Complete RTP facts for one local sender/receiver. These are not discovery IDs or
+// guesses copied from a remote publisher. Unsupported or unrepresentable facts
+// reject before partial installation; older authorized acceptance remains intact.
+message RtpParameters {
+  // Nonempty actual prepared MID, <=32 UTF-8 bytes. Reserve in the
+  // connection/direction scope. Recycle an m-line only after stopping the old
+  // transceiver and applying port-zero rejection, with a fresh MID/receiver.
+  string mid = 1;
+
+  // REQUIRED primary codec plus optional associated RTX and feedback.
+  RtpCodecParameters codec = 2;
+
+  // <=16; types and IDs each unique. Baseline
+  // RTP requires MID and TRANSPORT_CC_DRAFT_01 mappings. Declared features need
+  // capability and actual prepared support; omission invents neither.
+  repeated RtpHeaderExtensionParameters header_extensions = 3;
+
+  // Publication: 1..4 encodings. Subscription: exactly one.
+  // Every primary/repair SSRC is unique across the connection/direction scope.
+  repeated RtpEncodingParameters encodings = 4;
+
+  // REQUIRED actual RTCP mode/CNAME; cannot infer preparation from omission.
+  RtcpParameters rtcp = 5;
+}
+
+// One selected primary codec and optional associated repair payload type.
+// PT-to-format mappings MUST be consistent within an RTP session/direction.
+message RtpCodecParameters {
+  // Presence REQUIRED. 0..127 except 64..95; zero is a value, not omission.
+  optional uint32 payload_type = 1;
+
+  // Absent means no RTX. If present: valid distinct PT, advertised RTX support,
+  // and a distinct rtx_ssrc on every encoding are required.
+  optional uint32 rtx_payload_type = 2;
+
+  // <=4 unique known entries supported by this format/preparation. Baseline
+  // RTP requires TRANSPORT_CC; feedback MUST target only the admitted source.
+  repeated RtcpFeedback feedback = 3;
+
+  // REQUIRED typed primary format; replaces MIME/FMTP strings and codec registries.
+  CodecFormat format = 4;
+}
+
+
+// ============================================================================
+// 7. Codec formats and capabilities — typed, directional compatibility
+// ============================================================================
+
+// Self-contained codec envelope. A subscription intersects source format, HTTP
+// capabilities, and local decoder support; compatibility is not byte equality.
+// No transcoding or hidden codec registry is implied. Missing discovery format
+// is invalid; a present format without a recognized variant is unreceivable.
+// Desired bindings require a recognized supported format; never guess behavior.
+message CodecFormat {
+  // Exactly one codec; Opus is audio, H.264/VP8/VP9 are video.
+  oneof codec {
+    OpusParameters opus = 1;
+    H264Parameters h264 = 2;
+    Vp8Parameters vp8 = 3;
+    Vp9Parameters vp9 = 4;
+  }
+}
+
+// Required HTTP bootstrap rtp_capabilities, even for a data-only connection.
+// Encoded as ProtoJSON with snake_case field names and enum names. Describes this
+// connection's supported transport envelope in both directions, not room formats
+// or authorization. SDP and capabilities MUST agree; local preparation is still
+// required. Unsupported optional future capabilities may be filtered.
+message RtpCapabilities {
+  // <=32 unique codec entries. Disabled audio/video may have no matching entries.
+  repeated RtpCodecCapability codecs = 1;
+
+  // <=16 unique known extension types available for actual preparation.
+  repeated RtpHeaderExtensionType header_extensions = 2;
+
+  // <=2 unique known modes. Every prepared binding MUST select an advertised mode.
+  repeated RtcpMode rtcp_modes = 3;
+}
+
+// One supported format envelope and its admissible optional features.
+message RtpCodecCapability {
+  // Required format with resolved parameters where the codec requires them.
+  CodecFormat format = 1;
+
+  // <=4 unique known codec-appropriate feedback entries.
+  repeated RtcpFeedback feedback = 2;
+
+  // True permits associated RTX when actually prepared; false grants no RTX.
+  bool rtx_supported = 3;
+
+  // <=3 unique known modes; only these may be selected on an encoding.
+  repeated RtpScalabilityMode scalability_modes = 4;
+}
+
+// RTCP choices reflected by RtcpParameters.reduced_size.
+enum RtcpMode {
+  RTCP_MODE_UNSPECIFIED = 0; // Never advertised or selected.
+  RTCP_MODE_COMPOUND = 1;    // reduced_size=false.
+  RTCP_MODE_REDUCED_SIZE = 2; // reduced_size=true, subject to RFC 5506.
+}
+
+// Opus: fixed RTP clock 48000 and RTP channel declaration 2; mono application
+// audio remains valid. Optional booleans retain explicit false; omission uses
+// codec defaults. Apply RFC 7587 sections 6-7 directional receive limits/sender
+// hints, not whole-record equality. Unsupported declared constraints reject.
+message OpusParameters {
+  // FMTP stereo receive preference; absent uses the codec default.
+  optional bool stereo = 1;
+
+  // FMTP sprop-stereo source hint; distinct from the receiver's stereo preference.
+  optional bool source_stereo = 2;
+
+  // FMTP useinbandfec preference; explicit false remains present.
+  optional bool in_band_fec = 3;
+
+  // FMTP usedtx preference; omission is distinct from explicitly disabling it.
+  optional bool dtx = 4;
+
+  // FMTP cbr preference; does not promise an exact network bitrate.
+  optional bool constant_bitrate = 5;
+
+  // FMTP maxaveragebitrate, 6000..510000 bits/second when present.
+  optional uint32 max_average_bitrate_bps = 6;
+
+  // FMTP maxplaybackrate, 8000..48000 Hz when present.
+  optional uint32 max_playback_rate_hz = 7;
+
+  // FMTP sprop-maxcapturerate, 8000..48000 Hz when present.
+  optional uint32 max_capture_rate_hz = 8;
+
+  // Deployed minptime hint, 3..120 ms when supported; absent means no declared
+  // hint. Not an RFC 7587 codec-identity parameter.
+  optional uint32 min_packet_time_ms = 9;
+}
+
+// H.264: fixed RTP clock 90000 and packetization-mode=1.
+// Compatibility follows RFC 6184 section 8.2.2: equivalent profiles/constraints,
+// level-1b ordering, and directional level ceilings, not integer comparison.
+// Unrepresented packetization/parameter-set/receive-level constraints MUST NOT
+// be silently assumed. In-band parameter sets and decodable boundaries are
+// runtime requirements; this message alone does not establish decoder readiness.
+message H264Parameters {
+  // Presence REQUIRED; resolved 24-bit profile-level-id; upper byte MUST be zero.
+  optional uint32 profile_level_id = 1;
+
+  // Absent means false. True permits asymmetry only when both established peers
+  // agreed; this bit cannot grant it independently of SDP/preparation.
+  optional bool level_asymmetry_allowed = 2;
+}
+
+// VP8: fixed RTP clock 90000; the present empty variant selects this format.
+message Vp8Parameters {}
+
+// VP9: fixed RTP clock 90000. Source and receiver profiles MUST match and be
+// supported by both endpoints; no implicit profile conversion is provided.
+message Vp9Parameters {
+  // Absent normalizes to 0. Only explicit values 0 and 2 are supported.
+  optional uint32 profile_id = 1;
+}
+
+// Typed RTCP feedback capabilities; adapters map these to negotiated SDP values.
+enum RtcpFeedback {
+  RTCP_FEEDBACK_UNSPECIFIED = 0; // Invalid in a selected/advertised list.
+  RTCP_FEEDBACK_NACK = 1;        // Generic NACK.
+  RTCP_FEEDBACK_NACK_PLI = 2;    // Picture loss indication.
+  RTCP_FEEDBACK_CCM_FIR = 3;     // Full intra request.
+  RTCP_FEEDBACK_TRANSPORT_CC = 4; // Transport-wide congestion feedback.
+}
+
+// Actual prepared mapping. Extension-ID-to-type mappings MUST be consistent
+// within the same RTP session/direction; each binding has unique IDs and types.
+message RtpHeaderExtensionParameters {
+  // Required known extension type supported by the capability/preparation.
+  RtpHeaderExtensionType type = 1;
+
+  // 1..255. IDs>=15 require negotiated two-byte or mixed extmap support;
+  // 15 is reserved only in the one-byte form. Zero is invalid.
+  uint32 id = 2;
+}
+
+// Typed extension identifiers; adapters own URI/SDP conversion at their boundary.
+enum RtpHeaderExtensionType {
+  RTP_HEADER_EXTENSION_UNSPECIFIED = 0; // Invalid in a mapping/capability list.
+  RTP_HEADER_EXTENSION_MID = 1;
+  RTP_HEADER_EXTENSION_RID = 2;
+  RTP_HEADER_EXTENSION_REPAIRED_RID = 3;
+  RTP_HEADER_EXTENSION_TRANSPORT_CC_DRAFT_01 = 4;
+  RTP_HEADER_EXTENSION_PLAYOUT_DELAY = 5;
+  RTP_HEADER_EXTENSION_DEPENDENCY_DESCRIPTOR = 6;
+  RTP_HEADER_EXTENSION_AUDIO_LEVEL = 7;
+}
+
+// One prepared encoding; immutable coordinates within the resource's binding.
+// Layer switching preserves receiver packet indices, compatible format, RTCP
+// attribution, and decodable-frame boundaries rather than changing identity.
+message RtpEncodingParameters {
+  // Presence REQUIRED; zero is a real SSRC. Unique in connection/direction scope.
+  optional fixed32 ssrc = 1;
+
+  // Required for each encoding when RTX is selected, otherwise absent. Distinct
+  // from all primary/repair SSRCs in the same reservation scope.
+  optional fixed32 rtx_ssrc = 2;
+
+  // Actual prepared RID when used, <=16 UTF-8 bytes; uniqueness is per
+  // MID. Empty means no RID declaration, not permission to invent one.
+  string rid = 3;
+
+  // If present, a known mode advertised for this format and actually prepared.
+  // Omission does not invent scalable-layer support.
+  optional RtpScalabilityMode scalability_mode = 4;
+}
+
+// Advertised single-spatial-layer modes with one, two, or three temporal layers.
+enum RtpScalabilityMode {
+  RTP_SCALABILITY_MODE_UNSPECIFIED = 0; // Invalid when selected/advertised.
+  RTP_SCALABILITY_MODE_L1T1 = 1;
+  RTP_SCALABILITY_MODE_L1T2 = 2;
+  RTP_SCALABILITY_MODE_L1T3 = 3;
+}
+
+// Prepared RTCP facts. Preserve publisher synchronization groups at a receiver,
+// rewriting CNAME consistently where needed; never synthesize synchronization
+// between unrelated publishers. Sender-report timing remains coherent.
+message RtcpParameters {
+  // Actual prepared CNAME, <=256 UTF-8 bytes, obeying transport grammar.
+  string cname = 1;
+
+  // false selects COMPOUND; true selects REDUCED_SIZE with RFC 5506 requirements.
+  // The selected mode MUST be advertised and supported by actual preparation.
+  bool reduced_size = 2;
+}
+
+
+
+// ============================================================================
+// 8. Failure scope and connection termination
+// ============================================================================
+
+// Resource-scoped failure. None silently requests reconnection or modifies
+// unrelated resources. Retry is driven by changed prerequisites/application intent.
+enum FailureCode {
+  FAILURE_CODE_UNSPECIFIED = 0; // Invalid in a present Failure.
+  INVALID_CONFIGURATION = 1;   // Missing/invalid fields, ranges or immutable edit.
+  PERMISSION_DENIED = 2;       // Current grant/audience does not authorize work.
+  INCOMPATIBLE = 3;            // Source or prepared transport cannot satisfy it.
+  CAPACITY_EXCEEDED = 4;       // Scoped finite capacity unavailable.
+  UNSUPPORTED = 5;             // Required behavior/profile is unsupported.
+  INTERNAL_FAILURE = 6;        // Bounded preparation/execution failed or timed out.
+  RESOURCE_GONE = 7;           // Set targeted a consumed absent lifetime.
+}
+
+message Failure {
+  // Required known machine-readable category; diagnostics do not drive retry.
+  FailureCode code = 1;
+
+  // Optional non-secret text, <=256 UTF-8 bytes; not a stable application API.
+  string diagnostic = 2;
+}
+
+// Final causes. All retry attempts create fresh admitted connections and use
+// bounded jittered backoff; no cause confers cross-node replacement authority.
+enum CloseReason {
+  CLOSE_REASON_UNSPECIFIED = 0; // Invalid in SessionState.closed.
+  RECONSTRUCTION_REQUIRED = 1; // Exhausted lifetime/bindings; fresh transport helps.
+  AUTHORIZATION_EXPIRED = 2;   // Wait for new credentials/deliberate action.
+  PARTICIPANT_REPLACED = 3;    // Stop automatic reconnect; do not fight new owner.
+  PROTOCOL_ERROR = 4;          // Stop blind retry until input/profile is corrected.
+  INTERNAL_ERROR = 5;          // Bounded retry allowed while intent/authority permit.
+  AUTHORIZATION_REVOKED = 6;   // Wait for new credentials/deliberate action.
+  CONNECTION_CAPACITY_EXCEEDED = 7; // Stop hot retry; require changed capacity/load
+                                    // policy or deliberate reconnect.
+  TRANSPORT_UNSUPPORTED = 8;   // Wait for supported runtime/profile/configuration.
+}

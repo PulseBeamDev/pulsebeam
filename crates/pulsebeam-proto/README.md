@@ -4,10 +4,33 @@ Protobuf wire definitions and generated Rust types for reliable signaling over
 PulseBeam data channels. The crate also owns reserved RTP extension identifiers
 and stable signaling topic names.
 
-Edit the files in `proto/`, not generated output in `OUT_DIR`. Native media
-messages use one independent raw LZ4 block per protobuf envelope, with a
-32,768-byte decoded and 32,912-byte wire limit. Wire changes must be reviewed
-for every producer and consumer before the generated Rust API changes.
+Edit the files in `proto/`, not generated output in `OUT_DIR`. Wire changes
+must account for every producer and consumer before switching endpoints.
+
+`state` defines typed desired/confirmed resource records, prepared transport
+facts and capabilities. `state::codec` accepts raw protobuf or one independent
+raw LZ4 block with an encoding byte and little-endian decoded-length prefix.
+It enforces 4,096 decoded bytes, 4,101 framed bytes and at most 16 records,
+with structural preflight before generated decoding and exact input/output
+consumption. Callers select client or server direction explicitly.
+`state::validation::validate_spec` checks resource configuration separately:
+a valid desired envelope with an invalid configuration requires a scoped
+rejection, not a malformed-frame failure. Connection owners enforce revision
+history, immutable identity, capabilities and authorization.
+
+The optional `json` feature adds generated Serde support for HTTP bootstrap
+`RtpCapabilities`, its referenced types, and `DataDelivery` enum-name lists.
+Fields serialize with their protobuf snake_case names; optional zero/false
+values retain presence. This feature requires `std`; default builds retain the
+`no_std` surface. The Bazel `pulsebeam-proto-json` target selects this feature.
+The owner unit suite checks both configurations using the existing capability
+fixture. JSON parsing does not replace capability validation or the HTTP owner's
+body limits and whole-document duplicate-key enforcement. No JSON StateBatch
+codec or live HTTP endpoint switch is included.
+
+Existing Catalog/Intent/Mapping endpoints use `signaling_v1` and `codec`, whose
+independent raw LZ4 envelopes have 32,768-byte decoded and 32,912-byte wire
+limits. These bytes are not interchangeable with StateBatch frames.
 
 ## Ordered subscription recovery
 

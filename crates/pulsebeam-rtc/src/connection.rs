@@ -152,7 +152,9 @@ pub struct AcceptedConnection {
 impl Connection {
     /// Declare bounded ongoing RTP support once, even after an SCTP-only start.
     /// This selects the connection-wide feedback profile without rebuilding its
-    /// transport, receive feedback or committed send history.
+    /// transport, receive feedback or committed send history. Receipt-history
+    /// storage must fit the receive-runtime budget even before an inbound binding;
+    /// Capacity leaves the existing profiles and capability state unchanged.
     pub fn set_rtp_capabilities(
         &mut self,
         capabilities: crate::RtpCapabilities,
@@ -174,18 +176,14 @@ impl Connection {
         {
             return Err(Error::Unsupported);
         }
+        self.ingress.set_feedback_profile(capabilities.feedback)?;
         self.session.set_feedback_profile(capabilities.feedback);
         self.commit
             .history
             .set_feedback_profile(capabilities.feedback);
-        self.ingress.set_feedback_profile(capabilities.feedback);
         if self.session.ingress_media().is_empty() && self.session.egress_senders().is_empty() {
-            self.transport.configure_rtp_mappings(
-                Box::new([]),
-                Box::new([]),
-                Box::new([]),
-                Box::new([]),
-            );
+            self.transport
+                .configure_rtp_mappings(Box::new([]), Box::new([]), []);
         }
         self.rtp_configuration.capabilities = Some(capabilities);
         Ok(())
@@ -198,115 +196,88 @@ impl Connection {
         configuration: crate::RtpConfiguration,
     ) -> Result<(), crate::RtpConfigurationError> {
         use crate::RtpConfigurationError as Error;
-        use std::collections::BTreeSet;
         self.check_writable().map_err(|_| Error::ConnectionState)?;
-        let staged = self.rtp_configuration.stage(&configuration)?;
-        let limit = self
-            .rtp_configuration
-            .capabilities
-            .as_ref()
-            .ok_or(Error::CapabilityState)?
-            .limits
-            .max_retained_encodings;
-        let ingress_identities = self.ingress.physical_identities();
-        let egress_identities = self.egress.physical_identities();
-        for (physical, _) in &staged {
-            let opposite = if physical.outbound {
-                &ingress_identities
-            } else {
-                &egress_identities
-            };
+        let update = self.rtp_configuration.stage(configuration)?;
+        self.apply_rtp_configuration(update)
+    }
+
+    /// Atomically update addressed RTP groups and retire explicit primary SSRCs.
+    /// On first use, unmatched bootstrap candidates remain reserved but paused.
+    /// Later updates may adopt them; configure_rtp instead retires omissions.
+    pub fn update_rtp(
+        &mut self,
+        patch: crate::RtpConfigurationPatch,
+    ) -> Result<(), crate::RtpConfigurationError> {
+        use crate::RtpConfigurationError as Error;
+        self.check_writable().map_err(|_| Error::ConnectionState)?;
+        let update = self.rtp_configuration.stage_patch(patch)?;
+        self.apply_rtp_configuration(update)
+    }
+
+    fn apply_rtp_configuration(
+        &mut self,
+        update: crate::rtp_config::RtpConfigurationUpdate,
+    ) -> Result<(), crate::RtpConfigurationError> {
+        use crate::RtpConfigurationError as Error;
+        let staged = &update.bindings;
+        for (physical, _) in staged {
             let encoding = physical.encoding();
             if [Some(encoding.primary), encoding.repair]
                 .into_iter()
                 .flatten()
-                .any(|id| opposite.contains(&id.get()) || id.get() == self.ingress.control_ssrc())
+                .any(|id| {
+                    (if physical.outbound {
+                        self.ingress.has_issued_ssrc(id)
+                    } else {
+                        self.egress.has_issued_ssrc(id)
+                    }) || id == self.ingress.control_ssrc()
+                })
             {
                 return Err(Error::Collision);
             }
         }
-        let ingress = self.ingress.stage_configuration(&staged, limit)?;
-        let egress =
-            self.egress
-                .stage_configuration(&staged, self.session.protocol_randomness(), limit)?;
-        let mut history = self.rtp_configuration.history.clone();
-        history
-            .try_reserve(staged.len())
-            .map_err(|_| Error::Capacity)?;
-        for (physical, _) in &staged {
-            if !history.iter().any(|old| old.same_identity(physical)) {
-                history.push(physical.clone());
-            }
-        }
-        let retained_inbound: BTreeSet<_> = history
-            .iter()
-            .filter(|p| !p.outbound)
-            .flat_map(|p| {
-                [
-                    Some(p.encoding().primary.get()),
-                    p.encoding().repair.map(std::num::NonZeroU32::get),
-                ]
-                .into_iter()
-                .flatten()
-            })
-            .collect();
-        let retained_inbound: Vec<_> = retained_inbound.into_iter().collect();
-        if !self.transport.can_admit_ssrcs(&retained_inbound) {
+        let ingress = self.ingress.stage_configuration(
+            staged,
+            &update.removed_inbound.iter().copied().collect::<Vec<_>>(),
+            update.scope,
+        )?;
+        let egress = self.egress.stage_configuration(
+            staged,
+            self.session.protocol_randomness(),
+            &update.removed_outbound.iter().copied().collect::<Vec<_>>(),
+            update.scope,
+        )?;
+        let (reserved, new_inbound) = self.rtp_configuration.inbound_reservation(&update);
+        let retiring = self.ingress.retiring_ssrcs(&ingress);
+        if !self
+            .transport
+            .can_admit_ssrcs(reserved, &new_inbound, &retiring)
+        {
             return Err(Error::Capacity);
         }
-        let payloads = |outbound| {
-            staged
-                .iter()
-                .filter(move |(p, active)| p.outbound == outbound && *active)
-                .flat_map(|(p, _)| {
-                    std::iter::once(p.binding.codec.payload_type)
-                        .chain(p.binding.codec.repair_payload_type)
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Box<[_]>>()
-        };
-        let inbound = payloads(false);
-        let outbound = payloads(true);
-        let twcc: Box<[_]> = staged
-            .iter()
-            .filter(|(p, active)| p.outbound && *active)
-            .flat_map(|(p, _)| {
-                let id = crate::negotiation::TWCC_URIS
-                    .iter()
-                    .find_map(|uri| p.extension_id(uri));
-                std::iter::once(p.binding.codec.payload_type)
-                    .chain(p.binding.codec.repair_payload_type)
-                    .filter_map(move |pt| id.map(|id| (pt, id)))
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let identities: Box<[_]> = staged
-            .iter()
-            .filter(|(p, active)| !p.outbound && *active)
-            .flat_map(|(p, _)| {
-                [
-                    Some(p.encoding().primary.get()),
-                    p.encoding().repair.map(std::num::NonZeroU32::get),
-                ]
-                .into_iter()
-                .flatten()
-            })
-            .collect();
-        self.ingress.commit_configuration(ingress);
+        let inbound = self.rtp_configuration.payload_types(&update, false);
+        let outbound = self.rtp_configuration.payload_types(&update, true);
+        let retired = self.ingress.commit_configuration(ingress);
+        debug_assert!(retired.iter().eq(retiring.iter()));
+        self.transport.retire_inbound_ssrcs(retired);
         self.egress.commit_configuration(egress);
-        self.transport
-            .configure_rtp_mappings(inbound, outbound, twcc, identities);
-        self.rtp_configuration.history = history;
-        self.rtp_configuration.current = Some(configuration);
+        self.transport.reserve_inbound_ssrcs(reserved, &new_inbound);
+        self.transport.configure_rtp_mappings(
+            inbound,
+            outbound,
+            update
+                .inbound_membership
+                .iter()
+                .map(|(&ssrc, &active)| (ssrc, active)),
+        );
+        self.rtp_configuration.commit(update);
         Ok(())
     }
 
-    /// Accepted typed configuration. The initial SessionInfo remains a bootstrap
-    /// snapshot; None means no typed update has yet been accepted.
-    pub fn rtp_configuration(&self) -> Option<&crate::RtpConfiguration> {
-        self.rtp_configuration.current.as_ref()
+    /// Materialize the accepted typed set. This explicit snapshot is proportional
+    /// to the live set; None means no typed update has yet been accepted.
+    pub fn rtp_configuration(&self) -> Option<crate::RtpConfiguration> {
+        self.rtp_configuration.snapshot()
     }
 
     #[allow(
@@ -317,7 +288,7 @@ impl Connection {
         &mut self,
         at: Instant,
         mid: &str,
-        primary: std::num::NonZeroU32,
+        primary: u32,
         packet: RtpWrite,
     ) -> Result<(), RejectedRtp> {
         let at = self.time.observe(at);
@@ -331,7 +302,7 @@ impl Connection {
             });
         }
         self.egress
-            .admit_encoding(at, mid, Some(primary.get()), packet)
+            .admit_encoding(at, mid, Some(primary), packet)
             .map_err(|(reason, packet)| RejectedRtp { reason, packet })
     }
 
@@ -383,16 +354,40 @@ impl Connection {
     pub fn request_keyframe(&mut self, ssrc: u32) -> Result<(), WriteError> {
         self.check_writable()?;
         let packet = self.ingress.keyframe_request(ssrc)?;
+        let packet = self
+            .ingress
+            .compound_control(packet.to_vec())
+            .ok_or(WriteError::WouldBlock)?;
         self.transport
             .send_rtcp(&packet)
             .map_err(|_| WriteError::InvalidState)
     }
 
-    pub fn retire_encoding(&mut self, ssrc: u32) -> Result<(), WriteError> {
-        self.check_writable()?;
-        self.ingress.retire(ssrc)
+    #[cfg(test)]
+    pub(crate) fn test_inbound_guard_bytes(&self) -> (usize, usize) {
+        (
+            self.ingress.test_terminal_guard_bytes(),
+            self.transport.test_retired_guard_bytes(),
+        )
     }
 
+    pub fn retire_encoding(&mut self, ssrc: u32) -> Result<(), WriteError> {
+        self.check_writable()?;
+        let identities = self.ingress.retire(ssrc)?;
+        self.transport
+            .retire_inbound_ssrcs(identities.into_iter().flatten());
+        Ok(())
+    }
+
+    /// Actual bidirectional SCTP stream count, not the number of free channels.
+    /// IDs must be below this count. None means SCTP is not connected/available.
+    pub fn data_channel_capacity(&self) -> Option<u16> {
+        self.sctp.as_ref().and_then(Association::stream_capacity)
+    }
+
+    /// Reserve an explicitly identified negotiated channel even before SCTP connects.
+    /// `Opened` reports activation after peer stream-capacity checks; admission alone
+    /// does not permit sending. In-band channels still require connected SCTP.
     pub fn open_data_channel(
         &mut self,
         at: Instant,
@@ -541,7 +536,7 @@ impl Connection {
             self.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
             return Output::Closed(CloseReason::TransportFailure);
         }
-        while let Some(request) = self.ingress.poll_keyframe() {
+        for request in self.ingress.poll_keyframes() {
             self.egress.request_keyframe(request);
         }
         if let Some(repair) = self.ingress.poll_repair() {
@@ -715,6 +710,9 @@ impl Connection {
                             && self.transport.can_send_user_data())
                         .then(|| self.ingress.next_deadline())
                         .flatten(),
+                        matches!(self.lifecycle, Lifecycle::Open)
+                            .then(|| self.egress.maintenance_deadline(at))
+                            .flatten(),
                         self.transport
                             .can_send_user_data()
                             .then(|| self.egress.next_deadline(at))
@@ -768,13 +766,14 @@ impl Connection {
                 path_epoch,
                 bytes,
             } => {
-                let receipts = self.ingress.accept_rtcp(
+                let (receipts, retired) = self.ingress.accept_rtcp(
                     arrival,
                     bytes,
                     path_epoch,
                     self.session.feedback(),
                     self.transport.smoothed_rtt(),
                 );
+                self.transport.retire_inbound_ssrcs(retired);
                 for receipt in receipts {
                     self.egress.observe_receipt(arrival, receipt);
                 }
@@ -902,28 +901,31 @@ impl Connection {
         let mut entropy = EntropyConsumer::new(entropy);
         let negotiated = negotiation::negotiate(&config, &offer, at, &mut entropy)?;
         let session = negotiated.session.clone();
-        let transport = Transport::from_session(&negotiated.facts, at)
+        let transport = Transport::from_session(&negotiated.facts, config.limits, at)
             .map_err(|_| AcceptError::CryptographicFailure)?;
         let ingress = IngressOwner::new(
             negotiated.facts.ingress_media(),
-            config.limits.max_unsignaled_encodings,
             config.limits.max_queued_media_bytes,
+            config.limits.max_receive_runtime_bytes,
             u32::from_be_bytes(entropy.take(b"receive-rtcp-ssrc")).max(1),
+            negotiated.facts.local_cname(),
             crate::receive_feedback::ReceiveFeedback::new(negotiated.facts.inbound_feedback(), at),
-        );
+        )?;
         let egress = MediaEgress::new(
             negotiated.facts.egress_senders(),
             negotiated.facts.protocol_randomness(),
             config.limits.max_queued_media_bytes,
             config.limits.max_retransmission_bytes,
+            config.limits.max_send_runtime_bytes,
             at,
             crate::time::ProtocolClock::new(at, wallclock),
-        );
+        )?;
         let feedback = negotiated.facts.feedback();
         let sctp = negotiated
             .facts
             .sctp()
-            .map(|facts| Association::new(facts, config.limits, at));
+            .map(|facts| Association::new(facts, config.limits, at))
+            .transpose()?;
         let connection = Self {
             session: negotiated.facts,
             rtp_configuration: crate::rtp_config::RtpConfigurationState::default(),
@@ -994,6 +996,73 @@ mod tests {
     use super::*;
     use crate::test_support::{NetworkPolicy, PeerFixture, assert_native_rtp_pacing, sample};
     use std::time::Duration;
+    #[test]
+    fn retired_sender_cleanup_progresses_without_transport_send_readiness() {
+        let now = Instant::now();
+        let mut connection = Connection::accept(
+            ConnectionConfig {
+                local_candidates: vec![crate::LocalCandidate::Udp(
+                    "192.0.2.2:41000".parse().unwrap(),
+                )],
+                ..ConnectionConfig::default()
+            },
+            SdpOffer::new(
+                include_str!("../tests/fixtures/chrome-representative.sdp")
+                    .replace("a=sendonly", "a=sendrecv"),
+            ),
+            now,
+            std::time::UNIX_EPOCH,
+            ConnectionEntropy::new([43; 32]),
+        )
+        .unwrap()
+        .connection;
+        let mid = connection.stats().senders.first().unwrap().mid.clone();
+        // Model buffered media left behind by unavailable transport, below the
+        // public write API's connected-state gate.
+        for sequence in 0..257 {
+            connection
+                .egress
+                .admit(
+                    now,
+                    &mid,
+                    RtpWrite {
+                        sequence,
+                        timestamp: 0,
+                        wallclock: now,
+                        marker: false,
+                        payload: vec![7].into(),
+                        extensions: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        assert!(!connection.transport.can_send_user_data());
+        let charged = connection.stats().connection.queued_media_bytes;
+        let update = connection
+            .egress
+            .stage_configuration(&[], &[43; 32], &[], true)
+            .unwrap();
+        connection.egress.commit_configuration(update);
+        assert!(connection.stats().senders.is_empty());
+        assert_eq!(connection.stats().connection.queued_media_bytes, charged);
+        let _ = connection.poll(now);
+        let remaining = connection.stats().connection.queued_media_bytes;
+        assert!(remaining > 0 && remaining < charged);
+        for _ in 0..20 {
+            let output = connection.poll(now);
+            if connection.stats().connection.queued_media_bytes == 0 {
+                break;
+            }
+            if let Output::Idle { next_wakeup } = output {
+                assert!(
+                    next_wakeup.is_some_and(|at| at <= now),
+                    "cleanup is ready without transport"
+                );
+            }
+        }
+        assert_eq!(connection.stats().connection.queued_media_bytes, 0);
+    }
+
     #[test]
     fn aggregate_demand_obtains_native_rtx_feedback_without_primary_media() {
         let mut fixture = PeerFixture::connected_video().without_egress_observation();
@@ -1300,7 +1369,7 @@ mod tests {
         );
     }
     #[test]
-    fn native_authenticated_feedback_receipts_include_primary_wrap_and_late_holes() {
+    fn native_authenticated_feedback_survives_primary_wrap_and_inbound_retirement() {
         let mut fixture = PeerFixture::connected().without_egress_observation();
         let source = fixture.send_source(b"late-hole");
         let before = fixture.connection.commit.history.counters().received;
@@ -1323,6 +1392,54 @@ mod tests {
         assert_eq!(report.mid.as_ref(), fixture.sender_mid);
         assert_eq!(report.ssrc, fixture.connection.stats().senders[0].ssrc);
         assert_eq!(report.extended_highest_sequence, 65_538);
+        let (observed, input) = fixture.observe_source(b"late-after-retirement");
+        let protected = match &input {
+            NetworkInput::Udp { payload, .. } => payload.clone(),
+            NetworkInput::IceTcp { frame, .. } => frame.slice(2..),
+        };
+        assert_eq!(
+            crate::ingress::SSRC_GUARD_BYTES,
+            2 * std::mem::size_of::<u32>()
+        );
+        let (ingress_before, transport_before) = fixture.connection.test_inbound_guard_bytes();
+        fixture
+            .connection
+            .ingress
+            .test_limit_runtime_to_current_usage();
+        fixture
+            .connection
+            .retire_encoding(source.header.ssrc)
+            .unwrap();
+        let (ingress_after, transport_after) = fixture.connection.test_inbound_guard_bytes();
+        assert!(ingress_after > ingress_before);
+        assert_eq!(
+            ingress_after - ingress_before,
+            transport_after - transport_before,
+            "retirement at the full pool installs both prepaid native guard copies"
+        );
+        assert!(fixture.connection.stats().encodings.is_empty());
+        fixture
+            .connection
+            .receive(observed, observed, input)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .connection
+                .transport
+                .test_unprotect_unretired_rtp(&protected),
+            Err(crate::transport::SrtpError::Replay),
+            "the permanent fence must reject after replay storage is reclaimed"
+        );
+        fixture
+            .write_rtp(crate::test_support::rtp_write(source, 65_539))
+            .unwrap();
+        fixture.drive_for(Duration::from_secs(1));
+        assert!(fixture.connection.stats().encodings.is_empty());
+        assert_eq!(fixture.connection.stats().senders[0].transmitted_packets, 6);
+        assert!(fixture.connection.commit.history.counters().received >= before + 6);
+        fixture.connection.abort();
+        assert_eq!(fixture.connection.test_inbound_guard_bytes(), (0, 0));
+        assert_eq!(fixture.connection.ingress.test_runtime_bytes(), 0);
     }
 
     #[test]

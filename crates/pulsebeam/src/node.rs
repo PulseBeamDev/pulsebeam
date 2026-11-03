@@ -1071,6 +1071,7 @@ impl NodeBuilder {
                 ])
                 .expose_headers([
                     hyper::header::LOCATION,
+                    hyper::header::RETRY_AFTER,
                     hyper::header::ALLOW,
                     hyper::header::HeaderName::from_static("accept-post"),
                 ])

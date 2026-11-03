@@ -6,7 +6,7 @@ use pulsebeam_auth::identity::{UUID_TEXT_LEN, decode_uuid, encode_uuid};
 use pulsebeam_auth::identity::{format_id, parse_id, validate_external};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
-use std::{fmt, str::FromStr};
+use std::{fmt, num::NonZeroU64, str::FromStr};
 #[cfg(test)]
 use uuid::Variant;
 use uuid::{Uuid, Version};
@@ -17,6 +17,7 @@ const PARTICIPANT_DOMAIN: &[u8] = b"pulsebeam.identity.participant.v0";
 const AUDIO_TRACK_DOMAIN: &[u8] = b"pulsebeam.identity.audio-track.v0";
 const VIDEO_TRACK_DOMAIN: &[u8] = b"pulsebeam.identity.video-track.v0";
 const DATA_TRACK_DOMAIN: &[u8] = b"pulsebeam.identity.data-track.v0";
+const PUBLICATION_DOMAIN: &[u8] = b"pulsebeam.identity.publication.v1";
 
 fn write_string(hasher: &mut Sha3_256, value: &str) {
     let length = u32::try_from(value.len()).unwrap_or(u32::MAX);
@@ -24,12 +25,21 @@ fn write_string(hasher: &mut Sha3_256, value: &str) {
     hasher.update(value.as_bytes());
 }
 
-fn derive_v8(domain: &[u8], parent: &[u8; 16], kind: Option<TrackKind>, text: &str) -> Uuid {
+fn derive_v8(
+    domain: &[u8],
+    parent: &[u8; 16],
+    kind: Option<TrackKind>,
+    incarnation: Option<NonZeroU64>,
+    text: &str,
+) -> Uuid {
     let mut hasher = Sha3_256::new();
     hasher.update(domain);
     hasher.update(parent);
     if let Some(kind) = kind {
         hasher.update([kind as u8]);
+    }
+    if let Some(incarnation) = incarnation {
+        hasher.update(incarnation.get().to_be_bytes());
     }
     write_string(&mut hasher, text);
     let digest = hasher.finalize();
@@ -210,6 +220,7 @@ impl RoomId {
             ROOM_DOMAIN,
             project.as_bytes(),
             None,
+            None,
             external.as_str(),
         ))
     }
@@ -228,6 +239,7 @@ impl ParticipantId {
         Self(derive_v8(
             PARTICIPANT_DOMAIN,
             room.as_bytes(),
+            None,
             None,
             external.as_str(),
         ))
@@ -249,8 +261,31 @@ impl Default for ParticipantId {
     }
 }
 
-// The same sender label yields a new media identity on every connection.
 impl ConnectionId {
+    /// Identity of a native publication lifetime. `incarnation` is its first
+    /// desired revision (owned ref), not a mutable settings revision. Pausing
+    /// preserves it; retirement/republishing must use a fresh incarnation.
+    pub fn derive_publication_track_id(
+        &self,
+        kind: TrackKind,
+        label: &str,
+        incarnation: NonZeroU64,
+    ) -> TrackId {
+        let id = derive_v8(
+            PUBLICATION_DOMAIN,
+            self.as_bytes(),
+            Some(kind),
+            Some(incarnation),
+            label,
+        );
+        match kind {
+            TrackKind::Audio => AudioTrackId(id).into(),
+            TrackKind::Video => VideoTrackId(id).into(),
+            TrackKind::Data => DataTrackId(id).into(),
+        }
+    }
+
+    /// Single bootstrap lifetime, for SDP/legacy sources without owned refs.
     pub fn derive_track_id(&self, kind: TrackKind, label: &str) -> TrackId {
         match kind {
             TrackKind::Audio => AudioTrackId::derive(self, label).into(),
@@ -276,6 +311,7 @@ macro_rules! derived_track_id {
                     $domain,
                     connection.as_bytes(),
                     Some($kind),
+                    None,
                     label,
                 ))
             }
@@ -567,6 +603,36 @@ mod tests {
             connection_a.derive_track_id(TrackKind::Video, "main"),
             connection_b.derive_track_id(TrackKind::Video, "main")
         );
+    }
+
+    #[test]
+    fn publication_lifetimes_preserve_kind_label_and_exact_u64_incarnation() {
+        let connection = ConnectionId::new();
+        let first = NonZeroU64::MIN;
+        let next = NonZeroU64::new((1_u64 << 53) + 1).unwrap();
+        let after_next = NonZeroU64::new(next.get() + 1).unwrap();
+        let mut identities = std::collections::HashSet::new();
+        for kind in [TrackKind::Audio, TrackKind::Video, TrackKind::Data] {
+            for incarnation in [first, next, after_next, NonZeroU64::MAX] {
+                let track = connection.derive_publication_track_id(kind, "main", incarnation);
+                assert_eq!(
+                    track,
+                    connection.derive_publication_track_id(kind, "main", incarnation)
+                );
+                assert_eq!(track.kind(), kind);
+                assert_eq!(track.as_str().parse::<TrackId>().unwrap(), track);
+                assert!(identities.insert(track));
+                assert_ne!(track, connection.derive_track_id(kind, "main"));
+                assert_ne!(
+                    track,
+                    connection.derive_publication_track_id(kind, "Main", incarnation)
+                );
+                assert_ne!(
+                    track,
+                    ConnectionId::new().derive_publication_track_id(kind, "main", incarnation)
+                );
+            }
+        }
     }
 
     #[test]

@@ -58,16 +58,21 @@ fn data_only_bootstrap_prepares_duplex_with_independent_identities_and_rtp_facts
     let actual = offer(
         "v",
         "sendrecv",
-        "a=ssrc:200 cname:native\r\na=ssrc:201 cname:native\r\na=ssrc-group:FID 200 201\r\n",
+        "a=ssrc:0 cname:native\r\na=ssrc:4294967295 cname:native\r\na=ssrc-group:FID 0 4294967295\r\n",
     );
     let candidate = ctx.prepare(&actual, &[request("v", true, true)]).unwrap();
     let p = &candidate.bindings().publications[0];
     let r = &candidate.bindings().receptions[0];
     assert!(p.complete() && r.complete());
-    assert_eq!(p.encodings[0].primary.unwrap().get(), 200);
+    assert_eq!(p.encodings[0].primary, Some(0));
+    assert_eq!(p.encodings[0].repair, Some(u32::MAX));
     assert_ne!(p.encodings[0].primary, r.encodings[0].primary);
     let answer = inspect(candidate.answer()).unwrap();
     assert_eq!(answer[1].codecs[0], r.codec);
+    assert_eq!(p.rtcp.cname.as_deref(), Some("native"));
+    assert_eq!(answer[1].rtcp, r.rtcp);
+    assert_ne!(p.rtcp.cname, r.rtcp.cname);
+    assert!(!r.rtcp.reduced_size);
     assert_eq!(answer[1].encodings, r.encodings);
     assert_eq!(answer[1].mid, "v");
     assert!(candidate.answer().contains("o=- 7 3 IN IP4"));
@@ -83,12 +88,34 @@ fn bootstrap_media_is_adopted_once_with_caller_keys_and_retained_without_restati
     let actual = offer(
         "v",
         "sendrecv",
-        "a=ssrc:200 cname:native\r\na=ssrc:201 cname:native\r\na=ssrc-group:FID 200 201\r\n",
-    );
+        "a=ssrc:4294967295 cname:native\r\na=ssrc:0 cname:native\r\na=ssrc-group:FID 4294967295 0\r\n",
+    ).replace("a=rtcp-mux\r\n", "a=rtcp-mux\r\na=rtcp-rsize\r\n");
     let applied = generator
         .prepare(&actual, &[request("v", true, true)])
         .unwrap();
-    let mut ctx = Context::new(&actual, applied.answer(), caps(), 900, Limits::default()).unwrap();
+    let encoding = &applied.bindings().publications[0].encodings[0];
+    assert_eq!(encoding.primary, Some(u32::MAX));
+    assert_eq!(encoding.repair, Some(0));
+    let answer = applied
+        .answer()
+        .replace("a=rtcp-mux\r\n", "a=rtcp-mux\r\na=rtcp-rsize\r\n")
+        .replace("cname:pulsebeam-00000065", "cname:bootstrap-sync")
+        .replace("cname:pulsebeam-00000066", "cname:bootstrap-sync");
+    let mut expected = applied.bindings().clone();
+    expected.publications[0].rtcp.reduced_size = true;
+    expected.receptions[0].rtcp.reduced_size = true;
+    expected.receptions[0].rtcp.cname = Some("bootstrap-sync".into());
+    assert!(
+        Context::new(
+            &actual.replace("a=rtcp-rsize\r\n", ""),
+            &answer,
+            caps(),
+            900,
+            Limits::default()
+        )
+        .is_err()
+    );
+    let mut ctx = Context::new(&actual, &answer, caps(), 900, Limits::default()).unwrap();
     assert!(matches!(
         ctx.adopt_bootstrap_media(&[]),
         Err(Error::MissingConfiguration(_))
@@ -97,14 +124,16 @@ fn bootstrap_media_is_adopted_once_with_caller_keys_and_retained_without_restati
     assert_eq!(
         ctx.adopt_bootstrap_media(&[request("v", true, true)])
             .unwrap(),
-        applied.bindings()
+        &expected
     );
     assert_eq!(
         ctx.adopt_bootstrap_media(&[request("v", true, true)]),
         Err(Error::CandidateState)
     );
     let retained = ctx.prepare(&actual, &[]).unwrap();
-    assert_eq!(retained.bindings(), applied.bindings());
+    assert_eq!(retained.bindings(), &expected);
+    assert!(retained.answer().contains("a=rtcp-rsize\r\n"));
+    assert!(retained.answer().contains("cname:bootstrap-sync\r\n"));
     assert!(retained.answer().contains("o=- 7 4 IN IP4"));
     let primary = retained.bindings().receptions[0].encodings[0]
         .primary
@@ -194,16 +223,47 @@ fn rid_only_sender_requires_atomic_runtime_completion() {
     ctx.finish(candidate.id(), ApplyOutcome::Applied).unwrap();
     let mut observations = ctx.bindings().unwrap().publications[0].encodings.clone();
     for (index, encoding) in observations.iter_mut().enumerate() {
-        encoding.primary = NonZeroU32::new(300 + u32::try_from(index).unwrap() * 2);
-        encoding.repair = NonZeroU32::new(301 + u32::try_from(index).unwrap() * 2);
+        encoding.primary = Some(u32::try_from(index).unwrap() * 2);
+        encoding.repair = Some(1 + u32::try_from(index).unwrap() * 2);
     }
+    let rtcp = RtcpParameters {
+        cname: Some("native".into()),
+        reduced_size: false,
+    };
+    assert_eq!(
+        ctx.observe_sender("v", &observations, &RtcpParameters::default()),
+        Err(Error::Observation)
+    );
+    let mut wrong_mode = rtcp.clone();
+    wrong_mode.reduced_size = true;
+    assert_eq!(
+        ctx.observe_sender("v", &observations, &wrong_mode),
+        Err(Error::Observation)
+    );
     let mut bad = observations.clone();
     bad[1].primary = bad[0].primary;
-    assert_eq!(ctx.observe_sender("v", &bad), Err(Error::Collision));
+    assert_eq!(ctx.observe_sender("v", &bad, &rtcp), Err(Error::Collision));
     assert!(!ctx.bindings().unwrap().publications[0].complete());
-    assert!(ctx.observe_sender("v", &observations).unwrap().publications[0].complete());
+    let completed = ctx.observe_sender("v", &observations, &rtcp).unwrap();
+    assert!(completed.publications[0].complete());
+    assert_eq!(completed.publications[0].encodings[0].primary, Some(0));
+    assert_eq!(completed.publications[0].rtcp, rtcp);
+    assert_eq!(
+        ctx.observe_sender("v", &observations, &RtcpParameters::default())
+            .unwrap()
+            .publications[0]
+            .rtcp,
+        rtcp
+    );
+    let mut wrong_cname = rtcp.clone();
+    wrong_cname.cname = Some("changed".into());
+    assert_eq!(
+        ctx.observe_sender("v", &observations, &wrong_cname),
+        Err(Error::Observation)
+    );
     let retained = ctx.prepare(&actual, &[]).unwrap();
     assert!(retained.bindings().publications[0].complete());
+    assert_eq!(retained.bindings().publications[0].rtcp, rtcp);
 }
 
 #[test]
@@ -228,15 +288,34 @@ fn removed_capabilities_and_transport_changes_do_not_overwrite_accepted_state() 
         Error::TransportChange
     );
     assert_eq!(ctx.bindings(), Some(&before));
+    let extra = offer("unused", "inactive", "a=rtcp-rsize\r\n");
+    let extra = extra.split_once("m=video").unwrap().1;
+    let with_inactive =
+        format!("{actual}m=video{extra}").replace("BUNDLE data v", "BUNDLE data v unused");
+    let inactive = ctx.prepare(&with_inactive, &[]).unwrap();
+    assert!(!inactive.answer().contains("a=rtcp-rsize"));
+    assert_eq!(inactive.bindings(), &before);
 }
 
 #[test]
 fn inactivation_retains_identity_and_stopped_mid_reuse_allocates_fresh_identity() {
-    let mut ctx = context();
+    let mut generator = context();
     let actual = offer("v", "recvonly", "");
-    let first = ctx.prepare(&actual, &[request("v", false, true)]).unwrap();
-    let original = first.bindings().receptions[0].encodings.clone();
-    ctx.finish(first.id(), ApplyOutcome::Applied).unwrap();
+    let initial = generator
+        .prepare(&actual, &[request("v", false, true)])
+        .unwrap();
+    let answer = initial
+        .answer()
+        .replace("ssrc:101 ", "ssrc:0 ")
+        .replace("FID 101 102", "FID 0 102");
+    let mut ctx = Context::new(&actual, &answer, caps(), 100, Limits::default()).unwrap();
+    let original = ctx
+        .adopt_bootstrap_media(&[request("v", false, true)])
+        .unwrap()
+        .receptions[0]
+        .encodings
+        .clone();
+    assert_eq!(original[0].primary, Some(0));
     let inactive = ctx
         .prepare(&actual.replace("a=recvonly", "a=inactive"), &[])
         .unwrap();
@@ -254,6 +333,16 @@ fn inactivation_retains_identity_and_stopped_mid_reuse_allocates_fresh_identity(
         ctx.prepare(&actual, &[]),
         Err(Error::MissingConfiguration(_))
     ));
+    let retired_sender = offer(
+        "v",
+        "sendonly",
+        "a=ssrc:0 cname:native\r\na=ssrc:200 cname:native\r\na=ssrc-group:FID 0 200\r\n",
+    );
+    assert_eq!(
+        ctx.prepare(&retired_sender, &[request("v", true, false)])
+            .unwrap_err(),
+        Error::Collision
+    );
     let fresh = ctx.prepare(&actual, &[request("v", false, true)]).unwrap();
     assert_ne!(fresh.bindings().receptions[0].encodings, original);
 }
@@ -306,10 +395,7 @@ fn failed_sender_preparation_can_be_retried_without_reusing_receive_reservations
     );
     let first = ctx.prepare(&actual, &[request("v", true, true)]).unwrap();
     assert_ne!(
-        first.bindings().receptions[0].encodings[0]
-            .primary
-            .unwrap()
-            .get(),
+        first.bindings().receptions[0].encodings[0].primary.unwrap(),
         101
     );
     ctx.finish(first.id(), ApplyOutcome::NotApplied).unwrap();
@@ -365,6 +451,9 @@ fn batched_independent_encodings_have_grouping_and_connection_scoped_collision_h
             let p = &candidate.bindings().publications[0];
             let r = &candidate.bindings().receptions[0];
             assert_eq!(p.group, r.group);
+            if seed == u32::MAX {
+                assert_eq!(r.encodings[0].primary, Some(1));
+            }
             let identities: BTreeSet<_> = p
                 .encodings
                 .iter()
@@ -445,7 +534,7 @@ fn capacity_is_non_destructive_and_error_messages_never_contain_sdp() {
         &bootstrap(),
         &remote(),
         caps(),
-        0,
+        u32::MAX,
         Limits {
             max_identity_history: 2,
             ..Limits::default()
@@ -467,8 +556,52 @@ fn capacity_is_non_destructive_and_error_messages_never_contain_sdp() {
 
 #[test]
 fn malformed_supported_input_and_bounds_fail_without_credentials_in_errors() {
-    let actual = offer("v", "sendonly", "a=ssrc:0 cname:x\r\n");
-    assert_eq!(inspect(&actual), Err(Error::Malformed("ssrc")));
+    for ssrc in ["-1", "4294967296", "invalid"] {
+        let actual = offer("v", "sendonly", &format!("a=ssrc:{ssrc} cname:x\r\n"));
+        assert_eq!(inspect(&actual), Err(Error::Malformed("ssrc")));
+    }
+    let duplicate_fid = offer("v", "sendonly", "a=ssrc-group:FID 0 0\r\n");
+    assert_eq!(inspect(&duplicate_fid), Err(Error::Malformed("FID")));
+    for (cname, field) in [
+        (String::new(), "cname"),
+        ("bad value".into(), "cname"),
+        ("bad\0value".into(), "line"),
+        ("x".repeat(256), "cname"),
+    ] {
+        assert_eq!(
+            inspect(&offer(
+                "v",
+                "sendonly",
+                &format!("a=ssrc:0 cname:{cname}\r\n")
+            )),
+            Err(Error::Malformed(field))
+        );
+    }
+    let longest = "x".repeat(255);
+    assert_eq!(
+        inspect(&offer(
+            "v",
+            "sendonly",
+            &format!("a=ssrc:0 cname:{longest}\r\n")
+        ))
+        .unwrap()[1]
+            .rtcp
+            .cname,
+        Some(longest)
+    );
+    let mixed = offer("v", "sendonly", "a=ssrc:0 cname:x\r\na=ssrc:1 cname:y\r\n");
+    assert!(matches!(inspect(&mixed), Err(Error::Envelope(_))));
+    for (attributes, name) in [
+        ("a=rtcp-mux\r\n", "rtcp-mux"),
+        ("a=rtcp-rsize\r\na=rtcp-rsize\r\n", "rtcp-rsize"),
+        ("a=rtcp-rsize:invalid\r\n", "rtcp-rsize"),
+        ("a=ssrc:0 cname:x\r\na=ssrc:0 cname:x\r\n", "cname"),
+    ] {
+        assert_eq!(
+            inspect(&offer("v", "sendonly", attributes)),
+            Err(Error::Malformed(name))
+        );
+    }
     let duplicate = offer("data", "recvonly", "");
     assert!(inspect(&duplicate).is_err());
     let invalid = offer("v", "recvonly", "a=extmap:0 secret\r\n");

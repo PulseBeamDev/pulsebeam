@@ -37,13 +37,17 @@ pub(crate) struct ReceiveStream {
 }
 
 impl ReceiveStream {
+    pub(crate) fn missing_bytes(nack: bool) -> Option<usize> {
+        std::mem::size_of::<Missing>().checked_mul(if nack { REORDER_WINDOW } else { 0 })
+    }
+
     pub(crate) fn new(clock_rate: u32, nack: bool) -> Self {
         Self {
             base: None,
             highest: 0,
             seen: [u64::MAX; REORDER_WINDOW],
             received: 0,
-            missing: VecDeque::new(),
+            missing: VecDeque::with_capacity(if nack { REORDER_WINDOW } else { 0 }),
             nack,
             clock_rate,
             previous_arrival: None,
@@ -204,9 +208,6 @@ impl ReceiveStream {
         );
         packet.extend_from_slice(&last_sr.to_be_bytes());
         packet.extend_from_slice(&delay.to_be_bytes());
-        packet.extend_from_slice(&[0x81, 202, 0, 3]);
-        packet.extend_from_slice(&receiver_ssrc.to_be_bytes());
-        packet.extend_from_slice(&[1, 3, b'r', b't', b'c', 0, 0, 0]);
         Some(packet)
     }
 }
@@ -269,6 +270,20 @@ mod tests {
         assert!(stream.accept(1, 0, now, false));
         assert!(stream.accept(20_000, 0, now, false));
         assert_eq!(stream.missing.len(), REORDER_WINDOW - 1);
+        assert_eq!(stream.missing.capacity(), REORDER_WINDOW);
+        assert_eq!(
+            ReceiveStream::missing_bytes(true).unwrap(),
+            stream
+                .missing
+                .capacity()
+                .checked_mul(std::mem::size_of::<Missing>())
+                .unwrap()
+        );
+        let mut plain = ReceiveStream::new(48_000, false);
+        assert!(plain.accept(1, 0, now, false));
+        assert!(plain.accept(20_000, 0, now, false));
+        assert_eq!(plain.missing.capacity(), 0);
+        assert_eq!(ReceiveStream::missing_bytes(false), Some(0));
         assert_eq!(stream.missing.front().unwrap().sequence, 19_745);
         assert!(!stream.accept(1, 0, now, false));
         for retry in 0..5 {

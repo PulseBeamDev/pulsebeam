@@ -11,6 +11,8 @@ pub mod steering;
 pub(crate) mod topology;
 pub mod ufrag;
 
+pub(super) const MAX_NATIVE_SDP_BYTES: usize = 131_072;
+
 pub use negotiator::MAX_SEND_AUDIO_SLOTS;
 pub(crate) use negotiator::{NegotiatedMedia, NegotiatedResources};
 #[cfg(test)]

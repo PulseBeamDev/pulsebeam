@@ -76,8 +76,8 @@ pub(crate) struct NegotiatedSessionFacts {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IngressMediaFacts {
-    pub(crate) sender_index: u32,
     pub(crate) kind: crate::MediaKind,
+    pub(crate) rtcp: Option<crate::RtcpParameters>,
     pub(crate) mid: Box<str>,
     pub(crate) payloads: Box<[(u8, u32)]>,
     pub(crate) feedback_payloads: Box<[u8]>,
@@ -93,6 +93,7 @@ pub(crate) struct IngressMediaFacts {
 pub(crate) struct EgressSenderFacts {
     pub(crate) id: SenderId,
     pub(crate) kind: crate::MediaKind,
+    pub(crate) rtcp: Option<crate::RtcpParameters>,
     pub(crate) mid: Box<str>,
     pub(crate) payload_type: u8,
     pub(crate) retransmission_payload_type: Option<u8>,
@@ -137,18 +138,6 @@ impl NegotiatedSessionFacts {
         })
     }
 
-    pub(crate) fn outbound_twcc_extension_id(&self) -> Option<u8> {
-        self.media.iter().find_map(|section| {
-            section
-                .extensions
-                .iter()
-                .find(|extension| {
-                    extension.direction.allows_send() && TWCC_URIS.contains(&extension.uri.as_str())
-                })
-                .map(|extension| extension.id)
-        })
-    }
-
     pub(crate) fn ingress_media(&self) -> Box<[IngressMediaFacts]> {
         self.media
             .iter()
@@ -160,8 +149,8 @@ impl NegotiatedSessionFacts {
                     SectionKind::Application => return None,
                 };
                 Some(IngressMediaFacts {
-                    sender_index: section.media_index,
                     kind,
+                    rtcp: None,
                     mid: section.mid.clone().into_boxed_str(),
                     payloads: section
                         .codecs
@@ -218,7 +207,8 @@ impl NegotiatedSessionFacts {
     }
 
     pub(crate) fn egress_senders(&self) -> Box<[EgressSenderFacts]> {
-        let mut next_id = 1_u16;
+        let cname: String = self.local_cname().into_iter().map(char::from).collect();
+        let mut next_id = 1_u64;
         self.media
             .iter()
             .filter(|section| {
@@ -237,6 +227,10 @@ impl NegotiatedSessionFacts {
                 };
                 Some(EgressSenderFacts {
                     id,
+                    rtcp: Some(crate::RtcpParameters {
+                        cname: cname.clone(),
+                        reduced_size: section.rtcp_reduced_size,
+                    }),
                     kind: match section.kind {
                         SectionKind::Audio => crate::MediaKind::Audio,
                         SectionKind::Video => crate::MediaKind::Video,
@@ -287,15 +281,8 @@ impl NegotiatedSessionFacts {
             .collect()
     }
 
-    pub(crate) fn outbound_twcc_payload_map(&self) -> Box<[(u8, u8)]> {
-        self.egress_senders()
-            .iter()
-            .filter_map(|sender| {
-                sender
-                    .twcc_extension_id
-                    .map(|extension_id| (sender.payload_type, extension_id))
-            })
-            .collect()
+    pub(crate) fn local_cname(&self) -> [u8; 32] {
+        local_cname(&self.protocol_randomness)
     }
 
     pub(crate) const fn protocol_randomness(&self) -> &[u8; 32] {
@@ -377,6 +364,7 @@ struct NegotiatedMediaSection {
     inbound_rids: Box<[String]>,
     ssrcs: Box<[u32]>,
     ssrc_groups: Box<[SsrcGroupFacts]>,
+    rtcp_reduced_size: bool,
     sctp: Option<SctpFacts>,
 }
 
@@ -626,7 +614,7 @@ fn negotiate_inner(
             .len()
             .checked_add(1)
             .ok_or_else(NegotiationError::limit)?;
-        let id = u16::try_from(ordinal).map_err(|_| NegotiationError::limit())?;
+        let id = u64::try_from(ordinal).map_err(|_| NegotiationError::limit())?;
         let kind = match section.facts.kind {
             SectionKind::Audio => crate::MediaKind::Audio,
             SectionKind::Video => crate::MediaKind::Video,
@@ -670,12 +658,10 @@ fn negotiate_inner(
         inbound_media: Arc::from(inbound_media),
         senders: Arc::from(senders),
     };
-    let cname = token(
-        &Sha256::new()
-            .chain_update(b"pulsebeam rtc cname v1")
-            .chain_update(protocol_randomness)
-            .finalize(),
-    );
+    let cname: String = local_cname(&protocol_randomness)
+        .into_iter()
+        .map(char::from)
+        .collect();
     let answer_sections = builds
         .iter()
         .zip(&raw.sections)
@@ -691,6 +677,12 @@ fn negotiate_inner(
                 index == 0,
                 [feedback, inbound_feedback],
             );
+            if section.facts.sctp.is_some() {
+                answer.push_str(&format!(
+                    "a=max-message-size:{}\r\n",
+                    crate::sctp::receive_message_bytes(config.limits)
+                ));
+            }
             if let Some(sender) = session
                 .senders
                 .iter()
@@ -958,6 +950,7 @@ fn parse_section(
             inbound_rids: inbound_rids(raw)?.into_boxed_slice(),
             ssrcs: ssrcs.into_boxed_slice(),
             ssrc_groups: groups.into_boxed_slice(),
+            rtcp_reduced_size: raw.iter().any(|line| line == "a=rtcp-rsize"),
             sctp,
         },
         accepted_payloads,
@@ -1543,18 +1536,29 @@ fn remote_candidates(offer: &str) -> Result<Vec<String>, NegotiationError> {
     Ok(result)
 }
 
-fn token(bytes: &[u8]) -> String {
+fn local_cname(randomness: &[u8; 32]) -> [u8; 32] {
+    let digest: [u8; 32] = Sha256::new()
+        .chain_update(b"pulsebeam rtc cname v1")
+        .chain_update(randomness)
+        .finalize()
+        .into();
+    digest.map(token_byte)
+}
+
+fn token_byte(byte: u8) -> u8 {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    ALPHABET
+        .get(usize::from(byte & 63))
+        .copied()
+        .unwrap_or(b'A')
+}
+
+fn token(bytes: &[u8]) -> String {
     bytes
         .iter()
-        .map(|byte| {
-            char::from(
-                ALPHABET
-                    .get(usize::from(*byte & 63))
-                    .copied()
-                    .unwrap_or(b'A'),
-            )
-        })
+        .copied()
+        .map(token_byte)
+        .map(char::from)
         .collect()
 }
 
@@ -1736,7 +1740,6 @@ fn format_answer_section(
             || line.starts_with("a=rid:")
             || line.starts_with("a=simulcast:")
             || line.starts_with("a=sctp-port:")
-            || line.starts_with("a=max-message-size:")
             || keep_payload
             || keep_feedback
             || keep_extension;
@@ -2012,7 +2015,30 @@ mod tests {
                         .any(|(_, value)| value.as_ref() == uri)
                 );
             }
+            let cname = result.facts.local_cname();
+            for sender in &senders {
+                let rtcp = sender.rtcp.as_ref().unwrap();
+                assert_eq!(rtcp.cname.as_bytes(), cname);
+                let section = result
+                    .facts
+                    .media
+                    .iter()
+                    .find(|section| section.mid.as_str() == sender.mid.as_ref())
+                    .unwrap();
+                assert_eq!(rtcp.reduced_size, section.rtcp_reduced_size);
+                let (ssrc, _, _) = crate::egress::sender_rtp_identity(
+                    result.facts.protocol_randomness(),
+                    sender.id,
+                );
+                assert!(
+                    result
+                        .answer
+                        .as_str()
+                        .contains(&format!("a=ssrc:{ssrc} cname:{}\r\n", rtcp.cname))
+                );
+            }
             let inbound = result.facts.ingress_media();
+            assert!(inbound.iter().all(|media| media.rtcp.is_none()));
             assert_eq!(
                 inbound
                     .iter()
@@ -2039,8 +2065,11 @@ mod tests {
             header.replace("a=group:BUNDLE audio video data", "a=group:BUNDLE data"),
             application,
         ));
+        let mut local = config();
+        local.limits.max_inbound_data_message_bytes = 0;
+        local.limits.max_buffered_data_bytes = 0;
         let accepted = Connection::accept(
-            config(),
+            local,
             offer,
             at(),
             std::time::UNIX_EPOCH,
@@ -2052,6 +2081,15 @@ mod tests {
         assert!(accepted.session.senders.is_empty());
         assert_eq!(accepted.connection.stats().connection.feedback, None);
         assert!(accepted.answer.as_str().contains("a=sctp-port:"));
+        assert_eq!(
+            accepted
+                .answer
+                .as_str()
+                .lines()
+                .filter(|line| line.starts_with("a=max-message-size:"))
+                .collect::<Vec<_>>(),
+            ["a=max-message-size:131082"]
+        );
         assert!(!accepted.answer.as_str().contains("m=audio"));
         assert!(!accepted.answer.as_str().contains("m=video"));
         assert!(!accepted.answer.as_str().contains("transport-cc"));
@@ -2944,7 +2982,8 @@ mod tests {
 
     #[test]
     fn immutable_facts_retain_sctp_and_selected_limits() {
-        let config = config();
+        let mut config = config();
+        config.limits.max_inbound_data_message_bytes = 192 * 1024;
         let mut entropy = EntropyConsumer::new(ConnectionEntropy::new([5; 32]));
         let result = match negotiate_inner(&config, &fixture("firefox"), at(), &mut entropy) {
             Ok(result) => result,
@@ -2961,6 +3000,37 @@ mod tests {
         assert_eq!(sctp.port, 5000);
         assert_eq!(sctp.max_message_size, Some(65_536));
         assert!(!sctp.unlimited_message_size);
+        assert_eq!(
+            result
+                .answer
+                .as_str()
+                .lines()
+                .filter(|line| line.starts_with("a=max-message-size:"))
+                .collect::<Vec<_>>(),
+            ["a=max-message-size:196608"]
+        );
+        let offer = fixture("firefox");
+        let parsed = Sdp::parse(offer.as_str()).unwrap();
+        let application = parsed.media_lines.last().unwrap();
+        for (attribute, maximum, unlimited) in [
+            (None, None, false),
+            (Some("a=max-message-size:0"), None, true),
+            (Some("a=max-message-size:1"), Some(1), false),
+            (Some("a=max-message-size:65536"), Some(65_536), false),
+        ] {
+            let mut raw = vec![
+                "m=application 9 UDP/DTLS/SCTP webrtc-datachannel".to_owned(),
+                "a=sctp-port:5000".to_owned(),
+            ];
+            if let Some(attribute) = attribute {
+                raw.push(attribute.to_owned());
+            }
+            let facts = parse_sctp(application, &raw, SectionKind::Application, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(facts.max_message_size, maximum);
+            assert_eq!(facts.unlimited_message_size, unlimited);
+        }
         assert_eq!(result.facts.limits, config.limits);
         assert_eq!(
             result.facts.feedback,

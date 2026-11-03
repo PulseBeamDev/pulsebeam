@@ -34,6 +34,14 @@ playout remains supported through its negotiated extension. A receiver that
 actually negotiates audio playout-delay on every provisioned audio receiver can
 use the corresponding wire policy.
 
+## RTC bootstrap
+
+Core requests the Native control channel on externally negotiated physical SCTP
+stream 0, reliable and ordered. Both platform hosts apply the specification and
+check the actual channel configuration before returning offer resources. Topic
+channels remain in-band. `DataChannelSpec.negotiated_id` is a physical stream ID,
+separate from the logical `ChannelId` used for host callbacks.
+
 ## Track resources
 
 `TrackSpec` identifies media by kind and label, and data by label and delivery
@@ -111,7 +119,7 @@ This native-independent helper shows the prepare/apply/accept boundary:
 ```rust
 use pulsebeam_agent_core::client_sdp::{
     ApplyOutcome, Binding, Bindings, Capabilities, Context, Encoding, Error,
-    Limits, Preparation,
+    Limits, Preparation, RtcpParameters,
 };
 
 fn prepare_media(
@@ -138,8 +146,9 @@ fn finalize_sender(
     context: &mut Context,
     mid: &str,
     actual_encodings: &[Encoding],
+    actual_rtcp: &RtcpParameters,
 ) -> Result<Option<Bindings>, Error> {
-    let facts = context.observe_sender(mid, actual_encodings)?;
+    let facts = context.observe_sender(mid, actual_encodings, actual_rtcp)?;
     let complete = facts.publications.iter().chain(&facts.receptions)
         .all(Binding::complete);
     Ok(complete.then(|| facts.clone()))
@@ -163,8 +172,16 @@ candidates.
 
 An RID-only publication is not ready for admission: `Binding::complete()` stays
 false until the host passes actual sender encodings to
-`context.observe_sender(mid, &encodings)` after successful application. Submit
-only complete bindings to the server's typed API. Runtime
+`context.observe_sender(mid, &encodings, &rtcp)` after successful application.
+Supply actual sender RTCP observations with the encodings. An unexposed runtime
+CNAME retains the value from applied SDP; if neither source supplies it, the
+binding stays incomplete. Conflicting CNAME or mode observations fail atomically. CNAME is
+limited to the SDES field's 255 bytes. A binding needs one common CNAME across its
+primary and repair sources; unsupported mixed CNAMEs reject rather than merge.
+Fresh local answers select compound RTCP. Applied bootstrap reduced-size mode
+is retained only when offered, and continuing answers preserve the applied
+CNAME and mode. Fresh receive CNAMEs are distinct per physical receiver.
+Submit only complete bindings to the server's typed API. Runtime
 bitrate/framerate, activation and scalability observations remain separate from
 negotiated identities. Source or quality selection behind a compatible receive
 binding is caller policy and does not require SDP.

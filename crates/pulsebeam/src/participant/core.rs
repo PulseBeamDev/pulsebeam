@@ -939,6 +939,10 @@ impl Participant {
                 match intent {
                     DataTrackIntent::InternalSignaling => {
                         if self.profile == ConnectionProfile::Native {
+                            if !DataTrackIntent::is_native_signaling_channel(cid, &cfg) {
+                                self.disconnect(DisconnectReason::SignalingInput);
+                                return;
+                            }
                             plog_info!(self.log_ctx(), "internal media signaling is opened");
                             self.signaling.set_cid(cid);
                             if let Some(expiry) = self.authorization_expiry

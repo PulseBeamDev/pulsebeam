@@ -2,6 +2,22 @@
   const endpoint = "__DESTINATION_ENDPOINT__";
   // Test-only observation of the browser's real receivers, without a public Agent seam.
   const peers = new Set();
+  const controlConfigurations = [];
+  const originalCreateDataChannel =
+    RTCPeerConnection.prototype.createDataChannel;
+  RTCPeerConnection.prototype.createDataChannel = function (...args) {
+    const channel = originalCreateDataChannel.apply(this, args);
+    if (channel.label === "v1/sys/signaling") {
+      controlConfigurations.push({
+        id: channel.id,
+        negotiated: channel.negotiated,
+        ordered: channel.ordered,
+        maxRetransmits: channel.maxRetransmits,
+        maxPacketLifeTime: channel.maxPacketLifeTime,
+      });
+    }
+    return channel;
+  };
   const originalAddTransceiver = RTCPeerConnection.prototype.addTransceiver;
   RTCPeerConnection.prototype.addTransceiver = function (...args) {
     peers.add(this);
@@ -326,6 +342,18 @@
         defaultRtp.firstValue === null,
       "fresh SSRC has no obsolete playout extension",
     );
+    assert(
+      controlConfigurations.length >= 3 &&
+        controlConfigurations.every(
+          (channel) =>
+            channel.id === 0 &&
+            channel.negotiated &&
+            channel.ordered &&
+            channel.maxRetransmits === null &&
+            channel.maxPacketLifeTime === null,
+        ),
+      "initial and replacement native control channels use negotiated reliable ordered SID 0",
+    );
     attachment.close();
     assert(video.srcObject === null, "element cleanup");
     receiver.close();
@@ -347,6 +375,7 @@
     videoTrack.stop();
     audioTrack.stop();
     await source.close();
+    RTCPeerConnection.prototype.createDataChannel = originalCreateDataChannel;
     RTCPeerConnection.prototype.addTransceiver = originalAddTransceiver;
     RTCPeerConnection.prototype.setRemoteDescription =
       originalSetRemoteDescription;

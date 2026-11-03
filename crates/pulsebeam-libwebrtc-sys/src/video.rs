@@ -3450,6 +3450,17 @@ impl RtpTransceiver {
         ffi::rtp_transceiver_mid(self.native(), &mut mid).then_some(mid)
     }
 
+    /// CNAME from this transceiver's currently applied native local description.
+    /// RID-only SDP may omit it. This does not start a GetParameters transaction.
+    pub fn applied_local_cname_bytes(&self) -> Option<Vec<u8>> {
+        if self.peer.closed.get() {
+            return None;
+        }
+        let mut cname = Vec::new();
+        ffi::peer_rtp_transceiver_applied_local_cname(self.peer.native(), self.native(), &mut cname)
+            .then_some(cname)
+    }
+
     /// Order supported video codecs for this transceiver's next negotiation.
     /// An empty list restores upstream defaults. Pass capabilities returned by
     /// the peer, rather than inventing payload profiles or fmtp parameters.

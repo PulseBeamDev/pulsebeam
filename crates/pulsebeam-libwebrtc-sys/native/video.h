@@ -656,6 +656,9 @@ bool rtp_transceiver_set_header_extensions(
     const NativeRtpTransceiver& transceiver,
     rust::Slice<const FfiRtpHeaderExtension> extensions,
     std::uint8_t& error_type, rust::String& error) noexcept;
+bool peer_rtp_transceiver_applied_local_cname(
+    const NativePeerConnection& peer, const NativeRtpTransceiver& transceiver,
+    rust::Vec<std::uint8_t>& cname) noexcept;
 bool rtp_transceiver_mid(const NativeRtpTransceiver& transceiver,
                          rust::String& mid) noexcept;
 bool rtp_transceiver_set_video_codec_preferences(

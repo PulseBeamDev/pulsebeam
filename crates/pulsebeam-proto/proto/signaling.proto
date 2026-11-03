@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package pulsebeam.media.v1;
+package pulsebeam.media.legacy.v1;
 
 // Live media signaling for PulseBeam native WebRTC connections over a reliable,
 // ordered binary data channel.

@@ -268,36 +268,118 @@ impl fmt::Debug for LocalIceCredentials {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectionLimits {
-    pub max_unsignaled_encodings: u16,
-    pub max_data_channels: u16,
+    /// Local per-message policy. Together with buffered bytes, the derived
+    /// native receive window and send buffer must fit their u32 window fields.
     pub max_inbound_data_message_bytes: usize,
+    /// Independent SCTP allowances for outbound caller payload bytes until native
+    /// lifecycle completion and inbound completed-message Vec capacity until event
+    /// dequeue, stale drop or abort. Caller-retained deliveries are outside scope.
+    /// Inbound exhaustion resets the offending stream. Excludes native socket/
+    /// reassembly buffers and event/index storage.
     pub max_buffered_data_bytes: usize,
+    /// Local SCTP lifecycle-map key/value payloads, including empty sends, held
+    /// until native lifecycle completion or map cleanup. Each admitted channel
+    /// also prepays its reset-record and ready-set payloads until safe reset
+    /// completion or cleanup; unknown-SID resets need independent credit.
+    /// Includes channel-map payloads, config-lease payloads and label/protocol
+    /// contents reserved per configuration, once across the channel and queued
+    /// Opened event. Config credit lasts until the last native holder leaves;
+    /// caller-retained deliveries are outside scope. Includes actual event-deque
+    /// capacity: admission prepays Opened, Closed and one reset outcome; received
+    /// messages cannot displace those notifications. Buffer credit lasts until
+    /// idle with no future notifications, or abort. Independent of payload
+    /// allowances. Excludes allocator/tree/Arc headers and native socket/
+    /// reassembly; not an RSS bound.
+    pub max_data_runtime_bytes: usize,
+    /// For ingress, retained RTP Vec capacity, once across shared payload and
+    /// extension slices; also the RTP/RTCP input-length maximum. Dequeue, drop
+    /// or abort ends the ingress charge, not receiver retirement. Caller-retained
+    /// delivery and event/string/extension-vector storage are excluded here;
+    /// receive-runtime storage funds those owned metadata payloads and backing.
     pub max_queued_media_bytes: usize,
+    /// Retained-original transport wire-byte sum, also a per-packet maximum.
+    /// Independent of retained allocation/index payloads in send-runtime storage.
     pub max_retransmission_bytes: usize,
+    /// Stored ingress facts/boxed payloads and encoding/RID group headers,
+    /// with active/MID membership promises. Receiver/reservation tuples,
+    /// per-media receiver memberships, NACK backing and owned RID/lookup-key
+    /// payloads include future declared and paused receivers. Receiver
+    /// retirement retains media/group storage until its media key is removed.
+    /// Includes declared/observed SSRC ownership, declared-primary and repair-link
+    /// index tuples. Learned repair ownership joins its receiver's lease until
+    /// removal or transfer into declared media storage. Each issued SSRC reserves
+    /// both ingress and transport permanent terminal-guard payloads until abort;
+    /// transport active membership uses its future fence allowance until retirement.
+    /// Includes actual event-deque
+    /// capacity, with one future retirement-notice slot per receiver reservation,
+    /// plus queued MID/RID/extension-URI string contents and actual extension-vector
+    /// capacity until dequeue, drop or abort, not merely receiver retirement.
+    /// Also funds actual incoming RTCP feedback/repair/keyframe deque capacities
+    /// and owned TWCC/RFC 8888 report/status arrays until dequeue or abort.
+    /// A selected receive-feedback profile prepays the actual receipt deque
+    /// capacity before acceptance or late RTP capability declaration; history
+    /// clear keeps that backing funded for reuse, while abort releases it.
+    /// Excludes allocation/Arc header and tree overhead, parsing/staging copies, queued
+    /// packet backing and replay state; not an RSS bound.
+    pub max_receive_runtime_bytes: usize,
+    /// Sender/facts/RID, live and promised sender indexes, grouped MID keys,
+    /// permanent issued-SSRC guards and FIR/repair entries, plus retirement,
+    /// media-queue and owned extension-vector backing, including spare capacity;
+    /// retained-original Vec backing and cache record/group/expiry payloads,
+    /// plus original plaintext workspace across working and pending ownership.
+    /// Cleanup promises and jobs share funded retirement-buffer slots.
+    /// Excludes shared Bytes/Arc, repair/padding workspace and transport packets,
+    /// allocator/tree nodes, temporary growth/staging and other RTC storage;
+    /// not an RSS bound.
+    pub max_send_runtime_bytes: usize,
+    /// Independent allowances for queued SCTP plaintext output and protected
+    /// transport output, not an aggregate across stages. Each funds packet Vec
+    /// capacity and physical queue backing. RTP/RTCP reserves before protection;
+    /// unretainable emitted SCTP packets fail the association closed. Transfer
+    /// ends that stage's packet charge; backing stays charged until released.
+    /// Excludes caller-retained output, allocator overhead, temporary staging
+    /// overlaps, native socket/reassembly, upstream crypto storage and pending
+    /// inbound DTLS. This is not an RSS bound.
+    pub max_transport_output_bytes: usize,
+    /// Reserved/learned inbound RTP replay key/window payload bytes. Excludes
+    /// allocator and index-node overhead; not a process-RSS bound.
+    pub max_rtp_replay_state_bytes: usize,
+    /// Authenticated SRTCP replay key/window payload bytes, accounted separately
+    /// so RTP reservations cannot consume control's allowance.
+    pub max_rtcp_replay_state_bytes: usize,
 }
 
 impl ConnectionLimits {
+    /// Legacy compatibility value, no longer a source-admission policy.
     pub const DEFAULT_MAX_UNSIGNALED_ENCODINGS: u16 = 32;
+    /// Legacy compatibility value, no longer a source-admission policy.
     pub const HARD_MAX_UNSIGNALED_ENCODINGS: u16 = 1024;
+    /// Legacy compatibility value, no longer an RTC channel-admission policy.
     pub const DEFAULT_MAX_DATA_CHANNELS: u16 = 256;
-    pub const HARD_MAX_DATA_CHANNELS: u16 = 4096;
+    /// Legacy compatibility value matching the native u16 stream-count width,
+    /// not a separate local channel-admission policy.
+    pub const HARD_MAX_DATA_CHANNELS: u16 = u16::MAX;
     pub const DEFAULT_MAX_INBOUND_DATA_MESSAGE_BYTES: usize = 1024 * 1024;
+    /// Legacy compatibility value, no longer a configuration-validation ceiling.
     pub const HARD_MAX_INBOUND_DATA_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
     pub const DEFAULT_MAX_BUFFERED_DATA_BYTES: usize = 8 * 1024 * 1024;
+    /// Legacy compatibility value, no longer a configuration-validation ceiling.
     pub const HARD_MAX_BUFFERED_DATA_BYTES: usize = 64 * 1024 * 1024;
+    pub const DEFAULT_MAX_DATA_RUNTIME_BYTES: usize = 64 * 1024 * 1024;
     pub const DEFAULT_MAX_QUEUED_MEDIA_BYTES: usize = 8 * 1024 * 1024;
+    /// Legacy compatibility value, no longer a configuration-validation ceiling.
     pub const HARD_MAX_QUEUED_MEDIA_BYTES: usize = 64 * 1024 * 1024;
     pub const DEFAULT_MAX_RETRANSMISSION_BYTES: usize = 16 * 1024 * 1024;
+    /// Legacy compatibility value, no longer a configuration-validation ceiling.
     pub const HARD_MAX_RETRANSMISSION_BYTES: usize = 128 * 1024 * 1024;
+    pub const DEFAULT_MAX_RECEIVE_RUNTIME_BYTES: usize = 64 * 1024 * 1024;
+    pub const DEFAULT_MAX_SEND_RUNTIME_BYTES: usize = 64 * 1024 * 1024;
+    pub const DEFAULT_MAX_TRANSPORT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+    pub const DEFAULT_MAX_RTP_REPLAY_STATE_BYTES: usize = 1024 * 1024;
+    pub const DEFAULT_MAX_RTCP_REPLAY_STATE_BYTES: usize = 1024 * 1024;
 
     pub const fn validate(self) -> Result<Self, AcceptError> {
-        if self.max_unsignaled_encodings > Self::HARD_MAX_UNSIGNALED_ENCODINGS
-            || self.max_data_channels > Self::HARD_MAX_DATA_CHANNELS
-            || self.max_inbound_data_message_bytes > Self::HARD_MAX_INBOUND_DATA_MESSAGE_BYTES
-            || self.max_buffered_data_bytes > Self::HARD_MAX_BUFFERED_DATA_BYTES
-            || self.max_queued_media_bytes > Self::HARD_MAX_QUEUED_MEDIA_BYTES
-            || self.max_retransmission_bytes > Self::HARD_MAX_RETRANSMISSION_BYTES
-        {
+        if crate::sctp::buffer_limits(self).is_none() {
             return Err(AcceptError::InvalidConfiguration);
         }
         Ok(self)
@@ -307,12 +389,16 @@ impl ConnectionLimits {
 impl Default for ConnectionLimits {
     fn default() -> Self {
         Self {
-            max_unsignaled_encodings: Self::DEFAULT_MAX_UNSIGNALED_ENCODINGS,
-            max_data_channels: Self::DEFAULT_MAX_DATA_CHANNELS,
             max_inbound_data_message_bytes: Self::DEFAULT_MAX_INBOUND_DATA_MESSAGE_BYTES,
             max_buffered_data_bytes: Self::DEFAULT_MAX_BUFFERED_DATA_BYTES,
+            max_data_runtime_bytes: Self::DEFAULT_MAX_DATA_RUNTIME_BYTES,
             max_queued_media_bytes: Self::DEFAULT_MAX_QUEUED_MEDIA_BYTES,
             max_retransmission_bytes: Self::DEFAULT_MAX_RETRANSMISSION_BYTES,
+            max_receive_runtime_bytes: Self::DEFAULT_MAX_RECEIVE_RUNTIME_BYTES,
+            max_send_runtime_bytes: Self::DEFAULT_MAX_SEND_RUNTIME_BYTES,
+            max_transport_output_bytes: Self::DEFAULT_MAX_TRANSPORT_OUTPUT_BYTES,
+            max_rtp_replay_state_bytes: Self::DEFAULT_MAX_RTP_REPLAY_STATE_BYTES,
+            max_rtcp_replay_state_bytes: Self::DEFAULT_MAX_RTCP_REPLAY_STATE_BYTES,
         }
     }
 }

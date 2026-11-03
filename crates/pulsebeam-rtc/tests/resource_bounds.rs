@@ -13,39 +13,39 @@ use pulsebeam_rtc::{AcceptError, ConnectionLimits, DataMessage, WriteError};
 use support::{FixtureDataEvent, PeerFixture, rtp_write};
 
 #[test]
-fn every_configured_limit_accepts_its_hard_maximum_and_rejects_limit_plus_one() {
+fn byte_allowances_exceed_legacy_constants_but_preserve_native_buffer_widths() {
     let hard = ConnectionLimits {
-        max_unsignaled_encodings: ConnectionLimits::HARD_MAX_UNSIGNALED_ENCODINGS,
-        max_data_channels: ConnectionLimits::HARD_MAX_DATA_CHANNELS,
         max_inbound_data_message_bytes: ConnectionLimits::HARD_MAX_INBOUND_DATA_MESSAGE_BYTES,
         max_buffered_data_bytes: ConnectionLimits::HARD_MAX_BUFFERED_DATA_BYTES,
+        max_data_runtime_bytes: usize::MAX,
         max_queued_media_bytes: ConnectionLimits::HARD_MAX_QUEUED_MEDIA_BYTES,
         max_retransmission_bytes: ConnectionLimits::HARD_MAX_RETRANSMISSION_BYTES,
+        max_receive_runtime_bytes: usize::MAX,
+        max_send_runtime_bytes: usize::MAX,
+        max_transport_output_bytes: usize::MAX,
+        max_rtp_replay_state_bytes: usize::MAX,
+        max_rtcp_replay_state_bytes: usize::MAX,
     };
     assert_eq!(hard.validate(), Ok(hard));
+    let expanded_payload = ConnectionLimits {
+        max_inbound_data_message_bytes: hard.max_inbound_data_message_bytes + 1,
+        max_buffered_data_bytes: hard.max_buffered_data_bytes + 1,
+        ..hard
+    };
+    assert_eq!(expanded_payload.validate(), Ok(expanded_payload));
+    let expanded_media = ConnectionLimits {
+        max_queued_media_bytes: hard.max_queued_media_bytes + 1,
+        max_retransmission_bytes: hard.max_retransmission_bytes + 1,
+        ..hard
+    };
+    assert_eq!(expanded_media.validate(), Ok(expanded_media));
     for invalid in [
         ConnectionLimits {
-            max_unsignaled_encodings: hard.max_unsignaled_encodings + 1,
+            max_inbound_data_message_bytes: usize::MAX,
             ..hard
         },
         ConnectionLimits {
-            max_data_channels: hard.max_data_channels + 1,
-            ..hard
-        },
-        ConnectionLimits {
-            max_inbound_data_message_bytes: hard.max_inbound_data_message_bytes + 1,
-            ..hard
-        },
-        ConnectionLimits {
-            max_buffered_data_bytes: hard.max_buffered_data_bytes + 1,
-            ..hard
-        },
-        ConnectionLimits {
-            max_queued_media_bytes: hard.max_queued_media_bytes + 1,
-            ..hard
-        },
-        ConnectionLimits {
-            max_retransmission_bytes: hard.max_retransmission_bytes + 1,
+            max_buffered_data_bytes: usize::MAX,
             ..hard
         },
     ] {
@@ -86,9 +86,8 @@ fn media_queue_admission_is_exact_and_preserves_ownership_and_index_on_retry() {
 }
 
 #[test]
-fn data_channel_count_and_buffered_payload_stop_at_configured_limits() {
+fn data_channel_admission_is_independent_of_buffered_payload_backpressure() {
     let limits = ConnectionLimits {
-        max_data_channels: 1,
         max_buffered_data_bytes: 8,
         ..ConnectionLimits::default()
     };
@@ -128,14 +127,11 @@ fn data_channel_count_and_buffered_payload_stop_at_configured_limits() {
         priority: pulsebeam_rtc::DataChannelPriority::MEDIUM,
         negotiated: false,
     };
-    let label = config.label.as_ptr();
-    let (error, config) = fixture
+    fixture
         .connection
         .open_data_channel(fixture.at(), config)
-        .expect_err("channel limit");
-    assert_eq!(error, WriteError::WouldBlock);
-    assert_eq!(config.label.as_ref(), "second");
-    assert_eq!(config.label.as_ptr(), label);
+        .expect("another funded channel is independent of full caller-payload credit");
+    assert_eq!(fixture.connection.stats().data_channels.len(), 2);
     fixture.connection.abort();
     let rejected = fixture
         .connection

@@ -1,0 +1,234 @@
+--- a/src/rtp/srtp.rs
++++ b/src/rtp/srtp.rs
+@@ -183,6 +183,36 @@
+     }
+ }
+ 
++/// Packet storage required by the selected, derived cipher.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct SrtpProtectionLayout {
++    pub wire_bytes: usize,
++    /// Includes CTR tail workspace, not allocator capacity or provider-internal storage.
++    pub initialized_bytes: usize,
++}
++
++fn protection_layout(
++    cipher: &Derived,
++    plaintext: usize,
++    index_bytes: usize,
++) -> Option<SrtpProtectionLayout> {
++    let tag = match cipher {
++        Derived::Aes128CmSha1_80 { .. } => Aes128CmSha1_80::HMAC_TAG_LEN,
++        Derived::AeadAes128Gcm { .. } => AeadAes128Gcm::TAG_LEN,
++        Derived::AeadAes256Gcm { .. } => AeadAes256Gcm::TAG_LEN,
++    };
++    let wire_bytes = plaintext.checked_add(index_bytes)?.checked_add(tag)?;
++    let initialized_bytes = if matches!(cipher, Derived::Aes128CmSha1_80 { .. }) {
++        plaintext.checked_add(CTR_BUFFER_PADDING)?
++    } else {
++        wire_bytes
++    };
++    Some(SrtpProtectionLayout {
++        wire_bytes,
++        initialized_bytes,
++    })
++}
++
+ #[derive(Debug)]
+ pub struct SrtpContext {
+     /// Encryption/decryption derived from srtp_key for RTP.
+@@ -203,12 +233,36 @@
+ impl RefUnwindSafe for SrtpContext {}
+ 
+ impl SrtpContext {
+-    pub fn protect_rtp(
++    pub fn rtp_protection_layout(&self, plaintext: usize) -> Option<SrtpProtectionLayout> {
++        protection_layout(&self.rtp, plaintext, 0)
++    }
++
++    pub fn rtcp_protection_layout(&self, plaintext: usize) -> Option<SrtpProtectionLayout> {
++        protection_layout(&self.rtcp, plaintext, SRTCP_INDEX_LEN)
++    }
++
++    pub fn protect_rtp(&mut self, buf: &[u8], header: &RtpHeader, srtp_index: u64) -> Vec<u8> {
++        let layout = self.rtp_protection_layout(buf.len()).expect("RTP size");
++        let mut output = vec![0; layout.initialized_bytes];
++        let written = self
++            .protect_rtp_into(buf, header, srtp_index, &mut output)
++            .expect("RTP storage");
++        output.truncate(written);
++        output
++    }
++
++    /// Protect into caller-owned packet storage, returning the wire length.
++    /// Insufficient storage leaves output and cipher state untouched.
++    /// Provider-internal allocation behavior is unchanged.
++    pub fn protect_rtp_into(
+         &mut self,
+         buf: &[u8],
+         header: &RtpHeader,
+-        srtp_index: u64, // same as ext_seq
+-    ) -> Vec<u8> {
++        srtp_index: u64,
++        output: &mut [u8],
++    ) -> Option<usize> {
++        let layout = self.rtp_protection_layout(buf.len())?;
++        let output = output.get_mut(..layout.initialized_bytes)?;
+         // SRTP layout
+         // [header, [rtp, (padding + pad_count)], tag]
+ 
+@@ -241,18 +295,9 @@
+ 
+         match &mut self.rtp {
+             Derived::Aes128CmSha1_80 { key, salt, enc, .. } => {
+-                // arbitrary body lengths are fine: the output buffer below is
+-                // allocated with the CTR scratch the ciphers need and truncated
+-                // after encryption, so no 16-byte alignment is required.
++                // The caller provides CTR tail scratch; no block alignment is required.
+                 let iv = Aes128CmSha1_80::rtp_iv(*salt, *header.ssrc, srtp_index);
+ 
+-                // Allocate buffer with CTR padding (aws-lc-rs requirement)
+-                // HMAC_TAG_LEN is 10, CTR_BUFFER_PADDING is 15, so we need 5 extra bytes
+-                let padding_needed =
+-                    CTR_BUFFER_PADDING.saturating_sub(Aes128CmSha1_80::HMAC_TAG_LEN);
+-                let mut output =
+-                    vec![0_u8; buf.len() + Aes128CmSha1_80::HMAC_TAG_LEN + padding_needed];
+-
+                 enc.encrypt(&iv, input, &mut output[hlen..])
+                     .expect("rtp encrypt");
+ 
+@@ -260,10 +305,7 @@
+ 
+                 let hmac_start = buf.len();
+                 let sha1_hmac = |k: &[u8], p: &[&[u8]]| self.sha1_hmac_provider.sha1_hmac(k, p);
+-                Aes128CmSha1_80::rtp_hmac(sha1_hmac, key, &mut output, srtp_index, hmac_start);
+-
+-                output.truncate(buf.len() + Aes128CmSha1_80::HMAC_TAG_LEN);
+-                output
++                Aes128CmSha1_80::rtp_hmac(sha1_hmac, key, output, srtp_index, hmac_start);
+             }
+             Derived::AeadAes128Gcm { salt, enc, .. } => {
+                 let roc = (srtp_index >> 16) as u32;
+@@ -273,13 +315,10 @@
+ 
+                 // Input and output lengths for encryption:
+                 // https://www.rfc-editor.org/rfc/rfc7714#section-5.2.1
+-                let mut output = vec![0_u8; buf.len() + AeadAes128Gcm::TAG_LEN];
+                 enc.encrypt(&iv, aad, input, &mut output[hlen..])
+                     .expect("rtp encrypt");
+ 
+                 output[..hlen].copy_from_slice(aad);
+-
+-                output
+             }
+             Derived::AeadAes256Gcm { salt, enc, .. } => {
+                 let roc = (srtp_index >> 16) as u32;
+@@ -289,15 +328,13 @@
+ 
+                 // Input and output lengths for encryption:
+                 // https://www.rfc-editor.org/rfc/rfc7714#section-5.2.1
+-                let mut output = vec![0_u8; buf.len() + AeadAes256Gcm::TAG_LEN];
+                 enc.encrypt(&iv, aad, input, &mut output[hlen..])
+                     .expect("rtp encrypt");
+ 
+                 output[..hlen].copy_from_slice(aad);
+-
+-                output
+             }
+         }
++        Some(layout.wire_bytes)
+     }
+ 
+     /// Decrypts an SRTP packet into the internal reusable scratch buffer and
+@@ -414,12 +451,23 @@
+     }
+ 
+     pub fn protect_rtcp(&mut self, buf: &[u8]) -> Vec<u8> {
+-        let srtcp_index = self.srtcp_index;
++        let layout = self.rtcp_protection_layout(buf.len()).expect("RTCP size");
++        let mut output = vec![0; layout.initialized_bytes];
++        let written = self
++            .protect_rtcp_into(buf, &mut output)
++            .expect("RTCP storage");
++        output.truncate(written);
++        output
++    }
+ 
+-        // https://tools.ietf.org/html/rfc3711#page-15
+-        // The SRTCP index MUST be set to zero before the first SRTCP
+-        // packet is sent, and MUST be incremented by one,
+-        // modulo 2^31, after each SRTCP packet is sent.
++    /// Protect into caller-owned packet storage, returning the wire length.
++    /// Insufficient storage does not write output or consume an SRTCP index.
++    /// Provider-internal allocation behavior is unchanged.
++    pub fn protect_rtcp_into(&mut self, buf: &[u8], output: &mut [u8]) -> Option<usize> {
++        let layout = self.rtcp_protection_layout(buf.len())?;
++        let output = output.get_mut(..layout.initialized_bytes)?;
++        let srtcp_index = self.srtcp_index;
++        // Reserve the nonce after storage validation, before encryption can panic.
+         self.srtcp_index = (self.srtcp_index + 1) % 2_u32.pow(31);
+ 
+         // e is always encrypted, rest is 31 byte index.
+@@ -434,12 +482,7 @@
+             Derived::Aes128CmSha1_80 { key, salt, enc, .. } => {
+                 let iv = Aes128CmSha1_80::rtp_iv(*salt, ssrc, srtcp_index as u64);
+ 
+-                let final_size = buf.len() + SRTCP_INDEX_LEN + Aes128CmSha1_80::HMAC_TAG_LEN;
+-                // Allocate buffer with CTR padding (aws-lc-rs requirement)
+-                // SRTCP_INDEX_LEN + HMAC_TAG_LEN is 14, CTR_BUFFER_PADDING is 15, so we need 1 extra byte
+-                let padding_needed = CTR_BUFFER_PADDING
+-                    .saturating_sub(SRTCP_INDEX_LEN + Aes128CmSha1_80::HMAC_TAG_LEN);
+-                let mut output = vec![0_u8; final_size + padding_needed];
++                let final_size = layout.wire_bytes;
+ 
+                 output[0..8].copy_from_slice(&buf[0..8]);
+                 let input = &buf[8..];
+@@ -451,10 +494,7 @@
+ 
+                 let hmac_index = final_size - Aes128CmSha1_80::HMAC_TAG_LEN;
+                 let sha1_hmac = |k: &[u8], p: &[&[u8]]| self.sha1_hmac_provider.sha1_hmac(k, p);
+-                Aes128CmSha1_80::rtcp_hmac(sha1_hmac, key, &mut output, hmac_index);
+-
+-                output.truncate(final_size);
+-                output
++                Aes128CmSha1_80::rtcp_hmac(sha1_hmac, key, output, hmac_index);
+             }
+             Derived::AeadAes128Gcm { salt, enc, .. } => {
+                 let iv = AeadAes128Gcm::rtcp_iv(*salt, ssrc, srtcp_index);
+@@ -463,7 +503,6 @@
+                 aad[..8].copy_from_slice(&buf[..8]);
+                 aad[8..12].copy_from_slice(&e_and_si.to_be_bytes());
+ 
+-                let mut output = vec![0_u8; buf.len() + SRTCP_INDEX_LEN + AeadAes128Gcm::TAG_LEN];
+                 output[0..8].copy_from_slice(&buf[0..8]);
+                 let input = &buf[8..];
+ 
+@@ -475,8 +514,6 @@
+ 
+                 let to = &mut output[enc_end..];
+                 to[0..4].copy_from_slice(&e_and_si.to_be_bytes());
+-
+-                output
+             }
+             Derived::AeadAes256Gcm { salt, enc, .. } => {
+                 let iv = AeadAes256Gcm::rtcp_iv(*salt, ssrc, srtcp_index);
+@@ -485,7 +522,6 @@
+                 aad[..8].copy_from_slice(&buf[..8]);
+                 aad[8..12].copy_from_slice(&e_and_si.to_be_bytes());
+ 
+-                let mut output = vec![0_u8; buf.len() + SRTCP_INDEX_LEN + AeadAes256Gcm::TAG_LEN];
+                 output[0..8].copy_from_slice(&buf[0..8]);
+                 let input = &buf[8..];
+ 
+@@ -497,10 +533,9 @@
+ 
+                 let to = &mut output[enc_end..];
+                 to[0..4].copy_from_slice(&e_and_si.to_be_bytes());
+-
+-                output
+             }
+         }
++        Some(layout.wire_bytes)
+     }
+ 
+     // SRTCP layout

@@ -53,7 +53,7 @@ RoomId + ParticipantExternalId
 connection admission
     -> ConnectionId
 
-ConnectionId + TrackKind + TrackLabel
+ConnectionId + TrackKind + TrackLabel + publication incarnation
     -> TrackId
 
 TrackId + current placement
@@ -62,9 +62,20 @@ TrackId + current placement
 ```
 
 `RoomId` and `ParticipantId` are deterministic hierarchical UUIDv8 identities.
-`ConnectionId` is minted UUIDv7; `TrackId` is UUIDv8 derived from that connection,
-track kind, and immutable label. A reconnect creates fresh track IDs. Their V0 text encodings
-are `rm_0...`, `pa_0...`, `aud_0...` / `vid_0...` / `dat_0...`, and `c_0...`.
+`ConnectionId` is minted UUIDv7. `ConnectionId::derive_publication_track_id`
+derives a UUIDv8 `TrackId` from the connection, track kind, immutable label and
+nonzero publication incarnation. For desired/confirmed resources, the incarnation
+is the first desired revision (owned ref), not each later settings revision.
+Disabling a continuing publication preserves it; retirement and same-label
+republishing require a fresh one. The transcript is the publication domain
+`pulsebeam.identity.publication.v1`, connection UUID bytes, kind byte, incarnation
+as big-endian uint64, then the label's big-endian uint32 byte length and UTF-8
+bytes. UUID version/variant bits are applied to the first 16 SHA3-256 bytes.
+
+`derive_track_id` retains the single bootstrap-lifetime transcript for SDP and
+legacy sources without owned refs. It cannot identify multiple same-label
+lifetimes on one connection. Both derivations retain the existing canonical
+encoding; a reconnect creates fresh track IDs. The V0 text encodings are `rm_0...`, `pa_0...`, `aud_0...` / `vid_0...` / `dat_0...`, and `c_0...`.
 Only the canonical identity implementation may derive, mint, parse, or format
 these values.
 

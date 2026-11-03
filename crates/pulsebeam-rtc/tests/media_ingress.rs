@@ -13,6 +13,8 @@ use pulsebeam_rtc::{
     Connection, ConnectionConfig, ConnectionEntropy, LocalCandidate, NetworkInput, Output, SdpOffer,
 };
 
+use pulsebeam_rtc_simulation::{RtcStatsClass, RtcStatsValues};
+
 mod support;
 
 #[test]
@@ -35,19 +37,34 @@ fn mixed_direction_native_publisher_recovers_loss_as_primary_media() {
         fixture.source_repair_packets > 0,
         "native publisher must send real RTX"
     );
-    assert!(
-        fixture.publisher_nacks > 0,
-        "NACK must cross the authenticated protocol boundary"
-    );
     fixture.drive_for(Duration::from_millis(1_100));
+    // Nested feedback is encrypted in compound SRTCP; observe the native receiver.
+    let publisher = fixture.publisher_stats();
+    let outbound = publisher
+        .of_class(RtcStatsClass::OutboundRtpStreamStats)
+        .into_iter()
+        .find_map(|entry| match entry.values() {
+            RtcStatsValues::OutboundRtpStreamStats(value) if value.ssrc == Some(ssrc) => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("native publisher outbound stats");
     assert!(
-        fixture.publisher_reports > 0,
-        "publisher must receive an RTCP receiver report"
+        outbound.nack_count.unwrap() > 0,
+        "native publisher must authenticate and receive NACK"
     );
-    assert!(
-        fixture.publisher_feedback > 0,
-        "publisher must receive packet-level congestion feedback"
-    );
+    let remote = publisher
+        .of_class(RtcStatsClass::RemoteInboundRtpStreamStats)
+        .into_iter()
+        .find_map(|entry| match entry.values() {
+            RtcStatsValues::RemoteInboundRtpStreamStats(value) if value.ssrc == Some(ssrc) => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("native publisher must receive its source's receiver report");
+    assert!(remote.packets_lost.is_some() && remote.jitter.is_some());
     let stats = fixture.connection.stats();
     assert_eq!(stats.senders.len(), 1);
     assert_eq!(stats.encodings.len(), 1);
