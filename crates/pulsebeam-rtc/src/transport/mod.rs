@@ -5,9 +5,11 @@
 
 mod dtls;
 mod ice;
+mod output;
 mod srtp;
+use output::{OutputQueue, SlotReservation};
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -20,10 +22,10 @@ use crate::negotiation::{DtlsRole, NegotiatedSessionFacts};
 
 use crate::{NetworkInput, TransmitTarget};
 
-use srtp::{RtpMetadata, SrtpError, outbound_rtp_metadata, outbound_twcc_sequence};
+pub(crate) use srtp::SrtpError;
+use srtp::{RtpMetadata, outbound_rtp_metadata, outbound_twcc_sequence};
 
 const MAX_EVENTS: usize = 256;
-const MAX_TRANSMISSIONS: usize = 256;
 const MAX_CANDIDATE_PAIRS: usize = 128;
 const MAX_PENDING_DTLS: usize = 64;
 
@@ -177,11 +179,10 @@ pub(crate) struct TransportConfig {
     pub ice_tie_breaker: u64,
     pub max_candidate_pairs: usize,
     pub max_events: usize,
-    pub max_transmissions: usize,
+    pub max_output_bytes: usize,
     inbound_payload_types: Box<[u8]>,
     outbound_payload_types: Box<[u8]>,
-    twcc_extension_id: Option<u8>,
-    twcc_payload_map: Box<[(u8, u8)]>,
+    replay_limits: srtp::ReplayLimits,
 }
 
 impl TransportConfig {
@@ -226,13 +227,12 @@ impl TransportConfig {
             ice_tie_breaker: 1,
             max_candidate_pairs: MAX_CANDIDATE_PAIRS,
             max_events: MAX_EVENTS,
-            max_transmissions: MAX_TRANSMISSIONS,
+            max_output_bytes: crate::ConnectionLimits::DEFAULT_MAX_TRANSPORT_OUTPUT_BYTES,
             inbound_payload_types: (0..=127)
                 .filter(|payload| !(64..=95).contains(payload))
                 .collect(),
             outbound_payload_types: Box::new([]),
-            twcc_extension_id: None,
-            twcc_payload_map: Box::new([]),
+            replay_limits: srtp::ReplayLimits::default(),
         }
     }
 
@@ -252,23 +252,11 @@ impl TransportConfig {
         self
     }
 
-    fn with_twcc_extension_id(mut self, twcc_extension_id: Option<u8>) -> Self {
-        self.twcc_extension_id = twcc_extension_id;
-        self
-    }
-
-    fn with_twcc_payload_map(mut self, twcc_payload_map: Box<[(u8, u8)]>) -> Self {
-        self.twcc_payload_map = twcc_payload_map;
-        self
-    }
-
     pub(crate) fn validate(&self) -> Result<(), TransportError> {
         if self.max_candidate_pairs == 0
             || self.max_events == 0
-            || self.max_transmissions == 0
             || self.max_candidate_pairs > MAX_CANDIDATE_PAIRS
             || self.max_events > MAX_EVENTS
-            || self.max_transmissions > MAX_TRANSMISSIONS
             || self.ice_tie_breaker == 0
             || self.ice_controlling && self.remote_candidates.is_empty()
             || self.remote_candidates.len() > self.max_candidate_pairs
@@ -303,21 +291,21 @@ pub(crate) struct Transport {
     ice: ice::IceLayer,
     dtls: Option<dtls::DtlsLayer>,
     srtp: Option<srtp::SrtpLayer>,
-    allowed_inbound_ssrcs: Option<Box<[u32]>>,
+    allowed_inbound_ssrcs: Option<BTreeSet<u32>>,
+    retired_inbound_ssrcs: BTreeSet<u32>,
+    reserved_inbound_ssrcs: usize,
+    replay_limits: srtp::ReplayLimits,
     certificate: Option<DtlsCert>,
     local_fingerprint: Fingerprint,
     remote_fingerprint: Fingerprint,
     dtls_role: DtlsRole,
     inbound_payload_types: Box<[u8]>,
     outbound_payload_types: Box<[u8]>,
-    twcc_extension_id: Option<u8>,
-    twcc_payload_map: Box<[(u8, u8)]>,
     events: VecDeque<TransportEvent>,
-    transmissions: VecDeque<PreparedTransmit>,
+    transmissions: OutputQueue,
     pending_dtls: VecDeque<(SelectedPath, Vec<u8>)>,
     next_deadline: Option<Instant>,
     max_events: usize,
-    max_transmissions: usize,
     dropped_inputs: u64,
 }
 
@@ -334,6 +322,13 @@ pub(crate) enum NetworkEnvelope {
 }
 
 impl NetworkEnvelope {
+    fn secure_body_limit(&self) -> Option<usize> {
+        match self {
+            Self::Udp { .. } => None,
+            Self::IceTcp { .. } => Some(usize::from(u16::MAX)),
+        }
+    }
+
     fn source(&self) -> SocketAddr {
         match self {
             Self::Udp { remote, .. } | Self::IceTcp { remote, .. } => *remote,
@@ -397,6 +392,7 @@ impl SelectedPath {
 impl Transport {
     pub(crate) fn from_session(
         facts: &NegotiatedSessionFacts,
+        limits: crate::ConnectionLimits,
         now: Instant,
     ) -> Result<Self, TransportError> {
         let remote_candidates = facts
@@ -415,7 +411,7 @@ impl Transport {
             ufrag: facts.remote_ice.ufrag.clone(),
             pass: facts.remote_ice.password.clone(),
         };
-        let config = TransportConfig::from_candidates(
+        let mut config = TransportConfig::from_candidates(
             local_ice,
             facts.local_candidates.clone(),
             remote_ice,
@@ -430,9 +426,12 @@ impl Transport {
         .with_rtp_payload_types(
             facts.inbound_payload_types(),
             facts.outbound_payload_types(),
-        )
-        .with_twcc_payload_map(facts.outbound_twcc_payload_map())
-        .with_twcc_extension_id(facts.outbound_twcc_extension_id());
+        );
+        config.max_output_bytes = limits.max_transport_output_bytes;
+        config.replay_limits = srtp::ReplayLimits {
+            rtp_bytes: limits.max_rtp_replay_state_bytes,
+            rtcp_bytes: limits.max_rtcp_replay_state_bytes,
+        };
         Self::new(config, now)
     }
 
@@ -469,16 +468,17 @@ impl Transport {
             remote_fingerprint,
             dtls_role: config.dtls_role,
             allowed_inbound_ssrcs: None,
+            retired_inbound_ssrcs: BTreeSet::new(),
+            reserved_inbound_ssrcs: 0,
+            replay_limits: config.replay_limits,
             inbound_payload_types: config.inbound_payload_types,
             outbound_payload_types: config.outbound_payload_types,
-            twcc_extension_id: config.twcc_extension_id,
-            twcc_payload_map: config.twcc_payload_map,
+
             events: VecDeque::new(),
-            transmissions: VecDeque::new(),
+            transmissions: OutputQueue::new(config.max_output_bytes),
             pending_dtls: VecDeque::new(),
             next_deadline: None,
             max_events: config.max_events,
-            max_transmissions: config.max_transmissions,
             dropped_inputs: 0,
         };
         transport.push_event(TransportEvent::StateChanged(TransportState::Checking))?;
@@ -560,7 +560,6 @@ impl Transport {
         let TransmitTarget::Udp { local, remote, .. } = item.target else {
             return None;
         };
-        debug_assert!(self.transmissions.len() <= self.max_transmissions);
         Some(TransportTransmit {
             source: local,
             destination: remote,
@@ -707,13 +706,17 @@ impl Transport {
                     return Ok(());
                 }
                 if kind == DatagramKind::Rtp
-                    && self.allowed_inbound_ssrcs.as_ref().is_some_and(|allowed| {
-                        bytes
-                            .get(8..12)
-                            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                            .map(u32::from_be_bytes)
-                            .is_none_or(|ssrc| !allowed.contains(&ssrc))
-                    })
+                    && bytes
+                        .get(8..12)
+                        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                        .map(u32::from_be_bytes)
+                        .is_none_or(|ssrc| {
+                            self.retired_inbound_ssrcs.contains(&ssrc)
+                                || self
+                                    .allowed_inbound_ssrcs
+                                    .as_ref()
+                                    .is_some_and(|allowed| !allowed.contains(&ssrc))
+                        })
                 {
                     self.drop_input();
                     return Ok(());
@@ -722,29 +725,36 @@ impl Transport {
                     return Ok(());
                 };
                 match kind {
-                    DatagramKind::Rtp => match srtp.unprotect_rtp(&bytes) {
-                        Ok((bytes, metadata)) => {
-                            if self.inbound_payload_types.contains(&metadata.payload_type) {
-                                let path_epoch = self
-                                    .selected
-                                    .as_ref()
-                                    .and_then(|selected| selected.epoch)
-                                    .ok_or(TransportError::Protocol)?;
-                                self.push_event(TransportEvent::Rtp {
-                                    arrival,
-                                    path_epoch,
-                                    bytes,
-                                    metadata,
-                                    ecn,
-                                })?;
+                    DatagramKind::Rtp => {
+                        match srtp.unprotect_rtp(&bytes, self.allowed_inbound_ssrcs.is_some()) {
+                            Ok((bytes, metadata)) => {
+                                if self.inbound_payload_types.contains(&metadata.payload_type) {
+                                    let path_epoch = self
+                                        .selected
+                                        .as_ref()
+                                        .and_then(|selected| selected.epoch)
+                                        .ok_or(TransportError::Protocol)?;
+                                    self.push_event(TransportEvent::Rtp {
+                                        arrival,
+                                        path_epoch,
+                                        bytes,
+                                        metadata,
+                                        ecn,
+                                    })?;
+                                }
+                            }
+                            Err(
+                                SrtpError::Replay
+                                | SrtpError::InvalidPacket
+                                | SrtpError::OutputFull
+                                | SrtpError::OutputTooLarge,
+                            ) => self.drop_input(),
+                            Err(SrtpError::Crypto) => self.fail(TransportError::Crypto)?,
+                            Err(SrtpError::UnsupportedProfile) => {
+                                self.fail(TransportError::Protocol)?;
                             }
                         }
-                        Err(SrtpError::Replay | SrtpError::InvalidPacket) => self.drop_input(),
-                        Err(SrtpError::Crypto) => self.fail(TransportError::Crypto)?,
-                        Err(SrtpError::OutputFull | SrtpError::UnsupportedProfile) => {
-                            self.fail(TransportError::Protocol)?;
-                        }
-                    },
+                    }
                     DatagramKind::Rtcp => match srtp.unprotect_rtcp(&bytes) {
                         Ok(bytes) => {
                             let path_epoch = self
@@ -758,9 +768,14 @@ impl Transport {
                                 bytes,
                             })?;
                         }
-                        Err(SrtpError::Replay | SrtpError::InvalidPacket) => self.drop_input(),
+                        Err(
+                            SrtpError::Replay
+                            | SrtpError::InvalidPacket
+                            | SrtpError::OutputFull
+                            | SrtpError::OutputTooLarge,
+                        ) => self.drop_input(),
                         Err(SrtpError::Crypto) => self.fail(TransportError::Crypto)?,
-                        Err(SrtpError::OutputFull | SrtpError::UnsupportedProfile) => {
+                        Err(SrtpError::UnsupportedProfile) => {
                             self.fail(TransportError::Protocol)?;
                         }
                     },
@@ -843,8 +858,15 @@ impl Transport {
         packet: &[u8],
         index: u64,
         classification: crate::TransmitKind,
+        twcc_extension_id: Option<u8>,
     ) -> Result<(), TransportError> {
-        self.send_secure(packet, Some(index), DatagramKind::Rtp, classification)
+        self.send_secure(
+            packet,
+            Some(index),
+            DatagramKind::Rtp,
+            classification,
+            twcc_extension_id,
+        )
     }
 
     pub(crate) fn send_rtcp(&mut self, packet: &[u8]) -> Result<(), TransportError> {
@@ -853,6 +875,7 @@ impl Transport {
             None,
             DatagramKind::Rtcp,
             crate::TransmitKind::Control,
+            None,
         )
     }
 
@@ -897,6 +920,8 @@ impl Transport {
         self.dtls = None;
         self.srtp = None;
         self.certificate = None;
+        self.allowed_inbound_ssrcs = None;
+        self.retired_inbound_ssrcs.clear();
     }
 
     fn send_secure(
@@ -905,6 +930,7 @@ impl Transport {
         index: Option<u64>,
         kind: DatagramKind,
         classification: crate::TransmitKind,
+        twcc_extension_id: Option<u8>,
     ) -> Result<(), TransportError> {
         if self.state != TransportState::Connected {
             return Err(
@@ -927,20 +953,11 @@ impl Transport {
         let rtp = if kind == DatagramKind::Rtp {
             let metadata =
                 outbound_rtp_metadata(packet).map_err(|_| TransportError::InvalidInput)?;
-            let twcc_sequence = self
-                .twcc_payload_map
-                .iter()
-                .filter(|(payload_type, _)| *payload_type == metadata.payload_type)
-                .find_map(|(_, extension_id)| {
-                    outbound_twcc_sequence(packet, Some(*extension_id))
-                        .ok()
-                        .flatten()
-                })
-                .or_else(|| {
-                    outbound_twcc_sequence(packet, self.twcc_extension_id)
-                        .ok()
-                        .flatten()
-                });
+            let twcc_sequence = outbound_twcc_sequence(packet, twcc_extension_id)
+                .map_err(|_| TransportError::InvalidInput)?;
+            if twcc_extension_id.is_some() && twcc_sequence.is_none() {
+                return Err(TransportError::InvalidInput);
+            }
             Some(PreparedRtpIdentity {
                 ssrc: metadata.ssrc,
                 sequence: metadata.sequence,
@@ -956,15 +973,49 @@ impl Transport {
         let Some(srtp) = self.srtp.as_mut() else {
             return Err(TransportError::Protocol);
         };
-        let bytes = match kind {
-            DatagramKind::Rtp => {
-                srtp.protect_rtp(packet, index.ok_or(TransportError::InvalidInput)?)
-            }
-            DatagramKind::Rtcp => srtp.protect_rtcp(packet),
+        let wire_limit = path.envelope.secure_body_limit();
+        let layout = match kind {
+            DatagramKind::Rtp => srtp.rtp_layout(packet.len()),
+            DatagramKind::Rtcp => srtp.rtcp_layout(packet.len()),
+            _ => Err(SrtpError::InvalidPacket),
+        }
+        .and_then(|layout| layout.check_limit(wire_limit))
+        .map_err(|error| match error {
+            SrtpError::OutputTooLarge => TransportError::Protocol,
+            _ => TransportError::Crypto,
+        })?;
+        let prefix = match path.envelope {
+            NetworkEnvelope::Udp { .. } => None,
+            NetworkEnvelope::IceTcp { .. } => Some(
+                u16::try_from(layout.wire_bytes)
+                    .map_err(|_| TransportError::Protocol)?
+                    .to_be_bytes(),
+            ),
+        };
+        let prefix_len = prefix.map_or(0, |bytes| bytes.len());
+        let mut bytes = self.transmissions.secure_packet(layout, prefix)?;
+        let reservation = self.transmissions.reserve_slot(bytes.capacity())?;
+        let output = bytes
+            .as_mut_slice()
+            .get_mut(prefix_len..)
+            .ok_or(TransportError::Protocol)?;
+        let written = match kind {
+            DatagramKind::Rtp => srtp.protect_rtp_into(
+                packet,
+                index.ok_or(TransportError::InvalidInput)?,
+                wire_limit,
+                output,
+            ),
+            DatagramKind::Rtcp => srtp.protect_rtcp_into(packet, wire_limit, output),
             _ => Err(SrtpError::InvalidPacket),
         }
         .map_err(|_| TransportError::Crypto)?;
-        self.prepare_transmit(path, bytes, kind, rtp, classification)
+        bytes.truncate(
+            prefix_len
+                .checked_add(written)
+                .ok_or(TransportError::Protocol)?,
+        );
+        self.enqueue_transmit(path, bytes, kind, rtp, classification, reservation)
     }
 
     fn drain_ice(
@@ -1104,6 +1155,8 @@ impl Transport {
                             profile,
                             self.dtls_role == DtlsRole::Active,
                             &provider,
+                            self.replay_limits,
+                            self.reserved_inbound_ssrcs,
                         )
                         .map_err(|_| TransportError::Crypto)?,
                     );
@@ -1195,6 +1248,22 @@ impl Transport {
             frame.extend_from_slice(&bytes);
             bytes = frame;
         }
+        let reservation = match self.transmissions.reserve_slot(bytes.capacity()) {
+            Ok(reservation) => reservation,
+            Err(error) => return self.fail(error),
+        };
+        self.enqueue_transmit(path, bytes, kind, rtp, classification, reservation)
+    }
+
+    fn enqueue_transmit(
+        &mut self,
+        path: SelectedPath,
+        bytes: Vec<u8>,
+        kind: DatagramKind,
+        rtp: Option<PreparedRtpIdentity>,
+        classification: crate::TransmitKind,
+        reservation: SlotReservation,
+    ) -> Result<(), TransportError> {
         if classification.rtp_service() != rtp.map(|identity| identity.service)
             || (kind == DatagramKind::Rtp) != rtp.is_some()
             || (kind == DatagramKind::Rtp && path.epoch.is_none())
@@ -1210,12 +1279,11 @@ impl Transport {
             path_epoch: path.epoch,
             rtp,
         };
-        if transmission.bytes.is_empty() || self.transmissions.len() >= self.max_transmissions {
+        if transmission.bytes.is_empty() {
             let _ = self.fail(TransportError::QueueFull);
             return Err(TransportError::QueueFull);
         }
-        self.transmissions.push_back(transmission);
-        debug_assert!(self.transmissions.len() <= self.max_transmissions);
+        self.transmissions.push_reserved(transmission, reservation);
         Ok(())
     }
 
@@ -1328,26 +1396,81 @@ impl Transport {
         Err(error)
     }
 
-    pub(crate) fn can_admit_ssrcs(&self, identities: &[u32]) -> bool {
-        identities.len() <= 512
+    pub(crate) fn can_admit_ssrcs(
+        &self,
+        reserved: usize,
+        new: &BTreeSet<u32>,
+        retiring: &BTreeSet<u32>,
+    ) -> bool {
+        self.replay_limits.fits_rtp(reserved)
             && self
                 .srtp
                 .as_ref()
-                .is_none_or(|srtp| srtp.can_admit_ssrcs(identities))
+                .is_none_or(|srtp| srtp.can_admit_ssrcs(reserved, new, retiring))
+    }
+
+    pub(crate) fn reserve_inbound_ssrcs(&mut self, reserved: usize, identities: &BTreeSet<u32>) {
+        self.reserved_inbound_ssrcs = reserved;
+        if let Some(srtp) = self.srtp.as_mut() {
+            srtp.reserve_ssrcs(reserved, identities);
+        }
     }
 
     pub(crate) fn configure_rtp_mappings(
         &mut self,
         inbound: Box<[u8]>,
         outbound: Box<[u8]>,
-        twcc: Box<[(u8, u8)]>,
-        identities: Box<[u32]>,
+        identities: impl IntoIterator<Item = (u32, bool)>,
     ) {
         self.inbound_payload_types = inbound;
         self.outbound_payload_types = outbound;
-        self.twcc_extension_id = None;
-        self.twcc_payload_map = twcc;
-        self.allowed_inbound_ssrcs = Some(identities);
+        let allowed = self.allowed_inbound_ssrcs.get_or_insert_with(BTreeSet::new);
+        for (ssrc, active) in identities {
+            if active && !self.retired_inbound_ssrcs.contains(&ssrc) {
+                allowed.insert(ssrc);
+            } else {
+                allowed.remove(&ssrc);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_retired_guard_bytes(&self) -> usize {
+        self.retired_inbound_ssrcs
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .expect("retained SSRC payload bytes fit addressable memory")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_unprotect_unretired_rtp(&mut self, packet: &[u8]) -> Result<(), SrtpError> {
+        let ssrc = u32::from_be_bytes(
+            packet
+                .get(8..12)
+                .ok_or(SrtpError::InvalidPacket)?
+                .try_into()
+                .map_err(|_| SrtpError::InvalidPacket)?,
+        );
+        if self.retired_inbound_ssrcs.contains(&ssrc) {
+            return Err(SrtpError::Replay);
+        }
+        self.srtp
+            .as_mut()
+            .ok_or(SrtpError::Crypto)?
+            .unprotect_rtp(packet, false)
+            .map(|_| ())
+    }
+
+    pub(crate) fn retire_inbound_ssrcs(&mut self, identities: impl IntoIterator<Item = u32>) {
+        for ssrc in identities {
+            self.retired_inbound_ssrcs.insert(ssrc);
+            if let Some(srtp) = self.srtp.as_mut() {
+                srtp.retire_ssrc(ssrc);
+            }
+            if let Some(allowed) = self.allowed_inbound_ssrcs.as_mut() {
+                allowed.remove(&ssrc);
+            }
+        }
     }
 
     fn accepts_payload_type(&self, payload_type: u8) -> bool {
@@ -1380,6 +1503,28 @@ fn error_to_transport(error: dtls::DtlsError) -> TransportError {
         dtls::DtlsError::BufferTooSmall | dtls::DtlsError::OutputFull => TransportError::QueueFull,
         dtls::DtlsError::InvalidState => TransportError::Protocol,
     }
+}
+
+fn secure_output_buffer(
+    layout: srtp::ProtectionLayout,
+    prefix: Option<[u8; 2]>,
+) -> Result<Vec<u8>, TransportError> {
+    let prefix_len = prefix.map_or(0, |bytes| bytes.len());
+    let required = prefix_len
+        .checked_add(layout.initialized_bytes)
+        .ok_or(TransportError::QueueFull)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(required)
+        .map_err(|_| TransportError::QueueFull)?;
+    bytes.resize(required, 0);
+    if let Some(prefix) = prefix {
+        bytes
+            .get_mut(..prefix.len())
+            .ok_or(TransportError::Protocol)?
+            .copy_from_slice(&prefix);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -1529,17 +1674,16 @@ mod tests {
         let left_certificate = certificate();
         let right_certificate = certificate();
         let mut now = Instant::now();
-        let mut left = Transport::new(
-            config(
-                address(4000),
-                address(4001),
-                left_certificate.clone(),
-                &right_certificate,
-                true,
-            ),
-            now,
-        )
-        .unwrap();
+        let mut left_config = config(
+            address(4000),
+            address(4001),
+            left_certificate.clone(),
+            &right_certificate,
+            true,
+        );
+        left_config.max_output_bytes = 128 * 1024;
+        let output_byte_limit = left_config.max_output_bytes;
+        let mut left = Transport::new(left_config, now).unwrap();
         let mut right = Transport::new(
             config(
                 address(4001),
@@ -1551,16 +1695,107 @@ mod tests {
             now,
         )
         .unwrap();
+        right.replay_limits = srtp::ReplayLimits {
+            rtp_bytes: srtp::RTP_REPLAY_STATE_BYTES.saturating_mul(2),
+            rtcp_bytes: srtp::RTCP_REPLAY_STATE_BYTES,
+        };
+        let capacity = right.replay_limits.rtp_bytes / srtp::RTP_REPLAY_STATE_BYTES;
         connect(&mut left, &mut right, &mut now);
         assert_eq!(left.negotiated_security(), right.negotiated_security());
         assert!(left.negotiated_security().is_some());
+        assert_eq!(
+            left.selected.as_ref().unwrap().envelope.secure_body_limit(),
+            None
+        );
+        assert_eq!(
+            NetworkEnvelope::IceTcp {
+                local: address(4000),
+                remote: address(4001)
+            }
+            .secure_body_limit(),
+            Some(usize::from(u16::MAX))
+        );
+        assert!(right.can_admit_ssrcs(capacity, &BTreeSet::new(), &BTreeSet::new()));
+        let control = [0x80, 201, 0, 1, 0, 0, 0, 7];
+        let original = [0x80, 96, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7, 5];
+        let mut admitted = 0;
+        for _ in 0..=output_byte_limit / size_of::<PreparedTransmit>() {
+            match left.send_rtcp(&control) {
+                Ok(()) => admitted += 1,
+                Err(TransportError::QueueFull) => break,
+                Err(error) => panic!("unexpected secure output error: {error:?}"),
+            }
+        }
+        assert!(admitted > 256);
+        let pointer = left.transmissions.front().unwrap().bytes.as_ptr();
+        let queue_capacity = left.transmissions.capacity();
+        let counter = left.srtp.as_ref().unwrap().test_rtcp_packets();
+        assert_eq!(left.send_rtcp(&control), Err(TransportError::QueueFull));
+        assert_eq!(left.state(), TransportState::Connected);
+        assert_eq!(left.srtp.as_ref().unwrap().test_rtcp_packets(), counter);
+        assert_eq!(
+            left.send_rtp_with_info(
+                &original,
+                0,
+                crate::TransmitKind::Original { ssrc: 7 },
+                None
+            ),
+            Err(TransportError::QueueFull)
+        );
+        assert_eq!(left.state(), TransportState::Connected);
+        assert_eq!(left.transmissions.len(), admitted);
+        assert_eq!(left.transmissions.capacity(), queue_capacity);
+        assert_eq!(left.transmissions.front().unwrap().bytes.as_ptr(), pointer);
+        let funded = left.transmissions.assert_storage();
+        let exported = left.poll_prepared().unwrap();
+        let exported_capacity = exported.bytes.capacity();
+        let exported_pointer = exported.bytes.as_ptr();
+        assert_eq!(
+            left.transmissions.assert_storage(),
+            funded - exported_capacity
+        );
+        #[allow(
+            clippy::disallowed_types,
+            reason = "exercise the existing public Bytes handoff, not shared queue state"
+        )]
+        let caller_owned = Bytes::from(exported.bytes);
+        assert_eq!(caller_owned.as_ptr(), exported_pointer);
+        let caller_clone = caller_owned.clone();
+        while left.poll_prepared().is_some() {}
+        left.transmissions.assert_storage();
+        let compound_control = control.repeat(60 * 1024 / control.len());
+        left.send_rtcp(&compound_control).unwrap();
+        assert!(left.transmissions.capacity() < queue_capacity);
+        assert!(left.poll_prepared().unwrap().bytes.len() > compound_control.len());
+        left.transmissions.assert_storage();
+        drop(caller_owned);
+        drop(caller_clone);
+        left.send_rtp_with_info(
+            &original,
+            0,
+            crate::TransmitKind::Original { ssrc: 7 },
+            None,
+        )
+        .unwrap();
+        assert_eq!(left.poll_prepared().unwrap().rtp.unwrap().index, 0);
+        left.send_rtcp(&control).unwrap();
+        assert_eq!(
+            left.srtp.as_ref().unwrap().test_rtcp_packets(),
+            counter.checked_add(2).unwrap()
+        );
+        left.poll_prepared().unwrap();
         let mut replay = None;
         for index in [65_534_u64, 65_536, 65_535, 65_538, 65_537] {
             let mut packet = vec![0xa0, 96];
             packet.extend_from_slice(&u16::try_from(index & 0xffff).unwrap().to_be_bytes());
             packet.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 7, 9, 8, 7, 0, 0, 3]);
-            left.send_rtp_with_info(&packet, index, crate::TransmitKind::Original { ssrc: 7 })
-                .expect("caller-indexed SRTP");
+            left.send_rtp_with_info(
+                &packet,
+                index,
+                crate::TransmitKind::Original { ssrc: 7 },
+                None,
+            )
+            .expect("caller-indexed SRTP");
             let prepared = left.poll_prepared().expect("protected packet");
             assert_eq!(prepared.wire_len, prepared.bytes.len());
             assert_eq!(prepared.rtp.unwrap().index, index);
@@ -1570,6 +1805,26 @@ mod tests {
             let TransmitTarget::Udp { local, remote, .. } = prepared.target else {
                 panic!("UDP fixture");
             };
+            if index == 65_535 {
+                right.configure_rtp_mappings(Box::new([96]), Box::new([96]), [(7, false)]);
+                right
+                    .receive(
+                        now,
+                        now,
+                        NetworkInput::Udp {
+                            local: remote,
+                            remote: local,
+                            ecn: None,
+                            payload: prepared.bytes.clone().into(),
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    !std::iter::from_fn(|| right.poll_event())
+                        .any(|event| matches!(event, TransportEvent::Rtp { .. }))
+                );
+                right.configure_rtp_mappings(Box::new([96]), Box::new([96]), [(7, true)]);
+            }
             right
                 .receive(
                     now,
@@ -1588,6 +1843,64 @@ mod tests {
             assert!(
                 matches!(event, TransportEvent::Rtp { bytes, arrival, .. } if bytes == packet && arrival == now)
             );
+            if index == 65_534 {
+                let mut bootstrap = None;
+                for ssrc in [0u32, 11] {
+                    let mut packet = vec![0x80, 96, 0, 1, 0, 0, 0, 1];
+                    packet.extend_from_slice(&ssrc.to_be_bytes());
+                    packet.push(5);
+                    left.send_rtp_with_info(
+                        &packet,
+                        1,
+                        crate::TransmitKind::Original { ssrc },
+                        None,
+                    )
+                    .unwrap();
+                    let packet = left.poll_transmit().unwrap();
+                    if ssrc == 0 {
+                        bootstrap = Some(packet.bytes.clone());
+                    }
+                    right
+                        .handle_datagram(now, packet.source, packet.destination, packet.bytes)
+                        .unwrap();
+                    assert_eq!(
+                        std::iter::from_fn(|| right.poll_event())
+                            .any(|event| matches!(event, TransportEvent::Rtp { .. })),
+                        ssrc == 0
+                    );
+                    assert_eq!(right.state(), TransportState::Connected);
+                }
+                let new = BTreeSet::from([7, 8]);
+                let retiring = BTreeSet::from([0]);
+                let empty = BTreeSet::new();
+                assert!(!right.can_admit_ssrcs(capacity, &empty, &empty));
+                assert!(!right.can_admit_ssrcs(capacity, &new, &empty));
+                assert!(right.can_admit_ssrcs(capacity, &new, &retiring));
+                right.configure_rtp_mappings(
+                    Box::new([96]),
+                    Box::new([96]),
+                    [(7, true), (8, true)],
+                );
+                right.configure_rtp_mappings(Box::new([96]), Box::new([96]), [(0, true)]);
+                assert_eq!(
+                    right.allowed_inbound_ssrcs.as_ref().unwrap(),
+                    &BTreeSet::from([0, 7, 8])
+                );
+                right.retire_inbound_ssrcs([0]);
+                right.reserve_inbound_ssrcs(2, &new);
+                assert!(right.can_admit_ssrcs(capacity, &empty, &empty));
+                right.configure_rtp_mappings(Box::new([96]), Box::new([96]), [(0, true)]);
+                assert_eq!(
+                    right.allowed_inbound_ssrcs.as_ref().unwrap(),
+                    &BTreeSet::from([7, 8])
+                );
+                assert_eq!(
+                    right.test_unprotect_unretired_rtp(&bootstrap.unwrap()),
+                    Err(SrtpError::Replay)
+                );
+            } else {
+                assert!(right.can_admit_ssrcs(capacity, &BTreeSet::new(), &BTreeSet::new()));
+            }
         }
         right
             .handle_datagram(now, address(4000), address(4001), replay.unwrap())
@@ -1617,8 +1930,53 @@ mod tests {
         assert_eq!(right.last_now, Some(now));
         assert!(std::iter::from_fn(|| right.poll_event()).any(|event| matches!(event, TransportEvent::Rtcp { bytes, arrival: at, .. } if bytes == rtcp && at == arrival)));
 
+        for (ssrc, admitted) in [(9u32, false), (7, true)] {
+            let mut packet = vec![0x80, 201, 0, 1];
+            packet.extend_from_slice(&ssrc.to_be_bytes());
+            left.send_rtcp(&packet).unwrap();
+            let packet = left.poll_transmit().unwrap();
+            right
+                .handle_datagram(now, packet.source, packet.destination, packet.bytes)
+                .unwrap();
+            assert_eq!(right.state(), TransportState::Connected);
+            assert_eq!(
+                std::iter::from_fn(|| right.poll_event())
+                    .any(|event| matches!(event, TransportEvent::Rtcp { .. })),
+                admitted
+            );
+        }
+
+        for (ssrc, extension, expected) in [
+            (9_u32, Some(3), Some(99)),
+            (10, Some(1), Some(7)),
+            (11, None, None),
+        ] {
+            let mut packet = vec![0x90, 96, 0, 0, 0, 0, 0, 1];
+            packet.extend_from_slice(&ssrc.to_be_bytes());
+            packet.extend_from_slice(&[0xbe, 0xde, 0, 2, 0x11, 0, 7, 0x31, 0, 99, 0, 0, 5]);
+            assert_eq!(
+                left.send_rtp_with_info(
+                    &packet,
+                    0,
+                    crate::TransmitKind::Original { ssrc },
+                    Some(2)
+                ),
+                Err(TransportError::InvalidInput)
+            );
+            assert!(left.poll_prepared().is_none());
+            left.send_rtp_with_info(
+                &packet,
+                0,
+                crate::TransmitKind::Original { ssrc },
+                extension,
+            )
+            .unwrap();
+            let prepared = left.poll_prepared().unwrap();
+            assert_eq!(prepared.rtp.unwrap().twcc_sequence, expected);
+        }
+
         let packet = [0x80, 96, 0, 3, 0, 0, 0, 1, 0, 0, 0, 8, 1];
-        left.send_rtp_with_info(&packet, 3, crate::TransmitKind::Original { ssrc: 8 })
+        left.send_rtp_with_info(&packet, 3, crate::TransmitKind::Original { ssrc: 8 }, None)
             .unwrap();
         let mut encrypted = left.poll_transmit().unwrap();
         *encrypted.bytes.last_mut().unwrap() ^= 1;

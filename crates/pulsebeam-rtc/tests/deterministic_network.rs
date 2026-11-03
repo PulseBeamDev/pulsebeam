@@ -222,7 +222,7 @@ fn run(scenario: Scenario) {
 
     fixture.drive_for(scenario.duration);
     let stats = fixture.connection.stats();
-    let sender = stats.senders.first().expect("negotiated sender stats");
+    assert!(!stats.senders.is_empty(), "negotiated sender stats");
     let transmitted = stats
         .senders
         .iter()
@@ -230,8 +230,18 @@ fn run(scenario: Scenario) {
         .sum::<u64>();
     let (network_packets, dropped, duplicated, reordered) = fixture.network_counters();
 
-    assert!(transmitted <= admitted);
-    assert!(sender.queued_packets <= 8_192);
+    let queued = stats
+        .senders
+        .iter()
+        .map(|sender| u64::try_from(sender.queued_packets).expect("queued original count"))
+        .sum::<u64>();
+    assert!(
+        transmitted
+            .checked_add(queued)
+            .expect("original ownership count")
+            <= admitted,
+        "transmitted and queued originals cannot exceed admitted writes"
+    );
     assert!(stats.connection.queued_media_bytes <= 8 * 1024 * 1024);
     assert!(stats.connection.rtp_bytes_in_flight <= 8 * 1024 * 1024);
     assert!(stats.connection.duplicate_feedback <= stats.connection.transmitted_rtp_bytes);

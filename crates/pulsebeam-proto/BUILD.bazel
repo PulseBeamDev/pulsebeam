@@ -36,8 +36,23 @@ rust_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
+rust_library(
+    name = "pulsebeam-proto-json",
+    crate_name = "pulsebeam_proto",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**", "src/signaling.rs"]),
+    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]),
+    edition = crate_edition(),
+    crate_features = ["json"],
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True) + [":build_script"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
 rust_test(
-    name = "unit_tests",
+    name = "default_unit_tests",
     crate = ":pulsebeam-proto",
     lint_config = ":lints",
     aliases = aliases(normal_dev = True, proc_macro_dev = True),
@@ -46,5 +61,17 @@ rust_test(
     
 )
 
+rust_test(
+    name = "json_unit_tests",
+    crate = ":pulsebeam-proto-json",
+    args = ["--exact", "state::codec::tests::capability_identity_uses_typed_defaults_without_guessing_unsupported_formats"],
+    lint_config = ":lints",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+
+test_suite(name = "unit_tests", tests = [":default_unit_tests", ":json_unit_tests"])
+
 rustfmt_test(name = "format", targets = [":pulsebeam-proto"])
-rust_clippy_test(name = "clippy", targets = [":pulsebeam-proto", ":unit_tests"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-proto", ":default_unit_tests", ":pulsebeam-proto-json", ":json_unit_tests"])

@@ -40,8 +40,16 @@ class Peer {
   addTransceiver(kind, init) {
     return new Transceiver(new Sender(init.sendEncodings ?? [{}]));
   }
-  createDataChannel(label) {
-    return { label, close() {} };
+  createDataChannel(label, init = {}) {
+    return {
+      label,
+      id: init.id ?? null,
+      negotiated: init.negotiated ?? false,
+      ordered: init.ordered ?? true,
+      maxRetransmits: init.maxRetransmits ?? null,
+      maxPacketLifeTime: init.maxPacketLifeTime ?? null,
+      close() {},
+    };
   }
   createOffer() {
     return new Promise(() => {});

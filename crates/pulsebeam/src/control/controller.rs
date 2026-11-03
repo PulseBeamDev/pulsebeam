@@ -5,8 +5,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use super::MAX_NATIVE_SDP_BYTES;
 use crate::control::steering::Steering;
-use crate::track::{SelectionPolicy, TrackSelector};
+use crate::track::{DataTrackIntent, SelectionPolicy, TrackSelector};
 use crate::{
     control::{
         core::{ControllerCore, RoomPartitionPlacement},
@@ -1055,6 +1056,9 @@ impl ControllerActor {
         state: ParticipantState,
         offer: String,
     ) -> Result<PendingMaterialization, ControllerError> {
+        if state.profile == ConnectionProfile::Native && offer.len() > MAX_NATIVE_SDP_BYTES {
+            return Err(NegotiatorError::InvalidResources.into());
+        }
         let participant_id = state.participant_id;
         let (slot, placement) = self
             .core
@@ -1091,13 +1095,28 @@ impl ControllerActor {
         let address = self.core.reserve_transport(shard, now);
         let creds = IceUfrag::new(self.cluster_id, self.node_id, address.route, address.epoch)
             .into_ice_creds();
-        let (rtc, answer, resources) = match self.negotiator.create_answer(offer, creds, at) {
+        let (mut rtc, answer, resources) = match self.negotiator.create_answer(offer, creds, at) {
             Ok(value) => value,
             Err(error) => {
                 self.core.release_transport(address, now);
                 return Err(error.into());
             }
         };
+        if state.profile == ConnectionProfile::Native && answer.len() > MAX_NATIVE_SDP_BYTES {
+            self.core.release_transport(address, now);
+            return Err(NegotiatorError::InvalidResources.into());
+        }
+        if state.profile == ConnectionProfile::Native
+            && let Err((reason, _)) = rtc
+                .connection
+                .open_data_channel(now.into(), DataTrackIntent::native_signaling_config())
+        {
+            self.core.release_transport(address, now);
+            return Err(match reason {
+                pulsebeam_rtc::WriteError::InvalidState => NegotiatorError::InvalidResources.into(),
+                _ => ControllerError::ServiceUnavailable,
+            });
+        }
         let connection_id = state.connection_id;
         let participant_external_id = state.participant_external_id.clone();
         let authorization = state.authorization;
@@ -1923,20 +1942,30 @@ mod replacement_tests {
                 None,
             )
             .unwrap();
-        actor
-            .core
-            .registry
-            .commit_candidate(
-                participant_id,
-                room_id,
-                ShardId::new(0),
-                0,
-                current_transport,
-                current,
-                ConnectionProfile::Native,
-                None,
-            )
-            .unwrap();
+        let prepared = |connection_id, transport| PendingMaterialization {
+            shard: ShardId::new(0),
+            partition_index: 0,
+            command: None,
+            ack: None,
+            participant: participant_id,
+            participant_external_id: crate::entity::ParticipantExternalId::new("alice").unwrap(),
+            connection_id,
+            authorization: None,
+            profile: ConnectionProfile::Native,
+            transport,
+            room_id,
+            answer: "native-answer".to_owned(),
+        };
+        assert_eq!(
+            actor
+                .complete_materialization(prepared(current, current_transport), UNIX_EPOCH)
+                .unwrap(),
+            "native-answer"
+        );
+        assert!(matches!(
+            actor.complete_materialization(prepared(old, old_transport), UNIX_EPOCH),
+            Err(ControllerError::Superseded)
+        ));
 
         assert_eq!(
             actor.core.registry.commit_candidate(

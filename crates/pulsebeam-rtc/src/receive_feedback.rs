@@ -52,8 +52,50 @@ impl ReceiveFeedback {
         }
     }
 
-    pub(crate) fn set_profile(&mut self, profile: PacketFeedbackKind) {
-        self.mode = Some(profile);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "VecDeque capacity describes a valid allocation of Receipt elements"
+    )]
+    pub(crate) fn storage_bytes(&self) -> usize {
+        self.receipts.capacity() * std::mem::size_of::<Receipt>()
+    }
+
+    pub(crate) fn reserve(&mut self, limit: usize) -> Option<usize> {
+        self.reserve_profile(self.mode, limit)
+    }
+
+    pub(crate) fn set_profile(
+        &mut self,
+        profile: PacketFeedbackKind,
+        limit: usize,
+    ) -> Option<usize> {
+        self.reserve_profile(Some(profile), limit)
+    }
+
+    fn reserve_profile(&mut self, mode: Option<PacketFeedbackKind>, limit: usize) -> Option<usize> {
+        let required = if mode.is_some() { HISTORY } else { 0 };
+        let bytes = if self.receipts.capacity() < required {
+            required
+                .checked_mul(std::mem::size_of::<Receipt>())
+                .filter(|bytes| *bytes <= limit)?;
+            let mut expanded = VecDeque::new();
+            expanded.try_reserve_exact(required).ok()?;
+            let bytes = expanded
+                .capacity()
+                .checked_mul(std::mem::size_of::<Receipt>())
+                .filter(|bytes| *bytes <= limit)?;
+            expanded.append(&mut self.receipts);
+            self.receipts = expanded;
+            bytes
+        } else {
+            let bytes = self.storage_bytes();
+            if bytes > limit {
+                return None;
+            }
+            bytes
+        };
+        self.mode = mode;
+        Some(bytes)
     }
 
     pub(crate) fn observe(
@@ -82,6 +124,7 @@ impl ReceiveFeedback {
             }
             None => return,
         };
+        assert!(self.receipts.capacity() >= HISTORY);
         let mut index = if self.mode == Some(PacketFeedbackKind::TransportWide) {
             let highest = self
                 .twcc_highest
@@ -139,6 +182,11 @@ impl ReceiveFeedback {
         self.twcc_highest = None;
         self.twcc_next = None;
         self.deadline = None;
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.clear();
+        self.receipts = VecDeque::new();
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -354,9 +402,18 @@ mod tests {
     fn report(receiver: &mut ReceiveFeedback, now: Instant) -> FeedbackReport {
         let bytes = receiver.poll(now, 9).expect("due report");
         assert!(bytes.len() <= 1200);
+        let bytes = rtcp::compound(bytes, 9, b"feedback-reporter").unwrap();
+        assert_eq!(&bytes[..4], &[0x80, 201, 0, 1]);
         let mut parsed = rtcp::parse(&bytes, now, PathEpoch::from_value(1), receiver.mode)
             .expect("valid wire RTCP");
         assert_eq!(parsed.feedback.len(), 1);
+        assert_eq!(
+            parsed.lifecycle,
+            vec![rtcp::LifecycleFact::Cname {
+                ssrc: 9,
+                cname: "feedback-reporter".into()
+            }]
+        );
         let feedback = parsed.feedback.pop().unwrap();
         assert_eq!(feedback.sender_ssrc, 9);
         feedback.report
@@ -366,6 +423,7 @@ mod tests {
     fn twcc_tracks_one_transport_space_with_wrap_reorder_loss_and_late_arrival() {
         let start = Instant::now();
         let mut receiver = ReceiveFeedback::new(Some(PacketFeedbackKind::TransportWide), start);
+        receiver.reserve(usize::MAX).unwrap();
         receiver.observe(start, 7, 99, Some(u16::MAX - 1), None);
         receiver.observe(at(start, 1), 8, 50, Some(0), None);
         receiver.observe(at(start, 2), 9, 1, Some(u16::MAX), None);
@@ -439,10 +497,27 @@ mod tests {
     #[test]
     fn twcc_bounds_retained_receipts_report_work_and_unrepresentable_time_deltas() {
         let start = Instant::now();
-        let mut receiver = ReceiveFeedback::new(Some(PacketFeedbackKind::TransportWide), start);
+        let mut receiver = ReceiveFeedback::new(None, start);
+        assert_eq!(receiver.reserve(0), Some(0));
+        receiver.observe(start, 0, 0, Some(0), None);
+        assert!(receiver.receipts.is_empty() && receiver.deadline().is_none());
+        let required = HISTORY * std::mem::size_of::<Receipt>();
+        assert_eq!(
+            receiver.set_profile(PacketFeedbackKind::TransportWide, required - 1),
+            None
+        );
+        assert_eq!(receiver.mode, None);
+        assert_eq!(receiver.storage_bytes(), 0);
+        assert_eq!(
+            receiver.set_profile(PacketFeedbackKind::TransportWide, required),
+            Some(required)
+        );
+        receiver.observe(start, 0, 0, None, None);
+        assert!(receiver.receipts.is_empty() && receiver.deadline().is_none());
         for sequence in 0..600 {
-            receiver.observe(start, 7, sequence, Some(sequence), None);
+            receiver.observe(start, 0, sequence, Some(sequence), None);
             assert!(receiver.receipts.len() <= HISTORY);
+            assert_eq!(receiver.storage_bytes(), required);
         }
         let mut reported = 0;
         while receiver.deadline().is_some() {
@@ -453,7 +528,12 @@ mod tests {
             reported += statuses.len();
         }
         assert_eq!(reported, HISTORY);
+        let deadline = receiver.deadline();
+        assert_eq!(receiver.reserve(required - 1), None);
+        assert_eq!(receiver.storage_bytes(), required);
+        assert_eq!(receiver.deadline(), deadline);
         receiver.clear();
+        assert_eq!(receiver.storage_bytes(), required);
         receiver.observe(start, 11, 10, Some(10), None);
         receiver.observe(at(start, 30_000), 12, 11, Some(11), None);
         for (expected_sequence, expected_ssrc) in [(10, 11), (11, 12)] {
@@ -474,12 +554,17 @@ mod tests {
             assert_eq!(statuses.len(), 1);
         }
         assert_eq!(receiver.deadline(), None);
+        assert_eq!(receiver.storage_bytes(), required);
+        receiver.abort();
+        assert_eq!(receiver.storage_bytes(), 0);
+        assert_eq!(receiver.deadline(), None);
     }
 
     #[test]
     fn twcc_anchors_loss_only_ranges_without_splitting_transport_space() {
         let start = Instant::now();
         let mut receiver = ReceiveFeedback::new(Some(PacketFeedbackKind::TransportWide), start);
+        receiver.reserve(usize::MAX).unwrap();
         receiver.observe(start, 7, 10, Some(0), None);
         let FeedbackReport::Twcc { media_ssrc, .. } = report(&mut receiver, at(start, 50)) else {
             panic!("TWCC");
@@ -522,10 +607,11 @@ mod tests {
     fn rfc8888_reports_original_and_repair_spaces_with_arrival_hold_and_ecn() {
         let start = Instant::now();
         let mut receiver = ReceiveFeedback::new(Some(PacketFeedbackKind::Rfc8888), start);
-        receiver.observe(start, 7, u16::MAX, None, Some(EcnCodepoint::Ce));
+        let required = receiver.reserve(usize::MAX).unwrap();
+        receiver.observe(start, 0, u16::MAX, None, Some(EcnCodepoint::Ce));
         receiver.observe(at(start, 1), 8, 5, None, None);
-        receiver.observe(at(start, 2), 7, 1, None, Some(EcnCodepoint::Ect1));
-        receiver.observe(at(start, 3), 7, 0, None, Some(EcnCodepoint::Ect0));
+        receiver.observe(at(start, 2), 0, 1, None, Some(EcnCodepoint::Ect1));
+        receiver.observe(at(start, 3), 0, 0, None, Some(EcnCodepoint::Ect0));
         receiver.observe(at(start, 4), 9, 15, None, None);
         let FeedbackReport::Rfc8888 {
             reports,
@@ -538,7 +624,8 @@ mod tests {
         let [stream] = &*reports else {
             panic!("one SSRC block");
         };
-        assert_eq!(stream.ssrc, 7);
+        assert_eq!(stream.ssrc, 0);
+        assert_eq!(receiver.storage_bytes(), required);
         assert_eq!(stream.begin_sequence, u16::MAX);
         assert_eq!(stream.report_count, 3);
         assert_eq!(

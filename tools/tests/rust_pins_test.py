@@ -95,6 +95,22 @@ class NativeTracingPinsTests(unittest.TestCase):
                         pins.native_tracing_override(self.lock, changed)
 
 
+class RtcPatchAnnotationTests(unittest.TestCase):
+    def test_behavior_patch_is_preserved_with_or_without_visibility_changes(self):
+        for has_visibility, expected in [
+            (True, ["str0m-rtc-visibility.patch", "str0m-rtc-protect-into.patch"]),
+            (False, ["str0m-rtc-protect-into.patch"]),
+        ]:
+            with self.subTest(has_visibility=has_visibility):
+                annotation = pins.rtc_patch_annotation("9.8.7", has_visibility)
+                self.assertEqual(
+                    annotation,
+                    'crate.annotation(crate = "str0m", version = "=9.8.7", patches = ['
+                    + ", ".join(f'"//tools:patches/{name}"' for name in expected)
+                    + '], patch_args = ["-p1"], repositories = ["str0m_rtc"])\n',
+                )
+
+
 class RtcVisibilityTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

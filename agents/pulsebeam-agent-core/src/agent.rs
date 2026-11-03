@@ -818,6 +818,7 @@ impl Agent {
             label: signaling::SIGNALING_LABEL.to_string(),
             ordered: true,
             reliability: DataChannelReliability::Reliable,
+            negotiated_id: Some(0),
         }];
         data_channels.extend(Topics::channel_specs(&topic_registrations));
         self.effects.push_back(Effect::Rtc(RtcEffect::CreateOffer {
@@ -2086,6 +2087,9 @@ impl Agent {
             manual: true,
         })
         .map_err(|_| AgentError::InvalidOffer("SDP offer could not be encoded"))?;
+        if body.len() > 262_144 {
+            return Err(AgentError::InvalidOffer("native JSON request is too large"));
+        }
         Ok(HttpRequest {
             method: HttpMethod::Post,
             uri: format!("{}/api/v1/native", self.config.endpoint),
@@ -2141,7 +2145,7 @@ fn validate_offer(
     config: &AgentConfig,
     registrations: &crate::TopicRegistrations,
 ) -> Result<(), AgentError> {
-    const MAX_SDP_BYTES: usize = 1_048_576;
+    const MAX_SDP_BYTES: usize = 131_072;
     if offer.is_empty() || offer.len() > MAX_SDP_BYTES {
         return Err(AgentError::InvalidOffer("SDP offer is empty or too large"));
     }

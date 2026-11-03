@@ -4,10 +4,7 @@
 mod context;
 mod sdp;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    num::NonZeroU32,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use context::{ApplyOutcome, Candidate, CandidateId, Context};
 
@@ -95,10 +92,16 @@ pub struct RuntimeEncoding {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Encoding {
     pub rid: Option<String>,
-    pub primary: Option<NonZeroU32>,
-    pub repair: Option<NonZeroU32>,
+    pub primary: Option<u32>,
+    pub repair: Option<u32>,
     pub paused: bool,
     pub runtime: RuntimeEncoding,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RtcpParameters {
+    pub cname: Option<String>,
+    pub reduced_size: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +113,7 @@ pub struct Section {
     pub codecs: Vec<Codec>,
     pub extensions: Vec<Extension>,
     pub encodings: Vec<Encoding>,
+    pub rtcp: RtcpParameters,
 }
 
 /// Opaque caller correlation. Several physical bindings can share a group key.
@@ -125,12 +129,14 @@ pub struct Binding {
     pub codec: Codec,
     pub extensions: Vec<Extension>,
     pub encodings: Vec<Encoding>,
+    pub rtcp: RtcpParameters,
 }
 
 impl Binding {
-    /// RID-only sender facts cannot be submitted as admitted RTC bindings.
+    /// Missing sender identities or RTCP CNAME cannot grant media admission.
     pub fn complete(&self) -> bool {
-        !self.encodings.is_empty()
+        self.rtcp.cname.as_deref().is_some_and(sdp::cname)
+            && !self.encodings.is_empty()
             && self
                 .encodings
                 .iter()

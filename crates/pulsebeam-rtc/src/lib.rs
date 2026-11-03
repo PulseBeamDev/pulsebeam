@@ -1,6 +1,7 @@
 mod congestion;
 mod connection;
 mod egress;
+mod event_buffer;
 mod id;
 mod ingress;
 mod io;

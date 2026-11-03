@@ -85,6 +85,8 @@ pub struct DataChannelSpec {
     pub label: String,
     pub ordered: bool,
     pub reliability: DataChannelReliability,
+    /// Physical SCTP stream for external negotiation, not a callback ChannelId.
+    pub negotiated_id: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

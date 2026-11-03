@@ -48,17 +48,6 @@ pub struct RtpPacket {
     pub extensions: Vec<RtpExtension>,
 }
 
-impl RtpPacket {
-    pub(crate) fn queued_bytes(&self) -> usize {
-        self.payload.len().saturating_add(12).saturating_add(
-            self.extensions
-                .iter()
-                .map(|value| value.value.len().saturating_add(4))
-                .sum::<usize>(),
-        )
-    }
-}
-
 /// Wire Sender Report facts. Synchronization and media normalization are caller policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SenderReport {

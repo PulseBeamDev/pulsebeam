@@ -173,9 +173,14 @@ pub enum DataChannelEvent {
         channel: DataChannelId,
         message: DataMessage,
     },
-    Closed {
-        channel: DataChannelId,
-    },
+    /// Local delivery is fenced. This alone does not permit stream-ID reuse.
+    Closed { channel: DataChannelId },
+    /// Both reset directions completed and the native receive queue was drained.
+    /// The stream ID is reusable; callers still fence callbacks already handed
+    /// out for the old application/channel-object lifetime.
+    ResetComplete { channel: DataChannelId },
+    /// Reset failed. The stream remains unavailable until association teardown.
+    ResetFailed { channel: DataChannelId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

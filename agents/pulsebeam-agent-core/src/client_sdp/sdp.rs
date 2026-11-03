@@ -1,11 +1,8 @@
 use super::{
     Codec, CodecParameters, Direction, Encoding, Error, Extension, Kind, Limits, MAX_SDP_BYTES,
-    RepairCodec, RuntimeEncoding, Section,
+    RepairCodec, RtcpParameters, RuntimeEncoding, Section,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    num::NonZeroU32,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct Transport {
@@ -92,7 +89,8 @@ pub(super) struct Media {
     pub formats: Vec<String>,
     pub transport: Transport,
     pub sctp: Vec<String>,
-    pub signaled: BTreeMap<NonZeroU32, Option<NonZeroU32>>,
+    pub signaled: BTreeMap<u32, Option<u32>>,
+    pub cnames: BTreeMap<u32, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,8 +120,14 @@ fn pt(s: &str) -> Result<u8, Error> {
     }
     Ok(v)
 }
-fn ssrc(s: &str) -> Result<NonZeroU32, Error> {
-    NonZeroU32::new(number(s, "ssrc")?).ok_or(Error::Malformed("ssrc"))
+pub(super) fn cname(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= usize::from(u8::MAX)
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn ssrc(s: &str) -> Result<u32, Error> {
+    number(s, "ssrc")
 }
 fn direction(line: &str) -> Option<Direction> {
     match line {
@@ -349,6 +353,18 @@ fn parse_media(
     if kind != Kind::Application && !stopped && !lines.contains(&"a=rtcp-mux") {
         return Err(Error::Malformed("rtcp-mux"));
     }
+    for (attribute, name) in [("a=rtcp-mux", "rtcp-mux"), ("a=rtcp-rsize", "rtcp-rsize")] {
+        let mut occurrences = lines.iter().filter(|line| {
+            **line == attribute
+                || line
+                    .strip_prefix(attribute)
+                    .is_some_and(|suffix| suffix.starts_with(':'))
+        });
+        if occurrences.next().is_some_and(|line| *line != attribute) || occurrences.next().is_some()
+        {
+            return Err(Error::Malformed(name));
+        }
+    }
     let mut transport = inherited.clone();
     let mut selected_direction = None;
     let mut codecs: BTreeMap<u8, CodecParameters> = BTreeMap::new();
@@ -356,6 +372,7 @@ fn parse_media(
     let mut feedback: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut extensions = Vec::new();
     let mut primaries = BTreeSet::new();
+    let mut cnames = BTreeMap::new();
     let mut repairs = BTreeMap::new();
     let mut rids = BTreeSet::new();
     let mut simulcast = Vec::new();
@@ -429,7 +446,13 @@ fn parse_media(
             if !attribute.contains(':') {
                 return Err(Error::Malformed("ssrc"));
             }
-            primaries.insert(ssrc(id)?);
+            let id = ssrc(id)?;
+            primaries.insert(id);
+            if let Some(value) = attribute.strip_prefix("cname:")
+                && (!cname(value) || cnames.insert(id, value.to_owned()).is_some())
+            {
+                return Err(Error::Malformed("cname"));
+            }
         } else if let Some(value) = line.strip_prefix("a=ssrc-group:") {
             let fields: Vec<_> = value.split_whitespace().collect();
             match fields.first().copied() {
@@ -545,6 +568,17 @@ fn parse_media(
             repair,
         });
     }
+    let common_cname = cnames.values().next().cloned();
+    if cnames
+        .values()
+        .any(|value| Some(value) != common_cname.as_ref())
+    {
+        return Err(Error::Envelope(mid));
+    }
+    let rtcp = RtcpParameters {
+        cname: common_cname.filter(|_| primaries.iter().all(|id| cnames.contains_key(id))),
+        reduced_size: lines.contains(&"a=rtcp-rsize"),
+    };
     for (primary, repair) in &repairs {
         if !primaries.contains(primary) || !primaries.contains(repair) {
             return Err(Error::Malformed("FID"));
@@ -602,11 +636,13 @@ fn parse_media(
             codecs: selected,
             extensions,
             encodings,
+            rtcp,
         },
         proto,
         formats,
         transport,
         sctp,
         signaled,
+        cnames,
     })
 }

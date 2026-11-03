@@ -1496,6 +1496,7 @@ fn datagram_spec(label: String) -> DataChannelSpec {
         label,
         ordered: false,
         reliability: DataChannelReliability::MaxRetransmits(0),
+        negotiated_id: None,
     }
 }
 

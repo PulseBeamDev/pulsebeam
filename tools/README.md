@@ -40,6 +40,19 @@ After editing authoritative Rust/generator inputs, explicitly run
 Cargo/pnpm lock maintenance remains separate from supported application
 compilation; CI does not install parallel host tools.
 
+`tools/rust/build_tools/Cargo.lock` and `Cargo.Bazel.lock` preserve the build-tool
+universe's resolution when another universe's annotations change. They are
+maintained by crate-universe, not the Rust projection script or manual edits.
+When build-tool inputs require a repin, run:
+
+```sh
+CARGO_BAZEL_REPIN=1 CARGO_BAZEL_REPIN_ONLY=build_tools \
+  ./bazel mod deps --lockfile_mode=update
+```
+
+Review both build-tool locks and the module lock. Ordinary RTC-only patch changes
+do not require upgrading unrelated generator dependencies.
+
 ### Build the local WebRTC bindings
 
 Native SDK and controlled RTC builds consume
@@ -81,10 +94,10 @@ remain documented by the native owner's
 3. Run the affected [verification gates](../docs/build.md#testing-contract) and
    refresh [editor assets](../docs/ide.md#setup-and-refresh).
 
-Bazel applies the declared patch only to RTC's str0m universe. Normal builds,
+Bazel applies the declared patches only to RTC's str0m universe. Normal builds,
 checks and rules_rust IDE discovery consume that patched source without
 regenerating it. No fork-publishing script, sibling checkout, GitHub write access,
-manual patch rebase or separate visibility-generation command is required.
+manual visibility-patch rebase or separate visibility-generation command is required.
 The workspace `feat/bwe-6` str0m fork and its `str0m_native` universe remain
 for other consumers; the universe name does not imply native-agent execution.
 The native agent's normal and simulation-feature libraries use libwebrtc, not
@@ -97,6 +110,15 @@ required files/trees or missing/ambiguous root declarations fail pin refresh. Up
 future source changes may require adapting the transform or RTC consumers, and
 compilation failures must be repaired rather than bypassing exposure. Standalone
 Cargo compilation is not a supported patched build path.
+
+The separately maintained `patches/str0m-rtc-protect-into.patch` adds checked
+packet-storage layouts and caller-output SRTP/SRTCP protection. Existing allocating
+methods delegate to the same implementation. Insufficient output leaves bytes and
+the SRTCP index unchanged; after validation, the index is reserved before encryption
+so a provider panic cannot expose ciphertext and permit nonce reuse. RTC uses the
+caller-owned path, including ICE-TCP prefix space, to make actual packet capacity
+available before protection. Provider-internal storage behavior is unchanged, not universally
+allocation-free. Review this behavior patch when updating the upstream revision.
 
 ## Adopted upstream integrations
 

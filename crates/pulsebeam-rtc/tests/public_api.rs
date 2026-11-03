@@ -62,6 +62,11 @@ fn negotiated_codec_facts_are_public_and_directional() {
                 [192, 0, 2, 1],
                 5000,
             )))],
+            limits: ConnectionLimits {
+                max_queued_media_bytes: ConnectionLimits::HARD_MAX_QUEUED_MEDIA_BYTES + 1,
+                max_retransmission_bytes: ConnectionLimits::HARD_MAX_RETRANSMISSION_BYTES + 1,
+                ..ConnectionLimits::default()
+            },
             ..ConnectionConfig::default()
         },
         SdpOffer::new(offer),
@@ -160,45 +165,29 @@ fn offer_facts_retain_inactive_disabled_and_bidirectional_sections() {
 }
 
 #[test]
-fn configured_hard_limits_reject_invalid_values() {
+fn legacy_limit_constants_do_not_cap_configuration() {
     let defaults = ConnectionLimits::default();
     assert_eq!(defaults.validate(), Ok(defaults));
 
-    let invalid = ConnectionLimits {
-        max_unsignaled_encodings: ConnectionLimits::HARD_MAX_UNSIGNALED_ENCODINGS + 1,
-        ..defaults
-    };
-    assert!(invalid.validate().is_err());
+    assert_eq!(ConnectionLimits::DEFAULT_MAX_UNSIGNALED_ENCODINGS, 32);
+    assert_eq!(ConnectionLimits::HARD_MAX_UNSIGNALED_ENCODINGS, 1024);
 
-    let invalid = ConnectionLimits {
-        max_data_channels: ConnectionLimits::HARD_MAX_DATA_CHANNELS + 1,
-        ..defaults
-    };
-    assert!(invalid.validate().is_err());
+    assert_eq!(ConnectionLimits::DEFAULT_MAX_DATA_CHANNELS, 256);
+    assert_eq!(ConnectionLimits::HARD_MAX_DATA_CHANNELS, u16::MAX);
 
-    let invalid = ConnectionLimits {
+    let expanded_payload = ConnectionLimits {
         max_inbound_data_message_bytes: ConnectionLimits::HARD_MAX_INBOUND_DATA_MESSAGE_BYTES + 1,
-        ..defaults
-    };
-    assert!(invalid.validate().is_err());
-
-    let invalid = ConnectionLimits {
         max_buffered_data_bytes: ConnectionLimits::HARD_MAX_BUFFERED_DATA_BYTES + 1,
         ..defaults
     };
-    assert!(invalid.validate().is_err());
+    assert_eq!(expanded_payload.validate(), Ok(expanded_payload));
 
-    let invalid = ConnectionLimits {
+    let expanded_media = ConnectionLimits {
         max_queued_media_bytes: ConnectionLimits::HARD_MAX_QUEUED_MEDIA_BYTES + 1,
-        ..defaults
-    };
-    assert!(invalid.validate().is_err());
-
-    let invalid = ConnectionLimits {
         max_retransmission_bytes: ConnectionLimits::HARD_MAX_RETRANSMISSION_BYTES + 1,
         ..defaults
     };
-    assert!(invalid.validate().is_err());
+    assert_eq!(expanded_media.validate(), Ok(expanded_media));
 
     assert!(ConnectionConfig::default().validate().is_ok());
 }

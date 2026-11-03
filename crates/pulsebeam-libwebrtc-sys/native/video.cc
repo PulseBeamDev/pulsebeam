@@ -8,6 +8,7 @@
 #include "pulsebeam-webrtc-sys/native/source_encoded_video.h"
 #include "pc/video_rtp_track_source.h"
 #include "pc/video_track_source_proxy.h"
+#include "pc/session_description.h"
 #include "pulsebeam-webrtc-sys/native/audio.h"
 #include "pulsebeam-webrtc-sys/native/video_codec_values.h"
 #include "pulsebeam-webrtc-sys/native/rtp_values.h"
@@ -3392,6 +3393,30 @@ bool rtp_transceiver_set_header_extensions(
 bool rtp_transceiver_stopped(
     const NativeRtpTransceiver& transceiver) noexcept {
   return transceiver.state()->transceiver->stopped();
+}
+
+bool peer_rtp_transceiver_applied_local_cname(
+    const NativePeerConnection& peer, const NativeRtpTransceiver& transceiver,
+    rust::Vec<std::uint8_t>& cname) noexcept {
+  if (!peer.peer() || !peer.signaling_thread()) return false;
+  return peer.signaling_thread()->BlockingCall([&] {
+    if (peer.peer()->signaling_state() == webrtc::PeerConnectionInterface::kClosed ||
+        transceiver.state()->transceiver->stopped()) return false;
+    const auto mid = transceiver.state()->transceiver->mid();
+    const auto* local = peer.peer()->current_local_description();
+    if (!mid || !local || !local->description()) return false;
+    const auto* content = local->description()->GetContentByName(*mid);
+    if (!content || !content->media_description()) return false;
+    const auto sender_id = transceiver.state()->transceiver->sender()->id();
+    for (const auto& stream : content->media_description()->streams()) {
+      if (stream.id != sender_id || stream.cname.empty()) continue;
+      // RID streams retain CNAME here even when SDP serializes no SSRC lines.
+      cname.reserve(stream.cname.size());
+      for (unsigned char byte : stream.cname) cname.push_back(byte);
+      return true;
+    }
+    return false;
+  });
 }
 
 bool rtp_transceiver_mid(const NativeRtpTransceiver& transceiver,

@@ -10,6 +10,40 @@ const MAX_FEEDBACK_STATUSES: usize = 8_192;
 const MAX_REPORT_RECEIPTS: usize = 256;
 const MAX_RFC8888_REPORTS: usize = 16_384;
 
+pub(crate) fn append_cname(packet: &mut Vec<u8>, ssrc: u32, cname: &[u8]) -> Option<()> {
+    let length = u8::try_from(cname.len())
+        .ok()
+        .filter(|length| *length != 0)?;
+    let words = cname.len().checked_add(14)?.checked_div(4)?;
+    let size = words.checked_mul(4)?;
+    let end = packet.len().checked_add(size)?;
+    let words = u16::try_from(words.checked_sub(1)?).ok()?;
+    packet.try_reserve(size).ok()?;
+    packet.extend_from_slice(&[0x81, 202]);
+    packet.extend_from_slice(&words.to_be_bytes());
+    packet.extend_from_slice(&ssrc.to_be_bytes());
+    packet.extend_from_slice(&[1, length]);
+    packet.extend_from_slice(cname);
+    packet.resize(end, 0);
+    Some(())
+}
+
+pub(crate) fn compound(mut packet: Vec<u8>, sender_ssrc: u32, cname: &[u8]) -> Option<Vec<u8>> {
+    if packet.get(4..8)? != sender_ssrc.to_be_bytes() {
+        return None;
+    }
+    if matches!(packet.get(1), Some(200 | 201)) {
+        append_cname(&mut packet, sender_ssrc, cname)?;
+        return Some(packet);
+    }
+    let mut report = vec![0x80, 201, 0, 1];
+    report.extend_from_slice(&sender_ssrc.to_be_bytes());
+    append_cname(&mut report, sender_ssrc, cname)?;
+    report.try_reserve(packet.len()).ok()?;
+    report.extend_from_slice(&packet);
+    Some(report)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LifecycleFact {
     SenderReport {
@@ -1434,6 +1468,40 @@ mod tests {
 
     #[test]
     fn sdes_items_and_bye_reason_padding_are_typed() {
+        for size in [1, 2, 3, 4, 255] {
+            let cname = vec![b'a'; size];
+            for (raw, members) in [
+                (vec![0x80, 201, 0, 1, 0, 0, 0, 9], 2),
+                (vec![0x81, 206, 0, 2, 0, 0, 0, 9, 0, 0, 0, 7], 3),
+            ] {
+                let output = compound(raw, 9, &cname).unwrap();
+                assert_eq!(&output[..4], &[0x80, 201, 0, 1]);
+                assert_eq!(
+                    RtcpCompound::parse(&output)
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap()
+                        .len(),
+                    members
+                );
+                let parsed = parse(&output, at(), PathEpoch::from_value(0), None).unwrap();
+                assert_eq!(
+                    parsed.lifecycle,
+                    vec![LifecycleFact::Cname {
+                        ssrc: 9,
+                        cname: String::from_utf8(cname.clone()).unwrap().into()
+                    }]
+                );
+                assert_eq!(parsed.keyframes.len(), usize::from(members == 3));
+            }
+        }
+        let report = vec![0x80, 201, 0, 1, 0, 0, 0, 9];
+        for cname in [Vec::new(), vec![b'a'; 256]] {
+            let mut unchanged = report.clone();
+            assert!(append_cname(&mut unchanged, 9, &cname).is_none());
+            assert_eq!(unchanged, report);
+        }
+        assert!(compound(report, 10, b"wrong-source").is_none());
         let sdes = [0x81, 202, 0, 3, 0, 0, 0, 9, 1, 3, b'a', b'b', b'c', 0, 0, 0];
         let packet = RtcpPacket::parse(&sdes).unwrap();
         let chunk = packet.sdes().unwrap().unwrap().chunks().next().unwrap();

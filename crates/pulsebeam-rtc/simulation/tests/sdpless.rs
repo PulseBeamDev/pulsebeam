@@ -3,9 +3,24 @@ use super::*;
 use pulsebeam_agent_core::client_sdp as client;
 use pulsebeam_rtc::{
     RtpBinding, RtpCapabilities, RtpCodec, RtpCodecParameters, RtpConfiguration,
-    RtpConfigurationLimits, RtpEncoding, RtpExtensionMapping,
+    RtpConfigurationLimits, RtpConfigurationPatch, RtpEncoding, RtpExtensionMapping,
 };
-use std::{collections::BTreeMap, num::NonZeroU32};
+use std::collections::{BTreeMap, BTreeSet};
+
+fn sender_rtcp(transceiver: &RtpTransceiver) -> client::RtcpParameters {
+    let actual = transceiver.sender().get_parameters().rtcp();
+    assert!(actual.mux());
+    let cname = actual.cname_bytes();
+    let cname = if cname.is_empty() {
+        transceiver.applied_local_cname_bytes()
+    } else {
+        Some(cname)
+    };
+    client::RtcpParameters {
+        cname: cname.map(|value| String::from_utf8(value).unwrap()),
+        reduced_size: actual.reduced_size(),
+    }
+}
 
 fn opus() -> RtpCodecParameters {
     RtpCodecParameters {
@@ -95,6 +110,10 @@ fn binding(value: &client::Binding) -> RtpBinding {
             client::Kind::Video => pulsebeam_rtc::MediaKind::Video,
             _ => panic!("RTP kind"),
         },
+        rtcp: pulsebeam_rtc::RtcpParameters {
+            cname: value.rtcp.cname.clone().unwrap(),
+            reduced_size: value.rtcp.reduced_size,
+        },
         codec: RtpCodec {
             payload_type: value.codec.payload_type,
             parameters: RtpCodecParameters {
@@ -132,9 +151,40 @@ fn configuration(bindings: &client::Bindings) -> RtpConfiguration {
         outbound: bindings.receptions.iter().map(binding).collect(),
     }
 }
+fn configuration_patch(
+    previous: &RtpConfiguration,
+    next: &RtpConfiguration,
+) -> RtpConfigurationPatch {
+    let mut patch = RtpConfigurationPatch::default();
+    for (old, current, updates) in [
+        (&previous.inbound, &next.inbound, &mut patch.inbound),
+        (&previous.outbound, &next.outbound, &mut patch.outbound),
+    ] {
+        updates.extend(
+            current
+                .iter()
+                .filter(|binding| !old.contains(binding))
+                .cloned(),
+        );
+        let primaries = current
+            .iter()
+            .flat_map(|binding| &binding.encodings)
+            .map(|encoding| encoding.primary)
+            .collect::<BTreeSet<_>>();
+        patch.remove_encodings.extend(
+            old.iter()
+                .flat_map(|binding| &binding.encodings)
+                .map(|encoding| encoding.primary)
+                .filter(|ssrc| !primaries.contains(ssrc)),
+        );
+    }
+    patch
+}
+
 fn local_offer(world: &ControlledWorld, peer: &PeerConnection) -> SessionDescription {
-    let offer = complete(world, peer, peer.create_offer().unwrap()).unwrap();
-    complete(world, peer, peer.set_local_description(offer).unwrap());
+    // Re-parsing serialized RID SDP loses native StreamParams CNAME. Let the
+    // SDK apply its owned description before copying the signaling snapshot.
+    complete(world, peer, peer.set_local_description_auto().unwrap());
     for _ in 0..2000 {
         world.pump(512);
         if peer.ice_gathering_state() == IceGatheringState::Complete {
@@ -353,7 +403,7 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
         &bootstrap.sdp,
         accepted.answer.as_str(),
         client_capabilities(&server_profile),
-        3000,
+        u32::MAX,
         client::Limits::default(),
     )
     .unwrap();
@@ -402,6 +452,7 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
     let transceiver = peer
         .add_audio_transceiver(&track, RtpTransceiverDirection::SendReceive)
         .unwrap();
+    assert!(transceiver.applied_local_cname_bytes().is_none());
     let mono = peer
         .audio_sender_capabilities()
         .unwrap()
@@ -465,11 +516,12 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
     let mut observed = context.bindings().unwrap().publications[0]
         .encodings
         .clone();
-    observed[0].primary = transceiver.sender().get_parameters().encodings()[0]
-        .ssrc()
-        .and_then(NonZeroU32::new);
-    context.observe_sender(&media.mid, &observed).unwrap();
+    observed[0].primary = transceiver.sender().get_parameters().encodings()[0].ssrc();
+    context
+        .observe_sender(&media.mid, &observed, &sender_rtcp(&transceiver))
+        .unwrap();
     let configuration = configuration(context.bindings().unwrap());
+    assert_eq!(configuration.outbound[0].encodings[0].primary, 1);
     pump.connection
         .configure_rtp(configuration.clone())
         .unwrap();
@@ -477,7 +529,7 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
     pump.audio(&source, 10);
     assert!(pump.received.len() >= 10);
     assert!(pump.received.iter().all(|(mid, p)| mid == &media.mid
-        && p.header.ssrc == configuration.inbound[0].encodings[0].primary.get()
+        && p.header.ssrc == configuration.inbound[0].encodings[0].primary
         && p.header.payload_type == selected.payload_type
         && p.payload.as_ref() == [0xf8, 0xff, 0xfe]));
     let mut decoded = 0;
@@ -488,25 +540,48 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
     assert!(decoded >= 10, "attributable native receive payloads");
     let mut invalid = configuration.clone();
     invalid.outbound[0].encodings[0].primary = invalid.inbound[0].encodings[0].primary;
-    assert!(pump.connection.configure_rtp(invalid).is_err());
-    assert_eq!(pump.connection.rtp_configuration(), Some(&configuration));
+    assert!(
+        pump.connection
+            .update_rtp(RtpConfigurationPatch {
+                outbound: invalid.outbound,
+                remove_encodings: BTreeSet::from([configuration.inbound[0].encodings[0].primary]),
+                ..Default::default()
+            })
+            .is_err()
+    );
+    assert_eq!(
+        pump.connection.rtp_configuration().as_ref(),
+        Some(&configuration)
+    );
     pump.echo_mids.remove(&media.mid);
-    let mut withdrawn = configuration.clone();
-    withdrawn.outbound.clear();
-    pump.connection.configure_rtp(withdrawn).unwrap();
+    let mut paused = configuration.clone();
+    for binding in &mut paused.outbound {
+        for encoding in &mut binding.encodings {
+            encoding.active = false;
+        }
+    }
+    pump.connection
+        .update_rtp(RtpConfigurationPatch {
+            outbound: paused.outbound,
+            ..Default::default()
+        })
+        .unwrap();
     pump.drive(100);
     while sink.try_next_frame().is_some() {}
     let before = pump.received.len();
     pump.audio(&source, 5);
     assert!(pump.received.len() > before && sink.try_next_frame().is_none());
     assert_eq!(
-        channel.send(DataChannelMessage::text("during withdrawal")),
+        channel.send(DataChannelMessage::text("during pause")),
         DataChannelSendResult::Sent
     );
     pump.drive(100);
     assert_eq!(pump.data.len(), 2);
     pump.connection
-        .configure_rtp(configuration.clone())
+        .update_rtp(RtpConfigurationPatch {
+            outbound: configuration.outbound.clone(),
+            ..Default::default()
+        })
         .unwrap();
     pump.echo_mids.insert(media.mid.clone(), media.mid.clone());
     pump.output_sources
@@ -521,13 +596,16 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
         switched > 0,
         "another compatible fixture source uses the same output binding"
     );
-    assert_eq!(pump.connection.rtp_configuration(), Some(&configuration));
+    assert_eq!(
+        pump.connection.rtp_configuration().as_ref(),
+        Some(&configuration)
+    );
     assert!(pump.feedback > 0);
     let stats = pump.connection.stats();
     assert_eq!(stats.senders.len(), 1);
     assert_eq!(
         stats.senders[0].ssrc,
-        configuration.outbound[0].encodings[0].primary.get()
+        configuration.outbound[0].encodings[0].primary
     );
     assert!(stats.connection.rtp_bytes_in_flight < stats.connection.transmitted_rtp_bytes);
     assert_eq!(pump.data.len(), 2);
@@ -541,7 +619,7 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
         echoed,
         vec![
             DataChannelMessage::text("before media"),
-            DataChannelMessage::text("during withdrawal")
+            DataChannelMessage::text("during pause")
         ]
     );
     let feedback_before_video = pump.feedback;
@@ -588,6 +666,7 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
         "reference source continues through video and encoding updates"
     );
     peer.close().unwrap();
+    assert!(transceiver.applied_local_cname_bytes().is_none());
 }
 
 fn reconcile(
@@ -612,9 +691,70 @@ fn reconcile(
         .finish(candidate.id(), client::ApplyOutcome::Applied)
         .unwrap();
     let bindings = context.bindings().unwrap().clone();
-    pump.connection
-        .configure_rtp(configuration(&bindings))
-        .unwrap();
+    let mut configured = configuration(&bindings);
+    let sections = client::inspect(offer).unwrap();
+    let previous = pump.connection.rtp_configuration();
+    if let Some(previous) = &previous {
+        for (outbound, old, current) in [
+            (false, &previous.inbound, &mut configured.inbound),
+            (true, &previous.outbound, &mut configured.outbound),
+        ] {
+            for binding in old {
+                if current.iter().any(|b| b.mid == binding.mid)
+                    || requests.iter().any(|r| r.mid == binding.mid)
+                {
+                    continue;
+                }
+                // With no new owner request, a direction change pauses the
+                // continuing physical leg. A stopped section is terminal.
+                if sections.iter().any(|s| {
+                    s.mid == binding.mid
+                        && !s.stopped
+                        && matches!(
+                            (s.kind, binding.kind),
+                            (client::Kind::Audio, pulsebeam_rtc::MediaKind::Audio)
+                                | (client::Kind::Video, pulsebeam_rtc::MediaKind::Video)
+                        )
+                        && if outbound {
+                            !s.direction.receives()
+                        } else {
+                            !s.direction.sends()
+                        }
+                }) {
+                    let mut paused = binding.clone();
+                    for encoding in &mut paused.encodings {
+                        encoding.active = false;
+                    }
+                    current.push(paused);
+                }
+            }
+        }
+    }
+    if let Some(previous) = previous {
+        pump.connection
+            .update_rtp(configuration_patch(&previous, &configured))
+            .unwrap();
+    } else {
+        pump.connection
+            .update_rtp(RtpConfigurationPatch::default())
+            .unwrap();
+        for binding in configured.inbound {
+            pump.connection
+                .update_rtp(RtpConfigurationPatch {
+                    inbound: vec![binding],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        for binding in configured.outbound {
+            pump.connection
+                .update_rtp(RtpConfigurationPatch {
+                    outbound: vec![binding],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+    }
     bindings
 }
 
@@ -704,9 +844,9 @@ fn isolated_frame_repair(
     output: &RtpBinding,
     sink: &VideoSink,
 ) -> WireRtp {
-    let repair_ssrc = output.encodings[0].repair.unwrap().get();
+    let repair_ssrc = output.encodings[0].repair.unwrap();
     let repair_pt = output.codec.repair_payload_type.unwrap();
-    let primary_ssrc = output.encodings[0].primary.get();
+    let primary_ssrc = output.encodings[0].primary;
     pump.connection.request_keyframe(upstream).unwrap();
     pump.drive(20);
     let received_start = pump.received.len();
@@ -822,9 +962,9 @@ fn observed_encodings(
                             })
                             .unwrap();
                         let mut observed = encoding.clone();
-                        observed.primary = stats.ssrc.and_then(NonZeroU32::new);
+                        observed.primary = stats.ssrc;
                         observed.repair = if binding.codec.repair.is_some() {
-                            stats.rtx_ssrc.and_then(NonZeroU32::new)
+                            stats.rtx_ssrc
                         } else {
                             None
                         };
@@ -853,9 +993,7 @@ fn publication_passage(pump: &Pump<'_>, start: usize, binding: &RtpBinding) {
     for encoding in &binding.encodings {
         let packets: Vec<_> = pump.received[start..]
             .iter()
-            .filter(|(mid, packet)| {
-                mid == &binding.mid && packet.header.ssrc == encoding.primary.get()
-            })
+            .filter(|(mid, packet)| mid == &binding.mid && packet.header.ssrc == encoding.primary)
             .collect();
         if encoding.active {
             assert!(
@@ -983,8 +1121,26 @@ fn encoding_cycles(
             .all(|(mid, _)| mid == &reference.inbound[0].mid),
         "native discovery traffic is not implicitly admitted"
     );
+    assert!(
+        rid_binding.rtcp.cname.is_none(),
+        "RID SDP must exercise omitted CNAME"
+    );
+    let native_cname = transceivers[2].applied_local_cname_bytes().unwrap();
+    assert!(!native_cname.is_empty());
     let observations = observed_encodings(peer, pump, &transceivers[2].sender(), &rid_binding);
-    context.observe_sender(&rid_mid, &observations).unwrap();
+    let actual_rtcp = sender_rtcp(&transceivers[2]);
+    assert_eq!(
+        actual_rtcp.cname.as_deref().unwrap().as_bytes(),
+        native_cname
+    );
+    context
+        .observe_sender(&rid_mid, &observations, &actual_rtcp)
+        .unwrap_or_else(|error| {
+            panic!(
+                "sender observation {error:?}: prepared RTCP {:?}, native RTCP {actual_rtcp:?}",
+                rid_binding.rtcp
+            )
+        });
     let accepted = context.bindings().unwrap().clone();
     assert!(accepted.publications.iter().all(client::Binding::complete));
     let tiers: Vec<_> = accepted
@@ -995,7 +1151,16 @@ fn encoding_cycles(
     assert_eq!(tiers.len(), 2);
     assert_ne!(tiers[0].encodings[0].primary, tiers[1].encodings[0].primary);
     let declared = configuration(&accepted);
-    pump.connection.configure_rtp(declared.clone()).unwrap();
+    pump.connection
+        .update_rtp(configuration_patch(
+            &pump.connection.rtp_configuration().unwrap(),
+            &declared,
+        ))
+        .unwrap();
+    assert_eq!(
+        pump.connection.rtp_configuration().as_ref(),
+        Some(&declared)
+    );
     let start = pump.received.len();
     for (index, source) in sources.iter().enumerate() {
         video_frames_sized(source, audio, pump, 70 + index as u8 * 50, 8, 640, 360);
@@ -1016,7 +1181,7 @@ fn encoding_cycles(
         assert!(
             pump.received[start..].iter().any(|(mid, packet)| {
                 mid == &rid_mid
-                    && packet.header.ssrc == encoding.primary.get()
+                    && packet.header.ssrc == encoding.primary
                     && packet.extensions.iter().any(|extension| {
                         extension.uri.as_ref() == pulsebeam_rtc::RID_EXTENSION
                             && extension.value.as_ref() == encoding.rid.as_ref().unwrap().as_bytes()
@@ -1051,9 +1216,21 @@ fn encoding_cycles(
             encoding.runtime.active = Some(runtime.active);
             encoding.runtime.max_bitrate = runtime.max_bitrate_bps.map(u64::from);
         }
-        context.observe_sender(&rid_mid, &observed).unwrap();
+        context
+            .observe_sender(&rid_mid, &observed, &sender_rtcp(&transceivers[2]))
+            .unwrap();
         let current = configuration(context.bindings().unwrap());
-        pump.connection.configure_rtp(current.clone()).unwrap();
+        pump.connection
+            .update_rtp(RtpConfigurationPatch {
+                inbound: current
+                    .inbound
+                    .iter()
+                    .filter(|binding| binding.mid == rid_mid)
+                    .cloned()
+                    .collect(),
+                ..Default::default()
+            })
+            .unwrap();
         pump.audio(audio, 2);
         let start = pump.received.len();
         video_frames_sized(&sources[2], audio, pump, 170, 8, 640, 360);
@@ -1215,8 +1392,7 @@ fn video_cycles(
                 .find(|binding| binding.mid == media.mid)
                 .unwrap()
                 .encodings[0]
-                .primary
-                .get();
+                .primary;
             let first_repair =
                 isolated_frame_repair(&source, audio, pump, upstream, output, &video_sink);
             transceiver
@@ -1259,7 +1435,7 @@ fn video_cycles(
                 .find(|b| b.mid == media.mid)
                 .unwrap();
             pump.connection
-                .request_keyframe(publication.encodings[0].primary.unwrap().get())
+                .request_keyframe(publication.encodings[0].primary.unwrap())
                 .unwrap();
             pump.drive(20);
             video_frames(&source, audio, pump, value, 4);

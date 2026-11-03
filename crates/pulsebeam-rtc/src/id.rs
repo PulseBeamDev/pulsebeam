@@ -50,11 +50,11 @@ macro_rules! caller_id {
     };
 }
 
-connection_id!(SenderId, u16);
+connection_id!(SenderId, u64);
 caller_id!(DataChannelId, u16);
 
 impl SenderId {
-    pub(crate) const fn value(self) -> u16 {
+    pub(crate) const fn value(self) -> u64 {
         self.0
     }
 }
@@ -67,5 +67,6 @@ mod tests {
     fn connection_allocated_ids_are_distinct_values() {
         assert_ne!(SenderId::new(1), SenderId::new(2));
         assert_eq!(SenderId::new(0), None);
+        assert_ne!(SenderId::new(1), SenderId::new(65_537));
     }
 }

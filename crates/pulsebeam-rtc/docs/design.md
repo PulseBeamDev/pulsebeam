@@ -83,17 +83,22 @@ URI-addressed extension values and caller-owned primary translation retain the
 same write contract. Multiple outbound encodings use `write_rtp_encoding`;
 `write_rtp` rejects ambiguous MID-only writes.
 
-Withdrawal or inactivation rejects new writes/admission and discards queued
-originals, but cannot retract a returned `Transmit`. Re-admitting the exact
-physical binding preserves protocol state and independent primary/repair
-indices. New physical envelopes need fresh primary/repair identities, including
-when reusing a MID. Physical history and crypto replay capacity are bounded;
-capacity failure never evicts an identity or resets indices to admit new work.
-Retained repairs stay subject to the existing byte/age bounds and are not sent
-while their binding is inactive.
+Inactivation rejects new writes/admission and discards outbound queued originals,
+but cannot retract a returned `Transmit`. Reactivating an owned physical binding
+preserves protocol state and independent primary/repair indices. Omission is
+terminal in both directions: live declaration and sender/receiver runtime are
+removed, declared and observed SSRCs remain fenced, and pending buffers stay
+charged until bounded polling reclaims them. Replacements need fresh
+primary/repair identities, including when reusing a MID. Physical history and
+crypto replay capacity are bounded; capacity failure never evicts an identity or
+resets indices to admit new work. Retained repairs stay subject to the existing
+byte/age bounds and are not sent while their binding is inactive.
 
-`rtp_configuration()` is the accepted typed set after a successful update.
-`SessionInfo` and `offered_media` remain bootstrap snapshots, not competing
+`rtp_configuration()` explicitly materializes an owned snapshot of the accepted
+typed set after a successful update. The execution registry owns indexed binding
+records and shared MID/PT/extension constraints, not a full snapshot. Snapshot
+construction is proportional to the live set and is not part of a scoped registry
+commit. `SessionInfo` and `offered_media` remain bootstrap snapshots, not competing
 mutable configuration. Before a typed update, existing bootstrap media and
 bounded unsignaled discovery retain their supported SDP behavior. Source,
 quality, replay and playback policy remain outside RTC.

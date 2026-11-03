@@ -32,6 +32,20 @@ feature unification and per-dependency flavor labels do not select native code.
 Tests requiring physical devices or external services are not default acceptance.
 Other target platforms are not yet supported by the Bazel integration.
 
+## Prepared media facts
+
+`RtpTransceiver::applied_local_cname_bytes()` reads the exact sender's CNAME
+from its currently applied native local description. RID-only streams retain
+this value natively even when serialized SDP and `GetParameters` omit it.
+The accessor returns no value before application or after close, preserves raw
+bytes, and does not start a `GetParameters` transaction or alter its SDK snapshot.
+Use `PeerConnection::set_local_description_auto()` to generate and apply the
+SDK-owned local description before reading its signaling snapshot. Serializing a
+RID offer and reparsing it through `set_local_description` discards CNAME facts
+that SDP cannot represent.
+Pass these actual observations to the shared core's local SDP context rather
+than inferring CNAME from unrelated media.
+
 ## Lifetime instrumentation
 
 The focused teardown and callback suite can instrument the native implementation

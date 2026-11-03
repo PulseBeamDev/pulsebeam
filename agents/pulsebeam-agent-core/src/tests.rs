@@ -638,6 +638,12 @@ fn begin_connect(
             assert_eq!(topology, config().topology);
             assert_eq!(data_channels.len(), 1);
             assert_eq!(data_channels[0].label, "v1/sys/signaling");
+            assert_eq!(data_channels[0].negotiated_id, Some(0));
+            assert!(data_channels[0].ordered);
+            assert_eq!(
+                data_channels[0].reliability,
+                DataChannelReliability::Reliable
+            );
             generation
         }
         effect => panic!("expected CreateOffer, got {effect:?}"),
@@ -1308,6 +1314,17 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
         Err(AgentError::InvalidOffer(
             "slot mapping does not match configured topology"
         ))
+    );
+    assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
+    assert!(agent.next_effect().is_none());
+
+    assert_eq!(
+        agent.handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation,
+            offer: " ".repeat(131_073),
+            resources: resources(channel(3)),
+        })),
+        Err(AgentError::InvalidOffer("SDP offer is empty or too large"))
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
     assert!(agent.next_effect().is_none());
@@ -2760,6 +2777,12 @@ fn topic_registrations_validate_declare_and_retract_complete_channels() {
             "v2/ordered/sub/chat"
         ]
     );
+    assert_eq!(data_channels[0].negotiated_id, Some(0));
+    assert!(data_channels[1..].iter().all(|spec| {
+        spec.negotiated_id.is_none()
+            && !spec.ordered
+            && spec.reliability == DataChannelReliability::MaxRetransmits(0)
+    }));
     assert_eq!(agent.snapshot().topics.publishers.len(), 1);
     assert_eq!(agent.snapshot().topics.subscribers.len(), 1);
     let mut invalid = desired(3);

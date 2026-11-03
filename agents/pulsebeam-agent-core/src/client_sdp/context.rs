@@ -1,12 +1,9 @@
 use super::sdp::{self, Document, Transport};
 use super::{
     Binding, Bindings, Capabilities, Codec, Encoding, Error, Kind, Limits, MediaOwner, Preparation,
-    RuntimeEncoding,
+    RtcpParameters, RuntimeEncoding,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    num::NonZeroU32,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CandidateId(u64);
@@ -66,9 +63,9 @@ pub struct Context {
     limits: Limits,
     accepted: Accepted,
     pending: Option<(CandidateId, Accepted)>,
-    used: BTreeSet<NonZeroU32>,
-    sender_identities: BTreeMap<NonZeroU32, (String, Option<String>, bool)>,
-    retired: BTreeSet<NonZeroU32>,
+    used: BTreeSet<u32>,
+    sender_identities: BTreeMap<u32, (String, Option<String>, bool)>,
+    retired: BTreeSet<u32>,
     next_identity: u32,
     next_candidate: u64,
 }
@@ -101,6 +98,11 @@ impl Context {
                 .any(|(a, b)| a.section.mid != b.section.mid || a.section.kind != b.section.kind)
         {
             return Err(Error::Malformed("bootstrap alignment"));
+        }
+        for (offer, answer) in local.media.iter().zip(&remote.media) {
+            if answer.section.rtcp.reduced_size && !offer.section.rtcp.reduced_size {
+                return Err(Error::Envelope(answer.section.mid.clone()));
+            }
         }
         let local_transport = active_transport(&local)?;
         let remote_transport = active_transport(&remote)?;
@@ -276,6 +278,14 @@ impl Context {
                     codec: codec.clone(),
                     extensions,
                     encodings,
+                    rtcp: RtcpParameters {
+                        cname: if publication { local } else { remote }
+                            .section
+                            .rtcp
+                            .cname
+                            .clone(),
+                        reduced_size: remote.section.rtcp.reduced_size,
+                    },
                 });
             }
         }
@@ -380,6 +390,7 @@ impl Context {
                 retained.receptions.retain(|b| b.mid != mid);
                 media.section.codecs.clear();
                 media.section.encodings.clear();
+                media.section.rtcp = RtcpParameters::default();
                 media.section.extensions.clear();
                 media.transport = self.remote_transport.clone();
                 continue;
@@ -397,6 +408,7 @@ impl Context {
                     .ok_or_else(|| Error::Envelope(mid.clone()))?;
                 media.section.codecs = vec![codec];
                 media.section.encodings.clear();
+                media.section.rtcp = RtcpParameters::default();
                 media
                     .section
                     .extensions
@@ -477,6 +489,13 @@ impl Context {
             {
                 return Err(Error::MissingConfiguration(mid));
             }
+            let reduced_size = prior
+                .as_ref()
+                .filter(|p| !p.section.stopped)
+                .is_some_and(|p| p.section.rtcp.reduced_size);
+            if reduced_size && !media.section.rtcp.reduced_size {
+                return Err(Error::Envelope(mid.clone()));
+            }
             let offered_direction = media.section.direction;
             let extensions: Vec<_> = media
                 .section
@@ -546,6 +565,19 @@ impl Context {
                         }
                     }
                 }
+                let mut rtcp = media.section.rtcp.clone();
+                rtcp.reduced_size = reduced_size;
+                if let Some(old) = &publication_prior {
+                    if rtcp.cname.is_some()
+                        && old.rtcp.cname.is_some()
+                        && rtcp.cname != old.rtcp.cname
+                    {
+                        return Err(Error::Envelope(mid.clone()));
+                    }
+                    if rtcp.cname.is_none() {
+                        rtcp.cname.clone_from(&old.rtcp.cname);
+                    }
+                }
                 bindings.publications.push(Binding {
                     key: owner.key,
                     group: owner.group,
@@ -558,6 +590,7 @@ impl Context {
                         .cloned()
                         .collect(),
                     encodings,
+                    rtcp,
                 });
             }
             if let Some(owner) = reception_owner.filter(|_| offered_direction.receives()) {
@@ -587,6 +620,16 @@ impl Context {
                         .filter(|e| e.direction.receives())
                         .cloned()
                         .collect(),
+                    rtcp: reception_prior
+                        .as_ref()
+                        .map(|b| b.rtcp.clone())
+                        .unwrap_or_else(|| RtcpParameters {
+                            cname: encodings
+                                .first()
+                                .and_then(|e| e.primary)
+                                .map(|primary| format!("pulsebeam-{primary:08x}")),
+                            reduced_size,
+                        }),
                     encodings,
                 });
             }
@@ -599,6 +642,15 @@ impl Context {
                 })
                 .collect();
             media.section.direction = offered_direction.inverse();
+            media.section.rtcp = bindings
+                .receptions
+                .iter()
+                .find(|b| b.mid == mid)
+                .map(|b| b.rtcp.clone())
+                .unwrap_or(RtcpParameters {
+                    cname: None,
+                    reduced_size,
+                });
             media.section.encodings = bindings
                 .receptions
                 .iter()
@@ -711,6 +763,7 @@ impl Context {
         &mut self,
         mid: &str,
         observations: &[Encoding],
+        rtcp: &RtcpParameters,
     ) -> Result<&Bindings, Error> {
         if self.pending.is_some() || !self.accepted.declarable {
             return Err(Error::CandidateState);
@@ -728,7 +781,15 @@ impl Context {
             .publications
             .get(index)
             .ok_or(Error::Observation)?;
-        if observations.len() != binding.encodings.len() {
+        let mut rtcp = rtcp.clone();
+        if rtcp.cname.is_none() {
+            rtcp.cname.clone_from(&binding.rtcp.cname);
+        }
+        if observations.len() != binding.encodings.len()
+            || !rtcp.cname.as_deref().is_some_and(sdp::cname)
+            || rtcp.reduced_size != binding.rtcp.reduced_size
+            || binding.rtcp.cname.is_some() && rtcp.cname != binding.rtcp.cname
+        {
             return Err(Error::Observation);
         }
         let mut ids = BTreeSet::new();
@@ -763,6 +824,18 @@ impl Context {
                 .iter()
                 .find(|m| m.section.mid == mid)
                 .ok_or(Error::Observation)?;
+            if [observed.primary, observed.repair]
+                .into_iter()
+                .flatten()
+                .any(|id| {
+                    local
+                        .cnames
+                        .get(&id)
+                        .is_some_and(|cname| Some(cname) != rtcp.cname.as_ref())
+                })
+            {
+                return Err(Error::Observation);
+            }
             if !local.signaled.is_empty()
                 && !observed.primary.is_some_and(|primary| {
                     local.signaled.get(&primary).is_some_and(|repair| {
@@ -800,12 +873,14 @@ impl Context {
                 }
             }
         }
-        self.accepted
+        let binding = self
+            .accepted
             .bindings
             .publications
             .get_mut(index)
-            .ok_or(Error::Observation)?
-            .encodings = observations.to_vec();
+            .ok_or(Error::Observation)?;
+        binding.encodings = observations.to_vec();
+        binding.rtcp = rtcp.clone();
         if let Some(retained) = self
             .accepted
             .retained
@@ -814,6 +889,7 @@ impl Context {
             .find(|b| b.mid == mid)
         {
             retained.encodings = observations.to_vec();
+            retained.rtcp = rtcp;
         }
         Ok(&self.accepted.bindings)
     }
@@ -844,7 +920,7 @@ impl Context {
     }
     fn reserve_sender(
         &mut self,
-        id: NonZeroU32,
+        id: u32,
         mid: &str,
         rid: &Option<String>,
         repair: bool,
@@ -867,7 +943,7 @@ impl Context {
         self.sender_identities.insert(id, owner);
         Ok(())
     }
-    fn reserve(&mut self, id: NonZeroU32) -> Result<(), Error> {
+    fn reserve(&mut self, id: u32) -> Result<(), Error> {
         if self.used.contains(&id) {
             return Err(Error::Collision);
         }
@@ -877,16 +953,16 @@ impl Context {
         self.used.insert(id);
         Ok(())
     }
-    fn allocate(&mut self) -> Result<NonZeroU32, Error> {
-        // A bounded probe includes one extra slot for zero. Sequential allocation
-        // is deterministic; the caller supplies a connection-specific seed.
+    fn allocate(&mut self) -> Result<u32, Error> {
+        // libwebrtc reserves zero in its receiver frame-transformer API. Keep
+        // local allocations nonzero; observed SSRCs retain their full u32 value.
+        // One extra probe accounts for skipping zero.
         for _ in 0..self.limits.max_identity_history.saturating_add(2) {
             self.next_identity = self.next_identity.wrapping_add(1);
-            if let Some(id) = NonZeroU32::new(self.next_identity) {
-                if !self.used.contains(&id) {
-                    self.reserve(id)?;
-                    return Ok(id);
-                }
+            let id = self.next_identity;
+            if id != 0 && !self.used.contains(&id) {
+                self.reserve(id)?;
+                return Ok(id);
             }
         }
         Err(Error::Capacity)
@@ -1038,6 +1114,9 @@ fn render(document: &Document, bindings: &Bindings) -> Result<String, Error> {
         }
         lines.push(format!("a={}", section.direction.token()));
         lines.push("a=rtcp-mux".into());
+        if section.rtcp.reduced_size {
+            lines.push("a=rtcp-rsize".into());
+        }
         if section.stopped {
             continue;
         }
@@ -1092,13 +1171,19 @@ fn render(document: &Document, bindings: &Bindings) -> Result<String, Error> {
         }
         for encoding in &section.encodings {
             if let Some(primary) = encoding.primary {
-                lines.push(format!("a=ssrc:{primary} cname:pulsebeam"));
+                let cname = section
+                    .rtcp
+                    .cname
+                    .as_deref()
+                    .filter(|cname| sdp::cname(cname))
+                    .ok_or_else(|| Error::Envelope(section.mid.clone()))?;
+                lines.push(format!("a=ssrc:{primary} cname:{cname}"));
                 if let Some(msid) = &msid {
                     lines.push(format!("a=ssrc:{primary} msid:{msid}"));
                 }
                 if let Some(repair) = encoding.repair {
                     lines.extend([
-                        format!("a=ssrc:{repair} cname:pulsebeam"),
+                        format!("a=ssrc:{repair} cname:{cname}"),
                         format!("a=ssrc-group:FID {primary} {repair}"),
                     ]);
                     if let Some(msid) = &msid {

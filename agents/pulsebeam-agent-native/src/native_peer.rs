@@ -171,6 +171,8 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         for spec in specs {
             let mut settings = rtc::DataChannelConfiguration {
                 ordered: spec.ordered,
+                negotiated: spec.negotiated_id.is_some(),
+                id: spec.negotiated_id.map(i32::from),
                 ..rtc::DataChannelConfiguration::default()
             };
             match spec.reliability {
@@ -182,9 +184,24 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                     settings.max_retransmit_time_ms = Some(i32::from(ms));
                 }
             }
+            let expected_limits = (settings.max_retransmits, settings.max_retransmit_time_ms);
             let native = session
                 .create_channel(peer, &spec.label, settings)
                 .map_err(|e| error(e.to_string()))?;
+            if let Some(id) = spec.negotiated_id {
+                let actual = session.channel_configuration(native)?;
+                if actual.id != Some(i32::from(id))
+                    || !actual.negotiated
+                    || actual.ordered != spec.ordered
+                    || actual.reliable
+                        != matches!(spec.reliability, DataChannelReliability::Reliable)
+                    || (actual.max_retransmits, actual.max_retransmit_time_ms) != expected_limits
+                {
+                    return Err(error(
+                        "native negotiated data channel configuration mismatch",
+                    ));
+                }
+            }
             let channel = ChannelId::new(native.get())
                 .ok_or_else(|| error("zero native channel identity"))?;
             channels.insert(channel, native);

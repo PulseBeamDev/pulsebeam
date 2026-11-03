@@ -118,6 +118,16 @@ def rtc_visibility(root, lock, deps, metadata):
     return selected, bool(patch)
 
 
+def rtc_patch_annotation(version, has_visibility_patch):
+    patches = []
+    if has_visibility_patch:
+        patches.append("//tools:patches/str0m-rtc-visibility.patch")
+    patches.append("//tools:patches/str0m-rtc-protect-into.patch")
+    return (f'crate.annotation(crate = "str0m", version = "={version}", '
+            f'patches = {json.dumps(patches)}, patch_args = ["-p1"], '
+            'repositories = ["str0m_rtc"])\n')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cargo", required=True)
@@ -259,6 +269,8 @@ crate.annotation(crate = "uniffi-bindgen-react-native", gen_binaries = ["uniffi-
 crate.annotation(crate = "ubrn_common", patches = ["//tools:patches/ubrn-offline-workspace-metadata.patch"], patch_args = ["-p1"], repositories = ["build_tools"])
 crate.from_specs(
     name = "build_tools",
+    cargo_lockfile = "//tools:rust/build_tools/Cargo.lock",
+    lockfile = "//tools:rust/build_tools/Cargo.Bazel.lock",
     supported_platform_triples = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"],
     host_tools = "@pulsebeam_rust_host_tools//:BUILD.bazel",
 )
@@ -285,8 +297,7 @@ use_repo(crate, "{name}")
         fragment += f'crate.annotation(crate = "str0m", version = "={package["version"]}", override_target_lib = "@{name}//:str0m", repositories = ["crates"])\n'
     fragment += 'crate.annotation(crate = "is", override_target_lib = "@str0m_rtc//:is", repositories = ["crates"])\n'
     fragment += tracing_override
-    if has_visibility_patch:
-        fragment += f'crate.annotation(crate = "str0m", version = "={rtc_package["version"]}", patches = ["//tools:patches/str0m-rtc-visibility.patch"], patch_args = ["-p1"], repositories = ["str0m_rtc"])\n'
+    fragment += rtc_patch_annotation(rtc_package["version"], has_visibility_patch)
     (root / "tools/rust-pins.MODULE.bazel").write_text(fragment)
 
 

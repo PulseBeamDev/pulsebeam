@@ -396,23 +396,37 @@ mod tests {
         let provider = str0m::crypto::from_feature_flags();
         let client_material = pair.client_material.take().expect("client keying material");
         let server_material = pair.server_material.take().expect("server keying material");
-        let mut client_srtp =
-            SrtpLayer::new(client_material, pair.profile, true, &provider).expect("client SRTP");
-        let mut server_srtp =
-            SrtpLayer::new(server_material, pair.profile, false, &provider).expect("server SRTP");
+        let mut client_srtp = SrtpLayer::new(
+            client_material,
+            pair.profile,
+            true,
+            &provider,
+            super::super::srtp::ReplayLimits::default(),
+            0,
+        )
+        .expect("client SRTP");
+        let mut server_srtp = SrtpLayer::new(
+            server_material,
+            pair.profile,
+            false,
+            &provider,
+            super::super::srtp::ReplayLimits::default(),
+            0,
+        )
+        .expect("server SRTP");
         let rtp = [0x80, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 7, 1, 2, 3];
-        let protected = client_srtp.protect_rtp(&rtp, 1).expect("protect RTP");
+        let protected = client_srtp.protect_rtp(&rtp, 1, None).expect("protect RTP");
         assert_ne!(protected, rtp);
         assert_eq!(
             server_srtp
-                .unprotect_rtp(&protected)
+                .unprotect_rtp(&protected, false)
                 .expect("unprotect RTP")
                 .0,
             rtp
         );
 
         let rtcp = [0x80, 200, 0, 1, 0, 0, 0, 7];
-        let protected = client_srtp.protect_rtcp(&rtcp).expect("protect RTCP");
+        let protected = client_srtp.protect_rtcp(&rtcp, None).expect("protect RTCP");
         assert_ne!(protected, rtcp);
         assert_eq!(
             server_srtp

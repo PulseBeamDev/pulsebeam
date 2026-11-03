@@ -3228,6 +3228,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
+name = "pbjson"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8edd1efdd8ab23ba9cb9ace3d9987a72663d5d7c9f74fa00b51d6213645cf6c"
+dependencies = [
+ "base64",
+ "serde",
+]
+
+[[package]]
+name = "pbjson-build"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ed4d5c6ae95e08ac768883c8401cf0e8deb4e6e1d6a4e1fd3d2ec4f0ec63200"
+dependencies = [
+ "heck",
+ "itertools 0.14.0",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3836,9 +3858,14 @@ name = "pulsebeam-proto"
 version = "0.3.2"
 dependencies = [
  "lz4_flex",
+ "pbjson",
+ "pbjson-build",
  "prost 0.14.4",
  "prost-build 0.14.4",
  "prost-types 0.14.4",
+ "pulsebeam-proto",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

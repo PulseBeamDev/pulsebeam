@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::MAX_NATIVE_SDP_BYTES;
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -9,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{MethodFilter, post},
 };
-use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
+use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, LOCATION, RETRY_AFTER, WWW_AUTHENTICATE};
 use pulsebeam_core::auth::{
     KeyRegistry, TokenError, VerifiedAuthorization, verify_participant_token,
 };
@@ -27,6 +28,7 @@ use crate::{
 };
 
 const MAX_SIGNALING_BODY_BYTES: usize = 1_048_576;
+const MAX_NATIVE_BODY_BYTES: usize = 262_144;
 const ACCEPT_POST: hyper::header::HeaderName =
     hyper::header::HeaderName::from_static("accept-post");
 
@@ -53,7 +55,7 @@ pub enum ApiError {
     IdValidation(#[from] IdValidationError),
     #[error("join failed: {0}")]
     JoinError(#[from] controller::ControllerError),
-    #[error("request body exceeds the 1 MiB limit")]
+    #[error("request body exceeds signaling limits")]
     PayloadTooLarge,
     #[error("too many requests, please try again later")]
     RateLimited,
@@ -129,6 +131,14 @@ impl IntoResponse for ApiError {
             .into_response();
         if let Some(challenge) = challenge {
             response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
+        }
+        if matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
         }
         response
     }
@@ -342,12 +352,12 @@ async fn create_native(
         .as_secs();
     let authorization = verify_bearer(&headers, &state.key_registry, unix_now)?;
     ensure_json_content_type(&headers)?;
-    let body = to_bytes(request.into_body(), MAX_SIGNALING_BODY_BYTES)
+    let body = to_bytes(request.into_body(), MAX_NATIVE_BODY_BYTES)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
     let request: NativeRequest = serde_json::from_slice(&body)
-        .map_err(|error| ApiError::BadRequest(format!("invalid JSON request: {error}")))?;
-    if request.offer.len() > MAX_SIGNALING_BODY_BYTES {
+        .map_err(|_| ApiError::BadRequest("invalid native JSON request".to_owned()))?;
+    if request.offer.len() > MAX_NATIVE_SDP_BYTES {
         return Err(ApiError::PayloadTooLarge);
     }
     validate_native_directions(&request.offer)?;
@@ -1082,7 +1092,10 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({"offer": valid_offer(), "unknown": true}))
                 .unwrap(),
             b"{".to_vec(),
-            vec![b' '; MAX_SIGNALING_BODY_BYTES + 1],
+            vec![b' '; MAX_NATIVE_BODY_BYTES + 1],
+            serde_json::to_vec(&serde_json::json!({"offer": " ".repeat(MAX_NATIVE_SDP_BYTES + 1)})).unwrap(),
+            br#"{"offer":"v=0","offer":"v=1"}"#.to_vec(),
+            serde_json::to_vec(&serde_json::json!({"offer": valid_offer(), ("diagnostic-secret-".repeat(32)): true})).unwrap(),
         ];
         for body in cases {
             let (controller, mut commands) =
@@ -1101,6 +1114,12 @@ mod tests {
             );
             assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
             assert!(commands.try_recv().is_err());
+            let body = to_bytes(response.into_body(), 512).await.unwrap();
+            assert!(
+                !String::from_utf8(body.to_vec())
+                    .unwrap()
+                    .contains("diagnostic-secret")
+            );
         }
 
         let (controller, _) =

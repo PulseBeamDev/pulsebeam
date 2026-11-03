@@ -1403,14 +1403,26 @@ impl RuntimeInner {
         }) as Box<dyn FnMut(RtcTrackEvent)>);
         connection.set_ontrack(Some(track.as_ref().unchecked_ref()));
 
-        let mut channels = BTreeMap::new();
+        let mut channels = BTreeMap::<u64, DataChannel>::new();
         for (index, spec) in specs.iter().enumerate() {
             let numeric = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
             let Some(channel_id) = ChannelId::new(numeric) else {
                 return Err("data channel ID space exhausted".into());
             };
-            let channel = self.create_data_channel(generation, channel_id, &connection, spec);
-            let previous = channels.insert(channel_id.get(), channel?);
+            let channel = match self.create_data_channel(generation, channel_id, &connection, spec)
+            {
+                Ok(channel) => channel,
+                Err(error) => {
+                    connection.set_onconnectionstatechange(None);
+                    connection.set_ontrack(None);
+                    for channel in channels.into_values() {
+                        channel.close();
+                    }
+                    connection.close();
+                    return Err(error);
+                }
+            };
+            let previous = channels.insert(channel_id.get(), channel);
             debug_assert!(previous.is_none(), "channel IDs must be unique");
         }
 
@@ -1454,14 +1466,38 @@ impl RuntimeInner {
     ) -> Result<DataChannel, String> {
         let init = RtcDataChannelInit::new();
         init.set_ordered(spec.ordered);
-        match spec.reliability {
-            DataChannelReliability::Reliable => {}
-            DataChannelReliability::MaxRetransmits(value) => init.set_max_retransmits(value),
+        if let Some(id) = spec.negotiated_id {
+            init.set_negotiated(true);
+            init.set_id(id);
+        }
+        let expected_limits = match spec.reliability {
+            DataChannelReliability::Reliable => (None, None),
+            DataChannelReliability::MaxRetransmits(value) => {
+                init.set_max_retransmits(value);
+                (Some(value), None)
+            }
             DataChannelReliability::MaxPacketLifetime(value) => {
                 init.set_max_packet_life_time(value);
+                (None, Some(value))
+            }
+        };
+        let channel = connection.create_data_channel_with_data_channel_dict(&spec.label, &init);
+        if let Some(id) = spec.negotiated_id {
+            // Pinned web-sys omits these standard RTCDataChannel getters.
+            let boolean_property = |name: &str| {
+                Reflect::get(channel.as_ref(), &JsValue::from_str(name))
+                    .ok()
+                    .and_then(|value| value.as_bool())
+            };
+            if channel.id() != Some(id)
+                || boolean_property("negotiated") != Some(true)
+                || boolean_property("ordered") != Some(spec.ordered)
+                || (channel.max_retransmits(), channel.max_packet_life_time()) != expected_limits
+            {
+                channel.close();
+                return Err("browser negotiated data channel configuration mismatch".to_owned());
             }
         }
-        let channel = connection.create_data_channel_with_data_channel_dict(&spec.label, &init);
         channel.set_binary_type(RtcDataChannelType::Arraybuffer);
 
         let open_weak = Rc::downgrade(self);

@@ -22,4 +22,5 @@ serde_json = { version = "1", default-features = false, features = ["alloc"] }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["alloc", "checked-decode", "safe-decode", "safe-encode"] }
 prost = { version = "0.14.3", default-features = true, features = [] }
 prost-types = { version = "0.14.3", default-features = true, features = [] }
+pbjson = { version = "=0.9.0", default-features = true, features = [] }
 uniffi-runtime-javascript = { version = "=0.31.0-5", default-features = true, features = ["wasm32"] }
