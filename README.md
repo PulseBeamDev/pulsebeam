@@ -36,9 +36,10 @@ const videos = agent.remote.participants.flatMap(({ tracks }) =>
 
 return (
   <>
-    <button onClick={() => void capture.request()}>
+    <button onClick={() => void capture.request().catch(() => {})}>
       Enable camera & mic
     </button>
+    {capture.error && <p role="alert">{capture.error.message}</p>}
     <button onClick={() => agent.connect()}>
       Connect
     </button>
