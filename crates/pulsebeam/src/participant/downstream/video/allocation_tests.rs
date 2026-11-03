@@ -17,7 +17,8 @@ fn camera() -> (Track, LayerStates) {
     ] {
         state_of_mut(&mut states, track.by_quality(quality).unwrap())
             .update_for_test()
-            .bitrate(bitrate);
+            .bitrate(bitrate)
+            .set_height(quality.fallback_height());
     }
     (track, states)
 }
@@ -43,6 +44,7 @@ fn view<'a>(track: &'a Track, key: DownstreamSlotKey, mid: &str, priority: u32) 
         key,
         mid: Mid::from(mid),
         max_height: 720,
+        height_ceiling: None,
         min_height: 180,
         min_fps: 0,
         priority,
@@ -306,6 +308,19 @@ fn fps_minimum_can_raise_the_spatial_target_to_an_available_encoding() {
         forwarded_quality(decisions[key]),
         Some(LayerQuality::Medium)
     );
+    let mut bounded = views;
+    bounded.first_mut().unwrap().height_ceiling = Some(180);
+    let engine = AllocationEngine::new(&bounded, &states);
+    let decisions = engine.run_compute(Bitrate::from(500_000), &bounded);
+    assert_eq!(forwarded_quality(decisions[key]), Some(LayerQuality::Low));
+    let unknown = LayerStates::new();
+    let engine = AllocationEngine::new(&bounded, &unknown);
+    let decisions = engine.run_compute(Bitrate::from(2_000_000), &bounded);
+    assert_eq!(forwarded_quality(decisions[key]), None);
+    bounded.first_mut().unwrap().height_ceiling = Some(100);
+    let engine = AllocationEngine::new(&bounded, &states);
+    let decisions = engine.run_compute(Bitrate::from(2_000_000), &bounded);
+    assert_eq!(forwarded_quality(decisions[key]), None);
 }
 
 #[test]

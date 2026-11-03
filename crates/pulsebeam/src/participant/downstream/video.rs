@@ -1,3 +1,5 @@
+mod owned;
+
 use crate::bitrate::Bitrate;
 use crate::bitrate::{BitrateController, BitrateControllerConfig};
 use crate::media::{KeyframeRequest, Mid, Pt, Rid, Ssrc};
@@ -68,6 +70,7 @@ pub const INITIAL_BANDWIDTH: Bitrate = Bitrate::mbps(2);
 pub struct VideoAllocator {
     routes: SecondaryMap<TrackHandle, DownstreamSlotKey>,
     slots: SlotMap<DownstreamSlotKey, Slot>,
+    owned_slots: HashMap<Mid, DownstreamSlotKey>,
 
     // Cold
     ctx: LogCtx,
@@ -130,6 +133,7 @@ impl VideoAllocator {
             active_track_handles: HashMap::new(),
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
             routes: SecondaryMap::new(),
+            owned_slots: HashMap::new(),
             last_reconciled: HashSet::new(),
             desired_ctrl,
             current_allocation: Bitrate::ZERO,
@@ -213,85 +217,14 @@ impl VideoAllocator {
         let tracks = &self.tracks;
         let track_handles = &self.track_handles;
         for (_key, slot) in slots {
+            if slot.media_index.is_none() {
+                continue;
+            }
             if let Some(intent) = intents.get(&slot.mid) {
                 Self::configure_slot(tracks, track_handles, slot, Some(intent));
             } else {
                 Self::configure_slot(tracks, track_handles, slot, None);
             }
-        }
-    }
-
-    pub(crate) fn configure_native(
-        &mut self,
-        requests: &[pulsebeam_proto::signaling_v1::VideoTrackIntent],
-        fixed_mids: &HashSet<Mid>,
-    ) -> bool {
-        let mut desired = IndexMap::new();
-        for request in requests {
-            let Ok(track_id) = TrackId::try_from(request.track_id.clone()) else {
-                continue;
-            };
-            if track_id.kind() == crate::entity::TrackKind::Video
-                && self.track_handles.contains_key(&track_id)
-            {
-                desired
-                    .entry(track_id)
-                    .or_insert_with(|| request.options.unwrap_or_default());
-            }
-        }
-        let mut slots: Vec<_> = self
-            .slots
-            .values()
-            .map(|slot| (slot.media_index, slot.mid, slot.assignment))
-            .collect();
-        slots.sort_by_key(|(index, _, _)| *index);
-        let mut assigned = HashSet::new();
-        let mut intents = HashMap::new();
-        for (_, mid, current) in &slots {
-            if let Some(track_id) = current
-                && let Some(options) = desired.get(track_id)
-                && (options.playout_delay.is_some() || !fixed_mids.contains(mid))
-            {
-                assigned.insert(*track_id);
-                intents.insert(*mid, Self::native_slot_intent(*track_id, options));
-            }
-        }
-        let mut unused = slots
-            .iter()
-            .filter(|(_, mid, _)| !intents.contains_key(mid))
-            .map(|(_, mid, _)| *mid)
-            .collect::<Vec<_>>();
-        let mut reconnect = false;
-        for fixed in [false, true] {
-            for (&track_id, options) in &desired {
-                if assigned.contains(&track_id) || options.playout_delay.is_some() != fixed {
-                    continue;
-                }
-                let position = unused
-                    .iter()
-                    .position(|mid| fixed || !fixed_mids.contains(mid));
-                if let Some(position) = position {
-                    let mid = unused.remove(position);
-                    intents.insert(mid, Self::native_slot_intent(track_id, options));
-                } else if !fixed && !unused.is_empty() {
-                    reconnect = true;
-                }
-            }
-        }
-        self.configure(&intents);
-        reconnect
-    }
-
-    fn native_slot_intent(
-        track_id: TrackId,
-        options: &pulsebeam_proto::signaling_v1::VideoOptions,
-    ) -> Intent {
-        Intent {
-            track_id,
-            target_height: options.height,
-            min_height: options.min_height,
-            min_fps: options.min_fps,
-            priority: options.priority,
         }
     }
 
@@ -405,7 +338,7 @@ impl VideoAllocator {
     pub(crate) fn native_mapping_slots(&self) -> impl Iterator<Item = (u32, TrackId)> + '_ {
         self.slots
             .values()
-            .filter_map(|slot| slot.assignment.map(|track_id| (slot.media_index, track_id)))
+            .filter_map(|slot| Some((slot.media_index?, slot.assignment?)))
     }
 
     pub fn has_slot(&self, mid: Mid) -> bool {
@@ -416,7 +349,7 @@ impl VideoAllocator {
         self.slots
             .values()
             .find(|slot| slot.mid == mid)
-            .map(|slot| slot.media_index)
+            .and_then(|slot| slot.media_index)
     }
 
     pub fn add_slot(&mut self, config: SlotConfig) {
@@ -448,7 +381,7 @@ impl VideoAllocator {
         let idle_slot_count = self
             .slots
             .values()
-            .filter(|s| s.state() == SlotState::Idle)
+            .filter(|s| s.media_index.is_some() && s.state() == SlotState::Idle)
             .count();
         let pending_count = self.tracks.len().saturating_sub(already_assigned.len());
         if pending_count > 0 && idle_slot_count == 0 {
@@ -464,7 +397,7 @@ impl VideoAllocator {
         for slot in self
             .slots
             .values_mut()
-            .filter(|s| s.state() == SlotState::Idle)
+            .filter(|s| s.media_index.is_some() && s.state() == SlotState::Idle)
         {
             if let Some(track_state) = pending_tracks.next() {
                 let states = track_states(track_state);
@@ -522,6 +455,7 @@ impl VideoAllocator {
                     key,
                     mid: s.mid,
                     max_height: s.max_height,
+                    height_ceiling: s.height_ceiling,
                     min_height: s.min_height,
                     min_fps: s.min_fps,
                     priority: s.priority,
@@ -722,6 +656,9 @@ impl VideoAllocator {
     pub(crate) fn reconcile_routes(&mut self, events: &mut impl ParticipantSink) {
         let mut current = HashSet::new();
         for (slot_key, slot) in &self.slots {
+            if slot.media_index.is_none() {
+                continue;
+            }
             // Subscribe to every stream the switcher needs packets for — active,
             // staging (awaiting its keyframe), and draining (completing its tail)
             // — plus the assigned target so a just-assigned or paused-but-staged
@@ -839,7 +776,8 @@ impl VideoAllocator {
     fn no_duplicate_slot_assignments(&self) -> bool {
         let mut seen = HashSet::new();
         for (slot_key, slot) in &self.slots {
-            if let Some(layer) = slot.desired.as_ref()
+            if slot.media_index.is_some()
+                && let Some(layer) = slot.desired.as_ref()
                 && !seen.insert(layer.meta.id)
             {
                 let mut first_slot = None;
@@ -955,9 +893,10 @@ struct Slot {
     switcher: Switcher,
 
     mid: Mid,
-    media_index: u32,
+    media_index: Option<u32>,
     rid: Option<Rid>,
     max_height: u32,
+    height_ceiling: Option<u32>,
     min_height: u32,
     min_fps: u32,
     priority: u32,
@@ -972,13 +911,31 @@ struct Slot {
 
 impl Slot {
     fn new(ctx: LogCtx, cfg: SlotConfig) -> Self {
+        Self::output(
+            ctx,
+            Some(cfg.media_index),
+            cfg.mid,
+            cfg.rid,
+            cfg.ssrc,
+            cfg.pt,
+        )
+    }
+
+    fn output(
+        ctx: LogCtx,
+        media_index: Option<u32>,
+        mid: Mid,
+        rid: Option<Rid>,
+        ssrc: Ssrc,
+        pt: Pt,
+    ) -> Self {
         Self {
             ctx,
-            mid: cfg.mid,
-            media_index: cfg.media_index,
-            rid: cfg.rid,
-            ssrc: cfg.ssrc,
-            pt: cfg.pt,
+            mid,
+            media_index,
+            rid,
+            ssrc,
+            pt,
 
             desired: None,
             assignment: None,
@@ -986,6 +943,7 @@ impl Slot {
             switcher: Switcher::new(rtp::VIDEO_FREQUENCY),
             // With no signaling, we assume users are viewing with 720p playback
             max_height: 720,
+            height_ceiling: None,
             min_height: 0,
             min_fps: 0,
             priority: 0,
@@ -1234,9 +1192,26 @@ impl Slot {
         }
         let (mid, rid, ssrc, pt) = (self.mid, self.rid, self.ssrc, self.pt);
         let before = self.switcher.active_stream();
+        let ceiling = self.height_ceiling;
+        let mut blocked = false;
         self.switcher.feed(track_id, cache, arrival_ts, &mut |out| {
+            if blocked
+                || ceiling
+                    .is_some_and(|height| out.reported_height == 0 || out.reported_height > height)
+            {
+                blocked = true;
+                return;
+            }
             writer.write_video_owned(out, track_id, mid, rid, ssrc, pt);
         });
+        if blocked {
+            writer.discard_mid(mid);
+            if let Some(layer) = self.desired.clone() {
+                return self.pause_at(&layer);
+            }
+            self.stop();
+            return true;
+        }
         self.switcher.active_stream() != before
     }
 
@@ -1340,6 +1315,7 @@ struct LayerSnap {
     stable_bitrate_bps: f64,
     healthy: bool,
     height: u32,
+    observed_height: u32,
     /// Decode targets this encoding offers (>= 1). `1` means no scalability, so
     /// the encoding is one indivisible rung; `> 1` is the number of temporal/
     /// spatial sub-layers the SFU could shed to.
@@ -1393,6 +1369,7 @@ impl AllocationEngine {
                         stable_bitrate_bps,
                         healthy: state.is_healthy(),
                         height: state.height(),
+                        observed_height: state.observed_height,
                         decode_targets: state.decode_target_count(),
                         decode_target_heights: state.decode_target_heights,
                         temporal_only: state.temporal_only,
@@ -1405,6 +1382,7 @@ impl AllocationEngine {
                     stable_bitrate_bps: l.quality.seed_bitrate_bps() as f64,
                     healthy: false,
                     height: l.quality.fallback_height(),
+                    observed_height: 0,
                     decode_targets: 1,
                     decode_target_heights: [0; crate::rtp::monitor::MAX_LADDER_TARGETS],
                     temporal_only: false,
@@ -1477,6 +1455,7 @@ pub struct SlotView<'a> {
     pub mid: Mid,
     /// Preferred render height (px); the spatial floor can raise this target.
     pub max_height: u32,
+    pub height_ceiling: Option<u32>,
     /// Best-effort protected render height (px); zero disables spatial protection.
     pub min_height: u32,
     /// Higher values win minimums first, then target upgrades.
@@ -1865,7 +1844,7 @@ impl AllocationEngine {
                 if fallback && !full {
                     continue;
                 }
-                let height = if full {
+                let mut height = if full {
                     snap.height
                 } else {
                     match snap.decode_target_heights.get(dt).copied().unwrap_or(0) {
@@ -1873,6 +1852,18 @@ impl AllocationEngine {
                         height => u32::from(height),
                     }
                 };
+                if let Some(ceiling) = slot.height_ceiling {
+                    height = snap
+                        .decode_target_heights
+                        .get(dt)
+                        .copied()
+                        .filter(|height| *height > 0 && !(snap.temporal_only && *height == 1))
+                        .map(u32::from)
+                        .unwrap_or(snap.observed_height);
+                    if height == 0 || height > ceiling {
+                        continue;
+                    }
+                }
                 let cost = self.decode_target_cost(layer, dt);
                 // VLA target costs are cumulative. Scale their proportions by
                 // the stable full-encoding cost, just like simulcast decisions.
@@ -2280,6 +2271,7 @@ mod assignment_tests {
             key: keys.insert(()),
             mid: Mid::from("s0"),
             max_height: 720,
+            height_ceiling: None,
             min_height: 0,
             min_fps: 0,
             priority: 0,
@@ -2322,6 +2314,7 @@ mod assignment_tests {
             key: keys.insert(()),
             mid: Mid::from("s0"),
             max_height: 720,
+            height_ceiling: None,
             min_height: 720,
             min_fps: 0,
             priority: 10,
@@ -2371,6 +2364,7 @@ mod assignment_tests {
                 key: focused,
                 mid: Mid::from("s0"),
                 max_height: 720,
+                height_ceiling: None,
                 min_height: 720,
                 min_fps: 0,
                 priority: 200,
@@ -2383,6 +2377,7 @@ mod assignment_tests {
                 key: background,
                 mid: Mid::from("s1"),
                 max_height: 720,
+                height_ceiling: None,
                 min_height: 720,
                 min_fps: 0,
                 priority: 10,
@@ -2465,6 +2460,7 @@ mod assignment_tests {
                 key: focused_key,
                 mid: Mid::from("s0"),
                 max_height: 720,
+                height_ceiling: None,
                 min_height: 720,
                 min_fps: 0,
                 priority: 200,
@@ -2477,6 +2473,7 @@ mod assignment_tests {
                 key: background_key,
                 mid: Mid::from("s1"),
                 max_height: 720,
+                height_ceiling: None,
                 min_height: 720,
                 min_fps: 0,
                 priority: 10,
@@ -2535,6 +2532,7 @@ mod assignment_tests {
             key,
             mid: Mid::from("s0"),
             max_height: 720,
+            height_ceiling: None,
             min_height: 720,
             min_fps: 0,
             priority: 0,
@@ -2578,6 +2576,7 @@ mod assignment_tests {
             key,
             mid: Mid::from("s0"),
             max_height: 360,
+            height_ceiling: None,
             min_height: 720,
             min_fps: 0,
             priority: 0,
@@ -2832,68 +2831,6 @@ mod assignment_tests {
         allocator.deactivate_track_binding(key, track_id);
         allocator.remove_track(&track_id);
         assert_eq!(allocator.native_mapping_slots().count(), 0);
-    }
-
-    #[test]
-    fn native_receive_tracks_keep_slots_across_reordered_zero_height_requests() {
-        use pulsebeam_proto::signaling_v1::{VideoOptions, VideoTrackIntent};
-        let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 2);
-        add_slots(&mut allocator, 2);
-        let requests = tracks
-            .ids
-            .iter()
-            .map(|id| VideoTrackIntent {
-                track_id: id.as_str(),
-                options: Some(VideoOptions::default()),
-            })
-            .collect::<Vec<_>>();
-        allocator.configure_native(&requests, &HashSet::new());
-        let before = allocator.native_mapping_slots().collect::<Vec<_>>();
-        assert_eq!(before.len(), 2);
-        assert_eq!(allocator.assigned_slot_count(), 0);
-        allocator.configure_native(
-            &requests.into_iter().rev().collect::<Vec<_>>(),
-            &HashSet::new(),
-        );
-        let after = allocator.native_mapping_slots().collect::<Vec<_>>();
-        assert_eq!(before.len(), after.len());
-        for binding in before {
-            assert!(after.contains(&binding));
-        }
-    }
-
-    #[test]
-    fn native_default_playout_prefers_fresh_receiver_and_requests_reconnect_without_one() {
-        use pulsebeam_proto::signaling_v1::VideoTrackIntent;
-        let mut allocator = setup_allocator();
-        let tracks = add_tracks(&mut allocator, 1);
-        add_slots(&mut allocator, 2);
-        let request = VideoTrackIntent {
-            track_id: tracks.ids[0].as_str(),
-            options: None,
-        };
-        let fixed_mids = HashSet::from_iter([Mid::from("s0")]);
-        assert!(!allocator.configure_native(&[request], &fixed_mids));
-        assert_eq!(
-            allocator
-                .slots
-                .values()
-                .find(|slot| slot.assignment == Some(tracks.ids[0]))
-                .unwrap()
-                .mid,
-            Mid::from("s1")
-        );
-
-        let mut only_fixed = setup_allocator();
-        let tracks = add_tracks(&mut only_fixed, 1);
-        add_slots(&mut only_fixed, 1);
-        let request = VideoTrackIntent {
-            track_id: tracks.ids[0].as_str(),
-            options: None,
-        };
-        assert!(only_fixed.configure_native(&[request], &fixed_mids));
-        assert_eq!(only_fixed.native_mapping_slots().count(), 0);
     }
 
     #[test]

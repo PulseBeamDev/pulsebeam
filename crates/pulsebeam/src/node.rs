@@ -24,7 +24,6 @@ use pulsebeam_rtc::LocalCandidate;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::control::api;
@@ -1054,28 +1053,7 @@ impl NodeBuilder {
                     .unwrap_or_else(|| "[::]:0".to_string()),
             };
 
-            let cors = CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([
-                    hyper::Method::GET,
-                    hyper::Method::HEAD,
-                    hyper::Method::POST,
-                    hyper::Method::DELETE,
-                    hyper::Method::OPTIONS,
-                ])
-                .allow_headers([
-                    hyper::header::AUTHORIZATION,
-                    hyper::header::CONTENT_TYPE,
-                    hyper::header::CONTENT_ENCODING,
-                    hyper::header::ACCEPT,
-                ])
-                .expose_headers([
-                    hyper::header::LOCATION,
-                    hyper::header::RETRY_AFTER,
-                    hyper::header::ALLOW,
-                    hyper::header::HeaderName::from_static("accept-post"),
-                ])
-                .max_age(Duration::from_secs(86400));
+            let cors = api::cors();
 
             let key_registry = self
                 .key_registry

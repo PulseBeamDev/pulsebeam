@@ -172,6 +172,14 @@ impl Downstream {
         track: &Track,
         channels: &[(crate::media::ChannelId, crate::track::DataTopicChannel)],
     ) -> bool {
+        if !self.register_candidate(key, track) {
+            return false;
+        }
+        self.data.add_candidate(key, track, channels);
+        true
+    }
+
+    pub(crate) fn register_candidate(&mut self, key: TrackHandle, track: &Track) -> bool {
         let entry = TrackCatalogEntry {
             participant_id: track.meta().origin,
             track_id: track.id(),
@@ -183,7 +191,6 @@ impl Downstream {
         }
         let previous = self.catalog.insert(key, entry);
         debug_assert!(previous.is_none(), "a TrackHandle must be installed once");
-        self.data.add_candidate(key, track, channels);
         true
     }
 
@@ -194,15 +201,6 @@ impl Downstream {
 
     pub(crate) fn track_candidate(&self, key: TrackHandle) -> Option<TrackCatalogEntry> {
         self.catalog.get(key).copied()
-    }
-
-    fn encode_playout_delay(
-        bounds: &pulsebeam_proto::signaling_v1::PlayoutDelay,
-    ) -> (MediaTime, MediaTime) {
-        let min = bounds.min_ms.min(2_000);
-        let max = bounds.max_ms.min(2_000).max(min);
-        let rounded = |ms: u32| MediaTime::from_hundredths(u64::from(ms.saturating_add(5) / 10));
-        (rounded(min), rounded(max))
     }
 
     /// A fixed receiver cannot return to native defaults during this transport generation.
@@ -284,71 +282,6 @@ impl Downstream {
     /// Apply the client's audio selection policy.
     pub fn set_audio_intent(&mut self, intent: AudioIntent) {
         self.audio.set_intent(intent);
-    }
-
-    #[allow(
-        dead_code,
-        reason = "native v1 receive state replaces MID-based signaling intents"
-    )]
-    pub(crate) fn apply_native_receive(
-        &mut self,
-        receive: Option<&pulsebeam_proto::signaling_v1::ReceiveIntent>,
-    ) -> bool {
-        let requested_video = receive
-            .and_then(|request| request.video.as_ref())
-            .map_or(&[][..], |video| video.tracks.as_slice());
-        self.set_audio_intent(decode_native_audio(
-            receive.and_then(|request| request.audio.as_ref()),
-        ));
-        self.desired_playout.clear();
-        let mut seen = HashSet::new();
-        for request in requested_video {
-            if let Ok(id) = TrackId::try_from(request.track_id.clone())
-                && id.kind() == TrackKind::Video
-                && seen.insert(id)
-                && let Some(bounds) = request
-                    .options
-                    .as_ref()
-                    .and_then(|options| options.playout_delay.as_ref())
-            {
-                self.desired_playout
-                    .insert(id, Self::encode_playout_delay(bounds));
-            }
-        }
-        if let Some(audio) = receive.and_then(|request| request.audio.as_ref()) {
-            for request in &audio.tracks {
-                if let Ok(id) = TrackId::try_from(request.track_id.clone())
-                    && id.kind() == TrackKind::Audio
-                    && seen.insert(id)
-                    && let Some(bounds) = request
-                        .options
-                        .as_ref()
-                        .and_then(|options| options.playout_delay.as_ref())
-                {
-                    self.desired_playout
-                        .insert(id, Self::encode_playout_delay(bounds));
-                }
-            }
-        }
-        let fixed_mids = self.fixed_receivers.keys().copied().collect();
-        let fixed_audio = self
-            .desired_playout
-            .keys()
-            .filter(|id| id.kind() == TrackKind::Audio)
-            .copied()
-            .collect();
-        let fixed_audio_mids = self
-            .fixed_receivers
-            .keys()
-            .copied()
-            .filter(|mid| self.audio.has_slot(*mid))
-            .collect();
-        self.audio
-            .set_playout_compatibility(fixed_audio_mids, fixed_audio);
-        let reconnect = self.video.configure_native(requested_video, &fixed_mids)
-            || self.audio.default_needs_reconnect();
-        self.dirty_allocation = true;
-        reconnect
     }
 
     pub(crate) fn native_publications(&self) -> Vec<crate::track::TrackMeta> {
@@ -485,28 +418,6 @@ impl Downstream {
     }
 }
 
-fn decode_native_audio(audio: Option<&pulsebeam_proto::signaling_v1::AudioIntent>) -> AudioIntent {
-    use pulsebeam_proto::signaling_v1::AudioMode;
-    let mut pinned = Vec::new();
-    let mut seen = ahash::HashSet::new();
-    if let Some(request) = audio {
-        for track in &request.tracks {
-            let Ok(id) = TrackId::try_from(track.track_id.clone()) else {
-                continue;
-            };
-            if id.kind() == TrackKind::Audio && seen.insert(id) {
-                pinned.push(id);
-            }
-        }
-    }
-    AudioIntent {
-        pinned,
-        auto: !audio.is_some_and(|request| {
-            AudioMode::try_from(request.mode) == Ok(AudioMode::ExplicitOnly)
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Convenience only: a test is not a shard, so nothing here is
@@ -515,7 +426,6 @@ mod tests {
 
     #[test]
     fn fixed_playout_is_per_receiver_and_defaults_require_a_fresh_mid() {
-        use pulsebeam_proto::signaling_v1::PlayoutDelay;
         let mut downstream = Downstream::new(
             LogCtx {
                 room_id: crate::entity::RoomId::from_external(
@@ -530,16 +440,9 @@ mod tests {
             crate::entity::ConnectionId::new().derive_track_id(TrackKind::Video, "default");
         let first = Mid::from("0");
         let fresh = Mid::from("1");
-        let bounds = Downstream::encode_playout_delay(&PlayoutDelay {
-            min_ms: 1_995,
-            max_ms: 10,
-        });
-        assert_eq!(
-            bounds,
-            (
-                MediaTime::from_hundredths(200),
-                MediaTime::from_hundredths(200)
-            )
+        let bounds = (
+            MediaTime::from_hundredths(200),
+            MediaTime::from_hundredths(200),
         );
         downstream.desired_playout.insert(fixed, bounds);
         assert_eq!(
@@ -552,55 +455,11 @@ mod tests {
         downstream.desired_playout.clear();
         assert_eq!(downstream.playout_delay_to_stamp(default, first), Err(()));
         assert_eq!(downstream.playout_delay_to_stamp(default, fresh), Ok(None));
-        let zero = Downstream::encode_playout_delay(&PlayoutDelay {
-            min_ms: 0,
-            max_ms: 0,
-        });
-        assert_eq!(
-            zero,
-            (MediaTime::from_hundredths(0), MediaTime::from_hundredths(0))
-        );
+        let zero = (MediaTime::from_hundredths(0), MediaTime::from_hundredths(0));
         downstream.desired_playout.insert(default, zero);
         assert_eq!(
             downstream.playout_delay_to_stamp(default, first),
             Ok(Some(zero))
-        );
-    }
-
-    #[test]
-    fn native_audio_defaults_auto_and_preserves_first_unique_audio_preference() {
-        use pulsebeam_proto::signaling_v1::{AudioIntent as WireAudio, AudioTrackIntent};
-        let connection = crate::entity::ConnectionId::new();
-        let mic = connection.derive_track_id(TrackKind::Audio, "mic");
-        let camera = connection.derive_track_id(TrackKind::Video, "camera");
-        assert_eq!(decode_native_audio(None), AudioIntent::default());
-        let request = WireAudio {
-            mode: 999,
-            tracks: [mic, mic, camera]
-                .into_iter()
-                .map(|id| AudioTrackIntent {
-                    track_id: id.as_str(),
-                    ..Default::default()
-                })
-                .collect(),
-        };
-        assert_eq!(
-            decode_native_audio(Some(&request)),
-            AudioIntent {
-                pinned: vec![mic],
-                auto: true,
-            }
-        );
-        let request = WireAudio {
-            mode: pulsebeam_proto::signaling_v1::AudioMode::ExplicitOnly.into(),
-            tracks: Vec::new(),
-        };
-        assert_eq!(
-            decode_native_audio(Some(&request)),
-            AudioIntent {
-                pinned: Vec::new(),
-                auto: false,
-            }
         );
     }
 

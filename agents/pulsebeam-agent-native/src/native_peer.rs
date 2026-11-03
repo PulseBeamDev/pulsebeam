@@ -1,5 +1,6 @@
 //! The single RTC/media implementation, independent of runtime services.
-use std::collections::{BTreeMap, HashMap, VecDeque};
+mod preparation;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::task::{Context, Poll};
 
 use agent_core::{
@@ -22,14 +23,18 @@ const DD: &str =
     "https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension";
 const VLA: &str = "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Stage {
     Creating(rtc::OperationId),
     SettingLocal(rtc::OperationId),
     Gathering,
     Offered,
     SettingRemote(rtc::OperationId),
+    MediaCreating(rtc::OperationId),
+    MediaSettingLocal(rtc::OperationId),
+    MediaSettingRemote(rtc::OperationId),
     Ready,
+    Rejected,
 }
 
 pub(crate) enum Observation {
@@ -61,8 +66,13 @@ pub(crate) struct NativePeer<R: rtc::SessionRuntime> {
     peer: rtc::SessionPeerId,
     stage: Stage,
     gathered: bool,
+    bootstrap_capabilities: Option<agent_core::BootstrapCapabilities>,
+    sdp: Option<agent_core::client_sdp::Executor>,
+    media_config: MediaConfig,
+    media_work: Option<preparation::MediaWork>,
     connection: rtc::ConnectionState,
     channels: BTreeMap<ChannelId, rtc::SessionChannelId>,
+    closed_channels: BTreeSet<ChannelId>,
     signaling_channel: ChannelId,
     channel_bindings: Vec<DataChannelBinding>,
     pending_sends: BTreeMap<(ChannelId, u64), agent_core::OperationId>,
@@ -79,6 +89,53 @@ fn error(message: impl Into<String>) -> rtc::PeerError {
         kind: rtc::PeerErrorKind::Operation,
         message: message.into(),
     }
+}
+
+fn create_data_channel<R: rtc::SessionRuntime>(
+    session: &mut rtc::Session<R>,
+    peer: rtc::SessionPeerId,
+    spec: &DataChannelSpec,
+) -> Result<rtc::SessionChannelId, rtc::PeerError> {
+    let mut settings = rtc::DataChannelConfiguration {
+        ordered: spec.ordered,
+        negotiated: spec.negotiated_id.is_some(),
+        id: spec.negotiated_id.map(i32::from),
+        ..rtc::DataChannelConfiguration::default()
+    };
+    match spec.reliability {
+        DataChannelReliability::Reliable => {}
+        DataChannelReliability::MaxRetransmits(count) => {
+            settings.max_retransmits = Some(i32::from(count));
+        }
+        DataChannelReliability::MaxPacketLifetime(ms) => {
+            settings.max_retransmit_time_ms = Some(i32::from(ms));
+        }
+    }
+    let expected_limits = (settings.max_retransmits, settings.max_retransmit_time_ms);
+    let native = session
+        .create_channel(peer, &spec.label, settings)
+        .map_err(|error_bytes| error(error_bytes.to_string()))?;
+    if let Some(id) = spec.negotiated_id {
+        let actual = match session.channel_configuration(native) {
+            Ok(actual) => actual,
+            Err(error) => {
+                session.release_channel(native);
+                return Err(error);
+            }
+        };
+        if actual.id != Some(i32::from(id))
+            || !actual.negotiated
+            || actual.ordered != spec.ordered
+            || actual.reliable != matches!(spec.reliability, DataChannelReliability::Reliable)
+            || (actual.max_retransmits, actual.max_retransmit_time_ms) != expected_limits
+        {
+            session.release_channel(native);
+            return Err(error(
+                "native negotiated data channel configuration mismatch",
+            ));
+        }
+    }
+    Ok(native)
 }
 
 pub(crate) fn slots(topology: &MediaTopology) -> Vec<MediaSlot> {
@@ -169,39 +226,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         let mut channel_bindings = Vec::new();
         let mut signaling_channel = None;
         for spec in specs {
-            let mut settings = rtc::DataChannelConfiguration {
-                ordered: spec.ordered,
-                negotiated: spec.negotiated_id.is_some(),
-                id: spec.negotiated_id.map(i32::from),
-                ..rtc::DataChannelConfiguration::default()
-            };
-            match spec.reliability {
-                DataChannelReliability::Reliable => {}
-                DataChannelReliability::MaxRetransmits(count) => {
-                    settings.max_retransmits = Some(i32::from(count));
-                }
-                DataChannelReliability::MaxPacketLifetime(ms) => {
-                    settings.max_retransmit_time_ms = Some(i32::from(ms));
-                }
-            }
-            let expected_limits = (settings.max_retransmits, settings.max_retransmit_time_ms);
-            let native = session
-                .create_channel(peer, &spec.label, settings)
-                .map_err(|e| error(e.to_string()))?;
-            if let Some(id) = spec.negotiated_id {
-                let actual = session.channel_configuration(native)?;
-                if actual.id != Some(i32::from(id))
-                    || !actual.negotiated
-                    || actual.ordered != spec.ordered
-                    || actual.reliable
-                        != matches!(spec.reliability, DataChannelReliability::Reliable)
-                    || (actual.max_retransmits, actual.max_retransmit_time_ms) != expected_limits
-                {
-                    return Err(error(
-                        "native negotiated data channel configuration mismatch",
-                    ));
-                }
-            }
+            let native = create_data_channel(&mut session, peer, spec)?;
             let channel = ChannelId::new(native.get())
                 .ok_or_else(|| error("zero native channel identity"))?;
             channels.insert(channel, native);
@@ -270,8 +295,13 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             peer,
             stage: Stage::Creating(operation),
             gathered: false,
+            bootstrap_capabilities: None,
+            sdp: None,
+            media_config: config.clone(),
+            media_work: None,
             connection: rtc::ConnectionState::New,
             channels,
+            closed_channels: BTreeSet::new(),
             signaling_channel,
             channel_bindings,
             pending_sends: BTreeMap::new(),
@@ -337,7 +367,66 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         }
     }
 
+    fn prepared_data_channel(
+        &mut self,
+        channel: rtc::SessionChannelId,
+    ) -> Result<agent_core::PreparedDataChannel, String> {
+        let configuration = self
+            .session
+            .channel_configuration(channel)
+            .map_err(|_| "native channel facts unavailable".to_string())?;
+        let stream_id = configuration
+            .id
+            .and_then(|id| u16::try_from(id).ok())
+            .ok_or_else(|| "native channel stream ID unavailable".to_string())?;
+        let reliability = match (
+            configuration.max_retransmits,
+            configuration.max_retransmit_time_ms,
+        ) {
+            (None, None) => DataChannelReliability::Reliable,
+            (Some(count), None) => DataChannelReliability::MaxRetransmits(
+                u16::try_from(count).map_err(|_| "invalid native retransmit limit".to_string())?,
+            ),
+            (None, Some(time)) => DataChannelReliability::MaxPacketLifetime(
+                u16::try_from(time)
+                    .map_err(|_| "invalid native retransmit lifetime".to_string())?,
+            ),
+            _ => return Err("conflicting native retransmit limits".to_string()),
+        };
+        if configuration.reliable != matches!(reliability, DataChannelReliability::Reliable) {
+            return Err("inconsistent native channel reliability".to_string());
+        }
+        let transport = self
+            .session
+            .peer_sctp_transport(self.peer)
+            .map_err(|_| "native SCTP transport unavailable".to_string())?;
+        let information = transport
+            .map(|transport| self.session.sctp_information(transport))
+            .transpose()
+            .map_err(|_| "native SCTP facts unavailable".to_string())?;
+        let association_max_channels = information
+            .and_then(|information| information.max_channels)
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| "invalid native SCTP capacity".to_string())?;
+        Ok(agent_core::PreparedDataChannel {
+            stream_id,
+            negotiated: configuration.negotiated,
+            ordered: configuration.ordered,
+            reliability,
+            association_max_channels,
+        })
+    }
+
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if matches!(self.stage, Stage::Ready)
+            && self
+                .sdp
+                .as_ref()
+                .is_some_and(agent_core::client_sdp::Executor::ready)
+        {
+            return Poll::Ready(());
+        }
         if self
             .queued_sends
             .iter()
@@ -349,7 +438,11 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         }
     }
 
-    pub fn answer(&mut self, answer: String) -> Result<(), rtc::PeerError> {
+    pub fn answer(
+        &mut self,
+        answer: String,
+        capabilities: agent_core::BootstrapCapabilities,
+    ) -> Result<(), rtc::PeerError> {
         if !matches!(self.stage, Stage::Offered) {
             return Err(error("answer is not pending for this native generation"));
         }
@@ -360,7 +453,154 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                 sdp: answer,
             },
         )?;
+        self.bootstrap_capabilities = Some(capabilities);
         self.stage = Stage::SettingRemote(operation);
+        Ok(())
+    }
+
+    fn initialize_sdp(
+        &mut self,
+    ) -> Result<
+        Result<agent_core::client_sdp::Bindings, agent_core::client_sdp::Error>,
+        rtc::PeerError,
+    > {
+        if self.sdp.is_some() {
+            return Err(error("bootstrap context is already installed"));
+        }
+        let capabilities = self
+            .bootstrap_capabilities
+            .take()
+            .ok_or_else(|| error("bootstrap capabilities are absent"))?;
+        let descriptions = self.session.descriptions(self.peer)?;
+        let offer = descriptions
+            .local()
+            .ok_or_else(|| error("applied local bootstrap is absent"))?;
+        let answer = descriptions
+            .remote()
+            .ok_or_else(|| error("applied remote bootstrap is absent"))?;
+        let mut context = capabilities
+            .applied_context(&offer.sdp, &answer.sdp, self.generation)
+            .map_err(|_| error("unsupported applied bootstrap SDP"))?;
+        let slots = self
+            .bindings
+            .values()
+            .map(|binding| (binding.slot.clone(), binding.mid.clone()))
+            .collect::<Vec<_>>();
+        let preparation = agent_core::adopt_bootstrap_media(&mut context, &slots)
+            .and_then(|_| self.observe_senders(&mut context));
+        self.sdp = Some(agent_core::client_sdp::Executor::new(context));
+        Ok(preparation)
+    }
+
+    fn observe_senders(
+        &mut self,
+        context: &mut agent_core::client_sdp::Context,
+    ) -> Result<agent_core::client_sdp::Bindings, agent_core::client_sdp::Error> {
+        use agent_core::client_sdp::{Encoding, Error, RtcpParameters, RuntimeEncoding};
+        for (slot, transceiver) in &self.transceivers {
+            if !matches!(slot, MediaSlot::LocalAudio(_) | MediaSlot::LocalVideo(_)) {
+                continue;
+            }
+            let mid = &self.bindings.get(slot).ok_or(Error::Observation)?.mid;
+            let Some(binding) = context
+                .applied_bindings()
+                .publications
+                .iter()
+                .find(|binding| &binding.mid == mid)
+            else {
+                continue;
+            };
+            let sender = self
+                .session
+                .sender(*transceiver)
+                .map_err(|_| Error::Observation)?;
+            let parameters = self
+                .session
+                .get_sender_parameters(sender)
+                .map_err(|_| Error::Observation)?;
+            let encodings = parameters
+                .encodings()
+                .into_iter()
+                .map(|encoding| {
+                    let rid =
+                        String::from_utf8(encoding.rid_bytes()).map_err(|_| Error::Observation)?;
+                    let rid = (!rid.is_empty()).then_some(rid);
+                    let previous = binding
+                        .encodings
+                        .iter()
+                        .find(|previous| previous.rid == rid)
+                        .or_else(|| {
+                            if binding.encodings.len() == 1 && rid.is_none() {
+                                binding.encodings.first()
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or(Error::Observation)?;
+                    Ok(Encoding {
+                        rid,
+                        primary: encoding.ssrc(),
+                        repair: None,
+                        paused: previous.paused,
+                        runtime: RuntimeEncoding {
+                            active: Some(encoding.active()),
+                            max_bitrate: encoding
+                                .max_bitrate_bps()
+                                .map(u64::try_from)
+                                .transpose()
+                                .map_err(|_| Error::Observation)?,
+                            max_framerate: encoding.max_framerate(),
+                            scalability_mode: encoding
+                                .scalability_mode_bytes()
+                                .map(String::from_utf8)
+                                .transpose()
+                                .map_err(|_| Error::Observation)?,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            let rtcp = parameters.rtcp();
+            let cname = String::from_utf8(rtcp.cname_bytes()).map_err(|_| Error::Observation)?;
+            context.observe_sender_facts(
+                mid,
+                &encodings,
+                &RtcpParameters {
+                    cname: (!cname.is_empty()).then_some(cname),
+                    reduced_size: rtcp.reduced_size(),
+                },
+            )?;
+        }
+        context.bindings().cloned().ok_or(Error::CandidateState)
+    }
+
+    pub(crate) fn create_data_channel(
+        &mut self,
+        channel: ChannelId,
+        specification: &DataChannelSpec,
+    ) -> Result<(), rtc::PeerError> {
+        if specification
+            .negotiated_id
+            .is_none_or(|id| id == 0 || id == u16::MAX)
+        {
+            return Err(error(
+                "payload channel requires a negotiated non-control stream",
+            ));
+        }
+        if self.channels.contains_key(&channel) {
+            return Err(error("data channel identity is already owned"));
+        }
+        let native = create_data_channel(&mut self.session, self.peer, specification)?;
+        self.channels.insert(channel, native);
+        Ok(())
+    }
+
+    pub(crate) fn close_data_channel(&mut self, channel: ChannelId) -> Result<(), rtc::PeerError> {
+        if channel == self.signaling_channel {
+            return Ok(());
+        }
+        if let Some(native) = self.channels.get(&channel) {
+            self.session.close_channel(*native)?;
+        }
         Ok(())
     }
 
@@ -507,6 +747,16 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                         done.result?;
                         continue;
                     }
+                    let media_operation = match self.stage {
+                        Stage::MediaCreating(operation)
+                        | Stage::MediaSettingLocal(operation)
+                        | Stage::MediaSettingRemote(operation) => Some(operation),
+                        _ => None,
+                    };
+                    if media_operation == Some(done.operation_id) {
+                        self.media_completed(done.result, &mut progress.events)?;
+                        continue;
+                    }
                     let result = done.result?;
                     match self.stage {
                         Stage::Creating(operation) if operation == done.operation_id => {
@@ -520,6 +770,25 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                             self.stage = Stage::Gathering;
                         }
                         Stage::SettingRemote(operation) if operation == done.operation_id => {
+                            let preparation = match self.initialize_sdp() {
+                                Ok(preparation) => preparation,
+                                Err(error) => {
+                                    self.stage = Stage::Rejected;
+                                    progress.events.push(HostEvent::Rtc(
+                                        RtcEvent::BootstrapRejected {
+                                            generation: self.generation,
+                                            message: error.to_string(),
+                                        },
+                                    ));
+                                    continue;
+                                }
+                            };
+                            progress.events.push(HostEvent::Rtc(
+                                RtcEvent::BootstrapMediaPrepared {
+                                    generation: self.generation,
+                                    preparation,
+                                },
+                            ));
                             self.stage = Stage::Ready;
                             progress
                                 .events
@@ -536,7 +805,13 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                 }
                 rtc::SessionEvent::ConnectionStateChanged(state) => {
                     self.connection = state;
-                    if matches!(self.stage, Stage::Ready) {
+                    if matches!(
+                        self.stage,
+                        Stage::Ready
+                            | Stage::MediaCreating(_)
+                            | Stage::MediaSettingLocal(_)
+                            | Stage::MediaSettingRemote(_)
+                    ) {
                         self.connection_event(&mut progress.events);
                     }
                 }
@@ -625,25 +900,46 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             }));
             self.stage = Stage::Offered;
         }
+        if matches!(self.stage, Stage::Ready) {
+            self.start_media(&mut progress.events)?;
+            progress.more |= matches!(self.stage, Stage::Ready)
+                && self
+                    .sdp
+                    .as_ref()
+                    .is_some_and(agent_core::client_sdp::Executor::ready);
+        }
         let channels: Vec<_> = self
             .channels
             .iter()
             .map(|(&id, &native)| (id, native))
             .collect();
+        let mut drained_closed = Vec::new();
         for (channel, native) in channels {
+            let mut drained = false;
             for index in 0..EVENTS_PER_TURN {
                 let Some(event) = self.session.try_channel_event(native)? else {
+                    drained = true;
                     break;
                 };
                 progress.more |= index.saturating_add(1) == EVENTS_PER_TURN;
                 let event = match event {
                     rtc::DataChannelEvent::StateChanged(rtc::DataChannelState::Open) => {
+                        progress.events.push(HostEvent::DataChannel(
+                            agent_core::DataChannelEvent::Prepared {
+                                generation: self.generation,
+                                channel,
+                                preparation: self.prepared_data_channel(native),
+                            },
+                        ));
                         Some(agent_core::DataChannelEvent::Opened {
                             generation: self.generation,
                             channel,
                         })
                     }
                     rtc::DataChannelEvent::StateChanged(rtc::DataChannelState::Closed) => {
+                        if channel != self.signaling_channel {
+                            self.closed_channels.insert(channel);
+                        }
                         Some(agent_core::DataChannelEvent::Closed {
                             generation: self.generation,
                             channel,
@@ -691,10 +987,37 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                     progress.events.push(HostEvent::DataChannel(event));
                 }
             }
+            if drained && self.closed_channels.contains(&channel) {
+                drained_closed.push(channel);
+            }
         }
         // Consume terminal native outcomes before admitting the next burst.
         progress.events.extend(self.dispatch_sends());
+        self.reclaim_closed_channels(&drained_closed);
         Ok(progress)
+    }
+
+    fn reclaim_closed_channels(&mut self, drained: &[ChannelId]) {
+        for channel in drained {
+            if self
+                .pending_sends
+                .range((*channel, 0)..=(*channel, u64::MAX))
+                .next()
+                .is_some()
+                || self.queued_sends.iter().any(|effect| {
+                    let DataChannelEffect::Send {
+                        channel: queued, ..
+                    } = effect;
+                    queued == channel
+                })
+            {
+                continue;
+            }
+            self.closed_channels.remove(channel);
+            if let Some(native) = self.channels.remove(channel) {
+                self.session.release_channel(native);
+            }
+        }
     }
 
     fn connection_event(&self, events: &mut Vec<HostEvent>) {
@@ -764,7 +1087,6 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         Ok(())
     }
 
-    #[cfg(any(test, debug_assertions))]
     pub fn source_identity(&self, slot: &MediaSlot) -> Option<SourceIdentity> {
         self.sources
             .get(slot)
@@ -1054,6 +1376,63 @@ mod tests {
             drive();
         };
         assert_eq!(resources.slots.len(), 4);
+        let bootstrap_channels = peer.channels.clone();
+        let control = peer.channels[&peer.signaling_channel];
+        let state = peer.session.channel_state(control).unwrap();
+        peer.close_data_channel(peer.signaling_channel).unwrap();
+        assert_eq!(peer.session.channel_state(control).unwrap(), state);
+        for (stream, reliability, ordered) in [
+            (7, DataChannelReliability::MaxRetransmits(0), false),
+            (9, DataChannelReliability::Reliable, true),
+        ] {
+            let channel = ChannelId::new(1_000_000 + u64::from(stream)).unwrap();
+            let specification = DataChannelSpec {
+                label: format!("payload-{stream}"),
+                negotiated_id: Some(stream),
+                ordered,
+                reliability,
+            };
+            peer.create_data_channel(channel, &specification).unwrap();
+            let native = peer.channels[&channel];
+            let actual = peer.session.channel_configuration(native).unwrap();
+            assert_eq!(actual.id, Some(i32::from(stream)));
+            assert!(actual.negotiated);
+            assert_eq!(actual.ordered, ordered);
+            assert_eq!(
+                actual.reliable,
+                reliability == DataChannelReliability::Reliable
+            );
+            assert!(peer.create_data_channel(channel, &specification).is_err());
+            assert_eq!(peer.channels[&channel], native);
+            assert!(
+                peer.create_data_channel(
+                    ChannelId::new(channel.get() + 1).unwrap(),
+                    &DataChannelSpec {
+                        negotiated_id: None,
+                        ..specification.clone()
+                    },
+                )
+                .is_err()
+            );
+            for invalid in [0, u16::MAX] {
+                assert!(
+                    peer.create_data_channel(
+                        ChannelId::new(channel.get() + 1).unwrap(),
+                        &DataChannelSpec {
+                            negotiated_id: Some(invalid),
+                            ..specification.clone()
+                        },
+                    )
+                    .is_err()
+                );
+            }
+            peer.close_data_channel(channel).unwrap();
+            assert_eq!(peer.channels[&channel], native);
+            assert!(!peer.closed_channels.contains(&channel));
+        }
+        for (channel, native) in bootstrap_channels {
+            assert_eq!(peer.channels[&channel], native);
+        }
         assert_eq!(peer.sources.len(), 2);
         assert_eq!(peer.receivers.len(), 2);
         #[cfg(debug_assertions)]
@@ -1129,6 +1508,26 @@ mod tests {
         let next = peer.replace_source(&local).unwrap();
         assert_ne!(next, current);
         assert_eq!(peer.session.transceivers(peer.peer).unwrap().len(), 4);
+        let target = peer
+            .transceivers
+            .remove(&MediaSlot::RemoteVideo(0))
+            .unwrap();
+        let mid = peer.session.transceiver_mid(target).unwrap().unwrap();
+        let untouched = peer.transceivers[&local];
+        assert!(
+            peer.stop_media(&[mid.clone(), "missing-mid".into()])
+                .is_err()
+        );
+        assert!(!peer.session.transceiver_stopping(target).unwrap());
+        assert!(!peer.session.transceiver_stopped(target).unwrap());
+        peer.stop_media(&[mid]).unwrap();
+        assert!(
+            peer.session.transceiver_stopping(target).unwrap()
+                || peer.session.transceiver_stopped(target).unwrap()
+        );
+        assert!(!peer.session.transceiver_stopping(untouched).unwrap());
+        assert!(!peer.session.transceiver_stopped(untouched).unwrap());
+        assert_eq!(peer.source_identity(&local).unwrap(), next);
         peer.shutdown().unwrap();
     }
 

@@ -215,6 +215,17 @@ notifications use their separate runtime allowance and remain deliverable.
 Native socket/reassembly and subsequent DTLS/provider staging are outside this
 plaintext-stage ledger; caller-retained packets are outside it after transfer.
 
+The same setting separately funds preselection inbound DTLS packet capacity and
+physical queue backing. UDP and validated RFC4571 payloads are borrowed through
+classification and selected-path handling; pending admission reserves backing
+and owned packet capacity before copying. Exhaustion drops only the new packet,
+without discarding queued work or failing the transport. The existing 64-packet
+preselection window independently bounds synchronous replay work. Selected-tuple
+replay transfers the queue into temporary processing and ends its retained
+charge; ICE restart, close and failure discard it. Temporary replay and provider
+staging remain outside this allowance, which is neither shared with output
+stages nor an aggregate transport, provider-handshake or RSS bound.
+
 Closing a channel fences queued delivery immediately. `DataChannelEvent::Closed`
 is a cutoff notification, not permission to reuse its stream ID. Reuse requires
 `ResetComplete`: both reset directions have completed and the native receive
@@ -225,11 +236,24 @@ already handed to their application before retiring its logical handle.
 
 ## Configure media after bootstrap
 
-SDP remains the initial native, WHIP and WHEP interface. For ongoing native
-configuration, call `set_rtp_capabilities` once with the server's bounded exact
-codec-parameter and extension envelopes. This also initializes TWCC for an
-SCTP-only bootstrap. It does not reconstruct ICE, DTLS, SCTP or feedback history.
-The typed path currently requires TWCC; bootstrap SDP still supports RFC 8888.
+SDP remains the initial native, WHIP and WHEP interface. Set
+`ConnectionConfig::rtp_capabilities` to apply the bounded exact codec-parameter,
+feedback, format-scoped repair and extension envelopes during initial answer
+construction and retain that same envelope for typed updates. Unsupported offered
+formats and their RTX mappings are not accepted. Leave this option unset to retain
+the SDP-only bootstrap contract, then declare ongoing support with
+`set_rtp_capabilities`, including after an SCTP-only start. Declaring capabilities
+does not itself admit typed media; the first configuration or patch below selects
+the admitted bindings. Each `RtpCodecCapability` pairs its
+parameters with that format's `repair` support; RTX support from another format
+does not permit repair on the selected codec. This replaces the connection-wide
+`RtpCapabilities::repair` field. This also initializes TWCC for an
+SCTP-only bootstrap. An explicitly empty codec envelope permits an empty typed
+configuration and rejects every RTP binding. The envelope remains fixed: declare
+any media support needed later in the initial envelope, because an installed
+empty envelope cannot be expanded. It does not reconstruct ICE, DTLS, SCTP or
+feedback history. The typed path currently requires TWCC; bootstrap SDP still
+supports RFC 8888.
 
 Use `configure_rtp` for a complete desired `RtpConfiguration`, or `update_rtp`
 for independently prepared groups. `inbound` and `outbound` are from RTC's perspective. Each `RtpBinding` supplies its MID, media
@@ -270,7 +294,11 @@ mappings, collisions and capacity errors preserve the prior accepted set.
 Accepted bindings are owned in indexed records. `rtp_configuration()` explicitly
 materializes an owned snapshot, with cost proportional to the live set; no full
 snapshot is kept as mutable execution state or reconstructed for addressed edits. `SessionInfo` remains the immutable
-bootstrap snapshot, not a second mutable registry. Before the first typed update,
+bootstrap snapshot, not a second mutable registry. `EncodingDiscovered` carries
+the primary payload types, normalized codec names and clock rates from actual
+ingress admission. Use those encoding-scoped facts for packet and Sender Report
+conversion after bootstrap, rather than looking up new MIDs in `SessionInfo`.
+Before the first typed update,
 `rtp_configuration()` returns `None` and bootstrap facts apply. After a first patch,
 the snapshot contains only accepted typed groups, not paused bootstrap candidates.
 
@@ -288,12 +316,18 @@ be readmitted or retargeted to another MID or direction.
 
 Declaration facts belong to live bindings. Retired bindings retain only issued
 SSRC/direction guards and lifetime counters, not codec, MID or extension records.
-`RtpConfigurationLimits::max_live_metadata_bytes` bounds live typed declarations
-and their MID/encoding index payloads (8 MiB by default). The charge includes
-declaration string/vector capacities (including CNAME), format key/value payloads
-and the separate MID key contents. Each ingress/egress fact-owned CNAME copy is
-also charged to that owner's existing runtime allowance. Removing a binding releases that live charge; pausing retains
-it. `max_identity_guard_bytes` separately bounds issued SSRC/direction tuple
+`RtpConfigurationLimits::max_live_metadata_bytes` bounds the retained capability
+envelope, live typed declarations and their MID/encoding index payloads together
+(8 MiB by default). Capability charges include codec vector capacity, owned
+codec/FMTP/feedback payloads and extension URI entries/string capacities. Format
+choices and supported URI sets have no separate count ceiling; actual packet
+payload types and extension mappings still obey their wire namespaces. The live
+declaration charge includes string/vector capacities (including CNAME), format
+key/value payloads and the separate MID key contents. Each ingress/egress fact-owned CNAME copy is
+also charged to that owner's existing runtime allowance. Removing a binding
+releases its declaration charge; pausing retains it. The immutable capability
+charge remains until the connection is dropped. An over-budget capability
+declaration leaves the existing envelope and feedback profiles unchanged. `max_identity_guard_bytes` separately bounds issued SSRC/direction tuple
 payloads (1 MiB by default). Retirement never frees those guards under the same
 connection/key. Exhaustion rejects new bindings without forgetting history or
 changing the accepted set.
@@ -528,6 +562,44 @@ capacity is shared across senders and released at shutdown or omission of all
 senders. The existing pacing estimate is separate from this layout check, which
 is not a network path-MTU guarantee.
 
+`ConnectionLimits::max_sent_history_bytes` defaults to 8 MiB and funds the fixed
+sent-packet/TWCC windows, actual controller feedback/synthetic vector capacities,
+missing-debt deque capacity (including stale IDs awaiting bounded service), source
+key/value and readiness-index payloads, and each source's allocated
+RTP-index/SentPacketId capacity.
+Source lookup supports valid late sequence holes without assuming commit order.
+Index deletion retains its charge while the table backing remains allocated.
+Each admitted source prepays one readiness key. Permanent omission schedules its
+physical sources for bounded idle cleanup at the existing five-second packet-age
+boundary, not five seconds after omission. Until then, committed flight and valid
+late ACK/loss recovery remain connection-owned. Cleanup releases the source's
+header, index backing and readiness key; issued-SSRC guards remain. Paused and
+adopted sources retain their sequence and freshness anchors and are not reclaimed.
+Prepared source storage without a committed packet can be reclaimed immediately
+on terminal omission.
+A connection without a feedback profile allocates none of this backing. Bootstrap
+or late RTP capability declaration must fund it before enabling the profile;
+insufficiency returns `SessionLimitExceeded` at acceptance or `Capacity` on late
+declaration, without changing existing profiles or capabilities. Repeated profile
+selection and sample clearing retain the backing and do not reset committed history.
+Missing-debt growth is funded before recording a new missing entry; geometric
+capacity growth is clipped by remaining bytes, not a separate ID count limit.
+Expanded controller feedback rows share that allowance, charged by actual vector
+capacity rather than capped at the number of incoming status facts. Per-packet
+ACK, loss and arrival samples remain distinct and ordered. If required debt or
+sample storage cannot fit, the connection fails closed through the existing
+`TransportFailure` path before the controller consumes partial input. Queue order,
+stale-ID maintenance work, deadlines and loss classification are unchanged.
+Clearing debt or samples retains funded backing for reuse. Original, repair and
+padding RTP must fund source storage and pass history admission before SRTP
+protection; packet IDs, sequences and flight bytes change only on final commit.
+Source storage can remain funded for reuse if a later protection attempt fails.
+Path changes retain this capacity without reusing source identities. BTreeMap node
+and spare-slot overhead, hash-table control and excess buckets, allocator overhead
+and temporary staging remain outside this allowance; this is partial accounting,
+not an RSS bound. Packet-window,
+parser/input-status, ACK-edge interval and synthetic-work limits are unchanged.
+
 Secure RTP/RTCP preparation derives wire and initialized buffer lengths from the
 selected native cipher. The final packet buffer, including ICE-TCP prefix and CTR
 scratch space, is allocated fallibly before protection. Protection writes into that
@@ -538,8 +610,9 @@ before reserving a queue slot or protecting a packet; an SRTCP rejection does no
 consume its index. UDP has no framing limit at this seam, not a path-MTU guarantee.
 `ConnectionLimits::max_transport_output_bytes` defaults to 8 MiB and funds
 queued packet Vec capacity for all datagram kinds and actual output-queue backing.
-The SCTP plaintext stage independently applies this same configured value before
-DTLS, as described above; the value is not an aggregate across both stages.
+The SCTP plaintext stage and preselection inbound DTLS queue independently apply
+this same configured value, as described above; it is not an aggregate across
+these three stages.
 This replaces the transport queue's private 256-packet ceiling.
 Secure RTP/RTCP reserves packet and queue storage before protection. Byte
 exhaustion returns backpressure without consuming an SRTCP index, discarding

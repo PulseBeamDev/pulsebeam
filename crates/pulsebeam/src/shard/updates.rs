@@ -45,7 +45,7 @@ impl ShardUpdateApplication {
                 };
                 self.pending_update = Some(delta);
             }
-            let Some(delta) = self.pending_update.take() else {
+            let Some(mut delta) = self.pending_update.take() else {
                 debug_assert!(false, "a readable view delta must be retained");
                 break;
             };
@@ -105,6 +105,10 @@ impl ShardUpdateApplication {
             }
             self.generation = delta.generation;
             self.apply_pending_participant_effects(execution);
+            // This fences lifecycle/plan cutoff, not delivery of observation effects.
+            if let Some(ack) = delta.cutoff_ack.take() {
+                let _ = ack.send(());
+            }
             self.reset_pending();
             applied = applied.saturating_add(1);
         }

@@ -63,8 +63,12 @@ caller need not parse the answer again or depend on native types.
 
 ## Typed ongoing RTP configuration
 
-`set_rtp_capabilities` declares supported exact codec/FMTP/feedback and extension
-envelopes and mechanical bounds, independently of bootstrap media sections. It
+`ConnectionConfig::rtp_capabilities` constrains initial answer construction to the
+exact codec/FMTP/feedback, format-scoped repair and extension envelopes and installs
+that same capability declaration for typed updates. When unset, the SDP-only
+bootstrap contract is unchanged. `set_rtp_capabilities` can instead declare those
+envelopes and mechanical bounds after acceptance, independently of bootstrap media
+sections. It
 selects TWCC without reconstructing transport or history. Conflicting feedback
 profiles and capability changes are errors; existing SDP-only RFC 8888 sessions
 retain their bootstrap contract.

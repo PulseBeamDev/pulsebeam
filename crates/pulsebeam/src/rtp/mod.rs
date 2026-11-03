@@ -83,6 +83,9 @@ pub struct RtpPacket {
     /// Which switch-relevant H.264 NAL units this payload carries. Always empty
     /// for audio.
     pub nal: h264::NalFlags,
+    /// Height resolved at ingress from source declarations; zero is unknown.
+    /// Travels with cached packets rather than following later stream stats.
+    pub reported_height: u32,
     pub payload: Arc<[u8]>,
 }
 
@@ -103,6 +106,7 @@ impl Default for RtpPacket {
             is_keyframe: false,
             is_frame_start: true,
             nal: h264::NalFlags::empty(),
+            reported_height: 0,
             payload: Arc::new([0u8; 1200]), // 1.2KB payload for test realism
         }
     }
@@ -170,6 +174,7 @@ impl RtpPacket {
             is_keyframe: matches!(codec, Codec::Opus) || nal.idr(),
             is_frame_start: true,
             nal,
+            reported_height: 0,
             payload: Arc::from(rtp.payload.as_ref()),
         })
     }

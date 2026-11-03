@@ -81,29 +81,30 @@ Linux integration test; the simulator runs the same matrix once per family.
 
 ## Signaling contract under test
 
-The workspace wire contract is
-[`pulsebeam-proto/proto/signaling.proto`](../../pulsebeam-proto/proto/signaling.proto):
+The native wire definition is
+[`pulsebeam-proto/proto/state.proto`](../../pulsebeam-proto/proto/state.proto).
+It replaces the former Catalog/Intent/Mapping protocol:
 
-- `Intent` is a complete replacement of desired send and receive state.
-  Repeating it must be idempotent; omitting a video request withdraws it, and
-  omitting a send entry stops publication without releasing its reserved sender.
-- `Catalog` begins with a complete snapshot and advances through ordered
-  participant/track deltas. Each track has a stable canonical ID, kind, label,
-  and owning participant. Removing a track is terminal for its receive desire.
-- `Mapping` is a complete authoritative assignment of tracks to negotiated
-  video and audio receiver indices. An omitted assignment does not remove a
-  Catalog track. The client must not infer the origin from RTP alone.
-- A failed state write must leave unsent Catalog or Mapping state pending;
-  a later successful write must not skip a removal or binding replacement.
-- Native clients use the protobuf/LZ4 signaling channel. WHIP/WHEP clients
+- Desired records carry complete per-resource values. Omission does not delete
+  a resource; explicit absence permanently ends that owned lifetime.
+- Confirmed records distinguish accepted state from evaluation of a newer
+  target. An old completion cannot settle newer desire or revive a retired owner.
+- Discovery is incremental. `initial_complete` describes initial enumeration,
+  not an atomic snapshot, convergence or proof that an undiscovered source ended.
+- A source incarnation has an immutable identity, kind, name and owner. A name
+  change creates a new publication lifetime. Visibility is not ownership.
+- Failed writes preserve current unsent state; stale queued work cannot replace
+  a newer accepted source or bypass retirement.
+- Native clients use bounded protobuf/raw-LZ4 StateBatch framing. WHIP/WHEP
   retain their HTTP/SDP lifecycle and never require these messages.
 
-The Rust agent and browser contracts must follow the workspace proto rather
-than a historical `StateUpdate` or `ServerState` schema. Signaling tests should
-check complete state replacement, ordered Catalog revisions, removal fencing,
-receiver reassignment and recovery after failed writes. Audio shape changes
-include receiver replacement and emptying; loudness alone does not generate a
-signaling update.
+The shared Core lifecycle refactor targets permanently source-bound physical
+receivers, not a receiver pool or Top-N audio selection. Compatible consumers
+may share work for the same exact source. A replacement incarnation requires a
+fresh physical realization, while Core owns logical subscription intent and
+explicit discontinuities. Tests must prove correct source/content and stale-work
+fencing, not require one native receiver to survive switching between sources.
+Data transport and recovery remain provisional pending their separate design.
 
 ## State invariants
 
@@ -131,9 +132,11 @@ sets through exported snapshots:
 6. **Client roster.** Every observer eventually knows every expected live
    publication in its room and no publication in another room. After removal,
    the exact old set is gone; safety-only checks are insufficient.
-7. **Client bindings.** Each negotiated receiver index has at most one current
-   assignment, and each track is assigned to at most one receiver. Every assignment
-   names a current Catalog track of the right kind; empty Mapping sections are observable.
+7. **Client bindings.** Each physical receiver is dedicated to one exact source
+   incarnation for its lifetime. Retirement cannot detach a replacement receiver
+   or expose queued old-source media as a new source. Logical subscription intent
+   and physical realization have separate lifetimes; discovery absence alone
+   does not terminate an owned source.
 8. **User-visible result.** Every intended recipient receives the correct
    origin/lane according to that lane’s loss policy. A positive assertion must
    prove traffic moved; a negative assertion must prove the bystander did not

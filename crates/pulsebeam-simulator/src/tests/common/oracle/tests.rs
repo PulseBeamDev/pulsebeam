@@ -16,6 +16,7 @@ fn fixture() -> (ApplicationStateOracle, ClientObservation) {
     let viewer = ParticipantId::derive(&room, &ParticipantExternalId::new("viewer").unwrap());
     let source_connection = ConnectionId::new();
     let receiver_connection = ConnectionId::new();
+    let canonical = source_connection.derive_track_id(TrackKind::Video, "opaque-owned-source");
     let model = ApplicationStateOracle {
         participants: [
             (publisher, true, source_connection),
@@ -33,6 +34,16 @@ fn fixture() -> (ApplicationStateOracle, ClientObservation) {
             required: true,
             connection: Some(connection),
             topics: Default::default(),
+            media: if video {
+                vec![Publication {
+                    id: canonical.as_str(),
+                    participant_id: id.as_str(),
+                    kind: MediaKind::Video,
+                    label: "video".into(),
+                }]
+            } else {
+                Vec::new()
+            },
         })
         .collect(),
     };
@@ -66,7 +77,7 @@ fn fixture() -> (ApplicationStateOracle, ClientObservation) {
 fn audio_fixture(capacity: u32) -> (ApplicationStateOracle, ClientObservation) {
     let (mut model, mut client) = fixture();
     for name in ["audio-first", "audio-second", "audio-third"] {
-        let source = ExpectedParticipant {
+        let mut source = ExpectedParticipant {
             id: ParticipantId::derive(
                 &model.participants[0].room_id().unwrap(),
                 &ParticipantExternalId::new(name).unwrap(),
@@ -76,6 +87,16 @@ fn audio_fixture(capacity: u32) -> (ApplicationStateOracle, ClientObservation) {
             connection: Some(ConnectionId::new()),
             ..model.participants[0].clone()
         };
+        source.media = vec![Publication {
+            id: source
+                .connection
+                .unwrap()
+                .derive_track_id(TrackKind::Audio, "opaque-audio-source")
+                .as_str(),
+            participant_id: source.id.as_str(),
+            kind: MediaKind::Audio,
+            label: "audio".into(),
+        }];
         let publication = source.publications().next().unwrap();
         client.snapshot.participants.insert(
             source.id.as_str(),
@@ -398,4 +419,41 @@ fn publishers_expose_distinct_public_bindings_for_declared_registrations() {
             .check_client(&model.participants[1], &client, &requested)
             .is_err()
     );
+}
+
+#[test]
+fn public_catalog_binding_preserves_opaque_identity_and_declared_constraints() {
+    let (model, client) = fixture();
+    let mut publisher = model.participants[0].clone();
+    let mut descriptors = client
+        .snapshot
+        .publications
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!publisher.bind_media(&[]).unwrap());
+    assert!(publisher.bind_media(&descriptors).unwrap());
+    let canonical = publisher.track_id(TrackKind::Video, "video");
+    assert_ne!(
+        canonical,
+        publisher
+            .connection
+            .unwrap()
+            .derive_track_id(TrackKind::Video, "video")
+    );
+    descriptors.push(descriptors[0].clone());
+    assert!(publisher.bind_media(&descriptors).is_err());
+    descriptors.pop();
+    descriptors[0].label = "wrong".into();
+    assert!(!publisher.bind_media(&descriptors).unwrap());
+    descriptors[0].label = "video".into();
+    descriptors[0].participant_id = model.participants[1].id.as_str();
+    assert!(!publisher.bind_media(&descriptors).unwrap());
+    descriptors[0].participant_id = publisher.id.as_str();
+    descriptors[0].id = publisher
+        .connection
+        .unwrap()
+        .derive_track_id(TrackKind::Audio, "opaque-wrong-kind")
+        .as_str();
+    assert!(publisher.bind_media(&descriptors).is_err());
 }

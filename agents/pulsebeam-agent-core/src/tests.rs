@@ -9,7 +9,6 @@ use core::time::Duration;
 
 use pulsebeam_proto::{
     prelude::Message,
-    signaling_v1::{self as v1, client_message, server_message},
     topic::{
         TopicFloor, TopicFrame, TopicFrontier, TopicMessage as WireTopicMessage, TopicNack,
         TopicProbe, topic_frame::Body as TopicBody,
@@ -19,6 +18,8 @@ use pulsebeam_proto::{
 use crate::*;
 
 mod data_send;
+pub(crate) mod native_connection;
+mod native_media;
 
 const PARTICIPANT_URI: &str = "https://other-origin.test/an%20opaque/path?value=%2Fexact";
 const LOCAL_PUBLISHER: &str = "pa_00000000000000000000000000";
@@ -174,11 +175,39 @@ fn desired_video_intent_logs_do_not_follow_signaling_resends_or_reconnects() {
     let mut debug_config = config();
     debug_config.log_level = LogLevel::Debug;
     let mut agent = Agent::new(debug_config).unwrap();
-    let cid = channel(12);
-    let (generation, operation) = begin_connect(&mut agent, desired(1), cid);
-    let send = finish_connect(&mut agent, generation, operation, cid);
+    let mut initial = desired(1);
+    initial
+        .topics
+        .publishers
+        .push(publisher("state", TopicMode::Latest));
     let _ = take_video_intent_logs();
-
+    let cid = channel(12);
+    let (generation, operation) = begin_connect(&mut agent, initial, cid);
+    activate_connection(&mut agent, generation, operation, cid);
+    native_connection::observe(
+        &mut agent,
+        generation,
+        cid,
+        vec![native_connection::grant(1)],
+    );
+    let Effect::Rtc(RtcEffect::RetireMedia {
+        operation, mids, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("unprepared local publication retirement")
+    };
+    assert_eq!(mids, ["lv0"]);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
+            generation,
+            operation,
+            slots: Vec::new(),
+            outcome: crate::client_sdp::ApplyOutcome::NotApplied,
+            preparation: Err(crate::client_sdp::Error::Observation),
+        }))
+        .unwrap();
+    let (_, send, payload) = native_connection::prepare_data_pending(&mut agent, generation, cid);
+    assert_eq!(take_video_intent_logs().len(), 1);
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {
             operation: send,
@@ -187,19 +216,20 @@ fn desired_video_intent_logs_do_not_follow_signaling_resends_or_reconnects() {
             message: "full".to_string(),
         }))
         .unwrap();
-    let timer = match next_effect(&mut agent) {
-        Effect::Timer(TimerEffect::Schedule { timer, .. }) => timer,
-        effect => panic!("expected signaling retry, got {effect:?}"),
+    let Effect::Timer(TimerEffect::Schedule { timer, .. }) = next_effect(&mut agent) else {
+        panic!("retry")
     };
     agent
         .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
         .unwrap();
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::DataChannel(DataChannelEffect::Send { .. })
-    ));
+    let Effect::DataChannel(DataChannelEffect::Send {
+        payload: retried, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("serialized retry")
+    };
+    assert_eq!(retried, payload);
     assert!(take_video_intent_logs().is_empty());
-
     agent
         .handle(HostEvent::Rtc(RtcEvent::Disconnected { generation }))
         .unwrap();
@@ -333,224 +363,6 @@ fn subscriber(topic: &str, mode: TopicMode) -> TopicSubscriber {
     }
 }
 
-fn connect_with_topics(
-    registrations: TopicRegistrations,
-) -> (Agent, Generation, ChannelId, BTreeMap<String, ChannelId>) {
-    connect_with_topic_seed(registrations, true, &mut Vec::new())
-}
-
-fn connect_with_topic_seed(
-    registrations: TopicRegistrations,
-    complete_seed: bool,
-    timers: &mut Vec<(TimerId, Duration)>,
-) -> (Agent, Generation, ChannelId, BTreeMap<String, ChannelId>) {
-    let mut agent = Agent::new(config()).unwrap();
-    let mut state = desired(1);
-    let has_ordered_subscriber = registrations
-        .subscribers
-        .iter()
-        .any(|subscriber| subscriber.mode == TopicMode::Ordered);
-    state.topics = registrations.clone();
-    agent.command(AgentCommand::ReplaceDesired(state)).unwrap();
-    let (generation, specs) = match next_effect(&mut agent) {
-        Effect::Rtc(RtcEffect::CreateOffer {
-            generation,
-            data_channels,
-            ..
-        }) => (generation, data_channels),
-        effect => panic!("expected topic offer, got {effect:?}"),
-    };
-    let signal = channel(30);
-    let mut channels = BTreeMap::new();
-    let bindings = specs
-        .iter()
-        .skip(1)
-        .enumerate()
-        .map(|(index, spec)| {
-            let id = channel(31 + u64::try_from(index).unwrap());
-            channels.insert(spec.label.clone(), id);
-            DataChannelBinding {
-                label: spec.label.clone(),
-                channel: id,
-            }
-        })
-        .collect();
-    let mut offer_resources = resources(signal);
-    offer_resources.data_channels = bindings;
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
-            generation,
-            offer: offer(),
-            resources: offer_resources,
-        }))
-        .unwrap();
-    let operation = match next_effect(&mut agent) {
-        Effect::Http(HttpEffect::Request { operation, .. }) => operation,
-        effect => panic!("expected participant request, got {effect:?}"),
-    };
-    agent
-        .handle(HostEvent::Http(HttpEvent::Response {
-            operation,
-            response: create_response(LOCAL_PUBLISHER, "etag-1", PARTICIPANT_URI),
-        }))
-        .unwrap();
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::ApplyAnswer { .. })
-    ));
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
-        .unwrap();
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
-        .unwrap();
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
-            generation,
-            channel: signal,
-        }))
-        .unwrap();
-    for channel in channels.values().copied() {
-        agent
-            .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
-                generation,
-                channel,
-            }))
-            .unwrap();
-    }
-    let mut seeds = Vec::new();
-    while let Some(effect) = agent.next_effect() {
-        match effect {
-            Effect::DataChannel(DataChannelEffect::Send {
-                operation,
-                channel,
-                payload,
-                ..
-            }) => {
-                assert_eq!(channel, signal);
-                if let Some(v1::client_message::Payload::SubscriptionSeed(seed)) =
-                    pulsebeam_proto::codec::decode_client(&payload)
-                        .unwrap()
-                        .payload
-                {
-                    seeds.push(seed.seed_id);
-                }
-                acknowledge_send(&mut agent, generation, signal, operation);
-            }
-            Effect::Timer(TimerEffect::Schedule { timer, after }) => timers.push((timer, after)),
-            effect => panic!("unexpected activation effect: {effect:?}"),
-        }
-    }
-    assert_eq!(!seeds.is_empty(), has_ordered_subscriber);
-    inject_topic_catalog(&mut agent, generation, signal, &registrations, 1, "first");
-    for seed_id in seeds.into_iter().filter(|_| complete_seed) {
-        agent
-            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-                generation,
-                channel: signal,
-                payload: pulsebeam_proto::codec::encode_server(&v1::ServerMessage {
-                    payload: Some(v1::server_message::Payload::SubscriptionSeedComplete(
-                        v1::SubscriptionSeedComplete {
-                            seed_id,
-                            catalog_revision: 1,
-                        },
-                    )),
-                })
-                .unwrap(),
-            }))
-            .unwrap();
-    }
-    while let Some(effect) = agent.next_effect() {
-        if matches!(effect, Effect::Timer(TimerEffect::Cancel { .. })) {
-            continue;
-        }
-        let Effect::DataChannel(DataChannelEffect::Send {
-            operation,
-            channel,
-            payload,
-            ..
-        }) = effect
-        else {
-            panic!("expected initial Catalog probe");
-        };
-        assert!(matches!(
-            TopicFrame::decode_bounded(&payload).unwrap().body,
-            Some(TopicBody::Probe(_))
-        ));
-        acknowledge_send(&mut agent, generation, channel, operation);
-    }
-    let _ = drain_notifications(&mut agent);
-    (agent, generation, signal, channels)
-}
-
-fn data_id(local: bool, topic: &str, mode: TopicMode, incarnation: &str) -> String {
-    format!("server-{local}-{topic}-{mode:?}-{incarnation}")
-}
-
-fn inject_topic_catalog(
-    agent: &mut Agent,
-    generation: Generation,
-    signal: ChannelId,
-    registrations: &TopicRegistrations,
-    revision: u64,
-    incarnation: &str,
-) {
-    let mut tracks = Vec::new();
-    for (local, topic, mode) in registrations
-        .publishers
-        .iter()
-        .map(|p| (true, &p.topic, p.mode))
-        .chain(
-            registrations
-                .subscribers
-                .iter()
-                .map(|s| (false, &s.topic, s.mode)),
-        )
-    {
-        tracks.push(v1::RemoteTrack {
-            track_id: data_id(local, topic, mode, incarnation),
-            participant_id: if local {
-                LOCAL_PUBLISHER
-            } else {
-                REMOTE_PUBLISHER
-            }
-            .into(),
-            kind: v1::TrackKind::Data as i32,
-            label: topic.clone(),
-            mode: match mode {
-                TopicMode::Latest => v1::TopicMode::Latest,
-                TopicMode::Lossy => v1::TopicMode::Lossy,
-                TopicMode::Ordered => v1::TopicMode::Ordered,
-            } as i32,
-        });
-    }
-    let catalog = v1::ServerMessage {
-        payload: Some(server_message::Payload::Catalog(v1::Catalog {
-            revision,
-            state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
-                participants: vec![
-                    v1::Participant {
-                        participant_id: LOCAL_PUBLISHER.into(),
-                        participant_external_id: "participant".into(),
-                    },
-                    v1::Participant {
-                        participant_id: REMOTE_PUBLISHER.into(),
-                        participant_external_id: "remote-app-user".into(),
-                    },
-                ],
-                tracks,
-            })),
-        })),
-    };
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel: signal,
-            payload: pulsebeam_proto::codec::encode_server(&catalog).unwrap(),
-        }))
-        .unwrap();
-}
-
 fn topic_input(
     agent: &mut Agent,
     generation: Generation,
@@ -588,7 +400,7 @@ fn next_topic_send(agent: &mut Agent) -> (OperationId, ChannelId, TopicBody) {
     }
 }
 
-fn create_response(participant: &str, _etag: &str, uri: &str) -> HttpResponse {
+pub(crate) fn create_response(participant: &str, _etag: &str, uri: &str) -> HttpResponse {
     HttpResponse {
         status: 201,
         headers: vec![HttpHeader {
@@ -600,7 +412,9 @@ fn create_response(participant: &str, _etag: &str, uri: &str) -> HttpResponse {
             "room_id": "opaque room",
             "participant_external_id": "participant",
             "participant_id": participant,
-            "connection_id": "not-canonical",
+            "profile": "pulsebeam.media.v1",
+            "rtp_capabilities": {},
+            "data_delivery": ["LATEST", "LOSSY", "ORDERED"],
             "answer": "answer",
         }))
         .unwrap(),
@@ -666,7 +480,7 @@ fn begin_connect(
             assert_eq!(request.uri, "https://sfu.test/api/v1/native");
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
-                serde_json::json!({"offer": offer(), "manual": true}),
+                serde_json::json!({"profile": "pulsebeam.media.v1", "offer": offer()}),
             );
             assert!(request.headers.iter().any(|header| {
                 header.name == "Authorization" && header.value == "Bearer private-token"
@@ -678,12 +492,12 @@ fn begin_connect(
     (generation, operation)
 }
 
-fn finish_connect(
+fn activate_connection(
     agent: &mut Agent,
     generation: Generation,
     operation: OperationId,
     cid: ChannelId,
-) -> OperationId {
+) {
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,
@@ -695,6 +509,14 @@ fn finish_connect(
         Effect::Rtc(RtcEffect::ApplyAnswer {
             generation,
             answer: "answer".to_string(),
+            capabilities: BootstrapCapabilities {
+                rtp: Default::default(),
+                data_delivery: vec![
+                    pulsebeam_proto::state::DataDelivery::Latest,
+                    pulsebeam_proto::state::DataDelivery::Lossy,
+                    pulsebeam_proto::state::DataDelivery::Ordered
+                ],
+            },
         })
     );
     agent
@@ -710,6 +532,15 @@ fn finish_connect(
     agent
         .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
         .unwrap();
+}
+
+fn finish_connect(
+    agent: &mut Agent,
+    generation: Generation,
+    operation: OperationId,
+    cid: ChannelId,
+) -> OperationId {
+    activate_connection(agent, generation, operation, cid);
     match next_effect(agent) {
         Effect::DataChannel(DataChannelEffect::Send {
             operation,
@@ -728,7 +559,7 @@ fn finish_connect(
     }
 }
 
-fn connected_agent() -> (Agent, Generation, ChannelId, OperationId) {
+pub(super) fn connected_agent() -> (Agent, Generation, ChannelId, OperationId) {
     let mut agent = Agent::new(config()).unwrap();
     let cid = channel(9);
     let (generation, operation) = begin_connect(&mut agent, desired(1), cid);
@@ -749,22 +580,6 @@ fn acknowledge_send(
             channel: cid,
         }))
         .unwrap();
-}
-
-fn decode_intent(payload: &[u8]) -> v1::Intent {
-    let message = pulsebeam_proto::codec::decode_client(payload).unwrap();
-    match message.payload.unwrap() {
-        client_message::Payload::Intent(intent) => intent,
-        client_message::Payload::RenewAuthorization(_)
-        | client_message::Payload::SubscriptionSeed(_) => panic!("expected media intent"),
-    }
-}
-
-fn server_payload(payload: server_message::Payload) -> Vec<u8> {
-    pulsebeam_proto::codec::encode_server(&v1::ServerMessage {
-        payload: Some(payload),
-    })
-    .unwrap()
 }
 
 fn drain_notifications(agent: &mut Agent) -> Vec<Notification> {
@@ -812,175 +627,236 @@ fn disconnected_credential_update_is_used_for_next_http_admission() {
 }
 
 #[test]
-fn unsupported_intent_is_nonfatal_without_advancing_accepted_state() {
-    for (fatal, intent_revision, valid) in [
-        (false, Some(2), true),
-        (true, Some(2), false),
-        (false, None, false),
-    ] {
-        let (mut agent, generation, channel, send) = connected_agent();
-        acknowledge_send(&mut agent, generation, channel, send);
-        drain_notifications(&mut agent);
+fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
+    use pulsebeam_proto::state::{self, codec, validation};
+
+    for valid in [true, false] {
+        let (mut agent, generation, channel, accepted) =
+            native_connection::connected_publisher(TopicMode::Latest);
         let before = agent.snapshot().clone();
-        let result = agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
+        let desired = DesiredState {
+            revision: 2,
+            connected: true,
+            topics: TopicRegistrations {
+                publishers: vec![
+                    publisher("state", TopicMode::Latest),
+                    publisher("unsupported", TopicMode::Latest),
+                ],
+                subscribers: Vec::new(),
+            },
+            ..Default::default()
+        };
+        agent
+            .command(AgentCommand::ReplaceDesired(desired.clone()))
+            .unwrap();
+        let rejected = native_connection::prepare_data(&mut agent, generation, channel);
+        let mut record = native_connection::confirmed(
+            state::resource_key::Key::Owned(rejected.reference),
+            rejected.revision + u64::from(!valid),
+            state::confirmed_state::Value::Absent(state::AbsentState {
+                reason: state::AbsenceReason::CreateRejected as i32,
+            }),
+        );
+        let Some(state::state_record::State::Confirmed(confirmation)) = &mut record.state else {
+            panic!("confirmation")
+        };
+        confirmation.rejection = Some(state::Failure {
+            code: state::FailureCode::Unsupported as i32,
+            diagnostic: "unsupported resource settings".into(),
+        });
+        let event = HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel,
-            payload: server_payload(server_message::Payload::Error(v1::Error {
-                code: v1::ErrorCode::UnsupportedIntent.into(),
-                message: "unsupported receive policy".into(),
-                fatal,
-                intent_revision,
-            })),
-        }));
+            payload: codec::encode(
+                &state::StateBatch {
+                    records: vec![record],
+                    initial_complete: false,
+                },
+                validation::Direction::Server,
+            )
+            .unwrap(),
+        });
+        let result = agent.handle(event.clone());
         assert_eq!(result.is_ok(), valid);
-        assert_eq!(
-            agent.snapshot().accepted_intent_revision,
-            before.accepted_intent_revision
-        );
-        assert_eq!(agent.snapshot().audio_mapping, before.audio_mapping);
-        if valid {
-            assert_eq!(agent.snapshot().connection, before.connection);
-            assert_eq!(agent.snapshot().generation, before.generation);
-            assert!(
-                drain_notifications(&mut agent).contains(&Notification::ServerError(
-                    "unsupported receive policy".into()
-                ))
-            );
-        } else {
+        if !valid {
             assert_eq!(
                 agent.snapshot().connection,
                 ConnectionState::TerminalFailure
             );
+            continue;
         }
+        assert_eq!(
+            agent.snapshot().accepted_intent_revision,
+            before.accepted_intent_revision
+        );
+        assert_eq!(agent.snapshot().connection, before.connection);
+        assert_eq!(agent.snapshot().generation, before.generation);
+        assert!(agent.snapshot().terminal_failure.is_none());
+        assert!(
+            drain_notifications(&mut agent).contains(&Notification::ServerError(
+                "unsupported resource settings".into()
+            ))
+        );
+        assert_eq!(
+            next_effect(&mut agent),
+            Effect::Rtc(RtcEffect::CloseDataChannel {
+                generation,
+                channel: rejected.channel,
+            })
+        );
+        agent.handle(event).unwrap();
+        assert!(
+            drain_notifications(&mut agent)
+                .iter()
+                .all(|notification| !matches!(notification, Notification::ServerError(_)))
+        );
+        agent
+            .command(AgentCommand::ReplaceDesired(desired))
+            .unwrap();
+        assert!(agent.next_effect().is_none());
+        agent
+            .command(AgentCommand::SendTopic(TopicSend {
+                publisher: publisher("state", TopicMode::Latest),
+                payload: b"still accepted".to_vec(),
+            }))
+            .unwrap();
+        let (_, output, body) = next_topic_send(&mut agent);
+        assert_eq!(output, accepted.channel);
+        assert!(matches!(body, TopicBody::Message(message)
+            if message.data_track_id == native_connection::SOURCE
+                && message.payload == b"still accepted"));
     }
 }
 
 #[test]
 fn rejected_renewal_preserves_the_committed_credential_and_expiry() {
-    let (mut agent, generation, channel, send) = connected_agent();
-    acknowledge_send(&mut agent, generation, channel, send);
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel,
-            payload: server_payload(server_message::Payload::Authorization(v1::Authorization {
-                expires_at_unix_seconds: 100,
-            })),
-        }))
-        .unwrap();
-    assert_eq!(agent.snapshot().authorization_expires_at, Some(100));
+    let (mut agent, _, _) = native_connection::connected(Default::default());
+    assert_eq!(agent.snapshot().authorization_expires_at, Some(10_001));
     let command = AgentCommand::RenewAuthorization("new-secret".to_string());
     assert!(!format!("{command:?}").contains("new-secret"));
     agent.command(command).unwrap();
     let operation = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send {
-            operation, payload, ..
+        Effect::Http(HttpEffect::Request {
+            operation, request, ..
         }) => {
-            let decoded = pulsebeam_proto::codec::decode_client(&payload).unwrap();
-            assert!(matches!(
-                decoded.payload,
-                Some(client_message::Payload::RenewAuthorization(v1::RenewAuthorization { token }))
-                if token == "new-secret"
+            assert_eq!(request.method, HttpMethod::Patch);
+            assert_eq!(request.uri, PARTICIPANT_URI);
+            assert!(request.headers.iter().any(
+                |header| header.name == "Authorization" && header.value == "Bearer new-secret"
             ));
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .any(|header| header.name == "If-Match" && header.value == "\"auth-1\"")
+            );
+            assert!(!format!("{request:?}").contains("new-secret"));
             operation
         }
-        effect => panic!("expected renewal, got {effect:?}"),
+        effect => panic!("expected renewal PATCH, got {effect:?}"),
     };
     assert_eq!(
         agent.command(AgentCommand::RenewAuthorization("second".to_string())),
         Err(AgentError::RenewalBusy)
     );
     agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Sent {
+        .handle(HostEvent::Http(HttpEvent::Response {
             operation,
-            generation,
-            channel,
+            response: HttpResponse {
+                status: 401,
+                headers: vec![],
+                body: vec![],
+            },
         }))
         .unwrap();
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel,
-            payload: server_payload(server_message::Payload::Error(v1::Error {
-                code: v1::ErrorCode::AuthorizationRejected.into(),
-                message: "rejected".to_string(),
-                fatal: false,
-                intent_revision: None,
-            })),
-        }))
-        .unwrap();
-    assert_eq!(agent.snapshot().authorization_expires_at, Some(100));
+    assert_eq!(agent.snapshot().authorization_expires_at, Some(10_001));
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert!(agent.snapshot().terminal_failure.is_none());
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 2,
             ..DesiredState::default()
         }))
         .unwrap();
-    let delete = (0..4)
-        .filter_map(|_| agent.next_effect())
-        .find_map(|effect| match effect {
-            Effect::Http(HttpEffect::Request { request, .. })
-                if request.method == HttpMethod::Delete =>
-            {
-                Some(request)
-            }
-            _ => None,
-        })
-        .expect("delete request");
-    assert!(delete.headers.iter().any(|header| {
-        header.name == "Authorization" && header.value == "Bearer private-token"
-    }));
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { .. })
+    ));
+    let Effect::Http(HttpEffect::Request {
+        request: delete, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("delete request")
+    };
+    assert_eq!(delete.method, HttpMethod::Delete);
+    assert_eq!(delete.uri, PARTICIPANT_URI);
+    assert!(
+        delete
+            .headers
+            .iter()
+            .any(|header| header.name == "Authorization" && header.value == "Bearer private-token")
+    );
     assert!(!format!("{delete:?}").contains("private-token"));
 }
 
 #[test]
 fn accepted_renewal_commits_the_new_credential_only_on_authorization() {
-    let (mut agent, generation, channel, send) = connected_agent();
-    acknowledge_send(&mut agent, generation, channel, send);
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel,
-            payload: server_payload(server_message::Payload::Authorization(v1::Authorization {
-                expires_at_unix_seconds: 100,
-            })),
-        }))
-        .unwrap();
+    let (mut agent, generation, control) = native_connection::connected(Default::default());
     agent
         .command(AgentCommand::RenewAuthorization("new-secret".to_string()))
         .unwrap();
-    let _send = next_effect(&mut agent);
+    let Effect::Http(HttpEffect::Request {
+        operation, request, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("renewal PATCH")
+    };
+    assert_eq!(request.method, HttpMethod::Patch);
+    assert_eq!(request.uri, PARTICIPANT_URI);
     agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel,
-            payload: server_payload(server_message::Payload::Authorization(v1::Authorization {
-                expires_at_unix_seconds: 200,
-            })),
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![HttpHeader {
+                    name: "ETag".into(),
+                    value: "\"auth-2\"".into(),
+                }],
+                body: vec![],
+            },
         }))
         .unwrap();
-    assert_eq!(agent.snapshot().authorization_expires_at, Some(200));
+    assert_eq!(agent.snapshot().authorization_expires_at, Some(10_001));
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![native_connection::grant(2)],
+    );
+    assert_eq!(agent.snapshot().authorization_expires_at, Some(10_002));
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 2,
             ..DesiredState::default()
         }))
         .unwrap();
-    let delete = (0..4)
-        .filter_map(|_| agent.next_effect())
-        .find_map(|effect| match effect {
-            Effect::Http(HttpEffect::Request { request, .. })
-                if request.method == HttpMethod::Delete =>
-            {
-                Some(request)
-            }
-            _ => None,
-        })
-        .expect("delete request");
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { .. })
+    ));
+    let Effect::Http(HttpEffect::Request {
+        request: delete, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("delete request")
+    };
+    assert_eq!(delete.method, HttpMethod::Delete);
+    assert_eq!(delete.uri, PARTICIPANT_URI);
     assert!(
-        delete.headers.iter().any(|header| {
-            header.name == "Authorization" && header.value == "Bearer new-secret"
-        })
+        delete
+            .headers
+            .iter()
+            .any(|header| header.name == "Authorization" && header.value == "Bearer new-secret")
     );
     assert!(!format!("{delete:?}").contains("new-secret"));
 }
@@ -1027,14 +903,14 @@ fn publishing_uses_only_accepted_local_publication_intent() {
     assert!(!agent.is_publishing(&MediaSlot::LocalAudio("v0".into())));
     assert!(!agent.is_publishing(&MediaSlot::RemoteVideo(0)));
     state.revision = 2;
-    state.publications[0].label = "replacement".into();
+    state.publications[0].slot = "missing".into();
     assert!(
         agent
             .command(AgentCommand::ReplaceDesired(state.clone()))
             .is_err()
     );
     assert!(agent.is_publishing(&video));
-    state.publications[0].label = "camera".into();
+    state.publications[0].slot = "v0".into();
     state.publications[0].active = false;
     agent
         .command(AgentCommand::ReplaceDesired(state.clone()))
@@ -1047,7 +923,7 @@ fn publishing_uses_only_accepted_local_publication_intent() {
 }
 
 #[test]
-fn publication_label_is_bound_to_its_slot_even_after_desire_is_cleared() {
+fn publication_labels_can_change_after_desire_is_cleared() {
     let mut agent = Agent::new(config()).unwrap();
     let original = desired(1);
     agent
@@ -1063,22 +939,22 @@ fn publication_label_is_bound_to_its_slot_even_after_desire_is_cleared() {
     let mut relabelled = original.clone();
     relabelled.revision = 3;
     relabelled.publications[0].label = "different camera".into();
-    assert!(matches!(
-        agent.command(AgentCommand::ReplaceDesired(relabelled)),
-        Err(AgentError::InvalidConfiguration(
-            ValidationError::PublicationBinding(_)
-        ))
-    ));
-    assert_eq!(agent.snapshot().desired_revision, 2);
+    agent
+        .command(AgentCommand::ReplaceDesired(relabelled))
+        .unwrap();
+    assert_eq!(agent.snapshot().desired_revision, 3);
+    assert!(agent.is_publishing(&MediaSlot::LocalVideo("v0".into())));
 
     let mut audio = original;
-    audio.revision = 3;
+    audio.revision = 4;
     audio.publications = vec![PublicationIntent {
         slot: "a0".into(),
         label: "camera".into(),
         active: true,
     }];
     agent.command(AgentCommand::ReplaceDesired(audio)).unwrap();
+    assert!(!agent.is_publishing(&MediaSlot::LocalVideo("v0".into())));
+    assert!(agent.is_publishing(&MediaSlot::LocalAudio("a0".into())));
 }
 
 #[test]
@@ -1312,6 +1188,18 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
             },
         })),
         Err(AgentError::InvalidOffer(
+            "SDP RTP media section is missing a slot binding"
+        ))
+    );
+    let mut partial = resources(channel(3));
+    partial.slots.pop();
+    assert_eq!(
+        agent.handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation,
+            offer: offer(),
+            resources: partial,
+        })),
+        Err(AgentError::InvalidOffer(
             "slot mapping does not match configured topology"
         ))
     );
@@ -1332,14 +1220,62 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation,
-            offer: offer(),
-            resources: resources(channel(3)),
+            offer:
+                "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:data-channel\r\n"
+                    .into(),
+            resources: OfferResources {
+                slots: vec![],
+                signaling_channel: channel(3),
+                data_channels: vec![],
+            },
+        }))
+        .unwrap();
+    let Effect::Http(HttpEffect::Request { operation, .. }) = next_effect(&mut agent) else {
+        panic!("data-only session request")
+    };
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: create_response("p1", "unused", PARTICIPANT_URI),
         }))
         .unwrap();
     assert!(matches!(
         next_effect(&mut agent),
-        Effect::Http(HttpEffect::Request { .. })
+        Effect::Rtc(RtcEffect::ApplyAnswer { .. })
     ));
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::BootstrapMediaPrepared {
+            generation,
+            preparation: Ok(client_sdp::Bindings::default()),
+        }))
+        .unwrap();
+    for event in [
+        HostEvent::Rtc(RtcEvent::AnswerApplied { generation }),
+        HostEvent::Rtc(RtcEvent::Connected { generation }),
+        HostEvent::DataChannel(DataChannelEvent::Opened {
+            generation,
+            channel: channel(3),
+        }),
+    ] {
+        agent.handle(event).unwrap();
+    }
+    let mut allocations = Vec::new();
+    while let Some(effect) = agent.next_effect() {
+        if let Effect::Rtc(RtcEffect::AllocateMedia {
+            allocations: requested,
+            ..
+        }) = effect
+        {
+            allocations.extend(requested);
+        }
+    }
+    assert_eq!(
+        allocations,
+        [client_sdp::Allocation {
+            slot: MediaSlot::LocalVideo("v0".into()),
+            format: None,
+        }]
+    );
 }
 
 #[test]
@@ -1378,8 +1314,130 @@ fn malformed_negotiated_coordinates_are_rejected_transactionally() {
 }
 
 #[test]
+fn unavailable_bootstrap_rtp_does_not_retry_or_reject_the_transport() {
+    let mut agent = Agent::new(config()).unwrap();
+    let cid = channel(9);
+    let (generation, operation) = begin_connect(&mut agent, desired(1), cid);
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: create_response("p1", "etag-1", PARTICIPANT_URI),
+        }))
+        .unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::ApplyAnswer { .. })
+    ));
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::BootstrapMediaPrepared {
+            generation,
+            preparation: Err(client_sdp::Error::Observation),
+        }))
+        .unwrap();
+    assert!(agent.next_effect().is_none());
+    for event in [
+        HostEvent::Rtc(RtcEvent::AnswerApplied { generation }),
+        HostEvent::Rtc(RtcEvent::Connected { generation }),
+        HostEvent::DataChannel(DataChannelEvent::Opened {
+            generation,
+            channel: cid,
+        }),
+    ] {
+        agent.handle(event).unwrap();
+    }
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert!(agent.snapshot().terminal_failure.is_none());
+    while let Some(effect) = agent.next_effect() {
+        assert!(!matches!(
+            effect,
+            Effect::Rtc(RtcEffect::CreateOffer { .. })
+                | Effect::Timer(TimerEffect::Schedule { .. })
+        ));
+    }
+}
+
+#[test]
+fn rejected_bootstrap_is_terminal_and_late_completion_cannot_activate() {
+    let mut agent = Agent::new(config()).unwrap();
+    let cid = channel(9);
+    let (generation, operation) = begin_connect(&mut agent, desired(1), cid);
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: create_response("p1", "etag-1", PARTICIPANT_URI),
+        }))
+        .unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::ApplyAnswer { .. })
+    ));
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::BootstrapRejected {
+            generation,
+            message: "unsupported applied bootstrap SDP".into(),
+        }))
+        .unwrap();
+    let mut effects = Vec::new();
+    while let Some(effect) = agent.next_effect() {
+        effects.push(effect);
+    }
+    assert!(effects.contains(&Effect::Rtc(RtcEffect::Close { generation })));
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Timer(TimerEffect::Schedule { .. })))
+    );
+    let terminal = agent.snapshot().clone();
+    for event in [
+        HostEvent::Rtc(RtcEvent::AnswerApplied { generation }),
+        HostEvent::Rtc(RtcEvent::Connected { generation }),
+        HostEvent::DataChannel(DataChannelEvent::Opened {
+            generation,
+            channel: cid,
+        }),
+    ] {
+        agent.handle(event).unwrap();
+    }
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+    assert_eq!(
+        agent.snapshot().terminal_failure.as_ref().unwrap().class,
+        FailureClass::Protocol
+    );
+    assert_eq!(agent.snapshot(), &terminal);
+    assert!(agent.snapshot().participant_id.is_none());
+    assert!(agent.next_effect().is_none());
+}
+
+#[test]
 fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
-    let (mut agent, generation, cid, send) = connected_agent();
+    let (mut agent, generation, cid) = native_connection::joining(Default::default());
+    assert_eq!(agent.snapshot().connection, ConnectionState::ApplyingAnswer);
+    assert!(agent.snapshot().participant_id.is_none());
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
+        .unwrap();
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::WaitingForTransport
+    );
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
+            generation,
+            channel: cid,
+        }))
+        .unwrap();
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::WaitingForTransport
+    );
+    assert!(agent.snapshot().participant_id.is_none());
+    assert!(agent.next_effect().is_none());
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
+        .unwrap();
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p1"));
     assert_eq!(
@@ -1387,14 +1445,13 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
         Some("participant")
     );
     assert_eq!(agent.snapshot().room_external_id.as_deref(), Some("room"));
-    acknowledge_send(&mut agent, generation, cid, send);
+    assert!(agent.next_effect().is_none());
 
-    let disconnected = DesiredState {
-        revision: 2,
-        ..DesiredState::default()
-    };
     agent
-        .command(AgentCommand::ReplaceDesired(disconnected))
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            ..DesiredState::default()
+        }))
         .unwrap();
     assert_eq!(agent.snapshot().connection, ConnectionState::Closing);
     assert_eq!(
@@ -1486,50 +1543,126 @@ fn transient_failure_schedules_a_bounded_retry_that_disconnect_cancels() {
 
 #[test]
 fn transport_loss_fences_incumbent_signaling_during_replacement() {
-    for failed in [false, true] {
-        let (mut agent, generation, channel, send) = connected_agent();
-        acknowledge_send(&mut agent, generation, channel, send);
-        let event = if failed {
-            RtcEvent::Failed {
+    for ending in 0..3 {
+        let (mut agent, generation, control) = native_connection::connected(Default::default());
+        agent
+            .command(AgentCommand::RenewAuthorization("uncommitted".into()))
+            .unwrap();
+        let Effect::Http(HttpEffect::Request {
+            operation, request, ..
+        }) = next_effect(&mut agent)
+        else {
+            panic!("PATCH")
+        };
+        assert_eq!(request.method, HttpMethod::Patch);
+        native_connection::observe(
+            &mut agent,
+            generation,
+            control,
+            vec![native_connection::grant(2)],
+        );
+        let event = match ending {
+            0 => HostEvent::Rtc(RtcEvent::Disconnected { generation }),
+            1 => HostEvent::Rtc(RtcEvent::Failed {
                 generation,
                 message: "transport failed".into(),
-            }
-        } else {
-            RtcEvent::Disconnected { generation }
+            }),
+            _ => HostEvent::DataChannel(DataChannelEvent::Closed {
+                generation,
+                channel: control,
+            }),
         };
-        agent.handle(HostEvent::Rtc(event)).unwrap();
-        assert!(matches!(
+        agent.handle(event).unwrap();
+        assert_eq!(
             next_effect(&mut agent),
-            Effect::Rtc(RtcEffect::CreateOffer { .. })
-        ));
-        drain_notifications(&mut agent);
+            Effect::Http(HttpEffect::Cancel { operation })
+        );
+        let Effect::Rtc(RtcEffect::CreateOffer {
+            generation: replacement,
+            ..
+        }) = next_effect(&mut agent)
+        else {
+            panic!("replacement")
+        };
+        assert_ne!(replacement, generation);
+        let notifications = drain_notifications(&mut agent);
+        assert_eq!(
+            notifications
+                .iter()
+                .any(|notification| matches!(notification, Notification::Failure(_))),
+            ending == 1
+        );
         let before = agent.snapshot().clone();
         agent
             .handle(HostEvent::DataChannel(DataChannelEvent::Message {
                 generation,
-                channel,
+                channel: control,
                 payload: vec![0xff],
+            }))
+            .unwrap();
+        agent
+            .handle(HostEvent::Http(HttpEvent::Response {
+                operation,
+                response: HttpResponse {
+                    status: 204,
+                    headers: vec![HttpHeader {
+                        name: "ETag".into(),
+                        value: "\"auth-2\"".into(),
+                    }],
+                    body: vec![],
+                },
             }))
             .unwrap();
         assert_eq!(agent.snapshot(), &before);
         assert!(agent.next_notification().is_none());
+        assert!(agent.next_effect().is_none());
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+                generation: replacement,
+                offer: native_connection::OFFER.into(),
+                resources: OfferResources {
+                    slots: vec![],
+                    signaling_channel: channel(15),
+                    data_channels: vec![],
+                },
+            }))
+            .unwrap();
+        let Effect::Http(HttpEffect::Request { request, .. }) = next_effect(&mut agent) else {
+            panic!("POST")
+        };
+        assert_eq!(request.method, HttpMethod::Post);
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|header| header.name == "Authorization"
+                    && header.value == "Bearer private-token")
+        );
         assert!(agent.next_effect().is_none());
     }
 }
 
 #[test]
 fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() {
-    let (mut agent, old_generation, old_cid, send) = connected_agent();
-    acknowledge_send(&mut agent, old_generation, old_cid, send);
+    let (mut agent, old_generation, _) = native_connection::connected(Default::default());
     agent
         .handle(HostEvent::Rtc(RtcEvent::Disconnected {
             generation: old_generation,
         }))
         .unwrap();
     let replacement_generation = match next_effect(&mut agent) {
-        Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
+        Effect::Rtc(RtcEffect::CreateOffer {
+            generation,
+            data_channels,
+            ..
+        }) => {
+            assert_eq!(data_channels.len(), 1);
+            assert_eq!(data_channels[0].negotiated_id, Some(0));
+            generation
+        }
         effect => panic!("expected replacement offer, got {effect:?}"),
     };
+    assert_ne!(replacement_generation, old_generation);
     assert_eq!(agent.snapshot().generation, Some(old_generation));
     assert_eq!(
         agent.snapshot().participant_external_id.as_deref(),
@@ -1540,14 +1673,21 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation: replacement_generation,
-            offer: offer(),
-            resources: resources(replacement_cid),
+            offer: native_connection::OFFER.into(),
+            resources: OfferResources {
+                slots: vec![],
+                signaling_channel: replacement_cid,
+                data_channels: vec![],
+            },
         }))
         .unwrap();
     let update = match next_effect(&mut agent) {
         Effect::Http(HttpEffect::Request {
-            operation, request, ..
+            operation,
+            generation: Some(actual_generation),
+            request,
         }) => {
+            assert_eq!(actual_generation, replacement_generation);
             assert_eq!(request.method, HttpMethod::Post);
             assert_eq!(request.uri, "https://sfu.test/api/v1/native");
             operation
@@ -1560,10 +1700,9 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
             response: update_response("p1"),
         }))
         .unwrap();
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::ApplyAnswer { .. })
-    ));
+    assert!(
+        matches!(next_effect(&mut agent), Effect::Rtc(RtcEffect::ApplyAnswer { generation, .. }) if generation == replacement_generation)
+    );
     agent
         .handle(HostEvent::Rtc(RtcEvent::AnswerApplied {
             generation: replacement_generation,
@@ -1575,6 +1714,7 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
         }))
         .unwrap();
     assert_eq!(agent.snapshot().generation, Some(old_generation));
+    assert!(agent.next_effect().is_none());
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
             generation: replacement_generation,
@@ -1584,17 +1724,13 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     assert_eq!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::Close {
-            generation: old_generation,
+            generation: old_generation
         })
     );
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::DataChannel(DataChannelEffect::Send {
-            generation,
-            channel,
-            ..
-        }) if generation == replacement_generation && channel == replacement_cid
-    ));
+    assert!(
+        agent.next_effect().is_none(),
+        "no declarations without prepared resources"
+    );
     assert_eq!(agent.snapshot().generation, Some(replacement_generation));
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p1"));
     assert_eq!(
@@ -1606,8 +1742,7 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
 
 #[test]
 fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
-    let (mut agent, old_generation, old_cid, send) = connected_agent();
-    acknowledge_send(&mut agent, old_generation, old_cid, send);
+    let (mut agent, old_generation, _) = native_connection::connected(Default::default());
     agent
         .handle(HostEvent::Rtc(RtcEvent::Disconnected {
             generation: old_generation,
@@ -1620,8 +1755,12 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation: replacement_generation,
-            offer: offer(),
-            resources: resources(channel(11)),
+            offer: native_connection::OFFER.into(),
+            resources: OfferResources {
+                slots: vec![],
+                signaling_channel: channel(11),
+                data_channels: vec![],
+            },
         }))
         .unwrap();
     let update = match next_effect(&mut agent) {
@@ -1641,7 +1780,7 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
     assert_eq!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::Close {
-            generation: replacement_generation,
+            generation: replacement_generation
         })
     );
     assert_eq!(agent.snapshot().generation, Some(old_generation));
@@ -1649,24 +1788,28 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
         agent.snapshot().connection,
         ConnectionState::TerminalFailure
     );
-    assert!(drain_notifications(&mut agent).iter().any(|notification| {
-        matches!(
-            notification,
-            Notification::Failure(Failure {
-                class: FailureClass::InvalidConfiguration,
-                ..
-            })
-        )
-    }));
+    assert!(
+        drain_notifications(&mut agent)
+            .iter()
+            .any(|notification| matches!(
+                notification,
+                Notification::Failure(Failure {
+                    class: FailureClass::InvalidConfiguration,
+                    ..
+                })
+            ))
+    );
     let failure = agent.snapshot().terminal_failure.clone();
-    let mut changed = desired(2);
-    changed.video[0].height = 720;
-    changed
-        .topics
-        .publishers
-        .push(publisher("chat", TopicMode::Ordered));
     agent
-        .command(AgentCommand::ReplaceDesired(changed))
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            connected: true,
+            topics: TopicRegistrations {
+                publishers: vec![publisher("chat", TopicMode::Ordered)],
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
         .unwrap();
     agent
         .command(AgentCommand::RenewAuthorization("renewed".to_owned()))
@@ -1819,53 +1962,10 @@ fn authorization_is_latched_across_incidental_updates_until_explicit_reconnect()
 }
 
 #[test]
-fn signaling_messages_received_before_topic_channels_open_are_replayed_on_activation() {
-    let mut agent = Agent::new(config()).unwrap();
-    let mut state = desired(1);
-    state
-        .topics
-        .publishers
-        .push(publisher("events", TopicMode::Ordered));
-    agent.command(AgentCommand::ReplaceDesired(state)).unwrap();
-    let (generation, topic_label) = match next_effect(&mut agent) {
-        Effect::Rtc(RtcEffect::CreateOffer {
-            generation,
-            data_channels,
-            ..
-        }) => (generation, data_channels[1].label.clone()),
-        effect => panic!("expected offer, got {effect:?}"),
-    };
-    let signal = channel(40);
-    let topic = channel(41);
-    let mut offer_resources = resources(signal);
-    offer_resources.data_channels.push(DataChannelBinding {
-        label: topic_label,
-        channel: topic,
-    });
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
-            generation,
-            offer: offer(),
-            resources: offer_resources,
-        }))
-        .unwrap();
-    let operation = match next_effect(&mut agent) {
-        Effect::Http(HttpEffect::Request { operation, .. }) => operation,
-        effect => panic!("expected participant request, got {effect:?}"),
-    };
-    agent
-        .handle(HostEvent::Http(HttpEvent::Response {
-            operation,
-            response: create_response("p1", "etag-1", PARTICIPANT_URI),
-        }))
-        .unwrap();
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::ApplyAnswer { .. })
-    ));
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
-        .unwrap();
+fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
+    use native_connection::{confirmed, grant};
+    use pulsebeam_proto::state::{self, codec, validation};
+    let (mut agent, generation, signal) = native_connection::joining(Default::default());
     agent
         .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
         .unwrap();
@@ -1879,75 +1979,283 @@ fn signaling_messages_received_before_topic_channels_open_are_replayed_on_activa
         .handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: signal,
-            payload: server_payload(server_message::Payload::Catalog(v1::Catalog {
-                revision: 1,
-                state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
-                    participants: vec![v1::Participant {
-                        participant_id: "publisher".to_string(),
-                        participant_external_id: "publisher-external".to_string(),
-                    }],
-                    tracks: vec![v1::RemoteTrack {
-                        track_id: "video-track".to_string(),
-                        participant_id: "publisher".to_string(),
-                        kind: v1::TrackKind::Video.into(),
-                        mode: 0,
-                        label: "camera".to_string(),
-                    }],
-                })),
-            })),
+            payload: codec::encode(
+                &state::StateBatch {
+                    initial_complete: true,
+                    records: vec![
+                        grant(1),
+                        confirmed(
+                            state::resource_key::Key::Participant("publisher".into()),
+                            0,
+                            state::confirmed_state::Value::Participant(state::Participant {
+                                participant_id: "publisher".into(),
+                                participant_external_id: "publisher-external".into(),
+                            }),
+                        ),
+                        confirmed(
+                            state::resource_key::Key::Track("video-track".into()),
+                            0,
+                            state::confirmed_state::Value::Track(state::Track {
+                                track_id: "video-track".into(),
+                                participant_id: "publisher".into(),
+                                label: "camera".into(),
+                                kind: Some(state::track::Kind::Video(state::VideoTrack {
+                                    format: Some(state::CodecFormat {
+                                        codec: Some(state::codec_format::Codec::Vp8(
+                                            state::Vp8Parameters {},
+                                        )),
+                                    }),
+                                })),
+                            }),
+                        ),
+                    ],
+                },
+                validation::Direction::Server,
+            )
+            .unwrap(),
         }))
         .unwrap();
-    assert_eq!(agent.snapshot().catalog_revision, 0);
+    assert_eq!(agent.snapshot().connection, ConnectionState::ApplyingAnswer);
+    assert!(agent.snapshot().participant_id.is_none());
+    assert!(agent.snapshot().authorization_expires_at.is_none());
+    assert!(agent.snapshot().publications.is_empty());
+    assert!(agent.next_effect().is_none());
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
+        .unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert_eq!(agent.snapshot().authorization_expires_at, Some(10_001));
+    assert_eq!(
+        agent.snapshot().participants["publisher"].external_id,
+        "publisher-external"
+    );
+    assert_eq!(agent.snapshot().publications["video-track"].label, "camera");
+    assert_eq!(
+        agent.snapshot().remote_tracks["video-track"].participant_id,
+        "publisher-external"
+    );
+    let activated = agent.snapshot().clone();
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
             generation,
-            channel: topic,
+            channel: signal,
         }))
         .unwrap();
-    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-    assert_eq!(agent.snapshot().catalog_revision, 1);
-    assert_eq!(agent.snapshot().publications["video-track"].label, "camera");
+    assert_eq!(agent.snapshot(), &activated);
+    assert!(agent.next_effect().is_none());
 }
 
 #[test]
-fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
-    let (mut agent, generation, cid, send) = connected_agent();
-    acknowledge_send(&mut agent, generation, cid, send);
-    let _ = drain_notifications(&mut agent);
-    let initial = v1::Catalog {
-        revision: 1,
-        state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
-            participants: vec![v1::Participant {
-                participant_id: "publisher".to_string(),
-                participant_external_id: "publisher-external".to_string(),
-            }],
-            tracks: vec![
-                v1::RemoteTrack {
-                    track_id: "video-track".to_string(),
-                    participant_id: "publisher".to_string(),
-                    kind: v1::TrackKind::Video.into(),
-                    mode: 0,
-                    label: "camera".to_string(),
-                },
-                v1::RemoteTrack {
-                    track_id: "audio-track".to_string(),
-                    participant_id: "publisher".to_string(),
-                    kind: v1::TrackKind::Audio.into(),
-                    mode: 0,
-                    label: "microphone".to_string(),
-                },
-            ],
-        })),
+fn pending_sender_identities_preserve_the_physical_slot_until_application_withdrawal() {
+    use pulsebeam_proto::state;
+    let mut initial = desired(1);
+    initial.video.clear();
+    initial.audio = Default::default();
+    initial.audio.automatic = false;
+    let mut audio = initial.publications[0].clone();
+    audio.slot = "a0".into();
+    audio.label = "voice".into();
+    initial.publications.push(audio);
+    let mut actual = None;
+    let (mut agent, generation, channel) =
+        native_media::begin(Agent::new(config()).unwrap(), initial.clone(), |bindings| {
+            actual = Some(bindings.clone());
+            let video = bindings
+                .publications
+                .iter_mut()
+                .find(|binding| binding.mid == "lv0")
+                .unwrap();
+            video.rtcp.cname = None;
+            video.encodings[0].primary = None;
+            video.encodings[0].repair = None;
+        });
+    let available = native_media::next(&mut agent, generation, channel);
+    assert_eq!(available.len(), 1);
+    assert!(matches!(&available[0].spec().declaration,
+        Some(state::resource_spec::Declaration::Publication(publication))
+            if publication.label == "voice" && matches!(publication.kind, Some(state::publication_spec::Kind::Audio(_)))));
+    let participant = state::Participant {
+        participant_id: agent.snapshot().participant_id.clone().unwrap(),
+        participant_external_id: agent.snapshot().participant_external_id.clone().unwrap(),
     };
+    native_connection::observe(
+        &mut agent,
+        generation,
+        channel,
+        vec![available[0].installed(
+            participant.clone(),
+            native_media::track(
+                "local-voice-source",
+                &participant.participant_id,
+                "voice",
+                MediaKind::Audio,
+            ),
+        )],
+    );
+    assert!(
+        agent.next_effect().is_none(),
+        "pending facts cannot retire or reallocate the accepted physical slot"
+    );
+    initial.revision += 1;
+    initial
+        .publications
+        .retain(|publication| publication.slot != "v0");
     agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+        .command(AgentCommand::ReplaceDesired(initial))
+        .unwrap();
+    native_media::finish_retirements(&mut agent, generation, &["lv0"]);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::MediaObserved {
             generation,
-            channel: cid,
-            payload: server_payload(server_message::Payload::Catalog(initial)),
+            bindings: actual.unwrap(),
         }))
         .unwrap();
-    assert_eq!(agent.snapshot().catalog_revision, 1);
-    assert_eq!(agent.snapshot().accepted_intent_revision, 0);
+    assert!(agent.next_effect().is_none());
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+}
+
+#[test]
+fn late_sender_observations_complete_only_matching_pending_publications() {
+    let mut initial = desired(1);
+    initial.video.clear();
+    initial.audio = Default::default();
+    initial.audio.automatic = false;
+    let mut audio = initial.publications[0].clone();
+    audio.slot = "a0".into();
+    audio.label = "voice".into();
+    initial.publications.push(audio);
+    let mut actual = None;
+    let (mut agent, generation, channel) =
+        native_media::begin(Agent::new(config()).unwrap(), initial, |bindings| {
+            actual = Some(bindings.clone());
+            let video = bindings
+                .publications
+                .iter_mut()
+                .find(|binding| binding.mid == "lv0")
+                .unwrap();
+            video.rtcp.cname = None;
+            video.encodings[0].primary = None;
+            video.encodings[0].repair = None;
+        });
+    let available = native_media::next(&mut agent, generation, channel);
+    assert_eq!(available.len(), 1);
+    let participant = pulsebeam_proto::state::Participant {
+        participant_id: agent.snapshot().participant_id.clone().unwrap(),
+        participant_external_id: agent.snapshot().participant_external_id.clone().unwrap(),
+    };
+    native_connection::observe(
+        &mut agent,
+        generation,
+        channel,
+        vec![available[0].installed(
+            participant.clone(),
+            native_media::track(
+                "local-voice",
+                &participant.participant_id,
+                "voice",
+                MediaKind::Audio,
+            ),
+        )],
+    );
+    let actual = actual.unwrap();
+    let mut ids = crate::id::IdGenerator::new();
+    let mut wrong_generation = ids.generation();
+    if wrong_generation == generation {
+        wrong_generation = ids.generation();
+    }
+    let mut wrong_mid = actual.clone();
+    wrong_mid
+        .publications
+        .iter_mut()
+        .find(|binding| binding.mid == "lv0")
+        .unwrap()
+        .mid = "unowned".into();
+    let mut pending = actual.clone();
+    pending
+        .publications
+        .iter_mut()
+        .find(|binding| binding.mid == "lv0")
+        .unwrap()
+        .rtcp
+        .cname = None;
+    for (generation, bindings) in [
+        (wrong_generation, actual.clone()),
+        (generation, wrong_mid),
+        (generation, pending),
+    ] {
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::MediaObserved {
+                generation,
+                bindings,
+            }))
+            .unwrap();
+        assert!(agent.next_effect().is_none());
+    }
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::MediaObserved {
+            generation,
+            bindings: actual.clone(),
+        }))
+        .unwrap();
+    let targets = native_media::next(&mut agent, generation, channel);
+    assert_eq!(targets.len(), 1);
+    let Some(pulsebeam_proto::state::resource_spec::Declaration::Publication(publication)) =
+        &targets[0].spec().declaration
+    else {
+        panic!("publication")
+    };
+    assert_eq!(publication.label, "camera");
+    let Some(pulsebeam_proto::state::publication_spec::Kind::Video(video)) = &publication.kind
+    else {
+        panic!("video")
+    };
+    let Some(pulsebeam_proto::state::track_binding::Transport::Rtp(rtp)) = video
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.transport.as_ref())
+    else {
+        panic!("RTP")
+    };
+    let observed = actual
+        .publications
+        .iter()
+        .find(|binding| binding.mid == "lv0")
+        .unwrap();
+    assert_eq!(rtp.encodings[0].ssrc, observed.encodings[0].primary);
+    assert_eq!(rtp.encodings[0].rtx_ssrc, observed.encodings[0].repair);
+    assert_eq!(
+        rtp.rtcp.as_ref().unwrap().cname,
+        observed.rtcp.cname.as_deref().unwrap()
+    );
+    let mut changed = actual;
+    changed
+        .publications
+        .iter_mut()
+        .find(|binding| binding.mid == "lv0")
+        .unwrap()
+        .encodings[0]
+        .primary = Some(123456);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::MediaObserved {
+            generation,
+            bindings: changed,
+        }))
+        .unwrap();
+    assert!(
+        agent.next_effect().is_none(),
+        "observations cannot reinterpret admitted source identities"
+    );
+}
+
+#[test]
+fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
+    use native_connection::{confirmed, observe};
+    use pulsebeam_proto::state;
+
+    let (mut agent, generation, channel, targets) = native_media::connected();
+    drain_notifications(&mut agent);
+    let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
     assert_eq!(agent.snapshot().participants.len(), 1);
     assert_eq!(agent.snapshot().publications.len(), 2);
     assert_eq!(
@@ -1959,292 +2267,260 @@ fn signaling_snapshot_diff_and_empty_binding_groups_are_exact() {
         agent.snapshot().publications["audio-track"].label,
         "microphone"
     );
+    assert!(agent.snapshot().video_mapping.is_empty());
+    assert!(agent.snapshot().audio_mapping.is_empty());
+    assert!(agent.next_effect().is_none());
+    assert_eq!(targets.len(), 2);
+    let installations = targets
+        .iter()
+        .map(|target| target.receiver_installed(&participant, &tracks))
+        .collect();
+    observe(&mut agent, generation, channel, installations);
+    assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
+    assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
+    assert!(drain_notifications(&mut agent).contains(&Notification::SnapshotChanged));
+    assert!(agent.next_effect().is_none());
+
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        targets
+            .iter()
+            .map(|target| {
+                confirmed(
+                    state::resource_key::Key::Owned(target.reference),
+                    target.desired.revision,
+                    state::confirmed_state::Value::Absent(state::AbsentState {
+                        reason: state::AbsenceReason::SourceEnded as i32,
+                    }),
+                )
+            })
+            .collect(),
+    );
+    assert!(agent.snapshot().video_mapping.is_empty());
+    assert!(agent.snapshot().audio_mapping.is_empty());
+    assert_eq!(agent.snapshot().publications.len(), 2);
+    let mut withdrawal = tracks
+        .iter()
+        .map(|track| {
+            confirmed(
+                state::resource_key::Key::Track(track.track_id.clone()),
+                0,
+                state::confirmed_state::Value::Absent(state::AbsentState {
+                    reason: state::AbsenceReason::Removed as i32,
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    withdrawal.push(confirmed(
+        state::resource_key::Key::Participant(participant.participant_id),
+        0,
+        state::confirmed_state::Value::Absent(state::AbsentState {
+            reason: state::AbsenceReason::Removed as i32,
+        }),
+    ));
+    observe(&mut agent, generation, channel, withdrawal);
+    assert!(
+        agent.next_effect().is_none(),
+        "source absence does not release logical receive ownership"
+    );
+    let mut waiting = desired(2);
+    waiting.video[0].track_id = "future-video".into();
     agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel: cid,
-            payload: server_payload(server_message::Payload::Mapping(v1::Mapping {
-                intent_revision: 1,
-                video: Some(v1::TrackMappings {
-                    tracks: vec![v1::TrackMapping {
-                        receiver_index: 4,
-                        track_id: "video-track".to_string(),
-                    }],
-                }),
-                audio: Some(v1::TrackMappings {
-                    tracks: vec![v1::TrackMapping {
-                        receiver_index: 2,
-                        track_id: "audio-track".to_string(),
-                    }],
-                }),
-            })),
-        }))
+        .command(AgentCommand::ReplaceDesired(waiting))
         .unwrap();
-    assert_eq!(agent.snapshot().accepted_intent_revision, 1);
+    assert!(
+        agent.next_effect().is_none(),
+        "an unknown replacement parks the still-owned receiver"
+    );
+    let mut stopped = desired(3);
+    stopped.video.clear();
+    stopped.audio = AudioSubscription::default();
+    agent
+        .command(AgentCommand::ReplaceDesired(stopped))
+        .unwrap();
+    native_media::finish_retirements(&mut agent, generation, &["ra0", "rv0"]);
+    assert!(agent.snapshot().participants.is_empty());
+    assert!(agent.snapshot().publications.is_empty());
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert!(agent.next_effect().is_none());
+}
+
+#[test]
+fn partial_native_observations_preserve_other_receivers_and_declared_desire() {
+    use pulsebeam_proto::state;
+
+    let (mut agent, generation, channel, targets) = native_media::connected();
+    let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
+    for target in &targets {
+        native_connection::observe(
+            &mut agent,
+            generation,
+            channel,
+            vec![target.receiver_installed(&participant, &tracks)],
+        );
+    }
+    assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
+    assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
+    let video = targets
+        .iter()
+        .find(|target| {
+            matches!(&target.spec().declaration,
+            Some(state::resource_spec::Declaration::Subscription(subscription))
+                if subscription.kind == state::TrackKind::Video as i32)
+        })
+        .unwrap();
+    let installed = video.installed(participant, tracks[0].clone());
+    let mut waiting = installed.clone();
+    let Some(state::state_record::State::Confirmed(confirmation)) = &mut waiting.state else {
+        panic!("confirmation")
+    };
+    let Some(state::confirmed_state::Value::Owned(live)) = &mut confirmation.value else {
+        panic!("owned receiver")
+    };
+    live.execution = state::ExecutionStatus::WaitingForSource as i32;
+    native_connection::observe(&mut agent, generation, channel, vec![waiting]);
+    assert!(agent.snapshot().video_mapping.is_empty());
+    assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
+    agent
+        .command(AgentCommand::ReplaceDesired(desired(1)))
+        .unwrap();
+    assert!(agent.next_effect().is_none());
+    native_connection::observe(&mut agent, generation, channel, vec![installed]);
     assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     assert_eq!(agent.snapshot().publications.len(), 2);
-    assert!(drain_notifications(&mut agent).contains(&Notification::SnapshotChanged));
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert!(agent.next_effect().is_none());
+}
 
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel: cid,
-            payload: server_payload(server_message::Payload::Mapping(v1::Mapping {
-                intent_revision: 1,
-                video: Some(v1::TrackMappings { tracks: vec![] }),
-                audio: Some(v1::TrackMappings { tracks: vec![] }),
-            })),
-        }))
-        .unwrap();
-    assert!(agent.snapshot().video_mapping.is_empty());
-    assert!(agent.snapshot().audio_mapping.is_empty());
-    assert_eq!(
-        drain_notifications(&mut agent),
-        vec![Notification::SnapshotChanged]
+#[test]
+fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
+    use native_connection::{confirmed, observe};
+    use pulsebeam_proto::state;
+
+    let (mut agent, generation, channel, targets) = native_media::connected();
+    let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        targets
+            .iter()
+            .map(|target| target.receiver_installed(&participant, &tracks))
+            .collect(),
     );
-
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel: cid,
-            payload: server_payload(server_message::Payload::Catalog(v1::Catalog {
-                revision: 2,
-                state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
-                    removed_participant_ids: vec!["publisher".to_string()],
-                    ..Default::default()
-                })),
-            })),
-        }))
-        .unwrap();
+    let mut withdrawals = tracks
+        .iter()
+        .map(|track| {
+            confirmed(
+                state::resource_key::Key::Track(track.track_id.clone()),
+                0,
+                state::confirmed_state::Value::Absent(state::AbsentState {
+                    reason: state::AbsenceReason::Removed as i32,
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    withdrawals.push(confirmed(
+        state::resource_key::Key::Participant(participant.participant_id.clone()),
+        0,
+        state::confirmed_state::Value::Absent(state::AbsentState {
+            reason: state::AbsenceReason::Removed as i32,
+        }),
+    ));
+    observe(&mut agent, generation, channel, withdrawals);
     assert!(agent.snapshot().participants.is_empty());
     assert!(agent.snapshot().publications.is_empty());
-}
-
-#[test]
-fn mapping_omission_retains_desire_until_a_subsequent_mapping() {
-    let (mut agent, generation, cid, send) = connected_agent();
-    acknowledge_send(&mut agent, generation, cid, send);
-    let deliver = |agent: &mut Agent, payload: server_message::Payload| {
-        agent
-            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-                generation,
-                channel: cid,
-                payload: server_payload(payload),
-            }))
-            .unwrap();
-    };
-    deliver(
-        &mut agent,
-        server_message::Payload::Catalog(v1::Catalog {
-            revision: 1,
-            state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
-                participants: vec![v1::Participant {
-                    participant_id: "publisher".into(),
-                    participant_external_id: "publisher-external".into(),
-                }],
-                tracks: ["audio-track", "audio-second"]
-                    .into_iter()
-                    .map(|id| v1::RemoteTrack {
-                        track_id: id.into(),
-                        participant_id: "publisher".into(),
-                        kind: v1::TrackKind::Audio.into(),
-                        mode: 0,
-                        label: id.into(),
-                    })
-                    .collect(),
-            })),
-        }),
-    );
-    let mut selected = desired(2);
-    selected.audio.pinned.push("audio-second".into());
-    agent
-        .command(AgentCommand::ReplaceDesired(selected))
-        .unwrap();
-    let Effect::DataChannel(DataChannelEffect::Send {
-        operation, payload, ..
-    }) = next_effect(&mut agent)
-    else {
-        panic!("expected A+B intent");
-    };
-    let audio = decode_intent(&payload)
-        .receive
-        .unwrap()
-        .audio
-        .unwrap()
-        .tracks;
-    assert_eq!(audio.len(), 2);
-    assert_eq!(audio[0].track_id, "audio-track");
-    assert_eq!(audio[1].track_id, "audio-second");
-    acknowledge_send(&mut agent, generation, cid, operation);
-    for (id, expected) in [
-        ("audio-track", "audio-track"),
-        ("audio-second", "audio-second"),
-    ] {
-        deliver(
-            &mut agent,
-            server_message::Payload::Mapping(v1::Mapping {
-                intent_revision: 2,
-                video: Some(v1::TrackMappings { tracks: vec![] }),
-                audio: Some(v1::TrackMappings {
-                    tracks: vec![v1::TrackMapping {
-                        receiver_index: 2,
-                        track_id: id.into(),
-                    }],
-                }),
-            }),
-        );
-        assert_eq!(agent.snapshot().audio_mapping[&2], expected);
-        assert_eq!(agent.snapshot().publications.len(), 2);
-        assert!(agent.next_effect().is_none());
-    }
-    deliver(
-        &mut agent,
-        server_message::Payload::Mapping(v1::Mapping {
-            intent_revision: 2,
-            video: Some(v1::TrackMappings { tracks: vec![] }),
-            audio: Some(v1::TrackMappings { tracks: vec![] }),
-        }),
-    );
-    assert!(agent.snapshot().audio_mapping.is_empty());
-    assert_eq!(agent.snapshot().publications.len(), 2);
-    assert!(agent.next_effect().is_none());
-}
-
-#[test]
-fn catalog_removal_retracts_direct_video_and_pinned_audio_intent() {
-    let (mut agent, generation, cid, send) = connected_agent();
-    acknowledge_send(&mut agent, generation, cid, send);
-    let deliver = |agent: &mut Agent, catalog: v1::Catalog| {
-        agent
-            .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-                generation,
-                channel: cid,
-                payload: server_payload(server_message::Payload::Catalog(catalog)),
-            }))
-            .unwrap();
-    };
-    deliver(
-        &mut agent,
-        v1::Catalog {
-            revision: 1,
-            state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
-                participants: vec![v1::Participant {
-                    participant_id: "publisher".into(),
-                    participant_external_id: "publisher-external".into(),
-                }],
-                tracks: vec![
-                    v1::RemoteTrack {
-                        track_id: "video-track".into(),
-                        participant_id: "publisher".into(),
-                        kind: v1::TrackKind::Video.into(),
-                        mode: 0,
-                        label: "camera".into(),
-                    },
-                    v1::RemoteTrack {
-                        track_id: "audio-track".into(),
-                        participant_id: "publisher".into(),
-                        kind: v1::TrackKind::Audio.into(),
-                        mode: 0,
-                        label: "microphone".into(),
-                    },
-                ],
-            })),
-        },
-    );
-    assert!(agent.next_effect().is_none());
-    deliver(
-        &mut agent,
-        v1::Catalog {
-            revision: 2,
-            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
-                removed_track_ids: vec!["video-track".into(), "audio-track".into()],
-                ..Default::default()
-            })),
-        },
-    );
-    let Effect::DataChannel(DataChannelEffect::Send {
-        operation, payload, ..
-    }) = next_effect(&mut agent)
-    else {
-        panic!("expected retracted intent");
-    };
-    let receive = decode_intent(&payload).receive.unwrap();
-    assert!(receive.video.unwrap().tracks.is_empty());
-    assert!(receive.audio.unwrap().tracks.is_empty());
-    acknowledge_send(&mut agent, generation, cid, operation);
-    assert!(agent.next_effect().is_none());
-
-    deliver(
-        &mut agent,
-        v1::Catalog {
-            revision: 3,
-            state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
-                added_tracks: vec![v1::RemoteTrack {
-                    track_id: "video-track".into(),
-                    participant_id: "publisher".into(),
-                    kind: v1::TrackKind::Video.into(),
-                    mode: 0,
-                    label: "camera".into(),
-                }],
-                ..Default::default()
-            })),
-        },
-    );
+    assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
+    assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     assert!(agent.next_effect().is_none());
     let mut changed = desired(2);
     changed.video[0].height = 1080;
     agent
+        .command(AgentCommand::ReplaceDesired(changed.clone()))
+        .unwrap();
+    let updated = native_media::next(&mut agent, generation, channel);
+    assert_eq!(updated.len(), 1);
+    let video = targets
+        .iter()
+        .find(|target| {
+            matches!(&target.spec().declaration,
+            Some(state::resource_spec::Declaration::Subscription(subscription))
+                if subscription.kind == state::TrackKind::Video as i32)
+        })
+        .unwrap();
+    assert_eq!(updated[0].reference, video.reference);
+    assert_eq!(updated[0].spec().declaration, video.spec().declaration);
+    assert!(
+        matches!(&updated[0].spec().settings.as_ref().unwrap().receive,
+        Some(state::resource_settings::Receive::Video(options)) if options.max_height == Some(1080))
+    );
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        vec![updated[0].receiver_installed(&participant, &tracks)],
+    );
+    native_media::discover_receivers(&mut agent, generation, channel);
+    assert!(agent.next_effect().is_none());
+    assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
+    assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
+    changed.revision = 3;
+    changed.video.clear();
+    changed.audio.pinned.clear();
+    changed.audio.automatic = false;
+    agent
         .command(AgentCommand::ReplaceDesired(changed))
         .unwrap();
-    let Effect::DataChannel(DataChannelEffect::Send {
-        operation, payload, ..
-    }) = next_effect(&mut agent)
-    else {
-        panic!("expected intent after unrelated policy change");
-    };
+    let retired = native_media::next(&mut agent, generation, channel);
+    assert_eq!(retired.len(), 2);
+    for target in &retired {
+        assert!(
+            targets
+                .iter()
+                .any(|previous| previous.reference == target.reference)
+        );
+        assert_eq!(
+            target.desired.value,
+            Some(state::desired_state::Value::Absent(true))
+        );
+    }
     assert!(
-        decode_intent(&payload)
-            .receive
-            .unwrap()
-            .video
-            .unwrap()
-            .tracks
-            .is_empty()
+        agent.next_effect().is_none(),
+        "physical retirement waits for authoritative cutoff"
     );
-    acknowledge_send(&mut agent, generation, cid, operation);
-    let mut cleared = desired(3);
-    cleared.video.clear();
-    cleared.audio.pinned.clear();
-    agent
-        .command(AgentCommand::ReplaceDesired(cleared))
-        .unwrap();
-    let Effect::DataChannel(DataChannelEffect::Send { operation, .. }) = next_effect(&mut agent)
-    else {
-        panic!("expected cleared desire");
-    };
-    acknowledge_send(&mut agent, generation, cid, operation);
-    let mut fresh = desired(4);
-    fresh.audio.pinned.clear();
-    agent.command(AgentCommand::ReplaceDesired(fresh)).unwrap();
-    let Effect::DataChannel(DataChannelEffect::Send { payload, .. }) = next_effect(&mut agent)
-    else {
-        panic!("expected fresh explicit selection");
-    };
-    assert_eq!(
-        decode_intent(&payload)
-            .receive
-            .unwrap()
-            .video
-            .unwrap()
-            .tracks[0]
-            .track_id,
-        "video-track"
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        retired
+            .iter()
+            .map(|target| {
+                confirmed(
+                    state::resource_key::Key::Owned(target.reference),
+                    target.desired.revision,
+                    state::confirmed_state::Value::Absent(state::AbsentState {
+                        reason: state::AbsenceReason::Removed as i32,
+                    }),
+                )
+            })
+            .collect(),
     );
+    native_media::finish_retirements(&mut agent, generation, &["ra0", "rv0"]);
+    assert!(agent.snapshot().video_mapping.is_empty());
+    assert!(agent.snapshot().audio_mapping.is_empty());
+    assert_eq!(agent.snapshot().publications.len(), 2);
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert!(agent.next_effect().is_none());
 }
 
 #[test]
-fn catalog_selectors_remain_unresolved_then_follow_canonical_track_changes() {
+fn native_selectors_retarget_the_owned_receiver_after_source_cutoff() {
+    use native_connection::{confirmed, observe};
+    use pulsebeam_proto::state;
     for owned in [false, true] {
         let mut selected = desired(1);
         selected.video[0].track_id.clear();
@@ -2293,229 +2569,299 @@ fn catalog_selectors_remain_unresolved_then_follow_canonical_track_changes() {
         } else {
             None
         };
-        let cid = channel(9);
-        let (generation, operation) = begin_connect(&mut agent, selected, cid);
-        let send = finish_connect(&mut agent, generation, operation, cid);
-        acknowledge_send(&mut agent, generation, cid, send);
-
-        let deliver = |agent: &mut Agent, catalog: v1::Catalog| {
-            agent
-                .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-                    generation,
-                    channel: cid,
-                    payload: server_payload(server_message::Payload::Catalog(catalog)),
-                }))
-                .unwrap();
+        let (mut agent, generation, channel, unresolved) =
+            native_media::connected_with(agent, selected);
+        assert!(unresolved.is_empty());
+        let participant = state::Participant {
+            participant_id: "remote".into(),
+            participant_external_id: "remote-user".into(),
         };
-        deliver(
+        observe(
             &mut agent,
-            v1::Catalog {
-                revision: 1,
-                state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
-                    participants: vec![v1::Participant {
-                        participant_id: "remote".to_string(),
-                        participant_external_id: "remote-user".to_string(),
-                    }],
-                    tracks: vec![],
-                })),
-            },
+            generation,
+            channel,
+            vec![confirmed(
+                state::resource_key::Key::Participant(participant.participant_id.clone()),
+                0,
+                state::confirmed_state::Value::Participant(participant.clone()),
+            )],
         );
         assert!(agent.next_effect().is_none());
-
-        deliver(
+        let tracks = [
+            native_media::track("video-one", "remote", "camera", MediaKind::Video),
+            native_media::track("audio-one", "remote", "microphone", MediaKind::Audio),
+        ];
+        observe(
             &mut agent,
-            v1::Catalog {
-                revision: 2,
-                state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
-                    added_tracks: vec![
-                        v1::RemoteTrack {
-                            track_id: "video-one".to_string(),
-                            participant_id: "remote".to_string(),
-                            kind: v1::TrackKind::Video.into(),
-                            mode: 0,
-                            label: "camera".to_string(),
-                        },
-                        v1::RemoteTrack {
-                            track_id: "audio-one".to_string(),
-                            participant_id: "remote".to_string(),
-                            kind: v1::TrackKind::Audio.into(),
-                            mode: 0,
-                            label: "microphone".to_string(),
-                        },
-                    ],
-                    ..Default::default()
-                })),
-            },
+            generation,
+            channel,
+            tracks
+                .iter()
+                .map(|track| {
+                    confirmed(
+                        state::resource_key::Key::Track(track.track_id.clone()),
+                        0,
+                        state::confirmed_state::Value::Track(track.clone()),
+                    )
+                })
+                .collect(),
         );
-        let Effect::DataChannel(DataChannelEffect::Send {
-            operation, payload, ..
-        }) = next_effect(&mut agent)
-        else {
-            panic!("expected resolved intent");
-        };
-        let receive = decode_intent(&payload).receive.unwrap();
-        assert_eq!(receive.video.unwrap().tracks[0].track_id, "video-one");
-        let audio = receive.audio.unwrap().tracks;
-        assert_eq!(audio[0].track_id, "audio-one");
-        let delay = audio[0]
-            .options
-            .as_ref()
-            .unwrap()
-            .playout_delay
-            .as_ref()
+        let resolved = native_media::next(&mut agent, generation, channel);
+        assert_eq!(resolved.len(), 2);
+        for target in &resolved {
+            let Some(state::resource_spec::Declaration::Subscription(subscription)) =
+                &target.spec().declaration
+            else {
+                panic!("resolved receiver")
+            };
+            match state::TrackKind::try_from(subscription.kind).unwrap() {
+                state::TrackKind::Video => assert_eq!(subscription.track_id, "video-one"),
+                state::TrackKind::Audio => {
+                    assert_eq!(subscription.track_id, "audio-one");
+                    assert!(matches!(&target.spec().settings.as_ref().unwrap().receive,
+                        Some(state::resource_settings::Receive::Audio(options))
+                            if options.playout_delay == Some(state::PlayoutDelay { min_ms: 0, max_ms: 0 })));
+                }
+                _ => panic!("media receiver"),
+            }
+        }
+        let video = resolved
+            .iter()
+            .find(|target| {
+                matches!(&target.spec().declaration,
+            Some(state::resource_spec::Declaration::Subscription(subscription))
+                if subscription.kind == state::TrackKind::Video as i32)
+            })
             .unwrap();
-        assert_eq!((delay.min_ms, delay.max_ms), (0, 0));
-        acknowledge_send(&mut agent, generation, cid, operation);
-
-        deliver(
+        observe(
             &mut agent,
-            v1::Catalog {
-                revision: 3,
-                state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
-                    removed_track_ids: vec!["video-one".to_string()],
-                    ..Default::default()
-                })),
-            },
+            generation,
+            channel,
+            vec![video.receiver_installed(&participant, &tracks)],
         );
-        let Effect::DataChannel(DataChannelEffect::Send {
-            operation, payload, ..
+        assert_eq!(agent.snapshot().video_mapping[&4], "video-one");
+        let replacement = native_media::track("video-two", "remote", "camera", MediaKind::Video);
+        observe(
+            &mut agent,
+            generation,
+            channel,
+            vec![
+                confirmed(
+                    state::resource_key::Key::Track("video-one".into()),
+                    0,
+                    state::confirmed_state::Value::Absent(state::AbsentState {
+                        reason: state::AbsenceReason::Removed as i32,
+                    }),
+                ),
+                confirmed(
+                    state::resource_key::Key::Track(replacement.track_id.clone()),
+                    0,
+                    state::confirmed_state::Value::Track(replacement.clone()),
+                ),
+            ],
+        );
+        assert_eq!(agent.snapshot().video_mapping[&4], "video-one");
+        assert!(
+            agent.next_effect().is_none(),
+            "discovery changes do not end the installed source"
+        );
+        observe(
+            &mut agent,
+            generation,
+            channel,
+            vec![confirmed(
+                state::resource_key::Key::Owned(video.reference),
+                video.desired.revision,
+                state::confirmed_state::Value::Absent(state::AbsentState {
+                    reason: state::AbsenceReason::SourceEnded as i32,
+                }),
+            )],
+        );
+        assert!(agent.snapshot().video_mapping.is_empty());
+        let Effect::Rtc(RtcEffect::AllocateMedia {
+            operation, mode, ..
         }) = next_effect(&mut agent)
         else {
-            panic!("expected cleared video intent");
+            panic!("receiver retarget")
+        };
+        assert_eq!(mode, client_sdp::AllocationMode::RetargetReceiver);
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
+                generation,
+                operation,
+                slots: Vec::new(),
+                outcome: client_sdp::ApplyOutcome::NotApplied,
+                preparation: Err(client_sdp::Error::Observation),
+            }))
+            .unwrap();
+        assert!(
+            agent.next_effect().is_none(),
+            "failed target parks without stopping its physical receiver"
+        );
+        let replacement = native_media::track("video-three", "remote", "camera", MediaKind::Video);
+        observe(
+            &mut agent,
+            generation,
+            channel,
+            vec![
+                confirmed(
+                    state::resource_key::Key::Track("video-two".into()),
+                    0,
+                    state::confirmed_state::Value::Absent(state::AbsentState {
+                        reason: state::AbsenceReason::Removed as i32,
+                    }),
+                ),
+                confirmed(
+                    state::resource_key::Key::Track(replacement.track_id.clone()),
+                    0,
+                    state::confirmed_state::Value::Track(replacement.clone()),
+                ),
+            ],
+        );
+        let assigned = SlotBinding {
+            slot: MediaSlot::RemoteVideo(0),
+            mid: "rv0".into(),
+            media_index: 4,
+            kind: MediaKind::Video,
+            direction: MediaDirection::ReceiveOnly,
+        };
+        native_media::finish_retarget(&mut agent, generation, assigned);
+        let fresh = native_media::next(&mut agent, generation, channel);
+        assert_eq!(fresh.len(), 1);
+        assert!(fresh[0].reference > video.reference);
+        let Some(state::resource_spec::Declaration::Subscription(subscription)) =
+            &fresh[0].spec().declaration
+        else {
+            panic!("replacement receiver")
+        };
+        assert_eq!(subscription.track_id, "video-three");
+        let Some(state::resource_spec::Declaration::Subscription(previous)) =
+            &video.spec().declaration
+        else {
+            panic!("previous receiver")
+        };
+        let Some(state::track_binding::Transport::Rtp(previous)) = previous
+            .binding
+            .as_ref()
+            .and_then(|binding| binding.transport.as_ref())
+        else {
+            panic!("previous RTP facts")
         };
         assert!(
-            decode_intent(&payload)
-                .receive
-                .unwrap()
-                .video
-                .unwrap()
-                .tracks
-                .is_empty()
+            matches!(subscription.binding.as_ref().and_then(|binding| binding.transport.as_ref()),
+            Some(state::track_binding::Transport::Rtp(rtp)) if rtp.mid == "rv0" && rtp.encodings.iter().all(|encoding| previous.encodings.iter().all(|old| old.ssrc != encoding.ssrc)))
         );
-        acknowledge_send(&mut agent, generation, cid, operation);
-
-        deliver(
+        observe(
             &mut agent,
-            v1::Catalog {
-                revision: 4,
-                state: Some(v1::catalog::State::Delta(v1::CatalogDelta {
-                    added_tracks: vec![v1::RemoteTrack {
-                        track_id: "video-two".to_string(),
-                        participant_id: "remote".to_string(),
-                        kind: v1::TrackKind::Video.into(),
-                        mode: 0,
-                        label: "camera".to_string(),
-                    }],
-                    ..Default::default()
-                })),
-            },
+            generation,
+            channel,
+            vec![fresh[0].installed(participant, replacement)],
         );
-        let Effect::DataChannel(DataChannelEffect::Send {
-            operation, payload, ..
-        }) = next_effect(&mut agent)
-        else {
-            panic!("expected re-resolved video intent");
-        };
-        assert_eq!(
-            decode_intent(&payload)
-                .receive
-                .unwrap()
-                .video
-                .unwrap()
-                .tracks[0]
-                .track_id,
-            "video-two"
-        );
-        acknowledge_send(&mut agent, generation, cid, operation);
+        assert_eq!(agent.snapshot().video_mapping[&4], "video-three");
+        assert!(!agent.snapshot().video_mapping.contains_key(&5));
         assert!(agent.next_effect().is_none());
         if let Some(owner) = view {
             agent.resource(ResourceCommand::Release { owner }).unwrap();
-            let Effect::DataChannel(DataChannelEffect::Send { payload, .. }) =
-                next_effect(&mut agent)
-            else {
-                panic!("withdrawn view intent")
-            };
-            assert!(
-                decode_intent(&payload)
-                    .receive
-                    .unwrap()
-                    .video
-                    .unwrap()
-                    .tracks
-                    .is_empty()
+            let withdrawn = native_media::next(&mut agent, generation, channel);
+            assert_eq!(withdrawn.len(), 1);
+            assert_eq!(withdrawn[0].reference, fresh[0].reference);
+            assert_eq!(
+                withdrawn[0].desired.value,
+                Some(state::desired_state::Value::Absent(true))
             );
         }
+        assert_eq!(agent.snapshot().generation, Some(generation));
+        assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+        assert!(agent.next_effect().is_none());
     }
 }
 
 #[test]
-fn malformed_signaling_is_transactional_and_fences_an_in_flight_replacement() {
-    let (mut agent, generation, cid, send) = connected_agent();
-    acknowledge_send(&mut agent, generation, cid, send);
-    let mut changed = desired(2);
-    changed
-        .topics
-        .publishers
-        .push(publisher("chat", TopicMode::Ordered));
+fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
+    use pulsebeam_proto::state;
+    let (mut agent, generation, control) = native_connection::connected(Default::default());
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![
+            native_connection::confirmed(
+                state::resource_key::Key::Participant("remote".into()),
+                0,
+                state::confirmed_state::Value::Participant(state::Participant {
+                    participant_id: "remote".into(),
+                    participant_external_id: "stable-external".into(),
+                }),
+            ),
+            native_connection::confirmed(
+                state::resource_key::Key::Track("video-track".into()),
+                0,
+                state::confirmed_state::Value::Track(state::Track {
+                    track_id: "video-track".into(),
+                    participant_id: "remote".into(),
+                    label: "camera".into(),
+                    kind: Some(state::track::Kind::Video(state::VideoTrack {
+                        format: Some(state::CodecFormat {
+                            codec: Some(state::codec_format::Codec::Vp8(state::Vp8Parameters {})),
+                        }),
+                    })),
+                }),
+            ),
+        ],
+    );
     agent
-        .command(AgentCommand::ReplaceDesired(changed))
+        .command(AgentCommand::RenewAuthorization("new-secret".into()))
         .unwrap();
-    let (replacement, topic_label) = match next_effect(&mut agent) {
-        Effect::Rtc(RtcEffect::CreateOffer {
-            generation,
-            data_channels,
-            ..
-        }) => (generation, data_channels[1].label.clone()),
-        effect => panic!("expected replacement offer, got {effect:?}"),
+    let Effect::Http(HttpEffect::Request {
+        operation, request, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("PATCH")
     };
-    let mut replacement_resources = resources(channel(13));
-    replacement_resources
-        .data_channels
-        .push(DataChannelBinding {
-            label: topic_label,
-            channel: channel(14),
-        });
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
-            generation: replacement,
-            offer: offer(),
-            resources: replacement_resources,
-        }))
-        .unwrap();
-    let operation = match next_effect(&mut agent) {
-        Effect::Http(HttpEffect::Request { operation, .. }) => operation,
-        effect => panic!("expected replacement request, got {effect:?}"),
-    };
+    assert_eq!(request.method, HttpMethod::Patch);
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![native_connection::grant(2)],
+    );
     let before = agent.snapshot().clone();
-    let malformed = v1::Catalog {
-        revision: 1,
-        state: Some(v1::catalog::State::Snapshot(v1::CatalogSnapshot {
-            participants: vec![
-                v1::Participant {
-                    participant_id: "duplicate".to_string(),
-                    participant_external_id: "a".to_string(),
-                },
-                v1::Participant {
-                    participant_id: "duplicate".to_string(),
-                    participant_external_id: "b".to_string(),
-                },
-            ],
-            tracks: vec![],
-        })),
-    };
+    assert_eq!(before.participants.len(), 1);
+    assert_eq!(before.publications.len(), 1);
+    let malformed = state::StateBatch {
+        records: ["first", "second"]
+            .into_iter()
+            .map(|external| {
+                native_connection::confirmed(
+                    state::resource_key::Key::Participant("prospective".into()),
+                    0,
+                    state::confirmed_state::Value::Participant(state::Participant {
+                        participant_id: "prospective".into(),
+                        participant_external_id: external.into(),
+                    }),
+                )
+            })
+            .collect(),
+        initial_complete: false,
+    }
+    .encode_to_vec();
     assert!(matches!(
         agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
-            channel: cid,
-            payload: server_payload(server_message::Payload::Catalog(malformed)),
+            channel: control,
+            payload: malformed,
         })),
-        Err(AgentError::InvalidSignaling(SignalingError::Invalid(
-            "catalog"
-        )))
+        Err(AgentError::InvalidSignaling(SignalingError::Malformed))
     ));
     assert_eq!(agent.snapshot().participants, before.participants);
     assert_eq!(agent.snapshot().publications, before.publications);
+    assert_eq!(agent.snapshot().remote_tracks, before.remote_tracks);
     assert_eq!(agent.snapshot().video_mapping, before.video_mapping);
+    assert_eq!(agent.snapshot().audio_mapping, before.audio_mapping);
+    assert_eq!(
+        agent.snapshot().authorization_expires_at,
+        before.authorization_expires_at
+    );
     assert_eq!(
         agent.snapshot().connection,
         ConnectionState::TerminalFailure
@@ -2525,10 +2871,123 @@ fn malformed_signaling_is_transactional_and_fences_an_in_flight_replacement() {
             .snapshot()
             .terminal_failure
             .as_ref()
-            .map(|failure| &failure.class),
-        Some(&FailureClass::Protocol)
+            .map(|failure| failure.class),
+        Some(FailureClass::Protocol)
     );
-    let failure = agent.snapshot().terminal_failure.clone();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Http(HttpEffect::Cancel { operation })
+    );
+    assert!(agent.next_effect().is_none());
+    let terminal = agent.snapshot().clone();
+    drain_notifications(&mut agent);
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![HttpHeader {
+                    name: "ETag".into(),
+                    value: "\"auth-2\"".into(),
+                }],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![native_connection::grant(3)],
+    );
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
+        .unwrap();
+    assert_eq!(agent.snapshot(), &terminal);
+    assert!(agent.next_effect().is_none());
+    assert!(agent.next_notification().is_none());
+    agent.command(AgentCommand::Reconnect).unwrap();
+    let Effect::Rtc(RtcEffect::CreateOffer {
+        generation: replacement,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("explicit recovery")
+    };
+    assert_ne!(replacement, generation);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation: replacement,
+            offer: native_connection::OFFER.into(),
+            resources: OfferResources {
+                slots: vec![],
+                signaling_channel: channel(13),
+                data_channels: vec![],
+            },
+        }))
+        .unwrap();
+    let Effect::Http(HttpEffect::Request { request, .. }) = next_effect(&mut agent) else {
+        panic!("POST")
+    };
+    assert_eq!(request.method, HttpMethod::Post);
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|header| header.name == "Authorization" && header.value == "Bearer private-token"),
+        "late renewal cannot replace committed credentials"
+    );
+}
+
+#[test]
+fn cancelled_native_replacement_cleans_orphaned_http_resources_without_activating() {
+    let (mut agent, old, control) = native_connection::connected(Default::default());
+    agent.command(AgentCommand::Reconnect).unwrap();
+    let Effect::Rtc(RtcEffect::CreateOffer {
+        generation: replacement,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("replacement")
+    };
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation: replacement,
+            offer: native_connection::OFFER.into(),
+            resources: OfferResources {
+                slots: vec![],
+                signaling_channel: channel(14),
+                data_channels: vec![],
+            },
+        }))
+        .unwrap();
+    let Effect::Http(HttpEffect::Request {
+        operation, request, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("POST")
+    };
+    assert_eq!(request.method, HttpMethod::Post);
+    let pending = agent.snapshot().clone();
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation: old,
+            channel: control,
+            payload: vec![0xff],
+        }))
+        .unwrap();
+    assert_eq!(
+        agent.snapshot(),
+        &pending,
+        "fenced incumbent cannot poison a candidate"
+    );
+    assert!(agent.next_effect().is_none());
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            ..Default::default()
+        }))
+        .unwrap();
     assert_eq!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::Close {
@@ -2539,12 +2998,34 @@ fn malformed_signaling_is_transactional_and_fences_an_in_flight_replacement() {
         next_effect(&mut agent),
         Effect::Http(HttpEffect::Cancel { operation })
     );
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation: old })
+    );
+    let Effect::Http(HttpEffect::Request {
+        operation: delete,
+        request,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("incumbent delete")
+    };
+    assert_eq!(request.method, HttpMethod::Delete);
+    assert_eq!(request.uri, PARTICIPANT_URI);
+    let closing = agent.snapshot().clone();
+    assert_eq!(closing.connection, ConnectionState::Closing);
+    const ORPHAN_URI: &str = "https://sfu.test/native/orphan";
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,
-            response: update_response("p1"),
+            response: create_response("p2", "unused", ORPHAN_URI),
         }))
         .unwrap();
+    let Effect::Http(HttpEffect::Request { request, .. }) = next_effect(&mut agent) else {
+        panic!("orphan cleanup")
+    };
+    assert_eq!(request.method, HttpMethod::Delete);
+    assert_eq!(request.uri, ORPHAN_URI);
     for event in [
         RtcEvent::Connected {
             generation: replacement,
@@ -2552,54 +3033,40 @@ fn malformed_signaling_is_transactional_and_fences_an_in_flight_replacement() {
         RtcEvent::AnswerApplied {
             generation: replacement,
         },
+        RtcEvent::Closed {
+            generation: replacement,
+        },
     ] {
         agent.handle(HostEvent::Rtc(event)).unwrap();
     }
-    assert_eq!(
-        agent.snapshot().connection,
-        ConnectionState::TerminalFailure
-    );
-    assert_eq!(agent.snapshot().terminal_failure, failure);
-    while let Some(effect) = agent.next_effect() {
-        assert!(
-            matches!(&effect, Effect::Http(HttpEffect::Request {request, ..}) if request.method == HttpMethod::Delete),
-            "late completions can only clean orphaned resources, not activate or retry: {effect:?}"
-        );
-    }
-    agent.command(AgentCommand::Reconnect).unwrap();
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::CreateOffer { .. })
-    ));
+    assert_eq!(agent.snapshot(), &closing);
+    assert!(agent.next_effect().is_none());
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Closed { generation: old }))
+        .unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Closing);
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: delete,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Disconnected);
+    assert!(agent.snapshot().generation.is_none());
+    assert!(agent.snapshot().participant_id.is_none());
 }
 
 #[test]
-fn complete_intent_retracts_omitted_state_and_allows_per_track_playout_changes() {
-    let (mut agent, generation, cid, initial_send) = connected_agent();
-    assert!(agent.next_effect().is_none());
-    acknowledge_send(&mut agent, generation, cid, initial_send);
+fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_lifetimes() {
+    use native_connection::{confirmed, observe};
+    use pulsebeam_proto::state;
 
-    let mut retracted = desired(2);
-    retracted.publications.clear();
-    retracted.video.clear();
-    retracted.audio = AudioSubscription::default();
-    agent
-        .command(AgentCommand::ReplaceDesired(retracted))
-        .unwrap();
-    let (operation, intent) = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send {
-            operation, payload, ..
-        }) => (operation, decode_intent(&payload)),
-        effect => panic!("expected updated intent, got {effect:?}"),
-    };
-    assert_eq!(intent.revision, 2);
-    assert!(intent.send.unwrap().tracks.is_empty());
-    let receive = intent.receive.unwrap();
-    assert!(receive.video.unwrap().tracks.is_empty());
-    assert!(receive.audio.unwrap().tracks.is_empty());
-    acknowledge_send(&mut agent, generation, cid, operation);
-
-    let mut per_track = desired(3);
+    let (mut agent, generation, channel, targets) = native_media::connected();
+    let mut per_track = desired(2);
     per_track.video[0].playout_delay = PlayoutDelay::Fixed {
         min_ms: 20,
         max_ms: 100,
@@ -2614,91 +3081,219 @@ fn complete_intent_retracts_omitted_state_and_allows_per_track_playout_changes()
     agent
         .command(AgentCommand::ReplaceDesired(per_track))
         .unwrap();
-    let next = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send { payload, .. }) => decode_intent(&payload),
-        effect => panic!("expected track policy intent, got {effect:?}"),
-    };
-    let receive = next.receive.unwrap();
-    assert_eq!(
-        receive.video.unwrap().tracks[0]
-            .options
+    let fixed = native_media::next(&mut agent, generation, channel);
+    assert_eq!(fixed.len(), 2);
+    for target in &fixed {
+        assert!(
+            targets
+                .iter()
+                .any(|previous| previous.reference == target.reference
+                    && previous.spec().declaration == target.spec().declaration)
+        );
+        match target
+            .spec()
+            .settings
             .as_ref()
             .unwrap()
-            .playout_delay
+            .receive
             .as_ref()
             .unwrap()
-            .min_ms,
-        20
-    );
-    assert_eq!(
-        receive.audio.unwrap().tracks[0]
-            .options
-            .as_ref()
-            .unwrap()
-            .playout_delay
-            .as_ref()
-            .unwrap()
-            .max_ms,
-        0
-    );
-
-    let disconnected = DesiredState {
-        revision: 4,
-        ..DesiredState::default()
-    };
+        {
+            state::resource_settings::Receive::Video(options) => assert_eq!(
+                options.playout_delay,
+                Some(state::PlayoutDelay {
+                    min_ms: 20,
+                    max_ms: 100
+                })
+            ),
+            state::resource_settings::Receive::Audio(options) => assert_eq!(
+                options.playout_delay,
+                Some(state::PlayoutDelay {
+                    min_ms: 0,
+                    max_ms: 0
+                })
+            ),
+        }
+    }
     agent
-        .command(AgentCommand::ReplaceDesired(disconnected))
+        .command(AgentCommand::ReplaceDesired(desired(3)))
         .unwrap();
-    assert_eq!(agent.snapshot().desired_revision, 4);
+    let adaptive = native_media::next(&mut agent, generation, channel);
+    assert_eq!(adaptive.len(), 2);
+    for target in &adaptive {
+        assert!(
+            fixed
+                .iter()
+                .any(|previous| previous.reference == target.reference
+                    && previous.spec().declaration == target.spec().declaration)
+        );
+        match target
+            .spec()
+            .settings
+            .as_ref()
+            .unwrap()
+            .receive
+            .as_ref()
+            .unwrap()
+        {
+            state::resource_settings::Receive::Video(options) => {
+                assert!(options.playout_delay.is_none());
+            }
+            state::resource_settings::Receive::Audio(options) => {
+                assert!(options.playout_delay.is_none());
+            }
+        }
+    }
+    let mut retracted = desired(4);
+    retracted.publications.clear();
+    retracted.video.clear();
+    retracted.audio = AudioSubscription::default();
+    agent
+        .command(AgentCommand::ReplaceDesired(retracted))
+        .unwrap();
+    let withdrawals = native_media::next(&mut agent, generation, channel);
+    assert_eq!(withdrawals.len(), 3);
+    assert!(
+        withdrawals
+            .iter()
+            .all(|target| target.desired.value == Some(state::desired_state::Value::Absent(true)))
+    );
+    assert!(agent.next_effect().is_none());
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        withdrawals
+            .iter()
+            .map(|target| {
+                confirmed(
+                    state::resource_key::Key::Owned(target.reference),
+                    target.desired.revision,
+                    state::confirmed_state::Value::Absent(state::AbsentState {
+                        reason: state::AbsenceReason::Removed as i32,
+                    }),
+                )
+            })
+            .collect(),
+    );
+    native_media::finish_retirements(&mut agent, generation, &["lv0", "ra0", "rv0"]);
+    assert!(agent.next_effect().is_none());
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 5,
+            ..Default::default()
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().desired_revision, 5);
 }
 
 #[test]
-fn pending_signaling_coalesces_superseded_state_and_fences_retired_completion() {
-    let (mut agent, generation, cid, first_send) = connected_agent();
-    for (revision, height) in [(2, 360), (3, 1080)] {
-        let mut replacement = desired(revision);
-        replacement.video[0].height = height;
-        agent
-            .command(AgentCommand::ReplaceDesired(replacement))
-            .unwrap();
-        assert!(agent.next_effect().is_none());
-    }
-    acknowledge_send(&mut agent, generation, cid, first_send);
-    let (operation, intent) = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send {
-            operation, payload, ..
-        }) => (operation, decode_intent(&payload)),
-        effect => panic!("expected latest complete intent, got {effect:?}"),
+fn pending_control_fences_completion_before_a_replacement_lifetime() {
+    use pulsebeam_proto::state::{self, codec, validation};
+    let registrations = TopicRegistrations {
+        publishers: vec![publisher("state", TopicMode::Latest)],
+        subscribers: vec![],
+    };
+    let (mut agent, generation, control) = native_connection::connected(registrations.clone());
+    let (first, first_send, _) =
+        native_connection::prepare_data_pending(&mut agent, generation, control);
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            connected: true,
+            ..Default::default()
+        }))
+        .unwrap();
+    assert!(agent.next_effect().is_none());
+    acknowledge_send(&mut agent, generation, control, first_send);
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation: second_send,
+        payload,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("queued retirement")
+    };
+    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let [record] = batch.records.as_slice() else {
+        panic!("one retirement")
     };
     assert_eq!(
-        intent.receive.unwrap().video.unwrap().tracks[0]
-            .options
-            .as_ref()
-            .unwrap()
-            .height,
-        1080
+        record.key.as_ref().unwrap().key,
+        Some(state::resource_key::Key::Owned(first.reference))
+    );
+    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+        panic!("desired")
+    };
+    assert!(matches!(
+        desired.value,
+        Some(state::desired_state::Value::Absent(true))
+    ));
+    let retirement_revision = desired.revision;
+    assert!(retirement_revision > first.revision);
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 3,
+            connected: true,
+            topics: registrations,
+            ..Default::default()
+        }))
+        .unwrap();
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {
+            operation: second_send,
+            generation,
+            channel: control,
+            message: "full".into(),
+        }))
+        .unwrap();
+    let Effect::Timer(TimerEffect::Schedule { timer, .. }) = next_effect(&mut agent) else {
+        panic!("retry")
+    };
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation: retry,
+        payload: retried,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("serialized retry")
+    };
+    assert_eq!(retried, payload);
+    acknowledge_send(&mut agent, generation, control, retry);
+    assert_ne!(retirement_revision, agent.snapshot().desired_revision);
+    assert!(
+        agent.next_effect().is_none(),
+        "fresh lifetime waits for cutoff"
     );
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 4,
-            ..DesiredState::default()
+            ..Default::default()
         }))
         .unwrap();
-    while agent.next_effect().is_some() {}
-    acknowledge_send(&mut agent, generation, cid, operation);
-    assert!(agent.next_effect().is_none());
+    acknowledge_send(&mut agent, generation, control, retry);
     assert_eq!(agent.snapshot().desired_revision, 4);
 }
 
 #[test]
-fn failed_signaling_send_retries_only_the_latest_complete_intent() {
-    let (mut agent, generation, cid, send) = connected_agent();
+fn failed_control_send_retries_its_frame_before_coalesced_successors() {
+    use pulsebeam_proto::state::{self, codec, validation};
+    let initial = publisher("state", TopicMode::Latest);
+    let (mut agent, generation, control) = native_connection::connected(TopicRegistrations {
+        publishers: vec![initial.clone()],
+        subscribers: vec![],
+    });
+    let (first, operation, payload) =
+        native_connection::prepare_data_pending(&mut agent, generation, control);
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {
-            operation: send,
+            operation,
             generation,
-            channel: cid,
-            message: "full".to_string(),
+            channel: control,
+            message: "full".into(),
         }))
         .unwrap();
     let timer = match next_effect(&mut agent) {
@@ -2706,45 +3301,179 @@ fn failed_signaling_send_retries_only_the_latest_complete_intent() {
             assert_eq!(after, Duration::from_millis(100));
             timer
         }
-        effect => panic!("expected signaling retry, got {effect:?}"),
+        effect => panic!("expected retry, got {effect:?}"),
     };
-    let mut latest = desired(2);
-    latest.video[0].height = 360;
-    agent.command(AgentCommand::ReplaceDesired(latest)).unwrap();
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            connected: true,
+            topics: TopicRegistrations {
+                publishers: vec![initial.clone(), publisher("superseded", TopicMode::Latest)],
+                subscribers: vec![],
+            },
+            ..Default::default()
+        }))
+        .unwrap();
+    let (superseded, _) = native_connection::prepare_channel(&mut agent, generation, control);
+    assert!(agent.next_effect().is_none());
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 3,
+            connected: true,
+            topics: TopicRegistrations {
+                publishers: vec![initial, publisher("final", TopicMode::Latest)],
+                subscribers: vec![],
+            },
+            ..Default::default()
+        }))
+        .unwrap();
+    let (final_channel, _) = native_connection::prepare_channel(&mut agent, generation, control);
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CloseDataChannel {
+            generation,
+            channel: superseded
+        })
+    );
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+            generation,
+            channel: superseded,
+        }))
+        .unwrap();
     assert!(agent.next_effect().is_none());
     agent
         .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
         .unwrap();
-    let intent = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send { payload, .. }) => decode_intent(&payload),
-        effect => panic!("expected retried intent, got {effect:?}"),
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation: retry,
+        channel,
+        payload: retried,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("retry")
     };
-    assert_eq!(intent.revision, 2);
-    assert_eq!(
-        intent.receive.unwrap().video.unwrap().tracks[0]
-            .options
-            .as_ref()
-            .unwrap()
-            .height,
-        360
-    );
+    assert_eq!(channel, control);
+    assert_ne!(retry, operation);
+    assert_eq!(retried, payload);
+    acknowledge_send(&mut agent, generation, control, operation);
+    assert!(agent.next_effect().is_none());
+    acknowledge_send(&mut agent, generation, control, retry);
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation: successor,
+        channel,
+        payload,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("coalesced successor")
+    };
+    assert_eq!(channel, control);
+    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let [record] = batch.records.as_slice() else {
+        panic!("only final target is serialized")
+    };
+    let Some(state::resource_key::Key::Owned(reference)) =
+        record.key.as_ref().and_then(|key| key.key.as_ref())
+    else {
+        panic!("owned")
+    };
+    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+        panic!("desired")
+    };
+    assert_eq!(*reference, first.reference + 1);
+    assert_eq!(desired.revision, first.revision + 1);
+    let Some(state::desired_state::Value::Present(spec)) = &desired.value else {
+        panic!("present")
+    };
+    let Some(state::resource_spec::Declaration::Publication(publication)) = &spec.declaration
+    else {
+        panic!("publication")
+    };
+    assert_eq!(publication.label, "final");
+    let Some(state::publication_spec::Kind::Data(data)) = &publication.kind else {
+        panic!("data")
+    };
+    assert_eq!(data.delivery, state::DataDelivery::Latest as i32);
+    assert_ne!(final_channel, superseded);
+    acknowledge_send(&mut agent, generation, control, successor);
+    assert!(agent.next_effect().is_none());
 }
 
 #[test]
-fn topic_registrations_validate_declare_and_retract_complete_channels() {
-    let registrations = TopicRegistrations {
-        publishers: vec![
-            publisher("state", TopicMode::Latest),
-            publisher("state", TopicMode::Lossy),
-            publisher("chat", TopicMode::Ordered),
-        ],
-        subscribers: vec![
-            subscriber("state", TopicMode::Latest),
-            subscriber("state", TopicMode::Lossy),
-            subscriber("chat", TopicMode::Ordered),
-        ],
-    };
-    let (mut agent, _, _, _) = connect_with_topics(registrations);
+fn topic_registrations_validate_and_retire_only_omitted_sources() {
+    use alloc::collections::BTreeSet;
+    use pulsebeam_proto::state::{self, codec, validation};
+    let (mut agent, generation, control) =
+        native_connection::connected(TopicRegistrations::default());
+    let mut registrations = TopicRegistrations::default();
+    let mut omitted = Vec::new();
+    for (index, (label, mode, local, remote)) in [
+        ("state", TopicMode::Latest, "local-a", "remote-a"),
+        ("telemetry", TopicMode::Lossy, "local-b", "remote-b"),
+        ("chat/Δ", TopicMode::Ordered, "local-c", "remote-c"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        registrations.publishers.push(publisher(label, mode));
+        registrations.subscribers.push(subscriber(label, mode));
+        agent
+            .command(AgentCommand::ReplaceDesired(DesiredState {
+                revision: 2 + u64::try_from(index).unwrap(),
+                connected: true,
+                topics: registrations.clone(),
+                ..Default::default()
+            }))
+            .unwrap();
+        if mode == TopicMode::Ordered {
+            assert!(
+                matches!(next_effect(&mut agent), Effect::Timer(TimerEffect::Schedule { after, .. }) if after == Duration::from_secs(2))
+            );
+        }
+        let publication = native_connection::prepare_data(&mut agent, generation, control);
+        assert!(
+            matches!(&publication.spec.declaration, Some(state::resource_spec::Declaration::Publication(spec)) if spec.label == label)
+        );
+        native_connection::confirm_publication(
+            &mut agent,
+            generation,
+            control,
+            &publication,
+            local,
+        );
+        let receiving = native_connection::prepare_subscription(
+            &mut agent,
+            generation,
+            control,
+            remote,
+            &subscriber(label, mode),
+        );
+        for prepared in [&publication, &receiving] {
+            assert!(
+                prepared
+                    .requested_channel
+                    .negotiated_id
+                    .is_some_and(|stream| stream != 0)
+            );
+            assert_eq!(
+                prepared.requested_channel.ordered,
+                mode == TopicMode::Ordered
+            );
+            assert_eq!(
+                prepared.requested_channel.reliability,
+                if mode == TopicMode::Ordered {
+                    DataChannelReliability::Reliable
+                } else {
+                    DataChannelReliability::MaxRetransmits(0)
+                }
+            );
+            if index < 2 {
+                omitted.push((prepared.reference, prepared.channel));
+            }
+        }
+    }
     assert_eq!(agent.snapshot().topics.publishers.len(), 3);
     assert_eq!(agent.snapshot().topics.subscribers.len(), 3);
     assert!(
@@ -2755,89 +3484,215 @@ fn topic_registrations_validate_declare_and_retract_complete_channels() {
             .iter()
             .all(|status| status.channel.is_some() && status.data_track_id.is_some())
     );
-    let mut retracted = desired(2);
-    retracted.topics = TopicRegistrations {
-        publishers: vec![publisher("chat", TopicMode::Ordered)],
-        subscribers: vec![subscriber("chat", TopicMode::Ordered)],
+    let retained = DesiredState {
+        revision: 5,
+        connected: true,
+        topics: TopicRegistrations {
+            publishers: vec![publisher("chat/Δ", TopicMode::Ordered)],
+            subscribers: vec![subscriber("chat/Δ", TopicMode::Ordered)],
+        },
+        ..Default::default()
     };
     agent
-        .command(AgentCommand::ReplaceDesired(retracted))
+        .command(AgentCommand::ReplaceDesired(retained.clone()))
         .unwrap();
-    let Effect::Rtc(RtcEffect::CreateOffer { data_channels, .. }) = next_effect(&mut agent) else {
-        panic!("replacement offer");
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation,
+        channel,
+        payload,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("owned retirements")
     };
+    assert_eq!(channel, control);
+    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    assert_eq!(batch.records.len(), 4);
+    let mut refs = BTreeSet::new();
+    let confirmed = batch
+        .records
+        .iter()
+        .map(|record| {
+            let Some(state::resource_key::Key::Owned(reference)) =
+                record.key.as_ref().and_then(|key| key.key.as_ref())
+            else {
+                panic!("owned")
+            };
+            refs.insert(*reference);
+            let Some(state::state_record::State::Desired(desired)) = &record.state else {
+                panic!("desired")
+            };
+            assert!(matches!(
+                desired.value,
+                Some(state::desired_state::Value::Absent(true))
+            ));
+            native_connection::confirmed(
+                state::resource_key::Key::Owned(*reference),
+                desired.revision,
+                state::confirmed_state::Value::Absent(state::AbsentState {
+                    reason: state::AbsenceReason::Removed as i32,
+                }),
+            )
+        })
+        .collect();
     assert_eq!(
-        data_channels
-            .iter()
-            .map(|spec| spec.label.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "v1/sys/signaling",
-            "v2/ordered/pub/chat",
-            "v2/ordered/sub/chat"
-        ]
+        refs,
+        omitted.iter().map(|(reference, _)| *reference).collect()
     );
-    assert_eq!(data_channels[0].negotiated_id, Some(0));
-    assert!(data_channels[1..].iter().all(|spec| {
-        spec.negotiated_id.is_none()
-            && !spec.ordered
-            && spec.reliability == DataChannelReliability::MaxRetransmits(0)
-    }));
     assert_eq!(agent.snapshot().topics.publishers.len(), 1);
     assert_eq!(agent.snapshot().topics.subscribers.len(), 1);
-    let mut invalid = desired(3);
-    invalid.topics.publishers = vec![publisher("bad/topic", TopicMode::Latest)];
+    acknowledge_send(&mut agent, generation, control, operation);
+    assert!(
+        agent.next_effect().is_none(),
+        "physical channels await authoritative cutoff"
+    );
+    native_connection::observe(&mut agent, generation, control, confirmed);
+    let closed = (0..4)
+        .map(|_| {
+            let Effect::Rtc(RtcEffect::CloseDataChannel {
+                generation: actual,
+                channel,
+            }) = next_effect(&mut agent)
+            else {
+                panic!("scoped close")
+            };
+            assert_eq!(actual, generation);
+            channel
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        closed,
+        omitted.iter().map(|(_, channel)| *channel).collect()
+    );
+    for channel in closed {
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+                generation,
+                channel,
+            }))
+            .unwrap();
+    }
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert!(agent.next_effect().is_none());
+    let before = agent.snapshot().clone();
+    let mut invalid = retained.clone();
+    invalid.revision = 6;
+    invalid
+        .topics
+        .publishers
+        .push(publisher("", TopicMode::Latest));
     assert!(matches!(
         agent.command(AgentCommand::ReplaceDesired(invalid)),
         Err(AgentError::InvalidConfiguration(ValidationError::Topic(_)))
     ));
-    let mut duplicate = desired(3);
-    duplicate.topics.subscribers = vec![
-        subscriber("chat", TopicMode::Ordered),
-        subscriber("chat", TopicMode::Ordered),
-    ];
+    let mut duplicate = retained.clone();
+    duplicate.revision = 6;
+    duplicate
+        .topics
+        .subscribers
+        .push(subscriber("chat/Δ", TopicMode::Ordered));
     assert!(matches!(
         agent.command(AgentCommand::ReplaceDesired(duplicate)),
         Err(AgentError::InvalidConfiguration(
             ValidationError::Duplicate { .. }
         ))
     ));
+    let mut conflicting_delivery = retained;
+    conflicting_delivery.revision = 6;
+    conflicting_delivery
+        .topics
+        .publishers
+        .push(publisher("chat/Δ", TopicMode::Lossy));
+    assert!(matches!(
+        agent.command(AgentCommand::ReplaceDesired(conflicting_delivery)),
+        Err(AgentError::InvalidConfiguration(
+            ValidationError::Duplicate { .. }
+        ))
+    ));
+    assert_eq!(agent.snapshot(), &before);
+    assert!(agent.next_effect().is_none());
 }
 
 #[test]
-fn connected_subscription_bootstrap_is_bounded_and_completed_timers_are_retired() {
-    for complete in [false, true] {
-        let mut timers = Vec::new();
-        let (mut agent, generation, _, _) = connect_with_topic_seed(
-            TopicRegistrations {
-                subscribers: vec![subscriber("events", TopicMode::Ordered)],
-                ..TopicRegistrations::default()
-            },
-            complete,
-            &mut timers,
+fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
+    use pulsebeam_proto::state::{codec, validation};
+
+    for discovery_complete in [false, true] {
+        let subscriber = subscriber("events", TopicMode::Ordered);
+        let (mut agent, generation, channel) = native_connection::joining(TopicRegistrations {
+            subscribers: vec![subscriber.clone()],
+            ..Default::default()
+        });
+        for event in [
+            HostEvent::Rtc(RtcEvent::Connected { generation }),
+            HostEvent::DataChannel(DataChannelEvent::Opened {
+                generation,
+                channel,
+            }),
+            HostEvent::Rtc(RtcEvent::AnswerApplied { generation }),
+        ] {
+            agent.handle(event).unwrap();
+        }
+        native_connection::observe(
+            &mut agent,
+            generation,
+            channel,
+            vec![native_connection::grant(1)],
         );
-        let timer = timers
-            .iter()
-            .find_map(|(timer, after)| (*after == Duration::from_secs(30)).then_some(*timer))
-            .expect("connected bootstrap has a bounded deadline");
+        if discovery_complete {
+            agent
+                .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                    generation,
+                    channel,
+                    payload: codec::encode(
+                        &pulsebeam_proto::state::StateBatch {
+                            records: Vec::new(),
+                            initial_complete: true,
+                        },
+                        validation::Direction::Server,
+                    )
+                    .unwrap(),
+                }))
+                .unwrap();
+        }
+        let Effect::Timer(TimerEffect::Schedule { timer, after }) = next_effect(&mut agent) else {
+            panic!("source recovery timer")
+        };
+        assert_eq!(after, Duration::from_secs(2));
+        assert!(agent.next_effect().is_none());
+        let receiving = native_connection::prepare_subscription(
+            &mut agent,
+            generation,
+            channel,
+            native_connection::REMOTE_SOURCE,
+            &subscriber,
+        );
         agent
             .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
             .unwrap();
-        assert!(agent.snapshot().terminal_failure.is_none());
-        if complete {
-            assert!(
-                agent.next_effect().is_none(),
-                "retired completion deadline cannot reset a call"
-            );
-            assert_eq!(agent.snapshot().generation, Some(generation));
-        } else {
-            assert!(
-                matches!(next_effect(&mut agent), Effect::Rtc(RtcEffect::CreateOffer { generation: next, .. }) if next != generation)
-            );
-            assert!(drain_notifications(&mut agent).iter().any(|notification|
-                matches!(notification, Notification::Failure(failure) if failure.message.contains("subscription seed"))
-            ));
+        let mut effects = Vec::new();
+        while let Some(effect) = agent.next_effect() {
+            effects.push(effect);
         }
+        assert!(effects.iter().any(|effect| matches!(effect,
+            Effect::DataChannel(DataChannelEffect::Send { channel, payload, .. })
+                if *channel == receiving.channel
+                    && matches!(TopicFrame::decode_bounded(payload).unwrap().body,
+                        Some(TopicBody::Probe(probe)) if probe.data_track_id == native_connection::REMOTE_SOURCE))));
+        assert!(effects.iter().all(|effect| match effect {
+            Effect::Rtc(RtcEffect::CreateOffer { .. }) => false,
+            Effect::Timer(TimerEffect::Schedule { after, .. }) => *after == Duration::from_secs(2),
+            _ => true,
+        }));
+        assert_eq!(agent.snapshot().generation, Some(generation));
+        assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+        assert!(agent.snapshot().terminal_failure.is_none());
+        assert!(
+            drain_notifications(&mut agent)
+                .iter()
+                .all(|notification| !matches!(notification, Notification::Failure(_)))
+        );
     }
 }
 
@@ -2847,9 +3702,25 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
         publishers: vec![publisher("state", TopicMode::Latest)],
         subscribers: vec![subscriber("state", TopicMode::Latest)],
     };
-    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
-    let publish_channel = channels["v2/latest/pub/state"];
-    let subscribe_channel = channels["v2/latest/sub/state"];
+    let (mut agent, generation, control) = native_connection::connected(registrations);
+    let prepared = native_connection::prepare_data(&mut agent, generation, control);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &prepared,
+        native_connection::SOURCE,
+    );
+    let receiving = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        native_connection::REMOTE_SOURCE,
+        &subscriber("state", TopicMode::Latest),
+    );
+    let publish_channel = prepared.channel;
+    let subscribe_channel = receiving.channel;
+    drain_notifications(&mut agent);
     let publish = publisher("state", TopicMode::Latest);
     for value in [b"first".as_slice(), b"second", b"third"] {
         agent
@@ -2865,10 +3736,7 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
     };
     assert_eq!(first_message.payload, b"first");
     assert_eq!(first_message.sequence, 0);
-    assert_eq!(
-        first_message.data_track_id,
-        data_id(true, "state", TopicMode::Latest, "first")
-    );
+    assert_eq!(first_message.data_track_id, native_connection::SOURCE);
     assert!(agent.next_effect().is_none());
     assert_eq!(agent.snapshot().topics.accepted_sends, 3);
     assert_eq!(agent.snapshot().topics.dropped_sends, 1);
@@ -2903,7 +3771,7 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
         event,
         Notification::Topic(TopicNotification::ChannelFailed { .. })
     )));
-    let id = data_id(false, "state", TopicMode::Latest, "first");
+    let id = native_connection::REMOTE_SOURCE.to_string();
     for sequence in [5, 3, 5, 6] {
         topic_input(
             &mut agent,
@@ -3027,7 +3895,7 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
 }
 
 #[test]
-fn owned_publication_relabel_replaces_the_wire_session_and_fences_the_new_source() {
+fn owned_publication_relabel_replaces_the_physical_lease_without_replacing_the_connection() {
     let mut agent = Agent::new(config()).unwrap();
     let camera = TrackSpec::Video {
         label: "camera".into(),
@@ -3050,36 +3918,23 @@ fn owned_publication_relabel_replaces_the_wire_session_and_fences_the_new_source
         })
         .unwrap();
 
-    let channel = channel(21);
-    let (generation, request) = begin_connect(
-        &mut agent,
+    let (mut agent, generation, channel, receivers) = native_media::connected_with(
+        agent,
         DesiredState {
             revision: 1,
             connected: true,
-            ..DesiredState::default()
+            ..Default::default()
         },
-        channel,
     );
-    let signal = finish_connect(&mut agent, generation, request, channel);
-    acknowledge_send(&mut agent, generation, channel, signal);
-
+    assert!(receivers.is_empty());
     agent.resource(ResourceCommand::Release { owner }).unwrap();
-    let omitted = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send {
-            operation,
-            generation: actual,
-            channel: actual_channel,
-            payload,
-            ..
-        }) => {
-            assert_eq!(actual, generation);
-            assert_eq!(actual_channel, channel);
-            assert!(decode_intent(&payload).send.unwrap().tracks.is_empty());
-            operation
-        }
-        effect => panic!("expected publication withdrawal, got {effect:?}"),
-    };
-    acknowledge_send(&mut agent, generation, channel, omitted);
+    let retired = native_media::next(&mut agent, generation, channel);
+    assert_eq!(retired.len(), 1);
+    assert_eq!(
+        retired[0].desired.value,
+        Some(pulsebeam_proto::state::desired_state::Value::Absent(true))
+    );
+    assert!(agent.next_effect().is_none());
 
     let ResourceResult::Publication {
         owner: replacement,
@@ -3096,34 +3951,117 @@ fn owned_publication_relabel_replaces_the_wire_session_and_fences_the_new_source
         panic!("screen owner")
     };
     assert_eq!(reused, slot);
-    assert_eq!(after_generation, Some(generation));
+    assert_ne!(replacement, owner);
+    assert_eq!(after_generation, None);
     agent
         .resource(ResourceCommand::UpdatePublication {
             owner: replacement,
             present: true,
         })
         .unwrap();
-
-    let next_generation = match next_effect(&mut agent) {
-        Effect::Rtc(RtcEffect::CreateOffer {
-            generation: next, ..
-        }) => next,
-        effect => panic!("expected fresh wire session, got {effect:?}"),
-    };
-    assert_ne!(next_generation, generation);
     assert!(
         agent.next_effect().is_none(),
-        "relabel must not reach the bound session"
+        "replacement waits for the old owned cutoff"
     );
+    use pulsebeam_proto::state;
+    native_connection::observe(
+        &mut agent,
+        generation,
+        channel,
+        vec![native_connection::confirmed(
+            state::resource_key::Key::Owned(retired[0].reference),
+            retired[0].desired.revision,
+            state::confirmed_state::Value::Absent(state::AbsentState {
+                reason: state::AbsenceReason::Removed as i32,
+            }),
+        )],
+    );
+    let operations = native_media::finish_retirements(&mut agent, generation, &["lv0"]);
+    let assigned = SlotBinding {
+        slot: MediaSlot::LocalVideo(reused),
+        mid: "fresh-sender".into(),
+        media_index: 5,
+        kind: MediaKind::Video,
+        direction: MediaDirection::SendOnly,
+    };
+    native_media::finish_allocation(&mut agent, generation, assigned, &["lv0"]);
+    let fresh = native_media::next(&mut agent, generation, channel);
+    assert_eq!(fresh.len(), 1);
+    assert!(fresh[0].reference > retired[0].reference);
+    let Some(state::resource_spec::Declaration::Publication(publication)) =
+        &fresh[0].spec().declaration
+    else {
+        panic!("screen publication")
+    };
+    assert_eq!(publication.label, "screen");
+    let Some(state::publication_spec::Kind::Video(video)) = &publication.kind else {
+        panic!("video publication")
+    };
+    assert!(
+        matches!(video.binding.as_ref().and_then(|binding| binding.transport.as_ref()),
+        Some(state::track_binding::Transport::Rtp(rtp)) if rtp.mid == "fresh-sender")
+    );
+    let participant = state::Participant {
+        participant_id: agent.snapshot().participant_id.clone().unwrap(),
+        participant_external_id: agent.snapshot().participant_external_id.clone().unwrap(),
+    };
+    native_connection::observe(
+        &mut agent,
+        generation,
+        channel,
+        vec![fresh[0].installed(
+            participant.clone(),
+            native_media::track(
+                "replacement-screen-source",
+                &participant.participant_id,
+                "screen",
+                MediaKind::Video,
+            ),
+        )],
+    );
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
+            generation,
+            operation: operations[0],
+            slots: Vec::new(),
+            outcome: crate::client_sdp::ApplyOutcome::Applied,
+            preparation: Ok(Default::default()),
+        }))
+        .unwrap();
+    assert!(agent.next_effect().is_none());
+    agent
+        .resource(ResourceCommand::UpdatePublication {
+            owner: replacement,
+            present: false,
+        })
+        .unwrap();
+    let withdrawn = native_media::next(&mut agent, generation, channel);
+    assert_eq!(withdrawn.len(), 1);
+    assert_eq!(withdrawn[0].reference, fresh[0].reference);
+    assert_eq!(
+        withdrawn[0].desired.value,
+        Some(state::desired_state::Value::Absent(true))
+    );
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert!(agent.next_effect().is_none());
 }
 
 #[test]
 fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifetime() {
+    use pulsebeam_proto::state::{self, codec, validation};
     let registrations = TopicRegistrations {
         publishers: vec![],
         subscribers: vec![subscriber("events", TopicMode::Lossy)],
     };
-    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
+    let (mut agent, generation, control) = native_connection::connected(registrations);
+    let receiving = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        native_connection::REMOTE_SOURCE,
+        &subscriber("events", TopicMode::Lossy),
+    );
     let spec = TrackSpec::Data {
         label: "events".into(),
         delivery: TopicMode::Lossy,
@@ -3142,17 +4080,21 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         owners.push(owner);
     }
     agent
-        .command(AgentCommand::ReplaceDesired(desired(2)))
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            connected: true,
+            ..Default::default()
+        }))
         .unwrap();
     assert_eq!(agent.snapshot().topics.subscribers.len(), 1);
     assert!(agent.next_effect().is_none());
     drain_notifications(&mut agent);
-    let remote = data_id(false, "events", TopicMode::Lossy, "first");
+    let remote = native_connection::REMOTE_SOURCE.to_string();
     for _ in 0..2 {
         topic_input(
             &mut agent,
             generation,
-            channels["v2/lossy/sub/events"],
+            receiving.channel,
             wire_message(&remote, 0, &[255, 0]),
         )
         .unwrap();
@@ -3196,10 +4138,61 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         .resource(ResourceCommand::Release { owner: owners[2] })
         .unwrap();
     assert!(agent.snapshot().topics.subscribers.is_empty());
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation,
+        channel,
+        payload,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("owned retirement")
+    };
+    assert_eq!(channel, control);
+    let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+    let [record] = batch.records.as_slice() else {
+        panic!("one source retirement")
+    };
+    assert_eq!(
+        record.key.as_ref().unwrap().key,
+        Some(state::resource_key::Key::Owned(receiving.reference))
+    );
+    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+        panic!("desired")
+    };
     assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::CreateOffer { .. })
+        desired.value,
+        Some(state::desired_state::Value::Absent(true))
     ));
+    acknowledge_send(&mut agent, generation, control, operation);
+    assert!(agent.next_effect().is_none());
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![native_connection::confirmed(
+            state::resource_key::Key::Owned(receiving.reference),
+            desired.revision,
+            state::confirmed_state::Value::Absent(state::AbsentState {
+                reason: state::AbsenceReason::Removed as i32,
+            }),
+        )],
+    );
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CloseDataChannel {
+            generation,
+            channel: receiving.channel
+        })
+    );
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+            generation,
+            channel: receiving.channel,
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert!(agent.next_effect().is_none());
 }
 
 #[test]
@@ -3208,11 +4201,27 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
         publishers: vec![publisher("chat", TopicMode::Ordered)],
         subscribers: vec![subscriber("chat", TopicMode::Ordered)],
     };
-    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
-    let publish_channel = channels["v2/ordered/pub/chat"];
-    let subscribe_channel = channels["v2/ordered/sub/chat"];
-    let local = data_id(true, "chat", TopicMode::Ordered, "first");
-    let remote = data_id(false, "chat", TopicMode::Ordered, "first");
+    let (mut agent, generation, control) = native_connection::connected(registrations);
+    let prepared = native_connection::prepare_data(&mut agent, generation, control);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &prepared,
+        native_connection::SOURCE,
+    );
+    let receiving = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        native_connection::REMOTE_SOURCE,
+        &subscriber("chat", TopicMode::Ordered),
+    );
+    let publish_channel = prepared.channel;
+    let subscribe_channel = receiving.channel;
+    let local = native_connection::SOURCE.to_string();
+    let remote = native_connection::REMOTE_SOURCE.to_string();
+    drain_notifications(&mut agent);
     for sequence in 0..3 {
         agent
             .command(AgentCommand::SendTopic(TopicSend {
@@ -3353,9 +4362,18 @@ fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint()
         publishers: vec![publisher("events", TopicMode::Ordered)],
         subscribers: vec![],
     };
-    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
-    let channel = channels["v2/ordered/pub/events"];
-    let id = data_id(true, "events", TopicMode::Ordered, "first");
+    let (mut agent, generation, control) = native_connection::connected(registrations);
+    let prepared = native_connection::prepare_data(&mut agent, generation, control);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &prepared,
+        native_connection::SOURCE,
+    );
+    let channel = prepared.channel;
+    let id = native_connection::SOURCE.to_string();
+    drain_notifications(&mut agent);
     for sequence in 0..3 {
         agent
             .command(AgentCommand::SendTopic(TopicSend {
@@ -3412,9 +4430,17 @@ fn recovery_floor_reports_only_missing_confirmed_sequences() {
         publishers: vec![],
         subscribers: vec![subscriber("events", TopicMode::Ordered)],
     };
-    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
-    let channel = channels["v2/ordered/sub/events"];
-    let id = data_id(false, "events", TopicMode::Ordered, "first");
+    let (mut agent, generation, control) = native_connection::connected(registrations);
+    let receiving = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        native_connection::REMOTE_SOURCE,
+        &subscriber("events", TopicMode::Ordered),
+    );
+    let channel = receiving.channel;
+    let id = native_connection::REMOTE_SOURCE.to_string();
+    drain_notifications(&mut agent);
     topic_input(
         &mut agent,
         generation,
@@ -3502,9 +4528,17 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
         publishers: vec![publisher("events", TopicMode::Ordered)],
         subscribers: vec![],
     };
-    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
-    let channel = channels["v2/ordered/pub/events"];
-    let id = data_id(true, "events", TopicMode::Ordered, "first");
+    let (mut agent, generation, control) = native_connection::connected(registrations);
+    let prepared = native_connection::prepare_data(&mut agent, generation, control);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &prepared,
+        native_connection::SOURCE,
+    );
+    let channel = prepared.channel;
+    let id = native_connection::SOURCE.to_string();
     for sequence in 0..=TOPIC_HISTORY_CAPACITY {
         agent
             .command(AgentCommand::SendTopic(TopicSend {
@@ -3574,52 +4608,418 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
 
 #[test]
 fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
+    use pulsebeam_proto::state::{self, codec, validation};
     for mode in [TopicMode::Lossy, TopicMode::Ordered] {
-        let registrations = TopicRegistrations {
-            publishers: vec![publisher("state", mode)],
-            subscribers: vec![],
-        };
-        let (mut agent, generation, _, channels) = connect_with_topics(registrations);
-        let channel = *channels.values().next().unwrap();
-        for _ in 0..TOPIC_SEND_QUEUE_CAPACITY {
+        for cutoff_first in [false, true] {
+            let (mut agent, generation, control, old) =
+                native_connection::connected_publisher(mode);
+            let channel = old.channel;
+            for _ in 0..TOPIC_SEND_QUEUE_CAPACITY {
+                agent
+                    .command(AgentCommand::SendTopic(TopicSend {
+                        publisher: publisher("state", mode),
+                        payload: b"queued".to_vec(),
+                    }))
+                    .unwrap();
+            }
+            assert_eq!(
+                agent.snapshot().topics.publishers[0].queued_messages,
+                TOPIC_SEND_QUEUE_CAPACITY - 1
+            );
+            assert!(matches!(
+                agent.command(AgentCommand::SendTopic(TopicSend {
+                    publisher: publisher("state", mode),
+                    payload: b"overflow".to_vec(),
+                })),
+                Err(AgentError::InvalidTopic(TopicError::SendQueueFull(_)))
+            ));
+            let (late, _, _) = next_topic_send(&mut agent);
+            if cutoff_first {
+                native_connection::observe(
+                    &mut agent,
+                    generation,
+                    control,
+                    vec![native_connection::confirmed(
+                        state::resource_key::Key::Owned(old.reference),
+                        old.revision,
+                        state::confirmed_state::Value::Absent(state::AbsentState {
+                            reason: state::AbsenceReason::SourceEnded as i32,
+                        }),
+                    )],
+                );
+                assert_eq!(
+                    next_effect(&mut agent),
+                    Effect::Rtc(RtcEffect::CloseDataChannel {
+                        generation,
+                        channel
+                    })
+                );
+                assert!(
+                    agent.next_effect().is_none(),
+                    "cutoff cannot substitute for actual closure"
+                );
+            }
+            agent
+                .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+                    generation,
+                    channel,
+                }))
+                .unwrap();
+            assert_eq!(
+                agent.snapshot().topics.dropped_sends,
+                TOPIC_SEND_QUEUE_CAPACITY as u64 + 1
+            );
+            assert_eq!(agent.snapshot().topics.publishers[0].queued_messages, 0);
+            assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
+            assert_eq!(agent.snapshot().topics.publishers[0].data_track_id, None);
+            assert_eq!(
+                agent.snapshot().topics.channel_failures,
+                u64::from(!cutoff_first)
+            );
+            assert_eq!(agent.snapshot().generation, Some(generation));
+            assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+            if !cutoff_first {
+                let Effect::DataChannel(DataChannelEffect::Send {
+                    operation,
+                    channel: output,
+                    payload,
+                    ..
+                }) = next_effect(&mut agent)
+                else {
+                    panic!("retirement frame")
+                };
+                assert_eq!(output, control);
+                let batch = codec::decode(&payload, validation::Direction::Client).unwrap();
+                let [record] = batch.records.as_slice() else {
+                    panic!("one retirement")
+                };
+                assert_eq!(
+                    record.key.as_ref().unwrap().key,
+                    Some(state::resource_key::Key::Owned(old.reference))
+                );
+                let Some(state::state_record::State::Desired(desired)) = &record.state else {
+                    panic!("desired retirement")
+                };
+                assert!(matches!(
+                    desired.value,
+                    Some(state::desired_state::Value::Absent(true))
+                ));
+                assert!(desired.revision > old.revision);
+                acknowledge_send(&mut agent, generation, control, operation);
+                assert!(
+                    agent.next_effect().is_none(),
+                    "closure cannot substitute for authoritative cutoff"
+                );
+                native_connection::observe(
+                    &mut agent,
+                    generation,
+                    control,
+                    vec![native_connection::confirmed(
+                        state::resource_key::Key::Owned(old.reference),
+                        desired.revision,
+                        state::confirmed_state::Value::Absent(state::AbsentState {
+                            reason: state::AbsenceReason::Removed as i32,
+                        }),
+                    )],
+                );
+            }
+            let fresh = native_connection::prepare_data(&mut agent, generation, control);
+            assert_ne!(fresh.channel, channel);
+            assert!(fresh.reference > old.reference);
+            let sctp = |spec: &state::ResourceSpec| {
+                let Some(state::resource_spec::Declaration::Publication(publication)) =
+                    &spec.declaration
+                else {
+                    panic!("publication")
+                };
+                let Some(state::publication_spec::Kind::Data(data)) = &publication.kind else {
+                    panic!("data")
+                };
+                let Some(state::track_binding::Transport::Sctp(binding)) = data
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.transport.as_ref())
+                else {
+                    panic!("SCTP")
+                };
+                binding.stream_id
+            };
+            assert!(sctp(&fresh.spec) > sctp(&old.spec));
+            native_connection::confirm_publication(
+                &mut agent,
+                generation,
+                control,
+                &fresh,
+                "opaque/recovered/source",
+            );
+            assert!(
+                agent.next_effect().is_none(),
+                "old queued bytes must not be replayed"
+            );
             agent
                 .command(AgentCommand::SendTopic(TopicSend {
                     publisher: publisher("state", mode),
-                    payload: b"queued".to_vec(),
+                    payload: b"fresh".to_vec(),
                 }))
                 .unwrap();
-        }
-        assert_eq!(
-            agent.snapshot().topics.publishers[0].queued_messages,
-            TOPIC_SEND_QUEUE_CAPACITY - 1
-        );
-        assert!(matches!(
-            agent.command(AgentCommand::SendTopic(TopicSend {
-                publisher: publisher("state", mode),
-                payload: b"overflow".to_vec()
-            })),
-            Err(AgentError::InvalidTopic(TopicError::SendQueueFull(_)))
-        ));
-        next_topic_send(&mut agent);
-        agent
-            .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+            let (operation, output, body) = next_topic_send(&mut agent);
+            assert_eq!(output, fresh.channel);
+            assert!(
+                matches!(body, TopicBody::Message(message) if message.data_track_id == "opaque/recovered/source" && message.sequence == 0 && message.payload == b"fresh")
+            );
+            let before = agent.snapshot().clone();
+            acknowledge_send(&mut agent, generation, channel, late);
+            assert_eq!(agent.snapshot(), &before);
+            assert!(agent.next_effect().is_none());
+            acknowledge_send(&mut agent, generation, fresh.channel, operation);
+            assert!(!agent.snapshot().topics.publishers[0].send_pending);
+            assert!(agent.next_effect().is_none());
+            native_connection::observe(
+                &mut agent,
                 generation,
-                channel,
-            }))
-            .unwrap();
-        assert_eq!(
-            agent.snapshot().topics.dropped_sends,
-            TOPIC_SEND_QUEUE_CAPACITY as u64 + 1
-        );
-        assert_eq!(agent.snapshot().topics.publishers[0].queued_messages, 0);
-        assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
-        assert_eq!(agent.snapshot().topics.publishers[0].data_track_id, None);
-        assert_eq!(agent.snapshot().topics.channel_failures, 1);
-        assert!(matches!(
-            next_effect(&mut agent),
-            Effect::Rtc(RtcEffect::CreateOffer { .. })
-        ));
+                control,
+                vec![native_connection::confirmed(
+                    state::resource_key::Key::Owned(fresh.reference),
+                    fresh.revision,
+                    state::confirmed_state::Value::Absent(state::AbsentState {
+                        reason: state::AbsenceReason::PermissionRevoked as i32,
+                    }),
+                )],
+            );
+            assert_eq!(
+                next_effect(&mut agent),
+                Effect::Rtc(RtcEffect::CloseDataChannel {
+                    generation,
+                    channel: fresh.channel
+                })
+            );
+            agent
+                .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+                    generation,
+                    channel: fresh.channel,
+                }))
+                .unwrap();
+            assert!(
+                agent.next_effect().is_none(),
+                "permission loss cannot implicitly reconstruct"
+            );
+            assert_eq!(agent.snapshot().generation, Some(generation));
+            assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+        }
     }
+}
+
+#[test]
+fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
+    use pulsebeam_proto::state;
+    let (mut agent, generation, control) = native_connection::connected(TopicRegistrations {
+        publishers: vec![],
+        subscribers: vec![subscriber("state", TopicMode::Lossy)],
+    });
+    let participant = state::Participant {
+        participant_id: "remote".into(),
+        participant_external_id: "remote-app-user".into(),
+    };
+    let mut prepared = Vec::new();
+    for source in ["left", "right"] {
+        let track = state::Track {
+            track_id: source.into(),
+            participant_id: participant.participant_id.clone(),
+            label: "state".into(),
+            kind: Some(state::track::Kind::Data(state::DataTrack {
+                delivery: state::DataDelivery::Lossy as i32,
+            })),
+        };
+        native_connection::observe(
+            &mut agent,
+            generation,
+            control,
+            vec![
+                native_connection::confirmed(
+                    state::resource_key::Key::Participant(participant.participant_id.clone()),
+                    0,
+                    state::confirmed_state::Value::Participant(participant.clone()),
+                ),
+                native_connection::confirmed(
+                    state::resource_key::Key::Track(source.into()),
+                    0,
+                    state::confirmed_state::Value::Track(track.clone()),
+                ),
+            ],
+        );
+        let resource = native_connection::prepare_data(&mut agent, generation, control);
+        native_connection::observe(
+            &mut agent,
+            generation,
+            control,
+            vec![native_connection::confirmed(
+                state::resource_key::Key::Owned(resource.reference),
+                resource.revision,
+                state::confirmed_state::Value::Owned(alloc::boxed::Box::new(state::LiveResource {
+                    spec: Some(resource.spec.clone()),
+                    participant: Some(participant.clone()),
+                    track: Some(track),
+                    execution: state::ExecutionStatus::Installed as i32,
+                    execution_failure: None,
+                    activity: None,
+                })),
+            )],
+        );
+        assert!(agent.next_effect().is_none());
+        prepared.push(resource);
+    }
+    let [left, right] = prepared.as_slice() else {
+        panic!("two exact sources")
+    };
+    agent
+        .command(AgentCommand::RenewAuthorization(
+            "surviving-credential".into(),
+        ))
+        .unwrap();
+    let Effect::Http(HttpEffect::Request {
+        operation: renewal,
+        request,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("PATCH")
+    };
+    assert_eq!(request.method, HttpMethod::Patch);
+    drain_notifications(&mut agent);
+    topic_input(
+        &mut agent,
+        generation,
+        right.channel,
+        wire_message("right", 7, b"before"),
+    )
+    .unwrap();
+    assert!(matches!(
+        drain_notifications(&mut agent).as_slice(),
+        [Notification::Topic(TopicNotification::Message(
+            TopicMessage { sequence: 7, .. }
+        ))]
+    ));
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+            generation,
+            channel: left.channel,
+        }))
+        .unwrap();
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation,
+        channel,
+        payload,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("scoped retirement")
+    };
+    assert_eq!(channel, control);
+    let batch = state::codec::decode(&payload, state::validation::Direction::Client).unwrap();
+    let [record] = batch.records.as_slice() else {
+        panic!("one retirement")
+    };
+    assert_eq!(
+        record.key.as_ref().unwrap().key,
+        Some(state::resource_key::Key::Owned(left.reference))
+    );
+    let Some(state::state_record::State::Desired(desired)) = &record.state else {
+        panic!("desired")
+    };
+    assert!(matches!(
+        desired.value,
+        Some(state::desired_state::Value::Absent(true))
+    ));
+    acknowledge_send(&mut agent, generation, control, operation);
+    assert!(agent.next_effect().is_none());
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![native_connection::confirmed(
+            state::resource_key::Key::Owned(left.reference),
+            desired.revision,
+            state::confirmed_state::Value::Absent(state::AbsentState {
+                reason: state::AbsenceReason::SourceEnded as i32,
+            }),
+        )],
+    );
+    assert!(
+        agent.next_effect().is_none(),
+        "an ended exact source cannot reconstruct"
+    );
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert_eq!(agent.snapshot().topics.subscribers[0].publishers, 1);
+    assert!(agent.snapshot().terminal_failure.is_none());
+    drain_notifications(&mut agent);
+    topic_input(
+        &mut agent,
+        generation,
+        left.channel,
+        wire_message("left", 0, b"late"),
+    )
+    .unwrap();
+    topic_input(
+        &mut agent,
+        generation,
+        right.channel,
+        wire_message("right", 7, b"duplicate"),
+    )
+    .unwrap();
+    assert!(drain_notifications(&mut agent).is_empty());
+    topic_input(
+        &mut agent,
+        generation,
+        right.channel,
+        wire_message("right", 8, b"after"),
+    )
+    .unwrap();
+    assert!(
+        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { data_track_id, sequence: 8, payload, .. }))] if data_track_id == "right" && payload == b"after")
+    );
+    assert!(agent.next_effect().is_none());
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![native_connection::grant(2)],
+    );
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: renewal,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![HttpHeader {
+                    name: "ETag".into(),
+                    value: "\"auth-2\"".into(),
+                }],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            ..Default::default()
+        }))
+        .unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation })
+    );
+    let Effect::Http(HttpEffect::Request { request, .. }) = next_effect(&mut agent) else {
+        panic!("DELETE")
+    };
+    assert_eq!(request.method, HttpMethod::Delete);
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|header| header.name == "Authorization"
+                && header.value == "Bearer surviving-credential"),
+        "payload closure must not cancel the root renewal"
+    );
 }
 
 #[test]
@@ -3628,7 +5028,15 @@ fn explicit_disconnect_cancels_pending_topic_sends_and_releases_binding() {
         publishers: vec![publisher("chat", TopicMode::Ordered)],
         subscribers: vec![],
     };
-    let (mut agent, _, _, _) = connect_with_topics(registrations.clone());
+    let (mut agent, generation, control) = native_connection::connected(registrations.clone());
+    let prepared = native_connection::prepare_data(&mut agent, generation, control);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &prepared,
+        native_connection::SOURCE,
+    );
     for _ in 0..2 {
         agent
             .command(AgentCommand::SendTopic(TopicSend {
@@ -3638,9 +5046,11 @@ fn explicit_disconnect_cancels_pending_topic_sends_and_releases_binding() {
             .unwrap();
     }
     next_topic_send(&mut agent);
-    let mut disconnected = desired(2);
-    disconnected.connected = false;
-    disconnected.topics = registrations;
+    let disconnected = DesiredState {
+        revision: 2,
+        topics: registrations,
+        ..Default::default()
+    };
     agent
         .command(AgentCommand::ReplaceDesired(disconnected))
         .unwrap();
@@ -3666,19 +5076,54 @@ fn explicit_disconnect_cancels_pending_topic_sends_and_releases_binding() {
 #[test]
 fn topic_boundaries_reject_malformed_cross_mode_unknown_and_oversized_input() {
     let registrations = TopicRegistrations {
-        publishers: vec![
-            publisher("state", TopicMode::Latest),
-            publisher("chat", TopicMode::Ordered),
-        ],
+        publishers: vec![publisher("state", TopicMode::Latest)],
         subscribers: vec![subscriber("state", TopicMode::Latest)],
     };
-    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
+    let (mut agent, generation, control) = native_connection::connected(registrations);
+    let latest = native_connection::prepare_data(&mut agent, generation, control);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &latest,
+        native_connection::SOURCE,
+    );
+    let receiving = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        native_connection::REMOTE_SOURCE,
+        &subscriber("state", TopicMode::Latest),
+    );
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            connected: true,
+            topics: TopicRegistrations {
+                publishers: vec![
+                    publisher("state", TopicMode::Latest),
+                    publisher("chat", TopicMode::Ordered),
+                ],
+                subscribers: vec![subscriber("state", TopicMode::Latest)],
+            },
+            ..Default::default()
+        }))
+        .unwrap();
+    let ordered = native_connection::prepare_data(&mut agent, generation, control);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &ordered,
+        "opaque/server/chat/source",
+    );
+    drain_notifications(&mut agent);
     let before = agent.snapshot().clone();
     assert_eq!(
         agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
-            channel: channels["v2/ordered/pub/chat"],
-            payload: b"not-protobuf".to_vec()
+            channel: ordered.channel,
+            payload: b"not-protobuf".to_vec(),
         })),
         Err(AgentError::InvalidTopic(TopicError::MalformedMessage))
     );
@@ -3686,11 +5131,20 @@ fn topic_boundaries_reject_malformed_cross_mode_unknown_and_oversized_input() {
         topic_input(
             &mut agent,
             generation,
-            channels["v2/latest/pub/state"],
+            latest.channel,
             TopicBody::Nack(TopicNack {
-                data_track_id: data_id(true, "state", TopicMode::Latest, "first"),
-                from_sequence: 0
+                data_track_id: native_connection::SOURCE.into(),
+                from_sequence: 0,
             })
+        ),
+        Err(AgentError::InvalidTopic(TopicError::InvalidControl))
+    );
+    assert_eq!(
+        topic_input(
+            &mut agent,
+            generation,
+            receiving.channel,
+            wire_message(native_connection::SOURCE, 0, b"wrong source")
         ),
         Err(AgentError::InvalidTopic(TopicError::InvalidControl))
     );
@@ -3698,9 +5152,10 @@ fn topic_boundaries_reject_malformed_cross_mode_unknown_and_oversized_input() {
         agent.handle(HostEvent::DataChannel(DataChannelEvent::Message {
             generation,
             channel: channel(99),
-            payload: vec![]
+            payload: vec![],
         })),
-        Err(AgentError::InvalidTopic(TopicError::UnknownChannel))
+        Ok(()),
+        "messages without a live source binding are inert, including late channel callbacks"
     );
     assert_eq!(
         agent.handle(HostEvent::DataChannel(DataChannelEvent::Opened {
@@ -3713,9 +5168,9 @@ fn topic_boundaries_reject_malformed_cross_mode_unknown_and_oversized_input() {
         topic_input(
             &mut agent,
             generation,
-            channels["v2/latest/sub/state"],
+            receiving.channel,
             wire_message(
-                &data_id(false, "state", TopicMode::Latest, "first"),
+                native_connection::REMOTE_SOURCE,
                 0,
                 &vec![0; MAX_TOPIC_PAYLOAD_BYTES + 1]
             )
@@ -3732,7 +5187,23 @@ fn lossy_keeps_distinct_messages_without_duplicates_coalescing_or_ordering() {
         publishers: vec![publisher("events", TopicMode::Lossy)],
         subscribers: vec![subscriber("events", TopicMode::Lossy)],
     };
-    let (mut agent, generation, _, channels) = connect_with_topics(registrations);
+    let (mut agent, generation, control) = native_connection::connected(registrations);
+    let prepared = native_connection::prepare_data(&mut agent, generation, control);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &prepared,
+        native_connection::SOURCE,
+    );
+    let receiving = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        native_connection::REMOTE_SOURCE,
+        &subscriber("events", TopicMode::Lossy),
+    );
+    drain_notifications(&mut agent);
     for value in 0..3 {
         agent
             .command(AgentCommand::SendTopic(TopicSend {
@@ -3746,7 +5217,7 @@ fn lossy_keeps_distinct_messages_without_duplicates_coalescing_or_ordering() {
         assert_eq!(
             body,
             wire_message(
-                &data_id(true, "events", TopicMode::Lossy, "first"),
+                native_connection::SOURCE,
                 sequence,
                 &[u8::try_from(sequence).unwrap()]
             )
@@ -3755,12 +5226,12 @@ fn lossy_keeps_distinct_messages_without_duplicates_coalescing_or_ordering() {
     }
     assert_eq!(agent.snapshot().topics.dropped_sends, 0);
     drain_notifications(&mut agent);
-    let id = data_id(false, "events", TopicMode::Lossy, "first");
+    let id = native_connection::REMOTE_SOURCE.to_string();
     for sequence in [2, 2, 0, 1, 0] {
         topic_input(
             &mut agent,
             generation,
-            channels["v2/lossy/sub/events"],
+            receiving.channel,
             wire_message(&id, sequence, &[u8::try_from(sequence).unwrap()]),
         )
         .unwrap();
@@ -3784,51 +5255,157 @@ fn lossy_keeps_distinct_messages_without_duplicates_coalescing_or_ordering() {
 }
 
 #[test]
-fn catalog_races_and_retirement_never_guess_or_revive_sender_metadata() {
-    let registrations = TopicRegistrations {
+fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
+    use pulsebeam_proto::state;
+    let (mut agent, generation, control) = native_connection::connected(TopicRegistrations {
         publishers: vec![publisher("state", TopicMode::Latest)],
         subscribers: vec![subscriber("state", TopicMode::Latest)],
-    };
-    let (mut agent, generation, signal, channels) = connect_with_topics(registrations.clone());
-    let channel = channels["v2/latest/sub/state"];
-    let old = data_id(false, "state", TopicMode::Latest, "first");
-    let new = data_id(false, "state", TopicMode::Latest, "second");
+    });
+    let old_publication = native_connection::prepare_data(&mut agent, generation, control);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &old_publication,
+        native_connection::SOURCE,
+    );
+    let old_subscription = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        native_connection::REMOTE_SOURCE,
+        &subscriber("state", TopicMode::Latest),
+    );
+    const NEW_REMOTE: &str = "opaque/remote/replacement";
+    const NEW_LOCAL: &str = "opaque/local/replacement";
+    drain_notifications(&mut agent);
+    assert_eq!(
+        topic_input(
+            &mut agent,
+            generation,
+            old_subscription.channel,
+            wire_message(NEW_REMOTE, 0, b"unresolved")
+        ),
+        Err(AgentError::InvalidTopic(TopicError::InvalidControl))
+    );
+    assert!(drain_notifications(&mut agent).is_empty());
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![native_connection::confirmed(
+            state::resource_key::Key::Track(native_connection::REMOTE_SOURCE.into()),
+            0,
+            state::confirmed_state::Value::Absent(state::AbsentState {
+                reason: state::AbsenceReason::Removed as i32,
+            }),
+        )],
+    );
+    assert!(agent.next_effect().is_none());
+    drain_notifications(&mut agent);
     topic_input(
         &mut agent,
         generation,
-        channel,
-        wire_message(&new, 0, b"unresolved"),
+        old_subscription.channel,
+        wire_message(native_connection::REMOTE_SOURCE, 5, b"still-owned"),
     )
     .unwrap();
-    assert!(drain_notifications(&mut agent).is_empty());
+    assert!(
+        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { data_track_id, sequence: 5, .. }))] if data_track_id == native_connection::REMOTE_SOURCE)
+    );
     agent
         .command(AgentCommand::SendTopic(TopicSend {
             publisher: publisher("state", TopicMode::Latest),
             payload: b"old-pending".to_vec(),
         }))
         .unwrap();
-    next_topic_send(&mut agent);
-    inject_topic_catalog(&mut agent, generation, signal, &registrations, 2, "second");
+    let (old_operation, old_channel, _) = next_topic_send(&mut agent);
+    assert_eq!(old_channel, old_publication.channel);
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![
+            native_connection::confirmed(
+                state::resource_key::Key::Owned(old_publication.reference),
+                old_publication.revision,
+                state::confirmed_state::Value::Absent(state::AbsentState {
+                    reason: state::AbsenceReason::SourceEnded as i32,
+                }),
+            ),
+            native_connection::confirmed(
+                state::resource_key::Key::Owned(old_subscription.reference),
+                old_subscription.revision,
+                state::confirmed_state::Value::Absent(state::AbsentState {
+                    reason: state::AbsenceReason::SourceEnded as i32,
+                }),
+            ),
+        ],
+    );
     assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, 0);
     assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
     assert!(!agent.snapshot().topics.publishers[0].send_pending);
+    for channel in [old_publication.channel, old_subscription.channel] {
+        assert_eq!(
+            next_effect(&mut agent),
+            Effect::Rtc(RtcEffect::CloseDataChannel {
+                generation,
+                channel
+            })
+        );
+    }
+    assert!(
+        agent.next_effect().is_none(),
+        "cutoff does not substitute for closure"
+    );
+    for channel in [old_publication.channel, old_subscription.channel] {
+        agent
+            .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+                generation,
+                channel,
+            }))
+            .unwrap();
+    }
+    let publication = native_connection::prepare_data(&mut agent, generation, control);
+    assert_ne!(publication.channel, old_publication.channel);
+    assert!(publication.reference > old_publication.reference);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        control,
+        &publication,
+        NEW_LOCAL,
+    );
+    let receiving = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        NEW_REMOTE,
+        &subscriber("state", TopicMode::Latest),
+    );
+    assert_ne!(receiving.channel, old_subscription.channel);
+    assert!(receiving.reference > old_subscription.reference);
+    assert!(
+        agent.next_effect().is_none(),
+        "old pending bytes cannot replay"
+    );
     drain_notifications(&mut agent);
     topic_input(
         &mut agent,
         generation,
-        channel,
-        wire_message(&old, 999, b"retired"),
+        old_subscription.channel,
+        wire_message(native_connection::REMOTE_SOURCE, 999, b"retired"),
     )
     .unwrap();
     topic_input(
         &mut agent,
         generation,
-        channel,
-        wire_message(&new, 0, b"new"),
+        receiving.channel,
+        wire_message(NEW_REMOTE, 0, b"new"),
     )
     .unwrap();
     assert!(
-        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { participant_id, data_track_id, sequence: 0, payload, .. }))] if participant_id == "remote-app-user" && data_track_id == &new && payload == b"new")
+        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { participant_id, data_track_id, sequence: 0, payload, .. }))] if participant_id == "remote-app-user" && data_track_id == NEW_REMOTE && payload == b"new")
     );
     agent
         .command(AgentCommand::SendTopic(TopicSend {
@@ -3836,21 +5413,41 @@ fn catalog_races_and_retirement_never_guess_or_revive_sender_metadata() {
             payload: b"new-local".to_vec(),
         }))
         .unwrap();
-    let (_, _, body) = next_topic_send(&mut agent);
+    let (operation, channel, body) = next_topic_send(&mut agent);
+    assert_eq!(channel, publication.channel);
     assert!(
-        matches!(body, TopicBody::Message(message) if message.data_track_id == data_id(true, "state", TopicMode::Latest, "second") && message.sequence == 0)
+        matches!(body, TopicBody::Message(message) if message.data_track_id == NEW_LOCAL && message.sequence == 0)
     );
+    let before = agent.snapshot().clone();
+    acknowledge_send(&mut agent, generation, old_channel, old_operation);
+    assert_eq!(agent.snapshot(), &before);
+    assert!(agent.next_effect().is_none());
+    acknowledge_send(&mut agent, generation, channel, operation);
 }
 
 #[test]
 fn reconnect_starts_fresh_publications_without_old_history_or_generation_output() {
+    use pulsebeam_proto::state::{self, codec, validation};
     let registrations = TopicRegistrations {
         publishers: vec![publisher("chat", TopicMode::Ordered)],
         subscribers: vec![subscriber("chat", TopicMode::Ordered)],
     };
-    let (mut agent, old_generation, _, old_channels) = connect_with_topics(registrations.clone());
-    let old_publish_channel = old_channels["v2/ordered/pub/chat"];
-    let old_subscribe_channel = old_channels["v2/ordered/sub/chat"];
+    let (mut agent, old_generation, old_control) = native_connection::connected(registrations);
+    let old_publication = native_connection::prepare_data(&mut agent, old_generation, old_control);
+    native_connection::confirm_publication(
+        &mut agent,
+        old_generation,
+        old_control,
+        &old_publication,
+        native_connection::SOURCE,
+    );
+    let old_subscription = native_connection::prepare_subscription(
+        &mut agent,
+        old_generation,
+        old_control,
+        native_connection::REMOTE_SOURCE,
+        &subscriber("chat", TopicMode::Ordered),
+    );
     let publish = publisher("chat", TopicMode::Ordered);
     agent
         .command(AgentCommand::SendTopic(TopicSend {
@@ -3860,61 +5457,55 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         .unwrap();
     let (accepted, _, body) = next_topic_send(&mut agent);
     let TopicBody::Message(old_message) = body else {
-        panic!("message");
+        panic!("message")
     };
-    acknowledge_send(&mut agent, old_generation, old_publish_channel, accepted);
+    acknowledge_send(
+        &mut agent,
+        old_generation,
+        old_publication.channel,
+        accepted,
+    );
     drain_notifications(&mut agent);
     agent
         .handle(HostEvent::Rtc(RtcEvent::Disconnected {
             generation: old_generation,
         }))
         .unwrap();
-    let (generation, specs) = match next_effect(&mut agent) {
-        Effect::Rtc(RtcEffect::CreateOffer {
-            generation,
-            data_channels,
-            ..
-        }) => (generation, data_channels),
-        effect => panic!("expected replacement offer, got {effect:?}"),
+    let Effect::Rtc(RtcEffect::CreateOffer {
+        generation,
+        data_channels,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("replacement offer")
     };
+    assert_ne!(generation, old_generation);
+    assert_eq!(data_channels.len(), 1);
+    assert_eq!(data_channels[0].negotiated_id, Some(0));
     let signal = channel(50);
-    let mut new_channels = BTreeMap::new();
-    let bindings = specs
-        .iter()
-        .skip(1)
-        .enumerate()
-        .map(|(index, spec)| {
-            let id = channel(51 + u64::try_from(index).unwrap());
-            new_channels.insert(spec.label.clone(), id);
-            DataChannelBinding {
-                label: spec.label.clone(),
-                channel: id,
-            }
-        })
-        .collect();
-    let mut replacement_resources = resources(signal);
-    replacement_resources.data_channels = bindings;
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation,
-            offer: offer(),
-            resources: replacement_resources,
+            offer: native_connection::OFFER.into(),
+            resources: OfferResources {
+                slots: Vec::new(),
+                signaling_channel: signal,
+                data_channels: Vec::new(),
+            },
         }))
         .unwrap();
-    let update = match next_effect(&mut agent) {
-        Effect::Http(HttpEffect::Request { operation, .. }) => operation,
-        effect => panic!("expected replacement request, got {effect:?}"),
+    let Effect::Http(HttpEffect::Request { operation, .. }) = next_effect(&mut agent) else {
+        panic!("replacement POST")
     };
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
-            operation: update,
-            response: update_response(LOCAL_PUBLISHER),
+            operation,
+            response: create_response("p2", "unused", "https://sfu.test/sessions/p2"),
         }))
         .unwrap();
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::ApplyAnswer { .. })
-    ));
+    assert!(
+        matches!(next_effect(&mut agent), Effect::Rtc(RtcEffect::ApplyAnswer { generation: current, .. }) if current == generation)
+    );
     agent
         .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
         .unwrap();
@@ -3927,50 +5518,29 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
             channel: signal,
         }))
         .unwrap();
-    for channel in new_channels.values().copied() {
-        agent
-            .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
-                generation,
-                channel,
-            }))
-            .unwrap();
-    }
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel: signal,
+            payload: codec::encode(
+                &state::StateBatch {
+                    records: vec![native_connection::grant(1)],
+                    initial_complete: true,
+                },
+                validation::Direction::Server,
+            )
+            .unwrap(),
+        }))
+        .unwrap();
     assert_eq!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::Close {
-            generation: old_generation,
+            generation: old_generation
         })
     );
-    assert!(
-        matches!(next_effect(&mut agent), Effect::Timer(TimerEffect::Schedule { after, .. }) if after == Duration::from_secs(30))
-    );
-    let (operation, seed_id) = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send {
-            operation, payload, ..
-        }) => {
-            let Some(v1::client_message::Payload::SubscriptionSeed(seed)) =
-                pulsebeam_proto::codec::decode_client(&payload)
-                    .unwrap()
-                    .payload
-            else {
-                panic!("expected replacement subscription seed");
-            };
-            (operation, seed.seed_id)
-        }
-        effect => panic!("expected subscription seed, got {effect:?}"),
-    };
-    acknowledge_send(&mut agent, generation, signal, operation);
-    let signaling = match next_effect(&mut agent) {
-        Effect::DataChannel(DataChannelEffect::Send {
-            operation, channel, ..
-        }) => {
-            assert_eq!(channel, signal);
-            operation
-        }
-        effect => panic!("expected replacement signaling intent, got {effect:?}"),
-    };
-    acknowledge_send(&mut agent, generation, signal, signaling);
+
     assert!(agent.next_effect().is_none());
+    assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p2"));
     assert_eq!(agent.snapshot().topics.publishers[0].data_track_id, None);
     assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, 0);
     assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
@@ -3983,44 +5553,37 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
             _
         )))
     ));
-    inject_topic_catalog(&mut agent, generation, signal, &registrations, 1, "second");
-    agent
-        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
-            generation,
-            channel: signal,
-            payload: server_payload(v1::server_message::Payload::SubscriptionSeedComplete(
-                v1::SubscriptionSeedComplete {
-                    seed_id,
-                    catalog_revision: 1,
-                },
-            )),
-        }))
-        .unwrap();
-    while let Some(effect) = agent.next_effect() {
-        if matches!(effect, Effect::Timer(TimerEffect::Cancel { .. })) {
-            continue;
-        }
-        let Effect::DataChannel(DataChannelEffect::Send {
-            operation, channel, ..
-        }) = effect
-        else {
-            panic!("probe");
-        };
-        acknowledge_send(&mut agent, generation, channel, operation);
-    }
+    let publication = native_connection::prepare_data(&mut agent, generation, signal);
+    native_connection::confirm_publication(
+        &mut agent,
+        generation,
+        signal,
+        &publication,
+        "opaque/local/root-two",
+    );
+    let receiving = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        signal,
+        "opaque/remote/root-two",
+        &subscriber("chat", TopicMode::Ordered),
+    );
     drain_notifications(&mut agent);
     topic_input(
         &mut agent,
         old_generation,
-        old_subscribe_channel,
-        wire_message(
-            &data_id(false, "chat", TopicMode::Ordered, "first"),
-            0,
-            b"stale-generation",
-        ),
+        old_subscription.channel,
+        wire_message(native_connection::REMOTE_SOURCE, 0, b"stale-generation"),
     )
     .unwrap();
+    acknowledge_send(
+        &mut agent,
+        old_generation,
+        old_publication.channel,
+        accepted,
+    );
     assert!(drain_notifications(&mut agent).is_empty());
+    assert!(agent.next_effect().is_none());
     agent
         .command(AgentCommand::SendTopic(TopicSend {
             publisher: publish,
@@ -4028,9 +5591,11 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         }))
         .unwrap();
     let (_, new_publish_channel, body) = next_topic_send(&mut agent);
-    assert_eq!(new_publish_channel, new_channels["v2/ordered/pub/chat"]);
+    assert_eq!(new_publish_channel, publication.channel);
+    assert_ne!(publication.channel, old_publication.channel);
+    assert_ne!(receiving.channel, old_subscription.channel);
     let TopicBody::Message(new_message) = body else {
-        panic!("new message");
+        panic!("new message")
     };
     assert_ne!(new_message.data_track_id, old_message.data_track_id);
     assert_eq!(new_message.sequence, 0);
@@ -4060,5 +5625,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         next_topic_send(&mut agent).2,
         TopicBody::Message(new_message)
     );
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert!(agent.next_effect().is_none());
 }

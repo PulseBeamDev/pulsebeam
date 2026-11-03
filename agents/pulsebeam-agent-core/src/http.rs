@@ -34,6 +34,7 @@ impl core::fmt::Debug for HttpHeader {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum HttpMethod {
     Post,
+    Patch,
     Delete,
 }
 

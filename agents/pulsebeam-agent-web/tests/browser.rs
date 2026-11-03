@@ -4,7 +4,10 @@ mod support;
 
 use destination::DestinationServer;
 use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use support::{
     StaticServer, TestResult, capabilities, evaluate_json, managed_driver, mint_development_token,
     navigate,
@@ -19,17 +22,29 @@ fn root() -> PathBuf {
         .into()
 }
 
+fn authorization_expiry() -> TestResult<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs()
+        .checked_add(86_400)
+        .ok_or_else(|| "test authorization expiry overflow".into())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn native_platform_smoke() -> TestResult<()> {
     let destination = DestinationServer::start().await?;
     let server = StaticServer::start(root()).await?;
     let room = RoomExternalId::new("public-web-contract")?;
-    let sender =
-        mint_development_token(&room, &ParticipantExternalId::new("web-sender")?, u64::MAX)?;
+    let expires_at = authorization_expiry()?;
+    let sender = mint_development_token(
+        &room,
+        &ParticipantExternalId::new("web-sender")?,
+        expires_at,
+    )?;
     let receiver = mint_development_token(
         &room,
         &ParticipantExternalId::new("web-receiver")?,
-        u64::MAX,
+        expires_at,
     )?;
     let live = include_str!("contracts/live-agent-contract.js")
         .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
@@ -179,10 +194,14 @@ async fn web_adapter_restart_smoke() -> TestResult<()> {
     let address = destination.address();
     let server = StaticServer::start(root()).await?;
     let room = RoomExternalId::new("web-adapter-restart")?;
+    let expires_at = authorization_expiry()?;
     let sender =
-        mint_development_token(&room, &ParticipantExternalId::new("publisher")?, u64::MAX)?;
-    let receiver =
-        mint_development_token(&room, &ParticipantExternalId::new("subscriber")?, u64::MAX)?;
+        mint_development_token(&room, &ParticipantExternalId::new("publisher")?, expires_at)?;
+    let receiver = mint_development_token(
+        &room,
+        &ParticipantExternalId::new("subscriber")?,
+        expires_at,
+    )?;
     let start = include_str!("contracts/adapter-restart-start.js")
         .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
         .replace("__SENDER_TOKEN__", &sender)

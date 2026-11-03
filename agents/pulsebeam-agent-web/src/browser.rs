@@ -27,9 +27,15 @@ use web_sys::{
 };
 
 use crate::engine::{ActorHandle, Host, PublicCommand, Turn, TurnErrorSource, spawn_actor};
+use crate::local_operation::LocalOperationGate;
 use crate::logger::{BrowserLogger, LogLevel};
+use crate::sender_config::{
+    EncodingConfig, SenderConfig, media_kind_name, normalize_sender_config,
+};
 
+mod preparation;
 mod resources;
+mod rtp;
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
 const LOG_TARGET: &str = "pulsebeam_agent_web::browser";
@@ -206,15 +212,6 @@ enum PlayoutDelayConfig {
     },
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SenderConfig {
-    content_hint: String,
-    degradation_preference: Option<String>,
-    #[serde(default)]
-    encodings: Vec<EncodingConfig>,
-}
-
 struct LocalOperationError {
     class: &'static str,
     message: String,
@@ -244,18 +241,6 @@ impl LocalOperationError {
         );
         error.into()
     }
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EncodingConfig {
-    rid: Option<String>,
-    active: bool,
-    scale_resolution_down_by: Option<f64>,
-    max_bitrate: Option<f64>,
-    max_framerate: Option<f64>,
-    scalability_mode: Option<String>,
-    dtx: Option<String>,
 }
 
 #[derive(Clone)]
@@ -335,6 +320,53 @@ fn default_true() -> bool {
     true
 }
 
+fn prepared_data_channel(
+    connection: &RtcPeerConnection,
+    channel: &RtcDataChannel,
+) -> Result<agent_core::PreparedDataChannel, String> {
+    let boolean_property = |name: &str| {
+        Reflect::get(channel.as_ref(), &JsValue::from_str(name))
+            .ok()
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| "browser channel facts unavailable".to_owned())
+    };
+    let reliability = match (channel.max_retransmits(), channel.max_packet_life_time()) {
+        (None, None) => DataChannelReliability::Reliable,
+        (Some(count), None) => DataChannelReliability::MaxRetransmits(count),
+        (None, Some(time)) => DataChannelReliability::MaxPacketLifetime(time),
+        _ => return Err("conflicting browser retransmit limits".to_owned()),
+    };
+    // Pinned web-sys omits RTCSctpTransport and its nullable maxChannels getter.
+    let sctp = Reflect::get(connection.as_ref(), &JsValue::from_str("sctp"))
+        .map_err(|_| "browser SCTP transport unavailable".to_owned())?;
+    let association_max_channels = if sctp.is_null() || sctp.is_undefined() {
+        None
+    } else {
+        let capacity = Reflect::get(&sctp, &JsValue::from_str("maxChannels"))
+            .map_err(|_| "browser SCTP capacity unavailable".to_owned())?;
+        if capacity.is_null() || capacity.is_undefined() {
+            None
+        } else {
+            let capacity = capacity
+                .as_f64()
+                .filter(|value| {
+                    value.is_finite() && value.fract() == 0.0 && (1.0..=65_536.0).contains(value)
+                })
+                .ok_or_else(|| "invalid browser SCTP capacity".to_owned())?;
+            Some(capacity as u32)
+        }
+    };
+    Ok(agent_core::PreparedDataChannel {
+        stream_id: channel
+            .id()
+            .ok_or_else(|| "browser channel stream ID unavailable".to_owned())?,
+        negotiated: boolean_property("negotiated")?,
+        ordered: boolean_property("ordered")?,
+        reliability,
+        association_max_channels,
+    })
+}
+
 struct DataChannel {
     channel: RtcDataChannel,
     _open: Closure<dyn FnMut(Event)>,
@@ -352,7 +384,9 @@ impl DataChannel {
 }
 
 struct Peer {
+    generation: Generation,
     connection: RtcPeerConnection,
+    sdp: Option<agent_core::client_sdp::Executor>,
     transceivers: Vec<(MediaSlot, RtcRtpTransceiver)>,
     receiver_mids: BTreeMap<u32, String>,
     remote_tracks: BTreeMap<String, RemoteTrackState>,
@@ -362,6 +396,48 @@ struct Peer {
 }
 
 impl Peer {
+    fn observe_senders(
+        &self,
+        context: &mut agent_core::client_sdp::Context,
+        report: Option<&JsValue>,
+    ) -> Result<agent_core::client_sdp::Bindings, agent_core::client_sdp::Error> {
+        use agent_core::client_sdp::Error;
+        let mut facts = Vec::new();
+        let mut cname = None;
+        for (slot, transceiver) in &self.transceivers {
+            if !matches!(slot, MediaSlot::LocalVideo(_) | MediaSlot::LocalAudio(_)) {
+                continue;
+            }
+            let mid = transceiver.mid().ok_or(Error::Observation)?;
+            let Some(binding) = context
+                .applied_bindings()
+                .publications
+                .iter()
+                .find(|binding| binding.mid == mid)
+            else {
+                continue;
+            };
+            let (mut encodings, mut rtcp) = rtp::sender_facts(&transceiver.sender(), binding)?;
+            rtcp.cname = rtcp.cname.or_else(|| binding.rtcp.cname.clone());
+            if let Some(observed) = &rtcp.cname {
+                if cname.as_ref().is_some_and(|cname| cname != observed) {
+                    return Err(Error::Observation);
+                }
+                cname = Some(observed.clone());
+            }
+            if let Some(report) = report {
+                rtp::observe_stats(report, binding, &mut encodings)?;
+            }
+            facts.push((mid, encodings, rtcp));
+        }
+        for (mid, encodings, mut rtcp) in facts {
+            // RFC 8834 section 4.9 requires one endpoint CNAME per PeerConnection.
+            rtcp.cname = rtcp.cname.or_else(|| cname.clone());
+            context.observe_sender_facts(&mid, &encodings, &rtcp)?;
+        }
+        context.bindings().cloned().ok_or(Error::CandidateState)
+    }
+
     fn close(self) {
         self.connection.set_onconnectionstatechange(None);
         self.connection.set_ontrack(None);
@@ -468,7 +544,6 @@ struct RuntimeInner {
     local_operation_gates: BTreeMap<String, LocalOperationGate>,
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
     local_muted: RefCell<BTreeMap<String, bool>>,
-    local_source_revisions: RefCell<BTreeMap<String, u64>>,
     publication_slots: RefCell<BTreeMap<u64, PublicationSlot>>,
     peers: RefCell<BTreeMap<u64, Peer>>,
     requests: RefCell<BTreeMap<u64, AbortController>>,
@@ -479,34 +554,6 @@ struct RuntimeInner {
     last_error: RefCell<Option<String>>,
     closing: Cell<bool>,
     closed: Cell<bool>,
-}
-
-#[derive(Default)]
-struct LocalOperationGate {
-    tail: RefCell<Option<oneshot::Receiver<()>>>,
-}
-
-impl LocalOperationGate {
-    async fn enter(&self) -> LocalOperationPermit {
-        let (done, next) = oneshot::channel();
-        let previous = self.tail.replace(Some(next));
-        if let Some(previous) = previous {
-            let _ = previous.await;
-        }
-        LocalOperationPermit { done: Some(done) }
-    }
-}
-
-struct LocalOperationPermit {
-    done: Option<oneshot::Sender<()>>,
-}
-
-impl Drop for LocalOperationPermit {
-    fn drop(&mut self) {
-        if let Some(done) = self.done.take() {
-            let _ = done.send(());
-        }
-    }
 }
 
 #[wasm_bindgen]
@@ -549,7 +596,6 @@ impl BrowserRuntime {
             local_operation_gates,
             local_tracks: RefCell::new(BTreeMap::new()),
             local_muted: RefCell::new(BTreeMap::new()),
-            local_source_revisions: RefCell::new(BTreeMap::new()),
             publication_slots: RefCell::new(BTreeMap::new()),
             peers: RefCell::new(BTreeMap::new()),
             requests: RefCell::new(BTreeMap::new()),
@@ -952,17 +998,13 @@ impl RuntimeInner {
     }
 
     fn invalidate_local_slot(self: &Rc<Self>, slot: &str) {
-        let revision = {
-            let mut revisions = self.local_source_revisions.borrow_mut();
-            let current = revisions.entry(slot.into()).or_default();
-            let Some(next) = current.checked_add(1) else {
-                drop(revisions);
-                self.report_error("local source revision exhausted".into());
-                self.shutdown();
-                return;
-            };
-            *current = next;
-            next
+        let Some(gate) = self.local_operation_gates.get(slot) else {
+            return;
+        };
+        let Some(revision) = gate.advance_revision() else {
+            self.report_error("local source revision exhausted".into());
+            self.shutdown();
+            return;
         };
         if let Some(state) = self.local_tracks.borrow_mut().remove(slot) {
             state.track.stop();
@@ -979,9 +1021,7 @@ impl RuntimeInner {
                 return;
             };
             let _permit = gate.enter().await;
-            if inner.is_closed()
-                || inner.local_source_revisions.borrow().get(&slot) != Some(&revision)
-            {
+            if inner.is_closed() || gate.revision() != Some(revision) {
                 return;
             }
             if let Err(error) = inner.sync_local_slot(&slot).await {
@@ -1024,14 +1064,9 @@ impl RuntimeInner {
                 )));
             }
         }
-        let revision = {
-            let mut revisions = self.local_source_revisions.borrow_mut();
-            let current = revisions.entry(slot.clone()).or_default();
-            *current = current
-                .checked_add(1)
-                .ok_or_else(|| LocalOperationError::runtime("local source revision exhausted"))?;
-            *current
-        };
+        let revision = gate
+            .advance_revision()
+            .ok_or_else(|| LocalOperationError::runtime("local source revision exhausted"))?;
         if track.is_none() {
             if let Some(state) = self.local_tracks.borrow().get(&slot) {
                 state.track.stop();
@@ -1039,7 +1074,7 @@ impl RuntimeInner {
         }
         let _permit = gate.enter().await;
         self.ensure_local_operation_open()?;
-        if self.local_source_revisions.borrow().get(&slot) != Some(&revision) {
+        if gate.revision() != Some(revision) {
             return Ok(());
         }
         if let Some(owner) = owner {
@@ -1114,40 +1149,45 @@ impl RuntimeInner {
         Ok(())
     }
 
-    async fn sync_local_slot(&self, slot: &str) -> Result<(), String> {
-        let revision = self.local_source_revisions.borrow().get(slot).copied();
+    async fn sync_local_slot(self: &Rc<Self>, slot: &str) -> Result<(), String> {
+        let gate = self
+            .local_operation_gates
+            .get(slot)
+            .ok_or_else(|| format!("local publication slot has no operation gate: {slot}"))?;
+        let revision = gate.revision();
         let state = self.local_tracks.borrow().get(slot).cloned();
-        let senders: Vec<(u64, RtcRtpSender)> = self
+        let senders: Vec<(Generation, RtcRtpSender)> = self
             .peers
             .borrow()
-            .iter()
-            .flat_map(|(generation, peer)| {
+            .values()
+            .flat_map(|peer| {
                 peer.transceivers
                     .iter()
                     .filter_map(move |(media_slot, transceiver)| match media_slot {
                         MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name)
                             if name == slot =>
                         {
-                            Some((*generation, transceiver.sender()))
+                            Some((peer.generation, transceiver.sender()))
                         }
                         _ => None,
                     })
             })
             .collect();
         for (generation, sender) in senders {
-            if self.local_source_revisions.borrow().get(slot).copied() != revision {
+            if gate.revision() != revision {
                 return Ok(());
             }
             let eligible = state.as_ref().filter(|state| {
                 state
                     .after_generation
-                    .is_none_or(|after| generation > after.get())
+                    .is_none_or(|after| generation > after)
             });
             let result = apply_sender_state(&self.logger, &sender, eligible).await;
-            if self.local_source_revisions.borrow().get(slot).copied() != revision {
+            if gate.revision() != revision {
                 return Ok(());
             }
             result?;
+            self.observe_media(generation);
         }
         Ok(())
     }
@@ -1304,8 +1344,94 @@ impl RuntimeInner {
                 }
                 Err(error) => self.rtc_failed(generation, error),
             },
-            RtcEffect::ApplyAnswer { generation, answer } => {
-                self.apply_answer(generation, answer);
+            RtcEffect::ApplyAnswer {
+                generation,
+                answer,
+                capabilities,
+            } => {
+                self.apply_answer(generation, answer, capabilities);
+            }
+            RtcEffect::CreateDataChannel {
+                generation,
+                channel,
+                specification,
+            } => {
+                let connection = {
+                    let peers = self.peers.borrow();
+                    peers
+                        .get(&generation.get())
+                        .filter(|peer| !peer.channels.contains_key(&channel.get()))
+                        .map(|peer| peer.connection.clone())
+                };
+                let result = connection
+                    .filter(|_| {
+                        specification
+                            .negotiated_id
+                            .is_some_and(|id| id != 0 && id != u16::MAX)
+                    })
+                    .ok_or_else(|| "payload channel requires an available identity and negotiated non-control stream".to_owned())
+                    .and_then(|connection| {
+                        self.create_data_channel(generation, channel, &connection, &specification)
+                    });
+                match result {
+                    Ok(created) => {
+                        if let Some(peer) = self.peers.borrow_mut().get_mut(&generation.get()) {
+                            let previous = peer.channels.insert(channel.get(), created);
+                            debug_assert!(previous.is_none(), "channel identity must be unique");
+                        } else {
+                            created.close();
+                        }
+                    }
+                    Err(error) => {
+                        self.send_event(HostEvent::DataChannel(DataChannelEvent::Prepared {
+                            generation,
+                            channel,
+                            preparation: Err(error),
+                        }));
+                    }
+                }
+            }
+            RtcEffect::CloseDataChannel {
+                generation,
+                channel,
+            } => {
+                let channel = self
+                    .peers
+                    .borrow()
+                    .get(&generation.get())
+                    .and_then(|peer| peer.channels.get(&channel.get()))
+                    .map(|channel| channel.channel.clone());
+                if let Some(channel) = channel.filter(|channel| channel.id() != Some(0)) {
+                    channel.close();
+                }
+            }
+            RtcEffect::PrepareMedia {
+                generation,
+                operation,
+                requests,
+            } => {
+                self.prepare_media(generation, operation, requests);
+            }
+            RtcEffect::AllocateMedia {
+                generation,
+                operation,
+                allocations,
+                mode,
+            } => {
+                self.allocate_media(generation, operation, allocations, mode);
+            }
+            RtcEffect::RetireMedia {
+                generation,
+                operation,
+                mids,
+            } => {
+                self.retire_media(generation, operation, mids);
+            }
+            RtcEffect::CancelMediaPreparation {
+                generation,
+                operation,
+            } => {
+                self.cancel_media(generation, operation);
             }
             RtcEffect::Close { generation } => {
                 if let Some(peer) = self.peers.borrow_mut().remove(&generation.get()) {
@@ -1319,7 +1445,7 @@ impl RuntimeInner {
     fn build_peer(
         self: &Rc<Self>,
         generation: Generation,
-        topology: &MediaTopology,
+        _topology: &MediaTopology,
         specs: &[DataChannelSpec],
     ) -> Result<Peer, String> {
         let config = RtcConfiguration::new();
@@ -1336,6 +1462,7 @@ impl RuntimeInner {
             match state_connection.connection_state() {
                 RtcPeerConnectionState::Connected => {
                     inner.send_event(HostEvent::Rtc(RtcEvent::Connected { generation }));
+                    inner.observe_media(generation);
                 }
                 RtcPeerConnectionState::Disconnected | RtcPeerConnectionState::Failed => {
                     inner.send_event(HostEvent::Rtc(RtcEvent::Disconnected { generation }));
@@ -1426,29 +1553,12 @@ impl RuntimeInner {
             debug_assert!(previous.is_none(), "channel IDs must be unique");
         }
 
-        let mut transceivers = Vec::new();
-        for index in 0..topology.local_video {
-            let slot = MediaSlot::LocalVideo(format!("v{index}"));
-            let transceiver = add_transceiver(&connection, "video", true, true)?;
-            transceivers.push((slot, transceiver));
-        }
-        for index in 0..topology.local_audio {
-            let slot = MediaSlot::LocalAudio(format!("a{index}"));
-            let transceiver = add_transceiver(&connection, "audio", true, false)?;
-            transceivers.push((slot, transceiver));
-        }
-        for index in 0..topology.remote_video {
-            let transceiver = add_transceiver(&connection, "video", false, false)?;
-            transceivers.push((MediaSlot::RemoteVideo(index), transceiver));
-        }
-        for index in 0..topology.remote_audio {
-            let transceiver = add_transceiver(&connection, "audio", false, false)?;
-            transceivers.push((MediaSlot::RemoteAudio(index), transceiver));
-        }
-
         Ok(Peer {
+            generation,
             connection,
-            transceivers,
+            sdp: None,
+            // Keep the initial SCTP m-line as the non-retiring BUNDLE anchor.
+            transceivers: Vec::new(),
             receiver_mids: BTreeMap::new(),
             remote_tracks: BTreeMap::new(),
             channels,
@@ -1503,6 +1613,25 @@ impl RuntimeInner {
         let open_weak = Rc::downgrade(self);
         let open = Closure::wrap(Box::new(move |_event: Event| {
             if let Some(inner) = open_weak.upgrade() {
+                let preparation = {
+                    let peers = inner.peers.borrow();
+                    peers
+                        .get(&generation.get())
+                        .and_then(|peer| {
+                            peer.channels
+                                .get(&channel_id.get())
+                                .map(|channel| (peer, channel))
+                        })
+                        .ok_or_else(|| "browser channel generation retired".to_owned())
+                        .and_then(|(peer, channel)| {
+                            prepared_data_channel(&peer.connection, &channel.channel)
+                        })
+                };
+                inner.send_event(HostEvent::DataChannel(DataChannelEvent::Prepared {
+                    generation,
+                    channel: channel_id,
+                    preparation,
+                }));
                 inner.send_event(HostEvent::DataChannel(DataChannelEvent::Opened {
                     generation,
                     channel: channel_id,
@@ -1514,6 +1643,15 @@ impl RuntimeInner {
         let close_weak = Rc::downgrade(self);
         let close = Closure::wrap(Box::new(move |_event: Event| {
             if let Some(inner) = close_weak.upgrade() {
+                let retired = inner
+                    .peers
+                    .borrow_mut()
+                    .get_mut(&generation.get())
+                    .and_then(|peer| peer.channels.remove(&channel_id.get()));
+                // Keep this executing closure alive until its callback returns.
+                if let Some(retired) = retired {
+                    spawn_local(async move { retired.close() });
+                }
                 inner.send_event(HostEvent::DataChannel(DataChannelEvent::Closed {
                     generation,
                     channel: channel_id,
@@ -1649,7 +1787,54 @@ impl RuntimeInner {
         })
     }
 
-    fn apply_answer(self: &Rc<Self>, generation: Generation, answer: String) {
+    fn initialize_sdp(
+        &self,
+        generation: Generation,
+        capabilities: &agent_core::BootstrapCapabilities,
+    ) -> Result<Result<agent_core::client_sdp::Bindings, agent_core::client_sdp::Error>, String>
+    {
+        let mut peers = self.peers.borrow_mut();
+        let peer = peers
+            .get_mut(&generation.get())
+            .ok_or_else(|| "bootstrap generation is retired".to_owned())?;
+        if peer.sdp.is_some() {
+            return Err("bootstrap context is already installed".into());
+        }
+        let offer = peer
+            .connection
+            .local_description()
+            .ok_or_else(|| "applied local bootstrap is absent".to_owned())?;
+        let answer = peer
+            .connection
+            .remote_description()
+            .ok_or_else(|| "applied remote bootstrap is absent".to_owned())?;
+        let mut context = capabilities
+            .applied_context(&offer.sdp(), &answer.sdp(), generation)
+            .map_err(|_| "unsupported applied bootstrap SDP".to_owned())?;
+        let preparation = (|| {
+            let slots = peer
+                .transceivers
+                .iter()
+                .map(|(slot, transceiver)| {
+                    transceiver
+                        .mid()
+                        .map(|mid| (slot.clone(), mid))
+                        .ok_or(agent_core::client_sdp::Error::Identifier)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            agent_core::adopt_bootstrap_media(&mut context, &slots)?;
+            peer.observe_senders(&mut context, None)
+        })();
+        peer.sdp = Some(agent_core::client_sdp::Executor::new(context));
+        Ok(preparation)
+    }
+
+    fn apply_answer(
+        self: &Rc<Self>,
+        generation: Generation,
+        answer: String,
+        capabilities: agent_core::BootstrapCapabilities,
+    ) {
         let Some(connection) = self
             .peers
             .borrow()
@@ -1669,9 +1854,27 @@ impl RuntimeInner {
                     return;
                 }
                 match result {
-                    Ok(_) => {
-                        inner.send_event(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
-                    }
+                    Ok(_) => match inner.initialize_sdp(generation, &capabilities) {
+                        Ok(preparation) => {
+                            inner.send_event(HostEvent::Rtc(RtcEvent::BootstrapMediaPrepared {
+                                generation,
+                                preparation,
+                            }));
+                            inner
+                                .send_event(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }));
+                            inner.observe_media(generation);
+                        }
+                        Err(error) => {
+                            inner.report_error(format!(
+                                "generation={} bootstrap rejected: {error}",
+                                generation.get()
+                            ));
+                            inner.send_event(HostEvent::Rtc(RtcEvent::BootstrapRejected {
+                                generation,
+                                message: error,
+                            }));
+                        }
+                    },
                     Err(error) => inner.rtc_failed(generation, js_message(error)),
                 }
             }
@@ -1876,7 +2079,9 @@ impl RuntimeInner {
             state.track.stop();
         }
         self.local_muted.borrow_mut().clear();
-        self.local_source_revisions.borrow_mut().clear();
+        for gate in self.local_operation_gates.values() {
+            gate.clear_revision();
+        }
         self.publication_slots.borrow_mut().clear();
     }
 
@@ -1954,7 +2159,6 @@ fn add_transceiver(
             let encoding = Object::new();
             set(&encoding, "rid", rid);
             set(&encoding, "active", false);
-            set(&encoding, "scalabilityMode", "L1T3");
             encodings.push(&encoding);
         }
         init.set_send_encodings(&encodings);
@@ -1968,92 +2172,6 @@ fn add_transceiver(
         .map_err(js_message)?
         .dyn_into()
         .map_err(js_message)
-}
-
-fn normalize_sender_config(
-    kind: MediaKind,
-    mut config: SenderConfig,
-) -> Result<SenderConfig, String> {
-    if config.encodings.is_empty() {
-        config.encodings = match kind {
-            MediaKind::Video => ["q", "h", "f"]
-                .into_iter()
-                .map(|rid| EncodingConfig {
-                    rid: Some(rid.to_owned()),
-                    active: true,
-                    scale_resolution_down_by: None,
-                    max_bitrate: None,
-                    max_framerate: None,
-                    scalability_mode: None,
-                    dtx: None,
-                })
-                .collect(),
-            MediaKind::Audio => vec![EncodingConfig {
-                rid: None,
-                active: true,
-                scale_resolution_down_by: None,
-                max_bitrate: None,
-                max_framerate: None,
-                scalability_mode: None,
-                dtx: None,
-            }],
-        };
-    }
-    validate_sender_config(kind, &config)?;
-    Ok(config)
-}
-
-fn validate_sender_config(kind: MediaKind, config: &SenderConfig) -> Result<(), String> {
-    let valid_hint = match kind {
-        MediaKind::Video => matches!(config.content_hint.as_str(), "motion" | "detail" | "text"),
-        MediaKind::Audio => matches!(config.content_hint.as_str(), "speech" | "music"),
-    };
-    if !valid_hint {
-        return Err(format!(
-            "invalid {} content hint: {}",
-            media_kind_name(kind),
-            config.content_hint
-        ));
-    }
-    let expected = match kind {
-        MediaKind::Video => 3,
-        MediaKind::Audio => 1,
-    };
-    if config.encodings.len() != expected {
-        return Err(format!(
-            "{} sender configuration requires {expected} encoding entries",
-            media_kind_name(kind)
-        ));
-    }
-    for encoding in &config.encodings {
-        for value in [
-            encoding.scale_resolution_down_by,
-            encoding.max_bitrate,
-            encoding.max_framerate,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !value.is_finite() || value <= 0.0 {
-                return Err("sender encoding values must be finite and positive".into());
-            }
-        }
-        if encoding
-            .scalability_mode
-            .as_deref()
-            .is_some_and(|mode| !matches!(mode, "L1T1" | "L1T2" | "L1T3"))
-        {
-            return Err("sender scalability mode must be L1T1, L1T2, or L1T3".into());
-        }
-        if encoding
-            .dtx
-            .as_deref()
-            .is_some_and(|dtx| !matches!(dtx, "enabled" | "disabled"))
-        {
-            return Err("audio DTX must be enabled or disabled".into());
-        }
-    }
-    Ok(())
 }
 
 async fn apply_sender_state(
@@ -2170,13 +2288,6 @@ fn set_property(object: &JsValue, name: &str, value: &JsValue) -> Result<(), Str
         })
 }
 
-fn media_kind_name(kind: MediaKind) -> &'static str {
-    match kind {
-        MediaKind::Video => "video",
-        MediaKind::Audio => "audio",
-    }
-}
-
 fn connection_name_from_browser(connection: &RtcPeerConnection) -> &'static str {
     match connection.connection_state() {
         RtcPeerConnectionState::New => "new",
@@ -2196,6 +2307,7 @@ fn browser_request(
     let init = RequestInit::new();
     let method = match request.method {
         HttpMethod::Post => "POST",
+        HttpMethod::Patch => "PATCH",
         HttpMethod::Delete => "DELETE",
     };
     init.set_method(method);

@@ -155,12 +155,9 @@ if (process.argv[2] === "initialization-failure") {
     "emitted WASM authoritative binding, lossless u64 events and admission cancellation passed",
   );
   await import("./media-handles.mjs");
-  assert.ok(
-    Object.values(local).every((value) => value === true),
-    JSON.stringify(local),
-  );
+  assert.equal(local, true);
   console.log(
-    "emitted Rust runtime local ownership, serialization, replacement and close cancellation passed",
+    "emitted Rust runtime source ownership, mute persistence, slot reuse and close fencing passed",
   );
   console.log(
     "emitted WASM initialization, diagnostics, authorization, close fencing and free passed",

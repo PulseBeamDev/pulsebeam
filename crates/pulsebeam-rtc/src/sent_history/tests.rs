@@ -99,10 +99,10 @@ fn unreported_twcc_prefix_gets_span_credit_without_loss_evidence() {
 }
 
 #[test]
-fn absent_feedback_mode_rejects_rtp_commit() {
+fn feedback_activation_funds_fixed_backing_without_resetting_history() {
     let now = Instant::now();
     let epoch = PathEpoch::from_value(1);
-    let mut history = SentHistory::new(None);
+    let mut history = SentHistory::with_limit(None, 0).unwrap();
     history.path_changed(epoch, true);
     let before = history.counters();
     history
@@ -121,6 +121,85 @@ fn absent_feedback_mode_rejects_rtp_commit() {
     );
     assert_eq!(history.bytes_in_flight, 0);
     assert_eq!(history.next_sent_id, 0);
+    assert_eq!(history.expire(now, MAX_EXPIRATIONS_PER_POLL), 0);
+    assert_eq!(history.next_deadline(now), None);
+    history.clear_controller_inputs();
+    assert!(history.entries.is_empty());
+    assert!(history.twcc_index.is_empty());
+    assert_eq!(history.inputs.feedback.capacity(), 0);
+    assert_eq!(history.inputs.synthetic.capacity(), 0);
+    assert!(matches!(
+        history.prepare_feedback_profile(PacketFeedbackKind::TransportWide),
+        Err(HistoryError::Exhausted)
+    ));
+    assert_eq!(history.mode, None);
+
+    history.max_backing_bytes = crate::ConnectionLimits::DEFAULT_MAX_SENT_HISTORY_BYTES;
+    let staged = history
+        .prepare_feedback_profile(PacketFeedbackKind::TransportWide)
+        .unwrap();
+    let storage = staged.storage.as_ref().unwrap();
+    let bytes =
+        FixedHistoryStorage::bytes(storage.feedback.capacity(), storage.synthetic.capacity())
+            .unwrap();
+    drop(staged);
+    assert_eq!(history.mode, None);
+    assert!(history.entries.is_empty());
+    assert_eq!(history.inputs.feedback.capacity(), 0);
+    history.max_backing_bytes = bytes.checked_sub(1).unwrap();
+    assert!(matches!(
+        history.prepare_feedback_profile(PacketFeedbackKind::TransportWide),
+        Err(HistoryError::Exhausted)
+    ));
+    assert!(matches!(
+        SentHistory::with_limit(PacketFeedbackKind::TransportWide, history.max_backing_bytes),
+        Err(HistoryError::Exhausted)
+    ));
+    assert_eq!(history.mode, None);
+    assert_eq!(history.active_epoch, Some(epoch));
+    assert_eq!(history.counters(), before);
+    assert_eq!(history.next_sent_id, 0);
+
+    history.max_backing_bytes = bytes;
+    history
+        .prepare_feedback_profile(PacketFeedbackKind::TransportWide)
+        .unwrap()
+        .commit();
+    assert_eq!(history.entries.len(), SENT_HISTORY_CAPACITY);
+    assert_eq!(history.twcc_index.len(), SENT_HISTORY_CAPACITY);
+    assert_eq!(history.active_epoch, Some(epoch));
+    assert_eq!(history.counters(), before);
+    assert_eq!(history.next_sent_id, 0);
+    let backing = history.entries.as_ptr();
+    assert_eq!(
+        history.prepare_commit(context(now, epoch, 1)),
+        Err(HistoryError::Exhausted)
+    );
+    assert!(history.ssrcs.is_empty());
+    assert_eq!(history.next_sent_id, 0);
+    assert_eq!(history.assert_storage(), bytes);
+    history.max_backing_bytes += SOURCE_PAYLOAD_BYTES
+        + SOURCE_INDEX_ENTRY_BYTES * HashMap::<u64, SentPacketId>::with_capacity(1).capacity();
+    history.commit(context(now, epoch, 1)).unwrap();
+    assert_eq!(history.assert_storage(), history.max_backing_bytes);
+    let flight = history.bytes_in_flight;
+    let staged = history
+        .prepare_feedback_profile(PacketFeedbackKind::TransportWide)
+        .unwrap();
+    assert!(staged.storage.is_none());
+    staged.commit();
+    assert_eq!(history.entries.as_ptr(), backing);
+    assert_eq!(history.next_sent_id, 1);
+    assert_eq!(history.bytes_in_flight, flight);
+    assert_eq!(history.entry(SentPacketId(0)).unwrap().rtp_sequence, 1);
+    history.clear_controller_inputs();
+    assert_eq!(
+        FixedHistoryStorage::bytes(
+            history.inputs.feedback.capacity(),
+            history.inputs.synthetic.capacity()
+        ),
+        Some(bytes)
+    );
 }
 
 proptest::proptest! {
@@ -159,7 +238,9 @@ proptest::proptest! {
         proptest::prop_assert_eq!(first_credit + second_credit, received.len());
         proptest::prop_assert_eq!(history.bytes_in_flight, 0);
         proptest::prop_assert_eq!(history.counters.received, received.len() as u64);
-        proptest::prop_assert!(history.inputs.feedback.len() <= MAX_FEEDBACK_STATUSES);
+        proptest::prop_assert!(history.inputs.feedback.len() <= received.len());
+        proptest::prop_assert!(history.backing_bytes().unwrap() <= history.max_backing_bytes);
+        proptest::prop_assert!(!history.inputs.exhausted);
     }
 }
 
@@ -366,7 +447,7 @@ fn stale_rfc8888_generation_is_rejected_per_ssrc() {
     assert_eq!(history.counters.stale_feedback, 1);
     assert_eq!(history.inputs.bytes_in_flight, bytes_in_flight);
     assert!(history.inputs.feedback.is_empty());
-    assert!(history.ssrcs[0].highest_acked_sequence.is_none());
+    assert!(history.ssrcs[&7].highest_acked_sequence.is_none());
 }
 
 #[test]
@@ -531,7 +612,7 @@ fn future_rfc8888_feedback_cannot_advance_ack_edge() {
     });
     assert_eq!(history.inputs.bytes_in_flight, before_bif);
     assert!(history.inputs.feedback.is_empty());
-    assert!(history.ssrcs[0].highest_acked_sequence.is_none());
+    assert!(history.ssrcs[&7].highest_acked_sequence.is_none());
     assert!(history.counters.unknown_feedback >= 2);
 }
 
@@ -555,9 +636,9 @@ fn path_change_discards_pending_feedback_and_rebases_ssrc_history() {
     history.path_changed(new_epoch, true);
     assert!(history.inputs.synthetic.is_empty());
     assert!(history.inputs.timing.is_none());
-    assert!(history.ssrcs[0].sent_ids.is_empty());
+    assert!(history.ssrcs[&7].by_sequence.is_empty());
     history.commit(rfc_context(now, new_epoch, 500)).unwrap();
-    assert_eq!(history.ssrcs[0].first_sequence, 500);
+    assert_eq!(history.ssrcs[&7].first_sequence, 500);
 }
 
 #[test]
@@ -607,18 +688,96 @@ fn terminal_rfc8888_receipt_cannot_replace_new_feedback_hold() {
 }
 
 #[test]
-fn feedback_timing_uses_only_the_current_accepted_report() {
+fn rfc8888_source_keys_isolate_credit_and_report_timing() {
     let now = Instant::now();
     let epoch = PathEpoch::from_value(37);
     let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
     history.path_changed(epoch, true);
     let mut older = rfc_context(now, epoch, 1);
-    older.rtp.as_mut().unwrap().ssrc = 8;
+    older.rtp.as_mut().unwrap().ssrc = u32::MAX;
+    let fixed = history.assert_storage();
+    let stride = SOURCE_INDEX_ENTRY_BYTES;
+    let minimum = HashMap::<u64, SentPacketId>::with_capacity(1).capacity();
+    history.max_backing_bytes = fixed + SOURCE_PAYLOAD_BYTES + minimum * stride - 1;
+    assert_eq!(history.prepare_commit(older), Err(HistoryError::Exhausted));
+    assert!(history.ssrcs.is_empty());
+    assert_eq!(history.next_sent_id, 0);
+    assert_eq!(history.assert_storage(), fixed);
+    history.max_backing_bytes += 1;
+    history.prepare_commit(older).unwrap();
+    assert_eq!(history.ssrcs[&u32::MAX].index_capacity, minimum);
+    assert!(history.ssrcs[&u32::MAX].by_sequence.is_empty());
+    assert_eq!(history.next_sent_id, 0);
+    assert_eq!(history.bytes_in_flight, 0);
+    assert_eq!(history.assert_storage(), history.max_backing_bytes);
     history.commit(older).unwrap();
-    history
-        .commit(rfc_context(now + Duration::from_millis(10), epoch, 1))
-        .unwrap();
-    for (ssrc, received_at) in [(7, 20), (8, 100)] {
+    let newer = rfc_context(now + Duration::from_millis(10), epoch, 1);
+    assert_eq!(history.prepare_commit(newer), Err(HistoryError::Exhausted));
+    assert_eq!(history.ssrcs.len(), 1);
+    assert_eq!(history.bytes_in_flight, 1_200);
+    history.max_backing_bytes += SOURCE_PAYLOAD_BYTES + minimum * stride;
+    history.commit(newer).unwrap();
+    let retained = history.assert_storage();
+    let required = minimum + 1;
+    let grown = HashMap::<u64, SentPacketId>::with_capacity(required).capacity();
+    let mut abandoned = rfc_context(now, epoch, 2);
+    abandoned.rtp.as_mut().unwrap().ssrc = u32::MAX;
+    let identity = abandoned.rtp.unwrap();
+    history.max_backing_bytes = retained + (grown - minimum) * stride - 1;
+    assert_eq!(
+        history.reserve_source_capacity(identity, required),
+        Err(HistoryError::Exhausted)
+    );
+    assert_eq!(history.ssrcs[&u32::MAX].index_capacity, minimum);
+    assert_eq!(history.assert_storage(), retained);
+    history.max_backing_bytes += 1;
+    history.reserve_source_capacity(identity, required).unwrap();
+    assert_eq!(history.ssrcs[&u32::MAX].index_capacity, grown);
+    assert_eq!(history.ssrcs[&u32::MAX].by_sequence.len(), 1);
+    assert_eq!(
+        history.ssrcs[&u32::MAX].by_sequence.get(&1),
+        Some(&SentPacketId(0))
+    );
+    assert_eq!(history.ssrcs[&u32::MAX].newest_sequence, 1);
+    assert_eq!(history.ssrcs[&u32::MAX].highest_acked_sequence, None);
+    assert_eq!(history.next_sent_id, 2);
+    assert_eq!(history.bytes_in_flight, 2_400);
+    assert_eq!(history.assert_storage(), history.max_backing_bytes);
+    let mut late = rfc_context(now + Duration::from_millis(10), epoch, 0);
+    late.rtp.as_mut().unwrap().ssrc = u32::MAX;
+    history.commit(late).unwrap();
+    history.process_feedback(FeedbackBatch {
+        received_at: at(now + Duration::from_millis(15)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Rfc8888 {
+            reports: vec![crate::rtcp::Rfc8888Report {
+                ssrc: u32::MAX - 1,
+                begin_sequence: 1,
+                report_count: 1,
+                statuses: vec![Rfc8888Status::Received {
+                    ecn: 0,
+                    arrival_offset: ArrivalOffset::Ticks(0),
+                }]
+                .into(),
+            }]
+            .into(),
+            report_timestamp: 1,
+        },
+    });
+    assert_eq!(history.counters().unknown_feedback, 1);
+    assert_eq!(history.ssrcs.len(), 2);
+    assert_eq!(history.bytes_in_flight, 3_600);
+    assert!(history.inputs.feedback.is_empty());
+    assert!(history.inputs.timing.is_none());
+    assert_eq!(
+        history.ssrcs[&u32::MAX].latest_commit_at,
+        Some(now + Duration::from_millis(10))
+    );
+    history.retire_source(u32::MAX);
+    history.retire_source(u32::MAX);
+    assert_eq!(history.assert_storage(), history.max_backing_bytes);
+    for (ssrc, received_at) in [(7, 20), (u32::MAX, 100)] {
         history.process_feedback(FeedbackBatch {
             received_at: at(now + Duration::from_millis(received_at)),
             path_epoch: epoch,
@@ -626,12 +785,15 @@ fn feedback_timing_uses_only_the_current_accepted_report() {
             report: FeedbackReport::Rfc8888 {
                 reports: vec![crate::rtcp::Rfc8888Report {
                     ssrc,
-                    begin_sequence: 1,
-                    report_count: 1,
-                    statuses: vec![Rfc8888Status::Received {
-                        ecn: 0,
-                        arrival_offset: ArrivalOffset::Ticks(0),
-                    }]
+                    begin_sequence: if ssrc == u32::MAX { 0 } else { 1 },
+                    report_count: if ssrc == u32::MAX { 2 } else { 1 },
+                    statuses: vec![
+                        Rfc8888Status::Received {
+                            ecn: 0,
+                            arrival_offset: ArrivalOffset::Ticks(0),
+                        };
+                        if ssrc == u32::MAX { 2 } else { 1 }
+                    ]
                     .into(),
                 }]
                 .into(),
@@ -639,9 +801,91 @@ fn feedback_timing_uses_only_the_current_accepted_report() {
             },
         });
     }
+    assert_eq!(history.bytes_in_flight, 0);
+    assert_eq!(history.counters().received, 3);
+    assert_eq!(history.inputs.feedback.len(), 3);
+    for id in 0..3 {
+        assert_eq!(
+            history
+                .inputs
+                .feedback
+                .iter()
+                .filter(|sample| sample.sent_id == SentPacketId(id) && sample.newly_acked)
+                .count(),
+            1
+        );
+    }
+    for ssrc in [7, u32::MAX] {
+        assert_eq!(
+            history
+                .inputs
+                .feedback
+                .iter()
+                .filter(|sample| { sample.ssrc == ssrc && sample.received && sample.newly_acked })
+                .count(),
+            if ssrc == u32::MAX { 2 } else { 1 }
+        );
+        assert_eq!(history.ssrcs[&ssrc].highest_acked_sequence, Some(1));
+    }
     assert_eq!(
         history.inputs.timing.unwrap().newest_send_age,
-        Some(Duration::from_millis(100))
+        Some(Duration::from_millis(90))
+    );
+    let retained = history.assert_storage();
+    let first = history.entries[0].unwrap();
+    history.remove_indexes(SentEntry {
+        id: SentPacketId(u64::MAX),
+        ..first
+    });
+    assert_eq!(
+        history.ssrcs[&u32::MAX].by_sequence.get(&1),
+        Some(&SentPacketId(0))
+    );
+    history.remove_indexes(first);
+    assert_eq!(history.ssrcs[&u32::MAX].by_sequence.get(&1), None);
+    assert_eq!(
+        history.ssrcs[&u32::MAX].by_sequence.get(&0),
+        Some(&SentPacketId(2))
+    );
+    assert_eq!(history.assert_storage(), retained);
+    let source_bytes = SOURCE_PAYLOAD_BYTES + history.ssrcs[&u32::MAX].index_capacity * stride;
+    let deadline = now + Duration::from_millis(10) + SENT_HISTORY_MAX_AGE;
+    let before = deadline - Duration::from_nanos(1);
+    history.clear_controller_inputs();
+    history.expire(before, MAX_EXPIRATIONS_PER_POLL);
+    assert!(history.ssrcs.contains_key(&u32::MAX));
+    assert_eq!(history.assert_storage(), retained);
+    assert_eq!(history.next_deadline(before), Some(deadline));
+    history.clear_controller_inputs();
+    assert_eq!(history.expire(deadline, 1), 1);
+    assert!(!history.ssrcs.contains_key(&u32::MAX));
+    assert!(history.ssrcs.contains_key(&7));
+    let active_backing = retained - source_bytes;
+    assert_eq!(history.assert_storage(), active_backing);
+    history.clear_controller_inputs();
+    history.expire(deadline, MAX_EXPIRATIONS_PER_POLL);
+    assert_eq!(history.next_deadline(deadline), None);
+    assert!(history.inputs.feedback.is_empty());
+    let mut unused = rfc_context(deadline, epoch, 2);
+    unused.rtp.as_mut().unwrap().ssrc = u32::MAX - 2;
+    history.prepare_commit(unused).unwrap();
+    assert!(history.assert_storage() <= retained);
+    assert_eq!(history.next_sent_id, 3);
+    assert_eq!(history.bytes_in_flight, 0);
+    history.retire_source(u32::MAX - 2);
+    assert_eq!(history.next_deadline(deadline), Some(deadline));
+    history.clear_controller_inputs();
+    assert_eq!(history.expire(deadline, 1), 1);
+    assert_eq!(history.assert_storage(), active_backing);
+    assert_eq!(history.next_sent_id, 3);
+    assert_eq!(history.bytes_in_flight, 0);
+    history.path_changed(PathEpoch::from_value(38), true);
+    assert_eq!(history.assert_storage(), active_backing);
+    assert!(
+        history
+            .ssrcs
+            .values()
+            .all(|state| state.by_sequence.is_empty())
     );
 }
 
@@ -685,8 +929,8 @@ fn all_missing_rfc8888_report_does_not_advance_either_ssrc() {
                 && !sample.newly_acked
                 && !sample.lost)
     );
-    assert_eq!(history.ssrcs[0].highest_acked_sequence, None);
-    assert_eq!(history.ssrcs[1].highest_acked_sequence, None);
+    assert_eq!(history.ssrcs[&7].highest_acked_sequence, None);
+    assert_eq!(history.ssrcs[&8].highest_acked_sequence, None);
     assert!(history.inputs.fresh_network_feedback);
 }
 
@@ -775,7 +1019,7 @@ fn all_missing_twcc_report_does_not_advance_credit() {
 }
 
 #[test]
-fn all_missing_then_received_advances_credit_once_without_double_delivery() {
+fn missing_debt_is_funded_without_changing_credit_or_confirmation_work() {
     let now = Instant::now();
     let epoch = PathEpoch::from_value(14);
     let mut history = SentHistory::new(PacketFeedbackKind::TransportWide);
@@ -783,6 +1027,14 @@ fn all_missing_then_received_advances_credit_once_without_double_delivery() {
     for sequence in 1..=3 {
         history.commit(context(now, epoch, sequence)).unwrap();
     }
+    let fixed = history.assert_storage();
+    let stride = size_of::<SentPacketId>();
+    history.max_backing_bytes = fixed.checked_add(stride).unwrap().checked_sub(1).unwrap();
+    assert!(history.reserve_missing_slot().is_none());
+    assert_eq!(history.backing_bytes(), Some(fixed));
+    assert!(history.missing.is_empty());
+    assert!(!history.inputs.exhausted);
+    history.max_backing_bytes = fixed.checked_add(3 * stride).unwrap();
     history.process_feedback(batch(
         now + Duration::from_millis(10),
         epoch,
@@ -790,6 +1042,8 @@ fn all_missing_then_received_advances_credit_once_without_double_delivery() {
     ));
     assert_eq!(history.bytes_in_flight, 3_600);
     assert_eq!(history.missing.len(), 3);
+    assert_eq!(history.backing_bytes(), Some(history.max_backing_bytes));
+    assert!(!history.inputs.exhausted);
     history.clear_controller_inputs();
     history.process_feedback(batch(
         now + Duration::from_millis(20),
@@ -831,6 +1085,73 @@ fn all_missing_then_received_advances_credit_once_without_double_delivery() {
     ));
     assert_eq!(history.bytes_in_flight, 1_200);
     assert!(history.inputs.feedback.is_empty());
+    assert_eq!(history.missing.len(), 3);
+    assert_eq!(
+        history.confirm_losses(now + Duration::from_millis(30), MAX_EXPIRATIONS_PER_POLL),
+        3
+    );
+    assert_eq!(history.loss_work, 3);
+    assert_eq!(
+        history.missing.iter().copied().collect::<Vec<_>>(),
+        vec![SentPacketId(0), SentPacketId(2)]
+    );
+    assert_eq!(history.backing_bytes(), Some(history.max_backing_bytes));
+    let later = now + Duration::from_millis(31);
+    let source = &history.ssrcs[&7];
+    let future =
+        HashMap::<u64, SentPacketId>::with_capacity(source.by_sequence.len() + 3).capacity();
+    history.max_backing_bytes += (future - source.index_capacity) * SOURCE_INDEX_ENTRY_BYTES;
+    for sequence in 4..=6 {
+        history.commit(context(later, epoch, sequence)).unwrap();
+    }
+    history.set_missing(SentPacketId(3), later);
+    assert!(!history.inputs.exhausted);
+    let queued = history.missing.clone();
+    let observed = history.inputs.feedback.len();
+    history.process_feedback(FeedbackBatch {
+        received_at: at(later + Duration::from_millis(1)),
+        path_epoch: epoch,
+        sender_ssrc: 9,
+        report: FeedbackReport::Twcc {
+            media_ssrc: 7,
+            base_sequence: 5,
+            reference_time: 0,
+            feedback_count: 2,
+            statuses: vec![
+                TwccStatus::NotReceived,
+                TwccStatus::Received { delta_250us: 1 },
+            ]
+            .into(),
+        },
+    });
+    assert!(history.inputs.exhausted);
+    assert_eq!(history.missing, queued);
+    assert!(history.inputs.feedback.len() > observed);
+    for id in [SentPacketId(2), SentPacketId(3), SentPacketId(5)] {
+        assert_eq!(
+            history
+                .inputs
+                .feedback
+                .iter()
+                .filter(|sample| { sample.sent_id == id && sample.newly_acked })
+                .count(),
+            1
+        );
+    }
+    assert!(
+        history
+            .inputs
+            .feedback
+            .iter()
+            .all(|sample| sample.sent_id != SentPacketId(4))
+    );
+    assert_eq!(history.bytes_in_flight, 1_200);
+    assert_eq!(history.inputs.bytes_in_flight, 1_200);
+    assert_eq!(history.backing_bytes(), Some(history.max_backing_bytes));
+    let rejected = history.entry(SentPacketId(4)).unwrap();
+    assert!(rejected.in_flight);
+    assert_eq!(rejected.acknowledgment, Acknowledgment::Pending);
+    assert_eq!(rejected.missing_since, None);
 }
 
 #[test]
@@ -1188,7 +1509,7 @@ fn reorder_learning_preserves_elapsed_deadlines_when_loss_work_is_deferred() {
     ));
     assert_eq!(history.reordering_window, Duration::from_millis(90));
     assert_eq!(
-        history.next_deadline(),
+        history.next_deadline(receipt_at),
         Some(now + Duration::from_millis(80))
     );
     history.process_feedback(batch(
@@ -1235,7 +1556,7 @@ fn feedback_confirmation_shares_the_expiry_budget_and_defers_without_losing_evid
     assert_eq!(history.bytes_in_flight, 256 * 1_200);
     assert!(
         history
-            .next_deadline()
+            .next_deadline(expired_at)
             .is_some_and(|deadline| deadline <= expired_at)
     );
     history.clear_controller_inputs();
@@ -1245,49 +1566,180 @@ fn feedback_confirmation_shares_the_expiry_budget_and_defers_without_losing_evid
 }
 
 #[test]
-fn rfc8888_sparse_block_expansion_signals_terminal_resource_exhaustion() {
+fn rfc8888_sparse_block_expansion_is_funded_by_actual_backing() {
     let now = Instant::now();
+    let received_at = now + Duration::from_millis(10);
     let epoch = PathEpoch::from_value(34);
-    let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
-    history.path_changed(epoch, true);
-    for ssrc in 1..=3 {
-        for sequence in 1..=4_096 {
-            let mut commit = context(now, epoch, sequence);
-            let rtp = commit.rtp.as_mut().unwrap();
-            rtp.ssrc = ssrc;
-            rtp.twcc_sequence = None;
-            history.commit(commit).unwrap();
+    let source_count = 3u32;
+    let per_source = 4_096u16;
+    let packets = usize::try_from(source_count).unwrap() * usize::from(per_source);
+    for funded in [false, true] {
+        let mut history = SentHistory::with_limit(PacketFeedbackKind::Rfc8888, usize::MAX).unwrap();
+        history.path_changed(epoch, true);
+        // Retained missing capacity isolates output-row exhaustion.
+        history
+            .missing
+            .try_reserve_exact(packets.next_power_of_two())
+            .unwrap();
+        for ssrc in 1..=source_count {
+            for sequence in 1..=per_source {
+                let mut commit = context(now, epoch, sequence);
+                let rtp = commit.rtp.as_mut().unwrap();
+                rtp.ssrc = ssrc;
+                rtp.twcc_sequence = None;
+                history.commit(commit).unwrap();
+            }
         }
-    }
-    history.process_feedback(FeedbackBatch {
-        received_at: at(now + Duration::from_millis(10)),
-        path_epoch: epoch,
-        sender_ssrc: 9,
-        report: FeedbackReport::Rfc8888 {
-            report_timestamp: 65_536,
-            reports: (1..=3)
-                .map(|ssrc| crate::rtcp::Rfc8888Report {
-                    ssrc,
-                    begin_sequence: 4_096,
+        let initial_bytes = history.backing_bytes().unwrap();
+        let initial_capacity = history.inputs.feedback.capacity();
+        let extra = packets
+            .checked_sub(initial_capacity)
+            .unwrap()
+            .checked_mul(size_of::<PacketFeedback>())
+            .unwrap()
+            .checked_sub(usize::from(!funded))
+            .unwrap();
+        history.max_backing_bytes = initial_bytes.checked_add(extra).unwrap();
+        history.process_feedback(FeedbackBatch {
+            received_at: at(received_at),
+            path_epoch: epoch,
+            sender_ssrc: 9,
+            report: FeedbackReport::Rfc8888 {
+                report_timestamp: 65_536,
+                reports: (1..=source_count)
+                    .map(|ssrc| crate::rtcp::Rfc8888Report {
+                        ssrc,
+                        begin_sequence: per_source,
+                        report_count: 1,
+                        statuses: vec![Rfc8888Status::Received {
+                            ecn: 0,
+                            arrival_offset: ArrivalOffset::Ticks(1),
+                        }]
+                        .into(),
+                    })
+                    .collect(),
+            },
+        });
+        assert_eq!(history.inputs.exhausted, !funded);
+        assert_eq!(
+            history.inputs.feedback.len(),
+            if funded { packets } else { packets - 1 }
+        );
+        assert!(history.backing_bytes().unwrap() <= history.max_backing_bytes);
+        for (index, sample) in history.inputs.feedback.iter().enumerate() {
+            let received = index % usize::from(per_source) == usize::from(per_source) - 1;
+            assert_eq!(sample.sent_id, SentPacketId(u64::try_from(index).unwrap()));
+            assert_eq!(
+                sample.ssrc,
+                u32::try_from(index / usize::from(per_source) + 1).unwrap()
+            );
+            assert_eq!(sample.received, received);
+            assert!(sample.newly_acked);
+            assert!(!sample.lost);
+            assert_eq!(sample.reported_lost_for_the_first_time, !received);
+            assert!(!sample.recovered);
+            assert_eq!(sample.transport_bytes, 1_200);
+            assert_eq!(sample.service, RtpService::Original);
+            assert_eq!(sample.committed_at, now);
+            assert_eq!(sample.observed_at, Some(received_at));
+            assert_eq!(sample.controller_sample(received_at, now).lost, !received);
+            assert_eq!(
+                sample.receiver_arrival,
+                received.then_some(ReceiverTime::Micros(999_024))
+            );
+            assert_eq!(sample.ecn, received.then_some(EcnMark::NotEct));
+        }
+        if !funded {
+            assert_eq!(history.inputs.feedback.capacity(), packets - 1);
+            assert_eq!(
+                history.backing_bytes(),
+                Some(history.max_backing_bytes - (size_of::<PacketFeedback>() - 1))
+            );
+            continue;
+        }
+        assert_eq!(history.inputs.feedback.capacity(), packets);
+        assert_eq!(history.backing_bytes(), Some(history.max_backing_bytes));
+        assert_eq!(history.bytes_in_flight, 0);
+        assert_eq!(history.counters.received, u64::from(source_count));
+        assert_eq!(history.counters.not_received, 0);
+        assert!(history.inputs.synthetic.is_empty());
+        assert!(history.inputs.fresh_network_feedback);
+        assert_eq!(
+            history.inputs.timing.unwrap().feedback_hold,
+            Some(Duration::from_micros(976))
+        );
+        let retained = history.backing_bytes().unwrap();
+        let capacities = (
+            history.inputs.feedback.capacity(),
+            history.missing.capacity(),
+        );
+        history.clear_controller_inputs();
+        let profile = history
+            .prepare_feedback_profile(PacketFeedbackKind::Rfc8888)
+            .unwrap();
+        assert!(profile.storage.is_none());
+        profile.commit();
+        let recovered_at = now + Duration::from_millis(11);
+        history.process_feedback(FeedbackBatch {
+            received_at: at(recovered_at),
+            path_epoch: epoch,
+            sender_ssrc: 9,
+            report: FeedbackReport::Rfc8888 {
+                report_timestamp: 65_537,
+                reports: vec![crate::rtcp::Rfc8888Report {
+                    ssrc: 1,
+                    begin_sequence: per_source - 1,
                     report_count: 1,
                     statuses: vec![Rfc8888Status::Received {
-                        ecn: 0,
+                        ecn: 3,
                         arrival_offset: ArrivalOffset::Ticks(1),
                     }]
                     .into(),
-                })
-                .collect(),
-        },
-    });
-    assert!(history.inputs.exhausted);
-    assert_eq!(history.inputs.feedback.len(), MAX_FEEDBACK_STATUSES);
-    assert!(
-        history
-            .inputs
-            .feedback
-            .iter()
-            .all(|sample| sample.sent_id.0 < MAX_FEEDBACK_STATUSES as u64)
-    );
+                }]
+                .into(),
+            },
+        });
+        let [recovered] = history.inputs.feedback.as_slice() else {
+            panic!("one recovery sample must reuse retained backing");
+        };
+        assert_eq!(recovered.sent_id, SentPacketId(u64::from(per_source) - 2));
+        assert_eq!(recovered.ssrc, 1);
+        assert!(recovered.received);
+        assert!(recovered.recovered);
+        assert!(!recovered.newly_acked);
+        assert!(!recovered.lost);
+        assert!(!recovered.reported_lost_for_the_first_time);
+        assert_eq!(
+            recovered.receiver_arrival,
+            Some(ReceiverTime::Micros(999_039))
+        );
+        assert_eq!(recovered.ecn, Some(EcnMark::Ce));
+        assert_eq!(recovered.observed_at, Some(recovered_at));
+        assert_eq!(history.counters.received, u64::from(source_count) + 1);
+        assert_eq!(history.bytes_in_flight, 0);
+        assert!(history.inputs.fresh_network_feedback);
+        assert!(!history.inputs.exhausted);
+        assert_eq!(history.backing_bytes(), Some(retained));
+        assert_eq!(
+            (
+                history.inputs.feedback.capacity(),
+                history.missing.capacity()
+            ),
+            capacities
+        );
+        history.path_changed(PathEpoch::from_value(35), true);
+        assert!(history.inputs.feedback.is_empty());
+        assert!(history.missing.is_empty());
+        assert_eq!(history.backing_bytes(), Some(retained));
+        assert_eq!(
+            (
+                history.inputs.feedback.capacity(),
+                history.missing.capacity()
+            ),
+            capacities
+        );
+        assert!(!history.inputs.exhausted);
+    }
 }
 
 #[test]
@@ -1367,6 +1819,7 @@ fn new_rfc8888_report_can_recover_native_loss_without_erasing_terminal_loss() {
     let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888);
     history.path_changed(epoch, true);
     history.commit(rfc_context(now, epoch, 1)).unwrap();
+    history.retire_source(7);
     history.set_missing(SentPacketId(0), now);
     history.anchor_missing(None, Some((7, 2)), now);
     history.clear_controller_inputs();

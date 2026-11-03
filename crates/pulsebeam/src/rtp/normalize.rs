@@ -93,6 +93,9 @@ pub struct StreamNormalizer {
     /// on, learned from its own packets, so a VLA carried on any sibling's
     /// packet can address this stream.
     vla_index: Option<u8>,
+    vla_height: Option<(u64, u32)>,
+    highest_timestamp: u64,
+    dd_height_epoch: Option<u64>,
 }
 
 impl StreamNormalizer {
@@ -106,11 +109,31 @@ impl StreamNormalizer {
             cold_packets_since_request: 0,
             dd_errors: 0,
             vla_index: None,
+            vla_height: None,
+            highest_timestamp: 0,
+            dd_height_epoch: None,
         }
     }
 
     pub fn vla_index(&self) -> Option<u8> {
         self.vla_index
+    }
+
+    pub fn observe_vla(&mut self, vla: &pulsebeam_core::vla::VideoLayersAllocation) {
+        let Some(index) = self
+            .vla_index
+            .filter(|index| *index != vla.current_simulcast_stream_index)
+        else {
+            return;
+        };
+        if let Some(height) = crate::track::vla_stream_height_px(vla, usize::from(index))
+            && self
+                .vla_height
+                .is_some_and(|(_, previous)| previous != height)
+        {
+            // A sibling's RTP clock cannot anchor this encoding's new dimensions.
+            self.vla_height = Some((self.highest_timestamp.saturating_add(1), 0));
+        }
     }
 
     /// Dependency-descriptor parse failures seen so far, for tests and logs.
@@ -202,16 +225,60 @@ impl StreamNormalizer {
         parse_error: &mut Option<DdReadError>,
     ) -> Option<StreamFacts> {
         self.learn_vla_index(pkt);
+        let timestamp = pkt.rtp_ts.numer();
+        self.highest_timestamp = self.highest_timestamp.max(timestamp);
+        let own_height = pkt.ext_vals.video_layers_allocation().and_then(|vla| {
+            crate::track::vla_stream_height_px(vla, usize::from(vla.current_simulcast_stream_index))
+        });
+        if let Some(height) = own_height
+            && self.vla_height.is_none_or(|(epoch, _)| timestamp >= epoch)
+        {
+            self.vla_height = Some((timestamp, height));
+        }
+        // Older packets must not inherit dimensions from a later declaration.
+        pkt.reported_height = own_height
+            .or_else(|| {
+                self.vla_height
+                    .filter(|(epoch, _)| timestamp >= *epoch)
+                    .map(|(_, height)| height)
+            })
+            .unwrap_or(0);
         let Some(raw) = pkt.ext_vals.raw_dependency_descriptor() else {
             return Some(StreamFacts::default());
         };
-        match self.dd.read(&raw.0) {
+        let stale = self.dd_height_epoch.is_some_and(|epoch| timestamp < epoch)
+            || self.vla_height.is_some_and(|(epoch, _)| timestamp < epoch);
+        // An old attached structure may describe its packet, not replace the
+        // current parser context or invalidate newer VLA dimensions.
+        let parsed = if stale {
+            DependencyDescriptorReader::new().read(&raw.0)
+        } else {
+            self.dd.read(&raw.0)
+        };
+        match parsed {
             Ok(dd) => {
+                if !stale && dd.attached_structure.is_some() {
+                    self.dd_height_epoch = Some(timestamp);
+                }
+                if let Some(resolution) = dd.resolution {
+                    let height = u32::from(resolution.height);
+                    pkt.reported_height = height;
+                    if !stale
+                        && self.vla_height.is_some_and(|(epoch, full)| {
+                            timestamp >= epoch && full > 0 && full < height
+                        })
+                    {
+                        self.vla_height = Some((self.highest_timestamp.saturating_add(1), 0));
+                    }
+                }
                 // A resolved DD overrides codec hints, including opaque payloads
                 // and structure refreshes on dependent frames.
                 pkt.is_keyframe = dd.frame_dependencies.frame_diffs.is_empty();
                 pkt.is_frame_start = dd.start_of_frame;
                 pkt.ext_vals.set_descriptor_arc(std::sync::Arc::new(dd));
+                if stale {
+                    return Some(StreamFacts::default());
+                }
                 Some(StreamFacts {
                     decode_targets: self.dd.structure().map(|s| s.decode_target_count),
                     decode_target_heights: self.dd.structure().map(decode_target_heights),
@@ -339,6 +406,97 @@ mod tests {
             structure.templates.push(template);
         }
         assert_eq!(decode_target_heights(&structure), [180, 180, 720]);
+        let mut writer = pulsebeam_core::dd::DependencyDescriptorWriter::new();
+        let mut normalizer = StreamNormalizer::new(Mid::from("v0"), None);
+        let mut high = None;
+        for (template_id, height) in [(0, 180), (1, 720)] {
+            let descriptor = pulsebeam_core::dd::DependencyDescriptor {
+                start_of_frame: true,
+                end_of_frame: true,
+                template_id,
+                frame_number: u16::from(template_id),
+                frame_dependencies: structure
+                    .templates
+                    .get(usize::from(template_id))
+                    .unwrap()
+                    .clone(),
+                attached_structure: Some(Box::new(structure.clone())),
+                ..Default::default()
+            };
+            let mut bytes = [0; pulsebeam_core::dd::MAX_DD_LEN];
+            let len = writer.write(&descriptor, &mut bytes).unwrap();
+            let mut input = packet(
+                u64::from(template_id),
+                RawDependencyDescriptor(bytes.get(..len).unwrap().iter().copied().collect()),
+            );
+            input.rtp_ts =
+                crate::rtp::MediaTime::new(u64::from(template_id), crate::rtp::VIDEO_FREQUENCY);
+            if height == 720 {
+                high = Some(input.clone());
+            }
+            assert_eq!(
+                normalizer.normalize(input).first.unwrap().0.reported_height,
+                height
+            );
+        }
+        let mut latest = RtpPacket {
+            rtp_ts: crate::rtp::MediaTime::new(300, crate::rtp::VIDEO_FREQUENCY),
+            ..Default::default()
+        };
+        latest
+            .ext_vals
+            .set_video_layers_allocation(allocation(0, 180));
+        assert_eq!(
+            normalizer
+                .normalize(latest)
+                .first
+                .unwrap()
+                .0
+                .reported_height,
+            180
+        );
+        assert_eq!(
+            normalizer
+                .normalize(high.unwrap())
+                .first
+                .unwrap()
+                .0
+                .reported_height,
+            720
+        );
+        let next = RtpPacket {
+            rtp_ts: crate::rtp::MediaTime::new(400, crate::rtp::VIDEO_FREQUENCY),
+            ..Default::default()
+        };
+        assert_eq!(
+            normalizer.normalize(next).first.unwrap().0.reported_height,
+            180
+        );
+        let mut delayed = structure.clone();
+        delayed.resolutions[0].height = 360;
+        for (timestamp, attached_structure, expected) in
+            [(200, Some(Box::new(delayed)), 360), (500, None, 180)]
+        {
+            let descriptor = pulsebeam_core::dd::DependencyDescriptor {
+                start_of_frame: true,
+                end_of_frame: true,
+                frame_number: u16::try_from(timestamp).unwrap(),
+                frame_dependencies: structure.templates[0].clone(),
+                attached_structure,
+                ..Default::default()
+            };
+            let mut bytes = [0; pulsebeam_core::dd::MAX_DD_LEN];
+            let len = writer.write(&descriptor, &mut bytes).unwrap();
+            let mut input = packet(
+                timestamp,
+                RawDependencyDescriptor(bytes[..len].iter().copied().collect()),
+            );
+            input.rtp_ts = crate::rtp::MediaTime::new(timestamp, crate::rtp::VIDEO_FREQUENCY);
+            assert_eq!(
+                normalizer.normalize(input).first.unwrap().0.reported_height,
+                expected
+            );
+        }
         structure.resolutions.pop();
         assert_eq!(decode_target_heights(&structure), [180, 180, 0]);
     }
@@ -419,5 +577,73 @@ mod tests {
         let result = normalizer.normalize(packet(1000, descriptors[0].clone()));
         assert!(!result.request_keyframe);
         assert!(result.first.is_some());
+    }
+
+    fn allocation(current: u8, height: u32) -> pulsebeam_core::vla::VideoLayersAllocation {
+        use pulsebeam_core::vla::{
+            ResolutionAndFramerate, SimulcastStreamAllocation, SpatialLayerAllocation,
+            TemporalLayerAllocation, VideoLayersAllocation,
+        };
+        VideoLayersAllocation {
+            current_simulcast_stream_index: current,
+            simulcast_streams: vec![
+                SimulcastStreamAllocation {
+                    spatial_layers: vec![SpatialLayerAllocation {
+                        temporal_layers: vec![TemporalLayerAllocation {
+                            cumulative_kbps: 50
+                        }],
+                        resolution_and_framerate: Some(ResolutionAndFramerate {
+                            width: 1280,
+                            height,
+                            framerate: 30
+                        }),
+                    }]
+                };
+                2
+            ],
+        }
+    }
+
+    #[test]
+    fn declared_heights_stay_with_packets_across_reordering_and_sibling_updates() {
+        let vla = allocation;
+        let push = |normalizer: &mut StreamNormalizer, timestamp, declaration| {
+            let mut packet = RtpPacket {
+                rtp_ts: crate::rtp::MediaTime::new(timestamp, crate::rtp::VIDEO_FREQUENCY),
+                ..Default::default()
+            };
+            if let Some(declaration) = declaration {
+                packet.ext_vals.set_video_layers_allocation(declaration);
+            }
+            normalizer.normalize(packet).first.unwrap().0
+        };
+        let mut normalizer = StreamNormalizer::new(Mid::from("v0"), None);
+        assert_eq!(push(&mut normalizer, 0, None).reported_height, 0);
+        let old = push(&mut normalizer, 100, Some(vla(0, 180)));
+        assert_eq!(old.reported_height, 180);
+        assert_eq!(push(&mut normalizer, 200, None).reported_height, 180);
+        assert_eq!(
+            push(&mut normalizer, 300, Some(vla(0, 720))).reported_height,
+            720
+        );
+        assert_eq!(old.reported_height, 180);
+        assert_eq!(push(&mut normalizer, 150, None).reported_height, 0);
+        assert_eq!(
+            push(&mut normalizer, 100, Some(vla(0, 180))).reported_height,
+            180
+        );
+        assert_eq!(push(&mut normalizer, 400, None).reported_height, 720);
+        normalizer.observe_vla(&vla(1, 180));
+        assert_eq!(push(&mut normalizer, 450, None).reported_height, 0);
+        assert_eq!(
+            push(&mut normalizer, 300, Some(vla(0, 720))).reported_height,
+            720
+        );
+        assert_eq!(push(&mut normalizer, 500, None).reported_height, 0);
+        assert_eq!(
+            push(&mut normalizer, 600, Some(vla(0, 180))).reported_height,
+            180
+        );
+        assert_eq!(push(&mut normalizer, 700, None).reported_height, 180);
     }
 }

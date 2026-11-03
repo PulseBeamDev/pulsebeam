@@ -332,14 +332,32 @@ pub struct ConnectionLimits {
     /// allocator/tree nodes, temporary growth/staging and other RTC storage;
     /// not an RSS bound.
     pub max_send_runtime_bytes: usize,
-    /// Independent allowances for queued SCTP plaintext output and protected
-    /// transport output, not an aggregate across stages. Each funds packet Vec
-    /// capacity and physical queue backing. RTP/RTCP reserves before protection;
-    /// unretainable emitted SCTP packets fail the association closed. Transfer
-    /// ends that stage's packet charge; backing stays charged until released.
-    /// Excludes caller-retained output, allocator overhead, temporary staging
-    /// overlaps, native socket/reassembly, upstream crypto storage and pending
-    /// inbound DTLS. This is not an RSS bound.
+    /// Fixed sent-packet/TWCC windows, actual controller feedback/synthetic Vec
+    /// capacities, missing-debt deque capacity (including stale IDs), source
+    /// key/value/readiness payload and allocated per-source RTP-index/SentPacketId
+    /// capacity. Deletion retains the charge while table backing remains allocated.
+    /// Terminal sources release storage through bounded idle cleanup at the existing
+    /// five-second packet-age boundary; paused/adopted sources retain their anchors.
+    /// Admission reserves before RTP protection; only final commit records packets.
+    /// No-profile connections retain no such backing; bootstrap
+    /// or late profile selection must fund fixed backing before enabling RTP.
+    /// New missing entries and expanded controller feedback rows reserve backing
+    /// before admission; exhaustion fails the connection closed. Output rows have
+    /// no separate count quota. Clear and repeated profile selection retain backing
+    /// for reuse; parser, ACK-edge and synthetic-work limits remain unchanged.
+    /// Excludes BTreeMap node/spare-slot, hash-table control/excess buckets and
+    /// allocator overhead, temporary staging and other RTC storage; not an RSS bound.
+    pub max_sent_history_bytes: usize,
+    /// Independent allowances for queued SCTP plaintext output, protected
+    /// transport output and preselection inbound DTLS, not an aggregate across
+    /// stages. Each funds packet Vec capacity and physical queue backing.
+    /// RTP/RTCP reserves before protection; unretainable emitted SCTP packets fail
+    /// the association closed. Unretainable pending DTLS input is dropped before
+    /// copying without failing the transport; its 64-work window is independent.
+    /// Transfer ends that stage's packet charge; backing stays charged until
+    /// released. Excludes caller-retained packets, allocator overhead, temporary
+    /// staging overlaps, native socket/reassembly and upstream crypto storage.
+    /// This is not an RSS bound.
     pub max_transport_output_bytes: usize,
     /// Reserved/learned inbound RTP replay key/window payload bytes. Excludes
     /// allocator and index-node overhead; not a process-RSS bound.
@@ -374,6 +392,7 @@ impl ConnectionLimits {
     pub const HARD_MAX_RETRANSMISSION_BYTES: usize = 128 * 1024 * 1024;
     pub const DEFAULT_MAX_RECEIVE_RUNTIME_BYTES: usize = 64 * 1024 * 1024;
     pub const DEFAULT_MAX_SEND_RUNTIME_BYTES: usize = 64 * 1024 * 1024;
+    pub const DEFAULT_MAX_SENT_HISTORY_BYTES: usize = 8 * 1024 * 1024;
     pub const DEFAULT_MAX_TRANSPORT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
     pub const DEFAULT_MAX_RTP_REPLAY_STATE_BYTES: usize = 1024 * 1024;
     pub const DEFAULT_MAX_RTCP_REPLAY_STATE_BYTES: usize = 1024 * 1024;
@@ -396,6 +415,7 @@ impl Default for ConnectionLimits {
             max_retransmission_bytes: Self::DEFAULT_MAX_RETRANSMISSION_BYTES,
             max_receive_runtime_bytes: Self::DEFAULT_MAX_RECEIVE_RUNTIME_BYTES,
             max_send_runtime_bytes: Self::DEFAULT_MAX_SEND_RUNTIME_BYTES,
+            max_sent_history_bytes: Self::DEFAULT_MAX_SENT_HISTORY_BYTES,
             max_transport_output_bytes: Self::DEFAULT_MAX_TRANSPORT_OUTPUT_BYTES,
             max_rtp_replay_state_bytes: Self::DEFAULT_MAX_RTP_REPLAY_STATE_BYTES,
             max_rtcp_replay_state_bytes: Self::DEFAULT_MAX_RTCP_REPLAY_STATE_BYTES,
@@ -409,11 +429,17 @@ pub struct ConnectionConfig {
     pub local_ice_credentials: Option<LocalIceCredentials>,
     pub limits: ConnectionLimits,
     pub unknown_extension_policy: UnknownExtensionPolicy,
+    pub rtp_capabilities: Option<crate::RtpCapabilities>,
 }
 
 impl ConnectionConfig {
     pub fn validate(self) -> Result<Self, AcceptError> {
         self.limits.validate()?;
+        if let Some(capabilities) = &self.rtp_capabilities {
+            capabilities
+                .validate()
+                .map_err(|_| AcceptError::InvalidConfiguration)?;
+        }
         if self.local_candidates.len() > MAX_LOCAL_CANDIDATES {
             return Err(AcceptError::SessionLimitExceeded);
         }

@@ -1639,6 +1639,75 @@ fn migrated_actor_is_woken_for_real_reliable_channel_delivery() {
             DataChannelState::Open
         );
         assert_eq!(session.channel_error(incoming).unwrap(), None);
+        let payload_config = DataChannelConfiguration {
+            negotiated: true,
+            id: Some(7),
+            ordered: false,
+            max_retransmits: Some(0),
+            ..DataChannelConfiguration::default()
+        };
+        let payload_out = session
+            .create_channel(alice, "payload", payload_config.clone())
+            .unwrap();
+        let payload_in = session
+            .create_channel(bob, "payload", payload_config)
+            .unwrap();
+        let mut opened = HashSet::new();
+        while opened.len() != 2 {
+            for channel in [payload_out, payload_in] {
+                while let Some(event) = session.try_channel_event(channel).unwrap() {
+                    if event == DataChannelEvent::StateChanged(DataChannelState::Open) {
+                        opened.insert(channel);
+                    }
+                }
+            }
+            if opened.len() != 2 {
+                wait(&mut session);
+            }
+        }
+        let send = session
+            .send_async(payload_out, DataChannelMessage::binary([7]))
+            .unwrap();
+        session.close_channel(payload_out).unwrap();
+        let mut closed = HashSet::new();
+        let mut settled = false;
+        while closed.len() != 2 || !settled {
+            for channel in [payload_out, payload_in] {
+                while let Some(event) = session.try_channel_event(channel).unwrap() {
+                    match event {
+                        DataChannelEvent::StateChanged(DataChannelState::Closed) => {
+                            closed.insert(channel);
+                        }
+                        DataChannelEvent::SendComplete(completion) => {
+                            assert_eq!(channel, payload_out);
+                            assert_eq!(completion.send_id, send);
+                            assert!(!settled);
+                            settled = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if closed.len() != 2 || !settled {
+                wait(&mut session);
+            }
+        }
+        for channel in [payload_out, payload_in] {
+            session.release_channel(channel);
+            assert!(session.channel_configuration(channel).is_err());
+        }
+        for channel in [outgoing, incoming] {
+            assert_eq!(
+                session.channel_state(channel).unwrap(),
+                DataChannelState::Open
+            );
+        }
+        for peer in [alice, bob] {
+            assert_eq!(
+                session.peer_connection_state(peer).unwrap(),
+                ConnectionState::Connected
+            );
+        }
         session.close_peer(bob).unwrap();
         assert_eq!(
             session.channel_state(incoming).unwrap(),

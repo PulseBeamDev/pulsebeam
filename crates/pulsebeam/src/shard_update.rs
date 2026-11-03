@@ -131,6 +131,7 @@ pub(crate) struct ShardUpdate {
     pub participant_effects: Vec<(ParticipantId, crate::participant::ParticipantEffect)>,
     pub lifecycle: Vec<ShardUpdateOp>,
     pub plans: Vec<TrackPlanUpdate>,
+    pub cutoff_ack: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl ShardUpdate {
@@ -141,11 +142,15 @@ impl ShardUpdate {
             participant_effects: Vec::new(),
             lifecycle: Vec::new(),
             plans: Vec::new(),
+            cutoff_ack: None,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.participant_effects.is_empty() && self.lifecycle.is_empty() && self.plans.is_empty()
+        self.participant_effects.is_empty()
+            && self.lifecycle.is_empty()
+            && self.plans.is_empty()
+            && self.cutoff_ack.is_none()
     }
 
     pub(crate) fn validate_for(&self, shard: ShardId, current_revision: u64) -> bool {
@@ -164,6 +169,21 @@ pub(crate) struct ShardUpdateWriter {
 }
 
 impl ShardUpdateWriter {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    pub(crate) fn stage_cutoff(&mut self, generation: u64) -> tokio::sync::oneshot::Receiver<()> {
+        let commit = self
+            .staged
+            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
+        if commit.generation != generation || commit.cutoff_ack.is_some() {
+            pulsebeam_runtime::fatal!("a cutoff fence must have its own shard generation");
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        commit.cutoff_ack = Some(tx);
+        rx
+    }
     pub fn stage(&mut self, generation: u64, op: ShardUpdateOp) {
         let commit = self
             .staged
@@ -370,6 +390,13 @@ mod tests {
             writer.stage(generation, ShardUpdateOp::Placeholder);
             assert_eq!(writer.publish(), Some(generation));
         }
+        let fence_generation = (crate::shard::worker::SHARD_UPDATE_CAPACITY + 2) as u64;
+        let mut cutoff = writer.stage_cutoff(fence_generation);
+        assert_eq!(writer.publish(), None);
+        assert!(matches!(
+            cutoff.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         for expected in 1..=crate::shard::worker::SHARD_UPDATE_CAPACITY as u64 {
             assert_eq!(rx.try_recv().unwrap().generation, expected);
         }
@@ -378,6 +405,15 @@ mod tests {
             rx.try_recv().unwrap().generation,
             (crate::shard::worker::SHARD_UPDATE_CAPACITY + 1) as u64
         );
+        assert!(writer.flush_one());
+        let mut fence = rx.try_recv().unwrap();
+        assert_eq!(fence.generation, fence_generation);
+        assert!(matches!(
+            cutoff.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        fence.cutoff_ack.take().unwrap().send(()).unwrap();
+        assert_eq!(cutoff.try_recv(), Ok(()));
     }
 
     #[test]

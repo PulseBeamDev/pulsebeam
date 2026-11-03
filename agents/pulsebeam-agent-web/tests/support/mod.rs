@@ -272,28 +272,30 @@ async fn serve(
         let destination = fields
             .get("destination")
             .and_then(|value| value.parse().ok());
-        let extension = fields
-            .get("extension")
-            .and_then(|value| value.parse::<u8>().ok())
-            .filter(|value| *value > 0);
-        let (Some(destination), Some(extension)) = (destination, extension) else {
+        let Some(destination) = destination else {
             return respond(
                 &mut stream,
                 503,
                 "text/plain",
-                b"invalid relay destination or extension",
+                b"invalid relay destination",
                 method,
             )
             .await;
         };
-        let result = relays.lock().await.allocate(destination, extension).await;
+        let result = relays.lock().await.allocate(destination).await;
         return respond_relay(&mut stream, result, method).await;
     }
     if let Some(path) = target.strip_prefix("/__test/rtp-relay/") {
-        let keys = path
-            .split_once('/')
-            .and_then(|(id, ssrc)| Some((id.parse::<usize>().ok()?, ssrc.parse::<u32>().ok()?)));
-        let Some((id, ssrc)) = keys else {
+        let keys = path.split_once('?').and_then(|(path, query)| {
+            let (id, ssrc) = path.split_once('/')?;
+            let extension = query.strip_prefix("extension=")?.parse::<u8>().ok()?;
+            (extension > 0).then_some((
+                id.parse::<usize>().ok()?,
+                ssrc.parse::<u32>().ok()?,
+                extension,
+            ))
+        });
+        let Some((id, ssrc, extension)) = keys else {
             return respond(
                 &mut stream,
                 503,
@@ -303,7 +305,7 @@ async fn serve(
             )
             .await;
         };
-        let result = relays.lock().await.observation(id, ssrc).await;
+        let result = relays.lock().await.observation(id, ssrc, extension).await;
         return respond_relay(&mut stream, result, method).await;
     }
     let Some(path) = static_path(root, target) else {

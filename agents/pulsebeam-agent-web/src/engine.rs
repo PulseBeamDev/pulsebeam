@@ -747,7 +747,7 @@ mod tests {
 
         let rejected = driver.turn(Input::Event(HostEvent::Rtc(RtcEvent::OfferCreated {
             generation,
-            offer: "offer".into(),
+            offer: String::new(),
             resources: OfferResources {
                 slots: Vec::new(),
                 signaling_channel: ChannelId::new(1).unwrap(),

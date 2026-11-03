@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use pulsebeam_agent_native::agent_core::{TopicMode, TopicNotification};
 use std::{
     collections::BTreeMap,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -294,6 +295,30 @@ impl Scenario<'_> {
             .collect()
     }
 
+    async fn replace_transports(&self, receivers: &[&str], deadline: Instant) -> Result<()> {
+        for receiver in receivers {
+            let receipt = Arc::new(Mutex::new(None));
+            self.handles[*receiver]
+                .shared
+                .pending_ops
+                .lock()
+                .unwrap()
+                .push(PendingDriverOp::ApplicationAgent(receipt.clone()));
+            let agent = loop {
+                ensure!(
+                    Instant::now() < deadline,
+                    "receiver handle handoff timed out"
+                );
+                if let Some(agent) = receipt.lock().unwrap().take() {
+                    break agent;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            agent.reconnect().await?;
+        }
+        Ok(())
+    }
+
     fn loss(&self, receivers: &[&str], loss: Loss) {
         for receiver in receivers {
             pulsebeam_runtime::net::shaper::set_loss(self.ips[*receiver], loss);
@@ -407,6 +432,11 @@ pub(super) async fn execute(
         );
     }
     let available = u64::try_from(scenario.transcript.sent.len() - retained)?;
+    // Packet loss delays reliable SCTP. Fence the old generation before restoring
+    // the path, preserving Core's cursors but not its transport retransmit queue.
+    scenario
+        .replace_transports(&recovering, Instant::now() + PHASE)
+        .await?;
     scenario.loss(&recovering, Loss::wifi());
     let gap = Some((missing, available));
     scenario

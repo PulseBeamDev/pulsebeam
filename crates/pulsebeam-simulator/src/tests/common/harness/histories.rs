@@ -40,14 +40,10 @@ struct Transition {
 }
 
 fn publication_ids(expected: &ExpectedParticipant) -> BTreeSet<String> {
-    [
-        (expected.video, pulsebeam::entity::TrackKind::Video, "video"),
-        (expected.audio, pulsebeam::entity::TrackKind::Audio, "audio"),
-    ]
-    .into_iter()
-    .filter(|(present, _, _)| *present)
-    .map(|(_, kind, label)| expected.track_id(kind, label).as_str())
-    .collect()
+    expected
+        .publications()
+        .map(|publication| publication.id)
+        .collect()
 }
 
 fn observation(handle: &ParticipantHandle) -> Option<ClientObservation> {
@@ -90,6 +86,7 @@ fn fault_target(index: u8) -> &'static str {
 
 impl Transition {
     fn bind(&mut self, handles: &PlanHandles) -> Result<()> {
+        let media = observed_media(handles)?;
         for (name, handle) in handles.iter().filter(|(_, h)| h.present) {
             let Some(observed) = observation(handle) else {
                 continue;
@@ -108,7 +105,7 @@ impl Transition {
                 continue;
             }
             let intent = handle.shared.pending_ops.lock().unwrap().intent.clone();
-            let expected = ExpectedParticipant {
+            let mut expected = ExpectedParticipant {
                 id: id.parse()?,
                 room: handle.room_name,
                 video: handle.publishes_video,
@@ -119,7 +116,11 @@ impl Transition {
                 required: true,
                 connection: Some(connection),
                 topics: intent.topics,
+                media: Vec::new(),
             };
+            if !expected.bind_media(&media)? {
+                continue;
+            }
             self.bindings.push(Bound {
                 name,
                 expected,
@@ -250,10 +251,11 @@ impl Transition {
                     && b.retired
                         .is_some_and(|at| at.elapsed() >= CRASH_RETIREMENT_BUDGET)
             }) {
-                for track in publication_ids(&bound.expected) {
+                for publication in bound.expected.publications() {
                     ensure!(
-                        !observed.snapshot.publications.contains_key(&track),
-                        "crashed publication exceeded client retirement bound at {name}: {track}"
+                        !observed.snapshot.publications.contains_key(&publication.id),
+                        "crashed publication exceeded client retirement bound at {name}: {}",
+                        publication.id
                     );
                 }
                 if !self
@@ -308,8 +310,14 @@ impl Transition {
             loop {
                 self.clients_safe(handles)?;
                 if handles[who].connected()
-                    && observation(&handles[who])
-                        .is_some_and(|o| o.admission.is_some() && o.admission != previous)
+                    && observation(&handles[who]).is_some_and(|o| {
+                        o.admission.is_some()
+                            && o.admission != previous
+                            && self
+                                .bindings
+                                .iter()
+                                .any(|binding| binding.expected.connection == o.admission)
+                    })
                 {
                     return Ok::<_, anyhow::Error>(());
                 }

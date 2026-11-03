@@ -161,9 +161,16 @@ pub(crate) enum ShardCommand {
         source: std::net::SocketAddr,
         address: crate::route::NodeTransportAddress,
     },
+    PublicationCutoffResult {
+        participant: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
+        reference: u64,
+        success: bool,
+    },
     AuthorizationResult {
         participant: ParticipantId,
         connection_id: crate::entity::ConnectionId,
+        revision: u64,
         expiry: Option<i64>,
     },
 }
@@ -238,12 +245,15 @@ pub(crate) enum ShardEvent {
         connection_id: crate::entity::ConnectionId,
         track: crate::track::TrackMeta,
     },
-    SubscriptionSeedRequested {
+    OwnedSubscriptionSet {
+        connection_id: crate::entity::ConnectionId,
+        request: crate::control::topology::OwnedSubscription,
+    },
+    OwnedSubscriptionRemoved {
         room_id: crate::entity::RoomId,
         subscriber: ParticipantId,
         connection_id: crate::entity::ConnectionId,
-        selector: crate::track::TrackSelector,
-        seed_id: u64,
+        reference: u64,
     },
     TrackSubscriptionAdded {
         room_id: crate::entity::RoomId,
@@ -260,6 +270,10 @@ pub(crate) enum ShardEvent {
     },
     TrackPublished(Track),
     TrackUnpublished(crate::track::TrackMeta),
+    OwnedTrackUnpublished {
+        meta: crate::track::TrackMeta,
+        reference: u64,
+    },
 }
 
 #[derive(Clone)]

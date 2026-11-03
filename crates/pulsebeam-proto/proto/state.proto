@@ -615,6 +615,7 @@ enum RtpHeaderExtensionType {
   RTP_HEADER_EXTENSION_PLAYOUT_DELAY = 5;
   RTP_HEADER_EXTENSION_DEPENDENCY_DESCRIPTOR = 6;
   RTP_HEADER_EXTENSION_AUDIO_LEVEL = 7;
+  RTP_HEADER_EXTENSION_VIDEO_LAYERS_ALLOCATION = 8;
 }
 
 // One prepared encoding; immutable coordinates within the resource's binding.

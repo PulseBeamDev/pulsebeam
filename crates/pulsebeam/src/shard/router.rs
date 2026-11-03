@@ -116,6 +116,10 @@ impl ShardRuntime {
         self.tracks.get(handle).map(|runtime| runtime.id)
     }
 
+    pub(crate) fn source_origin(&self, handle: TrackHandle) -> Option<ParticipantHandle> {
+        self.tracks.get(handle).and_then(|runtime| runtime.origin)
+    }
+
     pub(crate) fn retire_track(&mut self, track_id: crate::entity::TrackId) {
         let Some(handle) = self.track_handles.remove(&track_id) else {
             return;

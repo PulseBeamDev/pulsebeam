@@ -1,4 +1,7 @@
-use super::signaling_v1::{AppliedInput, NativeSession};
+use super::native::{NativeSession, failure};
+mod native_data;
+mod native_receiver;
+mod native_rtp;
 use crate::media::{Direction, KeyframeRequestKind, MediaKind, Mid, Pt, Ssrc};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use pulsebeam_proto::topic::TopicFrame;
@@ -119,7 +122,14 @@ pub(crate) enum ParticipantInput<'a> {
         source_shard: crate::id::ShardId,
     },
     Timeout(Instant),
-    Authorization(Option<i64>),
+    PublicationCutoff {
+        reference: u64,
+        success: bool,
+    },
+    Authorization {
+        revision: u64,
+        expiry: Option<i64>,
+    },
     Track {
         key: TrackHandle,
         packet: TrackPacketRef<'a>,
@@ -158,6 +168,9 @@ pub struct Participant {
     /// topic — the identity it would otherwise have to reassemble on every
     /// packet.
     data: DataState,
+    native_data: native_data::NativeData,
+    native_receivers: native_receiver::NativeReceivers,
+    native_rtp: native_rtp::NativeRtp,
 
     /// Attributes str0m's own logs to this participant, for the simulator only.
     ///
@@ -177,7 +190,7 @@ pub struct Participant {
     renewal_pending: bool,
     playout_reconnect_sent: bool,
     authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
-    active_sender_indices: HashSet<u32>,
+    authorization_revision: u64,
     last_slow_poll: Instant,
     pub(crate) room_id: entity::RoomId,
     pub(crate) shard_id: ShardId,
@@ -192,7 +205,7 @@ impl Participant {
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         };
-        let signaling = NativeSession::new(&rtc.session);
+        let signaling = NativeSession::default();
         let now = Instant::now();
         #[cfg(feature = "sim")]
         let sim_span = tracing::info_span!(
@@ -215,22 +228,46 @@ impl Participant {
             profile: cfg.profile,
             upstream: UpstreamAllocator::new(ctx, cfg.connection_id),
             negotiated: cfg.resources,
-            downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
+            downstream: DownstreamAllocator::new(
+                ctx,
+                cfg.manual_sub || cfg.profile == ConnectionProfile::Native,
+            ),
             disconnect_reason: None,
             signaling,
             renewal_pending: false,
             playout_reconnect_sent: false,
             authorization_expiry: cfg.authorization_expiry,
-            active_sender_indices: HashSet::new(),
+            authorization_revision: u64::from(cfg.authorization_expiry.is_some()),
             last_slow_poll: now,
             last_keyframe_request: HashMap::new(),
             pending_keyframe_requests: HashSet::new(),
             data: DataState::new(),
+            native_data: native_data::NativeData::default(),
+            native_receivers: native_receiver::NativeReceivers::default(),
+            native_rtp: native_rtp::NativeRtp::default(),
             room_id: cfg.room_id,
             shard_id,
         };
-        for media in participant.negotiated.media_sections().to_vec() {
-            participant.handle_media_added(media);
+        if participant.profile == ConnectionProfile::Native {
+            let self_descriptor = pulsebeam_proto::state::Participant {
+                participant_id: participant.participant_id.as_str(),
+                participant_external_id: participant.participant_external_id.as_str().to_owned(),
+            };
+            if let Err(error) = participant.signaling.observe_participant(self_descriptor) {
+                tracing::warn!(?error, participant_id = %participant.participant_id, "native self observation failed");
+                participant.disconnect(DisconnectReason::SignalingOutput);
+            }
+            if let Some(expiry) = participant.authorization_expiry {
+                match i64::try_from(expiry.unix_seconds()) {
+                    Ok(expiry) => participant.send_authorization_result(Some(expiry)),
+                    Err(_) => participant.disconnect(DisconnectReason::SignalingOutput),
+                }
+            }
+        }
+        if participant.profile != ConnectionProfile::Native {
+            for media in participant.negotiated.media_sections().to_vec() {
+                participant.handle_media_added(media);
+            }
         }
         participant
     }
@@ -260,16 +297,13 @@ impl Participant {
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
         match effect {
-            ParticipantEffect::SubscriptionSeedComplete {
-                connection_id,
-                seed_id,
-            } => {
-                if connection_id == self.connection_id && self.data.has_seed(seed_id) {
-                    self.signaling.complete_seed(seed_id);
-                }
-            }
             ParticipantEffect::ParticipantsChanged { added, removed } => {
-                self.signaling.apply_participants(added, removed);
+                if self.profile == ConnectionProfile::Native
+                    && let Err(error) = self.signaling.apply_participants(added, removed)
+                {
+                    tracing::warn!(?error, participant_id = %self.participant_id, "native participant observation failed");
+                    self.disconnect(DisconnectReason::SignalingOutput);
+                }
             }
             ParticipantEffect::TrackCandidateAdded { track } => {
                 let Some(key) = track_handle else {
@@ -278,7 +312,10 @@ impl Participant {
                 };
                 self.add_track_candidate(key, track);
             }
-            ParticipantEffect::TrackCandidateRemoved { track_id } => {
+            ParticipantEffect::TrackCandidateRemoved { track_id, reason } => {
+                if self.profile == ConnectionProfile::Native {
+                    self.native_source_removed(track_id, reason);
+                }
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
@@ -290,6 +327,10 @@ impl Participant {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
+                if self.profile == ConnectionProfile::Native {
+                    self.native_source_binding(track_id, key, true);
+                    return;
+                }
                 self.activate_track_binding(key, track_id);
             }
             ParticipantEffect::TrackUnsubscribed { track_id } => {
@@ -297,6 +338,10 @@ impl Participant {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
+                if self.profile == ConnectionProfile::Native {
+                    self.native_source_binding(track_id, key, false);
+                    return;
+                }
                 self.deactivate_track_binding(key, track_id);
             }
             ParticipantEffect::TrackPublished { track_id } => {
@@ -304,6 +349,14 @@ impl Participant {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
+                if self.profile == ConnectionProfile::Native {
+                    if track_id.kind() == TrackKind::Data {
+                        self.native_data.bind_source(track_id, key);
+                    } else {
+                        self.native_rtp.bind_source(track_id, key);
+                    }
+                    return;
+                }
                 self.upstream.bind_track_handle(track_id, key);
                 if track_id.kind() == TrackKind::Data {
                     self.upstream.data.bind_source(track_id, key);
@@ -314,6 +367,9 @@ impl Participant {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
+                if self.profile == ConnectionProfile::Native {
+                    return;
+                }
                 self.upstream.unbind_track_handle(track_id, key);
                 if track_id.kind() == TrackKind::Data {
                     self.upstream.data.unpublish(track_id);
@@ -329,16 +385,31 @@ impl Participant {
                 source_shard,
             } => self.on_ingress(batch, source_shard),
             ParticipantInput::Timeout(now) => self.on_timeout(now),
-            ParticipantInput::Authorization(expiry) => {
-                if self.renewal_pending {
+            ParticipantInput::Authorization { revision, expiry } => {
+                if revision > self.authorization_revision
+                    && let Some(expiry) = expiry
+                {
+                    let Ok(expiry_seconds) = u64::try_from(expiry) else {
+                        return;
+                    };
+                    self.authorization_revision = revision;
+                    self.authorization_expiry = Some(
+                        pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(
+                            expiry_seconds,
+                        ),
+                    );
                     self.renewal_pending = false;
-                    if let Some(expiry) = expiry {
-                        self.authorization_expiry = u64::try_from(expiry)
-                            .ok()
-                            .map(pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds);
-                    }
-                    self.send_authorization_result(expiry);
+                    self.send_authorization_result(Some(expiry));
+                } else if revision == self.authorization_revision
+                    && expiry.is_none()
+                    && self.renewal_pending
+                {
+                    self.renewal_pending = false;
+                    self.send_authorization_result(None);
                 }
+            }
+            ParticipantInput::PublicationCutoff { reference, success } => {
+                self.complete_native_resource_cutoff(reference, success);
             }
             ParticipantInput::Track { key, packet, cache } => {
                 self.on_track_packet(key, packet, cache);
@@ -350,7 +421,22 @@ impl Participant {
     fn add_track_candidate(&mut self, key: TrackHandle, track: Track) {
         let track_id = track.id();
         let participant_id = track.meta().origin;
+        if self.profile == ConnectionProfile::Native
+            && self.signaling.observe_candidate(&track).is_err()
+        {
+            self.disconnect(DisconnectReason::SignalingOutput);
+            return;
+        }
         debug_assert_eq!(track_id.kind(), track.kind());
+        if self.profile == ConnectionProfile::Native {
+            if self.downstream.register_candidate(key, &track) {
+                if track.kind() == TrackKind::Video {
+                    self.downstream.install_track(key, track.clone());
+                }
+                self.native_source_added(key, &track);
+            }
+            return;
+        }
         if !self
             .downstream
             .add_track_candidate(key, &track, &self.data.channels_snapshot())
@@ -360,8 +446,6 @@ impl Participant {
         debug_assert_ne!(participant_id, self.participant_id);
         if track.kind() != TrackKind::Data {
             self.on_track_published(key, track);
-        } else {
-            self.signaling.mark_dirty();
         }
     }
 
@@ -393,10 +477,16 @@ impl Participant {
         };
         debug_assert_eq!(candidate.track_id, track_id);
         debug_assert_ne!(candidate.participant_id, self.participant_id);
-        if track_id.kind() != TrackKind::Data {
+        if self.profile == ConnectionProfile::Native
+            && self.signaling.remove_track(track_id.as_str()).is_err()
+        {
+            self.disconnect(DisconnectReason::SignalingOutput);
+        }
+        if self.profile == ConnectionProfile::Native && track_id.kind() == TrackKind::Video {
+            self.downstream.video.forget_owned_track(key, track_id);
+            self.downstream.dirty_allocation = true;
+        } else if track_id.kind() != TrackKind::Data {
             let _ = self.on_tracks_unpublished(std::slice::from_ref(&track_id));
-        } else {
-            self.signaling.mark_dirty();
         }
     }
 
@@ -414,6 +504,10 @@ impl Participant {
                     return;
                 }
             };
+            if self.profile == ConnectionProfile::Native {
+                self.native_data_delivery(stream, lane, bytes);
+                return;
+            }
             let Some(channel) = self.downstream.data.forwarding(stream) else {
                 debug_assert!(false, "a data forwarding plan must have a receiver binding");
                 return;
@@ -452,6 +546,10 @@ impl Participant {
         let kind = entry.track_id.kind();
         let participant_id = entry.participant_id;
         let track_id = entry.track_id;
+        if self.profile == ConnectionProfile::Native {
+            self.native_rtp_delivery(key, packet, cache);
+            return;
+        }
         match kind {
             TrackKind::Video => {
                 #[cfg(feature = "sim")]
@@ -465,9 +563,7 @@ impl Participant {
                     cache,
                     &mut self.stream_writer,
                 );
-                if promoted {
-                    self.signaling.mark_mapping_dirty();
-                }
+                let _ = promoted;
             }
             TrackKind::Audio => {
                 debug_assert!(cache.is_none(), "audio forwarding has no video cache");
@@ -477,9 +573,7 @@ impl Participant {
                 };
                 self.downstream
                     .on_forward_audio_rtp(origin, packet, &mut self.stream_writer);
-                if self.downstream.take_audio_speakers_changed() {
-                    self.signaling.mark_mapping_dirty();
-                }
+                self.downstream.take_audio_speakers_changed();
             }
             TrackKind::Data => debug_assert!(false, "data tracks carry bytes, not RTP"),
         }
@@ -521,16 +615,12 @@ impl Participant {
             "participant received published track"
         );
         self.downstream.install_track(key, track);
-        self.signaling.mark_dirty();
     }
 
     fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
         let mut removed = false;
         for track_id in tracks {
             removed |= self.downstream.remove_track(track_id);
-        }
-        if removed {
-            self.signaling.mark_dirty();
         }
         removed
     }
@@ -547,7 +637,11 @@ impl Participant {
     fn on_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
         match packet.decode() {
             Some(ReverseInput::Keyframe { rid, kind }) => {
-                let Some(track_id) = self.upstream.track_for_fanout(stream) else {
+                let Some(track_id) = (if self.profile == ConnectionProfile::Native {
+                    self.native_rtp.track_for_fanout(stream)
+                } else {
+                    self.upstream.track_for_fanout(stream)
+                }) else {
                     debug_assert!(
                         false,
                         "a reverse keyframe route must name a published track"
@@ -557,6 +651,10 @@ impl Participant {
                 self.enqueue_remote_keyframe((track_id, rid), kind);
             }
             Some(ReverseInput::ReliableControl(bytes)) => {
+                if self.profile == ConnectionProfile::Native {
+                    self.native_data_reverse(stream, bytes);
+                    return;
+                }
                 let Some(channel) = self.upstream.data.source(stream) else {
                     debug_assert!(
                         false,
@@ -588,7 +686,11 @@ impl Participant {
     }
 
     fn enqueue_remote_keyframe(&mut self, stream_id: StreamId, kind: KeyframeRequestKind) {
-        let Some(mid) = self.upstream.mid_for_track_id(stream_id.0) else {
+        let Some(mid) = (if self.profile == ConnectionProfile::Native {
+            self.native_rtp.keyframe_mid(stream_id.0, stream_id.1)
+        } else {
+            self.upstream.mid_for_track_id(stream_id.0)
+        }) else {
             plog_warn!(self.log_ctx(), stream_id = ?stream_id.0, "unknown upstream track for keyframe request");
             return;
         };
@@ -625,15 +727,25 @@ impl Participant {
         // Measure before allocating: the monitors produce this tick's numbers,
         // and running the allocator first would decide against last tick's.
         self.upstream.poll_slow(now);
+        self.native_rtp.poll_stats(now);
         let assignments_changed = self.downstream.poll_slow(now, events);
         self.transport
             .set_desired_bitrate(self.downstream.desired_bitrate());
-        if assignments_changed {
-            self.signaling.mark_mapping_dirty();
-        }
+        let _ = assignments_changed;
     }
 
     fn apply_one_rtc_mutation(&mut self, now: Instant) -> bool {
+        if self.profile == ConnectionProfile::Native
+            && self
+                .authorization_expiry
+                .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
+        {
+            // A controller renewal may be in flight; fence old work without declaring expiry terminal.
+            self.stream_writer.discard();
+            self.pending_keyframe_requests.clear();
+            self.transport.discard_mutations();
+            return false;
+        }
         if let Some(write) = self.stream_writer.pop() {
             let (pkt, track_id, mid, rid, ssrc, pt, kind) = match write {
                 StreamWrite::Video {
@@ -653,9 +765,17 @@ impl Participant {
                 } => (pkt, track_id, mid, None, ssrc, pt, MediaKind::Audio),
             };
             let seq_no = pkt.seq_no;
-            let Ok(playout_delay) = self.downstream.playout_delay_to_stamp(track_id, mid) else {
-                self.send_playout_reconnect();
-                return true;
+            let playout_delay = if self.profile == ConnectionProfile::Native {
+                if !self.native_receivers.can_write_rtp(mid, track_id, ssrc, pt) {
+                    return true;
+                }
+                self.native_receivers.playout_delay(mid)
+            } else {
+                let Ok(delay) = self.downstream.playout_delay_to_stamp(track_id, mid) else {
+                    self.send_playout_reconnect();
+                    return true;
+                };
+                delay
             };
             let result = self.transport.apply_rtp_command(RtpWriteCommand {
                 pkt,
@@ -686,7 +806,15 @@ impl Participant {
             }
             return true;
         }
-        let applied = self.transport.apply_next_mutation(now);
+        let native = self.profile == ConnectionProfile::Native;
+        let data = &self.native_data;
+        let receivers = &self.native_receivers;
+        let applied = self.transport.apply_next_mutation(now, |channel| {
+            !native
+                || channel.value() == 0
+                || data.can_write(channel)
+                || receivers.can_write(channel)
+        });
         match applied {
             Some(AppliedMutation::ControlNotWritten) => {
                 self.disconnect(DisconnectReason::SignalingOutput);
@@ -725,7 +853,9 @@ impl Participant {
         let _sim_guard = sim_span.enter();
 
         self.advance_rtc_clock(now, now);
+        self.expire_native_data(now, events);
         let mut work_budget = POLL_WORK_BUDGET;
+        let mut control_blocked = false;
         'drain: loop {
             if work_budget == 0 {
                 metrics::counter!("participant_poll_budget_hit").increment(1);
@@ -757,6 +887,10 @@ impl Participant {
                 continue;
             }
 
+            if self.advance_native_source(events) {
+                continue;
+            }
+
             if self.apply_one_rtc_mutation(now) {
                 self.transport.mark_needs_drain();
                 continue;
@@ -778,16 +912,9 @@ impl Participant {
                 }
             }
 
-            if self.signaling.needs_poll() {
-                let mut publications = self.downstream.native_publications();
-                publications.extend(self.data.publications().cloned());
-                let assignments = self.downstream.native_assignments();
-                match self.signaling.poll(
-                    &publications,
-                    assignments,
-                    self.participant_id,
-                    self.participant_external_id.as_str(),
-                ) {
+            if !control_blocked && self.signaling.needs_poll() {
+                let enumeration_progress = self.signaling.enumeration_progress();
+                match self.signaling.poll() {
                     Ok(Some(output)) => {
                         if self
                             .transport
@@ -795,14 +922,19 @@ impl Participant {
                         {
                             self.signaling.commit_sent();
                         } else {
-                            self.signaling.retry_pending();
+                            control_blocked = true;
                         }
                         self.transport.mark_needs_drain();
                         continue;
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if self.signaling.enumeration_progress() != enumeration_progress {
+                            continue;
+                        }
+                    }
                     Err(err) => {
                         plog_warn!(self.log_ctx(), ?err, "native signaling output failed");
+                        tracing::warn!(?err, participant_id = %self.participant_id, "native signaling output failed");
                         self.disconnect(DisconnectReason::SignalingOutput);
                         return None;
                     }
@@ -813,9 +945,7 @@ impl Participant {
                 let assignments_changed = self.downstream.update_allocations(now);
                 self.transport
                     .set_desired_bitrate(self.downstream.desired_bitrate());
-                if assignments_changed {
-                    self.signaling.mark_mapping_dirty();
-                }
+                let _ = assignments_changed;
                 self.downstream.reconcile_routes(now, events);
                 self.transport.mark_needs_drain();
                 continue;
@@ -832,6 +962,13 @@ impl Participant {
                 .deadline()
                 .unwrap_or(next_slow_poll)
                 .min(next_slow_poll);
+            let deadline = self
+                .signaling
+                .deadline()
+                .into_iter()
+                .chain(self.native_data.deadline())
+                .chain(self.native_receivers.deadline())
+                .fold(deadline, Instant::min);
 
             if let Some(rtc_now) = inline_rtc_timeout(deadline, now) {
                 self.advance_rtc_clock(rtc_now, now);
@@ -897,12 +1034,21 @@ impl Participant {
                 let Ok(mid) = Mid::new(&info.mid) else {
                     return;
                 };
-                if let Some(report) = self.transport.register_encoding(info) {
-                    self.handle_sender_report(report);
+                if self.profile == ConnectionProfile::Native {
+                    if self.native_rtp.owns_encoding(info.ssrc)
+                        && let Some(report) = self.transport.register_owned_encoding(info)
+                    {
+                        self.handle_sender_report(report);
+                    }
+                } else {
+                    if let Some(report) = self.transport.register_encoding(info) {
+                        self.handle_sender_report(report);
+                    }
+                    self.handle_stream_paused(mid, false, events);
                 }
-                self.handle_stream_paused(mid, false, events);
             }
             Event::EncodingRetired { ssrc, .. } => {
+                self.native_rtp_ended(ssrc, events);
                 self.transport.retire_encoding(ssrc);
                 self.upstream.clear_routes();
             }
@@ -928,6 +1074,10 @@ impl Participant {
                 channel: cid,
                 config: cfg,
             }) => {
+                if self.profile == ConnectionProfile::Native && cid.value() != 0 {
+                    self.native_data_opened(cid, cfg, events);
+                    return;
+                }
                 let intent = match DataTrackIntent::try_from(&cfg) {
                     Ok(intent) => intent,
                     Err(err) => {
@@ -954,6 +1104,9 @@ impl Participant {
                     }
 
                     DataTrackIntent::UserTopic(channel) => {
+                        if self.profile == ConnectionProfile::Native {
+                            return;
+                        }
                         if let Some(previous) = self.data.close(cid) {
                             self.downstream.data.close(cid);
                             self.upstream.data.close(cid);
@@ -985,29 +1138,21 @@ impl Participant {
                             None
                         };
                         let meta = publication.as_ref().map(|track| track.meta().clone());
-                        let seeded = match self.data.open(cid, channel.clone(), meta) {
-                            Ok(seeded) => seeded,
-                            Err(error) => {
-                                self.disconnect(match error {
-                                    DataOpenError::DuplicateDataChannelLabel(channel) => {
-                                        DisconnectReason::DuplicateDataChannelLabel(channel)
-                                    }
-                                    DataOpenError::TooManyDataTopicChannels => {
-                                        DisconnectReason::TooManyDataTopicChannels
-                                    }
-                                });
-                                return;
-                            }
-                        };
+                        if let Err(error) = self.data.open(cid, channel.clone(), meta) {
+                            self.disconnect(match error {
+                                DataOpenError::DuplicateDataChannelLabel(channel) => {
+                                    DisconnectReason::DuplicateDataChannelLabel(channel)
+                                }
+                                DataOpenError::TooManyDataTopicChannels => {
+                                    DisconnectReason::TooManyDataTopicChannels
+                                }
+                            });
+                            return;
+                        }
                         if let Some(track) = publication {
                             self.upstream.data.publish(cid, &track);
                             events.publish_track(track);
-                            self.signaling.mark_dirty();
-                        } else if let Some((selector, token)) = seeded {
-                            events.seed_subscription(selector, token);
-                        } else if channel.lane != DataLane::Ordered {
-                            // Ordered subscriptions start with their identity-bearing
-                            // seed request, not an additional anonymous registration.
+                        } else {
                             events.subscribe_tracks(
                                 DataState::selector(&channel),
                                 crate::track::SelectionPolicy::All,
@@ -1021,13 +1166,16 @@ impl Participant {
                     self.disconnect(DisconnectReason::SignalingClosed);
                     return;
                 }
+                if self.profile == ConnectionProfile::Native {
+                    self.native_data_closed(cid, events);
+                    return;
+                }
                 let Some(channel) = self.data.close(cid) else {
                     return;
                 };
                 self.downstream.data.close(cid);
                 self.upstream.data.close(cid);
                 self.release_data_channel(channel, events);
-                self.signaling.mark_dirty();
             }
             Event::DataChannel(DataChannelEvent::Message {
                 channel: cid,
@@ -1041,6 +1189,10 @@ impl Participant {
                 };
                 if Some(cid) == self.signaling.cid {
                     self.handle_native_signaling(&bytes, events);
+                    return;
+                }
+                if self.profile == ConnectionProfile::Native {
+                    self.native_data_message(cid, &bytes, events);
                     return;
                 }
                 let Some(channel) = self.data.channel(cid).cloned() else {
@@ -1100,86 +1252,41 @@ impl Participant {
     }
 
     fn handle_native_signaling(&mut self, bytes: &[u8], events: &mut impl ParticipantSink) {
-        let senders = self
-            .negotiated
-            .media_sections()
-            .iter()
-            .filter_map(|media| {
-                if media.direction != Direction::RecvOnly {
-                    return None;
-                }
-                let kind = match media.kind {
-                    MediaKind::Audio => TrackKind::Audio,
-                    MediaKind::Video => TrackKind::Video,
-                };
-                Some((media.media_index, kind))
-            })
-            .collect();
-        let result = self.signaling.apply_input(
-            bytes,
-            &senders,
-            self.downstream.video.slot_count(),
-            &mut self.upstream,
-        );
-        match result {
-            Ok(AppliedInput::Intent { published, receive }) => {
-                let next: HashSet<u32> = published.iter().map(|track| track.sender_index).collect();
-                let removed: Vec<u32> = self
-                    .active_sender_indices
-                    .difference(&next)
-                    .copied()
-                    .collect();
-                let added: Vec<u32> = next
-                    .difference(&self.active_sender_indices)
-                    .copied()
-                    .collect();
-                for (indices, active) in [(removed, false), (added, true)] {
-                    for index in indices {
-                        if let Some(mid) = self
-                            .negotiated
-                            .media_sections()
-                            .iter()
-                            .find(|media| media.media_index == index)
-                            .map(|media| media.mid)
-                        {
-                            self.handle_upstream_track_state(mid, active, events);
-                        }
-                    }
-                }
-                self.active_sender_indices = next;
-                if self.downstream.apply_native_receive(receive.as_ref()) {
-                    self.send_playout_reconnect();
-                }
-            }
-            Ok(AppliedInput::SubscriptionSeed(seed)) => match self.data.seed(&seed) {
-                Ok(Some(selector)) => events.seed_subscription(selector, seed.seed_id),
-                Ok(None) => {}
-                Err(()) => self.disconnect(DisconnectReason::SignalingInput),
-            },
-            Ok(AppliedInput::Replay) => {}
-            Ok(AppliedInput::RenewAuthorization(token)) => {
-                if self.renewal_pending {
-                    self.send_authorization_result(None);
-                } else {
-                    self.renewal_pending = true;
-                    events.renew_authorization(token);
-                }
-            }
+        let cutoffs = match self.signaling.apply_input(bytes) {
+            Ok(cutoffs) => cutoffs,
             Err(error) => {
-                let sent = if let Ok(bytes) =
-                    pulsebeam_proto::codec::encode_server(&error.response())
-                    && let Some(cid) = self.signaling.cid
-                {
-                    self.transport.write_channel(cid, true, &bytes)
-                } else {
-                    false
-                };
                 plog_warn!(self.log_ctx(), ?error, "native signaling input rejected");
-                if error.is_fatal() {
-                    self.disconnect(DisconnectReason::SignalingInput);
-                } else if !sent {
+                self.disconnect(DisconnectReason::SignalingInput);
+                return;
+            }
+        };
+        for reference in cutoffs {
+            self.retire_native_resource(reference, events);
+        }
+        self.evaluate_native_preparations(events);
+    }
+
+    fn evaluate_native_preparations(&mut self, events: &mut impl ParticipantSink) {
+        loop {
+            if !self
+                .signaling
+                .authorization_current(native_data::unix_now())
+            {
+                return;
+            }
+            let work = match self.signaling.take_preparation() {
+                Ok(Some(work)) => work,
+                Ok(None) => break,
+                Err(_) => {
                     self.disconnect(DisconnectReason::SignalingOutput);
+                    return;
                 }
+            };
+            if let Some(work) = self.current_native_preparation(work) {
+                self.prepare_native_resource(work, events);
+            }
+            if self.disconnect_reason.is_some() {
+                return;
             }
         }
     }
@@ -1189,46 +1296,24 @@ impl Participant {
             return;
         }
         self.playout_reconnect_sent = true;
-        use pulsebeam_proto::signaling_v1::{Reconnect, ServerMessage, server_message::Payload};
-        if let Some(cid) = self.signaling.cid
-            && let Ok(bytes) = pulsebeam_proto::codec::encode_server(&ServerMessage {
-                payload: Some(Payload::Reconnect(Reconnect {})),
-            })
-        {
-            self.transport.write_channel(cid, true, &bytes);
-            self.transport.mark_needs_drain();
-        }
+        let _ = self
+            .signaling
+            .close(pulsebeam_proto::state::CloseReason::ReconstructionRequired);
+        self.disconnect(DisconnectReason::SignalingOutput);
     }
 
     fn send_authorization_result(&mut self, expiry: Option<i64>) {
-        use pulsebeam_proto::signaling_v1::{
-            Authorization, Error, ErrorCode, ServerMessage, server_message::Payload,
-        };
-        let payload = match expiry {
-            Some(expires_at_unix_seconds) => Payload::Authorization(Authorization {
-                expires_at_unix_seconds,
-            }),
-            None => Payload::Error(Error {
-                code: ErrorCode::AuthorizationRejected as i32,
-                message: "authorization renewal rejected or busy".to_string(),
-                fatal: false,
-                intent_revision: None,
-            }),
-        };
-        if let Some(cid) = self.signaling.cid
-            && let Ok(bytes) = pulsebeam_proto::codec::encode_server(&ServerMessage {
-                payload: Some(payload),
-            })
+        if let Some(expiry) = expiry
+            && let Err(error) = self
+                .signaling
+                .authorization(expiry, self.authorization_revision)
         {
-            self.transport.write_channel(cid, true, &bytes);
-            self.transport.mark_needs_drain();
+            tracing::warn!(?error, participant_id = %self.participant_id, "native authorization observation failed");
+            self.disconnect(DisconnectReason::SignalingOutput);
         }
     }
 
     fn release_data_channel(&mut self, state: DataChannelState, events: &mut impl ParticipantSink) {
-        if let Some(seed) = state.seed {
-            self.signaling.retire_seed(seed);
-        }
         if let Some(meta) = state.publication {
             events.unpublish_track(meta);
         } else {
@@ -1334,7 +1419,6 @@ impl Participant {
             }
             Direction::SendOnly => {
                 self.try_add_downstream_slot(resource.media_index, media.mid, media.kind);
-                self.signaling.mark_mapping_dirty();
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
@@ -1378,6 +1462,10 @@ impl Participant {
         rid: Option<crate::media::Rid>,
         events: &mut impl ParticipantSink,
     ) {
+        if self.profile == ConnectionProfile::Native {
+            self.handle_native_rtp(rtp, mid, rid, events);
+            return;
+        }
         plog_trace!(self.log_ctx(), "tracing:rtp_event={}", rtp.header.sequence);
         let ssrc: Ssrc = rtp.header.ssrc.into();
         let incoming = if let Some(route) = self.upstream.route_for_ssrc(ssrc) {
@@ -1444,9 +1532,17 @@ impl Participant {
     }
 
     fn handle_sender_report(&mut self, report: pulsebeam_rtc::SenderReport) {
+        if self.profile == ConnectionProfile::Native && !self.native_rtp.owns_encoding(report.ssrc)
+        {
+            return;
+        }
         let arrival = report.arrival.into();
         if let Some((mid, report)) = self.transport.sender_report(report) {
-            self.upstream.sender_report(mid, report, arrival);
+            if self.profile == ConnectionProfile::Native {
+                self.native_rtp.sender_report(mid, report, arrival);
+            } else {
+                self.upstream.sender_report(mid, report, arrival);
+            }
         }
     }
 
@@ -1558,6 +1654,60 @@ mod rtc_clock_tests {
                 assert_eq!(sink.exit_count, 0);
             },
         );
+    }
+
+    #[test]
+    fn grant_replacement_updates_without_in_band_request_and_fences_stale_completions() {
+        let (rtc, resources, _) = crate::control::application_only_test_connection_and_binding();
+        let mut participant = Participant::new(
+            ParticipantConfig {
+                manual_sub: false,
+                room_id: entity::RoomId::from_external(
+                    &entity::RoomExternalId::new("grant-proof").unwrap(),
+                ),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: entity::ParticipantExternalId::new("peer").unwrap(),
+                connection_id: entity::ConnectionId::new(),
+                profile: ConnectionProfile::Native,
+                authorization_expiry: Some(
+                    pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(200),
+                ),
+                rtc,
+                resources,
+            },
+            ShardId::new(0),
+            8,
+        );
+        assert!(!participant.renewal_pending);
+        participant.input(ParticipantInput::Authorization {
+            revision: 2,
+            expiry: Some(150),
+        });
+        assert_eq!(participant.authorization_revision, 2);
+        assert_eq!(
+            participant.authorization_expiry.unwrap().unix_seconds(),
+            150
+        );
+        participant.renewal_pending = true;
+        for (revision, expiry) in [(1, Some(300)), (1, None), (2, Some(400))] {
+            participant.input(ParticipantInput::Authorization { revision, expiry });
+            assert_eq!(participant.authorization_revision, 2);
+            assert_eq!(
+                participant.authorization_expiry.unwrap().unix_seconds(),
+                150
+            );
+            assert!(participant.renewal_pending);
+        }
+        participant.input(ParticipantInput::Authorization {
+            revision: 3,
+            expiry: Some(160),
+        });
+        assert_eq!(participant.authorization_revision, 3);
+        assert_eq!(
+            participant.authorization_expiry.unwrap().unix_seconds(),
+            160
+        );
+        assert!(!participant.renewal_pending);
     }
 
     #[test]

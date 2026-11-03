@@ -66,7 +66,13 @@ fn profile() -> RtpCapabilities {
             video_codec("vp8"),
             video_codec("h264"),
             video_codec("vp9"),
-        ],
+        ]
+        .into_iter()
+        .map(|parameters| pulsebeam_rtc::RtpCodecCapability {
+            repair: parameters.name != "opus",
+            parameters,
+        })
+        .collect(),
         extensions: [
             pulsebeam_rtc::MID_EXTENSION,
             pulsebeam_rtc::TWCC_EXTENSION,
@@ -76,7 +82,6 @@ fn profile() -> RtpCapabilities {
         .into_iter()
         .map(str::to_owned)
         .collect(),
-        repair: true,
         feedback: pulsebeam_rtc::PacketFeedbackKind::TransportWide,
         limits: RtpConfigurationLimits::default(),
     }
@@ -86,16 +91,22 @@ fn client_capabilities(profile: &RtpCapabilities) -> client::Capabilities {
         codecs: profile
             .codecs
             .iter()
-            .map(|p| client::CodecParameters {
-                name: p.name.clone(),
-                clock_rate: p.clock_rate,
-                channels: p.channels,
-                fmtp: p.fmtp.clone(),
-                feedback: p.feedback.clone(),
+            .map(|supported| {
+                let p = &supported.parameters;
+                client::CodecCapability {
+                    parameters: client::CodecParameters {
+                        name: p.name.clone(),
+                        clock_rate: p.clock_rate,
+                        channels: p.channels,
+                        fmtp: p.fmtp.clone(),
+                        feedback: p.feedback.clone(),
+                    },
+                    repair: supported.repair,
+                }
             })
             .collect(),
         extensions: profile.extensions.clone(),
-        repair: profile.repair,
+        rtcp_modes: [client::RtcpMode::Compound, client::RtcpMode::ReducedSize].into(),
     }
 }
 fn binding(value: &client::Binding) -> RtpBinding {
@@ -206,6 +217,7 @@ struct Pump<'a> {
     echo_sequences: BTreeMap<String, u64>,
     output_sources: BTreeMap<String, Vec<u8>>,
     received: Vec<(String, pulsebeam_rtc::RtpPacket)>,
+    encodings: BTreeMap<u32, pulsebeam_rtc::EncodingInfo>,
     data: Vec<pulsebeam_rtc::DataMessage>,
     feedback: usize,
     connected: bool,
@@ -277,6 +289,12 @@ impl Pump<'_> {
                             .unwrap();
                     }
                     Output::Event(Event::Connected) => self.connected = true,
+                    Output::Event(Event::EncodingDiscovered(info)) => {
+                        self.encodings.insert(info.ssrc, info);
+                    }
+                    Output::Event(Event::EncodingRetired { ssrc, .. }) => {
+                        self.encodings.remove(&ssrc);
+                    }
                     Output::Event(Event::Rtp { mid, packet, .. }) => {
                         if let Some(output) = self.echo_mids.get(mid.as_ref()) {
                             let sequence = self.echo_sequences.entry(output.clone()).or_default();
@@ -427,6 +445,7 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
         echo_sequences: BTreeMap::new(),
         output_sources: BTreeMap::new(),
         received: vec![],
+        encodings: BTreeMap::new(),
         data: vec![],
         feedback: 0,
         connected: false,
@@ -996,6 +1015,23 @@ fn publication_passage(pump: &Pump<'_>, start: usize, binding: &RtpBinding) {
             .filter(|(mid, packet)| mid == &binding.mid && packet.header.ssrc == encoding.primary)
             .collect();
         if encoding.active {
+            let info = &pump.encodings[&encoding.primary];
+            assert_eq!(info.mid.as_ref(), binding.mid);
+            assert_eq!(info.kind, binding.kind);
+            assert_eq!(info.rid.as_deref(), encoding.rid.as_deref());
+            assert_eq!(
+                info.payloads.as_ref(),
+                &[pulsebeam_rtc::RtpPayloadInfo {
+                    payload_type: binding.codec.payload_type,
+                    name: binding
+                        .codec
+                        .parameters
+                        .name
+                        .to_ascii_lowercase()
+                        .into_boxed_str(),
+                    clock_rate: binding.codec.parameters.clock_rate,
+                }]
+            );
             assert!(
                 !packets.is_empty(),
                 "configured encoding has actual traffic: {} {:?}",

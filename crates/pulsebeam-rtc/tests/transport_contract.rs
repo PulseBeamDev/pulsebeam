@@ -117,10 +117,11 @@ fn replies(
 
 #[test]
 fn caller_budgets_alternate_owned_batches_without_draining_a_connection() {
-    let mut nodes = [
+    let mut nodes = vec![
         connection("192.0.2.1:5000".parse().expect("first"), false),
         connection("192.0.2.1:5002".parse().expect("second"), false),
-    ];
+    ]
+    .into_boxed_slice();
     let remote = "192.0.2.2:5001".parse().expect("remote");
     let payload = request(&format!("{UFRAG}:chromeufrag"), Some(PASSWORD.as_bytes()));
     for (index, (connection, at)) in nodes.iter_mut().enumerate() {

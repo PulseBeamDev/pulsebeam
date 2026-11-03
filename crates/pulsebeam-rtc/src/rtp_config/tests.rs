@@ -13,7 +13,10 @@ fn codec() -> RtpCodecParameters {
 }
 fn capabilities() -> RtpCapabilities {
     RtpCapabilities {
-        codecs: vec![codec()],
+        codecs: vec![RtpCodecCapability {
+            parameters: codec(),
+            repair: true,
+        }],
         extensions: [
             MID_EXTENSION,
             TWCC_EXTENSION,
@@ -23,7 +26,6 @@ fn capabilities() -> RtpCapabilities {
         .into_iter()
         .map(str::to_owned)
         .collect(),
-        repair: true,
         feedback: PacketFeedbackKind::TransportWide,
         limits: RtpConfigurationLimits::default(),
     }
@@ -107,10 +109,66 @@ fn connection_with_limits(limits: crate::ConnectionLimits) -> Connection {
 
 #[test]
 fn data_only_start_declares_feedback_and_atomic_duplex_encoding_configuration() {
+    let mut disabled = connection();
+    let mut unfunded = capabilities();
+    unfunded.codecs.reserve(256);
+    unfunded.limits.max_live_metadata_bytes = storage::capability_bytes(&unfunded).unwrap() - 1;
+    assert_eq!(
+        disabled.set_rtp_capabilities(unfunded),
+        Err(RtpConfigurationError::Capacity)
+    );
+    assert_eq!(disabled.stats().connection.feedback, None);
+    assert!(disabled.rtp_configuration().is_none());
+    let mut empty = capabilities();
+    empty.codecs.clear();
+    empty.extensions.clear();
+    disabled.set_rtp_capabilities(empty.clone()).unwrap();
+    disabled
+        .update_rtp(RtpConfigurationPatch::default())
+        .unwrap();
+    assert_eq!(
+        disabled.rtp_configuration(),
+        Some(RtpConfiguration::default())
+    );
+    assert_eq!(
+        disabled.update_rtp(RtpConfigurationPatch {
+            inbound: vec![binding("unadvertised", 0)],
+            ..Default::default()
+        }),
+        Err(RtpConfigurationError::Unsupported)
+    );
+    assert_eq!(
+        disabled.rtp_configuration(),
+        Some(RtpConfiguration::default())
+    );
+    assert_eq!(
+        disabled.set_rtp_capabilities(capabilities()),
+        Err(RtpConfigurationError::CapabilityState)
+    );
+    disabled.set_rtp_capabilities(empty).unwrap();
     let mut connection = connection();
     let mut many = beyond_encoding_count();
     many.outbound[0] = binding("duplex", 600);
     let mut caps = capabilities();
+    caps.codecs.extend((0..128).map(|index| RtpCodecCapability {
+        parameters: RtpCodecParameters {
+            name: "opus".into(),
+            clock_rate: 48000,
+            channels: Some(2),
+            fmtp: BTreeMap::from([(
+                "maxaveragebitrate".into(),
+                (6000 + index * 1000).to_string(),
+            )]),
+            feedback: BTreeSet::from(["transport-cc".into()]),
+        },
+        repair: false,
+    }));
+    caps.extensions
+        .extend((0..257).map(|index| format!("urn:example:capability:{index}")));
+    assert_eq!(caps.codecs.len(), 129);
+    assert_eq!(caps.extensions.len(), 261);
+    let mut installed_caps = caps.clone();
+    let capability_bytes = storage::capability_bytes(&installed_caps).unwrap();
     caps.limits.max_live_metadata_bytes = many
         .inbound
         .iter()
@@ -124,7 +182,9 @@ fn data_only_start_declares_feedback_and_atomic_duplex_encoding_configuration() 
             })
             .unwrap()
         })
-        .sum();
+        .sum::<usize>()
+        + capability_bytes;
+    installed_caps.limits = caps.limits;
     assert_eq!(connection.stats().connection.feedback, None);
     let configured = RtpConfiguration {
         inbound: vec![binding("duplex", 0)],
@@ -139,7 +199,7 @@ fn data_only_start_declares_feedback_and_atomic_duplex_encoding_configuration() 
         Err(RtpConfigurationError::CapabilityState)
     );
     assert!(connection.rtp_configuration().is_none());
-    connection.set_rtp_capabilities(caps.clone()).unwrap();
+    connection.set_rtp_capabilities(installed_caps).unwrap();
     assert_eq!(
         connection.stats().connection.feedback,
         Some(PacketFeedbackKind::TransportWide)
@@ -351,9 +411,13 @@ fn identity_storage_is_bounded_and_failed_updates_do_not_consume_it() {
             max_receive_runtime_bytes: 0,
             ..Default::default()
         },
+        crate::ConnectionLimits {
+            max_sent_history_bytes: 0,
+            ..Default::default()
+        },
     ] {
         let mut constrained = connection_with_limits(limits);
-        if limits.max_receive_runtime_bytes == 0 {
+        if limits.max_receive_runtime_bytes == 0 || limits.max_sent_history_bytes == 0 {
             for _ in 0..2 {
                 let declaration = capabilities();
                 assert_eq!(
@@ -401,11 +465,11 @@ fn identity_storage_is_bounded_and_failed_updates_do_not_consume_it() {
     let mut vp9 = codec();
     vp9.name = "vp9".into();
     vp9.fmtp.insert("profile-id".into(), "0".into());
-    formats.codecs.push(vp9.clone());
-    let mut registry = RtpConfigurationState {
-        capabilities: Some(formats),
-        ..RtpConfigurationState::default()
-    };
+    formats.codecs.push(RtpCodecCapability {
+        parameters: vp9.clone(),
+        repair: true,
+    });
+    let mut registry = RtpConfigurationState::with_capabilities(formats).unwrap();
     let mut inbound = binding("group", 0);
     inbound.encodings[0].rid = Some("q".into());
     inbound.encodings.push(RtpEncoding {
@@ -566,10 +630,9 @@ fn identity_storage_is_bounded_and_failed_updates_do_not_consume_it() {
 #[test]
 fn metadata_storage_and_guard_budgets_replace_binding_and_lifetime_quotas() {
     assert!(storage::identity_bytes(usize::MAX).is_none());
-    let mut registry = RtpConfigurationState {
-        capabilities: Some(capabilities()),
-        ..Default::default()
-    };
+    let caps = capabilities();
+    let capability_bytes = storage::capability_bytes(&caps).unwrap();
+    let mut registry = RtpConfigurationState::with_capabilities(caps).unwrap();
     let many = beyond_encoding_count();
     let update = registry.stage(many).unwrap();
     registry.commit(update);
@@ -581,10 +644,11 @@ fn metadata_storage_and_guard_budgets_replace_binding_and_lifetime_quotas() {
             .values()
             .map(|record| storage::live_bytes(record).unwrap())
             .sum::<usize>()
+            + capability_bytes
     );
     let update = registry.stage(RtpConfiguration::default()).unwrap();
     registry.commit(update);
-    assert_eq!(registry.live_metadata_bytes, 0);
+    assert_eq!(registry.live_metadata_bytes, capability_bytes);
     assert_eq!(registry.issued.len(), 1028);
 
     let mut light = binding("solo", 700);
@@ -613,13 +677,72 @@ fn metadata_storage_and_guard_budgets_replace_binding_and_lifetime_quotas() {
         Some(&light.rtcp)
     );
     let mut caps = capabilities();
-    caps.codecs.push(light.codec.parameters.clone());
+    caps.codecs.push(RtpCodecCapability {
+        parameters: light.codec.parameters.clone(),
+        repair: true,
+    });
+    type InflateCaps = fn(&mut RtpCapabilities);
+    let cap_inflaters: [(&str, InflateCaps); 7] = [
+        ("codec vector", |c| c.codecs.reserve(100)),
+        ("codec name", |c| c.codecs[0].parameters.name.reserve(4096)),
+        ("FMTP key", |c| {
+            let fmtp = &mut c.codecs[1].parameters.fmtp;
+            let (mut key, value) = fmtp.pop_first().unwrap();
+            key.reserve(4096);
+            fmtp.insert(key, value);
+        }),
+        ("FMTP value", |c| {
+            c.codecs[1]
+                .parameters
+                .fmtp
+                .values_mut()
+                .next()
+                .unwrap()
+                .reserve(4096);
+        }),
+        ("feedback", |c| {
+            let feedback = &mut c.codecs[0].parameters.feedback;
+            let mut value = feedback.pop_first().unwrap();
+            value.reserve(4096);
+            feedback.insert(value);
+        }),
+        ("extension URI", |c| {
+            let mut uri = c.extensions.pop_first().unwrap();
+            uri.reserve(4096);
+            c.extensions.insert(uri);
+        }),
+        ("extension entry", |c| {
+            c.extensions.insert("urn:example:extra".into());
+        }),
+    ];
+    for (field, inflate) in cap_inflaters {
+        let mut heavy = caps.clone();
+        heavy.limits.max_live_metadata_bytes = storage::capability_bytes(&heavy).unwrap();
+        assert_eq!(heavy.validate(), Ok(heavy.limits.max_live_metadata_bytes));
+        inflate(&mut heavy);
+        assert_eq!(
+            heavy.validate(),
+            Err(RtpConfigurationError::Capacity),
+            "unaccounted capability {field} storage"
+        );
+    }
+    let mut short_caps = caps.clone();
+    short_caps.limits.max_live_metadata_bytes =
+        storage::capability_bytes(&short_caps).unwrap() + limit - 1;
+    let short = RtpConfigurationState::with_capabilities(short_caps).unwrap();
+    assert!(matches!(
+        short.stage(RtpConfiguration {
+            inbound: vec![light.clone()],
+            outbound: vec![],
+        }),
+        Err(RtpConfigurationError::Capacity)
+    ));
+    assert!(short.snapshot().is_none() && short.issued.is_empty());
+    let capability_bytes = storage::capability_bytes(&caps).unwrap();
+    let limit = limit + capability_bytes;
     caps.limits.max_live_metadata_bytes = limit;
     caps.limits.max_identity_guard_bytes = storage::identity_bytes(3).unwrap();
-    let mut registry = RtpConfigurationState {
-        capabilities: Some(caps),
-        ..Default::default()
-    };
+    let mut registry = RtpConfigurationState::with_capabilities(caps).unwrap();
     type Inflate = fn(&mut RtpBinding);
     let inflaters: [(&str, Inflate); 10] = [
         ("MID", |b| b.mid.reserve(4096)),
@@ -693,7 +816,7 @@ fn metadata_storage_and_guard_budgets_replace_binding_and_lifetime_quotas() {
         })
         .unwrap();
     registry.commit(update);
-    assert_eq!(registry.live_metadata_bytes, 0);
+    assert_eq!(registry.live_metadata_bytes, capability_bytes);
     assert_eq!(registry.issued.len(), 2);
     assert!(matches!(
         registry.stage(RtpConfiguration {
@@ -909,7 +1032,11 @@ fn configured_ingress_admits_only_exact_primary_repair_mid_payload_and_rid() {
         };
         // Bootstrap narrowing keeps the real receiver, not a second physical lifetime.
         let mut bootstrap_facts = physical.ingress_facts();
-        bootstrap_facts.payloads = vec![(96, 90_000), (98, 90_000)].into_boxed_slice();
+        let mut extra = bootstrap_facts.payloads[0].clone();
+        extra.payload_type = 98;
+        let extra_payload_bytes = std::mem::size_of_val(&extra) + extra.name.len();
+        bootstrap_facts.payloads =
+            vec![bootstrap_facts.payloads[0].clone(), extra].into_boxed_slice();
         bootstrap_facts.ssrc_repairs = Box::new([]);
         let mut bootstrap = crate::ingress::IngressOwner::new(
             Box::new([bootstrap_facts]),
@@ -1048,7 +1175,11 @@ fn configured_ingress_admits_only_exact_primary_repair_mid_payload_and_rid() {
             .stage_configuration(&[(physical.clone(), true)], &[], true)
             .unwrap();
         bootstrap.commit_configuration(update);
-        assert!(bootstrap.test_media_bytes() > bootstrap_storage);
+        assert_eq!(
+            bootstrap.test_media_bytes(),
+            bootstrap_storage + std::mem::size_of::<(u32, u32)>() + owner_index
+                - extra_payload_bytes
+        );
         assert_eq!(
             bootstrap.test_runtime_bytes(),
             bootstrap_reserved
@@ -1059,7 +1190,10 @@ fn configured_ingress_admits_only_exact_primary_repair_mid_payload_and_rid() {
                 .checked_sub(owner_index)
                 .unwrap()
         );
-        assert_eq!(bootstrap.test_runtime_bytes(), exact);
+        assert_eq!(
+            bootstrap.test_runtime_bytes(),
+            exact + std::mem::size_of::<(u32, u32)>() - extra_payload_bytes
+        );
         assert!(bootstrap.poll_event().is_none());
         assert_eq!(bootstrap.stats().len(), 1);
         assert_eq!(bootstrap.stats()[0].received_packets, 3);
@@ -1442,6 +1576,59 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
         outbound: true,
         binding: binding("v", 0),
     };
+    let id = crate::id::SenderId::new(1).unwrap();
+    let (primary, repair, _) = crate::egress::sender_rtp_identity(&[7; 32], id);
+    let mut bootstrap_binding = physical.clone();
+    bootstrap_binding.binding.encodings[0].primary = primary;
+    bootstrap_binding.binding.encodings[0].repair = Some(repair);
+    let media_extensions = vec![
+        (
+            5,
+            "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay",
+        ),
+        (6, crate::negotiation::DEPENDENCY_URIS[0]),
+    ];
+    bootstrap_binding
+        .binding
+        .extensions
+        .extend(
+            media_extensions
+                .iter()
+                .map(|&(id, uri)| RtpExtensionMapping {
+                    id,
+                    uri: uri.into(),
+                }),
+        );
+    let expected = crate::negotiation::EgressSenderFacts {
+        forwarded_extensions: media_extensions
+            .into_iter()
+            .map(|(id, uri)| (id, uri.into()))
+            .collect(),
+        ..bootstrap_binding.egress_facts(id)
+    };
+    assert_eq!(bootstrap_binding.egress_facts(id), expected);
+    let mut bootstrap = crate::egress::MediaEgress::new(
+        Box::new([expected]),
+        &[7; 32],
+        65536,
+        65536,
+        crate::ConnectionLimits::DEFAULT_MAX_SEND_RUNTIME_BYTES,
+        now,
+        crate::time::ProtocolClock::new(now, std::time::UNIX_EPOCH),
+    )
+    .unwrap();
+    let adopted = bootstrap
+        .stage_configuration(
+            &[(bootstrap_binding, true)],
+            &[7; 32],
+            &[],
+            ConfigurationScope::Scoped,
+        )
+        .unwrap();
+    assert_eq!(bootstrap.retiring_ssrcs(&adopted).count(), 0);
+    bootstrap.commit_configuration(adopted);
+    assert_eq!(bootstrap.stats().1.len(), 1);
+    assert_eq!(bootstrap.stats().1[0].ssrc, primary);
     let other = PhysicalBinding {
         outbound: true,
         binding: binding("other", 200),
@@ -1545,6 +1732,7 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
     let update = egress
         .stage_configuration(&[(physical.clone(), false)], &[7; 32], &[], false)
         .unwrap();
+    assert_eq!(egress.retiring_ssrcs(&update).count(), 0);
     egress.commit_configuration(update);
     assert_eq!(egress.stats().1[0].queued_packets, 0);
     assert_eq!(egress.stats().1[1].ssrc, 200);
@@ -1562,10 +1750,12 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
         egress.stage_configuration(&[(physical.clone(), true)], &[7; 32], &[0], false),
         Err(RtpConfigurationError::Invalid)
     ));
-    let replacement = PhysicalBinding {
+    let mut replacement = PhysicalBinding {
         outbound: true,
         binding: binding("v", 100),
     };
+    replacement.binding.codec.repair_payload_type = None;
+    replacement.binding.encodings[0].repair = None;
     let staged = egress
         .stage_configuration(&[(replacement.clone(), true)], &[7; 32], &[], false)
         .unwrap();
@@ -1584,6 +1774,10 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
     let update = egress
         .stage_configuration(&[], &[7; 32], &[0], false)
         .unwrap();
+    assert_eq!(
+        egress.retiring_ssrcs(&update).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
     egress.commit_configuration(update);
     assert_eq!(egress.stats().1.len(), 1);
     assert_eq!(egress.stats().1[0].ssrc, 200);
@@ -1609,6 +1803,12 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
     let update = egress
         .stage_configuration(&[], &[7; 32], &[], true)
         .unwrap();
+    assert_eq!(
+        egress
+            .retiring_ssrcs(&update)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([100, 200, 201])
+    );
     egress.commit_configuration(update);
     assert!(egress.stats().1.is_empty());
     let desired: Vec<_> = beyond_encoding_count()
@@ -1659,9 +1859,17 @@ fn codec_parameter_model_accepts_opus_vp8_h264_and_representative_vp9_without_en
     let mut vp9 = codec();
     vp9.name = "vp9".into();
     vp9.fmtp.insert("profile-id".into(), "0".into());
-    caps.codecs.extend([opus, h264, vp9]);
+    caps.codecs.extend(
+        [opus, h264, vp9]
+            .into_iter()
+            .map(|parameters| RtpCodecCapability {
+                repair: parameters.name != "vp9",
+                parameters,
+            }),
+    );
     caps.validate().unwrap();
-    for parameters in &caps.codecs {
+    for supported in &caps.codecs {
+        let parameters = &supported.parameters;
         let mut media = binding("v", 100);
         media.kind = if parameters.name == "opus" {
             MediaKind::Audio
@@ -1669,10 +1877,18 @@ fn codec_parameter_model_accepts_opus_vp8_h264_and_representative_vp9_without_en
             MediaKind::Video
         };
         media.codec.parameters = parameters.clone();
-        let state = RtpConfigurationState {
-            capabilities: Some(caps.clone()),
-            ..RtpConfigurationState::default()
-        };
+        let state = RtpConfigurationState::with_capabilities(caps.clone()).unwrap();
+        if !supported.repair {
+            assert!(matches!(
+                state.stage(RtpConfiguration {
+                    inbound: vec![media.clone()],
+                    outbound: vec![]
+                }),
+                Err(RtpConfigurationError::Unsupported)
+            ));
+            media.codec.repair_payload_type = None;
+            media.encodings[0].repair = None;
+        }
         let config = RtpConfiguration {
             inbound: vec![media.clone()],
             outbound: vec![],
@@ -1682,7 +1898,11 @@ fn codec_parameter_model_accepts_opus_vp8_h264_and_representative_vp9_without_en
         assert_eq!(staged[0].0.binding.codec.parameters, *parameters);
         assert_eq!(
             staged[0].0.ingress_facts().payloads[0],
-            (96, parameters.clock_rate)
+            crate::RtpPayloadInfo {
+                payload_type: 96,
+                name: parameters.name.to_ascii_lowercase().into_boxed_str(),
+                clock_rate: parameters.clock_rate,
+            }
         );
     }
 }

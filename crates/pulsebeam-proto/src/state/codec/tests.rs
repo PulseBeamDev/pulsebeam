@@ -563,6 +563,213 @@ fn owned_confirmation_is_self_contained_and_execution_failure_is_not_rejection()
 }
 
 #[test]
+fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
+    let video = |binding: RtpParameters| ResourceSpec {
+        settings: Some(ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+        declaration: Some(resource_spec::Declaration::Publication(PublicationSpec {
+            label: String::from("camera"),
+            kind: Some(publication_spec::Kind::Video(VideoPublication {
+                binding: Some(TrackBinding {
+                    transport: Some(track_binding::Transport::Rtp(binding)),
+                }),
+            })),
+        })),
+    };
+    let mut binding = rtp();
+    binding
+        .header_extensions
+        .push(RtpHeaderExtensionParameters { r#type: 2, id: 2 });
+    binding.codec.as_mut().unwrap().format = Some(CodecFormat {
+        codec: Some(codec_format::Codec::Vp9(Vp9Parameters { profile_id: None })),
+    });
+    binding.codec.as_mut().unwrap().feedback.push(1);
+    let original = video(binding.clone());
+    let mut explicit = binding.clone();
+    explicit
+        .codec
+        .as_mut()
+        .unwrap()
+        .format
+        .as_mut()
+        .unwrap()
+        .codec = Some(codec_format::Codec::Vp9(Vp9Parameters {
+        profile_id: Some(0),
+    }));
+    explicit.codec.as_mut().unwrap().feedback.reverse();
+    explicit.header_extensions.reverse();
+    let mut equivalent = video(explicit);
+    equivalent.settings.as_mut().unwrap().enabled = Some(false);
+    assert_eq!(validation::validate_spec(&original), Ok(()));
+    assert_eq!(validation::validate_spec(&equivalent), Ok(()));
+    assert!(validation::declarations_equivalent(&original, &equivalent));
+    assert!(validation::declarations_equivalent(&equivalent, &original));
+    assert!(!validation::settings_equivalent(
+        original.settings.as_ref().unwrap(),
+        equivalent.settings.as_ref().unwrap()
+    ));
+    let changes: [fn(&mut RtpParameters); 8] = [
+        |v| v.mid = String::from("replacement"),
+        |v| v.encodings[0].ssrc = Some(1),
+        |v| {
+            v.codec.as_mut().unwrap().rtx_payload_type = Some(97);
+            v.encodings[0].rtx_ssrc = Some(2);
+        },
+        |v| v.encodings[0].rid = String::from("other"),
+        |v| v.encodings[0].scalability_mode = Some(RtpScalabilityMode::L1t1 as i32),
+        |v| v.rtcp.as_mut().unwrap().cname = String::from("other"),
+        |v| v.rtcp.as_mut().unwrap().reduced_size = true,
+        |v| v.header_extensions[0].id = 10,
+    ];
+    for change in changes {
+        let mut changed = binding.clone();
+        change(&mut changed);
+        let changed = video(changed);
+        assert_eq!(validation::validate_spec(&changed), Ok(()));
+        assert!(!validation::declarations_equivalent(&original, &changed));
+    }
+    let subscription = |track_id: &str| ResourceSpec {
+        settings: Some(ResourceSettings {
+            enabled: Some(true),
+            receive: Some(resource_settings::Receive::Video(
+                VideoReceiveOptions::default(),
+            )),
+        }),
+        declaration: Some(resource_spec::Declaration::Subscription(SubscriptionSpec {
+            track_id: String::from(track_id),
+            kind: TrackKind::Video as i32,
+            binding: Some(TrackBinding {
+                transport: Some(track_binding::Transport::Rtp(binding.clone())),
+            }),
+        })),
+    };
+    assert!(!validation::declarations_equivalent(
+        &subscription("source-a"),
+        &subscription("source-b")
+    ));
+    assert!(!validation::declarations_equivalent(
+        &original,
+        &subscription("source-a")
+    ));
+
+    let mut data = publication(1);
+    let Some(desired_state::Value::Present(data)) = desired(&mut data).value.as_ref() else {
+        panic!("present")
+    };
+    let mut moved = data.clone();
+    let Some(resource_spec::Declaration::Publication(p)) = &mut moved.declaration else {
+        panic!("publication")
+    };
+    let Some(publication_spec::Kind::Data(d)) = &mut p.kind else {
+        panic!("data")
+    };
+    let Some(track_binding::Transport::Sctp(sctp)) = d.binding.as_mut().unwrap().transport.as_mut()
+    else {
+        panic!("sctp")
+    };
+    sctp.stream_id = Some(2);
+    assert!(!validation::declarations_equivalent(data, &moved));
+}
+
+#[test]
+fn mutable_defaults_do_not_erase_presence_or_explicit_playout_requests() {
+    let settings = |options| ResourceSettings {
+        enabled: Some(false),
+        receive: Some(resource_settings::Receive::Video(options)),
+    };
+    let default = settings(VideoReceiveOptions::default());
+    let mut options = VideoReceiveOptions {
+        priority: Some(1),
+        ..VideoReceiveOptions::default()
+    };
+    assert!(validation::settings_equivalent(
+        &default,
+        &settings(options.clone())
+    ));
+    options.priority = Some(2);
+    assert!(!validation::settings_equivalent(
+        &default,
+        &settings(options.clone())
+    ));
+    options.priority = None;
+    options.playout_delay = Some(PlayoutDelay {
+        min_ms: 0,
+        max_ms: 0,
+    });
+    assert!(!validation::settings_equivalent(
+        &default,
+        &settings(options)
+    ));
+    let opus = |dtx| CodecFormat {
+        codec: Some(codec_format::Codec::Opus(OpusParameters {
+            dtx,
+            ..OpusParameters::default()
+        })),
+    };
+    assert!(!validation::formats_equivalent(
+        &opus(None),
+        &opus(Some(false))
+    ));
+    let format = |parameters| CodecFormat {
+        codec: Some(codec_format::Codec::Opus(parameters)),
+    };
+    for parameters in [
+        OpusParameters {
+            max_playback_rate_hz: Some(48000),
+            ..OpusParameters::default()
+        },
+        OpusParameters {
+            max_capture_rate_hz: Some(48000),
+            ..OpusParameters::default()
+        },
+    ] {
+        let explicit = format(parameters);
+        assert_ne!(opus(None), explicit);
+        assert!(validation::formats_equivalent(&opus(None), &explicit));
+        assert!(validation::formats_equivalent(&explicit, &opus(None)));
+    }
+    let changes: [fn(&mut OpusParameters); 6] = [
+        |v| v.stereo = Some(false),
+        |v| v.source_stereo = Some(false),
+        |v| v.in_band_fec = Some(false),
+        |v| v.constant_bitrate = Some(false),
+        |v| v.max_average_bitrate_bps = Some(510000),
+        |v| v.min_packet_time_ms = Some(10),
+    ];
+    for change in changes {
+        let mut parameters = OpusParameters::default();
+        change(&mut parameters);
+        assert!(!validation::formats_equivalent(
+            &opus(None),
+            &format(parameters)
+        ));
+    }
+    assert!(!validation::formats_equivalent(
+        &opus(None),
+        &format(OpusParameters {
+            max_playback_rate_hz: Some(16000),
+            ..OpusParameters::default()
+        })
+    ));
+    let h264 = |asymmetry| CodecFormat {
+        codec: Some(codec_format::Codec::H264(H264Parameters {
+            profile_level_id: Some(0x42e01f),
+            level_asymmetry_allowed: asymmetry,
+        })),
+    };
+    assert!(validation::formats_equivalent(
+        &h264(None),
+        &h264(Some(false))
+    ));
+    assert!(!validation::formats_equivalent(
+        &h264(None),
+        &h264(Some(true))
+    ));
+}
+
+#[test]
 fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats() {
     let default = CodecFormat {
         codec: Some(codec_format::Codec::Vp9(Vp9Parameters { profile_id: None })),
@@ -581,7 +788,11 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
     };
     let mut caps = RtpCapabilities {
         codecs: vec![capability(default)],
-        header_extensions: vec![1, 4],
+        header_extensions: vec![
+            1,
+            4,
+            RtpHeaderExtensionType::RtpHeaderExtensionVideoLayersAllocation as i32,
+        ],
         rtcp_modes: vec![1],
     };
     assert_eq!(validation::validate_capabilities(&caps), Ok(()));
@@ -599,7 +810,8 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
                 }],
                 "header_extensions": [
                     "RTP_HEADER_EXTENSION_MID",
-                    "RTP_HEADER_EXTENSION_TRANSPORT_CC_DRAFT_01"
+                    "RTP_HEADER_EXTENSION_TRANSPORT_CC_DRAFT_01",
+                    "RTP_HEADER_EXTENSION_VIDEO_LAYERS_ALLOCATION"
                 ],
                 "rtcp_modes": ["RTCP_MODE_COMPOUND"]
             })

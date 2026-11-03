@@ -41,13 +41,16 @@ fn descriptors_preserve_wire_identity_and_delivery() {
         }
     );
     assert_ne!(data(TopicMode::Latest), data(TopicMode::Ordered));
-    for label in ["", "with/slash", "control\n", &"x".repeat(65)] {
+    for label in ["", &"x".repeat(257), &"é".repeat(129)] {
         assert!(video(label).validate().is_err(), "{label:?}");
     }
-    assert!(video("é").validate().is_ok());
+    for label in ["é", "with/slash", "control\n", &"é".repeat(128)] {
+        assert!(video(label).validate().is_ok(), "{label:?}");
+        assert_eq!(video(label).label(), label);
+    }
     assert!(
         TrackSpec::Data {
-            label: "x".repeat(85),
+            label: "x".repeat(256),
             delivery: TopicMode::Ordered
         }
         .validate()
@@ -59,7 +62,7 @@ fn descriptors_preserve_wire_identity_and_delivery() {
             delivery: TopicMode::Ordered
         }
         .validate()
-        .is_err()
+        .is_ok()
     );
 }
 
@@ -270,7 +273,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
 }
 
 #[test]
-fn absent_and_hidden_video_demand_does_not_allocate_and_republication_uses_logical_identity() {
+fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest() {
     let mut resources = TrackResources::default();
     let owner = resources.new_owner().unwrap();
     let selector = TrackSelector {
@@ -306,12 +309,10 @@ fn absent_and_hidden_video_demand_does_not_allocate_and_republication_uses_logic
         1
     );
     tracks.clear();
-    assert!(
-        resources
-            .video_projection(&tracks, 1)
-            .subscriptions
-            .is_empty()
-    );
+    let retained = resources.video_projection(&tracks, 1);
+    assert_eq!(retained.subscriptions.len(), 1);
+    assert_eq!(retained.subscriptions[0].selector.as_ref(), Some(&selector));
+    assert_eq!(retained.subscriptions[0].slot, 0);
     tracks.insert(
         "replacement".into(),
         RemoteTrack {
@@ -464,9 +465,9 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
 }
 
 #[test]
-fn failed_data_admission_does_not_partially_claim_capacity() {
+fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
     let mut resources = TrackResources::default();
-    for index in 0..crate::MAX_TOPIC_CHANNELS {
+    for index in 0..65 {
         resources
             .retain_producer(&TrackSpec::Data {
                 label: format!("topic-{index}"),
@@ -476,16 +477,33 @@ fn failed_data_admission_does_not_partially_claim_capacity() {
     }
     assert!(
         resources
-            .receive(TrackOwner(1), &data(TopicMode::Lossy), None)
+            .receive(
+                TrackOwner(1),
+                &TrackSpec::Data {
+                    label: "x".repeat(257),
+                    delivery: TopicMode::Lossy
+                },
+                None
+            )
             .is_err()
     );
     assert!(resources.registrations().subscribers.is_empty());
-    assert_eq!(
-        resources.registrations().publishers.len(),
-        crate::MAX_TOPIC_CHANNELS
-    );
+    assert_eq!(resources.registrations().publishers.len(), 65);
     assert_eq!(
         resources.read(TrackOwner(1)),
         Err(TrackResourceError::Released)
     );
+    assert!(
+        resources
+            .retain_producer(&TrackSpec::Data {
+                label: "topic-0".into(),
+                delivery: TopicMode::Ordered
+            })
+            .is_err()
+    );
+    assert_eq!(resources.registrations().publishers.len(), 65);
+    resources
+        .receive(TrackOwner(1), &data(TopicMode::Lossy), None)
+        .unwrap();
+    assert_eq!(resources.registrations().subscribers.len(), 1);
 }

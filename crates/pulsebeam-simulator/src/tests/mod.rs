@@ -8,6 +8,7 @@ pub mod cross_shard;
 pub mod data_channel;
 pub mod histories;
 pub mod native_runtime;
+pub mod native_state;
 pub mod properties;
 pub mod room_isolation;
 pub mod subscriptions;

@@ -1,7 +1,8 @@
+use super::identity_history::IdentityHistory;
 use super::sdp::{self, Document, Transport};
 use super::{
-    Binding, Bindings, Capabilities, Codec, Encoding, Error, Kind, Limits, MediaOwner, Preparation,
-    RtcpParameters, RuntimeEncoding,
+    Allocation, AllocationMode, Binding, Bindings, Capabilities, Codec, Encoding, Error, Kind,
+    Limits, MediaOwner, Preparation, RtcpMode, RtcpParameters, RuntimeEncoding,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -60,12 +61,9 @@ pub struct Context {
     local_transport: Transport,
     remote_transport: Transport,
     capabilities: Capabilities,
-    limits: Limits,
     accepted: Accepted,
     pending: Option<(CandidateId, Accepted)>,
-    used: BTreeSet<u32>,
-    sender_identities: BTreeMap<u32, (String, Option<String>, bool)>,
-    retired: BTreeSet<u32>,
+    identities: IdentityHistory,
     next_identity: u32,
     next_candidate: u64,
 }
@@ -78,18 +76,9 @@ impl Context {
         seed: u32,
         limits: Limits,
     ) -> Result<Self, Error> {
-        if limits.max_sections == 0
-            || limits.max_sections > 256
-            || limits.max_encodings == 0
-            || limits.max_encodings > 1024
-            || limits.max_identity_history == 0
-            || limits.max_identity_history > 65536
-        {
-            return Err(Error::Capacity);
-        }
         validate_capabilities(&capabilities)?;
-        let local = Document::parse(bootstrap_offer, limits)?;
-        let remote = Document::parse(applied_answer, limits)?;
+        let local = Document::parse(bootstrap_offer)?;
+        let remote = Document::parse(applied_answer)?;
         if local.media.len() != remote.media.len()
             || local
                 .media
@@ -127,14 +116,11 @@ impl Context {
                 }
             }
         }
-        if used.len() > limits.max_identity_history {
-            return Err(Error::Capacity);
-        }
+        let identities = IdentityHistory::new(used, sender_identities, limits.max_identity_bytes)?;
         Ok(Self {
             local_transport,
             remote_transport,
             capabilities,
-            limits,
             accepted: Accepted {
                 document: remote,
                 bindings: Bindings::default(),
@@ -143,12 +129,33 @@ impl Context {
                 declarable: false,
             },
             pending: None,
-            used,
-            sender_identities,
-            retired: BTreeSet::new(),
+            identities,
             next_identity: seed,
             next_candidate: 0,
         })
+    }
+
+    pub(crate) fn bootstrap_payload_type(&self, mid: &str) -> Result<Option<u8>, Error> {
+        let media = self
+            .accepted
+            .document
+            .media
+            .iter()
+            .find(|media| media.section.mid == mid)
+            .ok_or(Error::Identifier)?;
+        if media.section.stopped
+            || media.section.kind == Kind::Application
+            || media.section.direction == super::Direction::Inactive
+        {
+            return Ok(None);
+        }
+        media
+            .section
+            .codecs
+            .iter()
+            .find_map(|codec| self.select_codec(codec).ok())
+            .map(|codec| Some(codec.payload_type))
+            .ok_or_else(|| Error::Envelope(mid.into()))
     }
 
     /// Correlate media already applied during bootstrap without applying another
@@ -158,7 +165,7 @@ impl Context {
         if self.next_candidate != 0 || self.pending.is_some() || self.accepted.declarable {
             return Err(Error::CandidateState);
         }
-        if requests.len() > self.limits.max_sections {
+        if requests.len() > self.accepted.document.media.len() {
             return Err(Error::Capacity);
         }
         let mut requested = BTreeMap::new();
@@ -178,6 +185,7 @@ impl Context {
                 continue;
             }
             let request = request.ok_or_else(|| Error::MissingConfiguration(mid.clone()))?;
+            self.check_rtcp_mode(remote.section.rtcp.reduced_size)?;
             let local = self
                 .accepted
                 .local
@@ -306,13 +314,214 @@ impl Context {
 
     /// Reconcile the current actual offer. Only new/replaced media need requests.
     pub fn prepare(&mut self, offer: &str, requests: &[Preparation]) -> Result<Candidate, Error> {
+        self.prepare_inner(offer, requests, &[], None)
+    }
+
+    pub(super) fn validate_retirements(&self, mids: &[String]) -> Result<(), Error> {
+        for mid in mids {
+            if !self
+                .accepted
+                .document
+                .media
+                .iter()
+                .any(|media| media.section.mid == *mid && media.section.kind != Kind::Application)
+            {
+                return Err(Error::Envelope(mid.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_retirement(
+        &mut self,
+        offer: &str,
+        mids: &[String],
+    ) -> Result<Candidate, Error> {
+        self.prepare_inner(offer, &[], mids, None)
+    }
+
+    pub(super) fn prepare_allocation(
+        &mut self,
+        offer: &str,
+        allocations: &[Allocation],
+        slots: &[crate::SlotBinding],
+        mode: AllocationMode,
+    ) -> Result<Candidate, Error> {
+        self.prepare_inner(offer, &[], &[], Some((allocations, slots, mode)))
+    }
+
+    pub(super) fn validate_allocations(
+        &self,
+        allocations: &[Allocation],
+        mode: AllocationMode,
+    ) -> Result<(), Error> {
+        for allocation in allocations {
+            allocation.validate()?;
+            let owner = allocation.owner();
+            let binding = self
+                .accepted
+                .retained
+                .publications
+                .iter()
+                .chain(&self.accepted.retained.receptions)
+                .find(|binding| binding.key == owner.key);
+            match mode {
+                AllocationMode::Create => {
+                    if let Some(binding) = binding {
+                        return Err(Error::Envelope(binding.mid.clone()));
+                    }
+                }
+                AllocationMode::RetargetReceiver => {
+                    if allocation.slot.direction() != crate::MediaDirection::ReceiveOnly
+                        || allocation.format.is_none()
+                        || !self
+                            .accepted
+                            .retained
+                            .receptions
+                            .iter()
+                            .any(|binding| binding.key == owner.key)
+                    {
+                        return Err(Error::Identifier);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_allocations(
+        &self,
+        offered: &Document,
+        allocations: &[Allocation],
+        slots: &[crate::SlotBinding],
+        mode: AllocationMode,
+    ) -> Result<Vec<Preparation>, Error> {
+        if allocations.len() > offered.media.len() || slots.len() > offered.media.len() {
+            return Err(Error::Capacity);
+        }
+        self.validate_allocations(allocations, mode)?;
+        if allocations.is_empty()
+            || allocations.len() != slots.len()
+            || slots
+                .iter()
+                .map(|slot| &slot.slot)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != slots.len()
+            || slots
+                .iter()
+                .map(|slot| &slot.mid)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != slots.len()
+        {
+            return Err(Error::Identifier);
+        }
+        let mut requests = Vec::with_capacity(allocations.len());
+        for allocation in allocations {
+            let slot = slots
+                .iter()
+                .find(|slot| slot.slot == allocation.slot)
+                .ok_or(Error::Identifier)?;
+            let media = &offered
+                .media
+                .get(slot.media_index as usize)
+                .ok_or(Error::Identifier)?
+                .section;
+            let kind = match allocation.slot.kind() {
+                crate::MediaKind::Audio => Kind::Audio,
+                crate::MediaKind::Video => Kind::Video,
+            };
+            let publication = allocation.slot.direction() == crate::MediaDirection::SendOnly;
+            if slot.mid != media.mid
+                || slot.kind != allocation.slot.kind()
+                || slot.direction != allocation.slot.direction()
+                || media.kind != kind
+                || media.stopped
+                || media.direction.sends() != publication
+                || media.direction.receives() == publication
+            {
+                return Err(Error::Envelope(slot.mid.clone()));
+            }
+            let owner = allocation.owner();
+            match mode {
+                AllocationMode::Create => {
+                    if self
+                        .accepted
+                        .local
+                        .media
+                        .iter()
+                        .any(|old| old.section.mid == media.mid && !old.section.stopped)
+                    {
+                        return Err(Error::Envelope(media.mid.clone()));
+                    }
+                }
+                AllocationMode::RetargetReceiver => {
+                    if !self
+                        .accepted
+                        .retained
+                        .receptions
+                        .iter()
+                        .any(|binding| binding.key == owner.key && binding.mid == media.mid)
+                    {
+                        return Err(Error::Envelope(media.mid.clone()));
+                    }
+                }
+            }
+            let expected = allocation
+                .format
+                .as_ref()
+                .map(pulsebeam_proto::state::sdp::codec_parameters)
+                .transpose()
+                .map_err(|_| Error::Identifier)?;
+            // A source format constrains codec selection, never receiver PT/SSRCs.
+            let codec = media
+                .codecs
+                .iter()
+                .filter(|codec| {
+                    expected.as_ref().is_none_or(|expected| {
+                        codec.parameters.name.eq_ignore_ascii_case(expected.name)
+                            && codec.parameters.clock_rate == expected.clock_rate
+                            && codec.parameters.channels == expected.channels
+                            && codec.parameters.fmtp == expected.fmtp
+                    })
+                })
+                .find_map(|codec| self.select_codec(codec).ok())
+                .ok_or_else(|| Error::Envelope(media.mid.clone()))?;
+            requests.push(Preparation {
+                mid: media.mid.clone(),
+                payload_type: codec.payload_type,
+                publication: publication.then(|| owner.clone()),
+                reception: (!publication).then_some(owner),
+            });
+        }
+        Ok(requests)
+    }
+
+    fn prepare_inner(
+        &mut self,
+        offer: &str,
+        requests: &[Preparation],
+        retirements: &[String],
+        allocations: Option<(&[Allocation], &[crate::SlotBinding], AllocationMode)>,
+    ) -> Result<Candidate, Error> {
         if self.pending.is_some() {
             return Err(Error::CandidateState);
         }
-        if requests.len() > self.limits.max_sections {
+        self.validate_retirements(retirements)?;
+        let offered = Document::parse(offer)?;
+        if requests.len() > offered.media.len() {
             return Err(Error::Capacity);
         }
-        let offered = Document::parse(offer, self.limits)?;
+        for mid in retirements {
+            if !offered.media.iter().any(|media| {
+                media.section.mid == *mid
+                    && media.section.kind != Kind::Application
+                    && media.section.stopped
+            }) {
+                return Err(Error::Envelope(mid.clone()));
+            }
+        }
         for media in offered.media.iter().filter(|m| !m.section.stopped) {
             if !media.transport.same_peer(&self.local_transport) {
                 return Err(Error::TransportChange);
@@ -336,6 +545,21 @@ impl Context {
                 }
             }
         }
+        let lowered = allocations
+            .map(|(allocations, slots, mode)| {
+                self.lower_allocations(&offered, allocations, slots, mode)
+            })
+            .transpose()?;
+        let retargeted = allocations
+            .filter(|(_, _, mode)| *mode == AllocationMode::RetargetReceiver)
+            .map(|(_, slots, _)| {
+                slots
+                    .iter()
+                    .map(|slot| slot.mid.as_str())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let requests = lowered.as_deref().unwrap_or(requests);
         let mut requested = BTreeMap::new();
         for request in requests {
             if !sdp::token(&request.mid)
@@ -433,6 +657,14 @@ impl Context {
                 .iter()
                 .find(|b| b.mid == mid)
                 .cloned();
+            media.msids = if reception_prior.is_some() {
+                prior
+                    .as_ref()
+                    .map(|prior| prior.msids.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let (codec, publication_owner, reception_owner) = if let Some(request) = request {
                 let offered = media
                     .section
@@ -447,7 +679,7 @@ impl Context {
                     return Err(Error::Envelope(mid));
                 }
                 if let Some(old) = publication_prior.as_ref().or(reception_prior.as_ref()) {
-                    // Explicit replacement needs a fresh physical section.
+                    // A retained physical section keeps its negotiated codec envelope.
                     codec = retain_codec_envelope(codec, &old.codec)
                         .ok_or_else(|| Error::Envelope(mid.clone()))?;
                 }
@@ -493,6 +725,7 @@ impl Context {
                 .as_ref()
                 .filter(|p| !p.section.stopped)
                 .is_some_and(|p| p.section.rtcp.reduced_size);
+            self.check_rtcp_mode(reduced_size)?;
             if reduced_size && !media.section.rtcp.reduced_size {
                 return Err(Error::Envelope(mid.clone()));
             }
@@ -594,7 +827,10 @@ impl Context {
                 });
             }
             if let Some(owner) = reception_owner.filter(|_| offered_direction.receives()) {
-                let encodings = if let Some(old) = &reception_prior {
+                let encodings = if let Some(old) = reception_prior
+                    .as_ref()
+                    .filter(|_| !retargeted.contains(mid.as_str()))
+                {
                     old.encodings.clone()
                 } else {
                     vec![Encoding {
@@ -609,6 +845,13 @@ impl Context {
                         runtime: RuntimeEncoding::default(),
                     }]
                 };
+                if reception_prior.is_none() {
+                    media.msids = encodings
+                        .first()
+                        .and_then(|encoding| encoding.primary)
+                        .map(|primary| vec![format!("pulsebeam-{mid} output-{primary}")])
+                        .unwrap_or_default();
+                }
                 bindings.receptions.push(Binding {
                     key: owner.key,
                     group: owner.group,
@@ -661,15 +904,6 @@ impl Context {
         }
         if !requested.is_empty() {
             return Err(Error::Identifier);
-        }
-        let total: usize = bindings
-            .publications
-            .iter()
-            .chain(&bindings.receptions)
-            .map(|b| b.encodings.len())
-            .sum();
-        if total > self.limits.max_encodings {
-            return Err(Error::Capacity);
         }
         for list in [&bindings.publications, &bindings.receptions] {
             let mut keys = BTreeSet::new();
@@ -738,13 +972,14 @@ impl Context {
                     .iter()
                     .any(|m| m.section.mid == binding.mid && m.section.stopped)
                 {
-                    self.retired.extend(
-                        binding
-                            .encodings
-                            .iter()
-                            .flat_map(|e| [e.primary, e.repair])
-                            .flatten(),
-                    );
+                    for id in binding
+                        .encodings
+                        .iter()
+                        .flat_map(|e| [e.primary, e.repair])
+                        .flatten()
+                    {
+                        self.identities.retire(id)?;
+                    }
                 }
             }
             self.accepted = pending;
@@ -757,6 +992,37 @@ impl Context {
         self.accepted.declarable.then_some(&self.accepted.bindings)
     }
 
+    /// Actual applied physical facts, including cancelled work. Not an admission.
+    pub fn applied_bindings(&self) -> &Bindings {
+        &self.accepted.bindings
+    }
+
+    pub fn stopped(&self, mid: &str) -> bool {
+        self.accepted
+            .local
+            .media
+            .iter()
+            .any(|media| media.section.mid == mid && media.section.stopped)
+    }
+
+    pub(super) fn prepare_abandoned_allocation(
+        &mut self,
+        offer: &str,
+        mids: &[String],
+    ) -> Result<Candidate, Error> {
+        let offered = Document::parse(offer)?;
+        for mid in mids {
+            if offered
+                .media
+                .iter()
+                .any(|media| media.section.mid == *mid && !media.section.stopped)
+            {
+                return Err(Error::Envelope(mid.clone()));
+            }
+        }
+        self.prepare(offer, &[])
+    }
+
     /// Finalize missing sender identities after applying the candidate. A failed
     /// batch changes neither accepted facts nor the declaration's completeness.
     pub fn observe_sender(
@@ -765,7 +1031,28 @@ impl Context {
         observations: &[Encoding],
         rtcp: &RtcpParameters,
     ) -> Result<&Bindings, Error> {
-        if self.pending.is_some() || !self.accepted.declarable {
+        self.observe_sender_inner(mid, observations, rtcp, true)
+    }
+
+    /// Retain partial runtime facts without treating missing values as identities.
+    /// Known applied SDP facts fill absent observations, never conflicting ones.
+    pub fn observe_sender_facts(
+        &mut self,
+        mid: &str,
+        observations: &[Encoding],
+        rtcp: &RtcpParameters,
+    ) -> Result<&Bindings, Error> {
+        self.observe_sender_inner(mid, observations, rtcp, false)
+    }
+
+    fn observe_sender_inner(
+        &mut self,
+        mid: &str,
+        observations: &[Encoding],
+        rtcp: &RtcpParameters,
+        complete: bool,
+    ) -> Result<&Bindings, Error> {
+        if self.pending.is_some() || complete && !self.accepted.declarable {
             return Err(Error::CandidateState);
         }
         let index = self
@@ -781,12 +1068,51 @@ impl Context {
             .publications
             .get(index)
             .ok_or(Error::Observation)?;
+        if observations.len() != binding.encodings.len()
+            || rtcp
+                .cname
+                .as_deref()
+                .is_some_and(|cname| !sdp::cname(cname))
+            || observations.iter().any(|observed| {
+                observed.rid.as_deref().is_some_and(|rid| !sdp::token(rid))
+                    || observed
+                        .runtime
+                        .scalability_mode
+                        .as_deref()
+                        .is_some_and(|mode| !sdp::token(mode))
+            })
+        {
+            return Err(Error::Observation);
+        }
+        let observations = observations
+            .iter()
+            .map(|observed| {
+                let mut observed = observed.clone();
+                if !complete {
+                    let old = binding
+                        .encodings
+                        .iter()
+                        .find(|old| same_encoding(old, &observed, binding.encodings.len()))
+                        .or_else(|| {
+                            if binding.encodings.len() == 1 && observed.rid.is_none() {
+                                binding.encodings.first()
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or(Error::Observation)?;
+                    observed.rid = observed.rid.or_else(|| old.rid.clone());
+                    observed.primary = observed.primary.or(old.primary);
+                    observed.repair = observed.repair.or(old.repair);
+                }
+                Ok(observed)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         let mut rtcp = rtcp.clone();
         if rtcp.cname.is_none() {
             rtcp.cname.clone_from(&binding.rtcp.cname);
         }
-        if observations.len() != binding.encodings.len()
-            || !rtcp.cname.as_deref().is_some_and(sdp::cname)
+        if complete && rtcp.cname.is_none()
             || rtcp.reduced_size != binding.rtcp.reduced_size
             || binding.rtcp.cname.is_some() && rtcp.cname != binding.rtcp.cname
         {
@@ -794,26 +1120,22 @@ impl Context {
         }
         let mut ids = BTreeSet::new();
         let mut rids = BTreeSet::new();
-        for observed in observations {
+        for observed in &observations {
             let old = binding
                 .encodings
                 .iter()
                 .find(|e| same_encoding(e, observed, binding.encodings.len()))
                 .ok_or(Error::Observation)?;
             if observed.rid.as_ref().is_some_and(|rid| !rids.insert(rid))
-                || observed.primary.is_none()
-                || binding.codec.repair.is_some() != observed.repair.is_some()
+                || complete && observed.primary.is_none()
+                || (binding.codec.repair.is_none() && observed.repair.is_some())
+                || (complete && binding.codec.repair.is_some() && observed.repair.is_none())
                 || old.primary.is_some() && old.primary != observed.primary
                 || old.repair.is_some() && old.repair != observed.repair
                 || observed
                     .runtime
                     .max_framerate
                     .is_some_and(|v| !v.is_finite() || v <= 0.0)
-                || observed
-                    .runtime
-                    .scalability_mode
-                    .as_ref()
-                    .is_some_and(|s| !sdp::token(s))
             {
                 return Err(Error::Observation);
             }
@@ -837,6 +1159,7 @@ impl Context {
                 return Err(Error::Observation);
             }
             if !local.signaled.is_empty()
+                && observed.primary.is_some()
                 && !observed.primary.is_some_and(|primary| {
                     local.signaled.get(&primary).is_some_and(|repair| {
                         binding.codec.repair.is_none() || *repair == observed.repair
@@ -847,13 +1170,10 @@ impl Context {
             }
             for (id, repair) in [(observed.primary, false), (observed.repair, true)] {
                 if let Some(id) = id {
-                    let same_owner = self.sender_identities.get(&id).is_some_and(|owner| {
-                        owner.0 == mid
-                            && owner.2 == repair
-                            && (owner.1.is_none() || owner.1 == observed.rid)
-                    });
-                    if !ids.insert(id)
-                        || self.used.contains(&id)
+                    let same_owner = self.identities.same_sender(id, mid, &observed.rid, repair);
+                    if self.identities.retired(id)
+                        || !ids.insert(id)
+                        || self.identities.contains(id)
                             && old.primary != Some(id)
                             && old.repair != Some(id)
                             && !same_owner
@@ -863,16 +1183,12 @@ impl Context {
                 }
             }
         }
-        if self.used.union(&ids).count() > self.limits.max_identity_history {
-            return Err(Error::Capacity);
-        }
-        for observed in observations {
-            for (id, repair) in [(observed.primary, false), (observed.repair, true)] {
-                if let Some(id) = id {
-                    self.reserve_sender(id, mid, &observed.rid, repair)?;
-                }
-            }
-        }
+        self.identities
+            .reserve_senders(observations.iter().flat_map(|observed| {
+                [(observed.primary, false), (observed.repair, true)]
+                    .into_iter()
+                    .filter_map(move |(id, repair)| id.map(|id| (id, mid, &observed.rid, repair)))
+            }))?;
         let binding = self
             .accepted
             .bindings
@@ -900,24 +1216,39 @@ impl Context {
             .codecs
             .iter()
             .find(|c| {
-                c.name.eq_ignore_ascii_case(&offered.parameters.name)
-                    && c.clock_rate == offered.parameters.clock_rate
-                    && c.channels == offered.parameters.channels
-                    && c.fmtp == offered.parameters.fmtp
+                c.parameters
+                    .name
+                    .eq_ignore_ascii_case(&offered.parameters.name)
+                    && c.parameters.clock_rate == offered.parameters.clock_rate
+                    && c.parameters.channels == offered.parameters.channels
+                    && c.parameters.fmtp == offered.parameters.fmtp
             })
             .ok_or_else(|| Error::Envelope("codec".into()))?;
         let mut codec = offered.clone();
-        if !self.capabilities.repair {
+        if !supported.repair {
             codec.repair = None;
         }
         codec.parameters.feedback = offered
             .parameters
             .feedback
-            .intersection(&supported.feedback)
+            .intersection(&supported.parameters.feedback)
             .cloned()
             .collect();
         Ok(codec)
     }
+    fn check_rtcp_mode(&self, reduced_size: bool) -> Result<(), Error> {
+        let mode = if reduced_size {
+            RtcpMode::ReducedSize
+        } else {
+            RtcpMode::Compound
+        };
+        if self.capabilities.rtcp_modes.contains(&mode) {
+            Ok(())
+        } else {
+            Err(Error::Envelope("RTCP mode".into()))
+        }
+    }
+
     fn reserve_sender(
         &mut self,
         id: u32,
@@ -925,43 +1256,17 @@ impl Context {
         rid: &Option<String>,
         repair: bool,
     ) -> Result<(), Error> {
-        if self.retired.contains(&id) {
-            return Err(Error::Collision);
-        }
-        let owner = (mid.to_owned(), rid.clone(), repair);
-        if let Some(old) = self.sender_identities.get_mut(&id) {
-            if old.0 != mid || old.2 != repair || old.1.is_some() && rid.is_some() && old.1 != *rid
-            {
-                return Err(Error::Collision);
-            }
-            if rid.is_some() {
-                old.1.clone_from(rid);
-            }
-            return Ok(());
-        }
-        self.reserve(id)?;
-        self.sender_identities.insert(id, owner);
-        Ok(())
-    }
-    fn reserve(&mut self, id: u32) -> Result<(), Error> {
-        if self.used.contains(&id) {
-            return Err(Error::Collision);
-        }
-        if self.used.len() >= self.limits.max_identity_history {
-            return Err(Error::Capacity);
-        }
-        self.used.insert(id);
-        Ok(())
+        self.identities.reserve_sender(id, mid, rid, repair)
     }
     fn allocate(&mut self) -> Result<u32, Error> {
         // libwebrtc reserves zero in its receiver frame-transformer API. Keep
         // local allocations nonzero; observed SSRCs retain their full u32 value.
         // One extra probe accounts for skipping zero.
-        for _ in 0..self.limits.max_identity_history.saturating_add(2) {
+        for _ in 0..self.identities.len().saturating_add(2) {
             self.next_identity = self.next_identity.wrapping_add(1);
             let id = self.next_identity;
-            if id != 0 && !self.used.contains(&id) {
-                self.reserve(id)?;
+            if id != 0 && !self.identities.contains(id) {
+                self.identities.reserve(id)?;
                 return Ok(id);
             }
         }
@@ -1021,10 +1326,11 @@ fn active_transport(document: &Document) -> Result<Transport, Error> {
 }
 
 fn validate_capabilities(caps: &Capabilities) -> Result<(), Error> {
-    if caps.codecs.is_empty() || caps.codecs.len() > 128 || caps.extensions.len() > 256 {
+    if caps.codecs.len() > 128 || caps.extensions.len() > 256 {
         return Err(Error::Capacity);
     }
-    for codec in &caps.codecs {
+    for capability in &caps.codecs {
+        let codec = &capability.parameters;
         if !sdp::token(&codec.name)
             || codec.clock_rate == 0
             || codec.channels == Some(0)
@@ -1123,9 +1429,17 @@ fn render(document: &Document, bindings: &Bindings) -> Result<String, Error> {
         for codec in &section.codecs {
             let p = &codec.parameters;
             let channels = p.channels.map(|c| format!("/{c}")).unwrap_or_default();
+            // Chromium's encoder dispatch requires canonical video codec spelling.
+            let name = match p.name.as_str() {
+                "h264" => "H264",
+                "vp8" => "VP8",
+                "vp9" => "VP9",
+                "av1" => "AV1",
+                name => name,
+            };
             lines.push(format!(
                 "a=rtpmap:{} {}/{}{channels}",
-                codec.payload_type, p.name, p.clock_rate
+                codec.payload_type, name, p.clock_rate
             ));
             if !p.fmtp.is_empty() {
                 lines.push(format!(
@@ -1160,13 +1474,17 @@ fn render(document: &Document, bindings: &Bindings) -> Result<String, Error> {
                 extension.uri
             ));
         }
-        // MSID names the transport output, never the currently selected source.
-        let msid = section
+        // MSID names the physical receiver, independently of source SSRC replacement.
+        let msids = if section
             .encodings
-            .first()
-            .and_then(|e| e.primary)
-            .map(|primary| format!("pulsebeam-{} output-{primary}", section.mid));
-        if let Some(msid) = &msid {
+            .iter()
+            .any(|encoding| encoding.primary.is_some())
+        {
+            media.msids.as_slice()
+        } else {
+            &[]
+        };
+        for msid in msids {
             lines.push(format!("a=msid:{msid}"));
         }
         for encoding in &section.encodings {
@@ -1178,7 +1496,7 @@ fn render(document: &Document, bindings: &Bindings) -> Result<String, Error> {
                     .filter(|cname| sdp::cname(cname))
                     .ok_or_else(|| Error::Envelope(section.mid.clone()))?;
                 lines.push(format!("a=ssrc:{primary} cname:{cname}"));
-                if let Some(msid) = &msid {
+                for msid in msids {
                     lines.push(format!("a=ssrc:{primary} msid:{msid}"));
                 }
                 if let Some(repair) = encoding.repair {
@@ -1186,7 +1504,7 @@ fn render(document: &Document, bindings: &Bindings) -> Result<String, Error> {
                         format!("a=ssrc:{repair} cname:{cname}"),
                         format!("a=ssrc-group:FID {primary} {repair}"),
                     ]);
-                    if let Some(msid) = &msid {
+                    for msid in msids {
                         lines.push(format!("a=ssrc:{repair} msid:{msid}"));
                     }
                 }

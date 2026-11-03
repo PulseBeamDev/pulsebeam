@@ -35,12 +35,22 @@ impl TrackAncestry {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct OwnedSubscription {
+    pub(crate) room_id: RoomId,
+    pub(crate) subscriber: ParticipantId,
+    pub(crate) reference: u64,
+    pub(crate) track: TrackId,
+    pub(crate) enabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Subscription {
     pub id: SubscriptionKey,
     pub subscriber: ParticipantId,
     pub selector: TrackSelector,
     pub selection: SelectionPolicy,
+    pub owned_ref: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -65,6 +75,7 @@ struct RoomTrackTopology {
     by_kind: HashMap<TrackKind, HashSet<TrackId>>,
     by_label: HashMap<String, HashSet<TrackId>>,
     subscriptions: SlotMap<SubscriptionKey, Subscription>,
+    owned: HashMap<(ParticipantId, u64), SubscriptionKey>,
     by_track: HashMap<TrackId, HashSet<SubscriptionKey>>,
     by_subscriber_publisher: HashMap<ParticipantId, HashSet<SubscriptionKey>>,
     by_subscription_kind: HashMap<TrackKind, HashSet<SubscriptionKey>>,
@@ -139,10 +150,59 @@ impl TrackTopology {
             subscriber,
             selector: selector.clone(),
             selection,
+            owned_ref: None,
         });
         room.index_subscription(&selector, id);
         room.add_subscription_reasons(id);
         id
+    }
+
+    pub(crate) fn set_owned(
+        &mut self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        reference: u64,
+        track: TrackId,
+        enabled: bool,
+    ) -> bool {
+        let room = self.rooms.entry(room_id).or_default();
+        let selector = TrackSelector::track(track);
+        if let Some(previous) = room.owned.get(&(subscriber, reference)).copied() {
+            if room
+                .subscriptions
+                .get(previous)
+                .is_none_or(|subscription| subscription.selector != selector)
+            {
+                return false;
+            }
+            room.unsubscribe(previous);
+        }
+        let id = room.subscriptions.insert_with_key(|id| Subscription {
+            id,
+            subscriber,
+            selector: selector.clone(),
+            selection: if enabled {
+                SelectionPolicy::All
+            } else {
+                SelectionPolicy::Allocated
+            },
+            owned_ref: Some(reference),
+        });
+        room.owned.insert((subscriber, reference), id);
+        room.index_subscription(&selector, id);
+        room.add_subscription_reasons(id);
+        true
+    }
+
+    pub(crate) fn remove_owned(
+        &mut self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        reference: u64,
+    ) -> Option<Subscription> {
+        let room = self.rooms.get_mut(&room_id)?;
+        let id = *room.owned.get(&(subscriber, reference))?;
+        room.unsubscribe(id)
     }
 
     pub(crate) fn remove_matching(
@@ -153,7 +213,9 @@ impl TrackTopology {
     ) -> Option<Subscription> {
         let room = self.rooms.get_mut(&room_id)?;
         let id = room.subscriptions.iter().find_map(|(id, subscription)| {
-            (subscription.subscriber == subscriber && subscription.selector == selector)
+            (subscription.owned_ref.is_none()
+                && subscription.subscriber == subscriber
+                && subscription.selector == selector)
                 .then_some(id)
         });
         let id = id?;
@@ -482,6 +544,9 @@ impl RoomTrackTopology {
 
     fn unsubscribe(&mut self, id: SubscriptionKey) -> Option<Subscription> {
         let subscription = self.subscriptions.remove(id)?;
+        if let Some(reference) = subscription.owned_ref {
+            self.owned.remove(&(subscription.subscriber, reference));
+        }
         self.unindex_subscription(&subscription.selector, id);
         let affected = self.selector_tracks(&subscription.selector);
         for track in affected {
@@ -778,9 +843,53 @@ mod tests {
         assert_eq!(topology.candidate_subscribers(identity).count(), 0);
         assert!(
             topology
+                .remove_matching(room(1), subscriber, exact.clone())
+                .is_none()
+        );
+        topology.subscribe(
+            room(1),
+            subscriber,
+            TrackSelector::audio(),
+            SelectionPolicy::Allocated,
+        );
+        assert_eq!(topology.active_subscribers(identity).count(), 0);
+        topology.set_owned(room(1), subscriber, 1, identity.track_id, true);
+        let unrelated = topology
+            .publish(track(TrackKind::Audio, 2, 1, "other"))
+            .unwrap();
+        assert!(!topology.set_owned(room(1), subscriber, 1, unrelated.track_id, true));
+        assert_eq!(topology.active_subscribers(unrelated).count(), 0);
+        assert_eq!(topology.active_subscribers(identity).count(), 1);
+        topology.unpublish(unrelated).unwrap();
+        topology.set_owned(room(1), subscriber, 2, identity.track_id, true);
+        assert_eq!(topology.active_subscribers(identity).count(), 1);
+        topology.set_owned(room(1), subscriber, 1, identity.track_id, false);
+        assert_eq!(topology.active_subscribers(identity).count(), 1);
+        assert!(
+            topology
                 .remove_matching(room(1), subscriber, exact)
                 .is_none()
         );
+        assert_eq!(
+            topology
+                .remove_owned(room(1), subscriber, 2)
+                .unwrap()
+                .owned_ref,
+            Some(2)
+        );
+        assert_eq!(topology.active_subscribers(identity).count(), 0);
+        topology.set_owned(room(1), subscriber, 1, identity.track_id, true);
+        assert_eq!(topology.rooms[&room(1)].subscriptions.len(), 2);
+        let other = participant(4);
+        topology.set_owned(room(1), other, 1, identity.track_id, true);
+        topology.remove_owned(room(1), subscriber, 1).unwrap();
+        assert_eq!(
+            topology.active_subscribers(identity).collect::<Vec<_>>(),
+            vec![other]
+        );
+        topology.unpublish(identity).unwrap();
+        topology.remove_owned(room(1), other, 1).unwrap();
+        assert!(topology.rooms[&room(1)].owned.is_empty());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::{
-    Codec, CodecParameters, Direction, Encoding, Error, Extension, Kind, Limits, MAX_SDP_BYTES,
+    Codec, CodecParameters, Direction, Encoding, Error, Extension, Kind, MAX_SDP_BYTES,
     RepairCodec, RtcpParameters, RuntimeEncoding, Section,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -89,6 +89,7 @@ pub(super) struct Media {
     pub formats: Vec<String>,
     pub transport: Transport,
     pub sctp: Vec<String>,
+    pub msids: Vec<String>,
     pub signaled: BTreeMap<u32, Option<u32>>,
     pub cnames: BTreeMap<u32, String>,
 }
@@ -140,7 +141,7 @@ fn direction(line: &str) -> Option<Direction> {
 }
 
 impl Document {
-    pub fn parse(text: &str, limits: Limits) -> Result<Self, Error> {
+    pub fn parse(text: &str) -> Result<Self, Error> {
         if text.len() > MAX_SDP_BYTES {
             return Err(Error::Capacity);
         }
@@ -155,9 +156,6 @@ impl Document {
                 return Err(Error::Malformed("line"));
             }
             if line.starts_with("m=") {
-                if sections.len() >= limits.max_sections {
-                    return Err(Error::Capacity);
-                }
                 sections.push(vec![line]);
             } else if let Some(section) = sections.last_mut() {
                 if section.len() >= 1024 {
@@ -242,10 +240,6 @@ impl Document {
             if live.any(|m| !m.transport.same_peer(&first.transport)) {
                 return Err(Error::TransportChange);
             }
-        }
-        let count: usize = media.iter().map(|m| m.section.encodings.len()).sum();
-        if count > limits.max_encodings {
-            return Err(Error::Capacity);
         }
         Ok(Self {
             origin,
@@ -642,6 +636,25 @@ fn parse_media(
         formats,
         transport,
         sctp,
+        msids: lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("a=msid:"))
+            .map(|value| {
+                let fields = value.split_ascii_whitespace().collect::<Vec<_>>();
+                if !(1..=2).contains(&fields.len())
+                    || fields.iter().any(|field| {
+                        field.is_empty()
+                            || field.len() > 64
+                            || !field.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`{|}~".contains(&byte)
+                            })
+                    })
+                {
+                    return Err(Error::Malformed("msid"));
+                }
+                Ok(fields.join(" "))
+            })
+            .collect::<Result<_, _>>()?,
         signaled,
         cnames,
     })

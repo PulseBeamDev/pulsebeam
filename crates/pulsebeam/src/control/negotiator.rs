@@ -71,6 +71,7 @@ pub struct NegotiatedMedia {
 pub struct NegotiatedResources {
     media: Vec<NegotiatedMedia>,
     pub(crate) local_ufrag: String,
+    pub(crate) native_rtp_capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
 }
 
 impl NegotiatedResources {
@@ -79,6 +80,7 @@ impl NegotiatedResources {
         Self {
             media: Vec::new(),
             local_ufrag: "test".to_owned(),
+            native_rtp_capabilities: None,
         }
     }
     pub fn media(&self, mid: Mid) -> Option<NegotiatedMedia> {
@@ -107,6 +109,7 @@ impl Negotiator {
         offer: String,
         creds: IceCredentials,
         at: ReceiveTime,
+        rtp_capabilities: Option<pulsebeam_rtc::RtpCapabilities>,
     ) -> Result<(AcceptedConnection, String, NegotiatedResources), NegotiatorError> {
         let local_ufrag = creds.ufrag.clone();
         let credentials = LocalIceCredentials::new(creds.ufrag, creds.pass)
@@ -117,6 +120,7 @@ impl Negotiator {
             ConnectionConfig {
                 local_candidates: self.candidates.clone(),
                 local_ice_credentials: Some(credentials),
+                rtp_capabilities,
                 ..Default::default()
             },
             pulsebeam_rtc::SdpOffer::new(offer),
@@ -192,7 +196,11 @@ impl Negotiator {
                 direction,
             });
         }
-        Ok(NegotiatedResources { media, local_ufrag })
+        Ok(NegotiatedResources {
+            media,
+            local_ufrag,
+            native_rtp_capabilities: None,
+        })
     }
 
     fn enforce_media_lines(session: &SessionInfo) -> Result<(), NegotiatorError> {
@@ -302,6 +310,7 @@ fn application_only_test_pair() -> (AcceptedConnection, NegotiatedResources, str
         offer.to_sdp_string(),
         crate::control::ufrag::test_credentials(),
         ReceiveTime::now(),
+        None,
     )
     .unwrap();
     peer.sdp_api()
@@ -367,6 +376,7 @@ mod tests {
                 chrome_like_offer(Direction::SendOnly),
                 test_credentials(),
                 ReceiveTime::now(),
+                None,
             )
             .unwrap();
         answer
@@ -384,6 +394,7 @@ mod tests {
                     chrome_like_offer(offer_direction),
                     test_credentials(),
                     ReceiveTime::now(),
+                    None,
                 )
                 .unwrap();
             assert!(answer.contains(answer_direction));
@@ -400,7 +411,7 @@ mod tests {
         let offer = change.apply().unwrap().0.to_sdp_string();
         let mut negotiator = negotiator();
         let (_, _, resources) = negotiator
-            .create_answer(offer, test_credentials(), ReceiveTime::now())
+            .create_answer(offer, test_credentials(), ReceiveTime::now(), None)
             .unwrap();
 
         assert_eq!(
@@ -499,7 +510,7 @@ mod tests {
         let offer = with_unique_media_identities(change.apply().unwrap().0);
         let mut negotiator = negotiator();
         negotiator
-            .create_answer(offer, test_credentials(), ReceiveTime::now())
+            .create_answer(offer, test_credentials(), ReceiveTime::now(), None)
             .unwrap();
     }
 
@@ -513,7 +524,7 @@ mod tests {
         let offer = with_unique_media_identities(change.apply().unwrap().0);
         let mut negotiator = negotiator();
         assert!(matches!(
-            negotiator.create_answer(offer, test_credentials(), ReceiveTime::now()),
+            negotiator.create_answer(offer, test_credentials(), ReceiveTime::now(), None),
             Err(NegotiatorError::SlotsLimit(
                 MediaType::Video,
                 crate::media::Direction::RecvOnly,
@@ -537,7 +548,7 @@ mod tests {
         let mut negotiator = negotiator();
         assert!(
             negotiator
-                .create_answer(offer, test_credentials(), ReceiveTime::now())
+                .create_answer(offer, test_credentials(), ReceiveTime::now(), None)
                 .is_ok()
         );
     }
@@ -560,7 +571,8 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\r\n")
                 + "\r\n";
-            let result = negotiator().create_answer(offer, test_credentials(), ReceiveTime::now());
+            let result =
+                negotiator().create_answer(offer, test_credentials(), ReceiveTime::now(), None);
             match direction {
                 Direction::SendOnly => assert!(result.is_ok()),
                 Direction::RecvOnly => assert!(matches!(

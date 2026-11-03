@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use agent_core::{
     AgentCommand, DesiredState, Effect, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod,
-    MediaSlot, Notification, OperationId, RtcEffect, RtcEvent, Snapshot, TimerEffect, TimerEvent,
-    TimerId, TopicSend,
+    MediaSlot, Notification, OperationId, RtcEffect, RtcEvent, Snapshot, SourceReadiness,
+    TimerEffect, TimerEvent, TimerId, TopicSend,
 };
 use pulsebeam_core::net::AsyncHttpClient;
 use pulsebeam_webrtc_sys as rtc;
@@ -227,6 +227,7 @@ enum Command {
     },
     Source {
         slot: MediaSlot,
+        generation: Option<agent_core::Generation>,
         response: oneshot::Sender<Result<LocalSource, Error>>,
     },
     CloseSource {
@@ -258,6 +259,7 @@ enum Command {
     },
     Observe {
         slot: MediaSlot,
+        generation: Option<agent_core::Generation>,
         mode: ReceiveMode,
         response: oneshot::Sender<Result<RemoteMedia, Error>>,
     },
@@ -289,6 +291,7 @@ pub struct Agent {
     topology: agent_core::MediaTopology,
     snapshot: watch::Receiver<Snapshot>,
     snapshot_events: broadcast::Sender<Snapshot>,
+    receivers_changed: Arc<Notify>,
     statistics: watch::Receiver<Option<NativeStatistics>>,
     events: broadcast::Sender<AgentEvent>,
     lease: Arc<AgentLease>,
@@ -350,11 +353,13 @@ impl Agent {
         let abort = Arc::new(Signal::default());
         let finished = Arc::new(Signal::default());
         let (http_tx, http_rx) = mpsc::channel(COMMANDS);
+        let receivers_changed = Arc::new(Notify::new());
         let agent = Self {
             commands: commands.clone(),
             topology: config.session.topology.clone(),
             snapshot,
             snapshot_events: snapshot_events.clone(),
+            receivers_changed: receivers_changed.clone(),
             statistics,
             events: events.clone(),
             lease: Arc::new(AgentLease {
@@ -375,12 +380,14 @@ impl Agent {
             media_tx: media,
             snapshot: snapshot_tx,
             snapshot_events,
+            receivers_changed,
             statistics: statistics_tx,
             events,
             abort,
             finished,
             leases_changed: Arc::new(Notify::new()),
             sources: BTreeMap::new(),
+            source_requests: BTreeMap::new(),
             streams: BTreeMap::new(),
             http_tasks: BTreeMap::new(),
             http_tx,
@@ -473,24 +480,67 @@ impl Agent {
         self.statistics.clone()
     }
     pub async fn source(&self, slot: MediaSlot) -> Result<LocalSource, Error> {
+        let generation = self.snapshot.borrow().generation;
         let (response, result) = oneshot::channel();
         self.commands
-            .send(Command::Source { slot, response })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-    pub async fn remote(&self, slot: MediaSlot, mode: ReceiveMode) -> Result<RemoteMedia, Error> {
-        let (response, result) = oneshot::channel();
-        self.commands
-            .send(Command::Observe {
+            .send(Command::Source {
                 slot,
-                mode,
+                generation,
                 response,
             })
             .await
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
+    }
+    pub async fn remote(&self, slot: MediaSlot, mode: ReceiveMode) -> Result<RemoteMedia, Error> {
+        let valid = match &slot {
+            MediaSlot::RemoteVideo(index) => *index < self.topology.remote_video,
+            MediaSlot::RemoteAudio(index) => *index < self.topology.remote_audio,
+            _ => false,
+        };
+        if !valid {
+            return Err(Error::UnknownSlot(slot));
+        }
+        let generation = self.snapshot.borrow().generation;
+        loop {
+            if generation.is_some() && self.snapshot.borrow().generation != generation {
+                return Err(Error::Closed);
+            }
+            // Register before requesting: receiver creation may precede its reply.
+            let available = self.receivers_changed.notified();
+            tokio::pin!(available);
+            let _ = available.as_mut().enable();
+            let (response, result) = oneshot::channel();
+            self.commands
+                .send(Command::Observe {
+                    slot: slot.clone(),
+                    generation,
+                    mode,
+                    response,
+                })
+                .await
+                .map_err(|_| Error::Closed)?;
+            match result.await.map_err(|_| Error::Closed)? {
+                Ok(remote)
+                    if generation
+                        .is_some_and(|generation| generation.get() != remote.generation()) =>
+                {
+                    return Err(Error::Closed);
+                }
+                Err(Error::NotReady) => {
+                    let current = {
+                        let snapshot = self.snapshot.borrow();
+                        snapshot.generation == generation
+                            && snapshot.connection == agent_core::ConnectionState::Connected
+                    };
+                    if !current {
+                        return Err(Error::NotReady);
+                    }
+                    available.await;
+                }
+                result => return result,
+            }
+        }
     }
     pub async fn close(&self) -> Result<(), Error> {
         self.begin_close().await?.await.map_err(|_| Error::Closed)?
@@ -757,6 +807,12 @@ impl RemoteMedia {
     }
 }
 
+struct SourceRequest {
+    generation: Option<agent_core::Generation>,
+    target: Option<String>,
+    response: oneshot::Sender<Result<LocalSource, Error>>,
+}
+
 struct SourceObservation {
     lease: Weak<SourceLease>,
     identity: SourceIdentity,
@@ -795,12 +851,14 @@ where
     media_tx: mpsc::Sender<Submission>,
     snapshot: watch::Sender<Snapshot>,
     snapshot_events: broadcast::Sender<Snapshot>,
+    receivers_changed: Arc<Notify>,
     statistics: watch::Sender<Option<NativeStatistics>>,
     events: broadcast::Sender<AgentEvent>,
     abort: Arc<Signal>,
     finished: Arc<Signal>,
     leases_changed: Arc<Notify>,
     sources: BTreeMap<MediaSlot, SourceObservation>,
+    source_requests: BTreeMap<MediaSlot, SourceRequest>,
     streams: BTreeMap<MediaSlot, StreamObservation>,
     http_tasks: BTreeMap<OperationId, JoinHandle<()>>,
     http_tx: mpsc::Sender<HttpCompletion>,
@@ -832,6 +890,7 @@ where
             self.drain_effects();
             let more = self.progress_peer();
             self.drain_effects();
+            self.progress_source_requests();
             self.publish().await;
             if more {
                 tokio::task::yield_now().await;
@@ -878,6 +937,14 @@ where
             let (generation, kind) = match event {
                 RtcEvent::OfferCreated { generation, .. } => (generation, "offer_created"),
                 RtcEvent::AnswerApplied { generation } => (generation, "answer_applied"),
+                RtcEvent::MediaPrepared { generation, .. } => (generation, "media_prepared"),
+                RtcEvent::MediaObserved { generation, .. } => (generation, "media_observed"),
+                RtcEvent::BootstrapMediaPrepared { generation, .. } => {
+                    (generation, "bootstrap_media_prepared")
+                }
+                RtcEvent::BootstrapRejected { generation, .. } => {
+                    (generation, "bootstrap_rejected")
+                }
                 RtcEvent::Connected { generation } => (generation, "connected"),
                 RtcEvent::Disconnected { generation } => (generation, "disconnected"),
                 RtcEvent::Failed { generation, .. } => (generation, "failed"),
@@ -887,8 +954,12 @@ where
             tracing::debug!(target: "pulsebeam_sim_recovery", ?generation, kind,
                 "native core RTC input");
         }
+        let media_completed = matches!(&event, HostEvent::Rtc(RtcEvent::MediaPrepared { .. }));
         if let Err(error) = self.core.handle(event) {
             self.fail(Error::Core(error));
+        }
+        if media_completed {
+            self.receivers_changed.notify_waiters();
         }
     }
     fn fail(&self, error: Error) {
@@ -933,9 +1004,16 @@ where
             Command::Core { command, response } => {
                 let _ = response.send(self.core.command(command).map_err(Error::Core));
             }
-            Command::Source { slot, response } => {
-                let result = self.new_source(slot);
-                let _ = response.send(result);
+            Command::Source {
+                slot,
+                generation,
+                response,
+            } => {
+                if generation.is_some() && generation != self.core.snapshot().generation {
+                    let _ = response.send(Err(Error::Closed));
+                } else {
+                    self.acquire_source(slot, response);
+                }
             }
             Command::CloseSource {
                 slot,
@@ -995,10 +1073,16 @@ where
             }
             Command::Observe {
                 slot,
+                generation,
                 mode,
                 response,
             } => {
-                let result = self.observe(slot, mode);
+                let result =
+                    if generation.is_some() && generation != self.core.snapshot().generation {
+                        Err(Error::Closed)
+                    } else {
+                        self.observe(slot, mode)
+                    };
                 let _ = response.send(result);
             }
             Command::Keyframe {
@@ -1046,7 +1130,75 @@ where
         }
     }
 
+    fn acquire_source(
+        &mut self,
+        slot: MediaSlot,
+        response: oneshot::Sender<Result<LocalSource, Error>>,
+    ) {
+        if response.is_closed() {
+            return;
+        }
+        if !matches!(slot, MediaSlot::LocalAudio(_) | MediaSlot::LocalVideo(_)) {
+            let _ = response.send(Err(Error::UnknownSlot(slot)));
+            return;
+        }
+        if let Some(previous) = self.source_requests.remove(&slot) {
+            let _ = previous.response.send(Err(Error::Closed));
+        }
+        let preparation = self.core.source_preparation(&slot);
+        if preparation.readiness == SourceReadiness::Preparing {
+            // Only existing changing slots can retain an acquisition, one per slot.
+            self.source_requests.insert(
+                slot,
+                SourceRequest {
+                    generation: self.core.snapshot().generation,
+                    target: preparation.target.map(str::to_owned),
+                    response,
+                },
+            );
+        } else {
+            let result = self.new_source(slot);
+            let _ = response.send(result);
+        }
+    }
+
+    fn progress_source_requests(&mut self) {
+        let completed = self
+            .source_requests
+            .iter()
+            .filter_map(|(slot, request)| {
+                let preparation = self.core.source_preparation(slot);
+                let cancelled = request.response.is_closed()
+                    || request.generation != self.core.snapshot().generation
+                    || request.target.as_deref() != preparation.target;
+                if cancelled || preparation.readiness != SourceReadiness::Preparing {
+                    Some((slot.clone(), cancelled))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for (slot, cancelled) in completed {
+            let Some(request) = self.source_requests.remove(&slot) else {
+                continue;
+            };
+            let result = if cancelled {
+                Err(Error::Closed)
+            } else {
+                self.new_source(slot)
+            };
+            let _ = request.response.send(result);
+        }
+    }
+
     fn new_source(&mut self, slot: MediaSlot) -> Result<LocalSource, Error> {
+        match self.core.source_preparation(&slot).readiness {
+            SourceReadiness::Preparing => return Err(Error::NotReady),
+            SourceReadiness::Failed => {
+                return Err(Error::Rtc("local source preparation failed".into()));
+            }
+            SourceReadiness::Ready => {}
+        }
         if !matches!(slot, MediaSlot::LocalAudio(_) | MediaSlot::LocalVideo(_)) {
             return Err(Error::UnknownSlot(slot));
         }
@@ -1102,6 +1254,19 @@ where
             return Err(Error::InvalidInput(
                 "combined observation is video-only".into(),
             ));
+        }
+        if self
+            .peer
+            .as_ref()
+            .is_none_or(|peer| !peer.receivers.contains_key(&slot))
+        {
+            return Err(
+                if self.core.source_preparation(&slot).readiness == SourceReadiness::Failed {
+                    Error::Rtc("receiver preparation failed".into())
+                } else {
+                    Error::NotReady
+                },
+            );
         }
         if let Some(stream) = self.streams.get(&slot) {
             if stream.mode != mode {
@@ -1243,12 +1408,16 @@ where
                             }
                         }
                     }
-                    RtcEffect::ApplyAnswer { generation, answer } => {
+                    RtcEffect::ApplyAnswer {
+                        generation,
+                        answer,
+                        capabilities,
+                    } => {
                         let result = self.peer_mut().and_then(|peer| {
                             if peer.generation != generation {
                                 Err(Error::Closed)
                             } else {
-                                peer.answer(answer).map_err(Error::from)
+                                peer.answer(answer, capabilities).map_err(Error::from)
                             }
                         });
                         if let Err(error) = result {
@@ -1256,6 +1425,137 @@ where
                                 generation,
                                 message: error.to_string(),
                             }));
+                        }
+                    }
+                    RtcEffect::CreateDataChannel {
+                        generation,
+                        channel,
+                        specification,
+                    } => {
+                        let result = self
+                            .peer
+                            .as_mut()
+                            .filter(|peer| peer.generation == generation)
+                            .ok_or(Error::Closed)
+                            .and_then(|peer| {
+                                peer.create_data_channel(channel, &specification)
+                                    .map_err(Error::from)
+                            });
+                        if let Err(error) = result {
+                            self.accept(HostEvent::DataChannel(
+                                agent_core::DataChannelEvent::Prepared {
+                                    generation,
+                                    channel,
+                                    preparation: Err(error.to_string()),
+                                },
+                            ));
+                        }
+                    }
+                    RtcEffect::CloseDataChannel {
+                        generation,
+                        channel,
+                    } => {
+                        if let Some(peer) = self
+                            .peer
+                            .as_mut()
+                            .filter(|peer| peer.generation == generation)
+                            && let Err(error) = peer.close_data_channel(channel)
+                        {
+                            self.accept(HostEvent::DataChannel(
+                                agent_core::DataChannelEvent::Prepared {
+                                    generation,
+                                    channel,
+                                    preparation: Err(error.to_string()),
+                                },
+                            ));
+                        }
+                    }
+                    RtcEffect::PrepareMedia {
+                        generation,
+                        operation,
+                        requests,
+                    } => {
+                        let event = match self
+                            .peer
+                            .as_mut()
+                            .filter(|peer| peer.generation == generation)
+                        {
+                            Some(peer) => peer.prepare_media(operation, requests),
+                            None => Some(HostEvent::Rtc(RtcEvent::MediaPrepared {
+                                generation,
+                                operation,
+                                slots: Vec::new(),
+                                outcome: agent_core::client_sdp::ApplyOutcome::NotApplied,
+                                preparation: Err(agent_core::client_sdp::Error::CandidateState),
+                            })),
+                        };
+                        if let Some(event) = event {
+                            self.accept(event);
+                        }
+                    }
+                    RtcEffect::AllocateMedia {
+                        generation,
+                        operation,
+                        allocations,
+                        mode,
+                    } => {
+                        let event = match self
+                            .peer
+                            .as_mut()
+                            .filter(|peer| peer.generation == generation)
+                        {
+                            Some(peer) => peer.allocate_media(
+                                operation,
+                                allocations,
+                                mode,
+                                &self.config.media,
+                            ),
+                            None => Some(HostEvent::Rtc(RtcEvent::MediaPrepared {
+                                generation,
+                                operation,
+                                slots: Vec::new(),
+                                outcome: agent_core::client_sdp::ApplyOutcome::NotApplied,
+                                preparation: Err(agent_core::client_sdp::Error::CandidateState),
+                            })),
+                        };
+                        if let Some(event) = event {
+                            self.accept(event);
+                        }
+                    }
+                    RtcEffect::RetireMedia {
+                        generation,
+                        operation,
+                        mids,
+                    } => {
+                        let event = match self
+                            .peer
+                            .as_mut()
+                            .filter(|peer| peer.generation == generation)
+                        {
+                            Some(peer) => peer.retire_media(operation, mids),
+                            None => Some(HostEvent::Rtc(RtcEvent::MediaPrepared {
+                                generation,
+                                operation,
+                                slots: Vec::new(),
+                                outcome: agent_core::client_sdp::ApplyOutcome::NotApplied,
+                                preparation: Err(agent_core::client_sdp::Error::CandidateState),
+                            })),
+                        };
+                        if let Some(event) = event {
+                            self.accept(event);
+                        }
+                    }
+                    RtcEffect::CancelMediaPreparation {
+                        generation,
+                        operation,
+                    } => {
+                        if let Some(event) = self
+                            .peer
+                            .as_mut()
+                            .filter(|peer| peer.generation == generation)
+                            .and_then(|peer| peer.cancel_media(operation))
+                        {
+                            self.accept(event);
                         }
                     }
                     RtcEffect::Close { generation } => {
@@ -1323,17 +1623,22 @@ where
                 return false;
             }
         };
+        self.retire_changed_media();
         for event in progress.events {
             self.accept(event);
         }
         for observation in progress.observations {
             match observation {
                 Observation::Track { slot, track } => {
+                    self.receivers_changed.notify_waiters();
                     if let Some(stream) = self.streams.get(&slot) {
                         let _ = stream.sender.send(MediaStreamUpdate::Track { track });
                     }
                 }
-                Observation::TrackRemoved { slot } => self.close_stream(&slot),
+                Observation::TrackRemoved { slot } => {
+                    self.close_stream(&slot);
+                    self.receivers_changed.notify_waiters();
+                }
                 Observation::Statistics(stats) => {
                     self.statistics.send_replace(Some(stats));
                 }
@@ -1470,6 +1775,45 @@ where
             }
         }
     }
+    fn retire_changed_media(&mut self) {
+        let peer = self.peer.as_ref();
+        let sources = self
+            .sources
+            .iter()
+            .filter_map(|(slot, source)| {
+                if peer.and_then(|peer| peer.source_identity(slot)) != Some(source.identity.clone())
+                {
+                    Some(slot.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let streams = self
+            .streams
+            .iter()
+            .filter_map(|(slot, stream)| {
+                if peer.is_none_or(|peer| {
+                    peer.generation.get() != stream.generation
+                        || peer
+                            .receivers
+                            .get(slot)
+                            .is_none_or(|receiver| receiver.id.get() != stream.receiver)
+                }) {
+                    Some(slot.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for slot in sources {
+            self.close_source_observation(&slot);
+        }
+        for slot in streams {
+            self.close_stream(&slot);
+        }
+    }
+
     fn close_stream(&mut self, slot: &MediaSlot) {
         if let Some(stream) = self.streams.remove(slot) {
             for lease in stream.leases {
@@ -1478,10 +1822,10 @@ where
                 }
             }
             if let Some(peer) = &mut self.peer
-                && peer
-                    .receivers
-                    .get(slot)
-                    .is_some_and(|receiver| receiver.mode.is_some())
+                && peer.generation.get() == stream.generation
+                && peer.receivers.get(slot).is_some_and(|receiver| {
+                    receiver.id.get() == stream.receiver && receiver.mode.is_some()
+                })
                 && let Err(error) = peer.detach(slot)
             {
                 self.fail(error.into());
@@ -1489,6 +1833,10 @@ where
         }
     }
     fn retire_peer(&mut self) {
+        self.receivers_changed.notify_waiters();
+        for (_, request) in std::mem::take(&mut self.source_requests) {
+            let _ = request.response.send(Err(Error::Closed));
+        }
         let slots: Vec<_> = self.sources.keys().cloned().collect();
         for slot in slots {
             self.close_source_observation(&slot);
@@ -1559,6 +1907,7 @@ where
                     method = ?request.method, "native signaling HTTP started");
                 let method = match request.method {
                     HttpMethod::Post => http::Method::POST,
+                    HttpMethod::Patch => http::Method::PATCH,
                     HttpMethod::Delete => http::Method::DELETE,
                 };
                 let mut builder = http::Request::builder().method(method).uri(request.uri);
@@ -1707,6 +2056,18 @@ mod tests {
             agent.source(MediaSlot::LocalVideo("v0".into())).await,
             Err(Error::NotReady)
         ));
+        assert!(matches!(
+            agent
+                .remote(MediaSlot::RemoteVideo(0), ReceiveMode::Encoded)
+                .await,
+            Err(Error::NotReady)
+        ));
+        assert!(matches!(
+            agent
+                .remote(MediaSlot::RemoteVideo(1), ReceiveMode::Encoded)
+                .await,
+            Err(Error::UnknownSlot(_))
+        ));
         agent.close().await.unwrap();
         agent.close().await.unwrap();
         assert_eq!(
@@ -1719,6 +2080,81 @@ mod tests {
         assert!(matches!(events.next().await, StreamUpdate::Closed));
         assert!(matches!(snapshots.try_next(), Some(StreamUpdate::Closed)));
         assert!(matches!(snapshots.next().await, StreamUpdate::Closed));
+    }
+
+    #[test]
+    fn pending_source_requests_fence_target_generation_and_retirement() {
+        let (_agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(reqwest::Client::new())),
+            || -> Result<(rtc::ManagedRuntime, ()), Error> {
+                panic!("source cancellation cannot construct a native graph")
+            },
+        )
+        .unwrap();
+        actor
+            .core
+            .command(AgentCommand::ReplaceDesired(DesiredState {
+                revision: 1,
+                connected: true,
+                publications: vec![agent_core::PublicationIntent {
+                    slot: "v0".into(),
+                    label: "camera".into(),
+                    active: true,
+                }],
+                ..DesiredState::default()
+            }))
+            .unwrap();
+        let slot = MediaSlot::LocalVideo("v0".into());
+        let generation = actor.core.snapshot().generation;
+        assert!(generation.is_some());
+        assert_eq!(actor.core.source_preparation(&slot).target, Some("camera"));
+        for (generation, target) in [(None, "camera"), (generation, "retired")] {
+            let (response, mut result) = oneshot::channel();
+            actor.source_requests.insert(
+                slot.clone(),
+                SourceRequest {
+                    generation,
+                    target: Some(target.into()),
+                    response,
+                },
+            );
+            actor.progress_source_requests();
+            assert!(matches!(result.try_recv(), Ok(Err(Error::Closed))));
+            assert!(actor.source_requests.is_empty());
+        }
+        let (response, result) = oneshot::channel();
+        actor.source_requests.insert(
+            slot.clone(),
+            SourceRequest {
+                generation,
+                target: Some("camera".into()),
+                response,
+            },
+        );
+        drop(result);
+        actor.progress_source_requests();
+        assert!(actor.source_requests.is_empty());
+        let (response, mut result) = oneshot::channel();
+        actor.source_requests.insert(
+            slot.clone(),
+            SourceRequest {
+                generation,
+                target: Some("camera".into()),
+                response,
+            },
+        );
+        let (cancelled, receiver) = oneshot::channel();
+        drop(receiver);
+        actor.acquire_source(slot, cancelled);
+        assert_eq!(actor.source_requests.len(), 1);
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        actor.retire_peer();
+        assert!(matches!(result.try_recv(), Ok(Err(Error::Closed))));
+        assert!(actor.source_requests.is_empty());
     }
 
     #[test]

@@ -541,7 +541,10 @@ async fn run_peer(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
             (room).as_str(),
             (participant).as_str(),
-            u64::MAX,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
+                .saturating_add(3600),
         )?,
         topology: pulsebeam_agent_core::MediaTopology {
             local_video: 1,
@@ -605,12 +608,6 @@ async fn run_peer(
         .ok_or_else(|| anyhow::anyhow!("connected without generation"))?;
     let mut video = agent.local_video("v0".into()).await?;
     let mut audio = agent.local_audio("a0".into()).await?;
-    let mut remote_video = agent.remote_video(0, ReceiveMode::Decoded).await?;
-    let mut remote_audio = agent.remote_audio(0, ReceiveMode::Decoded).await?;
-    let mut video_probe =
-        MediaProbe::start(remote_video.clone(), generation, core_ffi::MediaKind::Video);
-    let mut audio_probe =
-        MediaProbe::start(remote_audio.clone(), generation, core_ffi::MediaKind::Audio);
     barriers.before_media.wait().await;
     let mut frame_cursor = 0;
     let initial = wait_remote_media(&agent, &video, &mut frame_cursor).await?;
@@ -655,16 +652,20 @@ async fn run_peer(
     }];
     desired.audio.pinned = vec![remote_audio_id.clone()];
     agent.replace_desired(desired.clone()).await?;
-    wait_video_binding(&agent, &remote_video_id).await?;
+    wait_media_bindings(&agent, &remote_video_id, &remote_audio_id).await?;
+    let mut remote_video = agent.remote_video(0, ReceiveMode::Decoded).await?;
+    let mut remote_audio = agent.remote_audio(0, ReceiveMode::Decoded).await?;
+    let mut video_probe =
+        MediaProbe::start(remote_video.clone(), generation, core_ffi::MediaKind::Video);
+    let mut audio_probe =
+        MediaProbe::start(remote_audio.clone(), generation, core_ffi::MediaKind::Audio);
     let events = TopicProbe::start(agent.events(), name, &latest, &ordered, 1);
     prime_ordered_topic(&agent, &ordered, &events, &barriers.before_media).await?;
 
     let accepted = agent.snapshot();
     let errors = agent.events();
     let mut unsupported = desired.clone();
-    // Earlier valid work may still settle. A conflicting withdrawal tests
-    // rejection without treating an older observed revision as an input ACK.
-    unsupported.video.clear();
+    // Backend rejection is per resource; unrelated accepted video stays desired.
     let fixed = core_ffi::PlayoutDelay::Fixed {
         min_ms: 100,
         max_ms: 100,
@@ -728,7 +729,7 @@ async fn run_peer(
             .video
             .iter()
             .any(|binding| binding.publication_id == remote_video_id),
-        "unsupported audio applied the candidate's video withdrawal"
+        "unsupported audio disturbed unchanged video binding"
     );
     // The existing exchange must decode fresh audio and video after rejection.
     let first = exchange(
@@ -772,31 +773,20 @@ async fn run_peer(
                 .is_err(),
             "stale audio source admitted input"
         );
-        anyhow::ensure!(
-            matches!(remote_video.next().await, MediaStreamUpdate::Closed),
-            "retired video observer stayed open"
-        );
-        anyhow::ensure!(
-            matches!(remote_audio.next().await, MediaStreamUpdate::Closed),
-            "retired audio observer stayed open"
-        );
         video = agent.local_video("v0".into()).await?;
         audio = agent.local_audio("a0".into()).await?;
-        remote_video = agent.remote_video(0, ReceiveMode::Decoded).await?;
-        video_probe.ready(first_generation)?;
-        video_probe =
-            MediaProbe::start(remote_video.clone(), generation, core_ffi::MediaKind::Video);
-        audio_probe.ready(first_generation)?;
-        remote_audio = agent.remote_audio(0, ReceiveMode::Decoded).await?;
-        audio_probe =
-            MediaProbe::start(remote_audio.clone(), generation, core_ffi::MediaKind::Audio);
         let replacement = wait_remote_media(&agent, &video, &mut frame_cursor).await?;
         if replacement.participant_id.as_deref() != Some(participant.as_str()) {
             anyhow::bail!("{name} participant identity changed across reconnect");
         }
-        replacement
+        let replacement_generation = replacement
             .generation
-            .ok_or_else(|| anyhow::anyhow!("{name} replacement has no generation"))?
+            .ok_or_else(|| anyhow::anyhow!("{name} replacement has no generation"))?;
+        anyhow::ensure!(
+            replacement_generation == generation,
+            "replacement media escaped the connected generation"
+        );
+        replacement_generation
     } else {
         first_generation
     };
@@ -839,7 +829,34 @@ async fn run_peer(
         desired.audio.pinned = vec![replacement_audio];
         agent.replace_desired(desired.clone()).await?;
     }
-    wait_video_binding(&agent, &desired.video[0].publication_id).await?;
+    wait_media_bindings(
+        &agent,
+        &desired.video[0].publication_id,
+        &desired.audio.pinned[0],
+    )
+    .await?;
+    anyhow::ensure!(
+        matches!(remote_video.next().await, MediaStreamUpdate::Closed),
+        "retired video observer stayed open"
+    );
+    anyhow::ensure!(
+        matches!(remote_audio.next().await, MediaStreamUpdate::Closed),
+        "retired audio observer stayed open"
+    );
+    video_probe.ready(first_generation)?;
+    audio_probe.ready(first_generation)?;
+    remote_video = agent.remote_video(0, ReceiveMode::Decoded).await?;
+    remote_audio = agent.remote_audio(0, ReceiveMode::Decoded).await?;
+    video_probe = MediaProbe::start(
+        remote_video.clone(),
+        final_generation,
+        core_ffi::MediaKind::Video,
+    );
+    audio_probe = MediaProbe::start(
+        remote_audio.clone(),
+        final_generation,
+        core_ffi::MediaKind::Audio,
+    );
     barriers.after_reconnect.wait().await;
     let events = TopicProbe::start(agent.events(), name, &latest, &ordered, 2);
     prime_ordered_topic(&agent, &ordered, &events, &barriers.after_reconnect).await?;
@@ -977,7 +994,11 @@ async fn wait_ordered_admitted(
     .map_err(|_| anyhow::anyhow!("native ordered topic send was not admitted"))?
 }
 
-async fn wait_video_binding(agent: &Agent, video_id: &str) -> anyhow::Result<core_ffi::Snapshot> {
+async fn wait_media_bindings(
+    agent: &Agent,
+    video_id: &str,
+    audio_id: &str,
+) -> anyhow::Result<core_ffi::Snapshot> {
     let snapshots = agent.snapshots();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -989,13 +1010,18 @@ async fn wait_video_binding(agent: &Agent, video_id: &str) -> anyhow::Result<cor
                 .video
                 .iter()
                 .any(|binding| binding.publication_id == video_id);
-            if video_ready {
+            let audio_ready = snapshot
+                .mapping
+                .audio
+                .iter()
+                .any(|binding| binding.publication_id == audio_id);
+            if video_ready && audio_ready {
                 return Ok(snapshot);
             }
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("native video binding did not become ready"))?
+    .map_err(|_| anyhow::anyhow!("native media bindings did not become ready"))?
 }
 
 async fn prime_ordered_topic(
@@ -1096,7 +1122,12 @@ async fn wait_remote_media(
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("native agent did not discover remote media"))?
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "native agent did not discover remote media: {:?}",
+            agent.snapshot()
+        )
+    })?
 }
 
 fn video_frame(timestamp_us: i64) -> InputFrame {

@@ -147,12 +147,22 @@ pub enum Event {
     Warning(ConnectionWarning),
 }
 
+/// A primary payload type's codec name and RTP clock at encoding discovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RtpPayloadInfo {
+    pub payload_type: u8,
+    /// Lowercase RTP codec name, independent of its payload-type assignment.
+    pub name: Box<str>,
+    pub clock_rate: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncodingInfo {
     pub mid: Arc<str>,
     pub ssrc: u32,
     pub kind: MediaKind,
     pub rid: Option<Arc<str>>,
+    pub payloads: Box<[RtpPayloadInfo]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -16,8 +16,16 @@ pub(crate) trait ParticipantSink {
     fn deactivate_track(&mut self, track: TrackMeta);
     fn publish_track(&mut self, track: Track);
     fn unpublish_track(&mut self, meta: TrackMeta);
+    // The caller must fence local execution before requesting the compiled-plan cutoff.
+    fn unpublish_owned_track(&mut self, meta: TrackMeta, reference: u64);
+    fn set_owned_subscription(
+        &mut self,
+        reference: u64,
+        track: crate::entity::TrackId,
+        enabled: bool,
+    );
+    fn unsubscribe_owned(&mut self, reference: u64);
     fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy);
-    fn seed_subscription(&mut self, selector: TrackSelector, seed_id: u64);
     fn unsubscribe_tracks(&mut self, selector: TrackSelector);
     fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket);
     fn renew_authorization(&mut self, token: String);
@@ -43,6 +51,8 @@ pub mod test_utils {
         pub deactivate_track_calls: Vec<TrackMeta>,
         pub publish_track_calls: Vec<TrackId>,
         pub unpublish_track_calls: Vec<TrackId>,
+        pub owned_subscriptions: Vec<(u64, TrackId, bool)>,
+        pub owned_unsubscribes: Vec<u64>,
         pub reverse_requests: Vec<TrackHandle>,
         pub reverse_packets: Vec<ReversePacket>,
         pub exit_count: usize,
@@ -82,8 +92,18 @@ pub mod test_utils {
             self.unpublish_track_calls.push(meta.id);
         }
 
+        fn unpublish_owned_track(&mut self, meta: TrackMeta, _reference: u64) {
+            self.unpublish_track(meta);
+        }
+
+        fn set_owned_subscription(&mut self, reference: u64, track: TrackId, enabled: bool) {
+            self.owned_subscriptions.push((reference, track, enabled));
+        }
+        fn unsubscribe_owned(&mut self, reference: u64) {
+            self.owned_unsubscribes.push(reference);
+        }
+
         fn subscribe_tracks(&mut self, _selector: TrackSelector, _selection: SelectionPolicy) {}
-        fn seed_subscription(&mut self, _selector: TrackSelector, _seed_id: u64) {}
 
         fn unsubscribe_tracks(&mut self, _selector: TrackSelector) {}
 

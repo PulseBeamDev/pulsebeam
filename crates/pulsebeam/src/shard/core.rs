@@ -386,7 +386,11 @@ impl ShardExecution {
             debug_assert!(false, "a track plan must target a live shard track");
             return 0;
         };
-        match &operation.plan {
+        let previous = self
+            .plans
+            .get(track_handle)
+            .is_some_and(|plan| !plan.local.is_empty() || !plan.remote.is_empty());
+        let cost = match &operation.plan {
             Some(plan) => {
                 debug_assert!(plan.is_valid());
                 let local = plan
@@ -418,7 +422,19 @@ impl ShardExecution {
                 debug_assert!(self.plans.contains_key(track_handle));
                 usize::from(self.plans.remove(track_handle).is_some())
             }
+        };
+        let active = self
+            .plans
+            .get(track_handle)
+            .is_some_and(|plan| !plan.local.is_empty() || !plan.remote.is_empty());
+        if previous != active
+            && let Some(publisher) = self.runtime.source_origin(track_handle)
+            && let Some(meta) = self.registry.resolve_mut(publisher)
+        {
+            meta.native_rtp_demand(operation.track_id, active);
+            self.dirty.mark(publisher, meta);
         }
+        cost
     }
 
     fn on_media_frame(
@@ -698,16 +714,37 @@ impl ShardExecution {
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_routing_counter("demux_flow_authenticated");
             }
+            ShardCommand::PublicationCutoffResult {
+                participant,
+                connection_id,
+                reference,
+                success,
+            } => {
+                if let Some(key) = self.registry.resolve(&participant)
+                    && let Some(current) = self.registry.resolve_mut(key)
+                    && current.connection_id == connection_id
+                {
+                    current.input(crate::participant::ParticipantInput::PublicationCutoff {
+                        reference,
+                        success,
+                    });
+                    self.dirty.mark(key, current);
+                }
+            }
             ShardCommand::AuthorizationResult {
                 participant,
                 connection_id,
+                revision,
                 expiry,
             } => {
                 if let Some(key) = self.registry.resolve(&participant)
                     && let Some(current) = self.registry.resolve_mut(key)
                     && current.connection_id == connection_id
                 {
-                    current.input(crate::participant::ParticipantInput::Authorization(expiry));
+                    current.input(crate::participant::ParticipantInput::Authorization {
+                        revision,
+                        expiry,
+                    });
                     self.dirty.mark(key, current);
                 }
             }
@@ -1381,15 +1418,27 @@ mod wrong_owner_tests {
             crate::shard_update::ShardUpdateOp::RetireRoute { address: route },
         );
         assert_eq!(writer.publish(), Some(1));
+        let mut cutoff = writer.stage_cutoff(2);
+        assert_eq!(writer.publish(), Some(2));
 
         assert_eq!(core.apply_updates(1), 0);
         assert!(core.execution.runtime.routes.resolve(route).is_some());
+        assert!(matches!(
+            cutoff.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
 
         assert_eq!(core.apply_updates(1), 1);
         assert!(core.execution.runtime.routes.resolve(route).is_none());
+        assert!(matches!(
+            cutoff.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(core.apply_updates(1), 1);
+        assert_eq!(cutoff.await, Ok(()));
 
         writer.stage(
-            2,
+            3,
             crate::shard_update::ShardUpdateOp::InstallRoute {
                 address: route,
                 action: crate::shard_update::TrackRouteAction::Forward {
@@ -1398,7 +1447,7 @@ mod wrong_owner_tests {
             },
         );
         writer.stage_plans(
-            2,
+            3,
             track_ids
                 .iter()
                 .map(|track_id| crate::shard_update::TrackPlanUpdate {
@@ -1408,18 +1457,18 @@ mod wrong_owner_tests {
                 .collect(),
         );
         writer.stage(
-            2,
+            3,
             crate::shard_update::ShardUpdateOp::RetireRoute { address: route },
         );
         for track_id in &track_ids {
             writer.stage(
-                2,
+                3,
                 crate::shard_update::ShardUpdateOp::RemoveTrackRuntime {
                     track_id: *track_id,
                 },
             );
         }
-        assert_eq!(writer.publish(), Some(2));
+        assert_eq!(writer.publish(), Some(3));
         assert_eq!(core.apply_updates(1), 0);
         assert_eq!(core.execution.plans.len(), 1);
         assert!(core.execution.runtime.routes.resolve(route).is_some());

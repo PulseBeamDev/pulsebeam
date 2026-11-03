@@ -17,10 +17,16 @@
   const publisher = sender.track(spec);
   const stream = receiver.remote.participant("publisher").track(spec).events();
   const events = [];
+  let probe = 0;
+  let observedProbe = 0;
   const pumping = (async () => {
     for await (const event of stream) {
       if (event.type === "message") {
-        events.push({ sequence: event.sequence, payload: [...event.data] });
+        if (event.data.length === 2 && event.data[0] === 0) {
+          observedProbe = Math.max(observedProbe, event.data[1]);
+        } else {
+          events.push({ sequence: event.sequence, payload: [...event.data] });
+        }
       }
     }
   })();
@@ -43,6 +49,20 @@
       const removeListener = agent.subscribe(inspect);
       inspect();
     });
+  const synchronize = async () => {
+    const nonce = ++probe;
+    const deadline = Date.now() + 20000;
+    // Lossy admission is not subscription readiness; observe real application traffic.
+    while (observedProbe < nonce) {
+      await publisher.send(new Uint8Array([0, nonce]));
+      if (observedProbe >= nonce) break;
+      if (Date.now() > deadline)
+        throw new Error(
+          `lossy application synchronization missing: ${JSON.stringify({ sender: sender.getSnapshot(), receiver: receiver.getSnapshot() }, (_, value) => (typeof value === "bigint" ? value.toString() : value))}`,
+        );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  };
   sender.connect();
   receiver.connect();
   const before = await wait(
@@ -50,6 +70,7 @@
     (snapshot) => snapshot.connection === "connected",
     "subscriber",
   );
+  await synchronize();
   await publisher.send(new Uint8Array([1]));
   await new Promise((resolve, reject) => {
     const deadline = setTimeout(
@@ -71,6 +92,7 @@
     pumping,
     events,
     wait,
+    synchronize,
     previousGeneration: before.generation,
   };
   return { initial: events[0].payload, generation: Number(before.generation) };

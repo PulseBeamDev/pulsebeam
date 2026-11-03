@@ -22,7 +22,8 @@ use crate::{
     scheduler::SenderScheduler,
     time::ProtocolClock,
     transport::{
-        DatagramKind, PreparedRtpIdentity, PreparedTransmit, RtpService, Transport, TransportError,
+        DatagramKind, PreparedRtpIdentity, PreparedTransmit, RtpAdmission, RtpService, Transport,
+        TransportError,
     },
 };
 
@@ -582,6 +583,24 @@ impl MediaEgress {
         Ok(update)
     }
 
+    pub(crate) fn retiring_ssrcs<'a>(
+        &'a self,
+        update: &'a EgressUpdate,
+    ) -> impl Iterator<Item = u32> + 'a {
+        update
+            .removed
+            .iter()
+            .filter_map(|key| self.senders.get(key))
+            .flat_map(|sender| {
+                std::iter::once(sender.ssrc).chain(
+                    sender
+                        .facts
+                        .retransmission_payload_type
+                        .map(|_| sender.rtx_ssrc),
+                )
+            })
+    }
+
     pub(crate) fn commit_configuration(&mut self, update: EgressUpdate) {
         for key in update.removed {
             self.retire_sender(key);
@@ -1051,6 +1070,7 @@ impl MediaEgress {
         bytes_in_flight: u64,
         transport: &mut Transport,
         allow_padding: bool,
+        admission: &mut RtpAdmission<'_>,
     ) -> PrepareResult {
         if self.pending.is_some() {
             return PrepareResult::Fatal;
@@ -1076,13 +1096,13 @@ impl MediaEgress {
         {
             return PrepareResult::Blocked;
         }
-        if let Some(result) = self.prepare_repair(at, bytes_in_flight, transport) {
+        if let Some(result) = self.prepare_repair(at, bytes_in_flight, transport, admission) {
             return result;
         }
 
         let Some(sender_index) = self.scheduler.select(&self.eligible) else {
             return if allow_padding {
-                self.prepare_padding(at, bytes_in_flight, transport)
+                self.prepare_padding(at, bytes_in_flight, transport, admission)
             } else {
                 PrepareResult::Blocked
             };
@@ -1125,7 +1145,13 @@ impl MediaEgress {
             self.recycle_original(packet);
             return PrepareResult::Blocked;
         }
-        match transport.send_rtp_with_info(&packet, index, classification, twcc_extension_id) {
+        match transport.send_rtp_with_info(
+            &packet,
+            index,
+            classification,
+            twcc_extension_id,
+            admission,
+        ) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Original {
                     sender: sender_index,
@@ -1719,6 +1745,7 @@ impl MediaEgress {
         at: Instant,
         bytes_in_flight: u64,
         transport: &mut Transport,
+        admission: &mut RtpAdmission<'_>,
     ) -> Option<PrepareResult> {
         let (&request, &key) = self.repair_requests.first_key_value()?;
         if self.requested_repair(key) != Some(request) {
@@ -1776,6 +1803,7 @@ impl MediaEgress {
                 ssrc: sender.rtx_ssrc,
             },
             sender.facts.twcc_extension_id,
+            admission,
         ) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Repair {
@@ -1837,6 +1865,7 @@ impl MediaEgress {
         at: Instant,
         bytes_in_flight: u64,
         transport: &mut Transport,
+        admission: &mut RtpAdmission<'_>,
     ) -> PrepareResult {
         if !self.path_available || self.queued_packets != 0 || !self.repair_requests.is_empty() {
             return PrepareResult::Blocked;
@@ -1884,6 +1913,7 @@ impl MediaEgress {
                 ssrc: sender.rtx_ssrc,
             },
             sender.facts.twcc_extension_id,
+            admission,
         ) {
             Ok(()) => {
                 self.pending = Some(PendingTransmit::Padding {

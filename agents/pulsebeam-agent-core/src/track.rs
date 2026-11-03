@@ -24,7 +24,13 @@ impl TrackSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
             Self::Video { label } | Self::Audio { label } => {
-                validate_identifier("publication label", label, 64, false)
+                if label.is_empty() || label.len() > 256 {
+                    Err(ValidationError::Identifier {
+                        field: "publication label",
+                    })
+                } else {
+                    Ok(())
+                }
             }
             Self::Data { label, delivery } => TopicRegistrations {
                 publishers: vec![TopicPublisher {
@@ -37,22 +43,16 @@ impl TrackSpec {
         }
     }
 
-    pub(crate) fn from_catalog(track: &pulsebeam_proto::signaling_v1::RemoteTrack) -> Option<Self> {
-        use pulsebeam_proto::signaling_v1::{TopicMode as WireMode, TrackKind};
+    pub(crate) fn from_state(track: &pulsebeam_proto::state::Track) -> Option<Self> {
+        use pulsebeam_proto::state::track::Kind;
         let label = track.label.clone();
-        Some(match TrackKind::try_from(track.kind).ok()? {
-            TrackKind::Video => Self::Video { label },
-            TrackKind::Audio => Self::Audio { label },
-            TrackKind::Data => Self::Data {
+        Some(match track.kind.as_ref()? {
+            Kind::Audio(_) => Self::Audio { label },
+            Kind::Video(_) => Self::Video { label },
+            Kind::Data(format) => Self::Data {
                 label,
-                delivery: match WireMode::try_from(track.mode).ok()? {
-                    WireMode::Latest => TopicMode::Latest,
-                    WireMode::Lossy => TopicMode::Lossy,
-                    WireMode::Ordered => TopicMode::Ordered,
-                    WireMode::Unspecified => return None,
-                },
+                delivery: TopicMode::from_delivery(format.delivery)?,
             },
-            TrackKind::Unspecified => return None,
         })
     }
 
@@ -560,13 +560,14 @@ impl TrackResources {
         }
         grouped.retain(|selector, observation| {
             observation.height > 0
-                && tracks.values().any(|track| {
-                    track.participant_id == selector.participant_external_id
-                        && track.spec
-                            == (TrackSpec::Video {
-                                label: selector.label.clone(),
-                            })
-                })
+                && (self.video_slots.contains_key(selector)
+                    || tracks.values().any(|track| {
+                        track.participant_id == selector.participant_external_id
+                            && track.spec
+                                == (TrackSpec::Video {
+                                    label: selector.label.clone(),
+                                })
+                    }))
         });
         self.video_slots
             .retain(|selector, slot| grouped.contains_key(selector) && *slot < capacity);

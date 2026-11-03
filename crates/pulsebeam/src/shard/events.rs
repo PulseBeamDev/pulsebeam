@@ -200,6 +200,52 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     #[inline]
+    fn unpublish_owned_track(&mut self, meta: TrackMeta, reference: u64) {
+        debug_assert_eq!(meta.origin, self.id);
+        debug_assert_eq!(meta.connection_id, self.connection_id);
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ShardEvent::OwnedTrackUnpublished { meta, reference },
+            ));
+    }
+
+    fn set_owned_subscription(
+        &mut self,
+        reference: u64,
+        track: crate::entity::TrackId,
+        enabled: bool,
+    ) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ShardEvent::OwnedSubscriptionSet {
+                    connection_id: self.connection_id,
+                    request: crate::control::topology::OwnedSubscription {
+                        room_id: self.room_id,
+                        subscriber: self.id,
+                        reference,
+                        track,
+                        enabled,
+                    },
+                },
+            ));
+    }
+
+    fn unsubscribe_owned(&mut self, reference: u64) {
+        self.pipeline
+            .participant_events
+            .push_back(ParticipantEvent::Control(
+                ShardEvent::OwnedSubscriptionRemoved {
+                    room_id: self.room_id,
+                    subscriber: self.id,
+                    connection_id: self.connection_id,
+                    reference,
+                },
+            ));
+    }
+
+    #[inline]
     fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy) {
         self.pipeline
             .participant_events
@@ -210,21 +256,6 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                     connection_id: self.connection_id,
                     selector,
                     selection,
-                },
-            ));
-    }
-
-    #[inline]
-    fn seed_subscription(&mut self, selector: TrackSelector, seed_id: u64) {
-        self.pipeline
-            .participant_events
-            .push_back(ParticipantEvent::Control(
-                ShardEvent::SubscriptionSeedRequested {
-                    room_id: self.room_id,
-                    subscriber: self.id,
-                    connection_id: self.connection_id,
-                    selector,
-                    seed_id,
                 },
             ));
     }

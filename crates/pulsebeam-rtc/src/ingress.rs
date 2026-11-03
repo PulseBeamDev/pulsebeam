@@ -786,6 +786,7 @@ impl IngressOwner {
                     ssrc: packet.ssrc(),
                     kind: self.media[&media].kind,
                     rid: rid.map(Arc::from),
+                    payloads: self.media[&media].payloads.clone(),
                 }),
                 0,
             ) else {
@@ -1084,7 +1085,7 @@ impl IngressOwner {
                         facts
                             .payloads
                             .iter()
-                            .any(|(payload, _)| *payload == packet.header.payload_type)
+                            .any(|payload| payload.payload_type == packet.header.payload_type)
                     })
             {
                 continue;
@@ -1280,13 +1281,13 @@ impl IngressOwner {
             media
                 .payloads
                 .iter()
-                .find(|(pt, _)| {
-                    *pt == packet.payload_type()
+                .find(|payload| {
+                    payload.payload_type == packet.payload_type()
                         || media.repairs.iter().any(|(repair, primary)| {
-                            *repair == packet.payload_type() && primary == pt
+                            *repair == packet.payload_type() && *primary == payload.payload_type
                         })
                 })
-                .map(|(_, rate)| (index, *rate))
+                .map(|payload| (index, payload.clock_rate))
         };
         let (index, clock_rate) = if let Some(index) = by_ssrc {
             resolve(index)?
@@ -1409,7 +1410,11 @@ mod tests {
                 kind: crate::MediaKind::Video,
                 rtcp: None,
                 mid: "v".into(),
-                payloads: Box::new([(96, 90_000)]),
+                payloads: Box::new([crate::RtpPayloadInfo {
+                    payload_type: 96,
+                    name: "h264".into(),
+                    clock_rate: 90_000,
+                }]),
                 feedback_payloads: Box::new([96]),
                 repairs: Box::new([(97, 96)]),
                 nack_payloads: Box::new([96]),
@@ -1739,7 +1744,8 @@ mod tests {
             .unwrap()
             .checked_add(3 * std::mem::size_of::<QueuedEvent>())
             .unwrap();
-        let initial_metadata = 2 * "v".len();
+        let payload_metadata = std::mem::size_of::<crate::RtpPayloadInfo>() + "h264".len();
+        let initial_metadata = 2 * "v".len() + payload_metadata;
         ingress.max_runtime_bytes = total + initial_metadata;
         let mut oversized = rid_packet(11, 1, None);
         oversized.reserve_exact(ingress.max_bytes);
@@ -1845,7 +1851,8 @@ mod tests {
         assert_eq!(ingress.events.capacity(), 0);
         assert_eq!(ingress.test_runtime_bytes(), facts + guard);
         let next = rid_packet(22, 1, Some(b'h'));
-        let next_metadata = metadata_bytes(&ingress, &next, Some("h")) + "v".len() + "h".len();
+        let next_metadata =
+            metadata_bytes(&ingress, &next, Some("h")) + "v".len() + "h".len() + payload_metadata;
         let next_total = total + guard + next_metadata;
         ingress.max_runtime_bytes = next_total - 1;
         ingress.accept_rtp(now, next.clone(), None);
@@ -2316,7 +2323,11 @@ mod tests {
             kind: crate::MediaKind::Video,
             rtcp: None,
             mid: "video".into(),
-            payloads: Box::new([(96, 90_000)]),
+            payloads: Box::new([crate::RtpPayloadInfo {
+                payload_type: 96,
+                name: "h264".into(),
+                clock_rate: 90_000,
+            }]),
             feedback_payloads: Box::new([96]),
             repairs: Box::new([(97, 96)]),
             nack_payloads: Box::new([96]),
@@ -2394,7 +2405,8 @@ mod tests {
             rtcp::Rfc8888Status::Received { .. }
         ));
         assert_eq!(ingress.test_runtime_bytes(), required);
-        let metadata = 2 * "video".len();
+        let metadata =
+            2 * "video".len() + std::mem::size_of::<crate::RtpPayloadInfo>() + "h264".len();
         ingress.max_runtime_bytes = required + 2 * std::mem::size_of::<QueuedEvent>() + metadata;
         let capacity = ingress.events.capacity();
         let staged = ingress.prepare_events(ingress.runtime_bytes, 1, 2).unwrap();

@@ -62,6 +62,7 @@ impl SentHistory {
 
     pub(crate) fn expire(&mut self, now: Instant, limit: usize) -> usize {
         let mut work = self.confirm_losses(now, limit.min(MAX_EXPIRATIONS_PER_POLL / 2));
+        work += self.reclaim_sources(now, limit.saturating_sub(work).div_ceil(2));
         while work < limit
             && self.loss_work < MAX_EXPIRATIONS_PER_POLL
             && self.oldest_sent_id < self.next_sent_id
@@ -90,7 +91,7 @@ impl SentHistory {
         work
     }
 
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+    pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
         let scan_end = self
             .oldest_sent_id
             .saturating_add(SENT_HISTORY_CAPACITY as u64)
@@ -107,10 +108,11 @@ impl SentHistory {
                 self.reorder_deadline(entry)
             })
             .min();
-        match (sent, missing) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (left, None) | (None, left) => left,
-        }
+        let source = match self.source_readiness.first() {
+            Some(SourceReadiness::Retired { deadline, .. }) => Some(deadline.unwrap_or(now)),
+            _ => None,
+        };
+        [sent, missing, source].into_iter().flatten().min()
     }
 
     fn is_live_feedback_entry(&self, entry: &SentEntry, now: Instant) -> bool {
@@ -392,20 +394,19 @@ impl SentHistory {
     ) -> Option<Duration> {
         let mut minimum_hold: Option<Duration> = None;
         for report in reports {
-            let Some(ssrc_index) = self
-                .ssrcs
-                .iter()
-                .position(|state| state.ssrc == report.ssrc)
-            else {
+            let Some(state) = self.ssrcs.get(&report.ssrc) else {
                 self.add_unknown(report.statuses.len());
                 continue;
             };
-            if self.ssrcs[ssrc_index].sent_ids.is_empty() {
+            if state.by_sequence.is_empty() {
                 self.add_unknown(report.statuses.len());
                 continue;
             }
-            let floor = self.ssrcs[ssrc_index].first_sequence;
-            let newest = self.ssrcs[ssrc_index].newest_sequence;
+            let ssrc = report.ssrc;
+            let floor = state.first_sequence;
+            let newest = state.newest_sequence;
+            let previous_timestamp = state.last_report_timestamp;
+            let old_edge = state.highest_acked_sequence;
             let Some(base) = unwrap_near(u64::from(report.begin_sequence), newest, 1 << 16) else {
                 self.add_unknown(report.statuses.len());
                 continue;
@@ -431,14 +432,9 @@ impl SentHistory {
                     .saturating_add(report.statuses.len() as u64);
                 continue;
             }
-            let timestamp = unwrap_near_signed(
-                i64::from(report_timestamp),
-                self.ssrcs[ssrc_index].last_report_timestamp,
-                1_i64 << 32,
-            );
-            let report_is_new = self.ssrcs[ssrc_index]
-                .last_report_timestamp
-                .is_none_or(|previous| timestamp > previous);
+            let timestamp =
+                unwrap_near_signed(i64::from(report_timestamp), previous_timestamp, 1_i64 << 32);
+            let report_is_new = previous_timestamp.is_none_or(|previous| timestamp > previous);
             let report_micros = timestamp.saturating_mul(1_000_000) / 65_536;
             let mut normalized = Vec::with_capacity(report.statuses.len());
             for status in &report.statuses {
@@ -479,7 +475,7 @@ impl SentHistory {
                 base.saturating_add(offset as u64) >= floor
                     && status.0
                     && self
-                        .lookup_rtp(ssrc_index, base.saturating_add(offset as u64))
+                        .lookup_rtp(ssrc, base.saturating_add(offset as u64))
                         .and_then(|id| self.entry(id))
                         .is_some_and(|entry| {
                             self.recovery_is_fresh(entry, received_at, report_is_new)
@@ -487,11 +483,10 @@ impl SentHistory {
             });
             let has_nonterminal = !report.statuses.is_empty()
                 && (base.max(floor)..=last_reported).any(|sequence| {
-                    self.lookup_rtp(ssrc_index, sequence)
+                    self.lookup_rtp(ssrc, sequence)
                         .and_then(|id| self.entry(id))
                         .is_some_and(|entry| self.is_live_feedback_entry(entry, received_at))
                 });
-            let old_edge = self.ssrcs[ssrc_index].highest_acked_sequence;
             let received_edge = normalized
                 .iter()
                 .enumerate()
@@ -509,7 +504,7 @@ impl SentHistory {
                 }
                 let unresolved_reported = (base.max(floor)..=last_reported)
                     .filter(|&sequence| {
-                        self.lookup_rtp(ssrc_index, sequence)
+                        self.lookup_rtp(ssrc, sequence)
                             .and_then(|id| self.entry(id))
                             .is_none_or(|entry| entry.path_epoch != epoch)
                     })
@@ -517,7 +512,7 @@ impl SentHistory {
                 let unresolved_advance = if received_edge.is_some_and(|edge| edge >= start) {
                     (start..base.min(edge.saturating_add(1)))
                         .filter(|&sequence| {
-                            self.lookup_rtp(ssrc_index, sequence)
+                            self.lookup_rtp(ssrc, sequence)
                                 .and_then(|id| self.entry(id))
                                 .is_none_or(|entry| entry.path_epoch != epoch)
                         })
@@ -533,7 +528,7 @@ impl SentHistory {
                     if *received
                         && let Some(hold) = hold
                         && self
-                            .lookup_rtp(ssrc_index, base.saturating_add(offset as u64))
+                            .lookup_rtp(ssrc, base.saturating_add(offset as u64))
                             .and_then(|id| self.entry(id))
                             .is_some_and(|entry| {
                                 self.is_live_feedback_entry(entry, received_at)
@@ -546,7 +541,7 @@ impl SentHistory {
                 if received_edge.is_some() && edge >= start {
                     self.anchor_missing(None, Some((report.ssrc, edge)), received_at);
                     for sequence in start..=edge {
-                        let sent_id = self.lookup_rtp(ssrc_index, sequence);
+                        let sent_id = self.lookup_rtp(ssrc, sequence);
                         let offset = sequence
                             .checked_sub(base)
                             .and_then(|value| usize::try_from(value).ok());
@@ -556,23 +551,26 @@ impl SentHistory {
                             .unwrap_or((false, None, None, None));
                         self.advance_entry(sent_id, epoch, received, arrival, ecn, received_at);
                     }
-                    self.ssrcs[ssrc_index].highest_acked_sequence = Some(edge);
+                    if let Some(state) = self.ssrcs.get_mut(&ssrc) {
+                        state.highest_acked_sequence = Some(edge);
+                    }
                 }
             }
             let fresh = (has_nonterminal || late_receipt) && (report_is_new || late_receipt);
             self.inputs.fresh_network_feedback |= fresh;
-            if self.ssrcs[ssrc_index]
-                .last_report_timestamp
-                .is_none_or(|previous| timestamp >= previous)
+            if let Some(state) = self.ssrcs.get_mut(&ssrc)
+                && state
+                    .last_report_timestamp
+                    .is_none_or(|previous| timestamp >= previous)
             {
-                self.ssrcs[ssrc_index].last_report_timestamp = Some(timestamp);
+                state.last_report_timestamp = Some(timestamp);
             }
             for (offset, (received, arrival, ecn, _)) in normalized.iter().copied().enumerate() {
                 let sequence = base.saturating_add(offset as u64);
                 if sequence < floor {
                     continue;
                 }
-                let sent_id = self.lookup_rtp(ssrc_index, sequence);
+                let sent_id = self.lookup_rtp(ssrc, sequence);
                 if !received {
                     if let Some(sent_id) = sent_id {
                         self.set_missing(sent_id, received_at);
@@ -647,6 +645,13 @@ impl SentHistory {
             self.mark_lost(sent_id, LossOrigin::HistoryExpiry);
             return;
         }
+        if !received
+            && entry.acknowledgment == Acknowledgment::Pending
+            && self.reserve_missing_slot().is_none()
+        {
+            self.inputs.exhausted = true;
+            return;
+        }
         self.retire_from_flight(sent_id);
         if received {
             if self
@@ -660,6 +665,9 @@ impl SentHistory {
             self.set_received(sent_id, true, receiver_arrival, ecn, received_at);
         } else {
             self.set_missing(sent_id, received_at);
+            if self.inputs.exhausted {
+                return;
+            }
             self.emit(sent_id, false, true, None, None, None);
         }
     }
@@ -814,24 +822,26 @@ impl SentHistory {
     }
 
     pub(super) fn set_missing(&mut self, sent_id: SentPacketId, now: Instant) {
+        if !self
+            .entry(sent_id)
+            .is_some_and(|entry| entry.acknowledgment == Acknowledgment::Pending)
+        {
+            return;
+        }
+        if self.reserve_missing_slot().is_none() {
+            self.inputs.exhausted = true;
+            return;
+        }
         let Some(entry) = self.entry_mut(sent_id) else {
             return;
         };
-        match entry.acknowledgment {
-            Acknowledgment::Pending => {
-                entry.acknowledgment = Acknowledgment::Missing {
-                    since: now,
-                    higher_received_at: None,
-                };
-                entry.missing_since = Some(now);
-                self.missing.push_back(sent_id);
-                self.emit_observed(sent_id, false, false, None, None, None, Some(now));
-            }
-            Acknowledgment::Missing { .. }
-            | Acknowledgment::Received
-            | Acknowledgment::Lost
-            | Acknowledgment::Retired => {}
-        }
+        entry.acknowledgment = Acknowledgment::Missing {
+            since: now,
+            higher_received_at: None,
+        };
+        entry.missing_since = Some(now);
+        self.missing.push_back(sent_id);
+        self.emit_observed(sent_id, false, false, None, None, None, Some(now));
     }
 
     pub(super) fn confirm_losses(&mut self, now: Instant, limit: usize) -> usize {
@@ -958,6 +968,13 @@ impl SentHistory {
             previous.newly_acked = true;
             return;
         }
+        if self.entry(sent_id).is_none() {
+            return;
+        }
+        if loss_origin.is_none() && self.reserve_feedback_slot().is_none() {
+            self.inputs.exhausted = true;
+            return;
+        }
         // Native TWCC PacketResults leave loss/recovery flags unset. Only CCFB
         // qualifies provisional receiver loss for SCReAM; ledger loss is separate.
         let reports_controller_loss = self.mode == Some(PacketFeedbackKind::Rfc8888);
@@ -997,10 +1014,8 @@ impl SentHistory {
             } else {
                 self.inputs.exhausted = true;
             }
-        } else if self.inputs.feedback.len() < MAX_FEEDBACK_STATUSES {
-            self.inputs.feedback.push(sample);
         } else {
-            self.inputs.exhausted = true;
+            self.inputs.feedback.push(sample);
         }
     }
 
@@ -1010,20 +1025,10 @@ impl SentHistory {
             .map(|index| index.sent_id)
     }
 
-    fn lookup_rtp(&self, ssrc_index: usize, sequence: u64) -> Option<SentPacketId> {
-        let ids = &self.ssrcs[ssrc_index].sent_ids;
-        let mut low = 0;
-        let mut high = ids.len();
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let id = *ids.get(middle)?;
-            let entry = self.entry(id)?;
-            match entry.rtp_sequence.cmp(&sequence) {
-                std::cmp::Ordering::Less => low = middle + 1,
-                std::cmp::Ordering::Greater => high = middle,
-                std::cmp::Ordering::Equal => return Some(id),
-            }
-        }
-        None
+    fn lookup_rtp(&self, ssrc: u32, sequence: u64) -> Option<SentPacketId> {
+        let id = *self.ssrcs.get(&ssrc)?.by_sequence.get(&sequence)?;
+        self.entry(id)
+            .filter(|entry| entry.ssrc == ssrc && entry.rtp_sequence == sequence)
+            .map(|_| id)
     }
 }

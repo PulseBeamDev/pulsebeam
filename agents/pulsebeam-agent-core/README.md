@@ -21,25 +21,25 @@ SANS-I/O PulseBeam client agent.
 ## Receive policy support
 
 Use adaptive audio playout with the stock native and browser WebRTC profiles.
-They do not negotiate the audio RTP playout-delay extension, so per-track or
-selector-resolved fixed audio policies are rejected as `UNSUPPORTED_INTENT`.
-The existing `ServerError` notification reports the rejection; accepted media
-state stays live and its revision does not advance. Application-owned desired
-state is not rewritten: submit a supported replacement before reconnecting or
-changing other parts of that complete intent.
+They do not negotiate the audio RTP playout-delay extension. The native resource
+receiver rejects fixed audio with `FailureCode::Unsupported`; it does not use a
+receiver-local minimum-delay setter as a substitute for the full
+`Fixed { min_ms, max_ms }` interval.
 
-The native receiver-local minimum-delay setter cannot enforce the full
-`Fixed { min_ms, max_ms }` interval and is not used as a substitute. Fixed video
-playout remains supported through its negotiated extension. A receiver that
-actually negotiates audio playout-delay on every provisioned audio receiver can
-use the corresponding wire policy.
+Native StateBatch evaluates each resource independently. A rejected target does
+not replace its previously accepted resource or roll back unrelated resources.
+Application-owned desired state is not rewritten. The full-profile native
+cutover is still under integration: wire representation alone does not qualify
+fixed video or the other remaining runtime behaviors.
 
 ## RTC bootstrap
 
 Core requests the Native control channel on externally negotiated physical SCTP
 stream 0, reliable and ordered. Both platform hosts apply the specification and
-check the actual channel configuration before returning offer resources. Topic
-channels remain in-band. `DataChannelSpec.negotiated_id` is a physical stream ID,
+check the actual channel configuration before returning offer resources. Native
+topic payload channels also use externally negotiated, nonzero streams with
+resource-owned bindings. Core allocates those stream identities without reuse
+within a connection. `DataChannelSpec.negotiated_id` is a physical stream ID,
 separate from the logical `ChannelId` used for host callbacks.
 
 ## Track resources
@@ -54,9 +54,10 @@ replacement owner's resource.
 
 `Agent::resource` applies owned declarations through the existing reconciler,
 independently of the revisioned slot-based desired state. Resource-owned sender
-slots become reusable on release; legacy native slot-label bindings retain their
-existing lifetime. Slot-based intent cannot replace a live owned publication or
-video presentation.
+slots become reusable after retirement. Relabeling a publication replaces its
+owned resource and physical binding rather than retaining a permanent
+slot-to-label association. Slot-based intent cannot replace a live owned
+publication or video presentation.
 
 The resource model projects publication intents, shared video demand, and topic
 registrations. Feed its receive queues only validated,
@@ -170,6 +171,30 @@ identities remain unavailable. Receive identities are allocated
 without collisions across the context's bounded history, including cancelled
 candidates.
 
+Individual descriptions and generated answers are limited to 1 MiB, with
+additional line bounds. There is no separate whole-description section or
+aggregate encoding count ceiling. Preparation/adoption requests must fit the
+actual description's media count; sender observations must match the accepted
+encoding count before copying. The executor allows at most 32 unfinished operations and 2 MiB of retained
+request payloads. It charges per-work headers, actual request vector capacity
+and owned string capacities. Backing is checked before building validation
+indexes; allocation and retirement batches have no separate item-count ceiling.
+Requests still lower against actual sections and slots in the bounded SDP.
+Host staging, platform allocations and allocator overhead are outside this
+payload allowance; it is not an RSS bound or proof of physical platform scale.
+Full-profile scalability is not yet qualified.
+
+`Limits::max_identity_bytes` bounds retained identity payloads (1 MiB by default),
+replacing the former identity count quota and validation maximum. It charges
+issued-ID/retired-flag tuple payloads and sender MID/RID/primary-or-repair ownership
+records, including owned string capacities. Allocator/tree-node overhead and
+temporary staging are excluded; this is not a total-memory or RSS bound. The
+retirement flag is prepaid at admission. Terminal retirement releases sender
+ownership payloads but never forgets the issued ID or terminal veto. Sender
+observation batches preflight incremental guard and ownership charges before
+committing any reservations or accepted facts. Exhaustion rejects new work
+without evicting safety history; failed/cancelled candidates retain issued IDs.
+
 An RID-only publication is not ready for admission: `Binding::complete()` stays
 false until the host passes actual sender encodings to
 `context.observe_sender(mid, &encodings, &rtcp)` after successful application.
@@ -206,18 +231,21 @@ The repository gates are `./bazel test //:check` and `./bazel test //:test`.
 
 ## Ordered subscription recovery
 
-Ordered subscriptions wait for an internal, subscription-lifetime seed
-completion covering a committed Catalog revision. A temporary empty Catalog
-during reconnect is truthful discovery state, not publication retirement.
-While seeding, Core retains only the previous completed frontiers and gates
-ordered probes and delivery. Completion removes genuinely absent IDs and resumes
-same-publication recovery. New IDs start live without inheriting old cursors.
+A temporary empty discovery view during reconnect does not establish
+publication retirement. Transport replacement clears queued payloads while
+retaining frontiers for still-owned logical subscriptions. Unsubscribe and
+session close release frontiers. New source IDs start live without inheriting
+another source's cursor; ordered gaps keep their bounded-history semantics.
 
-Transport replacement clears queued payloads and retires seed tokens.
-Unsubscribe and session close immediately release frontiers. Late completion for
-a known retired token is harmless and cannot reconstruct its subscription or
-frontiers; unknown tokens remain protocol errors. A connected seed
-that does not complete within 30 seconds triggers connection recovery. Retrying
-incomplete seeds cannot accumulate publication frontiers. Applications do not
-manage seed tokens or wire cursors; ordered gaps retain their normal bounded
-history semantics.
+Native StateBatch does not implement the legacy Catalog revision or
+`SubscriptionSeed` completion protocol. Its `initial_complete` marker describes
+initial discovery enumeration, not a source-lifetime or recovery barrier.
+Core replays retained registration/source frontiers on fresh payload bindings,
+without waiting for discovery to replay. Only current eligible owned source
+confirmations make those channels routable and permit recovery probes. Physical
+detach retains an owned frontier; authoritative source end releases it. An
+unknown-source timeout is not source termination.
+
+Focused owner and public same-identity recovery checks cover this path, but do
+not establish full-profile runtime qualification. Applications do not manage
+internal ownership generations or wire cursors.

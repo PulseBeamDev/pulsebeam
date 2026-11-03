@@ -60,14 +60,7 @@ fn main() {
         .file_descriptor_set_path(out_dir.join("state-descriptors.bin"))
         .boxed(".pulsebeam.media.v1.DesiredState.value.present")
         .boxed(".pulsebeam.media.v1.ConfirmedState.value.owned")
-        .compile_protos(
-            &[
-                "proto/signaling.proto",
-                "proto/state.proto",
-                "proto/topic.proto",
-            ],
-            &["proto"],
-        )
+        .compile_protos(&["proto/state.proto", "proto/topic.proto"], &["proto"])
         .expect("Failed to compile .proto files");
 
     let descriptor_bytes = std::fs::read(out_dir.join("state-descriptors.bin"))

@@ -120,36 +120,43 @@ impl NativeSource {
                 return Err(native(error));
             }
         };
-        let sender = session.sender(transceiver)?;
-        let media_type = match kind {
-            SourceKind::Audio(_) => rtc::MediaType::Audio,
-            SourceKind::Video(_) => rtc::MediaType::Video,
-        };
-        let capabilities = session.get_rtp_sender_capabilities(media_type)?;
-        let codecs: Vec<_> = capabilities
-            .codecs()
-            .into_iter()
-            .filter(|codec| {
-                let name = codec.base_codec().name_bytes();
-                match kind {
-                    SourceKind::Audio(_) => name.eq_ignore_ascii_case(b"opus"),
-                    SourceKind::Video(_) => {
-                        name.eq_ignore_ascii_case(b"H264") || name.eq_ignore_ascii_case(b"rtx")
+        let initialized = (|| {
+            let sender = session.sender(transceiver)?;
+            let media_type = match kind {
+                SourceKind::Audio(_) => rtc::MediaType::Audio,
+                SourceKind::Video(_) => rtc::MediaType::Video,
+            };
+            let capabilities = session.get_rtp_sender_capabilities(media_type)?;
+            let codecs: Vec<_> = capabilities
+                .codecs()
+                .into_iter()
+                .filter(|codec| {
+                    let name = codec.base_codec().name_bytes();
+                    match kind {
+                        SourceKind::Audio(_) => name.eq_ignore_ascii_case(b"opus"),
+                        SourceKind::Video(_) => {
+                            name.eq_ignore_ascii_case(b"H264") || name.eq_ignore_ascii_case(b"rtx")
+                        }
                     }
-                }
+                })
+                .collect();
+            session
+                .set_rtp_codec_preferences(transceiver, &codecs)
+                .map_err(native)?;
+            Ok(Self {
+                id,
+                sender,
+                transceiver,
+                kind,
+                encodings: video.encodings.clone(),
+                active: true,
             })
-            .collect();
-        session
-            .set_rtp_codec_preferences(transceiver, &codecs)
-            .map_err(native)?;
-        Ok(Self {
-            id,
-            sender,
-            transceiver,
-            kind,
-            encodings: video.encodings.clone(),
-            active: true,
-        })
+        })();
+        if initialized.is_err() {
+            let _ = session.stop_standard(transceiver);
+            let _ = session.close_source(id);
+        }
+        initialized
     }
 
     fn allocate<R: rtc::SessionRuntime>(
@@ -194,6 +201,13 @@ impl NativeSource {
             SourceKind::Video(_) => session.replace_video_source(self.sender, Some(id), track_id),
         };
         if let Err(error) = replaced {
+            tracing::warn!(
+                ?error,
+                kind = ?self.kind,
+                transceiver = ?self.transceiver,
+                stopped = ?session.transceiver_stopped(self.transceiver),
+                "native source replacement rejected"
+            );
             session.close_source(id)?;
             return Err(error);
         }
@@ -416,13 +430,18 @@ impl NativeSource {
         &mut self,
         session: &mut rtc::Session<R>,
     ) -> Result<(), rtc::PeerError> {
-        match self.kind {
-            SourceKind::Audio(_) => session.replace_audio_source(self.sender, None, "")?,
-            SourceKind::Video(_) => session.replace_video_source(self.sender, None, "")?,
+        if session.transceiver_stopped(self.transceiver)? {
+            session.close_source(self.id)?;
+            self.active = false;
+            return Ok(());
         }
-        session.close_source(self.id)?;
+        let detached = match self.kind {
+            SourceKind::Audio(_) => session.replace_audio_source(self.sender, None, ""),
+            SourceKind::Video(_) => session.replace_video_source(self.sender, None, ""),
+        };
+        let closed = session.close_source(self.id);
         self.active = false;
-        Ok(())
+        detached.and(closed)
     }
 }
 
