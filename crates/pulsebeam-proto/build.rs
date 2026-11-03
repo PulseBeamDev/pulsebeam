@@ -68,6 +68,7 @@ fn main() {
         .register_descriptors(&descriptor_bytes)
         .expect("capability descriptors are valid")
         .preserve_proto_field_names()
+        .ignore_unknown_fields()
         .build(&prefixes)
         .expect("Failed to generate capability ProtoJSON");
 

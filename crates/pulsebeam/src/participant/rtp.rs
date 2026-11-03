@@ -12,50 +12,66 @@ pub(crate) fn capabilities() -> wire::RtpCapabilities {
     wire::RtpCapabilities {
         codecs: vec![
             wire::RtpCodecCapability {
-                format: Some(wire::CodecFormat {
-                    codec: Some(wire::codec_format::Codec::Opus(wire::OpusParameters {
+                format: Some(wire::CodecFormat::from(wire::codec_format::Codec::Opus(
+                    wire::OpusParameters {
                         min_packet_time_ms: Some(10),
                         in_band_fec: Some(true),
                         ..Default::default()
-                    })),
-                }),
-                feedback: vec![wire::RtcpFeedback::TransportCc as i32],
+                    },
+                ))),
+                feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()],
                 rtx_supported: false,
                 scalability_modes: vec![],
             },
             wire::RtpCodecCapability {
-                format: Some(wire::CodecFormat {
-                    codec: Some(wire::codec_format::Codec::H264(wire::H264Parameters {
+                format: Some(wire::CodecFormat::from(wire::codec_format::Codec::H264(
+                    wire::H264Parameters {
                         profile_level_id: Some(0x42e01f),
                         level_asymmetry_allowed: Some(true),
-                    })),
-                }),
+                    },
+                ))),
                 feedback: vec![
-                    wire::RtcpFeedback::TransportCc as i32,
-                    wire::RtcpFeedback::Nack as i32,
-                    wire::RtcpFeedback::NackPli as i32,
-                    wire::RtcpFeedback::CcmFir as i32,
+                    wire::RtcpFeedback::TransportCc.as_str().into(),
+                    wire::RtcpFeedback::Nack.as_str().into(),
+                    wire::RtcpFeedback::NackPli.as_str().into(),
+                    wire::RtcpFeedback::CcmFir.as_str().into(),
                 ],
                 rtx_supported: true,
                 scalability_modes: vec![
-                    wire::RtpScalabilityMode::L1t1 as i32,
-                    wire::RtpScalabilityMode::L1t3 as i32,
+                    wire::RtpScalabilityMode::L1t1.as_str().into(),
+                    wire::RtpScalabilityMode::L1t3.as_str().into(),
                 ],
             },
         ],
         header_extensions: vec![
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionMid as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionRid as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionRepairedRid as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01 as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionAudioLevel as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionVideoLayersAllocation as i32,
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionMid
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionRid
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionRepairedRid
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionAudioLevel
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionVideoLayersAllocation
+                .as_str()
+                .into(),
         ],
         rtcp_modes: vec![
-            wire::RtcpMode::Compound as i32,
-            wire::RtcpMode::ReducedSize as i32,
+            wire::RtcpMode::Compound.as_str().into(),
+            wire::RtcpMode::ReducedSize.as_str().into(),
         ],
     }
 }
@@ -86,7 +102,7 @@ pub(crate) fn transport_capabilities(
             codec.feedback = capability
                 .feedback
                 .iter()
-                .map(|feedback| feedback_name(*feedback).map(str::to_owned))
+                .map(|feedback| feedback_name(feedback).map(str::to_owned))
                 .collect::<Result<_, _>>()?;
             Ok(pulsebeam_rtc::RtpCodecCapability {
                 parameters: codec,
@@ -97,7 +113,7 @@ pub(crate) fn transport_capabilities(
     let extensions = capabilities
         .header_extensions
         .iter()
-        .map(|extension| extension_uri(*extension).map(str::to_owned))
+        .map(|extension| extension_uri(extension).map(str::to_owned))
         .collect::<Result<_, _>>()?;
     Ok(RtpCapabilities {
         codecs,
@@ -113,7 +129,7 @@ fn codec_parameters(
     let parameters =
         wire::sdp::codec_parameters(format).map_err(|_| RtpConfigurationError::Invalid)?;
     Ok(RtpCodecParameters {
-        name: parameters.name.into(),
+        name: parameters.name,
         clock_rate: parameters.clock_rate,
         channels: parameters.channels,
         fmtp: parameters.fmtp,
@@ -121,11 +137,11 @@ fn codec_parameters(
     })
 }
 
-fn feedback_name(value: i32) -> Result<&'static str, RtpConfigurationError> {
+fn feedback_name(value: &str) -> Result<&str, RtpConfigurationError> {
     wire::sdp::feedback_name(value).map_err(|_| RtpConfigurationError::Invalid)
 }
 
-fn extension_uri(value: i32) -> Result<&'static str, RtpConfigurationError> {
+fn extension_uri(value: &str) -> Result<&str, RtpConfigurationError> {
     wire::sdp::extension_uri(value).map_err(|_| RtpConfigurationError::Invalid)
 }
 
@@ -180,7 +196,10 @@ fn binding(
     } else {
         wire::RtcpMode::Compound
     };
-    if !capabilities.rtcp_modes.contains(&(mode as i32))
+    if !capabilities
+        .rtcp_modes
+        .iter()
+        .any(|value| value == mode.as_str())
         || codec.rtx_payload_type.is_some() && !capability.rtx_supported
         || codec
             .feedback
@@ -189,11 +208,12 @@ fn binding(
         || parameters
             .header_extensions
             .iter()
-            .any(|extension| !capabilities.header_extensions.contains(&extension.r#type))
+            .any(|extension| !capabilities.header_extensions.contains(&extension.uri))
         || parameters.encodings.iter().any(|encoding| {
             encoding
                 .scalability_mode
-                .is_some_and(|mode| !capability.scalability_modes.contains(&mode))
+                .as_ref()
+                .is_some_and(|mode| !capability.scalability_modes.contains(mode))
         })
     {
         return Err(Failure::Unsupported);
@@ -202,7 +222,7 @@ fn binding(
     selected.feedback = codec
         .feedback
         .iter()
-        .map(|value| feedback_name(*value).map(str::to_owned))
+        .map(|value| feedback_name(value).map(str::to_owned))
         .collect::<Result<_, _>>()
         .map_err(failure_code)?;
     Ok(pulsebeam_rtc::RtpBinding {
@@ -232,7 +252,7 @@ fn binding(
             .map(|extension| {
                 Ok(pulsebeam_rtc::RtpExtensionMapping {
                     id: u8::try_from(extension.id).map_err(|_| Failure::InvalidConfiguration)?,
-                    uri: extension_uri(extension.r#type)
+                    uri: extension_uri(&extension.uri)
                         .map_err(failure_code)?
                         .to_owned(),
                 })
@@ -288,7 +308,7 @@ mod tests {
                     codec
                         .format
                         .as_ref()
-                        .and_then(|format| format.codec.as_ref()),
+                        .and_then(wire::CodecFormat::known_codec),
                     Some(wire::codec_format::Codec::H264(_))
                 )
             })
@@ -296,13 +316,17 @@ mod tests {
         assert_eq!(
             default_h264.scalability_modes,
             [
-                wire::RtpScalabilityMode::L1t1 as i32,
-                wire::RtpScalabilityMode::L1t3 as i32,
+                wire::RtpScalabilityMode::L1t1.as_str(),
+                wire::RtpScalabilityMode::L1t3.as_str(),
             ]
         );
-        assert!(defaults.header_extensions.contains(
-            &(wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor as i32)
-        ));
+        assert!(
+            defaults.header_extensions.contains(
+                &(wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor
+                    .as_str()
+                    .into())
+            )
+        );
         let opus = wire::codec_format::Codec::Opus(wire::OpusParameters {
             stereo: Some(false),
             source_stereo: Some(false),
@@ -314,7 +338,7 @@ mod tests {
             max_capture_rate_hz: Some(48000),
             min_packet_time_ms: Some(10),
         });
-        let opus = wire::CodecFormat { codec: Some(opus) };
+        let opus = wire::CodecFormat::from(opus);
         let opus_parameters = codec_parameters(&opus).unwrap();
         assert_eq!(opus_parameters.clock_rate, 48000);
         assert_eq!(opus_parameters.channels, Some(2));
@@ -336,39 +360,36 @@ mod tests {
         }
         let formats = [
             opus,
-            wire::CodecFormat {
-                codec: Some(wire::codec_format::Codec::H264(wire::H264Parameters {
-                    profile_level_id: Some(0x42e01f),
-                    level_asymmetry_allowed: Some(true),
-                })),
-            },
-            wire::CodecFormat {
-                codec: Some(wire::codec_format::Codec::Vp8(wire::Vp8Parameters {})),
-            },
-            wire::CodecFormat {
-                codec: Some(wire::codec_format::Codec::Vp9(wire::Vp9Parameters {
-                    profile_id: Some(2),
-                })),
-            },
+            wire::CodecFormat::from(wire::codec_format::Codec::H264(wire::H264Parameters {
+                profile_level_id: Some(0x42e01f),
+                level_asymmetry_allowed: Some(true),
+            })),
+            wire::CodecFormat::from(wire::codec_format::Codec::Vp8(wire::Vp8Parameters {})),
+            wire::CodecFormat::from(wire::codec_format::Codec::Vp9(wire::Vp9Parameters {
+                profile_id: Some(2),
+            })),
         ];
         let caps = wire::RtpCapabilities {
             codecs: formats
                 .into_iter()
                 .map(|format| {
                     let rtx_supported = matches!(
-                        format.codec.as_ref(),
+                        format.known_codec(),
                         Some(wire::codec_format::Codec::Vp8(_))
                     );
                     wire::RtpCodecCapability {
                         format: Some(format),
-                        feedback: vec![wire::RtcpFeedback::TransportCc as i32],
+                        feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()],
                         rtx_supported,
                         scalability_modes: vec![],
                     }
                 })
                 .collect(),
-            header_extensions: (1..=8).collect(),
-            rtcp_modes: vec![1, 2],
+            header_extensions: capabilities().header_extensions,
+            rtcp_modes: vec![
+                wire::RtcpMode::Compound.into(),
+                wire::RtcpMode::ReducedSize.into(),
+            ],
         };
         let mut accepted = crate::control::application_only_test_connection();
         initialize(&mut accepted.connection, &caps).unwrap();
@@ -492,7 +513,7 @@ mod tests {
         assert_eq!(configured.as_ref().unwrap().inbound.len(), 2);
         assert!(configured.as_ref().unwrap().inbound.contains(&permitted));
         let mut invalid = caps;
-        invalid.header_extensions.push(0);
+        invalid.header_extensions.push(String::new());
         assert_eq!(
             initialize(&mut accepted.connection, &invalid),
             Err(RtpConfigurationError::Invalid)

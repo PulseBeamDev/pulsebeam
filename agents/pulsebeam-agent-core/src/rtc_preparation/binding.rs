@@ -40,7 +40,11 @@ pub(super) fn prepared_rtp_binding(
     } else {
         wire::RtcpMode::Compound
     };
-    if !capabilities.rtcp_modes.contains(&(mode as i32)) {
+    if !capabilities
+        .rtcp_modes
+        .iter()
+        .any(|value| value == mode.as_str())
+    {
         return Err(Error::Envelope("RTCP mode".into()));
     }
     let feedback = binding
@@ -52,8 +56,8 @@ pub(super) fn prepared_rtp_binding(
             capability
                 .feedback
                 .iter()
-                .copied()
-                .find(|value| sdp::feedback_name(*value) == Ok(name.as_str()))
+                .find(|value| sdp::feedback_name(value) == Ok(name.as_str()))
+                .cloned()
                 .ok_or_else(|| Error::Envelope("RTCP feedback".into()))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -64,11 +68,11 @@ pub(super) fn prepared_rtp_binding(
             let kind = capabilities
                 .header_extensions
                 .iter()
-                .copied()
-                .find(|value| sdp::extension_uri(*value) == Ok(extension.uri.as_str()))
+                .find(|value| sdp::extension_uri(value) == Ok(extension.uri.as_str()))
+                .cloned()
                 .ok_or_else(|| Error::Envelope("RTP extension".into()))?;
             Ok(wire::RtpHeaderExtensionParameters {
-                r#type: kind,
+                uri: kind,
                 id: u32::from(extension.id),
             })
         })
@@ -82,16 +86,10 @@ pub(super) fn prepared_rtp_binding(
                 .scalability_mode
                 .as_deref()
                 .map(|name| {
-                    let mode = match name {
-                        "L1T1" => wire::RtpScalabilityMode::L1t1,
-                        "L1T2" => wire::RtpScalabilityMode::L1t2,
-                        "L1T3" => wire::RtpScalabilityMode::L1t3,
-                        _ => return Err(Error::Envelope("scalability mode".into())),
-                    } as i32;
-                    if !capability.scalability_modes.contains(&mode) {
+                    if !capability.scalability_modes.iter().any(|mode| mode == name) {
                         return Err(Error::Envelope("scalability mode".into()));
                     }
-                    Ok(mode)
+                    Ok(alloc::string::String::from(name))
                 })
                 .transpose()?;
             Ok(wire::RtpEncodingParameters {
@@ -112,7 +110,7 @@ pub(super) fn prepared_rtp_binding(
                 .as_ref()
                 .map(|repair| u32::from(repair.payload_type)),
             feedback,
-            format: capability.format,
+            format: capability.format.clone(),
         }),
         header_extensions,
         encodings,

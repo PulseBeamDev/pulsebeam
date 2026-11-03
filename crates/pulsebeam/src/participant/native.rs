@@ -1114,19 +1114,17 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
         participant_id: identity.clone(),
         participant_external_id: diagnostic.clone(),
     };
-    let format = wire::CodecFormat {
-        codec: Some(wire::codec_format::Codec::Opus(wire::OpusParameters {
-            stereo: Some(true),
-            source_stereo: Some(true),
-            in_band_fec: Some(true),
-            dtx: Some(true),
-            constant_bitrate: Some(true),
-            max_average_bitrate_bps: Some(510000),
-            max_playback_rate_hz: Some(48000),
-            max_capture_rate_hz: Some(48000),
-            min_packet_time_ms: Some(120),
-        })),
-    };
+    let format = wire::CodecFormat::from(wire::codec_format::Codec::Opus(wire::OpusParameters {
+        stereo: Some(true),
+        source_stereo: Some(true),
+        in_band_fec: Some(true),
+        dtx: Some(true),
+        constant_bitrate: Some(true),
+        max_average_bitrate_bps: Some(510000),
+        max_playback_rate_hz: Some(48000),
+        max_capture_rate_hz: Some(48000),
+        min_packet_time_ms: Some(120),
+    }));
     let track = wire::Track {
         track_id: identity.clone(),
         participant_id: identity,
@@ -1190,10 +1188,10 @@ pub(crate) fn track_descriptor(track: &crate::track::Track) -> Option<wire::Trac
     use crate::track::{DataLane, Track};
     let kind = match track {
         Track::Audio(audio) => wire::track::Kind::Audio(wire::AudioTrack {
-            format: Some(audio.format?),
+            format: Some(audio.format.clone()?),
         }),
         Track::Video(video) => wire::track::Kind::Video(wire::VideoTrack {
-            format: Some(video.format?),
+            format: Some(video.format.clone()?),
         }),
         Track::Data(data) => wire::track::Kind::Data(wire::DataTrack {
             delivery: match data.lane {

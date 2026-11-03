@@ -14,12 +14,10 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         MediaSlot::RemoteAudio(256),
     ] {
         let (mut agent, generation, _) = connected(crate::TopicRegistrations::default());
-        let format = state::CodecFormat {
-            codec: Some(match slot.kind() {
-                crate::MediaKind::Video => state::codec_format::Codec::Vp8(Default::default()),
-                crate::MediaKind::Audio => state::codec_format::Codec::Opus(Default::default()),
-            }),
-        };
+        let format = state::CodecFormat::from(match slot.kind() {
+            crate::MediaKind::Video => state::codec_format::Codec::Vp8(Default::default()),
+            crate::MediaKind::Audio => state::codec_format::Codec::Opus(Default::default()),
+        });
         let receiving = slot.direction() == crate::MediaDirection::ReceiveOnly;
         let requested_format = receiving.then_some(format.clone());
         let want = |label: &str| MediaWant {
@@ -233,9 +231,9 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                         participant_id: "remote".into(),
                         label: "voice".into(),
                         kind: Some(state::track::Kind::Audio(state::AudioTrack {
-                            format: Some(state::CodecFormat {
-                                codec: Some(state::codec_format::Codec::Opus(Default::default())),
-                            }),
+                            format: Some(state::CodecFormat::from(
+                                state::codec_format::Codec::Opus(Default::default()),
+                            )),
                         })),
                     }),
                 )
@@ -923,9 +921,9 @@ fn selectors_do_not_choose_a_source_from_ambiguous_labels() {
         participant_id: participant.participant_id.clone(),
         label: "camera".into(),
         kind: Some(state::track::Kind::Video(state::VideoTrack {
-            format: Some(state::CodecFormat {
-                codec: Some(state::codec_format::Codec::Vp8(state::Vp8Parameters {})),
-            }),
+            format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
+                state::Vp8Parameters {},
+            ))),
         })),
     };
     let mut other = track.clone();

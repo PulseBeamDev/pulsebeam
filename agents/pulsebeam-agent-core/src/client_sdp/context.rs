@@ -444,7 +444,7 @@ impl Context {
                 .iter()
                 .filter(|codec| {
                     expected.as_ref().is_none_or(|expected| {
-                        codec.parameters.name.eq_ignore_ascii_case(expected.name)
+                        codec.parameters.name.eq_ignore_ascii_case(&expected.name)
                             && codec.parameters.clock_rate == expected.clock_rate
                             && codec.parameters.channels == expected.channels
                             && codec.parameters.fmtp == expected.fmtp

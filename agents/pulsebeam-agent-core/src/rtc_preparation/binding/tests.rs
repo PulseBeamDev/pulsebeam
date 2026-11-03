@@ -14,22 +14,28 @@ pub(crate) fn fixture(format: wire::CodecFormat) -> (Binding, wire::RtpCapabilit
     let audio = parameters.channels.is_some();
     let capability = wire::RtpCodecCapability {
         format: Some(format),
-        feedback: vec![wire::RtcpFeedback::TransportCc as i32],
+        feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()],
         rtx_supported: !audio,
         scalability_modes: if audio {
             vec![]
         } else {
-            vec![wire::RtpScalabilityMode::L1t1 as i32]
+            vec![wire::RtpScalabilityMode::L1t1.as_str().into()]
         },
     };
     let capabilities = wire::RtpCapabilities {
         codecs: vec![capability],
         header_extensions: vec![
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionMid as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01 as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionVideoLayersAllocation as i32,
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionMid
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionVideoLayersAllocation
+                .as_str()
+                .into(),
         ],
-        rtcp_modes: vec![wire::RtcpMode::Compound as i32],
+        rtcp_modes: vec![wire::RtcpMode::Compound.as_str().into()],
     };
     let binding = Binding {
         key: MediaKey("source".into()),
@@ -39,7 +45,7 @@ pub(crate) fn fixture(format: wire::CodecFormat) -> (Binding, wire::RtpCapabilit
         codec: Codec {
             payload_type: 0,
             parameters: CodecParameters {
-                name: parameters.name.into(),
+                name: parameters.name,
                 clock_rate: parameters.clock_rate,
                 channels: parameters.channels,
                 fmtp: parameters.fmtp,
@@ -60,7 +66,7 @@ pub(crate) fn fixture(format: wire::CodecFormat) -> (Binding, wire::RtpCapabilit
                 } else {
                     (19 + index).try_into().unwrap()
                 },
-                uri: sdp::extension_uri(*kind).unwrap().into(),
+                uri: sdp::extension_uri(kind).unwrap().into(),
                 direction: Direction::SendRecv,
             })
             .collect(),
@@ -80,9 +86,7 @@ pub(crate) fn fixture(format: wire::CodecFormat) -> (Binding, wire::RtpCapabilit
 }
 
 fn video() -> wire::CodecFormat {
-    wire::CodecFormat {
-        codec: Some(wire::codec_format::Codec::Vp8(wire::Vp8Parameters {})),
-    }
+    wire::CodecFormat::from(wire::codec_format::Codec::Vp8(wire::Vp8Parameters {}))
 }
 
 #[test]
@@ -105,8 +109,8 @@ fn actual_envelope_recovery_preserves_format_presence_zero_and_extension_ids() {
             profile_id: Some(2),
         }),
     ] {
-        let format = wire::CodecFormat { codec: Some(codec) };
-        let (binding, capabilities) = fixture(format);
+        let format = wire::CodecFormat::from(codec);
+        let (binding, capabilities) = fixture(format.clone());
         let actual = prepared_rtp_binding(&binding, &capabilities, true).unwrap();
         let Some(wire::track_binding::Transport::Rtp(actual)) = actual.transport else {
             panic!("RTP expected");
@@ -210,7 +214,7 @@ fn missing_or_unrepresentable_facts_are_not_defaulted_or_dropped() {
     };
     assert_eq!(
         actual.encodings[0].scalability_mode,
-        Some(wire::RtpScalabilityMode::L1t1 as i32)
+        Some(wire::RtpScalabilityMode::L1t1.as_str().into())
     );
 }
 

@@ -1992,11 +1992,9 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
                             participant_id: "publisher".into(),
                             label: "camera".into(),
                             kind: Some(state::track::Kind::Video(state::VideoTrack {
-                                format: Some(state::CodecFormat {
-                                    codec: Some(state::codec_format::Codec::Vp8(
-                                        state::Vp8Parameters {},
-                                    )),
-                                }),
+                                format: Some(state::CodecFormat::from(
+                                    state::codec_format::Codec::Vp8(state::Vp8Parameters {}),
+                                )),
                             })),
                         }),
                     ),
@@ -3145,9 +3143,9 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
                     participant_id: "remote".into(),
                     label: "camera".into(),
                     kind: Some(state::track::Kind::Video(state::VideoTrack {
-                        format: Some(state::CodecFormat {
-                            codec: Some(state::codec_format::Codec::Vp8(state::Vp8Parameters {})),
-                        }),
+                        format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
+                            state::Vp8Parameters {},
+                        ))),
                     })),
                 }),
             ),

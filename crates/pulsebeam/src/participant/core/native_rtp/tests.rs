@@ -6,11 +6,9 @@ use crate::participant::core::native_data::tests::{
 use crate::participant::event::test_utils::MockParticipantSink;
 
 fn opus() -> wire::CodecFormat {
-    wire::CodecFormat {
-        codec: Some(wire::codec_format::Codec::Opus(
-            wire::OpusParameters::default(),
-        )),
-    }
+    wire::CodecFormat::from(wire::codec_format::Codec::Opus(
+        wire::OpusParameters::default(),
+    ))
 }
 
 fn capabilities() -> wire::RtpCapabilities {
@@ -22,7 +20,7 @@ fn capabilities() -> wire::RtpCapabilities {
                 codec
                     .format
                     .as_ref()
-                    .and_then(|format| format.codec.as_ref()),
+                    .and_then(wire::CodecFormat::known_codec),
                 Some(wire::codec_format::Codec::H264(_))
             )
         })
@@ -31,19 +29,27 @@ fn capabilities() -> wire::RtpCapabilities {
         codecs: vec![
             wire::RtpCodecCapability {
                 format: Some(opus()),
-                feedback: vec![wire::RtcpFeedback::TransportCc as i32],
+                feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()],
                 rtx_supported: false,
                 scalability_modes: vec![],
             },
             video,
         ],
         header_extensions: vec![
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionMid as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01 as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay as i32,
-            wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor as i32,
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionMid
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay
+                .as_str()
+                .into(),
+            wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor
+                .as_str()
+                .into(),
         ],
-        rtcp_modes: vec![wire::RtcpMode::Compound as i32],
+        rtcp_modes: vec![wire::RtcpMode::Compound.as_str().into()],
     }
 }
 
@@ -55,8 +61,8 @@ fn spec(enabled: bool) -> wire::ResourceSpec {
             kind: Some(wire::publication_spec::Kind::Audio(wire::AudioPublication {
                 binding: Some(wire::TrackBinding { transport: Some(wire::track_binding::Transport::Rtp(wire::RtpParameters {
                     mid: "mic".into(),
-                    codec: Some(wire::RtpCodecParameters { payload_type: Some(111), rtx_payload_type: None, feedback: vec![wire::RtcpFeedback::TransportCc as i32], format: Some(opus()) }),
-                    header_extensions: vec![wire::RtpHeaderExtensionParameters { id: 1, r#type: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid as i32 }, wire::RtpHeaderExtensionParameters { id: 2, r#type: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01 as i32 }],
+                    codec: Some(wire::RtpCodecParameters { payload_type: Some(111), rtx_payload_type: None, feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()], format: Some(opus()) }),
+                    header_extensions: vec![wire::RtpHeaderExtensionParameters { id: 1, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str().into() }, wire::RtpHeaderExtensionParameters { id: 2, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str().into() }],
                     encodings: vec![wire::RtpEncodingParameters { ssrc: Some(0), rtx_ssrc: None, rid: String::new(), scalability_mode: None }],
                     rtcp: Some(wire::RtcpParameters { cname: "component-source-cname".into(), reduced_size: false }),
                 })) }),
@@ -75,25 +81,34 @@ fn video_spec(
         .codecs
         .into_iter()
         .find_map(|codec| {
-            codec
-                .format
-                .filter(|format| matches!(format.codec, Some(wire::codec_format::Codec::H264(_))))
+            codec.format.filter(|format| {
+                matches!(
+                    format.known_codec(),
+                    Some(wire::codec_format::Codec::H264(_))
+                )
+            })
         })
         .unwrap();
     let mut header_extensions = vec![
         wire::RtpHeaderExtensionParameters {
             id: 1,
-            r#type: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid as i32,
+            uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid
+                .as_str()
+                .into(),
         },
         wire::RtpHeaderExtensionParameters {
             id: 2,
-            r#type: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01 as i32,
+            uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01
+                .as_str()
+                .into(),
         },
     ];
     if descriptor {
         header_extensions.push(wire::RtpHeaderExtensionParameters {
             id: 3,
-            r#type: wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor as i32,
+            uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor
+                .as_str()
+                .into(),
         });
     }
     wire::ResourceSpec {
@@ -109,7 +124,9 @@ fn video_spec(
                                     mid: mid.into(),
                                     codec: Some(wire::RtpCodecParameters {
                                         payload_type: Some(96),
-                                        feedback: vec![wire::RtcpFeedback::TransportCc as i32],
+                                        feedback: vec![
+                                            wire::RtcpFeedback::TransportCc.as_str().into(),
+                                        ],
                                         format: Some(format),
                                         ..Default::default()
                                     }),
@@ -118,7 +135,7 @@ fn video_spec(
                                         .into_iter()
                                         .map(|ssrc| wire::RtpEncodingParameters {
                                             ssrc: Some(ssrc),
-                                            scalability_mode: Some(mode as i32),
+                                            scalability_mode: Some(mode.into()),
                                             ..Default::default()
                                         })
                                         .collect(),

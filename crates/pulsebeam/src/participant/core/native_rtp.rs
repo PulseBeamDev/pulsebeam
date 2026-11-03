@@ -293,7 +293,7 @@ impl Participant {
             track::new_video_ssrcs(mid, meta, encodings)
         };
         let format = declaration(&work.spec)
-            .and_then(|(_, _, parameters)| parameters.codec.as_ref()?.format);
+            .and_then(|(_, _, parameters)| parameters.codec.as_ref()?.format.clone());
         match &mut track {
             Track::Audio(audio) => audio.format = format,
             Track::Video(video) => video.format = format,
@@ -377,8 +377,8 @@ impl Participant {
         // opaque VP8/VP9 as H.264 or invent RID lanes. Temporal H.264 requires
         // its declared dependency descriptor, not guessed temporal-layer facts.
         let dependency_descriptor = parameters.header_extensions.iter().any(|extension| {
-            extension.r#type
-                == wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor as i32
+            extension.uri
+                == wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor.as_str()
         });
         if !matches!(binding.codec.parameters.name.as_str(), "opus" | "h264")
             || kind == wire::TrackKind::Audio
@@ -388,9 +388,9 @@ impl Participant {
                         .iter()
                         .any(|encoding| encoding.rid.is_some()))
             || parameters.encodings.iter().any(|encoding| {
-                encoding.scalability_mode.is_some_and(|mode| {
-                    mode != wire::RtpScalabilityMode::L1t1 as i32
-                        && (mode != wire::RtpScalabilityMode::L1t3 as i32
+                encoding.scalability_mode.as_deref().is_some_and(|mode| {
+                    mode != wire::RtpScalabilityMode::L1t1.as_str()
+                        && (mode != wire::RtpScalabilityMode::L1t3.as_str()
                             || binding.codec.parameters.name != "h264"
                             || !dependency_descriptor)
                 })

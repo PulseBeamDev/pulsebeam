@@ -19,18 +19,34 @@ a valid desired envelope with an invalid configuration requires a scoped
 rejection, not a malformed-frame failure. Connection owners enforce revision
 history, immutable identity, capabilities and authorization.
 
+## Extensible RTP descriptions
+
+`CodecFormat` carries a lowercase MIME type, clock rate, optional channel count,
+and named FMTP parameters. Feedback and header extensions use their transport
+names and URIs, not a closed wire enum. Descriptions retain unknown parameters
+and formats; validation does not grant transport or decoder support.
+
+Use the explicitly advertised capability intersection and actual engine
+observations before installing media. Unsupported resources fail locally without
+changing accepted resources. Omission keeps its defined meaning, and established
+bindings do not change because unrelated capabilities change.
+
 The optional `json` feature adds generated Serde support for HTTP bootstrap
 `RtpCapabilities`, its referenced types, and `DataDelivery` enum-name lists.
 Fields serialize with their protobuf snake_case names; optional zero/false
-values retain presence. This feature requires `std`; default builds retain the
+values retain presence. Unknown optional JSON fields are skipped; malformed known
+fields and duplicate known fields are still rejected. This feature requires `std`;
+default builds retain the
 `no_std` surface. The Bazel `pulsebeam-proto-json` target selects this feature.
 The owner unit suite checks both configurations using the existing capability
 fixture. JSON parsing does not replace capability validation or the HTTP owner's
 body limits and whole-document duplicate-key enforcement. There is no JSON
 state-batch codec.
 
-This pre-release cutover retains `pulsebeam.media.v1` and requires coordinated
-endpoint updates. Unsupported profiles are rejected during HTTP bootstrap.
+This pre-release structural cutover retains `pulsebeam.media.v1` and requires
+coordinated endpoint updates. Subsequent additive optional descriptions can evolve
+without another structural cutover. Unsupported profiles are rejected during HTTP
+bootstrap.
 Future compression requires an explicitly supported profile, not per-message
 negotiation. There is no Catalog/Intent/Mapping
 schema, legacy codec export or fallback decoder. The signaling data-channel label

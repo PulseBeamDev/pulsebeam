@@ -204,10 +204,6 @@ pub fn validate_track(track: &Track) -> Result {
 
 fn validate_discovery_format(format: Option<&CodecFormat>, audio: bool) -> Result {
     let format = format.ok_or(ValidationError::Format)?;
-    // A future codec is visible but unreceivable. Missing format is invalid.
-    if format.codec.is_none() {
-        return Ok(());
-    }
     if validate_format(format)? != audio {
         return Err(ValidationError::Format);
     }
@@ -379,8 +375,11 @@ pub fn validate_rtp_envelope(rtp: &RtpParameters, kind: TrackKind, publication: 
         || codec.rtx_payload_type.is_some()
             && (!payload_type(codec.rtx_payload_type)
                 || codec.rtx_payload_type == codec.payload_type)
-        || !unique_known::<RtcpFeedback>(&codec.feedback, 4)
-        || !codec.feedback.contains(&(RtcpFeedback::TransportCc as i32))
+        || !unique_text(&codec.feedback, 32, 128)
+        || !codec
+            .feedback
+            .iter()
+            .any(|feedback| feedback == RtcpFeedback::TransportCc.as_str())
     {
         return Err(ValidationError::Binding);
     }
@@ -395,16 +394,16 @@ pub fn validate_rtp_envelope(rtp: &RtpParameters, kind: TrackKind, publication: 
     let mut types = BTreeSet::new();
     for extension in &rtp.header_extensions {
         if !(1..=255).contains(&extension.id)
-            || !known::<RtpHeaderExtensionType>(extension.r#type)
+            || super::sdp::extension_uri(&extension.uri).is_err()
             || !ids.insert(extension.id)
-            || !types.insert(extension.r#type)
+            || !types.insert(extension.uri.as_str())
         {
             return Err(ValidationError::Binding);
         }
     }
     // MID and draft-01 transport-wide CC are mandatory in the native profile.
-    if !types.contains(&(RtpHeaderExtensionType::RtpHeaderExtensionMid as i32))
-        || !types.contains(&(RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01 as i32))
+    if !types.contains(RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str())
+        || !types.contains(RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str())
     {
         return Err(ValidationError::Binding);
     }
@@ -416,14 +415,15 @@ pub fn validate_rtp_envelope(rtp: &RtpParameters, kind: TrackKind, publication: 
             || encoding.rtx_ssrc.is_some_and(|ssrc| !ssrcs.insert(ssrc))
             || encoding
                 .scalability_mode
-                .is_some_and(|v| audio || !known::<RtpScalabilityMode>(v))
+                .as_ref()
+                .is_some_and(|v| audio || !text(v, 64))
             || !encoding.rid.is_empty()
                 && (!rid(&encoding.rid)
                     || !rids.insert(&encoding.rid)
-                    || !types.contains(&(RtpHeaderExtensionType::RtpHeaderExtensionRid as i32))
+                    || !types.contains(RtpHeaderExtensionType::RtpHeaderExtensionRid.as_str())
                     || codec.rtx_payload_type.is_some()
                         && !types.contains(
-                            &(RtpHeaderExtensionType::RtpHeaderExtensionRepairedRid as i32),
+                            RtpHeaderExtensionType::RtpHeaderExtensionRepairedRid.as_str(),
                         ))
         {
             return Err(ValidationError::Binding);
@@ -518,68 +518,81 @@ fn same_members<T: PartialEq>(left: &[T], right: &[T]) -> bool {
     left.len() == right.len() && left.iter().all(|value| right.contains(value))
 }
 
-/// Typed/default identity equality, not directional codec compatibility.
+/// Default-normalized transport equality, not directional codec compatibility.
 pub fn formats_equivalent(left: &CodecFormat, right: &CodecFormat) -> bool {
-    match (&left.codec, &right.codec) {
-        (Some(codec_format::Codec::Opus(left)), Some(codec_format::Codec::Opus(right))) => {
-            left.stereo == right.stereo
-                && left.source_stereo == right.source_stereo
-                && left.in_band_fec == right.in_band_fec
-                && left.dtx == right.dtx
-                && left.constant_bitrate == right.constant_bitrate
-                && left.max_average_bitrate_bps == right.max_average_bitrate_bps
-                // RFC 7587 section 6.1 supplies these two stable rate defaults.
-                && left.max_playback_rate_hz.unwrap_or(48000) == right.max_playback_rate_hz.unwrap_or(48000)
-                && left.max_capture_rate_hz.unwrap_or(48000) == right.max_capture_rate_hz.unwrap_or(48000)
-                && left.min_packet_time_ms == right.min_packet_time_ms
-        }
-        (Some(codec_format::Codec::H264(left)), Some(codec_format::Codec::H264(right))) => {
-            left.profile_level_id == right.profile_level_id
-                && left.level_asymmetry_allowed.unwrap_or(false)
-                    == right.level_asymmetry_allowed.unwrap_or(false)
-        }
-        (Some(codec_format::Codec::Vp9(left)), Some(codec_format::Codec::Vp9(right))) => {
-            left.profile_id.unwrap_or(0) == right.profile_id.unwrap_or(0)
-        }
-        _ => left == right,
-    }
+    left.mime_type == right.mime_type
+        && left.clock_rate == right.clock_rate
+        && left.channels == right.channels
+        && super::format::normalized_parameters(left) == super::format::normalized_parameters(right)
 }
 
-/// Returns true for audio, false for video. Compatibility between two valid
-/// formats is directional and must not be replaced by protobuf equality.
+/// Validates a description without granting codec support. True means audio.
 pub fn validate_format(format: &CodecFormat) -> Result<bool> {
-    match format.codec.as_ref().ok_or(ValidationError::Format)? {
-        codec_format::Codec::Opus(opus) => {
+    let (media, name) = format
+        .mime_type
+        .split_once('/')
+        .ok_or(ValidationError::Format)?;
+    let audio = match media {
+        "audio" => true,
+        "video" => false,
+        _ => return Err(ValidationError::Format),
+    };
+    if !parameter_name(name)
+        || format.clock_rate == 0
+        || format
+            .channels
+            .is_some_and(|channels| !audio || channels == 0)
+        || format.parameters.len() > 32
+    {
+        return Err(ValidationError::Format);
+    }
+    let mut names = BTreeSet::new();
+    for parameter in &format.parameters {
+        if !parameter_name(&parameter.name)
+            || !names.insert(&parameter.name)
+            || parameter.value.len() > 1024
+            || parameter.value.chars().any(|c| c.is_control() || c == ';')
+        {
+            return Err(ValidationError::Format);
+        }
+    }
+    match format.parse_known_codec()? {
+        Some(codec_format::Codec::Opus(opus))
             if !range(opus.max_average_bitrate_bps, 6000, 510000)
                 || !range(opus.max_playback_rate_hz, 8000, 48000)
                 || !range(opus.max_capture_rate_hz, 8000, 48000)
-                || !range(opus.min_packet_time_ms, 3, 120)
-            {
-                return Err(ValidationError::Format);
-            }
-            Ok(true)
+                || !range(opus.min_packet_time_ms, 3, 120) =>
+        {
+            Err(ValidationError::Format)
         }
-        codec_format::Codec::H264(h264) if matches!(h264.profile_level_id, Some(0..=0xffffff)) => {
-            Ok(false)
-        }
-        codec_format::Codec::Vp8(_) => Ok(false),
-        codec_format::Codec::Vp9(vp9) if matches!(vp9.profile_id, None | Some(0 | 2)) => Ok(false),
-        _ => Err(ValidationError::Format),
+        _ => Ok(audio),
     }
+}
+
+fn parameter_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_+.".contains(&byte)
+        })
 }
 
 pub fn validate_capabilities(caps: &RtpCapabilities) -> Result {
     if caps.codecs.len() > 32
-        || !unique_known::<RtpHeaderExtensionType>(&caps.header_extensions, 16)
-        || !unique_known::<RtcpMode>(&caps.rtcp_modes, 2)
+        || !unique_text(&caps.header_extensions, 64, 256)
+        || caps
+            .header_extensions
+            .iter()
+            .any(|uri| super::sdp::extension_uri(uri).is_err())
+        || !unique_text(&caps.rtcp_modes, 16, 64)
     {
         return Err(ValidationError::Capability);
     }
     for (index, codec) in caps.codecs.iter().enumerate() {
         let format = codec.format.as_ref().ok_or(ValidationError::Capability)?;
         let audio = validate_format(format)?;
-        if !unique_known::<RtcpFeedback>(&codec.feedback, 4)
-            || !unique_known::<RtpScalabilityMode>(&codec.scalability_modes, 3)
+        if !unique_text(&codec.feedback, 32, 128)
+            || !unique_text(&codec.scalability_modes, 32, 64)
             || audio && !codec.scalability_modes.is_empty()
             || audio && video_feedback(&codec.feedback)
             || caps
@@ -595,6 +608,15 @@ pub fn validate_capabilities(caps: &RtpCapabilities) -> Result {
     Ok(())
 }
 
+fn unique_text(values: &[alloc::string::String], max: usize, bytes: usize) -> bool {
+    values.len() <= max
+        && values.iter().enumerate().all(|(index, value)| {
+            text(value, bytes)
+                && !value.chars().any(char::is_control)
+                && !values.iter().take(index).any(|prior| prior == value)
+        })
+}
+
 fn validate_failure(failure: &Failure) -> Result {
     if !known::<FailureCode>(failure.code) || failure.diagnostic.len() > 256 {
         return Err(ValidationError::Failure);
@@ -602,17 +624,17 @@ fn validate_failure(failure: &Failure) -> Result {
     Ok(())
 }
 
-fn video_feedback(feedback: &[i32]) -> bool {
-    feedback.contains(&(RtcpFeedback::NackPli as i32))
-        || feedback.contains(&(RtcpFeedback::CcmFir as i32))
+fn video_feedback(feedback: &[alloc::string::String]) -> bool {
+    feedback.iter().any(|value| {
+        matches!(
+            RtcpFeedback::try_from(value.as_str()),
+            Ok(RtcpFeedback::NackPli | RtcpFeedback::CcmFir)
+        )
+    })
 }
 
 fn known<E: TryFrom<i32>>(value: i32) -> bool {
     value != 0 && E::try_from(value).is_ok()
-}
-fn unique_known<E: TryFrom<i32>>(values: &[i32], max: usize) -> bool {
-    let mut seen = BTreeSet::new();
-    values.len() <= max && values.iter().all(|v| known::<E>(*v) && seen.insert(*v))
 }
 fn range(value: Option<u32>, min: u32, max: u32) -> bool {
     value.is_none_or(|v| (min..=max).contains(&v))

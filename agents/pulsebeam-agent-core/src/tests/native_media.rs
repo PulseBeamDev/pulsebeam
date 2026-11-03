@@ -61,12 +61,10 @@ impl Target {
 }
 
 fn format(kind: MediaKind) -> state::CodecFormat {
-    state::CodecFormat {
-        codec: Some(match kind {
-            MediaKind::Video => state::codec_format::Codec::Vp8(Default::default()),
-            MediaKind::Audio => state::codec_format::Codec::Opus(Default::default()),
-        }),
-    }
+    state::CodecFormat::from(match kind {
+        MediaKind::Video => state::codec_format::Codec::Vp8(Default::default()),
+        MediaKind::Audio => state::codec_format::Codec::Opus(Default::default()),
+    })
 }
 
 pub(super) fn track(id: &str, participant: &str, label: &str, kind: MediaKind) -> state::Track {

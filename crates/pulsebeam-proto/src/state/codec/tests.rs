@@ -227,14 +227,20 @@ fn rtp() -> RtpParameters {
         codec: Some(RtpCodecParameters {
             payload_type: Some(0),
             rtx_payload_type: None,
-            feedback: vec![4],
-            format: Some(CodecFormat {
-                codec: Some(codec_format::Codec::Opus(OpusParameters::default())),
-            }),
+            feedback: vec![RtcpFeedback::TransportCc.into()],
+            format: Some(CodecFormat::from(codec_format::Codec::Opus(
+                OpusParameters::default(),
+            ))),
         }),
         header_extensions: vec![
-            RtpHeaderExtensionParameters { r#type: 1, id: 1 },
-            RtpHeaderExtensionParameters { r#type: 4, id: 4 },
+            RtpHeaderExtensionParameters {
+                uri: RtpHeaderExtensionType::RtpHeaderExtensionMid.into(),
+                id: 1,
+            },
+            RtpHeaderExtensionParameters {
+                uri: RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.into(),
+                id: 4,
+            },
         ],
         encodings: vec![RtpEncodingParameters {
             ssrc: Some(0),
@@ -331,9 +337,9 @@ fn receive_replacements_preserve_explicit_zero_and_reject_not_clamp() {
             binding: Some(TrackBinding {
                 transport: Some(track_binding::Transport::Rtp(RtpParameters {
                     codec: Some(RtpCodecParameters {
-                        format: Some(CodecFormat {
-                            codec: Some(codec_format::Codec::Vp8(Vp8Parameters {})),
-                        }),
+                        format: Some(CodecFormat::from(codec_format::Codec::Vp8(
+                            Vp8Parameters {},
+                        ))),
                         ..rtp().codec.unwrap()
                     }),
                     ..rtp()
@@ -495,23 +501,26 @@ fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
     let mut binding = rtp();
     binding
         .header_extensions
-        .push(RtpHeaderExtensionParameters { r#type: 2, id: 2 });
-    binding.codec.as_mut().unwrap().format = Some(CodecFormat {
-        codec: Some(codec_format::Codec::Vp9(Vp9Parameters { profile_id: None })),
-    });
-    binding.codec.as_mut().unwrap().feedback.push(1);
-    let original = video(binding.clone());
-    let mut explicit = binding.clone();
-    explicit
+        .push(RtpHeaderExtensionParameters {
+            uri: RtpHeaderExtensionType::RtpHeaderExtensionRid.into(),
+            id: 2,
+        });
+    binding.codec.as_mut().unwrap().format =
+        Some(CodecFormat::from(codec_format::Codec::Vp9(Vp9Parameters {
+            profile_id: None,
+        })));
+    binding
         .codec
         .as_mut()
         .unwrap()
-        .format
-        .as_mut()
-        .unwrap()
-        .codec = Some(codec_format::Codec::Vp9(Vp9Parameters {
-        profile_id: Some(0),
-    }));
+        .feedback
+        .push(RtcpFeedback::Nack.into());
+    let original = video(binding.clone());
+    let mut explicit = binding.clone();
+    explicit.codec.as_mut().unwrap().format =
+        Some(CodecFormat::from(codec_format::Codec::Vp9(Vp9Parameters {
+            profile_id: Some(0),
+        })));
     explicit.codec.as_mut().unwrap().feedback.reverse();
     explicit.header_extensions.reverse();
     let mut equivalent = video(explicit);
@@ -532,7 +541,7 @@ fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
             v.encodings[0].rtx_ssrc = Some(2);
         },
         |v| v.encodings[0].rid = String::from("other"),
-        |v| v.encodings[0].scalability_mode = Some(RtpScalabilityMode::L1t1 as i32),
+        |v| v.encodings[0].scalability_mode = Some(RtpScalabilityMode::L1t1.as_str().into()),
         |v| v.rtcp.as_mut().unwrap().cname = String::from("other"),
         |v| v.rtcp.as_mut().unwrap().reduced_size = true,
         |v| v.header_extensions[0].id = 10,
@@ -616,19 +625,17 @@ fn mutable_defaults_do_not_erase_presence_or_explicit_playout_requests() {
         &default,
         &settings(options)
     ));
-    let opus = |dtx| CodecFormat {
-        codec: Some(codec_format::Codec::Opus(OpusParameters {
+    let opus = |dtx| {
+        CodecFormat::from(codec_format::Codec::Opus(OpusParameters {
             dtx,
             ..OpusParameters::default()
-        })),
+        }))
     };
     assert!(!validation::formats_equivalent(
         &opus(None),
         &opus(Some(false))
     ));
-    let format = |parameters| CodecFormat {
-        codec: Some(codec_format::Codec::Opus(parameters)),
-    };
+    let format = |parameters| CodecFormat::from(codec_format::Codec::Opus(parameters));
     for parameters in [
         OpusParameters {
             max_playback_rate_hz: Some(48000),
@@ -667,11 +674,11 @@ fn mutable_defaults_do_not_erase_presence_or_explicit_playout_requests() {
             ..OpusParameters::default()
         })
     ));
-    let h264 = |asymmetry| CodecFormat {
-        codec: Some(codec_format::Codec::H264(H264Parameters {
+    let h264 = |asymmetry| {
+        CodecFormat::from(codec_format::Codec::H264(H264Parameters {
             profile_level_id: Some(0x42e01f),
             level_asymmetry_allowed: asymmetry,
-        })),
+        }))
     };
     assert!(validation::formats_equivalent(
         &h264(None),
@@ -685,72 +692,65 @@ fn mutable_defaults_do_not_erase_presence_or_explicit_playout_requests() {
 
 #[test]
 fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats() {
-    let default = CodecFormat {
-        codec: Some(codec_format::Codec::Vp9(Vp9Parameters { profile_id: None })),
-    };
-    let explicit = CodecFormat {
-        codec: Some(codec_format::Codec::Vp9(Vp9Parameters {
-            profile_id: Some(0),
-        })),
-    };
+    let default = CodecFormat::from(codec_format::Codec::Vp9(Vp9Parameters { profile_id: None }));
+    let explicit = CodecFormat::from(codec_format::Codec::Vp9(Vp9Parameters {
+        profile_id: Some(0),
+    }));
     assert!(validation::formats_equivalent(&default, &explicit));
     let capability = |format| RtpCodecCapability {
         format: Some(format),
-        feedback: vec![4],
+        feedback: vec![RtcpFeedback::TransportCc.into()],
         rtx_supported: false,
         scalability_modes: vec![],
     };
     let mut caps = RtpCapabilities {
         codecs: vec![capability(default)],
         header_extensions: vec![
-            1,
-            4,
-            RtpHeaderExtensionType::RtpHeaderExtensionVideoLayersAllocation as i32,
+            RtpHeaderExtensionType::RtpHeaderExtensionMid.into(),
+            RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.into(),
+            RtpHeaderExtensionType::RtpHeaderExtensionVideoLayersAllocation.into(),
         ],
-        rtcp_modes: vec![1],
+        rtcp_modes: vec![RtcpMode::Compound.into()],
     };
     assert_eq!(validation::validate_capabilities(&caps), Ok(()));
     #[cfg(feature = "json")]
     {
         use serde_json::{from_str, from_value, json, to_value};
-
         let encoded = to_value(&caps).unwrap();
         assert_eq!(
-            encoded,
-            json!({
-                "codecs": [{
-                    "format": {"vp9": {}},
-                    "feedback": ["RTCP_FEEDBACK_TRANSPORT_CC"]
-                }],
-                "header_extensions": [
-                    "RTP_HEADER_EXTENSION_MID",
-                    "RTP_HEADER_EXTENSION_TRANSPORT_CC_DRAFT_01",
-                    "RTP_HEADER_EXTENSION_VIDEO_LAYERS_ALLOCATION"
-                ],
-                "rtcp_modes": ["RTCP_MODE_COMPOUND"]
-            })
+            encoded["codecs"][0]["format"],
+            json!({"mime_type":"video/vp9","clock_rate":90000})
         );
+        assert_eq!(encoded["codecs"][0]["feedback"], json!(["transport-cc"]));
+        assert_eq!(encoded["rtcp_modes"], json!(["compound"]));
         assert_eq!(
             from_value::<RtpCapabilities>(encoded.clone()).unwrap(),
             caps
         );
         let explicit_json = to_value(&explicit).unwrap();
-        assert_eq!(explicit_json, json!({"vp9": {"profile_id": 0}}));
+        assert_eq!(
+            explicit_json["parameters"],
+            json!([{"name":"profile-id","value":"0"}])
+        );
         assert_eq!(from_value::<CodecFormat>(explicit_json).unwrap(), explicit);
-        let opus = OpusParameters {
+        let opus = CodecFormat::from(codec_format::Codec::Opus(OpusParameters {
             stereo: Some(false),
             source_stereo: Some(false),
             in_band_fec: Some(false),
             dtx: Some(false),
             constant_bitrate: Some(false),
             ..Default::default()
-        };
-        let opus_json = json!({
-            "stereo": false, "source_stereo": false, "in_band_fec": false,
-            "dtx": false, "constant_bitrate": false
-        });
-        assert_eq!(to_value(&opus).unwrap(), opus_json);
-        assert_eq!(from_value::<OpusParameters>(opus_json).unwrap(), opus);
+        }));
+        let opus_json = to_value(&opus).unwrap();
+        assert_eq!(opus_json["parameters"].as_array().unwrap().len(), 5);
+        assert!(
+            opus_json["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|parameter| parameter["value"] == "0")
+        );
+        assert_eq!(from_value::<CodecFormat>(opus_json).unwrap(), opus);
         assert_eq!(to_value(RtpCapabilities::default()).unwrap(), json!({}));
         let deliveries = [
             DataDelivery::Latest,
@@ -765,15 +765,20 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
             from_value::<[DataDelivery; 3]>(json!(["LATEST", "LOSSY", "ORDERED"])).unwrap(),
             deliveries
         );
-        assert!(from_str::<RtpCapabilities>(r#"{"rtcp_modes":[1],"rtcpModes":[2]}"#).is_err());
-        assert!(from_str::<RtpCapabilities>(r#"{"unknown":true}"#).is_err());
-        assert!(from_str::<RtpCapabilities>(r#"{"header_extensions":["UNKNOWN"]}"#).is_err());
+        assert!(
+            from_str::<RtpCapabilities>(
+                r#"{"rtcp_modes":["compound"],"rtcp_modes":["reduced-size"]}"#
+            )
+            .is_err()
+        );
+        let mut future = encoded.clone();
+        future["future_optional"] = json!({"enabled":true});
+        assert_eq!(from_value::<RtpCapabilities>(future).unwrap(), caps);
         assert!(from_str::<RtpCapabilities>("{} {}").is_err());
-        let mut unspecified_enum = encoded;
-        unspecified_enum["header_extensions"][0] = json!(0);
-        let parsed = from_value::<RtpCapabilities>(unspecified_enum).unwrap();
+        let mut invalid = encoded;
+        invalid["header_extensions"][0] = json!("");
         assert_eq!(
-            validation::validate_capabilities(&parsed),
+            validation::validate_capabilities(&from_value::<RtpCapabilities>(invalid).unwrap()),
             Err(ValidationError::Capability)
         );
     }
@@ -786,15 +791,31 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
         validation::validate_format(&CodecFormat::default()),
         Err(ValidationError::Format)
     );
+    let future_format = CodecFormat {
+        mime_type: "video/future-codec".into(),
+        clock_rate: u32::MAX,
+        channels: None,
+        parameters: vec![CodecParameter {
+            name: "future-hint".into(),
+            value: "1".into(),
+        }],
+    };
+    assert_eq!(future_format.known_codec(), None);
     let unknown = Track {
         track_id: String::from("track"),
         participant_id: String::from("participant"),
         label: String::from("camera"),
         kind: Some(track::Kind::Video(VideoTrack {
-            format: Some(CodecFormat::default()),
+            format: Some(future_format.clone()),
         })),
     };
     assert_eq!(validation::validate_track(&unknown), Ok(()));
+    caps.codecs.pop();
+    caps.codecs.push(capability(future_format));
+    caps.header_extensions
+        .push("urn:future:optional-extension".into());
+    caps.codecs[0].feedback.push("future-feedback".into());
+    assert_eq!(validation::validate_capabilities(&caps), Ok(()));
     let mut missing = unknown;
     missing.kind = Some(track::Kind::Video(VideoTrack { format: None }));
     assert_eq!(
