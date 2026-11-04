@@ -607,7 +607,7 @@ impl Switcher {
         if self.last_output.is_none_or(|last| seq_v > *last) {
             self.last_output = Some(seq);
         }
-        if marker {
+        if marker && self.last_marker_output.is_none_or(|last| seq_v > last) {
             self.last_marker_output = Some(seq_v);
         }
         if self.max_output_ts.is_none_or(|m| ts > m) {
@@ -880,6 +880,24 @@ mod test {
             burst_len,
             "cursor prevents re-emitting the burst"
         );
+
+        let older = b.delta_frame(2);
+        ingest(&mut switcher, q, &mut cache, &older[..1], &mut out);
+        let newer = b.delta_frame(2);
+        ingest(&mut switcher, q, &mut cache, &newer, &mut out);
+        let completed = *out.last().unwrap().seq_no;
+        ingest(&mut switcher, q, &mut cache, &older[1..], &mut out);
+        assert!(out.last().unwrap().marker);
+        assert!(*out.last().unwrap().seq_no < completed);
+
+        let next = b.delta_frame(1);
+        ingest(&mut switcher, q, &mut cache, &next, &mut out);
+        assert_eq!(
+            *out.last().unwrap().seq_no,
+            completed + 1,
+            "an older reordered marker must not reopen the newest frame"
+        );
+        rtp::conformance::assert_decodable(&out, "late marker after a completed frame");
     }
 
     #[test]
