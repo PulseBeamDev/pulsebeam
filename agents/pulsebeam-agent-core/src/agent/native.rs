@@ -1,5 +1,6 @@
 use super::*;
 
+mod receive;
 #[cfg(test)]
 mod tests;
 use crate::native_state::{Change, Resource};
@@ -31,6 +32,7 @@ pub(super) struct MediaLease {
     retirement_failed: bool,
     wire_retired: bool,
     source: Option<String>,
+    receive_offer: Option<state::RtpReceiveOffer>,
 }
 
 struct RetiringMedia {
@@ -54,6 +56,7 @@ pub(super) struct MediaWant {
 pub(super) struct MediaAllocation {
     pub operation: OperationId,
     wanted: BTreeMap<MediaSlot, MediaWant>,
+    receive: Option<receive::Stage>,
 }
 
 fn media_want(
@@ -195,6 +198,7 @@ fn rtp(
                         resource: resource.clone(),
                         mid: coordinate.mid.clone(),
                         source: source.map(str::to_owned),
+                        receive_offer: None,
                         identity_pending: pending,
                         retired: !pending,
                         retirement_failed: false,
@@ -225,22 +229,11 @@ fn rtp(
                 retirement_failed: false,
                 wire_retired: false,
                 source: source.map(str::to_owned),
+                receive_offer: None,
             },
         );
     }
     Some(prepared.binding.clone())
-}
-
-fn receive_rtp(
-    session: &mut Session,
-    resource: &Resource,
-    slot: &MediaSlot,
-    source: &str,
-) -> Option<state::TrackBinding> {
-    if session.state.target_spec(resource).and_then(|spec| spec.declaration.as_ref()).is_some_and(|declaration| matches!(declaration, state::resource_spec::Declaration::Subscription(value) if value.track_id != source)) {
-        return None;
-    }
-    rtp(session, resource, slot, Some(source))
 }
 
 fn receiver_spec_available(
@@ -291,7 +284,8 @@ fn publication(
 fn subscription(
     track: String,
     kind: state::TrackKind,
-    binding: state::TrackBinding,
+    binding: Option<state::TrackBinding>,
+    rtp_offer: Option<state::RtpReceiveOffer>,
     receive: Option<state::resource_settings::Receive>,
 ) -> state::ResourceSpec {
     state::ResourceSpec {
@@ -303,7 +297,8 @@ fn subscription(
             state::SubscriptionSpec {
                 track_id: track,
                 kind: kind as i32,
-                binding: Some(binding),
+                binding,
+                rtp_offer,
             },
         )),
     }
@@ -437,10 +432,26 @@ pub(super) fn prepared_payload(
             let Resource::DataSubscription(id) = &resource else {
                 return Ok(());
             };
-            subscription(id.clone(), state::TrackKind::Data, binding, None)
+            subscription(
+                id.clone(),
+                state::TrackKind::Data,
+                Some(binding),
+                None,
+                None,
+            )
         }
     };
     session.state.stage(resource, Some(spec))
+}
+
+pub(super) fn project_retired_receivers(session: &Session, snapshot: &mut Snapshot) -> bool {
+    let mut changed = false;
+    for (slot, lease) in &session.media_leases {
+        if lease.retired {
+            changed |= receive::project(session, snapshot, slot);
+        }
+    }
+    changed
 }
 
 pub(super) fn reconcile(
@@ -495,12 +506,13 @@ pub(super) fn reconcile(
             media.insert(slot.clone(), want);
         }
         if let Some(track) = track
-            && let Some(binding) = receive_rtp(session, &resource, &slot, &track)
+            && let Some(offer) = receive::offer(session, &resource, &slot, &track)
         {
             let spec = subscription(
                 track,
                 state::TrackKind::Video,
-                binding,
+                None,
+                Some(offer),
                 Some(state::resource_settings::Receive::Video(
                     state::VideoReceiveOptions {
                         max_height: (video.height != 0).then_some(video.height),
@@ -599,11 +611,12 @@ pub(super) fn reconcile(
         if let Some(want) = media_want(session, resource.clone(), &slot, Some(&id)) {
             media.insert(slot.clone(), want);
         }
-        if let Some(binding) = receive_rtp(session, &resource, &slot, &id) {
+        if let Some(offer) = receive::offer(session, &resource, &slot, &id) {
             let spec = subscription(
                 id,
                 state::TrackKind::Audio,
-                binding,
+                None,
+                Some(offer),
                 Some(state::resource_settings::Receive::Audio(
                     state::AudioReceiveOptions {
                         playout_delay: delay(buffering),
@@ -759,7 +772,13 @@ pub(super) fn reconcile(
                     let Resource::DataSubscription(id) = &resource else {
                         continue;
                     };
-                    subscription(id.clone(), state::TrackKind::Data, binding, None)
+                    subscription(
+                        id.clone(),
+                        state::TrackKind::Data,
+                        Some(binding),
+                        None,
+                        None,
+                    )
                 }
             };
             wanted.insert(resource, spec);
@@ -773,6 +792,7 @@ pub(super) fn reconcile(
             wanted.insert(resource, spec.clone());
         }
     }
+    receive::cancel_superseded(session, &media, &mut wanted, effects);
     let removed = session
         .state
         .resources()
@@ -825,6 +845,7 @@ pub(super) fn reconcile(
         .media_blocked
         .retain(|slot, blocked| media.get(slot) == Some(blocked));
     session.media_wanted = media;
+    receive::apply_plan(session, effects)?;
     retire_media(session, ids, effects);
     allocate_media(session, ids, effects);
     failure.map_or(Ok(()), Err)
@@ -882,6 +903,8 @@ fn allocate_media(session: &mut Session, ids: &mut IdGenerator, effects: &mut Ve
         .iter()
         .filter(|(slot, want)| {
             !session.media_leases.contains_key(*slot)
+                && (slot.direction() != crate::MediaDirection::ReceiveOnly
+                    || !session.state.retaining(&want.resource))
                 && session.media_blocked.get(*slot) != Some(*want)
         })
         .map(|(slot, want)| (slot.clone(), want.clone()))
@@ -891,15 +914,40 @@ fn allocate_media(session: &mut Session, ids: &mut IdGenerator, effects: &mut Ve
         return;
     }
     let operation = ids.operation();
-    effects.push_back(Effect::Rtc(RtcEffect::AllocateMedia {
-        generation: session.generation,
+    let receive = wanted
+        .first_key_value()
+        .filter(|(slot, _)| slot.direction() == crate::MediaDirection::ReceiveOnly)
+        .map(|(slot, want)| {
+            let target = session
+                .coordinates
+                .get(slot)
+                .and_then(Option::as_ref)
+                .map_or_else(
+                    || crate::ReceiveTarget::Allocate(want.allocation.clone()),
+                    |slot| crate::ReceiveTarget::Existing(slot.clone()),
+                );
+            effects.push_back(Effect::Rtc(RtcEffect::OfferReceiveMedia {
+                generation: session.generation,
+                operation,
+                target,
+            }));
+            receive::Stage::Offering
+        });
+    if receive.is_none() {
+        effects.push_back(Effect::Rtc(RtcEffect::AllocateMedia {
+            generation: session.generation,
+            operation,
+            allocations: wanted
+                .values()
+                .map(|want| want.allocation.clone())
+                .collect(),
+        }));
+    }
+    session.media_allocation = Some(MediaAllocation {
         operation,
-        allocations: wanted
-            .values()
-            .map(|want| want.allocation.clone())
-            .collect(),
-    }));
-    session.media_allocation = Some(MediaAllocation { operation, wanted });
+        wanted,
+        receive,
+    });
 }
 
 impl Agent {
@@ -922,6 +970,7 @@ impl Agent {
             return None;
         };
         if live.execution != state::ExecutionStatus::Installed as i32
+            || !receive::installed(active, slot, live)
             || live.track.as_ref()?.track_id != *source
         {
             return None;
@@ -1141,8 +1190,33 @@ impl Agent {
         {
             return false;
         }
+        if preparation.is_ok()
+            && outcome == crate::client_sdp::ApplyOutcome::Applied
+            && active.media_allocation.as_ref().is_some_and(|pending| {
+                matches!(
+                    pending.receive,
+                    Some(
+                        receive::Stage::Offering
+                            | receive::Stage::Offered
+                            | receive::Stage::Cancelling
+                    )
+                )
+            })
+        {
+            return true;
+        }
         let Some(pending) = active.media_allocation.take() else {
             return true;
+        };
+        if receive::cleanup_complete(active, &pending, outcome, &preparation) {
+            self.intent_dirty = true;
+            self.send_intent_if_ready();
+            return true;
+        }
+        let receiving = pending.receive.is_some();
+        let reference = match pending.receive {
+            Some(receive::Stage::Applying { reference }) => Some(reference),
+            _ => None,
         };
         if let Err(error) = &preparation {
             agent_log!(self, Warn, "RTP allocation {operation:?} failed: {error:?}");
@@ -1164,6 +1238,9 @@ impl Agent {
                 pending.wanted.contains_key(&slot.slot)
                     && slot.kind == slot.slot.kind()
                     && slot.direction == slot.slot.direction()
+                    && (!receiving
+                        || active.coordinates.get(&slot.slot).and_then(Option::as_ref)
+                            == Some(slot))
             });
         let mut geometry = active
             .coordinates
@@ -1198,6 +1275,7 @@ impl Agent {
             );
         }
         let prepared = prepared.ok().flatten();
+        let mut projected = false;
         for (slot, want) in pending.wanted {
             let assigned = slots
                 .iter()
@@ -1225,8 +1303,15 @@ impl Agent {
                     if parameters.codec.as_ref().and_then(|codec| codec.format.as_ref())
                         .is_some_and(|format| state::validation::formats_equivalent(expected, format)))
             }));
-            let accepted = active.media_wanted.get(&slot) == Some(&want)
-                && (identity_pending && want.allocation.format.is_none() || complete);
+            let mut accepted = active.media_wanted.get(&slot) == Some(&want)
+                && (identity_pending && want.allocation.format.is_none() || complete)
+                && (!receiving
+                    || reference.is_some_and(|reference| {
+                        active.state.reference(&want.resource) == Some(reference)
+                    }));
+            if let Some(reference) = reference {
+                accepted = receive::report(active, reference, value, accepted);
+            }
             if let Some(assigned) = assigned {
                 active
                     .coordinates
@@ -1242,7 +1327,14 @@ impl Agent {
                         retirement_failed: false,
                         wire_retired: false,
                         source: want.source.clone(),
+                        receive_offer: None,
                     });
+            }
+            if let Some(lease) = active.media_leases.get_mut(&slot)
+                && lease.resource == want.resource
+                && !accepted
+            {
+                lease.retired = true;
             }
             if accepted
                 && let Some(value) = prepared.as_ref().and_then(|prepared| prepared.get(&slot))
@@ -1257,9 +1349,16 @@ impl Agent {
                     cache.insert(slot.clone(), value.clone());
                 }
             }
+            if receiving {
+                projected |= receive::project(active, &mut self.snapshot, &slot);
+            }
             if !accepted {
                 active.media_blocked.insert(slot, want);
             }
+        }
+        if projected {
+            self.bump_snapshot();
+            self.notifications.push_back(Notification::SnapshotChanged);
         }
         self.intent_dirty = true;
         self.send_intent_if_ready();
@@ -1505,22 +1604,9 @@ impl Agent {
                     {
                         self.intent_dirty = true;
                     }
-                    if let Resource::Reception(slot) = &resource
-                        && let Some(coordinate) =
-                            active.coordinates.get(slot).and_then(Option::as_ref)
-                    {
-                        let mappings = if slot.kind() == crate::MediaKind::Audio {
-                            &mut self.snapshot.audio_mapping
-                        } else {
-                            &mut self.snapshot.video_mapping
-                        };
-                        if let Some(live) = active.state.eligible(&resource)
-                            && let Some(track) = &live.track
-                        {
-                            mappings.insert(coordinate.media_index, track.track_id.clone());
-                        } else {
-                            mappings.remove(&coordinate.media_index);
-                        }
+                    if let Resource::Reception(slot) = &resource {
+                        self.intent_dirty = true;
+                        receive::project(active, &mut self.snapshot, slot);
                     }
                     if let Some(channel) = active.payload_resources.get(&resource).copied() {
                         if let Some(live) = active.state.eligible(&resource)

@@ -103,6 +103,17 @@ impl NativeDecodedVideoLog {
         }
         if let Some(previous) = receiver.last_received {
             if let Some(gap) = now.checked_duration_since(previous) {
+                if gap > receiver.window_max_gap {
+                    tracing::debug!(
+                        track = ?frame.track,
+                        ?gap,
+                        previous_rtp = ?receiver.last_rtp,
+                        current_rtp = ?frame.metadata.rtp_timestamp,
+                        previous_dimensions = ?receiver.last_dimensions,
+                        ?dimensions,
+                        "native decoded continuity maximum increased"
+                    );
+                }
                 receiver.window_max_gap = receiver.window_max_gap.max(gap);
             } else {
                 receiver.invalid += 1;

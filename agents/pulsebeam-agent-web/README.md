@@ -197,9 +197,18 @@ local-handle modules without a DOM. Typed consumers check public and generated
 contracts. Deterministic native/SFU simulation owns delivery, identity,
 publication replacement, ordered loss and gaps, and late-subscription proof.
 
-Pinned-Node artifact tests instantiate emitted WASM and exercise lifecycle,
-resource ownership, cancellation, generation fences, and binary data streams.
-Controlled peer outcomes are not real WebRTC or application support for Node.
+Pinned-Node artifact tests instantiate emitted WASM and exercise initialization,
+local resource ownership, cancellation and generation fences. These controlled
+outcomes do not establish real receive execution, failed transceiver-stop repair
+or application support for Node.
+
+The browser adapter keeps receive-plan waiting inside the existing Peer/executor.
+It observes the applied local offer, awaits actual remote-description completion,
+checks completed SDP, receiver parameters and the live track, then refreshes track
+observation. Missing platform facts fail that resource rather than establishing
+installation. Packet arrival and statistics are not readiness gates. See
+[Core's receive flow](../pulsebeam-agent-core/README.md#server-directed-reception)
+for shared policy and completion fences.
 
 The required Web browser owner proves shipped SDK media through a local SFU,
 native-track handoff, decoded receiver replacement, layout and observer plumbing,

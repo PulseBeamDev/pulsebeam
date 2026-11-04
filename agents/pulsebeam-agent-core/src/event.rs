@@ -21,6 +21,12 @@ pub enum RtcEvent {
         generation: Generation,
         preparation: Result<crate::client_sdp::Bindings, crate::client_sdp::Error>,
     },
+    MediaOffered {
+        generation: Generation,
+        operation: OperationId,
+        slot: crate::SlotBinding,
+        offer: pulsebeam_proto::state::RtpReceiveOffer,
+    },
     MediaPrepared {
         generation: Generation,
         operation: OperationId,

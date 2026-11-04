@@ -292,6 +292,13 @@ impl Connection {
         Ok(())
     }
 
+    /// Includes issued and retired RTP identities and the local RTCP reporter.
+    pub fn rtp_ssrc_reserved(&self, ssrc: u32) -> bool {
+        ssrc == self.ingress.control_ssrc()
+            || self.ingress.has_issued_ssrc(ssrc)
+            || self.egress.has_issued_ssrc(ssrc)
+    }
+
     /// Materialize the accepted typed set. This explicit snapshot is proportional
     /// to the live set; None means no typed update has yet been accepted.
     pub fn rtp_configuration(&self) -> Option<crate::RtpConfiguration> {

@@ -4,7 +4,7 @@ use super::*;
 use crate::participant::core::native_data::tests::frame_for;
 use crate::rtp::{AUDIO_FREQUENCY, MediaTime, RtpPacket};
 
-fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, enabled: bool) -> wire::ResourceSpec {
+fn receiver_spec(track: TrackId, mid: &str, enabled: bool) -> wire::ResourceSpec {
     let mut source = spec(enabled);
     source.settings.as_mut().unwrap().receive =
         Some(wire::resource_settings::Receive::Audio(Default::default()));
@@ -21,15 +21,12 @@ fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, enabled: bool) -> wire::R
         panic!("RTP fixture")
     };
     parameters.mid = mid.into();
-    parameters.encodings[0].ssrc = Some(ssrc);
-    parameters.rtcp.as_mut().unwrap().cname = "component-receiver-cname".into();
     source.declaration = Some(resource_spec::Declaration::Subscription(
         wire::SubscriptionSpec {
             track_id: track.as_str(),
             kind: wire::TrackKind::Audio as i32,
-            binding: Some(wire::TrackBinding {
-                transport: Some(wire::track_binding::Transport::Rtp(parameters)),
-            }),
+            binding: None,
+            rtp_offer: Some(wire::RtpReceiveOffer::from(&parameters)),
         },
     ));
     source
@@ -54,6 +51,27 @@ fn desire(
     assert!(participant.disconnect_reason.is_none());
 }
 
+fn plan_ssrc(plan: &wire::TrackBinding) -> crate::media::Ssrc {
+    let Some(wire::track_binding::Transport::Rtp(parameters)) = &plan.transport else {
+        panic!("RTP plan")
+    };
+    parameters.encodings[0].ssrc.unwrap().into()
+}
+
+fn installed(
+    participant: &mut Participant,
+    sink: &mut MockParticipantSink,
+    reference: u64,
+    plan: wire::TrackBinding,
+) {
+    participant.apply_native_receiver_execution(
+        reference,
+        Some(wire::execution_report::Outcome::Installed(plan)),
+        sink,
+    );
+    assert!(participant.disconnect_reason.is_none());
+}
+
 pub(super) fn check(source: &Track) {
     let mut participant =
         participant_with_capabilities(native_data::unix_now() + 60, Some(capabilities()));
@@ -69,7 +87,7 @@ pub(super) fn check(source: &Track) {
     let mut handles = slotmap::SlotMap::<TrackHandle, _>::with_key();
     let handle = handles.insert(id);
     participant.add_track_candidate(handle, source.clone());
-    let first = receiver_spec(id, "listen", 321, true);
+    let first = receiver_spec(id, "listen", true);
     pulsebeam_proto::state::validation::validate_spec(&first).expect("valid receiving fixture");
     desire(&mut participant, &mut sink, 1, 1, Some(first.clone()));
     let (_, live) = last_live(&mut participant);
@@ -79,13 +97,12 @@ pub(super) fn check(source: &Track) {
         live.participant.unwrap().participant_id,
         source.meta().origin.as_str()
     );
-    assert_eq!(
-        live.execution,
-        wire::ExecutionStatus::WaitingForSource as i32
-    );
+    assert_eq!(live.execution, wire::ExecutionStatus::Preparing as i32);
     assert!(live.activity.is_none());
+    let plan = live.binding.unwrap();
+    let first_ssrc = plan_ssrc(&plan);
     let mid = Mid::from("listen");
-    assert_eq!(participant.transport.stream_tx_ssrc(mid), Some(321.into()));
+    assert_eq!(participant.transport.stream_tx_ssrc(mid), Some(first_ssrc));
     assert_eq!(
         participant
             .transport
@@ -95,7 +112,7 @@ pub(super) fn check(source: &Track) {
     assert!(
         !participant
             .native_receivers
-            .can_write_rtp(mid, id, 321.into(), 111u8.into())
+            .can_write_rtp(mid, id, first_ssrc, 111u8.into())
     );
     participant.native_source_binding(id, handle, true);
     for _ in 0..16 {
@@ -103,6 +120,12 @@ pub(super) fn check(source: &Track) {
             break;
         }
     }
+    assert!(
+        !participant
+            .native_receivers
+            .can_write_rtp(mid, id, first_ssrc, 111u8.into())
+    );
+    installed(&mut participant, &mut sink, 1, plan);
     assert_eq!(
         last_live(&mut participant).1.execution,
         wire::ExecutionStatus::Installed as i32
@@ -112,7 +135,7 @@ pub(super) fn check(source: &Track) {
         &mut sink,
         1,
         2,
-        Some(receiver_spec(id, "changed", 399, true)),
+        Some(receiver_spec(id, "changed", true)),
     );
     let (rejected, live) = last_live(&mut participant);
     assert_eq!(
@@ -126,9 +149,13 @@ pub(super) fn check(source: &Track) {
             .stream_tx_ssrc(Mid::from("changed"))
             .is_none()
     );
-    assert_eq!(participant.transport.stream_tx_ssrc(mid), Some(321.into()));
-    let second = receiver_spec(id, "second", 322, true);
+    assert_eq!(participant.transport.stream_tx_ssrc(mid), Some(first_ssrc));
+    let second = receiver_spec(id, "second", true);
     desire(&mut participant, &mut sink, 3, 3, Some(second));
+    let plan = last_live_for(&mut participant, 3).1.binding.unwrap();
+    let second_ssrc = plan_ssrc(&plan);
+    let second_plan = plan.clone();
+    installed(&mut participant, &mut sink, 3, plan);
     confirmations(&mut participant);
     let mut packet = RtpPacket {
         rtp_ts: MediaTime::new(960, AUDIO_FREQUENCY),
@@ -154,7 +181,7 @@ pub(super) fn check(source: &Track) {
     }
     assert_eq!(
         outputs,
-        vec![(mid, 321.into()), (Mid::from("second"), 322.into())]
+        vec![(mid, first_ssrc), (Mid::from("second"), second_ssrc)]
     );
     video::check(&mut participant, &mut sink, &mut handles, source);
     packet.seq_no = 2u64.into();
@@ -165,7 +192,7 @@ pub(super) fn check(source: &Track) {
         &mut sink,
         1,
         13,
-        Some(receiver_spec(id, "listen", 321, false)),
+        Some(receiver_spec(id, "listen", false)),
     );
     assert_eq!(
         last_live(&mut participant).1.execution,
@@ -174,7 +201,7 @@ pub(super) fn check(source: &Track) {
     assert!(
         !participant
             .native_receivers
-            .can_write_rtp(mid, id, 321.into(), 111u8.into())
+            .can_write_rtp(mid, id, first_ssrc, 111u8.into())
     );
     assert!(
         matches!(participant.stream_writer.pop(), Some(StreamWrite::Audio { mid, .. }) if mid == Mid::from("second"))
@@ -188,7 +215,7 @@ pub(super) fn check(source: &Track) {
     assert!(
         participant
             .native_receivers
-            .can_write_rtp(mid, id, 321.into(), 111u8.into())
+            .can_write_rtp(mid, id, first_ssrc, 111u8.into())
     );
     desire(&mut participant, &mut sink, 1, 15, None);
     assert!(participant.transport.stream_tx_ssrc(mid).is_none());
@@ -205,6 +232,34 @@ pub(super) fn check(source: &Track) {
             .iter()
             .any(|value| matches!(value.value, Some(wire::confirmed_state::Value::Absent(_))))
     );
+    participant.apply_native_receiver_execution(
+        3,
+        Some(wire::execution_report::Outcome::Failure(failure(
+            wire::FailureCode::InternalFailure,
+        ))),
+        &mut sink,
+    );
+    let failed = last_live_for(&mut participant, 3).1;
+    assert_eq!(failed.execution, wire::ExecutionStatus::Failed as i32);
+    assert_eq!(failed.binding, Some(second_plan.clone()));
+    assert_eq!(
+        failed.execution_failure.unwrap().code,
+        wire::FailureCode::InternalFailure as i32
+    );
+    installed(&mut participant, &mut sink, 3, second_plan);
+    participant.native_source_binding(id, handle, false);
+    participant.native_source_binding(id, handle, true);
+    for _ in 0..16 {
+        if !participant.advance_native_source(&mut sink) {
+            break;
+        }
+    }
+    assert!(!participant.native_receivers.can_write_rtp(
+        Mid::from("second"),
+        id,
+        second_ssrc,
+        111u8.into()
+    ));
     participant.native_source_removed(id, crate::participant::effect::TrackRemoval::SourceEnded);
     for _ in 0..16 {
         if !participant.advance_native_source(&mut sink) {

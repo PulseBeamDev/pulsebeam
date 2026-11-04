@@ -12,7 +12,7 @@ negotiated channel 0 is one raw protobuf `ClientStateBatch` or `ServerStateBatch
 with no encoding prefix or compression. `state::codec` enforces 1..4,096 bytes
 and at most 16 resource records, with structural preflight before generated
 decoding. Use `encode_client`/`decode_client` for owned desired proposals and
-`encode_server`/`decode_server` for authoritative observations. Their record
+execution reports, and `encode_server`/`decode_server` for authoritative observations. Their record
 types share resource values, not an envelope that permits either direction.
 `state::validation::validate_spec` checks resource configuration separately:
 a valid desired envelope with an invalid configuration requires a scoped
@@ -51,6 +51,35 @@ Future compression requires an explicitly supported profile, not per-message
 negotiation. There is no Catalog/Intent/Mapping
 schema, legacy codec export or fallback decoder. The signaling data-channel label
 is unchanged; it does not select a different wire protocol.
+
+## Media receive plans and execution
+
+An RTP `SubscriptionSpec` carries `rtp_offer` from the endpoint's applied local
+receive offer and leaves `binding` absent. The offer describes its actual MID,
+codec/PT possibilities, header-extension mappings and RTCP modes without choosing
+receive SSRCs or CNAME. Data subscriptions still carry their prepared SCTP binding.
+HTTP bootstrap capabilities alone are not endpoint receive capabilities.
+
+The server selects a source-compatible intersection, reserves fresh nonzero
+output SSRCs and publishes the authoritative `LiveResource.binding` with
+`Preparing` execution. That binding is immutable for the owned lifetime. A new
+source incarnation requires a fresh receiver and plan, not an active-binding
+retarget. Unrelated capability or settings changes do not reassign its identities.
+
+After actual platform application and readback, the endpoint sends a separate
+`ClientStateRecord.execution`: either the observed installed binding or a scoped
+failure. A record cannot contain both `desired` and `execution`. Reports use the
+same connection-wide monotonic input clock, with a revision later than the owned
+reference; they do not advance the resource's desired `evaluated_revision` or
+replace its accepted specification. A rejected settings proposal therefore cannot
+hide an independent execution failure.
+
+Forwarding and installed execution require matching endpoint evidence as well as
+the existing authorization, source and retirement gates. Endpoint readiness also
+requires its own matching local facts, not server status alone. Installation does
+not wait for RTP packets or statistics; those cannot arrive reliably before the
+forwarding gate opens. Malformed reports, scoped failures and superseded lifetimes
+remain distinct from a successful installation.
 
 ## Enumeration and ordered recovery
 

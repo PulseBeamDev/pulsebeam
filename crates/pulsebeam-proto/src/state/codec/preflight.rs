@@ -32,7 +32,8 @@ macro_rules! shapes {
 
 shapes! {
     ClientStateBatch { 1 => ClientStateRecord },
-    ClientStateRecord { 2 => DesiredState },
+    ClientStateRecord { 2 => DesiredState, 3 => ExecutionReport },
+    ExecutionReport { 2 => TrackBinding, 3 => Failure },
     ServerStateBatch { 1 => ServerStateRecord },
     ServerStateRecord { 1 => ResourceKey, 2 => ConfirmedState },
     ResourceKey {},
@@ -52,8 +53,9 @@ shapes! {
     AudioPublication { 1 => TrackBinding },
     VideoPublication { 1 => TrackBinding },
     DataPublication { 2 => TrackBinding },
-    SubscriptionSpec { 3 => TrackBinding },
-    LiveResource { 1 => ResourceSpec, 2 => Participant, 3 => Track, 5 => Failure },
+    SubscriptionSpec { 3 => TrackBinding, 4 => RtpReceiveOffer },
+    RtpReceiveOffer { 2 => RtpCodecParameters, 3 => RtpHeaderExtensionParameters },
+    LiveResource { 1 => ResourceSpec, 2 => Participant, 3 => Track, 5 => Failure, 7 => TrackBinding },
     AudioReceiveOptions { 1 => PlayoutDelay },
     VideoReceiveOptions { 5 => PlayoutDelay },
     PlayoutDelay {},

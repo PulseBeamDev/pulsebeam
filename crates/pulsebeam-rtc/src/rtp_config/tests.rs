@@ -855,12 +855,16 @@ fn metadata_storage_and_guard_budgets_replace_binding_and_lifetime_quotas() {
 #[test]
 fn physical_mutation_and_cross_direction_reuse_are_not_fresh_bindings() {
     let mut connection = connection();
+    assert!(!connection.rtp_ssrc_reserved(100));
+    assert!(!connection.rtp_ssrc_reserved(101));
     connection.set_rtp_capabilities(capabilities()).unwrap();
     let first = RtpConfiguration {
         inbound: vec![binding("v", 100)],
         outbound: vec![],
     };
     connection.configure_rtp(first.clone()).unwrap();
+    assert!(connection.rtp_ssrc_reserved(100));
+    assert!(connection.rtp_ssrc_reserved(101));
     let mut extension_order = first.clone();
     extension_order.inbound[0].extensions.reverse();
     connection.configure_rtp(extension_order.clone()).unwrap();
@@ -885,6 +889,8 @@ fn physical_mutation_and_cross_direction_reuse_are_not_fresh_bindings() {
     connection
         .configure_rtp(RtpConfiguration::default())
         .unwrap();
+    assert!(connection.rtp_ssrc_reserved(100));
+    assert!(connection.rtp_ssrc_reserved(101));
     let reversed = RtpConfiguration {
         inbound: vec![],
         outbound: first.inbound.clone(),

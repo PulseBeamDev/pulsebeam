@@ -313,6 +313,7 @@ impl WirePeer {
                         None => wire::desired_state::Value::Absent(true),
                     }),
                 }),
+                execution: None,
             }],
         })
         .unwrap();
@@ -410,6 +411,7 @@ fn subscription(source: &wire::Track, channel: u32, enabled: bool) -> wire::Reso
             wire::SubscriptionSpec {
                 track_id: source.track_id.clone(),
                 kind: wire::TrackKind::Data as i32,
+                rtp_offer: None,
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
                         stream_id: Some(channel),

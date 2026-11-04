@@ -94,8 +94,10 @@ pub struct StreamNormalizer {
     /// packet can address this stream.
     vla_index: Option<u8>,
     vla_height: Option<(u64, u32)>,
+    vla_timestamp: u64,
     highest_timestamp: u64,
     dd_height_epoch: Option<u64>,
+    dd_structure_timestamp: u64,
 }
 
 impl StreamNormalizer {
@@ -110,8 +112,10 @@ impl StreamNormalizer {
             dd_errors: 0,
             vla_index: None,
             vla_height: None,
+            vla_timestamp: 0,
             highest_timestamp: 0,
             dd_height_epoch: None,
+            dd_structure_timestamp: 0,
         }
     }
 
@@ -231,9 +235,16 @@ impl StreamNormalizer {
             crate::track::vla_stream_height_px(vla, usize::from(vla.current_simulcast_stream_index))
         });
         if let Some(height) = own_height
+            && timestamp >= self.vla_timestamp
             && self.vla_height.is_none_or(|(epoch, _)| timestamp >= epoch)
         {
-            self.vla_height = Some((timestamp, height));
+            self.vla_timestamp = timestamp;
+            if self
+                .vla_height
+                .is_none_or(|(_, previous)| previous != height)
+            {
+                self.vla_height = Some((timestamp, height));
+            }
         }
         // Older packets must not inherit dimensions from a later declaration.
         pkt.reported_height = own_height
@@ -246,19 +257,26 @@ impl StreamNormalizer {
         let Some(raw) = pkt.ext_vals.raw_dependency_descriptor() else {
             return Some(StreamFacts::default());
         };
-        let stale = self.dd_height_epoch.is_some_and(|epoch| timestamp < epoch)
+        let mut stale = self.dd_height_epoch.is_some_and(|epoch| timestamp < epoch)
             || self.vla_height.is_some_and(|(epoch, _)| timestamp < epoch);
         // An old attached structure may describe its packet, not replace the
         // current parser context or invalidate newer VLA dimensions.
         let parsed = if stale {
             DependencyDescriptorReader::new().read(&raw.0)
         } else {
-            self.dd.read(&raw.0)
+            self.dd.parse(&raw.0)
         };
         match parsed {
             Ok(dd) => {
-                if !stale && dd.attached_structure.is_some() {
-                    self.dd_height_epoch = Some(timestamp);
+                stale |= dd.attached_structure.is_some() && timestamp < self.dd_structure_timestamp;
+                if !stale {
+                    if let Some(structure) = dd.attached_structure.as_deref() {
+                        self.dd_structure_timestamp = timestamp;
+                        if Some(structure) != self.dd.structure() {
+                            self.dd_height_epoch = Some(timestamp);
+                        }
+                    }
+                    self.dd.commit(&dd);
                 }
                 if let Some(resolution) = dd.resolution {
                     let height = u32::from(resolution.height);
@@ -543,6 +561,58 @@ mod tests {
         assert!(result.first.is_some());
         assert!(result.remaining.is_empty());
         assert!(!result.request_keyframe);
+    }
+
+    #[test]
+    fn repeated_declarations_preserve_reordered_dependent_packets() {
+        let mut source = TemporalDdSource::new(3);
+        let keyframe = source.next_frame(true, 1).unwrap().remove(0);
+        let dependent = source.next_frame(false, 1).unwrap().remove(0);
+        let old = source.next_frame(true, 1).unwrap().remove(0);
+        let refresh = source.next_frame(true, 1).unwrap().remove(0);
+        let latest = source.next_frame(false, 1).unwrap().remove(0);
+        let mut old = DependencyDescriptorReader::new().read(&old.0).unwrap();
+        old.attached_structure.as_mut().unwrap().resolutions.push(
+            pulsebeam_core::dd::RenderResolution {
+                width: 1280,
+                height: 720,
+            },
+        );
+        let mut bytes = [0; pulsebeam_core::dd::MAX_DD_LEN];
+        let len = pulsebeam_core::dd::DependencyDescriptorWriter::new()
+            .write(&old, &mut bytes)
+            .unwrap();
+        let old = RawDependencyDescriptor(bytes[..len].iter().copied().collect());
+        let mut normalizer = StreamNormalizer::new(Mid::from("v0"), None);
+        let input = |seq, timestamp, raw, declared_height| {
+            let mut input = packet(seq, raw);
+            input.rtp_ts = crate::rtp::MediaTime::new(timestamp, crate::rtp::VIDEO_FREQUENCY);
+            if let Some(height) = declared_height {
+                input
+                    .ext_vals
+                    .set_video_layers_allocation(allocation(0, height));
+            }
+            input
+        };
+        for (seq, timestamp, raw, declaration, height) in [
+            (1, 100, keyframe, Some(180), 180),
+            (3, 300, refresh, Some(180), 180),
+            (2, 200, dependent, None, 180),
+            (4, 250, old, Some(720), 720),
+            (5, 400, latest, None, 180),
+        ] {
+            let normalized = normalizer.normalize(input(seq, timestamp, raw, declaration));
+            assert!(!normalized.request_keyframe);
+            let (packet, _) = normalized.first.unwrap();
+            assert_eq!(packet.reported_height, height);
+            assert!(packet.ext_vals.dependency_descriptor().is_some());
+            assert_eq!(packet.is_keyframe, matches!(seq, 1 | 3 | 4));
+        }
+        assert_eq!(normalizer.dd_errors(), 0);
+        assert_eq!(normalizer.dd_height_epoch, Some(100));
+        assert_eq!(normalizer.dd_structure_timestamp, 300);
+        assert_eq!(normalizer.vla_height, Some((100, 180)));
+        assert_eq!(normalizer.vla_timestamp, 300);
     }
 
     #[test]

@@ -891,6 +891,7 @@ where
             let (generation, kind) = match event {
                 RtcEvent::OfferCreated { generation, .. } => (generation, "offer_created"),
                 RtcEvent::AnswerApplied { generation } => (generation, "answer_applied"),
+                RtcEvent::MediaOffered { generation, .. } => (generation, "media_offered"),
                 RtcEvent::MediaPrepared { generation, .. } => (generation, "media_prepared"),
                 RtcEvent::MediaObserved { generation, .. } => (generation, "media_observed"),
                 RtcEvent::BootstrapMediaPrepared { generation, .. } => {
@@ -1410,6 +1411,51 @@ where
                                 outcome: agent_core::client_sdp::ApplyOutcome::NotApplied,
                                 preparation: Err(agent_core::client_sdp::Error::CandidateState),
                             })),
+                        };
+                        if let Some(event) = event {
+                            self.accept(event);
+                        }
+                    }
+                    RtcEffect::OfferReceiveMedia {
+                        generation,
+                        operation,
+                        target,
+                    } => {
+                        let event = match self
+                            .peer
+                            .as_mut()
+                            .filter(|peer| peer.generation == generation)
+                        {
+                            Some(peer) => peer.offer_receive_media(operation, target),
+                            None => Some(super::native_peer::media_event(
+                                generation,
+                                operation,
+                                agent_core::client_sdp::ApplyOutcome::NotApplied,
+                                Err(agent_core::client_sdp::Error::CandidateState),
+                            )),
+                        };
+                        if let Some(event) = event {
+                            self.accept(event);
+                        }
+                    }
+                    RtcEffect::ApplyReceivePlan {
+                        generation,
+                        operation,
+                        slot,
+                        parameters,
+                    } => {
+                        let event = match self
+                            .peer
+                            .as_mut()
+                            .filter(|peer| peer.generation == generation)
+                        {
+                            Some(peer) => peer.apply_receive_plan(operation, slot, parameters),
+                            None => Some(super::native_peer::media_event(
+                                generation,
+                                operation,
+                                agent_core::client_sdp::ApplyOutcome::NotApplied,
+                                Err(agent_core::client_sdp::Error::CandidateState),
+                            )),
                         };
                         if let Some(event) = event {
                             self.accept(event);

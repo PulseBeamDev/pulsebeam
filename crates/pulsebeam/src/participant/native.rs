@@ -56,6 +56,12 @@ pub(crate) struct NativeOutput {
     pub(crate) bytes: Vec<u8>,
 }
 
+#[derive(Default)]
+pub(crate) struct NativeInput {
+    pub(crate) cutoffs: Vec<u64>,
+    pub(crate) executions: Vec<(u64, wire::ExecutionReport)>,
+}
+
 pub(crate) struct Preparation {
     pub(crate) reference: u64,
     pub(crate) revision: u64,
@@ -292,6 +298,15 @@ impl NativeSession {
         reference: u64,
         execution: wire::ExecutionStatus,
     ) -> Result<(), OutputError> {
+        self.observe_execution_result(reference, execution, None)
+    }
+
+    pub(crate) fn observe_execution_result(
+        &mut self,
+        reference: u64,
+        execution: wire::ExecutionStatus,
+        failure: Option<wire::Failure>,
+    ) -> Result<(), OutputError> {
         let key = Key::Owned(reference);
         let Some(row) = self.rows.get(&key) else {
             return Ok(());
@@ -304,7 +319,7 @@ impl NativeSession {
             return Ok(());
         };
         live.execution = execution as i32;
-        live.execution_failure = None;
+        live.execution_failure = failure;
         self.put(key, value)
     }
 
@@ -376,16 +391,26 @@ impl NativeSession {
         )
     }
 
-    pub(crate) fn apply_input(&mut self, bytes: &[u8]) -> Result<Vec<u64>, InputError> {
+    pub(crate) fn apply_input(&mut self, bytes: &[u8]) -> Result<NativeInput, InputError> {
         let batch = codec::decode_client(bytes).map_err(InputError::Decode)?;
-        let mut cutoffs = Vec::new();
+        let mut effects = NativeInput::default();
         for record in batch.records {
             let reference = record.owned;
-            let target = record.desired.ok_or(InputError::Revision)?;
-            if self.closed || target.revision <= self.last_revision {
+            let revision = record
+                .desired
+                .as_ref()
+                .map(|desired| desired.revision)
+                .or_else(|| record.execution.as_ref().map(|report| report.revision))
+                .ok_or(InputError::Revision)?;
+            if self.closed || revision <= self.last_revision {
                 return Err(InputError::Revision);
             }
-            self.last_revision = target.revision;
+            self.last_revision = revision;
+            if let Some(report) = record.execution {
+                effects.executions.push((reference, report));
+                continue;
+            }
+            let target = record.desired.ok_or(InputError::Revision)?;
             let key = Key::Owned(reference);
             if matches!(target.value, Some(wire::desired_state::Value::Absent(true))) {
                 let previous = self
@@ -404,7 +429,7 @@ impl NativeSession {
                     owned.retired = true;
                     owned.cutoff_pending = true;
                     owned.cutoff_reason = wire::AbsenceReason::Removed;
-                    cutoffs.push(reference);
+                    effects.cutoffs.push(reference);
                 } else {
                     self.put(
                         key,
@@ -511,7 +536,7 @@ impl NativeSession {
             }
             self.queue_preparation(reference);
         }
-        Ok(cutoffs)
+        Ok(effects)
     }
 
     fn reject(
@@ -1150,6 +1175,7 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
                     execution: wire::ExecutionStatus::Failed as i32,
                     execution_failure: Some(failure),
                     activity: Some(wire::MediaActivity::Active as i32),
+                    binding: None,
                 },
             ))),
         }),
@@ -1157,6 +1183,29 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
     wire::ServerStateBatch {
         records: vec![record],
         initial_complete: true,
+    }
+    .encoded_len()
+        <= codec::MAX_FRAME_SIZE
+}
+
+pub(super) fn execution_fits(live: &wire::LiveResource) -> bool {
+    let failure = wire::Failure {
+        code: wire::FailureCode::InternalFailure as i32,
+        diagnostic: "e".repeat(256),
+    };
+    let mut live = live.clone();
+    live.execution = wire::ExecutionStatus::Failed as i32;
+    live.execution_failure = Some(failure.clone());
+    wire::ServerStateBatch {
+        initial_complete: true,
+        records: vec![wire::ServerStateRecord {
+            key: Some(Key::Owned(u64::MAX).wire()),
+            confirmed: Some(wire::ConfirmedState {
+                evaluated_revision: u64::MAX,
+                rejection: Some(failure),
+                value: Some(wire::confirmed_state::Value::Owned(Box::new(live))),
+            }),
+        }],
     }
     .encoded_len()
         <= codec::MAX_FRAME_SIZE

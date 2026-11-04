@@ -94,6 +94,7 @@ struct Owned {
     sent_revision: u64,
     sent: wire::ResourceSpec,
     confirmed: Option<wire::ConfirmedState>,
+    execution: Option<Box<wire::ExecutionReport>>,
     retiring: bool,
 }
 
@@ -110,6 +111,9 @@ impl Owned {
             .saturating_add(self.resource.retained_bytes())
             .saturating_add(self.sent.encoded_len())
             .saturating_add(self.confirmed.as_ref().map_or(0, Message::encoded_len))
+            .saturating_add(self.execution.as_ref().map_or(0, |report| {
+                size_of::<wire::ExecutionReport>().saturating_add(report.encoded_len())
+            }))
     }
 }
 
@@ -134,6 +138,8 @@ pub(crate) struct NativeState {
     owned: BTreeMap<u64, Owned>,
     dirty: BTreeSet<Resource>,
     retiring: BTreeSet<u64>,
+    executions: BTreeSet<u64>,
+    prefer_execution: bool,
     retiring_resources: BTreeMap<Resource, u64>,
     cursor: Option<Resource>,
     prefer_retirement: bool,
@@ -162,6 +168,8 @@ impl NativeState {
             owned: BTreeMap::new(),
             dirty: BTreeSet::new(),
             retiring: BTreeSet::new(),
+            executions: BTreeSet::new(),
+            prefer_execution: true,
             retiring_resources: BTreeMap::new(),
             cursor: None,
             prefer_retirement: true,
@@ -279,6 +287,51 @@ impl NativeState {
         }
     }
 
+    pub(crate) fn report_execution(
+        &mut self,
+        reference: u64,
+        outcome: wire::execution_report::Outcome,
+    ) -> Result<(), SignalingError> {
+        let Some(owned) = self
+            .owned
+            .get(&reference)
+            .filter(|owned| !owned.retiring && !self.terminal)
+        else {
+            return Ok(());
+        };
+        let Some(wire::confirmed_state::Value::Owned(live)) = owned
+            .confirmed
+            .as_ref()
+            .and_then(|state| state.value.as_ref())
+        else {
+            return Err(SignalingError::Invalid("execution without receive plan"));
+        };
+        if !matches!(owned.resource, Resource::Reception(_)) || live.binding.is_none() {
+            return Err(SignalingError::Invalid("execution without receive plan"));
+        }
+        if let wire::execution_report::Outcome::Installed(observed) = &outcome
+            && !validation::bindings_equivalent(Some(observed), live.binding.as_ref())
+        {
+            return Err(SignalingError::Invalid("installed receive binding"));
+        }
+        let report = Box::new(wire::ExecutionReport {
+            revision: u64::MAX,
+            outcome: Some(outcome),
+        });
+        validation::validate_execution_report(&report)
+            .map_err(|_| SignalingError::Invalid("execution report"))?;
+        let old = owned.execution.as_ref().map_or(0, |report| {
+            size_of::<wire::ExecutionReport>().saturating_add(report.encoded_len())
+        });
+        let next = size_of::<wire::ExecutionReport>().saturating_add(report.encoded_len());
+        self.account(old, next)?;
+        if let Some(owned) = self.owned.get_mut(&reference) {
+            owned.execution = Some(report);
+        }
+        self.executions.insert(reference);
+        Ok(())
+    }
+
     pub(crate) fn next_frame(&mut self) -> Result<Option<Vec<u8>>, SignalingError> {
         if self.terminal {
             return Ok(None);
@@ -303,6 +356,47 @@ impl NativeState {
             } else {
                 None
             };
+            let execution = retirement
+                .filter(|reference| self.executions.contains(reference))
+                .or_else(|| self.executions.first().copied());
+            if let Some(reference) = execution
+                && (self.prefer_execution
+                    || (resource.is_none() && retirement.is_none())
+                    || retirement == Some(reference))
+            {
+                let Some(report) = self
+                    .owned
+                    .get(&reference)
+                    .and_then(|owned| owned.execution.as_ref())
+                else {
+                    self.executions.remove(&reference);
+                    continue;
+                };
+                let bytes = size_of::<wire::ExecutionReport>().saturating_add(report.encoded_len());
+                let revision = self.next_revision()?;
+                let mut report = report.as_ref().clone();
+                report.revision = revision;
+                batch.records.push(wire::ClientStateRecord {
+                    owned: reference,
+                    desired: None,
+                    execution: Some(report),
+                });
+                if batch.encoded_len() > codec::MAX_FRAME_SIZE {
+                    batch.records.pop();
+                    if batch.records.is_empty() {
+                        return Err(SignalingError::Encode);
+                    }
+                    break;
+                }
+                self.account(bytes, 0)?;
+                if let Some(owned) = self.owned.get_mut(&reference) {
+                    owned.execution = None;
+                }
+                self.executions.remove(&reference);
+                self.revision = revision;
+                self.prefer_execution = false;
+                continue;
+            }
             let (reference, resource, spec) = if let Some(reference) = retirement {
                 let Some(owned) = self.owned.get(&reference) else {
                     self.retiring.remove(&reference);
@@ -351,6 +445,7 @@ impl NativeState {
                 sent_revision: revision,
                 sent,
                 confirmed: previous.and_then(|owned| owned.confirmed.clone()),
+                execution: previous.and_then(|owned| owned.execution.clone()),
                 retiring: retirement.is_some(),
             };
             let old_bytes = previous.map_or(0, Owned::retained_bytes);
@@ -364,6 +459,7 @@ impl NativeState {
             self.owned.insert(reference, next);
             self.revision = revision;
             self.prefer_retirement = retirement.is_none();
+            self.prefer_execution = true;
             if retirement.is_some() {
                 self.retiring.remove(&reference);
             } else {
@@ -530,6 +626,12 @@ impl NativeState {
                 .as_ref()
                 .and_then(|state| state.value.as_ref())
                 && (previous.participant != live.participant
+                    || match (&previous.binding, &live.binding) {
+                        (None, None) => false,
+                        (previous, next) => {
+                            !validation::bindings_equivalent(previous.as_ref(), next.as_ref())
+                        }
+                    }
                     || !matches!((&previous.track, &live.track), (Some(previous), Some(next)) if tracks_equal(previous, next)))
             {
                 return Err(SignalingError::Invalid("owned source identity"));
@@ -542,14 +644,17 @@ impl NativeState {
         let resource = owned.resource.clone();
         let terminal = matches!(state.value, Some(wire::confirmed_state::Value::Absent(_)));
         let retired_binding = if terminal {
-            match owned.sent.declaration.as_ref() {
-                Some(wire::resource_spec::Declaration::Subscription(subscription))
-                    if matches!(resource, Resource::Reception(_)) =>
-                {
-                    subscription.binding.clone().map(Box::new)
-                }
-                _ => None,
-            }
+            owned
+                .confirmed
+                .as_ref()
+                .and_then(|state| match state.value.as_ref() {
+                    Some(wire::confirmed_state::Value::Owned(live))
+                        if matches!(resource, Resource::Reception(_)) =>
+                    {
+                        live.binding.clone().map(Box::new)
+                    }
+                    _ => None,
+                })
         } else {
             None
         };
@@ -623,6 +728,7 @@ impl NativeState {
         if terminal {
             self.owned.remove(&reference);
             self.retiring.remove(&reference);
+            self.executions.remove(&reference);
             if self.retiring_resources.get(&resource) == Some(&reference) {
                 self.retiring_resources.remove(&resource);
             }
@@ -842,6 +948,7 @@ fn desired_record(
 ) -> wire::ClientStateRecord {
     wire::ClientStateRecord {
         owned: reference,
+        execution: None,
         desired: Some(wire::DesiredState {
             revision,
             value: Some(match spec {

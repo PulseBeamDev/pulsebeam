@@ -52,6 +52,7 @@ fn desired(
 ) -> wire::ClientStateRecord {
     wire::ClientStateRecord {
         owned: reference,
+        execution: None,
         desired: Some(wire::DesiredState {
             revision,
             value: Some(value),
@@ -64,7 +65,7 @@ fn input(
     records: Vec<wire::ClientStateRecord>,
 ) -> Result<Vec<u64>, InputError> {
     let bytes = codec::encode_client(&wire::ClientStateBatch { records }).unwrap();
-    session.apply_input(&bytes)
+    session.apply_input(&bytes).map(|input| input.cutoffs)
 }
 
 fn source(reference: u64, label: &str) -> wire::Track {
@@ -97,6 +98,7 @@ fn live(work: &Preparation) -> wire::LiveResource {
         } as i32,
         execution_failure: None,
         activity: None,
+        binding: None,
     }
 }
 
@@ -224,8 +226,26 @@ fn overlapping_proposals_cannot_replace_queued_or_active_targets() {
             if start_preparation {
                 session.take_preparation().unwrap().unwrap();
             }
+            let report = wire::ExecutionReport {
+                revision: 2,
+                outcome: Some(wire::execution_report::Outcome::Failure(failure(
+                    wire::FailureCode::Unsupported,
+                ))),
+            };
+            let bytes = codec::encode_client(&wire::ClientStateBatch {
+                records: vec![wire::ClientStateRecord {
+                    owned: 1,
+                    desired: None,
+                    execution: Some(report.clone()),
+                }],
+            })
+            .unwrap();
+            let effects = session.apply_input(&bytes).unwrap();
+            assert!(effects.cutoffs.is_empty());
+            assert_eq!(effects.executions, vec![(1, report)]);
+            assert_eq!(session.last_revision, 2);
             assert!(matches!(
-                input(&mut session, vec![present(1, 2, next)]),
+                input(&mut session, vec![present(1, 3, next)]),
                 Err(InputError::Revision)
             ));
             let owned = session.rows[&Key::Owned(1)].owned.as_ref().unwrap();

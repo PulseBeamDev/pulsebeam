@@ -415,6 +415,7 @@ impl Participant {
                 participant_external_id: self.participant_external_id.as_str().to_owned(),
             }),
             track,
+            binding: None,
             execution: if enabled {
                 wire::ExecutionStatus::Installed
             } else {

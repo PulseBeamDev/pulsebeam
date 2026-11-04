@@ -384,6 +384,7 @@ struct Peer {
     generation: Generation,
     connection: RtcPeerConnection,
     sdp: Option<agent_core::client_sdp::Executor>,
+    receive_wait: Option<preparation::ReceiveWait>,
     transceivers: Vec<(MediaSlot, RtcRtpTransceiver)>,
     receiver_mids: BTreeMap<u32, String>,
     remote_tracks: BTreeMap<String, RemoteTrackState>,
@@ -1431,6 +1432,21 @@ impl RuntimeInner {
             } => {
                 self.allocate_media(generation, operation, allocations);
             }
+            RtcEffect::OfferReceiveMedia {
+                generation,
+                operation,
+                target,
+            } => {
+                self.offer_receive_media(generation, operation, target);
+            }
+            RtcEffect::ApplyReceivePlan {
+                generation,
+                operation,
+                slot,
+                parameters,
+            } => {
+                self.apply_receive_plan(generation, operation, slot, parameters);
+            }
             RtcEffect::RetireMedia {
                 generation,
                 operation,
@@ -1450,6 +1466,54 @@ impl RuntimeInner {
                 }
                 self.send_event(HostEvent::Rtc(RtcEvent::Closed { generation }));
             }
+        }
+    }
+
+    fn refresh_remote_track(
+        self: &Rc<Self>,
+        generation: Generation,
+        mid: String,
+        remote_track: MediaStreamTrack,
+    ) {
+        let inner = self;
+        let ended_weak = Rc::downgrade(inner);
+        let ended_mid = mid.clone();
+        let ended_track = Clone::clone(&remote_track);
+        let ended = Closure::wrap(Box::new(move |_event: Event| {
+            let Some(inner) = ended_weak.upgrade() else {
+                return;
+            };
+            let removed = inner
+                .peers
+                .borrow_mut()
+                .get_mut(&generation.get())
+                .and_then(|peer| {
+                    let current = peer.remote_tracks.get(&ended_mid)?;
+                    if !Object::is(current.track.as_ref(), ended_track.as_ref()) {
+                        return None;
+                    }
+                    peer.remote_tracks.remove(&ended_mid)
+                });
+            if removed.is_some() {
+                inner.publish_current_snapshot();
+            }
+        }) as Box<dyn FnMut(Event)>);
+        remote_track.set_onended(Some(ended.as_ref().unchecked_ref()));
+        let state = RemoteTrackState {
+            track: remote_track,
+            _ended: ended,
+        };
+        let replaced = inner
+            .peers
+            .borrow_mut()
+            .get_mut(&generation.get())
+            .map(|peer| peer.remote_tracks.insert(mid, state));
+        let inserted = replaced.is_some();
+        if let Some(previous) = replaced.flatten() {
+            previous.close();
+        }
+        if inserted {
+            inner.publish_current_snapshot();
         }
     }
 
@@ -1496,46 +1560,7 @@ impl RuntimeInner {
                 ));
                 return;
             };
-            let remote_track = event.track();
-            let ended_weak = Rc::downgrade(&inner);
-            let ended_mid = mid.clone();
-            let ended_track = Clone::clone(&remote_track);
-            let ended = Closure::wrap(Box::new(move |_event: Event| {
-                let Some(inner) = ended_weak.upgrade() else {
-                    return;
-                };
-                let removed = inner
-                    .peers
-                    .borrow_mut()
-                    .get_mut(&generation.get())
-                    .and_then(|peer| {
-                        let current = peer.remote_tracks.get(&ended_mid)?;
-                        if !Object::is(current.track.as_ref(), ended_track.as_ref()) {
-                            return None;
-                        }
-                        peer.remote_tracks.remove(&ended_mid)
-                    });
-                if removed.is_some() {
-                    inner.publish_current_snapshot();
-                }
-            }) as Box<dyn FnMut(Event)>);
-            remote_track.set_onended(Some(ended.as_ref().unchecked_ref()));
-            let state = RemoteTrackState {
-                track: remote_track,
-                _ended: ended,
-            };
-            let replaced = inner
-                .peers
-                .borrow_mut()
-                .get_mut(&generation.get())
-                .map(|peer| peer.remote_tracks.insert(mid, state));
-            let inserted = replaced.is_some();
-            if let Some(previous) = replaced.flatten() {
-                previous.close();
-            }
-            if inserted {
-                inner.publish_current_snapshot();
-            }
+            inner.refresh_remote_track(generation, mid, event.track());
         }) as Box<dyn FnMut(RtcTrackEvent)>);
         connection.set_ontrack(Some(track.as_ref().unchecked_ref()));
 
@@ -1566,6 +1591,7 @@ impl RuntimeInner {
             generation,
             connection,
             sdp: None,
+            receive_wait: None,
             // Keep the initial SCTP m-line as the non-retiring BUNDLE anchor.
             transceivers: Vec::new(),
             receiver_mids: BTreeMap::new(),
