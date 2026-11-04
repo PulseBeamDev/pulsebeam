@@ -14,8 +14,8 @@ use validation::ValidationError;
 fn publication(revision: u64) -> ClientStateBatch {
     ClientStateBatch {
         records: vec![ClientStateRecord {
-            execution: None,
             owned: revision,
+            execution: None,
             desired: Some(DesiredState {
                 revision,
                 value: Some(desired_state::Value::Present(
@@ -335,16 +335,17 @@ fn receive_replacements_preserve_explicit_zero_and_reject_not_clamp() {
         declaration: Some(resource_spec::Declaration::Subscription(SubscriptionSpec {
             track_id: String::from("opaque-track"),
             kind: TrackKind::Video as i32,
-            binding: None,
-            rtp_offer: Some(RtpReceiveOffer::from(&RtpParameters {
-                codec: Some(RtpCodecParameters {
-                    format: Some(CodecFormat::from(codec_format::Codec::Vp8(
-                        Vp8Parameters {},
-                    ))),
-                    ..rtp().codec.unwrap()
-                }),
-                ..rtp()
-            })),
+            binding: Some(TrackBinding {
+                transport: Some(track_binding::Transport::Rtp(RtpParameters {
+                    codec: Some(RtpCodecParameters {
+                        format: Some(CodecFormat::from(codec_format::Codec::Vp8(
+                            Vp8Parameters {},
+                        ))),
+                        ..rtp().codec.unwrap()
+                    }),
+                    ..rtp()
+                })),
+            }),
         })),
     };
     let defaults = VideoReceiveOptions::default();
@@ -404,7 +405,6 @@ fn owned_confirmation_is_self_contained_and_execution_failure_is_not_rejection()
         panic!("present")
     };
     let live = LiveResource {
-        binding: None,
         spec: Some(*spec),
         participant: Some(Participant {
             participant_id: String::from("participant"),
@@ -564,8 +564,9 @@ fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
         declaration: Some(resource_spec::Declaration::Subscription(SubscriptionSpec {
             track_id: String::from(track_id),
             kind: TrackKind::Video as i32,
-            binding: None,
-            rtp_offer: Some(RtpReceiveOffer::from(&binding)),
+            binding: Some(TrackBinding {
+                transport: Some(track_binding::Transport::Rtp(binding.clone())),
+            }),
         })),
     };
     assert!(!validation::declarations_equivalent(
@@ -594,100 +595,6 @@ fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
     };
     sctp.stream_id = Some(2);
     assert!(!validation::declarations_equivalent(data, &moved));
-}
-
-#[test]
-fn receive_plans_and_execution_evidence_are_distinct_from_desired_targets() {
-    let plan = rtp();
-    let offer = RtpReceiveOffer::from(&plan);
-    assert_eq!(
-        validation::validate_receive_plan(&offer, &plan, TrackKind::Audio),
-        Ok(())
-    );
-    let binding = TrackBinding {
-        transport: Some(track_binding::Transport::Rtp(plan.clone())),
-    };
-    let spec = ResourceSpec {
-        declaration: Some(resource_spec::Declaration::Subscription(SubscriptionSpec {
-            track_id: "source".into(),
-            kind: TrackKind::Audio as i32,
-            binding: None,
-            rtp_offer: Some(offer.clone()),
-        })),
-        settings: Some(ResourceSettings {
-            enabled: Some(true),
-            receive: Some(resource_settings::Receive::Audio(
-                AudioReceiveOptions::default(),
-            )),
-        }),
-    };
-    let mut live = LiveResource {
-        spec: Some(spec.clone()),
-        participant: Some(Participant {
-            participant_id: "participant".into(),
-            participant_external_id: "alice".into(),
-        }),
-        track: Some(Track {
-            track_id: "source".into(),
-            participant_id: "participant".into(),
-            label: "microphone".into(),
-            kind: Some(track::Kind::Audio(AudioTrack {
-                format: plan.codec.as_ref().unwrap().format.clone(),
-            })),
-        }),
-        execution: ExecutionStatus::Preparing as i32,
-        binding: Some(binding.clone()),
-        execution_failure: None,
-        activity: None,
-    };
-    assert_eq!(validation::validate_live(&live), Ok(()));
-    live.binding = None;
-    assert_eq!(
-        validation::validate_live(&live),
-        Err(ValidationError::Binding)
-    );
-    let mut changed = plan;
-    changed.mid = "different".into();
-    assert_eq!(
-        validation::validate_receive_plan(&offer, &changed, TrackKind::Audio),
-        Err(ValidationError::Capability)
-    );
-    let mut batch = ClientStateBatch {
-        records: vec![ClientStateRecord {
-            owned: 4,
-            desired: None,
-            execution: Some(ExecutionReport {
-                revision: 8,
-                outcome: Some(execution_report::Outcome::Installed(binding)),
-            }),
-        }],
-    };
-    assert_eq!(
-        decode_client(&encode_client(&batch).unwrap()),
-        Ok(batch.clone())
-    );
-    batch.records[0].desired = Some(DesiredState {
-        revision: 7,
-        value: Some(desired_state::Value::Present(spec.into())),
-    });
-    assert_eq!(
-        validation::validate_client_batch(&batch),
-        Err(ValidationError::Desired)
-    );
-    batch.records[0].desired = None;
-    let report = batch.records[0].execution.as_mut().unwrap();
-    report.revision = 4;
-    assert_eq!(
-        validation::validate_client_batch(&batch),
-        Err(ValidationError::Desired)
-    );
-    let report = batch.records[0].execution.as_mut().unwrap();
-    report.revision = 8;
-    report.outcome = Some(execution_report::Outcome::Failure(Failure {
-        code: FailureCode::Unsupported as i32,
-        diagnostic: "decoder unavailable".into(),
-    }));
-    assert_eq!(decode_client(&encode_client(&batch).unwrap()), Ok(batch));
 }
 
 #[test]
@@ -974,4 +881,45 @@ fn session_and_owned_absence_have_distinct_failure_and_direction_rules() {
     };
     let batch = confirmed(resource_key::Key::Session(true), terminal);
     assert_eq!(decode_server(&encode_server(&batch).unwrap()), Ok(batch));
+}
+
+#[test]
+fn execution_failures_are_required_scoped_and_independently_revisioned() {
+    let mut batch = ClientStateBatch {
+        records: vec![ClientStateRecord {
+            owned: 1,
+            desired: None,
+            execution: Some(ExecutionReport {
+                revision: 2,
+                failure: Some(Failure {
+                    code: FailureCode::InternalFailure as i32,
+                    diagnostic: String::from("receiver failed after admission"),
+                }),
+            }),
+        }],
+    };
+    assert_eq!(
+        decode_client(&encode_client(&batch).unwrap()),
+        Ok(batch.clone())
+    );
+    batch.records[0].execution.as_mut().unwrap().failure = None;
+    assert_eq!(
+        encode_client(&batch),
+        Err(EncodeError::Validation(ValidationError::Failure))
+    );
+    batch.records[0].execution.as_mut().unwrap().failure = Some(Failure {
+        code: FailureCode::InternalFailure as i32,
+        diagnostic: String::new(),
+    });
+    batch.records[0].execution.as_mut().unwrap().revision = 1;
+    assert_eq!(
+        encode_client(&batch),
+        Err(EncodeError::Validation(ValidationError::Desired))
+    );
+    batch.records[0].execution.as_mut().unwrap().revision = 2;
+    batch.records[0].desired = publication(3).records.pop().unwrap().desired;
+    assert_eq!(
+        encode_client(&batch),
+        Err(EncodeError::Validation(ValidationError::Desired))
+    );
 }

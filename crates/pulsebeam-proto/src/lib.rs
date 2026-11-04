@@ -23,7 +23,6 @@ pub mod state {
     pub mod codec;
     mod format;
     pub use format::*;
-    mod receive;
     pub mod sdp;
     pub mod validation;
 }

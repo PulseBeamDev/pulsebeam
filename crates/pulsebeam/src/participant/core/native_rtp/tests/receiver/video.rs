@@ -3,7 +3,7 @@ use crate::media::{Rid, SimulcastLayer};
 use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::test_utils::H264StreamBuilder;
 
-fn receiver_spec(track: TrackId, mid: &str, fixed: bool) -> wire::ResourceSpec {
+fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, fixed: bool) -> wire::ResourceSpec {
     let format = capabilities()
         .codecs
         .into_iter()
@@ -17,49 +17,18 @@ fn receiver_spec(track: TrackId, mid: &str, fixed: bool) -> wire::ResourceSpec {
         })
         .unwrap();
     wire::ResourceSpec {
-        declaration: Some(resource_spec::Declaration::Subscription(
-            wire::SubscriptionSpec {
-                track_id: track.as_str(),
-                kind: wire::TrackKind::Video as i32,
-                binding: None,
-                rtp_offer: Some(wire::RtpReceiveOffer {
-                    mid: mid.into(),
-                    codecs: vec![wire::RtpCodecParameters {
-                        payload_type: Some(96),
-                        format: Some(format),
-                        feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()],
-                        ..Default::default()
-                    }],
-                    rtcp_modes: vec![wire::RtcpMode::Compound.into()],
-                    header_extensions: [
-                        wire::RtpHeaderExtensionType::RtpHeaderExtensionMid,
-                        wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01,
-                        wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay,
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, kind)| wire::RtpHeaderExtensionParameters {
-                        id: u32::try_from(i.checked_add(1).unwrap()).unwrap(),
-                        uri: kind.as_str().into(),
-                    })
-                    .collect(),
-                }),
-            },
-        )),
-        settings: Some(wire::ResourceSettings {
-            enabled: Some(true),
-            receive: Some(wire::resource_settings::Receive::Video(
-                wire::VideoReceiveOptions {
-                    min_height: Some(1),
-                    min_fps: Some(1),
-                    playout_delay: fixed.then_some(wire::PlayoutDelay {
-                        min_ms: 100,
-                        max_ms: 100,
-                    }),
-                    ..Default::default()
-                },
-            )),
-        }),
+        declaration: Some(resource_spec::Declaration::Subscription(wire::SubscriptionSpec {
+            track_id: track.as_str(),
+            kind: wire::TrackKind::Video as i32,
+            binding: Some(wire::TrackBinding { transport: Some(wire::track_binding::Transport::Rtp(wire::RtpParameters {
+                mid: mid.into(),
+                codec: Some(wire::RtpCodecParameters { payload_type: Some(96), format: Some(format), feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()], ..Default::default() }),
+                encodings: vec![wire::RtpEncodingParameters { ssrc: Some(ssrc), ..Default::default() }],
+                rtcp: Some(wire::RtcpParameters { cname: "component-video-receiver".into(), reduced_size: false }),
+                header_extensions: vec![wire::RtpHeaderExtensionParameters { id: 1, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str().into() }, wire::RtpHeaderExtensionParameters { id: 2, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str().into() }, wire::RtpHeaderExtensionParameters { id: 3, uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionPlayoutDelay.as_str().into() }],
+            })) }),
+        })),
+        settings: Some(wire::ResourceSettings { enabled: Some(true), receive: Some(wire::resource_settings::Receive::Video(wire::VideoReceiveOptions { min_height: Some(1), min_fps: Some(1), playout_delay: fixed.then_some(wire::PlayoutDelay { min_ms: 100, max_ms: 100 }), ..Default::default() })) }),
     }
 }
 
@@ -144,27 +113,32 @@ pub(super) fn check(
         .update_bitrate(Instant::now(), crate::bitrate::Bitrate::from(2_000_000));
     let (mut tx, mut video) =
         track::new_video(Mid::from("camera"), meta, vec![SimulcastLayer::new("q")]);
-    let first = receiver_spec(id, "video-a", true);
+    let first = receiver_spec(id, "video-a", 801, true);
     let Some(resource_spec::Declaration::Subscription(subscription)) = &first.declaration else {
+        unreachable!()
+    };
+    let Some(wire::track_binding::Transport::Rtp(parameters)) = subscription
+        .binding
+        .as_ref()
+        .and_then(|binding| binding.transport.as_ref())
+    else {
         unreachable!()
     };
     let Track::Video(source) = &mut video else {
         unreachable!()
     };
-    source.format = subscription.rtp_offer.as_ref().unwrap().codecs[0]
-        .format
-        .clone();
+    source.format = parameters
+        .codec
+        .as_ref()
+        .and_then(|codec| codec.format.clone());
     let handle = handles.insert(id);
     participant.add_track_candidate(handle, video);
-    let mut identities = Vec::new();
-    for (reference, spec) in [(5, first.clone()), (7, receiver_spec(id, "video-b", false))] {
+    for (reference, spec) in [
+        (5, first.clone()),
+        (7, receiver_spec(id, "video-b", 802, false)),
+    ] {
         pulsebeam_proto::state::validation::validate_spec(&spec).unwrap();
         desire(participant, sink, reference, reference, Some(spec));
-        let live = last_live_for(participant, reference).1;
-        assert_eq!(live.execution, wire::ExecutionStatus::Preparing as i32);
-        let plan = live.binding.unwrap();
-        identities.push(plan_ssrc(&plan));
-        installed(participant, sink, reference, plan);
         assert_eq!(
             last_live_for(participant, reference).1.execution,
             wire::ExecutionStatus::WaitingForSource as i32
@@ -177,33 +151,32 @@ pub(super) fn check(
         }
     }
     confirmations(participant);
-    let [a_ssrc, b_ssrc]: [crate::media::Ssrc; 2] = identities.try_into().unwrap();
     let a = Mid::from("video-a");
     let b = Mid::from("video-b");
     assert!(
         participant
             .native_receivers
-            .can_write_rtp(a, id, a_ssrc, 96u8.into())
+            .can_write_rtp(a, id, 801.into(), 96u8.into())
     );
     assert!(
         !participant
             .native_receivers
-            .can_write_rtp(a, audio.id(), a_ssrc, 96u8.into())
+            .can_write_rtp(a, audio.id(), 801.into(), 96u8.into())
     );
     assert!(
         !participant
             .native_receivers
-            .can_write_rtp(a, id, b_ssrc, 96u8.into())
+            .can_write_rtp(a, id, 802.into(), 96u8.into())
     );
     assert!(
         !participant
             .native_receivers
-            .can_write_rtp(a, id, a_ssrc, 97u8.into())
+            .can_write_rtp(a, id, 801.into(), 97u8.into())
     );
     assert!(!participant.native_receivers.can_write_rtp(
         Mid::from("unknown"),
         id,
-        a_ssrc,
+        801.into(),
         96u8.into()
     ));
     assert!(participant.native_receivers.playout_delay(a).is_some());
@@ -225,12 +198,12 @@ pub(super) fn check(
         sink,
         5,
         8,
-        Some(receiver_spec(id, "video-a", false)),
+        Some(receiver_spec(id, "video-a", 801, false)),
     );
     confirmations(participant);
     assert!(participant.native_receivers.playout_delay(a).is_none());
     assert_eq!(outputs(participant, id), [b].into());
-    let mut bounded = receiver_spec(id, "video-a", false);
+    let mut bounded = receiver_spec(id, "video-a", 801, false);
     let Some(wire::resource_settings::Receive::Video(options)) = bounded
         .settings
         .as_mut()
@@ -296,7 +269,7 @@ pub(super) fn check(
     assert!(
         !participant
             .native_receivers
-            .can_write_rtp(b, id, b_ssrc, 96u8.into())
+            .can_write_rtp(b, id, 802.into(), 96u8.into())
     );
     desire(participant, sink, 7, 12, None);
     assert!(!participant.downstream.video.has_slot(b));

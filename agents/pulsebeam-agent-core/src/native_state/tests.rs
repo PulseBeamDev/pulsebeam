@@ -82,7 +82,6 @@ fn live(revision: u64, spec: wire::ResourceSpec) -> wire::ConfirmedState {
                     wire::ExecutionStatus::Disabled
                 } as i32,
                 execution_failure: None,
-                binding: None,
                 activity: None,
             },
         ))),

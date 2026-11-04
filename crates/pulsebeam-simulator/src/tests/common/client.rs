@@ -627,13 +627,24 @@ impl SimClientBuilder {
                                 &publishers,
                                 frame.metadata.temporal_index,
                             ) {
-                                Ok(event) => log.native_origin.encoded_event(&frame, event),
+                                Ok(event) => {
+                                    let publisher = event
+                                        .as_ref()
+                                        .and_then(|event| publishers.get(&event.event.source))
+                                        .map(|source| source.participant_id.as_str());
+                                    log.record(publisher, &frame);
+                                    log.native_origin.encoded_event(&frame, event);
+                                }
                                 Err(_) => {
                                     failures.fetch_add(1, std::sync::atomic::Ordering::Release);
                                 }
                             }
                         }
-                        pulsebeam_agent_native::EncodedVideoObservation::Dropped { .. } => {
+                        pulsebeam_agent_native::EncodedVideoObservation::Dropped {
+                            skipped,
+                            ..
+                        } => {
+                            log.non_contiguous += skipped;
                             log.native_origin.encoded_observation_lost();
                         }
                     }
@@ -1472,6 +1483,7 @@ impl VideoReceiveLog {
         }
         if missing_dependency {
             self.non_contiguous += 1;
+            tracing::debug!(track = ?frame.track, timestamp, keyframe, metadata = ?frame.metadata, "native encoded observer missing dependency");
         }
         missing_dependency
     }
@@ -1886,7 +1898,9 @@ fn record_native_fixture_sample(
     }
     // Retain observed-slot/encoded diagnostics, but neither independently decode
     // nor turn polling loss into an application-generated keyframe request.
-    observed.record(publisher, frame);
+    if !observed.native_encoded_callback_enabled {
+        observed.record(publisher, frame);
+    }
 }
 
 fn record_fixture_video_frame(
@@ -1941,7 +1955,11 @@ fn record_fixture_video_frame(
                 .native_origin
                 .encoded(&frame, marker.filter(|_| authenticated.is_some()));
         }
-        observed.record(publisher, &frame)
+        if observed.native_encoded_callback_enabled {
+            false
+        } else {
+            observed.record(publisher, &frame)
+        }
     };
     if missing_dependency {
         *decoder_ready = false;
@@ -2176,6 +2194,7 @@ mod tests {
         let log = Arc::new(Mutex::new(VideoReceiveLog {
             native_callback_enabled: true,
             native_encoded_callback_enabled: true,
+            native_playback_only: true,
             ..VideoReceiveLog::default()
         }));
         {
@@ -2189,6 +2208,7 @@ mod tests {
         }
         let mut streams = HashMap::new();
         record_video_drop(&log, &mut streams, 1, "native SDK sink", false);
+        assert_eq!(log.lock().unwrap().non_contiguous, 0);
         assert!(
             log.lock()
                 .unwrap()
@@ -2201,6 +2221,7 @@ mod tests {
         // correlation reset even when independent capture is enabled.
         log.lock().unwrap().native_encoded_callback_enabled = false;
         record_video_drop(&log, &mut streams, 1, "native SDK sink", false);
+        assert_eq!(log.lock().unwrap().non_contiguous, 1);
         assert!(
             log.lock()
                 .unwrap()
@@ -4704,7 +4725,9 @@ fn record_video_drop(
 ) {
     tracing::warn!(skipped, cause, "native video observation loss");
     let mut log = log.lock().unwrap();
-    log.non_contiguous += skipped;
+    if !log.native_encoded_callback_enabled {
+        log.non_contiguous += skipped;
+    }
     log.native_queue_drops += skipped;
     // Native callback evidence is independent of these best-effort polling
     // queues. Actual pre-observation metadata loss still revokes it through

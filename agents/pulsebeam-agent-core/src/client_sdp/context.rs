@@ -6,7 +6,6 @@ use super::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-mod receiver;
 mod sender;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,12 +49,6 @@ impl Candidate {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReceptionPlan {
-    Bootstrap,
-    Authoritative,
-}
-
 #[derive(Clone)]
 struct Accepted {
     document: Document,
@@ -63,13 +56,6 @@ struct Accepted {
     retained: Bindings,
     local: Document,
     declarable: bool,
-    reception_plans: BTreeMap<String, ReceptionPlan>,
-}
-
-impl Accepted {
-    fn unclaimed_reception(&self, mid: &str) -> bool {
-        self.reception_plans.get(mid) == Some(&ReceptionPlan::Bootstrap)
-    }
 }
 
 /// One context per PeerConnection. No ambient entropy, network or async state.
@@ -133,16 +119,6 @@ impl Context {
             }
         }
         let identities = IdentityHistory::new(used, sender_identities, limits.max_identity_bytes)?;
-        let reception_plans = remote
-            .media
-            .iter()
-            .filter(|media| {
-                !media.section.stopped
-                    && media.section.kind != Kind::Application
-                    && media.section.direction.sends()
-            })
-            .map(|media| (media.section.mid.clone(), ReceptionPlan::Bootstrap))
-            .collect();
         Ok(Self {
             local_transport,
             remote_transport,
@@ -153,7 +129,6 @@ impl Context {
                 retained: Bindings::default(),
                 local,
                 declarable: false,
-                reception_plans,
             },
             pending: None,
             identities,
@@ -341,7 +316,7 @@ impl Context {
 
     /// Reconcile the current actual offer. Only new/replaced media need requests.
     pub fn prepare(&mut self, offer: &str, requests: &[Preparation]) -> Result<Candidate, Error> {
-        self.prepare_inner(offer, requests, &[], None, None)
+        self.prepare_inner(offer, requests, &[], None)
     }
 
     pub(super) fn validate_retirements(&self, mids: &[String]) -> Result<(), Error> {
@@ -364,7 +339,7 @@ impl Context {
         offer: &str,
         mids: &[String],
     ) -> Result<Candidate, Error> {
-        self.prepare_inner(offer, &[], mids, None, None)
+        self.prepare_inner(offer, &[], mids, None)
     }
 
     pub(super) fn prepare_allocation(
@@ -373,7 +348,7 @@ impl Context {
         allocations: &[Allocation],
         slots: &[crate::SlotBinding],
     ) -> Result<Candidate, Error> {
-        self.prepare_inner(offer, &[], &[], Some((allocations, slots)), None)
+        self.prepare_inner(offer, &[], &[], Some((allocations, slots)))
     }
 
     pub(super) fn validate_allocations(&self, allocations: &[Allocation]) -> Result<(), Error> {
@@ -493,7 +468,6 @@ impl Context {
         requests: &[Preparation],
         retirements: &[String],
         allocations: Option<(&[Allocation], &[crate::SlotBinding])>,
-        planned: Option<&Binding>,
     ) -> Result<Candidate, Error> {
         if self.pending.is_some() {
             return Err(Error::CandidateState);
@@ -555,7 +529,6 @@ impl Context {
         }
         let mut bindings = Bindings::default();
         let mut retained = self.accepted.retained.clone();
-        let mut reception_plans = self.accepted.reception_plans.clone();
         let mut answered = offered.clone();
         for media in &mut answered.media {
             let mid = media.section.mid.clone();
@@ -567,7 +540,6 @@ impl Context {
                 .find(|m| m.section.mid == mid)
                 .cloned();
             let request = requested.remove(mid.as_str());
-            let claims_reception = request.is_some_and(|request| request.reception.is_some());
             if media.section.kind == Kind::Application {
                 if request.is_some() {
                     return Err(Error::Envelope(mid));
@@ -593,7 +565,6 @@ impl Context {
                 }
                 retained.publications.retain(|b| b.mid != mid);
                 retained.receptions.retain(|b| b.mid != mid);
-                reception_plans.remove(&mid);
                 media.section.codecs.clear();
                 media.section.encodings.clear();
                 media.section.rtcp = RtcpParameters::default();
@@ -632,21 +603,13 @@ impl Context {
                 .iter()
                 .find(|b| b.mid == mid)
                 .cloned();
-            let retained_reception = self
+            let reception_prior = self
                 .accepted
                 .retained
                 .receptions
                 .iter()
                 .find(|b| b.mid == mid)
                 .cloned();
-            let plan = planned.filter(|binding| binding.mid == mid).or_else(|| {
-                retained_reception.as_ref().filter(|_| {
-                    self.accepted.reception_plans.get(&mid) == Some(&ReceptionPlan::Authoritative)
-                })
-            });
-            let reception_prior = retained_reception
-                .as_ref()
-                .filter(|_| plan.is_none() || !self.accepted.unclaimed_reception(&mid));
             media.msids = if reception_prior.is_some() {
                 prior
                     .as_ref()
@@ -668,7 +631,7 @@ impl Context {
                 {
                     return Err(Error::Envelope(mid));
                 }
-                if let Some(old) = publication_prior.as_ref().or(reception_prior) {
+                if let Some(old) = publication_prior.as_ref().or(reception_prior.as_ref()) {
                     // A retained physical section keeps its negotiated codec envelope.
                     codec = retain_codec_envelope(codec, &old.codec)
                         .ok_or_else(|| Error::Envelope(mid.clone()))?;
@@ -702,56 +665,31 @@ impl Context {
                 (
                     codec,
                     publication_prior.as_ref().map(binding_owner),
-                    reception_prior.map(binding_owner),
+                    reception_prior.as_ref().map(binding_owner),
                 )
             };
-            let codec =
-                plan.map_or_else(|| self.select_codec(&codec), |plan| Ok(plan.codec.clone()))?;
+            let codec = self.select_codec(&codec)?;
             if media.section.direction.sends() && publication_owner.is_none()
                 || media.section.direction.receives() && reception_owner.is_none()
             {
                 return Err(Error::MissingConfiguration(mid));
             }
-            let reduced_size = plan.map_or_else(
-                || {
-                    prior
-                        .as_ref()
-                        .filter(|p| !p.section.stopped)
-                        .is_some_and(|p| p.section.rtcp.reduced_size)
-                },
-                |plan| plan.rtcp.reduced_size,
-            );
+            let reduced_size = prior
+                .as_ref()
+                .filter(|p| !p.section.stopped)
+                .is_some_and(|p| p.section.rtcp.reduced_size);
             self.check_rtcp_mode(reduced_size)?;
             if reduced_size && !media.section.rtcp.reduced_size {
                 return Err(Error::Envelope(mid.clone()));
             }
             let offered_direction = media.section.direction;
-            let extensions: Vec<_> = if let Some(plan) = plan {
-                plan.extensions
-                    .iter()
-                    .map(|selected| {
-                        media
-                            .section
-                            .extensions
-                            .iter()
-                            .find(|offered| {
-                                offered.id == selected.id
-                                    && offered.uri == selected.uri
-                                    && offered.direction.receives()
-                            })
-                            .cloned()
-                            .ok_or_else(|| Error::Envelope(mid.clone()))
-                    })
-                    .collect::<Result<_, _>>()?
-            } else {
-                media
-                    .section
-                    .extensions
-                    .iter()
-                    .filter(|extension| self.capabilities.extensions.contains(&extension.uri))
-                    .cloned()
-                    .collect()
-            };
+            let extensions: Vec<_> = media
+                .section
+                .extensions
+                .iter()
+                .filter(|e| self.capabilities.extensions.contains(&e.uri))
+                .cloned()
+                .collect();
             if let Some(owner) = publication_owner.filter(|_| offered_direction.sends()) {
                 let mut encodings = media.section.encodings.clone();
                 if codec.repair.is_none() {
@@ -842,27 +780,7 @@ impl Context {
                 });
             }
             if let Some(owner) = reception_owner.filter(|_| offered_direction.receives()) {
-                if plan.is_some_and(|plan| plan.key != owner.key || plan.group != owner.group) {
-                    return Err(Error::Envelope(mid));
-                }
-                if planned.is_some_and(|binding| binding.mid == mid) {
-                    reception_plans.insert(mid.clone(), ReceptionPlan::Authoritative);
-                } else if claims_reception && self.accepted.unclaimed_reception(&mid) {
-                    reception_plans.remove(&mid);
-                }
-                let encodings = if let Some(plan) = plan {
-                    if reception_prior.is_none() {
-                        for identity in plan
-                            .encodings
-                            .iter()
-                            .flat_map(|encoding| [encoding.primary, encoding.repair])
-                            .flatten()
-                        {
-                            self.identities.reserve(identity)?;
-                        }
-                    }
-                    plan.encodings.clone()
-                } else if let Some(old) = reception_prior {
+                let encodings = if let Some(old) = reception_prior.as_ref() {
                     old.encodings.clone()
                 } else {
                     vec![Encoding {
@@ -895,8 +813,7 @@ impl Context {
                         .filter(|e| e.direction.receives())
                         .cloned()
                         .collect(),
-                    rtcp: plan
-                        .or(reception_prior)
+                    rtcp: reception_prior
                         .as_ref()
                         .map(|b| b.rtcp.clone())
                         .unwrap_or_else(|| RtcpParameters {
@@ -975,7 +892,6 @@ impl Context {
                 retained,
                 local: offered,
                 declarable: true,
-                reception_plans,
             },
         ));
         Ok(Candidate {
@@ -1000,20 +916,11 @@ impl Context {
                 .iter()
                 .chain(&self.accepted.retained.receptions)
             {
-                let replaced_bootstrap = self.accepted.unclaimed_reception(&binding.mid)
-                    && !pending.unclaimed_reception(&binding.mid)
-                    && pending
-                        .retained
-                        .receptions
-                        .iter()
-                        .find(|next| next.mid == binding.mid)
-                        .is_some_and(|next| next.encodings != binding.encodings);
-                if replaced_bootstrap
-                    || pending
-                        .document
-                        .media
-                        .iter()
-                        .any(|m| m.section.mid == binding.mid && m.section.stopped)
+                if pending
+                    .document
+                    .media
+                    .iter()
+                    .any(|m| m.section.mid == binding.mid && m.section.stopped)
                 {
                     for id in binding
                         .encodings

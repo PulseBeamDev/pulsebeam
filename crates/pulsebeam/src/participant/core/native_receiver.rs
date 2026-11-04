@@ -35,7 +35,6 @@ pub(super) struct Receiver {
     track: wire::Track,
     handle: Option<TrackHandle>,
     enabled: bool,
-    installed: bool,
     client_failure: Option<wire::Failure>,
     opened: bool,
     reset_pending: bool,
@@ -52,8 +51,6 @@ impl Receiver {
     ) -> (wire::ExecutionStatus, Option<wire::Failure>) {
         let status = if self.client_failure.is_some() {
             wire::ExecutionStatus::Failed
-        } else if !self.installed {
-            wire::ExecutionStatus::Preparing
         } else if !enabled {
             wire::ExecutionStatus::Disabled
         } else if ready {
@@ -146,7 +143,6 @@ impl NativeReceivers {
 
     fn receiver_ready(&self, receiver: &Receiver) -> bool {
         receiver.enabled
-            && receiver.installed
             && receiver.client_failure.is_none()
             && receiver.opened
             && !receiver.retiring
@@ -418,7 +414,13 @@ impl Participant {
             return;
         };
         let Some((participant, track)) = self.signaling.source(&subscription.track_id) else {
-            if subscription.rtp_offer.is_some() {
+            if matches!(
+                subscription
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.transport.as_ref()),
+                Some(wire::track_binding::Transport::Rtp(_))
+            ) {
                 self.complete_native_preparation(
                     work,
                     Err(failure(wire::FailureCode::ResourceGone)),
@@ -471,10 +473,6 @@ impl Participant {
             spec: Some(work.spec.clone()),
             participant: Some(participant.clone()),
             track: Some(track.clone()),
-            binding: match &transport {
-                ReceiveTransport::Rtp(rtp) => Some(rtp.plan.clone()),
-                _ => None,
-            },
             ..Default::default()
         };
         if !crate::participant::native::execution_fits(&preview) {
@@ -592,7 +590,6 @@ impl Participant {
                 track,
                 handle: None,
                 enabled: false,
-                installed: matches!(&transport, ReceiveTransport::Sctp { .. }),
                 client_failure: None,
                 transport,
                 opened,
@@ -663,17 +660,16 @@ impl Participant {
                 }
                 Ok(ReceiveTransport::Sctp { channel, lane })
             }
-            (Some(wire::track::Kind::Audio(_) | wire::track::Kind::Video(_)), None)
-                if subscription.rtp_offer.is_some() =>
-            {
+            (
+                Some(wire::track::Kind::Audio(_) | wire::track::Kind::Video(_)),
+                Some(wire::track_binding::Transport::Rtp(_)),
+            ) => {
                 let capabilities = self
                     .negotiated
                     .native_rtp_capabilities
                     .as_ref()
                     .ok_or(wire::FailureCode::Unsupported)?;
-                let receiver = rtp::RtpReceiver::prepare(spec, &state.track, capabilities, || {
-                    self.transport.allocate_receive_ssrc()
-                })?;
+                let receiver = rtp::RtpReceiver::prepare(spec, &state.track, capabilities)?;
                 if self.native_receivers.mids.contains_key(&receiver.mid()) {
                     return Err(wire::FailureCode::Incompatible);
                 }
@@ -848,11 +844,8 @@ impl Participant {
             .as_ref()
             .is_some_and(|settings| settings.enabled == Some(true));
         let handle = source.handle;
-        let ready = enabled
-            && receiver.installed
-            && receiver.client_failure.is_none()
-            && source.bound
-            && handle.is_some();
+        let ready =
+            enabled && receiver.client_failure.is_none() && source.bound && handle.is_some();
         let (status, execution_failure) = receiver.execution(enabled, ready);
         let previous_ready = self.native_receivers.receiver_ready(receiver);
         let live = wire::LiveResource {
@@ -862,10 +855,6 @@ impl Participant {
             execution: status as i32,
             execution_failure,
             activity: None,
-            binding: match &receiver.transport {
-                ReceiveTransport::Rtp(rtp) => Some(rtp.plan.clone()),
-                _ => None,
-            },
         };
         if !crate::participant::native::execution_fits(&live) {
             self.complete_native_preparation(
@@ -925,7 +914,7 @@ impl Participant {
     pub(super) fn apply_native_receiver_execution(
         &mut self,
         reference: u64,
-        outcome: Option<wire::execution_report::Outcome>,
+        error: Option<wire::Failure>,
         events: &mut impl ParticipantSink,
     ) {
         if !self.signaling.owns_lifetime(reference)
@@ -943,20 +932,11 @@ impl Participant {
         else {
             return;
         };
-        let ReceiveTransport::Rtp(rtp) = &receiver.transport else {
+        if !matches!(&receiver.transport, ReceiveTransport::Rtp(_)) {
             return;
-        };
-        match outcome {
-            Some(wire::execution_report::Outcome::Installed(observed))
-                if wire::validation::bindings_equivalent(Some(&observed), Some(&rtp.plan)) =>
-            {
-                receiver.installed = true;
-            }
-            Some(wire::execution_report::Outcome::Failure(error)) => {
-                receiver.client_failure = Some(error);
-            }
-            _ => receiver.client_failure = Some(failure(wire::FailureCode::InvalidConfiguration)),
         }
+        receiver.client_failure =
+            Some(error.unwrap_or_else(|| failure(wire::FailureCode::InvalidConfiguration)));
         let Some(receiver) = self.native_receivers.receivers.get(&reference) else {
             return;
         };
@@ -1171,7 +1151,6 @@ impl Participant {
                 continue;
             };
             let ready = receiver.enabled
-                && receiver.installed
                 && receiver.client_failure.is_none()
                 && receiver.opened
                 && !receiver.retiring

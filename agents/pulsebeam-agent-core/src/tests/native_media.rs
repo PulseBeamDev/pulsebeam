@@ -2,9 +2,6 @@ use super::*;
 use crate::{client_sdp, rtc_preparation};
 use pulsebeam_proto::state::{self, codec};
 
-mod receiver;
-pub(super) use receiver::{prepare_receivers, prepare_reception};
-
 pub(super) struct Target {
     pub reference: u64,
     pub desired: state::DesiredState,
@@ -35,21 +32,6 @@ impl Target {
         self.installed(participant.clone(), track.clone())
     }
 
-    pub fn receiver_preparing(
-        &self,
-        participant: &state::Participant,
-        tracks: &[state::Track],
-    ) -> state::ServerStateRecord {
-        let mut record = self.receiver_installed(participant, tracks);
-        let Some(state::confirmed_state::Value::Owned(live)) =
-            record.confirmed.as_mut().unwrap().value.as_mut()
-        else {
-            panic!("receiver plan")
-        };
-        live.execution = state::ExecutionStatus::Preparing as i32;
-        record
-    }
-
     pub fn installed(
         &self,
         participant: state::Participant,
@@ -68,7 +50,6 @@ impl Target {
                     state::ExecutionStatus::Disabled
                 } as i32,
                 execution_failure: None,
-                binding: self.receive_plan(),
                 activity: matches!(
                     self.spec().declaration,
                     Some(state::resource_spec::Declaration::Publication(_))
@@ -211,14 +192,13 @@ pub(super) fn finish_retirements(
     operations
 }
 
-pub(super) fn finish_publication(
+pub(super) fn finish_allocation(
     agent: &mut Agent,
     generation: Generation,
     assigned: SlotBinding,
     retired: &[&str],
     updated: &[SlotBinding],
 ) {
-    assert_eq!(assigned.direction, MediaDirection::SendOnly);
     let Effect::Rtc(RtcEffect::AllocateMedia {
         operation,
         generation: actual,
@@ -232,7 +212,8 @@ pub(super) fn finish_publication(
         allocations,
         [client_sdp::Allocation {
             slot: assigned.slot.clone(),
-            format: None,
+            format: (assigned.direction == MediaDirection::ReceiveOnly)
+                .then(|| format(assigned.kind)),
         }]
     );
     let mut resources = resources(channel(9));
@@ -258,7 +239,9 @@ pub(super) fn finish_publication(
         .unwrap();
 }
 
-fn prepared_media(resources: &OfferResources) -> (client_sdp::Bindings, state::RtpCapabilities) {
+pub(super) fn prepared_media(
+    resources: &OfferResources,
+) -> (client_sdp::Bindings, state::RtpCapabilities) {
     let mut bindings = client_sdp::Bindings::default();
     let mut capabilities = state::RtpCapabilities::default();
     for assigned in &resources.slots {
@@ -291,7 +274,9 @@ fn prepared_media(resources: &OfferResources) -> (client_sdp::Bindings, state::R
 }
 
 pub(super) fn connected() -> (Agent, Generation, ChannelId, Vec<Target>) {
-    connected_with(Agent::new(config()).unwrap(), desired(1))
+    let connected = connected_with(Agent::new(config()).unwrap(), desired(1));
+    assert_eq!(connected.3.len(), 2);
+    connected
 }
 
 pub(super) fn begin(

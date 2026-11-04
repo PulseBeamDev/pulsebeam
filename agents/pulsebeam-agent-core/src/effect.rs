@@ -1,8 +1,6 @@
 use alloc::{string::String, vec::Vec};
 use core::time::Duration;
 
-pub use pulsebeam_proto::state::{RtpParameters, RtpReceiveOffer};
-
 use crate::{
     ChannelId, Generation, HttpRequest, MediaDirection, MediaKind, MediaSlot, OperationId,
     SlotBinding, TimerId,
@@ -43,12 +41,6 @@ impl BootstrapCapabilities {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum ReceiveTarget {
-    Existing(crate::SlotBinding),
-    Allocate(crate::client_sdp::Allocation),
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub enum RtcEffect {
     CreateOffer {
         generation: Generation,
@@ -77,17 +69,6 @@ pub enum RtcEffect {
         generation: Generation,
         operation: OperationId,
         allocations: Vec<crate::client_sdp::Allocation>,
-    },
-    OfferReceiveMedia {
-        generation: Generation,
-        operation: OperationId,
-        target: ReceiveTarget,
-    },
-    ApplyReceivePlan {
-        generation: Generation,
-        operation: OperationId,
-        slot: crate::SlotBinding,
-        parameters: pulsebeam_proto::state::RtpParameters,
     },
     RetireMedia {
         generation: Generation,

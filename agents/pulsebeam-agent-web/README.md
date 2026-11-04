@@ -202,12 +202,13 @@ local resource ownership, cancellation and generation fences. These controlled
 outcomes do not establish real receive execution, failed transceiver-stop repair
 or application support for Node.
 
-The browser adapter keeps receive-plan waiting inside the existing Peer/executor.
-It observes the applied local offer, awaits actual remote-description completion,
-checks completed SDP, receiver parameters and the live track, then refreshes track
-observation. Missing platform facts fail that resource rather than establishing
-installation. Packet arrival and statistics are not readiness gates. See
-[Core's receive flow](../pulsebeam-agent-core/README.md#server-directed-reception)
+The browser adapter prepares receivers through the existing Peer/executor before
+Core requests server admission. Successful description completion, correlated to
+the current generation, operation and owner, establishes local configuration.
+Actual track events provide track observations; packets, frames, unmuting and
+exhaustive parameter readback are not configuration gates. Server acceptance is
+still required for application-visible subscription readiness. See
+[Core's receive flow](../pulsebeam-agent-core/README.md#prepared-reception)
 for shared policy and completion fences.
 
 The required Web browser owner proves shipped SDK media through a local SFU,

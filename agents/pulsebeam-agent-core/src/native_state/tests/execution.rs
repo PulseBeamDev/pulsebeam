@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn receive_evidence_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetime() {
+fn receiver_failure_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetime() {
     let mut client = NativeState::new(1024 * 1024, participant()).unwrap();
     let resource = Resource::Reception(MediaSlot::RemoteAudio(0));
     let format = wire::CodecFormat::from(wire::codec_format::Codec::Opus(
@@ -39,8 +39,9 @@ fn receive_evidence_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
             wire::SubscriptionSpec {
                 track_id: "source".into(),
                 kind: wire::TrackKind::Audio as i32,
-                binding: None,
-                rtp_offer: Some(wire::RtpReceiveOffer::from(&parameters)),
+                binding: Some(wire::TrackBinding {
+                    transport: Some(wire::track_binding::Transport::Rtp(parameters.clone())),
+                }),
             },
         )),
         settings: Some(wire::ResourceSettings {
@@ -73,22 +74,28 @@ fn receive_evidence_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
                         format: Some(format),
                     })),
                 }),
-                execution: wire::ExecutionStatus::Preparing as i32,
+                execution: wire::ExecutionStatus::Installed as i32,
                 execution_failure: None,
                 activity: None,
-                binding: Some(plan.clone()),
             },
         ))),
     };
     client
         .apply(&frame(vec![record(1, accepted.clone())], false))
         .unwrap();
+    assert!(
+        client.next_frame().unwrap().is_none(),
+        "admission needs no installation report"
+    );
     desired.settings.as_mut().unwrap().enabled = Some(false);
     client.stage(resource.clone(), Some(desired)).unwrap();
     assert_eq!(next(&mut client)[0].1.revision, 2);
     assert!(client.owned[&1].awaiting_evaluation());
 
-    let outcome = wire::execution_report::Outcome::Installed(plan.clone());
+    let outcome = wire::Failure {
+        code: wire::FailureCode::InternalFailure as i32,
+        diagnostic: "receiver failed after admission".into(),
+    };
     let budget = client.memory_limit;
     client.memory_limit = client.retained_bytes;
     assert!(client.report_execution(1, outcome.clone()).is_err());
@@ -109,10 +116,15 @@ fn receive_evidence_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
     let Some(wire::confirmed_state::Value::Owned(live)) = changed.value.as_mut() else {
         panic!("owned receive plan fixture")
     };
-    let Some(wire::track_binding::Transport::Rtp(binding)) =
-        live.binding.as_mut().unwrap().transport.as_mut()
+    let Some(wire::resource_spec::Declaration::Subscription(subscription)) =
+        live.spec.as_mut().unwrap().declaration.as_mut()
     else {
-        panic!("RTP receive plan fixture")
+        panic!("receiver fixture")
+    };
+    let Some(wire::track_binding::Transport::Rtp(binding)) =
+        subscription.binding.as_mut().unwrap().transport.as_mut()
+    else {
+        panic!("RTP receiver fixture")
     };
     binding.encodings[0].ssrc = Some(88);
     assert!(
@@ -124,10 +136,10 @@ fn receive_evidence_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
     client
         .report_execution(
             1,
-            wire::execution_report::Outcome::Failure(wire::Failure {
+            wire::Failure {
                 code: wire::FailureCode::InternalFailure as i32,
                 diagnostic: "platform rejected receiver".into(),
-            }),
+            },
         )
         .unwrap();
     client.stage(resource, None).unwrap();
@@ -136,17 +148,20 @@ fn receive_evidence_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
         .records;
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].execution.as_ref().unwrap().revision, 4);
-    assert!(matches!(
-        records[0].execution.as_ref().unwrap().outcome,
-        Some(wire::execution_report::Outcome::Failure(_))
-    ));
+    assert!(records[0].execution.as_ref().unwrap().failure.is_some());
     assert_eq!(records[1].desired.as_ref().unwrap().revision, 5);
     assert!(matches!(
         records[1].desired.as_ref().unwrap().value,
         Some(wire::desired_state::Value::Absent(true))
     ));
     client
-        .report_execution(1, wire::execution_report::Outcome::Installed(plan.clone()))
+        .report_execution(
+            1,
+            wire::Failure {
+                code: wire::FailureCode::InternalFailure as i32,
+                diagnostic: "late retired receiver failure".into(),
+            },
+        )
         .unwrap();
     assert!(client.next_frame().unwrap().is_none());
     let changes = client

@@ -1281,7 +1281,7 @@ impl Participant {
             self.retire_native_resource(reference, events);
         }
         for (reference, report) in input.executions {
-            self.apply_native_receiver_execution(reference, report.outcome, events);
+            self.apply_native_receiver_execution(reference, report.failure, events);
         }
         self.evaluate_native_preparations(events);
     }

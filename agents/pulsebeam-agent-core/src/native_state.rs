@@ -290,7 +290,7 @@ impl NativeState {
     pub(crate) fn report_execution(
         &mut self,
         reference: u64,
-        outcome: wire::execution_report::Outcome,
+        failure: wire::Failure,
     ) -> Result<(), SignalingError> {
         let Some(owned) = self
             .owned
@@ -304,19 +304,18 @@ impl NativeState {
             .as_ref()
             .and_then(|state| state.value.as_ref())
         else {
-            return Err(SignalingError::Invalid("execution without receive plan"));
+            return Err(SignalingError::Invalid("failure without admitted receiver"));
         };
-        if !matches!(owned.resource, Resource::Reception(_)) || live.binding.is_none() {
-            return Err(SignalingError::Invalid("execution without receive plan"));
-        }
-        if let wire::execution_report::Outcome::Installed(observed) = &outcome
-            && !validation::bindings_equivalent(Some(observed), live.binding.as_ref())
+        if !matches!(owned.resource, Resource::Reception(_))
+            || !matches!(live.spec.as_ref().and_then(|spec| spec.declaration.as_ref()),
+                Some(wire::resource_spec::Declaration::Subscription(subscription))
+                    if matches!(subscription.binding.as_ref().and_then(|binding| binding.transport.as_ref()), Some(wire::track_binding::Transport::Rtp(_))))
         {
-            return Err(SignalingError::Invalid("installed receive binding"));
+            return Err(SignalingError::Invalid("failure without admitted receiver"));
         }
         let report = Box::new(wire::ExecutionReport {
             revision: u64::MAX,
-            outcome: Some(outcome),
+            failure: Some(failure),
         });
         validation::validate_execution_report(&report)
             .map_err(|_| SignalingError::Invalid("execution report"))?;
@@ -626,12 +625,6 @@ impl NativeState {
                 .as_ref()
                 .and_then(|state| state.value.as_ref())
                 && (previous.participant != live.participant
-                    || match (&previous.binding, &live.binding) {
-                        (None, None) => false,
-                        (previous, next) => {
-                            !validation::bindings_equivalent(previous.as_ref(), next.as_ref())
-                        }
-                    }
                     || !matches!((&previous.track, &live.track), (Some(previous), Some(next)) if tracks_equal(previous, next)))
             {
                 return Err(SignalingError::Invalid("owned source identity"));
@@ -651,7 +644,14 @@ impl NativeState {
                     Some(wire::confirmed_state::Value::Owned(live))
                         if matches!(resource, Resource::Reception(_)) =>
                     {
-                        live.binding.clone().map(Box::new)
+                        live.spec
+                            .as_ref()
+                            .and_then(|spec| match spec.declaration.as_ref() {
+                                Some(wire::resource_spec::Declaration::Subscription(
+                                    subscription,
+                                )) => subscription.binding.clone().map(Box::new),
+                                _ => None,
+                            })
                     }
                     _ => None,
                 })

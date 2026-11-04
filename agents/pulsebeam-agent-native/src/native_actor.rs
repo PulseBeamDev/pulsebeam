@@ -891,7 +891,6 @@ where
             let (generation, kind) = match event {
                 RtcEvent::OfferCreated { generation, .. } => (generation, "offer_created"),
                 RtcEvent::AnswerApplied { generation } => (generation, "answer_applied"),
-                RtcEvent::MediaOffered { generation, .. } => (generation, "media_offered"),
                 RtcEvent::MediaPrepared { generation, .. } => (generation, "media_prepared"),
                 RtcEvent::MediaObserved { generation, .. } => (generation, "media_observed"),
                 RtcEvent::BootstrapMediaPrepared { generation, .. } => {
@@ -1416,51 +1415,6 @@ where
                             self.accept(event);
                         }
                     }
-                    RtcEffect::OfferReceiveMedia {
-                        generation,
-                        operation,
-                        target,
-                    } => {
-                        let event = match self
-                            .peer
-                            .as_mut()
-                            .filter(|peer| peer.generation == generation)
-                        {
-                            Some(peer) => peer.offer_receive_media(operation, target),
-                            None => Some(super::native_peer::media_event(
-                                generation,
-                                operation,
-                                agent_core::client_sdp::ApplyOutcome::NotApplied,
-                                Err(agent_core::client_sdp::Error::CandidateState),
-                            )),
-                        };
-                        if let Some(event) = event {
-                            self.accept(event);
-                        }
-                    }
-                    RtcEffect::ApplyReceivePlan {
-                        generation,
-                        operation,
-                        slot,
-                        parameters,
-                    } => {
-                        let event = match self
-                            .peer
-                            .as_mut()
-                            .filter(|peer| peer.generation == generation)
-                        {
-                            Some(peer) => peer.apply_receive_plan(operation, slot, parameters),
-                            None => Some(super::native_peer::media_event(
-                                generation,
-                                operation,
-                                agent_core::client_sdp::ApplyOutcome::NotApplied,
-                                Err(agent_core::client_sdp::Error::CandidateState),
-                            )),
-                        };
-                        if let Some(event) = event {
-                            self.accept(event);
-                        }
-                    }
                     RtcEffect::RetireMedia {
                         generation,
                         operation,
@@ -1629,6 +1583,7 @@ where
                     .and_then(|peer| peer.frame(&slot, playout).map_err(Error::from));
                 match result {
                     Ok(Some(frame)) => {
+                        self.report_media_drops(&slot);
                         if !pcm && index.saturating_add(1) == budget {
                             more = true;
                         }
@@ -1644,42 +1599,47 @@ where
                     }
                 }
             }
-            let drops = self
-                .peer
-                .as_mut()
-                .and_then(|peer| peer.dropped_frames(&slot).ok());
-            if let (Some(drops), Some(stream)) = (drops, self.streams.get_mut(&slot))
-                && drops > stream.native_dropped
-            {
-                let skipped = drops.saturating_sub(stream.native_dropped);
-                tracing::warn!(?slot, mode = ?stream.mode, skipped, drops, "native receive sink dropped media");
-                stream.native_dropped = drops;
-                let _ = stream
-                    .sender
-                    .send(MediaStreamUpdate::NativeDropped { skipped });
-            }
-            if self
-                .streams
-                .get(&slot)
-                .is_some_and(|stream| stream.mode == ReceiveMode::EncodedAndDecoded)
-            {
-                let drops = self
-                    .peer
-                    .as_mut()
-                    .and_then(|peer| peer.dropped_decoded_frames(&slot).ok());
-                if let (Some(drops), Some(stream)) = (drops, self.streams.get_mut(&slot))
-                    && drops > stream.native_decoded_dropped
-                {
-                    let skipped = drops.saturating_sub(stream.native_decoded_dropped);
-                    stream.native_decoded_dropped = drops;
-                    let _ = stream
-                        .sender
-                        .send(MediaStreamUpdate::NativeDecodedDropped { skipped });
-                }
-            }
+            self.report_media_drops(&slot);
         }
         more
     }
+
+    fn report_media_drops(&mut self, slot: &MediaSlot) {
+        let drops = self
+            .peer
+            .as_mut()
+            .and_then(|peer| peer.dropped_frames(slot).ok());
+        if let (Some(drops), Some(stream)) = (drops, self.streams.get_mut(slot))
+            && drops > stream.native_dropped
+        {
+            let skipped = drops.saturating_sub(stream.native_dropped);
+            tracing::warn!(?slot, mode = ?stream.mode, skipped, drops, "native receive sink dropped media");
+            stream.native_dropped = drops;
+            let _ = stream
+                .sender
+                .send(MediaStreamUpdate::NativeDropped { skipped });
+        }
+        if self
+            .streams
+            .get(slot)
+            .is_some_and(|stream| stream.mode == ReceiveMode::EncodedAndDecoded)
+        {
+            let drops = self
+                .peer
+                .as_mut()
+                .and_then(|peer| peer.dropped_decoded_frames(slot).ok());
+            if let (Some(drops), Some(stream)) = (drops, self.streams.get_mut(slot))
+                && drops > stream.native_decoded_dropped
+            {
+                let skipped = drops.saturating_sub(stream.native_decoded_dropped);
+                stream.native_decoded_dropped = drops;
+                let _ = stream
+                    .sender
+                    .send(MediaStreamUpdate::NativeDecodedDropped { skipped });
+            }
+        }
+    }
+
     fn producer_feedback(&mut self) {
         let Some(peer) = &mut self.peer else {
             return;

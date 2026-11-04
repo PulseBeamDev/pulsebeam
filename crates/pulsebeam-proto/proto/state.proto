@@ -43,17 +43,14 @@ message ClientStateRecord {
   ExecutionReport execution = 3;
 }
 
-// Evidence about this lifetime's immutable server receive plan, not authority.
+// Scoped local failure of an admitted receiver, independent of desired settings.
 message ExecutionReport {
   // Strictly increases across all serialized client records, like desired.revision.
   // Does not advance the server's evaluated desired revision.
   uint64 revision = 1;
-  oneof outcome {
-    // Actual binding after successful platform application.
-    TrackBinding installed = 2;
-    // Scoped local execution failure. Cannot revive or retarget a lifetime.
-    Failure failure = 3;
-  }
+  reserved 2;
+  // Required. Cannot revive or retarget a lifetime.
+  Failure failure = 3;
 }
 
 message ServerStateBatch {
@@ -316,7 +313,7 @@ message DataPublication {
   TrackBinding binding = 2;
 }
 
-// Exact source and observed receiving capabilities for one lifetime.
+// Exact source and independently prepared receiver binding for one lifetime.
 message SubscriptionSpec {
   // Nonempty opaque canonical TrackId string, <=128 UTF-8 bytes. Owner
   // revalidates source eligibility/authority; SDK never parses its encoding.
@@ -325,18 +322,10 @@ message SubscriptionSpec {
   // Required expected kind, matching the exact source.
   TrackKind kind = 2;
 
-  // Data only: actual prepared SCTP payload binding.
+  // Complete RTP/SCTP configuration after successful local platform preparation.
+  // Never copy publisher demux coordinates.
   TrackBinding binding = 3;
-
-  // Audio/video only: actual local offer, without invented receive identities.
-  RtpReceiveOffer rtp_offer = 4;
-}
-
-message RtpReceiveOffer {
-  string mid = 1;
-  repeated RtpCodecParameters codecs = 2;
-  repeated RtpHeaderExtensionParameters header_extensions = 3;
-  repeated string rtcp_modes = 4;
+  reserved 4;
 }
 
 
@@ -367,9 +356,7 @@ message LiveResource {
   // Required ACTIVE/IDLE for audio/video publications, absent for other kinds.
   optional MediaActivity activity = 6;
 
-  // Required for audio/video subscriptions, absent otherwise. Server-selected
-  // immutable receiver plan. PREPARING is not evidence of client installation.
-  TrackBinding binding = 7;
+  reserved 7;
 }
 
 enum ExecutionStatus {
@@ -378,7 +365,7 @@ enum ExecutionStatus {
   WAITING_FOR_SOURCE = 2;          // Enabled receive; exact route unavailable.
   INSTALLED = 3;                   // Enabled admitted plan; no payload guarantee.
   FAILED = 4;                      // Requires execution_failure; gates closed.
-  PREPARING = 5;                   // Plan admitted; matching client evidence pending.
+  reserved 5;
 }
 
 enum MediaActivity {
