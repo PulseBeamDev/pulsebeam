@@ -49,6 +49,36 @@ fenced old-lifetime delivery. A failed or unproven reset never permits reuse.
 `DataChannelSpec.negotiated_id` is a physical stream ID, separate from the
 logical `ChannelId` used for host callbacks.
 
+## Server-directed reception
+
+Core owns receive policy; platform adapters execute it through the existing
+per-peer SDP executor. Bootstrap HTTP capabilities describe server support, not
+an endpoint's decoder capabilities or an installed receiver.
+
+1. `OfferReceiveMedia` creates or adopts the requested physical receiver. After
+   applying the local offer, the host uses `Context::receive_offer` to observe its
+   MID, codec/PT choices, extension mappings and RTCP modes, then returns
+   `MediaOffered`. The subscription carries that offer, not client-assigned
+   receive SSRCs or CNAME.
+2. Core retains the same operation while waiting for the server's immutable
+   binding on the owned resource. `ApplyReceivePlan` supplies that binding for
+   `Context::prepare_receive_plan`; the host applies the resulting answer.
+3. After actual remote-description completion, the host calls
+   `Context::observe_receive_answer` while the candidate is pending and checks
+   actual receiver parameters and the live receiver/track. Finish the candidate
+   with its actual apply outcome even if observation fails, preserving applied
+   identity history. Missing readback is not installation evidence.
+4. A matching completion produces an independent execution report. Core exposes
+   receiver mappings and observation targets only when local prepared facts match
+   the plan and the server confirms installation. Neither cached bootstrap facts
+   nor server status alone establishes readiness.
+
+Generation, operation, resource-reference and source-lifetime fences apply
+throughout. Cancellation repairs the existing operation; hosts retain owned
+transceivers and tracks until stop/description repair is confirmed. Scoped
+preparation failure does not install the receiver or rewrite unrelated desire.
+See the [wire receive contract](../../crates/pulsebeam-proto/README.md#media-receive-plans-and-execution).
+
 ## Track resources
 
 `TrackSpec` identifies media by kind and label, and data by label and delivery
@@ -161,7 +191,9 @@ are never inferred from a data-only answer. Supply a connection-specific SSRC
 seed and `Limits`; no randomness or identity set is required from the host.
 
 The adapter serializes operations and applies answers to its PeerConnection.
-This native-independent helper shows the prepare/apply/accept boundary:
+This native-independent helper shows the generic prepare/apply/accept boundary.
+Managed reception uses the [server-directed flow](#server-directed-reception),
+not standalone `Preparation.reception` identity allocation:
 
 ```rust
 use pulsebeam_agent_core::client_sdp::{
@@ -213,9 +245,10 @@ Unchanged sections are reconciled automatically. Codec replacement requires an
 explicitly prepared fresh compatible section. Inactivation retains identities;
 stopped-MID reuse requires fresh identities. A stopped section can disappear
 when the current offer recycles its m-line under a new MID; its reserved
-identities remain unavailable. Receive identities are allocated
-without collisions across the context's bounded history, including cancelled
-candidates.
+identities remain unavailable. Standalone receive identity allocation avoids
+collisions across the context's bounded history, including cancelled candidates.
+Managed receivers instead retain the server-selected identities across unrelated
+offers and reject retargeting or removal of a selected extension.
 
 Individual descriptions and generated answers are limited to 1 MiB, with
 additional line bounds. There is no separate whole-description section or
@@ -251,13 +284,14 @@ CNAME retains the value from applied SDP; if neither source supplies it, the
 binding stays incomplete. Conflicting CNAME or mode observations fail atomically. CNAME is
 limited to the SDES field's 255 bytes. A binding needs one common CNAME across its
 primary and repair sources; unsupported mixed CNAMEs reject rather than merge.
-Fresh local answers select compound RTCP. Applied bootstrap reduced-size mode
-is retained only when offered, and continuing answers preserve the applied
-CNAME and mode. Fresh receive CNAMEs are distinct per physical receiver.
-Submit only complete bindings to the server's typed API. Runtime
-bitrate/framerate, activation and scalability observations remain separate from
-negotiated identities. Source or quality selection behind a compatible receive
-binding is caller policy and does not require SDP.
+Standalone fresh local answers select compound RTCP. Authoritative receive
+plans select an offered, supported mode. Applied bootstrap reduced-size mode is
+retained only when offered, and continuing answers preserve the applied CNAME
+and mode. Submit only complete publication bindings; receivers report observed
+application of the server's binding. Runtime bitrate/framerate, activation and
+scalability observations remain separate from negotiated identities. Mutable
+receive preferences do not retarget a physical receiver: a replacement source
+incarnation requires a fresh receiver and authoritative plan.
 
 Report `NotApplied` for failure or cancellation before application.
 `AppliedButCancelled` preserves actual SDP history while suppressing declaration;

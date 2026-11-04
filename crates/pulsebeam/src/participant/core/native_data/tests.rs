@@ -81,6 +81,7 @@ pub(in crate::participant::core) fn frame_for(
     codec::encode_client(&wire::ClientStateBatch {
         records: vec![wire::ClientStateRecord {
             owned: reference,
+            execution: None,
             desired: Some(wire::DesiredState {
                 revision,
                 value: Some(value),

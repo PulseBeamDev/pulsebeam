@@ -1071,6 +1071,15 @@ impl Agent {
                 }
                 Ok(())
             }
+            RtcEvent::MediaOffered {
+                generation,
+                operation,
+                slot,
+                offer,
+            } => {
+                self.media_offered(generation, operation, slot, offer);
+                Ok(())
+            }
             RtcEvent::MediaPrepared {
                 generation,
                 operation,
@@ -2070,6 +2079,10 @@ impl Agent {
             ) {
                 self.notifications
                     .push_back(Notification::ServerError(error.to_string()));
+            }
+            if native::project_retired_receivers(active, &mut self.snapshot) {
+                self.snapshot.version = self.snapshot.version.saturating_add(1);
+                self.notifications.push_back(Notification::SnapshotChanged);
             }
         }
         if self.signal_retry.is_some() {

@@ -5,6 +5,7 @@ use pulsebeam_rtc::{RtpBinding, RtpConfigurationPatch};
 
 pub(super) struct RtpReceiver {
     pub(super) binding: RtpBinding,
+    pub(super) plan: wire::TrackBinding,
     pub(super) video_options: Option<wire::VideoReceiveOptions>,
     mid: Mid,
     rid: Option<crate::media::Rid>,
@@ -18,59 +19,124 @@ impl RtpReceiver {
         spec: &wire::ResourceSpec,
         source: &Track,
         capabilities: &wire::RtpCapabilities,
+        mut allocate: impl FnMut() -> Result<u32, wire::FailureCode>,
     ) -> Result<Self, wire::FailureCode> {
+        use wire::FailureCode as Failure;
         let Some(resource_spec::Declaration::Subscription(subscription)) = &spec.declaration else {
-            return Err(wire::FailureCode::InvalidConfiguration);
+            return Err(Failure::InvalidConfiguration);
         };
-        let Some(wire::track_binding::Transport::Rtp(parameters)) = subscription
-            .binding
+        let offer = subscription
+            .rtp_offer
             .as_ref()
-            .and_then(|binding| binding.transport.as_ref())
-        else {
-            return Err(wire::FailureCode::Incompatible);
-        };
+            .ok_or(Failure::InvalidConfiguration)?;
         let kind = wire::TrackKind::try_from(subscription.kind)
-            .map_err(|_| wire::FailureCode::InvalidConfiguration)?;
-        let binding = receiving_binding(parameters, kind, capabilities)?;
-        let [encoding] = binding.encodings.as_slice() else {
-            return Err(wire::FailureCode::InvalidConfiguration);
-        };
-        let ssrc = encoding.primary.into();
-        let rid = encoding
-            .rid
-            .as_deref()
-            .map(crate::media::Rid::new)
-            .transpose()
-            .map_err(|_| wire::FailureCode::Unsupported)?;
-        if matches!(source, Track::Audio(_))
-            && (binding.codec.parameters.name != "opus" || encoding.rid.is_some())
-        {
-            return Err(wire::FailureCode::Unsupported);
-        }
-        let format = parameters
-            .codec
-            .as_ref()
-            .and_then(|codec| codec.format.as_ref())
-            .ok_or(wire::FailureCode::InvalidConfiguration)?;
+            .map_err(|_| Failure::InvalidConfiguration)?;
+        wire::validation::validate_receive_offer(offer, kind)
+            .map_err(|_| Failure::InvalidConfiguration)?;
         let source_format = match source {
             Track::Audio(audio) if kind == wire::TrackKind::Audio => audio.format.as_ref(),
             Track::Video(video) if kind == wire::TrackKind::Video => video.format.as_ref(),
-            _ => return Err(wire::FailureCode::Unsupported),
-        };
-        if source_format.is_none_or(|source| {
-            !pulsebeam_proto::state::validation::formats_equivalent(source, format)
-        }) {
-            return Err(wire::FailureCode::Incompatible);
+            _ => return Err(Failure::Unsupported),
         }
+        .ok_or(Failure::Unsupported)?;
+        let capability = capabilities
+            .codecs
+            .iter()
+            .find(|capability| {
+                capability.format.as_ref().is_some_and(|format| {
+                    wire::validation::formats_equivalent(format, source_format)
+                })
+            })
+            .ok_or(Failure::Unsupported)?;
+        let offered = offer
+            .codecs
+            .iter()
+            .find(|codec| {
+                codec.format.as_ref().is_some_and(|format| {
+                    wire::validation::formats_equivalent(format, source_format)
+                })
+            })
+            .ok_or(Failure::Incompatible)?;
+        let feedback: Vec<_> = offered
+            .feedback
+            .iter()
+            .filter(|value| capability.feedback.contains(value))
+            .cloned()
+            .collect();
+        let extensions: Vec<_> = offer
+            .header_extensions
+            .iter()
+            .filter(|extension| capabilities.header_extensions.contains(&extension.uri))
+            .cloned()
+            .collect();
+        if !feedback
+            .iter()
+            .any(|value| value == wire::RtcpFeedback::TransportCc.as_str())
+            || ![
+                wire::RtpHeaderExtensionType::RtpHeaderExtensionMid,
+                wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01,
+            ]
+            .iter()
+            .all(|kind| {
+                extensions
+                    .iter()
+                    .any(|extension| extension.uri == kind.as_str())
+            })
+        {
+            return Err(Failure::Unsupported);
+        }
+        let mode = [wire::RtcpMode::Compound, wire::RtcpMode::ReducedSize]
+            .into_iter()
+            .find(|mode| {
+                offer.rtcp_modes.iter().any(|value| value == mode.as_str())
+                    && capabilities
+                        .rtcp_modes
+                        .iter()
+                        .any(|value| value == mode.as_str())
+            })
+            .ok_or(Failure::Unsupported)?;
+        let repair = offered
+            .rtx_payload_type
+            .filter(|_| capability.rtx_supported);
+        let primary = allocate()?;
+        let parameters = wire::RtpParameters {
+            mid: offer.mid.clone(),
+            codec: Some(wire::RtpCodecParameters {
+                payload_type: offered.payload_type,
+                rtx_payload_type: repair,
+                format: Some(source_format.clone()),
+                feedback,
+            }),
+            header_extensions: extensions,
+            encodings: vec![wire::RtpEncodingParameters {
+                ssrc: Some(primary),
+                rtx_ssrc: if repair.is_some() {
+                    Some(allocate()?)
+                } else {
+                    None
+                },
+                ..Default::default()
+            }],
+            rtcp: Some(wire::RtcpParameters {
+                cname: format!("pulsebeam-{primary:08x}"),
+                reduced_size: mode == wire::RtcpMode::ReducedSize,
+            }),
+        };
+        wire::validation::validate_receive_plan(offer, &parameters, kind)
+            .map_err(|_| Failure::Unsupported)?;
+        let binding = receiving_binding(&parameters, kind, capabilities)?;
         Self::validate_settings(&binding, spec)?;
         let video_options = Self::video_options(&binding, spec);
-        let mid = Mid::new(&binding.mid).map_err(|_| wire::FailureCode::Unsupported)?;
+        let mid = Mid::new(&binding.mid).map_err(|_| Failure::Unsupported)?;
         Ok(Self {
             binding,
+            plan: wire::TrackBinding {
+                transport: Some(wire::track_binding::Transport::Rtp(parameters)),
+            },
             video_options,
             mid,
-            rid,
-            ssrc,
+            rid: None,
+            ssrc: primary.into(),
             timeline: Timeline::new(AUDIO_FREQUENCY),
             started: false,
         })

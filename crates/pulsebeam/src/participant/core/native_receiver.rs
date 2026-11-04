@@ -35,11 +35,34 @@ pub(super) struct Receiver {
     track: wire::Track,
     handle: Option<TrackHandle>,
     enabled: bool,
+    installed: bool,
+    client_failure: Option<wire::Failure>,
     opened: bool,
     reset_pending: bool,
     pub(super) retiring: bool,
     preparation: Option<Preparation>,
     deadline: Option<Instant>,
+}
+
+impl Receiver {
+    fn execution(
+        &self,
+        enabled: bool,
+        ready: bool,
+    ) -> (wire::ExecutionStatus, Option<wire::Failure>) {
+        let status = if self.client_failure.is_some() {
+            wire::ExecutionStatus::Failed
+        } else if !self.installed {
+            wire::ExecutionStatus::Preparing
+        } else if !enabled {
+            wire::ExecutionStatus::Disabled
+        } else if ready {
+            wire::ExecutionStatus::Installed
+        } else {
+            wire::ExecutionStatus::WaitingForSource
+        };
+        (status, self.client_failure.clone())
+    }
 }
 
 enum ReceiveTransport {
@@ -123,6 +146,8 @@ impl NativeReceivers {
 
     fn receiver_ready(&self, receiver: &Receiver) -> bool {
         receiver.enabled
+            && receiver.installed
+            && receiver.client_failure.is_none()
             && receiver.opened
             && !receiver.retiring
             && self
@@ -341,19 +366,16 @@ impl Participant {
             return true;
         };
         let ready = self.native_receivers.receiver_ready(receiver);
-        let enabled = receiver.enabled;
+        let (status, failure) = receiver.execution(receiver.enabled, ready);
         if self.apply_native_receiver_gate(reference, ready).is_err() {
             self.disconnect(DisconnectReason::SignalingOutput);
             return true;
         }
-        let status = if !enabled {
-            wire::ExecutionStatus::Disabled
-        } else if ready {
-            wire::ExecutionStatus::Installed
-        } else {
-            wire::ExecutionStatus::WaitingForSource
-        };
-        if self.signaling.observe_execution(reference, status).is_err() {
+        if self
+            .signaling
+            .observe_execution_result(reference, status, failure)
+            .is_err()
+        {
             self.disconnect(DisconnectReason::SignalingOutput);
         }
         true
@@ -396,6 +418,13 @@ impl Participant {
             return;
         };
         let Some((participant, track)) = self.signaling.source(&subscription.track_id) else {
+            if subscription.rtp_offer.is_some() {
+                self.complete_native_preparation(
+                    work,
+                    Err(failure(wire::FailureCode::ResourceGone)),
+                );
+                return;
+            }
             if self
                 .signaling
                 .reserve_execution(work.reference, 4096)
@@ -438,6 +467,23 @@ impl Participant {
                 return;
             }
         };
+        let preview = wire::LiveResource {
+            spec: Some(work.spec.clone()),
+            participant: Some(participant.clone()),
+            track: Some(track.clone()),
+            binding: match &transport {
+                ReceiveTransport::Rtp(rtp) => Some(rtp.plan.clone()),
+                _ => None,
+            },
+            ..Default::default()
+        };
+        if !crate::participant::native::execution_fits(&preview) {
+            self.complete_native_preparation(
+                work,
+                Err(failure(wire::FailureCode::CapacityExceeded)),
+            );
+            return;
+        }
         let bytes = execution_bytes(&track.label)
             .saturating_add(participant.encoded_len())
             .saturating_add(track.encoded_len())
@@ -541,12 +587,14 @@ impl Participant {
         self.native_receivers.receivers.insert(
             reference,
             Receiver {
-                transport,
                 source,
                 participant,
                 track,
                 handle: None,
                 enabled: false,
+                installed: matches!(&transport, ReceiveTransport::Sctp { .. }),
+                client_failure: None,
+                transport,
                 opened,
                 reset_pending,
                 retiring: false,
@@ -569,7 +617,7 @@ impl Participant {
     }
 
     fn prepare_native_receiver_transport(
-        &self,
+        &mut self,
         spec: &wire::ResourceSpec,
         source: TrackId,
         track: &wire::Track,
@@ -615,16 +663,17 @@ impl Participant {
                 }
                 Ok(ReceiveTransport::Sctp { channel, lane })
             }
-            (
-                Some(wire::track::Kind::Audio(_) | wire::track::Kind::Video(_)),
-                Some(wire::track_binding::Transport::Rtp(_)),
-            ) => {
+            (Some(wire::track::Kind::Audio(_) | wire::track::Kind::Video(_)), None)
+                if subscription.rtp_offer.is_some() =>
+            {
                 let capabilities = self
                     .negotiated
                     .native_rtp_capabilities
                     .as_ref()
                     .ok_or(wire::FailureCode::Unsupported)?;
-                let receiver = rtp::RtpReceiver::prepare(spec, &state.track, capabilities)?;
+                let receiver = rtp::RtpReceiver::prepare(spec, &state.track, capabilities, || {
+                    self.transport.allocate_receive_ssrc()
+                })?;
                 if self.native_receivers.mids.contains_key(&receiver.mid()) {
                     return Err(wire::FailureCode::Incompatible);
                 }
@@ -799,22 +848,32 @@ impl Participant {
             .as_ref()
             .is_some_and(|settings| settings.enabled == Some(true));
         let handle = source.handle;
-        let ready = enabled && source.bound && handle.is_some();
+        let ready = enabled
+            && receiver.installed
+            && receiver.client_failure.is_none()
+            && source.bound
+            && handle.is_some();
+        let (status, execution_failure) = receiver.execution(enabled, ready);
         let previous_ready = self.native_receivers.receiver_ready(receiver);
         let live = wire::LiveResource {
             spec: Some(work.spec.clone()),
             participant: Some(receiver.participant.clone()),
             track: Some(receiver.track.clone()),
-            execution: if !enabled {
-                wire::ExecutionStatus::Disabled
-            } else if ready {
-                wire::ExecutionStatus::Installed
-            } else {
-                wire::ExecutionStatus::WaitingForSource
-            } as i32,
-            execution_failure: None,
+            execution: status as i32,
+            execution_failure,
             activity: None,
+            binding: match &receiver.transport {
+                ReceiveTransport::Rtp(rtp) => Some(rtp.plan.clone()),
+                _ => None,
+            },
         };
+        if !crate::participant::native::execution_fits(&live) {
+            self.complete_native_preparation(
+                work,
+                Err(failure(wire::FailureCode::CapacityExceeded)),
+            );
+            return;
+        }
         if let Err(code) = self.apply_native_receiver_gate(reference, ready) {
             self.complete_native_preparation(work, Err(failure(code)));
             return;
@@ -856,7 +915,65 @@ impl Participant {
                 .received
                 .insert((handle.data().as_ffi(), reference));
         }
-        events.set_owned_subscription(reference, receiver.source, enabled);
+        events.set_owned_subscription(
+            reference,
+            receiver.source,
+            enabled && receiver.client_failure.is_none(),
+        );
+    }
+
+    pub(super) fn apply_native_receiver_execution(
+        &mut self,
+        reference: u64,
+        outcome: Option<wire::execution_report::Outcome>,
+        events: &mut impl ParticipantSink,
+    ) {
+        if !self.signaling.owns_lifetime(reference)
+            || !self.signaling.authorization_current(unix_now())
+        {
+            return;
+        }
+        let Some(receiver) =
+            self.native_receivers
+                .receivers
+                .get_mut(&reference)
+                .filter(|receiver| {
+                    !receiver.retiring && receiver.opened && receiver.client_failure.is_none()
+                })
+        else {
+            return;
+        };
+        let ReceiveTransport::Rtp(rtp) = &receiver.transport else {
+            return;
+        };
+        match outcome {
+            Some(wire::execution_report::Outcome::Installed(observed))
+                if wire::validation::bindings_equivalent(Some(&observed), Some(&rtp.plan)) =>
+            {
+                receiver.installed = true;
+            }
+            Some(wire::execution_report::Outcome::Failure(error)) => {
+                receiver.client_failure = Some(error);
+            }
+            _ => receiver.client_failure = Some(failure(wire::FailureCode::InvalidConfiguration)),
+        }
+        let Some(receiver) = self.native_receivers.receivers.get(&reference) else {
+            return;
+        };
+        let source = receiver.source;
+        let demand = receiver.enabled && receiver.client_failure.is_none();
+        let ready = self.native_receivers.receiver_ready(receiver);
+        let (status, error) = receiver.execution(receiver.enabled, ready);
+        if self.apply_native_receiver_gate(reference, ready).is_err()
+            || self
+                .signaling
+                .observe_execution_result(reference, status, error)
+                .is_err()
+        {
+            self.disconnect(DisconnectReason::SignalingOutput);
+            return;
+        }
+        events.set_owned_subscription(reference, source, demand);
     }
 
     fn close_native_receiver_transport(&mut self, receiver: &Receiver) {
@@ -1054,6 +1171,8 @@ impl Participant {
                 continue;
             };
             let ready = receiver.enabled
+                && receiver.installed
+                && receiver.client_failure.is_none()
                 && receiver.opened
                 && !receiver.retiring
                 && receivers

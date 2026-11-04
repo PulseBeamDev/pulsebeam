@@ -2243,9 +2243,11 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
     use native_connection::{confirmed, observe};
     use pulsebeam_proto::state;
 
-    let (mut agent, generation, channel, targets) = native_media::connected();
+    let (mut agent, generation, channel, _) = native_media::connected();
     drain_notifications(&mut agent);
     let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
+    let targets =
+        native_media::prepare_receivers(&mut agent, generation, channel, &participant, &tracks);
     assert_eq!(agent.snapshot().participants.len(), 1);
     assert_eq!(agent.snapshot().publications.len(), 2);
     assert_eq!(
@@ -2342,8 +2344,10 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
 fn partial_native_observations_preserve_other_receivers_and_declared_desire() {
     use pulsebeam_proto::state;
 
-    let (mut agent, generation, channel, targets) = native_media::connected();
+    let (mut agent, generation, channel, _) = native_media::connected();
     let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
+    let targets =
+        native_media::prepare_receivers(&mut agent, generation, channel, &participant, &tracks);
     for target in &targets {
         native_connection::observe(
             &mut agent,
@@ -2391,8 +2395,10 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
     use native_connection::{confirmed, observe};
     use pulsebeam_proto::state;
 
-    let (mut agent, generation, channel, targets) = native_media::connected();
+    let (mut agent, generation, channel, _) = native_media::connected();
     let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
+    let targets =
+        native_media::prepare_receivers(&mut agent, generation, channel, &participant, &tracks);
     observe(
         &mut agent,
         generation,
@@ -2465,6 +2471,14 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
     agent
         .command(AgentCommand::ReplaceDesired(changed))
         .unwrap();
+    assert!(
+        agent.snapshot().video_mapping.is_empty(),
+        "local withdrawal must clear video eligibility before the server cutoff arrives"
+    );
+    assert!(
+        agent.snapshot().audio_mapping.is_empty(),
+        "local withdrawal must clear audio eligibility before the server cutoff arrives"
+    );
     let retired = native_media::next(&mut agent, generation, channel);
     assert_eq!(retired.len(), 2);
     for target in &retired {
@@ -2629,7 +2643,8 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
                 })
                 .collect(),
         );
-        let resolved = native_media::next(&mut agent, generation, channel);
+        let resolved =
+            native_media::prepare_receivers(&mut agent, generation, channel, &participant, &tracks);
         assert_eq!(resolved.len(), 2);
         for target in &resolved {
             let Some(state::resource_spec::Declaration::Subscription(subscription)) =
@@ -2844,9 +2859,9 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         );
         assert!(agent.snapshot().video_mapping.is_empty());
         native_media::finish_retirements(&mut agent, generation, &["rv0"], &[]);
-        let Effect::Rtc(RtcEffect::AllocateMedia { operation, .. }) = next_effect(&mut agent)
+        let Effect::Rtc(RtcEffect::OfferReceiveMedia { operation, .. }) = next_effect(&mut agent)
         else {
-            panic!("fresh receiver allocation")
+            panic!("fresh receiver offer")
         };
         agent
             .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
@@ -2888,8 +2903,14 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             kind: MediaKind::Video,
             direction: MediaDirection::ReceiveOnly,
         };
-        native_media::finish_allocation(&mut agent, generation, assigned.clone(), &["rv0"], &[]);
-        let fresh = native_media::next(&mut agent, generation, channel);
+        let fresh = [native_media::prepare_reception(
+            &mut agent,
+            generation,
+            channel,
+            &participant,
+            core::slice::from_ref(&replacement),
+            assigned.clone(),
+        )];
         assert_eq!(fresh.len(), 1);
         assert!(fresh[0].reference > video.reference);
         let Some(state::resource_spec::Declaration::Subscription(subscription)) =
@@ -2898,20 +2919,14 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             panic!("replacement receiver")
         };
         assert_eq!(subscription.track_id, "video-three");
-        let Some(state::resource_spec::Declaration::Subscription(previous)) =
-            &video.spec().declaration
-        else {
-            panic!("previous receiver")
-        };
-        let Some(state::track_binding::Transport::Rtp(previous)) = previous
-            .binding
-            .as_ref()
-            .and_then(|binding| binding.transport.as_ref())
+        assert!(subscription.binding.is_none());
+        let Some(state::track_binding::Transport::Rtp(previous)) =
+            video.receive_plan().unwrap().transport
         else {
             panic!("previous RTP facts")
         };
         assert!(
-            matches!(subscription.binding.as_ref().and_then(|binding| binding.transport.as_ref()),
+            matches!(fresh[0].receive_plan().as_ref().and_then(|binding| binding.transport.as_ref()),
             Some(state::track_binding::Transport::Rtp(rtp)) if rtp.mid == "fresh-rv0" && rtp.mid != previous.mid && rtp.encodings.iter().all(|encoding| previous.encodings.iter().all(|old| old.ssrc != encoding.ssrc)))
         );
         observe(
@@ -3049,9 +3064,12 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             &["ra0"],
             core::slice::from_ref(&assigned),
         );
-        native_media::finish_allocation(
+        let fresh_audio = [native_media::prepare_reception(
             &mut agent,
             generation,
+            channel,
+            &participant,
+            core::slice::from_ref(&replacement),
             SlotBinding {
                 slot: MediaSlot::RemoteAudio(0),
                 mid: "fresh-ra0".into(),
@@ -3059,10 +3077,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
                 kind: MediaKind::Audio,
                 direction: MediaDirection::ReceiveOnly,
             },
-            &["ra0"],
-            core::slice::from_ref(&assigned),
-        );
-        let fresh_audio = native_media::next(&mut agent, generation, channel);
+        )];
         assert_eq!(fresh_audio.len(), 1);
         assert!(fresh_audio[0].reference > audio.reference);
         assert!(matches!(&fresh_audio[0].spec().declaration,
@@ -3409,8 +3424,10 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
     use native_connection::{confirmed, observe};
     use pulsebeam_proto::state;
 
-    let (mut agent, generation, channel, targets) = native_media::connected();
+    let (mut agent, generation, channel, _) = native_media::connected();
     let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
+    let targets =
+        native_media::prepare_receivers(&mut agent, generation, channel, &participant, &tracks);
     observe(
         &mut agent,
         generation,
@@ -4339,7 +4356,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         kind: MediaKind::Video,
         direction: MediaDirection::SendOnly,
     };
-    native_media::finish_allocation(&mut agent, generation, assigned, &["lv0"], &[]);
+    native_media::finish_publication(&mut agent, generation, assigned, &["lv0"], &[]);
     let fresh = native_media::next(&mut agent, generation, channel);
     assert_eq!(fresh.len(), 1);
     assert!(fresh[0].reference > retired[0].reference);
@@ -5260,6 +5277,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
                 resource.revision,
                 state::confirmed_state::Value::Owned(alloc::boxed::Box::new(state::LiveResource {
                     spec: Some(resource.spec.clone()),
+                    binding: None,
                     participant: Some(participant.clone()),
                     track: Some(track),
                     execution: state::ExecutionStatus::Installed as i32,

@@ -353,6 +353,7 @@ impl Participant {
             } as i32,
             execution_failure: None,
             activity: None,
+            binding: None,
         };
         if !self.complete_native_preparation(work, Ok(live)) {
             return;

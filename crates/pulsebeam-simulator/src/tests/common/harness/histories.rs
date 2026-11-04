@@ -69,9 +69,11 @@ fn request_changes(
     mapped: &BTreeSet<String>,
 ) -> (bool, bool) {
     let changed = requested != previous_requested;
+    let pending = previous_requested != previous_mapped;
     (
-        changed && previous_requested != previous_mapped,
-        changed && requested.is_empty() && !mapped.is_empty(),
+        changed && pending,
+        // Local ineligibility may clear mappings while the held wire work is still pending.
+        changed && requested.is_empty() && (pending || !mapped.is_empty()),
     )
 }
 
@@ -1143,20 +1145,23 @@ mod tests {
                 .map(|name| (*name).to_owned())
                 .collect::<BTreeSet<_>>()
         };
-        for (before, mapped, after, expected) in [
-            (vec!["y"], vec!["x"], vec!["x"], (true, false)),
-            (vec!["x"], vec!["x"], vec![], (false, true)),
-            (vec!["y"], vec!["x"], vec![], (true, true)),
-            (vec![], vec!["x"], vec![], (false, false)),
-            (vec!["x"], vec!["x"], vec!["y"], (false, false)),
-            (vec!["y"], vec!["x"], vec!["y"], (false, false)),
-            (vec!["y"], vec!["x"], vec!["z"], (true, false)),
-            (vec![], vec![], vec![], (false, false)),
+        for (before, previous_mapped, after, mapped, expected) in [
+            (vec!["y"], vec!["x"], vec!["x"], vec!["x"], (true, false)),
+            (vec!["x"], vec!["x"], vec![], vec!["x"], (false, true)),
+            (vec!["y"], vec!["x"], vec![], vec!["x"], (true, true)),
+            (vec![], vec!["x"], vec![], vec!["x"], (false, false)),
+            (vec!["x"], vec!["x"], vec!["y"], vec!["x"], (false, false)),
+            (vec!["y"], vec!["x"], vec!["y"], vec!["x"], (false, false)),
+            (vec!["y"], vec!["x"], vec!["z"], vec!["x"], (true, false)),
+            (vec![], vec![], vec![], vec![], (false, false)),
+            (vec!["y"], vec![], vec![], vec![], (true, true)),
+            (vec!["y"], vec![], vec!["z"], vec![], (true, false)),
+            (vec!["x"], vec!["x"], vec![], vec![], (false, false)),
         ] {
             assert_eq!(
                 request_changes(
                     &tracks(&before),
-                    &tracks(&mapped),
+                    &tracks(&previous_mapped),
                     &tracks(&after),
                     &tracks(&mapped)
                 ),

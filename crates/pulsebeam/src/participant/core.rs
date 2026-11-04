@@ -863,6 +863,36 @@ impl Participant {
                 return Some(next);
             }
             work_budget = work_budget.saturating_sub(1);
+            // Offer control before media draining can exhaust this turn. Drain RTC after
+            // each batch so continuous control churn cannot starve packet service either.
+            let mut control_progress = false;
+            if !control_blocked && self.signaling.needs_poll() {
+                let enumeration_progress = self.signaling.enumeration_progress();
+                match self.signaling.poll() {
+                    Ok(Some(output)) => {
+                        if self
+                            .transport
+                            .write_channel(output.cid, true, &output.bytes)
+                        {
+                            self.signaling.commit_sent();
+                        } else {
+                            control_blocked = true;
+                        }
+                        self.transport.mark_needs_drain();
+                        control_progress = true;
+                    }
+                    Ok(None) => {
+                        control_progress =
+                            self.signaling.enumeration_progress() != enumeration_progress;
+                    }
+                    Err(err) => {
+                        plog_warn!(self.log_ctx(), ?err, "native signaling output failed");
+                        tracing::warn!(?err, participant_id = %self.participant_id, "native signaling output failed");
+                        self.disconnect(DisconnectReason::SignalingOutput);
+                        return None;
+                    }
+                }
+            }
             if self.transport.needs_drain() {
                 match self.poll_rtc(now, events, &mut work_budget) {
                     RtcDrainResult::Quiescent(deadline) => {
@@ -912,33 +942,8 @@ impl Participant {
                 }
             }
 
-            if !control_blocked && self.signaling.needs_poll() {
-                let enumeration_progress = self.signaling.enumeration_progress();
-                match self.signaling.poll() {
-                    Ok(Some(output)) => {
-                        if self
-                            .transport
-                            .write_channel(output.cid, true, &output.bytes)
-                        {
-                            self.signaling.commit_sent();
-                        } else {
-                            control_blocked = true;
-                        }
-                        self.transport.mark_needs_drain();
-                        continue;
-                    }
-                    Ok(None) => {
-                        if self.signaling.enumeration_progress() != enumeration_progress {
-                            continue;
-                        }
-                    }
-                    Err(err) => {
-                        plog_warn!(self.log_ctx(), ?err, "native signaling output failed");
-                        tracing::warn!(?err, participant_id = %self.participant_id, "native signaling output failed");
-                        self.disconnect(DisconnectReason::SignalingOutput);
-                        return None;
-                    }
-                }
+            if control_progress {
+                continue;
             }
 
             if self.downstream.dirty_allocation {
@@ -1264,16 +1269,19 @@ impl Participant {
     }
 
     fn handle_native_signaling(&mut self, bytes: &[u8], events: &mut impl ParticipantSink) {
-        let cutoffs = match self.signaling.apply_input(bytes) {
-            Ok(cutoffs) => cutoffs,
+        let input = match self.signaling.apply_input(bytes) {
+            Ok(input) => input,
             Err(error) => {
                 plog_warn!(self.log_ctx(), ?error, "native signaling input rejected");
                 self.disconnect(DisconnectReason::SignalingInput);
                 return;
             }
         };
-        for reference in cutoffs {
+        for reference in input.cutoffs {
             self.retire_native_resource(reference, events);
+        }
+        for (reference, report) in input.executions {
+            self.apply_native_receiver_execution(reference, report.outcome, events);
         }
         self.evaluate_native_preparations(events);
     }

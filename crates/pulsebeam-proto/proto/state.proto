@@ -28,7 +28,7 @@ package pulsebeam.media.v1;
 // Complete values applied individually in reliable stream order, not a map-wide
 // transaction. Send promptly; coalesce unsent updates by key. No batch ACK/cursor.
 message ClientStateBatch {
-  // 1..16 proposals. The entire raw protobuf message must fit 4096 bytes.
+  // 1..16 desired values or execution observations. The message must fit 4096 bytes.
   repeated ClientStateRecord records = 1;
 }
 
@@ -38,8 +38,22 @@ message ClientStateRecord {
   // discovery and session keys cannot be proposed by a client.
   uint64 owned = 1;
 
-  // Required complete desired value for this lifetime.
+  // Exactly one of desired or execution. Reports never replace desired state.
   DesiredState desired = 2;
+  ExecutionReport execution = 3;
+}
+
+// Evidence about this lifetime's immutable server receive plan, not authority.
+message ExecutionReport {
+  // Strictly increases across all serialized client records, like desired.revision.
+  // Does not advance the server's evaluated desired revision.
+  uint64 revision = 1;
+  oneof outcome {
+    // Actual binding after successful platform application.
+    TrackBinding installed = 2;
+    // Scoped local execution failure. Cannot revive or retarget a lifetime.
+    Failure failure = 3;
+  }
 }
 
 message ServerStateBatch {
@@ -91,7 +105,7 @@ message ServerStateRecord {
 // Another present before evaluation is a protocol error. Absence bypasses this
 // gate to cut off pending work promptly; other resources progress independently.
 message DesiredState {
-  // Nonzero; strictly increases across all serialized client proposals. Gaps
+  // Nonzero; strictly increases across all serialized client records. Gaps
   // are valid. Allocate after coalescing; never reuse/wrap. The server echoes
   // evaluation of this target. It is independent of batch position/size.
   uint64 revision = 1;
@@ -302,7 +316,7 @@ message DataPublication {
   TrackBinding binding = 2;
 }
 
-// Exact source and independently prepared receiver binding for one lifetime.
+// Exact source and observed receiving capabilities for one lifetime.
 message SubscriptionSpec {
   // Nonempty opaque canonical TrackId string, <=128 UTF-8 bytes. Owner
   // revalidates source eligibility/authority; SDK never parses its encoding.
@@ -311,8 +325,18 @@ message SubscriptionSpec {
   // Required expected kind, matching the exact source.
   TrackKind kind = 2;
 
-  // Required receiving RTP/SCTP facts. Never copy publisher demux coordinates.
+  // Data only: actual prepared SCTP payload binding.
   TrackBinding binding = 3;
+
+  // Audio/video only: actual local offer, without invented receive identities.
+  RtpReceiveOffer rtp_offer = 4;
+}
+
+message RtpReceiveOffer {
+  string mid = 1;
+  repeated RtpCodecParameters codecs = 2;
+  repeated RtpHeaderExtensionParameters header_extensions = 3;
+  repeated string rtcp_modes = 4;
 }
 
 
@@ -342,6 +366,10 @@ message LiveResource {
 
   // Required ACTIVE/IDLE for audio/video publications, absent for other kinds.
   optional MediaActivity activity = 6;
+
+  // Required for audio/video subscriptions, absent otherwise. Server-selected
+  // immutable receiver plan. PREPARING is not evidence of client installation.
+  TrackBinding binding = 7;
 }
 
 enum ExecutionStatus {
@@ -350,6 +378,7 @@ enum ExecutionStatus {
   WAITING_FOR_SOURCE = 2;          // Enabled receive; exact route unavailable.
   INSTALLED = 3;                   // Enabled admitted plan; no payload guarantee.
   FAILED = 4;                      // Requires execution_failure; gates closed.
+  PREPARING = 5;                   // Plan admitted; matching client evidence pending.
 }
 
 enum MediaActivity {

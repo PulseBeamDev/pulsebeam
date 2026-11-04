@@ -364,7 +364,7 @@ impl WirePeer {
         );
         push(&source, 20).await?;
         native.frames(5)?;
-        native.enabled(31, false).await?;
+        native.enabled(32, false).await?;
         anyhow::ensure!(
             self.audio_state(
                 20,
@@ -380,7 +380,7 @@ impl WirePeer {
         silence(&source, || native.sink.try_next_frame().is_some())
             .await
             .context("Native demand-off receive window")?;
-        native.enabled(32, true).await?;
+        native.enabled(33, true).await?;
         anyhow::ensure!(
             self.audio_state(
                 20,
@@ -487,7 +487,7 @@ impl WirePeer {
         );
 
         native.frames(5)?;
-        native.enabled(33, false).await?;
+        native.enabled(34, false).await?;
         drain_in_flight(|| {
             sink.try_next_frame().is_some() || native.sink.try_next_frame().is_some()
         })
@@ -500,7 +500,7 @@ impl WirePeer {
             "WHEP stopped with an unrelated Native receiver"
         );
         while sink.try_next_frame().is_some() {}
-        native.enabled(34, true).await?;
+        native.enabled(35, true).await?;
         push(&source, 10).await?;
         native.frames(1)?;
         while sink.try_next_frame().is_some() {}
@@ -562,9 +562,9 @@ impl WirePeer {
         })
         .await
         .context("retired source receive window")?;
-        native.absent(34, wire::AbsenceReason::SourceEnded).await?;
-        native.peer.desire(30, 35, None);
-        native.absent(35, wire::AbsenceReason::Gone).await?;
+        native.absent(35, wire::AbsenceReason::SourceEnded).await?;
+        native.peer.desire(30, 36, None);
+        native.absent(36, wire::AbsenceReason::Gone).await?;
         native.peer.peer.close()?;
         receiver.close()?;
         Ok(())
