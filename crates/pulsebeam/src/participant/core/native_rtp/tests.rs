@@ -173,6 +173,71 @@ fn last_live_for(
 }
 
 #[test]
+fn unsupported_congestion_control_rejects_before_source_installation() {
+    for (feedback, extension) in [(false, true), (true, false), (false, false)] {
+        let mut participant =
+            participant_with_capabilities(native_data::unix_now() + 60, Some(capabilities()));
+        let mut sink = MockParticipantSink::new();
+        let mut unsupported = spec(true);
+        let Some(resource_spec::Declaration::Publication(publication)) =
+            unsupported.declaration.as_mut()
+        else {
+            panic!("publication")
+        };
+        let Some(wire::publication_spec::Kind::Audio(audio)) = publication.kind.as_mut() else {
+            panic!("audio")
+        };
+        let Some(wire::track_binding::Transport::Rtp(rtp)) =
+            audio.binding.as_mut().unwrap().transport.as_mut()
+        else {
+            panic!("RTP")
+        };
+        if !feedback {
+            rtp.codec.as_mut().unwrap().feedback.clear();
+        }
+        if !extension {
+            rtp.header_extensions.retain(|extension| {
+                extension.uri
+                    != wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str()
+            });
+        }
+        assert_eq!(wire::validation::validate_spec(&unsupported), Ok(()));
+        participant.handle_native_signaling(
+            &frame(
+                1,
+                wire::desired_state::Value::Present(Box::new(unsupported)),
+            ),
+            &mut sink,
+        );
+        let rejected = confirmations(&mut participant).pop().unwrap();
+        assert_eq!(rejected.evaluated_revision, 1);
+        assert_eq!(
+            rejected.rejection.unwrap().code,
+            wire::FailureCode::Unsupported as i32
+        );
+        assert!(participant.native_rtp.publications.is_empty());
+        assert!(sink.publish_track_calls.is_empty());
+        assert!(participant.native_rtp.ssrcs.is_empty());
+        assert!(participant.native_rtp.mids.is_empty());
+        assert!(participant.disconnect_reason.is_none());
+
+        participant.handle_native_signaling(
+            &native_data::tests::frame_for(
+                2,
+                2,
+                wire::desired_state::Value::Present(Box::new(spec(true))),
+            ),
+            &mut sink,
+        );
+        let (accepted, live) = last_live_for(&mut participant, 2);
+        assert_eq!(accepted.evaluated_revision, 2);
+        assert!(accepted.rejection.is_none());
+        assert_eq!(live.execution, wire::ExecutionStatus::Installed as i32);
+        assert_eq!(sink.publish_track_calls.len(), 1);
+    }
+}
+
+#[test]
 fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire() {
     let mut participant =
         participant_with_capabilities(native_data::unix_now() + 60, Some(capabilities()));

@@ -490,7 +490,7 @@ message RtpCodecParameters {
   // and a distinct rtx_ssrc on every encoding are required.
   optional uint32 rtx_payload_type = 2;
 
-  // Negotiated feedback spellings. Baseline RTP requires transport-cc.
+  // Negotiated feedback spellings. Backend admission selects congestion-control policy.
   repeated string feedback = 3;
 
   // Required admitted primary format.

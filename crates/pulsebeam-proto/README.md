@@ -24,7 +24,10 @@ history, immutable identity, capabilities and authorization.
 `CodecFormat` carries a lowercase MIME type, clock rate, optional channel count,
 and named FMTP parameters. Feedback and header extensions use their transport
 names and URIs, not a closed wire enum. Descriptions retain unknown parameters
-and formats; validation does not grant transport or decoder support.
+and formats; validation does not grant transport or decoder support. Structural
+RTP validity does not select congestion control. The current RTC backend requires
+`transport-cc` feedback and a supported transport-wide CC extension before
+installing either a publication or a subscription; there is no silent fallback.
 
 Use the explicitly advertised capability intersection and actual engine
 observations before installing media. Unsupported resources fail locally without
@@ -45,8 +48,12 @@ state-batch codec.
 
 This pre-release structural cutover retains `pulsebeam.media.v1` and requires
 coordinated endpoint updates. Subsequent additive optional descriptions can evolve
-without another structural cutover. Unsupported profiles are rejected during HTTP
-bootstrap.
+without another structural cutover. Unknown protobuf fields, including nested
+fields, are discarded during decoding and are not preserved by re-encoding.
+Only safely ignorable descriptions may rely on this behavior. A requirement
+whose omission would be unsafe, such as mandatory encryption, needs explicit
+negotiated support before use; adding an optional field is not negotiation.
+Unsupported profiles are rejected during HTTP bootstrap.
 Future compression requires an explicitly supported profile, not per-message
 negotiation. There is no Catalog/Intent/Mapping
 schema, legacy codec export or fallback decoder. The signaling data-channel label

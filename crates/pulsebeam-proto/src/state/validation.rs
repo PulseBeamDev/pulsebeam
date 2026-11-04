@@ -355,6 +355,7 @@ fn validate_binding(binding: Option<&TrackBinding>, kind: TrackKind, publication
     }
 }
 
+/// Checks a complete wire binding, not backend capabilities or congestion-control policy.
 pub fn validate_rtp(rtp: &RtpParameters, kind: TrackKind, publication: bool) -> Result {
     validate_rtp_envelope(rtp, kind, publication)?;
     let repair = rtp
@@ -391,10 +392,6 @@ pub fn validate_rtp_envelope(rtp: &RtpParameters, kind: TrackKind, publication: 
             && (!payload_type(codec.rtx_payload_type)
                 || codec.rtx_payload_type == codec.payload_type)
         || !unique_text(&codec.feedback, 32, 128)
-        || !codec
-            .feedback
-            .iter()
-            .any(|feedback| feedback == RtcpFeedback::TransportCc.as_str())
     {
         return Err(ValidationError::Binding);
     }
@@ -416,10 +413,7 @@ pub fn validate_rtp_envelope(rtp: &RtpParameters, kind: TrackKind, publication: 
             return Err(ValidationError::Binding);
         }
     }
-    // MID and draft-01 transport-wide CC are mandatory in the native profile.
-    if !types.contains(RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str())
-        || !types.contains(RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str())
-    {
+    if !types.contains(RtpHeaderExtensionType::RtpHeaderExtensionMid.as_str()) {
         return Err(ValidationError::Binding);
     }
     let mut ssrcs = BTreeSet::new();

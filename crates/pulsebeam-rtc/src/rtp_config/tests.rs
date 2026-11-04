@@ -221,6 +221,36 @@ fn data_only_start_declares_feedback_and_atomic_duplex_encoding_configuration() 
     );
     assert_eq!(connection.rtp_configuration().as_ref(), Some(&configured));
     assert_eq!(connection.stats().senders[0].ssrc, 200);
+    for outbound in [false, true] {
+        for (feedback, extension) in [(false, true), (true, false), (false, false)] {
+            let mut unsupported = binding("no-cc", 800);
+            if !feedback {
+                unsupported.codec.parameters.feedback.remove("transport-cc");
+            }
+            if !extension {
+                unsupported
+                    .extensions
+                    .retain(|extension| extension.uri != TWCC_EXTENSION);
+            }
+            let patch = if outbound {
+                RtpConfigurationPatch {
+                    outbound: vec![unsupported],
+                    ..Default::default()
+                }
+            } else {
+                RtpConfigurationPatch {
+                    inbound: vec![unsupported],
+                    ..Default::default()
+                }
+            };
+            assert_eq!(
+                connection.update_rtp(patch),
+                Err(RtpConfigurationError::Unsupported)
+            );
+            assert_eq!(connection.rtp_configuration().as_ref(), Some(&configured));
+            assert_eq!(connection.stats().senders[0].ssrc, 200);
+        }
+    }
     connection.set_rtp_capabilities(caps.clone()).unwrap();
     let mut changed = caps;
     changed.feedback = PacketFeedbackKind::Rfc8888;

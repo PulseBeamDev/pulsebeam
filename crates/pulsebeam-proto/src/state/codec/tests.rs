@@ -219,7 +219,19 @@ fn structural_preflight_bounds_repeated_empty_messages_groups_and_bad_varints() 
     record.extend_from_slice(&[0x12, 0]);
     let mut duplicate = vec![0x0a, u8::try_from(record.len()).unwrap()];
     duplicate.extend_from_slice(&record);
-    assert_eq!(decode_client(&duplicate), Ok(batch));
+    assert_eq!(decode_client(&duplicate), Ok(batch.clone()));
+
+    // Merge a future ResourceSpec field 31 = true into desired.present.
+    // Unknown requirements are discarded, not negotiated or preserved.
+    let mut record = batch.records[0].encode_to_vec();
+    record.extend_from_slice(&[0x12, 5, 0x12, 3, 0xf8, 1, 1]);
+    let mut future = vec![0x0a, u8::try_from(record.len()).unwrap()];
+    future.extend_from_slice(&record);
+    let decoded = decode_client(&future).unwrap();
+    assert_eq!(decoded, batch);
+    let canonical = encode_client(&decoded).unwrap();
+    assert_eq!(canonical, encode_client(&batch).unwrap());
+    assert_ne!(canonical, future);
 }
 
 fn rtp() -> RtpParameters {
@@ -323,6 +335,38 @@ fn rtp_presence_and_source_coordinates_are_not_conflated_with_zero() {
         validation::validate_rtp(&binding, TrackKind::Audio, true),
         Err(ValidationError::Binding)
     );
+}
+
+#[test]
+fn rtp_validity_does_not_select_congestion_control() {
+    let mut binding = rtp();
+    binding.codec.as_mut().unwrap().feedback.clear();
+    binding.header_extensions.retain(|extension| {
+        extension.uri != RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str()
+    });
+    assert_eq!(
+        validation::validate_rtp(&binding, TrackKind::Audio, true),
+        Ok(())
+    );
+
+    binding
+        .codec
+        .as_mut()
+        .unwrap()
+        .feedback
+        .push("future-cc".into());
+    binding
+        .header_extensions
+        .push(RtpHeaderExtensionParameters {
+            id: 4,
+            uri: "urn:example:future-cc".into(),
+        });
+    for publication in [false, true] {
+        assert_eq!(
+            validation::validate_rtp(&binding, TrackKind::Audio, publication),
+            Ok(())
+        );
+    }
 }
 
 #[test]

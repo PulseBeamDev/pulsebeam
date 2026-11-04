@@ -131,6 +131,19 @@ fn actual_envelope_recovery_preserves_format_presence_zero_and_extension_ids() {
         assert_eq!(actual.encodings[0].scalability_mode, None);
         assert_eq!(actual.header_extensions[1].id, 20);
         assert_eq!(actual.rtcp.unwrap().cname, "actual-source");
+
+        let mut binding = binding;
+        binding.codec.parameters.feedback.remove("transport-cc");
+        binding.extensions.remove(1);
+        let actual = prepared_rtp_binding(&binding, &capabilities, true).unwrap();
+        let Some(wire::track_binding::Transport::Rtp(actual)) = actual.transport else {
+            panic!("RTP expected");
+        };
+        assert!(actual.codec.unwrap().feedback.is_empty());
+        assert!(!actual.header_extensions.iter().any(|extension| {
+            extension.uri
+                == wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.as_str()
+        }));
     }
 }
 
@@ -180,9 +193,6 @@ fn missing_or_unrepresentable_facts_are_not_defaulted_or_dropped() {
     let mut mode = binding.clone();
     mode.rtcp.reduced_size = true;
     cases.push(mode);
-    let mut baseline = binding.clone();
-    baseline.extensions.remove(1);
-    cases.push(baseline);
     let mut collision = binding.clone();
     collision.encodings[0].repair = collision.encodings[0].primary;
     cases.push(collision);
