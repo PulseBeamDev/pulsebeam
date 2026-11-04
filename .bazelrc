@@ -1,5 +1,6 @@
 startup --max_idle_secs=300
 startup --shutdown_on_low_sys_mem
+startup --host_jvm_args=-Xmx2g
 
 common --enable_bzlmod
 common --lockfile_mode=error
