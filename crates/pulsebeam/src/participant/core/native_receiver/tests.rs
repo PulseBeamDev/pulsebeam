@@ -14,7 +14,6 @@ fn subscription(source: TrackId, channel: u32, enabled: bool) -> wire::ResourceS
         declaration: Some(resource_spec::Declaration::Subscription(
             wire::SubscriptionSpec {
                 track_id: source.as_str(),
-                rtp_offer: None,
                 kind: wire::TrackKind::Data as i32,
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
@@ -111,7 +110,6 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
             track: descriptor,
             handle: None,
             enabled: false,
-            installed: true,
             client_failure: None,
             opened: false,
             reset_pending: false,

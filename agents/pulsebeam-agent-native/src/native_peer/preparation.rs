@@ -7,11 +7,9 @@ use agent_core::{
 #[derive(Default)]
 pub(super) struct MediaWork {
     allocations: Vec<Allocation>,
-    owned: BTreeMap<MediaSlot, rtc::SessionTransceiverId>,
+    created: BTreeMap<MediaSlot, rtc::SessionTransceiverId>,
     slots: Vec<SlotBinding>,
     stopped: Vec<String>,
-    receiving: bool,
-    observed: Option<Box<agent_core::client_sdp::Binding>>,
     retiring: bool,
     cleaning: bool,
     failure: Option<Error>,
@@ -73,95 +71,6 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                     Err(error),
                 )
             })
-    }
-
-    pub fn offer_receive_media(
-        &mut self,
-        operation: OperationId,
-        target: agent_core::ReceiveTarget,
-    ) -> Option<HostEvent> {
-        self.sdp
-            .as_mut()
-            .ok_or(Error::CandidateState)
-            .and_then(|executor| match target {
-                agent_core::ReceiveTarget::Existing(slot) => {
-                    executor.enqueue_reception(operation, slot)
-                }
-                agent_core::ReceiveTarget::Allocate(allocation) => {
-                    executor.enqueue_allocation(operation, vec![allocation])
-                }
-            })
-            .err()
-            .map(|error| {
-                media_event(
-                    self.generation,
-                    operation,
-                    ApplyOutcome::NotApplied,
-                    Err(error),
-                )
-            })
-    }
-
-    pub fn apply_receive_plan(
-        &mut self,
-        operation: OperationId,
-        slot: SlotBinding,
-        parameters: agent_core::RtpParameters,
-    ) -> Option<HostEvent> {
-        if !matches!(self.stage, Stage::MediaAwaitingPlan)
-            || self.sdp.as_ref().and_then(Executor::operation) != Some(operation)
-            || !self.media_work.as_ref().is_some_and(|work| {
-                work.receiving && work.slots.as_slice() == std::slice::from_ref(&slot)
-            })
-        {
-            return None;
-        }
-        let applied = (|| {
-            let descriptions = self
-                .session
-                .descriptions(self.peer)
-                .map_err(|_| Error::Observation)?;
-            let offer = &descriptions.local().ok_or(Error::Observation)?.sdp;
-            let mut candidate = self
-                .sdp
-                .as_mut()
-                .ok_or(Error::CandidateState)?
-                .prepare_received(operation, offer, &slot, &parameters)?;
-            self.capture_sender_modes(operation, &mut candidate)?;
-            let native = self
-                .session
-                .set_remote_description(
-                    self.peer,
-                    rtc::SessionDescription {
-                        kind: rtc::SessionDescriptionType::Answer,
-                        sdp: candidate.answer().to_owned(),
-                    },
-                )
-                .map_err(|_| Error::Observation)?;
-            self.stage = Stage::MediaSettingRemote(native);
-            Ok::<_, Error>(())
-        })();
-        applied
-            .err()
-            .and_then(|error| self.repair_event(operation, error))
-    }
-
-    fn repair_event(&mut self, operation: OperationId, failure: Error) -> Option<HostEvent> {
-        let mut events = Vec::new();
-        if let Err(error) = self.repair_media(operation, failure, &mut events) {
-            tracing::warn!(
-                ?operation,
-                ?error,
-                "native receive repair could not complete"
-            );
-            return Some(media_event(
-                self.generation,
-                operation,
-                ApplyOutcome::NotApplied,
-                Err(Error::Observation),
-            ));
-        }
-        events.pop()
     }
 
     pub fn retire_media(&mut self, operation: OperationId, mids: Vec<String>) -> Option<HostEvent> {
@@ -274,7 +183,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             self.media_work
                 .as_mut()
                 .ok_or(Error::CandidateState)?
-                .owned
+                .created
                 .insert(slot, transceiver);
             codecs_and_extensions(
                 &mut self.session,
@@ -350,27 +259,17 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
     }
 
     pub fn cancel_media(&mut self, operation: OperationId) -> Option<HostEvent> {
-        let queued = self
-            .sdp
+        self.sdp
             .as_mut()
-            .is_some_and(|executor| executor.cancel(operation));
-        if queued {
-            return Some(media_event(
-                self.generation,
-                operation,
-                ApplyOutcome::NotApplied,
-                Err(Error::CandidateState),
-            ));
-        }
-        if matches!(self.stage, Stage::MediaAwaitingPlan)
-            && self
-                .sdp
-                .as_ref()
-                .is_some_and(|executor| executor.cancelled(operation))
-        {
-            return self.repair_event(operation, Error::CandidateState);
-        }
-        None
+            .is_some_and(|executor| executor.cancel(operation))
+            .then(|| {
+                media_event(
+                    self.generation,
+                    operation,
+                    ApplyOutcome::NotApplied,
+                    Err(Error::CandidateState),
+                )
+            })
     }
 
     pub(super) fn start_media(
@@ -385,43 +284,17 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             Ok::<_, Error>((
                 executor.retirement_targets(operation)?.to_vec(),
                 executor.allocation_targets(operation)?.to_vec(),
-                executor.reception_target(operation)?.cloned(),
             ))
         })();
-        let (mids, allocations, existing) = match targets {
+        let (mids, allocations) = match targets {
             Ok(targets) => targets,
             Err(error) => return self.finish_media(operation, false, Some(error), events),
         };
-        let receiving = existing.is_some()
-            || (!allocations.is_empty()
-                && allocations.iter().all(|allocation| {
-                    allocation.slot.direction() == agent_core::MediaDirection::ReceiveOnly
-                }));
-        if receiving && allocations.len() > 1 {
-            return self.finish_media(operation, false, Some(Error::Identifier), events);
-        }
         self.media_work = Some(MediaWork {
             allocations,
-            receiving,
             retiring: !mids.is_empty(),
             ..Default::default()
         });
-        if let Some(slot) = existing {
-            let target = self
-                .transceivers
-                .get(&slot.slot)
-                .copied()
-                .filter(|_| self.bindings.get(&slot.slot) == Some(&slot));
-            let Some(transceiver) = target else {
-                return self.finish_media(operation, false, Some(Error::Observation), events);
-            };
-            let work = self
-                .media_work
-                .as_mut()
-                .ok_or_else(|| error("native media work is absent"))?;
-            work.owned.insert(slot.slot.clone(), transceiver);
-            work.slots.push(slot);
-        }
         if let Err(error) = self.stop_media(&mids).and_then(|()| self.create_media()) {
             return self.repair_media(operation, error, events);
         }
@@ -441,25 +314,24 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         if !matches!(failure, Error::CandidateState) {
             tracing::warn!(?operation, ?failure, stage = ?self.stage,
                 allocations = ?self.media_work.as_ref().map(|work| &work.allocations),
-                owned = self.media_work.as_ref().map_or(0, |work| work.owned.len()),
+                created = self.media_work.as_ref().map_or(0, |work| work.created.len()),
                 "native RTP preparation failed");
         }
         let Some(work) = self
             .media_work
             .as_mut()
-            .filter(|work| !work.owned.is_empty() && !work.cleaning)
+            .filter(|work| !work.created.is_empty() && !work.cleaning)
         else {
             return self.finish_media(operation, false, Some(failure), events);
         };
         work.cleaning = true;
         work.failure = Some(failure);
-        for transceiver in work.owned.values() {
-            let mid = self.session.transceiver_mid(*transceiver).ok().flatten();
+        for transceiver in work.created.values() {
+            if let Ok(Some(mid)) = self.session.transceiver_mid(*transceiver) {
+                work.stopped.push(mid);
+            }
             if self.session.stop_standard(*transceiver).is_err() {
                 return self.finish_media(operation, false, Some(Error::Observation), events);
-            }
-            if let Some(mid) = mid {
-                work.stopped.push(mid);
             }
         }
         match self.session.set_local_description_auto(self.peer) {
@@ -475,7 +347,6 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         &mut self,
         result: Result<Option<rtc::SessionDescription>, rtc::PeerError>,
         events: &mut Vec<HostEvent>,
-        observations: &mut Vec<Observation>,
     ) -> Result<(), rtc::PeerError> {
         let operation = self
             .sdp
@@ -526,20 +397,6 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                 }
             }
             Stage::MediaSettingLocal(_) => {
-                if self
-                    .media_work
-                    .as_ref()
-                    .is_some_and(|work| work.receiving && !work.cleaning)
-                {
-                    match self.receive_offer(operation) {
-                        Ok(event) => {
-                            self.stage = Stage::MediaAwaitingPlan;
-                            events.push(event);
-                        }
-                        Err(error) => self.repair_media(operation, error, events)?,
-                    }
-                    return Ok(());
-                }
                 let answer = self.media_answer(operation);
                 let answer = match answer {
                     Ok(answer) => answer,
@@ -556,161 +413,9 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                     Err(_) => self.repair_media(operation, Error::Observation, events)?,
                 }
             }
-            Stage::MediaSettingRemote(_) => {
-                let failure = if self
-                    .media_work
-                    .as_ref()
-                    .is_some_and(|work| work.receiving && !work.cleaning)
-                {
-                    self.observe_receive(observations).err()
-                } else {
-                    None
-                };
-                self.finish_media(operation, true, failure, events)?;
-            }
+            Stage::MediaSettingRemote(_) => self.finish_media(operation, true, None, events)?,
             _ => return Err(error("native media stage is absent")),
         }
-        Ok(())
-    }
-
-    fn receive_offer(&mut self, operation: OperationId) -> Result<HostEvent, Error> {
-        let descriptions = self
-            .session
-            .descriptions(self.peer)
-            .map_err(|_| Error::Observation)?;
-        let offer = &descriptions.local().ok_or(Error::Observation)?.sdp;
-        let work = self.media_work.as_mut().ok_or(Error::CandidateState)?;
-        let mids = work
-            .owned
-            .iter()
-            .map(|(slot, transceiver)| {
-                let mid = self
-                    .session
-                    .transceiver_mid(*transceiver)
-                    .map_err(|_| Error::Observation)?
-                    .ok_or(Error::Observation)?;
-                Ok((slot.clone(), mid))
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let slots = agent_core::client_sdp::assigned_slot_bindings(offer, mids)?;
-        let [slot] = slots.as_slice() else {
-            return Err(Error::Identifier);
-        };
-        let offered = self
-            .sdp
-            .as_mut()
-            .ok_or(Error::CandidateState)?
-            .receive_offer(operation, offer, slot)?;
-        let slot = slot.clone();
-        self.bindings.insert(slot.slot.clone(), slot.clone());
-        work.slots = slots;
-        Ok(HostEvent::Rtc(RtcEvent::MediaOffered {
-            generation: self.generation,
-            operation,
-            slot,
-            offer: offered,
-        }))
-    }
-
-    fn observe_receive(&mut self, observations: &mut Vec<Observation>) -> Result<(), Error> {
-        let work = self.media_work.as_ref().ok_or(Error::CandidateState)?;
-        let [slot] = work.slots.as_slice() else {
-            return Err(Error::Identifier);
-        };
-        let slot = slot.clone();
-        let descriptions = self
-            .session
-            .descriptions(self.peer)
-            .map_err(|_| Error::Observation)?;
-        let answer = &descriptions.remote().ok_or(Error::Observation)?.sdp;
-        let actual = self
-            .sdp
-            .as_mut()
-            .ok_or(Error::CandidateState)?
-            .context_mut()
-            .observe_receive_answer(answer, &slot.mid)?;
-        let transceiver = *self
-            .transceivers
-            .get(&slot.slot)
-            .ok_or(Error::Observation)?;
-        if self
-            .session
-            .transceiver_stopped(transceiver)
-            .map_err(|_| Error::Observation)?
-            || self
-                .session
-                .transceiver_mid(transceiver)
-                .map_err(|_| Error::Observation)?
-                .as_deref()
-                != Some(slot.mid.as_str())
-        {
-            return Err(Error::Observation);
-        }
-        let receiver = self
-            .session
-            .receiver(transceiver)
-            .map_err(|_| Error::Observation)?;
-        let parameters = self
-            .session
-            .get_receiver_parameters(receiver)
-            .map_err(|_| Error::Observation)?;
-        let codecs = parameters.codecs();
-        if !codecs.iter().any(|codec| {
-            codec.payload_type() == i32::from(actual.codec.payload_type)
-                && codec.mime_type_bytes().is_some_and(|mime| {
-                    mime.eq_ignore_ascii_case(
-                        format!(
-                            "{}/{}",
-                            if actual.kind == agent_core::client_sdp::Kind::Audio {
-                                "audio"
-                            } else {
-                                "video"
-                            },
-                            actual.codec.parameters.name
-                        )
-                        .as_bytes(),
-                    )
-                })
-        }) {
-            return Err(Error::Observation);
-        }
-        if let Some(repair) = &actual.codec.repair
-            && !codecs.iter().any(|codec| {
-                codec.payload_type() == i32::from(repair.payload_type)
-                    && codec.mime_type_bytes().is_some_and(|mime| {
-                        mime.eq_ignore_ascii_case(
-                            format!(
-                                "{}/rtx",
-                                if actual.kind == agent_core::client_sdp::Kind::Audio {
-                                    "audio"
-                                } else {
-                                    "video"
-                                }
-                            )
-                            .as_bytes(),
-                        )
-                    })
-            })
-        {
-            return Err(Error::Observation);
-        }
-        let extensions = parameters.header_extensions();
-        if actual.extensions.iter().any(|expected| {
-            !(0..extensions.len()).any(|index| {
-                extensions.get(index).is_some_and(|extension| {
-                    extension.id().to_int() == i32::from(expected.id)
-                        && extension.uri_bytes() == expected.uri.as_bytes()
-                })
-            })
-        }) {
-            return Err(Error::Observation);
-        }
-        self.refresh_receiver(transceiver, receiver, observations)
-            .map_err(|_| Error::Observation)?;
-        self.media_work
-            .as_mut()
-            .ok_or(Error::CandidateState)?
-            .observed = Some(Box::new(actual));
         Ok(())
     }
 
@@ -748,58 +453,45 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             executor.prepare(operation, offer)?
         };
         if !work.cleaning {
-            self.capture_sender_modes(operation, &mut candidate)?;
+            let mids = candidate
+                .bindings()
+                .publications
+                .iter()
+                .map(|binding| binding.mid.clone())
+                .collect::<Vec<_>>();
+            for mid in mids {
+                let transceiver = self
+                    .transceivers
+                    .iter()
+                    .find_map(|(slot, transceiver)| {
+                        self.bindings
+                            .get(slot)
+                            .filter(|binding| binding.mid == mid)
+                            .map(|_| *transceiver)
+                    })
+                    .ok_or(Error::Observation)?;
+                let sender = self
+                    .session
+                    .sender(transceiver)
+                    .map_err(|_| Error::Observation)?;
+                let modes = self
+                    .session
+                    .get_sender_parameters(sender)
+                    .map_err(|_| Error::Observation)?
+                    .encodings()
+                    .into_iter()
+                    .map(|encoding| {
+                        encoding
+                            .scalability_mode_bytes()
+                            .map(String::from_utf8)
+                            .transpose()
+                            .map_err(|_| Error::Observation)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                executor.prepare_sender_modes(operation, &mut candidate, &mid, &modes)?;
+            }
         }
         Ok(candidate.answer().to_owned())
-    }
-
-    fn capture_sender_modes(
-        &mut self,
-        operation: OperationId,
-        candidate: &mut agent_core::client_sdp::Candidate,
-    ) -> Result<(), Error> {
-        let mids = candidate
-            .bindings()
-            .publications
-            .iter()
-            .map(|binding| binding.mid.clone())
-            .collect::<Vec<_>>();
-        for mid in mids {
-            let transceiver = self
-                .transceivers
-                .iter()
-                .find_map(|(slot, transceiver)| {
-                    self.bindings
-                        .get(slot)
-                        .filter(|binding| binding.mid == mid)
-                        .map(|_| *transceiver)
-                })
-                .ok_or(Error::Observation)?;
-            let sender = self
-                .session
-                .sender(transceiver)
-                .map_err(|_| Error::Observation)?;
-            let modes = self
-                .session
-                .get_sender_parameters(sender)
-                .map_err(|_| Error::Observation)?
-                .encodings()
-                .into_iter()
-                .map(|encoding| {
-                    encoding
-                        .scalability_mode_bytes()
-                        .map(String::from_utf8)
-                        .transpose()
-                        .map_err(|_| Error::Observation)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.sdp
-                .as_mut()
-                .ok_or(Error::CandidateState)?
-                .prepare_sender_modes(operation, candidate, &mid, &modes)?;
-        }
-
-        Ok(())
     }
 
     fn finish_media(
@@ -825,14 +517,14 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         } else {
             Ok(())
         };
-        if work.cleaning && applied {
-            for (slot, transceiver) in &work.owned {
+        if work.cleaning {
+            for (slot, transceiver) in &work.created {
                 if let Err(error) = self.drop_media_mapping(slot, *transceiver) {
                     cleaned = Err(error);
                 }
             }
         }
-        let mut observed = executor
+        let observed = executor
             .context_mut()
             .bindings()
             .filter(|bindings| {
@@ -843,12 +535,6 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             })
             .cloned()
             .ok_or(Error::CandidateState);
-        if let (Ok(bindings), Some(actual)) = (&mut observed, work.observed) {
-            bindings
-                .receptions
-                .retain(|binding| binding.mid != actual.mid);
-            bindings.receptions.push(*actual);
-        }
         if let Err(error) = &observed {
             tracing::warn!(
                 ?operation,
@@ -861,13 +547,6 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         }
         let preparation = finished.and_then(|outcome| {
             cleaned?;
-            if work.receiving
-                && work.cleaning
-                && applied
-                && outcome == ApplyOutcome::AppliedButCancelled
-            {
-                return Ok(executor.context_mut().applied_bindings().clone());
-            }
             if let Some(error) = failure.or(work.failure) {
                 return Err(error);
             }

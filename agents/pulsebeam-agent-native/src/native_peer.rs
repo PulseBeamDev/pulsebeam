@@ -1,6 +1,5 @@
 //! The single RTC/media implementation, independent of runtime services.
 mod preparation;
-pub(super) use preparation::media_event;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::task::{Context, Poll};
 
@@ -33,7 +32,6 @@ enum Stage {
     MediaCreatingOffer(rtc::OperationId),
     MediaSettingLocal(rtc::OperationId),
     MediaSettingRemote(rtc::OperationId),
-    MediaAwaitingPlan,
     Ready,
     Rejected,
 }
@@ -681,11 +679,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                         _ => None,
                     };
                     if media_operation == Some(done.operation_id) {
-                        self.media_completed(
-                            done.result,
-                            &mut progress.events,
-                            &mut progress.observations,
-                        )?;
+                        self.media_completed(done.result, &mut progress.events)?;
                         continue;
                     }
                     done.result?;
@@ -735,7 +729,6 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
                             | Stage::MediaCreatingOffer(_)
                             | Stage::MediaSettingLocal(_)
                             | Stage::MediaSettingRemote(_)
-                            | Stage::MediaAwaitingPlan
                     ) {
                         self.connection_event(&mut progress.events);
                     }

@@ -3254,7 +3254,19 @@ async fn execute_plan(
                         &proof.track,
                         *expected,
                         Instant::now(),
-                    )?;
+                    )
+                    .inspect_err(|_| {
+                        if let Some(stats) = handle.shared.statistics.lock().unwrap().as_ref() {
+                            tracing::error!(
+                                participant,
+                                publisher,
+                                generation = stats.generation,
+                                timestamp_us = stats.timestamp_us,
+                                report = %String::from_utf8_lossy(&stats.report_json),
+                                "native decoder statistics at playback failure"
+                            );
+                        }
+                    })?;
                 handle.native_playback_track = Some(proof.track.clone());
                 tracing::info!(description, participant, publisher, ?expected, ?proof.track, "source-authenticated native playback verified");
             }

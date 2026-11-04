@@ -49,35 +49,30 @@ fenced old-lifetime delivery. A failed or unproven reset never permits reuse.
 `DataChannelSpec.negotiated_id` is a physical stream ID, separate from the
 logical `ChannelId` used for host callbacks.
 
-## Server-directed reception
+## Prepared reception
 
-Core owns receive policy; platform adapters execute it through the existing
-per-peer SDP executor. Bootstrap HTTP capabilities describe server support, not
-an endpoint's decoder capabilities or an installed receiver.
+Core owns receive policy and chooses within the exact source format and the
+server's advertised support. Native and Web adapters prepare the local receiver
+through the existing per-peer SDP executor before Core submits its complete RTP
+binding. Bootstrap HTTP capabilities describe server support, not an installed
+endpoint receiver.
 
-1. `OfferReceiveMedia` creates or adopts the requested physical receiver. After
-   applying the local offer, the host uses `Context::receive_offer` to observe its
-   MID, codec/PT choices, extension mappings and RTCP modes, then returns
-   `MediaOffered`. The subscription carries that offer, not client-assigned
-   receive SSRCs or CNAME.
-2. Core retains the same operation while waiting for the server's immutable
-   binding on the owned resource. `ApplyReceivePlan` supplies that binding for
-   `Context::prepare_receive_plan`; the host applies the resulting answer.
-3. After actual remote-description completion, the host calls
-   `Context::observe_receive_answer` while the candidate is pending and checks
-   actual receiver parameters and the live receiver/track. Finish the candidate
-   with its actual apply outcome even if observation fails, preserving applied
-   identity history. Missing readback is not installation evidence.
-4. A matching completion produces an independent execution report. Core exposes
-   receiver mappings and observation targets only when local prepared facts match
-   the plan and the server confirms installation. Neither cached bootstrap facts
-   nor server status alone establishes readiness.
+Successful description completion establishes local configuration, correlated to
+its generation, operation and owner. Core then requests admission. The server
+validates source compatibility, authorization, identities and limits before
+accepting the binding and forwarding. There is no server-plan wait or initial
+installation-success report. Application-visible readiness requires accepted
+server state and the current local receiver lifetime.
 
-Generation, operation, resource-reference and source-lifetime fences apply
-throughout. Cancellation repairs the existing operation; hosts retain owned
-transceivers and tracks until stop/description repair is confirmed. Scoped
-preparation failure does not install the receiver or rewrite unrelated desire.
-See the [wire receive contract](../../crates/pulsebeam-proto/README.md#media-receive-plans-and-execution).
+Configured and receiving are distinct: packets, frames and track unmuting are
+observations, not prerequisites for forwarding. Exhaustive parameter readback is
+not a readiness gate. Later receiver failures remain scoped execution reports,
+independent of application intent and desired settings evaluation.
+
+Cancellation retains actual applied identity history. Hosts retain owned
+transceivers and tracks until stop/description repair completes. New source
+incarnations require fresh receiver lifetimes, never silent retargeting.
+See the [wire receive contract](../../crates/pulsebeam-proto/README.md#prepared-media-reception-and-failure).
 
 ## Track resources
 
@@ -191,9 +186,8 @@ are never inferred from a data-only answer. Supply a connection-specific SSRC
 seed and `Limits`; no randomness or identity set is required from the host.
 
 The adapter serializes operations and applies answers to its PeerConnection.
-This native-independent helper shows the generic prepare/apply/accept boundary.
-Managed reception uses the [server-directed flow](#server-directed-reception),
-not standalone `Preparation.reception` identity allocation:
+This native-independent helper shows the prepare/apply/accept boundary used for
+local reception preparation:
 
 ```rust
 use pulsebeam_agent_core::client_sdp::{
@@ -245,10 +239,8 @@ Unchanged sections are reconciled automatically. Codec replacement requires an
 explicitly prepared fresh compatible section. Inactivation retains identities;
 stopped-MID reuse requires fresh identities. A stopped section can disappear
 when the current offer recycles its m-line under a new MID; its reserved
-identities remain unavailable. Standalone receive identity allocation avoids
-collisions across the context's bounded history, including cancelled candidates.
-Managed receivers instead retain the server-selected identities across unrelated
-offers and reject retargeting or removal of a selected extension.
+identities remain unavailable. Receive identity allocation avoids collisions
+across the context's bounded history, including cancelled candidates.
 
 Individual descriptions and generated answers are limited to 1 MiB, with
 additional line bounds. There is no separate whole-description section or
@@ -284,14 +276,13 @@ CNAME retains the value from applied SDP; if neither source supplies it, the
 binding stays incomplete. Conflicting CNAME or mode observations fail atomically. CNAME is
 limited to the SDES field's 255 bytes. A binding needs one common CNAME across its
 primary and repair sources; unsupported mixed CNAMEs reject rather than merge.
-Standalone fresh local answers select compound RTCP. Authoritative receive
-plans select an offered, supported mode. Applied bootstrap reduced-size mode is
+Fresh local answers select compound RTCP. Applied bootstrap reduced-size mode is
 retained only when offered, and continuing answers preserve the applied CNAME
-and mode. Submit only complete publication bindings; receivers report observed
-application of the server's binding. Runtime bitrate/framerate, activation and
-scalability observations remain separate from negotiated identities. Mutable
-receive preferences do not retarget a physical receiver: a replacement source
-incarnation requires a fresh receiver and authoritative plan.
+and mode. Submit only complete prepared publication and receiver bindings.
+Runtime bitrate/framerate, activation and scalability observations remain
+separate from negotiated identities. Mutable receive preferences do not retarget
+a physical receiver: a replacement source incarnation requires a fresh receiver
+and binding.
 
 Report `NotApplied` for failure or cancellation before application.
 `AppliedButCancelled` preserves actual SDP history while suppressing declaration;

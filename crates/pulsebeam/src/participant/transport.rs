@@ -3,7 +3,6 @@ use std::{collections::VecDeque, net::SocketAddr, time::Duration};
 use ahash::{HashMap, HashMapExt};
 #[cfg(test)]
 use bytes::Bytes;
-use pulsebeam_proto::state as wire;
 use pulsebeam_rtc::{
     AcceptedConnection, AuthenticatedPath, Connection, DataMessage, Event, NetworkInput,
     NetworkProtocol, Output, RtpExtension, RtpWrite, SessionInfo, TransmitTarget,
@@ -263,7 +262,6 @@ impl Sender {
 pub(crate) struct Transport {
     rtc: Connection,
     session: SessionInfo,
-    next_receive_ssrc: u32,
     senders: HashMap<Mid, Sender>,
     encodings: HashMap<Ssrc, Encoding>,
     pending_reports: indexmap::IndexMap<u32, pulsebeam_rtc::SenderReport>,
@@ -318,7 +316,6 @@ impl Transport {
         Self {
             rtc: accepted.connection,
             session: accepted.session,
-            next_receive_ssrc: 0x7fff_ffff,
             senders,
             encodings: HashMap::new(),
             pending_reports: Default::default(),
@@ -584,18 +581,6 @@ impl Transport {
 
     pub(crate) fn discard_channel_mutations(&mut self, cid: ChannelId) {
         self.pending_mutations.retain(|mutation| !matches!(mutation, TransportMutation::Data { channel, .. } if *channel == cid));
-    }
-
-    pub(crate) fn allocate_receive_ssrc(&mut self) -> Result<u32, wire::FailureCode> {
-        loop {
-            self.next_receive_ssrc = self
-                .next_receive_ssrc
-                .checked_add(1)
-                .ok_or(wire::FailureCode::CapacityExceeded)?;
-            if !self.rtc.rtp_ssrc_reserved(self.next_receive_ssrc) {
-                return Ok(self.next_receive_ssrc);
-            }
-        }
     }
 
     pub(crate) fn update_rtp(

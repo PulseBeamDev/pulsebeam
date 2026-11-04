@@ -1175,7 +1175,6 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
                     execution: wire::ExecutionStatus::Failed as i32,
                     execution_failure: Some(failure),
                     activity: Some(wire::MediaActivity::Active as i32),
-                    binding: None,
                 },
             ))),
         }),

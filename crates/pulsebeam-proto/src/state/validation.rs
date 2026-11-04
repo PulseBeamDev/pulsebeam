@@ -188,17 +188,7 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
                 (TrackKind::Data, None) => (),
                 _ => return Err(ValidationError::Settings),
             }
-            match (
-                kind,
-                subscription.binding.as_ref(),
-                subscription.rtp_offer.as_ref(),
-            ) {
-                (TrackKind::Data, binding, None) => validate_binding(binding, kind, false),
-                (TrackKind::Audio | TrackKind::Video, None, Some(offer)) => {
-                    validate_receive_offer(offer, kind)
-                }
-                _ => Err(ValidationError::Binding),
-            }
+            validate_binding(subscription.binding.as_ref(), kind, false)
         }
     }
 }
@@ -277,39 +267,9 @@ pub fn validate_live(live: &LiveResource) -> Result {
             if subscription.track_id != track.track_id || subscription.kind != kind as i32 {
                 return Err(ValidationError::Identity);
             }
-            match (
-                kind,
-                subscription.rtp_offer.as_ref(),
-                live.binding
-                    .as_ref()
-                    .and_then(|binding| binding.transport.as_ref()),
-            ) {
-                (TrackKind::Data, None, None) => {}
-                (
-                    TrackKind::Audio | TrackKind::Video,
-                    Some(offer),
-                    Some(track_binding::Transport::Rtp(plan)),
-                ) => {
-                    validate_receive_plan(offer, plan, kind)?;
-                    let source = match track.kind.as_ref() {
-                        Some(track::Kind::Audio(source)) => source.format.as_ref(),
-                        Some(track::Kind::Video(source)) => source.format.as_ref(),
-                        _ => None,
-                    };
-                    validate_source_format(live.binding.as_ref(), source)?;
-                }
-                _ => return Err(ValidationError::Binding),
-            }
             false
         }
     };
-    if matches!(
-        spec.declaration,
-        Some(resource_spec::Declaration::Publication(_))
-    ) && live.binding.is_some()
-    {
-        return Err(ValidationError::Binding);
-    }
     if media_publication != live.activity.is_some()
         || live.activity.is_some_and(|v| !known::<MediaActivity>(v))
     {
@@ -332,11 +292,6 @@ pub fn validate_live(live: &LiveResource) -> Result {
                     spec.declaration,
                     Some(resource_spec::Declaration::Subscription(_))
                 ) =>
-        {
-            Ok(())
-        }
-        ExecutionStatus::Preparing
-            if live.execution_failure.is_none() && live.binding.is_some() =>
         {
             Ok(())
         }
@@ -381,122 +336,7 @@ fn validate_playout(delay: Option<&PlayoutDelay>) -> Result {
 }
 
 pub fn validate_execution_report(report: &ExecutionReport) -> Result {
-    match report.outcome.as_ref().ok_or(ValidationError::Binding)? {
-        execution_report::Outcome::Installed(binding) => {
-            let Some(track_binding::Transport::Rtp(parameters)) = binding.transport.as_ref() else {
-                return Err(ValidationError::Binding);
-            };
-            let format = parameters
-                .codec
-                .as_ref()
-                .and_then(|codec| codec.format.as_ref())
-                .ok_or(ValidationError::Format)?;
-            let kind = if validate_format(format)? {
-                TrackKind::Audio
-            } else {
-                TrackKind::Video
-            };
-            validate_rtp(parameters, kind, false)
-        }
-        execution_report::Outcome::Failure(failure) => validate_failure(failure),
-    }
-}
-
-pub fn validate_receive_offer(offer: &RtpReceiveOffer, kind: TrackKind) -> Result {
-    if !matches!(kind, TrackKind::Audio | TrackKind::Video)
-        || !mid(&offer.mid)
-        || offer.codecs.is_empty()
-        || offer.codecs.len() > 32
-        || offer.header_extensions.len() > 16
-        || !unique_text(&offer.rtcp_modes, 16, 64)
-    {
-        return Err(ValidationError::Binding);
-    }
-    let mut payloads = BTreeSet::new();
-    for codec in &offer.codecs {
-        if !payload_type(codec.payload_type)
-            || !payloads.insert(codec.payload_type)
-            || !unique_text(&codec.feedback, 32, 128)
-            || codec
-                .rtx_payload_type
-                .is_some_and(|repair| !payload_type(Some(repair)) || !payloads.insert(Some(repair)))
-            || validate_format(codec.format.as_ref().ok_or(ValidationError::Format)?)?
-                != (kind == TrackKind::Audio)
-        {
-            return Err(ValidationError::Binding);
-        }
-    }
-    let mut ids = BTreeSet::new();
-    let mut uris = BTreeSet::new();
-    if offer.header_extensions.iter().any(|extension| {
-        !(1..=255).contains(&extension.id)
-            || !ids.insert(extension.id)
-            || !uris.insert(&extension.uri)
-            || super::sdp::extension_uri(&extension.uri).is_err()
-    }) {
-        return Err(ValidationError::Binding);
-    }
-    Ok(())
-}
-
-pub fn validate_receive_plan(
-    offer: &RtpReceiveOffer,
-    plan: &RtpParameters,
-    kind: TrackKind,
-) -> Result {
-    validate_receive_offer(offer, kind)?;
-    validate_rtp(plan, kind, false)?;
-    let selected = plan.codec.as_ref().ok_or(ValidationError::Binding)?;
-    let offered = offer.codecs.iter().find(|codec|
-        codec.payload_type == selected.payload_type
-            && matches!((&codec.format, &selected.format), (Some(left), Some(right)) if formats_equivalent(left, right)))
-        .ok_or(ValidationError::Capability)?;
-    let rtcp = plan.rtcp.as_ref().ok_or(ValidationError::Binding)?;
-    let mode = if rtcp.reduced_size {
-        RtcpMode::ReducedSize
-    } else {
-        RtcpMode::Compound
-    };
-    if plan.mid != offer.mid
-        || selected.rtx_payload_type.is_some()
-            && selected.rtx_payload_type != offered.rtx_payload_type
-        || selected
-            .feedback
-            .iter()
-            .any(|value| !offered.feedback.contains(value))
-        || plan
-            .header_extensions
-            .iter()
-            .any(|extension| !offer.header_extensions.contains(extension))
-        || !offer.rtcp_modes.iter().any(|value| value == mode.as_str())
-        || plan
-            .encodings
-            .iter()
-            .any(|encoding| !encoding.rid.is_empty())
-    {
-        return Err(ValidationError::Capability);
-    }
-    Ok(())
-}
-
-fn receive_offers_equivalent(left: &RtpReceiveOffer, right: &RtpReceiveOffer) -> bool {
-    left.mid == right.mid
-        && same_members(&left.header_extensions, &right.header_extensions)
-        && same_members(&left.rtcp_modes, &right.rtcp_modes)
-        && left.codecs.len() == right.codecs.len()
-        && left.codecs.iter().all(|left| {
-            right
-                .codecs
-                .iter()
-                .any(|right| codecs_equivalent(left, right))
-        })
-}
-
-fn codecs_equivalent(left: &RtpCodecParameters, right: &RtpCodecParameters) -> bool {
-    left.payload_type == right.payload_type
-        && left.rtx_payload_type == right.rtx_payload_type
-        && same_members(&left.feedback, &right.feedback)
-        && matches!((&left.format, &right.format), (Some(left), Some(right)) if formats_equivalent(left, right))
+    validate_failure(report.failure.as_ref().ok_or(ValidationError::Failure)?)
 }
 
 fn validate_binding(binding: Option<&TrackBinding>, kind: TrackKind, publication: bool) -> Result {
@@ -636,13 +476,7 @@ pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> boo
         (Some(Declaration::Subscription(left)), Some(Declaration::Subscription(right))) => {
             left.track_id == right.track_id
                 && left.kind == right.kind
-                && match (&left.rtp_offer, &right.rtp_offer) {
-                    (Some(left), Some(right)) => receive_offers_equivalent(left, right),
-                    (None, None) => {
-                        bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())
-                    }
-                    _ => false,
-                }
+                && bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())
         }
         _ => false,
     }
@@ -679,7 +513,15 @@ pub fn bindings_equivalent(left: Option<&TrackBinding>, right: Option<&TrackBind
                 && left.encodings == right.encodings
                 && same_members(&left.header_extensions, &right.header_extensions)
                 && match (&left.codec, &right.codec) {
-                    (Some(left), Some(right)) => codecs_equivalent(left, right),
+                    (Some(left), Some(right)) => {
+                        left.payload_type == right.payload_type
+                            && left.rtx_payload_type == right.rtx_payload_type
+                            && same_members(&left.feedback, &right.feedback)
+                            && match (&left.format, &right.format) {
+                                (Some(left), Some(right)) => formats_equivalent(left, right),
+                                _ => false,
+                            }
+                    }
                     _ => false,
                 }
         }

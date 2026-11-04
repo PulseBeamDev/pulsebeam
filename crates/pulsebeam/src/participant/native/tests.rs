@@ -98,7 +98,6 @@ fn live(work: &Preparation) -> wire::LiveResource {
         } as i32,
         execution_failure: None,
         activity: None,
-        binding: None,
     }
 }
 
@@ -228,9 +227,7 @@ fn overlapping_proposals_cannot_replace_queued_or_active_targets() {
             }
             let report = wire::ExecutionReport {
                 revision: 2,
-                outcome: Some(wire::execution_report::Outcome::Failure(failure(
-                    wire::FailureCode::Unsupported,
-                ))),
+                failure: Some(failure(wire::FailureCode::Unsupported)),
             };
             let bytes = codec::encode_client(&wire::ClientStateBatch {
                 records: vec![wire::ClientStateRecord {

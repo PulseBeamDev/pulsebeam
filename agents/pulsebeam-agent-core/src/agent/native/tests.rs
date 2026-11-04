@@ -13,7 +13,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         MediaSlot::RemoteVideo(256),
         MediaSlot::RemoteAudio(256),
     ] {
-        let (mut agent, generation, channel) = connected(crate::TopicRegistrations::default());
+        let (mut agent, generation, _) = connected(crate::TopicRegistrations::default());
         let format = state::CodecFormat::from(match slot.kind() {
             crate::MediaKind::Video => state::codec_format::Codec::Vp8(Default::default()),
             crate::MediaKind::Audio => state::codec_format::Codec::Opus(Default::default()),
@@ -49,10 +49,6 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         let (mut binding, capabilities) = crate::rtc_preparation::binding_fixture(format);
         binding.key = crate::rtc_preparation::bootstrap_media_key(&slot);
         binding.mid = assigned.mid.clone();
-        binding.encodings[0].primary = Some(1000);
-        if binding.encodings[0].repair.is_some() {
-            binding.encodings[0].repair = Some(1001);
-        }
         let bindings = if receiving {
             Bindings {
                 publications: Vec::new(),
@@ -115,75 +111,17 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
             assert!(!active.media_leases.contains_key(&slot));
             assert!(agent.next_effect().is_none());
         }
-        let participant = state::Participant {
-            participant_id: "remote".into(),
-            participant_external_id: "remote-user".into(),
-        };
-        let track = state::Track {
-            track_id: "camera".into(),
-            participant_id: participant.participant_id.clone(),
-            label: "camera".into(),
-            kind: Some(match slot.kind() {
-                crate::MediaKind::Video => state::track::Kind::Video(state::VideoTrack {
-                    format: requested_format.clone(),
-                }),
-                crate::MediaKind::Audio => state::track::Kind::Audio(state::AudioTrack {
-                    format: requested_format.clone(),
-                }),
-            }),
-        };
-        let mut desired = agent.declared.clone();
-        if receiving {
-            observe(
-                &mut agent,
-                generation,
-                channel,
-                vec![
-                    confirmed(
-                        state::resource_key::Key::Participant(participant.participant_id.clone()),
-                        0,
-                        state::confirmed_state::Value::Participant(participant.clone()),
-                    ),
-                    confirmed(
-                        state::resource_key::Key::Track(track.track_id.clone()),
-                        0,
-                        state::confirmed_state::Value::Track(track.clone()),
-                    ),
-                ],
-            );
-            match slot {
-                MediaSlot::RemoteVideo(index) => {
-                    desired.video.push(crate::VideoSubscription {
-                        slot: index,
-                        track_id: "camera".into(),
-                        selector: None,
-                        height: 0,
-                        min_height: 0,
-                        min_fps: 0,
-                        priority: 0,
-                        playout_delay: crate::PlayoutDelay::Adaptive,
-                    });
-                }
-                MediaSlot::RemoteAudio(_) => desired.audio.pinned.push("camera".into()),
-                _ => panic!("receive slot"),
-            }
-        }
         let active = agent.active.as_mut().unwrap();
-        active.capabilities.rtp = capabilities.clone();
+        active.capabilities.rtp = capabilities;
         active.media_wanted.insert(slot.clone(), want("camera"));
         allocate_media(active, &mut agent.ids, &mut agent.effects);
-        let (operation, allocations) = match agent.next_effect() {
-            Some(Effect::Rtc(RtcEffect::AllocateMedia {
-                operation,
-                allocations,
-                ..
-            })) if !receiving => (operation, allocations),
-            Some(Effect::Rtc(RtcEffect::OfferReceiveMedia {
-                operation,
-                target: crate::ReceiveTarget::Allocate(allocation),
-                ..
-            })) if receiving => (operation, vec![allocation]),
-            effect => panic!("allocation: {effect:?}"),
+        let Some(Effect::Rtc(RtcEffect::AllocateMedia {
+            operation,
+            allocations,
+            ..
+        })) = agent.next_effect()
+        else {
+            panic!("allocation")
         };
         assert_eq!(
             agent.source_preparation(&slot).readiness,
@@ -202,89 +140,6 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                 format: requested_format.clone()
             }]
         );
-        let owned = if receiving {
-            desired.revision += 1;
-            agent
-                .command(AgentCommand::ReplaceDesired(desired))
-                .unwrap();
-            let prepared = crate::rtc_preparation::prepare_bootstrap_bindings(
-                bindings.clone(),
-                core::slice::from_ref(&assigned),
-                &capabilities,
-            )
-            .unwrap();
-            let selected = prepared[&slot].as_ref().unwrap().binding.clone();
-            let Some(state::track_binding::Transport::Rtp(parameters)) = &selected.transport else {
-                panic!("RTP")
-            };
-            agent
-                .handle(HostEvent::Rtc(RtcEvent::MediaOffered {
-                    generation,
-                    operation,
-                    slot: assigned.clone(),
-                    offer: state::RtpReceiveOffer {
-                        mid: assigned.mid.clone(),
-                        codecs: vec![parameters.codec.clone().unwrap()],
-                        header_extensions: parameters.header_extensions.clone(),
-                        rtcp_modes: capabilities.rtcp_modes.clone(),
-                    },
-                }))
-                .unwrap();
-            let target = allocation_frame(&mut agent, generation, channel)
-                .records
-                .remove(0);
-            let desired = target.desired.unwrap();
-            let Some(state::desired_state::Value::Present(spec)) = desired.value else {
-                panic!("receive desire")
-            };
-            observe(
-                &mut agent,
-                generation,
-                channel,
-                vec![confirmed(
-                    state::resource_key::Key::Owned(target.owned),
-                    desired.revision,
-                    state::confirmed_state::Value::Owned(Box::new(state::LiveResource {
-                        spec: Some(*spec),
-                        participant: Some(participant),
-                        track: Some(track),
-                        execution: state::ExecutionStatus::Preparing as i32,
-                        execution_failure: None,
-                        binding: Some(selected.clone()),
-                        activity: None,
-                    })),
-                )],
-            );
-            let Some(Effect::Rtc(RtcEffect::ApplyReceivePlan {
-                generation: actual,
-                operation: applied,
-                slot: actual_slot,
-                parameters,
-            })) = agent.next_effect()
-            else {
-                panic!("receive plan application")
-            };
-            assert_eq!(
-                (actual, applied, actual_slot),
-                (generation, operation, assigned.clone())
-            );
-            assert_eq!(
-                selected.transport,
-                Some(state::track_binding::Transport::Rtp(parameters))
-            );
-            assert_eq!(
-                agent
-                    .active
-                    .as_ref()
-                    .unwrap()
-                    .state
-                    .reference(&want("camera").resource),
-                Some(target.owned)
-            );
-            Some(target.owned)
-        } else {
-            None
-        };
         let stale_generation = agent.ids.generation();
         for (callback_generation, callback_operation) in [
             (stale_generation, operation),
@@ -332,46 +187,6 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         let lease = &active.media_leases[&slot];
         assert!(lease.retired);
         assert_eq!(lease.resource, want("camera").resource);
-        if let Some(reference) = owned {
-            let absent_revision = (0..2)
-                .find_map(|_| {
-                    let batch = allocation_frame(&mut agent, generation, channel);
-                    assert!(batch.records.iter().all(|record| {
-                        record.execution.as_ref().is_none_or(|report| {
-                            !matches!(
-                                report.outcome,
-                                Some(state::execution_report::Outcome::Installed(_))
-                            )
-                        })
-                    }));
-                    batch
-                        .records
-                        .iter()
-                        .filter(|record| record.owned == reference)
-                        .filter_map(|record| record.desired.as_ref())
-                        .find(|desired| {
-                            desired.value == Some(state::desired_state::Value::Absent(true))
-                        })
-                        .map(|desired| desired.revision)
-                })
-                .expect("the pending execution report and retirement must emit the absence");
-            assert!(
-                agent.next_effect().is_none(),
-                "physical retirement waits for wire cutoff"
-            );
-            observe(
-                &mut agent,
-                generation,
-                channel,
-                vec![confirmed(
-                    state::resource_key::Key::Owned(reference),
-                    absent_revision,
-                    state::confirmed_state::Value::Absent(state::AbsentState {
-                        reason: state::AbsenceReason::Removed as i32,
-                    }),
-                )],
-            );
-        }
         let Some(Effect::Rtc(RtcEffect::RetireMedia {
             operation, mids, ..
         })) = agent.next_effect()
@@ -437,15 +252,15 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
     agent
         .command(AgentCommand::ReplaceDesired(desired.clone()))
         .unwrap();
-    let Some(Effect::Rtc(RtcEffect::OfferReceiveMedia {
+    let Some(Effect::Rtc(RtcEffect::AllocateMedia {
         operation,
-        target: crate::ReceiveTarget::Allocate(allocation),
+        allocations,
         ..
     })) = agent.next_effect()
     else {
-        panic!("audio receive offer")
+        panic!("audio allocation")
     };
-    assert_eq!(allocation.slot, MediaSlot::RemoteAudio(0));
+    assert_eq!(allocations[0].slot, MediaSlot::RemoteAudio(0));
     desired.revision += 1;
     desired.audio.pinned.push("a-source".into());
     agent
@@ -469,34 +284,6 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         Some("a-source")
     );
     assert!(agent.next_effect().is_none());
-}
-
-#[track_caller]
-fn allocation_frame(
-    agent: &mut Agent,
-    generation: Generation,
-    channel: crate::ChannelId,
-) -> state::ClientStateBatch {
-    let Some(Effect::DataChannel(crate::DataChannelEffect::Send {
-        operation,
-        generation: actual,
-        channel: actual_channel,
-        payload,
-        ..
-    })) = agent.next_effect()
-    else {
-        panic!("allocation control frame")
-    };
-    assert_eq!((actual, actual_channel), (generation, channel));
-    let batch = codec::decode_client(&payload).unwrap();
-    agent
-        .handle(HostEvent::DataChannel(crate::DataChannelEvent::Sent {
-            operation,
-            generation,
-            channel,
-        }))
-        .unwrap();
-    batch
 }
 
 #[test]
@@ -540,7 +327,6 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
                 retirement_failed: false,
                 wire_retired: false,
                 source: None,
-                receive_offer: None,
             },
         );
     };
@@ -941,7 +727,6 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
                 }),
                 execution: state::ExecutionStatus::Installed as i32,
                 execution_failure: None,
-                binding: None,
                 activity: None,
             })),
         )],

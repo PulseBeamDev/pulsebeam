@@ -1071,15 +1071,6 @@ impl Agent {
                 }
                 Ok(())
             }
-            RtcEvent::MediaOffered {
-                generation,
-                operation,
-                slot,
-                offer,
-            } => {
-                self.media_offered(generation, operation, slot, offer);
-                Ok(())
-            }
             RtcEvent::MediaPrepared {
                 generation,
                 operation,

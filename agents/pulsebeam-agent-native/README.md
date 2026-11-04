@@ -173,11 +173,12 @@ injection does not turn its bookkeeping into an application observation.
 
 Use the commands in [Build and publish](BUILDING.md#check-the-build). Binding generation reads the native shared library and emits the native and core namespaces. Core-owned portable types remain in core. Generated files are build artifacts; change Rust definitions and run the owner generator, never edit generated output.
 
-Receive execution uses the existing per-peer executor and media work through
-local offer, server-plan wait and remote-description completion. The host checks
-completed SDP and actual receiver codec/header parameters, then refreshes the
-receiver/sink identity before returning facts to Core. Packet arrival and
-statistics are not readiness gates. See [Core's receive flow](../pulsebeam-agent-core/README.md#server-directed-reception)
+Receive preparation uses the existing per-peer executor through successful
+local-offer and remote-answer completion before Core submits the complete
+binding for server admission. Completion is correlated to the current generation,
+operation and owner; cancellation retains applied history and safe cleanup.
+Packet arrival, statistics and exhaustive receiver-parameter readback are not
+readiness gates. See [Core's receive flow](../pulsebeam-agent-core/README.md#prepared-reception)
 for policy and completion fences.
 
 Implementation owners are `native_actor` (effects and lifecycle), `native_peer` (one generation), `native_source`/`native_receiver` (native resources), `native_media` (owned values), and `ffi` (thin foreign boundary). `media` retains an application-side Annex-B fixture slicer. The former str0m transport, RTP packetization, jitter and socket-pumping modules are removed.

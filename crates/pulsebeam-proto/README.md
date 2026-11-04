@@ -52,34 +52,34 @@ negotiation. There is no Catalog/Intent/Mapping
 schema, legacy codec export or fallback decoder. The signaling data-channel label
 is unchanged; it does not select a different wire protocol.
 
-## Media receive plans and execution
+## Prepared media reception and failure
 
-An RTP `SubscriptionSpec` carries `rtp_offer` from the endpoint's applied local
-receive offer and leaves `binding` absent. The offer describes its actual MID,
-codec/PT possibilities, header-extension mappings and RTCP modes without choosing
-receive SSRCs or CNAME. Data subscriptions still carry their prepared SCTP binding.
-HTTP bootstrap capabilities alone are not endpoint receive capabilities.
+`SubscriptionSpec.binding` carries the complete RTP or SCTP configuration after
+successful local platform preparation. RTP bindings contain the independently
+allocated receive identities and negotiated codec/PT, extension and RTCP maps,
+never copied publisher demux coordinates. The source descriptor supplies its
+admitted codec envelope; HTTP capabilities supply server support.
 
-The server selects a source-compatible intersection, reserves fresh nonzero
-output SSRCs and publishes the authoritative `LiveResource.binding` with
-`Preparing` execution. That binding is immutable for the owned lifetime. A new
-source incarnation requires a fresh receiver and plan, not an active-binding
-retarget. Unrelated capability or settings changes do not reassign its identities.
+The server authorizes the exact source and validates its format, binding,
+identity conflicts and limits before admitting the configuration. It confirms the
+accepted resource and can forward without another installation acknowledgment.
+There is no server-authored receive plan or `Preparing` phase. Bindings remain
+immutable for their owned lifetime. A new source incarnation requires a fresh
+receiver and binding, not silent active-binding retargeting.
 
-After actual platform application and readback, the endpoint sends a separate
-`ClientStateRecord.execution`: either the observed installed binding or a scoped
-failure. A record cannot contain both `desired` and `execution`. Reports use the
+Local readiness follows successful platform description completion and current
+generation/operation/owner correlation. It does not require packet arrival,
+frames, unmuting or exhaustive receiver readback. Application-visible readiness
+also requires authoritative server acceptance and the current receiver lifetime.
+
+A later local receiver failure uses `ClientStateRecord.execution.failure`. A
+record cannot contain both `desired` and `execution`. Failure reports use the
 same connection-wide monotonic input clock, with a revision later than the owned
-reference; they do not advance the resource's desired `evaluated_revision` or
-replace its accepted specification. A rejected settings proposal therefore cannot
-hide an independent execution failure.
-
-Forwarding and installed execution require matching endpoint evidence as well as
-the existing authorization, source and retirement gates. Endpoint readiness also
-requires its own matching local facts, not server status alone. Installation does
-not wait for RTP packets or statistics; those cannot arrive reliably before the
-forwarding gate opens. Malformed reports, scoped failures and superseded lifetimes
-remain distinct from a successful installation.
+reference; they do not advance the desired `evaluated_revision` or replace its
+accepted specification. A rejected settings proposal cannot hide an independent
+execution failure. Failure closes forwarding and demand for that lifetime;
+settings or source availability cannot revive it. Withdrawal and physical
+cleanup retain the existing authorization, source and retirement fences.
 
 ## Enumeration and ordered recovery
 

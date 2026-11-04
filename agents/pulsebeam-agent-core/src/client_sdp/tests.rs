@@ -1,7 +1,5 @@
 use super::*;
 
-mod receiver;
-
 const MID: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
 fn transport() -> &'static str {
     "a=ice-ufrag:local\r\na=ice-pwd:localpasswordlocalpassword\r\na=fingerprint:sha-256 AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB:AA:BB\r\na=setup:actpass\r\n"
