@@ -33,12 +33,18 @@ flock --shared --nonblock --conflict-exit-code 75 "$worktree_lock"
 command_name=
 executor=reapi
 endpoint=grpc://127.0.0.1:50051
+remote_executor=grpc://127.0.0.1:50051
+remote_cache=grpc://127.0.0.1:50051
 manual_server=0
 expect=
 for arg in "$@"; do
   [[ "$arg" != -- ]] || break
   if [[ -n "$expect" ]]; then
-    case "$expect" in executor) executor=$arg ;; endpoint) endpoint=$arg ;; esac
+    case "$expect" in
+      executor) executor=$arg ;; endpoint) endpoint=$arg ;;
+      remote_executor) remote_executor=$arg ;; remote_cache) remote_cache=$arg ;;
+      config) [[ "$arg" != local ]] || { executor=local; remote_executor=; remote_cache=; } ;;
+    esac
     expect=
     continue
   fi
@@ -50,16 +56,38 @@ for arg in "$@"; do
     --//crates/pulsebeam-libwebrtc-sys:executor) expect=executor ;;
     --//crates/pulsebeam-libwebrtc-sys:reapi=*) endpoint=${arg#*=} ;;
     --//crates/pulsebeam-libwebrtc-sys:reapi) expect=endpoint ;;
+    --remote_executor=*) remote_executor=${arg#*=} ;;
+    --remote_executor) expect=remote_executor ;;
+    --remote_cache=*) remote_cache=${arg#*=} ;;
+    --remote_cache) expect=remote_cache ;;
+    --config=local) executor=local; remote_executor=; remote_cache= ;;
+    --config) expect=config ;;
     --config=webrtc-reapi) executor=reapi ;;
     --config=webrtc-cache) executor=cache ;;
     //tools/nativelink:server) manual_server=1 ;;
   esac
 done
-if [[ "$arch" == amd64 && -n "$command_name" && "$executor" != local && \
-      "$endpoint" == grpc://127.0.0.1:50051 && \
+needs_service=0
+if [[ "$remote_executor" == grpc://127.0.0.1:50051 || "$remote_cache" == grpc://127.0.0.1:50051 || \
+      ( "$executor" != local && "$endpoint" == grpc://127.0.0.1:50051 ) ]]; then
+  needs_service=1
+fi
+if [[ "$arch" == amd64 && -n "$command_name" && "$needs_service" == 1 && \
       ! ( "$command_name" == run && "$manual_server" == 1 ) && \
       "${PULSEBEAM_NATIVELINK_AUTOSTART:-1}" != 0 ]]; then
   python3 "$workspace/tools/nativelink/autostart.py" \
     --workspace "$workspace" --bazelisk "$launcher" --output-base "$workspace/.bazel/output"
+fi
+if [[ -n "$command_name" && ( "$arch" != amd64 || ( "$command_name" == run && "$manual_server" == 1 ) ) ]]; then
+  arguments=()
+  configured=0
+  for arg in "$@"; do
+    arguments+=("$arg")
+    if [[ "$configured" == 0 && "$arg" == "$command_name" ]]; then
+      arguments+=(--config=local)
+      configured=1
+    fi
+  done
+  set -- "${arguments[@]}"
 fi
 exec "$launcher" "--output_base=$workspace/.bazel/output" "$@"

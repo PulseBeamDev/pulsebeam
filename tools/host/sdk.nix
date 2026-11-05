@@ -15,6 +15,13 @@ in pkgs.buildEnv {
   ];
   pathsToLink = [ "/include" "/lib" ];
   postBuild = ''
+    # Remote inputs dereference symlinks, so linker scripts must resolve inside
+    # the staged sysroot rather than relative to their original Nix store paths.
+    for name in libc.so libm.so; do
+      source=$(readlink -f "$out/lib/$name")
+      rm "$out/lib/$name"
+      ${pkgs.gnused}/bin/sed -E 's|/nix/store/[^/]+/lib/|=/lib/|g' "$source" > "$out/lib/$name"
+    done
     # LLVM's Linux sysroot search follows the conventional usr/include layout.
     mkdir -p "$out/usr" "$out/bin"
     ln -s ../include "$out/usr/include"

@@ -209,7 +209,7 @@ def start(workspace, bazelisk, output_base, state):
         if server_locked(state):
             raise StartupError(f"An unrecognized service holds {state / 'server.lock'}; identify it with fuser {state / 'server.lock'}, stop it and retry (it will not be killed)")
         ports_free()
-        subprocess.run([str(bazelisk), f"--output_base={output_base}", "build", "//tools/nativelink:server"], cwd=workspace, check=True)
+        subprocess.run([str(bazelisk), f"--output_base={output_base}", "build", "--config=local", "//tools/nativelink:server"], cwd=workspace, check=True)
         if identity(workspace) != expected:
             raise StartupError("NativeLink inputs changed during bootstrap; retry")
         binary = output_base / "external/+http_archive+nativelink/nativelink"

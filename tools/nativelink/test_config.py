@@ -39,7 +39,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(set(c["servers"][0]["services"]), {"cas", "ac", "bytestream", "execution", "capabilities"})
         self.assertEqual(set(c["servers"][1]["services"]), {"worker_api", "health"})
         cas, ac, fast = c["stores"]
-        self.assertEqual([cas["filesystem"]["eviction_policy"]["max_bytes"], ac["completeness_checking"]["backend"]["filesystem"]["eviction_policy"]["max_bytes"], fast["fast_slow"]["fast"]["filesystem"]["eviction_policy"]["max_bytes"]], [2_000_000_000, 200_000_000, 2_000_000_000])
+        self.assertEqual([cas["filesystem"]["eviction_policy"]["max_bytes"], ac["completeness_checking"]["backend"]["filesystem"]["eviction_policy"]["max_bytes"], fast["fast_slow"]["fast"]["filesystem"]["eviction_policy"]["max_bytes"]], [64 * 1024**3, 1024**3, 8 * 1024**3])
         self.assertEqual(fast["fast_slow"]["slow"]["ref_store"]["name"], cas["name"])
         self.assertEqual(len(c["workers"]), 1)
         worker = c["workers"][0]["local"]
@@ -84,10 +84,14 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("--die-with-parent", script)
         self.assertIn("--bind /private/work /private/work", script)
         self.assertIn("--ro-bind /nix/store /nix/store", script)
+        self.assertIn("--ro-bind /nix/store/tools/bin /bin", script)
+        self.assertIn("--ro-bind /nix/store/tools/bin/env /usr/bin/env", script)
         self.assertNotIn("--ro-bind / /", script)
         self.assertNotIn("/home", script)
         self.assertNotIn("/usr/include", script)
         self.assertIn('"$@"', script)
+        self.assertIn('--chdir "$(pwd -P)"', script)
+        self.assertNotIn('--chdir "$PWD"', script)
         self.assertLess(script.index("--tmpfs /tmp"), script.index("--bind /private/work"))
 
     def test_json_roundtrip(self):

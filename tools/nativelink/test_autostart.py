@@ -50,7 +50,7 @@ class StartupTests(unittest.TestCase):
     def test_first_start_and_reuse(self):
         self.start()
         self.run.assert_called_once_with(
-            [str(self.bazelisk), f"--output_base={self.output}", "build", "//tools/nativelink:server"],
+            [str(self.bazelisk), f"--output_base={self.output}", "build", "--config=local", "//tools/nativelink:server"],
             cwd=self.workspace, check=True)
         args, kwargs = self.popen.call_args
         self.assertEqual(args[0][1:], [str(self.workspace / "tools/nativelink/server.py"),

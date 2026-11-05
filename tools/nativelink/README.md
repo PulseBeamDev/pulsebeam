@@ -74,8 +74,9 @@ machine. The worker uses a pinned Nix bubblewrap entrypoint to deny network and
 expose only the action work tree, Nix store and host loader libraries. This is a
 local setup; a remote host fleet has not been verified.
 
-Actions reserve 1 CPU and 1 GiB by default. CPU and memory capacities control
-scheduler admission, not hard cgroup quotas. The outer WebRTC GN action and
+Bazel actions reserve 1 CPU and 2 GiB by default; Siso actions reserve 1 CPU
+and 1 GiB. CPU and memory capacities control scheduler admission, not hard
+cgroup quotas. The outer WebRTC GN action and
 Siso's local-only generators and archiving remain client-local, with two local
 Siso jobs per client. Tests and generators may also stay local when their
 contracts require it. The service does not govern every process on the machine.

@@ -12,6 +12,13 @@ build --experimental_disk_cache_gc_max_size=400G
 build --experimental_disk_cache_gc_idle_delay=30s
 build --incompatible_strict_action_env
 build --announce_rc
+build --remote_executor=grpc://127.0.0.1:50051
+build --remote_cache=grpc://127.0.0.1:50051
+build --remote_timeout=600
+build --remote_default_exec_properties=OSFamily=Linux
+build --remote_default_exec_properties=cpu_count=1
+build --remote_default_exec_properties=memory_kb=2097152
+build --remote_download_outputs=toplevel
 build --workspace_status_command=tools/simulation-status.sh
 build --@rules_python//python/config_settings:bootstrap_impl=script
 build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
@@ -19,6 +26,9 @@ build --@rules_rust//rust/settings:extra_rustc_flags=--cfg=tokio_unstable,--cfg=
 build --@rules_rust//rust/settings:extra_exec_rustc_flags=--cfg=tokio_unstable,--cfg=tracing_unstable
 build --//crates/pulsebeam-libwebrtc-sys:executor=reapi
 test --nobuild_runfile_links
+build:local --remote_executor=
+build:local --remote_cache=
+build:local --//crates/pulsebeam-libwebrtc-sys:executor=local
 build:webrtc-reapi --//crates/pulsebeam-libwebrtc-sys:executor=reapi
 build:webrtc-cache --//crates/pulsebeam-libwebrtc-sys:executor=cache
 build:dev --compilation_mode=dbg

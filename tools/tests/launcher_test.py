@@ -95,15 +95,24 @@ class LauncherContractTest(unittest.TestCase):
     def test_local_or_external_service_does_not_autostart(self):
         options = [
             ("info", "output_base"),
-            ("test", "--//crates/pulsebeam-libwebrtc-sys:executor=local"),
-            ("build", "--//crates/pulsebeam-libwebrtc-sys:executor", "local"),
-            ("build", "--//crates/pulsebeam-libwebrtc-sys:reapi=grpc://127.0.0.1:50052"),
+            ("test", "--config=local"),
+            ("build", "--config", "local"),
+            ("build", "--remote_executor=grpc://127.0.0.1:50052", "--remote_cache=grpc://127.0.0.1:50052",
+             "--//crates/pulsebeam-libwebrtc-sys:reapi=grpc://127.0.0.1:50052"),
             ("run", "//tools/nativelink:server"),
         ]
         for args in options:
             with self.subTest(args=args):
                 self.forwarded_arguments(self.run_launcher(*args))
                 self.assertFalse(Path(self.env["AUTOSTART_LOG"]).exists())
+
+    def test_local_webrtc_still_starts_bazel_coordinator(self):
+        self.forwarded_arguments(self.run_launcher("build", "--//crates/pulsebeam-libwebrtc-sys:executor=local"))
+        self.assertTrue(Path(self.env["AUTOSTART_LOG"]).exists())
+
+    def test_manual_service_bootstraps_locally(self):
+        self.assertEqual(self.forwarded_arguments(self.run_launcher("run", "//tools/nativelink:server")),
+                         ["1", self.output_base, "run", "--config=local", "//tools/nativelink:server"])
 
     def test_autostart_failure_stops_bazel(self):
         helper = self.root / "tools/nativelink/autostart.py"

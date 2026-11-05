@@ -17,10 +17,14 @@ def sandbox_script(host, work):
         "--ro-bind", "/nix/store", "/nix/store",
         "--ro-bind", "/usr/lib", "/usr/lib",
         "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
+        "--ro-bind", str(host), "/bin",
+        "--ro-bind", str(host / "env"), "/usr/bin/env",
         "--tmpfs", "/tmp",
         "--bind", str(work), str(work), "--proc", "/proc", "--dev", "/dev",
     ]
-    return f'#!{host / "bash"}\nexec {shlex.join(command)} --chdir "$PWD" -- "$@"\n'
+    # Bazel may set PWD=/proc/self/cwd; that resolves differently after /proc
+    # is remounted in the worker's PID namespace.
+    return f'#!{host / "bash"}\nexec {shlex.join(command)} --chdir "$(pwd -P)" -- "$@"\n'
 
 
 def main():
