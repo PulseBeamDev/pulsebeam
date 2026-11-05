@@ -512,6 +512,9 @@ impl NativeState {
                     {
                         return Err(SignalingError::Invalid("authorization revision"));
                     }
+                    if self.session.as_ref() == Some(&session) {
+                        continue;
+                    }
                     let old_bytes = self.session.as_ref().map_or(0, Message::encoded_len);
                     self.account(old_bytes, session.encoded_len())?;
                     self.terminal = session.closed.is_some();
@@ -541,6 +544,9 @@ impl NativeState {
                         Some(wire::confirmed_state::Value::Absent(_)) => None,
                         _ => return Err(SignalingError::Invalid("participant value")),
                     };
+                    if old == next.as_ref() {
+                        continue;
+                    }
                     let old_bytes = old.map_or(0, |value| entry_bytes(&id, value));
                     let new_bytes = next.as_ref().map_or(0, |value| entry_bytes(&id, value));
                     self.account(old_bytes, new_bytes)?;
@@ -571,6 +577,9 @@ impl NativeState {
                         Some(wire::confirmed_state::Value::Absent(_)) => None,
                         _ => return Err(SignalingError::Invalid("track value")),
                     };
+                    if old == next.as_ref() {
+                        continue;
+                    }
                     let old_bytes = old.map_or(0, |value| entry_bytes(&id, value));
                     let new_bytes = next.as_ref().map_or(0, |value| entry_bytes(&id, value));
                     self.account(old_bytes, new_bytes)?;
@@ -629,6 +638,9 @@ impl NativeState {
             {
                 return Err(SignalingError::Invalid("owned source identity"));
             }
+        }
+        if owned.confirmed.as_ref() == Some(&state) {
+            return Ok(None);
         }
         let new_evaluation = owned
             .confirmed

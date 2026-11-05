@@ -20,6 +20,7 @@ use crate::*;
 mod data_send;
 pub(crate) mod native_connection;
 mod native_media;
+mod reconciliation;
 
 const PARTICIPANT_URI: &str = "https://other-origin.test/an%20opaque/path?value=%2Fexact";
 const LOCAL_PUBLISHER: &str = "pa_00000000000000000000000000";
@@ -428,9 +429,27 @@ fn update_response(participant: &str) -> HttpResponse {
     response
 }
 
+pub(crate) trait RunReconciliation {
+    fn next_effect_after_turn(&mut self) -> Option<Effect>;
+}
+
+impl RunReconciliation for Agent {
+    fn next_effect_after_turn(&mut self) -> Option<Effect> {
+        loop {
+            match self.next_effect()? {
+                Effect::Timer(TimerEffect::Schedule { timer, after }) if after.is_zero() => {
+                    self.handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+                        .unwrap();
+                }
+                effect => return Some(effect),
+            }
+        }
+    }
+}
+
 #[track_caller]
 fn next_effect(agent: &mut Agent) -> Effect {
-    agent.next_effect().expect("expected effect")
+    agent.next_effect_after_turn().expect("expected effect")
 }
 
 fn begin_connect(
@@ -704,7 +723,7 @@ fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
         agent
             .command(AgentCommand::ReplaceDesired(desired))
             .unwrap();
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
         agent
             .command(AgentCommand::SendTopic(TopicSend {
                 publisher: publisher("state", TopicMode::Latest),
@@ -1100,7 +1119,7 @@ fn desired_revisions_are_idempotent_and_offer_events_are_correlated() {
     agent
         .command(AgentCommand::ReplaceDesired(state.clone()))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 
     let mut conflicting = state.clone();
     conflicting.audio.automatic = false;
@@ -1122,7 +1141,7 @@ fn desired_revisions_are_idempotent_and_offer_events_are_correlated() {
             resources: resources(channel(1)),
         }))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -1162,7 +1181,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
         ))
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 
     assert_eq!(
         agent.handle(HostEvent::Rtc(RtcEvent::OfferCreated {
@@ -1173,7 +1192,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
         Err(AgentError::InvalidOffer("SDP offer is empty or too large"))
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
@@ -1218,7 +1237,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
         agent.handle(event).unwrap();
     }
     let mut allocations = Vec::new();
-    while let Some(effect) = agent.next_effect() {
+    while let Some(effect) = agent.next_effect_after_turn() {
         if let Effect::Rtc(RtcEffect::AllocateMedia {
             allocations: requested,
             ..
@@ -1267,7 +1286,7 @@ fn malformed_negotiated_coordinates_are_rejected_transactionally() {
             ))
         );
         assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
     }
 }
 
@@ -1292,7 +1311,7 @@ fn unavailable_bootstrap_rtp_does_not_retry_or_reject_the_transport() {
             preparation: Err(client_sdp::Error::Observation),
         }))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     for event in [
         HostEvent::Rtc(RtcEvent::AnswerApplied { generation }),
         HostEvent::Rtc(RtcEvent::Connected { generation }),
@@ -1305,7 +1324,7 @@ fn unavailable_bootstrap_rtp_does_not_retry_or_reject_the_transport() {
     }
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert!(agent.snapshot().terminal_failure.is_none());
-    while let Some(effect) = agent.next_effect() {
+    while let Some(effect) = agent.next_effect_after_turn() {
         assert!(!matches!(
             effect,
             Effect::Rtc(RtcEffect::CreateOffer { .. })
@@ -1336,7 +1355,7 @@ fn rejected_bootstrap_is_terminal_and_late_completion_cannot_activate() {
         }))
         .unwrap();
     let mut effects = Vec::new();
-    while let Some(effect) = agent.next_effect() {
+    while let Some(effect) = agent.next_effect_after_turn() {
         effects.push(effect);
     }
     assert!(effects.contains(&Effect::Rtc(RtcEffect::Close { generation })));
@@ -1366,7 +1385,7 @@ fn rejected_bootstrap_is_terminal_and_late_completion_cannot_activate() {
     );
     assert_eq!(agent.snapshot(), &terminal);
     assert!(agent.snapshot().participant_id.is_none());
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -1392,7 +1411,7 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
         ConnectionState::WaitingForTransport
     );
     assert!(agent.snapshot().participant_id.is_none());
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
         .unwrap();
@@ -1403,7 +1422,7 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
         Some("participant")
     );
     assert_eq!(agent.snapshot().room_external_id.as_deref(), Some("room"));
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
@@ -1496,7 +1515,7 @@ fn transient_failure_schedules_a_bounded_retry_that_disconnect_cancels() {
     agent
         .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -1574,7 +1593,7 @@ fn transport_loss_fences_incumbent_signaling_during_replacement() {
             .unwrap();
         assert_eq!(agent.snapshot(), &before);
         assert!(agent.next_notification().is_none());
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
         agent
             .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
                 generation: replacement,
@@ -1597,7 +1616,7 @@ fn transport_loss_fences_incumbent_signaling_during_replacement() {
                 .any(|header| header.name == "Authorization"
                     && header.value == "Bearer private-token")
         );
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
     }
 }
 
@@ -1702,7 +1721,7 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
         }))
         .unwrap();
     assert_eq!(agent.snapshot().generation, Some(old_generation));
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Opened {
             generation: replacement_generation,
@@ -1716,7 +1735,7 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
         })
     );
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "no declarations without prepared resources"
     );
     assert_eq!(agent.snapshot().generation, Some(replacement_generation));
@@ -1827,7 +1846,7 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
         ConnectionState::TerminalFailure
     );
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "incidental work and late RTC events cannot create or schedule a retry"
     );
     agent.command(AgentCommand::Reconnect).unwrap();
@@ -1842,7 +1861,7 @@ fn explicit_connect_retries_terminal_intent_but_not_an_in_flight_attempt() {
     let mut agent = Agent::new(config()).unwrap();
     let (failed_generation, operation) = begin_connect(&mut agent, desired(1), channel(12));
     agent.command(AgentCommand::Connect).unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,
@@ -1869,7 +1888,7 @@ fn explicit_connect_retries_terminal_intent_but_not_an_in_flight_attempt() {
     );
     assert_eq!(agent.snapshot().terminal_failure, None);
     agent.command(AgentCommand::Connect).unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -1881,7 +1900,7 @@ fn explicit_connect_establishes_connected_intent_from_idle() {
         Effect::Rtc(RtcEffect::CreateOffer { .. })
     ));
     agent.command(AgentCommand::Connect).unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -1916,7 +1935,7 @@ fn authorization_is_latched_across_incidental_updates_until_explicit_reconnect()
             .map(|failure| failure.class),
         Some(FailureClass::Authorization)
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 
     let mut retry = desired(2);
     retry.video[0].height = 360;
@@ -1935,7 +1954,7 @@ fn authorization_is_latched_across_incidental_updates_until_explicit_reconnect()
             generation: failed_generation,
         }))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(
         agent.snapshot().connection,
         ConnectionState::TerminalFailure
@@ -2007,7 +2026,7 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
     assert!(agent.snapshot().participant_id.is_none());
     assert!(agent.snapshot().authorization_expires_at.is_none());
     assert!(agent.snapshot().publications.is_empty());
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
         .unwrap();
@@ -2030,7 +2049,7 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
         }))
         .unwrap();
     assert_eq!(agent.snapshot(), &activated);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -2082,7 +2101,7 @@ fn pending_sender_identities_preserve_the_physical_slot_until_application_withdr
         )],
     );
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "pending facts cannot retire or reallocate the accepted physical slot"
     );
     initial.revision += 1;
@@ -2099,7 +2118,7 @@ fn pending_sender_identities_preserve_the_physical_slot_until_application_withdr
             bindings: actual.unwrap(),
         }))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(agent.snapshot().generation, Some(generation));
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
 }
@@ -2180,7 +2199,7 @@ fn late_sender_observations_complete_only_matching_pending_publications() {
                 bindings,
             }))
             .unwrap();
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
     }
     agent
         .handle(HostEvent::Rtc(RtcEvent::MediaObserved {
@@ -2233,7 +2252,7 @@ fn late_sender_observations_complete_only_matching_pending_publications() {
         }))
         .unwrap();
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "observations cannot reinterpret admitted source identities"
     );
 }
@@ -2259,7 +2278,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
     );
     assert!(agent.snapshot().video_mapping.is_empty());
     assert!(agent.snapshot().audio_mapping.is_empty());
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(targets.len(), 2);
     let installations = targets
         .iter()
@@ -2269,7 +2288,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
     assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     assert!(drain_notifications(&mut agent).contains(&Notification::SnapshotChanged));
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 
     observe(
         &mut agent,
@@ -2312,7 +2331,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
     ));
     observe(&mut agent, generation, channel, withdrawal);
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "source absence does not release logical receive ownership"
     );
     let mut waiting = desired(2);
@@ -2322,7 +2341,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
         .unwrap();
     native_media::finish_retirements(&mut agent, generation, &["rv0"], &[]);
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "unknown source intent waits without retaining another source's receiver"
     );
     let mut stopped = desired(3);
@@ -2335,7 +2354,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
     assert!(agent.snapshot().participants.is_empty());
     assert!(agent.snapshot().publications.is_empty());
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -2377,13 +2396,13 @@ fn partial_native_observations_preserve_other_receivers_and_declared_desire() {
     agent
         .command(AgentCommand::ReplaceDesired(desired(1)))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     native_connection::observe(&mut agent, generation, channel, vec![installed]);
     assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     assert_eq!(agent.snapshot().publications.len(), 2);
     assert_eq!(agent.snapshot().generation, Some(generation));
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 
     let mut observed = native_media::prepared_media(&resources(channel)).0;
     observed
@@ -2465,7 +2484,7 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
     assert!(agent.snapshot().publications.is_empty());
     assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     let mut changed = desired(2);
     changed.video[0].height = 1080;
     agent
@@ -2494,7 +2513,7 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
         vec![updated[0].receiver_installed(&participant, &tracks)],
     );
     native_media::discover_receivers(&mut agent, generation, channel);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     changed.revision = 3;
@@ -2518,7 +2537,7 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
         );
     }
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "physical retirement waits for authoritative cutoff"
     );
     observe(
@@ -2544,7 +2563,7 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
     assert_eq!(agent.snapshot().publications.len(), 2);
     assert_eq!(agent.snapshot().generation, Some(generation));
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -2648,7 +2667,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
                 state::confirmed_state::Value::Participant(participant.clone()),
             )],
         );
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
         let tracks = [
             native_media::track("video-one", "remote", "camera", MediaKind::Video),
             native_media::track("audio-one", "remote", "microphone", MediaKind::Audio),
@@ -2764,7 +2783,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
                 ResourceResult::Updated
             );
             assert!(
-                agent.next_effect().is_none(),
+                agent.next_effect_after_turn().is_none(),
                 "pending settings do not replace an installed observation"
             );
             control
@@ -2828,7 +2847,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         );
         assert_eq!(agent.snapshot().video_mapping[&4], "video-one");
         assert!(
-            agent.next_effect().is_none(),
+            agent.next_effect_after_turn().is_none(),
             "discovery changes do not end the installed source"
         );
         if let Some(control) = &observation {
@@ -2850,6 +2869,13 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         };
         live.execution = state::ExecutionStatus::WaitingForSource as i32;
         observe(&mut agent, generation, channel, vec![waiting]);
+        if let Some(previous) = &observation {
+            let Effect::MediaObservation(closed) = next_effect(&mut agent) else {
+                panic!("retired observation")
+            };
+            assert!(closed.closed && closed.target.is_none());
+            assert_eq!(closed.observation, previous.observation);
+        }
         let cutoff = native_media::next(&mut agent, generation, channel);
         assert_eq!(cutoff.len(), 1);
         assert_eq!(cutoff[0].reference, video.reference);
@@ -2858,9 +2884,6 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             Some(state::desired_state::Value::Absent(true))
         );
         let fresh_observation = observation.as_ref().map(|previous| {
-            let Effect::MediaObservation(closed) = next_effect(&mut agent) else { panic!("retired observation") };
-            assert!(closed.closed && closed.target.is_none());
-            assert_eq!(closed.observation, previous.observation);
             assert_eq!(agent.resource(ResourceCommand::CompleteMediaObservation { control: previous.clone(), succeeded: false }).unwrap(), ResourceResult::Superseded);
             agent.resource(ResourceCommand::Release { owner: previous.observation.request() }).unwrap();
             assert!(matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == previous.observation));
@@ -2897,7 +2920,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             }))
             .unwrap();
         assert!(
-            agent.next_effect().is_none(),
+            agent.next_effect_after_turn().is_none(),
             "failed allocation neither revives the retired receiver nor spins"
         );
         let replacement = native_media::track("video-three", "remote", "camera", MediaKind::Video);
@@ -2992,7 +3015,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             );
             control
         });
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
         if let Some(owner) = view {
             agent.resource(ResourceCommand::Release { owner }).unwrap();
             assert!(
@@ -3041,7 +3064,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             ],
         );
         assert!(
-            agent.next_effect().is_none(),
+            agent.next_effect_after_turn().is_none(),
             "catalog replacement alone does not retire installed audio"
         );
         let mut waiting = audio.receiver_installed(&participant, &tracks);
@@ -3053,6 +3076,11 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         };
         live.execution = state::ExecutionStatus::WaitingForSource as i32;
         observe(&mut agent, generation, channel, vec![waiting]);
+        if let Some(old) = &audio_observation {
+            assert!(
+                matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == old.observation)
+            );
+        }
         let cutoff = native_media::next(&mut agent, generation, channel);
         assert_eq!(cutoff.len(), 1);
         assert_eq!(cutoff[0].reference, audio.reference);
@@ -3061,7 +3089,6 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             Some(state::desired_state::Value::Absent(true))
         );
         let fresh_audio_request = audio_observation.as_ref().map(|old| {
-            assert!(matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == old.observation));
             assert_eq!(agent.resource(ResourceCommand::CompleteMediaObservation { control: old.clone(), succeeded: true }).unwrap(), ResourceResult::Superseded);
             agent.resource(ResourceCommand::Release { owner: old.observation.request() }).unwrap();
             assert!(matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == old.observation));
@@ -3153,7 +3180,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         }
         assert_eq!(agent.snapshot().generation, Some(generation));
         assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
     }
 }
 
@@ -3261,7 +3288,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
         next_effect(&mut agent),
         Effect::Http(HttpEffect::Cancel { operation })
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     let terminal = agent.snapshot().clone();
     drain_notifications(&mut agent);
     agent
@@ -3287,7 +3314,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
         .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
         .unwrap();
     assert_eq!(agent.snapshot(), &terminal);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     assert!(agent.next_notification().is_none());
     agent.command(AgentCommand::Reconnect).unwrap();
     let Effect::Rtc(RtcEffect::CreateOffer {
@@ -3364,7 +3391,7 @@ fn cancelled_native_replacement_cleans_orphaned_http_resources_without_activatin
         &pending,
         "fenced incumbent cannot poison a candidate"
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 2,
@@ -3423,7 +3450,7 @@ fn cancelled_native_replacement_cleans_orphaned_http_resources_without_activatin
         agent.handle(HostEvent::Rtc(event)).unwrap();
     }
     assert_eq!(agent.snapshot(), &closing);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::Rtc(RtcEvent::Closed { generation: old }))
         .unwrap();
@@ -3512,7 +3539,7 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
         .command(AgentCommand::ReplaceDesired(desired(3)))
         .unwrap();
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "settings wait for the preceding evaluation"
     );
     observe(
@@ -3564,7 +3591,7 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
             .iter()
             .all(|target| target.desired.value == Some(state::desired_state::Value::Absent(true)))
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     observe(
         &mut agent,
         generation,
@@ -3583,7 +3610,7 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
             .collect(),
     );
     native_media::finish_retirements(&mut agent, generation, &["lv0", "ra0", "rv0"], &[]);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 5,
@@ -3610,7 +3637,7 @@ fn pending_control_fences_completion_before_a_replacement_lifetime() {
             ..Default::default()
         }))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     acknowledge_send(&mut agent, generation, control, first_send);
     let Effect::DataChannel(DataChannelEffect::Send {
         operation: second_send,
@@ -3668,7 +3695,7 @@ fn pending_control_fences_completion_before_a_replacement_lifetime() {
     acknowledge_send(&mut agent, generation, control, retry);
     assert_ne!(retirement_revision, agent.snapshot().desired_revision);
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "fresh lifetime waits for cutoff"
     );
     agent
@@ -3718,7 +3745,7 @@ fn failed_control_send_retries_its_frame_before_coalesced_successors() {
         }))
         .unwrap();
     let (superseded, _) = native_connection::prepare_channel(&mut agent, generation, control);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 3,
@@ -3745,7 +3772,7 @@ fn failed_control_send_retries_its_frame_before_coalesced_successors() {
             reset_complete: true,
         }))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
         .unwrap();
@@ -3762,7 +3789,7 @@ fn failed_control_send_retries_its_frame_before_coalesced_successors() {
     assert_ne!(retry, operation);
     assert_eq!(retried, payload);
     acknowledge_send(&mut agent, generation, control, operation);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     acknowledge_send(&mut agent, generation, control, retry);
     let Effect::DataChannel(DataChannelEffect::Send {
         operation: successor,
@@ -3798,7 +3825,7 @@ fn failed_control_send_retries_its_frame_before_coalesced_successors() {
     assert_eq!(data.delivery, state::DataDelivery::Latest as i32);
     assert_ne!(final_channel, superseded);
     acknowledge_send(&mut agent, generation, control, successor);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -3939,7 +3966,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     assert_eq!(agent.snapshot().topics.subscribers.len(), 1);
     acknowledge_send(&mut agent, generation, control, operation);
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "physical channels await authoritative cutoff"
     );
     native_connection::observe(&mut agent, generation, control, confirmed);
@@ -3971,7 +3998,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     }
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().generation, Some(generation));
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     let before = agent.snapshot().clone();
     let mut invalid = retained.clone();
     invalid.revision = 6;
@@ -4008,7 +4035,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
         ))
     ));
     assert_eq!(agent.snapshot(), &before);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -4054,7 +4081,7 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
             panic!("source recovery timer")
         };
         assert_eq!(after, Duration::from_secs(2));
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
         let receiving = native_connection::prepare_subscription(
             &mut agent,
             generation,
@@ -4066,7 +4093,7 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
             .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
             .unwrap();
         let mut effects = Vec::new();
-        while let Some(effect) = agent.next_effect() {
+        while let Some(effect) = agent.next_effect_after_turn() {
             effects.push(effect);
         }
         assert!(effects.iter().any(|effect| matches!(effect,
@@ -4131,7 +4158,7 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
     assert_eq!(first_message.payload, b"first");
     assert_eq!(first_message.sequence, 0);
     assert_eq!(first_message.data_track_id, native_connection::SOURCE);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(agent.snapshot().topics.accepted_sends, 3);
     assert_eq!(agent.snapshot().topics.dropped_sends, 1);
     acknowledge_send(&mut agent, generation, publish_channel, first);
@@ -4328,7 +4355,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         retired[0].desired.value,
         Some(pulsebeam_proto::state::desired_state::Value::Absent(true))
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 
     let ResourceResult::Publication {
         owner: replacement,
@@ -4354,7 +4381,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         })
         .unwrap();
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "replacement waits for the old owned cutoff"
     );
     use pulsebeam_proto::state;
@@ -4422,7 +4449,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
             preparation: Ok(Default::default()),
         }))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .resource(ResourceCommand::UpdatePublication {
             owner: replacement,
@@ -4451,7 +4478,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
             ),
         )],
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .resource(ResourceCommand::UpdatePublication {
             owner: replacement,
@@ -4476,7 +4503,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
             ),
         )],
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .resource(ResourceCommand::Release { owner: replacement })
         .unwrap();
@@ -4489,7 +4516,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
     );
     assert_eq!(agent.snapshot().generation, Some(generation));
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -4532,7 +4559,7 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         }))
         .unwrap();
     assert_eq!(agent.snapshot().topics.subscribers.len(), 1);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     drain_notifications(&mut agent);
     let remote = native_connection::REMOTE_SOURCE.to_string();
     for _ in 0..2 {
@@ -4606,7 +4633,7 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         Some(state::desired_state::Value::Absent(true))
     ));
     acknowledge_send(&mut agent, generation, control, operation);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     native_connection::observe(
         &mut agent,
         generation,
@@ -4635,7 +4662,7 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         .unwrap();
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().generation, Some(generation));
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -4847,7 +4874,7 @@ fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint()
         })
     );
     acknowledge_send(&mut agent, generation, channel, operation);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     topic_input(
         &mut agent,
         generation,
@@ -4864,7 +4891,7 @@ fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint()
         assert!(matches!(body, TopicBody::Message(message) if message.sequence == sequence));
         acknowledge_send(&mut agent, generation, channel, operation);
     }
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -5017,7 +5044,7 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
     );
     acknowledge_send(&mut agent, generation, channel, operation);
     let mut recovered = Vec::new();
-    while let Some(effect) = agent.next_effect() {
+    while let Some(effect) = agent.next_effect_after_turn() {
         let Effect::DataChannel(DataChannelEffect::Send {
             operation, payload, ..
         }) = effect
@@ -5046,7 +5073,7 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
     let (operation, _, body) = next_topic_send(&mut agent);
     assert!(matches!(body, TopicBody::Message(message) if message.sequence == 256));
     acknowledge_send(&mut agent, generation, channel, operation);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -5098,7 +5125,7 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
                     })
                 );
                 assert!(
-                    agent.next_effect().is_none(),
+                    agent.next_effect_after_turn().is_none(),
                     "cutoff cannot substitute for actual closure"
                 );
             }
@@ -5148,7 +5175,7 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
                 assert!(desired.revision > old.revision);
                 acknowledge_send(&mut agent, generation, control, operation);
                 assert!(
-                    agent.next_effect().is_none(),
+                    agent.next_effect_after_turn().is_none(),
                     "closure cannot substitute for authoritative cutoff"
                 );
                 native_connection::observe(
@@ -5194,7 +5221,7 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
                 "opaque/recovered/source",
             );
             assert!(
-                agent.next_effect().is_none(),
+                agent.next_effect_after_turn().is_none(),
                 "old queued bytes must not be replayed"
             );
             agent
@@ -5211,10 +5238,10 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
             let before = agent.snapshot().clone();
             acknowledge_send(&mut agent, generation, channel, late);
             assert_eq!(agent.snapshot(), &before);
-            assert!(agent.next_effect().is_none());
+            assert!(agent.next_effect_after_turn().is_none());
             acknowledge_send(&mut agent, generation, fresh.channel, operation);
             assert!(!agent.snapshot().topics.publishers[0].send_pending);
-            assert!(agent.next_effect().is_none());
+            assert!(agent.next_effect_after_turn().is_none());
             native_connection::observe(
                 &mut agent,
                 generation,
@@ -5242,7 +5269,7 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
                 }))
                 .unwrap();
             assert!(
-                agent.next_effect().is_none(),
+                agent.next_effect_after_turn().is_none(),
                 "permission loss cannot implicitly reconstruct"
             );
             assert_eq!(agent.snapshot().generation, Some(generation));
@@ -5307,7 +5334,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
                 })),
             )],
         );
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
         prepared.push(resource);
     }
     let [left, right] = prepared.as_slice() else {
@@ -5371,7 +5398,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
         Some(state::desired_state::Value::Absent(true))
     ));
     acknowledge_send(&mut agent, generation, control, operation);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     native_connection::observe(
         &mut agent,
         generation,
@@ -5385,7 +5412,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
         )],
     );
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "an ended exact source cannot reconstruct"
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
@@ -5418,7 +5445,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
     assert!(
         matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { data_track_id, sequence: 8, payload, .. }))] if data_track_id == "right" && payload == b"after")
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     native_connection::observe(
         &mut agent,
         generation,
@@ -5742,7 +5769,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
             }),
         )],
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     drain_notifications(&mut agent);
     topic_input(
         &mut agent,
@@ -5796,7 +5823,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
         );
     }
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "cutoff does not substitute for closure"
     );
     for channel in [old_publication.channel, old_subscription.channel] {
@@ -5828,7 +5855,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
     assert_ne!(receiving.channel, old_subscription.channel);
     assert!(receiving.reference > old_subscription.reference);
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "old pending bytes cannot replay"
     );
     drain_notifications(&mut agent);
@@ -5863,7 +5890,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
     let before = agent.snapshot().clone();
     acknowledge_send(&mut agent, generation, old_channel, old_operation);
     assert_eq!(agent.snapshot(), &before);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     acknowledge_send(&mut agent, generation, channel, operation);
 }
 
@@ -5978,7 +6005,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         })
     );
 
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p2"));
     assert_eq!(agent.snapshot().topics.publishers[0].data_track_id, None);
     assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, 0);
@@ -6022,7 +6049,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         accepted,
     );
     assert!(drain_notifications(&mut agent).is_empty());
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .command(AgentCommand::SendTopic(TopicSend {
             publisher: publish,
@@ -6066,5 +6093,5 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
     );
     assert_eq!(agent.snapshot().generation, Some(generation));
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }

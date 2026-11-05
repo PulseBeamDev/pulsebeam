@@ -50,7 +50,7 @@ fn owned_sends_wait_for_host_acceptance_and_latest_supersession_is_explicit() {
         .handle(HostEvent::Timer(TimerEvent::Fired { timer: first_timer }))
         .unwrap();
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "a stale admission deadline cannot override an in-flight host outcome"
     );
     assert!(
@@ -97,7 +97,7 @@ fn owned_sends_wait_for_host_acceptance_and_latest_supersession_is_explicit() {
         finished(&mut agent).is_empty(),
         "late host events cannot resurrect a send"
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -108,7 +108,7 @@ fn owned_send_waits_for_its_first_authoritative_owned_binding() {
     });
     let ticket = agent.send_data(spec(TopicMode::Lossy), vec![255]).unwrap();
     let timer = deadline(&mut agent);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     assert!(finished(&mut agent).is_empty());
     let publication = native_connection::prepare_data(&mut agent, generation, signal);
     native_connection::observe(
@@ -129,7 +129,7 @@ fn owned_send_waits_for_its_first_authoritative_owned_binding() {
         )],
     );
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "discovery does not admit a publication"
     );
     assert!(finished(&mut agent).is_empty());
@@ -251,7 +251,7 @@ fn queued_timeout_updates_observation_and_cannot_transmit_later() {
     assert_eq!(agent.snapshot().topics.publishers[0].queued_messages, 0);
     acknowledge_send(&mut agent, generation, channel, operation);
     assert_eq!(finished(&mut agent), vec![(first, None)]);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn owned_source_end_rejects_in_flight_and_queued_bytes() {
         ]
     );
     let mut closed = false;
-    while let Some(effect) = agent.next_effect() {
+    while let Some(effect) = agent.next_effect_after_turn() {
         match effect {
             Effect::Timer(TimerEffect::Cancel { .. }) => {}
             Effect::Rtc(RtcEffect::CloseDataChannel {
@@ -305,7 +305,7 @@ fn owned_source_end_rejects_in_flight_and_queued_bytes() {
     acknowledge_send(&mut agent, generation, channel, old_operation);
     assert!(finished(&mut agent).is_empty());
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "retired bytes cannot move to a replacement"
     );
 }

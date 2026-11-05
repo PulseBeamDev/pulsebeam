@@ -1169,7 +1169,7 @@ impl TrackResources {
                 })
         });
         self.video_slots
-            .retain(|selector, _| grouped.contains_key(selector));
+            .retain(|selector, _| self.video.values().any(|view| view.selector == *selector));
         let mut occupied: BTreeSet<_> = self.video_slots.values().copied().collect();
         let mut projection = Vec::new();
         for (selector, observation) in grouped {

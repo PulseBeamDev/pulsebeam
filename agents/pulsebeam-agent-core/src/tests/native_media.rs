@@ -387,6 +387,6 @@ pub(super) fn connected_with(
         )],
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     (agent, generation, channel, targets)
 }

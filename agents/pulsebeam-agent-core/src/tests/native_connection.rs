@@ -73,7 +73,7 @@ pub(crate) fn joining(topics: crate::TopicRegistrations) -> (Agent, Generation, 
         generation,
         data_channels,
         ..
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("offer")
     };
@@ -91,7 +91,8 @@ pub(crate) fn joining(topics: crate::TopicRegistrations) -> (Agent, Generation, 
             },
         }))
         .unwrap();
-    let Some(Effect::Http(HttpEffect::Request { operation, .. })) = agent.next_effect() else {
+    let Some(Effect::Http(HttpEffect::Request { operation, .. })) = agent.next_effect_after_turn()
+    else {
         panic!("POST")
     };
     agent
@@ -101,7 +102,7 @@ pub(crate) fn joining(topics: crate::TopicRegistrations) -> (Agent, Generation, 
         }))
         .unwrap();
     assert!(matches!(
-        agent.next_effect(),
+        agent.next_effect_after_turn(),
         Some(Effect::Rtc(RtcEffect::ApplyAnswer { .. }))
     ));
     (agent, generation, channel)
@@ -139,10 +140,10 @@ pub(crate) fn connected(topics: crate::TopicRegistrations) -> (Agent, Generation
         .unwrap();
     if ordered {
         assert!(
-            matches!(agent.next_effect(), Some(Effect::Timer(TimerEffect::Schedule { after, .. })) if after == Duration::from_secs(2))
+            matches!(agent.next_effect_after_turn(), Some(Effect::Timer(TimerEffect::Schedule { after, .. })) if after == Duration::from_secs(2))
         );
     }
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     (agent, generation, channel)
 }
 
@@ -364,7 +365,7 @@ pub(crate) fn prepare_subscription(
         );
         acknowledge_send(agent, generation, channel, operation);
     }
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     prepared
 }
 
@@ -375,7 +376,7 @@ pub(crate) fn connected_publisher(mode: TopicMode) -> (Agent, Generation, Channe
     });
     let publication = prepare_data(&mut agent, generation, control);
     confirm_publication(&mut agent, generation, control, &publication, SOURCE);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     let _ = drain_notifications(&mut agent);
     (agent, generation, control, publication)
 }

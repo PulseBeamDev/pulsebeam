@@ -268,6 +268,7 @@ pub(crate) struct Topics {
     log_level: LogLevel,
     publishers: BTreeMap<TopicPublisher, PublisherState>,
     subscribers: BTreeMap<TopicSubscriber, SubscriberState>,
+    registrations: TopicRegistrations,
     active: Option<ActiveTopics>,
     catalog: BTreeMap<String, CatalogBinding>,
     auxiliary_sends: BTreeMap<OperationId, AuxiliarySend>,
@@ -582,12 +583,22 @@ impl Topics {
         })
     }
 
+    pub(crate) fn accept_registrations(
+        &mut self,
+        registrations: &TopicRegistrations,
+        snapshot: &mut Snapshot,
+    ) {
+        self.registrations = registrations.clone();
+        self.refresh_snapshot(snapshot);
+    }
+
     pub(crate) fn reconcile(
         &mut self,
         registrations: &TopicRegistrations,
         snapshot: &mut Snapshot,
         notifications: &mut VecDeque<Notification>,
     ) {
+        self.registrations = registrations.clone();
         let desired_publishers = registrations
             .publishers
             .iter()
@@ -721,9 +732,7 @@ impl Topics {
                 maximum: MAX_TOPIC_PAYLOAD_BYTES,
             });
         }
-        let channel = self.channel_for_publisher(&send.publisher);
-        let waiting = self.waiting_data_sends(&send.publisher);
-        let Some(state) = self.publishers.get_mut(&send.publisher) else {
+        if !self.registrations.publishers.contains(&send.publisher) {
             self.record_drop(
                 &send.publisher,
                 TopicDropReason::NotRegistered,
@@ -731,6 +740,17 @@ impl Topics {
             );
             self.refresh_snapshot(snapshot);
             return Err(TopicError::PublisherNotRegistered(send.publisher.topic));
+        }
+        let channel = self.channel_for_publisher(&send.publisher);
+        let waiting = self.waiting_data_sends(&send.publisher);
+        let Some(state) = self.publishers.get_mut(&send.publisher) else {
+            self.record_drop(
+                &send.publisher,
+                TopicDropReason::ChannelUnavailable,
+                notifications,
+            );
+            self.refresh_snapshot(snapshot);
+            return Err(TopicError::PublisherUnavailable(send.publisher.topic));
         };
         let Some(data_track_id) = state
             .data_track_id
@@ -1365,22 +1385,27 @@ impl Topics {
     fn refresh_snapshot(&self, snapshot: &mut Snapshot) {
         let next = TopicSnapshot {
             publishers: self
+                .registrations
                 .publishers
                 .iter()
-                .map(|(registration, state)| TopicPublisherStatus {
-                    registration: registration.clone(),
-                    channel: self.channel_for_publisher(registration),
-                    data_track_id: state.data_track_id.clone(),
-                    next_sequence: state.next_sequence,
-                    accepted_history: state.history.len(),
-                    queued_messages: state.queue.len(),
-                    send_pending: state.pending.is_some(),
+                .map(|registration| {
+                    let state = self.publishers.get(registration);
+                    TopicPublisherStatus {
+                        registration: registration.clone(),
+                        channel: self.channel_for_publisher(registration),
+                        data_track_id: state.and_then(|state| state.data_track_id.clone()),
+                        next_sequence: state.map_or(0, |state| state.next_sequence),
+                        accepted_history: state.map_or(0, |state| state.history.len()),
+                        queued_messages: state.map_or(0, |state| state.queue.len()),
+                        send_pending: state.is_some_and(|state| state.pending.is_some()),
+                    }
                 })
                 .collect(),
             subscribers: self
+                .registrations
                 .subscribers
                 .iter()
-                .map(|(registration, state)| TopicSubscriberStatus {
+                .map(|registration| TopicSubscriberStatus {
                     registration: registration.clone(),
                     channel: self.channel_for_subscriber(registration),
                     publishers: self
@@ -1388,8 +1413,10 @@ impl Topics {
                         .values()
                         .filter(|binding| binding.matches(registration))
                         .count(),
-                    buffered_messages: state.ordered.values().fold(0usize, |total, state| {
-                        total.saturating_add(state.pending.len())
+                    buffered_messages: self.subscribers.get(registration).map_or(0, |state| {
+                        state.ordered.values().fold(0usize, |total, state| {
+                            total.saturating_add(state.pending.len())
+                        })
                     }),
                 })
                 .collect(),
@@ -1765,6 +1792,10 @@ mod tests {
             let generation = ids.generation();
             let channel = ChannelId::new(1).unwrap();
             let mut topics = Topics {
+                registrations: TopicRegistrations {
+                    publishers: alloc::vec![publisher.clone()],
+                    subscribers: Vec::new(),
+                },
                 active: Some(ActiveTopics {
                     generation,
                     canonical_participant_id: "local".into(),

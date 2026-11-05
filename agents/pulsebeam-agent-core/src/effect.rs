@@ -98,8 +98,14 @@ pub enum HttpEffect {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TimerEffect {
-    Schedule { timer: TimerId, after: Duration },
-    Cancel { timer: TimerId },
+    /// Zero duration requests the next runnable host boundary, not a wall-clock timer.
+    Schedule {
+        timer: TimerId,
+        after: Duration,
+    },
+    Cancel {
+        timer: TimerId,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]

@@ -2,7 +2,10 @@ use super::*;
 use alloc::boxed::Box;
 use state::codec;
 
-use crate::tests::native_connection::{confirmed, connected, grant, observe};
+use crate::tests::{
+    RunReconciliation,
+    native_connection::{confirmed, connected, grant, observe},
+};
 
 #[test]
 fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
@@ -89,7 +92,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
             retire_media(active, &mut agent.ids, &mut agent.effects);
             let Some(Effect::Rtc(RtcEffect::RetireMedia {
                 operation, mids, ..
-            })) = agent.next_effect()
+            })) = agent.next_effect_after_turn()
             else {
                 panic!("incomplete bootstrap retirement");
             };
@@ -109,7 +112,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
             assert!(!active.media_leases.contains_key(&slot));
             assert!(rtp(active, &resource, &slot, None).is_none());
             assert!(!active.media_leases.contains_key(&slot));
-            assert!(agent.next_effect().is_none());
+            assert!(agent.next_effect_after_turn().is_none());
         }
         let active = agent.active.as_mut().unwrap();
         active.capabilities.rtp = capabilities;
@@ -119,7 +122,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
             operation,
             allocations,
             ..
-        })) = agent.next_effect()
+        })) = agent.next_effect_after_turn()
         else {
             panic!("allocation")
         };
@@ -159,7 +162,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                 agent.source_preparation(&slot).readiness,
                 SourceReadiness::Preparing
             );
-            assert!(agent.next_effect().is_none());
+            assert!(agent.next_effect_after_turn().is_none());
         }
         agent
             .active
@@ -189,12 +192,12 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         assert_eq!(lease.resource, want("camera").resource);
         let Some(Effect::Rtc(RtcEffect::RetireMedia {
             operation, mids, ..
-        })) = agent.next_effect()
+        })) = agent.next_effect_after_turn()
         else {
             panic!("orphan retirement")
         };
         assert_eq!(mids, ["actual"]);
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
         agent
             .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
                 generation,
@@ -212,7 +215,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                 .media_leases
                 .contains_key(&slot)
         );
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
     }
 
     let (mut agent, generation, channel) = connected(crate::TopicRegistrations::default());
@@ -256,7 +259,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         operation,
         allocations,
         ..
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("audio allocation")
     };
@@ -266,6 +269,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
     agent
         .command(AgentCommand::ReplaceDesired(desired))
         .unwrap();
+    assert!(agent.next_effect_after_turn().is_none());
     let active = agent.active.as_ref().unwrap();
     assert_eq!(
         active.media_allocation.as_ref().unwrap().operation,
@@ -283,7 +287,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
             .as_deref(),
         Some("a-source")
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -337,13 +341,13 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
             generation: actual,
             operation,
             mids,
-        })) = agent.next_effect()
+        })) = agent.next_effect_after_turn()
         else {
             panic!("retirement")
         };
         assert_eq!(actual, generation);
         assert_eq!(mids, [mid]);
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
         operation
     };
     seed(&mut agent, "old", false);
@@ -369,7 +373,10 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
         &mut agent.ids,
         &mut agent.effects,
     );
-    assert!(agent.next_effect().is_none(), "live leases cannot retire");
+    assert!(
+        agent.next_effect_after_turn().is_none(),
+        "live leases cannot retire"
+    );
     agent
         .active
         .as_mut()
@@ -410,7 +417,7 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
             agent.active.as_ref().unwrap().media_leases[&slot].mid,
             "old"
         );
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
     }
     agent
         .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
@@ -461,7 +468,7 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
             .unwrap(),
         &cached("replacement")
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .active
         .as_mut()
@@ -486,14 +493,14 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
         SourceReadiness::Failed
     );
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "failed retirement cannot spin or reuse old facts"
     );
     seed(&mut agent, "fenced", true);
     let operation = start(&mut agent, "fenced");
     agent.fence_signaling(generation);
     assert_eq!(
-        agent.next_effect(),
+        agent.next_effect_after_turn(),
         Some(Effect::Rtc(RtcEffect::CancelMediaPreparation {
             generation,
             operation
@@ -512,7 +519,7 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
         agent.active.as_ref().unwrap().media_leases[&slot].mid,
         "fenced"
     );
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -542,14 +549,14 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         generation: actual,
         channel,
         specification,
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("payload allocation")
     };
     assert_eq!(actual, generation);
     assert_eq!(specification.negotiated_id, Some(1));
     assert!(specification.ordered);
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Prepared {
             generation,
@@ -564,7 +571,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         }))
         .unwrap();
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "requested properties cannot override incompatible host facts"
     );
     assert!(
@@ -583,7 +590,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         generation: actual,
         channel: replacement,
         specification,
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("fresh payload after actual closure")
     };
@@ -613,7 +620,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         .unwrap();
     assert_eq!(agent.snapshot(), &before);
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "late valid-looking facts cannot revive the closed physical identity"
     );
     let channel = replacement;
@@ -635,7 +642,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         payload,
         channel: sent_channel,
         ..
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("StateBatch")
     };
@@ -662,7 +669,8 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
             message: "not admitted".into(),
         }))
         .unwrap();
-    let Some(Effect::Timer(TimerEffect::Schedule { timer, .. })) = agent.next_effect() else {
+    let Some(Effect::Timer(TimerEffect::Schedule { timer, .. })) = agent.next_effect_after_turn()
+    else {
         panic!("retry timer")
     };
     let mut successor = agent.desired.clone();
@@ -671,7 +679,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     agent
         .command(AgentCommand::ReplaceDesired(successor))
         .unwrap();
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
         .unwrap();
@@ -679,7 +687,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         operation: retry,
         payload: retried,
         ..
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("retry")
     };
@@ -695,7 +703,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     let Some(Effect::DataChannel(DataChannelEffect::Send {
         payload: retirement,
         ..
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("serialized retirement")
     };
@@ -733,7 +741,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     );
     assert!(!agent.topics.has_channel(generation, channel));
     assert!(agent.snapshot.terminal_failure.is_none());
-    assert!(agent.next_effect().is_none());
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
             generation,
@@ -748,7 +756,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         .command(AgentCommand::ReplaceDesired(successor))
         .unwrap();
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "reset completion cannot release a stream retained by the server"
     );
     let Some(absent) = &retired.records[0].desired else {
@@ -770,7 +778,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         generation: actual,
         channel: fresh,
         specification,
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("reuse after both reset and authoritative cutoff")
     };
@@ -801,7 +809,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     ] {
         agent.handle(HostEvent::DataChannel(event)).unwrap();
         assert_eq!(agent.snapshot(), &before);
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
     }
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
@@ -811,7 +819,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
         }))
         .unwrap();
     assert!(
-        agent.next_effect().is_none(),
+        agent.next_effect_after_turn().is_none(),
         "generic closure without a reset barrier quarantines the only payload SID"
     );
     assert_eq!(agent.snapshot().generation, Some(generation));
@@ -829,7 +837,7 @@ fn renewal_retries_original_precondition_and_commits_credentials_only_after_orde
         .unwrap();
     let Some(Effect::Http(HttpEffect::Request {
         operation, request, ..
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("PATCH")
     };
@@ -855,7 +863,7 @@ fn renewal_retries_original_precondition_and_commits_credentials_only_after_orde
         .unwrap();
     let Some(Effect::Http(HttpEffect::Request {
         operation, request, ..
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("retry PATCH")
     };
@@ -881,7 +889,7 @@ fn renewal_retries_original_precondition_and_commits_credentials_only_after_orde
         .unwrap();
     let Some(Effect::Http(HttpEffect::Request {
         operation, request, ..
-    })) = agent.next_effect()
+    })) = agent.next_effect_after_turn()
     else {
         panic!("fresh PATCH")
     };

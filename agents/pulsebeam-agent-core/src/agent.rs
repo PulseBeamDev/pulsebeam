@@ -224,6 +224,7 @@ pub struct Agent {
     pending_signal: Option<PendingSignal>,
     signal_retry: Option<TimerId>,
     topic_probe: Option<TimerId>,
+    reconciliation_wake: Option<TimerId>,
     intent_dirty: bool,
     closing: Option<Closing>,
     orphaned_creates: BTreeSet<OperationId>,
@@ -252,6 +253,7 @@ impl Agent {
             pending_signal: None,
             signal_retry: None,
             topic_probe: None,
+            reconciliation_wake: None,
             intent_dirty: false,
             closing: None,
             orphaned_creates: BTreeSet::new(),
@@ -302,7 +304,9 @@ impl Agent {
             HostEvent::Timer(event) => self.handle_timer(event),
             HostEvent::DataChannel(event) => self.handle_data_channel(event),
         };
-        self.send_intent_if_ready();
+        if self.intent_dirty {
+            self.request_reconciliation();
+        }
         let flushed = self.flush_notifications();
         let result = result.and(flushed);
         if let Err(error) = &result {
@@ -358,6 +362,7 @@ impl Agent {
         command: crate::ResourceCommand,
     ) -> Result<crate::ResourceResult, AgentError> {
         use crate::{ResourceCommand, ResourceResult, TrackOwner, TrackResourceError};
+        let releasing = matches!(&command, ResourceCommand::Release { .. });
         let result = match command {
             ResourceCommand::ClaimPublication { spec } => {
                 spec.validate()?;
@@ -578,6 +583,18 @@ impl Agent {
             }
         };
         self.refresh_resources()?;
+        if releasing
+            && let Some(active) = self
+                .active
+                .as_mut()
+                .filter(|active| !active.signaling_terminal)
+        {
+            native::fence_unwanted_media(active, &self.desired, &mut self.ids, &mut self.effects)?;
+            if native::project_retired_receivers(active, &mut self.snapshot) {
+                self.snapshot.version = self.snapshot.version.saturating_add(1);
+                self.notifications.push_back(Notification::SnapshotChanged);
+            }
+        }
         Ok(result)
     }
 
@@ -926,18 +943,11 @@ impl Agent {
             self.desired.audio.pinned.len(),
         );
         if topics_changed {
-            self.topics.reconcile(
-                &self.desired.topics,
-                &mut self.snapshot,
-                &mut self.notifications,
-            );
-            self.schedule_topic_probe();
+            self.topics
+                .accept_registrations(&self.desired.topics, &mut self.snapshot);
         }
         if intent_changed || topics_changed {
             self.intent_dirty = true;
-        }
-        if topics_changed {
-            self.schedule_topic_probe();
         }
 
         if self.desired.connected {
@@ -946,11 +956,11 @@ impl Agent {
                     return Ok(());
                 } else if self.active.is_none() {
                     self.start_attempt(AttemptMode::Fresh);
-                } else {
-                    self.send_intent_if_ready();
+                } else if self.intent_dirty {
+                    self.request_reconciliation();
                 }
-            } else {
-                self.send_intent_if_ready();
+            } else if self.intent_dirty {
+                self.request_reconciliation();
             }
         } else {
             self.begin_close();
@@ -1238,6 +1248,7 @@ impl Agent {
         }
         self.pending_signal = None;
         self.cancel_signal_retry();
+        self.cancel_reconciliation();
         self.topics.unbind_generation(
             generation,
             TopicDropReason::TransportReplaced,
@@ -1423,9 +1434,12 @@ impl Agent {
                     {
                         self.start_attempt(retry.mode);
                     }
+                } else if self.reconciliation_wake == Some(timer) {
+                    self.reconciliation_wake = None;
+                    self.reconcile_current();
                 } else if self.signal_retry == Some(timer) {
                     self.signal_retry = None;
-                    self.send_intent_if_ready();
+                    self.request_reconciliation();
                 } else if self.topic_probe == Some(timer) {
                     self.topic_probe = None;
                     if self.active.is_some() && self.desired.connected {
@@ -1504,6 +1518,7 @@ impl Agent {
                             active.generation == generation && !active.signaling_terminal
                         })
                     {
+                        self.intent_dirty = true;
                         if active.signaling_channel == channel {
                             self.intent_dirty = true;
                         } else if let Some(error) = active
@@ -1529,14 +1544,6 @@ impl Agent {
                                 self.notifications
                                     .push_back(Notification::ServerError(error));
                             }
-                        } else if let Err(error) = native::prepared_payload(
-                            active,
-                            channel,
-                            &mut self.ids,
-                            &mut self.effects,
-                        ) {
-                            self.notifications
-                                .push_back(Notification::ServerError(error.to_string()));
                         }
                     }
                 }
@@ -1617,12 +1624,15 @@ impl Agent {
                                 reset_complete: true
                             }
                         );
-                        physical.state = native::PayloadState::Closed {
+                        let closed = native::PayloadState::Closed {
                             reset_complete: previous_reset || reset_complete,
                         };
-                        let resource = physical.resource.clone();
-                        active.state.stage(resource, None)?;
-                        self.intent_dirty = true;
+                        if physical.state != closed {
+                            physical.state = closed;
+                            let resource = physical.resource.clone();
+                            active.state.stage(resource, None)?;
+                            self.intent_dirty = true;
+                        }
                     }
                     if active.signaling_channel == channel {
                         active.signaling_terminal = true;
@@ -1631,6 +1641,7 @@ impl Agent {
                 if signaling_closed {
                     self.cancel_renewal(generation);
                     self.cancel_media(generation);
+                    self.cancel_reconciliation();
                 }
                 let candidate_channel = self.attempt.as_ref().is_some_and(|attempt| {
                     attempt.generation == generation
@@ -1749,7 +1760,7 @@ impl Agent {
                         channel.get(),
                     );
                     self.pending_signal = None;
-                    self.send_intent_if_ready();
+                    self.request_reconciliation();
                 } else {
                     let _ = self.topics.handle_sent(
                         operation,
@@ -1910,7 +1921,7 @@ impl Agent {
             })?;
         }
         self.refresh_resources()?;
-        self.send_intent_if_ready();
+        self.request_reconciliation();
         self.schedule_topic_probe();
         Ok(())
     }
@@ -2048,10 +2059,49 @@ impl Agent {
         });
     }
 
-    fn send_intent_if_ready(&mut self) {
+    fn request_reconciliation(&mut self) {
+        if self.reconciliation_wake.is_some()
+            || self.snapshot.terminal_failure.is_some()
+            || self.closing.is_some()
+            || self
+                .active
+                .as_ref()
+                .is_none_or(|active| active.signaling_terminal)
+        {
+            return;
+        }
+        let timer = self.ids.timer();
+        self.reconciliation_wake = Some(timer);
+        self.effects.push_back(Effect::Timer(TimerEffect::Schedule {
+            timer,
+            after: Duration::ZERO,
+        }));
+    }
+
+    fn cancel_reconciliation(&mut self) {
+        if let Some(timer) = self.reconciliation_wake.take() {
+            let queued = self.effects.iter().position(|effect| {
+                matches!(effect, Effect::Timer(TimerEffect::Schedule { timer: pending, .. }) if *pending == timer)
+            });
+            if let Some(index) = queued {
+                self.effects.remove(index);
+            } else {
+                self.effects
+                    .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
+            }
+        }
+    }
+
+    fn reconcile_current(&mut self) {
         if self.snapshot.terminal_failure.is_some() || self.closing.is_some() {
             return;
         }
+        self.topics.reconcile(
+            &self.desired.topics,
+            &mut self.snapshot,
+            &mut self.notifications,
+        );
+        self.schedule_topic_probe();
         let Some(active) = self
             .active
             .as_mut()
@@ -2181,6 +2231,7 @@ impl Agent {
                 .push_back(Effect::Timer(TimerEffect::Cancel { timer: retry.timer }));
         }
         self.cancel_signal_retry();
+        self.cancel_reconciliation();
         if let Some(timer) = self.topic_probe.take() {
             self.effects
                 .push_back(Effect::Timer(TimerEffect::Cancel { timer }));
@@ -2593,7 +2644,7 @@ fn validate_resource_uri(uri: &str) -> Result<(), String> {
 #[cfg(test)]
 mod preparation_tests {
     use super::*;
-    use crate::{DataChannelReliability, PreparedDataChannel};
+    use crate::{DataChannelReliability, PreparedDataChannel, tests::RunReconciliation};
 
     fn facts() -> PreparedDataChannel {
         PreparedDataChannel {
@@ -2647,7 +2698,7 @@ mod preparation_tests {
             Ok(known)
         );
         assert!(agent.attempt.is_none());
-        assert!(agent.next_effect().is_none());
+        assert!(agent.next_effect_after_turn().is_none());
     }
 
     #[test]

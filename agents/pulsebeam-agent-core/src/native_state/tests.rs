@@ -414,13 +414,10 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
     let changes = client
         .apply(&frame(alloc::vec![record(1, rejected)], false))
         .unwrap();
-    assert!(matches!(
-        changes.as_slice(),
-        [Change::Owned {
-            new_evaluation: false,
-            ..
-        }]
-    ));
+    assert!(
+        changes.is_empty(),
+        "duplicate confirmation does not unblock work"
+    );
     assert!(client.eligible(&resource()).is_some());
     assert!(!client.converged(&resource()));
     client.stage(resource(), Some(spec(true, 1))).unwrap();

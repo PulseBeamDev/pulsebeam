@@ -18,6 +18,24 @@ SANS-I/O PulseBeam client agent.
 * Production diagnostics and per-agent filtering through the `log` facade
 * Shared UniFFI-compatible domain types
 
+## Reconciliation turns
+
+Commands and observations synchronously validate and update current intent and
+owner authority. Ordinary physical planning and signaling selection run at one
+Core-owned reconciliation boundary, not once per intermediate edit. Core emits
+at most one pending zero-duration timer; hosts service it at the next runnable
+actor boundary without a wall-clock debounce or draining an unbounded mailbox.
+A pass does not schedule itself. New intent, changed facts, matching completions
+and bounded retry timers permit further progress.
+
+Each pass compares current desire with applied and issued work. Returning to a
+still-valid applied target before the boundary causes no physical or wire work.
+Already-issued operations and payload retries retain their identities and
+completion fences. Disconnect, owner release and local safety failures revoke
+exposure promptly; an irreversibly retired lifetime cannot be recovered by
+restoring desire. Topic registrations are reduced, but payload sends and their
+completion/failure results remain ordered operations.
+
 ## Receive policy support
 
 Use adaptive audio playout with the stock native and browser WebRTC profiles.

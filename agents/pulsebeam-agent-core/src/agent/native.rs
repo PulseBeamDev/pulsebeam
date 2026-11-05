@@ -406,43 +406,6 @@ fn payload(
     })
 }
 
-pub(super) fn prepared_payload(
-    session: &mut Session,
-    channel: ChannelId,
-    ids: &mut IdGenerator,
-    effects: &mut VecDeque<Effect>,
-) -> Result<(), SignalingError> {
-    let Some(physical) = session
-        .payloads
-        .get(&channel)
-        .filter(|physical| physical.wanted && physical.state == PayloadState::Active)
-    else {
-        return Ok(());
-    };
-    let resource = physical.resource.clone();
-    let registration = physical.registration.clone();
-    let Some(binding) = payload(session, &resource, registration.clone(), ids, effects) else {
-        return Ok(());
-    };
-    let spec = match registration {
-        crate::TopicChannel::Publisher(value) => publication(
-            &value.topic,
-            true,
-            state::publication_spec::Kind::Data(state::DataPublication {
-                delivery: value.mode.delivery() as i32,
-                binding: Some(binding),
-            }),
-        ),
-        crate::TopicChannel::Subscriber(_) => {
-            let Resource::DataSubscription(id) = &resource else {
-                return Ok(());
-            };
-            subscription(id.clone(), state::TrackKind::Data, binding, None)
-        }
-    };
-    session.state.stage(resource, Some(spec))
-}
-
 pub(super) fn project_retired_receivers(session: &Session, snapshot: &mut Snapshot) -> bool {
     let mut changed = false;
     for (slot, lease) in &session.media_leases {
@@ -849,6 +812,85 @@ pub(super) fn reconcile(
     failure.map_or(Ok(()), Err)
 }
 
+fn media_needed(
+    session: &Session,
+    desired: &DesiredState,
+    slot: &MediaSlot,
+    want: &MediaWant,
+) -> bool {
+    match slot {
+        MediaSlot::LocalVideo(_) | MediaSlot::LocalAudio(_) => {
+            desired.publications.iter().any(|value| {
+                value.media_slot() == *slot
+                    && want.resource
+                        == (Resource::Publication {
+                            kind: if value.kind == crate::MediaKind::Audio {
+                                state::TrackKind::Audio
+                            } else {
+                                state::TrackKind::Video
+                            },
+                            label: value.label.clone(),
+                        })
+            })
+        }
+        MediaSlot::RemoteVideo(index) => desired.video.iter().any(|value| {
+            value.slot == *index
+                && want.source.as_deref()
+                    == match &value.selector {
+                        Some(selector) => {
+                            selected(session, &want.resource, selector, state::TrackKind::Video)
+                        }
+                        None => Some(value.track_id.as_str()),
+                    }
+        }),
+        MediaSlot::RemoteAudio(_) => want.source.as_ref().is_some_and(|source| {
+            desired.audio.pinned.contains(source)
+                || desired.audio.selected.iter().any(|selector| {
+                    selected(session, &want.resource, selector, state::TrackKind::Audio)
+                        == Some(source.as_str())
+                })
+                || desired.audio.automatic
+                    && session
+                        .state
+                        .source(source)
+                        .or_else(|| {
+                            session
+                                .state
+                                .eligible(&want.resource)
+                                .and_then(|live| live.track.as_ref())
+                                .filter(|track| track.track_id == *source)
+                        })
+                        .is_some_and(|track| {
+                            kind(track) == state::TrackKind::Audio
+                                && track.participant_id != session.participant_id
+                        })
+        }),
+    }
+}
+
+pub(super) fn fence_unwanted_media(
+    session: &mut Session,
+    desired: &DesiredState,
+    ids: &mut IdGenerator,
+    effects: &mut VecDeque<Effect>,
+) -> Result<(), SignalingError> {
+    let removed = session
+        .media_wanted
+        .iter()
+        .filter(|(slot, want)| !media_needed(session, desired, slot, want))
+        .map(|(slot, _)| slot.clone())
+        .collect::<Vec<_>>();
+    for slot in removed {
+        session.media_wanted.remove(&slot);
+        if let Some(lease) = session.media_leases.get_mut(&slot) {
+            lease.retired = true;
+            session.state.stage(lease.resource.clone(), None)?;
+        }
+    }
+    retire_media(session, ids, effects);
+    Ok(())
+}
+
 fn release_payload(session: &mut Session, resource: &Resource, channel: ChannelId) {
     session.payload_resources.remove(resource);
     if let Some(physical) = session.payloads.remove(&channel)
@@ -1169,8 +1211,12 @@ impl Agent {
             }
         }
         if changed {
+            if project_retired_receivers(active, &mut self.snapshot) {
+                self.snapshot.version = self.snapshot.version.saturating_add(1);
+                self.notifications.push_back(Notification::SnapshotChanged);
+            }
             self.intent_dirty = true;
-            self.send_intent_if_ready();
+            self.request_reconciliation();
         }
     }
 
@@ -1281,6 +1327,7 @@ impl Agent {
                         .is_some_and(|format| state::validation::formats_equivalent(expected, format)))
             }));
             let accepted = active.media_wanted.get(&slot) == Some(&want)
+                && media_needed(active, &self.desired, &slot, &want)
                 && (identity_pending && want.allocation.format.is_none() || complete);
             if let Some(assigned) = assigned {
                 active
@@ -1323,7 +1370,7 @@ impl Agent {
             }
         }
         self.intent_dirty = true;
-        self.send_intent_if_ready();
+        self.request_reconciliation();
         true
     }
 
@@ -1397,7 +1444,7 @@ impl Agent {
             ));
         }
         self.intent_dirty = true;
-        self.send_intent_if_ready();
+        self.request_reconciliation();
     }
 
     pub(super) fn apply_native(&mut self, payload: &[u8]) -> Result<(), AgentError> {
@@ -1407,6 +1454,7 @@ impl Agent {
             .ok_or(SignalingError::Invalid("inactive Session"))?
             .state
             .apply(payload)?;
+        let progress = !changes.is_empty();
         let mut discovery_changed = false;
         for change in changes {
             match change {
@@ -1669,7 +1717,9 @@ impl Agent {
         if discovery_changed {
             self.refresh_resources()?;
         }
-        self.send_intent_if_ready();
+        if progress {
+            self.request_reconciliation();
+        }
         Ok(())
     }
 
