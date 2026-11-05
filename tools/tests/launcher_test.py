@@ -69,6 +69,46 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(self.forwarded_arguments(result),
                          ["1", self.output_base, *arguments])
 
+    def test_startup_values_and_informational_commands_are_forwarded_without_autostart(self):
+        for args in (("--bazelrc", "build", "version"),
+                     ("--output_base", "run", "info", "build"),
+                     ("--host_jvm_profile", "test", "version"),
+                     ("--bazelrc=build", "query", "build")):
+            with self.subTest(args=args):
+                self.assertEqual(self.forwarded_arguments(self.run_launcher(*args)),
+                                 ["1", self.output_base, *args])
+                self.assertFalse(Path(self.env["AUTOSTART_LOG"]).exists())
+
+    def test_boolean_startup_flags_do_not_consume_command(self):
+        args = ("--host_jvm_debug", "--idle_server_tasks", "build", "//:example")
+        self.assertEqual(self.forwarded_arguments(self.run_launcher(*args)),
+                         ["1", self.output_base, *args])
+        self.assertTrue(Path(self.env["AUTOSTART_LOG"]).exists())
+
+    def test_local_config_follows_actual_command_not_matching_startup_value(self):
+        args = ("--bazelrc", "run", "run", "//tools/nativelink:server")
+        self.assertEqual(self.forwarded_arguments(self.run_launcher(*args)),
+                         ["1", self.output_base, "--bazelrc", "run", "run",
+                          "--config=local", "//tools/nativelink:server"])
+        self.assertFalse(Path(self.env["AUTOSTART_LOG"]).exists())
+
+    def test_arm_inserts_local_config_after_actual_command(self):
+        commands = self.root / "bin"
+        commands.mkdir()
+        uname = commands / "uname"
+        uname.write_text('#!/usr/bin/env bash\nif [[ "$1" == -m ]]; then echo aarch64; else echo Linux; fi\n')
+        uname.chmod(0o755)
+        self.env["PATH"] = str(commands) + os.pathsep + self.env["PATH"]
+        arm_binary = self.binary.parent.parent / "bazelisk-1.27.0-arm64" / "bazelisk"
+        arm_binary.parent.mkdir(exist_ok=True)
+        arm_binary.write_bytes(self.binary.read_bytes())
+        arm_binary.chmod(0o755)
+        args = ("--bazelrc", "build", "build", "//:example")
+        self.assertEqual(self.forwarded_arguments(self.run_launcher(*args)),
+                         ["1", self.output_base, "--bazelrc", "build", "build",
+                          "--config=local", "//:example"])
+        self.assertFalse(Path(self.env["AUTOSTART_LOG"]).exists())
+
     def test_retirement_lock_blocks_builds_without_leaving_per_worktree_files(self):
         key = hashlib.sha256(os.fsencode(str(self.root.resolve()))).hexdigest()[:2]
         lock = Path(self.env["HOME"]) / ".cache/dev/worktree-locks" / key
@@ -105,6 +145,18 @@ class LauncherContractTest(unittest.TestCase):
             with self.subTest(args=args):
                 self.forwarded_arguments(self.run_launcher(*args))
                 self.assertFalse(Path(self.env["AUTOSTART_LOG"]).exists())
+
+    def test_split_config_has_same_service_needs_as_equals_form(self):
+        for config in ("local", "webrtc-cache", "webrtc-reapi"):
+            for split in (False, True):
+                with self.subTest(config=config, split=split):
+                    args = ["build", "--config=local"]
+                    args.extend(["--config", config] if split else [f"--config={config}"])
+                    self.assertEqual(self.forwarded_arguments(self.run_launcher(*args)),
+                                     ["1", self.output_base, *args])
+                    log = Path(self.env["AUTOSTART_LOG"])
+                    self.assertEqual(log.exists(), config != "local")
+                    log.unlink(missing_ok=True)
 
     def test_local_webrtc_still_starts_bazel_coordinator(self):
         self.forwarded_arguments(self.run_launcher("build", "--//crates/pulsebeam-libwebrtc-sys:executor=local"))

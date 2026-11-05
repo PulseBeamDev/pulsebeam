@@ -29,27 +29,61 @@ mkdir -p "$lock_dir"
 exec {worktree_lock}<>"$lock_dir/${lock_key:0:2}"
 flock --shared --nonblock --conflict-exit-code 75 "$worktree_lock"
 
-# Informational commands and explicitly local builds do not need the service.
+# Locate the first non-startup token, without confusing separated option values
+# for commands. Keep its position for local-config insertion below. The unary
+# flags match Bazel 9.3.0 startup_options.cc and bazel_startup_options.cc.
 command_name=
+command_index=0
+index=0
+startup_value=0
+for arg in "$@"; do
+  ((index+=1))
+  if [[ "$startup_value" == 1 ]]; then
+    startup_value=0
+    continue
+  fi
+  case "$arg" in
+    --bazelrc|--command_port|--connect_timeout_secs|--local_startup_timeout_secs|\
+    --digest_function|--unix_digest_hash_attribute_name|--server_javabase|\
+    --host_jvm_args|--host_jvm_profile|--invocation_policy|--io_nice_level|\
+    --install_base|--macos_qos_class|--max_idle_secs|--output_base|\
+    --output_user_root|--server_jvm_out|--failure_detail_out|\
+    --experimental_cgroup_parent|--extra_classpath)
+      startup_value=1 ;;
+    --) break ;;
+    -*) ;;
+    *)
+      case "$arg" in build|test|run|coverage|mobile-install) command_name=$arg; command_index=$index ;; esac
+      break ;;
+  esac
+done
+
+# Informational commands and explicitly local builds do not need the service.
 executor=reapi
 endpoint=grpc://127.0.0.1:50051
 remote_executor=grpc://127.0.0.1:50051
 remote_cache=grpc://127.0.0.1:50051
 manual_server=0
 expect=
+index=0
 for arg in "$@"; do
+  ((index+=1))
+  [[ -n "$command_name" ]] || break
+  ((index > command_index)) || continue
   [[ "$arg" != -- ]] || break
   if [[ -n "$expect" ]]; then
     case "$expect" in
       executor) executor=$arg ;; endpoint) endpoint=$arg ;;
       remote_executor) remote_executor=$arg ;; remote_cache) remote_cache=$arg ;;
-      config) [[ "$arg" != local ]] || { executor=local; remote_executor=; remote_cache=; } ;;
+      config)
+        case "$arg" in
+          local) executor=local; remote_executor=; remote_cache= ;;
+          webrtc-reapi) executor=reapi ;;
+          webrtc-cache) executor=cache ;;
+        esac ;;
     esac
     expect=
     continue
-  fi
-  if [[ -z "$command_name" ]]; then
-    case "$arg" in build|test|run|coverage|mobile-install) command_name=$arg ;; esac
   fi
   case "$arg" in
     --//crates/pulsebeam-libwebrtc-sys:executor=*) executor=${arg#*=} ;;
@@ -80,12 +114,12 @@ if [[ "$arch" == amd64 && -n "$command_name" && "$needs_service" == 1 && \
 fi
 if [[ -n "$command_name" && ( "$arch" != amd64 || ( "$command_name" == run && "$manual_server" == 1 ) ) ]]; then
   arguments=()
-  configured=0
+  index=0
   for arg in "$@"; do
+    ((index+=1))
     arguments+=("$arg")
-    if [[ "$configured" == 0 && "$arg" == "$command_name" ]]; then
+    if ((index == command_index)); then
       arguments+=(--config=local)
-      configured=1
     fi
   done
   set -- "${arguments[@]}"
