@@ -15,7 +15,9 @@ build also uses shared REAPI by default. Actions explicitly marked local or
 no-remote remain local. No special config or separate service startup is
 required. First use provisions the pinned NativeLink binary and host tools and
 may require network access. Each worktree must keep its own Bazel output base;
-share the service, not output bases.
+share the service, not output bases. The launcher includes the ready worker's
+pinned host-tools identity in Bazel action properties so runtime-tool changes
+cannot reuse an incompatible cached result.
 
 Pass `--config=local` to opt the whole build out of NativeLink remote caching
 and execution. The narrower `--//crates/pulsebeam-libwebrtc-sys:executor=local`
@@ -39,22 +41,30 @@ The local config prevents the server-launching command from autostarting a
 separate service. Leave the foreground service running while using it from
 another terminal. For a manually started service at the default endpoint, set
 `PULSEBEAM_NATIVELINK_AUTOSTART=0` on the client command so the launcher does
-not try to manage it. Stop the foreground service with Ctrl-C when it is no
-longer needed.
+not try to manage it. Also set the worker host-tools property as shown below,
+so manually configured clients retain the same cache-identity boundary. Stop
+the foreground service with Ctrl-C when it is no longer needed.
 
 ## Configuration and recovery
 
 The REAPI endpoint defaults to `127.0.0.1:50051` and the worker endpoint to
 `127.0.0.1:50061`. State defaults to `~/.cache/pulsebeam/nativelink/v1`, with
-mode `0700`. The server accepts `--state` (an absolute path), `--cpu` (positive,
-default `min(8, cpu_count)`), `--memory-kb` (default `8388608`), `--reapi-port`
-and `--worker-port`. For example:
+mode `0700`. By default the scheduler advertises all CPUs in the service's
+CPU affinity and the host's total memory. Bazel submits up to twice the CPU
+capacity (minimum 8, maximum 128 jobs) to hide scheduling and CAS latency;
+explicit client `--jobs` overrides this. The shared capacity is fixed at
+service startup.
+
+The server accepts `--state` (an absolute path), `--cpu` (positive),
+`--memory-kb` (positive), `--reapi-port` and `--worker-port` to configure
+a foreground service. For example:
 
 ```sh
 ./bazel run --config=local //tools/nativelink:server -- --cpu 4 --reapi-port 50052
 PULSEBEAM_NATIVELINK_AUTOSTART=0 ./bazel test --config=webrtc-reapi \
   --remote_executor=grpc://127.0.0.1:50052 \
   --remote_cache=grpc://127.0.0.1:50052 \
+  --remote_default_exec_properties="pulsebeam-host-tools=$(<.bazel/output/external/+webrtc+webrtc_host/host-bin)" \
   --//crates/pulsebeam-libwebrtc-sys:reapi=grpc://127.0.0.1:50052 \
   //crates/pulsebeam-libwebrtc-sys:fast
 ```
@@ -75,8 +85,10 @@ expose only the action work tree, Nix store and host loader libraries. This is a
 local setup; a remote host fleet has not been verified.
 
 Bazel actions reserve 1 CPU and 2 GiB by default; Siso actions reserve 1 CPU
-and 1 GiB. CPU and memory capacities control scheduler admission, not hard
-cgroup quotas. The outer WebRTC GN action and
+and 1 GiB. Simulator test actions reserve their four-child budget explicitly.
+Scheduler reservations provide shared admission control, not hard OS limits.
+Actions can use more resources than they reserve, and local processes are not
+included in that budget. The outer WebRTC GN action and
 Siso's local-only generators and archiving remain client-local, with two local
 Siso jobs per client. Tests and generators may also stay local when their
 contracts require it. The service does not govern every process on the machine.

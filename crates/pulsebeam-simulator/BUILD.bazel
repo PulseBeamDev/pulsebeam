@@ -104,6 +104,7 @@ py_test(
     data = [":sim_binary", ":candidate"],
     size = "large",
     tags = ["cpu:%s" % SIMULATION_JOBS],
+    exec_properties = {"cpu_count": str(SIMULATION_JOBS), "memory_kb": str(SIMULATION_JOBS * 1024 * 1024)},
 )
 
 py_test(
@@ -114,6 +115,7 @@ py_test(
     data = [":sim_binary", ":candidate"],
     size = "enormous",
     tags = ["slow", "cpu:%s" % SIMULATION_JOBS],
+    exec_properties = {"cpu_count": str(SIMULATION_JOBS), "memory_kb": str(SIMULATION_JOBS * 1024 * 1024)},
 )
 
 REPLAY_ARGS = ["$(rootpath :sim_binary)", "--mode", "all"] + CANDIDATE_ARGS

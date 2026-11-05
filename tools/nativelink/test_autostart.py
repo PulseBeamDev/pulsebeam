@@ -1,8 +1,11 @@
 """Fast startup protocol tests; no service or subprocess is actually started."""
 
 import concurrent.futures
+import io
+import json
 from pathlib import Path
 import tempfile
+import sys
 import threading
 import unittest
 from unittest import mock
@@ -51,7 +54,7 @@ class StartupTests(unittest.TestCase):
         self.start()
         self.run.assert_called_once_with(
             [str(self.bazelisk), f"--output_base={self.output}", "build", "--config=local", "//tools/nativelink:server"],
-            cwd=self.workspace, check=True)
+            cwd=self.workspace, check=True, stdout=sys.stderr)
         args, kwargs = self.popen.call_args
         self.assertEqual(args[0][1:], [str(self.workspace / "tools/nativelink/server.py"),
                          "--binary", str(self.output / "external/+http_archive+nativelink/nativelink"),
@@ -138,6 +141,22 @@ class StartupTests(unittest.TestCase):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_cli_reports_tools_from_the_ready_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            config = {"workers": [{"local": {"platform_properties": {
+                "pulsebeam-host-tools": {"values": ["/nix/store/pinned-tools/bin"]},
+                "cpu_count": {"values": ["18"]},
+            }}}]}
+            (state / "config.json").write_text(json.dumps(config))
+            with mock.patch.object(autostart, "state_directory", return_value=state), \
+                 mock.patch.object(autostart, "start") as start, \
+                 mock.patch.object(sys, "argv", ["autostart", "--workspace", "/repo", "--bazelisk", "/bazelisk", "--output-base", "/output", "--print-host-tools"]), \
+                 mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(autostart.main(), 0)
+                self.assertEqual(output.getvalue(), "/nix/store/pinned-tools/bin\n36\n")
+                start.assert_called_once()
+
     def test_readiness_requires_both_owned_listeners_and_lock(self):
         with mock.patch.multiple(autostart, alive=mock.DEFAULT, server_locked=mock.DEFAULT,
                                  owns_lock=mock.DEFAULT, listening_ports=mock.DEFAULT,

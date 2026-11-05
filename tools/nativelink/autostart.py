@@ -15,11 +15,14 @@ import sys
 import tempfile
 import time
 
+from resources import client_jobs
+
 PORTS = (50051, 50061)
 TIMEOUT = 30.0
 INPUTS = (
     "tools/nativelink/server.py",
     "tools/nativelink/config.py",
+    "tools/nativelink/resources.py",
     "crates/pulsebeam-libwebrtc-sys/gn/host.nix",
     "tools/host/flake.lock",
 )
@@ -40,8 +43,7 @@ def identity(workspace):
     if pin is None:
         raise StartupError("Cannot locate the NativeLink pin in MODULE.bazel")
     digest.update(pin.group().encode())
-    # server.py derives its default capacity from the host.
-    digest.update(str(min(8, os.cpu_count() or 1)).encode())
+    # The scheduler's host capacity is selected once at startup.
     return digest.hexdigest()
 
 
@@ -209,7 +211,7 @@ def start(workspace, bazelisk, output_base, state):
         if server_locked(state):
             raise StartupError(f"An unrecognized service holds {state / 'server.lock'}; identify it with fuser {state / 'server.lock'}, stop it and retry (it will not be killed)")
         ports_free()
-        subprocess.run([str(bazelisk), f"--output_base={output_base}", "build", "--config=local", "//tools/nativelink:server"], cwd=workspace, check=True)
+        subprocess.run([str(bazelisk), f"--output_base={output_base}", "build", "--config=local", "//tools/nativelink:server"], cwd=workspace, check=True, stdout=sys.stderr)
         if identity(workspace) != expected:
             raise StartupError("NativeLink inputs changed during bootstrap; retry")
         binary = output_base / "external/+http_archive+nativelink/nativelink"
@@ -252,11 +254,18 @@ def main():
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--bazelisk", type=Path, required=True)
     parser.add_argument("--output-base", type=Path, required=True)
+    parser.add_argument("--print-host-tools", action="store_true")
     args = parser.parse_args()
     if not all(path.is_absolute() for path in (args.workspace, args.bazelisk, args.output_base)):
         parser.error("all paths must be absolute")
     try:
-        start(args.workspace, args.bazelisk, args.output_base, state_directory())
+        state = state_directory()
+        start(args.workspace, args.bazelisk, args.output_base, state)
+        if args.print_host_tools:
+            config = json.loads((state / "config.json").read_text())
+            properties = config["workers"][0]["local"]["platform_properties"]
+            print(properties["pulsebeam-host-tools"]["values"][0])
+            print(client_jobs(int(properties["cpu_count"]["values"][0])))
     except (StartupError, OSError, subprocess.CalledProcessError) as error:
         print(f"NativeLink autostart failed: {error}", file=sys.stderr)
         return 1

@@ -35,7 +35,8 @@ class LauncherContractTest(unittest.TestCase):
         helper = self.root / "tools/nativelink/autostart.py"
         helper.parent.mkdir(parents=True)
         helper.write_text("import os, sys\nfrom pathlib import Path\n"
-                          "Path(os.environ['AUTOSTART_LOG']).write_text('\\n'.join(sys.argv[1:]))\n")
+                          "Path(os.environ['AUTOSTART_LOG']).write_text('\\n'.join(sys.argv[1:]))\n"
+                          "print('/nix/store/pinned-tools/bin')\nprint('36')\n")
 
     def run_launcher(self, *arguments, cwd=None, launcher=None):
         return subprocess.run([str(launcher or self.launcher), *arguments], env=self.env,
@@ -48,6 +49,10 @@ class LauncherContractTest(unittest.TestCase):
     @property
     def output_base(self):
         return f"--output_base={self.root}/.bazel/output"
+
+    @property
+    def service_properties(self):
+        return ["--remote_default_exec_properties=pulsebeam-host-tools=/nix/store/pinned-tools/bin", "--jobs=36"]
 
     def test_default_output_stays_in_checkout_from_nested_directory(self):
         nested = self.root / "package"
@@ -67,7 +72,7 @@ class LauncherContractTest(unittest.TestCase):
         arguments = ["--output_base=/tmp/with spaces", "test", "//:example", "--test_arg=quote ' \""]
         result = self.run_launcher(*arguments)
         self.assertEqual(self.forwarded_arguments(result),
-                         ["1", self.output_base, *arguments])
+                         ["1", self.output_base, *arguments[:2], *self.service_properties, *arguments[2:]])
 
     def test_startup_values_and_informational_commands_are_forwarded_without_autostart(self):
         for args in (("--bazelrc", "build", "version"),
@@ -82,7 +87,7 @@ class LauncherContractTest(unittest.TestCase):
     def test_boolean_startup_flags_do_not_consume_command(self):
         args = ("--host_jvm_debug", "--idle_server_tasks", "build", "//:example")
         self.assertEqual(self.forwarded_arguments(self.run_launcher(*args)),
-                         ["1", self.output_base, *args])
+                         ["1", self.output_base, *args[:3], *self.service_properties, *args[3:]])
         self.assertTrue(Path(self.env["AUTOSTART_LOG"]).exists())
 
     def test_local_config_follows_actual_command_not_matching_startup_value(self):
@@ -121,14 +126,14 @@ class LauncherContractTest(unittest.TestCase):
                          ["1", self.output_base, "version"])
         self.assertEqual([entry.name for entry in lock.parent.iterdir()], [key])
 
-    def test_build_commands_ensure_shared_service_without_changing_arguments(self):
+    def test_build_commands_pin_worker_tools_and_preserve_user_arguments(self):
         for command in ("build", "test", "run", "coverage"):
             with self.subTest(command=command):
                 result = self.run_launcher(command, "//:example")
-                self.assertEqual(self.forwarded_arguments(result), ["1", self.output_base, command, "//:example"])
+                self.assertEqual(self.forwarded_arguments(result), ["1", self.output_base, command, *self.service_properties, "//:example"])
                 self.assertEqual(Path(self.env["AUTOSTART_LOG"]).read_text().splitlines(), [
                     "--workspace", str(self.root), "--bazelisk", str(self.binary),
-                    "--output-base", str(self.root / ".bazel/output"),
+                    "--output-base", str(self.root / ".bazel/output"), "--print-host-tools",
                 ])
                 Path(self.env["AUTOSTART_LOG"]).unlink()
 
@@ -152,8 +157,9 @@ class LauncherContractTest(unittest.TestCase):
                 with self.subTest(config=config, split=split):
                     args = ["build", "--config=local"]
                     args.extend(["--config", config] if split else [f"--config={config}"])
+                    properties = [] if config == "local" else self.service_properties
                     self.assertEqual(self.forwarded_arguments(self.run_launcher(*args)),
-                                     ["1", self.output_base, *args])
+                                     ["1", self.output_base, args[0], *properties, *args[1:]])
                     log = Path(self.env["AUTOSTART_LOG"])
                     self.assertEqual(log.exists(), config != "local")
                     log.unlink(missing_ok=True)
@@ -172,6 +178,14 @@ class LauncherContractTest(unittest.TestCase):
         result = self.run_launcher("build", "//:example")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"service failed", result.stderr)
+        self.assertEqual(result.stdout, b"")
+
+    def test_invalid_worker_identity_stops_bazel(self):
+        helper = self.root / "tools/nativelink/autostart.py"
+        helper.write_text("print('bad-identity')\nprint('36')\n")
+        result = self.run_launcher("build", "//:example")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"invalid host-tools identity", result.stderr)
         self.assertEqual(result.stdout, b"")
 
     def test_corrupt_cached_launcher_fails_actionably(self):

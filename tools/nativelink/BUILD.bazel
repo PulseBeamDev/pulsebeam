@@ -4,7 +4,7 @@ package(default_visibility = ["//visibility:public"])
 
 py_binary(
     name = "server",
-    srcs = ["server.py", "config.py"],
+    srcs = ["server.py", "config.py", "resources.py"],
     main = "server.py",
     imports = ["."],
     data = ["@nativelink//:bin", "@webrtc_host//:tools", "@webrtc_host//:host-bin"],
@@ -16,7 +16,7 @@ py_binary(
 
 py_test(
     name = "autostart_test",
-    srcs = ["test_autostart.py", "autostart.py"],
+    srcs = ["test_autostart.py", "autostart.py", "resources.py"],
     main = "test_autostart.py",
     imports = ["."],
 )
@@ -29,8 +29,15 @@ py_test(
 )
 
 py_test(
+    name = "resources_test",
+    srcs = ["test_resources.py", "resources.py"],
+    main = "test_resources.py",
+    imports = ["."],
+)
+
+py_test(
     name = "config_test",
-    srcs = ["test_config.py", "config.py", "server.py"],
+    srcs = ["test_config.py", "config.py", "server.py", "resources.py"],
     main = "test_config.py",
     imports = ["."],
 )

@@ -9,6 +9,7 @@ import shlex
 import stat
 
 from config import make_config, port, positive
+from resources import machine_budget
 
 
 def sandbox_script(host, work):
@@ -32,8 +33,8 @@ def main():
     parser.add_argument("--binary", required=True)
     parser.add_argument("--host-bin-file", required=True)
     parser.add_argument("--state", type=Path, default=Path.home() / ".cache/pulsebeam/nativelink/v1")
-    parser.add_argument("--cpu", type=positive, default=min(8, os.cpu_count() or 1))
-    parser.add_argument("--memory-kb", type=positive, default=8_388_608)
+    parser.add_argument("--cpu", type=positive)
+    parser.add_argument("--memory-kb", type=positive)
     parser.add_argument("--reapi-port", type=port, default=50051)
     parser.add_argument("--worker-port", type=port, default=50061)
     args = parser.parse_args()
@@ -42,6 +43,13 @@ def main():
     info = state.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         parser.error("state must be an owned private directory (mode 0700), not a symlink")
+    try:
+        if args.cpu is None or args.memory_kb is None:
+            cpu, memory_kb = machine_budget()
+            args.cpu = cpu if args.cpu is None else args.cpu
+            args.memory_kb = memory_kb if args.memory_kb is None else args.memory_kb
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     lock = os.open(state / "server.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -64,7 +72,7 @@ def main():
     config_path = state / "config.json"
     config_path.write_text(json.dumps(config, indent=2))
     os.set_inheritable(lock, True)
-    print(f"NativeLink REAPI grpc://127.0.0.1:{args.reapi_port}, capacity {args.cpu} CPU / {args.memory_kb} KiB", flush=True)
+    print(f"NativeLink REAPI grpc://127.0.0.1:{args.reapi_port}, scheduler capacity {args.cpu} CPU / {args.memory_kb} KiB", flush=True)
     print(f"State: {state}. Stop with Ctrl-C. Trusted local clients only.", flush=True)
     os.execve(os.path.abspath(args.binary), [args.binary, str(config_path)],
               {**os.environ, "PATH": str(host)})
