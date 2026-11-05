@@ -71,7 +71,8 @@ impl Bound {
         };
         Ok(Socket {
             local_addr: self.local_addr,
-            socket: tokio::net::UdpSocket::from_std(self.socket.into())?,
+            socket: tokio::io::unix::AsyncFd::try_new(self.socket)
+                .map_err(|error| error.into_parts().1)?,
             recv_cmsg: cmsg_space!(i32, libc::in_pktinfo, libc::in6_pktinfo),
             send_headers: SendHeaders(MultiHeaders::preallocate(BATCH_SIZE, None)),
             gso_headers: SendHeaders(MultiHeaders::preallocate(
@@ -88,12 +89,67 @@ impl Bound {
 }
 
 pub(crate) struct Socket {
-    socket: tokio::net::UdpSocket,
+    socket: tokio::io::unix::AsyncFd<socket2::Socket>,
     local_addr: SocketAddr,
     caps: Capabilities,
     recv_cmsg: Vec<u8>,
     send_headers: SendHeaders,
     gso_headers: SendHeaders,
+}
+
+pub(crate) struct Detached {
+    socket: socket2::Socket,
+    local_addr: SocketAddr,
+    caps: Capabilities,
+    recv_cmsg: Vec<u8>,
+    send_headers: SendHeaders,
+    gso_headers: SendHeaders,
+}
+
+impl AsFd for Detached {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.as_fd()
+    }
+}
+
+impl Detached {
+    pub(crate) fn activate(self) -> Result<Socket, (Box<Self>, io::Error)> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err((Box::new(self), io::Error::other("no current Tokio runtime")));
+        }
+        let Self {
+            socket,
+            local_addr,
+            caps,
+            recv_cmsg,
+            send_headers,
+            gso_headers,
+        } = self;
+        match tokio::io::unix::AsyncFd::try_new(socket) {
+            Ok(socket) => Ok(Socket {
+                socket,
+                local_addr,
+                caps,
+                recv_cmsg,
+                send_headers,
+                gso_headers,
+            }),
+            Err(error) => {
+                let (socket, error) = error.into_parts();
+                Err((
+                    Box::new(Self {
+                        socket,
+                        local_addr,
+                        caps,
+                        recv_cmsg,
+                        send_headers,
+                        gso_headers,
+                    }),
+                    error,
+                ))
+            }
+        }
+    }
 }
 
 struct SendHeaders(MultiHeaders<SockaddrStorage>);
@@ -115,10 +171,21 @@ impl Socket {
         self.caps
     }
     pub(crate) async fn readable(&self) -> io::Result<()> {
-        self.socket.readable().await
+        self.socket.readable().await.map(|_| ())
     }
     pub(crate) async fn writable(&self) -> io::Result<()> {
-        self.socket.writable().await
+        self.socket.writable().await.map(|_| ())
+    }
+
+    pub(crate) fn detach(self) -> Detached {
+        Detached {
+            socket: self.socket.into_inner(),
+            local_addr: self.local_addr,
+            caps: self.caps,
+            recv_cmsg: self.recv_cmsg,
+            send_headers: self.send_headers,
+            gso_headers: self.gso_headers,
+        }
     }
 
     pub(crate) fn recv(
@@ -130,12 +197,12 @@ impl Socket {
         let cmsg = &mut self.recv_cmsg;
         let local_addr = self.local_addr;
         let caps = self.caps;
-        self.socket.try_io(tokio::io::Interest::READABLE, || {
+        self.socket.try_io(tokio::io::Interest::READABLE, |socket| {
             if caps.max_batch_messages == 1 {
                 let bytes = arena.bytes.get_mut(..arena.slot_size).unwrap_or_default();
                 let mut iovs = [IoSliceMut::new(bytes)];
                 let message = recvmsg(
-                    self.socket.as_raw_fd(),
+                    socket.as_raw_fd(),
                     &mut iovs,
                     Some(&mut *cmsg),
                     MsgFlags::MSG_DONTWAIT,
@@ -165,7 +232,7 @@ impl Socket {
             let mut iovs: [[IoSliceMut<'_>; 1]; BATCH_SIZE] =
                 std::array::from_fn(|_| [IoSliceMut::new(slots.next().unwrap_or_default())]);
             let received = recvmmsg(
-                self.socket.as_raw_fd(),
+                socket.as_raw_fd(),
                 &mut headers,
                 iovs.iter_mut().take(self.caps.max_batch_messages),
                 MsgFlags::MSG_DONTWAIT,
@@ -214,7 +281,7 @@ impl Socket {
                 .and_then(|entry| entry.gso_segment_size)
                 .map(NonZeroU16::get);
             let cmsg = segment.as_ref().map(ControlMessage::UdpGsoSegments);
-            self.socket.try_io(tokio::io::Interest::WRITABLE, || {
+            self.socket.try_io(tokio::io::Interest::WRITABLE, |socket| {
                 // nix retains cmsg storage between calls. Separate ordinary
                 // headers prevent a previous GSO cmsg bleeding into a send.
                 let headers = if segment.is_some() {
@@ -223,7 +290,7 @@ impl Socket {
                     &mut *ordinary_headers
                 };
                 sendmmsg(
-                    self.socket.as_raw_fd(),
+                    socket.as_raw_fd(),
                     &mut headers.0,
                     iovs.get(..group.len()).unwrap_or_default(),
                     addresses.get(..group.len()).unwrap_or_default(),

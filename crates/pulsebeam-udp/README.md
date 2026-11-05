@@ -60,7 +60,12 @@ Offloads are probed; callers must inspect capabilities before building GSO entri
 Explicit `Batch` fails on platforms without batching; `Auto` selects scalar there.
 The portable scalar backend requires a specific local address and separate IPv4
 and IPv6 sockets because it cannot recover wildcard/dual-stack destination metadata.
-Only the pre-activation Linux socket exposes its FD.
+On Linux, `UdpSocket::detach` deregisters the owned socket without closing it.
+`DetachedUdpSocket::activate` registers it on the current Tokio I/O reactor,
+returning the detached socket and error if registration fails. The current runtime
+must have its I/O driver enabled. The same FD, socket options, queued datagrams,
+capabilities, and counters survive the move. Only bound and detached Linux sockets
+expose their FD.
 
 With `sim`, the same concrete API uses virtual time. A simple specifically bound
 Turmoil socket works directly; a host needing reuseport, steering, GSO/GRO, or

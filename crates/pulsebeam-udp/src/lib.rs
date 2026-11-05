@@ -222,6 +222,53 @@ impl std::os::fd::AsFd for BoundUdpSocket {
     }
 }
 
+/// An unregistered Linux socket retaining its descriptor, queued packets and state.
+#[cfg(all(target_os = "linux", not(feature = "sim")))]
+pub struct DetachedUdpSocket {
+    inner: backend::Detached,
+    arena: ReceiveArena,
+    max_datagram_bytes: usize,
+    counters: Counters,
+}
+
+#[cfg(all(target_os = "linux", not(feature = "sim")))]
+impl std::os::fd::AsFd for DetachedUdpSocket {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.inner)
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "sim")))]
+impl DetachedUdpSocket {
+    /// Register on the current Tokio I/O reactor, returning ownership on failure.
+    /// The current runtime must have its I/O driver enabled.
+    pub fn activate(self) -> Result<UdpSocket, (Box<Self>, io::Error)> {
+        let Self {
+            inner,
+            arena,
+            max_datagram_bytes,
+            counters,
+        } = self;
+        match inner.activate() {
+            Ok(inner) => Ok(UdpSocket {
+                inner,
+                arena,
+                max_datagram_bytes,
+                counters,
+            }),
+            Err((inner, error)) => Err((
+                Box::new(Self {
+                    inner: *inner,
+                    arena,
+                    max_datagram_bytes,
+                    counters,
+                }),
+                error,
+            )),
+        }
+    }
+}
+
 pub struct UdpSocket {
     inner: backend::Socket,
     arena: ReceiveArena,
@@ -230,6 +277,17 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
+    /// Deregister without closing or duplicating the underlying Linux socket.
+    #[cfg(all(target_os = "linux", not(feature = "sim")))]
+    pub fn detach(self) -> DetachedUdpSocket {
+        DetachedUdpSocket {
+            inner: self.inner.detach(),
+            arena: self.arena,
+            max_datagram_bytes: self.max_datagram_bytes,
+            counters: self.counters,
+        }
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.local_addr()
     }

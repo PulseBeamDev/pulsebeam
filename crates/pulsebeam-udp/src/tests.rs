@@ -137,6 +137,81 @@ fn production_socket_can_move_with_its_single_owner_between_workers() {
     send_sync::<UdpSocket>();
 }
 
+#[cfg(all(target_os = "linux", not(feature = "sim")))]
+#[test]
+fn detached_socket_moves_between_reactors_and_recovers_failed_registration() {
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::time::Duration;
+
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let first = runtime();
+    let (detached, address, caps) = first.block_on(async {
+        let mut options = BindOptions::new("127.0.0.1:0".parse().unwrap());
+        options.reuse_port = true;
+        let socket = bind(options).await.unwrap().activate().unwrap();
+        let address = socket.local_addr();
+        let caps = socket.capabilities();
+        (socket.detach(), address, caps)
+    });
+    let fd = detached.as_fd().as_raw_fd();
+    drop(first);
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    sender.send_to(b"queued", address).unwrap();
+
+    let failed_runtime = runtime();
+    let handle = failed_runtime.handle().clone();
+    drop(failed_runtime);
+    let detached = {
+        let _guard = handle.enter();
+        match detached.activate() {
+            Ok(_) => panic!("registration on a stopped reactor succeeded"),
+            Err((detached, _)) => detached,
+        }
+    };
+    assert_eq!(detached.as_fd().as_raw_fd(), fd);
+    assert!(
+        nix::sys::socket::getsockopt(&*detached, nix::sys::socket::sockopt::ReusePort).unwrap()
+    );
+
+    let second = runtime();
+    second.block_on(async {
+        let mut socket = match detached.activate() {
+            Ok(socket) => socket,
+            Err((_, error)) => panic!("reactivation failed: {error}"),
+        };
+        assert_eq!(socket.local_addr(), address);
+        assert_eq!(socket.capabilities(), caps);
+        tokio::time::timeout(Duration::from_secs(2), socket.readable())
+            .await
+            .unwrap()
+            .unwrap();
+        let batch = socket.try_recv_batch().unwrap();
+        let packet = batch.iter().next().unwrap();
+        assert_eq!(packet.payload, b"queued");
+        assert_eq!(packet.source, sender.local_addr().unwrap());
+        assert_eq!(packet.destination, address);
+        assert!(packet.received_at.wall <= SystemTime::now());
+        assert_eq!(
+            socket.try_recv_batch().err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        sender.send_to(b"rearmed", address).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), socket.readable())
+            .await
+            .unwrap()
+            .unwrap();
+        let batch = socket.try_recv_batch().unwrap();
+        assert_eq!(batch.iter().next().unwrap().payload, b"rearmed");
+        let detached = socket.detach();
+        assert_eq!(detached.as_fd().as_raw_fd(), fd);
+    });
+}
+
 #[cfg(not(feature = "sim"))]
 #[tokio::test]
 async fn native_modes_receive_limits_mixed_destinations_and_reuse() {
