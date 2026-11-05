@@ -37,8 +37,12 @@ test("production attachment reports controlled geometry and visibility to core",
   let demand = [];
   let nextOwner = 1n;
   const observations = new Map();
+  const pending = new Map();
   const owners = new ResourceOwners(() => {});
   owners.activate({
+    async observe_media(owner) {
+      return new Promise((_resolve, reject) => pending.set(owner, reject));
+    },
     async resource(command) {
       if (command.op === "claimVideo") return { owner: nextOwner++ };
       if (command.op === "observeVideo") {
@@ -47,6 +51,10 @@ test("production attachment reports controlled geometry and visibility to core",
         return { type: "updated" };
       }
       if (command.op === "release") {
+        pending.get(command.owner)?.(
+          Object.assign(new Error("closed"), { pulsebeamCode: "closed" }),
+        );
+        pending.delete(command.owner);
         observations.delete(command.owner);
         demand = [...observations.values()].filter(({ visible }) => visible);
         return { type: "released" };
@@ -58,11 +66,12 @@ test("production attachment reports controlled geometry and visibility to core",
   const catalog = new RemoteCatalog(agent, new DataRegistry(agent), owners);
   catalog.update(snapshot);
   const handle = catalog.participant("alice").video("camera");
-  handle.setReceiveOptions({ minHeight: 720 });
   const parent = new Video();
   const small = new Video();
   small.parentElement = parent;
-  const first = attachRemoteVideo(handle, small);
+  const first = attachRemoteVideo(handle, small, undefined, {
+    preferences: { minHeight: 720 },
+  });
   await first.ready;
   assert.equal(demand[0].height, 240);
   const large = new Video();
@@ -71,8 +80,7 @@ test("production attachment reports controlled geometry and visibility to core",
   await second.ready;
   assert.equal(demand.length, 2);
   assert.equal(demand[1].height, 460);
-  second.close();
-  await Promise.resolve();
+  await second.close();
   assert.equal(demand[0].height, 240);
   small.rect.height = 200;
   Resize.notify();
@@ -113,7 +121,12 @@ test("production attachment reports controlled geometry and visibility to core",
   for (const query of [...queries]) query.dispatchEvent(new Event("change"));
   assert.equal(demand[0].height, 600);
   assert.equal(demand[0].minHeight, 720);
-  first.close();
+  await first.close();
+  assert.equal(
+    pending.size,
+    0,
+    "teardown cancels pending physical observation",
+  );
   assert.deepEqual(demand, []);
   assert.equal(small.srcObject, null);
   Resize.notify();
@@ -122,5 +135,6 @@ test("production attachment reports controlled geometry and visibility to core",
   viewport.dispatchEvent(new Event("resize"));
   assert.deepEqual(demand, [], "teardown cannot resurrect measured demand");
   catalog.close();
+  assert.throws(() => attachRemoteVideo(handle, small), { code: "closed" });
   viewport.devicePixelRatio = 2;
 });

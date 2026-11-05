@@ -33,11 +33,18 @@ use crate::sender_config::{
     EncodingConfig, SenderConfig, media_kind_name, normalize_sender_config,
 };
 
+mod media_observation;
 mod preparation;
 mod resources;
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
 const LOG_TARGET: &str = "pulsebeam_agent_web::browser";
+
+fn same_js_object<T: AsRef<JsValue>>(left: &T, right: &T) -> bool {
+    let left: &JsValue = left.as_ref();
+    let right: &JsValue = right.as_ref();
+    left == right
+}
 
 fn input_is_live(track: &MediaStreamTrack) -> bool {
     Reflect::get(track.as_ref(), &JsValue::from_str("readyState"))
@@ -94,7 +101,7 @@ struct DesiredConfig {
     #[serde(default)]
     video: Vec<VideoSubscriptionConfig>,
     #[serde(default)]
-    audio: AudioSubscriptionConfig,
+    audio: AudioDemandConfig,
     #[serde(default)]
     topics: Vec<TopicRegistrationConfig>,
 }
@@ -114,14 +121,14 @@ struct VideoSubscriptionConfig {
     playout_delay: PlayoutDelayConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AudioSubscriptionConfig {
+struct AudioDemandConfig {
     #[serde(default)]
     pinned: Vec<String>,
     #[serde(default)]
     selected: Vec<TrackSelectorConfig>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     automatic: bool,
     #[serde(default)]
     playout_delays: Vec<AudioTrackDelayConfig>,
@@ -157,18 +164,6 @@ struct SelectorDelayConfig {
 struct AudioTrackDelayConfig {
     track_id: String,
     playout_delay: PlayoutDelayConfig,
-}
-
-impl Default for AudioSubscriptionConfig {
-    fn default() -> Self {
-        Self {
-            pinned: Vec::new(),
-            selected: Vec::new(),
-            automatic: true,
-            playout_delays: Vec::new(),
-            selector_delays: Vec::new(),
-        }
-    }
 }
 
 #[derive(Default, Deserialize)]
@@ -280,23 +275,7 @@ impl DesiredConfig {
                     playout_delay: video.playout_delay.into(),
                 })
                 .collect(),
-            audio: AudioSubscription {
-                pinned: self.audio.pinned,
-                selected: self.audio.selected.into_iter().map(Into::into).collect(),
-                automatic: self.audio.automatic,
-                playout_delays: self
-                    .audio
-                    .playout_delays
-                    .into_iter()
-                    .map(|entry| (entry.track_id, entry.playout_delay.into()))
-                    .collect(),
-                selector_delays: self
-                    .audio
-                    .selector_delays
-                    .into_iter()
-                    .map(|entry| (entry.selector.into(), entry.playout_delay.into()))
-                    .collect(),
-            },
+            audio: self.audio.into(),
             topics: topic_registrations(&self.topics),
         }
     }
@@ -311,8 +290,24 @@ impl From<PlayoutDelayConfig> for PlayoutDelay {
     }
 }
 
-fn default_true() -> bool {
-    true
+impl From<AudioDemandConfig> for AudioSubscription {
+    fn from(value: AudioDemandConfig) -> Self {
+        Self {
+            pinned: value.pinned,
+            selected: value.selected.into_iter().map(Into::into).collect(),
+            automatic: value.automatic,
+            playout_delays: value
+                .playout_delays
+                .into_iter()
+                .map(|entry| (entry.track_id, entry.playout_delay.into()))
+                .collect(),
+            selector_delays: value
+                .selector_delays
+                .into_iter()
+                .map(|entry| (entry.selector.into(), entry.playout_delay.into()))
+                .collect(),
+        }
+    }
 }
 
 fn prepared_data_channel(
@@ -413,7 +408,9 @@ struct RemoteTrackState {
 
 impl RemoteTrackState {
     fn close(self) {
-        self.track.set_onended(None);
+        let _ = self
+            .track
+            .remove_event_listener_with_callback("ended", self._ended.as_ref().unchecked_ref());
     }
 }
 
@@ -528,6 +525,7 @@ struct RuntimeInner {
     local_operation_gates: RefCell<BTreeMap<String, Weak<LocalSlotOperations>>>,
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
     publication_slots: RefCell<BTreeMap<u64, PublicationSlot>>,
+    observations: RefCell<media_observation::Observations>,
     peers: RefCell<BTreeMap<u64, Peer>>,
     requests: RefCell<BTreeMap<u64, AbortController>>,
     timers: RefCell<BTreeMap<u64, TimerHandle>>,
@@ -562,6 +560,7 @@ impl BrowserRuntime {
             local_operation_gates: RefCell::new(BTreeMap::new()),
             local_tracks: RefCell::new(BTreeMap::new()),
             publication_slots: RefCell::new(BTreeMap::new()),
+            observations: RefCell::new(media_observation::Observations::default()),
             peers: RefCell::new(BTreeMap::new()),
             requests: RefCell::new(BTreeMap::new()),
             timers: RefCell::new(BTreeMap::new()),
@@ -643,6 +642,16 @@ impl BrowserRuntime {
                 .ensure_open()?;
             result.map(resources::result).map_err(resources::error)
         }))
+    }
+
+    #[wasm_bindgen(unchecked_return_type = "Promise<BrowserMediaObservation>")]
+    pub fn observe_media(
+        &self,
+        owner: u64,
+        source: Option<String>,
+    ) -> Result<js_sys::Promise, JsValue> {
+        self.inner.ensure_open()?;
+        Ok(self.inner.begin_observation(owner, source))
     }
 
     pub fn renew_authorization(&self, token: String) -> Result<(), JsValue> {
@@ -906,6 +915,7 @@ impl RuntimeInner {
 
     fn request_close(&self) {
         self.closing.set(true);
+        self.close_observations();
         self.stop_local_sources();
         let actor = self.actor.borrow();
         let Some(actor) = actor.as_ref() else {
@@ -918,6 +928,7 @@ impl RuntimeInner {
 
     fn request_abort(&self) {
         self.closing.set(true);
+        self.close_observations();
         self.stop_local_sources();
         let actor = self.actor.borrow();
         let Some(actor) = actor.as_ref() else {
@@ -1323,20 +1334,7 @@ impl RuntimeInner {
             Effect::PublicationInput(control) => {
                 BrowserHost::new(self).publication_input_state(&control.state());
             }
-            Effect::MediaObservation(control) => {
-                // Browser presentation does not expose the native observation port.
-                if control.target.is_some() {
-                    let inner = Rc::clone(self);
-                    spawn_local(async move {
-                        let _ = inner
-                            .input_resource(agent_core::ResourceCommand::CompleteMediaObservation {
-                                control,
-                                succeeded: false,
-                            })
-                            .await;
-                    });
-                }
-            }
+            Effect::MediaObservation(control) => self.observation_control(control),
         }
     }
 
@@ -1445,9 +1443,11 @@ impl RuntimeInner {
                 self.cancel_media(generation, operation);
             }
             RtcEffect::Close { generation } => {
-                if let Some(peer) = self.peers.borrow_mut().remove(&generation.get()) {
+                let peer = self.peers.borrow_mut().remove(&generation.get());
+                if let Some(peer) = peer {
                     peer.close();
                 }
+                self.retire_observation_tracks();
                 self.send_event(HostEvent::Rtc(RtcEvent::Closed { generation }));
             }
         }
@@ -1469,6 +1469,7 @@ impl RuntimeInner {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
+            inner.retire_observation_tracks();
             match state_connection.connection_state() {
                 RtcPeerConnectionState::Connected => {
                     inner.send_event(HostEvent::Rtc(RtcEvent::Connected { generation }));
@@ -1510,30 +1511,46 @@ impl RuntimeInner {
                     .get_mut(&generation.get())
                     .and_then(|peer| {
                         let current = peer.remote_tracks.get(&ended_mid)?;
-                        if !Object::is(current.track.as_ref(), ended_track.as_ref()) {
+                        if !same_js_object(&current.track, &ended_track) {
                             return None;
                         }
                         peer.remote_tracks.remove(&ended_mid)
                     });
-                if removed.is_some() {
+                if let Some(removed) = removed {
+                    removed.close();
+                    inner.retire_observation_tracks();
                     inner.publish_current_snapshot();
                 }
             }) as Box<dyn FnMut(Event)>);
-            remote_track.set_onended(Some(ended.as_ref().unchecked_ref()));
+            if let Err(error) = remote_track
+                .add_event_listener_with_callback("ended", ended.as_ref().unchecked_ref())
+            {
+                inner.rtc_failed(
+                    generation,
+                    format!("could not observe remote track end: {}", js_message(error)),
+                );
+                return;
+            }
             let state = RemoteTrackState {
                 track: remote_track,
                 _ended: ended,
             };
-            let replaced = inner
-                .peers
-                .borrow_mut()
-                .get_mut(&generation.get())
-                .map(|peer| peer.remote_tracks.insert(mid, state));
-            let inserted = replaced.is_some();
-            if let Some(previous) = replaced.flatten() {
+            let (inserted, previous, orphan) = {
+                let mut peers = inner.peers.borrow_mut();
+                if let Some(peer) = peers.get_mut(&generation.get()) {
+                    (true, peer.remote_tracks.insert(mid, state), None)
+                } else {
+                    (false, None, Some(state))
+                }
+            };
+            if let Some(previous) = previous {
                 previous.close();
             }
+            if let Some(orphan) = orphan {
+                orphan.close();
+            }
             if inserted {
+                inner.retire_observation_tracks();
                 inner.publish_current_snapshot();
             }
         }) as Box<dyn FnMut(RtcTrackEvent)>);
@@ -1787,7 +1804,7 @@ impl RuntimeInner {
     }
 
     fn offer_resources(
-        &self,
+        self: &Rc<Self>,
         generation: Generation,
         offer: &str,
     ) -> Result<OfferResources, String> {
@@ -1832,11 +1849,14 @@ impl RuntimeInner {
                 channel: channel_id,
             });
         }
-        Ok(OfferResources {
+        let resources = OfferResources {
             slots,
             signaling_channel,
             data_channels,
-        })
+        };
+        drop(peers);
+        self.retire_observation_tracks();
+        Ok(resources)
     }
 
     fn initialize_sdp(
@@ -2136,6 +2156,7 @@ impl RuntimeInner {
         if self.closed.replace(true) {
             return;
         }
+        self.close_observations();
         self.stop_local_sources();
         for (_, peer) in std::mem::take(&mut *self.peers.borrow_mut()) {
             peer.close();

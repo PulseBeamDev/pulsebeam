@@ -1,62 +1,65 @@
 export { createAgent } from "./agent.js";
-export { track } from "./track.js";
 export type {
-  TrackSpec,
-  VideoTrackSpec,
-  AudioTrackSpec,
-  DataTrackSpec,
-  Delivery,
-} from "./track.js";
+  SnapshotStream,
+  SnapshotUpdate,
+  EventStream,
+  EventUpdate,
+} from "./observation.js";
+export type { Delivery } from "./track.js";
 export { DataError } from "./data.js";
 export type {
   LocalDataTrack,
   RemoteDataTrack,
+  DataReceiver,
+  DataUpdate,
   DataEvent,
   DataMessage,
   DataGap,
-  DataEventsOptions,
 } from "./data.js";
-export { attachLocalTrack } from "./media.js";
+export type { AudioPublication, VideoPublication } from "./media.js";
+export { AudioSource, VideoSource } from "./capture-source.js";
+export { attachRemoteVideo, attachRemoteAudio } from "./remote-catalog.js";
 export type {
-  LocalMediaAttachment,
-  LocalMediaAttachmentOptions,
-} from "./media.js";
-export { createCaptureSource } from "./capture-source.js";
-export type {
-  CapturedAudioTrack,
-  CapturedTrack,
-  CapturedVideoTrack,
-} from "./capture-source.js";
-export { attachRemoteAudio, attachRemoteVideo } from "./remote-catalog.js";
-export { ResourceError, ResourceOwnershipError } from "./resources.js";
-export type {
+  RemoteVideoAttachment,
   RemoteAudioAttachment,
   RemoteAudioAttachmentOptions,
-  RemoteVideoAttachment,
 } from "./remote-catalog.js";
+export type {
+  AudioSelection,
+  AudioSubscription,
+  MediaObservation,
+  VideoSubscription,
+} from "./reception.js";
+export { ResourceError, ResourceOwnershipError } from "./resources.js";
 export type {
   Agent,
   AgentConfig,
   AgentError,
+  AgentEvent,
   AgentLogging,
   AgentSnapshot,
+  AudioDemand,
   AudioSenderConfig,
+  AudioSubscriptionConfig,
   CatalogSnapshot,
   CatalogTrack,
   ConnectionState,
   FailureClass,
+  FixedPlayoutDelay,
   LogLevel,
   LocalAudioTrack,
   LocalVideoTrack,
   MediaKind,
   PlaybackFailure,
+  PlayoutDelay,
+  PublicationConfig,
   ReceiveOptions,
   RemoteAudioTrack,
-  RemoteMedia,
   RemoteParticipant,
   RemotePublishedTrack,
   RemoteVideoTrack,
   SenderConfig,
   SenderEncoding,
+  VideoObservation,
   VideoSenderConfig,
 } from "./types.js";

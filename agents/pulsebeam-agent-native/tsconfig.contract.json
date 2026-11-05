@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "skipLibCheck": true,
+    "rootDir": ".",
+    "outDir": "contract-javascript"
+  },
+  "include": [
+    "tests/generated_contract.ts"
+  ]
+}

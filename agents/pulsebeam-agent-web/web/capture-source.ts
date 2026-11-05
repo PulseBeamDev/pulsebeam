@@ -1,44 +1,101 @@
-const nativeTracks = new WeakMap<object, MediaStreamTrack>();
+import { ResourceError } from "./resources.js";
 
-declare const captureSourceBrand: unique symbol;
+type Source = VideoSource | AudioSource;
+interface SourceState {
+  readonly track: MediaStreamTrack;
+  readonly listeners: Set<() => void>;
+  readonly ended: () => void;
+  closed: boolean;
+}
+const sources = new WeakMap<Source, SourceState>();
 
-export interface CapturedVideoTrack {
-  readonly kind: "video";
-  readonly [captureSourceBrand]: true;
+function initialize(source: Source, track: MediaStreamTrack): void {
+  if (track.kind !== source.kind)
+    throw new TypeError("source track kind mismatch");
+  if (track.readyState !== "live")
+    throw new ResourceError("closed", "source track is ended");
+  const state: SourceState = {
+    track,
+    listeners: new Set(),
+    ended: () => retire(state),
+    closed: false,
+  };
+  sources.set(source, state);
+  track.addEventListener("ended", state.ended, { once: true });
 }
 
-export interface CapturedAudioTrack {
-  readonly kind: "audio";
-  readonly [captureSourceBrand]: true;
+function stateOf(source: Source): SourceState {
+  const state = sources.get(source);
+  if (!state) throw new TypeError("invalid media source");
+  return state;
+}
+function retire(state: SourceState): void {
+  if (state.closed) return;
+  state.closed = true;
+  state.track.removeEventListener("ended", state.ended);
+  const listeners = [...state.listeners];
+  state.listeners.clear();
+  for (const listener of listeners) listener();
+}
+function closed(source: Source): boolean {
+  const state = stateOf(source);
+  return state.closed || state.track.readyState !== "live";
+}
+async function close(source: Source): Promise<void> {
+  const state = stateOf(source);
+  if (state.closed) return;
+  state.track.stop();
+  retire(state);
 }
 
-export type CapturedTrack = CapturedVideoTrack | CapturedAudioTrack;
-
-export function createCaptureSource(
-  track: MediaStreamTrack,
-  kind: "video",
-): CapturedVideoTrack;
-export function createCaptureSource(
-  track: MediaStreamTrack,
-  kind: "audio",
-): CapturedAudioTrack;
-export function createCaptureSource(
-  track: MediaStreamTrack,
-  kind: "video" | "audio",
-): CapturedTrack {
-  if (track.kind !== kind) throw new TypeError("capture track kind mismatch");
-  const source = Object.freeze({ kind });
-  nativeTracks.set(source, track);
-  return source as CapturedTrack;
+export class VideoSource {
+  readonly kind = "video";
+  private constructor(track: MediaStreamTrack) {
+    initialize(this, track);
+  }
+  static fromTrack(track: MediaStreamTrack): VideoSource {
+    return new VideoSource(track);
+  }
+  isClosed(): boolean {
+    return closed(this);
+  }
+  close(): Promise<void> {
+    return close(this);
+  }
 }
 
-export function nativeCaptureTrack(
-  source: CapturedTrack,
+export class AudioSource {
+  readonly kind = "audio";
+  private constructor(track: MediaStreamTrack) {
+    initialize(this, track);
+  }
+  static fromTrack(track: MediaStreamTrack): AudioSource {
+    return new AudioSource(track);
+  }
+  isClosed(): boolean {
+    return closed(this);
+  }
+  close(): Promise<void> {
+    return close(this);
+  }
+}
+
+export function nativeSourceTrack(
+  source: Source,
   kind: "video" | "audio",
 ): MediaStreamTrack {
-  const track = nativeTracks.get(source);
-  if (!track || source.kind !== kind || track.kind !== kind) {
-    throw new TypeError("invalid capture source");
+  const state = stateOf(source);
+  if (source.kind !== kind || state.track.kind !== kind)
+    throw new TypeError("source track kind mismatch");
+  return state.track;
+}
+
+export function watchSource(source: Source, listener: () => void): () => void {
+  const state = stateOf(source);
+  if (closed(source)) {
+    listener();
+    return () => {};
   }
-  return track;
+  state.listeners.add(listener);
+  return () => state.listeners.delete(listener);
 }

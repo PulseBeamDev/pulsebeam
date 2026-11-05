@@ -28,6 +28,8 @@ export class BrowserRuntime {
   }[] = [];
   ownedMuted = new Map<bigint, boolean>();
   audioOwner?: bigint;
+  audioSelections = new Map<bigint, any>();
+  observationWaiters = new Map<bigint, Set<(error: unknown) => void>>();
   dataOwners = new Map<
     bigint,
     { spec: { label: string; delivery: string }; events: any[] }
@@ -103,6 +105,17 @@ export class BrowserRuntime {
     }
     if (command.op === "readData")
       return this.dataOwners.get(command.owner)?.events.shift() ?? null;
+    if (command.op === "claimAudioPolicy") {
+      const owner = this.nextOwner++;
+      this.audioSelections.set(owner, command.policy);
+      return { owner };
+    }
+    if (command.op === "configureAudioPolicy") {
+      if (!this.audioSelections.has(command.owner))
+        throw new Error("released selection owner");
+      this.audioSelections.set(command.owner, command.policy);
+      return { type: "updated" };
+    }
     if (command.op === "claimAudio") {
       if (this.audioOwner !== undefined) {
         const error = new Error("audio already has an owner") as Error & {
@@ -117,16 +130,42 @@ export class BrowserRuntime {
     }
     if (command.op === "release") {
       this.videoOwners.delete(command.owner);
+      this.retireObservations(command.owner);
       const publication = this.publicationOwners.get(command.owner);
       if (publication) this.claimedPublications.delete(publication.key);
       this.publicationOwners.delete(command.owner);
       this.dataOwners.delete(command.owner);
+      this.audioSelections.delete(command.owner);
       if (this.audioOwner === command.owner) this.audioOwner = undefined;
       this.recomputeVideo();
       return { type: "released" };
     }
     if (command.op === "updatePublication") return { type: "updated" };
     throw new Error(`unsupported resource command ${command.op}`);
+  }
+  // This component boundary has no physical receiver or decoded DOM media.
+  async observe_media(owner: bigint): Promise<any> {
+    if (this.closed || !this.videoOwners.has(owner))
+      throw Object.assign(new Error("observation owner closed"), {
+        pulsebeamCode: "closed",
+      });
+    return new Promise((_resolve, reject) => {
+      const waiters = this.observationWaiters.get(owner) ?? new Set();
+      waiters.add(reject);
+      this.observationWaiters.set(owner, waiters);
+    });
+  }
+  retireObservations(owner?: bigint) {
+    for (const [token, waiters] of this.observationWaiters) {
+      if (owner !== undefined && token !== owner) continue;
+      this.observationWaiters.delete(token);
+      for (const reject of waiters)
+        reject(
+          Object.assign(new Error("observation owner closed"), {
+            pulsebeamCode: "closed",
+          }),
+        );
+    }
   }
   recomputeVideo() {
     if (!this.desired) return;
@@ -156,7 +195,7 @@ export class BrowserRuntime {
       }
       occupied.add(slot);
       const delays = views.flatMap((view) =>
-        view.playoutDelay ? [view.playoutDelay] : [],
+        view.playoutDelay?.mode === "fixed" ? [view.playoutDelay] : [],
       );
       video.push({
         slot,
@@ -228,8 +267,10 @@ export class BrowserRuntime {
   }
   close() {
     this.closed = true;
+    this.retireObservations();
   }
   abort() {
     this.closed = true;
+    this.retireObservations();
   }
 }

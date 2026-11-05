@@ -6,7 +6,9 @@ use js_sys::{Array, BigInt, Object};
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
 
-use super::{PlayoutDelayConfig, TopicModeConfig, TrackSelectorConfig, js_error, set};
+use super::{
+    AudioDemandConfig, PlayoutDelayConfig, TopicModeConfig, TrackSelectorConfig, js_error, set,
+};
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
@@ -83,6 +85,20 @@ enum CommandConfig {
         observation: ObservationConfig,
     },
     ClaimAudio,
+    ClaimAudioSubscription {
+        selector: TrackSelectorConfig,
+    },
+    ConfigureAudio {
+        owner: u64,
+        playout_delay: PlayoutDelayConfig,
+    },
+    ClaimAudioPolicy {
+        policy: AudioDemandConfig,
+    },
+    ConfigureAudioPolicy {
+        owner: u64,
+        policy: AudioDemandConfig,
+    },
     RetainProducer {
         spec: SpecConfig,
     },
@@ -122,6 +138,27 @@ pub(super) fn command(value: JsValue) -> Result<ResourceCommand, JsValue> {
             observation: observation.into(),
         },
         CommandConfig::ClaimAudio => ResourceCommand::ClaimAudio,
+        CommandConfig::ClaimAudioSubscription { selector } => {
+            ResourceCommand::ClaimAudioSubscription {
+                selector: selector.into(),
+            }
+        }
+        CommandConfig::ConfigureAudio {
+            owner,
+            playout_delay,
+        } => ResourceCommand::ConfigureAudio {
+            owner,
+            playout_delay: playout_delay.into(),
+        },
+        CommandConfig::ClaimAudioPolicy { policy } => ResourceCommand::ClaimAudioPolicy {
+            policy: policy.into(),
+        },
+        CommandConfig::ConfigureAudioPolicy { owner, policy } => {
+            ResourceCommand::ConfigureAudioPolicy {
+                owner,
+                policy: policy.into(),
+            }
+        }
         CommandConfig::RetainProducer { spec } => {
             ResourceCommand::RetainProducer { spec: spec.into() }
         }
@@ -257,7 +294,7 @@ pub(super) fn send_error(error: crate::engine::DataSendError) -> JsValue {
     coded_error(code, &message)
 }
 
-fn coded_error(code: &str, message: &str) -> JsValue {
+pub(super) fn coded_error(code: &str, message: &str) -> JsValue {
     let value = js_sys::Error::new(message);
     set(value.as_ref(), "pulsebeamCode", code);
     value.into()

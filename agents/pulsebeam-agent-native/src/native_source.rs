@@ -1,5 +1,9 @@
 //! Session-owned sources shared by the production and managed RTC actors.
 use pulsebeam_webrtc_sys as rtc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::native_media::{
     AudioInput, Encoding, H264Frame, InputFrame, VideoInput, VideoSourceConfig,
@@ -11,13 +15,20 @@ pub(crate) enum SourceKind {
     Video(VideoInput),
 }
 
-pub(crate) struct NativeSource {
+#[derive(Clone)]
+pub(crate) struct NativeProducer {
     pub id: rtc::SessionSourceId,
-    pub sender: rtc::SessionSenderId,
-    pub transceiver: rtc::SessionTransceiverId,
     pub kind: SourceKind,
     pub encodings: Vec<Encoding>,
+    closed: Arc<AtomicBool>,
+}
+
+pub(crate) struct NativeSource {
+    pub producer: NativeProducer,
+    pub sender: rtc::SessionSenderId,
+    pub transceiver: rtc::SessionTransceiverId,
     pub active: bool,
+    owns_producer: bool,
 }
 
 fn invalid(message: impl Into<String>) -> rtc::PeerError {
@@ -105,7 +116,8 @@ impl NativeSource {
             SourceKind::Audio(_) => Vec::new(),
             SourceKind::Video(_) => encoding_values(video)?,
         };
-        let id = Self::allocate(session, kind, &video.encodings)?;
+        let producer = NativeProducer::create(session, kind, video)?;
+        let id = producer.id;
         let mut init = rtc::RtpTransceiverInit::default();
         init.set_direction(rtc::RtpTransceiverDirectionValue::SendOnly);
         init.set_send_encodings(&encodings);
@@ -144,12 +156,11 @@ impl NativeSource {
                 .set_rtp_codec_preferences(transceiver, &codecs)
                 .map_err(native)?;
             Ok(Self {
-                id,
+                producer,
                 sender,
                 transceiver,
-                kind,
-                encodings: video.encodings.clone(),
                 active: true,
+                owns_producer: true,
             })
         })();
         if initialized.is_err() {
@@ -157,6 +168,36 @@ impl NativeSource {
             let _ = session.close_source(id);
         }
         initialized
+    }
+}
+
+impl NativeProducer {
+    pub fn create<R: rtc::SessionRuntime>(
+        session: &mut rtc::Session<R>,
+        kind: SourceKind,
+        video: &VideoSourceConfig,
+    ) -> Result<Self, rtc::PeerError> {
+        Self::validate(kind, video)?;
+        Ok(Self {
+            id: Self::allocate(session, kind, &video.encodings)?,
+            kind,
+            encodings: video.encodings.clone(),
+            closed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn validate(kind: SourceKind, video: &VideoSourceConfig) -> Result<(), rtc::PeerError> {
+        if matches!(kind, SourceKind::Video(_)) {
+            encoding_values(video)?;
+        }
+        if kind == SourceKind::Video(VideoInput::EncodedH264)
+            && !matches!(video.encodings.len(), 1 | 3)
+        {
+            return Err(invalid(
+                "native encoded H264 currently admits one or three encodings",
+            ));
+        }
+        Ok(())
     }
 
     fn allocate<R: rtc::SessionRuntime>(
@@ -188,32 +229,92 @@ impl NativeSource {
             }
         }
     }
+}
 
-    /// Replace only the producer. Native sender/transceiver identity is stable.
+impl NativeSource {
+    /// Replace the binding-owned bootstrap producer, retaining the sender.
     pub fn replace<R: rtc::SessionRuntime>(
         &mut self,
         session: &mut rtc::Session<R>,
         track_id: &str,
     ) -> Result<(), rtc::PeerError> {
-        let id = Self::allocate(session, self.kind, &self.encodings)?;
-        let replaced = match self.kind {
-            SourceKind::Audio(_) => session.replace_audio_source(self.sender, Some(id), track_id),
-            SourceKind::Video(_) => session.replace_video_source(self.sender, Some(id), track_id),
+        let producer = NativeProducer::create(
+            session,
+            self.producer.kind,
+            &VideoSourceConfig {
+                encodings: self.producer.encodings.clone(),
+                ..VideoSourceConfig::default()
+            },
+        )?;
+        self.attach(session, producer, track_id, true)
+    }
+
+    pub fn borrow<R: rtc::SessionRuntime>(
+        &mut self,
+        session: &mut rtc::Session<R>,
+        producer: &NativeProducer,
+        track_id: &str,
+    ) -> Result<(), rtc::PeerError> {
+        producer.ensure_open()?;
+        if self.producer.kind != producer.kind || self.producer.encodings != producer.encodings {
+            return Err(invalid(
+                "producer profile differs from the publication binding",
+            ));
+        }
+        self.attach(session, producer.clone(), track_id, false)
+    }
+
+    fn attach<R: rtc::SessionRuntime>(
+        &mut self,
+        session: &mut rtc::Session<R>,
+        producer: NativeProducer,
+        track_id: &str,
+        owns_producer: bool,
+    ) -> Result<(), rtc::PeerError> {
+        let replaced = match producer.kind {
+            SourceKind::Audio(_) => {
+                session.replace_audio_source(self.sender, Some(producer.id), track_id)
+            }
+            SourceKind::Video(_) => {
+                session.replace_video_source(self.sender, Some(producer.id), track_id)
+            }
         };
         if let Err(error) = replaced {
-            tracing::warn!(
-                ?error,
-                kind = ?self.kind,
-                transceiver = ?self.transceiver,
-                stopped = ?session.transceiver_stopped(self.transceiver),
-                "native source replacement rejected"
-            );
-            session.close_source(id)?;
+            if owns_producer {
+                let _ = producer.close(session);
+            }
             return Err(error);
         }
-        let old = std::mem::replace(&mut self.id, id);
+        let old = std::mem::replace(&mut self.producer, producer);
+        let close_old = self.owns_producer && self.active;
         self.active = true;
-        session.close_source(old)
+        self.owns_producer = owns_producer;
+        if close_old && let Err(error) = old.close(session) {
+            let _ = self.close(session);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn push<R: rtc::SessionRuntime>(
+        &self,
+        session: &mut rtc::Session<R>,
+        frame: InputFrame,
+    ) -> Result<(), rtc::PeerError> {
+        if !self.active {
+            return Err(rtc::PeerError {
+                kind: rtc::PeerErrorKind::Closed,
+                message: "publication binding is detached".into(),
+            });
+        }
+        self.producer.push(session, frame)
+    }
+
+    pub fn feedback<R: rtc::SessionRuntime>(
+        &self,
+        session: &mut rtc::Session<R>,
+    ) -> Result<crate::ProducerFeedback, rtc::PeerError> {
+        self.producer.feedback(session)
     }
 
     pub fn set_enabled<R: rtc::SessionRuntime>(
@@ -288,11 +389,14 @@ impl NativeSource {
         }
         self.encoding_state(session)
     }
+}
 
+impl NativeProducer {
     pub fn feedback<R: rtc::SessionRuntime>(
         &self,
         session: &mut rtc::Session<R>,
     ) -> Result<crate::ProducerFeedback, rtc::PeerError> {
+        self.ensure_open()?;
         if self.kind != SourceKind::Video(VideoInput::EncodedH264) {
             return Err(rtc::PeerError {
                 kind: rtc::PeerErrorKind::UnsupportedOperation,
@@ -338,6 +442,7 @@ impl NativeSource {
         session: &mut rtc::Session<R>,
         frame: InputFrame,
     ) -> Result<(), rtc::PeerError> {
+        self.ensure_open()?;
         match (self.kind, frame) {
             (SourceKind::Audio(AudioInput::Pcm), InputFrame::Pcm { frame }) => {
                 let channels = u8::try_from(frame.channels)
@@ -423,19 +528,65 @@ impl NativeSource {
     }
 
     pub fn close<R: rtc::SessionRuntime>(
+        &self,
+        session: &mut rtc::Session<R>,
+    ) -> Result<(), rtc::PeerError> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        session.close_source(self.id)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn ensure_open(&self) -> Result<(), rtc::PeerError> {
+        if self.is_closed() {
+            return Err(rtc::PeerError {
+                kind: rtc::PeerErrorKind::Closed,
+                message: "native producer has been retired".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl NativeSource {
+    pub fn close<R: rtc::SessionRuntime>(
         &mut self,
         session: &mut rtc::Session<R>,
     ) -> Result<(), rtc::PeerError> {
-        if session.transceiver_stopped(self.transceiver)? {
-            session.close_source(self.id)?;
-            self.active = false;
+        if !self.active {
             return Ok(());
         }
-        let detached = match self.kind {
-            SourceKind::Audio(_) => session.replace_audio_source(self.sender, None, ""),
-            SourceKind::Video(_) => session.replace_video_source(self.sender, None, ""),
+        let detached = if session.transceiver_stopped(self.transceiver)?
+            || session.transceiver_stopping(self.transceiver)?
+        {
+            Ok(())
+        } else {
+            match self.producer.kind {
+                SourceKind::Audio(_) => session.replace_audio_source(self.sender, None, ""),
+                SourceKind::Video(_) => session.replace_video_source(self.sender, None, ""),
+            }
         };
-        let closed = session.close_source(self.id);
+        // A borrowed producer may keep pushing after detach. If detach fails,
+        // stopping this sender must fence that path before retaining the input.
+        if detached.is_err()
+            && !self.owns_producer
+            && let Err(error) = session.stop_standard(self.transceiver)
+        {
+            // If neither detach nor sender stop succeeds, retire the physical
+            // producer and invalidate every borrowed view rather than forward.
+            let _ = self.producer.close(session);
+            self.active = false;
+            return Err(native(error));
+        }
+        let closed = if self.owns_producer {
+            self.producer.close(session)
+        } else {
+            Ok(())
+        };
         self.active = false;
         detached.and(closed)
     }
@@ -532,11 +683,11 @@ mod tests {
         assert!(!audio_source.set_enabled(&mut session, false).unwrap());
         assert!(audio_source.set_enabled(&mut session, true).unwrap());
         assert!(audio_source.set_enabled(&mut session, true).unwrap());
-        let old_source = audio_source.id;
+        let old_source = audio_source.producer.id;
         audio_source
             .replace(&mut session, "replacement-audio")
             .unwrap();
-        assert_ne!(old_source, audio_source.id);
+        assert_ne!(old_source, audio_source.producer.id);
         assert!(
             session
                 .push_pcm(

@@ -1,4 +1,4 @@
-//! Public SDK controls shared unchanged by the finite SFU variants.
+//! Controlled Rust transport controls shared unchanged by the finite SFU variants.
 use std::{
     net::IpAddr,
     sync::{Arc, Mutex},
@@ -57,6 +57,7 @@ impl AsyncHttpClient for HttpWitness {
 
 struct Peer {
     agent: Arc<Agent>,
+    transport: RuntimeAgent,
     statuses: Arc<Mutex<Vec<(String, u16)>>>,
     name: String,
     publishes: bool,
@@ -94,24 +95,30 @@ async fn peer(ip: IpAddr, server: IpAddr, name: &str, publishes: bool) -> anyhow
         move || host.runtime(),
     )?;
     tokio::task::spawn_local(actor);
-    let agent = Agent::from_runtime(runtime);
-    agent
-        .replace_desired(api::DesiredState {
-            connected: true,
-            topic_publishers: if publishes { vec![publisher()] } else { vec![] },
-            topic_subscribers: if publishes {
-                vec![]
-            } else {
-                vec![api::TopicSubscriber {
-                    name: TOPIC.into(),
-                    mode: api::TopicMode::Lossy,
-                }]
-            },
-            ..Default::default()
-        })
+    let agent = Agent::from_runtime(runtime.clone());
+    // Explicit transport registrations are native controlled-host fixture inputs.
+    runtime
+        .replace_desired(
+            api::DesiredState {
+                connected: true,
+                topic_publishers: if publishes { vec![publisher()] } else { vec![] },
+                topic_subscribers: if publishes {
+                    vec![]
+                } else {
+                    vec![api::TopicSubscriber {
+                        name: TOPIC.into(),
+                        mode: api::TopicMode::Lossy,
+                    }]
+                },
+                ..Default::default()
+            }
+            .into_core(1)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+        )
         .await?;
     Ok(Peer {
         agent,
+        transport: runtime,
         statuses,
         name: name.into(),
         publishes,
@@ -168,8 +175,11 @@ async fn delivery(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         source
-            .agent
-            .send_topic(publisher(), payload.clone())
+            .transport
+            .send_topic(pulsebeam_agent_core::TopicSend {
+                publisher: publisher().into(),
+                payload: payload.clone(),
+            })
             .await?;
         for (index, events) in events.iter().enumerate() {
             if received[index] {

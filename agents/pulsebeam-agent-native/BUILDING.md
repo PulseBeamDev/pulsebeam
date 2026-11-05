@@ -37,7 +37,10 @@ The outputs are `bazel-bin/agents/pulsebeam-agent-native/node_package.tgz` and t
   //crates/pulsebeam-cli:production_native \
   //crates/pulsebeam-cli:installed_foreign
 ./bazel build //agents/pulsebeam-agent-native:pulsebeam-agent-native-sim
+./bazel test //agents/pulsebeam-agent-native:generated_api_contract
 ```
+
+The generated API contract executes direct Node and Python consumers of the same native metadata and generator outputs used by the packages. These local witnesses do not require an npm archive, wheel or registry publication, and do not qualify mobile execution.
 
 `production_native` exercises the fast Rust/real-SFU boundary. `installed_foreign` installs both archives into isolated directories and exercises their generated APIs against the same local production SFU. These are focused native checks, not full release qualification. Follow the [support scope](QUALIFICATION.md) and [repository testing contract](../../docs/build.md#testing-contract) for affected and complete acceptance gates. Change Rust definitions and regenerate bindings; do not edit generated files.
 

@@ -233,12 +233,7 @@ copy_to_directory(
     replace_prefixes = {"node-javascript/": ""},
 )
 
-js_test(
-    name = "node_bindings_contract",
-    entry_point = "tests/node/bindings.mjs",
-    data = [":node_assets", ":node_modules", "package.json"],
-    no_copy_to_bin = ["package.json"],
-)
+test_suite(name = "node_bindings_contract", tests = [":generated_node_contract"])
 
 js_binary(
     name = "installed_node_witness",
@@ -302,6 +297,43 @@ npm_package(
 # Both installed languages share one owned local-SFU fixture.
 test_suite(name = "node_consumer", tests = ["//crates/pulsebeam-cli:installed_foreign"])
 test_suite(name = "python_consumer", tests = ["//crates/pulsebeam-cli:installed_foreign"])
+
+js_run_binary(
+    name = "contract_javascript",
+    tool = ":tsc",
+    srcs = [":node_modules", ":node_assets", "package.json", "tsconfig.contract.json", "tests/generated_contract.ts"],
+    args = ["-p", "tsconfig.contract.json"],
+    chdir = package_name(),
+    out_dirs = ["contract-javascript"],
+)
+
+copy_to_directory(
+    name = "contract_runtime",
+    srcs = [":contract_javascript", ":node_assets"],
+    replace_prefixes = {"contract-javascript/": ""},
+)
+
+js_test(
+    name = "generated_node_contract",
+    entry_point = "tests/generated_contract.mjs",
+    data = [":contract_runtime", ":node_modules", "package.json"],
+    no_copy_to_bin = ["package.json"],
+    timeout = "short",
+)
+
+py_test(
+    name = "generated_python_contract",
+    srcs = ["tests/generated_contract.py"],
+    main = "tests/generated_contract.py",
+    data = [":bindings", ":native_library"],
+    args = ["$(rootpath :bindings)", "$(rootpath :native_library)"],
+    timeout = "short",
+)
+
+test_suite(
+    name = "generated_api_contract",
+    tests = [":generated_node_contract", ":generated_python_contract"],
+)
 
 rustfmt_test(name = "format", targets = [":pulsebeam-agent-native"])
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-native", ":pulsebeam-agent-native-sim", ":pulsebeam-agent-native-transport", ":unit_tests"])

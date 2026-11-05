@@ -62,7 +62,7 @@ export async function videoPreferences() {
     });
     change = (patch) => setState((before) => ({ ...before, ...patch }));
     const remote = createReactAgent(managedAgent(agent))
-      .remote.participant("alice")
+      .participant("alice")
       .video("camera");
     const views = [
       <Video
@@ -91,9 +91,9 @@ export async function videoPreferences() {
   try {
     await flush(() => root.render(<Room />));
     const runtime = runtimes.at(-1)!;
-    const remote = agent.remote.participant("alice").video("camera");
+    const remote = agent.participant("alice").video("camera");
     assert.equal(
-      "agent" in agent.remote,
+      "agent" in agent.participant("alice"),
       false,
       "remote facade cannot expose the managed Agent",
     );
@@ -191,7 +191,7 @@ export async function videoPreferences() {
     assert.equal(desired().trackId, "camera-id");
     assert.equal(desired().height, 240);
     assert.equal(runtimes.at(-1), runtime, "handoff keeps the session runtime");
-    assert.equal(agent.remote.participant("alice").video("camera"), remote);
+    assert.equal(agent.participant("alice").video("camera"), remote);
     await flush(() => change({ remove: true }));
     assert.deepEqual([...runtime.videoOwners.keys()], [continuingOwner]);
     host.remove();
@@ -201,7 +201,7 @@ export async function videoPreferences() {
       [],
       "detached presentation contributes no demand",
     );
-    assert.equal(agent.remote.participant("alice").video("camera"), remote);
+    assert.equal(agent.participant("alice").video("camera"), remote);
   } finally {
     await flush(() => root.unmount());
     HTMLVideoElement.prototype.getBoundingClientRect = original;

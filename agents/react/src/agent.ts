@@ -1,7 +1,6 @@
 import type {
   Agent as WebAgent,
-  DataEvent,
-  DataEventsOptions,
+  DataReceiver,
   Delivery,
   LocalAudioTrack as WebLocalAudioTrack,
   LocalDataTrack as WebLocalDataTrack,
@@ -12,7 +11,6 @@ import type {
   RemoteVideoTrack as WebRemoteVideoTrack,
 } from "@pulsebeam/web";
 import type { ManagedAgent } from "@pulsebeam/web/internal/react";
-import { track } from "@pulsebeam/web";
 
 export interface LocalVideoTrack {
   readonly kind: "video";
@@ -37,7 +35,7 @@ export interface RemoteVideoTrack {
   readonly participantId: string;
   readonly label: string;
   readonly active: boolean;
-  subscribe(listener: () => void): () => void;
+  watch(listener: () => void): () => void;
 }
 
 export interface RemoteAudioTrack {
@@ -46,7 +44,7 @@ export interface RemoteAudioTrack {
   readonly participantId: string;
   readonly label: string;
   readonly active: boolean;
-  subscribe(listener: () => void): () => void;
+  watch(listener: () => void): () => void;
 }
 
 export interface RemoteDataTrack<D extends Delivery = Delivery> {
@@ -56,23 +54,19 @@ export interface RemoteDataTrack<D extends Delivery = Delivery> {
   readonly label: string;
   readonly delivery: D;
   readonly active: boolean;
-  subscribe(listener: () => void): () => void;
+  watch(listener: () => void): () => void;
 }
 
 export type RemoteTrack = RemoteVideoTrack | RemoteAudioTrack | RemoteDataTrack;
 
 export interface RemoteParticipant {
+  id(): string;
   readonly participantId: string;
   readonly active: boolean;
   readonly tracks: readonly RemoteTrack[];
   video(label: string): RemoteVideoTrack;
   audio(label: string): RemoteAudioTrack;
   data<D extends Delivery>(label: string, delivery: D): RemoteDataTrack<D>;
-}
-
-export interface RemoteMedia {
-  readonly participants: readonly RemoteParticipant[];
-  participant(participantId: string): RemoteParticipant;
 }
 
 export interface Agent
@@ -86,7 +80,8 @@ export interface Agent
     | "connect"
     | "disconnect"
   > {
-  readonly remote: RemoteMedia;
+  readonly participants: readonly RemoteParticipant[];
+  participant(id: string): RemoteParticipant;
   video(label: string): LocalVideoTrack;
   audio(label: string): LocalAudioTrack;
   data<D extends Delivery>(label: string, delivery: D): LocalDataTrack<D>;
@@ -128,13 +123,12 @@ export function managedAgent(agent: Agent): ManagedAgent {
   if (!managed) throw new TypeError("invalid Agent");
   return managed;
 }
-export function dataEvents<D extends Delivery>(
+export function receiveData<D extends Delivery>(
   value: LocalDataTrack<D> | RemoteDataTrack<D>,
-  options?: DataEventsOptions,
-): AsyncIterableIterator<DataEvent<D>> {
+): Promise<DataReceiver<D>> {
   const raw = webDataTracks.get(value);
   if (!raw) throw new TypeError("invalid data track");
-  return raw.events(options) as AsyncIterableIterator<DataEvent<D>>;
+  return raw.receive() as Promise<DataReceiver<D>>;
 }
 export function remoteVideo(value: RemoteVideoTrack): WebRemoteVideoTrack {
   const raw = webVideos.get(value);
@@ -195,7 +189,7 @@ export function createReactAgent(raw: ManagedAgent): Agent {
             get active() {
               return value.active;
             },
-            subscribe: (listener: () => void) => value.subscribe(listener),
+            watch: (listener: () => void) => value.watch(listener),
           })
         : Object.freeze({
             kind: value.kind,
@@ -220,7 +214,7 @@ export function createReactAgent(raw: ManagedAgent): Agent {
         get active() {
           return value.active;
         },
-        subscribe: (listener: () => void) => value.subscribe(listener),
+        watch: (listener: () => void) => value.watch(listener),
       });
       videos.set(value, wrapped);
       webVideos.set(wrapped, value);
@@ -240,7 +234,7 @@ export function createReactAgent(raw: ManagedAgent): Agent {
         get active() {
           return value.active;
         },
-        subscribe: (listener: () => void) => value.subscribe(listener),
+        watch: (listener: () => void) => value.watch(listener),
       });
       audios.set(value, wrapped);
     }
@@ -251,6 +245,7 @@ export function createReactAgent(raw: ManagedAgent): Agent {
     if (wrapped) return wrapped;
     wrapped = Object.freeze({
       participantId: value.participantId,
+      id: () => value.id(),
       get active() {
         return value.active;
       },
@@ -263,23 +258,14 @@ export function createReactAgent(raw: ManagedAgent): Agent {
               : (wrapData(entry) as RemoteDataTrack),
         );
       },
-      video: (label: string) => wrapVideo(value.track(track.video(label))),
-      audio: (label: string) => wrapAudio(value.track(track.audio(label))),
+      video: (label: string) => wrapVideo(value.video(label)),
+      audio: (label: string) => wrapAudio(value.audio(label)),
       data: <D extends Delivery>(label: string, delivery: D) =>
-        wrapData(
-          value.track(track.data(label, delivery)),
-        ) as RemoteDataTrack<D>,
+        wrapData(value.data(label, delivery)) as RemoteDataTrack<D>,
     });
     participants.set(value, wrapped);
     return wrapped;
   };
-  const remote: RemoteMedia = Object.freeze({
-    get participants() {
-      return collection(raw.remote.participants, wrapParticipant);
-    },
-    participant: (participantId: string) =>
-      wrapParticipant(raw.remote.participant(participantId)),
-  });
   const facade: Agent = Object.freeze({
     get connection() {
       return raw.connection;
@@ -296,15 +282,16 @@ export function createReactAgent(raw: ManagedAgent): Agent {
     get authorizationExpiresAt() {
       return raw.authorizationExpiresAt;
     },
-    get remote() {
-      return remote;
+    get participants() {
+      return collection(raw.participants, wrapParticipant);
     },
+    participant: (id: string) => wrapParticipant(raw.participant(id)),
     connect: () => raw.connect(),
     disconnect: () => raw.disconnect(),
-    video: (label: string) => wrapLocal(raw.track(track.video(label))),
-    audio: (label: string) => wrapLocal(raw.track(track.audio(label))),
+    video: (label: string) => wrapLocal(raw.video(label)),
+    audio: (label: string) => wrapLocal(raw.audio(label)),
     data: <D extends Delivery>(label: string, delivery: D) =>
-      wrapData(raw.track(track.data(label, delivery))) as LocalDataTrack<D>,
+      wrapData(raw.data(label, delivery)) as LocalDataTrack<D>,
   });
   managedAgents.set(facade, raw);
   return facade;

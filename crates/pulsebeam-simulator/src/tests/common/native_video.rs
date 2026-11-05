@@ -1,7 +1,7 @@
 //! Native decoded-output facts, separate from passive encoded observations.
 //! Only actual I420 callbacks qualify; independent decoder results never do.
 use anyhow::{Context, Result, ensure};
-use pulsebeam_agent_native::{OutputFrame, RemoteFrame, RemoteTrack};
+use pulsebeam_agent_native::{NativeReceiverInfo, OutputFrame, RemoteFrame};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{
@@ -38,7 +38,7 @@ pub struct NativeDecodedVideoLog {
 
 #[derive(Clone, Debug, Default)]
 struct Receiver {
-    track: Option<RemoteTrack>,
+    track: Option<NativeReceiverInfo>,
     nontrivial: BTreeMap<(u32, u32), u64>,
     last_dimensions: Option<(u32, u32)>,
     last_received: Option<Instant>,
@@ -170,7 +170,7 @@ impl NativeDecodedVideoLog {
     pub fn require_playback(
         &self,
         baseline: &Self,
-        track: &RemoteTrack,
+        track: &NativeReceiverInfo,
         expected: PlaybackExpectation,
         now: Instant,
     ) -> Result<()> {
@@ -247,7 +247,7 @@ impl NativeDecodedVideoLog {
         Ok(())
     }
 
-    pub fn require_recent(&self, track: &RemoteTrack, now: Instant) -> Result<()> {
+    pub fn require_recent(&self, track: &NativeReceiverInfo, now: Instant) -> Result<()> {
         self.require_valid_receiver(track.generation, track.receiver)?;
         let receiver = self
             .receivers
@@ -288,7 +288,7 @@ impl NativeDecodedVideoLog {
         self.polling_drops += skipped;
     }
 
-    pub fn malformed_callback(&mut self, track: &RemoteTrack) {
+    pub fn malformed_callback(&mut self, track: &NativeReceiverInfo) {
         self.receivers
             .retain(|(generation, _), _| *generation == track.generation);
         let receiver = self
@@ -306,7 +306,7 @@ impl NativeDecodedVideoLog {
         dimensions: (u32, u32),
         min_frames: u64,
         now: Instant,
-    ) -> Result<RemoteTrack> {
+    ) -> Result<NativeReceiverInfo> {
         ensure!(min_frames > 0, "native decoded proof requires fresh frames");
         self.require_callback_collector()?;
         ensure!(
@@ -474,7 +474,7 @@ mod tests {
     // Synthetic owned buffers test the oracle, never an RTC media path.
     fn observation(generation: u64, width: u32, height: u32, timestamp: u32) -> RemoteFrame {
         RemoteFrame {
-            track: RemoteTrack {
+            track: NativeReceiverInfo {
                 generation,
                 receiver: 7,
                 track_id: "unit".into(),

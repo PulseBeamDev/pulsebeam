@@ -254,7 +254,7 @@ fn transition_safety_allows_pending_withdrawal_but_rejects_invalid_assignments()
     client
         .owned_receivers
         .push(super::super::client::OwnedReceiverEvidence {
-            track: pulsebeam_agent_native::RemoteTrack {
+            track: pulsebeam_agent_native::NativeReceiverInfo {
                 generation: generation.get(),
                 receiver: 1,
                 track_id: "native-receiver".into(),

@@ -5,11 +5,12 @@ import {
   Audio,
   Data,
   Publish,
+  SelectAudio,
   useAgent,
   type Agent,
   type DataEvent,
 } from "../../src/index.js";
-import { createCaptureSource, ResourceOwnershipError } from "@pulsebeam/web";
+import { VideoSource, ResourceOwnershipError } from "@pulsebeam/web";
 import { publishableVideoSource } from "../../src/sources.js";
 import { createReactAgent, managedAgent } from "../../src/agent.js";
 import { deferred, flush, Track } from "./platform.js";
@@ -37,7 +38,7 @@ export async function stalePublicationClaim() {
   const native = new Track("video");
   const source = publishableVideoSource(
     { kind: "video" },
-    createCaptureSource(native as unknown as MediaStreamTrack, "video"),
+    VideoSource.fromTrack(native as unknown as MediaStreamTrack),
   );
   let activate!: () => void;
   function Room() {
@@ -84,7 +85,12 @@ export async function stalePublicationClaim() {
 export async function ownershipAdapters() {
   let agent!: Agent;
   let update!: (
-    patch: Partial<{ source: boolean; enabled: boolean; duplicate: boolean }>,
+    patch: Partial<{
+      source: boolean;
+      enabled: boolean;
+      duplicate: boolean;
+      selection: boolean;
+    }>,
   ) => void;
   let duplicateFailure: Error | undefined;
   let audioFailure: Error | undefined;
@@ -92,15 +98,16 @@ export async function ownershipAdapters() {
   const native = new Track("video");
   const source = publishableVideoSource(
     { kind: "video" },
-    createCaptureSource(native as unknown as MediaStreamTrack, "video"),
+    VideoSource.fromTrack(native as unknown as MediaStreamTrack),
   );
 
   function Room() {
     agent = useAgent({ endpoint: "http://localhost", token: "ownership" });
     const [state, setState] = useState({
-      source: true,
+      source: false,
       enabled: true,
       duplicate: false,
+      selection: false,
     });
     update = (patch) => setState((before) => ({ ...before, ...patch }));
     // Distinct SDK wrappers still denote the same Web-interned value.
@@ -110,6 +117,12 @@ export async function ownershipAdapters() {
     return (
       <>
         <Audio agent={equivalent} />
+        {state.selection && (
+          <SelectAudio
+            agent={equivalent}
+            policy={{ automatic: state.enabled }}
+          />
+        )}
         <Data
           track={messages}
           onEvent={(event) => {
@@ -146,13 +159,26 @@ export async function ownershipAdapters() {
     ),
   );
   const runtime = runtimes.at(-1)!;
+  assert.equal(
+    runtime.claimedPublications.size,
+    0,
+    "initial null waits for a concrete source",
+  );
+  assert.equal(
+    runtime.resourceCommands.some(
+      (command) => command.op === "claimAudioPolicy",
+    ),
+    false,
+    "playback does not create selection demand",
+  );
+  await flush(() => update({ source: true }));
   assert.equal(runtime.claimedPublications.size, 1);
   const publicationOwner = [...runtime.publicationOwners.keys()][0];
   const dataOwner = [...runtime.dataOwners.keys()][0];
   const audioOwner = runtime.audioOwner;
   assert.deepEqual(Object.keys(agent.video("camera")), ["kind", "label"]);
   assert.equal("track" in agent, false);
-  assert.equal("track" in agent.remote.participant("alice"), false);
+  assert.equal("track" in agent.participant("alice"), false);
   assert.notEqual(runtime.audioOwner, undefined);
   assert.equal(runtime.dataOwners.size, 1);
   runtime.deliverData("messages", {
@@ -177,12 +203,25 @@ export async function ownershipAdapters() {
   assert.equal(runtime.ownedReplacements.at(-1)?.track, null);
   assert.equal(native.readyState, "live");
 
-  await flush(() => update({ source: true, duplicate: true }));
+  await flush(() => update({ source: true, duplicate: true, selection: true }));
   await flush();
   assert.ok(duplicateFailure instanceof ResourceOwnershipError);
   assert.ok(audioFailure instanceof ResourceOwnershipError);
   assert.equal(runtime.audioOwner, audioOwner);
   assert.equal(runtime.claimedPublications.size, 1);
+  assert.equal(runtime.audioSelections.size, 1);
+  const selection = [...runtime.audioSelections.keys()][0]!;
+  assert.equal(runtime.audioSelections.get(selection).automatic, false);
+  await flush(() => update({ enabled: true }));
+  assert.deepEqual([...runtime.audioSelections.keys()], [selection]);
+  assert.equal(runtime.audioSelections.get(selection).automatic, true);
+  await flush(() => update({ selection: false }));
+  assert.equal(runtime.audioSelections.size, 0);
+  assert.equal(
+    runtime.audioOwner,
+    audioOwner,
+    "selection withdrawal does not close playback",
+  );
 
   await flush(() => root.unmount());
   assert.equal(runtime.claimedPublications.size, 0);

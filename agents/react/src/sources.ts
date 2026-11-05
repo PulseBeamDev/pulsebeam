@@ -1,9 +1,9 @@
 import type {
-  CapturedAudioTrack,
-  CapturedVideoTrack,
+  AudioSource as WebAudioSource,
+  VideoSource as WebVideoSource,
   ReceiveOptions,
 } from "@pulsebeam/web";
-import { nativeCaptureTrack } from "@pulsebeam/web/internal/react";
+import { nativeSourceTrack } from "@pulsebeam/web/internal/react";
 
 const sourceBrand = Symbol("PulseBeam source");
 const publishableBrand = Symbol("PulseBeam publishable source");
@@ -36,7 +36,7 @@ export type VideoBinding = (
 ) => VideoAttachment;
 
 const videos = new WeakMap<VideoSource, VideoBinding>();
-const tracks = new WeakMap<object, CapturedVideoTrack | CapturedAudioTrack>();
+const tracks = new WeakMap<object, WebVideoSource | WebAudioSource>();
 
 export function videoSource<T extends { readonly kind: "video" }>(
   value: T,
@@ -65,7 +65,7 @@ export function attachVideoSource(
 
 export function publishableVideoSource<T extends { readonly kind: "video" }>(
   value: T,
-  track: CapturedVideoTrack,
+  track: WebVideoSource,
 ): T & PublishableVideoSource {
   const source = videoSource(
     value,
@@ -77,7 +77,7 @@ export function publishableVideoSource<T extends { readonly kind: "video" }>(
 }
 export function publishableAudioSource<T extends { readonly kind: "audio" }>(
   value: T,
-  track: CapturedAudioTrack,
+  track: WebAudioSource,
 ): T & PublishableAudioSource {
   const source = audioSource(value);
   tracks.set(source, track);
@@ -94,14 +94,20 @@ export function publicationTrack(
   return track;
 }
 
+export function releasePublicationSource(
+  source: PublishableVideoSource | PublishableAudioSource | null,
+): void {
+  if (source) void tracks.get(source)?.close();
+}
+
 export function localVideoBinding(
-  read: () => CapturedVideoTrack | null,
+  read: () => WebVideoSource | null,
   subscribe: (listener: () => void) => () => void = () => () => {},
 ): VideoBinding {
   return (element, onError, options) => {
     let autoPlay = options.autoPlay;
     let live = true;
-    let current: CapturedVideoTrack | null | undefined;
+    let current: WebVideoSource | null | undefined;
     let stream: MediaStream | null = null;
     const play = () => {
       const attached = stream;
@@ -117,7 +123,7 @@ export function localVideoBinding(
       if (next === current) return;
       current = next;
       if (stream && element.srcObject === stream) element.srcObject = null;
-      const track = next ? nativeCaptureTrack(next, "video") : null;
+      const track = next ? nativeSourceTrack(next, "video") : null;
       stream = track?.readyState === "live" ? new MediaStream([track]) : null;
       if (!stream) return;
       element.srcObject = stream;

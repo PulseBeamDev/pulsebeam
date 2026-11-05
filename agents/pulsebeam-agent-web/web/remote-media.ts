@@ -1,23 +1,29 @@
-import type {
-  Agent,
-  PlaybackFailure,
-  RemoteMediaAttachment,
-  RemoteMediaAttachmentOptions,
-} from "./types.js";
+import type { MediaObservation } from "./reception.js";
+import type { AgentSnapshot, PlaybackFailure } from "./types.js";
 
-function normalizePublicationIds(
-  publicationIds: readonly string[],
-): ReadonlySet<string> {
-  return new Set(publicationIds);
+export interface MediaHost {
+  getSnapshot(): AgentSnapshot;
+  subscribe(listener: () => void): () => void;
 }
-
-function samePublicationIds(
-  left: ReadonlySet<string>,
-  right: ReadonlySet<string>,
-): boolean {
-  return left.size === right.size && [...left].every((id) => right.has(id));
+interface VideoReceiver {
+  observe(): Promise<MediaObservation>;
+  isClosed(): boolean;
+  close(): Promise<void>;
 }
-
+export interface MediaAttachment {
+  setAutoPlay(autoPlay: boolean): void;
+  retryPlayback(): Promise<void>;
+  close(): Promise<void>;
+}
+interface AttachmentOptions {
+  readonly ready: Promise<void>;
+  readonly subscribe: (listener: () => void) => () => void;
+  readonly autoPlay?: boolean;
+  readonly onPlaybackBlocked?: (
+    failure: PlaybackFailure,
+    retry: () => Promise<void>,
+  ) => void;
+}
 function failure(error: unknown, retry: () => Promise<void>): PlaybackFailure {
   return Object.freeze({
     message: error instanceof Error ? error.message : String(error),
@@ -26,127 +32,160 @@ function failure(error: unknown, retry: () => Promise<void>): PlaybackFailure {
   });
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
-}
-
-class Attachment implements RemoteMediaAttachment {
-  #publicationIds: ReadonlySet<string>;
-  #tracks = new Set<MediaStreamTrack>();
+class Attachment implements MediaAttachment {
   #closed = false;
-  #playAttempt = 0;
-  readonly #agent: Agent;
-  readonly #element: HTMLMediaElement;
+  #closing: Promise<void> | undefined;
+  #ready = false;
   #autoPlay: boolean;
-  readonly #onPlaybackBlocked: RemoteMediaAttachmentOptions["onPlaybackBlocked"];
+  #playAttempt = 0;
+  #observation: MediaObservation | undefined;
+  #track: MediaStreamTrack | undefined;
+  #acquiring: Promise<void> | undefined;
+  #invalidated = false;
+  readonly #pending = new Set<Promise<unknown>>();
   readonly #stream = new MediaStream();
   readonly #unsubscribe: () => void;
 
   constructor(
-    agent: Agent,
-    element: HTMLMediaElement,
-    onPlaybackBlocked: RemoteMediaAttachmentOptions["onPlaybackBlocked"],
-    publicationIds: readonly string[],
-    autoPlay: boolean,
+    readonly source: VideoReceiver,
+    readonly element: HTMLVideoElement,
+    readonly options: AttachmentOptions,
   ) {
     if (!(element instanceof HTMLVideoElement))
       throw new TypeError("remote attachment requires a video element");
-    this.#agent = agent;
-    this.#element = element;
-    this.#autoPlay = autoPlay;
-    this.#onPlaybackBlocked = onPlaybackBlocked;
-    this.#publicationIds = normalizePublicationIds(publicationIds);
-    this.#element.srcObject = this.#stream;
-    this.#unsubscribe = this.#agent.subscribe(this.#reconcile);
-    this.#reconcile();
+    this.#autoPlay = options.autoPlay ?? true;
+    element.srcObject = this.#stream;
+    this.#unsubscribe = options.subscribe(this.#reconcile);
+    void options.ready.then(
+      () => {
+        if (this.#closed) return;
+        this.#ready = true;
+        this.#reconcile();
+      },
+      () => {},
+    );
   }
-
-  setPublicationIds(publicationIds: readonly string[]): void {
-    if (this.#closed) return;
-    const normalized = normalizePublicationIds(publicationIds);
-    if (samePublicationIds(this.#publicationIds, normalized)) return;
-    this.#publicationIds = normalized;
-    this.#reconcile();
+  #trackPending<T>(pending: Promise<T>): Promise<T> {
+    this.#pending.add(pending);
+    void pending.then(
+      () => this.#pending.delete(pending),
+      () => this.#pending.delete(pending),
+    );
+    return pending;
   }
-
+  #detach(): void {
+    this.#playAttempt++;
+    if (this.#track) {
+      this.#track.removeEventListener("ended", this.#reconcile);
+      this.#stream.removeTrack(this.#track);
+      this.#track = undefined;
+    }
+  }
+  readonly #reconcile = (): void => {
+    if (this.#closed || !this.#ready) return;
+    if (this.source.isClosed()) {
+      void this.close();
+      return;
+    }
+    if (this.#observation) {
+      if (!this.#observation.isClosed() && this.#track?.readyState !== "ended")
+        return;
+      const retired = this.#observation;
+      this.#observation = undefined;
+      this.#detach();
+      void this.#trackPending(retired.close());
+    }
+    if (this.#acquiring) {
+      this.#invalidated = true;
+      return;
+    }
+    let retired = false;
+    const acquiring = this.source
+      .observe()
+      .then(async (observation) => {
+        if (this.#closed || this.source.isClosed() || observation.isClosed()) {
+          await observation.close();
+          retired = !this.#closed && !this.source.isClosed();
+          return;
+        }
+        const track = observation.track();
+        if (!track || track.kind !== "video") {
+          await observation.close();
+          return;
+        }
+        this.#observation = observation;
+        this.#track = track;
+        track.addEventListener("ended", this.#reconcile);
+        this.#stream.addTrack(track);
+        this.#playAttempt++;
+        if (this.#autoPlay) void this.#play();
+      })
+      .catch((error: unknown) => {
+        if (this.#closed || this.source.isClosed()) return;
+        if (
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "closed"
+        )
+          retired = true;
+        else this.#report(error);
+      })
+      .finally(() => {
+        this.#acquiring = undefined;
+        const invalidated = this.#invalidated;
+        this.#invalidated = false;
+        if ((retired || invalidated) && !this.#closed) this.#reconcile();
+      });
+    this.#acquiring = this.#trackPending(acquiring);
+  };
+  #report(error: unknown): void {
+    const retry = () => this.retryPlayback();
+    this.options.onPlaybackBlocked?.(failure(error, retry), retry);
+  }
   setAutoPlay(autoPlay: boolean): void {
     if (this.#closed || autoPlay === this.#autoPlay) return;
     this.#autoPlay = autoPlay;
-    this.#playAttempt += 1;
+    this.#playAttempt++;
     if (autoPlay) void this.#play();
   }
-
   retryPlayback(): Promise<void> {
     return this.#play();
   }
-
-  close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
-    this.#playAttempt += 1;
-    this.#unsubscribe();
-    for (const track of this.#tracks) this.#stream.removeTrack(track);
-    this.#tracks.clear();
-    if (this.#element.srcObject === this.#stream)
-      this.#element.srcObject = null;
-  }
-
-  readonly #reconcile = (): void => {
-    if (this.#closed) return;
-    const next = new Set<MediaStreamTrack>();
-    const tracks = this.#agent.getSnapshot().tracks;
-    for (const publicationId of this.#publicationIds) {
-      const track = tracks[publicationId]?.media;
-      if (track?.kind === "video") next.add(track);
-    }
-    let changed = false;
-    for (const track of this.#tracks) {
-      if (!next.has(track)) {
-        this.#stream.removeTrack(track);
-        changed = true;
-      }
-    }
-    for (const track of next) {
-      if (!this.#tracks.has(track)) {
-        this.#stream.addTrack(track);
-        changed = true;
-      }
-    }
-    this.#tracks = next;
-    if (changed) {
-      this.#playAttempt += 1;
-      if (next.size > 0 && this.#autoPlay) void this.#play();
-    }
-  };
-
   #play(): Promise<void> {
-    if (this.#closed || this.#tracks.size === 0) return Promise.resolve();
-    const attempt = this.#playAttempt + 1;
-    this.#playAttempt = attempt;
-    return this.#element.play().catch((error: unknown) => {
+    if (this.#closed || !this.#track) return Promise.resolve();
+    const attempt = ++this.#playAttempt;
+    return this.element.play().catch((error: unknown) => {
       if (
         this.#closed ||
         attempt !== this.#playAttempt ||
-        isAbortError(error)
-      ) {
+        (error instanceof DOMException && error.name === "AbortError")
+      )
         return;
-      }
-      const retry = () => this.#play();
-      this.#onPlaybackBlocked?.(failure(error, retry), retry);
+      this.#report(error);
     });
+  }
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    this.#closed = true;
+    this.#unsubscribe();
+    this.#detach();
+    if (this.element.srcObject === this.#stream) this.element.srcObject = null;
+    const observation = this.#observation;
+    this.#observation = undefined;
+    return (this.#closing = Promise.allSettled([
+      this.source.close(),
+      observation?.close(),
+      this.options.ready,
+      ...this.#pending,
+    ]).then(() => {}));
   }
 }
 
 export function attachRemoteMedia(
-  agent: Agent,
+  source: VideoReceiver,
   element: HTMLVideoElement,
-  options: RemoteMediaAttachmentOptions,
-): RemoteMediaAttachment {
-  return new Attachment(
-    agent,
-    element,
-    options.onPlaybackBlocked,
-    options.publicationIds,
-    options.autoPlay ?? true,
-  );
+  options: AttachmentOptions,
+): MediaAttachment {
+  return new Attachment(source, element, options);
 }

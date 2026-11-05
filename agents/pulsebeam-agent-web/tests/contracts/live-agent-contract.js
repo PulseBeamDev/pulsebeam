@@ -212,18 +212,13 @@
     [...peers].find((peer) =>
       peer.getReceivers().some((receiver) => receiver.track === track),
     );
-  const {
-    attachLocalTrack,
-    attachRemoteVideo,
-    createAgent,
-    createCaptureSource,
-    track,
-  } = pulsebeam;
-  const sender = createAgent({
+  const { attachRemoteVideo, createAgent, VideoSource, AudioSource } =
+    pulsebeam;
+  const sender = await createAgent({
     endpoint,
     token: "__SENDER_TOKEN__",
   });
-  const receiver = createAgent({
+  const receiver = await createAgent({
     endpoint,
     token: "__RECEIVER_TOKEN__",
   });
@@ -236,7 +231,7 @@
       if (Date.now() > deadline) {
         const agents = [sender, receiver].map((agent) => {
           const { connection, generation, failure, catalog, mapping, topics } =
-            agent.getSnapshot();
+            agent.snapshot();
           return { connection, generation, failure, catalog, mapping, topics };
         });
         const physical = await Promise.all(
@@ -323,6 +318,14 @@
   document.body.append(video);
   const originalReplaceTrack = RTCRtpSender.prototype.replaceTrack;
   const originalClone = MediaStreamTrack.prototype.clone;
+  const cloneSources = new WeakMap();
+  const observeClone = function () {
+    const clone = originalClone.call(this);
+    cloneSources.set(clone, this);
+    return clone;
+  };
+  const presentedFrom = (source, element = video) =>
+    cloneSources.get(element.srcObject?.getVideoTracks()[0]) === source;
   const handoffClones = [];
   let releaseReplacement;
   let attachment;
@@ -333,19 +336,24 @@
   let replacementVideoTrack;
   let steadyIterator;
   let cyclingIterator;
+  let audioSelection;
+  let audioPlayback;
+  let retiringPublication;
+  const pendingReplacements = [];
   try {
+    MediaStreamTrack.prototype.clone = observeClone;
     await source.resume();
-    const audioPlayback = pulsebeam.attachRemoteAudio(receiver);
+    audioSelection = await receiver.selectAudio({ automatic: true });
+    audioPlayback = pulsebeam.attachRemoteAudio(receiver);
     await audioPlayback.ready;
-    videoPublication = attachLocalTrack(sender.track(track.video("camera")), {
-      source: createCaptureSource(videoTrack, "video"),
-    });
-    audioPublication = attachLocalTrack(sender.track(track.audio("voice")), {
-      source: createCaptureSource(audioTrack, "audio"),
-    });
-    await Promise.all([videoPublication.ready, audioPublication.ready]);
-    sender.connect();
-    receiver.connect();
+    videoPublication = await sender
+      .video("camera")
+      .publish(VideoSource.fromTrack(videoTrack), { enabled: true });
+    audioPublication = await sender
+      .audio("voice")
+      .publish(AudioSource.fromTrack(audioTrack), { enabled: true });
+    await sender.connect();
+    await receiver.connect();
     await until(
       () =>
         sender.connection === "connected" &&
@@ -358,8 +366,8 @@
       "admission identity",
     );
     assert(receiver.roomId === "public-web-contract", "room identity");
-    const senderGeneration = sender.getSnapshot().generation;
-    const receiverGeneration = receiver.getSnapshot().generation;
+    const senderGeneration = sender.snapshot().generation;
+    const receiverGeneration = receiver.snapshot().generation;
     const receiveValue = async (iterator, expected) => {
       let received;
       let failure;
@@ -367,15 +375,15 @@
         while (true) {
           const update = await iterator.next();
           assert(
-            !update.done && update.value.type === "message",
+            update.type === "event" && update.event.type === "message",
             "ordered data stays live without gaps",
           );
           assert(
-            update.value.data.length === 1 && update.value.data[0] <= expected,
+            update.event.data.length === 1 && update.event.data[0] <= expected,
             "data from a future lifetime",
           );
-          if (update.value.data[0] === expected) {
-            received = update.value;
+          if (update.event.data[0] === expected) {
+            received = update.event;
             return;
           }
         }
@@ -392,16 +400,16 @@
       await until(
         () =>
           sender
-            .getSnapshot()
+            .snapshot()
             .topics.publishers.some(
               (publisher) =>
                 publisher.name === name &&
                 publisher.mode === "ordered" &&
                 publisher.connected &&
-                publisher.dataTrackId !== null,
+                typeof publisher.dataTrackId === "string",
             ) &&
           receiver
-            .getSnapshot()
+            .snapshot()
             .topics.subscribers.some(
               (subscriber) =>
                 subscriber.name === name &&
@@ -433,14 +441,12 @@
       await delivery;
       await dataReady(name);
     };
-    const steadySpec = track.data("reuse-steady", "ordered");
-    const cyclingSpec = track.data("reuse-cycle", "ordered");
-    const steadyPublisher = sender.track(steadySpec);
-    const cyclingPublisher = sender.track(cyclingSpec);
-    steadyIterator = receiver.remote
+    const steadyPublisher = sender.data("reuse-steady", "ordered");
+    const cyclingPublisher = sender.data("reuse-cycle", "ordered");
+    steadyIterator = await receiver
       .participant("web-sender")
-      .track(steadySpec)
-      .events();
+      .data("reuse-steady", "ordered")
+      .receive();
     await warmOrdered(steadyPublisher, steadyIterator, 0, "reuse-steady");
     await steadyPublisher.send(Uint8Array.of(1));
     await receiveValue(steadyIterator, 1);
@@ -453,10 +459,10 @@
     );
     let retiredPayload;
     for (let lifetime = 0; lifetime < 3; lifetime++) {
-      cyclingIterator = receiver.remote
+      cyclingIterator = await receiver
         .participant("web-sender")
-        .track(cyclingSpec)
-        .events();
+        .data("reuse-cycle", "ordered")
+        .receive();
       // Earlier retained values on a fresh subscription are legitimate replay.
       await warmOrdered(
         cyclingPublisher,
@@ -487,7 +493,7 @@
           "reuse keeps the original connected SCTP association",
         );
       }
-      await cyclingIterator.return();
+      await cyclingIterator.close();
       await until(
         () =>
           live.filter(({ channel }) => channel.readyState === "closed")
@@ -514,8 +520,8 @@
         "continuing ordered bindings are not replaced",
       );
       assert(
-        sender.getSnapshot().generation === senderGeneration &&
-          receiver.getSnapshot().generation === receiverGeneration,
+        sender.snapshot().generation === senderGeneration &&
+          receiver.snapshot().generation === receiverGeneration,
         "payload reuse does not reconnect either peer",
       );
       await steadyPublisher.send(Uint8Array.of(lifetime + 2));
@@ -524,16 +530,14 @@
     await until(
       () =>
         receiver
-          .getSnapshot()
+          .snapshot()
           .catalog.publications.some((p) => p.kind === "video"),
       "video discovery",
     );
     const publication = receiver
-      .getSnapshot()
+      .snapshot()
       .catalog.publications.find((p) => p.kind === "video");
-    const remoteVideo = receiver.remote
-      .participant("web-sender")
-      .track(track.video("camera"));
+    const remoteVideo = receiver.participant("web-sender").video("camera");
     attachment = attachRemoteVideo(remoteVideo, video, undefined, {
       preferences: {
         minHeight: 1,
@@ -545,11 +549,10 @@
     await attachment.ready;
     await until(
       () =>
-        receiver.getSnapshot().tracks[publication.id]?.media.readyState ===
-        "live",
+        receiver.snapshot().tracks[publication.id]?.media.readyState === "live",
       "mapped fixed-delay track",
     );
-    const fixedTrack = receiver.getSnapshot().tracks[publication.id].media;
+    const fixedTrack = receiver.snapshot().tracks[publication.id].media;
     const fixedPeer = peerForTrack(fixedTrack);
     const fixedReceiver = fixedPeer
       .getReceivers()
@@ -566,9 +569,12 @@
         !video.paused,
       "fresh fixed-delay decoded/renderable frames",
     );
+    let fixedPresentation = video.srcObject.getVideoTracks()[0];
     assert(
-      video.srcObject.getVideoTracks()[0] === fixedTrack,
-      "element uses current native receiver",
+      presentedFrom(fixedTrack) &&
+        fixedPresentation !== fixedTrack &&
+        fixedPresentation.readyState === "live",
+      "element uses an owned observation clone of the current native receiver",
     );
     // Keep one committed view throughout each handoff. A final release below is
     // deliberately different: it may retire the physical receiver lifetime.
@@ -576,23 +582,21 @@
       const before = await decoded(fixedReceiver);
       await until(
         async () =>
-          receiver.getSnapshot().tracks[publication.id]?.media === fixedTrack &&
+          receiver.snapshot().tracks[publication.id]?.media === fixedTrack &&
           fixedTrack.readyState === "live" &&
           peerForTrack(fixedTrack) === fixedPeer &&
           (await decoded(fixedReceiver)) > before + 1 &&
-          element.srcObject?.getVideoTracks()[0] === fixedTrack &&
+          presentedFrom(fixedTrack, element) &&
           element.videoWidth > 0 &&
           !element.paused,
         label,
       );
       assert(
-        sender.getSnapshot().generation === senderGeneration &&
-          receiver.getSnapshot().generation === receiverGeneration &&
+        sender.snapshot().generation === senderGeneration &&
+          receiver.snapshot().generation === receiverGeneration &&
           fixedPeer.connectionState === "connected" &&
           peers.size === 2 &&
-          receiver.remote
-            .participant("web-sender")
-            .track(track.video("camera")) === remoteVideo,
+          receiver.participant("web-sender").video("camera") === remoteVideo,
         `${label}: same agents, connection and remote handle`,
       );
     };
@@ -633,8 +637,11 @@
     );
     await handoffAttachment.ready;
     await witnessView(handoffVideo, "overlapping presentation");
-    attachment.close();
-    assert(video.srcObject === null, "old presentation releases its element");
+    await attachment.close();
+    assert(
+      video.srcObject === null && fixedPresentation.readyState === "ended",
+      "old presentation releases its element and owned observation",
+    );
     await deliverDuringView(6);
     await witnessView(handoffVideo, "handoff retains live receiver");
 
@@ -643,14 +650,20 @@
     });
     await attachment.ready;
     await witnessView(video, "remounted presentation");
-    handoffAttachment.close();
+    const handoffPresentation = handoffVideo.srcObject.getVideoTracks()[0];
+    await handoffAttachment.close();
     handoffAttachment = undefined;
-    assert(handoffVideo.srcObject === null, "handoff element released");
+    assert(
+      handoffVideo.srcObject === null &&
+        handoffPresentation.readyState === "ended",
+      "handoff element and owned observation released",
+    );
     handoffVideo.remove();
     handoffVideo = undefined;
     await deliverDuringView(7);
     await witnessView(video, "remount retains live receiver");
-    await steadyIterator.return();
+    fixedPresentation = video.srcObject.getVideoTracks()[0];
+    await steadyIterator.close();
     steadyIterator = undefined;
 
     const fixedRtp = await packetEvidence(fixedPeer, fixedReceiver);
@@ -688,7 +701,7 @@
         packetsWithoutDelay + 4,
     );
     assert(
-      receiver.getSnapshot().tracks[publication.id].media === fixedTrack &&
+      receiver.snapshot().tracks[publication.id].media === fixedTrack &&
         fixedTrack.readyState === "live",
       "mutable playout settings preserve the installed receiver",
     );
@@ -701,10 +714,14 @@
     );
     replacementVideoTrack = canvas.captureStream(10).getVideoTracks()[0];
     await videoPublication.setSource(
-      createCaptureSource(replacementVideoTrack, "video"),
+      VideoSource.fromTrack(replacementVideoTrack),
     );
     videoTrack.stop();
-    attachment.close();
+    await attachment.close();
+    assert(
+      fixedPresentation.readyState === "ended",
+      "attachment close ends its owned observation track",
+    );
     await until(
       () => fixedTrack.readyState === "ended" && retired.mid === null,
       "retired receiver ends and its actual browser MID clears",
@@ -714,7 +731,7 @@
     });
     await attachment.ready;
     await until(() => {
-      const track = receiver.getSnapshot().tracks[publication.id]?.media;
+      const track = receiver.snapshot().tracks[publication.id]?.media;
       return (
         track &&
         track !== fixedTrack &&
@@ -722,21 +739,22 @@
         fixedTrack.readyState === "ended"
       );
     }, "released slot receives a fresh native receiver");
-    const current = receiver.getSnapshot().tracks[publication.id].media;
+    const current = receiver.snapshot().tracks[publication.id].media;
     const peer = peerForTrack(current);
     const rtpReceiver = peer.getReceivers().find((r) => r.track === current);
     assert(
       peer === fixedPeer && fixedPeer.signalingState !== "closed",
-      `physical receiver retirement preserves the connection; warnings: ${warnings.join("; ")}; sender generation: ${sender.getSnapshot().generation}; receiver generation: ${receiver.getSnapshot().generation}; old peer: ${fixedPeer.connectionState}/${fixedPeer.signalingState}; new peer: ${peer.connectionState}/${peer.signalingState}; transport: ${JSON.stringify({ actual: transportLines(fixedPeer.localDescription), offers: localOffers.get(fixedPeer), applied: appliedAnswers.get(fixedPeer)?.map((answer) => answer.transport) })}`,
+      `physical receiver retirement preserves the connection; warnings: ${warnings.join("; ")}; sender generation: ${sender.snapshot().generation}; receiver generation: ${receiver.snapshot().generation}; old peer: ${fixedPeer.connectionState}/${fixedPeer.signalingState}; new peer: ${peer.connectionState}/${peer.signalingState}; transport: ${JSON.stringify({ actual: transportLines(fixedPeer.localDescription), offers: localOffers.get(fixedPeer), applied: appliedAnswers.get(fixedPeer)?.map((answer) => answer.transport) })}`,
     );
     const baseline = await decoded(rtpReceiver);
     await until(
       async () =>
         (await decoded(rtpReceiver)) > baseline + 1 &&
-        video.srcObject.getVideoTracks()[0] === current &&
+        presentedFrom(current) &&
         audible(),
       "fresh current-incarnation video and decoded audio",
     );
+    const currentPresentation = video.srcObject.getVideoTracks()[0];
     const defaultRtp = await packetEvidence(peer, rtpReceiver);
     assert(
       defaultRtp.relay === fixedRtp.relay &&
@@ -762,7 +780,7 @@
     const previousOwnedTrack = allocatedSender.track;
     let pendingTrack;
     MediaStreamTrack.prototype.clone = function () {
-      const clone = originalClone.call(this);
+      const clone = observeClone.call(this);
       if (this === replacementVideoTrack) handoffClones.push(clone);
       return clone;
     };
@@ -775,8 +793,8 @@
           originalReplaceTrack.call(this, next).then(resolve, reject);
       });
     };
-    videoPublication.setSource(
-      createCaptureSource(replacementVideoTrack, "video"),
+    pendingReplacements.push(
+      videoPublication.setSource(VideoSource.fromTrack(replacementVideoTrack)),
     );
     await until(() => pendingTrack, "native sender replacement is in flight");
     assert(
@@ -784,7 +802,7 @@
         pendingTrack.readyState === "live",
       "replacement stops the previous owned capture before native completion",
     );
-    videoPublication.setEnabled(false);
+    await videoPublication.configure({ enabled: false });
     await until(
       () => !pendingTrack.enabled,
       "in-flight owned capture is muted",
@@ -793,21 +811,24 @@
       replacementVideoTrack.enabled,
       "mute does not change caller capture",
     );
-    videoPublication.setSource(
-      createCaptureSource(replacementVideoTrack, "video"),
+    pendingReplacements.push(
+      videoPublication.setSource(VideoSource.fromTrack(replacementVideoTrack)),
     );
     await Promise.resolve();
-    await videoPublication.close();
+    retiringPublication = videoPublication.close();
+    await until(
+      () => pendingTrack.readyState === "ended",
+      "release retires in-flight owned capture",
+    );
     assert(
       pendingTrack.readyState === "ended" &&
         replacementVideoTrack.readyState === "live" &&
         handoffClones.length === 1,
       "release immediately stops only owned capture and fences queued cloning",
     );
-    videoPublication = attachLocalTrack(sender.track(track.video("camera")), {
-      source: createCaptureSource(replacementVideoTrack, "video"),
-    });
-    await videoPublication.ready;
+    videoPublication = await sender
+      .video("camera")
+      .publish(VideoSource.fromTrack(replacementVideoTrack), { enabled: true });
     assert(
       handoffClones.length === 1,
       "reused slot waits for the old operation",
@@ -816,6 +837,9 @@
     const release = releaseReplacement;
     releaseReplacement = undefined;
     await release();
+    await retiringPublication;
+    retiringPublication = undefined;
+    await Promise.all(pendingReplacements);
     await until(
       () =>
         handoffClones.length === 2 &&
@@ -828,12 +852,12 @@
         ),
       "fresh owner installs its capture after the stale native completion",
     );
-    MediaStreamTrack.prototype.clone = originalClone;
+    MediaStreamTrack.prototype.clone = observeClone;
     const previousAudio = receiver
-      .getSnapshot()
+      .snapshot()
       .catalog.publications.find((publication) => publication.kind === "audio");
     const previousAudioTrack =
-      receiver.getSnapshot().tracks[previousAudio.id].media;
+      receiver.snapshot().tracks[previousAudio.id].media;
     const previousAudioTransceiver = fixedPeer
       .getTransceivers()
       .find((transceiver) => transceiver.receiver.track === previousAudioTrack);
@@ -841,7 +865,7 @@
     await until(
       () =>
         !receiver
-          .getSnapshot()
+          .snapshot()
           .catalog.publications.some(
             (publication) => publication.id === previousAudio.id,
           ) &&
@@ -850,12 +874,11 @@
         outputRoutes.size === 0,
       "retired audio source ends its receiver and owned playback route",
     );
-    audioPublication = attachLocalTrack(sender.track(track.audio("voice")), {
-      source: createCaptureSource(audioTrack, "audio"),
-    });
-    await audioPublication.ready;
+    audioPublication = await sender
+      .audio("voice")
+      .publish(AudioSource.fromTrack(audioTrack), { enabled: true });
     await until(() => {
-      const snapshot = receiver.getSnapshot();
+      const snapshot = receiver.snapshot();
       const fresh = (kind, oldId) => {
         const publication = snapshot.catalog.publications.find(
           (publication) =>
@@ -868,7 +891,7 @@
       };
       return fresh("video", publication.id) && fresh("audio", previousAudio.id);
     }, "both re-added named publications have fresh actual receivers");
-    const readded = receiver.getSnapshot();
+    const readded = receiver.snapshot();
     const freshVideo = readded.catalog.publications.find(
       (publication) => publication.kind === "video",
     );
@@ -886,8 +909,8 @@
           peer.getSenders().some((sender) => sender.track === handoffClones[1]),
         ) === publishingPeer &&
         peers.size === 2 &&
-        sender.getSnapshot().generation === senderGeneration &&
-        receiver.getSnapshot().generation === receiverGeneration,
+        sender.snapshot().generation === senderGeneration &&
+        receiver.snapshot().generation === receiverGeneration,
       "publication churn creates fresh source-bound objects on the same two actual peers",
     );
     const freshReceiver = fixedPeer
@@ -898,7 +921,7 @@
       async () =>
         (await decoded(freshReceiver)) > freshFrames + 1 &&
         audible() &&
-        video.srcObject?.getVideoTracks()[0] === freshVideoTrack &&
+        presentedFrom(freshVideoTrack) &&
         video.videoWidth > 0 &&
         !video.paused,
       "re-added sources deliver fresh decoded/renderable video and real decoded tone",
@@ -911,7 +934,9 @@
         previousVideoTransceiver.mid === null &&
         previousAudioTrack.readyState === "ended" &&
         previousAudioTransceiver.mid === null &&
-        video.srcObject.getVideoTracks()[0] !== current &&
+        fixedPresentation.readyState === "ended" &&
+        currentPresentation.readyState === "ended" &&
+        video.srcObject.getVideoTracks()[0] !== currentPresentation &&
         outputRoutes.size === 1,
       "old source observations remain terminal while replacement media flows",
     );
@@ -950,11 +975,11 @@
         ),
       "in-place receiver replacement keeps the two negotiated reliable ordered SID 0 channels",
     );
-    attachment.close();
+    await attachment.close();
     assert(video.srcObject === null, "element cleanup");
-    receiver.close();
+    await receiver.close();
     await until(() => outputRoutes.size === 0, "owned audio routes released");
-    sender.close();
+    await sender.close();
     assert(
       replacementVideoTrack.readyState === "live" &&
         audioTrack.readyState === "live" &&
@@ -963,18 +988,24 @@
     );
     return true;
   } finally {
-    void steadyIterator?.return();
-    void cyclingIterator?.return();
-    attachment?.close();
-    handoffAttachment?.close();
-    handoffVideo?.remove();
-    void videoPublication?.close();
-    void audioPublication?.close();
-    sender.close();
-    receiver.close();
     RTCRtpSender.prototype.replaceTrack = originalReplaceTrack;
     MediaStreamTrack.prototype.clone = originalClone;
-    void releaseReplacement?.();
+    await releaseReplacement?.();
+    await Promise.allSettled([
+      steadyIterator?.close(),
+      cyclingIterator?.close(),
+      attachment?.close(),
+      handoffAttachment?.close(),
+      videoPublication?.close(),
+      audioPublication?.close(),
+      audioPlayback?.close(),
+      audioSelection?.close(),
+      retiringPublication,
+      ...pendingReplacements,
+      sender.close(),
+      receiver.close(),
+    ]);
+    handoffVideo?.remove();
     video.remove();
     clearInterval(painting);
     videoTrack.stop();

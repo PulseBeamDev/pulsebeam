@@ -59,12 +59,13 @@ new one after commit. Fabricated handles are unsupported.
 
 This is a source-breaking replacement of the React `track` export,
 `TrackSpec`/`VideoTrackSpec`/`AudioTrackSpec`/`DataTrackSpec` exports, `.track(spec)`
-methods, and local media setters. There are no deprecated aliases. The public
-Web descriptor API is unchanged.
+methods, and local media setters. There are no deprecated aliases. The
+caller-owned Web SDK also uses typed lookups, awaited factories, and explicit
+resource lifetimes.
 
 Core validates portable label rules when an owner acquires the resource. Media
-labels are nonempty UTF-8 strings of at most 64 bytes, without control characters
-or `/`. Data labels are 1 to 85 ASCII characters from `[A-Za-z0-9_-]`.
+and data labels are nonempty UTF-8 strings of at most 256 bytes. Limits count
+encoded bytes, not JavaScript characters.
 
 Data delivery is `"latest" | "lossy" | "ordered"`:
 

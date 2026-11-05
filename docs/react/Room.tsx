@@ -2,6 +2,7 @@ import { useState } from "react";
 import {
   Audio,
   Publish,
+  SelectAudio,
   Video,
   useAgent,
   useCapture,
@@ -22,7 +23,7 @@ export function Room({ config }: { config: AgentConfig }) {
     null,
   );
   const report = (failure: unknown) => setError(String(failure));
-  const remoteVideos = agent.remote.participants.flatMap((participant) =>
+  const remoteVideos = agent.participants.flatMap((participant) =>
     participant.tracks.filter(
       (value): value is RemoteVideoTrack => value.kind === "video",
     ),
@@ -32,6 +33,7 @@ export function Room({ config }: { config: AgentConfig }) {
     <main>
       <Publish track={agent.video("camera")} source={capture.video} />
       <Publish track={agent.audio("microphone")} source={capture.audio} />
+      <SelectAudio agent={agent} policy={{ automatic: true }} />
       <Audio agent={agent} onPlaybackError={setAudioPlayback} />
       <h1>PulseBeam React room</h1>
       <p role="status">
@@ -39,14 +41,14 @@ export function Room({ config }: { config: AgentConfig }) {
         {agent.participantId ?? "not admitted"}
       </p>
       <p>Capture: {capture.state}</p>
-      <button onClick={() => agent.connect()}>Join</button>
+      <button onClick={() => void agent.connect().catch(report)}>Join</button>
       <button onClick={() => void capture.request().catch(report)}>
         Enable camera and microphone
       </button>
       <button
         onClick={() => {
           capture.stop();
-          agent.disconnect();
+          void agent.disconnect().catch(report);
         }}
       >
         Leave and stop capture

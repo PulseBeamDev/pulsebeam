@@ -4,7 +4,7 @@ use super::decoder::PixelSample;
 use super::provenance::{AuthenticatedSourceEvent, SourceLedger};
 use anyhow::{Context, Result, ensure};
 use pulsebeam_agent_native::agent_core::PlayoutDelay;
-use pulsebeam_agent_native::{OutputFrame, RemoteFrame, RemoteTrack};
+use pulsebeam_agent_native::{NativeReceiverInfo, OutputFrame, RemoteFrame};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ enum Origin {
 
 #[derive(Clone, Debug)]
 struct NativePicture {
-    track: RemoteTrack,
+    track: NativeReceiverInfo,
     dimensions: (u32, u32),
     at: Instant,
     nontrivial: bool,
@@ -32,7 +32,7 @@ struct NativePicture {
 
 #[derive(Clone, Debug, Default)]
 struct Picture {
-    track: Option<RemoteTrack>,
+    track: Option<NativeReceiverInfo>,
     origin: Origin,
     event: Option<AuthenticatedSourceEvent>,
     event_conflict: bool,
@@ -50,14 +50,14 @@ struct Receipt {
 
 #[derive(Debug)]
 pub struct NativeOriginProof {
-    pub track: RemoteTrack,
+    pub track: NativeReceiverInfo,
     pub dimensions: (u32, u32),
     pub frames: u64,
 }
 
 #[derive(Debug)]
 pub struct NativeProgressProof {
-    pub track: RemoteTrack,
+    pub track: NativeReceiverInfo,
     pub min_dimensions: (u32, u32),
     pub frames: u64,
 }
@@ -94,7 +94,7 @@ impl SourceTiming {
 #[derive(Clone, Debug)]
 pub struct SourceWindow {
     pub source: String,
-    pub track: RemoteTrack,
+    pub track: NativeReceiverInfo,
     pub encodings: BTreeSet<String>,
     pub start: Instant,
     pub end: Instant,
@@ -147,7 +147,12 @@ impl SourceTrace {
         (key.0, key.1) == (self.window.track.generation, self.window.track.receiver)
     }
 
-    fn event(&mut self, key: Key, track: &RemoteTrack, event: Option<AuthenticatedSourceEvent>) {
+    fn event(
+        &mut self,
+        key: Key,
+        track: &NativeReceiverInfo,
+        event: Option<AuthenticatedSourceEvent>,
+    ) {
         if !self.receiver(key) {
             return;
         }
@@ -346,7 +351,7 @@ impl SourceTrace {
 #[derive(Clone, Debug)]
 struct SourceProgress {
     source: String,
-    track: RemoteTrack,
+    track: NativeReceiverInfo,
     dimensions: (u32, u32),
     capture: u64,
     frames: u64,
@@ -393,7 +398,7 @@ impl NativeOriginCorrelation {
         self.pictures.insert(key, Picture::default());
     }
 
-    fn bind_track(&mut self, key: Key, track: &RemoteTrack) -> bool {
+    fn bind_track(&mut self, key: Key, track: &NativeReceiverInfo) -> bool {
         self.admit(key);
         let picture = self.pictures.get_mut(&key).unwrap();
         if let Some(previous) = &picture.track {
@@ -878,7 +883,7 @@ mod tests {
     // injected into RTC; actual native encoded+I420 delivery has separate gates.
     fn frame(receiver: u64, timestamp: u32, decoded: bool) -> RemoteFrame {
         RemoteFrame {
-            track: RemoteTrack {
+            track: NativeReceiverInfo {
                 generation: 1,
                 receiver,
                 track_id: "unit".into(),

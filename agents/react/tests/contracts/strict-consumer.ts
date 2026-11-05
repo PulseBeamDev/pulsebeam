@@ -2,6 +2,7 @@ import {
   Audio,
   Data,
   Publish,
+  SelectAudio,
   Video,
   useAgent,
   useCapture,
@@ -35,9 +36,9 @@ const config: AgentConfig = {
   logging: { level: "info" },
 };
 const agent: Agent = useAgent(config);
-const direct = createAgent(config);
-direct.connect();
-direct.close();
+const direct = await createAgent(config);
+await direct.connect();
+await direct.close();
 // @ts-expect-error Required ownership configuration.
 useAgent();
 
@@ -66,7 +67,7 @@ useCapture("display", { video: { device: cameraDevice }, audio: false });
 // @ts-expect-error Display video is required.
 useCapture("display", { video: false, audio: false });
 
-// @ts-expect-error React descriptors were removed; Web retains its descriptor API.
+// @ts-expect-error Descriptors are not normal SDK API.
 import { track } from "@pulsebeam/react";
 // @ts-expect-error Descriptor-only types are not React API.
 import type { TrackSpec } from "@pulsebeam/react";
@@ -106,7 +107,9 @@ agent.track({ kind: "video", label: "camera" });
 // @ts-expect-error Delivery is required.
 agent.data("chat");
 
-const participant = agent.remote.participant("alice");
+const participant = agent.participant("alice");
+const participantId: string = participant.id();
+void participantId;
 const remoteVideo = participant.video("camera");
 const remoteAudio = participant.audio("microphone");
 const remoteChat = participant.data("chat", "ordered");
@@ -140,6 +143,7 @@ createElement(Video, {
   },
 });
 createElement(Video, { source: capture.video });
+createElement(SelectAudio, { agent, policy: { automatic: true } });
 createElement(Audio, {
   agent,
   onPlaybackError: (failure) => void failure.retry(),
@@ -173,8 +177,8 @@ remoteChat.send(new Uint8Array());
 remoteVideo.setReceiveOptions({});
 // @ts-expect-error Audio analysis is not per-track React API.
 remoteAudio.readWaveform(new Float32Array());
-// @ts-expect-error Kind-specific remote collection roots were removed.
-agent.remote.videoTracks;
+// @ts-expect-error Nested remote lookup roots were removed.
+agent.remote;
 // @ts-expect-error Kind-specific participant collection roots were removed.
 participant.audioTracks;
 // @ts-expect-error Old callable local roots were removed.

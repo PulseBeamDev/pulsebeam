@@ -74,14 +74,32 @@
   video.playsInline = true;
   document.body.append(video);
   let retry;
+  const observedVideo = Promise.withResolvers();
+  let receiverClosed = false;
   const attachment = attachRemoteMedia(
     {
-      getSnapshot: () => ({ tracks: { video: { media: videoTrack } } }),
-      subscribe: () => () => {},
+      async observe() {
+        let closed = false;
+        return {
+          track: () => {
+            observedVideo.resolve();
+            return closed ? null : videoTrack;
+          },
+          isClosed: () => closed,
+          async close() {
+            closed = true;
+          },
+        };
+      },
+      isClosed: () => receiverClosed,
+      async close() {
+        receiverClosed = true;
+      },
     },
     video,
     {
-      publicationIds: ["video"],
+      ready: Promise.resolve(),
+      subscribe: () => () => {},
       autoPlay: false,
       onPlaybackBlocked: (failure) => {
         retry = failure.retry;
@@ -89,6 +107,9 @@
     },
   );
   video.srcObject.addTrack(track);
+  await observedVideo.promise;
+  if (video.srcObject.getVideoTracks()[0] !== videoTrack)
+    throw new Error("attachment did not install its observed video track");
   await attachment.retryPlayback();
   if (!retry || !video.paused)
     throw new Error(

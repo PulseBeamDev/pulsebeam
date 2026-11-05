@@ -13,7 +13,7 @@ use crate::{
 
 const SEND_ADMISSION_WINDOW: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, uniffi::Enum)]
 pub enum DataSendFailure {
     #[error("data send was disconnected")]
     Disconnected,

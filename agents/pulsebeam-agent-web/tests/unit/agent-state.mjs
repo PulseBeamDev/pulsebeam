@@ -8,6 +8,59 @@ import {
   validatePlayoutDelay,
 } from "../../unit-javascript/agent-state.js";
 
+import {
+  observeSnapshots,
+  observeEvents,
+} from "../../unit-javascript/observation.js";
+
+test("state cursors are bounded, independently closed, and wake all pending reads", async () => {
+  let released = 0;
+  const initial = emptySnapshot("disconnected");
+  const first = observeSnapshots(initial, false, () => released++);
+  const sibling = observeSnapshots(initial, false, () => released++);
+  const events = observeEvents(false, () => released++);
+  assert.deepEqual(await first.stream.next(), {
+    type: "snapshot",
+    snapshot: initial,
+  });
+  const pending = first.stream.next();
+  const queued = first.stream.next();
+  await first.stream.close();
+  await first.stream.close();
+  assert.deepEqual(await pending, { type: "closed" });
+  assert.deepEqual(await queued, { type: "closed" });
+  assert.equal(released, 1);
+  assert.equal(sibling.stream.isClosed(), false);
+  for (let index = 0; index < 70; index++) sibling.publish(initial);
+  assert.deepEqual(
+    await sibling.stream.next(),
+    { type: "snapshot", snapshot: initial },
+    "initial snapshot is not lost when later updates overflow",
+  );
+  assert.deepEqual(await sibling.stream.next(), {
+    type: "lagged",
+    skipped: 6n,
+  });
+  assert.equal((await sibling.stream.next()).type, "snapshot");
+  const retiring = sibling.stream.next();
+  sibling.close();
+  assert.deepEqual(
+    await retiring,
+    { type: "closed" },
+    "retirement wins over queued data",
+  );
+  for (let index = 0; index < 70; index++)
+    events.publish({ type: "state-change" });
+  assert.deepEqual(await events.stream.next(), { type: "lagged", skipped: 6n });
+  for (let index = 0; index < 64; index++)
+    assert.equal((await events.stream.next()).type, "event");
+  const pendingEvent = events.stream.next();
+  events.close();
+  assert.deepEqual(await pendingEvent, { type: "closed" });
+  assert.equal(released, 3);
+  assert.equal("observation" in first.stream, false);
+});
+
 test("configuration owns immutable connection and logging inputs", () => {
   const input = { endpoint: "https://example.test", token: "credential" };
   const config = copyConfig(input);
@@ -64,7 +117,7 @@ test("desired revisions copy nested policy and omission withdraws complete inten
   assert.deepEqual(withdrawn.video, []);
   assert.deepEqual(withdrawn.topics, []);
   assert.deepEqual(withdrawn.audio.pinned, []);
-  assert.equal(withdrawn.audio.automatic, true);
+  assert.equal(withdrawn.audio.automatic, false);
   validatePlayoutDelay(state);
   for (const minMs of [-1, NaN, 0.5, 2 ** 32])
     assert.throws(

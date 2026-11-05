@@ -31,7 +31,11 @@
   let wire = [];
   let owner = 0n;
   const owners = new ResourceOwners(() => {});
+  const pending = new Map();
   owners.activate({
+    async observe_media(token) {
+      return new Promise((_resolve, reject) => pending.set(token, reject));
+    },
     async resource(command) {
       if (command.op === "claimVideo") return { owner: ++owner };
       if (command.op === "observeVideo") {
@@ -39,6 +43,10 @@
         return { type: "updated" };
       }
       if (command.op === "release") {
+        pending.get(command.owner)?.(
+          Object.assign(new Error("closed"), { pulsebeamCode: "closed" }),
+        );
+        pending.delete(command.owner);
         wire = [];
         return { type: "released" };
       }
@@ -49,7 +57,6 @@
   const catalog = new RemoteCatalog(agent, new DataRegistry(agent), owners);
   catalog.update(snapshot);
   const handle = catalog.participant("alice").video("camera");
-  handle.setReceiveOptions({ minHeight: 720 });
   const host = document.createElement("div");
   document.body.append(host);
   const attachments = [];
@@ -71,7 +78,9 @@
       display: "block",
     });
     host.append(element);
-    const attachment = attachRemoteVideo(handle, element);
+    const attachment = attachRemoteVideo(handle, element, undefined, {
+      preferences: { minHeight: 720 },
+    });
     attachments.push(attachment);
     return { element, attachment };
   };
@@ -88,11 +97,13 @@
     small.element.style.top = "0";
     await until(() => wire[0]?.height === Math.ceil(230 * devicePixelRatio));
     const viewportNotifications = wire.length === 1;
-    small.attachment.close();
+    await small.attachment.close();
     const released = wire.length === 0 && listeners.size === 0;
     return { resizedPhysicalPixels, viewportNotifications, released };
   } finally {
-    for (const attachment of attachments) attachment.close();
+    await Promise.allSettled(
+      attachments.map((attachment) => attachment.close()),
+    );
     host.remove();
     catalog.close();
   }

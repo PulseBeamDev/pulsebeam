@@ -6,7 +6,9 @@ use agent_core::{
 
 pub(super) struct PublicationLease {
     pub(super) owner: u64,
+    pub(super) spec: TrackSpec,
     pub(super) closed: Arc<Signal>,
+    readiness: watch::Sender<Option<PhysicalSource>>,
     commands: mpsc::Sender<Command>,
     changed: Arc<Notify>,
 }
@@ -20,7 +22,7 @@ impl Drop for PublicationLease {
 
 #[derive(Clone)]
 pub struct Publication {
-    inner: Arc<PublicationLease>,
+    pub(super) inner: Arc<PublicationLease>,
 }
 
 impl Publication {
@@ -28,7 +30,28 @@ impl Publication {
         self.inner.closed.is_closed()
     }
 
-    pub async fn input(&self) -> Result<PublicationInput, Error> {
+    pub async fn ready(&self) -> Result<(), Error> {
+        let mut readiness = self.inner.readiness.subscribe();
+        loop {
+            if self.is_closed() {
+                return Err(Error::Closed);
+            }
+            if readiness
+                .borrow()
+                .as_ref()
+                .is_some_and(|source| !source.is_closed())
+            {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = self.inner.closed.wait() => return Err(Error::Closed),
+                changed = readiness.changed() => if changed.is_err() { return Err(Error::Closed); },
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn input(&self) -> Result<PublicationInput, Error> {
         if self.is_closed() {
             return Err(Error::Closed);
         }
@@ -44,7 +67,27 @@ impl Publication {
         result.await.map_err(|_| Error::Closed)?
     }
 
-    pub async fn set_muted(&self, muted: bool) -> Result<(), Error> {
+    pub async fn set_source(&self, producer: Option<&ProducerInput>) -> Result<(), Error> {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
+        let (response, result) = oneshot::channel();
+        self.inner
+            .commands
+            .send(Command::BindProducer {
+                owner: self.inner.owner,
+                producer: producer.cloned(),
+                response,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
+    pub async fn configure(
+        &self,
+        configuration: agent_core::ffi::PublicationConfig,
+    ) -> Result<(), Error> {
         if self.is_closed() {
             return Err(Error::Closed);
         }
@@ -54,7 +97,7 @@ impl Publication {
             .send(Command::Resource {
                 command: ResourceCommand::SetPublicationMuted {
                     owner: self.inner.owner,
-                    muted,
+                    muted: !configuration.enabled,
                 },
                 response,
             })
@@ -112,23 +155,25 @@ pub(super) struct RegisteredInput {
     pub(super) operation: PublicationInputOperation,
     pub(super) lease: Weak<InputLease>,
     pub(super) target: watch::Sender<Option<InputTarget>>,
+    pub(super) producer: Option<u64>,
+    pending_control: Option<PublicationInputControl>,
 }
 
 #[derive(Clone)]
-pub struct PublicationInput {
-    inner: Arc<InputLease>,
+pub(super) struct PublicationInput {
+    pub(super) inner: Arc<InputLease>,
 }
 
 impl PublicationInput {
     pub fn is_closed(&self) -> bool {
         self.inner.closed.is_closed()
     }
+}
 
+#[cfg(test)]
+impl PublicationInput {
     pub fn feedback(&self) -> ObservationStream<ProducerFeedback> {
-        ObservationStream {
-            receiver: Mutex::new(self.inner.feedback.subscribe()),
-            closed: self.inner.closed.clone(),
-        }
+        ObservationStream::new(self.inner.feedback.subscribe(), self.inner.closed.clone())
     }
 
     pub(super) fn target(&self) -> Result<InputTarget, Error> {
@@ -211,6 +256,16 @@ where
             && self
                 .inputs
                 .get(&control.operation.owner())
+                .is_some_and(|input| {
+                    input.producer.is_none_or(|owner| {
+                        self.producers
+                            .get(&owner)
+                            .is_some_and(|producer| !producer.is_closed())
+                    })
+                })
+            && self
+                .inputs
+                .get(&control.operation.owner())
                 .and_then(|input| input.lease.upgrade())
                 .is_some_and(|lease| {
                     !lease.closed.is_closed()
@@ -221,13 +276,15 @@ where
     pub(super) fn claim_publication(&mut self, spec: TrackSpec) -> Result<Publication, Error> {
         let ResourceResult::Publication { owner, .. } = self
             .core
-            .resource(ResourceCommand::ClaimPublication { spec })?
+            .resource(ResourceCommand::ClaimPublication { spec: spec.clone() })?
         else {
             return Err(Error::Rtc("Core did not claim a publication".into()));
         };
         let inner = Arc::new(PublicationLease {
             owner,
+            spec,
             closed: Arc::new(Signal::default()),
+            readiness: watch::channel(None).0,
             commands: self.command_tx.clone(),
             changed: self.leases_changed.clone(),
         });
@@ -270,6 +327,8 @@ where
                 operation: operation.clone(),
                 lease: Arc::downgrade(&inner),
                 target: target_tx,
+                producer: None,
+                pending_control: None,
             },
         );
         self.core
@@ -309,14 +368,38 @@ where
         Ok(())
     }
 
+    pub(super) fn progress_publication_inputs(&mut self) {
+        let generation = self.peer.as_ref().map(|peer| peer.generation);
+        let controls: Vec<_> = self
+            .inputs
+            .values_mut()
+            .filter_map(|input| {
+                let control = input.pending_control.as_ref()?;
+                if control
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| Some(target.generation) == generation)
+                {
+                    input.pending_control.take()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for control in controls {
+            self.input_control(control);
+        }
+    }
+
     pub(super) fn input_control(&mut self, control: PublicationInputControl) {
         if !self.core.publication_input_control_current(&control) {
             return;
         }
         let owner = control.operation.owner();
-        let Some(registered) = self.inputs.get(&owner) else {
+        let Some(registered) = self.inputs.get_mut(&owner) else {
             return;
         };
+        registered.pending_control = None;
         let Some(lease) = registered.lease.upgrade() else {
             return;
         };
@@ -324,6 +407,20 @@ where
             lease.closed.close();
             self.clear_input_target(owner);
             self.inputs.remove(&owner);
+            return;
+        }
+        let producer = registered.producer;
+        if producer.is_some() && !control.enabled {
+            self.clear_input_target(owner);
+            if let Err(error) =
+                self.core
+                    .resource(ResourceCommand::CompletePublicationInputTarget {
+                        control,
+                        succeeded: true,
+                    })
+            {
+                self.fail(error.into());
+            }
             return;
         }
         let previous = registered.target.borrow().clone();
@@ -346,9 +443,13 @@ where
                 .as_ref()
                 .is_none_or(|peer| peer.generation != target.generation) =>
             {
-                Err(Error::NotReady)
+                self.clear_input_target(owner);
+                if let Some(registered) = self.inputs.get_mut(&owner) {
+                    registered.pending_control = Some(control);
+                }
+                return;
             }
-            _ => self.create_source(target.binding.slot.clone()),
+            _ => self.create_source(target.binding.slot.clone(), producer),
         };
         let result = source.and_then(|source| {
             let enabled =
@@ -363,25 +464,39 @@ where
         });
         match result {
             Ok(source) => {
+                let ready_source = source.clone();
                 if let Some(registered) = self.inputs.get(&owner) {
-                    registered.target.send_replace(Some(InputTarget {
+                    let target = InputTarget {
                         source,
                         control: Arc::new(control.clone()),
-                    }));
+                    };
+                    registered.target.send_replace(Some(target.clone()));
+                    if let Some(owner) = registered.producer
+                        && let Some(producer) = self.producers.get(&owner)
+                    {
+                        producer.bind_target(target);
+                    }
                 }
-                if let Err(error) =
-                    self.core
-                        .resource(ResourceCommand::CompletePublicationInputTarget {
-                            control,
-                            succeeded: true,
-                        })
-                {
-                    self.fail(error.into());
+                let enabled = control.enabled;
+                match self
+                    .core
+                    .resource(ResourceCommand::CompletePublicationInputTarget {
+                        control,
+                        succeeded: true,
+                    }) {
+                    Ok(ResourceResult::Updated) => {
+                        self.publication_readiness(owner, enabled.then_some(ready_source));
+                    }
+                    Ok(_) => self.clear_input_target(owner),
+                    Err(error) => {
+                        self.clear_input_target(owner);
+                        self.fail(error.into());
+                    }
                 }
             }
             Err(error) => {
-                self.fail(error);
                 self.clear_input_target(owner);
+                self.fail(error);
                 if let Err(error) =
                     self.core
                         .resource(ResourceCommand::CompletePublicationInputTarget {
@@ -395,7 +510,21 @@ where
         }
     }
 
+    fn publication_readiness(&self, owner: u64, readiness: Option<PhysicalSource>) {
+        if let Some(lease) = self.publications.get(&owner).and_then(Weak::upgrade) {
+            lease.readiness.send_replace(readiness);
+        }
+    }
+
     pub(super) fn clear_input_target(&mut self, owner: u64) {
+        self.publication_readiness(owner, None);
+        if let Some(registered) = self.inputs.get(&owner)
+            && let Some(producer) = registered
+                .producer
+                .and_then(|producer| self.producers.get(&producer))
+        {
+            producer.clear_target(owner);
+        }
         let previous = self
             .inputs
             .get(&owner)

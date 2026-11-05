@@ -1355,7 +1355,7 @@ struct ParticipantHandle {
     interval_decoded_video_baseline: BTreeMap<String, u64>,
     interval_decoded_size_baseline: BTreeMap<String, DecodedVideoSizes>,
     native_video_baseline: super::native_video::NativeDecodedVideoLog,
-    native_playback_track: Option<pulsebeam_agent_native::RemoteTrack>,
+    native_playback_track: Option<pulsebeam_agent_native::NativeReceiverInfo>,
     native_playback_started: bool,
     native_origin_interval: Instant,
     native_video_stats_timestamp: Option<i64>,

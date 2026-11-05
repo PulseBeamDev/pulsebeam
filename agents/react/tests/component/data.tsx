@@ -101,12 +101,12 @@ export async function dataLifetimes() {
     assert.notEqual(room, trackIdentity(agent.video("chat")));
     assert.notEqual(room, trackIdentity(agent.data("other", "ordered")));
     const participant = trackIdentity(
-      agent.remote.participant("alice").data("chat", "ordered"),
+      agent.participant("alice").data("chat", "ordered"),
     );
     assert.notEqual(room, participant);
     assert.notEqual(
       participant,
-      trackIdentity(agent.remote.participant("bob").data("chat", "ordered")),
+      trackIdentity(agent.participant("bob").data("chat", "ordered")),
     );
     const owners = [...runtime.dataOwners.keys()];
     assert.equal(owners.length, 2);

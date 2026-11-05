@@ -1,36 +1,37 @@
+import type { AudioSource, VideoSource } from "./capture-source.js";
+import type { EventStream, SnapshotStream } from "./observation.js";
+import type { AudioPublication, VideoPublication } from "./media.js";
 import type {
-  CapturedAudioTrack,
-  CapturedVideoTrack,
-} from "./capture-source.js";
+  AudioSelection,
+  AudioSubscription,
+  VideoSubscription,
+} from "./reception.js";
 
-import type {
-  AudioTrackSpec,
-  DataTrackSpec,
-  Delivery,
-  VideoTrackSpec,
-} from "./track.js";
+import type { Delivery } from "./track.js";
 import type { LocalDataTrack, RemoteDataTrack } from "./data.js";
 
 export type MediaKind = "audio" | "video";
 
+export interface PublicationConfig {
+  readonly enabled: boolean;
+}
+
 export interface LocalVideoTrack {
   readonly kind: "video";
   readonly label: string;
-  readonly source: CapturedVideoTrack | null;
-  readonly enabled: boolean;
-  setEnabled(enabled: boolean): void;
-  setSource(source: CapturedVideoTrack | null): void;
-  subscribe(listener: () => void): () => void;
+  publish(
+    source: VideoSource,
+    configuration: PublicationConfig,
+  ): Promise<VideoPublication>;
 }
 
 export interface LocalAudioTrack {
   readonly kind: "audio";
   readonly label: string;
-  readonly source: CapturedAudioTrack | null;
-  readonly enabled: boolean;
-  setEnabled(enabled: boolean): void;
-  setSource(source: CapturedAudioTrack | null): void;
-  subscribe(listener: () => void): () => void;
+  publish(
+    source: AudioSource,
+    configuration: PublicationConfig,
+  ): Promise<AudioPublication>;
 }
 export type TopicMode = "latest" | "lossy" | "ordered";
 export type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
@@ -84,6 +85,21 @@ export interface AudioDemand {
     readonly selector: TrackSelector;
     readonly playoutDelay: FixedPlayoutDelay;
   }[];
+}
+
+export type PlayoutDelay = { readonly mode: "adaptive" } | FixedPlayoutDelay;
+
+export interface VideoObservation {
+  readonly visible: boolean;
+  readonly height: number;
+  readonly minHeight: number;
+  readonly minFps: number;
+  readonly priority: number;
+  readonly playoutDelay: PlayoutDelay;
+}
+
+export interface AudioSubscriptionConfig {
+  readonly playoutDelay: PlayoutDelay;
 }
 
 export interface FixedPlayoutDelay {
@@ -187,7 +203,8 @@ export interface RemoteVideoTrack {
   readonly participantId: string;
   readonly label: string;
   readonly active: boolean;
-  subscribe(listener: () => void): () => void;
+  watch(listener: () => void): () => void;
+  subscribe(configuration: VideoObservation): Promise<VideoSubscription>;
 }
 
 export interface RemoteAudioTrack {
@@ -196,7 +213,8 @@ export interface RemoteAudioTrack {
   readonly active: boolean;
   readonly participantId: string;
   readonly label: string;
-  subscribe(listener: () => void): () => void;
+  watch(listener: () => void): () => void;
+  subscribe(configuration: AudioSubscriptionConfig): Promise<AudioSubscription>;
 }
 
 export type RemotePublishedTrack =
@@ -208,9 +226,10 @@ export interface RemoteParticipant {
   readonly participantId: string;
   readonly active: boolean;
   readonly tracks: readonly RemotePublishedTrack[];
-  track(spec: VideoTrackSpec): RemoteVideoTrack;
-  track(spec: AudioTrackSpec): RemoteAudioTrack;
-  track<D extends Delivery>(spec: DataTrackSpec<D>): RemoteDataTrack<D>;
+  id(): string;
+  video(label: string): RemoteVideoTrack;
+  audio(label: string): RemoteAudioTrack;
+  data<D extends Delivery>(label: string, delivery: D): RemoteDataTrack<D>;
 }
 
 export interface RemoteMedia {
@@ -429,17 +448,20 @@ export interface Agent {
   readonly participantId: string | null;
   readonly roomId: string | null;
   readonly authorizationExpiresAt: number | null;
-  readonly remote: RemoteMedia;
-  track(spec: VideoTrackSpec): LocalVideoTrack;
-  track(spec: AudioTrackSpec): LocalAudioTrack;
-  track<D extends Delivery>(spec: DataTrackSpec<D>): LocalDataTrack<D>;
-  connect(): void;
-  disconnect(): void;
-  renewAuthorization(token: string): void;
+  video(label: string): LocalVideoTrack;
+  audio(label: string): LocalAudioTrack;
+  data<D extends Delivery>(label: string, delivery: D): LocalDataTrack<D>;
+  participant(id: string): RemoteParticipant;
+  selectAudio(policy: AudioDemand): Promise<AudioSelection>;
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  renewAuthorization(token: string): Promise<void>;
+  isClosed(): boolean;
   setLogging(level: LogLevel): void;
-  readonly getSnapshot: () => AgentSnapshot;
-  readonly subscribe: (listener: () => void) => () => void;
-  close(): void;
+  snapshot(): AgentSnapshot;
+  snapshots(): SnapshotStream;
+  events(): EventStream;
+  close(): Promise<void>;
 }
 
 export type PlaybackFailure = Readonly<{

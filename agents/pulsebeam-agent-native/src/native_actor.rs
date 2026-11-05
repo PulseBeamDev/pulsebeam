@@ -21,12 +21,20 @@ use tokio::time::Instant;
 use crate::native_media::*;
 use crate::native_peer::{NativePeer, Observation};
 
+mod data;
+use data::DataIo;
+pub use data::{DataReceiver, LocalDataTrack, Participant, RemoteDataTrack};
+mod producer;
+pub use producer::ProducerInput;
+use producer::ProducerIo;
 mod publication;
-pub use publication::{Publication, PublicationInput};
-use publication::{PublicationLease, RegisteredInput};
+pub use publication::Publication;
+use publication::{PublicationInput, PublicationLease, RegisteredInput};
 mod subscription;
 pub use subscription::Subscription;
 use subscription::{ObservationIo, SubscriptionLease};
+mod track;
+pub use track::{LocalAudioTrack, LocalVideoTrack, RemoteAudioTrack, RemoteVideoTrack};
 
 const COMMANDS: usize = 64;
 const MEDIA_COMMANDS: usize = 4;
@@ -102,6 +110,8 @@ pub enum AgentEvent {
 pub enum Error {
     #[error(transparent)]
     Core(#[from] agent_core::AgentError),
+    #[error("data send failed: {0}")]
+    DataSend(agent_core::DataSendFailure),
     #[error("native RTC error: {0}")]
     Rtc(String),
     #[error("agent or media resource is closed")]
@@ -160,31 +170,51 @@ pub enum StreamUpdate<T> {
 /// Bounded observations with an explicit terminal signal even while a retained
 /// application handle still owns a broadcast sender.
 pub struct ObservationStream<T: Clone> {
-    receiver: Mutex<broadcast::Receiver<T>>,
+    receiver: Mutex<Option<broadcast::Receiver<T>>>,
     closed: Arc<Signal>,
+    retired: Signal,
 }
 impl<T: Clone> ObservationStream<T> {
+    fn new(receiver: broadcast::Receiver<T>, closed: Arc<Signal>) -> Self {
+        Self {
+            receiver: Mutex::new(Some(receiver)),
+            closed,
+            retired: Signal::default(),
+        }
+    }
     pub fn is_closed(&self) -> bool {
-        self.closed.is_closed()
+        self.closed.is_closed() || self.retired.is_closed()
+    }
+    pub async fn close(&self) {
+        self.retired.close();
+        self.receiver.lock().await.take();
     }
     /// Nonblocking observation for application loops. `None` means no update
     /// is ready (or another reader holds the stream), never terminal closure.
     pub fn try_next(&self) -> Option<StreamUpdate<T>> {
-        let mut receiver = self.receiver.try_lock().ok()?;
-        if self.closed.is_closed() {
-            *receiver = receiver.resubscribe();
+        if self.is_closed() {
+            if let Ok(mut receiver) = self.receiver.try_lock() {
+                receiver.take();
+            }
             return Some(StreamUpdate::Closed);
         }
-        let result = match receiver.try_recv() {
+        let mut receiver = self.receiver.try_lock().ok()?;
+        let Some(active) = receiver.as_mut() else {
+            return Some(StreamUpdate::Closed);
+        };
+        let result = match active.try_recv() {
             Ok(value) => Some(StreamUpdate::Value(value)),
             Err(broadcast::error::TryRecvError::Empty) => None,
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                 Some(StreamUpdate::Lagged { skipped })
             }
-            Err(broadcast::error::TryRecvError::Closed) => Some(StreamUpdate::Closed),
+            Err(broadcast::error::TryRecvError::Closed) => {
+                self.retired.close();
+                Some(StreamUpdate::Closed)
+            }
         };
-        if self.closed.is_closed() {
-            *receiver = receiver.resubscribe();
+        if self.is_closed() {
+            receiver.take();
             Some(StreamUpdate::Closed)
         } else {
             result
@@ -192,28 +222,45 @@ impl<T: Clone> ObservationStream<T> {
     }
 
     pub async fn next(&self) -> StreamUpdate<T> {
-        let mut receiver = self.receiver.lock().await;
-        if self.closed.is_closed() {
-            *receiver = receiver.resubscribe();
+        let mut receiver = tokio::select! {
+            biased;
+            _ = self.closed.wait() => return StreamUpdate::Closed,
+            _ = self.retired.wait() => return StreamUpdate::Closed,
+            receiver = self.receiver.lock() => receiver,
+        };
+        if self.is_closed() {
+            receiver.take();
             return StreamUpdate::Closed;
         }
-        let result = tokio::select! {
-            _ = self.closed.wait() => { *receiver = receiver.resubscribe(); return StreamUpdate::Closed; },
-            result = receiver.recv() => result,
+        let Some(active) = receiver.as_mut() else {
+            return StreamUpdate::Closed;
         };
-        if self.closed.is_closed() {
-            *receiver = receiver.resubscribe();
+        let result = tokio::select! {
+            biased;
+            _ = self.closed.wait() => None,
+            _ = self.retired.wait() => None,
+            result = active.recv() => Some(result),
+        };
+        if self.is_closed() {
+            receiver.take();
             return StreamUpdate::Closed;
         }
         match result {
-            Ok(value) => StreamUpdate::Value(value),
-            Err(broadcast::error::RecvError::Lagged(skipped)) => StreamUpdate::Lagged { skipped },
-            Err(broadcast::error::RecvError::Closed) => StreamUpdate::Closed,
+            Some(Ok(value)) => StreamUpdate::Value(value),
+            Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                StreamUpdate::Lagged { skipped }
+            }
+            Some(Err(broadcast::error::RecvError::Closed)) | None => {
+                self.retired.close();
+                receiver.take();
+                StreamUpdate::Closed
+            }
         }
     }
 }
 
 struct AgentLease {
+    close: Arc<Signal>,
     abort: Arc<Signal>,
     finished: Arc<Signal>,
 }
@@ -224,6 +271,39 @@ impl Drop for AgentLease {
 }
 
 enum Command {
+    CreateProducer {
+        video: Option<VideoSourceConfig>,
+        response: oneshot::Sender<Result<ProducerInput, Error>>,
+    },
+    BindProducer {
+        owner: u64,
+        producer: Option<ProducerInput>,
+        response: oneshot::Sender<Result<(), Error>>,
+    },
+    CloseProducer {
+        owner: u64,
+        response: oneshot::Sender<Result<(), Error>>,
+    },
+    ProducerCaptureTime {
+        owner: u64,
+        identity: SourceIdentity,
+        response: oneshot::Sender<Result<i64, Error>>,
+    },
+    SendData {
+        spec: agent_core::TrackSpec,
+        data: Vec<u8>,
+        response: oneshot::Sender<Result<(), Error>>,
+    },
+    ReceiveData {
+        spec: agent_core::TrackSpec,
+        participant_id: Option<String>,
+        response: oneshot::Sender<Result<DataReceiver, Error>>,
+    },
+    ReadData {
+        owner: u64,
+        response: oneshot::Sender<Result<agent_core::DataUpdate, Error>>,
+    },
+    #[cfg(test)]
     ForeignDesired {
         desired: agent_core::ffi::DesiredState,
         response: oneshot::Sender<Result<(), agent_core::ffi::AgentError>>,
@@ -250,11 +330,18 @@ enum Command {
         receiver: u64,
         response: oneshot::Sender<Result<(), Error>>,
     },
-    Close {
+    Disconnect {
         response: oneshot::Sender<Result<(), Error>>,
     },
+    #[cfg(test)]
     Publication {
         spec: agent_core::TrackSpec,
+        response: oneshot::Sender<Result<Publication, Error>>,
+    },
+    PublishTrack {
+        spec: agent_core::TrackSpec,
+        source: ProducerInput,
+        configuration: agent_core::ffi::PublicationConfig,
         response: oneshot::Sender<Result<Publication, Error>>,
     },
     VideoSubscription {
@@ -264,6 +351,7 @@ enum Command {
     },
     AudioSubscription {
         selector: agent_core::TrackSelector,
+        playout_delay: agent_core::PlayoutDelay,
         response: oneshot::Sender<Result<Subscription, Error>>,
     },
     AudioPolicy {
@@ -276,10 +364,12 @@ enum Command {
         mode: ReceiveMode,
         response: oneshot::Sender<Result<RemoteMedia, Error>>,
     },
+    #[cfg(test)]
     PublicationInput {
         owner: u64,
         response: oneshot::Sender<Result<PublicationInput, Error>>,
     },
+    #[cfg(test)]
     ClosePublicationInput {
         operation: agent_core::PublicationInputOperation,
         response: oneshot::Sender<Result<(), Error>>,
@@ -289,6 +379,11 @@ enum Command {
         response: oneshot::Sender<Result<agent_core::ResourceResult, Error>>,
     },
 }
+enum MediaCommand {
+    Publication(Submission),
+    Producer(producer::ProducerSubmission),
+}
+
 struct Submission {
     control: Arc<agent_core::PublicationInputControl>,
     slot: MediaSlot,
@@ -360,6 +455,7 @@ impl Agent {
         let (snapshot_events, _) = broadcast::channel(EVENTS);
         let (statistics_tx, statistics) = watch::channel(None);
         let (events, _) = broadcast::channel(EVENTS);
+        let close = Arc::new(Signal::default());
         let abort = Arc::new(Signal::default());
         let finished = Arc::new(Signal::default());
         let (http_tx, http_rx) = mpsc::channel(COMMANDS);
@@ -370,6 +466,7 @@ impl Agent {
             statistics,
             events: events.clone(),
             lease: Arc::new(AgentLease {
+                close: close.clone(),
                 abort: abort.clone(),
                 finished: finished.clone(),
             }),
@@ -389,14 +486,20 @@ impl Agent {
             snapshot_events,
             statistics: statistics_tx,
             events,
+            close,
+            terminal_requested: false,
             abort,
             finished,
             leases_changed: Arc::new(Notify::new()),
             sources: BTreeMap::new(),
             publications: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
+            data_receivers: BTreeMap::new(),
+            data_sends: BTreeMap::new(),
             observations: BTreeMap::new(),
             inputs: BTreeMap::new(),
+            producers: BTreeMap::new(),
+            next_producer: 0,
             streams: BTreeMap::new(),
             http_tasks: BTreeMap::new(),
             http_tx,
@@ -411,6 +514,9 @@ impl Agent {
     }
 
     async fn command(&self, command: AgentCommand) -> Result<(), Error> {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
         let (response, result) = oneshot::channel();
         self.commands
             .send(Command::Core { command, response })
@@ -420,6 +526,7 @@ impl Agent {
     }
     // Foreign callers submit complete states without revisions. Assign them in
     // the actor's control order, including close and Rust-originated commands.
+    #[cfg(test)]
     pub(crate) async fn replace_foreign_desired(
         &self,
         desired: agent_core::ffi::DesiredState,
@@ -436,7 +543,8 @@ impl Agent {
         result.await.map_err(|_| closed())?
     }
 
-    pub async fn video_subscription(
+    #[cfg(test)]
+    async fn video_subscription(
         &self,
         selector: agent_core::TrackSelector,
         observation: agent_core::VideoObservation,
@@ -453,19 +561,24 @@ impl Agent {
         result.await.map_err(|_| Error::Closed)?
     }
 
-    pub async fn audio_subscription(
+    #[cfg(test)]
+    async fn audio_subscription(
         &self,
         selector: agent_core::TrackSelector,
     ) -> Result<Subscription, Error> {
         let (response, result) = oneshot::channel();
         self.commands
-            .send(Command::AudioSubscription { selector, response })
+            .send(Command::AudioSubscription {
+                selector,
+                playout_delay: agent_core::PlayoutDelay::Adaptive,
+                response,
+            })
             .await
             .map_err(|_| Error::Closed)?;
         result.await.map_err(|_| Error::Closed)?
     }
 
-    pub async fn audio_policy(
+    pub async fn select_audio(
         &self,
         policy: agent_core::AudioSubscription,
     ) -> Result<Subscription, Error> {
@@ -477,7 +590,8 @@ impl Agent {
         result.await.map_err(|_| Error::Closed)?
     }
 
-    pub async fn publication(&self, spec: agent_core::TrackSpec) -> Result<Publication, Error> {
+    #[cfg(test)]
+    async fn publication(&self, spec: agent_core::TrackSpec) -> Result<Publication, Error> {
         let (response, result) = oneshot::channel();
         self.commands
             .send(Command::Publication { spec, response })
@@ -508,8 +622,16 @@ impl Agent {
     pub async fn send_topic(&self, send: TopicSend) -> Result<(), Error> {
         self.command(AgentCommand::SendTopic(send)).await
     }
+    pub async fn connect(&self) -> Result<(), Error> {
+        self.command(AgentCommand::Connect).await
+    }
     pub async fn reconnect(&self) -> Result<(), Error> {
         self.command(AgentCommand::Reconnect).await
+    }
+    pub fn is_closed(&self) -> bool {
+        self.lease.close.is_closed()
+            || self.lease.abort.is_closed()
+            || self.lease.finished.is_closed()
     }
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.borrow().clone()
@@ -521,31 +643,30 @@ impl Agent {
         let receiver = self.snapshot_events.subscribe();
         (
             self.snapshot(),
-            ObservationStream {
-                receiver: Mutex::new(receiver),
-                closed: self.lease.finished.clone(),
-            },
+            ObservationStream::new(receiver, self.lease.finished.clone()),
         )
     }
     pub fn events(&self) -> ObservationStream<AgentEvent> {
-        ObservationStream {
-            receiver: Mutex::new(self.events.subscribe()),
-            closed: self.lease.finished.clone(),
-        }
+        ObservationStream::new(self.events.subscribe(), self.lease.finished.clone())
     }
     pub fn statistics(&self) -> watch::Receiver<Option<NativeStatistics>> {
         self.statistics.clone()
     }
-    pub async fn close(&self) -> Result<(), Error> {
-        self.begin_close().await?.await.map_err(|_| Error::Closed)?
-    }
-    pub(crate) async fn begin_close(&self) -> Result<oneshot::Receiver<Result<(), Error>>, Error> {
+    pub async fn disconnect(&self) -> Result<(), Error> {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
         let (response, result) = oneshot::channel();
         self.commands
-            .send(Command::Close { response })
+            .send(Command::Disconnect { response })
             .await
             .map_err(|_| Error::Closed)?;
-        Ok(result)
+        result.await.map_err(|_| Error::Closed)?
+    }
+    pub async fn close(&self) -> Result<(), Error> {
+        self.lease.close.close();
+        self.lease.finished.wait().await;
+        Ok(())
     }
     pub async fn abort(&self) -> Result<(), Error> {
         self.lease.abort.close();
@@ -560,7 +681,7 @@ struct SourceLease {
     closed: Arc<Signal>,
     leases_changed: Arc<Notify>,
     commands: mpsc::Sender<Command>,
-    media: mpsc::Sender<Submission>,
+    media: mpsc::Sender<MediaCommand>,
 }
 impl Drop for SourceLease {
     fn drop(&mut self) {
@@ -590,35 +711,17 @@ impl PhysicalSource {
         if self.is_closed() {
             return Err(Error::Closed);
         }
-        if matches!(&frame, InputFrame::H264Simulcast { frames } if frames.len() != 3) {
-            return Err(Error::InvalidInput(
-                "simulcast requires three genuine encoding-specific units".into(),
-            ));
-        }
-        let bytes = match &frame {
-            InputFrame::Pcm { frame } => frame.samples.len().saturating_mul(2),
-            InputFrame::I420 { frame } => frame.data.len(),
-            InputFrame::Opus { frame } => frame.payload.len(),
-            InputFrame::H264 { frame } => frame.payload.len(),
-            InputFrame::H264Simulcast { frames } => frames
-                .iter()
-                .fold(0usize, |n, frame| n.saturating_add(frame.payload.len())),
-        };
-        if bytes > MAX_FRAME_BYTES {
-            return Err(Error::InvalidInput(
-                "frame exceeds the owned input byte limit".into(),
-            ));
-        }
+        producer::validate_frame(&frame)?;
         let (response, result) = oneshot::channel();
         self.inner
             .media
-            .try_send(Submission {
+            .try_send(MediaCommand::Publication(Submission {
                 control,
                 slot: self.inner.slot.clone(),
                 identity: self.identity(),
                 frame,
                 response,
-            })
+            }))
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => Error::Backpressure,
                 mpsc::error::TrySendError::Closed(_) => Error::Closed,
@@ -795,19 +898,25 @@ where
     http: Arc<dyn AsyncHttpClient>,
     commands: mpsc::Receiver<Command>,
     command_tx: mpsc::Sender<Command>,
-    media: mpsc::Receiver<Submission>,
-    media_tx: mpsc::Sender<Submission>,
+    media: mpsc::Receiver<MediaCommand>,
+    media_tx: mpsc::Sender<MediaCommand>,
     snapshot: watch::Sender<Snapshot>,
     snapshot_events: broadcast::Sender<Snapshot>,
     statistics: watch::Sender<Option<NativeStatistics>>,
     events: broadcast::Sender<AgentEvent>,
+    close: Arc<Signal>,
+    terminal_requested: bool,
     abort: Arc<Signal>,
     finished: Arc<Signal>,
     leases_changed: Arc<Notify>,
     sources: BTreeMap<MediaSlot, SourceObservation>,
     publications: BTreeMap<u64, Weak<PublicationLease>>,
     inputs: BTreeMap<u64, RegisteredInput>,
+    producers: BTreeMap<u64, ProducerIo>,
+    next_producer: u64,
     subscriptions: BTreeMap<u64, Weak<SubscriptionLease>>,
+    data_receivers: BTreeMap<u64, DataIo>,
+    data_sends: BTreeMap<OperationId, oneshot::Sender<Result<(), Error>>>,
     observations: BTreeMap<agent_core::MediaObservationId, ObservationIo>,
     streams: BTreeMap<MediaSlot, StreamObservation>,
     http_tasks: BTreeMap<OperationId, JoinHandle<()>>,
@@ -837,28 +946,42 @@ where
             if self.abort.is_closed() {
                 break;
             }
+            if self.close.is_closed() && !self.terminal_requested {
+                self.terminal_requested = true;
+                self.commands.close();
+                self.media.close();
+                if let Err(error) = self.core.command(AgentCommand::Disconnect) {
+                    self.fail(Error::Core(error));
+                    break;
+                }
+            }
             self.retire_dropped();
             self.drain_effects();
+            self.prepare_producers();
+            self.progress_publication_inputs();
             let more = self.progress_peer();
             self.drain_effects();
             self.progress_observations();
+            self.progress_data_reads();
             self.drain_effects();
             self.publish().await;
             let woke = self.wake_core();
+            if self.terminal_requested
+                && self.core.snapshot().connection == agent_core::ConnectionState::Disconnected
+                && self.peer.is_none()
+            {
+                break;
+            }
             let timer = self.timers.values().copied().min();
             tokio::select! {
                 _ = tokio::task::yield_now(), if more || woke => {},
                 _ = self.abort.wait() => break,
+                _ = self.close.wait(), if !self.terminal_requested => {},
                 _ = self.leases_changed.notified() => {},
                 _ = std::future::poll_fn(|cx| match self.peer.as_mut() { Some(peer) => peer.poll_ready(cx), None => std::task::Poll::Pending }) => {},
-                command = self.commands.recv() => match command { Some(command) => self.command(command), None => break },
-                submission = self.media.recv() => if let Some(submission) = submission {
-                    let result = if !self.input_submission_current(&submission.control) {
-                        Err(Error::Closed)
-                    } else {
-                        self.peer.as_mut().ok_or(Error::Closed).and_then(|peer| peer.submit(&submission.slot, &submission.identity, submission.frame).map_err(Error::from))
-                    };
-                    let _ = submission.response.send(result);
+                command = self.commands.recv(), if !self.terminal_requested => match command { Some(command) => self.command(command), None => break },
+                submission = self.media.recv(), if !self.terminal_requested => if let Some(submission) = submission {
+                    self.submit_media(submission);
                 },
                 completion = self.http_rx.recv() => if let Some(completion) = completion {
                     self.http_tasks.remove(&completion.operation);
@@ -962,6 +1085,58 @@ where
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::CreateProducer { video, response } => {
+                let result = self.create_producer(video);
+                let _ = response.send(result);
+            }
+            Command::BindProducer {
+                owner,
+                producer,
+                response,
+            } => {
+                let result = self.bind_producer(owner, producer);
+                let _ = response.send(result);
+            }
+            Command::CloseProducer { owner, response } => {
+                let result = self.close_producer(owner);
+                let _ = response.send(result);
+            }
+            Command::ProducerCaptureTime {
+                owner,
+                identity,
+                response,
+            } => {
+                let result = self.producer_current(owner, &identity).and_then(|()| {
+                    self.peer
+                        .as_ref()
+                        .ok_or(Error::Closed)?
+                        .producer_capture_time_us(&identity)
+                        .map_err(Into::into)
+                });
+                let _ = response.send(result);
+            }
+            Command::SendData {
+                spec,
+                data,
+                response,
+            } => match self.core.send_data(spec, data) {
+                Ok(send) => {
+                    self.data_sends.insert(send, response);
+                }
+                Err(error) => {
+                    let _ = response.send(Err(error.into()));
+                }
+            },
+            Command::ReceiveData {
+                spec,
+                participant_id,
+                response,
+            } => {
+                let result = self.receive_data(spec, participant_id);
+                let _ = response.send(result);
+            }
+            Command::ReadData { owner, response } => self.read_data(owner, response),
+            #[cfg(test)]
             Command::ForeignDesired { desired, response } => {
                 let result = self
                     .core
@@ -1030,26 +1205,33 @@ where
                 });
                 let _ = response.send(result);
             }
-            Command::Close { response } => {
+            Command::Disconnect { response } => {
                 if self.close_waiters.len() >= COMMANDS {
                     let _ = response.send(Err(Error::Backpressure));
                     return;
                 }
-                let desired = DesiredState {
-                    revision: self.core.snapshot().desired_revision.saturating_add(1),
-                    connected: false,
-                    ..DesiredState::default()
-                };
-                match self.core.command(AgentCommand::ReplaceDesired(desired)) {
+                match self.core.command(AgentCommand::Disconnect) {
                     Ok(()) => self.close_waiters.push(response),
                     Err(error) => {
                         let _ = response.send(Err(Error::Core(error)));
                     }
                 }
             }
+            #[cfg(test)]
             Command::Publication { spec, response } => {
                 if !response.is_closed() {
                     let result = self.claim_publication(spec);
+                    let _ = response.send(result);
+                }
+            }
+            Command::PublishTrack {
+                spec,
+                source,
+                configuration,
+                response,
+            } => {
+                if !response.is_closed() {
+                    let result = self.publish_track(spec, source, configuration);
                     let _ = response.send(result);
                 }
             }
@@ -1063,9 +1245,13 @@ where
                     let _ = response.send(result);
                 }
             }
-            Command::AudioSubscription { selector, response } => {
+            Command::AudioSubscription {
+                selector,
+                playout_delay,
+                response,
+            } => {
                 if !response.is_closed() {
-                    let result = self.claim_audio_subscription(selector);
+                    let result = self.claim_configured_audio_subscription(selector, playout_delay);
                     let _ = response.send(result);
                 }
             }
@@ -1083,12 +1269,14 @@ where
             } => {
                 self.observe_subscription(owner, source, mode, response);
             }
+            #[cfg(test)]
             Command::PublicationInput { owner, response } => {
                 if !response.is_closed() {
                     let result = self.register_input(owner);
                     let _ = response.send(result);
                 }
             }
+            #[cfg(test)]
             Command::ClosePublicationInput {
                 operation,
                 response,
@@ -1122,11 +1310,22 @@ where
         }
     }
 
-    fn create_source(&mut self, slot: MediaSlot) -> Result<PhysicalSource, Error> {
+    fn create_source(
+        &mut self,
+        slot: MediaSlot,
+        producer: Option<u64>,
+    ) -> Result<PhysicalSource, Error> {
         if !matches!(slot, MediaSlot::LocalAudio(_) | MediaSlot::LocalVideo(_)) {
             return Err(Error::UnknownSlot(slot));
         }
-        let identity = self.peer_mut()?.replace_source(&slot)?;
+        let identity = match producer {
+            Some(owner) => {
+                let identity = self.ensure_producer(owner)?.ok_or(Error::NotReady)?;
+                self.peer_mut()?.bind_producer(&slot, &identity)?;
+                identity
+            }
+            None => self.peer_mut()?.replace_source(&slot)?,
+        };
         self.close_source_observation(&slot);
         let inner = Arc::new(SourceLease {
             slot: slot.clone(),
@@ -1248,8 +1447,10 @@ where
     }
 
     fn retire_dropped(&mut self) {
+        self.retire_producers();
         self.retire_publications();
         self.retire_subscriptions();
+        self.retire_data_receivers();
         let dropped: Vec<_> = self
             .sources
             .iter()
@@ -1694,6 +1895,11 @@ where
                         if let Some(lease) = input.lease.upgrade() {
                             let _ = lease.feedback.send(feedback.clone());
                         }
+                        if let Some(owner) = input.producer
+                            && let Some(producer) = self.producers.get(&owner)
+                        {
+                            producer.feedback(&feedback);
+                        }
                     }
                 }
                 let _ = self.events.send(AgentEvent::ProducerFeedback {
@@ -1762,6 +1968,9 @@ where
         }
     }
     fn retire_peer(&mut self) {
+        for producer in self.producers.values_mut() {
+            producer.retire_target();
+        }
         let slots: Vec<_> = self.sources.keys().cloned().collect();
         for slot in slots {
             self.close_source_observation(&slot);
@@ -1799,6 +2008,11 @@ where
         // Give active observers a turn without growing the bounded event bus.
         let mut published = 0usize;
         while let Some(notification) = self.core.next_notification() {
+            if let Notification::DataSendFinished { send, error } = &notification
+                && let Some(response) = self.data_sends.remove(send)
+            {
+                let _ = response.send(error.map_or(Ok(()), |reason| Err(Error::DataSend(reason))));
+            }
             let _ = self.events.send(AgentEvent::Core(notification));
             published = published.saturating_add(1);
             if published >= EVENTS / 2 {
@@ -1869,7 +2083,17 @@ where
         }
     }
     fn shutdown(&mut self) {
+        self.data_receivers.clear();
+        for (_, response) in std::mem::take(&mut self.data_sends) {
+            let _ = response.send(Err(Error::Closed));
+        }
         self.close_subscription_handles();
+        for producer in self.producers.values() {
+            if let Some(lease) = producer.lease.upgrade() {
+                lease.closed.close();
+            }
+        }
+        self.producers.clear();
         for lease in self.publications.values().filter_map(Weak::upgrade) {
             lease.closed.close();
         }
@@ -1930,6 +2154,38 @@ async fn execute_signaling_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn observation_cursor_close_retires_pending_reads_without_closing_siblings() {
+        let (sender, receiver) = broadcast::channel::<u8>(2);
+        let closed = Arc::new(Signal::default());
+        let first = ObservationStream::new(receiver, closed.clone());
+        let sibling = ObservationStream::new(sender.subscribe(), closed.clone());
+        let mut pending = Box::pin(first.next());
+        let mut queued = Box::pin(first.next());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(pending.as_mut(), cx).is_pending()
+                    && std::future::Future::poll(queued.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        let ((), pending, queued) = tokio::join!(first.close(), pending, queued);
+        assert_eq!(pending, StreamUpdate::Closed);
+        assert_eq!(queued, StreamUpdate::Closed);
+        first.close().await;
+        assert!(first.is_closed());
+        assert_eq!(first.try_next(), Some(StreamUpdate::Closed));
+        assert!(!closed.is_closed());
+        assert!(!sibling.is_closed());
+        assert_eq!(sender.receiver_count(), 1);
+        sender.send(7).unwrap();
+        assert_eq!(sibling.next().await, StreamUpdate::Value(7));
+        closed.close();
+        assert_eq!(sibling.next().await, StreamUpdate::Closed);
+        sibling.close().await;
+        assert_eq!(sender.receiver_count(), 0);
+    }
 
     struct PendingHttp(Arc<AtomicBool>);
     impl AsyncHttpClient for PendingHttp {
@@ -2038,10 +2294,124 @@ mod tests {
         assert!(!actor.wake_core());
     }
 
+    #[tokio::test]
+    async fn terminal_data_read_failure_wakes_owner_retirement() {
+        let (_agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(reqwest::Client::new())),
+            || Ok((rtc::ThreadedRuntime, ())),
+        )
+        .unwrap();
+        let cursor = actor
+            .receive_data(
+                agent_core::TrackSpec::Data {
+                    label: "control".into(),
+                    delivery: agent_core::TopicMode::Ordered,
+                },
+                None,
+            )
+            .unwrap();
+        let owner = *actor.data_receivers.keys().next().unwrap();
+        actor
+            .core
+            .resource(agent_core::ResourceCommand::Release { owner })
+            .unwrap();
+        let (response, result) = oneshot::channel();
+        actor.read_data(owner, response);
+        actor.progress_data_reads();
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(Error::Core(agent_core::AgentError::InvalidResource(
+                agent_core::TrackResourceError::Released
+            )))
+        ));
+        assert!(cursor.is_closed());
+        {
+            let changed = actor.leases_changed.notified();
+            tokio::pin!(changed);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(changed.as_mut().poll(cx)))
+                    .await
+                    .is_ready()
+            );
+        }
+        actor.retire_data_receivers();
+        assert!(actor.data_receivers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn data_lookup_is_inert_and_send_waits_for_core_settlement() {
+        let (agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(reqwest::Client::new())),
+            || Ok((rtc::ThreadedRuntime, ())),
+        )
+        .unwrap();
+        let initial = actor.core.snapshot().clone();
+        let _local = agent
+            .data("control".into(), agent_core::TopicMode::Ordered)
+            .unwrap();
+        let remote = agent.participant("remote".into()).unwrap();
+        assert_eq!(remote.id(), "remote");
+        let _remote = remote
+            .data("control".into(), agent_core::TopicMode::Ordered)
+            .unwrap();
+        assert_eq!(*actor.core.snapshot(), initial);
+        assert!(actor.data_receivers.is_empty());
+        assert!(actor.core.next_effect().is_none());
+        assert!(
+            agent
+                .data(String::new(), agent_core::TopicMode::Ordered)
+                .is_err()
+        );
+        assert!(agent.participant(String::new()).is_err());
+
+        let spec = agent_core::TrackSpec::Data {
+            label: "control".into(),
+            delivery: agent_core::TopicMode::Ordered,
+        };
+        let (response, result) = oneshot::channel();
+        actor.command(Command::SendData {
+            spec: spec.clone(),
+            data: vec![0, 255],
+            response,
+        });
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(Error::Core(agent_core::AgentError::InvalidResource(
+                agent_core::TrackResourceError::NotConnected
+            )))
+        ));
+        assert!(actor.core.snapshot().topics.publishers.is_empty());
+
+        // Policy component only: no physical peer or signaling effect is executed.
+        actor.core.command(AgentCommand::Connect).unwrap();
+        let (response, mut result) = oneshot::channel();
+        actor.command(Command::SendData {
+            spec,
+            data: vec![0, 255],
+            response,
+        });
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(actor.data_sends.len(), 1);
+        actor.core.command(AgentCommand::Disconnect).unwrap();
+        actor.publish().await;
+        assert!(matches!(
+            result.await.unwrap(),
+            Err(Error::DataSend(agent_core::DataSendFailure::Disconnected))
+        ));
+        assert!(actor.data_sends.is_empty());
+        assert_eq!(actor.core.snapshot().topics.publishers.len(), 1);
+        assert!(actor.peer.is_none());
+    }
+
     // No connect intent is submitted here, so no SDK graph or network witness
     // is claimed. This exercises actor ownership and terminal observation rules.
     #[tokio::test]
-    async fn close_and_abort_are_idempotent_and_streams_terminate_with_retained_handles() {
+    async fn disconnect_preserves_owners_and_terminal_close_ends_retained_handles() {
         let agent = Agent::spawn(config(), Host::new(Box::new(reqwest::Client::new())))
             .await
             .unwrap();
@@ -2106,8 +2476,9 @@ mod tests {
             input.capture_time_us().await,
             Err(Error::NotReady)
         ));
-        agent.close().await.unwrap();
-        agent.close().await.unwrap();
+        agent.disconnect().await.unwrap();
+        agent.disconnect().await.unwrap();
+        assert!(!agent.is_closed());
         assert_eq!(
             agent.snapshot().connection,
             agent_core::ConnectionState::Disconnected
@@ -2117,10 +2488,46 @@ mod tests {
             input.capture_time_us().await,
             Err(Error::NotReady)
         ));
-        publication.close().await.unwrap();
+        let retained = agent
+            .audio_subscription(agent_core::TrackSelector {
+                participant_external_id: "remote".into(),
+                label: "microphone".into(),
+            })
+            .await
+            .unwrap();
+        let mut pending_observation = Box::pin(retained.observe(ReceiveMode::Decoded));
+        let mut pending_input = Box::pin(input.ready());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                pending_observation.as_mut().poll(cx).is_pending()
+                    && pending_input.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        agent.close().await.unwrap();
+        agent.close().await.unwrap();
+        assert!(agent.is_closed());
+        assert!(retained.is_closed());
+        assert!(matches!(pending_observation.await, Err(Error::Closed)));
+        assert!(matches!(pending_input.await, Err(Error::Closed)));
+        assert!(publication.is_closed());
         assert!(input.is_closed());
-        agent.abort().await.unwrap();
-        agent.abort().await.unwrap();
+        assert!(matches!(agent.connect().await, Err(Error::Closed)));
+        assert!(matches!(agent.reconnect().await, Err(Error::Closed)));
+        assert!(matches!(agent.disconnect().await, Err(Error::Closed)));
+        assert!(matches!(
+            agent.renew_authorization("new-token".into()).await,
+            Err(Error::Closed)
+        ));
+        assert!(matches!(
+            agent
+                .publication(agent_core::TrackSpec::Audio {
+                    label: "late".into()
+                })
+                .await,
+            Err(Error::Closed)
+        ));
+        publication.close().await.unwrap();
         assert!(matches!(events.try_next(), Some(StreamUpdate::Closed)));
         assert!(matches!(events.next().await, StreamUpdate::Closed));
         assert!(matches!(snapshots.try_next(), Some(StreamUpdate::Closed)));
@@ -2175,21 +2582,14 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            publication.set_muted(true).await.unwrap();
+            publication.configure(agent_core::ffi::PublicationConfig { enabled: false }).await.unwrap();
             let input = publication.input().await.unwrap();
             let feedback = input.feedback();
             assert!(matches!(input.submit(pcm()).await, Err(Error::NotReady)));
             for round in 1..=2 {
-                agent
-                    .replace_desired(DesiredState {
-                        revision: agent.snapshot().desired_revision + 1,
-                        connected: true,
-                        ..DesiredState::default()
-                    })
-                    .await
-                    .unwrap();
+                agent.connect().await.unwrap();
                 if round == 1 {
-                    publication.set_muted(false).await.unwrap();
+                    publication.configure(agent_core::ffi::PublicationConfig { enabled: true }).await.unwrap();
                 }
                 for turn in 0..4096 {
                     if agent.snapshot().connection == agent_core::ConnectionState::Joining {
@@ -2216,7 +2616,7 @@ mod tests {
                 assert!(!input.is_closed());
                 assert_eq!(created.get(), round);
                 assert_eq!(retired.get(), round - 1);
-                agent.close().await.unwrap();
+                agent.disconnect().await.unwrap();
                 assert!(!input.is_closed());
                 assert!(matches!(input.capture_time_us().await, Err(Error::NotReady)));
                 assert!(feedback.try_next().is_none());
@@ -2225,16 +2625,180 @@ mod tests {
             publication.close().await.unwrap();
             assert!(input.is_closed());
             assert!(matches!(feedback.try_next(), Some(StreamUpdate::Closed)));
-            agent.abort().await.unwrap();
+            agent.close().await.unwrap();
             actor.await.unwrap();
             assert_eq!(retired.get(), 2);
         }));
     }
 
+    #[test]
+    fn owned_producer_survives_publication_retirement_and_fences_queued_frames() {
+        let _guard = crate::native_media::NATIVE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (agent, mut actor) = Agent::parts(
+                    config(),
+                    Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+                    || Ok((rtc::ThreadedRuntime, ())),
+                )
+                .unwrap();
+                let initial = actor.core.snapshot().clone();
+                let _camera = agent.video("camera".into()).unwrap();
+                let _microphone = agent.audio("microphone".into()).unwrap();
+                let participant = agent.participant("remote".into()).unwrap();
+                let _remote_camera = participant.video("camera".into()).unwrap();
+                let _remote_microphone = participant.audio("microphone".into()).unwrap();
+                assert!(matches!(
+                    actor.commands.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                assert_eq!(actor.core.snapshot(), &initial);
+                let source = actor.create_producer(None).unwrap();
+                let feedback = source.feedback();
+                assert_eq!(actor.core.snapshot(), &initial);
+                assert!(matches!(source.submit(pcm()).await, Err(Error::NotReady)));
+                let spec = agent_core::TrackSpec::Audio {
+                    label: "microphone".into(),
+                };
+                let publication = actor
+                    .publish_track(spec.clone(), source.clone(), Default::default())
+                    .unwrap();
+                actor.core.command(AgentCommand::Connect).unwrap();
+                actor.drain_effects();
+                actor.prepare_producers();
+                source.ready().await.unwrap();
+                let mut bound_ready = Box::pin(publication.ready());
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(
+                        bound_ready.as_mut().poll(cx)
+                    ))
+                    .await
+                    .is_pending()
+                );
+                let producer_owner = *actor.producers.keys().next().unwrap();
+                let original = actor.producers[&producer_owner].physical.clone().unwrap();
+
+                let mut send = Box::pin(source.submit(pcm()));
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(send.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                let queued = actor.media.recv().await.unwrap();
+                let mut close = Box::pin(publication.close());
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                let command = actor.commands.recv().await.unwrap();
+                actor.command(command);
+                close.await.unwrap();
+                assert!(matches!(bound_ready.await, Err(Error::Closed)));
+                actor.drain_effects();
+                actor.retire_dropped();
+                assert!(!source.is_closed());
+                assert!(feedback.try_next().is_none());
+                assert_eq!(
+                    actor.producers[&producer_owner].physical,
+                    Some(original.clone())
+                );
+                actor.submit_media(queued);
+                send.await.unwrap();
+
+                let publication = actor.claim_publication(spec.clone()).unwrap();
+                let owner = *actor.publications.keys().next().unwrap();
+                actor.bind_producer(owner, Some(source.clone())).unwrap();
+                let (_other_agent, mut other_actor) = Agent::parts(
+                    config(),
+                    Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+                    || Ok((rtc::ThreadedRuntime, ())),
+                )
+                .unwrap();
+                let foreign = other_actor.create_producer(None).unwrap();
+                assert!(matches!(
+                    actor.bind_producer(owner, Some(foreign)),
+                    Err(Error::Closed)
+                ));
+
+                let mut sends = Vec::new();
+                for _ in 0..MEDIA_COMMANDS {
+                    let mut send = Box::pin(source.submit(pcm()));
+                    assert!(
+                        std::future::poll_fn(|cx| std::task::Poll::Ready(send.as_mut().poll(cx)))
+                            .await
+                            .is_pending()
+                    );
+                    sends.push(send);
+                }
+                assert!(matches!(
+                    source.submit(pcm()).await,
+                    Err(Error::Backpressure)
+                ));
+                let mut close = Box::pin(source.close());
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                let command = actor.commands.recv().await.unwrap();
+                actor.command(command);
+                close.await.unwrap();
+                assert!(source.is_closed());
+                assert!(matches!(feedback.try_next(), Some(StreamUpdate::Closed)));
+                assert!(!publication.is_closed());
+                assert!(matches!(
+                    actor.claim_publication(spec),
+                    Err(Error::Core(agent_core::AgentError::InvalidResource(
+                        agent_core::TrackResourceError::AlreadyOwned
+                    )))
+                ));
+                let fresh = actor.create_producer(None).unwrap();
+                let fresh_owner = *actor.producers.keys().next().unwrap();
+                assert_ne!(
+                    actor.producers[&fresh_owner].physical.as_ref(),
+                    Some(&original)
+                );
+                while let Ok(queued) = actor.media.try_recv() {
+                    actor.submit_media(queued);
+                }
+                for send in sends {
+                    assert!(matches!(send.await, Err(Error::Closed)));
+                }
+                actor.bind_producer(owner, Some(fresh.clone())).unwrap();
+                let mut send = Box::pin(fresh.submit(pcm()));
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(send.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                let queued = actor.media.recv().await.unwrap();
+                actor.retire_peer();
+                actor.submit_media(queued);
+                assert!(matches!(send.await, Err(Error::Closed)));
+                assert!(!fresh.is_closed());
+                assert!(matches!(fresh.submit(pcm()).await, Err(Error::NotReady)));
+                let mut ready = Box::pin(fresh.ready());
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(ready.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                actor.shutdown();
+                assert!(matches!(ready.await, Err(Error::Closed)));
+                assert!(fresh.is_closed());
+            });
+    }
+
     fn source_fixture() -> (
         PhysicalSource,
         Arc<agent_core::PublicationInputControl>,
-        mpsc::Receiver<Submission>,
+        mpsc::Receiver<MediaCommand>,
     ) {
         // Queue ownership only, not native admission or target readiness.
         let mut core = agent_core::Agent::new(config().session).unwrap();
@@ -2327,13 +2891,13 @@ mod tests {
             source
                 .inner
                 .media
-                .try_send(Submission {
+                .try_send(MediaCommand::Publication(Submission {
                     control: control.clone(),
                     slot: source.inner.slot.clone(),
                     identity: source.identity(),
                     frame: pcm(),
                     response,
-                })
+                }))
                 .unwrap();
         }
         assert!(matches!(
@@ -2389,7 +2953,7 @@ mod tests {
         forged.control = resumed.clone();
         assert!(actor.input_submission_current(&forged.control));
 
-        let replacement = actor.register_input(owner).unwrap();
+        let _replacement = actor.register_input(owner).unwrap();
         let replacement_control = latest_control(&mut actor.core);
         assert!(input.is_closed());
         assert!(matches!(feedback.try_next(), Some(StreamUpdate::Closed)));
@@ -2427,6 +2991,74 @@ mod tests {
             Err(Error::Closed)
         ));
         assert!(matches!(source.capture_time_us().await, Err(Error::Closed)));
+
+        // Queue capture and Core authority only, not native parameter acceptance.
+        let producer = actor
+            .create_producer(Some(VideoSourceConfig::default()))
+            .unwrap();
+        let producer_owner = *actor.producers.keys().next().unwrap();
+        let _publication = actor
+            .claim_publication(agent_core::TrackSpec::Video {
+                label: "encoder".into(),
+            })
+            .unwrap();
+        let owner = *actor.publications.keys().next_back().unwrap();
+        actor.bind_producer(owner, Some(producer.clone())).unwrap();
+        let original = latest_control(&mut actor.core);
+        let physical = PhysicalSource {
+            inner: Arc::new(SourceLease {
+                slot: MediaSlot::LocalVideo("v0".into()),
+                identity: SourceIdentity {
+                    generation: 17,
+                    source: 99,
+                },
+                closed: Arc::new(Signal::default()),
+                leases_changed: actor.leases_changed.clone(),
+                commands: actor.command_tx.clone(),
+                media: actor.media_tx.clone(),
+            }),
+        };
+        actor.producers[&producer_owner].bind_target(publication::InputTarget {
+            source: physical.clone(),
+            control: original.clone(),
+        });
+        let mut limits = Box::pin(producer.set_limits(vec![EncodingLimits {
+            max_bitrate_bps: Some(200_000),
+            max_framerate: Some(30.0),
+        }]));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(limits.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let command = actor.commands.try_recv().unwrap();
+        let Command::Limits {
+            control,
+            identity,
+            slot,
+            ..
+        } = &command
+        else {
+            panic!("captured limit command");
+        };
+        assert_eq!(control, &original);
+        assert_eq!(identity, &physical.identity());
+        assert_eq!(slot, physical.slot());
+        for muted in [true, false] {
+            actor
+                .core
+                .resource(agent_core::ResourceCommand::SetPublicationMuted { owner, muted })
+                .unwrap();
+        }
+        let resumed = latest_control(&mut actor.core);
+        actor.producers[&producer_owner].bind_target(publication::InputTarget {
+            source: physical,
+            control: resumed.clone(),
+        });
+        assert!(actor.input_submission_current(&resumed));
+        assert!(!actor.input_submission_current(control));
+        actor.command(command);
+        assert!(matches!(limits.await, Err(Error::Closed)));
     }
 
     #[test]
@@ -2507,7 +3139,7 @@ mod tests {
             commands,
         };
         let frame = RemoteFrame {
-            track: RemoteTrack {
+            track: NativeReceiverInfo {
                 generation: 1,
                 receiver: 7,
                 track_id: "native-track".into(),

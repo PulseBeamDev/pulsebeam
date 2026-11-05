@@ -2,10 +2,14 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { sessionKey } from "./session-key.js";
 import { createReactAgent, type Agent } from "./agent.js";
 import type { AgentConfig } from "@pulsebeam/web";
-import { createManagedAgent } from "@pulsebeam/web/internal/react";
+import {
+  createManagedAgent,
+  type ManagedAgent,
+} from "@pulsebeam/web/internal/react";
 
 export type {
   AgentConfig,
+  AudioDemand,
   AgentError,
   AgentLogging,
   ConnectionState,
@@ -25,14 +29,14 @@ export type {
   LocalDataTrack,
   RemoteAudioTrack,
   RemoteDataTrack,
-  RemoteMedia,
   RemoteParticipant,
   RemoteTrack,
   RemoteVideoTrack,
 } from "./agent.js";
-export { Publish, Data, Audio } from "./ownership.js";
+export { Publish, Data, Audio, SelectAudio } from "./ownership.js";
 export type {
   AudioProps,
+  SelectAudioProps,
   DataProps,
   PublicationSource,
   PublishProps,
@@ -68,12 +72,22 @@ export function useAgent(config: AgentConfig): Agent {
     setOwned(current);
   }
   const { managed, facade } = current;
+  const [failure, setFailure] = useState<{
+    managed: ManagedAgent;
+    error: unknown;
+  } | null>(null);
   useEffect(() => {
     managed.activate();
     return () => managed.deactivate();
   }, [managed]);
   useEffect(() => {
-    managed.renewAuthorization(config.token);
+    let active = true;
+    void managed.renewAuthorization(config.token).catch((error: unknown) => {
+      if (active) setFailure({ managed, error });
+    });
+    return () => {
+      active = false;
+    };
   }, [managed, config.token]);
   useEffect(() => {
     managed.setLogging(config.logging?.level ?? "warn");
@@ -83,5 +97,6 @@ export function useAgent(config: AgentConfig): Agent {
     managed.getSnapshot,
     managed.getSnapshot,
   );
+  if (failure?.managed === managed) throw failure.error;
   return facade;
 }

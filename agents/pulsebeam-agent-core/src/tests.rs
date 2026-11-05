@@ -2144,6 +2144,72 @@ fn explicit_connect_establishes_connected_intent_from_idle() {
 }
 
 #[test]
+fn explicit_disconnect_preserves_resource_owners_and_declared_intent() {
+    let mut agent = Agent::new(config()).unwrap();
+    let spec = TrackSpec::Audio {
+        label: "microphone".into(),
+    };
+    let ResourceResult::Publication { owner, slot, .. } = agent
+        .resource(ResourceCommand::ClaimPublication { spec: spec.clone() })
+        .unwrap()
+    else {
+        panic!("publication owner")
+    };
+    agent
+        .resource(ResourceCommand::UpdatePublication {
+            owner,
+            present: true,
+        })
+        .unwrap();
+    let owned = MediaSlot::LocalAudio(slot);
+    let declared = MediaSlot::LocalVideo("camera".into());
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 1,
+            publications: vec![PublicationIntent {
+                slot: "camera".into(),
+                kind: MediaKind::Video,
+                label: "camera".into(),
+                active: true,
+            }],
+            ..Default::default()
+        }))
+        .unwrap();
+    agent.command(AgentCommand::Connect).unwrap();
+    let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = next_effect(&mut agent) else {
+        panic!("connection attempt")
+    };
+    agent.command(AgentCommand::Disconnect).unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation })
+    );
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Closed { generation }))
+        .unwrap();
+    assert_eq!(agent.snapshot().connection, ConnectionState::Disconnected);
+    let revision = agent.snapshot().desired_revision;
+    agent.command(AgentCommand::Disconnect).unwrap();
+    assert_eq!(agent.snapshot().desired_revision, revision);
+    assert!(agent.is_publishing(&owned));
+    assert!(agent.is_publishing(&declared));
+    assert_eq!(
+        agent.resource(ResourceCommand::ClaimPublication { spec }),
+        Err(AgentError::InvalidResource(
+            TrackResourceError::AlreadyOwned
+        ))
+    );
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(matches!(next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CreateOffer { generation: next, .. }) if next != generation));
+    assert!(agent.is_publishing(&owned));
+    assert!(agent.is_publishing(&declared));
+    agent.resource(ResourceCommand::Release { owner }).unwrap();
+    assert!(!agent.is_publishing(&owned));
+    assert!(agent.is_publishing(&declared));
+}
+
+#[test]
 fn authorization_is_latched_across_incidental_updates_until_explicit_reconnect() {
     let mut agent = Agent::new(config()).unwrap();
     let (failed_generation, operation) = begin_connect(&mut agent, desired(1), channel(12));

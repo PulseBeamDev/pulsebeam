@@ -1,10 +1,7 @@
 import { DataRegistry, type LocalDataTrack } from "./data.js";
-import type {
-  AudioTrackSpec,
-  DataTrackSpec,
-  Delivery,
-  VideoTrackSpec,
-} from "./track.js";
+import { track, type Delivery } from "./track.js";
+import { selectAudio } from "./reception.js";
+import { observeSnapshots, observeEvents } from "./observation.js";
 import type {
   Agent,
   AgentConfig,
@@ -12,6 +9,7 @@ import type {
   AgentError,
   AgentSnapshot,
   AgentState,
+  AudioDemand,
   CatalogSnapshot,
   ConnectionState,
   LogLevel,
@@ -21,7 +19,7 @@ import type {
   Participant,
   Publication,
   RemoteTrack,
-  RemoteMedia,
+  RemoteParticipant,
   Topic,
   TopicMode,
   TopicRegistration,
@@ -31,7 +29,7 @@ import type {
 } from "./types.js";
 import { RemoteCatalog } from "./remote-catalog.js";
 import { TopicRegistry } from "./topic.js";
-import { ResourceOwners } from "./resources.js";
+import { ResourceError, ResourceOwners } from "./resources.js";
 import { LocalMediaRegistry } from "./media.js";
 import { BrowserRuntime, whenInitialized } from "./wasm.js";
 import {
@@ -99,6 +97,8 @@ class AgentFacade implements Agent {
   #snapshot: AgentSnapshot = emptySnapshot("disconnected");
   #listeners = new Set<() => void>();
   #eventListeners = new Set<(event: AgentEvent) => void>();
+  readonly #snapshots = new Set<ReturnType<typeof observeSnapshots>>();
+  readonly #events = new Set<ReturnType<typeof observeEvents>>();
   #state: AgentState = copyState({ connected: false });
   #runtime: Runtime | undefined;
   #runtimeGeneration: bigint | null = null;
@@ -115,6 +115,7 @@ class AgentFacade implements Agent {
   readonly #topics: TopicRegistry;
   #managedTopics: readonly TopicRegistration[] = [];
   #closed = false;
+  #closing: Promise<void> | undefined;
   #active = false;
   #activation = 0;
   #ready: Promise<Runtime> | undefined;
@@ -203,7 +204,7 @@ class AgentFacade implements Agent {
   }
 
   deactivate(): void {
-    if (!this.#active || this.#closed) return;
+    if (!this.#active) return;
     this.#active = false;
     ++this.#activation;
     this.#ready = undefined;
@@ -243,23 +244,35 @@ class AgentFacade implements Agent {
     return this.#snapshot.authorizationExpiresAt;
   }
 
-  get remote(): RemoteMedia {
-    return this.#remote.facade();
+  async initialized(): Promise<void> {
+    await this.#ready;
+    if (this.#closed) throw new ResourceError("closed", "agent is closed");
   }
 
   bindPublicAgent(agent: Agent): void {
     this.#remote.bindAgent(agent);
   }
 
-  track(spec: VideoTrackSpec): LocalVideoTrack;
-  track(spec: AudioTrackSpec): LocalAudioTrack;
-  track<D extends Delivery>(spec: DataTrackSpec<D>): LocalDataTrack<D>;
-  track(
-    spec: VideoTrackSpec | AudioTrackSpec | DataTrackSpec,
-  ): LocalVideoTrack | LocalAudioTrack | LocalDataTrack {
-    if (spec.kind === "data") return this.#data.local(spec);
-    if (spec.kind === "video") return this.#media.track(spec);
-    return this.#media.track(spec);
+  video(label: string): LocalVideoTrack {
+    return this.#media.track(track.video(label));
+  }
+  audio(label: string): LocalAudioTrack {
+    return this.#media.track(track.audio(label));
+  }
+  data<D extends Delivery>(label: string, delivery: D): LocalDataTrack<D> {
+    return this.#data.local(track.data(label, delivery));
+  }
+  get participants(): readonly RemoteParticipant[] {
+    return this.#remote.facade().participants;
+  }
+  participant(id: string): RemoteParticipant {
+    return this.#remote.facade().participant(id);
+  }
+  selectAudio(policy: AudioDemand) {
+    return selectAudio(this.#resources, policy);
+  }
+  isClosed(): boolean {
+    return this.#closed;
   }
 
   topic<T>(name: string, options: { readonly mode: TopicMode }): Topic<T> {
@@ -272,6 +285,24 @@ class AgentFacade implements Agent {
     callbacks: TopicCallbacks<T>,
   ): () => void {
     return this.#topics.listen(name, options, callbacks);
+  }
+
+  snapshot(): AgentSnapshot {
+    return this.#snapshot;
+  }
+  snapshots() {
+    const observation = observeSnapshots(this.#snapshot, this.#closed, () =>
+      this.#snapshots.delete(observation),
+    );
+    if (!this.#closed) this.#snapshots.add(observation);
+    return observation.stream;
+  }
+  events() {
+    const observation = observeEvents(this.#closed, () =>
+      this.#events.delete(observation),
+    );
+    if (!this.#closed) this.#events.add(observation);
+    return observation.stream;
   }
 
   readonly getSnapshot = (): AgentSnapshot => this.#snapshot;
@@ -300,8 +331,8 @@ class AgentFacade implements Agent {
     };
   };
 
-  connect(): void {
-    if (this.#closed) throw new Error("agent is closed");
+  async connect(): Promise<void> {
+    if (this.#closed) throw new ResourceError("closed", "agent is closed");
     if (this.#snapshot.connection === "terminal-failure" && !this.#runtime) {
       this.deactivate();
       this.activate();
@@ -309,12 +340,14 @@ class AgentFacade implements Agent {
     if (!this.#state.connected)
       this.#applyState({ ...this.#state, connected: true });
     else this.#runtime?.connect();
+    await this.#ready;
   }
 
-  disconnect(): void {
-    if (this.#closed) throw new Error("agent is closed");
+  async disconnect(): Promise<void> {
+    if (this.#closed) throw new ResourceError("closed", "agent is closed");
     if (this.#state.connected)
       this.#applyState({ ...this.#state, connected: false });
+    await this.#ready;
   }
 
   setState(state: AgentState): void {
@@ -372,8 +405,8 @@ class AgentFacade implements Agent {
     this.#requireRuntime().force_reconnect();
   }
 
-  renewAuthorization(token: string): void {
-    if (this.#closed) throw new Error("agent is closed");
+  async renewAuthorization(token: string): Promise<void> {
+    if (this.#closed) throw new ResourceError("closed", "agent is closed");
     if (!token || token.length > 16_384 || !/^[!-~]+$/.test(token)) {
       throw new Error("authorization token is invalid");
     }
@@ -396,29 +429,32 @@ class AgentFacade implements Agent {
     return this.#publishTopic(name, mode, payload);
   }
 
-  close(): void {
-    if (this.#closed) return;
-    this.deactivate();
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    const initialized = this.#ready;
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    this.#closing = new Promise<void>((done, failed) => {
+      resolve = done;
+      reject = failed;
+    });
     this.#closed = true;
-    const runtime = this.#runtime;
-    this.#runtime = undefined;
-    this.#runtimeGeneration = null;
-    if (runtime) {
-      runtime.set_snapshot_listener();
-      runtime.set_event_listener();
-      runtime.set_error_listener();
-      runtime.close();
-      runtime.abort();
-    }
+    for (const observation of this.#snapshots) observation.close();
+    for (const observation of this.#events) observation.close();
+    this.deactivate();
     this.#media.close();
-    this.#resources.close();
-    this.#data.close();
+    const released = [this.#resources.close(), this.#data.close()];
     this.#topics.close();
     this.#remote.close();
     this.#state = copyState({ connected: false });
     this.#publish(emptySnapshot("disconnected"));
     this.#listeners.clear();
     this.#eventListeners.clear();
+    void Promise.all([...released, initialized?.catch(() => {})]).then(
+      () => resolve(),
+      reject,
+    );
+    return this.#closing;
   }
 
   #requireRuntime(): Runtime {
@@ -675,16 +711,21 @@ class AgentFacade implements Agent {
   #publish(snapshot: AgentSnapshot): void {
     if (snapshot === this.#snapshot) return;
     this.#snapshot = snapshot;
+    for (const observation of this.#snapshots) observation.publish(snapshot);
     this.#remote.update(snapshot);
     for (const listener of [...this.#listeners]) listener();
   }
 
   #emit(event: AgentEvent): void {
+    for (const observation of this.#events) observation.publish(event);
     for (const listener of [...this.#eventListeners]) listener(event);
   }
 }
 
 export interface ManagedAgent extends Agent {
+  readonly participants: readonly RemoteParticipant[];
+  readonly getSnapshot: () => AgentSnapshot;
+  readonly subscribe: (listener: () => void) => () => void;
   activate(): void;
   deactivate(): void;
 }
@@ -693,8 +734,14 @@ export function createManagedAgent(config: AgentConfig): ManagedAgent {
   return new AgentFacade(config, true);
 }
 
-export function createAgent(config: AgentConfig): Agent {
+export async function createAgent(config: AgentConfig): Promise<Agent> {
   const raw = new AgentFacade(config);
+  try {
+    await raw.initialized();
+  } catch (error) {
+    await raw.close();
+    throw error;
+  }
   const agent: Agent = Object.freeze({
     get connection() {
       return raw.connection;
@@ -711,16 +758,20 @@ export function createAgent(config: AgentConfig): Agent {
     get authorizationExpiresAt() {
       return raw.authorizationExpiresAt;
     },
-    get remote() {
-      return raw.remote;
-    },
-    track: raw.track.bind(raw) as Agent["track"],
+    video: (label: string) => raw.video(label),
+    audio: (label: string) => raw.audio(label),
+    data: <D extends Delivery>(label: string, delivery: D) =>
+      raw.data(label, delivery),
+    participant: (id: string) => raw.participant(id),
+    selectAudio: (policy: AudioDemand) => raw.selectAudio(policy),
+    isClosed: () => raw.isClosed(),
     connect: () => raw.connect(),
     disconnect: () => raw.disconnect(),
     renewAuthorization: (token: string) => raw.renewAuthorization(token),
     setLogging: (level: LogLevel) => raw.setLogging(level),
-    getSnapshot: raw.getSnapshot,
-    subscribe: raw.subscribe,
+    snapshot: () => raw.snapshot(),
+    snapshots: () => raw.snapshots(),
+    events: () => raw.events(),
     close: () => raw.close(),
   });
   raw.bindPublicAgent(agent);

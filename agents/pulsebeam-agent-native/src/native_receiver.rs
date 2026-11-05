@@ -2,8 +2,8 @@
 use pulsebeam_webrtc_sys as rtc;
 
 use crate::native_media::{
-    DecodeTargetIndication, FrameMetadata, I420Frame, OutputFrame, ReceiveMode, RemoteFrame,
-    RemoteTrack,
+    DecodeTargetIndication, FrameMetadata, I420Frame, NativeReceiverInfo, OutputFrame, ReceiveMode,
+    RemoteFrame,
 };
 
 fn decoded_frame(frame: rtc::VideoFrame) -> (OutputFrame, FrameMetadata) {
@@ -60,7 +60,7 @@ fn encoded_frame(frame: rtc::EncodedReceivedVideoFrame) -> (OutputFrame, FrameMe
 
 pub(crate) struct NativeReceiver {
     pub id: rtc::SessionReceiverId,
-    pub track: RemoteTrack,
+    pub track: NativeReceiverInfo,
     pub kind: rtc::MediaType,
     pub mode: Option<ReceiveMode>,
     prefer_decoded: bool,
@@ -90,7 +90,7 @@ impl NativeReceiver {
         })?;
         Ok(Self {
             id,
-            track: RemoteTrack {
+            track: NativeReceiverInfo {
                 generation,
                 receiver: id.get(),
                 track_id,

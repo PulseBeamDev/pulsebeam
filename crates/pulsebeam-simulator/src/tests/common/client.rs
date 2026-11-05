@@ -11,11 +11,11 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use pulsebeam_agent_native::agent_core::{
     AgentConfig, AudioSubscription, ConnectionState, DesiredState, MediaKind,
     Publication as CatalogPublication, TopicMode, TopicNotification, TopicPublisher, TopicSend,
-    TopicSubscriber, TrackSelector, TrackSpec, VideoObservation, VideoSubscription,
+    TopicSubscriber, TrackSelector, VideoObservation, VideoSubscription,
 };
 use pulsebeam_agent_native::{
     Agent, AgentEvent, AsyncHttpClient, AudioInput, Config, Encoding, Host, InputFrame,
-    MediaConfig, PublicationInput, VideoInput, VideoPublicationConfig, VideoSourceConfig,
+    MediaConfig, ProducerInput, VideoInput, VideoPublicationConfig, VideoSourceConfig,
 };
 use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
 use pulsebeam_core::net::{HttpError, HttpRequest, HttpResult};
@@ -692,7 +692,7 @@ impl SimClientBuilder {
                 .publishes_video
                 .then(|| VideoPublicationConfig {
                     slot: "v0".into(),
-                    source: source_profile,
+                    source: source_profile.clone(),
                 })
                 .into_iter()
                 .collect(),
@@ -710,23 +710,31 @@ impl SimClientBuilder {
         )?;
         let actor = tokio::task::spawn_local(actor);
         let events = NativeEventCollector::new(agent.events());
-        let video_publication = if self.publishes_video {
+        let video_source = if self.publishes_video {
+            Some(agent.create_video_input(source_profile.clone()).await?)
+        } else {
+            None
+        };
+        let video_publication = if let Some(source) = &video_source {
             Some(
                 agent
-                    .publication(TrackSpec::Video {
-                        label: "video".into(),
-                    })
+                    .video("video".into())?
+                    .publish(source, Default::default())
                     .await?,
             )
         } else {
             None
         };
-        let audio_publication = if self.audio_level_dbov.is_some() {
+        let audio_source = if self.audio_level_dbov.is_some() {
+            Some(agent.create_audio_input().await?)
+        } else {
+            None
+        };
+        let audio_publication = if let Some(source) = &audio_source {
             Some(
                 agent
-                    .publication(TrackSpec::Audio {
-                        label: "audio".into(),
-                    })
+                    .audio("audio".into())?
+                    .publish(source, Default::default())
                     .await?,
             )
         } else {
@@ -742,7 +750,7 @@ impl SimClientBuilder {
             },
             ..DesiredState::default()
         };
-        let audio_policy = agent.audio_policy(desired.audio.clone()).await?;
+        let audio_policy = agent.select_audio(desired.audio.clone()).await?;
         let mut declared = desired.clone();
         declared.audio = AudioSubscription::default();
         agent.replace_desired(declared).await?;
@@ -822,6 +830,9 @@ impl SimClientBuilder {
             events,
             video_publication,
             audio_publication,
+            video_source,
+            audio_source,
+            video_source_config: source_profile,
             audio_policy,
             video_subscriptions: BTreeMap::new(),
         };
@@ -935,7 +946,7 @@ impl From<&pulsebeam_agent_native::RemoteFrame> for NativeVideoStream {
 
 #[derive(Default, Debug, Clone)]
 pub struct NativeVideoTimeline {
-    pub track: Option<pulsebeam_agent_native::RemoteTrack>,
+    pub track: Option<pulsebeam_agent_native::NativeReceiverInfo>,
     pub decoded: DecodedVideoStream,
     pub decoded_by_incarnation: BTreeMap<String, u64>,
     pub dd_frames: u64,
@@ -1091,7 +1102,7 @@ pub struct AudioReceiveLog {
     pub native_pcm: super::native_audio::NativePcmLog,
     pub encoded_observers: usize,
     pub by_receiver: BTreeMap<NativeAudioStream, AudioStream>,
-    pub tracks: BTreeMap<NativeAudioStream, pulsebeam_agent_native::RemoteTrack>,
+    pub tracks: BTreeMap<NativeAudioStream, pulsebeam_agent_native::NativeReceiverInfo>,
     /// Native encoded packet observations, fenced by generation/receiver/SSRC.
     /// Sequence holes can include padding omitted by the SFU, not missing audio.
     /// Native PCM and SDK statistics, not this diagnostic, qualify playout.
@@ -1587,7 +1598,7 @@ impl QualityAudioLooper {
         self,
         input: AudioInput,
         mut snapshots: tokio::sync::watch::Receiver<pulsebeam_agent_native::agent_core::Snapshot>,
-        sender: PublicationInput,
+        sender: ProducerInput,
         pressure: Option<tokio::sync::mpsc::Receiver<PressureInput>>,
     ) {
         while snapshots.borrow().connection != ConnectionState::Connected {
@@ -1665,7 +1676,7 @@ impl QualityAudioLooper {
 impl QualityAudioLooper {
     async fn run_pcm(
         self,
-        sender: PublicationInput,
+        sender: ProducerInput,
         mut pressure: tokio::sync::mpsc::Receiver<PressureInput>,
     ) {
         let prepared = quality_audio_reference();
@@ -2171,7 +2182,7 @@ mod tests {
         payload: Vec<u8>,
     ) -> pulsebeam_agent_native::RemoteFrame {
         pulsebeam_agent_native::RemoteFrame {
-            track: pulsebeam_agent_native::RemoteTrack {
+            track: pulsebeam_agent_native::NativeReceiverInfo {
                 generation: 1,
                 receiver,
                 track_id: "unit-native-track".into(),
@@ -3427,7 +3438,7 @@ impl NativeTrafficStatistics {
 
 #[derive(Clone, Debug)]
 pub struct OwnedReceiverEvidence {
-    pub track: pulsebeam_agent_native::RemoteTrack,
+    pub track: pulsebeam_agent_native::NativeReceiverInfo,
     pub publication: CatalogPublication,
 }
 
@@ -3460,7 +3471,7 @@ impl ReceiverObservation {
         }
     }
 
-    fn track(&self, track: pulsebeam_agent_native::RemoteTrack) {
+    fn track(&self, track: pulsebeam_agent_native::NativeReceiverInfo) {
         assert_eq!((track.generation, track.receiver), self.key);
         if let Some(publication) = &self.publication {
             self.receivers.lock().unwrap().insert(
@@ -3601,6 +3612,9 @@ pub struct ClientContext {
     events: NativeEventCollector,
     video_publication: Option<pulsebeam_agent_native::Publication>,
     audio_publication: Option<pulsebeam_agent_native::Publication>,
+    video_source: Option<ProducerInput>,
+    audio_source: Option<ProducerInput>,
+    video_source_config: VideoSourceConfig,
     audio_policy: pulsebeam_agent_native::Subscription,
     video_subscriptions: BTreeMap<TrackSelector, VideoInterest>,
 }
@@ -3742,7 +3756,16 @@ impl ClientContext {
             .take()
             .ok_or_else(|| anyhow::anyhow!("participant has no owned video"))?;
         publication.close().await?;
-        self.video_publication = Some(self.agent.publication(TrackSpec::Video { label }).await?);
+        let source = self
+            .video_source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("participant has no video producer"))?;
+        self.video_publication = Some(
+            self.agent
+                .video(label)?
+                .publish(source, Default::default())
+                .await?,
+        );
         Ok(true)
     }
 
@@ -3890,7 +3913,9 @@ impl ClientContext {
             } else {
                 let subscription = self
                     .agent
-                    .video_subscription(selector.clone(), observation.clone())
+                    .participant(selector.participant_external_id.clone())?
+                    .video(selector.label.clone())?
+                    .subscribe(observation.clone())
                     .await?;
                 self.video_subscriptions.insert(
                     selector,
@@ -4065,7 +4090,7 @@ struct ClientMediaPlan {
 }
 
 struct VideoFeed {
-    source: PublicationInput,
+    source: ProducerInput,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -4126,7 +4151,7 @@ pub struct SimClient {
     audio_pressure: Option<tokio::sync::mpsc::Sender<PressureInput>>,
     video_source_incarnation: u64,
     video_feed: Option<VideoFeed>,
-    retired_video_sources: Vec<PublicationInput>,
+    retired_video_sources: Vec<ProducerInput>,
     media: ClientMediaPlan,
 }
 
@@ -4154,7 +4179,7 @@ impl SimClient {
             .is_some_and(|current| !connected || generation != Some(current))
         {
             // Capture anchors belong to this application admission, not the
-            // logical input's future native targets.
+            // producer's future native targets.
             if let Some(feed) = self.video_feed.take() {
                 feed.stop().await?;
             }
@@ -4200,13 +4225,12 @@ impl SimClient {
             } else {
                 None
             };
-            let input = ctx
-                .audio_publication
+            let input = ctx.audio_source.as_ref().expect("audio producer").clone();
+            ctx.audio_publication
                 .as_ref()
                 .expect("audio publication")
-                .input()
+                .ready()
                 .await?;
-            input.ready().await?;
             self.join_set.spawn(run_capture_generation(
                 agent.snapshots(),
                 generation,
@@ -4301,13 +4325,12 @@ impl SimClient {
                     },
                 );
             }
-            let media = ctx
-                .video_publication
+            let media = ctx.video_source.as_ref().expect("video producer").clone();
+            ctx.video_publication
                 .as_ref()
                 .expect("video publication")
-                .input()
+                .ready()
                 .await?;
-            media.ready().await?;
             let generation = ctx
                 .snapshots
                 .borrow()
@@ -4355,6 +4378,18 @@ impl SimClient {
         let feed = self.video_feed.take().expect("checked attached video feed");
         self.retired_video_sources.push(feed.source.clone());
         feed.stop().await?;
+        let source = self
+            .ctx
+            .agent
+            .create_video_input(self.ctx.video_source_config.clone())
+            .await?;
+        self.ctx
+            .video_publication
+            .as_ref()
+            .expect("video publication")
+            .set_source(Some(&source))
+            .await?;
+        self.ctx.video_source = Some(source);
         self.attach_video_source().await?;
         Ok(true)
     }
@@ -4573,8 +4608,8 @@ impl SimClient {
         self.join_set.abort_all();
         // Do not abort the actor alongside application feeds before it can
         // acknowledge the core's graceful close and retire its native graph.
+        self.ctx.agent.disconnect().await?;
         self.ctx.agent.close().await?;
-        self.ctx.agent.abort().await?;
         if let Some(actor) = self.actor.take() {
             actor.await?;
         }

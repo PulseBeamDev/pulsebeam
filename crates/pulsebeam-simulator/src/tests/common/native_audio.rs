@@ -1,6 +1,6 @@
 //! Native PCM playout facts, deliberately without per-block publication identity.
 use anyhow::{Context, Result, ensure};
-use pulsebeam_agent_native::{OutputFrame, RemoteFrame, RemoteTrack};
+use pulsebeam_agent_native::{NativeReceiverInfo, OutputFrame, RemoteFrame};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,7 @@ pub struct NativePcmLog {
 
 #[derive(Clone, Debug, PartialEq)]
 struct Receiver {
-    track: RemoteTrack,
+    track: NativeReceiverInfo,
     nontrivial_samples: u64,
     blocks: u64,
     last_at: Instant,
@@ -75,7 +75,7 @@ impl NativePcmLog {
         min_receivers: usize,
         max_silence: Option<Duration>,
         now: Instant,
-    ) -> Result<Vec<RemoteTrack>> {
+    ) -> Result<Vec<NativeReceiverInfo>> {
         ensure!(
             min_samples > 0 && min_receivers > 0,
             "native PCM proof requires nontrivial samples and receivers"
@@ -130,7 +130,7 @@ impl NativePcmLog {
         min_blocks: u64,
         min_receivers: usize,
         now: Instant,
-    ) -> Result<Vec<RemoteTrack>> {
+    ) -> Result<Vec<NativeReceiverInfo>> {
         self.require_silent(generation)?;
         self.require_progress(generation, min_blocks, min_receivers, now)
     }
@@ -141,7 +141,7 @@ impl NativePcmLog {
         min_blocks: u64,
         min_receivers: usize,
         now: Instant,
-    ) -> Result<Vec<RemoteTrack>> {
+    ) -> Result<Vec<NativeReceiverInfo>> {
         ensure!(
             min_blocks > 0 && min_receivers > 0,
             "PCM progress requires actual blocks and receivers"
@@ -255,7 +255,7 @@ pub fn require_decoder_progress(before: &[u8], after: &[u8], mid: &str) -> Resul
 pub fn require_decoder_receivers(
     before: Option<&[u8]>,
     after: &[u8],
-    tracks: &[RemoteTrack],
+    tracks: &[NativeReceiverInfo],
     required: usize,
 ) -> Result<()> {
     ensure!(required > 0, "audio decode requires actual receivers");
@@ -308,7 +308,7 @@ mod tests {
     // Synthetic values exercise oracle failures, never native media acceptance.
     fn pcm(generation: u64, audible: bool) -> RemoteFrame {
         RemoteFrame {
-            track: RemoteTrack {
+            track: NativeReceiverInfo {
                 generation,
                 receiver: 3,
                 track_id: "unit".into(),

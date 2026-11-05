@@ -250,7 +250,7 @@ pub enum OutputFrame {
 
 /// Native receiver identity, separate from the control-plane catalog mapping.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct RemoteTrack {
+pub struct NativeReceiverInfo {
     pub generation: u64,
     pub receiver: u64,
     pub track_id: String,
@@ -293,7 +293,7 @@ pub struct FrameMetadata {
 /// Track identity is captured from the native receiver before sink attachment.
 #[derive(Debug)]
 pub struct DecodedVideoObservation {
-    pub track: RemoteTrack,
+    pub track: NativeReceiverInfo,
     pub observed_at: std::time::Instant,
     /// SDK global monotonic callback clock, controlled by an exclusive world.
     pub native_observed_at_us: i64,
@@ -324,8 +324,13 @@ impl DecodedVideoObserver {
 /// Dropped means unavailable native identity/metadata, not polling queue loss.
 #[derive(Debug)]
 pub enum EncodedVideoObservation {
-    Frame { frame: Box<RemoteFrame> },
-    Dropped { track: RemoteTrack, skipped: u64 },
+    Frame {
+        frame: Box<RemoteFrame>,
+    },
+    Dropped {
+        track: NativeReceiverInfo,
+        skipped: u64,
+    },
 }
 
 /// Optional Rust-only synchronous observation of combined video reception.
@@ -350,7 +355,7 @@ impl EncodedVideoObserver {
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct RemoteFrame {
-    pub track: RemoteTrack,
+    pub track: NativeReceiverInfo,
     pub metadata: FrameMetadata,
     pub frame: OutputFrame,
 }
@@ -362,7 +367,7 @@ pub struct RemoteFrame {
 )]
 pub enum MediaStreamUpdate {
     Track {
-        track: RemoteTrack,
+        track: NativeReceiverInfo,
     },
     Frame {
         frame: RemoteFrame,

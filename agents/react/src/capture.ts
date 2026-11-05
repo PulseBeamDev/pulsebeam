@@ -7,10 +7,14 @@ import {
   useState,
 } from "react";
 import { useCommittedRef } from "./committed-ref.js";
-import { createCaptureSource } from "@pulsebeam/web";
+import {
+  AudioSource as WebAudioSource,
+  VideoSource as WebVideoSource,
+} from "@pulsebeam/web";
 import {
   publishableVideoSource,
   publishableAudioSource,
+  releasePublicationSource,
   type PublishableVideoSource,
   type PublishableAudioSource,
 } from "./sources.js";
@@ -412,10 +416,12 @@ function useCaptureImpl(
   } | null>(null);
 
   const release = useCallback((session: Session) => {
-    for (const track of session.stream.getTracks()) {
+    for (const track of session.stream.getTracks())
       track.removeEventListener("ended", session.onEnded);
-      track.stop();
-    }
+    releasePublicationSource(session.snapshot.video);
+    releasePublicationSource(session.snapshot.audio);
+    for (const track of session.stream.getTracks())
+      if (track.readyState === "live") track.stop();
   }, []);
   const stop = useCallback(() => {
     generation.current++;
@@ -496,14 +502,14 @@ function useCaptureImpl(
           video?.readyState === "live"
             ? publishableVideoSource(
                 { kind: "video", ...observe(video, "video", chosen, display) },
-                createCaptureSource(video, "video"),
+                WebVideoSource.fromTrack(video),
               )
             : null,
         audio:
           audio?.readyState === "live"
             ? publishableAudioSource(
                 { kind: "audio", ...observe(audio, "audio", chosen, display) },
-                createCaptureSource(audio, "audio"),
+                WebAudioSource.fromTrack(audio),
               )
             : null,
         state: "active",

@@ -4,9 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::decoder::{H264ReferenceDecoder, PixelSample};
-use pulsebeam_agent_native::{
-    EncodingLimits, H264Frame, InputFrame, PublicationInput, StreamUpdate,
-};
+use pulsebeam_agent_native::{EncodingLimits, H264Frame, InputFrame, ProducerInput, StreamUpdate};
 
 use pulsebeam_rtc_simulation::NativeH264AccessUnit;
 
@@ -437,7 +435,7 @@ impl VideoSource {
     }
     /// One caller capture batch, with actual encoding-specific elementary
     /// streams. Never submit independent per-RID frames to a native sender.
-    pub async fn run_batch(mut sources: Vec<(Option<String>, Self)>, media: PublicationInput) {
+    pub async fn run_batch(mut sources: Vec<(Option<String>, Self)>, media: ProducerInput) {
         assert!(!sources.is_empty());
         let fps = sources[0].1.fps;
         assert!(sources.iter().all(|(_, source)| source.fps == fps));
@@ -615,7 +613,7 @@ impl VbrSource {
         u32::try_from(saturating_u64(self.target_bps.round()))
             .expect("fixture bitrate must fit native limit")
     }
-    pub async fn run(mut self, media: PublicationInput) {
+    pub async fn run(mut self, media: ProducerInput) {
         let mut last_keyframe = true;
         let mut sequence = 0u64;
         let capture_origin = media.capture_time_us().await.expect("native capture clock");

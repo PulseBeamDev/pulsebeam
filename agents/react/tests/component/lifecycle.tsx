@@ -3,7 +3,7 @@ import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Publish, Video, useAgent } from "../../src/index.js";
 import { dataLifetimes, staleDataClaims } from "./data.js";
-import { useUserMedia, useMediaDevices } from "../../src/capture.js";
+import { useCapture, useDevices } from "../../src/index.js";
 import { captures, deferred, flush, stream } from "./platform.js";
 import { runtimes } from "./runtime.js";
 import { concurrentRender } from "./concurrency.js";
@@ -21,7 +21,7 @@ await staleDataClaims();
 await videoPreferences();
 
 let agent: ReturnType<typeof useAgent>;
-let capture: ReturnType<typeof useUserMedia>;
+let capture: ReturnType<typeof useCapture>;
 let updateToken: () => void;
 let replaceSession: () => void;
 let playback: { retry(): Promise<void> } | undefined;
@@ -31,8 +31,8 @@ function Room() {
   const [token, setToken] = useState("first");
   const [endpoint, setEndpoint] = useState("http://localhost");
   agent = useAgent({ endpoint, token });
-  capture = useUserMedia({ video: true, audio: true });
-  devicesReady = useMediaDevices().state === "ready";
+  capture = useCapture("device", { video: true, audio: true });
+  devicesReady = useDevices().state === "ready";
   updateToken = () => setToken("renewed");
   replaceSession = () => setEndpoint("http://localhost/replacement");
   const camera = agent.video("camera");

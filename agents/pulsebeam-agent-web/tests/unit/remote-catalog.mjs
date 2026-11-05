@@ -3,6 +3,10 @@ import { test } from "node:test";
 import { RemoteCatalog } from "../../unit-javascript/remote-catalog.js";
 import { DataRegistry } from "../../unit-javascript/data.js";
 import { ResourceOwners } from "../../unit-javascript/resources.js";
+import {
+  subscribeVideo,
+  selectAudio,
+} from "../../unit-javascript/reception.js";
 
 function fixture() {
   let snapshot = {
@@ -49,6 +53,17 @@ test("catalog preserves external-identity handles across absence and publication
   const aliceHandle = f.catalog.participant("alice");
   const video = aliceHandle.video("camera");
   const audio = aliceHandle.audio("microphone");
+  const publicParticipant = f.catalog.facade().participant("alice");
+  assert.equal(publicParticipant.id(), "alice");
+  assert.equal(
+    publicParticipant.video("camera"),
+    publicParticipant.video("camera"),
+  );
+  assert.notEqual(
+    publicParticipant.audio("camera"),
+    publicParticipant.video("camera"),
+  );
+  assert.equal("track" in publicParticipant, false);
   assert.equal(video.active, false);
   assert.equal(audio.receiving, false);
   assert.deepEqual(f.catalog.participants, []);
@@ -67,7 +82,7 @@ test("catalog preserves external-identity handles across absence and publication
   assert.equal(f.catalog.videoTracks, videos);
   assert.equal(f.catalog.audioTracks, audios);
   let notifications = 0;
-  video.subscribe(() => notifications++);
+  video.watch(() => notifications++);
   f.update([], []);
   assert.equal(video.active, false);
   assert.equal(notifications, 1);
@@ -86,7 +101,7 @@ test("audio receiving follows mapping, not catalog or media availability, and cl
   const f = fixture();
   const audio = f.catalog.participant("alice").audio("microphone");
   let notifications = 0;
-  audio.subscribe(() => notifications++);
+  audio.watch(() => notifications++);
   f.update([alice], [microphone]);
   assert.equal(audio.receiving, false);
   f.update(
@@ -163,4 +178,108 @@ test("receive option validation is atomic and inert without an attachment", () =
     RangeError,
   );
   f.catalog.close();
+});
+
+test("subscription close drains a late physical observation without adopting it", async () => {
+  const commands = [];
+  let finish;
+  const pending = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const resources = new ResourceOwners((error) => {
+    throw error;
+  });
+  resources.activate({
+    async resource(command) {
+      commands.push(command);
+      return command.op === "claimVideo" ? { owner: 9n } : undefined;
+    },
+    observe_media(owner, source) {
+      assert.equal(owner, 9n);
+      assert.equal(source, undefined);
+      return pending;
+    },
+  });
+  const selector = { participantId: "alice", label: "camera" };
+  const configuration = {
+    visible: true,
+    height: 720,
+    minHeight: 0,
+    minFps: 0,
+    priority: 0,
+    playoutDelay: { mode: "adaptive" },
+  };
+  const subscription = await subscribeVideo(resources, selector, configuration);
+  assert.deepEqual(commands.slice(0, 2), [
+    { op: "claimVideo", selector },
+    { op: "observeVideo", owner: 9n, observation: configuration },
+  ]);
+  let freed = 0;
+  let stopped = false;
+  const acquiring = assert.rejects(subscription.observe(), { code: "closed" });
+  const closing = subscription.close();
+  assert.equal(subscription.isClosed(), true);
+  finish({
+    track: () => undefined,
+    is_closed: () => stopped,
+    async close() {
+      stopped = true;
+    },
+    free() {
+      freed++;
+    },
+  });
+  await Promise.all([acquiring, closing]);
+  assert.equal(stopped, true);
+  assert.equal(freed, 1);
+  assert.equal(
+    commands.filter((command) => command.op === "release").length,
+    1,
+  );
+  assert.equal(subscription.close(), closing);
+  await resources.close();
+});
+
+test("audio selection reattachment claims the latest explicit policy", async () => {
+  const resources = new ResourceOwners((error) => {
+    throw error;
+  });
+  resources.activate({
+    async resource(command) {
+      return command.op === "claimAudioPolicy" ? { owner: 1n } : undefined;
+    },
+  });
+  const initial = {
+    automatic: false,
+    pinned: [],
+    selected: [],
+    playoutDelays: [],
+  };
+  const selection = await selectAudio(resources, initial);
+  const next = {
+    ...initial,
+    selected: [{ participantId: "alice", label: "microphone" }],
+  };
+  await selection.configure(next);
+  let configured;
+  const applied = new Promise((resolve) => {
+    configured = resolve;
+  });
+  const commands = [];
+  resources.activate({
+    async resource(command) {
+      commands.push(command);
+      if (command.op === "claimAudioPolicy") return { owner: 2n };
+      if (command.op === "configureAudioPolicy") configured();
+    },
+  });
+  await applied;
+  assert.deepEqual(commands[0], { op: "claimAudioPolicy", policy: next });
+  assert.deepEqual(commands[1], {
+    op: "configureAudioPolicy",
+    owner: 2n,
+    policy: next,
+  });
+  await selection.close();
+  await resources.close();
 });

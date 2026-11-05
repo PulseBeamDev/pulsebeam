@@ -1,8 +1,11 @@
 import { createElement, useEffect, useRef } from "react";
 import type * as React from "react";
 import { useCommittedRef } from "./committed-ref.js";
-import { attachRemoteVideo, type ReceiveOptions } from "@pulsebeam/web";
-import { validateReceiveOptions } from "@pulsebeam/web/internal/react";
+import type { ReceiveOptions } from "@pulsebeam/web";
+import {
+  attachRemoteVideo,
+  validateReceiveOptions,
+} from "@pulsebeam/web/internal/react";
 import { remoteVideo, trackIdentity, type RemoteVideoTrack } from "./agent.js";
 import {
   attachVideoSource,

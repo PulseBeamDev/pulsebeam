@@ -20,15 +20,15 @@ export interface DataGap {
 export type DataEvent<D extends Delivery = Delivery> =
   | DataMessage
   | (D extends "ordered" ? DataGap : never);
-export interface DataEventsOptions {
-  readonly signal?: AbortSignal;
-}
+export type DataUpdate<D extends Delivery = Delivery> =
+  | { readonly type: "event"; readonly event: DataEvent<D> }
+  | { readonly type: "closed" };
 
 interface DataReceive<D extends Delivery> {
   readonly kind: "data";
   readonly label: string;
   readonly delivery: D;
-  events(options?: DataEventsOptions): AsyncIterableIterator<DataEvent<D>>;
+  receive(): Promise<DataReceiver<D>>;
 }
 
 export interface LocalDataTrack<D extends Delivery = Delivery>
@@ -41,7 +41,7 @@ export interface RemoteDataTrack<D extends Delivery = Delivery>
   readonly participantId: string;
   readonly id: string | null;
   readonly active: boolean;
-  subscribe(listener: () => void): () => void;
+  watch(listener: () => void): () => void;
 }
 
 export class DataError extends Error {
@@ -86,13 +86,14 @@ interface Binding {
   readonly owner: bigint;
 }
 type PendingRead<D extends Delivery> = {
-  resolve(result: IteratorResult<DataEvent<D>>): void;
+  resolve(result: DataUpdate<D>): void;
   reject(error: unknown): void;
 };
 
 export class DataRegistry {
   #runtime: DataRuntime | undefined;
   #closed = false;
+  #closing: Promise<void> | undefined;
   readonly #locals = new Map<string, LocalDataTrack>();
   readonly #remotes = new Map<string, RemoteDataTrack>();
   readonly #streams = new Set<DataStream<Delivery>>();
@@ -111,8 +112,7 @@ export class DataRegistry {
         label: spec.label,
         delivery: spec.delivery,
         send: (data: Uint8Array) => this.#send(spec, data),
-        events: (options?: DataEventsOptions) =>
-          this.events(spec, undefined, options),
+        receive: () => this.receive(spec),
       });
       this.#locals.set(key, handle);
     }
@@ -150,27 +150,24 @@ export class DataRegistry {
         get active() {
           return id() !== null;
         },
-        events: (options?: DataEventsOptions) =>
-          registry.events(spec, participantId, options),
-        subscribe: (listener: () => void) => registry.host.subscribe(listener),
+        receive: () => registry.receive(spec, participantId),
+        watch: (listener: () => void) => registry.host.subscribe(listener),
       });
       this.#remotes.set(key, handle);
     }
     return handle as RemoteDataTrack<D>;
   }
 
-  events<D extends Delivery>(
+  async receive<D extends Delivery>(
     spec: DataTrackSpec<D>,
     participantId?: string,
-    options?: DataEventsOptions,
-  ): AsyncIterableIterator<DataEvent<D>> {
+  ): Promise<DataReceiver<D>> {
     this.#requireOpen();
-    const stream = new DataStream(this, spec, participantId, options?.signal);
-    if (!stream.closed) {
-      this.#streams.add(stream);
-      if (this.#runtime) stream.bind(this.#runtime);
-    }
-    return stream;
+    const stream = new DataStream(this, spec, participantId);
+    this.#streams.add(stream);
+    if (this.#runtime) stream.bind(this.#runtime);
+    await stream.ready();
+    return new DataReceiver(stream);
   }
 
   activate(runtime: DataRuntime): void {
@@ -214,13 +211,14 @@ export class DataRegistry {
     return release(binding);
   }
 
-  close(): void {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
     this.#closed = true;
-    for (const stream of [...this.#streams]) void stream.close();
+    const closing = [...this.#streams].map((stream) => stream.close());
     this.#locals.clear();
     this.#remotes.clear();
     this.deactivate();
+    return (this.#closing = Promise.all(closing).then(() => {}));
   }
 
   #requireOpen(): void {
@@ -250,64 +248,77 @@ async function release(binding: Binding): Promise<void> {
   }
 }
 
-class DataStream<D extends Delivery>
-  implements AsyncIterableIterator<DataEvent<D>>
-{
+export class DataReceiver<D extends Delivery = Delivery> {
+  constructor(private readonly stream: DataStream<D>) {}
+
+  next(): Promise<DataUpdate<D>> {
+    return this.stream.next();
+  }
+  close(): Promise<void> {
+    return this.stream.close();
+  }
+  isClosed(): boolean {
+    return this.stream.isClosed();
+  }
+}
+
+class DataStream<D extends Delivery> {
   #closed = false;
   #error: DataError | undefined;
   #binding: Binding | undefined;
   #attachment: object | undefined;
-  #claim: Promise<void> | undefined;
+  readonly #lifecycle = new Set<Promise<void>>();
   #closing: Promise<void> | undefined;
   #pumping = false;
   #again = false;
   readonly #pending: PendingRead<D>[] = [];
-  readonly #abort = () => {
-    void this.close();
-  };
+  #resolveReady!: () => void;
+  #rejectReady!: (error: DataError) => void;
+  readonly #ready = new Promise<void>((resolve, reject) => {
+    this.#resolveReady = resolve;
+    this.#rejectReady = reject;
+  });
 
   constructor(
     private registry: DataRegistry,
     private spec: DataTrackSpec<D>,
     private participantId?: string,
-    private signal?: AbortSignal,
-  ) {
-    if (signal?.aborted) this.#closed = true;
-    else signal?.addEventListener("abort", this.#abort, { once: true });
-  }
+  ) {}
 
-  get closed(): boolean {
+  ready(): Promise<void> {
+    return this.#ready;
+  }
+  isClosed(): boolean {
     return this.#closed;
   }
-  [Symbol.asyncIterator](): AsyncIterableIterator<DataEvent<D>> {
-    return this;
-  }
-  next(): Promise<IteratorResult<DataEvent<D>>> {
+  next(): Promise<DataUpdate<D>> {
     if (this.#error) return Promise.reject(this.#error);
-    if (this.#closed) return Promise.resolve({ done: true, value: undefined });
-    const result = new Promise<IteratorResult<DataEvent<D>>>(
-      (resolve, reject) => this.#pending.push({ resolve, reject }),
+    if (this.#closed) return Promise.resolve({ type: "closed" });
+    const result = new Promise<DataUpdate<D>>((resolve, reject) =>
+      this.#pending.push({ resolve, reject }),
     );
     this.wake();
     return result;
-  }
-  async return(): Promise<IteratorResult<DataEvent<D>>> {
-    this.#error = undefined;
-    await this.close();
-    return { done: true, value: undefined };
   }
   bind(runtime: DataRuntime): void {
     if (this.#closed) return;
     this.detach();
     const attachment = {};
     this.#attachment = attachment;
-    this.#claim = this.#acquire(runtime, attachment);
+    this.#track(this.#acquire(runtime, attachment));
   }
   detach(): void {
     this.#attachment = undefined;
     const binding = this.#binding;
     this.#binding = undefined;
-    if (binding) void this.registry.release(this, binding);
+    if (binding) this.#track(this.registry.release(this, binding));
+  }
+  #track(promise: Promise<void>): void {
+    this.#lifecycle.add(promise);
+    void promise.then(
+      () => this.#lifecycle.delete(promise),
+      () => this.#lifecycle.delete(promise),
+    );
   }
   async #acquire(runtime: DataRuntime, attachment: object): Promise<void> {
     try {
@@ -334,6 +345,7 @@ class DataStream<D extends Delivery>
       }
       this.#binding = binding;
       this.registry.claimed(this, binding);
+      this.#resolveReady();
       this.wake();
     } catch (error) {
       if (
@@ -344,27 +356,28 @@ class DataStream<D extends Delivery>
         this.#fail(failure(error));
     }
   }
-  close(): Promise<void> {
+  close(clearError = true): Promise<void> {
+    if (clearError) this.#error = undefined;
     if (this.#closed) return this.#closing ?? Promise.resolve();
     this.#closed = true;
-    this.signal?.removeEventListener("abort", this.#abort);
+    this.#resolveReady();
     this.#attachment = undefined;
     const binding = this.#binding;
     this.#binding = undefined;
-    this.registry.forget(this);
     for (const pending of this.#pending.splice(0)) {
       if (this.#error) pending.reject(this.#error);
-      else pending.resolve({ done: true, value: undefined });
+      else pending.resolve({ type: "closed" });
     }
     this.#closing = Promise.all([
       binding ? this.registry.release(this, binding) : undefined,
-      this.#claim,
-    ]).then(() => {});
+      ...this.#lifecycle,
+    ]).then(() => this.registry.forget(this));
     return this.#closing;
   }
   #fail(error: DataError): void {
     this.#error = error;
-    void this.close();
+    this.#rejectReady(error);
+    void this.close(false);
   }
   wake(): void {
     this.#again = true;
@@ -393,8 +406,8 @@ class DataStream<D extends Delivery>
           break;
         }
         this.#pending.shift()?.resolve({
-          done: false,
-          value: Object.freeze(value) as DataEvent<D>,
+          type: "event",
+          event: Object.freeze(value) as DataEvent<D>,
         });
       }
     } finally {

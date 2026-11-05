@@ -1,4 +1,13 @@
-import { attachRemoteMedia } from "./remote-media.js";
+import {
+  attachRemoteMedia,
+  type MediaHost,
+  type MediaAttachment,
+} from "./remote-media.js";
+import {
+  claimVideoSubscription,
+  subscribeAudio,
+  subscribeVideo,
+} from "./reception.js";
 import { RemoteAudioPlayback } from "./remote-audio.js";
 import {
   ResourceError,
@@ -6,23 +15,18 @@ import {
   type ResourceBinding,
 } from "./resources.js";
 import type { DataRegistry, RemoteDataTrack } from "./data.js";
-import {
-  track,
-  type AudioTrackSpec,
-  type DataTrackSpec,
-  type Delivery,
-  type VideoTrackSpec,
-} from "./track.js";
+import { track, type Delivery } from "./track.js";
 import type {
   Agent,
   AgentSnapshot,
+  AudioSubscriptionConfig,
+  VideoObservation,
   LogLevel,
   PlaybackFailure,
   ReceiveOptions,
   RemoteAudioTrack,
   RemoteParticipant,
   RemotePublishedTrack,
-  RemoteMediaAttachment,
   RemoteMediaAttachmentOptions,
   RemoteVideoTrack,
   RemoteMedia,
@@ -32,7 +36,7 @@ type PlaybackCallback = (
   failure: PlaybackFailure,
   retry: () => Promise<void>,
 ) => void;
-export interface RemoteVideoAttachment extends RemoteMediaAttachment {
+export interface RemoteVideoAttachment extends MediaAttachment {
   readonly ready: Promise<void>;
   setPreferences(options: ReceiveOptions): void;
 }
@@ -117,10 +121,20 @@ class VideoHandle implements RemoteVideoTrack {
   get active(): boolean {
     return this.publicationId !== undefined;
   }
-  subscribe(listener: () => void): () => void {
+  watch(listener: () => void): () => void {
     if (this.catalog.closed) return () => {};
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+  subscribe(configuration: VideoObservation) {
+    return subscribeVideo(
+      this.catalog.owners,
+      {
+        participantId: this.participantId,
+        label: this.label,
+      },
+      configuration,
+    );
   }
   bind(id: string | undefined): void {
     if (id === this.publicationId) return;
@@ -168,10 +182,20 @@ class AudioHandle implements RemoteAudioTrack {
     this.#binding = receiver;
     if (changed) for (const listener of this.#listeners) listener();
   }
-  subscribe(listener: () => void): () => void {
+  watch(listener: () => void): () => void {
     if (this.catalog.closed) return () => {};
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+  subscribe(configuration: AudioSubscriptionConfig) {
+    return subscribeAudio(
+      this.catalog.owners,
+      {
+        participantId: this.participantId,
+        label: this.label,
+      },
+      configuration,
+    );
   }
   readWaveform(buffer: Float32Array): void {
     this.catalog.read(this.publicationId, buffer, false);
@@ -194,15 +218,14 @@ class ParticipantHandle implements RemoteParticipant {
   get active(): boolean {
     return this.catalog.participants.includes(this);
   }
-  track(spec: VideoTrackSpec): RemoteVideoTrack;
-  track(spec: AudioTrackSpec): RemoteAudioTrack;
-  track<D extends Delivery>(spec: DataTrackSpec<D>): RemoteDataTrack<D>;
-  track(
-    spec: VideoTrackSpec | AudioTrackSpec | DataTrackSpec,
-  ): RemotePublishedTrack {
-    if (spec.kind === "video") return this.video(track.video(spec.label).label);
-    if (spec.kind === "audio") return this.audio(track.audio(spec.label).label);
-    return this.catalog.data.remote(spec, this.participantId);
+  id(): string {
+    return this.participantId;
+  }
+  data<D extends Delivery>(label: string, delivery: D): RemoteDataTrack<D> {
+    return this.catalog.data.remote(
+      track.data(label, delivery),
+      this.participantId,
+    );
   }
   constructor(
     readonly catalog: RemoteCatalog,
@@ -251,7 +274,7 @@ export class RemoteCatalog implements RemoteMedia {
   videoTracks: readonly RemoteVideoTrack[] = Object.freeze([]);
   audioTracks: readonly RemoteAudioTrack[] = Object.freeze([]);
   constructor(
-    readonly agent: Agent,
+    readonly agent: Agent & MediaHost,
     readonly data: DataRegistry,
     readonly owners: ResourceOwners,
     private logLevel: LogLevel = "warn",
@@ -273,7 +296,9 @@ export class RemoteCatalog implements RemoteMedia {
           get active() {
             return handle.active;
           },
-          subscribe: (listener: () => void) => handle.subscribe(listener),
+          watch: (listener: () => void) => handle.watch(listener),
+          subscribe: (configuration: VideoObservation) =>
+            handle.subscribe(configuration),
         });
         this.#publicVideos.set(handle, value);
         videoOwners.set(value, handle);
@@ -293,7 +318,9 @@ export class RemoteCatalog implements RemoteMedia {
           get active() {
             return handle.active;
           },
-          subscribe: (listener: () => void) => handle.subscribe(listener),
+          watch: (listener: () => void) => handle.watch(listener),
+          subscribe: (configuration: AudioSubscriptionConfig) =>
+            handle.subscribe(configuration),
         });
         this.#publicAudios.set(handle, value);
       }
@@ -310,6 +337,7 @@ export class RemoteCatalog implements RemoteMedia {
             : entry;
       value = Object.freeze({
         participantId: handle.participantId,
+        id: () => handle.id(),
         get active() {
           return handle.active;
         },
@@ -326,12 +354,10 @@ export class RemoteCatalog implements RemoteMedia {
           }
           return collection;
         },
-        track: ((spec: VideoTrackSpec | AudioTrackSpec | DataTrackSpec) =>
-          spec.kind === "video"
-            ? wrapVideo(handle.video(spec.label))
-            : spec.kind === "audio"
-              ? wrapAudio(handle.audio(spec.label))
-              : handle.track(spec)) as RemoteParticipant["track"],
+        video: (label: string) => wrapVideo(handle.video(label)),
+        audio: (label: string) => wrapAudio(handle.audio(label)),
+        data: <D extends Delivery>(label: string, delivery: D) =>
+          handle.data(label, delivery),
       });
       this.#publicParticipants.set(handle, value);
       return value;
@@ -498,7 +524,7 @@ export class RemoteCatalog implements RemoteMedia {
           .filter((entry) => entry.participantId === participant.participantId)
           .map((entry) =>
             entry.kind === "data"
-              ? participant.track(track.data(entry.label, entry.delivery))
+              ? participant.data(entry.label, entry.delivery)
               : entry.kind === "video"
                 ? participant.video(entry.label)
                 : participant.audio(entry.label),
@@ -552,14 +578,7 @@ export function attachRemoteVideo(
   const handle = videoOwners.get(source);
   if (!handle) throw new TypeError("invalid remote video source");
   if (handle.catalog.closed)
-    return {
-      ready: Promise.resolve(),
-      setPublicationIds() {},
-      setAutoPlay() {},
-      setPreferences() {},
-      retryPlayback: async () => {},
-      close() {},
-    };
+    throw new ResourceError("closed", "agent is closed");
   return attachVideoHandle(handle, element, onPlaybackBlocked, options);
 }
 
@@ -591,37 +610,36 @@ function attachVideoHandle(
     readonly preferences?: ReceiveOptions;
   },
 ): RemoteVideoAttachment {
+  if (!(element instanceof HTMLVideoElement))
+    throw new TypeError("remote attachment requires a video element");
   let preferences = validateReceiveOptions(options.preferences ?? {});
-  let binding: ResourceBinding | undefined;
-  let sync = () => {};
-  const resource = handle.catalog.owners.acquire(
+  const claim = claimVideoSubscription(
+    handle.catalog.owners,
     {
-      op: "claimVideo",
-      selector: {
-        participantId: handle.participantId,
-        label: handle.label,
-      },
+      participantId: handle.participantId,
+      label: handle.label,
     },
     {
-      bind: (next) => {
-        binding = next;
-        sync();
-      },
-      unbind: () => {
-        binding = undefined;
-      },
+      visible: false,
+      height: 0,
+      minHeight: 0,
+      minFps: 0,
+      priority: 0,
+      playoutDelay: { mode: "adaptive" },
     },
   );
+  const subscription = claim.subscription;
   const agent = handle.catalog.agent;
-  const attachment = attachRemoteMedia(agent, element, {
-    publicationIds: handle.publicationId ? [handle.publicationId] : [],
+  const attachment = attachRemoteMedia(subscription, element, {
+    ready: claim.ready,
+    subscribe: agent.subscribe,
     onPlaybackBlocked,
     autoPlay: options.autoPlay,
   });
   const viewport = element.ownerDocument.defaultView;
   let intersecting = true;
   let closed = false;
-  sync = () => {
+  const sync = () => {
     if (closed) return;
     const rect = element.getBoundingClientRect();
     const visible =
@@ -641,39 +659,29 @@ function attachVideoHandle(
           Math.ceil(rect.height * (viewport?.devicePixelRatio || 1)),
         )
       : 0;
-    const current = binding;
-    if (!current || !resource.current(current)) return;
-    const baseline = handle.options;
-    const delay = [baseline.playoutDelay, preferences.playoutDelay].filter(
-      (value) => value !== undefined,
-    );
-    void current.runtime
-      .resource({
-        op: "observeVideo",
-        owner: current.owner,
-        observation: {
-          visible,
-          height,
-          minHeight: Math.max(
-            baseline.minHeight ?? 0,
-            preferences.minHeight ?? 0,
-          ),
-          minFps: Math.max(baseline.minFps ?? 0, preferences.minFps ?? 0),
-          priority: Math.max(baseline.priority ?? 0, preferences.priority ?? 0),
-          ...(delay.length
-            ? {
-                playoutDelay: {
-                  mode: "fixed",
-                  minMs: Math.min(...delay.map((value) => value!.minMs)),
-                  maxMs: Math.max(...delay.map((value) => value!.maxMs)),
-                },
-              }
-            : {}),
+    if (subscription.isClosed()) return;
+    const observation: VideoObservation = {
+      visible,
+      height,
+      minHeight: preferences.minHeight ?? 0,
+      minFps: preferences.minFps ?? 0,
+      priority: preferences.priority ?? 0,
+      playoutDelay: preferences.playoutDelay
+        ? { mode: "fixed", ...preferences.playoutDelay }
+        : { mode: "adaptive" },
+    };
+    void subscription.configure(observation).catch((error: unknown) => {
+      if (closed || subscription.isClosed()) return;
+      const retry = () => subscription.configure(observation);
+      onPlaybackBlocked?.(
+        {
+          message: error instanceof Error ? error.message : String(error),
+          cause: error,
+          retry,
         },
-      })
-      .catch((error) => {
-        if (resource.current(current)) resource.fail(error);
-      });
+        retry,
+      );
+    });
   };
   let pixelRatioQuery: MediaQueryList | null = null;
   const onPixelRatioChange = () => {
@@ -714,16 +722,9 @@ function attachVideoHandle(
   viewport?.addEventListener("resize", onResize);
   viewport?.addEventListener("scroll", sync, true);
   element.ownerDocument.addEventListener("visibilitychange", sync);
-  const updateBinding = () =>
-    attachment.setPublicationIds(
-      handle.publicationId ? [handle.publicationId] : [],
-    );
-  handle.bindingListeners.add(updateBinding);
-  handle.optionListeners.add(sync);
   sync();
   return {
-    ready: resource.ready,
-    setPublicationIds: (ids) => attachment.setPublicationIds(ids),
+    ready: claim.ready,
     setAutoPlay: (autoPlay) => attachment.setAutoPlay(autoPlay),
     setPreferences: (next) => {
       if (closed) return;
@@ -732,7 +733,7 @@ function attachVideoHandle(
     },
     retryPlayback: () => attachment.retryPlayback(),
     close: () => {
-      if (closed) return;
+      if (closed) return attachment.close();
       closed = true;
       resize?.disconnect();
       intersection?.disconnect();
@@ -741,10 +742,7 @@ function attachVideoHandle(
       viewport?.removeEventListener("resize", onResize);
       viewport?.removeEventListener("scroll", sync, true);
       element.ownerDocument.removeEventListener("visibilitychange", sync);
-      handle.bindingListeners.delete(updateBinding);
-      handle.optionListeners.delete(sync);
-      void resource.close();
-      attachment.close();
+      return attachment.close();
     },
   };
 }

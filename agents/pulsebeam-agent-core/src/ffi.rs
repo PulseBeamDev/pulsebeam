@@ -56,6 +56,17 @@ pub enum LogLevel {
     Trace,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PublicationConfig {
+    pub enabled: bool,
+}
+
+impl Default for PublicationConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct PublicationIntent {
     pub slot: String,
@@ -83,6 +94,11 @@ pub struct VideoObservation {
     pub min_height: u32,
     pub min_fps: u32,
     pub priority: u32,
+    pub playout_delay: PlayoutDelay,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct AudioSubscriptionConfig {
     pub playout_delay: PlayoutDelay,
 }
 
@@ -159,7 +175,7 @@ pub enum MediaKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct Participant {
+pub struct ParticipantInfo {
     pub participant_id: String,
 }
 
@@ -214,7 +230,7 @@ pub struct RemoteTrack {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct CatalogSnapshot {
     pub revision: u64,
-    pub participants: Vec<Participant>,
+    pub participants: Vec<ParticipantInfo>,
     pub publications: Vec<Publication>,
     pub tracks: Vec<RemoteTrack>,
 }
@@ -426,6 +442,83 @@ pub enum ErrorCode {
     RenewalBusy,
     Closed,
     Runtime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ResourceFailure {
+    InvalidSpec { message: String },
+    WrongKind,
+    NotConnected,
+    AlreadyOwned,
+    OwnerInUse,
+    OwnerSpaceExhausted,
+    InputOperationSpaceExhausted,
+    SlotSpaceExhausted { kind: MediaKind },
+    Released,
+    InvalidPlayoutDelay,
+    ReceiveOverflow,
+    ReceiveChannelFailed { message: String },
+}
+
+impl From<model::TrackResourceError> for ResourceFailure {
+    fn from(error: model::TrackResourceError) -> Self {
+        match error {
+            model::TrackResourceError::InvalidSpec(error) => Self::InvalidSpec {
+                message: error.to_string(),
+            },
+            model::TrackResourceError::WrongKind => Self::WrongKind,
+            model::TrackResourceError::NotConnected => Self::NotConnected,
+            model::TrackResourceError::AlreadyOwned => Self::AlreadyOwned,
+            model::TrackResourceError::OwnerInUse => Self::OwnerInUse,
+            model::TrackResourceError::OwnerSpaceExhausted => Self::OwnerSpaceExhausted,
+            model::TrackResourceError::InputOperationSpaceExhausted => {
+                Self::InputOperationSpaceExhausted
+            }
+            model::TrackResourceError::SlotSpaceExhausted { kind } => {
+                Self::SlotSpaceExhausted { kind: kind.into() }
+            }
+            model::TrackResourceError::Released => Self::Released,
+            model::TrackResourceError::InvalidPlayoutDelay => Self::InvalidPlayoutDelay,
+            model::TrackResourceError::ReceiveOverflow => Self::ReceiveOverflow,
+            model::TrackResourceError::ReceiveChannelFailed(message) => {
+                Self::ReceiveChannelFailed { message }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum TopicFailure {
+    InvalidTopic { name: String },
+    PayloadTooLarge { actual: u64, maximum: u64 },
+    PublisherNotRegistered { name: String },
+    PublisherUnavailable { name: String },
+    SendQueueFull { name: String },
+    SequenceExhausted { name: String },
+    MalformedMessage,
+    InvalidControl,
+    UnknownChannel,
+}
+
+impl From<model::TopicError> for TopicFailure {
+    fn from(error: model::TopicError) -> Self {
+        match error {
+            model::TopicError::InvalidTopic(name) => Self::InvalidTopic { name },
+            model::TopicError::PayloadTooLarge { actual, maximum } => Self::PayloadTooLarge {
+                actual: count(actual),
+                maximum: count(maximum),
+            },
+            model::TopicError::PublisherNotRegistered(name) => {
+                Self::PublisherNotRegistered { name }
+            }
+            model::TopicError::PublisherUnavailable(name) => Self::PublisherUnavailable { name },
+            model::TopicError::SendQueueFull(name) => Self::SendQueueFull { name },
+            model::TopicError::SequenceExhausted(name) => Self::SequenceExhausted { name },
+            model::TopicError::MalformedMessage => Self::MalformedMessage,
+            model::TopicError::InvalidControl => Self::InvalidControl,
+            model::TopicError::UnknownChannel => Self::UnknownChannel,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -786,7 +879,7 @@ impl From<model::MediaKind> for MediaKind {
     }
 }
 
-impl From<model::Participant> for Participant {
+impl From<model::Participant> for ParticipantInfo {
     fn from(value: model::Participant) -> Self {
         Self {
             participant_id: value.external_id,
@@ -1406,7 +1499,7 @@ mod tests {
             topic_publishers: vec![publisher],
             topic_subscribers: vec![subscriber],
         });
-        assert_ffi_round_trip(Participant {
+        assert_ffi_round_trip(ParticipantInfo {
             participant_id: "user".to_string(),
         });
         assert_ffi_round_trip(publication.clone());
@@ -1427,7 +1520,7 @@ mod tests {
             authorization_expires_at: Some(1_720_000_000),
             catalog: CatalogSnapshot {
                 revision: 2,
-                participants: vec![Participant {
+                participants: vec![ParticipantInfo {
                     participant_id: "user".to_string(),
                 }],
                 publications: vec![publication],

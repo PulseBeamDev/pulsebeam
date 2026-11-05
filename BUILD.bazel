@@ -36,6 +36,7 @@ test_suite(
         "//crates/pulsebeam:transport_conformance", "//crates/pulsebeam-udp:transport_conformance",
         ":artifacts", "//agents/pulsebeam-agent-web:js_format", "//agents/pulsebeam-agent-web:js_unit_tests", "//agents/pulsebeam-agent-web:public_contract",
         "//agents/pulsebeam-agent-web:uniffi_types", "//agents/pulsebeam-agent-web:node_runtime_tests",
+        "//agents/pulsebeam-agent-native:generated_api_contract",
         "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:calibration_contract", "//tools:scoreboard_contract", "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract", "//tools:runtime_boundary_contract", "//tools:clippy_fix_contract", "//tools:fix_contract",
         "//server/auth:fast", "//server/typescript:fast", "//server/go:fast", "//server/python:fast", "//server/rust:fast",
         "//tools/nativelink:config_test", "//tools/nativelink:analyze_test", "//tools/nativelink:autostart_test",

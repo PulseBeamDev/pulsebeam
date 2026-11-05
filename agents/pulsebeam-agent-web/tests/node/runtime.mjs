@@ -19,17 +19,25 @@ if (process.argv[2] === "initialization-failure") {
     throw new Error("controlled artifact fetch failure");
   };
   const { createAgent } = await import("../../node_assets/dist/index.js");
-  const agent = createAgent(config);
+  await assert.rejects(
+    createAgent(config),
+    /controlled artifact fetch failure/,
+  );
+  const { createManagedAgent } = await import(
+    "../../node_assets/dist/internal/react.js"
+  );
+  const agent = createManagedAgent(config);
   const failure = new Promise((resolve) =>
     agent.subscribe(() => {
       if (agent.connection === "terminal-failure")
         resolve(agent.getSnapshot().failure);
     }),
   );
-  agent.connect();
+  agent.activate();
+  await assert.rejects(agent.connect(), /controlled artifact fetch failure/);
   const observed = await failure;
   assert.equal(observed.class, "initialization");
-  agent.disconnect();
+  await assert.rejects(agent.disconnect(), /controlled artifact fetch failure/);
   assert.equal(agent.getSnapshot().failure, observed);
   assert.equal(agent.connection, "terminal-failure");
   await import("./platform.mjs");
@@ -47,15 +55,15 @@ if (process.argv[2] === "initialization-failure") {
       }
     });
   });
-  agent.connect();
+  await agent.connect();
   await recovered;
   assert.equal(
     attempts,
-    2,
-    "explicit connect permits another initialization attempt",
+    3,
+    "public creation rejects and managed explicit connect retries initialization",
   );
   assert.equal(agent.error, null);
-  agent.close();
+  await agent.close();
   console.log(
     "artifact fetch failure persists through state updates and explicit connect retries initialization",
   );
@@ -149,6 +157,8 @@ if (process.argv[2] === "initialization-failure") {
   const { resourceContract } = await import("./resource-contract.mjs");
   await resourceContract(BrowserRuntime);
   const pulsebeam = await import("../../node_assets/dist/index.js");
+  const { dataResourceContract } = await import("./data-resource-contract.mjs");
+  await dataResourceContract(pulsebeam);
   const { mediaResourceContract } = await import(
     "./media-resource-contract.mjs"
   );

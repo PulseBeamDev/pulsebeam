@@ -453,14 +453,13 @@ impl DesiredState {
 
 impl TrackSelector {
     fn validate(&self) -> Result<(), ValidationError> {
-        validate_identifier(
-            "participant external id",
-            &self.participant_external_id,
-            256,
-            true,
-        )?;
+        validate_participant_id(&self.participant_external_id)?;
         validate_identifier("track label", &self.label, 64, true)
     }
+}
+
+pub fn validate_participant_id(id: &str) -> Result<(), ValidationError> {
+    validate_identifier("participant external id", id, 256, true)
 }
 
 pub(crate) fn validate_identifier(

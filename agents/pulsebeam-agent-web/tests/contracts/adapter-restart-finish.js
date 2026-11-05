@@ -37,10 +37,9 @@
       receiver.connection === "connected" && sender.connection === "connected"
     );
   } finally {
-    await stream.return();
+    await stream.close();
     await pumping;
-    sender.close();
-    receiver.close();
+    await Promise.all([sender.close(), receiver.close()]);
     delete globalThis.__adapterRestart;
   }
 })();

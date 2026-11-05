@@ -34,6 +34,7 @@ for (const name of [
   "useDevices",
   "useCapture",
   "Publish",
+  "SelectAudio",
   "Data",
   "Video",
   "Audio",
@@ -50,7 +51,9 @@ const web = await import(
   pathToFileURL(join(directory, "node_modules/@pulsebeam/web/dist/index.js"))
 );
 assert.equal(typeof web.createAgent, "function");
-assert.equal(typeof web.track, "object", "Web descriptor API remains public");
+assert.equal("track" in web, false, "Web descriptor export was removed");
+assert.equal(typeof web.VideoSource.fromTrack, "function");
+assert.equal(typeof web.AudioSource.fromTrack, "function");
 assert.equal(
   "createManagedAgent" in web,
   false,

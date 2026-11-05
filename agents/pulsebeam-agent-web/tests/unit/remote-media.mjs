@@ -1,200 +1,247 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { attachRemoteMedia } from "../../unit-javascript/remote-media.js";
-
 import { Video } from "./media-platform.mjs";
-const document = { createElement: () => new Video() };
 
-test("media attachments reconcile independent consumers and fence retired playback completions", async () => {
-  function trackSet(stream) {
-    return new Set(stream.getTracks());
-  }
+function videoTrack() {
+  return Object.assign(new EventTarget(), {
+    kind: "video",
+    readyState: "live",
+  });
+}
+async function settle() {
+  for (let index = 0; index < 12; index++) await Promise.resolve();
+}
+function feed(initial) {
+  let current = initial;
+  const receivers = new Set();
+  return {
+    publish(track) {
+      current = track;
+      for (const receiver of receivers) receiver.update();
+    },
+    receiver() {
+      let closed = false;
+      const listeners = new Set();
+      const pending = new Set();
+      const observations = [];
+      function observation() {
+        const track = current;
+        let retired = false;
+        const value = {
+          isClosed: () => retired || closed || track !== current,
+          track: () => (value.isClosed() ? null : track),
+          async close() {
+            retired = true;
+          },
+        };
+        observations.push(value);
+        return value;
+      }
+      const source = {
+        observations,
+        isClosed: () => closed,
+        async observe() {
+          if (closed)
+            throw Object.assign(new Error("closed"), { code: "closed" });
+          if (current) return observation();
+          return new Promise((resolve, reject) =>
+            pending.add({ resolve, reject }),
+          );
+        },
+        subscribe(listener) {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+        update() {
+          if (closed) return;
+          if (current) {
+            for (const reader of pending) reader.resolve(observation());
+            pending.clear();
+          }
+          for (const listener of listeners) listener();
+        },
+        async close() {
+          closed = true;
+          receivers.delete(source);
+          for (const reader of pending)
+            reader.reject(
+              Object.assign(new Error("closed"), { code: "closed" }),
+            );
+          pending.clear();
+        },
+      };
+      receivers.add(source);
+      return source;
+    },
+  };
+}
+function attach(source, element, options = {}) {
+  return attachRemoteMedia(source, element, {
+    ready: Promise.resolve(),
+    subscribe: source.subscribe,
+    ...options,
+  });
+}
 
-  function hasTracks(stream, ...tracks) {
-    const actual = trackSet(stream);
-    return (
-      actual.size === tracks.length &&
-      tracks.every((track) => actual.has(track))
-    );
-  }
-
-  function fakeAgent(initialTracks = {}) {
-    let tracks = initialTracks;
-    const listeners = new Set();
-    return {
-      getSnapshot: () => ({ tracks }),
-      subscribe(listener) {
-        listeners.add(listener);
-        return () => listeners.delete(listener);
-      },
-      publish(nextTracks) {
-        tracks = nextTracks;
-        for (const listener of listeners) listener();
-      },
-    };
-  }
-
-  function videoTrack() {
-    return {
-      kind: "video",
-      readyState: "live",
-      stop() {
-        this.readyState = "ended";
-      },
-    };
-  }
-
-  async function settle() {
-    await Promise.resolve();
-    await Promise.resolve();
-  }
-
-  const audio = videoTrack();
-  const video = videoTrack();
+test("media presentation acquires exact-source observations and fences retired playback", async () => {
+  const firstTrack = videoTrack();
   const replacement = videoTrack();
-  const attachments = [];
-  try {
-    const agent = fakeAgent();
-    const element = document.createElement("video");
-    let plays = 0;
-    Object.defineProperty(element, "play", {
-      value: () => {
-        plays++;
-        return Promise.resolve();
-      },
-    });
+  const media = feed();
+  const source = media.receiver();
+  const element = new Video();
+  let plays = 0;
+  element.play = async () => {
+    plays++;
+  };
+  const attachment = attach(source, element, { autoPlay: false });
+  const stream = element.srcObject;
+  await settle();
+  assert.deepEqual(stream.getTracks(), []);
+  media.publish(firstTrack);
+  await settle();
+  assert.deepEqual(stream.getTracks(), [firstTrack]);
+  const original = source.observations[0];
+  media.publish(firstTrack);
+  await settle();
+  assert.equal(
+    source.observations.length,
+    1,
+    "unchanged source keeps its observation",
+  );
+  media.publish(replacement);
+  await settle();
+  assert.equal(original.isClosed(), true);
+  assert.equal(
+    original.track(),
+    null,
+    "retired observation cannot switch tracks",
+  );
+  assert.equal(
+    source.observations.length,
+    2,
+    "presentation explicitly acquires a fresh observation",
+  );
+  assert.deepEqual(stream.getTracks(), [replacement]);
+  media.publish(undefined);
+  await settle();
+  assert.deepEqual(stream.getTracks(), []);
+  media.publish(firstTrack);
+  await settle();
+  assert.deepEqual(stream.getTracks(), [firstTrack]);
+  assert.equal(plays, 0);
+  attachment.setAutoPlay(true);
+  assert.equal(plays, 1);
+  attachment.setAutoPlay(true);
+  assert.equal(plays, 1, "unchanged autoplay does not retry");
+  attachment.setAutoPlay(false);
+  media.publish(replacement);
+  await settle();
+  assert.equal(plays, 1, "disabled autoplay applies to replacement media");
+  attachment.setAutoPlay(true);
+  assert.equal(plays, 2);
+  assert.equal(element.srcObject, stream);
 
-    const attachment = attachRemoteMedia(agent, element, {
-      publicationIds: ["audio", "video", "audio"],
-      autoPlay: false,
-    });
-    attachments.push(attachment);
-    const stream = element.srcObject;
-    agent.publish({ audio: { media: audio } });
-    const firstAvailable =
-      stream instanceof MediaStream && hasTracks(stream, audio);
-    agent.publish({ ignored: { media: video }, audio: { media: audio } });
-    attachment.setPublicationIds(["video", "audio", "audio"]);
-    const unchanged = element.srcObject === stream && hasTracks(stream, audio);
+  const siblingSource = media.receiver();
+  const siblingElement = new Video();
+  const sibling = attach(siblingSource, siblingElement);
+  await settle();
+  const external = new MediaStream();
+  element.srcObject = external;
+  const closing = attachment.close();
+  assert.equal(attachment.close(), closing);
+  await closing;
+  assert.equal(
+    element.srcObject,
+    external,
+    "cleanup preserves an external replacement",
+  );
+  assert.deepEqual(stream.getTracks(), []);
+  assert.deepEqual(siblingElement.srcObject.getTracks(), [replacement]);
+  assert.equal(siblingSource.isClosed(), false);
+  assert.equal(
+    replacement.readyState,
+    "live",
+    "closing a consumer does not stop receiver media",
+  );
+  await sibling.close();
+  assert.equal(siblingElement.srcObject, null);
 
-    agent.publish({ audio: { media: audio }, video: { media: video } });
-    const combined = hasTracks(stream, audio, video);
-    agent.publish({ audio: { media: audio }, video: { media: replacement } });
-    const replaced = hasTracks(stream, audio, replacement);
-    agent.publish({ audio: { media: audio } });
-    const removed = hasTracks(stream, audio);
-    agent.publish({ audio: { media: audio }, video: { media: replacement } });
-    const restored = hasTracks(stream, audio, replacement);
-    assert.equal(plays, 0);
-    attachment.setAutoPlay(true);
-    assert.equal(plays, 1);
-    attachment.setAutoPlay(true);
-    assert.equal(plays, 1, "unchanged autoplay does not retry");
-    attachment.setAutoPlay(false);
-    agent.publish({ audio: { media: audio }, video: { media: video } });
-    assert.equal(plays, 1, "disabled autoplay applies to replacement media");
-    attachment.setAutoPlay(true);
-    assert.equal(plays, 2);
-    assert.equal(
-      element.srcObject,
-      stream,
-      "autoplay updates preserve the attachment",
-    );
+  const blockedSource = media.receiver();
+  const blockedElement = new Video();
+  let rejected;
+  let retry;
+  let blocked = 0;
+  blockedElement.play = () =>
+    new Promise((_, reject) => {
+      rejected = reject;
+    });
+  const pending = attach(blockedSource, blockedElement, {
+    onPlaybackBlocked(failure, nextRetry) {
+      assert.equal(failure.message, "current receiver blocked");
+      blocked++;
+      retry = nextRetry;
+    },
+  });
+  await settle();
+  media.publish(undefined);
+  rejected(new Error("retired receiver rejected late"));
+  await settle();
+  assert.equal(blocked, 0);
+  media.publish(firstTrack);
+  await settle();
+  rejected(new Error("current receiver blocked"));
+  await settle();
+  assert.equal(blocked, 1);
+  blockedElement.play = async () => {
+    plays++;
+  };
+  await retry();
+  assert.equal(plays, 3, "retry reaches the current attached element");
+  blockedElement.play = () =>
+    new Promise((_, reject) => {
+      rejected = reject;
+    });
+  media.publish(replacement);
+  await settle();
+  await pending.close();
+  rejected(new Error("closed receiver rejected late"));
+  await settle();
+  assert.equal(blocked, 1);
+});
 
-    const secondElement = document.createElement("video");
-    Object.defineProperty(secondElement, "play", {
-      value: () => Promise.resolve(),
-    });
-    const second = attachRemoteMedia(agent, secondElement, {
-      publicationIds: ["audio"],
-    });
-    attachments.push(second);
-    const secondStream = secondElement.srcObject;
-    const external = new MediaStream();
-    element.srcObject = external;
-    attachment.close();
-    attachment.close();
-    const isolated =
-      secondStream instanceof MediaStream &&
-      hasTracks(secondStream, audio) &&
-      audio.readyState !== "ended" &&
-      element.srcObject === external;
-    second.close();
-    const terminal = secondElement.srcObject === null && hasTracks(stream);
-
-    const blockedAgent = fakeAgent({ audio: { media: audio } });
-    const blockedElement = document.createElement("video");
-    let blockedPlays = 0;
-    let retry;
-    let blockedMessage = "";
-    let recovered = false;
-    Object.defineProperty(blockedElement, "play", {
-      value: () => {
-        blockedPlays += 1;
-        return blockedPlays === 1
-          ? Promise.reject(new Error("interaction required"))
-          : ((recovered = true), Promise.resolve());
-      },
-    });
-    const blocked = attachRemoteMedia(blockedAgent, blockedElement, {
-      publicationIds: ["audio"],
-      onPlaybackBlocked: (failure, nextRetry) => {
-        blockedMessage = failure.message;
-        retry = nextRetry;
-      },
-    });
-    attachments.push(blocked);
-    await settle();
-    const reported =
-      blockedMessage === "interaction required" && typeof retry === "function";
-    await retry?.();
-    const retried = recovered;
-    blocked.close();
-
-    const pendingAgent = fakeAgent({ audio: { media: audio } });
-    const pendingElement = document.createElement("video");
-    let rejectPlay;
-    let pendingBlocked = false;
-    Object.defineProperty(pendingElement, "play", {
-      value: () => new Promise((_, reject) => (rejectPlay = reject)),
-    });
-    const pending = attachRemoteMedia(pendingAgent, pendingElement, {
-      publicationIds: ["audio"],
-      onPlaybackBlocked: () => (pendingBlocked = true),
-    });
-    attachments.push(pending);
-    pendingAgent.publish({});
-    rejectPlay?.(new Error("retired receiver rejected late"));
-    await settle();
-    const retiredSuppressed = !pendingBlocked;
-    pendingAgent.publish({ audio: { media: replacement } });
-    rejectPlay?.(new Error("current receiver blocked"));
-    await settle();
-    const replacementReported = pendingBlocked;
-    pendingBlocked = false;
-    pendingAgent.publish({ audio: { media: audio } });
-    pending.close();
-    rejectPlay?.(new Error("closed receiver rejected late"));
-    await settle();
-
-    const report = {
-      firstAvailable,
-      unchanged,
-      combined,
-      replaced,
-      removed,
-      restored,
-      isolated,
-      terminal,
-      reported,
-      retried,
-      pendingSuppressed:
-        retiredSuppressed && replacementReported && !pendingBlocked,
-    };
-    for (const [name, value] of Object.entries(report))
-      assert.equal(value, true, name);
-  } finally {
-    for (const attachment of attachments) attachment.close();
-    for (const track of [audio, video, replacement]) track.stop();
-  }
+test("closing presentation awaits and retires a late physical observation", async () => {
+  let resolve;
+  let retired = false;
+  let closed = false;
+  const source = {
+    isClosed: () => closed,
+    observe: () =>
+      new Promise((done) => {
+        resolve = done;
+      }),
+    async close() {
+      closed = true;
+    },
+    subscribe: () => () => {},
+  };
+  const element = new Video();
+  const presentation = attach(source, element);
+  await settle();
+  let completed = false;
+  const closing = presentation.close().then(() => {
+    completed = true;
+  });
+  await settle();
+  assert.equal(completed, false);
+  resolve({
+    isClosed: () => false,
+    track: () => videoTrack(),
+    async close() {
+      retired = true;
+    },
+  });
+  await closing;
+  assert.equal(retired, true);
+  assert.equal(element.srcObject, null);
 });

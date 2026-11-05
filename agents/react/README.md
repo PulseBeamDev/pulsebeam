@@ -49,8 +49,8 @@ waiting for application promises; it cannot undo their side effects.
 
 This API replaces React descriptors and `.track(spec)` without compatibility
 aliases. Local media handles expose only readonly `kind` and `label`; use
-`Publish` props instead of imperative media setters. The Web SDK descriptor API
-is unchanged.
+`Publish` props instead of imperative media setters. The caller-owned Web SDK also
+uses typed lookups, with awaited factories and explicit resource lifetimes.
 
 React exposes only `useAgent` for Agent ownership, with no `createAgent` export
 or advanced escape hatch. Non-React applications use caller-owned `createAgent`

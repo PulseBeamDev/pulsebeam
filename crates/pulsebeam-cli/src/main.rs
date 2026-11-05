@@ -12,13 +12,12 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, ConnectionState, DesiredState, MediaKind, Snapshot, TrackSelector, TrackSpec,
-    VideoObservation,
+    AgentConfig, ConnectionState, MediaKind, Snapshot, TrackSelector, VideoObservation,
 };
 use pulsebeam_agent_native::{
     Agent, Config, Encoding, H264Frame, Host, InputFrame, MediaStreamUpdate, NativeStatistics,
-    PublicationInput, ReceiveMode, StreamUpdate, Subscription, VideoInput, VideoPublicationConfig,
-    VideoSourceConfig,
+    ProducerInput, Publication, ReceiveMode, StreamUpdate, Subscription, VideoInput,
+    VideoPublicationConfig, VideoSourceConfig,
 };
 use pulsebeam_core::auth::{
     ApiKey, ApiSigningKey, DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY,
@@ -144,8 +143,8 @@ impl VideoSource {
         }
     }
 
-    async fn run(mut self, media: PublicationInput) {
-        if let Err(error) = media.ready().await {
+    async fn run(mut self, media: ProducerInput, publication: Publication) {
+        if let Err(error) = publication.ready().await {
             tracing::warn!(%error, "bench input unavailable");
             return;
         }
@@ -172,7 +171,7 @@ impl VideoSource {
                     }
                 },
                 _ = interval.tick() => {
-                    if media.ready().await.is_err() { return; }
+                    if publication.ready().await.is_err() { return; }
                     let capture = tokio::time::Instant::now();
                     let Some(timestamp_us) = i64::try_from(capture.duration_since(started).as_micros()).ok()
                         .and_then(|offset| capture_origin.checked_add(offset)) else {
@@ -590,25 +589,20 @@ async fn spawn_agent(
         source: benchmark_video_profile(simulcast),
     }];
     let agent = Agent::spawn(config, Host::new(Box::new(reqwest::Client::new()))).await?;
+    let camera = agent
+        .create_video_input(benchmark_video_profile(simulcast))
+        .await?;
+    let microphone = agent.create_audio_input().await?;
     let camera_owner = agent
-        .publication(TrackSpec::Video {
-            label: "camera".into(),
-        })
+        .video("camera".into())?
+        .publish(&camera, Default::default())
         .await?;
-    let microphone_owner = agent
-        .publication(TrackSpec::Audio {
-            label: "microphone".into(),
-        })
+    let _microphone_owner = agent
+        .audio("microphone".into())?
+        .publish(&microphone, Default::default())
         .await?;
-    let camera = camera_owner.input().await?;
-    let _microphone = microphone_owner.input().await?;
-    let desired = DesiredState {
-        revision: 1,
-        connected: true,
-        ..Default::default()
-    };
     let mut snapshots = agent.snapshots();
-    agent.replace_desired(desired).await?;
+    agent.connect().await?;
     wait_until_connected(&mut snapshots).await?;
 
     let mut media_tasks = JoinSet::new();
@@ -620,7 +614,10 @@ async fn spawn_agent(
     } else {
         vec![ctx.assets.for_encoding(None)]
     };
-    media_tasks.spawn(VideoSource::new(assets, pulsebeam_testdata::QUALITY_VIDEO_FPS).run(camera));
+    media_tasks.spawn(
+        VideoSource::new(assets, pulsebeam_testdata::QUALITY_VIDEO_FPS)
+            .run(camera, camera_owner.clone()),
+    );
 
     let (received_video_tx, received_video) = watch::channel(false);
     // Catalog absence does not cancel this benchmark's named interests.
@@ -682,6 +679,7 @@ async fn spawn_agent(
         }
     }
 
+    agent.disconnect().await?;
     agent.close().await?;
     media_tasks.shutdown().await;
     if !interests.is_empty() && !*received_video.borrow() {
@@ -791,14 +789,13 @@ async fn subscribe_remote_videos(
 ) -> Result<()> {
     for selector in video_subscriptions(snapshot, interests) {
         let subscription = agent
-            .video_subscription(
-                selector.clone(),
-                VideoObservation {
-                    visible: true,
-                    height: 720,
-                    ..Default::default()
-                },
-            )
+            .participant(selector.participant_external_id.clone())?
+            .video(selector.label.clone())?
+            .subscribe(VideoObservation {
+                visible: true,
+                height: 720,
+                ..Default::default()
+            })
             .await?;
         interests.insert(selector);
         tasks.spawn(handle_receiving(

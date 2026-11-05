@@ -130,7 +130,7 @@ pub enum TrackResourceError {
     ReceiveChannelFailed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum DataEvent {
     Message {
         participant_id: String,
@@ -144,6 +144,12 @@ pub enum DataEvent {
         from: u64,
         to: u64,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DataUpdate {
+    Event { event: DataEvent },
+    Closed,
 }
 
 impl DataEvent {
@@ -1224,7 +1230,7 @@ impl TrackResources {
             return Err(TrackResourceError::OwnerInUse);
         }
         if let Some(id) = &participant_id {
-            validate_identifier("participant external id", id, 256, true)?;
+            crate::validate_participant_id(id)?;
         }
         let mut registrations = self.registrations();
         registrations.subscribers.push(subscriber.clone());

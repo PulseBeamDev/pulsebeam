@@ -2,6 +2,7 @@ import {
   Audio,
   Data,
   Publish,
+  SelectAudio,
   Video,
   useAgent,
   useCapture,
@@ -30,7 +31,7 @@ camera.setEnabled(false);
 camera.source;
 // @ts-expect-error Kind-specific sources must remain safe in packed declarations.
 Publish({ track: camera, source: capture.audio });
-const remote = agent.remote.participant("alice");
+const remote = agent.participant("alice");
 const messages = remote.data("messages", "lossy");
 Data({
   track: messages,
@@ -58,9 +59,10 @@ const settings: VideoCaptureSettings | undefined = capture.video?.settings;
 Publish({ track: camera, source: capture.video });
 Video({ source: capture.video });
 Video({
-  source: agent.remote.participant("alice").video("camera"),
+  source: agent.participant("alice").video("camera"),
   onPlaybackError: (failure: PlaybackError) => void failure.retry(),
 });
+SelectAudio({ agent, policy: { automatic: true } });
 Audio({ agent });
 void settings;
 agent.connect();

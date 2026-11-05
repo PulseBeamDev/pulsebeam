@@ -51,9 +51,11 @@ Combined mode requires a decoding-capable factory, retains independent polling
 queues, and preserves the encoded observer's receiver-lifetime reservation.
 Changing or reattaching modes can therefore require a new receiver/generation.
 
-Named `PublicationInput` ports follow Core-authorized targets across generation
-replacement; wait for `ready` before producing again. Remote observation
-handles must be reacquired, using current generation
+Independently owned source inputs and publication owners survive generation
+replacement. Wait for publication `ready` before resuming a bound media workflow;
+source `ready` alone establishes producer allocation, not an enabled publication.
+Queued input captures one physical producer incarnation and is never redirected.
+Remote observation handles must be reacquired using current generation
 observations. Retired physical handles do not reattach automatically. Returned
 owned frames remain valid after stream closure; closure does not keep the RTC
 graph alive. Observe native sink drops and application lag rather than treating
@@ -93,8 +95,9 @@ to select affected checks and reuse unchanged evidence.
 | --- | --- |
 | Sys codec/runtime behavior, native linking and lifetime | `//crates/pulsebeam-libwebrtc-sys:fast`, `:runtime_tests`, `:lifetime` in separate core/native configurations |
 | Native API, admission, controls and lifecycle components | `//agents/pulsebeam-agent-native:unit_tests`, `:format`, `:clippy` |
+| Direct generated Node/Python concrete objects, async operations and owned source/data boundaries without network delivery | `//agents/pulsebeam-agent-native:generated_api_contract` |
 | Real-SFU I420 media and retirement with stock native discovery | `//crates/pulsebeam-cli:production_native` |
-| Installed Node archive and Python wheel, real-SFU connection, topic payloads, owned decoded video and close | `//crates/pulsebeam-cli:installed_foreign` (also `//agents/pulsebeam-agent-native:node_consumer` and `:python_consumer`) |
+| Installed Node archive and Python wheel, real-SFU connection, owned binary data, decoded video and close | `//crates/pulsebeam-cli:installed_foreign` (also `//agents/pulsebeam-agent-native:node_consumer` and `:python_consumer`) |
 | Concurrent real IPv4/IPv6 ICE selection and bidirectional application topics | `//crates/pulsebeam:transport_conformance` |
 | Generated bindings, native library variants and distribution archives | `//agents/pulsebeam-agent-native:bindings`, `:native_static`, `:pulsebeam-agent-native-sim`, `:node_package.pack`, `:python_wheel` |
 | Shared controlled/native RTC interoperability | `//crates/pulsebeam-rtc/simulation:interop` |

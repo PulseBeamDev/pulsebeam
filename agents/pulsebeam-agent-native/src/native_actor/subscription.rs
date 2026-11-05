@@ -180,6 +180,23 @@ where
         Ok(self.subscription_handle(owner))
     }
 
+    pub(super) fn claim_configured_audio_subscription(
+        &mut self,
+        selector: TrackSelector,
+        playout_delay: agent_core::PlayoutDelay,
+    ) -> Result<Subscription, Error> {
+        let subscription = self.claim_audio_subscription(selector)?;
+        if let Err(error) = self.core.resource(ResourceCommand::ConfigureAudio {
+            owner: subscription.inner.owner,
+            playout_delay,
+        }) {
+            subscription.inner.closed.close();
+            self.retire_subscriptions();
+            return Err(error.into());
+        }
+        Ok(subscription)
+    }
+
     pub(super) fn claim_audio_policy(
         &mut self,
         policy: agent_core::AudioSubscription,

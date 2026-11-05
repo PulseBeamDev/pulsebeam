@@ -436,6 +436,94 @@ struct PeerBarriers {
     before_close: Arc<tokio::sync::Barrier>,
 }
 
+struct OwnedData {
+    sender: Arc<pulsebeam_agent_native::ffi::LocalDataTrack>,
+    room: Arc<pulsebeam_agent_native::ffi::DataReceiver>,
+    participant: Arc<pulsebeam_agent_native::ffi::DataReceiver>,
+    remote: String,
+}
+
+impl OwnedData {
+    async fn new(agent: &Agent, remote: String) -> anyhow::Result<Self> {
+        let sender = agent.data("owned-bytes".into(), core_ffi::TopicMode::Ordered)?;
+        let room = sender.receive().await?;
+        let participant = agent
+            .participant(remote.clone())?
+            .data("owned-bytes".into(), core_ffi::TopicMode::Ordered)?
+            .receive()
+            .await?;
+        Ok(Self {
+            sender,
+            room,
+            participant,
+            remote,
+        })
+    }
+
+    async fn message(
+        &self,
+        cursor: &pulsebeam_agent_native::ffi::DataReceiver,
+        expected: &[u8],
+    ) -> anyhow::Result<pulsebeam_agent_core::DataEvent> {
+        loop {
+            let pulsebeam_agent_core::DataUpdate::Event { event } = cursor.next().await? else {
+                anyhow::bail!("owned data cursor closed before its message");
+            };
+            let pulsebeam_agent_core::DataEvent::Message {
+                participant_id,
+                track_id,
+                data,
+                ..
+            } = &event
+            else {
+                anyhow::bail!("owned data cursor unexpectedly lost ordered messages");
+            };
+            anyhow::ensure!(
+                participant_id == &self.remote && !track_id.is_empty(),
+                "data cursor lost publisher identity"
+            );
+            if data == expected {
+                return Ok(event);
+            }
+            anyhow::ensure!(data == &[0, 255, 128, 0], "unexpected binary payload");
+        }
+    }
+
+    async fn exchange(&self, barrier: &tokio::sync::Barrier, round: u8) -> anyhow::Result<()> {
+        barrier.wait().await;
+        let payload = vec![0, 255, 128, round];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Ordered receive starts at a live frontier, not retained history.
+            // Establish it with received setup traffic before sending the marker once.
+            let setup = vec![0, 255, 128, 0];
+            let ready = async {
+                let room = self.message(&self.room, &setup).await?;
+                let participant = self.message(&self.participant, &setup).await?;
+                anyhow::ensure!(room == participant, "independent setup cursors diverged");
+                barrier.wait().await;
+                anyhow::Ok(())
+            };
+            tokio::pin!(ready);
+            let mut tick = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    result = &mut ready => { result?; break; },
+                    _ = tick.tick() => self.sender.send(setup.clone()).await?,
+                }
+            }
+            self.sender.send(payload.clone()).await?;
+            let room = self.message(&self.room, &payload).await?;
+            let participant = self.message(&self.participant, &payload).await?;
+            anyhow::ensure!(room == participant, "independent data cursors diverged");
+            anyhow::Ok(())
+        })
+        .await??;
+        // Neither peer may replace its graph until the other has consumed this round.
+        barrier.wait().await;
+        Ok(())
+    }
+}
+
 #[test]
 fn native_agents_prove_media_topics_reconnect_and_close() {
     let seed = std::env::var("PULSEBEAM_SIM_SEED")
@@ -579,18 +667,16 @@ async fn run_peer(
         })?;
     tokio::task::spawn_local(actor);
     let agent = Agent::from_runtime(runtime.clone());
+    let mut video = agent.create_video_input(Default::default()).await?;
+    let mut audio = agent.create_audio_input().await?;
     let mut video_owner = agent
-        .publication(core_ffi::TrackSpec::Video {
-            label: "camera".into(),
-        })
+        .video("camera".into())?
+        .publish(video.clone(), Default::default())
         .await?;
     let mut audio_owner = agent
-        .publication(core_ffi::TrackSpec::Audio {
-            label: "microphone".into(),
-        })
+        .audio("microphone".into())?
+        .publish(audio.clone(), Default::default())
         .await?;
-    let mut video = video_owner.input().await?;
-    let mut audio = audio_owner.input().await?;
     let latest = core_ffi::TopicPublisher {
         name: "latest-state".into(),
         mode: core_ffi::TopicMode::Latest,
@@ -614,14 +700,14 @@ async fn run_peer(
         ],
         ..Default::default()
     };
-    agent.replace_desired(desired.clone()).await?;
+    replace_transport_desired(&runtime, desired.clone()).await?;
 
     let connected = wait_connected(&agent, None).await?;
     let generation = connected
         .generation
         .ok_or_else(|| anyhow::anyhow!("connected without generation"))?;
-    video.ready().await?;
-    audio.ready().await?;
+    video_owner.ready().await?;
+    audio_owner.ready().await?;
     barriers.before_media.wait().await;
     let mut frame_cursor = 0;
     let initial = wait_remote_media(&agent, &video, &mut frame_cursor).await?;
@@ -644,20 +730,16 @@ async fn run_peer(
         .ok_or_else(|| anyhow::anyhow!("{name} did not discover remote video"))?;
     let remote_video_id = remote_video_publication.id.clone();
     let video_subscription = agent
-        .video_subscription(
-            core_ffi::TrackSelector {
-                participant_id: remote_video_publication.participant_id.clone(),
-                label: remote_video_publication.label.clone(),
-            },
-            core_ffi::VideoObservation {
-                visible: true,
-                height: 720,
-                min_height: 0,
-                min_fps: 0,
-                priority: 1,
-                playout_delay: core_ffi::PlayoutDelay::Adaptive,
-            },
-        )
+        .participant(remote_video_publication.participant_id.clone())?
+        .video(remote_video_publication.label.clone())?
+        .subscribe(core_ffi::VideoObservation {
+            visible: true,
+            height: 720,
+            min_height: 0,
+            min_fps: 0,
+            priority: 1,
+            playout_delay: core_ffi::PlayoutDelay::Adaptive,
+        })
         .await?;
     let remote_audio_publication = initial
         .catalog
@@ -670,10 +752,9 @@ async fn run_peer(
         .ok_or_else(|| anyhow::anyhow!("{name} did not discover remote audio"))?;
     let remote_audio_id = remote_audio_publication.id.clone();
     let audio_subscription = agent
-        .audio_subscription(core_ffi::TrackSelector {
-            participant_id: remote_audio_publication.participant_id.clone(),
-            label: remote_audio_publication.label.clone(),
-        })
+        .participant(remote_audio_publication.participant_id.clone())?
+        .audio(remote_audio_publication.label.clone())?
+        .subscribe(Default::default())
         .await?;
 
     wait_media_bindings(&agent, &remote_video_id, &remote_audio_id).await?;
@@ -692,7 +773,7 @@ async fn run_peer(
     let mut audio_probe =
         MediaProbe::start(remote_audio.clone(), generation, core_ffi::MediaKind::Audio);
     let events = TopicProbe::start(agent.events(), name, &latest, &ordered, 1);
-    prime_ordered_topic(&agent, &ordered, &events, &barriers.before_media).await?;
+    prime_ordered_topic(&runtime, &agent, &ordered, &events, &barriers.before_media).await?;
 
     let accepted = agent.snapshot();
     let errors = agent.events();
@@ -701,7 +782,11 @@ async fn run_peer(
         min_ms: 100,
         max_ms: 100,
     };
-    audio_subscription.configure_audio(fixed).await?;
+    audio_subscription
+        .configure(core_ffi::AudioSubscriptionConfig {
+            playout_delay: fixed,
+        })
+        .await?;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match errors.next().await {
@@ -743,6 +828,7 @@ async fn run_peer(
     let first = exchange(
         &barriers.before_reconnect,
         &agent,
+        &runtime,
         &video,
         &audio,
         &video_probe,
@@ -773,7 +859,7 @@ async fn run_peer(
     reduced
         .topic_subscribers
         .retain(|subscriber| subscriber.name == ordered.name);
-    agent.replace_desired(reduced).await?;
+    replace_transport_desired(&runtime, reduced).await?;
     // Channel rows disappear before signaling observes kClosed. Only the
     // withdrawn pair may close in this phase; wait for their terminal counter.
     let closed_after = closed_before
@@ -788,7 +874,7 @@ async fn run_peer(
         );
     }
     barriers.before_reconnect.wait().await;
-    agent.replace_desired(desired.clone()).await?;
+    replace_transport_desired(&runtime, desired.clone()).await?;
     let rebound = wait_connected(&agent, None).await?;
     let new_latest = rebound
         .topics
@@ -825,7 +911,9 @@ async fn run_peer(
         "payload reuse replaced the native peer"
     );
     audio_subscription
-        .configure_audio(core_ffi::PlayoutDelay::Adaptive)
+        .configure(core_ffi::AudioSubscriptionConfig {
+            playout_delay: core_ffi::PlayoutDelay::Adaptive,
+        })
         .await?;
 
     let first_expected = first.retained.clone();
@@ -836,8 +924,14 @@ async fn run_peer(
     video_owner.close().await?;
     audio_owner.close().await?;
     anyhow::ensure!(
+        !video.is_closed() && !audio.is_closed(),
+        "publication retirement stopped independent producers"
+    );
+    video.close().await?;
+    audio.close().await?;
+    anyhow::ensure!(
         video.is_closed() && audio.is_closed(),
-        "retired publication retained an input"
+        "explicit producer retirement retained an input"
     );
     barriers.before_reconnect.wait().await;
     wait_media_absent(&agent, &remote_video_id, &remote_audio_id).await?;
@@ -858,20 +952,18 @@ async fn run_peer(
         "media retirement replaced the established session"
     );
     barriers.before_reconnect.wait().await;
+    video = agent.create_video_input(Default::default()).await?;
+    audio = agent.create_audio_input().await?;
     video_owner = agent
-        .publication(core_ffi::TrackSpec::Video {
-            label: "camera".into(),
-        })
+        .video("camera".into())?
+        .publish(video.clone(), Default::default())
         .await?;
     audio_owner = agent
-        .publication(core_ffi::TrackSpec::Audio {
-            label: "microphone".into(),
-        })
+        .audio("microphone".into())?
+        .publish(audio.clone(), Default::default())
         .await?;
-    video = video_owner.input().await?;
-    audio = audio_owner.input().await?;
-    video.ready().await?;
-    audio.ready().await?;
+    video_owner.ready().await?;
+    audio_owner.ready().await?;
     barriers.before_reconnect.wait().await;
     let readded = wait_remote_media(&agent, &video, &mut frame_cursor).await?;
     let readded_video_id = readded
@@ -901,13 +993,21 @@ async fn run_peer(
     let readded = wait_media_bindings(&agent, &readded_video_id, &readded_audio_id).await?;
     let replaced_video_input = video;
     let replaced_audio_input = audio;
-    video = video_owner.input().await?;
-    audio = audio_owner.input().await?;
-    video.ready().await?;
-    audio.ready().await?;
+    video = agent.create_video_input(Default::default()).await?;
+    audio = agent.create_audio_input().await?;
+    video_owner.set_source(Some(video.clone())).await?;
+    audio_owner.set_source(Some(audio.clone())).await?;
+    video_owner.ready().await?;
+    audio_owner.ready().await?;
+    anyhow::ensure!(
+        !replaced_video_input.is_closed() && !replaced_audio_input.is_closed(),
+        "source replacement stopped borrowed producers"
+    );
+    replaced_video_input.close().await?;
+    replaced_audio_input.close().await?;
     anyhow::ensure!(
         replaced_video_input.is_closed() && replaced_audio_input.is_closed(),
-        "same-generation input replacement retained an old child"
+        "explicit old-producer retirement failed"
     );
     anyhow::ensure!(
         readded.generation == Some(first_generation)
@@ -933,10 +1033,18 @@ async fn run_peer(
         core_ffi::MediaKind::Audio,
     );
     let events = TopicProbe::start(agent.events(), name, &latest, &ordered, 2);
-    prime_ordered_topic(&agent, &ordered, &events, &barriers.before_reconnect).await?;
+    prime_ordered_topic(
+        &runtime,
+        &agent,
+        &ordered,
+        &events,
+        &barriers.before_reconnect,
+    )
+    .await?;
     let same_peer = exchange(
         &barriers.before_reconnect,
         &agent,
+        &runtime,
         &video,
         &audio,
         &video_probe,
@@ -950,6 +1058,9 @@ async fn run_peer(
     )
     .await?;
     drop(events);
+    let owned_data =
+        OwnedData::new(&agent, remote_video_publication.participant_id.clone()).await?;
+    owned_data.exchange(&barriers.before_reconnect, 1).await?;
     let same_peer_expected = same_peer.retained.clone();
     anyhow::ensure!(
         agent.snapshot().generation == Some(first_generation)
@@ -1012,8 +1123,8 @@ async fn run_peer(
                 && !audio_subscription.is_closed(),
             "generation retirement ended logical inputs or media interests"
         );
-        video.ready().await?;
-        audio.ready().await?;
+        video_owner.ready().await?;
+        audio_owner.ready().await?;
         let replacement = wait_remote_media(&agent, &video, &mut frame_cursor).await?;
         if replacement.participant_id.as_deref() != Some(participant.as_str()) {
             anyhow::bail!("{name} participant identity changed across reconnect");
@@ -1092,7 +1203,14 @@ async fn run_peer(
     );
     barriers.after_reconnect.wait().await;
     let events = TopicProbe::start(agent.events(), name, &latest, &ordered, 3);
-    prime_ordered_topic(&agent, &ordered, &events, &barriers.after_reconnect).await?;
+    prime_ordered_topic(
+        &runtime,
+        &agent,
+        &ordered,
+        &events,
+        &barriers.after_reconnect,
+    )
+    .await?;
 
     anyhow::ensure!(
         first.retained == first_expected,
@@ -1101,6 +1219,7 @@ async fn run_peer(
     let second = exchange(
         &barriers.before_close,
         &agent,
+        &runtime,
         &video,
         &audio,
         &video_probe,
@@ -1114,8 +1233,9 @@ async fn run_peer(
     )
     .await?;
     drop(events);
+    owned_data.exchange(&barriers.before_close, 2).await?;
     let second_expected = second.retained.clone();
-    agent.close().await?;
+    agent.disconnect().await?;
     anyhow::ensure!(
         runtime.snapshot().connection == pulsebeam_agent_core::ConnectionState::Disconnected,
         "graceful close did not disconnect"
@@ -1127,7 +1247,9 @@ async fn run_peer(
         "native graph or runtime services not retired with retained media handles"
     );
     anyhow::ensure!(
-        !video.is_closed()
+        !owned_data.room.is_closed()
+            && !owned_data.participant.is_closed()
+            && !video.is_closed()
             && !audio.is_closed()
             && !video_subscription.is_closed()
             && !audio_subscription.is_closed(),
@@ -1149,8 +1271,14 @@ async fn run_peer(
     video_owner.close().await?;
     audio_owner.close().await?;
     anyhow::ensure!(
+        !video.is_closed() && !audio.is_closed(),
+        "publication close stopped independently owned producers"
+    );
+    video.close().await?;
+    audio.close().await?;
+    anyhow::ensure!(
         video.is_closed() && audio.is_closed(),
-        "released owners retained inputs"
+        "explicit producer close retained inputs"
     );
     anyhow::ensure!(
         matches!(remote_video.next().await, MediaStreamUpdate::Closed),
@@ -1171,6 +1299,33 @@ async fn run_peer(
             && same_peer.retained == same_peer_expected
             && second.retained == second_expected,
         "returned owning frames changed after close"
+    );
+
+    let mut pending_data = Box::pin(owned_data.participant.next());
+    anyhow::ensure!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+            pending_data.as_mut(),
+            cx
+        )))
+        .await
+        .is_pending(),
+        "disconnect ended logical data demand"
+    );
+    owned_data.room.close().await?;
+    anyhow::ensure!(
+        matches!(
+            owned_data.room.next().await?,
+            pulsebeam_agent_core::DataUpdate::Closed
+        ) && !owned_data.participant.is_closed(),
+        "cursor close ended independent demand"
+    );
+    agent.close().await?;
+    anyhow::ensure!(
+        matches!(
+            pending_data.await?,
+            pulsebeam_agent_core::DataUpdate::Closed
+        ),
+        "terminal Agent close did not finish a pending data read"
     );
 
     Ok(PeerReport {
@@ -1375,7 +1530,39 @@ async fn wait_media_bindings(
     .map_err(|_| anyhow::anyhow!("native media bindings did not become ready"))?
 }
 
+// Raw transport churn is a controlled-host fixture, not a generated SDK policy path.
+async fn replace_transport_desired(
+    runtime: &RuntimeAgent,
+    state: core_ffi::DesiredState,
+) -> anyhow::Result<()> {
+    let revision = runtime
+        .snapshot()
+        .desired_revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("transport fixture revision overflow"))?;
+    let desired = state
+        .into_core(revision)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    runtime.replace_desired(desired).await?;
+    Ok(())
+}
+
+async fn send_transport_topic(
+    runtime: &RuntimeAgent,
+    publisher: core_ffi::TopicPublisher,
+    payload: Vec<u8>,
+) -> anyhow::Result<()> {
+    runtime
+        .send_topic(pulsebeam_agent_core::TopicSend {
+            publisher: publisher.into(),
+            payload,
+        })
+        .await?;
+    Ok(())
+}
+
 async fn prime_ordered_topic(
+    runtime: &RuntimeAgent,
     agent: &Agent,
     publisher: &core_ffi::TopicPublisher,
     events: &TopicProbe,
@@ -1394,7 +1581,7 @@ async fn prime_ordered_topic(
             tokio::select! {
                 _ = &mut synchronized, if received => return Ok(()),
                 _ = tick.tick() => {
-                    agent.send_topic(publisher.clone(), b"route-ready".to_vec()).await?;
+                    send_transport_topic(runtime, publisher.clone(), b"route-ready".to_vec()).await?;
                 }
             }
         }
@@ -1433,7 +1620,7 @@ async fn prime_ordered_topic(
 
 async fn wait_remote_media(
     agent: &Agent,
-    video: &pulsebeam_agent_native::ffi::PublicationInput,
+    video: &pulsebeam_agent_native::ffi::VideoSource,
     frame_number: &mut u64,
 ) -> anyhow::Result<core_ffi::Snapshot> {
     let snapshots = agent.snapshots();
@@ -1511,8 +1698,9 @@ fn video_frame_for(
 async fn exchange(
     completion: &tokio::sync::Barrier,
     agent: &Agent,
-    video: &pulsebeam_agent_native::ffi::PublicationInput,
-    audio: &pulsebeam_agent_native::ffi::PublicationInput,
+    runtime: &RuntimeAgent,
+    video: &pulsebeam_agent_native::ffi::VideoSource,
+    audio: &pulsebeam_agent_native::ffi::AudioSource,
     video_probe: &MediaProbe,
     audio_probe: &MediaProbe,
     events: &TopicProbe,
@@ -1522,12 +1710,18 @@ async fn exchange(
     round: u64,
     frame_number: &mut u64,
 ) -> anyhow::Result<ExchangeReport> {
-    agent
-        .send_topic(latest.clone(), format!("latest-{round}-old").into_bytes())
-        .await?;
-    agent
-        .send_topic(latest.clone(), format!("latest-{round}").into_bytes())
-        .await?;
+    send_transport_topic(
+        runtime,
+        latest.clone(),
+        format!("latest-{round}-old").into_bytes(),
+    )
+    .await?;
+    send_transport_topic(
+        runtime,
+        latest.clone(),
+        format!("latest-{round}").into_bytes(),
+    )
+    .await?;
     let snapshot = agent.snapshots().next().await;
     let SnapshotUpdate::Snapshot { snapshot } = snapshot else {
         anyhow::bail!("native snapshot stream closed")
@@ -1539,9 +1733,12 @@ async fn exchange(
         .find(|state| state.publisher == *ordered)
         .map(|state| state.next_sequence)
         .ok_or_else(|| anyhow::anyhow!("native ordered topic publisher is not connected"))?;
-    agent
-        .send_topic(ordered.clone(), format!("ordered-{round}-0").into_bytes())
-        .await?;
+    send_transport_topic(
+        runtime,
+        ordered.clone(),
+        format!("ordered-{round}-0").into_bytes(),
+    )
+    .await?;
     wait_ordered_admitted(agent, ordered, next_sequence).await?;
     if round == 1 {
         // The actor processes these commands separately; this exercises real
@@ -1550,13 +1747,16 @@ async fn exchange(
         without_latest
             .topic_subscribers
             .retain(|subscriber| subscriber.name != latest.name);
-        agent.replace_desired(without_latest).await?;
-        agent.replace_desired(desired.clone()).await?;
+        replace_transport_desired(runtime, without_latest).await?;
+        replace_transport_desired(runtime, desired.clone()).await?;
         events.state.lock().unwrap().latest_messages = 0;
     }
-    agent
-        .send_topic(ordered.clone(), format!("ordered-{round}-1").into_bytes())
-        .await?;
+    send_transport_topic(
+        runtime,
+        ordered.clone(),
+        format!("ordered-{round}-1").into_bytes(),
+    )
+    .await?;
     wait_ordered_admitted(agent, ordered, next_sequence.saturating_add(1)).await?;
 
     let generation = snapshot
@@ -1625,9 +1825,7 @@ async fn exchange(
                 _ = tick.tick() => {
                     // Keep the peer's latest state and media live until both
                     // receivers have completed, not only this receiver.
-                    agent
-                        .send_topic(latest.clone(), format!("latest-{round}").into_bytes())
-                        .await?;
+                    send_transport_topic(runtime, latest.clone(), format!("latest-{round}").into_bytes()).await?;
                     if !video_diagnosed && started.elapsed() >= Duration::from_secs(1) {
                         let observed = video_probe.state.lock().unwrap();
                         let error = observed.video.require(&observed.video_baseline, generation, (320, 180), 2, Instant::now()).err();

@@ -13,7 +13,7 @@ use crate::native_media::{
     self, MediaConfig, NativeStatistics, ReceiveMode, SourceIdentity, VideoSourceConfig,
 };
 use crate::native_receiver::NativeReceiver;
-use crate::native_source::{NativeSource, SourceKind};
+use crate::native_source::{NativeProducer, NativeSource, SourceKind};
 
 const EVENTS_PER_TURN: usize = 64;
 const PENDING_SENDS: usize = 256;
@@ -39,7 +39,7 @@ enum Stage {
 pub(crate) enum Observation {
     Track {
         slot: MediaSlot,
-        track: crate::RemoteTrack,
+        track: crate::NativeReceiverInfo,
     },
     TrackRemoved {
         slot: MediaSlot,
@@ -86,6 +86,7 @@ pub(crate) struct NativePeer<R: rtc::SessionRuntime> {
     transceivers: BTreeMap<MediaSlot, rtc::SessionTransceiverId>,
     bindings: BTreeMap<MediaSlot, agent_core::SlotBinding>,
     pub sources: BTreeMap<MediaSlot, NativeSource>,
+    producers: BTreeMap<u64, NativeProducer>,
     pub receivers: BTreeMap<MediaSlot, NativeReceiver>,
 }
 
@@ -93,6 +94,13 @@ fn error(message: impl Into<String>) -> rtc::PeerError {
     rtc::PeerError {
         kind: rtc::PeerErrorKind::Operation,
         message: message.into(),
+    }
+}
+
+fn retired_producer() -> rtc::PeerError {
+    rtc::PeerError {
+        kind: rtc::PeerErrorKind::Closed,
+        message: "producer identity has been retired".into(),
     }
 }
 
@@ -310,6 +318,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             transceivers,
             bindings: BTreeMap::new(),
             sources,
+            producers: BTreeMap::new(),
             receivers: BTreeMap::new(),
         };
         #[cfg(debug_assertions)]
@@ -329,7 +338,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         for (slot, source) in &self.sources {
             debug_assert_eq!(self.transceivers.get(slot), Some(&source.transceiver));
             debug_assert!(matches!(
-                (slot, source.kind),
+                (slot, source.producer.kind),
                 (MediaSlot::LocalAudio(_), SourceKind::Audio(_))
                     | (MediaSlot::LocalVideo(_), SourceKind::Video(_))
             ));
@@ -1028,13 +1037,114 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         Ok(())
     }
 
+    pub fn create_producer(
+        &mut self,
+        kind: SourceKind,
+        config: &VideoSourceConfig,
+    ) -> Result<SourceIdentity, rtc::PeerError> {
+        let supported = match kind {
+            SourceKind::Audio(input) => input == self.media_config.audio_input,
+            SourceKind::Video(input) => input == self.media_config.video_input,
+        };
+        if !supported {
+            return Err(rtc::PeerError {
+                kind: rtc::PeerErrorKind::UnsupportedOperation,
+                message: "producer input differs from this native session's media factory".into(),
+            });
+        }
+        let producer = NativeProducer::create(&mut self.session, kind, config)?;
+        let identity = SourceIdentity {
+            generation: self.generation.get(),
+            source: producer.id.get(),
+        };
+        self.producers.insert(identity.source, producer);
+        Ok(identity)
+    }
+
+    fn producer(&self, identity: &SourceIdentity) -> Result<&NativeProducer, rtc::PeerError> {
+        self.producers
+            .get(&identity.source)
+            .filter(|producer| {
+                identity.generation == self.generation.get() && !producer.is_closed()
+            })
+            .ok_or_else(retired_producer)
+    }
+
+    pub fn producer_is_live(&self, identity: &SourceIdentity) -> bool {
+        self.producer(identity).is_ok()
+    }
+
+    pub fn bind_producer(
+        &mut self,
+        slot: &MediaSlot,
+        identity: &SourceIdentity,
+    ) -> Result<(), rtc::PeerError> {
+        self.producer(identity)?;
+        let producer = self
+            .producers
+            .get(&identity.source)
+            .ok_or_else(retired_producer)?;
+        let (MediaSlot::LocalAudio(name) | MediaSlot::LocalVideo(name)) = slot else {
+            return Err(error("not a local source"));
+        };
+        self.sources
+            .get_mut(slot)
+            .ok_or_else(|| error("unknown native publication slot"))?
+            .borrow(&mut self.session, producer, name)
+    }
+
+    pub fn submit_producer(
+        &mut self,
+        identity: &SourceIdentity,
+        frame: crate::InputFrame,
+    ) -> Result<(), rtc::PeerError> {
+        self.producer(identity)?;
+        self.producers
+            .get(&identity.source)
+            .ok_or_else(retired_producer)?
+            .push(&mut self.session, frame)
+    }
+
+    pub fn producer_capture_time_us(
+        &self,
+        identity: &SourceIdentity,
+    ) -> Result<i64, rtc::PeerError> {
+        self.producer(identity)?;
+        self.session
+            .clock_timestamp()?
+            .microseconds()
+            .map_err(|value| error(format!("invalid native capture clock: {value}")))
+    }
+
+    pub fn close_producer(&mut self, identity: &SourceIdentity) -> Result<(), rtc::PeerError> {
+        if identity.generation != self.generation.get() {
+            return Err(retired_producer());
+        }
+        let producer = self
+            .producers
+            .remove(&identity.source)
+            .ok_or_else(retired_producer)?;
+        let mut result = Ok(());
+        for source in self
+            .sources
+            .values_mut()
+            .filter(|source| source.active && source.producer.id.get() == identity.source)
+        {
+            let detached = source.close(&mut self.session);
+            source.active = false;
+            result = result.and(detached);
+        }
+        let closed = producer.close(&mut self.session);
+        result.and(closed)
+    }
+
     pub fn source_identity(&self, slot: &MediaSlot) -> Option<SourceIdentity> {
         self.sources
             .get(slot)
-            .filter(|source| source.active)
+            .filter(|source| source.active && !source.producer.is_closed())
             .map(|source| SourceIdentity {
                 generation: self.generation.get(),
-                source: source.id.get(),
+                source: source.producer.id.get(),
             })
     }
 
@@ -1049,7 +1159,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         source.replace(&mut self.session, name)?;
         Ok(SourceIdentity {
             generation: self.generation.get(),
-            source: source.id.get(),
+            source: source.producer.id.get(),
         })
     }
 
@@ -1062,8 +1172,9 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             .get(slot)
             .filter(|source| {
                 source.active
+                    && !source.producer.is_closed()
                     && identity.generation == self.generation.get()
-                    && identity.source == source.id.get()
+                    && identity.source == source.producer.id.get()
             })
             .ok_or_else(|| rtc::PeerError {
                 kind: rtc::PeerErrorKind::Closed,
@@ -1146,7 +1257,7 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
         mode: ReceiveMode,
         observer: Option<&crate::DecodedVideoObserver>,
         encoded: Option<&crate::EncodedVideoObserver>,
-    ) -> Result<crate::RemoteTrack, rtc::PeerError> {
+    ) -> Result<crate::NativeReceiverInfo, rtc::PeerError> {
         let receiver = self
             .receivers
             .get_mut(slot)
@@ -1432,6 +1543,62 @@ mod tests {
         peer.close_source(&local, &current).unwrap();
         assert!(peer.capture_time_us(&local, &current).is_err());
         assert!(peer.source_identity(&local).is_none());
+        let kind = peer.sources[&local].producer.kind;
+        let config = VideoSourceConfig {
+            encodings: peer.sources[&local].producer.encodings.clone(),
+            ..VideoSourceConfig::default()
+        };
+        let producer = peer.create_producer(kind, &config).unwrap();
+        let frame = || crate::InputFrame::I420 {
+            frame: crate::I420Frame {
+                width: 16,
+                height: 16,
+                timestamp_us: capture,
+                data: vec![16; 384],
+                rotation_degrees: 0,
+            },
+        };
+        let raw = kind == SourceKind::Video(crate::VideoInput::I420);
+        let foreign = SourceIdentity {
+            generation: generation.get() + 1,
+            ..producer.clone()
+        };
+        for error in [
+            peer.bind_producer(&local, &foreign).unwrap_err(),
+            peer.submit_producer(&foreign, frame()).unwrap_err(),
+            peer.close_producer(&foreign).unwrap_err(),
+        ] {
+            assert_eq!(error.kind, rtc::PeerErrorKind::Closed);
+        }
+        if raw {
+            peer.submit_producer(&producer, frame()).unwrap();
+        }
+        let sender = peer.sources[&local].sender;
+        let transceiver = peer.sources[&local].transceiver;
+        peer.bind_producer(&local, &producer).unwrap();
+        assert_eq!(peer.source_identity(&local), Some(producer.clone()));
+        peer.close_source(&local, &producer).unwrap();
+        assert!(peer.source_identity(&local).is_none());
+        assert_eq!(peer.producer(&producer).unwrap().id.get(), producer.source);
+        if raw {
+            peer.submit_producer(&producer, frame()).unwrap();
+        }
+        peer.bind_producer(&local, &producer).unwrap();
+        assert_eq!(peer.sources[&local].sender, sender);
+        assert_eq!(peer.sources[&local].transceiver, transceiver);
+        assert_eq!(peer.source_identity(&local), Some(producer.clone()));
+        let borrowed = peer.sources[&local].producer.clone();
+        peer.close_producer(&producer).unwrap();
+        assert!(borrowed.is_closed());
+        assert!(peer.source_identity(&local).is_none());
+        for error in [
+            peer.bind_producer(&local, &producer).unwrap_err(),
+            peer.submit_producer(&producer, frame()).unwrap_err(),
+            peer.submit(&local, &producer, frame()).unwrap_err(),
+            borrowed.push(&mut peer.session, frame()).unwrap_err(),
+        ] {
+            assert_eq!(error.kind, rtc::PeerErrorKind::Closed);
+        }
         let next = peer.replace_source(&local).unwrap();
         assert_ne!(next, current);
         assert_eq!(peer.session.transceivers(peer.peer).unwrap().len(), 4);
@@ -1455,6 +1622,18 @@ mod tests {
         assert!(!peer.session.transceiver_stopping(untouched).unwrap());
         assert!(!peer.session.transceiver_stopped(untouched).unwrap());
         assert_eq!(peer.source_identity(&local).unwrap(), next);
+        let producer = peer.create_producer(kind, &config).unwrap();
+        peer.session
+            .close_source(peer.sources[&local].producer.id)
+            .unwrap();
+        peer.bind_producer(&local, &producer).unwrap();
+        assert_eq!(peer.source_identity(&local), Some(producer.clone()));
+        assert!(peer.producer_is_live(&producer));
+        peer.session.stop_standard(untouched).unwrap();
+        peer.close_source(&local, &producer).unwrap();
+        assert!(peer.producer(&producer).is_ok());
+        peer.close_producer(&producer).unwrap();
+        assert!(peer.producer(&producer).is_err());
         peer.session.close_peer(peer.peer).unwrap();
         while peer.session.channel_state(control).unwrap() != rtc::DataChannelState::Closed {
             drive();

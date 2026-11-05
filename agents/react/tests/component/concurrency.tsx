@@ -3,8 +3,8 @@ import { startTransition, Suspense, useLayoutEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { Audio, Data, Publish, Video, useAgent } from "../../src/index.js";
 import { runtimes } from "./runtime.js";
-import { useUserMedia, type CaptureResult } from "../../src/capture.js";
-import { createCaptureSource } from "@pulsebeam/web";
+import { useCapture, type CaptureResult } from "../../src/index.js";
+import { VideoSource } from "@pulsebeam/web";
 import { publishableVideoSource } from "../../src/sources.js";
 import { captures, deferred, flush, stream } from "./platform.js";
 
@@ -15,9 +15,8 @@ export async function concurrentRender() {
   const never = new Promise<void>(() => {});
   const source = publishableVideoSource(
     { kind: "video" },
-    createCaptureSource(
+    VideoSource.fromTrack(
       preview.getVideoTracks()[0] as unknown as MediaStreamTrack,
-      "video",
     ),
   );
   let current: CaptureResult;
@@ -37,9 +36,9 @@ export async function concurrentRender() {
     });
     const camera = agent.video("camera");
     const messages = agent.data("messages", "ordered");
-    const remote = agent.remote.participant("alice").video("camera");
-    const capture = useUserMedia({
-      video: { preferences: { width: speculative ? 1280 : 640 } },
+    const remote = agent.participant("alice").video("camera");
+    const capture = useCapture("device", {
+      video: { width: speculative ? 1280 : 640 },
       audio: false,
     });
     useLayoutEffect(() => {

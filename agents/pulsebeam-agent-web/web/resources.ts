@@ -16,7 +16,7 @@ export class ResourceOwnershipError extends ResourceError {
   }
 }
 
-function failure(error: unknown): ResourceError {
+export function resourceFailure(error: unknown): ResourceError {
   if (error instanceof ResourceError) return error;
   const code =
     typeof error === "object" &&
@@ -49,6 +49,7 @@ export interface ResourceObserver {
 export class ResourceOwners {
   #runtime: ResourceRuntime | undefined;
   #closed = false;
+  #closing: Promise<void> | undefined;
   readonly #owners = new Set<ResourceOwner>();
   constructor(readonly report: (error: ResourceError) => void) {}
 
@@ -75,10 +76,12 @@ export class ResourceOwners {
   forget(owner: ResourceOwner): void {
     this.#owners.delete(owner);
   }
-  close(): void {
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
     this.#closed = true;
     this.#runtime = undefined;
-    for (const owner of this.#owners) void owner.close();
+    const closing = [...this.#owners].map((owner) => owner.close());
+    return (this.#closing = Promise.all(closing).then(() => {}));
   }
 }
 
@@ -106,6 +109,9 @@ export class ResourceOwner {
   get binding(): ResourceBinding | undefined {
     return this.#binding;
   }
+  isClosed(): boolean {
+    return this.#closed;
+  }
   current(binding: ResourceBinding): boolean {
     return (
       !this.#closed &&
@@ -114,13 +120,16 @@ export class ResourceOwner {
     );
   }
   activate(runtime: ResourceRuntime): void {
+    if (this.#closed) return;
     const attachment = {};
     this.#attachment = attachment;
     this.#track(this.#acquire(runtime, attachment));
   }
   async #acquire(runtime: ResourceRuntime, attachment: object): Promise<void> {
     try {
-      const result = await runtime.resource(this.command);
+      const command =
+        typeof this.command === "function" ? this.command() : this.command;
+      const result = await runtime.resource(command);
       if (
         !result ||
         typeof result !== "object" ||
@@ -157,7 +166,7 @@ export class ResourceOwner {
   }
   fail(error: unknown): void {
     if (this.#closed) return;
-    const value = failure(error);
+    const value = resourceFailure(error);
     this.#reject(value);
     void this.close();
     (this.observer.error ?? this.registry.report)(value);
@@ -187,8 +196,9 @@ export class ResourceOwner {
     if (this.#closing) return this.#closing;
     this.#closed = true;
     this.detach();
-    this.registry.forget(this);
     this.#reject(new ResourceError("closed", "resource owner is closed"));
-    return (this.#closing = Promise.all([...this.#pending]).then(() => {}));
+    return (this.#closing = Promise.all([...this.#pending]).then(() =>
+      this.registry.forget(this),
+    ));
   }
 }

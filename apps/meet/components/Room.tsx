@@ -3,6 +3,7 @@ import {
   Audio,
   Data,
   Publish,
+  SelectAudio,
   Video,
   useAgent,
   useCapture,
@@ -92,15 +93,20 @@ export function Room({
     dismiss: dismissReaction,
     send: sendReaction,
   } = useReaction(agent);
-  const remoteVideoTracks = agent.remote.participants.flatMap((participant) =>
+  const remoteVideoTracks = agent.participants.flatMap((participant) =>
     participant.tracks.filter(
       (value): value is RemoteVideoTrack => value.kind === "video",
     ),
   );
   const { remoteTracks, spotlight, setPin } = useVideoLayout(remoteVideoTracks);
-  useEffect(() => {
-    agent.connect();
+  const connect = useCallback(() => {
+    void agent.connect().catch((reason: unknown) => {
+      setFailure(
+        `Connection: ${reason instanceof Error ? reason.message : String(reason)}`,
+      );
+    });
   }, [agent]);
+  useEffect(connect, [connect]);
   const startShare = async () => {
     try {
       await requestShare();
@@ -195,6 +201,7 @@ export function Room({
       <Publish track={Camera} source={capture.video} enabled={cameraOn} />
       <Publish track={Microphone} source={capture.audio} enabled={micOn} />
       <Publish track={Screen} source={screen} content="detail" />
+      <SelectAudio agent={agent} policy={{ automatic: true }} />
       <Audio
         agent={agent}
         onPlaybackError={(failure) =>
@@ -261,10 +268,7 @@ export function Room({
           >
             <Icons.Settings2 size={20} />
           </IconButton>
-          <IconButton
-            aria-label="Retry connection"
-            onClick={() => agent.connect()}
-          >
+          <IconButton aria-label="Retry connection" onClick={connect}>
             <Icons.RotateCcw size={20} />
           </IconButton>
           <Button

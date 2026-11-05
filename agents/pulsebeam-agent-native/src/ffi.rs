@@ -4,12 +4,14 @@ use std::sync::Arc;
 use agent_core::ffi as core_ffi;
 use tokio::sync::Mutex;
 
+mod media;
+pub use media::*;
+
 use crate::{
     Agent as RuntimeAgent, AgentEvent as RuntimeEvent, Config, EncodingLimits, EncodingState,
     Error as RuntimeError, Host, InputFrame, MediaConfig, MediaStreamUpdate, NativeStatistics,
-    ObservationStream, ProducerFeedback, Publication as RuntimePublication,
-    PublicationInput as RuntimePublicationInput, ReceiveMode, RemoteMedia, SourceIdentity,
-    StreamUpdate, Subscription as RuntimeSubscription,
+    ObservationStream, ProducerFeedback, Publication as RuntimePublication, ReceiveMode,
+    RemoteMedia, SourceIdentity, StreamUpdate, Subscription as RuntimeSubscription,
 };
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -22,6 +24,12 @@ pub struct NativeAgentConfig {
 pub enum NativeError {
     #[error("core operation failed: {error:?}")]
     Core { error: core_ffi::AgentError },
+    #[error("resource operation failed: {reason:?}")]
+    Resource { reason: core_ffi::ResourceFailure },
+    #[error("topic operation failed: {reason:?}")]
+    Topic { reason: core_ffi::TopicFailure },
+    #[error("data send failed: {reason}")]
+    DataSend { reason: agent_core::DataSendFailure },
     #[error("native SDK operation failed: {message}")]
     Native { message: String },
     #[error("agent or media resource is closed")]
@@ -37,6 +45,13 @@ pub enum NativeError {
 impl From<RuntimeError> for NativeError {
     fn from(error: RuntimeError) -> Self {
         match error {
+            RuntimeError::Core(agent_core::AgentError::InvalidResource(reason)) => Self::Resource {
+                reason: reason.into(),
+            },
+            RuntimeError::Core(agent_core::AgentError::InvalidTopic(reason)) => Self::Topic {
+                reason: reason.into(),
+            },
+            RuntimeError::DataSend(reason) => Self::DataSend { reason },
             RuntimeError::Core(error) => Self::Core {
                 error: error.into(),
             },
@@ -107,7 +122,16 @@ pub struct Agent {
 impl Agent {
     // UniFFI 0.31 Python supports named async constructors, not async primary ones.
     #[uniffi::constructor]
-    pub async fn create(config: NativeAgentConfig) -> Result<Arc<Self>, NativeError> {
+    pub async fn create(config: core_ffi::AgentConfig) -> Result<Arc<Self>, NativeError> {
+        Self::create_with_media(NativeAgentConfig {
+            session: config,
+            media: MediaConfig::default(),
+        })
+        .await
+    }
+
+    #[uniffi::constructor]
+    pub async fn create_with_media(config: NativeAgentConfig) -> Result<Arc<Self>, NativeError> {
         let session = config
             .session
             .into_core()
@@ -130,73 +154,26 @@ impl Agent {
         Ok(Self::from_runtime(runtime))
     }
 
-    pub async fn replace_desired(
-        &self,
-        desired: core_ffi::DesiredState,
-    ) -> Result<(), NativeError> {
-        self.runtime
-            .replace_foreign_desired(desired)
-            .await
-            .map_err(|error| NativeError::Core { error })
-    }
     pub async fn renew_authorization(&self, token: String) -> Result<(), NativeError> {
         self.runtime
             .renew_authorization(token)
             .await
             .map_err(Into::into)
     }
-    pub async fn send_topic(
+    pub fn data(
         &self,
-        publisher: core_ffi::TopicPublisher,
-        payload: Vec<u8>,
-    ) -> Result<(), NativeError> {
-        self.runtime
-            .send_topic(agent_core::TopicSend {
-                publisher: publisher.into(),
-                payload,
-            })
-            .await
-            .map_err(Into::into)
-    }
-    pub async fn publication(
-        &self,
-        spec: core_ffi::TrackSpec,
-    ) -> Result<Arc<Publication>, NativeError> {
-        Ok(Arc::new(Publication {
-            runtime: self.runtime.publication(spec.into()).await?,
+        label: String,
+        delivery: core_ffi::TopicMode,
+    ) -> Result<Arc<LocalDataTrack>, NativeError> {
+        Ok(Arc::new(LocalDataTrack {
+            runtime: self.runtime.data(label, delivery.into())?,
         }))
     }
-    pub async fn video_subscription(
-        &self,
-        selector: core_ffi::TrackSelector,
-        observation: core_ffi::VideoObservation,
-    ) -> Result<Arc<Subscription>, NativeError> {
-        Ok(Arc::new(Subscription {
-            runtime: self
-                .runtime
-                .video_subscription(selector.into(), observation.into())
-                .await?,
+    pub fn participant(&self, id: String) -> Result<Arc<Participant>, NativeError> {
+        Ok(Arc::new(Participant {
+            runtime: self.runtime.participant(id)?,
         }))
     }
-
-    pub async fn audio_subscription(
-        &self,
-        selector: core_ffi::TrackSelector,
-    ) -> Result<Arc<Subscription>, NativeError> {
-        Ok(Arc::new(Subscription {
-            runtime: self.runtime.audio_subscription(selector.into()).await?,
-        }))
-    }
-
-    pub async fn audio_policy(
-        &self,
-        policy: core_ffi::AudioDemand,
-    ) -> Result<Arc<Subscription>, NativeError> {
-        Ok(Arc::new(Subscription {
-            runtime: self.runtime.audio_policy(policy.into()).await?,
-        }))
-    }
-
     pub fn snapshot(&self) -> core_ffi::Snapshot {
         (&self.runtime.snapshot()).into()
     }
@@ -215,14 +192,20 @@ impl Agent {
     pub fn statistics(&self) -> Option<NativeStatistics> {
         self.runtime.statistics().borrow().clone()
     }
+    pub fn is_closed(&self) -> bool {
+        self.runtime.is_closed()
+    }
+    pub async fn connect(&self) -> Result<(), NativeError> {
+        self.runtime.connect().await.map_err(Into::into)
+    }
+    pub async fn disconnect(&self) -> Result<(), NativeError> {
+        self.runtime.disconnect().await.map_err(Into::into)
+    }
     pub async fn reconnect(&self) -> Result<(), NativeError> {
         self.runtime.reconnect().await.map_err(Into::into)
     }
     pub async fn close(&self) -> Result<(), NativeError> {
         self.runtime.close().await.map_err(Into::into)
-    }
-    pub async fn abort(&self) -> Result<(), NativeError> {
-        self.runtime.abort().await.map_err(Into::into)
     }
 }
 
@@ -233,117 +216,69 @@ impl Agent {
 }
 
 #[derive(uniffi::Object)]
-pub struct Publication {
-    runtime: RuntimePublication,
+pub struct LocalDataTrack {
+    runtime: crate::LocalDataTrack,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
-impl Publication {
-    pub fn is_closed(&self) -> bool {
-        self.runtime.is_closed()
+impl LocalDataTrack {
+    pub async fn send(&self, data: Vec<u8>) -> Result<(), NativeError> {
+        self.runtime.send(data).await.map_err(Into::into)
     }
-    pub async fn input(&self) -> Result<Arc<PublicationInput>, NativeError> {
-        Ok(Arc::new(PublicationInput {
-            runtime: self.runtime.input().await?,
+    pub async fn receive(&self) -> Result<Arc<DataReceiver>, NativeError> {
+        Ok(Arc::new(DataReceiver {
+            runtime: self.runtime.receive().await?,
         }))
-    }
-    pub async fn set_muted(&self, muted: bool) -> Result<(), NativeError> {
-        self.runtime.set_muted(muted).await.map_err(Into::into)
-    }
-    pub async fn close(&self) -> Result<(), NativeError> {
-        self.runtime.close().await.map_err(Into::into)
     }
 }
 
 #[derive(uniffi::Object)]
-pub struct PublicationInput {
-    runtime: RuntimePublicationInput,
+pub struct Participant {
+    runtime: crate::Participant,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
-impl PublicationInput {
-    pub fn is_closed(&self) -> bool {
-        self.runtime.is_closed()
+#[uniffi::export]
+impl Participant {
+    pub fn id(&self) -> String {
+        self.runtime.id().into()
     }
-    pub async fn ready(&self) -> Result<(), NativeError> {
-        self.runtime.ready().await.map_err(Into::into)
-    }
-    /// Ok acknowledges native input admission, not encode or remote delivery.
-    pub async fn submit(&self, frame: InputFrame) -> Result<(), NativeError> {
-        self.runtime.submit(frame).await.map_err(Into::into)
-    }
-    pub async fn close(&self) -> Result<(), NativeError> {
-        self.runtime.close().await.map_err(Into::into)
-    }
-    pub async fn capture_time_us(&self) -> Result<i64, NativeError> {
-        self.runtime.capture_time_us().await.map_err(Into::into)
-    }
-    pub async fn set_limits(
+    pub fn data(
         &self,
-        limits: Vec<EncodingLimits>,
-    ) -> Result<Vec<EncodingState>, NativeError> {
-        self.runtime.set_limits(limits).await.map_err(Into::into)
-    }
-    pub fn feedback(&self) -> Arc<FeedbackStream> {
-        Arc::new(FeedbackStream {
-            updates: self.runtime.feedback(),
-        })
+        label: String,
+        delivery: core_ffi::TopicMode,
+    ) -> Result<Arc<RemoteDataTrack>, NativeError> {
+        Ok(Arc::new(RemoteDataTrack {
+            runtime: self.runtime.data(label, delivery.into())?,
+        }))
     }
 }
 
 #[derive(uniffi::Object)]
-pub struct Subscription {
-    runtime: RuntimeSubscription,
+pub struct RemoteDataTrack {
+    runtime: crate::RemoteDataTrack,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
-impl Subscription {
+impl RemoteDataTrack {
+    pub async fn receive(&self) -> Result<Arc<DataReceiver>, NativeError> {
+        Ok(Arc::new(DataReceiver {
+            runtime: self.runtime.receive().await?,
+        }))
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct DataReceiver {
+    runtime: crate::DataReceiver,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl DataReceiver {
     pub fn is_closed(&self) -> bool {
         self.runtime.is_closed()
     }
-    pub async fn observe(
-        &self,
-        mode: ReceiveMode,
-    ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
-        Ok(Arc::new(RemoteMediaReceiver {
-            runtime: self.runtime.observe(mode).await?,
-        }))
-    }
-    pub async fn observe_source(
-        &self,
-        source: String,
-        mode: ReceiveMode,
-    ) -> Result<Arc<RemoteMediaReceiver>, NativeError> {
-        Ok(Arc::new(RemoteMediaReceiver {
-            runtime: self.runtime.observe_source(source, mode).await?,
-        }))
-    }
-    pub async fn configure_audio_policy(
-        &self,
-        policy: core_ffi::AudioDemand,
-    ) -> Result<(), NativeError> {
-        self.runtime
-            .configure_audio_policy(policy.into())
-            .await
-            .map_err(Into::into)
-    }
-    pub async fn configure_video(
-        &self,
-        observation: core_ffi::VideoObservation,
-    ) -> Result<(), NativeError> {
-        self.runtime
-            .configure_video(observation.into())
-            .await
-            .map_err(Into::into)
-    }
-    pub async fn configure_audio(
-        &self,
-        playout_delay: core_ffi::PlayoutDelay,
-    ) -> Result<(), NativeError> {
-        self.runtime
-            .configure_audio(playout_delay.into())
-            .await
-            .map_err(Into::into)
+    pub async fn next(&self) -> Result<agent_core::DataUpdate, NativeError> {
+        self.runtime.next().await.map_err(Into::into)
     }
     pub async fn close(&self) -> Result<(), NativeError> {
         self.runtime.close().await.map_err(Into::into)
@@ -384,6 +319,13 @@ pub struct SnapshotStream {
 }
 #[uniffi::export(async_runtime = "tokio")]
 impl SnapshotStream {
+    pub fn is_closed(&self) -> bool {
+        self.updates.is_closed()
+    }
+    pub async fn close(&self) {
+        self.updates.close().await;
+        self.initial.lock().await.take();
+    }
     pub async fn next(&self) -> SnapshotUpdate {
         let initial = self.initial.lock().await.take();
         if self.updates.is_closed() {
@@ -410,6 +352,12 @@ pub struct EventStream {
 }
 #[uniffi::export(async_runtime = "tokio")]
 impl EventStream {
+    pub fn is_closed(&self) -> bool {
+        self.updates.is_closed()
+    }
+    pub async fn close(&self) {
+        self.updates.close().await;
+    }
     pub async fn next(&self) -> EventUpdate {
         match self.updates.next().await {
             StreamUpdate::Value(event) => EventUpdate::Event {
@@ -455,6 +403,12 @@ pub struct FeedbackStream {
 }
 #[uniffi::export(async_runtime = "tokio")]
 impl FeedbackStream {
+    pub fn is_closed(&self) -> bool {
+        self.updates.is_closed()
+    }
+    pub async fn close(&self) {
+        self.updates.close().await;
+    }
     pub async fn next(&self) -> FeedbackUpdate {
         match self.updates.next().await {
             StreamUpdate::Value(feedback) => FeedbackUpdate::Feedback { feedback },
@@ -477,12 +431,7 @@ mod tests {
             log_level: agent_core::LogLevel::default(),
         };
         // No connect intent: this is a boundary/policy test, not native media proof.
-        let agent = Agent::create(NativeAgentConfig {
-            session: session.into(),
-            media: MediaConfig::default(),
-        })
-        .await
-        .unwrap();
+        let agent = Agent::create(session.into()).await.unwrap();
         let mut desired = core_ffi::DesiredState::from(agent_core::DesiredState::default());
         desired.publications.push(core_ffi::PublicationIntent {
             slot: "publication".into(),
@@ -491,27 +440,41 @@ mod tests {
             label: String::new(),
         });
         assert!(matches!(
-            agent.replace_desired(desired).await,
-            Err(NativeError::Core { .. })
+            agent.runtime.replace_foreign_desired(desired).await,
+            Err(_)
         ));
         assert_eq!(agent.snapshot().desired_revision, 0);
         let disconnected = || core_ffi::DesiredState::from(agent_core::DesiredState::default());
-        agent.replace_desired(disconnected()).await.unwrap();
+        agent
+            .runtime
+            .replace_foreign_desired(disconnected())
+            .await
+            .unwrap();
         assert_eq!(agent.snapshot().desired_revision, 1);
-        agent.close().await.unwrap();
-        agent.replace_desired(disconnected()).await.unwrap();
-        assert_eq!(agent.snapshot().desired_revision, 3);
+        agent.disconnect().await.unwrap();
+        agent
+            .runtime
+            .replace_foreign_desired(disconnected())
+            .await
+            .unwrap();
+        assert_eq!(agent.snapshot().desired_revision, 2);
         let events = agent.events();
         let snapshots = agent.snapshots();
-        agent.abort().await.unwrap();
+        agent.close().await.unwrap();
+        agent.close().await.unwrap();
+        assert!(agent.is_closed());
+        assert!(matches!(agent.connect().await, Err(NativeError::Closed)));
+        assert!(
+            agent
+                .runtime
+                .replace_foreign_desired(disconnected())
+                .await
+                .is_err()
+        );
         assert!(matches!(events.next().await, EventUpdate::Closed));
         assert!(matches!(snapshots.next().await, SnapshotUpdate::Closed));
         assert!(matches!(
-            agent
-                .publication(core_ffi::TrackSpec::Audio {
-                    label: "microphone".into()
-                })
-                .await,
+            agent.audio("microphone".into()),
             Err(NativeError::Closed)
         ));
     }

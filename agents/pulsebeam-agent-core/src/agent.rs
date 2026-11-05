@@ -41,6 +41,7 @@ pub enum AgentCommand {
     ReplaceDesired(DesiredState),
     RenewAuthorization(String),
     Connect,
+    Disconnect,
     Reconnect,
     SendTopic(TopicSend),
 }
@@ -54,6 +55,7 @@ impl core::fmt::Debug for AgentCommand {
                 .finish(),
             Self::RenewAuthorization(_) => formatter.write_str("RenewAuthorization([REDACTED])"),
             Self::Connect => formatter.write_str("Connect"),
+            Self::Disconnect => formatter.write_str("Disconnect"),
             Self::Reconnect => formatter.write_str("Reconnect"),
             Self::SendTopic(send) => formatter.debug_tuple("SendTopic").field(send).finish(),
         }
@@ -274,6 +276,7 @@ impl Agent {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
             AgentCommand::RenewAuthorization(token) => self.renew_authorization(token),
             AgentCommand::Connect => self.connect(),
+            AgentCommand::Disconnect => self.disconnect(),
             AgentCommand::Reconnect => {
                 self.reconnect();
                 Ok(())
@@ -986,6 +989,16 @@ impl Agent {
             .terminal_failure
             .as_ref()
             .is_some_and(|failure| failure.class == FailureClass::ParticipantSuperseded)
+    }
+
+    fn disconnect(&mut self) -> Result<(), AgentError> {
+        if self.desired.connected {
+            let mut desired = self.declared.clone();
+            desired.revision = desired.revision.saturating_add(1);
+            desired.connected = false;
+            self.replace_desired(desired)?;
+        }
+        Ok(())
     }
 
     fn reconnect(&mut self) {

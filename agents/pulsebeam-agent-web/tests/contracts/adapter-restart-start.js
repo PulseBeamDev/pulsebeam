@@ -5,16 +5,21 @@
       endpoint,
       token,
     });
-  const sender = create("__SENDER_TOKEN__");
-  const receiver = create("__RECEIVER_TOKEN__");
-  const spec = window.pulsebeam.track.data("chat", "lossy");
-  const publisher = sender.track(spec);
-  const stream = receiver.remote.participant("publisher").track(spec).events();
+  const sender = await create("__SENDER_TOKEN__");
+  const receiver = await create("__RECEIVER_TOKEN__");
+  const publisher = sender.data("chat", "lossy");
+  const stream = await receiver
+    .participant("publisher")
+    .data("chat", "lossy")
+    .receive();
   const events = [];
   let probe = 0;
   let observedProbe = 0;
   const pumping = (async () => {
-    for await (const event of stream) {
+    while (true) {
+      const update = await stream.next();
+      if (update.type === "closed") return;
+      const event = update.event;
       if (event.type === "message") {
         if (event.data.length === 2 && event.data[0] === 0) {
           observedProbe = Math.max(observedProbe, event.data[1]);
@@ -24,25 +29,38 @@
       }
     }
   })();
-  const wait = (agent, predicate, label) =>
-    new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        removeListener();
-        reject(
-          new Error(
-            `timeout waiting for ${label}: ${JSON.stringify(agent.getSnapshot(), (_, value) => (typeof value === "bigint" ? value.toString() : value))}`,
-          ),
-        );
-      }, 60000);
-      const inspect = () => {
-        if (!predicate(agent.getSnapshot())) return;
-        clearTimeout(timeout);
-        removeListener();
-        resolve(agent.getSnapshot());
-      };
-      const removeListener = agent.subscribe(inspect);
-      inspect();
-    });
+  const wait = async (agent, predicate, label) => {
+    const snapshots = agent.snapshots();
+    let timeout;
+    try {
+      return await new Promise((resolve, reject) => {
+        timeout = setTimeout(() => {
+          void snapshots.close();
+          reject(
+            new Error(
+              `timeout waiting for ${label}: ${JSON.stringify(agent.snapshot(), (_, value) => (typeof value === "bigint" ? value.toString() : value))}`,
+            ),
+          );
+        }, 60000);
+        void (async () => {
+          while (true) {
+            const update = await snapshots.next();
+            if (update.type === "closed")
+              throw new Error(`closed while waiting for ${label}`);
+            const snapshot =
+              update.type === "snapshot" ? update.snapshot : agent.snapshot();
+            if (predicate(snapshot)) {
+              resolve(snapshot);
+              return;
+            }
+          }
+        })().catch(reject);
+      });
+    } finally {
+      clearTimeout(timeout);
+      await snapshots.close();
+    }
+  };
   const synchronize = async () => {
     const nonce = ++probe;
     const deadline = Date.now() + 20000;
@@ -52,13 +70,13 @@
       if (observedProbe >= nonce) break;
       if (Date.now() > deadline)
         throw new Error(
-          `lossy application synchronization missing: ${JSON.stringify({ sender: sender.getSnapshot(), receiver: receiver.getSnapshot() }, (_, value) => (typeof value === "bigint" ? value.toString() : value))}`,
+          `lossy application synchronization missing: ${JSON.stringify({ sender: sender.snapshot(), receiver: receiver.snapshot() }, (_, value) => (typeof value === "bigint" ? value.toString() : value))}`,
         );
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   };
-  sender.connect();
-  receiver.connect();
+  await sender.connect();
+  await receiver.connect();
   const before = await wait(
     receiver,
     (snapshot) => snapshot.connection === "connected",
