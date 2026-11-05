@@ -8,7 +8,7 @@ use crate::channel::{self, mpsc, mpsc::TrySendError as MpscTrySendError, watch};
 
 use agent_core::{
     Agent, AgentCommand, AgentConfig, AgentError, DesiredState, Effect, Failure, Generation,
-    HostEvent, Notification, Snapshot, TopicSend,
+    HostEvent, Notification, Snapshot, TimerEffect, TimerEvent, TimerId, TopicSend,
 };
 
 #[derive(Clone)]
@@ -332,6 +332,7 @@ pub(crate) struct Actor<H: Host> {
     closed: bool,
     last_snapshot: Option<Snapshot>,
     data_sends: BTreeMap<agent_core::OperationId, DataSendCompletion>,
+    core_wake: Option<TimerId>,
 }
 
 impl<H: Host> Actor<H> {
@@ -351,6 +352,7 @@ impl<H: Host> Actor<H> {
             closed: false,
             last_snapshot: None,
             data_sends: BTreeMap::new(),
+            core_wake: None,
         })
     }
 
@@ -452,11 +454,33 @@ impl<H: Host> Actor<H> {
         }
 
         for effect in turn.effects.drain(..) {
-            self.host.execute_effect(effect);
+            match effect {
+                Effect::Timer(TimerEffect::Schedule { timer, after }) if after.is_zero() => {
+                    self.core_wake = Some(timer);
+                }
+                Effect::Timer(TimerEffect::Cancel { timer }) => {
+                    if self.core_wake == Some(timer) {
+                        self.core_wake = None;
+                    } else {
+                        self.host
+                            .execute_effect(Effect::Timer(TimerEffect::Cancel { timer }));
+                    }
+                }
+                effect => self.host.execute_effect(effect),
+            }
         }
 
         if !turn.notifications.is_empty() || turn.error.is_some() {
             self.host.publish_turn(&turn);
+        }
+    }
+
+    fn wake_core(&mut self) -> bool {
+        if let Some(timer) = self.core_wake.take() {
+            self.event(HostEvent::Timer(TimerEvent::Fired { timer }));
+            true
+        } else {
+            false
         }
     }
 
@@ -476,6 +500,7 @@ impl<H: Host> Actor<H> {
 
         self.closed = true;
         self.running = false;
+        self.core_wake = None;
         for (_, completion) in std::mem::take(&mut self.data_sends) {
             let _ = completion.send(Err(DataSendError::Closed));
         }
@@ -580,23 +605,50 @@ impl<H: Host> Actor<H> {
     }
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
+async fn run_actor<H: Host>(mut actor: Actor<H>, message_rx: mpsc::Receiver<Message>) -> Actor<H> {
+    loop {
+        if actor.wake_core() && actor.core_wake.is_some() {
+            // A rearmed wake must not monopolize the actor or the executor.
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    std::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            if let Some(message) = message_rx.try_recv() {
+                actor.process(message);
+            }
+            continue;
+        }
+        let Some(message) = message_rx.recv().await else {
+            break;
+        };
+        actor.process(message);
+    }
+    actor.shutdown();
+    actor
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn spawn_actor<H: Host + 'static>(
     config: AgentConfig,
     host: H,
 ) -> Result<ActorHandle, AgentError> {
     let mut actor = Actor::new(config.clone(), host)?;
-    let (message_tx, mut message_rx) = channel::mpsc::channel(32);
+    let (message_tx, message_rx) = channel::mpsc::channel(32);
     let initial_snapshot = actor.driver.snapshot().clone();
     let (snapshot_tx, snapshot_rx) = channel::watch::channel(initial_snapshot);
 
     actor.snapshots = snapshot_tx;
 
     wasm_bindgen_futures::spawn_local(async move {
-        while let Some(message) = message_rx.recv().await {
-            actor.process(message);
-        }
-        actor.shutdown();
+        run_actor(actor, message_rx).await;
     });
 
     Ok(ActorHandle {
@@ -712,6 +764,170 @@ mod tests {
             retry: agent_core::RetryPolicy::default(),
             log_level: agent_core::LogLevel::default(),
         }
+    }
+
+    fn retry_timer() -> (agent_core::TimerId, agent_core::Generation) {
+        let mut driver = Driver::new(config()).unwrap();
+        let turn = driver.turn(Input::Command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 1,
+            connected: true,
+            ..DesiredState::default()
+        })));
+        let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = turn.effects[0] else {
+            panic!("expected offer");
+        };
+        let turn = driver.turn(Input::Event(HostEvent::Rtc(RtcEvent::Failed {
+            generation,
+            message: "offline".into(),
+        })));
+        let timer = turn
+            .effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Timer(agent_core::TimerEffect::Schedule { timer, .. }) => Some(timer),
+                _ => None,
+            })
+            .unwrap();
+        (timer, generation)
+    }
+
+    #[test]
+    fn zero_timer_is_actor_owned_cancelled_and_fired_once() {
+        use agent_core::TimerEffect;
+        use std::time::Duration;
+        let (timer, generation) = retry_timer();
+        let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
+        let publish = |actor: &mut Actor<FakeHost>, effects| {
+            actor.publish_turn(super::Turn {
+                effects,
+                ..Default::default()
+            });
+        };
+        publish(
+            &mut actor,
+            vec![
+                Effect::Timer(TimerEffect::Schedule {
+                    timer,
+                    after: Duration::ZERO,
+                }),
+                Effect::Rtc(RtcEffect::Close { generation }),
+            ],
+        );
+        assert_eq!(
+            actor.host.effect_events(),
+            vec![Effect::Rtc(RtcEffect::Close { generation })]
+        );
+        assert_eq!(actor.core_wake, Some(timer));
+        publish(
+            &mut actor,
+            vec![Effect::Timer(TimerEffect::Cancel { timer })],
+        );
+        assert!(!actor.wake_core());
+        assert_eq!(
+            actor.host.effect_events(),
+            vec![Effect::Rtc(RtcEffect::Close { generation })]
+        );
+        publish(
+            &mut actor,
+            vec![Effect::Timer(TimerEffect::Schedule {
+                timer,
+                after: Duration::ZERO,
+            })],
+        );
+        assert!(actor.wake_core()); // stale for this Core instance
+        assert!(!actor.wake_core());
+        publish(
+            &mut actor,
+            vec![Effect::Timer(TimerEffect::Schedule {
+                timer,
+                after: Duration::from_secs(1),
+            })],
+        );
+        assert!(
+            matches!(actor.host.effect_events().last(), Some(Effect::Timer(TimerEffect::Schedule { after, .. })) if *after == Duration::from_secs(1))
+        );
+        publish(
+            &mut actor,
+            vec![Effect::Timer(TimerEffect::Schedule {
+                timer,
+                after: Duration::ZERO,
+            })],
+        );
+        actor.shutdown();
+        assert!(!actor.wake_core());
+    }
+
+    #[test]
+    fn pending_wake_precedes_queued_input_and_preserves_input_order() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        use std::time::Duration;
+
+        let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
+        actor.process(Message::Public(PublicCommand::SetConnected(true)));
+        let generation = actor.driver.snapshot().generation.unwrap();
+        actor.process(Message::HostEvent(HostEvent::Rtc(RtcEvent::Failed {
+            generation,
+            message: "offline".into(),
+        })));
+        let timer = actor
+            .host
+            .effect_events()
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Timer(agent_core::TimerEffect::Schedule { timer, .. }) => Some(*timer),
+                _ => None,
+            })
+            .unwrap();
+        actor.publish_turn(super::Turn {
+            effects: vec![Effect::Timer(agent_core::TimerEffect::Schedule {
+                timer,
+                after: Duration::ZERO,
+            })],
+            ..Default::default()
+        });
+        let (sender, receiver) = super::channel::mpsc::channel(4);
+        sender
+            .try_send(Message::Public(PublicCommand::SetConnected(false)))
+            .unwrap();
+        sender
+            .try_send(Message::Public(PublicCommand::SetConnected(true)))
+            .unwrap();
+        drop(sender);
+        let mut run = Box::pin(super::run_actor(actor, receiver));
+        let Poll::Ready(actor) = run.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            panic!("closed mailbox should finish without wall time");
+        };
+        let effects = actor.host.effect_events();
+        let offers: Vec<_> = effects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, effect)| match effect {
+                Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => {
+                    Some((index, *generation))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            offers.len(),
+            2,
+            "the pending wake fires despite queued input"
+        );
+        let (retry, retry_generation) = offers[1];
+        let close = effects
+            .iter()
+            .rposition(|effect| matches!(effect, Effect::Rtc(RtcEffect::Close { .. })))
+            .unwrap();
+        assert!(retry < close, "the retry runs before the queued disconnect");
+        assert_eq!(
+            effects[close],
+            Effect::Rtc(RtcEffect::Close {
+                generation: retry_generation
+            })
+        );
+        assert_eq!(actor.driver.snapshot().desired_revision, 3);
+        assert!(actor.desired.connected);
     }
 
     #[test]

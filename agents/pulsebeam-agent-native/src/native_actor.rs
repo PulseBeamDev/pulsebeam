@@ -402,6 +402,7 @@ impl Agent {
             http_tx,
             http_rx,
             timers: BTreeMap::new(),
+            core_wake: None,
             close_waiters: Vec::new(),
             next_playout: None,
             next_stats: None,
@@ -813,6 +814,7 @@ where
     http_tx: mpsc::Sender<HttpCompletion>,
     http_rx: mpsc::Receiver<HttpCompletion>,
     timers: BTreeMap<TimerId, Instant>,
+    core_wake: Option<TimerId>,
     close_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
     next_playout: Option<Instant>,
     next_stats: Option<Instant>,
@@ -842,12 +844,10 @@ where
             self.progress_observations();
             self.drain_effects();
             self.publish().await;
-            if more {
-                tokio::task::yield_now().await;
-                continue;
-            }
+            let woke = self.wake_core();
             let timer = self.timers.values().copied().min();
             tokio::select! {
+                _ = tokio::task::yield_now(), if more || woke => {},
                 _ = self.abort.wait() => break,
                 _ = self.leases_changed.notified() => {},
                 _ = std::future::poll_fn(|cx| match self.peer.as_mut() { Some(peer) => peer.poll_ready(cx), None => std::task::Poll::Pending }) => {},
@@ -883,6 +883,35 @@ where
             }
         }
         self.shutdown();
+    }
+
+    fn wake_core(&mut self) -> bool {
+        if let Some(timer) = self.core_wake.take() {
+            self.accept(HostEvent::Timer(TimerEvent::Fired { timer }));
+            self.drain_effects();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn timer_effect(&mut self, effect: TimerEffect) {
+        match effect {
+            TimerEffect::Schedule { timer, after } if after.is_zero() => {
+                self.core_wake = Some(timer);
+            }
+            TimerEffect::Schedule { timer, after } => {
+                if let Some(at) = self.later(after) {
+                    self.timers.insert(timer, at);
+                }
+            }
+            TimerEffect::Cancel { timer } => {
+                if self.core_wake == Some(timer) {
+                    self.core_wake = None;
+                }
+                self.timers.remove(&timer);
+            }
+        }
     }
 
     fn accept(&mut self, event: HostEvent) {
@@ -1487,14 +1516,7 @@ where
                     }
                 }
                 Effect::Http(effect) => self.http_effect(effect),
-                Effect::Timer(TimerEffect::Schedule { timer, after }) => {
-                    if let Some(at) = self.later(after) {
-                        self.timers.insert(timer, at);
-                    }
-                }
-                Effect::Timer(TimerEffect::Cancel { timer }) => {
-                    self.timers.remove(&timer);
-                }
+                Effect::Timer(effect) => self.timer_effect(effect),
             }
         }
     }
@@ -1863,6 +1885,7 @@ where
             task.abort();
         }
         self.timers.clear();
+        self.core_wake = None;
         self.retire_peer();
         for waiter in self.close_waiters.drain(..) {
             let _ = waiter.send(Err(Error::Closed));
@@ -1950,6 +1973,69 @@ mod tests {
             retry: agent_core::RetryPolicy::default(),
             log_level: agent_core::LogLevel::default(),
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_timer_is_actor_owned_cancelled_and_fired_once() {
+        let mut core = agent_core::Agent::new(config().session).unwrap();
+        core.command(AgentCommand::ReplaceDesired(agent_core::DesiredState {
+            revision: 1,
+            connected: true,
+            ..Default::default()
+        }))
+        .unwrap();
+        let effect = core.next_effect().unwrap();
+        let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = effect else {
+            panic!("expected offer, got {effect:?}");
+        };
+        core.handle(HostEvent::Rtc(RtcEvent::Failed {
+            generation,
+            message: "offline".into(),
+        }))
+        .unwrap();
+        let timer = std::iter::from_fn(|| core.next_effect())
+            .find_map(|effect| match effect {
+                Effect::Timer(TimerEffect::Schedule { timer, .. }) => Some(timer),
+                _ => None,
+            })
+            .unwrap();
+        let (_agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(reqwest::Client::new())),
+            || Ok((rtc::ThreadedRuntime, ())),
+        )
+        .unwrap();
+        let start = Instant::now();
+        actor.timer_effect(TimerEffect::Schedule {
+            timer,
+            after: Duration::ZERO,
+        });
+        assert!(actor.timers.is_empty());
+        actor.timer_effect(TimerEffect::Cancel { timer });
+        assert!(!actor.wake_core());
+        actor.timer_effect(TimerEffect::Schedule {
+            timer,
+            after: Duration::ZERO,
+        });
+        assert!(actor.wake_core()); // stale for this Core instance
+        assert!(!actor.wake_core());
+        assert_eq!(Instant::now(), start);
+        actor.timer_effect(TimerEffect::Schedule {
+            timer,
+            after: Duration::from_secs(1),
+        });
+        assert_eq!(
+            actor.timers.get(&timer),
+            Some(&(start + Duration::from_secs(1)))
+        );
+        actor.timer_effect(TimerEffect::Cancel { timer });
+        assert!(actor.timers.is_empty());
+        actor.timer_effect(TimerEffect::Schedule {
+            timer,
+            after: Duration::ZERO,
+        });
+        actor.shutdown();
+        assert!(!actor.wake_core());
     }
 
     // No connect intent is submitted here, so no SDK graph or network witness
