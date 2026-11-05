@@ -19,8 +19,8 @@ use pulsebeam_core::auth::{
     KeyRegistry, TokenError, VerifiedAuthorization, verify_participant_token,
 };
 use pulsebeam_queue::TrySendError;
+use pulsebeam_runtime::time::Instant;
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -409,7 +409,7 @@ async fn create_native(
     let lease = controller::AuthorizationLease::from_expiry(
         authorization.expiry,
         wall_now,
-        tokio::time::Instant::now(),
+        pulsebeam_runtime::time::Instant::now(),
     )?;
     lease.native_expiry()?;
     let connection_id = ConnectionId::new();
@@ -425,7 +425,7 @@ async fn create_native(
         profile: ConnectionProfile::Native,
         rtp_capabilities: Some(rtp_capabilities.clone()),
     };
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let (reply_tx, reply_rx) = pulsebeam_runtime::sync::oneshot::channel();
     state
         .controller
         .try_send(
@@ -540,7 +540,7 @@ async fn patch_native(
     to_bytes(request.into_body(), 0).await.map_err(|_| {
         ApiError::BadRequest("native grant replacement requires an empty body".to_owned())
     })?;
-    let (send, receive) = tokio::sync::oneshot::channel();
+    let (send, receive) = pulsebeam_runtime::sync::oneshot::channel();
     state
         .controller
         .try_send(
@@ -587,7 +587,7 @@ async fn delete_native(
         .as_secs();
     let authorization = verify_bearer(&headers, &state.key_registry, now)?;
     let connection_id = connection_id.parse().map_err(|_| ApiError::NotFound)?;
-    let (send, receive) = tokio::sync::oneshot::channel();
+    let (send, receive) = pulsebeam_runtime::sync::oneshot::channel();
     state
         .controller
         .try_send(
@@ -634,10 +634,10 @@ async fn create_sdp_profile(
     let lease = controller::AuthorizationLease::from_expiry(
         authorization.expiry,
         wall_now,
-        tokio::time::Instant::now(),
+        pulsebeam_runtime::time::Instant::now(),
     )?;
     let connection_id = ConnectionId::new();
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let (reply_tx, reply_rx) = pulsebeam_runtime::sync::oneshot::channel();
     state
         .controller
         .try_send(
@@ -1160,7 +1160,7 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn native_post_returns_claim_identity_answer_and_absolute_location() {
         let (controller, mut commands) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(4).unwrap() });
@@ -1180,7 +1180,7 @@ mod tests {
             u64::MAX,
         )
         .unwrap();
-        let rejected = tokio::select! {
+        let rejected = pulsebeam_runtime::select! {
             response = app.clone().oneshot(native_post(&unrepresentable, body.clone())) => {
                 response.unwrap()
             }
@@ -1189,7 +1189,7 @@ mod tests {
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
         assert!(commands.try_recv().is_err());
 
-        let responder = tokio::spawn(async move {
+        let responder = pulsebeam_runtime::task::spawn(async move {
             let controller::ControllerCommand::CreateParticipant(message, reply) =
                 commands.recv().await.unwrap()
             else {
@@ -1240,7 +1240,7 @@ mod tests {
         responder.await.unwrap();
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn malformed_offer_is_a_negotiation_error_response() {
         let (controller, mut commands) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
@@ -1250,7 +1250,7 @@ mod tests {
             &serde_json::json!({"profile": "pulsebeam.media.v1", "offer": offer}),
         )
         .unwrap();
-        let responder = tokio::spawn(async move {
+        let responder = pulsebeam_runtime::task::spawn(async move {
             let controller::ControllerCommand::CreateParticipant(message, reply) =
                 commands.recv().await.unwrap()
             else {
@@ -1287,7 +1287,7 @@ mod tests {
         responder.await.unwrap();
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn native_post_rejects_malformed_contract_before_controller_allocation() {
         let token = live_token();
         let cases = [
@@ -1340,7 +1340,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn native_patch_requires_exact_precondition_and_empty_body() {
         let (controller, mut commands) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
@@ -1403,7 +1403,7 @@ mod tests {
                 .as_secs(),
         )
         .unwrap();
-        let responder = tokio::spawn(async move {
+        let responder = pulsebeam_runtime::task::spawn(async move {
             for result in [
                 Ok(2),
                 Err(controller::ControllerError::AuthorizationPrecondition { revision: 2 }),
@@ -1461,7 +1461,7 @@ mod tests {
         assert_eq!(grant_precondition(&headers).unwrap(), u64::MAX);
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn native_delete_uses_claim_identity_profile_and_path_connection() {
         let (controller, mut commands) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
@@ -1475,7 +1475,7 @@ mod tests {
             .unwrap();
         let app = router(controller, cfg(), auth_registry());
         let response = app.oneshot(request);
-        tokio::pin!(response);
+        pulsebeam_runtime::pin!(response);
         assert!(
             futures_lite::future::poll_once(&mut response)
                 .await
@@ -1511,7 +1511,7 @@ mod tests {
         assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn strict_sdp_posts_return_raw_answers_and_opaque_locations() {
         for (resource, direction, profile) in [
             ("whip", Direction::SendOnly, ConnectionProfile::Whip),
@@ -1523,7 +1523,7 @@ mod tests {
             let token = live_token();
             let offer = directional_offer(direction);
             let answer = offer.clone();
-            let responder = tokio::spawn(async move {
+            let responder = pulsebeam_runtime::task::spawn(async move {
                 let controller::ControllerCommand::CreateParticipant(message, reply) =
                     commands.recv().await.unwrap()
                 else {
@@ -1552,7 +1552,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn strict_sdp_posts_enforce_content_type_and_body_limit() {
         let token = live_token();
         let cases = [
@@ -1581,7 +1581,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn whip_and_whep_delete_use_claim_identity_path_and_profile() {
         for (resource, profile) in [
             ("whip", ConnectionProfile::Whip),
@@ -1760,7 +1760,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn authorization_failures_are_secret_safe_rfc_9457_responses() {
         let token = pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
@@ -1799,7 +1799,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn strict_profile_discovery_has_exact_methods_and_authentication() {
         let (controller, _) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
@@ -1930,7 +1930,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn router_serves_embedded_swagger_assets() {
         let (controller, _) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
@@ -1976,7 +1976,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn router_exposes_native_without_legacy_signaling_routes() {
         let (controller, _) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
@@ -2006,7 +2006,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn native_options_remains_available_through_cors() {
         let (controller, _) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });

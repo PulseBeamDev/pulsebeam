@@ -8,7 +8,7 @@ use pulsebeam_rtc::{
     NetworkProtocol, Output, RtpExtension, RtpWrite, SessionInfo, TransmitTarget,
 };
 use pulsebeam_runtime::net::RecvPacketBatch;
-use tokio::time::Instant;
+use pulsebeam_runtime::time::Instant;
 
 use crate::bitrate::Bitrate;
 use crate::entity::TrackId;

@@ -526,16 +526,16 @@ fn discovery_requires_real_immutable_descriptors_and_does_not_delay_initial_gran
     ));
 }
 
-#[tokio::test(start_paused = true)]
+#[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
 async fn unrelated_grant_churn_cannot_hide_a_stalled_selected_frame() {
     let mut session = session();
     let bytes = session.poll().unwrap().unwrap().bytes.clone();
     for revision in 2..=30 {
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        pulsebeam_runtime::time::advance(std::time::Duration::from_secs(1)).await;
         session.authorization(10000, revision).unwrap();
         assert_eq!(session.poll().unwrap().unwrap().bytes, bytes);
     }
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    pulsebeam_runtime::time::advance(std::time::Duration::from_secs(1)).await;
     assert!(matches!(session.poll(), Err(OutputError::ProgressExpired)));
 }
 

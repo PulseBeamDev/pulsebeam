@@ -97,7 +97,7 @@ struct Pending {
     selected: Vec<(Key, u64)>,
     initial_cursor: u64,
     initial_complete: bool,
-    deadline: tokio::time::Instant,
+    deadline: pulsebeam_runtime::time::Instant,
 }
 
 // Finite local retained-control work, not a stream-count or identity-history ceiling.
@@ -123,7 +123,7 @@ pub(crate) struct NativeSession {
     closed: bool,
     retained_bytes: usize,
     unavailable: usize,
-    initial_deadline: Option<tokio::time::Instant>,
+    initial_deadline: Option<pulsebeam_runtime::time::Instant>,
 }
 
 impl NativeSession {
@@ -878,7 +878,7 @@ impl NativeSession {
         self.initial_cursor
     }
 
-    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+    pub(crate) fn deadline(&self) -> Option<pulsebeam_runtime::time::Instant> {
         self.pending
             .as_ref()
             .map(|pending| pending.deadline)
@@ -890,7 +890,7 @@ impl NativeSession {
     pub(crate) fn poll(&mut self) -> Result<Option<&NativeOutput>, OutputError> {
         if self
             .deadline()
-            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            .is_some_and(|deadline| pulsebeam_runtime::time::Instant::now() >= deadline)
         {
             return Err(OutputError::ProgressExpired);
         }
@@ -1105,8 +1105,8 @@ impl NativeSession {
     }
 }
 
-fn progress_deadline() -> tokio::time::Instant {
-    let now = tokio::time::Instant::now();
+fn progress_deadline() -> pulsebeam_runtime::time::Instant {
+    let now = pulsebeam_runtime::time::Instant::now();
     now.checked_add(std::time::Duration::from_secs(30))
         .unwrap_or(now)
 }

@@ -22,8 +22,8 @@
 #![deny(clippy::arithmetic_side_effects)]
 
 use pulsebeam_runtime::net::ReceiveTime;
+use pulsebeam_runtime::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::Instant;
 
 /// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
 const NTP_UNIX_OFFSET_SECS: u64 = 2_208_988_800;
@@ -593,7 +593,7 @@ mod tests {
         assert_eq!(anchor.observe_execution(caught_up), forward_step);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn anchor_round_trips_instants() {
         let mono = Instant::now();
         let wall = UNIX_EPOCH + Duration::new(1_700_000_000, 0);

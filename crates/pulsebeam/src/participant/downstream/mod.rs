@@ -22,8 +22,8 @@ use ahash::{HashMap, HashMapExt};
 pub use audio::DownstreamAudio;
 pub(crate) use data::DownstreamData;
 use indexmap::IndexMap;
+use pulsebeam_runtime::time::Instant;
 use slotmap::SecondaryMap;
-use tokio::time::Instant;
 pub use video::DownstreamVideo;
 
 #[derive(Clone)]

@@ -2,7 +2,7 @@ use super::UpstreamMedia;
 use crate::media::Mid;
 use crate::rtp::sync::SenderInfo;
 use crate::{entity::TrackId, log::LogCtx, rtp::RtpPacket, track::UpstreamTrack};
-use tokio::time::Instant;
+use pulsebeam_runtime::time::Instant;
 
 pub(crate) struct UpstreamAudio {
     media: UpstreamMedia,

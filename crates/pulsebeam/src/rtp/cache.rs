@@ -637,8 +637,8 @@ mod test {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
+    use pulsebeam_runtime::time::Instant;
     use std::time::Duration;
-    use tokio::time::Instant;
 
     fn builder(style: ParameterSetStyle) -> H264StreamBuilder {
         H264StreamBuilder::new(1, 1000, 90_000, Instant::now()).with_parameter_sets(style)

@@ -12,8 +12,8 @@ use crate::clock::NtpTime;
 use crate::media::Ssrc;
 use crate::rtp::{Frequency, MediaTime, RtpPacket};
 use ahash::HashMap;
+use pulsebeam_runtime::time::Instant;
 use std::time::Duration;
-use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SenderInfo {

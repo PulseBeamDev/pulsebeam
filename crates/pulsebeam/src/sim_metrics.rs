@@ -16,10 +16,10 @@
 //! Thread-local storage isolates parallel simulations driven on separate threads.
 //! Compiled only under the `sim` feature.
 
+use pulsebeam_runtime::{sync::oneshot, time::Instant};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::{sync::oneshot, time::Instant};
 
 use crate::entity::ParticipantId;
 
@@ -105,7 +105,8 @@ pub async fn wait_controller_stall() {
     let request = CONTROLLER_STALL.with_borrow_mut(Option::take);
     if let Some(ControllerStall { until, begun }) = request {
         let _ = begun.send(());
-        tokio::time::sleep(until.saturating_duration_since(std::time::Instant::now())).await;
+        pulsebeam_runtime::time::sleep(until.saturating_duration_since(std::time::Instant::now()))
+            .await;
     }
 }
 

@@ -54,6 +54,21 @@ mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
 
+    #[crate::test(start_paused = true, crate = "crate::__harness")]
+    async fn facade_timers_share_the_paused_clock() {
+        let start = crate::time::Instant::now();
+        let (sender, receiver) = crate::sync::oneshot::channel();
+        crate::task::spawn(async move {
+            crate::time::sleep(crate::time::Duration::from_secs(2)).await;
+            sender.send(crate::time::Instant::now()).unwrap();
+        });
+        let observed = receiver.await.unwrap();
+        assert_eq!(
+            observed.duration_since(start),
+            crate::time::Duration::from_secs(2)
+        );
+    }
+
     #[test]
     fn local_future_completes_after_yielding() {
         let completed = Rc::new(Cell::new(false));

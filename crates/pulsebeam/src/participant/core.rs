@@ -7,8 +7,8 @@ use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use pulsebeam_proto::topic::TopicFrame;
 use pulsebeam_rtc::{DataChannelEvent, DataMessage, Event};
 use pulsebeam_runtime::net::{self};
+use pulsebeam_runtime::time::Instant;
 use std::time::Duration;
-use tokio::time::Instant;
 
 use crate::control::{NegotiatedResources, controller::ConnectionProfile};
 use crate::entity::{self, TrackId, TrackKind};

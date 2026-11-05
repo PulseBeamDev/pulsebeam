@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use pulsebeam_runtime::time::Instant;
 use slotmap::{SlotMap, new_key_type};
-use tokio::time::Instant;
 
 use crate::{
     entity::{ParticipantId, RoomId, TrackId, TrackKind},

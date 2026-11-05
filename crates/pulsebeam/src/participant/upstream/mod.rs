@@ -17,7 +17,7 @@ use crate::{
 use ahash::{HashMap, HashMapExt, HashSetExt};
 pub(crate) use audio::UpstreamAudio;
 pub(crate) use data::UpstreamData;
-use tokio::time::Instant;
+use pulsebeam_runtime::time::Instant;
 pub(crate) use video::UpstreamVideo;
 
 pub(crate) const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 32;

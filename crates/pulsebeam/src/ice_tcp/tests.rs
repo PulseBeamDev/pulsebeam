@@ -1,7 +1,7 @@
 use super::*;
 use crate::{id::ShardId, route::TransportRoute};
 #[cfg(feature = "sim")]
-use tokio::io::AsyncWriteExt;
+use pulsebeam_runtime::io::AsyncWriteExt;
 
 fn address(epoch: u16) -> NodeTransportAddress {
     NodeTransportAddress::new(TransportRoute::new(ShardId::new(0), 7), epoch)
@@ -76,7 +76,7 @@ fn first_stun_is_delivered_once_and_ack_fences_following_frames() {
         let route = flow.route;
         drop(first_stun);
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), inbox.receiver.recv())
+            pulsebeam_runtime::time::timeout(Duration::from_millis(1), inbox.receiver.recv())
                 .await
                 .is_err()
         );
@@ -88,7 +88,7 @@ fn first_stun_is_delivered_once_and_ack_fences_following_frames() {
         assert_eq!(packet.packet, b"next");
         drop(packet);
         // An idle authenticated flow is not a stalled partial frame.
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        pulsebeam_runtime::time::sleep(Duration::from_millis(120)).await;
         assert!(flow.is_open());
         assert!(flow.try_send(b"reply"));
         assert_eq!(&read.recv().await.unwrap().unwrap()[..], b"reply");
@@ -124,7 +124,7 @@ fn frame_quota_follows_deferred_input_and_egress_full_retires_flow() {
         let mut transport = crate::participant::transport::Transport::new(
             accepted,
             8,
-            tokio::time::Instant::now(),
+            pulsebeam_runtime::time::Instant::now(),
             #[cfg(feature = "sim")]
             tracing::Span::none(),
         );
@@ -136,7 +136,7 @@ fn frame_quota_follows_deferred_input_and_egress_full_retires_flow() {
                 .packet(route, b"overflow", ReceiveTime::now())
                 .is_err()
         );
-        transport.receive_pending(tokio::time::Instant::now());
+        transport.receive_pending(pulsebeam_runtime::time::Instant::now());
         assert!(
             sender
                 .packet(route, b"released", ReceiveTime::now())

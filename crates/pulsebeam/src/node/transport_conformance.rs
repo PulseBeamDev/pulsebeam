@@ -9,10 +9,10 @@ use pulsebeam_agent_native::{
     Agent, AgentEvent, AsyncHttpClient, Config, Host, NativeStatistics, ObservationStream,
     StreamUpdate,
 };
+use pulsebeam_runtime::sync::watch;
 use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
 
 const CONNECT: Duration = Duration::from_secs(30);
 const DELIVERY: Duration = Duration::from_secs(30);
@@ -333,7 +333,7 @@ async fn ready(
         {
             return Ok(pair);
         }
-        tokio::select! {
+        pulsebeam_runtime::select! {
             result = snapshots.changed() => { result.context("SDK snapshots closed before readiness")?; }
             result = statistics.changed() => { result.context("SDK statistics closed before selected-pair evidence")?; }
         }
@@ -426,9 +426,9 @@ fn config(endpoint: &str, participant: &str) -> Result<Config> {
 async fn witness(a: &Agent, b: &Agent, port: u16, protocol: Protocol) -> Result<()> {
     let events_a = a.events();
     let events_b = b.events();
-    let (pair_a, pair_b) = tokio::time::timeout(CONNECT, async {
-        tokio::try_join!(a.replace_desired(desired()), b.replace_desired(desired()))?;
-        tokio::try_join!(ready(a, Family::V4.address(port), None, protocol), ready(b, Family::V6.address(port), None, protocol))
+    let (pair_a, pair_b) = pulsebeam_runtime::time::timeout(CONNECT, async {
+        pulsebeam_runtime::try_join!(a.replace_desired(desired()), b.replace_desired(desired()))?;
+        pulsebeam_runtime::try_join!(ready(a, Family::V4.address(port), None, protocol), ready(b, Family::V6.address(port), None, protocol))
     }).await.context("FAILED: 30s dual-stack connection/topic/selected-pair evidence deadline; require IPv4/IPv6 loopback and compatible native candidates")??;
     tracing::info!(
         ?protocol,
@@ -442,8 +442,8 @@ async fn witness(a: &Agent, b: &Agent, port: u16, protocol: Protocol) -> Result<
         .snapshot()
         .participant_external_id
         .context("IPv6 external participant identity missing")?;
-    tokio::time::timeout(DELIVERY, async {
-        tokio::try_join!(
+    pulsebeam_runtime::time::timeout(DELIVERY, async {
+        pulsebeam_runtime::try_join!(
             a.send_topic(TopicSend {
                 publisher: publisher(),
                 payload: A_TO_B.to_vec()
@@ -453,12 +453,12 @@ async fn witness(a: &Agent, b: &Agent, port: u16, protocol: Protocol) -> Result<
                 payload: B_TO_A.to_vec()
             }),
         )?;
-        tokio::try_join!(
+        pulsebeam_runtime::try_join!(
             received(&events_b, &sender_a, A_TO_B),
             received(&events_a, &sender_b, B_TO_A)
         )?;
         tracing::info!("EXERCISED both recipient application payloads");
-        tokio::try_join!(
+        pulsebeam_runtime::try_join!(
             ready(a, pair_a.remote, Some(&pair_a), protocol),
             ready(b, pair_b.remote, Some(&pair_b), protocol)
         )?;
@@ -517,8 +517,11 @@ async fn run(protocol: Protocol) -> Result<()> {
     };
     let advertised = builder.advertised_udp_addrs()?;
     let shutdown = CancellationToken::new();
-    let mut node =
-        tokio::task::spawn_local(builder.run_bound(sockets, advertised, shutdown.clone()));
+    let mut node = pulsebeam_runtime::task::spawn_local(builder.run_bound(
+        sockets,
+        advertised,
+        shutdown.clone(),
+    ));
     let mut node_observed = false;
     let mut agents = Vec::new();
     let mut answers = Vec::new();
@@ -541,7 +544,7 @@ async fn run(protocol: Protocol) -> Result<()> {
         }
         let a = agents.first().context("IPv4 agent missing")?;
         let b = agents.get(1).context("IPv6 agent missing")?;
-        tokio::select! {
+        pulsebeam_runtime::select! {
             result = witness(a, b, port, protocol) => result?,
             result = &mut node => {
                 node_observed = true;
@@ -562,7 +565,7 @@ async fn run(protocol: Protocol) -> Result<()> {
         anyhow::Ok(())
     }
     .await;
-    let cleanup = tokio::time::timeout(CLEANUP, async {
+    let cleanup = pulsebeam_runtime::time::timeout(CLEANUP, async {
         let closed = futures_lite::future::zip(
             async {
                 if let Some(a) = agents.first() {
@@ -597,7 +600,7 @@ async fn run(protocol: Protocol) -> Result<()> {
     if !matches!(&cleanup, Ok(Ok(()))) {
         shutdown.cancel();
         node.abort();
-        let _ = tokio::time::timeout(CLEANUP, async {
+        let _ = pulsebeam_runtime::time::timeout(CLEANUP, async {
             for agent in &agents {
                 let _ = agent.abort().await;
             }
@@ -610,16 +613,16 @@ async fn run(protocol: Protocol) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
 async fn concurrent_dual_stack_sdk_payloads() -> Result<()> {
-    tokio::task::LocalSet::new()
+    pulsebeam_runtime::task::LocalSet::new()
         .run_until(run(Protocol::Udp))
         .await
 }
 
-#[tokio::test]
+#[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
 async fn concurrent_dual_stack_tcp_sdk_payloads() -> Result<()> {
-    tokio::task::LocalSet::new()
+    pulsebeam_runtime::task::LocalSet::new()
         .run_until(run(Protocol::Tcp))
         .await
 }

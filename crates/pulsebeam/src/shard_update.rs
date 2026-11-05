@@ -130,7 +130,7 @@ pub(crate) struct ShardUpdate {
     pub participant_effects: Vec<(ParticipantId, crate::participant::ParticipantEffect)>,
     pub lifecycle: Vec<ShardUpdateOp>,
     pub plans: Vec<TrackPlanUpdate>,
-    pub cutoff_ack: Option<tokio::sync::oneshot::Sender<()>>,
+    pub cutoff_ack: Option<pulsebeam_runtime::sync::oneshot::Sender<()>>,
 }
 
 impl ShardUpdate {
@@ -172,14 +172,17 @@ impl ShardUpdateWriter {
         self.closed
     }
 
-    pub(crate) fn stage_cutoff(&mut self, generation: u64) -> tokio::sync::oneshot::Receiver<()> {
+    pub(crate) fn stage_cutoff(
+        &mut self,
+        generation: u64,
+    ) -> pulsebeam_runtime::sync::oneshot::Receiver<()> {
         let commit = self
             .staged
             .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
         if commit.generation != generation || commit.cutoff_ack.is_some() {
             pulsebeam_runtime::fatal!("a cutoff fence must have its own shard generation");
         }
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = pulsebeam_runtime::sync::oneshot::channel();
         commit.cutoff_ack = Some(tx);
         rx
     }
@@ -394,7 +397,7 @@ mod tests {
         assert_eq!(writer.publish(), None);
         assert!(matches!(
             cutoff.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            Err(pulsebeam_runtime::sync::oneshot::error::TryRecvError::Empty)
         ));
         for expected in 1..=crate::shard::worker::SHARD_UPDATE_CAPACITY as u64 {
             assert_eq!(rx.try_recv().unwrap().generation, expected);
@@ -409,7 +412,7 @@ mod tests {
         assert_eq!(fence.generation, fence_generation);
         assert!(matches!(
             cutoff.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            Err(pulsebeam_runtime::sync::oneshot::error::TryRecvError::Empty)
         ));
         fence.cutoff_ack.take().unwrap().send(()).unwrap();
         assert_eq!(cutoff.try_recv(), Ok(()));

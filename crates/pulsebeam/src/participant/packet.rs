@@ -34,8 +34,8 @@ pub struct RoutedTrackPacket {
 impl RoutedTrackPacket {
     pub fn set_remote_timing(
         &mut self,
-        playout: tokio::time::Instant,
-        arrival: tokio::time::Instant,
+        playout: pulsebeam_runtime::time::Instant,
+        arrival: pulsebeam_runtime::time::Instant,
     ) {
         if let TrackPacket::Rtp(packet) = &mut self.packet {
             packet.playout_time = playout;

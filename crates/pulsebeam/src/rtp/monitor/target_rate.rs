@@ -1,5 +1,5 @@
 use super::{MAX_LADDER_TARGETS, RATE_FALL_TIME_CONSTANT, RateFilter};
-use tokio::time::Instant;
+use pulsebeam_runtime::time::Instant;
 
 /// Payload costs, in the same units as the stream estimator. A complete reactive
 /// fall interval avoids treating an individual keyframe as a sustained rate.

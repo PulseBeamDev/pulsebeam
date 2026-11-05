@@ -1,7 +1,7 @@
 use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::net;
+use pulsebeam_runtime::time::Instant;
 use slotmap::SecondaryMap;
-use tokio::time::Instant;
 
 use crate::clock::WallAnchor;
 use crate::route::{Envelope, NodeTransportAddress};
@@ -939,7 +939,7 @@ mod wrong_owner_tests {
     /// The compatibility entry point has no transport for forwarding, so a
     /// foreign datagram is counted and discarded. Workers use
     /// `on_udp_batch_routed`, which forwards the same datagram to its owner.
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn a_datagram_for_another_shard_is_dropped_not_asserted() {
         let shard = ShardId::new(0);
         let (_writer, update_rx) = crate::shard_update::new_shard_update(shard);
@@ -984,7 +984,7 @@ mod wrong_owner_tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn a_datagram_for_another_shard_is_forwarded_to_its_owner() {
         let shard = ShardId::new(0);
         let (_writer, update_rx) = crate::shard_update::new_shard_update(shard);
@@ -1023,7 +1023,7 @@ mod wrong_owner_tests {
         assert!(matches!(frame, ShardFrame::Ingress { source_shard, .. } if source_shard == shard));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn a_view_delta_is_applied_as_one_consistent_state_transition() {
         let shard = ShardId::new(0);
         let (mut writer, update_rx) = crate::shard_update::new_shard_update(shard);
@@ -1074,7 +1074,7 @@ mod wrong_owner_tests {
         let host_ip = pulsebeam_runtime::testing::test_host_ip("192.168.250.13");
         pulsebeam_runtime::testing::run_local(host_ip, async move {
             #[cfg(not(feature = "sim"))]
-            tokio::time::pause();
+            pulsebeam_runtime::time::pause();
 
             let owner = ShardId::new(2);
             let (_writer, update_rx) = crate::shard_update::new_shard_update(owner);
@@ -1095,7 +1095,7 @@ mod wrong_owner_tests {
             );
             let address = NodeTransportAddress::new(TransportRoute::new(owner, 51), 7);
             let materialize = |core: &mut ShardCore| {
-                let (ack, received) = tokio::sync::oneshot::channel();
+                let (ack, received) = pulsebeam_runtime::sync::oneshot::channel();
                 core.on_command(
                     ShardCommand::MaterializeParticipant {
                         transport: address,
@@ -1171,7 +1171,7 @@ mod wrong_owner_tests {
         let host_ip = pulsebeam_runtime::testing::test_host_ip("192.168.250.12");
         pulsebeam_runtime::testing::run_local(host_ip, async move {
             #[cfg(not(feature = "sim"))]
-            tokio::time::pause();
+            pulsebeam_runtime::time::pause();
 
             let shard = ShardId::new(0);
             let (mut writer, update_rx) = crate::shard_update::new_shard_update(shard);
@@ -1202,7 +1202,7 @@ mod wrong_owner_tests {
                 resources: crate::control::NegotiatedResources::empty_for_test(),
             };
             let materialize = |core: &mut ShardCore, address, config| {
-                let (ack, received) = tokio::sync::oneshot::channel();
+                let (ack, received) = pulsebeam_runtime::sync::oneshot::channel();
                 core.on_command(
                     ShardCommand::MaterializeParticipant {
                         transport: address,
@@ -1286,7 +1286,7 @@ mod wrong_owner_tests {
             );
             writer.publish();
             let turn_started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            pulsebeam_runtime::time::sleep(Duration::from_millis(50)).await;
             assert_eq!(core.apply_updates(1), 1);
             let new_handle = core.execution.registry.resolve(&participant).unwrap();
             assert_ne!(new_handle, old_handle);
@@ -1341,7 +1341,7 @@ mod wrong_owner_tests {
     }
 
     #[cfg(debug_assertions)]
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     #[should_panic(expected = "track plan removal must precede runtime retirement")]
     async fn runtime_retirement_rejects_a_live_plan() {
         let shard = ShardId::new(0);
@@ -1368,7 +1368,7 @@ mod wrong_owner_tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn route_retirement_waits_for_the_bounded_plan_cursor() {
         let shard = ShardId::new(0);
         let (mut writer, update_rx) = crate::shard_update::new_shard_update(shard);
@@ -1425,14 +1425,14 @@ mod wrong_owner_tests {
         assert!(core.execution.runtime.routes.resolve(route).is_some());
         assert!(matches!(
             cutoff.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            Err(pulsebeam_runtime::sync::oneshot::error::TryRecvError::Empty)
         ));
 
         assert_eq!(core.apply_updates(1), 1);
         assert!(core.execution.runtime.routes.resolve(route).is_none());
         assert!(matches!(
             cutoff.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            Err(pulsebeam_runtime::sync::oneshot::error::TryRecvError::Empty)
         ));
         assert_eq!(core.apply_updates(1), 1);
         assert_eq!(cutoff.await, Ok(()));

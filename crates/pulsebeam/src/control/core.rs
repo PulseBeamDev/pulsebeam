@@ -1,4 +1,4 @@
-use tokio::time::Instant;
+use pulsebeam_runtime::time::Instant;
 
 use crate::{
     control::{

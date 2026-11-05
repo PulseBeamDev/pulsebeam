@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 
 use pulsebeam_queue as mailbox;
-use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
+use pulsebeam_runtime::sync::CancellationToken;
+use pulsebeam_runtime::sync::oneshot;
 
 use crate::id::ShardId;
 use crate::shard::recorder::{
@@ -339,7 +339,7 @@ pub(crate) async fn run(
     let mut aggregator = StatsAggregator::new(shard_count);
 
     loop {
-        tokio::select! {
+        pulsebeam_runtime::select! {
             report = stats_rx.recv() => match report {
                 Some(report) => aggregator.absorb(*report),
                 None => break,

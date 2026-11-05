@@ -6,8 +6,8 @@
 //! allocator sizes the ladder to it.
 
 use crate::bitrate::Bitrate;
+use pulsebeam_runtime::time::Instant;
 use std::time::Duration;
-use tokio::time::Instant;
 
 use crate::entity::TrackKind;
 use crate::rtp::RtpPacket;
@@ -887,8 +887,8 @@ mod test {
     use super::*;
     use crate::rtp::{Frequency, MediaTime};
     use more_asserts::{assert_ge, assert_le};
+    use pulsebeam_runtime::time::Instant;
     use std::time::Duration;
-    use tokio::time::Instant;
 
     fn packet(seq: u64, arrival_ts: Instant) -> RtpPacket {
         RtpPacket {

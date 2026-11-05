@@ -18,13 +18,13 @@ pub mod timeline;
 pub mod conformance;
 
 use crate::media::{Rid, SeqNo, Ssrc};
+use pulsebeam_runtime::time::Instant;
 #[allow(
     clippy::disallowed_types,
     reason = "immutable payload snapshots stay shard-local; transit copies storage"
 )]
 use std::sync::Arc;
 pub use time::{Frequency, MediaTime};
-use tokio::time::Instant;
 
 use crate::entity::{ParticipantId, TrackId};
 

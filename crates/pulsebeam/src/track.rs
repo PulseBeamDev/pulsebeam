@@ -22,7 +22,7 @@ use crate::rtp::{
 };
 pub use data_track::*;
 pub use pulsebeam_core::simulcast::LayerQuality;
-use tokio::time::Instant;
+use pulsebeam_runtime::time::Instant;
 
 /// A prepared encoding selector, scoped to one track. SSRC lanes do not invent
 /// wire RIDs; the real optional RID remains transport metadata.

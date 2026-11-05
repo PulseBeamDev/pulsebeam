@@ -8,9 +8,9 @@
 use crate::media::SeqNo;
 use crate::rtp::{Frequency, MediaTime};
 use ahash::HashMap;
+use pulsebeam_runtime::time::Instant;
 use std::collections::BTreeSet;
 use std::time::Duration;
-use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::rtp::RtpPacket;
@@ -647,7 +647,7 @@ mod test {
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
 
     use crate::media::Rid;
-    use tokio::time::Instant;
+    use pulsebeam_runtime::time::Instant;
 
     /// Two distinct streams (two simulcast layers of one track) to switch between.
     fn two_streams() -> (StreamId, StreamId) {

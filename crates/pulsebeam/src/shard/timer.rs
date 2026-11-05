@@ -1,6 +1,6 @@
+use pulsebeam_runtime::time::Instant;
 use slotmap::SecondaryMap;
 use std::time::Duration;
-use tokio::time::Instant;
 
 use super::participants::ParticipantHandle;
 

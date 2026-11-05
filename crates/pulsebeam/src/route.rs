@@ -17,8 +17,8 @@
 //! the correct answer.
 #![deny(clippy::arithmetic_side_effects)]
 
+use pulsebeam_runtime::time::{Duration, Instant};
 use std::collections::VecDeque;
-use tokio::time::{Duration, Instant};
 
 use crate::clock::{NtpExpander, NtpTime};
 use crate::id::ShardId;
@@ -792,7 +792,7 @@ mod tests {
     /// resolving with no error anywhere — a control-plane bug becoming silent
     /// media loss. The allocator refuses the duplicate; in a build with
     /// assertions on it aborts instead, because a caller doing this is broken.
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     #[should_panic(expected = "already quarantined")]
     async fn a_double_retire_is_refused() {
         let mut alloc = SlotAllocator::with_max_slots(ShardId::new(0), 8);
@@ -804,13 +804,13 @@ mod tests {
 
     /// The ordinary path the guard must not disturb: retire, wait out the
     /// quarantine, and the slot comes back exactly once with a fresh epoch.
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn a_retired_slot_returns_once_with_a_new_epoch() {
         let mut alloc = SlotAllocator::with_max_slots(ShardId::new(0), 8);
         let (slot, first_epoch) = alloc.allocate(Instant::now());
         alloc.retire(slot, Instant::now());
 
-        tokio::time::advance(ROUTE_QUARANTINE).await;
+        pulsebeam_runtime::time::advance(ROUTE_QUARANTINE).await;
         let (reused, second_epoch) = alloc.allocate(Instant::now());
         assert_eq!(reused, slot);
         assert_ne!(first_epoch, second_epoch);
@@ -1016,7 +1016,7 @@ mod tests {
 
     /// An address handed out for a shard must carry that shard, so a
     /// misdelivered packet is recognised by reading its high bits alone.
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn an_allocated_route_carries_the_shard_it_was_allocated_for() {
         let mut allocator = alloc(41);
         let (slot, _) = allocator.allocate(Instant::now());
@@ -1026,7 +1026,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     #[should_panic(expected = "route table exhausted")]
     async fn an_allocator_at_its_cap_crashes() {
         let mut allocator = SlotAllocator::with_max_slots(ShardId::new(0), 2);
@@ -1041,21 +1041,21 @@ mod tests {
     /// A slot only comes back once no datagram addressed to its previous
     /// incarnation could still be in flight, and it comes back as a new
     /// epoch so the old address cannot reach the new tenant.
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn a_recycled_slot_comes_back_under_a_new_epoch() {
         let mut allocator = alloc(0);
         let now = Instant::now();
         let (slot, epoch) = allocator.allocate(now);
         allocator.retire(slot, now);
 
-        tokio::time::advance(ROUTE_QUARANTINE).await;
+        pulsebeam_runtime::time::advance(ROUTE_QUARANTINE).await;
         let (reused, reused_epoch) = allocator.allocate(Instant::now());
 
         assert_eq!(reused, slot, "the slot should be reused after quarantine");
         assert_ne!(reused_epoch, epoch, "but as a new incarnation");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn a_slot_is_not_reused_inside_its_quarantine() {
         let mut allocator = alloc(0);
         let now = Instant::now();
@@ -1069,7 +1069,7 @@ mod tests {
     /// The accounting behind a route is epoch-checked the same way its
     /// resolution is: a frame for a superseded incarnation must not fold into
     /// the counters of the one that replaced it.
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn accounting_is_scoped_to_one_incarnation() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         runtime.install(address(0, 0, 1), NtpTime::ZERO);
@@ -1085,7 +1085,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn same_epoch_action_updates_preserve_packet_accounting() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let route = address(0, 0, 7);
@@ -1121,7 +1121,7 @@ mod tests {
         assert_eq!(entry.expander.reference(), expander_before.reference());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn reverse_deduplication_expires_without_retaining_payloads() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let route = address(0, 0, 7);
@@ -1136,11 +1136,11 @@ mod tests {
 
         assert!(runtime.accept_reverse(route, packet.dedup(), now));
         assert!(!runtime.accept_reverse(route, packet.dedup(), now));
-        tokio::time::advance(Duration::from_millis(101)).await;
+        pulsebeam_runtime::time::advance(Duration::from_millis(101)).await;
         assert!(runtime.accept_reverse(route, packet.dedup(), Instant::now()));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn stale_reverse_packets_do_not_poison_a_replacement_route() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let old = address(0, 0, 7);
@@ -1163,7 +1163,7 @@ mod tests {
         assert!(!runtime.accept_reverse(replacement, packet.dedup(), now));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     #[should_panic(expected = "a reverse envelope must resolve to a reverse route")]
     async fn reverse_packets_must_not_target_a_live_forward_route() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
@@ -1178,7 +1178,7 @@ mod tests {
         runtime.accept_reverse(route, packet.dedup(), Instant::now());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn a_new_epoch_restarts_packet_accounting() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let old = address(0, 0, 7);
@@ -1204,7 +1204,7 @@ mod tests {
         assert!(runtime.entry(old).is_none());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn retiring_accounting_is_idempotent_and_epoch_checked() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         runtime.install(address(0, 0, 4), NtpTime::ZERO);
@@ -1223,7 +1223,7 @@ mod tests {
         assert_eq!(runtime.len(), 0);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn link_seq_detects_loss_duplication_and_reorder() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let route = address(0, 0, 0);
@@ -1326,7 +1326,7 @@ mod tests {
     /// route instead worked only on shard 0, where the shard bits are zero —
     /// on any other shard the queue held a number far outside the namespace
     /// and the slot never came back.
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn a_slot_returns_from_quarantine_on_a_shard_other_than_zero() {
         for shard in [0usize, 1, 41] {
             let mut allocator = alloc(shard);
@@ -1334,7 +1334,7 @@ mod tests {
             let (slot, epoch) = allocator.allocate(now);
             allocator.retire(slot, now);
 
-            tokio::time::advance(ROUTE_QUARANTINE).await;
+            pulsebeam_runtime::time::advance(ROUTE_QUARANTINE).await;
             let (reused, reused_epoch) = allocator.allocate(Instant::now());
 
             assert_eq!(reused, slot, "shard {shard}: the slot must come back");

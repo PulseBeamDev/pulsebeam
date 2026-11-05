@@ -28,8 +28,8 @@ use pulsebeam_core::auth::{
 };
 use pulsebeam_queue as mailbox;
 use pulsebeam_rtc::LocalCandidate;
-use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
+use pulsebeam_runtime::sync::CancellationToken;
+use pulsebeam_runtime::sync::oneshot;
 
 #[derive(Debug, Clone)]
 pub struct ParticipantState {
@@ -56,7 +56,7 @@ const AUTHORIZATION_TIMER_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorizationLease {
     expiry: AuthorizationExpiry,
-    deadline: tokio::time::Instant,
+    deadline: pulsebeam_runtime::time::Instant,
     revision: u64,
 }
 
@@ -64,7 +64,7 @@ impl AuthorizationLease {
     pub fn from_expiry(
         expiry: AuthorizationExpiry,
         wall_now: SystemTime,
-        runtime_now: tokio::time::Instant,
+        runtime_now: pulsebeam_runtime::time::Instant,
     ) -> Result<Self, TokenError> {
         let unix_now = wall_now
             .duration_since(UNIX_EPOCH)
@@ -93,7 +93,7 @@ impl AuthorizationLease {
     fn refresh_at(
         self,
         wall_now: SystemTime,
-        runtime_now: tokio::time::Instant,
+        runtime_now: pulsebeam_runtime::time::Instant,
     ) -> Result<Self, TokenError> {
         let refreshed = Self::from_expiry(self.expiry, wall_now, runtime_now)?;
         Ok(Self {
@@ -110,7 +110,7 @@ impl AuthorizationLease {
         self,
         expiry: AuthorizationExpiry,
         wall_now: SystemTime,
-        runtime_now: tokio::time::Instant,
+        runtime_now: pulsebeam_runtime::time::Instant,
     ) -> Result<Self, ControllerError> {
         let mut next = Self::from_expiry(expiry, wall_now, runtime_now)
             .map_err(|_| ControllerError::AuthorizationExpired)?;
@@ -121,7 +121,7 @@ impl AuthorizationLease {
         Ok(next)
     }
 
-    pub(crate) fn deadline(self) -> tokio::time::Instant {
+    pub(crate) fn deadline(self) -> pulsebeam_runtime::time::Instant {
         self.deadline
     }
 
@@ -136,7 +136,7 @@ impl AuthorizationLease {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct AuthorizationExpiryWork {
-    deadline: tokio::time::Instant,
+    deadline: pulsebeam_runtime::time::Instant,
     participant_id: ParticipantId,
     connection_id: ConnectionId,
 }
@@ -307,11 +307,11 @@ pub struct ControllerActor {
     command_backlog: VecDeque<(ShardId, ShardCommand)>,
     authorization_expiries: BTreeSet<AuthorizationExpiryWork>,
     key_registry: Option<KeyRegistry>,
-    renewal_tx: tokio::sync::mpsc::Sender<RenewalResult>,
-    renewal_rx: tokio::sync::mpsc::Receiver<RenewalResult>,
+    renewal_tx: pulsebeam_runtime::sync::mpsc::Sender<RenewalResult>,
+    renewal_rx: pulsebeam_runtime::sync::mpsc::Receiver<RenewalResult>,
     renewals_inflight: usize,
-    deletion_tx: tokio::sync::mpsc::Sender<NativeDeletionCompletion>,
-    deletion_rx: tokio::sync::mpsc::Receiver<NativeDeletionCompletion>,
+    deletion_tx: pulsebeam_runtime::sync::mpsc::Sender<NativeDeletionCompletion>,
+    deletion_rx: pulsebeam_runtime::sync::mpsc::Receiver<NativeDeletionCompletion>,
     deletion_bytes: usize,
     steering: Option<Box<dyn Steering>>,
 }
@@ -327,8 +327,8 @@ impl ControllerActor {
     ) -> Self {
         let shard_count = shard_contexts.len();
         debug_assert_eq!(updates.len(), shard_count);
-        let (renewal_tx, renewal_rx) = tokio::sync::mpsc::channel(MAX_PENDING_RENEWALS);
-        let (deletion_tx, deletion_rx) = tokio::sync::mpsc::channel(API_COMMAND_BUDGET);
+        let (renewal_tx, renewal_rx) = pulsebeam_runtime::sync::mpsc::channel(MAX_PENDING_RENEWALS);
+        let (deletion_tx, deletion_rx) = pulsebeam_runtime::sync::mpsc::channel(API_COMMAND_BUDGET);
         Self {
             router: crate::control::router::ShardRouter::new(shard_contexts),
             core: ControllerCore::with_shards(shard_count, room_partition_size, placement),
@@ -381,8 +381,8 @@ impl ControllerActor {
         mut shard_event_rx: mailbox::Receiver<ShardEventMessage>,
         shutdown: CancellationToken,
     ) {
-        let mut poll_interval = tokio::time::interval(SHARD_LOAD_POLL_INTERVAL);
-        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut poll_interval = pulsebeam_runtime::time::interval(SHARD_LOAD_POLL_INTERVAL);
+        poll_interval.set_missed_tick_behavior(pulsebeam_runtime::time::MissedTickBehavior::Skip);
 
         describe_controller_metrics();
 
@@ -394,11 +394,11 @@ impl ControllerActor {
             let maintenance_due = if self.has_ready_egress() {
                 false
             } else {
-                tokio::select! {
+                pulsebeam_runtime::select! {
                     biased;
                     _ = shutdown.cancelled() => break,
-                    _ = tokio::time::sleep_until(
-                        authorization_deadline.unwrap_or_else(tokio::time::Instant::now)
+                    _ = pulsebeam_runtime::time::sleep_until(
+                        authorization_deadline.unwrap_or_else(pulsebeam_runtime::time::Instant::now)
                     ), if authorization_deadline.is_some() => false,
                     true = shard_event_rx.readable() => false,
                     Some(bytes) = self.deletion_rx.recv() => {
@@ -430,7 +430,7 @@ impl ControllerActor {
         shard_event_rx: &mut mailbox::Receiver<ShardEventMessage>,
         maintenance_due: bool,
     ) -> Option<RequiredAction> {
-        let started = tokio::time::Instant::now();
+        let started = pulsebeam_runtime::time::Instant::now();
         for _ in 0..API_COMMAND_BUDGET {
             let Ok(bytes) = self.deletion_rx.try_recv() else {
                 break;
@@ -504,7 +504,7 @@ impl ControllerActor {
                 match self.begin_native_delete(message, SystemTime::now()) {
                     Ok((bytes, acks)) => {
                         let completed = self.deletion_tx.clone();
-                        tokio::spawn(async move {
+                        pulsebeam_runtime::task::spawn(async move {
                             complete_native_delete(
                                 acks,
                                 NativeDeleteReply::Http(reply),
@@ -524,7 +524,7 @@ impl ControllerActor {
                 let result = self.replace_authorization(
                     message,
                     SystemTime::now(),
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 );
                 let _ = reply.send(result);
                 None
@@ -547,7 +547,7 @@ impl ControllerActor {
     async fn run_required_action(&mut self, action: RequiredAction) {
         match action {
             RequiredAction::Materialize { pending, reply } => {
-                let started = tokio::time::Instant::now();
+                let started = pulsebeam_runtime::time::Instant::now();
                 let mut pending = pending;
                 let Some(ack) = pending.ack.take() else {
                     pulsebeam_runtime::fatal!(
@@ -558,8 +558,10 @@ impl ControllerActor {
                     pulsebeam_runtime::fatal!("materialization must retain its shard command");
                 };
                 if !self.candidate_is_newer(pending.participant, pending.connection_id) {
-                    self.core
-                        .release_transport(pending.transport, tokio::time::Instant::now());
+                    self.core.release_transport(
+                        pending.transport,
+                        pulsebeam_runtime::time::Instant::now(),
+                    );
                     match reply {
                         MaterializationReply::Create(reply) => {
                             let _ = reply.send(Err(ControllerError::Superseded));
@@ -601,12 +603,14 @@ impl ControllerActor {
                             self.publish_staged();
                         }
                         self.core
-                            .release_transport(transport, tokio::time::Instant::now());
+                            .release_transport(transport, pulsebeam_runtime::time::Instant::now());
                     }
                     result
                 } else {
-                    self.core
-                        .release_transport(pending.transport, tokio::time::Instant::now());
+                    self.core.release_transport(
+                        pending.transport,
+                        pulsebeam_runtime::time::Instant::now(),
+                    );
                     Err(ControllerError::ServiceUnavailable)
                 };
                 let commands_ready = self.flush_command_backlog();
@@ -637,10 +641,11 @@ impl ControllerActor {
                 if !self.current_incarnation(track.meta().origin, track.meta().connection_id) {
                     return;
                 }
-                if let Some(outcome) =
-                    self.lifecycle
-                        .publish(track, &self.core.registry, tokio::time::Instant::now())
-                {
+                if let Some(outcome) = self.lifecycle.publish(
+                    track,
+                    &self.core.registry,
+                    pulsebeam_runtime::time::Instant::now(),
+                ) {
                     self.publish_track_lifecycle(outcome);
                 }
             }
@@ -655,7 +660,7 @@ impl ControllerActor {
                     meta.origin,
                     meta.id,
                     &self.core.registry,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 ) {
                     self.apply_track_lifecycle(outcome);
                     self.publish_staged();
@@ -681,7 +686,7 @@ impl ControllerActor {
                 let outcomes = self.lifecycle.set_owned_subscription(
                     request,
                     &self.core.registry,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 );
                 for outcome in outcomes {
                     self.publish_track_lifecycle(outcome);
@@ -710,7 +715,7 @@ impl ControllerActor {
                     track.id,
                     subscriber,
                     &self.core.registry,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 );
                 self.publish_track_lifecycle(outcome);
             }
@@ -729,7 +734,7 @@ impl ControllerActor {
                     track.id,
                     subscriber,
                     &self.core.registry,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 );
                 self.publish_track_lifecycle(outcome);
             }
@@ -749,7 +754,7 @@ impl ControllerActor {
                     selector,
                     selection,
                     &self.core.registry,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 );
                 for outcome in outcomes {
                     self.publish_track_lifecycle(outcome);
@@ -769,7 +774,7 @@ impl ControllerActor {
                     subscriber,
                     selector,
                     &self.core.registry,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 );
                 for outcome in outcomes {
                     self.publish_track_lifecycle(outcome);
@@ -891,7 +896,7 @@ impl ControllerActor {
                     meta.origin,
                     meta.id,
                     &self.core.registry,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 )
                 .into_iter()
                 .collect()
@@ -901,7 +906,7 @@ impl ControllerActor {
                 participant,
                 reference,
                 &self.core.registry,
-                tokio::time::Instant::now(),
+                pulsebeam_runtime::time::Instant::now(),
             )
         };
         let generation = outcomes
@@ -950,7 +955,7 @@ impl ControllerActor {
         self.deletion_bytes = self.deletion_bytes.saturating_add(bytes);
         self.publish_staged();
         let completed = self.deletion_tx.clone();
-        tokio::spawn(complete_native_delete(
+        pulsebeam_runtime::task::spawn(complete_native_delete(
             acks,
             NativeDeleteReply::Publication {
                 participant,
@@ -1025,7 +1030,7 @@ impl ControllerActor {
         &mut self,
         request: ReplaceAuthorization,
         wall_now: SystemTime,
-        runtime_now: tokio::time::Instant,
+        runtime_now: pulsebeam_runtime::time::Instant,
     ) -> Result<u64, ControllerError> {
         let verified = request.authorization;
         let meta = self
@@ -1133,7 +1138,7 @@ impl ControllerActor {
         }
         self.renewals_inflight = self.renewals_inflight.saturating_add(1);
         let tx = self.renewal_tx.clone();
-        tokio::task::spawn_blocking(move || {
+        pulsebeam_runtime::task::spawn_blocking(move || {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
@@ -1173,7 +1178,11 @@ impl ControllerActor {
             }
             i64::try_from(verified.expiry.unix_seconds()).ok()?;
             previous?
-                .replacing(verified.expiry, wall_now, tokio::time::Instant::now())
+                .replacing(
+                    verified.expiry,
+                    wall_now,
+                    pulsebeam_runtime::time::Instant::now(),
+                )
                 .ok()
         });
         if let (Some(lease), Some(previous)) = (expiry, previous) {
@@ -1211,7 +1220,7 @@ impl ControllerActor {
     where
         F: Future,
     {
-        tokio::pin!(future);
+        pulsebeam_runtime::pin!(future);
         loop {
             let Some(deadline) = self
                 .authorization_expiries
@@ -1220,10 +1229,10 @@ impl ControllerActor {
             else {
                 return future.await;
             };
-            tokio::select! {
+            pulsebeam_runtime::select! {
                 biased;
-                _ = tokio::time::sleep_until(deadline) => {
-                    self.expire_authorizations(tokio::time::Instant::now(), SystemTime::now());
+                _ = pulsebeam_runtime::time::sleep_until(deadline) => {
+                    self.expire_authorizations(pulsebeam_runtime::time::Instant::now(), SystemTime::now());
                 }
                 result = &mut future => return result,
             }
@@ -1664,7 +1673,7 @@ impl ControllerActor {
             participant_id,
             defaults,
             &self.core.registry,
-            tokio::time::Instant::now(),
+            pulsebeam_runtime::time::Instant::now(),
         );
         for outcome in outcomes {
             self.publish_track_lifecycle(outcome);
@@ -1785,7 +1794,7 @@ impl ControllerActor {
         let mut outcomes = self.lifecycle.remove_participant(
             participant,
             &self.core.registry,
-            tokio::time::Instant::now(),
+            pulsebeam_runtime::time::Instant::now(),
         );
         let generation = outcomes
             .first()
@@ -1827,10 +1836,14 @@ impl ControllerActor {
             self.publish_staged();
         }
         self.core
-            .release_transport(address, tokio::time::Instant::now());
+            .release_transport(address, pulsebeam_runtime::time::Instant::now());
     }
 
-    fn expire_authorizations(&mut self, runtime_now: tokio::time::Instant, wall_now: SystemTime) {
+    fn expire_authorizations(
+        &mut self,
+        runtime_now: pulsebeam_runtime::time::Instant,
+        wall_now: SystemTime,
+    ) {
         while self
             .authorization_expiries
             .first()
@@ -1897,10 +1910,11 @@ async fn drain_cutoffs(acks: &mut Vec<oneshot::Receiver<()>>) -> bool {
 async fn complete_native_delete(
     mut acks: Vec<oneshot::Receiver<()>>,
     reply: NativeDeleteReply,
-    completed: tokio::sync::mpsc::Sender<NativeDeletionCompletion>,
+    completed: pulsebeam_runtime::sync::mpsc::Sender<NativeDeletionCompletion>,
     bytes: usize,
 ) {
-    let success = tokio::time::timeout(NATIVE_DELETE_TIMEOUT, drain_cutoffs(&mut acks)).await;
+    let success =
+        pulsebeam_runtime::time::timeout(NATIVE_DELETE_TIMEOUT, drain_cutoffs(&mut acks)).await;
     match reply {
         NativeDeleteReply::Http(reply) => {
             let _ = reply.send(match success {
@@ -1955,8 +1969,8 @@ mod replacement_tests {
         reason = "the production ShardContext owns the sanctioned shared occupancy counters"
     )]
     fn actor_with_shards(shard_count: usize) -> ControllerActor {
-        let (renewal_tx, renewal_rx) = tokio::sync::mpsc::channel(MAX_PENDING_RENEWALS);
-        let (deletion_tx, deletion_rx) = tokio::sync::mpsc::channel(API_COMMAND_BUDGET);
+        let (renewal_tx, renewal_rx) = pulsebeam_runtime::sync::mpsc::channel(MAX_PENDING_RENEWALS);
+        let (deletion_tx, deletion_rx) = pulsebeam_runtime::sync::mpsc::channel(API_COMMAND_BUDGET);
         let mut contexts = Vec::new();
         let mut updates = Vec::new();
         for index in 0..shard_count {
@@ -1996,7 +2010,7 @@ mod replacement_tests {
     }
 
     struct RecordingSteering(
-        tokio::sync::mpsc::Sender<(std::net::SocketAddr, std::net::SocketAddr, u16)>,
+        pulsebeam_runtime::sync::mpsc::Sender<(std::net::SocketAddr, std::net::SocketAddr, u16)>,
     );
 
     impl Steering for RecordingSteering {
@@ -2022,7 +2036,7 @@ mod replacement_tests {
                 crate::route::TransportRoute::new(owner_shard, 51),
                 7,
             );
-            let (pins, mut received) = tokio::sync::mpsc::channel(2);
+            let (pins, mut received) = pulsebeam_runtime::sync::mpsc::channel(2);
             actor.set_steering(Some(Box::new(RecordingSteering(pins))));
             actor.handle_shard_event((
                 owner_shard,
@@ -2056,7 +2070,7 @@ mod replacement_tests {
     fn authorization_lease(
         expiry: u64,
         wall_now: SystemTime,
-        runtime_now: tokio::time::Instant,
+        runtime_now: pulsebeam_runtime::time::Instant,
     ) -> AuthorizationLease {
         AuthorizationLease::from_expiry(
             AuthorizationExpiry::from_unix_seconds(expiry),
@@ -2066,7 +2080,7 @@ mod replacement_tests {
         .unwrap()
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn native_delete_fences_former_owners_without_touching_the_replacement() {
         let mut actor = actor();
         let (writer, mut current_rx) = new_shard_update(ShardId::new(0));
@@ -2080,7 +2094,7 @@ mod replacement_tests {
         let participant_external_id = crate::entity::ParticipantExternalId::new("alice").unwrap();
         let transport = actor
             .core
-            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+            .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
         actor
             .commit_candidate(
                 participant_id,
@@ -2092,7 +2106,7 @@ mod replacement_tests {
                 Some(authorization_lease(
                     100,
                     UNIX_EPOCH,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 )),
                 ConnectionProfile::Native,
                 participant_external_id.clone(),
@@ -2144,14 +2158,14 @@ mod replacement_tests {
         let mut former = former_rx.try_recv().unwrap();
         assert!(former.generation > old.generation);
         let (reply, mut response) = oneshot::channel();
-        let task = tokio::spawn(complete_native_delete(
+        let task = pulsebeam_runtime::task::spawn(complete_native_delete(
             acks,
             NativeDeleteReply::Http(reply),
             actor.deletion_tx.clone(),
             bytes,
         ));
         current.cutoff_ack.take().unwrap().send(()).unwrap();
-        tokio::task::yield_now().await;
+        pulsebeam_runtime::task::yield_now().await;
         assert!(matches!(
             response.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
@@ -2165,7 +2179,7 @@ mod replacement_tests {
                         expected_revision: 1,
                     },
                     UNIX_EPOCH,
-                    tokio::time::Instant::now()
+                    pulsebeam_runtime::time::Instant::now()
                 )
                 .unwrap(),
             2
@@ -2197,9 +2211,9 @@ mod replacement_tests {
         assert_eq!(acks.len(), 2);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn native_delete_failure_never_acknowledges_cutoff_or_releases_retained_work() {
-        let (done, mut completed) = tokio::sync::mpsc::channel(1);
+        let (done, mut completed) = pulsebeam_runtime::sync::mpsc::channel(1);
         let (ack, pending) = oneshot::channel();
         let (reply, response) = oneshot::channel();
         drop(ack);
@@ -2218,28 +2232,28 @@ mod replacement_tests {
 
         let (ack, pending) = oneshot::channel();
         let (reply, response) = oneshot::channel();
-        let task = tokio::spawn(complete_native_delete(
+        let task = pulsebeam_runtime::task::spawn(complete_native_delete(
             vec![pending],
             NativeDeleteReply::Http(reply),
             done,
             11,
         ));
-        tokio::task::yield_now().await;
-        tokio::time::advance(NATIVE_DELETE_TIMEOUT).await;
+        pulsebeam_runtime::task::yield_now().await;
+        pulsebeam_runtime::time::advance(NATIVE_DELETE_TIMEOUT).await;
         assert!(matches!(
             response.await.unwrap(),
             Err(ControllerError::ServiceUnavailable)
         ));
         assert!(matches!(
             completed.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            Err(pulsebeam_runtime::sync::mpsc::error::TryRecvError::Empty)
         ));
         ack.send(()).unwrap();
         assert_eq!(completed.recv().await.unwrap().bytes, 11);
         task.await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn owned_publication_cutoff_waits_for_only_affected_shards_and_fences_replacements() {
         let mut actor = actor();
         actor.core = ControllerCore::with_shards(3, 1, RoomPartitionPlacement::Hashed);
@@ -2259,7 +2273,7 @@ mod replacement_tests {
         for (participant, shard) in [(publisher, 0), (subscriber, 1)] {
             let address = actor
                 .core
-                .reserve_transport(ShardId::new(shard), tokio::time::Instant::now());
+                .reserve_transport(ShardId::new(shard), pulsebeam_runtime::time::Instant::now());
             actor
                 .core
                 .registry
@@ -2322,10 +2336,10 @@ mod replacement_tests {
         let mut destination = receivers[1].try_recv().unwrap();
         assert!(receivers[2].try_recv().is_err());
         assert_eq!(origin.generation, destination.generation);
-        tokio::task::yield_now().await;
+        pulsebeam_runtime::task::yield_now().await;
         assert!(actor.deletion_rx.try_recv().is_err());
         origin.cutoff_ack.take().unwrap().send(()).unwrap();
-        tokio::task::yield_now().await;
+        pulsebeam_runtime::task::yield_now().await;
         assert!(actor.deletion_rx.try_recv().is_err());
         destination.cutoff_ack.take().unwrap().send(()).unwrap();
         let completed = actor.deletion_rx.recv().await.unwrap();
@@ -2371,7 +2385,7 @@ mod replacement_tests {
         let mut destination = receivers[1].try_recv().unwrap();
         assert!(receivers[2].try_recv().is_err());
         origin.cutoff_ack.take().unwrap().send(()).unwrap();
-        tokio::task::yield_now().await;
+        pulsebeam_runtime::task::yield_now().await;
         assert!(actor.deletion_rx.try_recv().is_err());
         destination.cutoff_ack.take().unwrap().send(()).unwrap();
         for _ in 0..2 {
@@ -2422,7 +2436,7 @@ mod replacement_tests {
                     publisher,
                     rejected.id(),
                     &actor.core.registry,
-                    tokio::time::Instant::now()
+                    pulsebeam_runtime::time::Instant::now()
                 )
                 .is_none()
         );
@@ -2445,7 +2459,7 @@ mod replacement_tests {
         ));
         let address = actor
             .core
-            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+            .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
         actor
             .core
             .registry
@@ -2484,12 +2498,12 @@ mod replacement_tests {
         assert!(actor.command_backlog.is_empty());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn owned_publication_timeout_reports_failure_but_retains_fence_credit() {
         let (ack, pending) = oneshot::channel();
-        let (completed, mut results) = tokio::sync::mpsc::channel(2);
+        let (completed, mut results) = pulsebeam_runtime::sync::mpsc::channel(2);
         let participant = ParticipantId::new();
-        let task = tokio::spawn(complete_native_delete(
+        let task = pulsebeam_runtime::task::spawn(complete_native_delete(
             vec![pending],
             NativeDeleteReply::Publication {
                 participant,
@@ -2499,8 +2513,8 @@ mod replacement_tests {
             completed,
             123,
         ));
-        tokio::task::yield_now().await;
-        tokio::time::advance(NATIVE_DELETE_TIMEOUT).await;
+        pulsebeam_runtime::task::yield_now().await;
+        pulsebeam_runtime::time::advance(NATIVE_DELETE_TIMEOUT).await;
         let failure = results.recv().await.unwrap();
         assert_eq!(failure.bytes, 0);
         assert!(
@@ -2519,7 +2533,7 @@ mod replacement_tests {
         let mut actor = actor();
         let room_id = RoomId::from_external(&RoomExternalId::new("expired-prepare").unwrap());
         let participant_id = ParticipantId::new();
-        let runtime_now = tokio::time::Instant::now();
+        let runtime_now = pulsebeam_runtime::time::Instant::now();
         let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
         let lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
 
@@ -2547,12 +2561,12 @@ mod replacement_tests {
         assert!(actor.authorization_expiries.is_empty());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn current_connection_closes_at_authorization_deadline_without_grace() {
         let mut actor = actor();
         let room_id = RoomId::from_external(&RoomExternalId::new("expiry").unwrap());
         let participant_id = ParticipantId::new();
-        let runtime_now = tokio::time::Instant::now();
+        let runtime_now = pulsebeam_runtime::time::Instant::now();
         let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
         let lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
         actor
@@ -2570,9 +2584,9 @@ mod replacement_tests {
             )
             .unwrap();
 
-        tokio::time::advance(Duration::from_secs(10)).await;
+        pulsebeam_runtime::time::advance(Duration::from_secs(10)).await;
         actor.expire_authorizations(
-            tokio::time::Instant::now(),
+            pulsebeam_runtime::time::Instant::now(),
             UNIX_EPOCH + Duration::from_secs(10),
         );
 
@@ -2598,12 +2612,12 @@ mod replacement_tests {
         let old_lease = AuthorizationLease::from_expiry(
             AuthorizationExpiry::from_unix_seconds(old_expiry),
             now,
-            tokio::time::Instant::now(),
+            pulsebeam_runtime::time::Instant::now(),
         )
         .unwrap();
         let transport = actor
             .core
-            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+            .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
         actor
             .commit_candidate(
                 participant_id,
@@ -2695,7 +2709,7 @@ mod replacement_tests {
         };
         assert_eq!(
             actor
-                .replace_authorization(request(), now, tokio::time::Instant::now())
+                .replace_authorization(request(), now, pulsebeam_runtime::time::Instant::now())
                 .unwrap(),
             3
         );
@@ -2710,7 +2724,7 @@ mod replacement_tests {
         assert_eq!(current.expiry(), narrowed.expiry);
         assert_eq!(
             current
-                .refresh_at(now, tokio::time::Instant::now())
+                .refresh_at(now, pulsebeam_runtime::time::Instant::now())
                 .unwrap()
                 .revision(),
             3
@@ -2721,7 +2735,7 @@ mod replacement_tests {
                 if *expiry == i64::try_from(unix_now + 30).unwrap()));
         let delivered = actor.command_backlog.len();
         assert!(matches!(
-            actor.replace_authorization(request(), now, tokio::time::Instant::now()),
+            actor.replace_authorization(request(), now, pulsebeam_runtime::time::Instant::now()),
             Err(ControllerError::AuthorizationPrecondition { revision: 3 })
         ));
         actor.finish_renewal(RenewalResult {
@@ -2753,7 +2767,11 @@ mod replacement_tests {
         unrepresentable.authorization.expiry = AuthorizationExpiry::from_unix_seconds(u64::MAX);
         let queued = actor.command_backlog.len();
         assert!(matches!(
-            actor.replace_authorization(unrepresentable, now, tokio::time::Instant::now()),
+            actor.replace_authorization(
+                unrepresentable,
+                now,
+                pulsebeam_runtime::time::Instant::now()
+            ),
             Err(ControllerError::AuthorizationRejected)
         ));
         assert_eq!(
@@ -2771,26 +2789,30 @@ mod replacement_tests {
         wrong.authorization.room_id =
             RoomId::from_external(&RoomExternalId::new("other-room").unwrap());
         assert!(matches!(
-            actor.replace_authorization(wrong, now, tokio::time::Instant::now()),
+            actor.replace_authorization(wrong, now, pulsebeam_runtime::time::Instant::now()),
             Err(ControllerError::AuthorizationRejected)
         ));
         let mut expired = request();
         expired.expected_revision = 3;
         expired.authorization.expiry = AuthorizationExpiry::from_unix_seconds(unix_now);
         assert!(matches!(
-            actor.replace_authorization(expired, now, tokio::time::Instant::now()),
+            actor.replace_authorization(expired, now, pulsebeam_runtime::time::Instant::now()),
             Err(ControllerError::AuthorizationExpired)
         ));
         let mut exhausted = current;
         exhausted.revision = u64::MAX;
         assert!(matches!(
-            exhausted.replacing(narrowed.expiry, now, tokio::time::Instant::now()),
+            exhausted.replacing(
+                narrowed.expiry,
+                now,
+                pulsebeam_runtime::time::Instant::now()
+            ),
             Err(ControllerError::ServiceUnavailable)
         ));
         let mut stale = request();
         stale.connection_id = connection_id(2);
         assert!(matches!(
-            actor.replace_authorization(stale, now, tokio::time::Instant::now()),
+            actor.replace_authorization(stale, now, pulsebeam_runtime::time::Instant::now()),
             Err(ControllerError::GrantGone)
         ));
         actor.finish_renewal(RenewalResult {
@@ -2811,7 +2833,7 @@ mod replacement_tests {
         );
     }
 
-    #[tokio::test]
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn renewal_verifies_jwt_off_control_loop_and_commits_only_current_identity() {
         use pulsebeam_core::auth::{
             DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID,
@@ -2838,12 +2860,12 @@ mod replacement_tests {
         let previous = AuthorizationLease::from_expiry(
             AuthorizationExpiry::from_unix_seconds(unix_now + 60),
             now,
-            tokio::time::Instant::now(),
+            pulsebeam_runtime::time::Instant::now(),
         )
         .unwrap();
         let transport = actor
             .core
-            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+            .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
         actor
             .commit_candidate(
                 participant,
@@ -2884,10 +2906,11 @@ mod replacement_tests {
                 token: crate::shard::worker::RenewalToken(token),
             },
         ));
-        let result = tokio::time::timeout(Duration::from_secs(2), actor.renewal_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let result =
+            pulsebeam_runtime::time::timeout(Duration::from_secs(2), actor.renewal_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
         actor.finish_renewal(result);
         assert_eq!(
             actor
@@ -2916,7 +2939,7 @@ mod replacement_tests {
         let mut actor = actor();
         let room_id = RoomId::from_external(&RoomExternalId::new("expiry-fence").unwrap());
         let participant_id = ParticipantId::new();
-        let runtime_now = tokio::time::Instant::now();
+        let runtime_now = pulsebeam_runtime::time::Instant::now();
         let old_id = connection_id(1);
         let current_id = connection_id(2);
         let old_lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
@@ -2978,7 +3001,7 @@ mod replacement_tests {
         let mut actor = actor();
         let room_id = RoomId::from_external(&RoomExternalId::new("bounded-expiry").unwrap());
         let participant_id = ParticipantId::new();
-        let runtime_now = tokio::time::Instant::now();
+        let runtime_now = pulsebeam_runtime::time::Instant::now();
 
         for sequence in 1..=100 {
             let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
@@ -3072,10 +3095,10 @@ mod replacement_tests {
         let current = connection_id(2);
         let old_transport = actor
             .core
-            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+            .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
         let current_transport = actor
             .core
-            .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+            .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
         actor
             .core
             .registry
@@ -3202,7 +3225,7 @@ mod replacement_tests {
         for connection_id in [stale, current] {
             let address = actor
                 .core
-                .reserve_transport(ShardId::new(0), tokio::time::Instant::now());
+                .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
             actor
                 .core
                 .registry
@@ -3245,7 +3268,7 @@ mod replacement_tests {
                     participant,
                     stale_meta.id,
                     &actor.core.registry,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 )
                 .is_none(),
             "a retired connection cannot add a publication"
@@ -3263,7 +3286,7 @@ mod replacement_tests {
                     participant,
                     track_id,
                     &actor.core.registry,
-                    tokio::time::Instant::now(),
+                    pulsebeam_runtime::time::Instant::now(),
                 )
                 .is_some(),
             "the replacement's publication must survive stale teardown"

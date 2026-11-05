@@ -13,11 +13,11 @@ use crate::rtp::frame_selector::DecodeTargetSelection;
 use crate::rtp::switcher::{LayerStates, Switcher};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use indexmap::IndexSet;
+use pulsebeam_runtime::time::Instant;
 use slotmap::{SecondaryMap, SlotMap};
 use std::cmp::Ordering;
 use std::ops::{Deref, DerefMut};
 use std::time::Duration;
-use tokio::time::Instant;
 
 use crate::entity::TrackId;
 use crate::keys::{DownstreamSlotKey, TrackHandle};
@@ -3177,7 +3177,7 @@ mod assignment_tests {
             1,
             1000,
             90_000,
-            tokio::time::Instant::now(),
+            pulsebeam_runtime::time::Instant::now(),
         );
         for pkt in builder.keyframe(4) {
             cache.push(pkt.clone());

@@ -30,6 +30,24 @@ pub mod rand;
 pub mod rt;
 pub mod sync;
 pub mod system;
+pub mod task;
 pub mod testing;
+pub mod time;
+
+pub use tokio::{join, main, pin, select, signal, test, try_join};
+
+/// Async I/O extension traits used at integration boundaries.
+pub mod io {
+    pub use tokio::io::AsyncWriteExt;
+}
+
+/// Implementation detail required by the reexported harness macros.
+#[doc(hidden)]
+pub mod __harness {
+    pub use tokio::pin;
+    pub mod runtime {
+        pub use tokio::runtime::Builder;
+    }
+}
 
 pub const SHARD_TIMER_QUANTUM: std::time::Duration = std::time::Duration::from_millis(1);

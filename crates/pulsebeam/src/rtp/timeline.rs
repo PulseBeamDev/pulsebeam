@@ -14,8 +14,8 @@ use crate::rtp::{Frequency, MediaTime};
 #[cfg(test)]
 use pulsebeam_core::dd::DependencyDescriptor;
 use pulsebeam_runtime::rand::RngCore;
+use pulsebeam_runtime::time::Instant;
 use std::time::Duration;
-use tokio::time::Instant;
 
 // Timeline maps a succession of input streams onto one output stream that looks
 // to the subscriber like it came from a single sender.
