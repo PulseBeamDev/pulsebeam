@@ -750,6 +750,7 @@ async fn run_peer(
         &events,
         &latest,
         &ordered,
+        &desired,
         1,
         &mut frame_cursor,
     )
@@ -787,7 +788,7 @@ async fn run_peer(
         );
     }
     barriers.before_reconnect.wait().await;
-    agent.replace_desired(desired).await?;
+    agent.replace_desired(desired.clone()).await?;
     let rebound = wait_connected(&agent, None).await?;
     let new_latest = rebound
         .topics
@@ -943,6 +944,7 @@ async fn run_peer(
         &events,
         &latest,
         &ordered,
+        &desired,
         2,
         &mut frame_cursor,
     )
@@ -1106,6 +1108,7 @@ async fn run_peer(
         &events,
         &latest,
         &ordered,
+        &desired,
         3,
         &mut frame_cursor,
     )
@@ -1515,6 +1518,7 @@ async fn exchange(
     events: &TopicProbe,
     latest: &core_ffi::TopicPublisher,
     ordered: &core_ffi::TopicPublisher,
+    desired: &core_ffi::DesiredState,
     round: u64,
     frame_number: &mut u64,
 ) -> anyhow::Result<ExchangeReport> {
@@ -1539,6 +1543,17 @@ async fn exchange(
         .send_topic(ordered.clone(), format!("ordered-{round}-0").into_bytes())
         .await?;
     wait_ordered_admitted(agent, ordered, next_sequence).await?;
+    if round == 1 {
+        // The actor processes these commands separately; this exercises real
+        // registration churn between ordered sends, not a same-turn batch.
+        let mut without_latest = desired.clone();
+        without_latest
+            .topic_subscribers
+            .retain(|subscriber| subscriber.name != latest.name);
+        agent.replace_desired(without_latest).await?;
+        agent.replace_desired(desired.clone()).await?;
+        events.state.lock().unwrap().latest_messages = 0;
+    }
     agent
         .send_topic(ordered.clone(), format!("ordered-{round}-1").into_bytes())
         .await?;
