@@ -172,9 +172,42 @@ fn pending_resource_coalesces_without_blocking_other_resources_or_retirement() {
         panic!("publication")
     };
     publication.label = "other".into();
-    client.stage(other, Some(other_spec)).unwrap();
+    client
+        .stage(other.clone(), Some(other_spec.clone()))
+        .unwrap();
     let records = next(&mut client);
     assert_eq!((records[0].0, records[0].1.revision), (2, 2));
+    let mut accepted = live(2, other_spec.clone());
+    let Some(wire::confirmed_state::Value::Owned(accepted_live)) = accepted.value.as_mut() else {
+        panic!("owned")
+    };
+    let track = accepted_live.track.as_mut().unwrap();
+    track.label = "other".into();
+    track.track_id = "other-source".into();
+    client
+        .apply(&frame(alloc::vec![record(2, accepted.clone())], false))
+        .unwrap();
+    let mut disabled = other_spec.clone();
+    disabled.settings.as_mut().unwrap().enabled = Some(false);
+    client.stage(other.clone(), Some(disabled)).unwrap();
+    assert_eq!(next(&mut client)[0].1.revision, 3);
+    client.stage(other, Some(other_spec.clone())).unwrap();
+    assert!(client.next_frame().unwrap().is_none());
+    let mut rejected = accepted;
+    rejected.evaluated_revision = 3;
+    rejected.rejection = Some(wire::Failure {
+        code: wire::FailureCode::CapacityExceeded as i32,
+        diagnostic: String::new(),
+    });
+    client
+        .apply(&frame(alloc::vec![record(2, rejected)], false))
+        .unwrap();
+    let records = next(&mut client);
+    assert_eq!((records[0].0, records[0].1.revision), (2, 4));
+    assert_eq!(
+        records[0].1.value,
+        Some(wire::desired_state::Value::Present(Box::new(other_spec)))
+    );
 
     client.stage(resource(), Some(spec(true, 1))).unwrap();
     client.stage(resource(), Some(spec(false, 1))).unwrap();
@@ -186,18 +219,138 @@ fn pending_resource_coalesces_without_blocking_other_resources_or_retirement() {
         ))
         .unwrap();
     let records = next(&mut client);
-    assert_eq!((records[0].0, records[0].1.revision), (1, 3));
+    assert_eq!((records[0].0, records[0].1.revision), (1, 5));
     let Some(wire::desired_state::Value::Present(latest)) = &records[0].1.value else {
         panic!("present")
     };
     assert_eq!(latest.settings.as_ref().unwrap().enabled, Some(false));
     client.stage(resource(), None).unwrap();
     let retirement = next(&mut client);
-    assert_eq!((retirement[0].0, retirement[0].1.revision), (1, 4));
+    assert_eq!((retirement[0].0, retirement[0].1.revision), (1, 6));
     assert_eq!(
         retirement[0].1.value,
         Some(wire::desired_state::Value::Absent(true))
     );
+}
+
+#[test]
+fn bounded_batches_emit_current_targets_for_mixed_resources() {
+    for long in [false, true] {
+        let mut client = NativeState::new(1024 * 1024, participant()).unwrap();
+        let mut remaining = BTreeMap::new();
+        for index in 0..(2 * codec::MAX_RECORDS + 4) {
+            let suffix = if long { "x".repeat(100) } else { String::new() };
+            let id = alloc::format!("{index:03}{suffix}");
+            let stream = u32::try_from(index + 1).unwrap();
+            let (resource, desired) = if index % 2 == 0 {
+                let label = if long {
+                    alloc::format!("{id}{}", "y".repeat(140))
+                } else {
+                    id
+                };
+                let mut desired = spec(true, stream);
+                let Some(wire::resource_spec::Declaration::Publication(publication)) =
+                    desired.declaration.as_mut()
+                else {
+                    panic!("publication")
+                };
+                publication.label = label.clone();
+                (
+                    Resource::Publication {
+                        kind: wire::TrackKind::Data,
+                        label,
+                    },
+                    desired,
+                )
+            } else {
+                (
+                    Resource::DataSubscription(id.clone()),
+                    wire::ResourceSpec {
+                        settings: Some(wire::ResourceSettings {
+                            enabled: Some(true),
+                            receive: None,
+                        }),
+                        declaration: Some(wire::resource_spec::Declaration::Subscription(
+                            wire::SubscriptionSpec {
+                                track_id: id,
+                                kind: wire::TrackKind::Data as i32,
+                                binding: Some(binding(stream)),
+                            },
+                        )),
+                    },
+                )
+            };
+            client
+                .stage(resource.clone(), Some(desired.clone()))
+                .unwrap();
+            remaining.insert(resource, desired);
+        }
+
+        let mut first_sent = None;
+        let mut batches = 0;
+        while !remaining.is_empty() {
+            batches += 1;
+            assert!(batches <= 2 * codec::MAX_RECORDS + 4);
+            let bytes = client.next_frame().unwrap().unwrap();
+            assert!(bytes.len() <= codec::MAX_FRAME_SIZE);
+            let batch = codec::decode_client(&bytes).unwrap();
+            assert!(!batch.records.is_empty() && batch.records.len() <= codec::MAX_RECORDS);
+            if batches == 1 && !long {
+                assert_eq!(batch.records.len(), codec::MAX_RECORDS);
+            }
+            for record in &batch.records {
+                let desired = record.desired.as_ref().unwrap();
+                let Some(wire::desired_state::Value::Present(spec)) = &desired.value else {
+                    panic!("present")
+                };
+                let resource = remaining
+                    .keys()
+                    .find(|resource| resource.matches_spec(spec))
+                    .unwrap()
+                    .clone();
+                assert_eq!(**spec, remaining.remove(&resource).unwrap());
+                if first_sent.is_none() {
+                    first_sent = Some((resource, (**spec).clone(), record.owned));
+                }
+            }
+            if batches == 1 && long {
+                assert!(batch.records.len() < codec::MAX_RECORDS);
+                let revision = u64::try_from(batch.records.len() + 1).unwrap();
+                let mut oversized = batch.clone();
+                oversized.records.push(desired_record(
+                    revision,
+                    revision,
+                    Some(remaining.first_key_value().unwrap().1.clone()),
+                ));
+                assert!(oversized.encoded_len() > codec::MAX_FRAME_SIZE);
+            }
+            if batches == 1 {
+                let (resource, desired, _) = first_sent.as_ref().unwrap();
+                let mut newer = desired.clone();
+                newer.settings.as_mut().unwrap().enabled = Some(false);
+                client.stage(resource.clone(), Some(newer)).unwrap();
+            }
+            for (resource, desired) in &mut remaining {
+                let enabled = desired.settings.as_mut().unwrap().enabled.as_mut().unwrap();
+                *enabled = !*enabled;
+                client
+                    .stage(resource.clone(), Some(desired.clone()))
+                    .unwrap();
+            }
+        }
+        assert!(batches >= 3);
+        assert!(client.next_frame().unwrap().is_none());
+        let (resource, _, reference) = first_sent.unwrap();
+        client.stage(resource, None).unwrap();
+        let retirement = next(&mut client);
+        assert_eq!(retirement.len(), 1);
+        assert_eq!(retirement[0].0, reference);
+        assert_eq!(
+            retirement[0].1.value,
+            Some(wire::desired_state::Value::Absent(true))
+        );
+        assert!(client.next_frame().unwrap().is_none());
+    }
 }
 
 #[test]
