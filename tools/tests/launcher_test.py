@@ -30,7 +30,12 @@ class LauncherContractTest(unittest.TestCase):
         self.binary.chmod(0o755)
         home = self.root / "home"
         home.mkdir()
-        self.env = dict(os.environ, HOME=str(home), XDG_CACHE_HOME=str(cache))
+        self.env = dict(os.environ, HOME=str(home), XDG_CACHE_HOME=str(cache),
+                        PULSEBEAM_NATIVELINK_AUTOSTART="1", AUTOSTART_LOG=str(self.root / "autostart.log"))
+        helper = self.root / "tools/nativelink/autostart.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("import os, sys\nfrom pathlib import Path\n"
+                          "Path(os.environ['AUTOSTART_LOG']).write_text('\\n'.join(sys.argv[1:]))\n")
 
     def run_launcher(self, *arguments, cwd=None, launcher=None):
         return subprocess.run([str(launcher or self.launcher), *arguments], env=self.env,
@@ -75,6 +80,38 @@ class LauncherContractTest(unittest.TestCase):
         self.assertEqual(self.forwarded_arguments(self.run_launcher("version")),
                          ["1", self.output_base, "version"])
         self.assertEqual([entry.name for entry in lock.parent.iterdir()], [key])
+
+    def test_build_commands_ensure_shared_service_without_changing_arguments(self):
+        for command in ("build", "test", "run", "coverage"):
+            with self.subTest(command=command):
+                result = self.run_launcher(command, "//:example")
+                self.assertEqual(self.forwarded_arguments(result), ["1", self.output_base, command, "//:example"])
+                self.assertEqual(Path(self.env["AUTOSTART_LOG"]).read_text().splitlines(), [
+                    "--workspace", str(self.root), "--bazelisk", str(self.binary),
+                    "--output-base", str(self.root / ".bazel/output"),
+                ])
+                Path(self.env["AUTOSTART_LOG"]).unlink()
+
+    def test_local_or_external_service_does_not_autostart(self):
+        options = [
+            ("info", "output_base"),
+            ("test", "--//crates/pulsebeam-libwebrtc-sys:executor=local"),
+            ("build", "--//crates/pulsebeam-libwebrtc-sys:executor", "local"),
+            ("build", "--//crates/pulsebeam-libwebrtc-sys:reapi=grpc://127.0.0.1:50052"),
+            ("run", "//tools/nativelink:server"),
+        ]
+        for args in options:
+            with self.subTest(args=args):
+                self.forwarded_arguments(self.run_launcher(*args))
+                self.assertFalse(Path(self.env["AUTOSTART_LOG"]).exists())
+
+    def test_autostart_failure_stops_bazel(self):
+        helper = self.root / "tools/nativelink/autostart.py"
+        helper.write_text("raise SystemExit('service failed')\n")
+        result = self.run_launcher("build", "//:example")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"service failed", result.stderr)
+        self.assertEqual(result.stdout, b"")
 
     def test_corrupt_cached_launcher_fails_actionably(self):
         self.binary.write_bytes(b"corrupt")

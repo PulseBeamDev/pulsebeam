@@ -122,6 +122,14 @@ class StartupTests(unittest.TestCase):
             self.start()
         self.run.assert_not_called()
 
+    def test_failed_startup_cleans_up_its_child(self):
+        self.fakes["wait_ready"].side_effect = autostart.StartupError("not ready")
+        with self.assertRaisesRegex(autostart.StartupError, "not ready"):
+            self.start()
+        self.popen.return_value.terminate.assert_called_once()
+        self.popen.return_value.wait.assert_called_once()
+        self.assertIsNone(autostart.read_marker(self.state))
+
     def test_inputs_changing_during_build_fail(self):
         self.fakes["identity"].side_effect = ["before", "after"]
         with self.assertRaisesRegex(autostart.StartupError, "inputs changed"):
@@ -182,7 +190,11 @@ class ProbeTests(unittest.TestCase):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(name)
+            module = root / "MODULE.bazel"
+            module.write_text('http_archive(\n    name = "nativelink",\n    sha256 = "one",\n)\n')
             before = autostart.identity(root)
+            module.write_text(module.read_text() + '\nbazel_dep(name = "unrelated", version = "2")\n')
+            self.assertEqual(before, autostart.identity(root))
             (root / "tools/nativelink/config.py").write_text("changed")
             self.assertNotEqual(before, autostart.identity(root))
 

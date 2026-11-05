@@ -17,6 +17,7 @@ build --@rules_python//python/config_settings:bootstrap_impl=script
 build --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
 build --@rules_rust//rust/settings:extra_rustc_flags=--cfg=tokio_unstable,--cfg=tracing_unstable,-Cforce-frame-pointers=yes
 build --@rules_rust//rust/settings:extra_exec_rustc_flags=--cfg=tokio_unstable,--cfg=tracing_unstable
+build --//crates/pulsebeam-libwebrtc-sys:executor=reapi
 test --nobuild_runfile_links
 build:webrtc-reapi --//crates/pulsebeam-libwebrtc-sys:executor=reapi
 build:webrtc-cache --//crates/pulsebeam-libwebrtc-sys:executor=cache

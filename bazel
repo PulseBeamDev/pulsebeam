@@ -26,5 +26,40 @@ workspace=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 lock_key=$(printf '%s' "$workspace" | sha256sum)
 lock_dir="$HOME/.cache/dev/worktree-locks"
 mkdir -p "$lock_dir"
-exec flock --shared --nonblock --conflict-exit-code 75 "$lock_dir/${lock_key:0:2}" \
-  "$launcher" "--output_base=$workspace/.bazel/output" "$@"
+exec {worktree_lock}<>"$lock_dir/${lock_key:0:2}"
+flock --shared --nonblock --conflict-exit-code 75 "$worktree_lock"
+
+# Informational commands and explicitly local builds do not need the service.
+command_name=
+executor=reapi
+endpoint=grpc://127.0.0.1:50051
+manual_server=0
+expect=
+for arg in "$@"; do
+  [[ "$arg" != -- ]] || break
+  if [[ -n "$expect" ]]; then
+    case "$expect" in executor) executor=$arg ;; endpoint) endpoint=$arg ;; esac
+    expect=
+    continue
+  fi
+  if [[ -z "$command_name" ]]; then
+    case "$arg" in build|test|run|coverage|mobile-install) command_name=$arg ;; esac
+  fi
+  case "$arg" in
+    --//crates/pulsebeam-libwebrtc-sys:executor=*) executor=${arg#*=} ;;
+    --//crates/pulsebeam-libwebrtc-sys:executor) expect=executor ;;
+    --//crates/pulsebeam-libwebrtc-sys:reapi=*) endpoint=${arg#*=} ;;
+    --//crates/pulsebeam-libwebrtc-sys:reapi) expect=endpoint ;;
+    --config=webrtc-reapi) executor=reapi ;;
+    --config=webrtc-cache) executor=cache ;;
+    //tools/nativelink:server) manual_server=1 ;;
+  esac
+done
+if [[ "$arch" == amd64 && -n "$command_name" && "$executor" != local && \
+      "$endpoint" == grpc://127.0.0.1:50051 && \
+      ! ( "$command_name" == run && "$manual_server" == 1 ) && \
+      "${PULSEBEAM_NATIVELINK_AUTOSTART:-1}" != 0 ]]; then
+  python3 "$workspace/tools/nativelink/autostart.py" \
+    --workspace "$workspace" --bazelisk "$launcher" --output-base "$workspace/.bazel/output"
+fi
+exec "$launcher" "--output_base=$workspace/.bazel/output" "$@"

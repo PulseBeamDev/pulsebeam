@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 import subprocess
@@ -19,15 +20,8 @@ TIMEOUT = 30.0
 INPUTS = (
     "tools/nativelink/server.py",
     "tools/nativelink/config.py",
-    "tools/nativelink/BUILD.bazel",
     "crates/pulsebeam-libwebrtc-sys/gn/host.nix",
-    "crates/pulsebeam-libwebrtc-sys/repositories.bzl",
-    "MODULE.bazel",
-    "MODULE.bazel.lock",
-    "tools/os.bzl",
-    "tools/host/BUILD.bazel",
     "tools/host/flake.lock",
-    "tools/host/flake.nix",
 )
 
 
@@ -40,6 +34,12 @@ def identity(workspace):
     for name in INPUTS:
         data = (workspace / name).read_bytes()
         digest.update(name.encode() + b"\0" + len(data).to_bytes(8, "big") + data)
+    # Other MODULE changes must not prevent worktrees sharing the service.
+    module = (workspace / "MODULE.bazel").read_text()
+    pin = re.search(r'(?ms)^http_archive\(\s*name\s*=\s*"nativelink",.*?^\)', module)
+    if pin is None:
+        raise StartupError("Cannot locate the NativeLink pin in MODULE.bazel")
+    digest.update(pin.group().encode())
     # server.py derives its default capacity from the host.
     digest.update(str(min(8, os.cpu_count() or 1)).encode())
     return digest.hexdigest()
@@ -231,7 +231,18 @@ def start(workspace, bazelisk, output_base, state):
             raise StartupError(f"NativeLink exited during startup; inspect {state / 'autostart.log'}")
         marker = {"pid": child.pid, "start": start_time, "boot": boot_id(), "identity": expected}
         write_marker(state, marker)
-        wait_ready(state, marker, child)
+        try:
+            wait_ready(state, marker, child)
+        except BaseException:
+            # This process started the service, so clean up a failed startup.
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5)
+            (state / "autostart.json").unlink(missing_ok=True)
+            raise
     finally:
         os.close(fd)
 

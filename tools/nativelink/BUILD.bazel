@@ -15,6 +15,13 @@ py_binary(
 )
 
 py_test(
+    name = "autostart_test",
+    srcs = ["test_autostart.py", "autostart.py"],
+    main = "test_autostart.py",
+    imports = ["."],
+)
+
+py_test(
     name = "analyze_test",
     srcs = ["test_analyze.py", "analyze.py"],
     main = "test_analyze.py",

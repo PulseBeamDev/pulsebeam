@@ -31,7 +31,9 @@ and worker in the foreground:
 ./bazel run //tools/nativelink:server
 ```
 
-Leave it running while using it from another terminal. Stop this foreground
+Leave it running while using it from another terminal. For a manually started
+service at the default endpoint, set `PULSEBEAM_NATIVELINK_AUTOSTART=0` on the
+client command so the launcher does not try to manage it. Stop the foreground
 service with Ctrl-C when it is no longer needed.
 
 ## Configuration and recovery
