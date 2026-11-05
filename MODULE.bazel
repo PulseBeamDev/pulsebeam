@@ -22,6 +22,7 @@ bazel_dep(name = "rules_python", version = "1.9.0")
 bazel_dep(name = "aspect_rules_js", version = "3.5.0")
 bazel_dep(name = "bazel_lib", version = "3.7.0")
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "rules_shell", version = "0.6.1")
 bazel_dep(name = "rules_nodejs", version = "6.7.5")
 bazel_dep(name = "rules_go", version = "0.59.0")
 single_version_override(
@@ -95,6 +96,18 @@ http_file(
 )
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "nativelink",
+    urls = ["https://github.com/TraceMachina/nativelink/releases/download/v1.8.3/nativelink-1.8.3-x86_64-unknown-linux-musl.tar.gz"],
+    sha256 = "1a6596c96f059d4e99f7352164321e1f1cdff435275667ad8489e83f7e2977c5",
+    build_file_content = """
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+exports_files(["nativelink", "LICENSE"], visibility = ["//visibility:public"])
+sh_binary(name = "bin", srcs = ["nativelink"], visibility = ["//visibility:public"])
+""",
+)
 
 # npm >=11.5.1 supports GitHub OIDC trusted publishing. Its bundled dependencies
 # are provisioned with the CLI, independently of application package lockfiles.
