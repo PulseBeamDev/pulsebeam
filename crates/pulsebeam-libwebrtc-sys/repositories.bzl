@@ -137,7 +137,7 @@ def _webrtc_impl(ctx):
         name = "webrtc_host",
         nix_file = Label("//crates/pulsebeam-libwebrtc-sys:gn/host.nix"),
         repository = "@nixpkgs",
-        build_file_content = 'package(default_visibility = ["//visibility:public"])\nfilegroup(name = "tools", srcs = glob(["bin/**"]))\nexports_files(["bin/python3"])\n',
+        build_file_content = 'package(default_visibility = ["//visibility:public"])\nfilegroup(name = "tools", srcs = glob(["bin/**"]) + ["host-bin"])\nexports_files(["bin/python3", "host-bin"])\n',
     )
     nixpkgs_package(
         name = "webrtc_test_tools",

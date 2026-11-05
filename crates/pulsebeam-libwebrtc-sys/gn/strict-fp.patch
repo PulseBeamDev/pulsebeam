@@ -1,0 +1,31 @@
+# Preserve final floating-point flags without hiding clang from Siso.
+--- a/build/toolchain/gcc_toolchain.gni
++++ b/build/toolchain/gcc_toolchain.gni
+@@ -352,5 +352,5 @@
+       # {{output}} may contain .dwo file, so use $output instead of {{output}}
+       # in command.
+-      command = "$coverage_wrapper$cc $md -MF $depfile {{defines}} {{include_dirs}} {{cflags}} {{cflags_c}}${extra_cppflags}${extra_cflags}${module_name_flag} -c {{source}} -o $output"
++      command = "$coverage_wrapper$cc $md -MF $depfile {{defines}} {{include_dirs}} {{cflags}} {{cflags_c}}${extra_cppflags}${extra_cflags}${module_name_flag} -c {{source}} -o $output -fno-fast-math -ffp-contract=off"
+       depsformat = "gcc"
+       description = "CC {{output}}"
+@@ -365,5 +365,5 @@
+       # {{output}} may contain .dwo file, so use $output instead of {{output}}
+       # in command.
+-      command = "$coverage_wrapper$cxx $md -MF $depfile {{defines}} {{include_dirs}} {{cflags}} {{cflags_cc}}${extra_cppflags}${extra_cxxflags} {{module_deps}}${module_name_flag} -c {{source}} -o $output"
++      command = "$coverage_wrapper$cxx $md -MF $depfile {{defines}} {{include_dirs}} {{cflags}} {{cflags_cc}}${extra_cppflags}${extra_cxxflags} {{module_deps}}${module_name_flag} -c {{source}} -o $output -fno-fast-math -ffp-contract=off"
+       depsformat = "gcc"
+       description = "CXX {{output}}"
+@@ -376,5 +376,5 @@
+       # Module file doesn't need coverage instrumentation because module files
+       # represent interfaces rather than implementations.
+-      command = "$cxx -MD -MF $depfile {{defines}} {{include_dirs}} {{cflags}} {{cflags_cc}}${extra_cppflags}${extra_cxxflags} {{module_deps_no_self}} -fmodule-name=\"{{cc_module_name}}\" -x c++ -Xclang -emit-module -c {{source}} -o {{output}}"
++      command = "$cxx -MD -MF $depfile {{defines}} {{include_dirs}} {{cflags}} {{cflags_cc}}${extra_cppflags}${extra_cxxflags} {{module_deps_no_self}} -fmodule-name=\"{{cc_module_name}}\" -x c++ -Xclang -emit-module -c {{source}} -o {{output}} -fno-fast-math -ffp-contract=off"
+       depsformat = "gcc"
+       description = "CXX_MODULE {{output}}"
+@@ -385,5 +385,5 @@
+       # For GCC we can just use the C compiler to compile assembly.
+       depfile = "{{output}}.d"
+-      command = "$asm $md -MF $depfile {{defines}} {{include_dirs}} {{asmflags}}${extra_asmflags} -c {{source}} -o {{output}}"
++      command = "$asm $md -MF $depfile {{defines}} {{include_dirs}} {{asmflags}}${extra_asmflags} -c {{source}} -o {{output}} -fno-fast-math -ffp-contract=off"
+       depsformat = "gcc"
+       description = "ASM {{output}}"

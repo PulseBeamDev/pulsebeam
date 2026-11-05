@@ -54,7 +54,10 @@ def make_config(state, cpu, memory_kb, action_cpu, action_memory_kb, reapi_port,
     return {
         "stores": [
             {"name": cas, **filesystem("cas", 2_000_000_000)},
-            {"name": ac, **filesystem("ac", 200_000_000)},
+            {"name": ac, "completeness_checking": {
+                "backend": filesystem("ac", 200_000_000),
+                "cas_store": {"ref_store": {"name": cas}},
+            }},
             {"name": fast, "fast_slow": {
                 "fast": filesystem("worker-cas", 2_000_000_000),
                 "slow": {"ref_store": {"name": cas}},
@@ -62,10 +65,13 @@ def make_config(state, cpu, memory_kb, action_cpu, action_memory_kb, reapi_port,
         ],
         "schedulers": [{"name": scheduler, "property_modifier": {
             "modifications": modifications,
-            "scheduler": {"simple": {"supported_platform_properties": {
-                "cpu_count": "minimum", "memory_kb": "minimum",
-                "OSFamily": "priority", "container-image": "priority",
-            }}},
+            "scheduler": {"cache_lookup": {
+                "ac_store": ac,
+                "scheduler": {"simple": {"supported_platform_properties": {
+                    "cpu_count": "minimum", "memory_kb": "minimum",
+                    "OSFamily": "priority", "container-image": "priority",
+                }}},
+            }},
         }}],
         "workers": [{"local": {
             "worker_api_endpoint": {"uri": f"grpc://127.0.0.1:{worker_port}"},

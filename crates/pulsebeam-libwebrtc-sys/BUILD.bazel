@@ -12,6 +12,8 @@ filegroup(name = "workflow_inputs", srcs = ["README.md"])
 
 string_flag(name = "flavor", build_setting_default = "core", values = ["core", "native"])
 bool_flag(name = "asan", build_setting_default = False)
+string_flag(name = "executor", build_setting_default = "local", values = ["local", "cache", "reapi"])
+string_flag(name = "reapi", build_setting_default = "grpc://127.0.0.1:50051")
 config_setting(name = "native_selected", flag_values = {":flavor": "native"})
 config_setting(name = "asan_selected", flag_values = {":asan": "true"})
 
@@ -19,6 +21,13 @@ native_build(
     name = "gn_native",
     bridge = "src/bridge.rs",
     adapters = glob(["native/**"]),
+)
+
+py_test(
+    name = "native_build_test",
+    srcs = ["native_build.py", "native_build_test.py"],
+    main = "native_build_test.py",
+    imports = ["."],
 )
 
 [
@@ -81,5 +90,5 @@ rustfmt_test(name = "format", targets = [":pulsebeam-webrtc-sys"])
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-webrtc-sys"])
 test_suite(
     name = "fast",
-    tests = [":unit_tests", ":lifetime", ":managed_h264", ":managed_vp8", ":managed_vp9", ":managed_av1", ":event_log_codec", ":audio_processing", ":shared_smoke"],
+    tests = [":native_build_test", ":unit_tests", ":lifetime", ":managed_h264", ":managed_vp8", ":managed_vp9", ":managed_av1", ":event_log_codec", ":audio_processing", ":shared_smoke"],
 )

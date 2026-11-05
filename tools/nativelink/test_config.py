@@ -1,7 +1,6 @@
 import json
 import os
 from pathlib import Path
-import signal
 import socket
 import subprocess
 import tempfile
@@ -9,6 +8,7 @@ import time
 import unittest
 
 import config
+from server import sandbox_script
 
 
 def modified(properties, modifications):
@@ -39,7 +39,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(set(c["servers"][0]["services"]), {"cas", "ac", "bytestream", "execution", "capabilities"})
         self.assertEqual(set(c["servers"][1]["services"]), {"worker_api", "health"})
         cas, ac, fast = c["stores"]
-        self.assertEqual([cas["filesystem"]["eviction_policy"]["max_bytes"], ac["filesystem"]["eviction_policy"]["max_bytes"], fast["fast_slow"]["fast"]["filesystem"]["eviction_policy"]["max_bytes"]], [2_000_000_000, 200_000_000, 2_000_000_000])
+        self.assertEqual([cas["filesystem"]["eviction_policy"]["max_bytes"], ac["completeness_checking"]["backend"]["filesystem"]["eviction_policy"]["max_bytes"], fast["fast_slow"]["fast"]["filesystem"]["eviction_policy"]["max_bytes"]], [2_000_000_000, 200_000_000, 2_000_000_000])
         self.assertEqual(fast["fast_slow"]["slow"]["ref_store"]["name"], cas["name"])
         self.assertEqual(len(c["workers"]), 1)
         worker = c["workers"][0]["local"]
@@ -51,7 +51,10 @@ class ConfigTest(unittest.TestCase):
         scheduler = c["schedulers"][0]
         self.assertEqual(c["servers"][0]["services"]["execution"][0]["scheduler"], scheduler["name"])
         self.assertEqual(c["servers"][1]["services"]["worker_api"]["scheduler"], scheduler["name"])
-        props = scheduler["property_modifier"]["scheduler"]["simple"]["supported_platform_properties"]
+        lookup = scheduler["property_modifier"]["scheduler"]["cache_lookup"]
+        self.assertEqual(lookup["ac_store"], ac["name"])
+        self.assertEqual(ac["completeness_checking"]["cas_store"]["ref_store"]["name"], cas["name"])
+        props = lookup["scheduler"]["simple"]["supported_platform_properties"]
         self.assertEqual((props["cpu_count"], props["memory_kb"]), ("minimum", "minimum"))
 
     def test_default_and_explicit_reservations(self):
@@ -73,6 +76,19 @@ class ConfigTest(unittest.TestCase):
             candidate[index] = value
             with self.subTest(index=index, value=value), self.assertRaises(ValueError):
                 config.make_config(*candidate)
+
+    def test_worker_sandbox_denies_network_and_undeclared_host_files(self):
+        script = sandbox_script(Path("/nix/store/tools/bin"), Path("/private/work"))
+        self.assertIn("--unshare-net", script)
+        self.assertIn("--unshare-pid", script)
+        self.assertIn("--die-with-parent", script)
+        self.assertIn("--bind /private/work /private/work", script)
+        self.assertIn("--ro-bind /nix/store /nix/store", script)
+        self.assertNotIn("--ro-bind / /", script)
+        self.assertNotIn("/home", script)
+        self.assertNotIn("/usr/include", script)
+        self.assertIn('"$@"', script)
+        self.assertLess(script.index("--tmpfs /tmp"), script.index("--bind /private/work"))
 
     def test_json_roundtrip(self):
         self.assertEqual(json.loads(json.dumps(self.config)), self.config)
@@ -97,7 +113,7 @@ class StartupTest(unittest.TestCase):
             config_path.write_text(json.dumps(cfg))
             log_path = Path(tmp) / "nativelink.log"
             with log_path.open("w+") as log:
-                process = subprocess.Popen([binary, str(config_path)], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                process = subprocess.Popen([binary, str(config_path)], stdout=log, stderr=subprocess.STDOUT)
                 try:
                     deadline = time.monotonic() + 15
                     remaining = {first, second}
@@ -114,13 +130,13 @@ class StartupTest(unittest.TestCase):
                     self.assertFalse(remaining, log_path.read_text())
                 finally:
                     try:
-                        os.killpg(process.pid, signal.SIGTERM)
+                        process.terminate()
                     except ProcessLookupError:
                         pass
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        process.kill()
                         process.wait(timeout=5)
 
 
