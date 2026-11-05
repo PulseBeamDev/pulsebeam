@@ -5,7 +5,13 @@
 #[cfg(test)]
 mod allocation;
 mod receiver;
+mod sender;
 pub use receiver::{Observation, Receipt, Receiver, ReceiverConfig, ReportOrder, ReportWindow};
+pub use sender::{
+    AvailabilityChange, FeedbackMode, FeedbackTiming, HistoryCounters, IndependentReport,
+    LossOrigin, PreparedProfile, SendCommit, SendFeedback, SendIdentity, SendReport, SendStatus,
+    Sender, SenderConfig, SenderError, SenderInputs, SentObservation, SentPacketId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct SpaceId(pub u64);
