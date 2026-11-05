@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -27,7 +28,9 @@ class LauncherContractTest(unittest.TestCase):
         self.binary.parent.mkdir(parents=True)
         self.binary.write_bytes(probe)
         self.binary.chmod(0o755)
-        self.env = dict(os.environ, XDG_CACHE_HOME=str(cache))
+        home = self.root / "home"
+        home.mkdir()
+        self.env = dict(os.environ, HOME=str(home), XDG_CACHE_HOME=str(cache))
 
     def run_launcher(self, *arguments, cwd=None, launcher=None):
         return subprocess.run([str(launcher or self.launcher), *arguments], env=self.env,
@@ -60,6 +63,18 @@ class LauncherContractTest(unittest.TestCase):
         result = self.run_launcher(*arguments)
         self.assertEqual(self.forwarded_arguments(result),
                          ["1", self.output_base, *arguments])
+
+    def test_retirement_lock_blocks_builds_without_leaving_per_worktree_files(self):
+        key = hashlib.sha256(os.fsencode(str(self.root.resolve()))).hexdigest()[:2]
+        lock = Path(self.env["HOME"]) / ".cache/dev/worktree-locks" / key
+        lock.parent.mkdir(parents=True)
+        with lock.open("w") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_launcher("test")
+            self.assertEqual(result.returncode, 75)
+        self.assertEqual(self.forwarded_arguments(self.run_launcher("version")),
+                         ["1", self.output_base, "version"])
+        self.assertEqual([entry.name for entry in lock.parent.iterdir()], [key])
 
     def test_corrupt_cached_launcher_fails_actionably(self):
         self.binary.write_bytes(b"corrupt")

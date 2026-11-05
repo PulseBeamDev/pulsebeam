@@ -8,7 +8,8 @@ Linux x86_64. Linux aarch64 runners support release binary assembly only.
 
 Use a writable checkout/cache and ordinary non-root execution on Linux. Install
 [Nix](https://nix.dev/install-nix), with access to its normal `/nix/store`, and
-make its `nix` and `nix-build` commands available on PATH. The clean reference
+make its `nix` and `nix-build` commands available on PATH. The launcher also
+requires `flock` from util-linux. The clean reference
 baseline is Ubuntu 24.04 with its standard shell utilities, Git, curl and CA trust,
 plus Nix. No distro package-manager setup, host language/compiler installation,
 or browser-library installation is part of the supported workflow.
@@ -89,7 +90,11 @@ state, execution roots and locks. `.bazel/` is ignored by both Git and Bazel's
 package discovery. Removing the worktree, including with `git worktree remove`,
 removes its output state too. Stop active builds first; `./bazel shutdown` stops
 that worktree's server before removal. Shared caches remain available to other
-worktrees and need their own retention policy.
+worktrees and need their own retention policy. The launcher and `dev wt` use a
+bounded set of shared lock files under `~/.cache/dev/worktree-locks` so supported
+builds cannot overlap retirement of the same worktree. Lock shards can also
+briefly serialize unrelated worktrees. Direct Bazel invocations outside the
+launcher do not participate; stop those builds before removing a worktree.
 
 Use `./bazel clean --expunge` to discard output state without deleting the
 worktree. Explicit `--output_base` startup arguments still override the local
@@ -111,10 +116,13 @@ only individually identified output bases, not the whole user cache directory.
 
 Declared SDK/browser files, toolchains and action arguments remain part of the
 action keys. The cache does not weaken checks or make results from a different
-runtime reusable. Disk-cache GC size/age policies are disabled by default; use
-Bazel's `--experimental_disk_cache_gc_max_size` or
-`--experimental_disk_cache_gc_max_age` if a local retention limit is needed.
-`--disk_cache=` explicitly disables action caching for diagnostics.
+runtime reusable. Bazel garbage-collects the shared action cache toward 200 GiB
+after 30 seconds of server inactivity. This is a background target, not a hard
+quota; builds can temporarily exceed it. Repository contents use Bazel's default
+14-day unused-entry policy, with the same 30-second idle delay. That policy does
+not bound their size. The separate download cache and worktree output state are
+not covered by the action-cache target. `--disk_cache=` explicitly disables
+action caching for diagnostics.
 
 Native input-tree memoization avoids repeated Merkle-tree construction within a
 command, including when using the disk cache. Its default 1,000-entry bound is

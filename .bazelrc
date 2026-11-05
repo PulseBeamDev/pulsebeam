@@ -5,8 +5,11 @@ startup --host_jvm_args=-Xmx2g
 common --enable_bzlmod
 common --lockfile_mode=error
 common --repo_contents_cache=~/.cache/pulsebeam/bazel/repo-contents-cache
+common --repo_contents_cache_gc_idle_delay=30s
 common --watchfs
 build --disk_cache=~/.cache/pulsebeam/bazel/disk-cache
+build --experimental_disk_cache_gc_max_size=200G
+build --experimental_disk_cache_gc_idle_delay=30s
 build --incompatible_strict_action_env
 build --announce_rc
 build --workspace_status_command=tools/simulation-status.sh

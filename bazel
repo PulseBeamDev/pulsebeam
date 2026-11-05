@@ -22,4 +22,9 @@ echo "$sha  $launcher" | sha256sum --check --status || { echo "Corrupt launcher:
 export BAZELISK_SKIP_WRAPPER=1
 # Keep disposable output state with the checkout, including analyzer output-base siblings.
 workspace=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
-exec "$launcher" "--output_base=$workspace/.bazel/output" "$@"
+# A bounded shard set coordinates builds with dev wt retirement without per-worktree lock files.
+lock_key=$(printf '%s' "$workspace" | sha256sum)
+lock_dir="$HOME/.cache/dev/worktree-locks"
+mkdir -p "$lock_dir"
+exec flock --shared --nonblock --conflict-exit-code 75 "$lock_dir/${lock_key:0:2}" \
+  "$launcher" "--output_base=$workspace/.bazel/output" "$@"
