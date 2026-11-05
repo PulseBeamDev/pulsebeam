@@ -6,20 +6,23 @@ mod tests;
 use crate::{
     control::ufrag::IceUfrag, route::NodeTransportAddress, shard::demux::extract_stun_server_ufrag,
 };
-use pulsebeam_core::net::{TcpListener, TcpStream};
 use pulsebeam_queue as mailbox;
-use pulsebeam_runtime::net::ReceiveTime;
+use pulsebeam_runtime::{
+    net::{
+        ReceiveTime,
+        tcp::{self, TcpListener, TcpStream},
+    },
+    role::{self, IdleRole},
+    sync::{self, CancellationToken, Semaphore, mpsc, oneshot},
+    task::{self, JoinSet},
+    time,
+};
 use std::{
     collections::HashMap,
     io,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
-use tokio::{
-    sync::{Semaphore, mpsc, oneshot},
-    task::JoinSet,
-};
-use tokio_util::sync::CancellationToken;
 
 /// Finite resource limits for the optional passive fallback.
 #[derive(Clone, Debug)]
@@ -87,12 +90,12 @@ impl Limits {
 }
 
 struct AdmissionPermit {
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: sync::OwnedSemaphorePermit,
     gauge: metrics::Gauge,
 }
 
 impl AdmissionPermit {
-    fn new(permit: tokio::sync::OwnedSemaphorePermit, metric: &'static str) -> Self {
+    fn new(permit: sync::OwnedSemaphorePermit, metric: &'static str) -> Self {
         let gauge = metrics::gauge!(metric);
         gauge.increment(1.0);
         Self {
@@ -201,7 +204,7 @@ pub(crate) struct TcpPacket {
     pub packet: Vec<u8>,
     pub received_at: ReceiveTime,
     // The quota follows the allocation through inbox and deferred RTC input.
-    _slot: tokio::sync::OwnedSemaphorePermit,
+    _slot: sync::OwnedSemaphorePermit,
 }
 
 #[cfg(test)]
@@ -305,17 +308,7 @@ impl Routing {
 }
 
 pub(crate) struct Service {
-    shutdown: CancellationToken,
-    #[cfg(not(feature = "sim"))]
-    thread: Option<std::thread::JoinHandle<io::Result<()>>>,
-    #[cfg(feature = "sim")]
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for Service {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-    }
+    role: IdleRole,
 }
 
 impl Service {
@@ -333,124 +326,31 @@ impl Service {
         shutdown: CancellationToken,
     ) -> io::Result<(Self, SocketAddr)> {
         limits.validate(routing.shard_count)?;
-        #[cfg(feature = "sim")]
-        {
-            let _ = spare_core;
-            let listener = crate::node::bind_tcp_listener(bind).await?;
-            let bound = listener.local_addr()?;
-            let task = tokio::spawn(accept_loop(
-                listener,
-                advertised,
-                routing,
-                limits,
-                inboxes,
-                shutdown.clone(),
-            ));
-            Ok((
-                Self {
-                    shutdown,
-                    task: Some(task),
-                },
-                bound,
-            ))
-        }
-        #[cfg(not(feature = "sim"))]
-        {
-            let (ready, result) = oneshot::channel();
-            let stop = shutdown.clone();
-            let thread = std::thread::Builder::new()
-                .name("pb-ice-tcp".into())
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-                    runtime.block_on(async move {
-                        let listener = match tune_thread(spare_core) {
-                            Ok(()) => crate::node::bind_tcp_listener(bind).await,
-                            Err(error) => Err(error),
-                        };
-                        let listener = match listener {
-                            Ok(listener) => listener,
-                            Err(error) => {
-                                let _ = ready.send(Err(error));
-                                return Ok(());
-                            }
-                        };
-                        let bound = listener.local_addr()?;
-                        if ready.send(Ok(bound)).is_ok() {
-                            accept_loop(listener, advertised, routing, limits, inboxes, stop).await;
-                        }
-                        Ok(())
-                    })
-                })?;
-            let service = Self {
-                shutdown,
-                thread: Some(thread),
-            };
-            let bound = result
-                .await
-                .map_err(|_| io::Error::other("ICE-TCP thread failed at startup"))??;
-            Ok((service, bound))
-        }
+        let stop = shutdown.clone();
+        let (role, bound) = IdleRole::start(
+            "pb-ice-tcp",
+            spare_core.map(|core| core.id),
+            shutdown,
+            move || async move {
+                let listener = tcp::bind(bind).await?;
+                let bound = listener.local_addr()?;
+                Ok((
+                    bound,
+                    accept_loop(listener, advertised, routing, limits, inboxes, stop),
+                ))
+            },
+        )
+        .await?;
+        Ok((Self { role }, bound))
     }
 
-    pub(crate) async fn finish(mut self) -> io::Result<()> {
-        self.shutdown.cancel();
-        #[cfg(feature = "sim")]
-        if let Some(task) = self.task.take() {
-            task.await.map_err(io::Error::other)?;
-        }
-        #[cfg(not(feature = "sim"))]
-        if let Some(thread) = self.thread.take() {
-            tokio::task::spawn_blocking(move || {
-                thread
-                    .join()
-                    .map_err(|_| io::Error::other("ICE-TCP thread panicked"))?
-            })
-            .await
-            .map_err(io::Error::other)??;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(not(feature = "sim"))]
-fn tune_thread(spare_core: Option<core_affinity::CoreId>) -> io::Result<()> {
-    use thread_priority::{
-        NormalThreadSchedulePolicy, ThreadPriority, ThreadSchedulePolicy, thread_native_id,
-    };
-    thread_priority::set_thread_priority_and_policy(
-        thread_native_id(),
-        ThreadPriority::Min,
-        ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Idle),
-    )
-    .map_err(io::Error::other)?;
-    if let Some(core) = spare_core
-        && !core_affinity::set_for_current(core)
-    {
-        tracing::warn!(core = core.id, "ICE-TCP spare-core affinity unavailable");
-    }
-    tracing::info!(?spare_core, "ICE-TCP thread uses SCHED_IDLE");
-    Ok(())
-}
-
-fn thread_cpu_nanos() -> u64 {
-    #[cfg(not(feature = "sim"))]
-    {
-        let time = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
-        u64::try_from(time.tv_sec)
-            .unwrap_or_default()
-            .saturating_mul(1_000_000_000)
-            .saturating_add(u64::try_from(time.tv_nsec).unwrap_or_default())
-    }
-    #[cfg(feature = "sim")]
-    {
-        0
+    pub(crate) async fn finish(self) -> io::Result<()> {
+        self.role.finish().await
     }
 }
 
 fn observe_cpu(previous: &mut u64) {
-    let next = thread_cpu_nanos();
+    let next = role::thread_cpu_nanos();
     metrics::counter!("ice_tcp_thread_cpu_ns").increment(next.saturating_sub(*previous));
     *previous = next;
 }
@@ -475,11 +375,11 @@ async fn accept_loop(
     let (done_tx, mut done_rx) = mpsc::channel::<IpAddr>(task_capacity);
     let mut ips = HashMap::<IpAddr, usize>::new();
     let mut connections = JoinSet::new();
-    let mut cpu_due = tokio::time::interval(Duration::from_secs(1));
-    cpu_due.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut cpu_sample = thread_cpu_nanos();
+    let mut cpu_due = time::interval(Duration::from_secs(1));
+    cpu_due.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut cpu_sample = role::thread_cpu_nanos();
     loop {
-        tokio::select! {
+        pulsebeam_runtime::select! {
             biased;
             _ = shutdown.cancelled() => break,
             _ = cpu_due.tick() => observe_cpu(&mut cpu_sample),
@@ -495,7 +395,7 @@ async fn accept_loop(
             accepted = listener.accept() => {
                 let Ok((stream, remote)) = accepted else {
                     metrics::counter!("ice_tcp_rejected", "reason" => "accept_error").increment(1);
-                    tokio::task::yield_now().await;
+                    task::yield_now().await;
                     continue;
                 };
                 let remote = canonical(remote);
@@ -528,7 +428,7 @@ async fn accept_loop(
                     }
                     let _ = done.try_send(ip);
                     if let Some((route, sender)) = terminal {
-                        tokio::select! {
+                        pulsebeam_runtime::select! {
                             biased;
                             _ = stop.cancelled() => {},
                             _ = sender.channel.send(TcpIngress::Closed { route }) => {},
@@ -570,7 +470,7 @@ async fn flow(
         .copied()
         .find(|addr| addr.is_ipv4() == remote.ip().to_canonical().is_ipv4())
         .unwrap_or(socket_local);
-    let (mut reader, mut writer) = pulsebeam_tcp::split(stream, limits.max_frame_bytes)?;
+    let (mut reader, mut writer) = tcp::split(stream, limits.max_frame_bytes)?;
     let cancel = shutdown.child_token();
     let handshake = async {
         let mut nulls = 0usize;
@@ -628,17 +528,16 @@ async fn flow(
         }
         Ok((route, sender, outgoing, active))
     };
-    let adopted = tokio::select! {
+    let adopted = pulsebeam_runtime::select! {
         biased;
         _ = shutdown.cancelled() => return Ok(()),
-        result = tokio::time::timeout(limits.first_stun_timeout, handshake) => result??,
+        result = time::timeout(limits.first_stun_timeout, handshake) => result??,
     };
     let (route, sender, mut outgoing, _active) = adopted;
     let read = async {
         let mut nulls = 0usize;
         loop {
-            let packet = match tokio::time::timeout(limits.stalled_io_timeout, reader.recv()).await
-            {
+            let packet = match time::timeout(limits.stalled_io_timeout, reader.recv()).await {
                 Ok(result) => result?,
                 Err(_) if !reader.is_partial() => continue,
                 Err(error) => return Err(io::Error::other(error)),
@@ -672,7 +571,7 @@ async fn flow(
     };
     let write = async {
         while let Some(packet) = outgoing.recv().await {
-            match tokio::time::timeout(limits.stalled_io_timeout, writer.send(&packet)).await {
+            match time::timeout(limits.stalled_io_timeout, writer.send(&packet)).await {
                 Ok(result) => result?,
                 Err(error) => {
                     metrics::counter!("ice_tcp_stalled_write_close").increment(1);
@@ -682,7 +581,7 @@ async fn flow(
         }
         Ok::<(), io::Error>(())
     };
-    tokio::select! {
+    pulsebeam_runtime::select! {
         biased;
         _ = cancel.cancelled() => Ok(()),
         result = read => result,
