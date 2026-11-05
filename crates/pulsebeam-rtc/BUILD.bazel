@@ -7,7 +7,7 @@ filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfi
 exports_files(["Cargo.toml"])
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
 
-CORE_DEPS = ["//crates/pulsebeam-core:pulsebeam-core-portable", "//crates/pulsebeam-cc:pulsebeam-cc"]
+CORE_DEPS = ["//crates/pulsebeam-core:pulsebeam-core-portable", "//crates/pulsebeam-cc:pulsebeam-cc", "//crates/pulsebeam-feedback:pulsebeam-feedback"]
 TEST_DEPS = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + CORE_DEPS + [":pulsebeam-rtc", "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"]
 TEST_ALIASES = aliases(normal_dev = True, proc_macro_dev = True) | aliases()
 

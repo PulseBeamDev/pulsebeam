@@ -1,0 +1,13 @@
+[package]
+name = "pulsebeam-feedback"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Bounded sans-I/O transport receipt and send accounting"
+
+[lints]
+workspace = true

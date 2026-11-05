@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use pulsebeam_feedback::{
+    Ecn, Epoch, PacketId, Receipt, Receiver, ReceiverConfig, ReportOrder, ReportWindow, SpaceId,
+};
 use str0m::rtp_::rtcp::{
     Rtcp, Twcc,
     twcc::{Delta, PacketChunk},
@@ -16,27 +19,29 @@ use str0m::rtp_::rtcp::{
 use crate::{EcnCodepoint, PacketFeedbackKind};
 
 const HISTORY: usize = 512;
-const REPORT_STATUSES: u64 = 256;
+const REPORT_STATUSES: usize = 256;
 const INTERVAL: Duration = Duration::from_millis(50);
+const EPOCH: Epoch = Epoch(0);
+const TRANSPORT: SpaceId = SpaceId(0);
 
-#[derive(Clone, Copy, Debug)]
-struct Receipt {
-    ssrc: u32,
-    sequence: u64,
-    arrival: Instant,
-    ecn: Option<EcnCodepoint>,
-    pending: bool,
+fn config(mode: PacketFeedbackKind) -> ReceiverConfig {
+    ReceiverConfig {
+        capacity: HISTORY,
+        max_report_statuses: REPORT_STATUSES,
+        interval: INTERVAL,
+        order: match mode {
+            PacketFeedbackKind::TransportWide => ReportOrder::Continuous(TRANSPORT),
+            PacketFeedbackKind::Rfc8888 => ReportOrder::Independent,
+        },
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct ReceiveFeedback {
     mode: Option<PacketFeedbackKind>,
     origin: Instant,
-    receipts: VecDeque<Receipt>,
-    twcc_highest: Option<u64>,
-    twcc_next: Option<u64>,
+    receiver: Option<Receiver>,
     feedback_count: u8,
-    deadline: Option<Instant>,
 }
 
 impl ReceiveFeedback {
@@ -44,24 +49,20 @@ impl ReceiveFeedback {
         Self {
             mode,
             origin,
-            receipts: VecDeque::new(),
-            twcc_highest: None,
-            twcc_next: None,
+            receiver: None,
             feedback_count: 0,
-            deadline: None,
         }
     }
 
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "VecDeque capacity describes a valid allocation of Receipt elements"
-    )]
     pub(crate) fn storage_bytes(&self) -> usize {
-        self.receipts.capacity() * std::mem::size_of::<Receipt>()
+        self.receiver.as_ref().map_or(0, Receiver::storage_bytes)
     }
 
     pub(crate) fn reserve(&mut self, limit: usize) -> Option<usize> {
-        self.reserve_profile(self.mode, limit)
+        match self.mode {
+            Some(mode) => self.set_profile(mode, limit),
+            None => Some(0),
+        }
     }
 
     pub(crate) fn set_profile(
@@ -69,32 +70,18 @@ impl ReceiveFeedback {
         profile: PacketFeedbackKind,
         limit: usize,
     ) -> Option<usize> {
-        self.reserve_profile(Some(profile), limit)
-    }
-
-    fn reserve_profile(&mut self, mode: Option<PacketFeedbackKind>, limit: usize) -> Option<usize> {
-        let required = if mode.is_some() { HISTORY } else { 0 };
-        let bytes = if self.receipts.capacity() < required {
-            required
-                .checked_mul(std::mem::size_of::<Receipt>())
-                .filter(|bytes| *bytes <= limit)?;
-            let mut expanded = VecDeque::new();
-            expanded.try_reserve_exact(required).ok()?;
-            let bytes = expanded
-                .capacity()
-                .checked_mul(std::mem::size_of::<Receipt>())
-                .filter(|bytes| *bytes <= limit)?;
-            expanded.append(&mut self.receipts);
-            self.receipts = expanded;
-            bytes
+        if self.mode.is_some_and(|mode| mode != profile) {
+            return None;
+        }
+        let bytes = if let Some(receiver) = &mut self.receiver {
+            receiver.reserve(limit).ok()?
         } else {
-            let bytes = self.storage_bytes();
-            if bytes > limit {
-                return None;
-            }
+            let mut receiver = Receiver::new(config(profile), EPOCH).ok()?;
+            let bytes = receiver.reserve(limit).ok()?;
+            self.receiver = Some(receiver);
             bytes
         };
-        self.mode = mode;
+        self.mode = Some(profile);
         Some(bytes)
     }
 
@@ -106,144 +93,102 @@ impl ReceiveFeedback {
         twcc: Option<u16>,
         ecn: Option<EcnCodepoint>,
     ) {
-        let (ssrc, sequence) = match self.mode {
+        let Some(receiver) = &mut self.receiver else {
+            return;
+        };
+        let (space, sequence) = match self.mode {
             Some(PacketFeedbackKind::TransportWide) => {
                 let Some(sequence) = twcc else {
                     return;
                 };
-                (ssrc, extend(self.twcc_highest, sequence))
+                (TRANSPORT, sequence)
             }
-            Some(PacketFeedbackKind::Rfc8888) => {
-                let highest = self
-                    .receipts
-                    .iter()
-                    .filter(|r| r.ssrc == ssrc)
-                    .map(|r| r.sequence)
-                    .max();
-                (ssrc, extend(highest, sequence))
-            }
+            Some(PacketFeedbackKind::Rfc8888) => (SpaceId(u64::from(ssrc)), sequence),
             None => return,
         };
-        assert!(self.receipts.capacity() >= HISTORY);
-        let mut index = if self.mode == Some(PacketFeedbackKind::TransportWide) {
-            let highest = self
-                .twcc_highest
-                .map_or(sequence, |highest| highest.max(sequence));
-            let floor = highest.saturating_sub(HISTORY.saturating_sub(1) as u64);
-            if sequence < floor {
-                return;
-            }
-            self.twcc_highest = Some(highest);
-            while self.receipts.front().is_some_and(|r| r.sequence < floor) {
-                self.receipts.pop_front();
-            }
-            let Err(index) = self
-                .receipts
-                .binary_search_by_key(&sequence, |r| r.sequence)
-            else {
-                return;
-            };
-            self.twcc_next = Some(
-                self.twcc_next
-                    .map_or(sequence, |next| next.min(sequence))
-                    .max(floor),
-            );
-            index
-        } else {
-            if self
-                .receipts
-                .iter()
-                .any(|r| r.ssrc == ssrc && r.sequence == sequence)
-            {
-                return;
-            }
-            self.receipts.len()
-        };
-        if self.receipts.len() == HISTORY {
-            self.receipts.pop_front();
-            index = index.saturating_sub(1);
-        }
-        self.receipts.insert(
-            index,
+        let sequence = extend(receiver.highest(space).map(|id| id.0), sequence);
+        let _ = receiver.observe(
+            EPOCH,
             Receipt {
-                ssrc,
-                sequence,
-                arrival: now,
-                ecn,
-                pending: true,
+                space,
+                packet: PacketId(sequence),
+                arrived_at: now.saturating_duration_since(self.origin),
+                ecn: ecn.map(|mark| match mark {
+                    EcnCodepoint::NotEct => Ecn::NotEct,
+                    EcnCodepoint::Ect1 => Ecn::Ect1,
+                    EcnCodepoint::Ect0 => Ecn::Ect0,
+                    EcnCodepoint::Ce => Ecn::Ce,
+                }),
+                tag: u64::from(ssrc),
             },
         );
-        self.deadline
-            .get_or_insert_with(|| now.checked_add(INTERVAL).unwrap_or(now));
     }
 
     pub(crate) fn clear(&mut self) {
-        self.receipts.clear();
-        self.twcc_highest = None;
-        self.twcc_next = None;
-        self.deadline = None;
+        if let Some(receiver) = &mut self.receiver {
+            receiver.clear(EPOCH);
+        }
     }
 
     pub(crate) fn abort(&mut self) {
-        self.clear();
-        self.receipts = VecDeque::new();
+        if let Some(receiver) = &mut self.receiver {
+            receiver.abort();
+        }
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.deadline
+        self.origin.checked_add(self.receiver.as_ref()?.deadline()?)
     }
 
     pub(crate) fn poll(&mut self, now: Instant, sender_ssrc: u32) -> Option<Vec<u8>> {
-        if now < self.deadline? {
+        let elapsed = now.saturating_duration_since(self.origin);
+        let report = self.receiver.as_ref()?.report(elapsed)?;
+        let encoded = match self.mode? {
+            PacketFeedbackKind::TransportWide => self.twcc(elapsed, sender_ssrc, report),
+            PacketFeedbackKind::Rfc8888 => self.rfc8888(elapsed, sender_ssrc, report),
+        };
+        let receiver = self.receiver.as_mut()?;
+        let Some((bytes, count)) = encoded else {
+            let _ = receiver.defer(elapsed, elapsed.saturating_add(INTERVAL));
             return None;
+        };
+        receiver.accept(report, count, elapsed).ok()?;
+        if self.mode == Some(PacketFeedbackKind::TransportWide) {
+            self.feedback_count = self.feedback_count.wrapping_add(1);
         }
-        let packet = match self.mode? {
-            PacketFeedbackKind::TransportWide => self.twcc(now, sender_ssrc),
-            PacketFeedbackKind::Rfc8888 => self.rfc8888(now, sender_ssrc),
-        };
-        let pending = match self.mode? {
-            PacketFeedbackKind::TransportWide => self
-                .twcc_next
-                .zip(self.twcc_highest)
-                .is_some_and(|(next, highest)| next <= highest),
-            PacketFeedbackKind::Rfc8888 => self.receipts.iter().any(|r| r.pending),
-        };
-        self.deadline = pending.then_some(now);
-        packet
+        Some(bytes)
     }
 
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "each report spans at most 256 sequences and each status vector contains at most seven symbols"
     )]
-    fn twcc(&mut self, now: Instant, sender_ssrc: u32) -> Option<Vec<u8>> {
-        let base = self.twcc_next?;
-        let end = (base + REPORT_STATUSES).min(self.twcc_highest? + 1);
-        let first_receipt = self
-            .receipts
-            .get(self.receipts.partition_point(|r| r.sequence < base))?;
-        // libwebrtc dispatches TWCC only for a local/registered media SSRC.
-        // Anchor to an actual transport receipt, including when this bounded
-        // slice contains only losses and its next received packet is later.
-        // Sequence accounting remains transport-wide, not per media stream.
-        let media_ssrc = first_receipt.ssrc;
-        let first_time = if first_receipt.sequence < end {
-            first_receipt.arrival
+    fn twcc(
+        &self,
+        now: Duration,
+        sender_ssrc: u32,
+        window: ReportWindow,
+    ) -> Option<(Vec<u8>, usize)> {
+        let receiver = self.receiver.as_ref()?;
+        let base = window.base.0;
+        let end = base.checked_add(u64::try_from(window.count).ok()?)?;
+        let first = receiver.first_receipt(window)?;
+        // libwebrtc dispatches TWCC only for a registered media SSRC, including
+        // loss-only slices whose next receipt lies beyond this bounded window.
+        let media_ssrc = u32::try_from(first.tag).ok()?;
+        let first_time = if first.packet.0 < end {
+            first.arrived_at
         } else {
             now
         };
-        let reference_ticks = self.ticks(first_time) / 256;
+        let reference_ticks = ticks(first_time) / 256;
         let mut previous = reference_ticks * 256;
-        let mut statuses = Vec::with_capacity(REPORT_STATUSES as usize);
+        let mut statuses = Vec::with_capacity(REPORT_STATUSES);
         let mut deltas = VecDeque::new();
         for sequence in base..end {
-            let receipt = self
-                .receipts
-                .binary_search_by_key(&sequence, |r| r.sequence)
-                .ok()
-                .and_then(|index| self.receipts.get(index));
+            let receipt = receiver.receipt(window.space, PacketId(sequence));
             let status = if let Some(receipt) = receipt {
-                let ticks = self.ticks(receipt.arrival);
+                let ticks = ticks(receipt.arrived_at);
                 let Ok(delta) = i16::try_from(i128::from(ticks) - i128::from(previous)) else {
                     break;
                 };
@@ -260,7 +205,10 @@ impl ReceiveFeedback {
             };
             statuses.push(status);
         }
-        let count = statuses.len() as u16;
+        let count = statuses.len();
+        if count == 0 {
+            return None;
+        }
         let chunks = statuses
             .chunks(7)
             .map(|statuses| {
@@ -277,7 +225,7 @@ impl ReceiveFeedback {
             sender_ssrc: sender_ssrc.into(),
             ssrc: media_ssrc.into(),
             base_seq: base as u16,
-            status_count: count,
+            status_count: u16::try_from(count).ok()?,
             reference_time: reference_ticks as u32 & 0x00ff_ffff,
             feedback_count: self.feedback_count,
             chunks,
@@ -286,17 +234,16 @@ impl ReceiveFeedback {
         let mut queue = VecDeque::from([Rtcp::Twcc(report)]);
         let mut bytes = vec![0; 1200];
         let len = Rtcp::write_packet(&mut queue, &mut bytes, |_| {});
-        debug_assert!(queue.is_empty());
-        bytes.truncate(len);
-        let covered_end = base + u64::from(count);
-        for receipt in &mut self.receipts {
-            if (base..covered_end).contains(&receipt.sequence) {
-                receipt.pending = false;
-            }
+        if !queue.is_empty() || len == 0 {
+            return None;
         }
-        self.feedback_count = self.feedback_count.wrapping_add(1);
-        self.twcc_next = Some(covered_end);
-        Some(bytes)
+        bytes.truncate(len);
+        let serialized = bytes.get(14..16)?;
+        let serialized = usize::from(u16::from_be_bytes(serialized.try_into().ok()?));
+        if serialized == 0 || serialized > count {
+            return None;
+        }
+        Some((bytes, serialized))
     }
 
     #[allow(
@@ -304,50 +251,35 @@ impl ReceiveFeedback {
         clippy::indexing_slicing,
         reason = "the report has at most 256 statuses and its fixed four-byte header is present before patching its length"
     )]
-    fn rfc8888(&mut self, now: Instant, sender_ssrc: u32) -> Option<Vec<u8>> {
-        let ssrc = self.receipts.iter().find(|r| r.pending)?.ssrc;
-        let first = self
-            .receipts
-            .iter()
-            .filter(|r| r.ssrc == ssrc && r.pending)
-            .map(|r| r.sequence)
-            .min()?;
-        let preceding = self
-            .receipts
-            .iter()
-            .filter(|r| r.ssrc == ssrc && !r.pending && r.sequence < first)
-            .map(|r| r.sequence + 1)
-            .max()
-            .unwrap_or(first);
-        let base = preceding.max(first.saturating_sub(REPORT_STATUSES - 1));
-        let end = self
-            .receipts
-            .iter()
-            .filter(|r| r.ssrc == ssrc && r.pending)
-            .map(|r| r.sequence + 1)
-            .max()?
-            .min(base + REPORT_STATUSES);
-        let count = (end - base) as u16;
+    fn rfc8888(
+        &self,
+        now: Duration,
+        sender_ssrc: u32,
+        window: ReportWindow,
+    ) -> Option<(Vec<u8>, usize)> {
+        let receiver = self.receiver.as_ref()?;
+        let ssrc = u32::try_from(window.space.0).ok()?;
+        let base = window.base.0;
+        let count = u16::try_from(window.count).ok()?;
+        let end = base.checked_add(u64::from(count))?;
         let mut bytes = vec![0x8b, 205, 0, 0];
         bytes.extend_from_slice(&sender_ssrc.to_be_bytes());
         bytes.extend_from_slice(&ssrc.to_be_bytes());
         bytes.extend_from_slice(&(base as u16).to_be_bytes());
         bytes.extend_from_slice(&count.to_be_bytes());
         for sequence in base..end {
-            let status = self
-                .receipts
-                .iter()
-                .find(|r| r.ssrc == ssrc && r.sequence == sequence)
-                .map_or(0, |r| {
+            let status = receiver
+                .receipt(window.space, PacketId(sequence))
+                .map_or(0, |receipt| {
                     let offset = now
-                        .saturating_duration_since(r.arrival)
+                        .saturating_sub(receipt.arrived_at)
                         .as_micros()
                         .saturating_mul(1024)
                         / 1_000_000;
-                    let ecn = match r.ecn {
-                        Some(EcnCodepoint::Ect1) => 1,
-                        Some(EcnCodepoint::Ect0) => 2,
-                        Some(EcnCodepoint::Ce) => 3,
+                    let ecn = match receipt.ecn {
+                        Some(Ecn::Ect1) => 1,
+                        Some(Ecn::Ect0) => 2,
+                        Some(Ecn::Ce) => 3,
                         _ => 0,
                     };
                     0x8000 | (ecn << 13) | offset.min(0x1ffe) as u16
@@ -357,25 +289,16 @@ impl ReceiveFeedback {
         if !count.is_multiple_of(2) {
             bytes.extend_from_slice(&[0, 0]);
         }
-        let timestamp = (now
-            .saturating_duration_since(self.origin)
-            .as_micros()
-            .saturating_mul(65536)
-            / 1_000_000) as u32;
+        let timestamp = (now.as_micros().saturating_mul(65536) / 1_000_000) as u32;
         bytes.extend_from_slice(&timestamp.to_be_bytes());
         let words = (bytes.len() / 4 - 1) as u16;
         bytes[2..4].copy_from_slice(&words.to_be_bytes());
-        for receipt in &mut self.receipts {
-            if receipt.ssrc == ssrc && (base..end).contains(&receipt.sequence) {
-                receipt.pending = false;
-            }
-        }
-        Some(bytes)
+        Some((bytes, usize::from(count)))
     }
+}
 
-    fn ticks(&self, at: Instant) -> u64 {
-        (at.saturating_duration_since(self.origin).as_micros() / 250) as u64
-    }
+fn ticks(at: Duration) -> u64 {
+    (at.as_micros() / 250) as u64
 }
 
 fn extend(highest: Option<u64>, sequence: u16) -> u64 {
@@ -500,8 +423,13 @@ mod tests {
         let mut receiver = ReceiveFeedback::new(None, start);
         assert_eq!(receiver.reserve(0), Some(0));
         receiver.observe(start, 0, 0, Some(0), None);
-        assert!(receiver.receipts.is_empty() && receiver.deadline().is_none());
-        let required = HISTORY * std::mem::size_of::<Receipt>();
+        assert!(
+            receiver.receiver.as_ref().is_none_or(Receiver::is_empty)
+                && receiver.deadline().is_none()
+        );
+        let required = config(PacketFeedbackKind::TransportWide)
+            .minimum_storage_bytes()
+            .unwrap();
         assert_eq!(
             receiver.set_profile(PacketFeedbackKind::TransportWide, required - 1),
             None
@@ -513,10 +441,10 @@ mod tests {
             Some(required)
         );
         receiver.observe(start, 0, 0, None, None);
-        assert!(receiver.receipts.is_empty() && receiver.deadline().is_none());
+        assert!(receiver.receiver.as_ref().unwrap().is_empty() && receiver.deadline().is_none());
         for sequence in 0..600 {
             receiver.observe(start, 0, sequence, Some(sequence), None);
-            assert!(receiver.receipts.len() <= HISTORY);
+            assert!(receiver.receiver.as_ref().unwrap().len() <= HISTORY);
             assert_eq!(receiver.storage_bytes(), required);
         }
         let mut reported = 0;
@@ -524,7 +452,7 @@ mod tests {
             let FeedbackReport::Twcc { statuses, .. } = report(&mut receiver, at(start, 50)) else {
                 panic!("TWCC");
             };
-            assert!(statuses.len() <= REPORT_STATUSES as usize);
+            assert!(statuses.len() <= REPORT_STATUSES);
             reported += statuses.len();
         }
         assert_eq!(reported, HISTORY);
@@ -585,7 +513,7 @@ mod tests {
             "even a loss-only slice uses an observed source"
         );
         assert_eq!(base_sequence, 1);
-        assert_eq!(statuses.len(), REPORT_STATUSES as usize);
+        assert_eq!(statuses.len(), REPORT_STATUSES);
         assert!(statuses.iter().all(|s| *s == TwccStatus::NotReceived));
         let FeedbackReport::Twcc {
             media_ssrc,

@@ -3891,6 +3891,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-feedback"
+version = "0.3.2"
+
+[[package]]
 name = "pulsebeam-membership"
 version = "0.3.2"
 dependencies = [
@@ -3939,6 +3943,7 @@ dependencies = [
  "proptest",
  "pulsebeam-cc",
  "pulsebeam-core",
+ "pulsebeam-feedback",
  "rcgen",
  "sha2",
  "str0m 0.23.1",

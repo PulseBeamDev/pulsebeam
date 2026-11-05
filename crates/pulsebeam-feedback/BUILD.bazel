@@ -1,0 +1,23 @@
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test")
+
+package(default_visibility = ["//visibility:public"])
+exports_files(["Cargo.toml"])
+filegroup(name = "workflow_inputs", srcs = ["Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs"]))
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+rust_library(
+    name = "pulsebeam-feedback",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+)
+
+rust_test(name = "unit_tests", crate = ":pulsebeam-feedback", lint_config = ":lints")
+rustfmt_test(name = "format", targets = [":pulsebeam-feedback", ":unit_tests"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-feedback", ":unit_tests"])
+test_suite(name = "test", tests = [":unit_tests", ":format", ":clippy"])

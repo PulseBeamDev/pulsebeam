@@ -15,6 +15,7 @@ is = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd424
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
 pulsebeam-core = { path = "../pulsebeam-core", default-features = false }
 pulsebeam-cc = { path = "../pulsebeam-cc" }
+pulsebeam-feedback = { path = "../pulsebeam-feedback" }
 rcgen = { version = "0.14.7", default-features = false, features = ["aws_lc_rs"] }
 sha2.workspace = true
 str0m = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd4246d9e7faf0ad4ca099c1bc", default-features = false, features = ["aws-lc-rs"] }
