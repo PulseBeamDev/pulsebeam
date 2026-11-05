@@ -23,6 +23,8 @@ mod transport;
 #[cfg(test)]
 extern crate self as pulsebeam_rtc;
 #[cfg(test)]
+mod feedback_trace;
+#[cfg(test)]
 mod network_tests;
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]

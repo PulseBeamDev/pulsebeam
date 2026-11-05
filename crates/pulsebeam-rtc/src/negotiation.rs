@@ -1049,7 +1049,8 @@ fn parse_codecs(
                 nack: allows_feedback("nack") && codec_feedback(raw, *parameter.pt, "nack"),
                 twcc: allows_feedback("transport-cc")
                     && codec_feedback(raw, *parameter.pt, "transport-cc"),
-                rfc8888: allows_feedback("ccfb") && codec_feedback(raw, *parameter.pt, "ccfb"),
+                rfc8888: allows_feedback("ack ccfb")
+                    && codec_feedback(raw, *parameter.pt, "ack ccfb"),
                 pli: allows_feedback("nack pli") && codec_feedback(raw, *parameter.pt, "nack pli"),
                 fir: allows_feedback("ccm fir") && codec_feedback(raw, *parameter.pt, "ccm fir"),
             });
@@ -1777,27 +1778,28 @@ fn format_answer_section(
             .is_some_and(|payload| payloads.contains(&payload));
         let keep_feedback = !section.explicit_capabilities
             && line.strip_prefix("a=rtcp-fb:").is_some_and(|value| {
-                let mut fields = value.split_whitespace();
-                let payload = fields.next().unwrap_or_default();
+                let Some((payload, name)) = value.split_once(char::is_whitespace) else {
+                    return false;
+                };
                 let applies = payload == "*"
                     || payload
                         .parse::<u8>()
                         .is_ok_and(|payload| section.accepted_payloads.contains(&payload));
-                let name = fields.next().unwrap_or_default();
                 applies
-                    && match name {
+                    && match name.trim() {
                         "transport-cc" => {
                             (section.facts.direction.allows_send()
                                 && feedback[0] == Some(PacketFeedbackKind::TransportWide))
                                 || (section.facts.direction.allows_receive()
                                     && feedback[1] == Some(PacketFeedbackKind::TransportWide))
                         }
-                        "ccfb" => {
+                        "ack ccfb" => {
                             (section.facts.direction.allows_send()
                                 && feedback[0] == Some(PacketFeedbackKind::Rfc8888))
                                 || (section.facts.direction.allows_receive()
                                     && feedback[1] == Some(PacketFeedbackKind::Rfc8888))
                         }
+                        "ccfb" => false,
                         _ => true,
                     }
             });
@@ -1855,7 +1857,7 @@ fn format_answer_section(
                 ),
                 (
                     codec.rfc8888 && selected(PacketFeedbackKind::Rfc8888),
-                    "ccfb",
+                    "ack ccfb",
                 ),
             ] {
                 if allowed {
@@ -2614,11 +2616,11 @@ mod tests {
         let direction_base = base
             .replace(
                 "a=rtcp-fb:109 transport-cc",
-                "a=rtcp-fb:109 transport-cc\na=rtcp-fb:109 ccfb",
+                "a=rtcp-fb:109 transport-cc\na=rtcp-fb:109 ack ccfb",
             )
             .replace(
                 "a=rtcp-fb:120 transport-cc",
-                "a=rtcp-fb:120 transport-cc\na=rtcp-fb:120 ccfb",
+                "a=rtcp-fb:120 transport-cc\na=rtcp-fb:120 ack ccfb",
             );
         for (offered, answered, expected) in [
             ("", "", Direction::Bidirectional),
@@ -2685,11 +2687,11 @@ mod tests {
             let with_fallback = SdpOffer::new(
                 base.replace(
                     "a=rtcp-fb:109 transport-cc",
-                    "a=rtcp-fb:109 transport-cc\na=rtcp-fb:109 ccfb",
+                    "a=rtcp-fb:109 transport-cc\na=rtcp-fb:109 ack ccfb",
                 )
                 .replace(
                     "a=rtcp-fb:120 transport-cc",
-                    "a=rtcp-fb:120 transport-cc\na=rtcp-fb:120 ccfb",
+                    "a=rtcp-fb:120 transport-cc\na=rtcp-fb:120 ack ccfb",
                 )
                 .replace(
                     "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
@@ -2727,11 +2729,11 @@ mod tests {
             base.replace("a=sendonly\na=rtcp-mux", "a=recvonly\na=rtcp-mux")
                 .replace(
                     "a=rtcp-fb:109 transport-cc",
-                    "a=rtcp-fb:109 transport-cc\na=rtcp-fb:109 ccfb",
+                    "a=rtcp-fb:109 transport-cc\na=rtcp-fb:109 ack ccfb",
                 )
                 .replace(
                     "a=rtcp-fb:120 transport-cc",
-                    "a=rtcp-fb:120 transport-cc\na=rtcp-fb:120 ccfb",
+                    "a=rtcp-fb:120 transport-cc\na=rtcp-fb:120 ack ccfb",
                 )
                 .replacen(
                     "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time",
@@ -2936,11 +2938,11 @@ mod tests {
                     .replace("a=sendonly", "a=sendrecv")
                     .replace(
                         "a=rtcp-fb:111 transport-cc",
-                        "a=rtcp-fb:111 transport-cc\na=rtcp-fb:111 ccfb",
+                        "a=rtcp-fb:111 transport-cc\na=rtcp-fb:111 ack ccfb",
                     )
                     .replace(
                         "a=rtcp-fb:102 transport-cc",
-                        "a=rtcp-fb:102 transport-cc\na=rtcp-fb:102 ccfb",
+                        "a=rtcp-fb:102 transport-cc\na=rtcp-fb:102 ack ccfb",
                     )
                     .replace("a=extmap:3 ", &format!("a=extmap:3/{offered} "))
                     .replace("a=extmap:4 ", &format!("a=extmap:4/{offered} ")),
@@ -2968,7 +2970,12 @@ mod tests {
                     .as_str()
                     .contains("a=rtcp-fb:102 transport-cc")
             );
-            assert!(negotiated.answer.as_str().contains("a=rtcp-fb:102 ccfb"));
+            assert!(
+                negotiated
+                    .answer
+                    .as_str()
+                    .contains("a=rtcp-fb:102 ack ccfb")
+            );
             assert!(negotiated.answer.as_str().contains(&format!(
                 "a=extmap:4/{} ",
                 if offered == "sendonly" {
@@ -2985,7 +2992,7 @@ mod tests {
         let source = fixture("firefox");
         let both = SdpOffer::new(source.as_str().replace(
             "a=rtcp-fb:120 transport-cc",
-            "a=rtcp-fb:120 transport-cc\r\na=rtcp-fb:120 ccfb",
+            "a=rtcp-fb:120 transport-cc\r\na=rtcp-fb:120 ack ccfb",
         ));
         let both_result = RtcConnection::accept(
             config(),
@@ -3002,10 +3009,11 @@ mod tests {
             accepted.session.feedback,
             Some(PacketFeedbackKind::TransportWide)
         );
+        assert!(!accepted.answer.as_str().contains("ack ccfb"));
         let rfc = SdpOffer::new(
             source
                 .as_str()
-                .replace("a=rtcp-fb:120 transport-cc", "a=rtcp-fb:120 ccfb"),
+                .replace("a=rtcp-fb:120 transport-cc", "a=rtcp-fb:120 ack ccfb"),
         );
         let rfc_result = RtcConnection::accept(
             config(),
@@ -3019,6 +3027,35 @@ mod tests {
             Err(error) => panic!("RFC 8888 failed: {error}"),
         };
         assert_eq!(accepted.session.feedback, Some(PacketFeedbackKind::Rfc8888));
+        assert!(accepted.answer.as_str().contains("a=rtcp-fb:120 ack ccfb"));
+        assert!(!accepted.answer.as_str().contains("transport-cc"));
+    }
+
+    #[test]
+    fn rfc8888_uses_standard_ack_feedback_including_wildcard() {
+        let source = fixture("firefox");
+        let accept = |feedback: &str| {
+            Connection::accept(
+                config(),
+                SdpOffer::new(
+                    source
+                        .as_str()
+                        .replace("a=rtcp-fb:120 transport-cc", feedback),
+                ),
+                at(),
+                std::time::UNIX_EPOCH,
+                ConnectionEntropy::new([2; 32]),
+            )
+        };
+        let accepted = accept("a=rtcp-fb:* ack ccfb").expect("standard wildcard CCFB");
+        assert_eq!(accepted.session.feedback, Some(PacketFeedbackKind::Rfc8888));
+        assert!(accepted.answer.as_str().contains("a=rtcp-fb:* ack ccfb"));
+        for invalid in ["a=rtcp-fb:120 ccfb", "a=rtcp-fb:120 ack ccfb extra"] {
+            assert_eq!(
+                accept(invalid).err(),
+                Some(AcceptError::MissingPacketFeedback)
+            );
+        }
     }
 
     #[test]

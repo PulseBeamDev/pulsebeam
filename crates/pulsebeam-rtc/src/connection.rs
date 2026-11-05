@@ -1178,6 +1178,10 @@ impl Drop for EntropyConsumer {
 }
 
 #[cfg(test)]
+#[path = "connection_feedback_trace.rs"]
+mod feedback_trace;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{NetworkPolicy, PeerFixture, assert_native_rtp_pacing, sample};

@@ -54,6 +54,7 @@ pub struct PeerFixture<M = MediaFixture> {
     source_timestamp: u32,
     headers: VecDeque<FixtureRtpHeader>,
     transmit_observations: Option<VecDeque<(Instant, pulsebeam_rtc::TransmitKind)>>,
+    idle_observations: Option<VecDeque<(Instant, Option<Instant>)>>,
     extension_ids: FixtureExtensionIds,
     last_video_wire_header: Option<(u32, u16)>,
     observe_egress: bool,
@@ -368,6 +369,39 @@ impl PeerFixture {
         Self::connected_with(FixtureTransport::Udp, None, false)
     }
 
+    pub fn connected_with_feedback(feedback: pulsebeam_rtc::PacketFeedbackKind) -> Self {
+        let trial = match feedback {
+            pulsebeam_rtc::PacketFeedbackKind::TransportWide => "Disabled",
+            pulsebeam_rtc::PacketFeedbackKind::Rfc8888 => "Enabled,offer:true",
+        };
+        let trials =
+            FieldTrials::parse(&format!("WebRTC-RFC8888CongestionControlFeedback/{trial}/"))
+                .expect("pinned native feedback trial");
+        let mut fixture = Self::build_with_trials(
+            FixtureTransport::Udp,
+            None,
+            None,
+            1,
+            MediaKind::Audio,
+            Self::default_start(),
+            Some(trials),
+            |senders| MediaFixture {
+                sender_mid: senders[0].mid.to_string(),
+            },
+        );
+        assert_eq!(
+            fixture.connection.stats().connection.feedback,
+            Some(feedback)
+        );
+        for _ in 0..2_000 {
+            let _ = fixture.step();
+            if fixture.peer_connected && fixture.connection_connected {
+                return fixture;
+            }
+        }
+        panic!("native feedback peer did not connect");
+    }
+
     /// Keep bounded native interception and RTCP/TWCC, but omit Rust frame observation.
     pub fn without_egress_observation(mut self) -> Self {
         self.observe_egress = false;
@@ -568,6 +602,32 @@ impl<M> PeerFixture<M> {
         start: Instant,
         media_state: impl FnOnce(&[pulsebeam_rtc::SenderInfo]) -> M,
     ) -> Self {
+        Self::build_with_trials(
+            transport,
+            limits,
+            datachannels,
+            sender_count,
+            media,
+            start,
+            None,
+            media_state,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the controlled peer constructor keeps per-peer trial selection explicit alongside its existing fixture inputs"
+    )]
+    fn build_with_trials(
+        transport: FixtureTransport,
+        limits: Option<ConnectionLimits>,
+        datachannels: Option<DataChannelConfiguration>,
+        sender_count: usize,
+        media: MediaKind,
+        start: Instant,
+        trials: Option<FieldTrials>,
+        media_state: impl FnOnce(&[pulsebeam_rtc::SenderInfo]) -> M,
+    ) -> Self {
         assert!(sender_count <= 128);
         assert!(sender_count != 0 || datachannels.is_some());
         let world = SimulationWorld::acquire();
@@ -620,11 +680,22 @@ impl<M> PeerFixture<M> {
             )
             .build()
             .expect("controlled native factory");
+        let rfc8888 = trials
+            .as_ref()
+            .is_some_and(|trials| trials.is_enabled("WebRTC-RFC8888CongestionControlFeedback"));
+        let mut dependencies = PeerConnectionDependencies::default();
+        if let Some(trials) = trials {
+            dependencies = dependencies.field_trials(trials);
+        }
         let peer = factory
-            .create_peer_connection(PeerConfiguration {
-                always_negotiate_data_channels: datachannels.is_some(),
-                ..PeerConfiguration::default()
-            })
+            .create_peer_connection_with_dependencies(
+                PeerConfiguration {
+                    always_negotiate_data_channels: datachannels.is_some(),
+                    ..PeerConfiguration::default()
+                }
+                .into(),
+                dependencies,
+            )
             .expect("controlled native peer");
         if !matches!(media, MediaKind::Audio) {
             // Sustain VBR source bursts before PulseBeam admission and pacing.
@@ -711,6 +782,21 @@ impl<M> PeerFixture<M> {
                     transceiver
                 }
             };
+            if rfc8888 {
+                let mut extensions = transceiver
+                    .header_extensions_to_negotiate()
+                    .expect("native extensions");
+                for extension in &mut extensions {
+                    if extension.uri()
+                        == "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
+                    {
+                        extension.direction = RtpHeaderExtensionDirection::Stopped;
+                    }
+                }
+                transceiver
+                    .set_header_extensions_to_negotiate(&extensions)
+                    .expect("offer CCFB without TWCC");
+            }
             transceivers.push(transceiver);
         }
         let peer_channel = datachannels.as_ref().map(|config| {
@@ -889,6 +975,7 @@ impl<M> PeerFixture<M> {
             source_timestamp: 0,
             headers: VecDeque::new(),
             transmit_observations: None,
+            idle_observations: None,
             extension_ids,
             last_video_wire_header: None,
             observe_egress: true,
@@ -1204,6 +1291,18 @@ impl<M> PeerFixture<M> {
 
     pub fn record_transmits(&mut self) {
         self.transmit_observations = Some(VecDeque::new());
+    }
+
+    pub fn record_idle_wakeups(&mut self) {
+        self.idle_observations = Some(VecDeque::new());
+    }
+
+    pub fn take_idle_observations(&mut self) -> Vec<(Instant, Option<Instant>)> {
+        self.idle_observations
+            .as_mut()
+            .expect("recording")
+            .drain(..)
+            .collect()
     }
 
     pub fn take_transmit_observations(&mut self) -> Vec<(Instant, pulsebeam_rtc::TransmitKind)> {
@@ -1762,6 +1861,13 @@ impl<M> PeerFixture<M> {
                 }
                 ConnectionOutput::Event(_) => return None,
                 ConnectionOutput::Idle { next_wakeup } => {
+                    let at = self.at();
+                    if let Some(observations) = &mut self.idle_observations {
+                        if observations.len() == 256 {
+                            observations.pop_front();
+                        }
+                        observations.push_back((at, next_wakeup));
+                    }
                     connection_wakeup = next_wakeup.map(|at| {
                         self.network.rtc_wakeup_quantum.map_or(at, |quantum| {
                             let nanos = at
