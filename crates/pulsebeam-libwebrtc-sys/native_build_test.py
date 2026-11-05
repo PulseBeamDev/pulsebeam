@@ -85,6 +85,19 @@ class SisoCommandTest(unittest.TestCase):
             (stage / "config/backend.star").write_text("local")
             self.assertEqual(original.read_text(), "upstream")
 
+    def test_rustfmt_config_is_copied_into_source_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "upstream.toml"
+            source.write_text('ignore = ["third_party/**"]\n')
+            stage = root / "stage"
+            stage.mkdir()
+            config = stage / ".rustfmt.toml"
+            config.symlink_to(source)
+            writable_file(stage, ".rustfmt.toml")
+            self.assertFalse(config.is_symlink())
+            self.assertEqual(config.read_text(), source.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

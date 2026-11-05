@@ -123,7 +123,9 @@ def build(args, lock_fd=None):
         (owned / "src").mkdir(parents=True)
         (owned / "src/bridge.rs").symlink_to(bridge)
         (owned / "native").symlink_to(bridge.parent.parent / "native", target_is_directory=True)
-        for relative in (".gn", "BUILD.gn", "buildtools/third_party/libc++/BUILD.gn", "buildtools/third_party/libc++abi/BUILD.gn", "build/toolchain/gcc_toolchain.gni"):
+        # rustfmt resolves ignore patterns relative to the real config path; a
+        # symlink into the upstream checkout puts generated files outside it.
+        for relative in (".gn", ".rustfmt.toml", "BUILD.gn", "buildtools/third_party/libc++/BUILD.gn", "buildtools/third_party/libc++abi/BUILD.gn", "build/toolchain/gcc_toolchain.gni"):
             writable_file(root, relative)
         for patch in ("integration.patch", "strict-fp.patch"):
             run([host / "patch", "--batch", "--fuzz=0", "-p1", "-i", overlay / patch], cwd=root, env=env, lock_fd=lock_fd)
