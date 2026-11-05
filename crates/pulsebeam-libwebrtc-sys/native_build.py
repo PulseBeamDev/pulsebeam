@@ -157,9 +157,7 @@ def build(args, lock_fd=None):
             output = Path(getattr(args, name))
             output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(build / relative, output)
-        if output_build.exists():
-            output_build.rmdir()
-        build.rename(output_build)
+        output_build.mkdir(exist_ok=True)
 
 
 if __name__ == "__main__":
