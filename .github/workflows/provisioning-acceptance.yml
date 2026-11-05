@@ -14,7 +14,7 @@ jobs:
   native-image:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
       - name: Validate GNU release artifacts
         run: ./bazel test --config=release //release:elf_contract //release:contract --test_output=errors
@@ -30,17 +30,17 @@ jobs:
   native-arm:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
       - name: Validate native aarch64 GNU release contracts
         run: ./bazel test --config=release //release:contract //release:elf_contract --test_output=errors
   meet:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
       - name: Assemble deployable Meet output without deployment
         run: ./bazel test //apps/meet:check --test_output=errors
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: bazel-bin/apps/meet/out

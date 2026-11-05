@@ -29,14 +29,14 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
       - name: Build and load Bazel-owned linux/amd64 image
         if: ${{ !inputs.reuse_image }}
         run: ./bazel run --config=release //release:load
       - name: Restore validated release image
         if: ${{ inputs.reuse_image }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pulsebeam-amd64-image
           path: ${{ runner.temp }}/pulsebeam-image
@@ -53,14 +53,14 @@ jobs:
         run: docker save pulsebeam:local -o "$RUNNER_TEMP/pulsebeam-amd64-image.tar"
       - name: Retain validated release image
         if: ${{ inputs.validate_only }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pulsebeam-amd64-image
           path: ${{ runner.temp }}/pulsebeam-amd64-image.tar
           if-no-files-found: error
       - name: Image tags
         id: meta
-        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
         with:
           images: ${{ env.GHCR_IMAGE }}
           tags: |
@@ -71,7 +71,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
       - name: Registry login
         if: ${{ !inputs.validate_only && github.event_name != 'pull_request' }}
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

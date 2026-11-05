@@ -15,7 +15,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-ci
       - name: Validate package release identity
         run: ./bazel run //release/npm:plan -- --tag "$GITHUB_REF_NAME"
