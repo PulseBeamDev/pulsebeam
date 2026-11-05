@@ -11,6 +11,7 @@ build --disk_cache=~/.cache/pulsebeam/bazel/disk-cache
 build --experimental_disk_cache_gc_max_size=400G
 build --experimental_disk_cache_gc_idle_delay=30s
 build --incompatible_strict_action_env
+build --action_env=HOME=/tmp
 build --announce_rc
 build --remote_executor=grpc://127.0.0.1:50051
 build --remote_cache=grpc://127.0.0.1:50051
