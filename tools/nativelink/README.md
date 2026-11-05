@@ -1,32 +1,66 @@
-# NativeLink local execution candidate
+# Local NativeLink service for WebRTC builds
 
-Generate a standalone configuration for NativeLink **v1.8.3** with Python 3. Run only trusted builds on a trusted single-user machine: both loopback endpoints are unauthenticated, and actions execute with the worker user's privileges, without container or namespace isolation. Any local user able to connect can submit work or poison the cache.
-
-```sh
-umask 077
-mkdir -p "$HOME/.cache/pulsebeam-nativelink"
-python3 tools/nativelink/config.py \
-  --state "$HOME/.cache/pulsebeam-nativelink" --cpu 4 --memory-kb 4194304 \
-  > "$HOME/.cache/pulsebeam-nativelink/config.json"
-nativelink "$HOME/.cache/pulsebeam-nativelink/config.json"
-```
-
-Run the pinned binary in the foreground as an unprivileged user. Stop it with Ctrl-C. REAPI listens on `127.0.0.1:50051`; the worker API listens on `127.0.0.1:50061`. Set `--reapi-port` and `--worker-port` to distinct available ports for another instance. Each instance needs its own private state directory. The state path must be absolute and cannot contain `$` because NativeLink expands environment variables in paths. Protect it against other local users and symlink manipulation.
-
-`--cpu` and `--memory-kb` set the worker's scheduler capacity. When omitted by an action, `--action-cpu` and `--action-memory-kb` reserve 1 CPU and 1,048,576 KiB by default. Supplied action values are preserved; the default must fit the worker. Actions requesting more than capacity cannot run. Reservations are accounting, not CPU or memory enforcement. A client can request zero or too little, so this is not a resource security boundary. Tune capacities and defaults to the workload; no workload-specific Siso behavior has been validated here.
-
-The CAS and worker fast CAS each have a 2,000,000,000-byte eviction target; the action cache has a 200,000,000-byte target. These are not disk quotas: temporary files, in-flight data, action work directories, filesystem overhead and delayed eviction can consume more. Arrange external disk headroom and cleanup. The priority-only `OSFamily` and `container-image` properties follow the upstream example and do not enforce platform compatibility or launch a container. Shared caches are unsafe across incompatible hosts, toolchains or trust domains unless the integration accounts for them. The config does not provide authentication, TLS, a hard process limit, network isolation, action timeouts, or lifecycle management.
-
-## Checks
+Run one per-user service for all your worktrees on a trusted Linux x86_64
+machine. In a terminal, start the pinned NativeLink 1.8.3 CAS, action cache,
+scheduler and worker in the foreground:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/nativelink -p 'test_*.py' -v
-NATIVELINK_BINARY=/absolute/path/to/nativelink PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest discover -s tools/nativelink -p 'test_*.py' -v
+./bazel run //tools/nativelink:server
 ```
 
-The optional startup smoke test uses ephemeral loopback ports and a temporary state directory, then terminates its process group with a bounded timeout. Port allocation has a small bind race. It checks listeners and process startup, not action execution or real Siso interoperability.
+Leave it running. In another terminal, from any worktree, use REAPI for the
+WebRTC build:
 
-## Upstream basis
+```sh
+./bazel test --config=webrtc-reapi //crates/pulsebeam-libwebrtc-sys:fast
+```
 
-The topology is adapted from [`local_rbe_self_test.json5` at v1.8.3](https://github.com/TraceMachina/nativelink/blob/v1.8.3/nativelink-config/examples/local_rbe_self_test.json5), commit `bd336137d794a6a4e7ac32e561ab55e2d7e70ff3`. Unlike the example, both listeners bind loopback, and memory is a scheduler resource. In that version, [`schedulers.rs`](https://github.com/TraceMachina/nativelink/blob/v1.8.3/nativelink-config/src/schedulers.rs) defines `property_modifier`, ordered `remove`/`replace`/`add` edits, and `minimum` resource properties. [`property_modifier_scheduler.rs`](https://github.com/TraceMachina/nativelink/blob/v1.8.3/nativelink-scheduler/src/property_modifier_scheduler.rs) implements those edits as map operations, with `add` overwriting an existing property. The modifier temporarily renames explicit values, adds defaults, then restores the explicit values; it clears its temporary names first. [`default_scheduler_factory.rs`](https://github.com/TraceMachina/nativelink/blob/v1.8.3/nativelink-scheduler/src/default_scheduler_factory.rs) passes the nested scheduler's worker interface through the modifier, and [`worker.rs`](https://github.com/TraceMachina/nativelink/blob/v1.8.3/nativelink-scheduler/src/worker.rs) accounts for minimum properties when allocating and releasing work. This is a candidate component, not a PulseBeam integration decision.
+The same config can be used with normal consumer pipeline commands. Stop the
+service with Ctrl-C when it is no longer needed. Each worktree must keep its own
+Bazel output base; share the service, not output bases. Normal Bazel builds use
+offline Siso and do not require the service. For local execution with a shared
+cache instead, use `--config=webrtc-cache`. For the explicit local fallback, use
+`--//crates/pulsebeam-libwebrtc-sys:executor=local`. See the [WebRTC build
+guide](../../crates/pulsebeam-libwebrtc-sys/README.md#build-ownership-and-caching)
+for execution and caching boundaries.
+
+## Configuration and recovery
+
+The REAPI endpoint defaults to `127.0.0.1:50051` and the worker endpoint to
+`127.0.0.1:50061`. State defaults to `~/.cache/pulsebeam/nativelink/v1`, with
+mode `0700`. The server accepts `--state` (an absolute path), `--cpu` (positive,
+default `min(8, cpu_count)`), `--memory-kb` (default `8388608`), `--reapi-port`
+and `--worker-port`. For example:
+
+```sh
+./bazel run //tools/nativelink:server -- --cpu 4 --reapi-port 50052
+./bazel test --config=webrtc-reapi \
+  --//crates/pulsebeam-libwebrtc-sys:reapi=grpc://127.0.0.1:50052 \
+  //crates/pulsebeam-libwebrtc-sys:fast
+```
+
+Run these commands in separate terminals. Custom REAPI endpoints must be
+loopback. If a build cannot connect, check that the service is still running and
+that the client and server ports match. If a port is occupied, stop the other
+service or select distinct free ports. Restart the service after a failure; use
+the explicit local fallback above if it is unavailable. REAPI uses strict remote
+execution, so a failed remote compile does not silently run locally.
+
+## Limits and trust
+
+Both loopback endpoints are unauthenticated. Other local users able to connect
+can submit work or poison the cache, so use this only on a trusted single-user
+machine. The worker uses a pinned Nix bubblewrap entrypoint to deny network and
+expose only the action work tree, Nix store and host loader libraries. This is a
+local setup; a remote host fleet has not been verified.
+
+Actions reserve 1 CPU and 1 GiB by default. CPU and memory capacities control
+scheduler admission, not hard cgroup quotas. GN, Rust, and Siso's local-only
+generators and archiving remain client-local, with two local Siso jobs per
+client. The service does not govern every process on the machine. The CAS and
+worker CAS each target 2 GB for eviction, and the action cache targets 200 MB;
+these are not hard disk quotas. Leave disk headroom.
+
+Cold duplicate work can join an in-flight action only when its cacheable action
+key is identical. No multi-agent performance result is claimed. NativeLink is
+licensed under FSL-1.1-Apache-2.0, which explicitly permits internal use.

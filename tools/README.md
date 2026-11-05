@@ -58,7 +58,7 @@ do not require upgrading unrelated generator dependencies.
 Native SDK and controlled RTC builds consume
 [`crates/pulsebeam-libwebrtc-sys`](../crates/pulsebeam-libwebrtc-sys/README.md).
 Normal Bazel commands acquire pinned WebRTC/DEPS sources and tools through the
-package repository rule, then compile WebRTC, CXX and the adapters with GN/Ninja
+package repository rule, then compile WebRTC, CXX and the adapters with GN/Siso
 in a declared action. No candidate archives, preparation command, archive
 environment variables or external sys worktree are required.
 
@@ -76,9 +76,11 @@ protobuf events. See the package guide for native and focused ASan commands.
 
 Whole-native-build caching is intentional. Ordinary Rust edits reuse the native
 result; bridge, adapter, patch, pin, toolchain or GN configuration edits may
-rebuild the whole native graph. Acquisition may use the network; native compile
-and link actions may not. Update native pins and behavior patches in the package,
-then run both configurations and the affected consumer proofs. Runtime limits
+rebuild the whole native graph. Acquisition may use the network; Siso is offline
+by default. For opt-in shared caching or local REAPI execution across worktrees,
+see the [NativeLink service guide](nativelink/README.md). Update native pins and
+behavior patches in the package, then run both configurations and the affected
+consumer proofs. Runtime limits
 remain documented by the native owner's
 [support and verification scope](../agents/pulsebeam-agent-native/QUALIFICATION.md).
 

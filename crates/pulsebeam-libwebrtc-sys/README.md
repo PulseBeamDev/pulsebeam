@@ -67,15 +67,17 @@ instrumented by this native lifetime configuration.
 
 `repositories.bzl` acquires the pinned WebRTC and depot_tools revisions, their
 DEPS inputs, prebuilt tools and Bullseye amd64 sysroot, then applies the tracked
-patches. Acquisition can use the network. Compile and link actions cannot.
-The locked Nixpkgs dependency provisions package-local host tools, separate from
-the upstream target sysroot and native desktop libraries.
+patches. Acquisition can use the network. The locked Nixpkgs dependency
+provisions package-local host tools, separate from the upstream target sysroot
+and native desktop libraries.
 
 `native_build.bzl` declares the whole native build action. It stages an
-action-owned source view and invokes GN and Ninja. The GN overlay compiles
-WebRTC, the owned adapters and CXX-generated C++, with PIC, the software codec
-policy, protobuf events and strict x86_64 floating-point behavior. Bazel consumes
-fixed GN archives for WebRTC, the bridge/additional roots and libc++/libc++abi.
+editable action-owned source view of declared upstream GN sources, adapters and
+bridge, then invokes GN and Siso. The GN overlay compiles WebRTC, the owned
+adapters and CXX-generated C++, with PIC, the software codec policy, protobuf
+events and strict x86_64 floating-point behavior. `strict-fp.patch` preserves
+all compile flags at the tail without a compiler wrapper. Bazel consumes fixed GN
+archives for WebRTC, the bridge/additional roots and libc++/libc++abi.
 The pinned Bullseye sysroot supplies target headers and link metadata, but its
 shared libraries are stripped link-only stubs. Native desktop runtime libraries
 come from checksum-pinned original packages in that sysroot's Debian snapshot,
@@ -88,12 +90,28 @@ Bazel compiles the upstream registry Rust runtime and proc macro with the
 monorepo's Rust toolchain. Package-local dependency annotations disable Cargo's
 native compiler and C++ linker-helper build scripts.
 
-Bazel caches the entire native result. Unchanged rebuilds and ordinary Rust,
-test or documentation edits reuse it. Bridge declarations in `src/bridge.rs`,
+The outer `WebRtcGn` action stays local (`no-remote-exec`) and retains Bazel
+outputs and whole-build caching. Unchanged rebuilds and ordinary Rust, test or
+documentation edits reuse its result. Bridge declarations in `src/bridge.rs`,
 adapters, patches, pins, native tooling or GN configuration changes can rebuild
-the whole native graph. Core, native and ASan configurations have distinct
-action/output identities. Object-level incremental reuse, native remote
-execution and additional platforms are not promised.
+the native graph. Core, native and ASan retain distinct action/output identities.
+
+By default Siso runs offline and needs no service. To share object-level work
+across worktrees, start the [local NativeLink service](../../tools/nativelink/README.md)
+once, then pass `--config=webrtc-reapi` to a Bazel test or consumer pipeline
+command. Siso uses pinned upstream Chromium configs and package-local backend
+properties for `OSFamily=Linux` and the exact Nix host-tools identity. REAPI's
+`strict_remote` prevents silent local compile fallback. GN, Rust and Siso's
+local-only generators and archiving still run on the client, with two local Siso
+jobs per client. The service is not a governor for all machine processes.
+
+Alternatively, `--config=webrtc-cache` uses the shared cache with local execution
+and retains the whole-build guard. Only cache and REAPI modes permit the outer
+action's REAPI network access. Use
+`--//crates/pulsebeam-libwebrtc-sys:executor=local` for the explicit local
+fallback. See the service guide for custom loopback endpoints, recovery and
+security and resource limits. Additional platforms and a remote host fleet have
+not been verified.
 
 The imported implementation is Apache-2.0 licensed. Upstream WebRTC patent and
 license notices and CXX's dual-license notices are in `licenses/`; acquired
