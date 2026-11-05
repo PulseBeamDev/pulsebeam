@@ -17,6 +17,14 @@ From the repository root:
 ./bazel test //crates/pulsebeam-libwebrtc-sys:runtime_tests --test_output=errors
 ```
 
+Ordinary `./bazel build`, `test` and `run` commands automatically start and
+share a local NativeLink service across worktrees. Shared REAPI execution is
+the default for WebRTC builds; no special config or separate startup is needed.
+First use provisions the pinned service and host tools and may require network
+access. Use this service only on a trusted single-user machine: its loopback
+endpoints are unauthenticated. To build without the service, pass
+`--//crates/pulsebeam-libwebrtc-sys:executor=local` to the command.
+
 Core is the default and does not open platform audio or capture devices. Select
 native for the entire configured dependency graph to enable the Linux desktop
 backend:
@@ -96,22 +104,21 @@ documentation edits reuse its result. Bridge declarations in `src/bridge.rs`,
 adapters, patches, pins, native tooling or GN configuration changes can rebuild
 the native graph. Core, native and ASan retain distinct action/output identities.
 
-By default Siso runs offline and needs no service. To share object-level work
-across worktrees, start the [local NativeLink service](../../tools/nativelink/README.md)
-once, then pass `--config=webrtc-reapi` to a Bazel test or consumer pipeline
-command. Siso uses pinned upstream Chromium configs and package-local backend
-properties for `OSFamily=Linux` and the exact Nix host-tools identity. REAPI's
-`strict_remote` prevents silent local compile fallback. GN, Rust and Siso's
-local-only generators and archiving still run on the client, with two local Siso
-jobs per client. The service is not a governor for all machine processes.
+By default Siso uses shared REAPI through the automatically started [local
+NativeLink service](../../tools/nativelink/README.md). Siso uses pinned upstream
+Chromium configs and package-local backend properties for `OSFamily=Linux` and
+the exact Nix host-tools identity. REAPI's `strict_remote` prevents silent local
+compile fallback. GN, Rust and Siso's local-only generators and archiving still
+run on the client, with two local Siso jobs per client. The service is not a
+governor for all machine processes.
 
 Alternatively, `--config=webrtc-cache` uses the shared cache with local execution
 and retains the whole-build guard. Only cache and REAPI modes permit the outer
 action's REAPI network access. Use
 `--//crates/pulsebeam-libwebrtc-sys:executor=local` for the explicit local
-fallback. See the service guide for custom loopback endpoints, recovery and
-security and resource limits. Additional platforms and a remote host fleet have
-not been verified.
+fallback, which runs Siso offline. See the service guide for the advanced foreground alternative,
+custom loopback endpoints, recovery, and security and resource limits.
+Additional platforms and a remote host fleet have not been verified.
 
 The imported implementation is Apache-2.0 licensed. Upstream WebRTC patent and
 license notices and CXX's dual-license notices are in `licenses/`; acquired
