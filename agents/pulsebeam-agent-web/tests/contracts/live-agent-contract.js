@@ -326,6 +326,8 @@
   const handoffClones = [];
   let releaseReplacement;
   let attachment;
+  let handoffAttachment;
+  let handoffVideo;
   let videoPublication;
   let audioPublication;
   let replacementVideoTrack;
@@ -519,7 +521,6 @@
       await steadyPublisher.send(Uint8Array.of(lifetime + 2));
       await receiveValue(steadyIterator, lifetime + 2);
     }
-    await steadyIterator.return();
     await until(
       () =>
         receiver
@@ -569,6 +570,89 @@
       video.srcObject.getVideoTracks()[0] === fixedTrack,
       "element uses current native receiver",
     );
+    // Keep one committed view throughout each handoff. A final release below is
+    // deliberately different: it may retire the physical receiver lifetime.
+    const witnessView = async (element, label) => {
+      const before = await decoded(fixedReceiver);
+      await until(
+        async () =>
+          receiver.getSnapshot().tracks[publication.id]?.media === fixedTrack &&
+          fixedTrack.readyState === "live" &&
+          peerForTrack(fixedTrack) === fixedPeer &&
+          (await decoded(fixedReceiver)) > before + 1 &&
+          element.srcObject?.getVideoTracks()[0] === fixedTrack &&
+          element.videoWidth > 0 &&
+          !element.paused,
+        label,
+      );
+      assert(
+        sender.getSnapshot().generation === senderGeneration &&
+          receiver.getSnapshot().generation === receiverGeneration &&
+          fixedPeer.connectionState === "connected" &&
+          peers.size === 2 &&
+          receiver.remote
+            .participant("web-sender")
+            .track(track.video("camera")) === remoteVideo,
+        `${label}: same agents, connection and remote handle`,
+      );
+    };
+    const deliverDuringView = async (value) => {
+      await steadyPublisher.send(Uint8Array.of(value));
+      await receiveValue(steadyIterator, value);
+    };
+    video.style.cssText =
+      "position:fixed;left:30px;top:20px;width:220px;height:160px";
+    attachment.setPreferences({
+      minHeight: 2,
+      minFps: 1,
+      priority: 90,
+      playoutDelay: { minMs: 100, maxMs: 100 },
+    });
+    await deliverDuringView(5);
+    await witnessView(video, "moved and resized view");
+
+    handoffVideo = document.createElement("video");
+    handoffVideo.muted = true;
+    handoffVideo.playsInline = true;
+    handoffVideo.style.cssText =
+      "position:fixed;left:10px;top:10px;width:160px;height:120px";
+    document.body.append(handoffVideo);
+    const fixedPreferences = {
+      minHeight: 1,
+      minFps: 1,
+      priority: 100,
+      playoutDelay: { minMs: 100, maxMs: 100 },
+    };
+    handoffAttachment = attachRemoteVideo(
+      remoteVideo,
+      handoffVideo,
+      undefined,
+      {
+        preferences: fixedPreferences,
+      },
+    );
+    await handoffAttachment.ready;
+    await witnessView(handoffVideo, "overlapping presentation");
+    attachment.close();
+    assert(video.srcObject === null, "old presentation releases its element");
+    await deliverDuringView(6);
+    await witnessView(handoffVideo, "handoff retains live receiver");
+
+    attachment = attachRemoteVideo(remoteVideo, video, undefined, {
+      preferences: fixedPreferences,
+    });
+    await attachment.ready;
+    await witnessView(video, "remounted presentation");
+    handoffAttachment.close();
+    handoffAttachment = undefined;
+    assert(handoffVideo.srcObject === null, "handoff element released");
+    handoffVideo.remove();
+    handoffVideo = undefined;
+    await deliverDuringView(7);
+    await witnessView(video, "remount retains live receiver");
+    await steadyIterator.return();
+    steadyIterator = undefined;
+
     const fixedRtp = await packetEvidence(fixedPeer, fixedReceiver);
     assert(
       fixedRtp.withExtension > 0 &&
@@ -882,6 +966,8 @@
     void steadyIterator?.return();
     void cyclingIterator?.return();
     attachment?.close();
+    handoffAttachment?.close();
+    handoffVideo?.remove();
     void videoPublication?.close();
     void audioPublication?.close();
     sender.close();

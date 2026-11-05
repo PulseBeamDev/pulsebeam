@@ -177,6 +177,23 @@ export async function videoPreferences() {
     await flush(() => change({ hide: false, remove: true }));
     assert.equal(desired().height, 120);
     assert.equal("playoutDelay" in desired(), false);
+    const [continuingOwner] = runtime.videoOwners.keys();
+    assert.equal(runtime.videoOwners.size, 1);
+    assert.ok(owners.includes(continuingOwner));
+    await flush(() => change({ remove: false }));
+    const remountedOwners = [...runtime.videoOwners.keys()];
+    assert.equal(remountedOwners.length, 2);
+    assert.ok(remountedOwners.includes(continuingOwner));
+    assert.equal(
+      remountedOwners.filter((owner) => !owners.includes(owner)).length,
+      1,
+    );
+    assert.equal(desired().trackId, "camera-id");
+    assert.equal(desired().height, 240);
+    assert.equal(runtimes.at(-1), runtime, "handoff keeps the session runtime");
+    assert.equal(agent.remote.participant("alice").video("camera"), remote);
+    await flush(() => change({ remove: true }));
+    assert.deepEqual([...runtime.videoOwners.keys()], [continuingOwner]);
     host.remove();
     await flush(() => window.dispatchEvent(new Event("resize")));
     assert.deepEqual(
