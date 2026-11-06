@@ -53,7 +53,18 @@ mode `0700`. By default the scheduler advertises all CPUs in the service's
 CPU affinity and the host's total memory. Bazel submits up to twice the CPU
 capacity (minimum 8, maximum 128 jobs) to hide scheduling and CAS latency;
 explicit client `--jobs` overrides this. The shared capacity is fixed at
-service startup.
+service startup. The worker shares a pool of 64 input-blob downloads across
+all actions, rather than multiplying download fan-out with each client's
+cold build. This does not limit cached-input hardlinking or action processes.
+
+Worker heartbeats retain their 2.5-second cadence. The scheduler allows
+120 seconds without a heartbeat before treating the worker as stale, instead
+of NativeLink's 10-second default. This tolerates loaded-host pauses without
+immediately reassigning still-running operations; an unresponsive worker can
+therefore take up to two minutes to detect. The scheduler's fallback grace
+after an action deadline also becomes 120 seconds; the worker's own input,
+command and upload timeouts remain enforced independently. This is not a
+guarantee against arbitrary host stalls or resource exhaustion.
 
 To verify in-flight deduplication and subsequent cache reuse with isolated Siso
 clients and a temporary service, run the focused integration test:
@@ -63,7 +74,18 @@ clients and a temporary service, run the focused integration test:
 ```
 
 The test starts its own loopback service on temporary ports. It does not use the
-shared service or its cache. To summarize a retained Siso INFO log, run
+shared service or its cache. Each worktree still analyzes its own Bazel graph,
+hashes inputs and prepares its own outputs. Matching action names in client
+progress do not prove duplicate worker execution: NativeLink can join
+identical in-flight action digests, while different inputs or flags require
+separate actions.
+
+After service-defining build-system changes, stop active builds, update the
+agent worktrees to the same build-system revision, and restart the shared
+service. Autostart rejects incompatible live services rather than silently
+using stale worker settings or killing another build's backend.
+
+To summarize a retained Siso INFO log, run
 `python3 tools/nativelink/siso_summary.py /path/to/siso.INFO`. The summary
 reports completed backend cache outcomes and queue times. Matching digests
 alone do not prove that concurrent requests were joined.
