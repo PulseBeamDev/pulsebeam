@@ -37,8 +37,10 @@ def _upstream_impl(ctx):
     python = ctx.which("python3")
     if not git or not python:
         fail("WebRTC acquisition requires git and python3 on PATH.")
-    # Resolve label dependencies before starting long-running acquisition: Bazel
-    # can restart a repository rule when a previously unseen label is resolved.
+    # Register patch contents before acquisition. Passing only ctx.path() to git
+    # does not include file contents in the shared repository cache identity.
+    for patch in ctx.attr.patches + [ctx.attr.libvpx_patch]:
+        ctx.read(patch)
     patches = [str(ctx.path(patch)) for patch in ctx.attr.patches]
     libvpx_patch = str(ctx.path(ctx.attr.libvpx_patch))
     _run(ctx, [git, "init", "depot_tools"])
