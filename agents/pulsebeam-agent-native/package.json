@@ -1,0 +1,51 @@
+{
+  "name": "@pulsebeam/agent",
+  "version": "0.3.2",
+  "description": "Generated native PulseBeam agent API",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PulseBeamDev/pulsebeam.git",
+    "directory": "agents/pulsebeam-agent-native"
+  },
+  "type": "module",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "files": [
+    "dist",
+    "THIRD_PARTY_NOTICES.md",
+    "RUST_STANDARD_LIBRARY_NOTICES.html",
+    "NODE_ADDON_SOURCE_MANIFEST.json",
+    "NODE_ADDON_SOURCE_NOTICES.json",
+    "NODE_ADDON_SOURCE_PROVENANCE.txt",
+    "NODE_ADDON_RUST_STANDARD_LIBRARY_NOTICES.html"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/pulsebeam_agent_core.d.ts",
+      "import": "./dist/pulsebeam_agent_core.js"
+    },
+    "./native": {
+      "types": "./dist/pulsebeam_agent_native.d.ts",
+      "import": "./dist/pulsebeam_agent_native.js"
+    }
+  },
+  "dependencies": {
+    "@ubjs/core": "0.31.0-5",
+    "@ubjs/node": "0.31.0-5"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,41 @@
+load("@bazel_lib//lib:run_binary.bzl", "run_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load(":repositories.bzl", "ADDON_LOCK_SHA256")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["graph.py", "inventory.py", "repositories.bzl"])
+
+py_binary(
+    name = "generator",
+    srcs = ["inventory.py"],
+    main = "inventory.py",
+    python_version = "PY3",
+)
+
+py_test(
+    name = "inventory_test",
+    size = "small",
+    srcs = ["inventory.py", "inventory_test.py"],
+    main = "inventory_test.py",
+    python_version = "PY3",
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+)
+
+run_binary(
+    name = "inventory_bundle",
+    tool = ":generator",
+    srcs = [
+        "@native_agent_node_addon_sources//:inputs",
+        "@native_agent_node_addon_sources//:Cargo.lock",
+        "@native_agent_node_addon_sources//:sources.json",
+    ],
+    args = [
+        "--lock", "$(execpath @native_agent_node_addon_sources//:Cargo.lock)",
+        "--lock-sha256", ADDON_LOCK_SHA256,
+        "--inputs", "$(execpath @native_agent_node_addon_sources//:sources.json)",
+        "--manifest", "$(RULEDIR)/NODE_ADDON_SOURCE_MANIFEST.json",
+        "--notices", "$(RULEDIR)/NODE_ADDON_SOURCE_NOTICES.json",
+    ],
+    outs = ["NODE_ADDON_SOURCE_MANIFEST.json", "NODE_ADDON_SOURCE_NOTICES.json"],
+)

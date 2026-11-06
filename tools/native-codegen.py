@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--rustc", required=True)
     parser.add_argument("--library", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--node", action="store_true", help="use the pinned UBRN N-API generator")
     args = parser.parse_args()
     generator = Path(args.generator).resolve()
     cargo = Path(args.cargo).resolve()
@@ -52,12 +53,21 @@ def main():
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",
         }
-        subprocess.run(
+        command = (
+            [str(generator), "generate", "napi", "bindings", "--library",
+             str(library), "--ts-dir", str(output), "--lib-colocated", "--no-format"]
+            if args.node else
             [str(generator), "generate", "--library", "--metadata-no-deps",
              "--language", "kotlin", "--language", "swift", "--language", "python",
-             "--no-format", "--out-dir", str(output), str(library)],
-            cwd=workspace, env=env, check=True,
+             "--no-format", "--out-dir", str(output), str(library)]
         )
+        subprocess.run(command, cwd=workspace, env=env, check=True)
+    if args.node:
+        for namespace in ("pulsebeam_agent_native", "pulsebeam_agent_core"):
+            for suffix in (".ts", "-ffi.ts"):
+                if not (output / f"{namespace}{suffix}").is_file():
+                    raise RuntimeError(f"UBRN did not emit {namespace}{suffix}")
+        return
     core = output / "uniffi/pulsebeam_agent_core/pulsebeam_agent_core.kt"
     native = output / "dev/pulsebeam/agent/pulsebeam_agent_native.kt"
     if not core.is_file() or not native.is_file():

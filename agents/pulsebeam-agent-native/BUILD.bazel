@@ -2,10 +2,22 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_shared_library", "rust_static_library", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test")
 load("@bazel_lib//lib:run_binary.bzl", "run_binary")
+load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@bazel_lib//lib:copy_file.bzl", "copy_file")
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
+load("@aspect_rules_js//npm:defs.bzl", "npm_package")
+load("@native_agent_npm//:defs.bzl", "npm_link_all_packages")
+load("@native_agent_npm//agents/pulsebeam-agent-native:typescript/package_json.bzl", typescript = "bin")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@native_agent_pypi//:requirements.bzl", "requirement")
+load("//tools/native_licenses:inventory.bzl", "native_license_inventory")
 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
-exports_files(["Cargo.toml"])
+exports_files(["Cargo.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "requirements.in", "requirements.lock"])
+
+npm_link_all_packages(name = "node_modules")
+typescript.tsc_binary(name = "tsc")
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
 
 cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
@@ -83,6 +95,68 @@ rust_shared_library(
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
+native_license_inventory(
+    name = "rust_licenses",
+    roots = [":native_library"],
+    supplemental = {
+        "//tools/native_licenses:supplemental/uniffi-MPL-2.0.txt": "\n".join([
+            "rules_rust++crate+crates__%s-0.31.0|%s|0.31.0" % (name, name)
+            for name in ["uniffi", "uniffi_core", "uniffi_internal_macros", "uniffi_macros", "uniffi_meta", "uniffi_pipeline"]
+        ]),
+        "//tools/native_licenses:supplemental/pbjson-MIT.txt": "\n".join([
+            "rules_rust++crate+crates__%s-0.9.0|%s|0.9.0" % (name, name)
+            for name in ["pbjson", "pbjson-build"]
+        ]),
+    },
+)
+
+filegroup(name = "rust_license_notices", srcs = [":rust_licenses"], output_group = "notices")
+filegroup(name = "rust_license_manifest", srcs = [":rust_licenses"], output_group = "manifest")
+
+py_binary(
+    name = "notice_combiner",
+    srcs = ["combine_notices.py"],
+    main = "combine_notices.py",
+)
+
+run_binary(
+    name = "third_party_notices",
+    tool = ":notice_combiner",
+    srcs = [":rust_license_notices", "//crates/pulsebeam-libwebrtc-sys:webrtc_notices"],
+    args = ["$(execpath //crates/pulsebeam-libwebrtc-sys:webrtc_notices)", "$(execpath :rust_license_notices)", "$(RULEDIR)/THIRD_PARTY_NOTICES.md"],
+    outs = ["THIRD_PARTY_NOTICES.md"],
+)
+
+copy_file(
+    name = "rust_standard_notices",
+    src = "@native_agent_rust_std_notices//:COPYRIGHT-library.html",
+    out = "RUST_STANDARD_LIBRARY_NOTICES.html",
+)
+
+copy_file(
+    name = "addon_source_manifest",
+    src = "//tools/native_addon_licenses:NODE_ADDON_SOURCE_MANIFEST.json",
+    out = "NODE_ADDON_SOURCE_MANIFEST.json",
+)
+
+copy_file(
+    name = "addon_source_notices",
+    src = "//tools/native_addon_licenses:NODE_ADDON_SOURCE_NOTICES.json",
+    out = "NODE_ADDON_SOURCE_NOTICES.json",
+)
+
+copy_file(
+    name = "addon_source_provenance",
+    src = "@native_agent_node_addon_sources//:NODE_ADDON_SOURCE_PROVENANCE.txt",
+    out = "NODE_ADDON_SOURCE_PROVENANCE.txt",
+)
+
+copy_file(
+    name = "addon_rust_notices",
+    src = "@native_agent_node_addon_sources//:NODE_ADDON_RUST_STANDARD_LIBRARY_NOTICES.html",
+    out = "NODE_ADDON_RUST_STANDARD_LIBRARY_NOTICES.html",
+)
+
 rust_static_library(
     name = "native_static",
     crate_name = "pulsebeam_agent_native",
@@ -126,6 +200,108 @@ run_binary(
     ],
     mnemonic = "UniFFIBindings",
 )
+
+run_binary(
+    name = "node_bindings",
+    tool = "//tools:native-codegen",
+    srcs = [":native_library", "//:cargo_metadata_inputs"],
+    tools = ["@build_tools//:uniffi-bindgen-react-native__uniffi-bindgen-react-native", "@pulsebeam_rust_host_tools//:cargo", "@pulsebeam_rust_host_tools//:rustc", "@pulsebeam_rust_host_tools//:rustc_lib"],
+    out_dirs = ["node-bindings"],
+    args = [
+        "--node",
+        "--generator", "$(execpath @build_tools//:uniffi-bindgen-react-native__uniffi-bindgen-react-native)",
+        "--cargo", "$(execpath @pulsebeam_rust_host_tools//:cargo)",
+        "--rustc", "$(execpath @pulsebeam_rust_host_tools//:rustc)",
+        "--library", "$(execpath :native_library)",
+        "--output", "$(RULEDIR)/node-bindings",
+    ],
+    mnemonic = "NativeNodeBindings",
+)
+
+js_run_binary(
+    name = "node_javascript",
+    tool = ":tsc",
+    srcs = [":node_bindings", ":node_modules", "tsconfig.node.json", "package.json"],
+    args = ["-p", "tsconfig.node.json", "--outDir", "node-javascript"],
+    chdir = package_name(),
+    out_dirs = ["node-javascript"],
+)
+
+copy_to_directory(
+    name = "node_assets",
+    srcs = [":node_javascript", ":native_library"],
+    replace_prefixes = {"node-javascript/": ""},
+)
+
+js_test(
+    name = "node_bindings_contract",
+    entry_point = "tests/node/bindings.mjs",
+    data = [":node_assets", ":node_modules", "package.json"],
+    no_copy_to_bin = ["package.json"],
+)
+
+js_binary(
+    name = "installed_node_witness",
+    testonly = True,
+    entry_point = "tests/node/install_and_connect.mjs",
+    data = ["tests/node/installed.mjs", "tests/node/typecheck.mts", ":node_modules", ":node_package.pack", "//release/npm:npm"],
+)
+
+py_test(
+    name = "package_versions",
+    srcs = ["tests/package_versions.py"],
+    main = "tests/package_versions.py",
+    args = ["$(rootpath //:Cargo.toml)", "$(rootpath :package.json)", "$(rootpath :pyproject.toml)"],
+    data = ["//:Cargo.toml", "package.json", "pyproject.toml"],
+)
+
+py_test(
+    name = "node_addon_elf",
+    srcs = ["tests/node_addon_elf.py"],
+    main = "tests/node_addon_elf.py",
+    args = ["$(rootpath :package.json)"],
+    data = [":node_modules", "package.json"],
+    deps = [requirement("pyelftools")],
+)
+
+py_binary(
+    name = "wheel_builder",
+    srcs = ["build_wheel.py"],
+    main = "build_wheel.py",
+    deps = [requirement("auditwheel"), requirement("pyelftools"), requirement("setuptools"), requirement("wheel")],
+)
+
+run_binary(
+    name = "python_wheel",
+    tool = ":wheel_builder",
+    srcs = ["pyproject.toml", "setup.py", "README.md", "LICENSE", "pulsebeam_agent/__init__.py", ":bindings", ":native_library", ":third_party_notices", ":rust_standard_notices"],
+    tools = ["@native_agent_patchelf//:patchelf-0.17.2.4.data/scripts/patchelf"],
+    out_dirs = ["python-wheel"],
+    args = [
+        "--manifest", "$(execpath :pyproject.toml)",
+        "--bindings", "$(execpath :bindings)",
+        "--library", "$(execpath :native_library)",
+        "--third-party", "$(execpath :third_party_notices)",
+        "--rust-std", "$(execpath :rust_standard_notices)",
+        "--patchelf", "$(execpath @native_agent_patchelf//:patchelf-0.17.2.4.data/scripts/patchelf)",
+        "--output", "$(RULEDIR)/python-wheel",
+    ],
+    mnemonic = "NativePythonWheel",
+)
+
+npm_package(
+    name = "node_package",
+    srcs = [
+        "package.json", "README.md", "LICENSE", ":node_assets", ":third_party_notices", ":rust_standard_notices",
+        ":addon_source_manifest", ":addon_source_notices", ":addon_source_provenance", ":addon_rust_notices",
+    ],
+    replace_prefixes = {"node_assets/": "dist/"},
+    packable = True,
+)
+
+# Both installed languages share one owned local-SFU fixture.
+test_suite(name = "node_consumer", tests = ["//crates/pulsebeam-cli:installed_foreign"])
+test_suite(name = "python_consumer", tests = ["//crates/pulsebeam-cli:installed_foreign"])
 
 rustfmt_test(name = "format", targets = [":pulsebeam-agent-native"])
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-agent-native", ":pulsebeam-agent-native-sim", ":pulsebeam-agent-native-transport", ":unit_tests"])

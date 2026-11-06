@@ -2,6 +2,7 @@ load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_python//python:defs.bzl", "py_binary")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy_test", "rust_test", "rustfmt_test")
+load("@native_agent_pypi//:requirements.bzl", "requirement")
 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "scripts/*.sh"], allow_empty = True))
@@ -35,32 +36,47 @@ py_binary(
     testonly = True,
     srcs = ["tests/native_foreign_smoke.py"],
     main = "tests/native_foreign_smoke.py",
+    deps = [requirement("installer")],
 )
 
-rust_test(
-    name = "production_native",
-    crate_root = "tests/production_native.rs",
-    srcs = ["tests/production_native.rs", "//agents/pulsebeam-agent-web:destination_test_support"],
-    data = [":native_foreign_smoke", "//agents/pulsebeam-agent-native:bindings", "//agents/pulsebeam-agent-native:native_library"],
-    env = {
-        "PULSEBEAM_FOREIGN_SMOKE": "$(rootpath :native_foreign_smoke)",
-        "PULSEBEAM_NATIVE_BINDINGS": "$(rootpath //agents/pulsebeam-agent-native:bindings)",
-        "PULSEBEAM_NATIVE_LIBRARY": "$(rootpath //agents/pulsebeam-agent-native:native_library)",
-    },
-    edition = crate_edition(),
-    lint_config = ":lints",
-    aliases = aliases(normal = True, normal_dev = True),
-    deps = all_crate_deps(normal = True, normal_dev = True) + [
-        "//agents/pulsebeam-agent-native",
-        "//crates/pulsebeam:pulsebeam",
-        "//crates/pulsebeam-core:pulsebeam-core",
-        "//crates/pulsebeam-runtime:pulsebeam-runtime",
-        "//server/rust:pulsebeam-server",
-    ],
-    proc_macro_deps = all_crate_deps(proc_macro = True),
-    size = "medium",
-    tags = ["cpu:2"],
-)
+[
+    rust_test(
+        name = name,
+        crate_root = "tests/production_native.rs",
+        srcs = ["tests/production_native.rs", "//agents/pulsebeam-agent-web:destination_test_support"],
+        data = data,
+        env = env,
+        edition = crate_edition(),
+        lint_config = ":lints",
+        aliases = aliases(normal = True, normal_dev = True),
+        deps = all_crate_deps(normal = True, normal_dev = True) + [
+            "//agents/pulsebeam-agent-native",
+            "//crates/pulsebeam:pulsebeam",
+            "//crates/pulsebeam-core:pulsebeam-core",
+            "//crates/pulsebeam-runtime:pulsebeam-runtime",
+            "//server/rust:pulsebeam-server",
+        ],
+        proc_macro_deps = all_crate_deps(proc_macro = True),
+        size = "medium",
+        tags = ["cpu:2"],
+    )
+    for name, data, env in [
+        ("production_native", [], {}),
+        ("installed_foreign", [
+            ":native_foreign_smoke",
+            "//agents/pulsebeam-agent-native:installed_node_witness",
+            "//agents/pulsebeam-agent-native:node_package.pack",
+            "//agents/pulsebeam-agent-native:python_wheel",
+            "//release/npm:npm",
+        ], {
+            "PULSEBEAM_FOREIGN_SMOKE": "$(rootpath :native_foreign_smoke)",
+            "PULSEBEAM_NATIVE_WHEEL": "$(rootpath //agents/pulsebeam-agent-native:python_wheel)",
+            "PULSEBEAM_NODE_WITNESS": "$(rootpath //agents/pulsebeam-agent-native:installed_node_witness)",
+            "PULSEBEAM_NODE_PACKAGE": "$(rootpath //agents/pulsebeam-agent-native:node_package.pack)",
+            "PULSEBEAM_NPM": "$(rootpath //release/npm:npm)",
+        }),
+    ]
+]
 
 rustfmt_test(name = "format", targets = [":pulsebeam-cli", ":production_native"])
 rust_clippy_test(name = "clippy", targets = [":pulsebeam-cli", ":unit_tests", ":production_native"])

@@ -21,7 +21,7 @@ build_test(
     name = "artifacts",
     targets = [
         "//crates/pulsebeam:server", "//crates/pulsebeam-cli:pulsebeam-cli",
-        "//agents/pulsebeam-agent-native:native", "//agents/pulsebeam-agent-web:package",
+        "//agents/pulsebeam-agent-native:native", "//agents/pulsebeam-agent-native:node_package.pack", "//agents/pulsebeam-agent-native:python_wheel", "//agents/pulsebeam-agent-web:package",
         "//agents/pulsebeam-agent-web:uniffi_proof", "//agents/react:package",
         "//apps/meet:export", "//docs:site",
         "//server/typescript:package.pack", "//server/go:package", "//server/python:package", "//server/rust:package",
@@ -39,7 +39,8 @@ test_suite(
         "//agents/react:format", "//agents/react:fast", "//apps/meet:check", "//tools:workflow_contract", "//tools:simulation_runner_contract", "//tools:calibration_contract", "//tools:scoreboard_contract", "//tools:ide_contract", "//tools:launcher_contract", "//tools:rust_pins_contract", "//tools:runtime_boundary_contract", "//tools:clippy_fix_contract", "//tools:fix_contract",
         "//server/auth:fast", "//server/typescript:fast", "//server/go:fast", "//server/python:fast", "//server/rust:fast",
         "//tools/nativelink:config_test", "//tools/nativelink:analyze_test", "//tools/nativelink:autostart_test",
-        "//release:contract", "//release:elf_contract", "//release:plan_contract", "//release/npm:contract",
+        "//release:contract", "//release:elf_contract", "//release:plan_contract", "//release/npm:contract", "//release/npm:agent_synthetic", "//release/pypi:contract_test",
+        "//tools/native_licenses:generator_test", "//tools/native_licenses:aspect_test", "//tools/native_addon_licenses:inventory_test", "//agents/pulsebeam-agent-native:node_addon_elf", "//agents/pulsebeam-agent-native:node_bindings_contract", "//crates/pulsebeam-cli:installed_foreign",
     ],
 )
 
@@ -50,7 +51,7 @@ test_suite(
         "//crates/pulsebeam-rtc:integration_tests",
         "//crates/pulsebeam-runtime:steering_tests",
         "//crates/pulsebeam-udp:simulation_tests",
-        "//crates/pulsebeam-cli:production_native",
+        "//crates/pulsebeam-cli:production_native", "//agents/pulsebeam-agent-native:package_versions",
         "//crates/pulsebeam-simulator:fast",
         "//server/auth:contract", "//server/go:conformance",
         "//agents/pulsebeam-agent-web:js_format", "//agents/pulsebeam-agent-web:js_unit_tests",

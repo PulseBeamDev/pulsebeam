@@ -35,6 +35,10 @@ py_test(
     for name in ["pulsebeam", "webrtc", "runtime"]
 ]
 [
+    filegroup(name = "webrtc_" + name, srcs = [":gn_native"], output_group = name)
+    for name in ["notices", "license_manifest"]
+]
+[
     cc_import(name = name + "_import", static_library = ":" + name + "_archive", visibility = ["//visibility:private"])
     for name in ["pulsebeam", "webrtc", "runtime"]
 ]

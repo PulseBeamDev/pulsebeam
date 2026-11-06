@@ -6,8 +6,10 @@ and understand what the local integration does not establish. Start with the
 
 ## Supported local integration
 
-The native integration is unpublished and targets Linux x86_64. Applications provide
-capture, device permissions, rendering and credentials. The same libwebrtc actor
+The native integration is unpublished and targets Linux x86_64. The generated Node
+archive requires Node 22 and glibc 2.39 or newer; the Python wheel requires
+Python 3.12 and glibc 2.39 or newer. Applications provide capture, device
+permissions, rendering and credentials. The same libwebrtc actor
 runs with production `ThreadedRuntime` services or controlled execution services;
 core owns session, topology, topics and recovery policy.
 
@@ -91,9 +93,10 @@ to select affected checks and reuse unchanged evidence.
 | --- | --- |
 | Sys codec/runtime behavior, native linking and lifetime | `//crates/pulsebeam-libwebrtc-sys:fast`, `:runtime_tests`, `:lifetime` in separate core/native configurations |
 | Native API, admission, controls and lifecycle components | `//agents/pulsebeam-agent-native:unit_tests`, `:format`, `:clippy` |
-| Current dynamic ABI, generated Python use, real-SFU I420 media and retirement with stock native discovery | `//crates/pulsebeam-cli:production_native` |
+| Real-SFU I420 media and retirement with stock native discovery | `//crates/pulsebeam-cli:production_native` |
+| Installed Node archive and Python wheel, real-SFU connection, topic payloads, owned decoded video and close | `//crates/pulsebeam-cli:installed_foreign` (also `//agents/pulsebeam-agent-native:node_consumer` and `:python_consumer`) |
 | Concurrent real IPv4/IPv6 ICE selection and bidirectional application topics | `//crates/pulsebeam:transport_conformance` |
-| Generated Swift/Kotlin/Python artifacts and native library variants | `//agents/pulsebeam-agent-native:bindings`, `:native_static`, `:pulsebeam-agent-native-sim` |
+| Generated bindings, native library variants and distribution archives | `//agents/pulsebeam-agent-native:bindings`, `:native_static`, `:pulsebeam-agent-native-sim`, `:node_package.pack`, `:python_wheel` |
 | Shared controlled/native RTC interoperability | `//crates/pulsebeam-rtc/simulation:interop` |
 | Web artifact/type/runtime contracts | `//agents/pulsebeam-agent-web:node_runtime_tests`, `:uniffi_types`, `:public_contract` |
 | Irreducible browser glue against the local SFU | `//agents/pulsebeam-agent-web:browser` |

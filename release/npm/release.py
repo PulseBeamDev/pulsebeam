@@ -12,6 +12,7 @@ PACKAGES = {
     "web": "@pulsebeam/web",
     "react": "@pulsebeam/react",
     "server": "@pulsebeam/server",
+    "agent": "@pulsebeam/agent",
 }
 REGISTRY = "https://registry.npmjs.org/"
 VERSION = re.compile(
@@ -40,7 +41,53 @@ def plan(tag, manifests):
             if tag[len(prefix):] != release["version"]:
                 raise ValueError("tag does not match the package manifest version")
             return release
-    raise ValueError("expected npm-web-v*, npm-react-v* or npm-server-v* tag")
+    raise ValueError("expected npm-web-v*, npm-react-v*, npm-server-v* or npm-agent-v* tag")
+
+
+def validate_agent(manifest, files):
+    package_plan("agent", {manifest["name"]: manifest})
+    for field, expected in (
+        ("type", "module"), ("os", ["linux"]), ("cpu", ["x64"]),
+        ("libc", ["glibc"]), ("engines", {"node": ">=22 <23"}),
+    ):
+        if manifest.get(field) != expected:
+            raise ValueError(f"agent has invalid {field}")
+    dependencies = manifest.get("dependencies", {})
+    if not isinstance(dependencies, dict) or any(
+        dependencies.get(name) != "0.31.0-5" for name in ("@ubjs/core", "@ubjs/node")
+    ):
+        raise ValueError("agent requires pinned @ubjs dependencies")
+    for group in ("dependencies", "peerDependencies", "optionalDependencies", "devDependencies"):
+        requirements = manifest.get(group, {})
+        if not isinstance(requirements, dict) or any(
+            not isinstance(value, str) or any(marker in value for marker in ("link:", "workspace:", "file:"))
+            or re.match(r"^(?:\.{1,2}/|/|~/|[A-Za-z]:[\\/])", value)
+            for value in requirements.values()
+        ):
+            raise ValueError("public dependencies cannot use local workspace paths")
+    exports = manifest.get("exports")
+    if not isinstance(exports, dict) or not {".", "./core", "./native"} <= exports.keys():
+        raise ValueError("agent is missing public exports")
+    for conditions in exports.values():
+        if not isinstance(conditions, dict) or set(conditions) != {"types", "import"}:
+            raise ValueError("agent export must declare types and import")
+        for condition, suffix in (("types", ".d.ts"), ("import", ".js")):
+            entry = conditions[condition]
+            if (
+                not isinstance(entry, str) or not entry.startswith("./dist/")
+                or not entry.endswith(suffix) or any(part in ("", ".", "..") for part in entry[2:].split("/"))
+                or not files.get("package/" + entry[2:])
+            ):
+                raise ValueError("agent public export is missing or invalid")
+    for document in (
+        "THIRD_PARTY_NOTICES.md", "RUST_STANDARD_LIBRARY_NOTICES.html",
+        "NODE_ADDON_SOURCE_MANIFEST.json", "NODE_ADDON_SOURCE_NOTICES.json",
+        "NODE_ADDON_SOURCE_PROVENANCE.txt", "NODE_ADDON_RUST_STANDARD_LIBRARY_NOTICES.html",
+    ):
+        if not files.get("package/" + document):
+            raise ValueError(f"agent is missing {document}")
+    if not files.get("package/dist/libpulsebeam_agent_native.so", b"").startswith(b"\x7fELF"):
+        raise ValueError("agent is missing its ELF native library")
 
 
 def validate_archive(path, expected):
@@ -63,9 +110,12 @@ def validate_archive(path, expected):
     for document in ("README.md", "LICENSE"):
         if not files.get(f"package/{document}"):
             raise ValueError(f"package is missing {document}")
-    for entry in manifest["exports"]["."].values():
-        if not entry.startswith("./dist/") or not files.get("package/" + entry[2:]):
-            raise ValueError("public export is missing from the archive")
+    if manifest["name"] == "@pulsebeam/agent":
+        validate_agent(manifest, files)
+    else:
+        for entry in manifest["exports"]["."].values():
+            if not entry.startswith("./dist/") or not files.get("package/" + entry[2:]):
+                raise ValueError("public export is missing from the archive")
     for group in ("dependencies", "peerDependencies"):
         for requirement in manifest.get(group, {}).values():
             if any(marker in requirement for marker in ("link:", "workspace:", "file:")):

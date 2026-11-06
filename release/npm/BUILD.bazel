@@ -6,11 +6,13 @@ MANIFESTS = [
     "//agents/pulsebeam-agent-web:package.json",
     "//agents/react:package.json",
     "//server/typescript:package.json",
+    "//agents/pulsebeam-agent-native:package.json",
 ]
 ARCHIVES = [
     "//agents/pulsebeam-agent-web:package.pack",
     "//agents/react:package.pack",
     "//server/typescript:package.pack",
+    "//agents/pulsebeam-agent-native:node_package.pack",
 ]
 MANIFEST_ARGS = [arg for manifest in MANIFESTS for arg in ["--manifest", "$(rootpath %s)" % manifest]]
 ARCHIVE_ARGS = [arg for archive in ARCHIVES for arg in ["--archive", "$(rootpath %s)" % archive]]
@@ -37,7 +39,7 @@ py_binary(
             "--npm", "$(rootpath :npm)", "--package", key, "--publish",
         ],
     )
-    for key, manifest, archive in zip(["web", "react", "server"], MANIFESTS, ARCHIVES)
+    for key, manifest, archive in zip(["web", "react", "server", "agent"], MANIFESTS, ARCHIVES)
 ]
 
 py_binary(
@@ -57,11 +59,17 @@ py_binary(
 )
 
 py_test(
+    name = "agent_synthetic",
+    srcs = ["agent_synthetic_test.py", "release.py"],
+    main = "agent_synthetic_test.py",
+)
+
+py_test(
     name = "contract",
     srcs = ["release_test.py", "release.py"],
     main = "release_test.py",
-    data = MANIFESTS + ARCHIVES + [":npm", ":login", ":publish_web", ":publish_react", ":publish_server"],
+    data = MANIFESTS + ARCHIVES + [":npm", ":login", ":publish_web", ":publish_react", ":publish_server", ":publish_agent"],
     args = MANIFEST_ARGS + ARCHIVE_ARGS + ["--npm", "$(rootpath :npm)", "--login", "$(rootpath :login)"] + [
-        arg for key in ["web", "react", "server"] for arg in ["--publisher", "$(rootpath :publish_%s)" % key]
+        arg for key in ["web", "react", "server", "agent"] for arg in ["--publisher", "$(rootpath :publish_%s)" % key]
     ],
 )

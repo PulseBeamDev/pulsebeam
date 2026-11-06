@@ -1,11 +1,11 @@
 """Generated Python/dynamic RTC boundary, using the Rust witness's real SFU."""
 
 import asyncio
-import ctypes
 import importlib
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -32,6 +32,9 @@ async def witness(endpoint, token, package):
     )
     try:
         updates = agent.snapshots()
+        events = agent.events()
+        topic_publisher = core.TopicPublisher(name="foreign-exchange", mode=core.TopicMode.ORDERED)
+        topic_subscriber = core.TopicSubscriber(name="foreign-exchange", mode=core.TopicMode.ORDERED)
         publication = await agent.publication(core.TrackSpec.VIDEO(label="foreign-camera"))
         camera = await publication.input()
         await agent.replace_desired(
@@ -43,8 +46,8 @@ async def witness(endpoint, token, package):
                     pinned=[], selected=[], automatic=False,
                     playout_delays=[], selector_delays=[]
                 ),
-                topic_publishers=[],
-                topic_subscribers=[],
+                topic_publishers=[topic_publisher],
+                topic_subscribers=[topic_subscriber],
             )
         )
         while True:
@@ -52,10 +55,54 @@ async def witness(endpoint, token, package):
             assert update.is_SNAPSHOT(), f"lost foreign snapshot observation: {update}"
             snapshot = update.snapshot
             assert not snapshot.connection.is_TERMINAL_FAILURE(), snapshot.failure
-            if snapshot.connection.is_CONNECTED() and snapshot.participant_id:
+            if (snapshot.connection.is_CONNECTED() and snapshot.participant_id
+                    and any(item.connected and item.data_track_id for item in snapshot.topics.publishers)
+                    and any(item.connected and item.publishers for item in snapshot.topics.subscribers)):
                 break
         assert snapshot.generation is not None
+        assert isinstance(snapshot.generation, int)
         await camera.ready()
+        async def send_until_reply():
+            while True:
+                await agent.send_topic(topic_publisher, b"python-bytes-\0\xff")
+                await asyncio.sleep(0.2)
+
+        async with asyncio.TaskGroup() as group:
+            sender = group.create_task(send_until_reply())
+            while True:
+                update = await events.next()
+                assert not update.is_LAGGED() and not update.is_CLOSED(), update
+                if not update.is_EVENT() or not update.event.is_CORE():
+                    continue
+                notification = update.event.notification
+                if not notification.is_TOPIC() or not notification.notification.is_MESSAGE():
+                    continue
+                message = notification.notification.message
+                if message.name == "foreign-exchange" and message.payload == b"rust-ack:python-bytes-\0\xff":
+                    assert isinstance(message.sequence, int)
+                    break
+            sender.cancel()
+        received_interest = await agent.video_subscription(
+            core.TrackSelector(participant_id="publisher", label="production-camera"),
+            core.VideoObservation(
+                visible=True, height=96, min_height=0, min_fps=0, priority=1,
+                playout_delay=core.PlayoutDelay.ADAPTIVE(),
+            ),
+        )
+        received = await received_interest.observe(native.ReceiveMode.DECODED)
+        while True:
+            update = await received.next()
+            assert not update.is_CLOSED() and not update.is_LAGGED(), update
+            if update.is_FRAME() and update.frame.frame.is_I420():
+                pixels = update.frame.frame.frame
+                assert pixels.width == 160 and pixels.height == 96
+                assert len(pixels.data) == 160 * 96 + 2 * 80 * 48
+                assert isinstance(pixels.timestamp_us, int)
+                retained = bytes(pixels.data)
+                break
+        await received.close()
+        await received_interest.close()
+        assert bytes(pixels.data) == retained, "owned pixels changed after observation close"
         interest = await agent.audio_subscription(
             core.TrackSelector(participant_id="absent-publisher", label="microphone")
         )
@@ -130,20 +177,46 @@ async def witness(endpoint, token, package):
 
 
 def main():
-    bindings = Path(os.environ["PULSEBEAM_NATIVE_BINDINGS"]).resolve(strict=True)
-    library = Path(os.environ["PULSEBEAM_NATIVE_LIBRARY"]).resolve(strict=True)
-    # Keep ELF $ORIGIN anchored to the declared runtime closure before loading the package alias.
-    _native_library = ctypes.CDLL(str(library))
+    if len(sys.argv) == 4 and sys.argv[1] == "--witness":
+        package = importlib.import_module("pulsebeam_agent")
+        assert Path(package.__file__).is_relative_to("/opt/lib/python3.12/site-packages")
+        asyncio.run(asyncio.wait_for(witness(sys.argv[2], sys.argv[3], package.__name__), timeout=25))
+        return
+
+    from installer import install
+    from installer.destinations import SchemeDictionaryDestination
+    from installer.sources import WheelFile
+
+    wheels = list(Path(os.environ["PULSEBEAM_NATIVE_WHEEL"]).resolve(strict=True).glob("*.whl"))
+    if len(wheels) != 1:
+        raise RuntimeError(f"expected one native agent wheel, got {wheels}")
     with tempfile.TemporaryDirectory(prefix="native-foreign-") as temporary:
-        package = "native_boundary"
-        directory = Path(temporary) / package
-        directory.mkdir()
-        (directory / "__init__.py").touch()
-        for module in ("pulsebeam_agent_core.py", "pulsebeam_agent_native.py"):
-            shutil.copyfile(bindings / module, directory / module)
-        (directory / "libpulsebeam_agent_native.so").symlink_to(library)
-        sys.path.insert(0, temporary)
-        asyncio.run(asyncio.wait_for(witness(sys.argv[1], sys.argv[2], package), timeout=15))
+        site = Path(temporary) / "site"
+        destination = SchemeDictionaryDestination(
+            {key: str(site) for key in ("purelib", "platlib", "headers", "scripts", "data")},
+            interpreter=sys.executable,
+            script_kind="posix",
+        )
+        with WheelFile.open(wheels[0]) as wheel:
+            install(wheel, destination, additional_metadata={"INSTALLER": b"pulsebeam-conformance"})
+        baseline = os.environ.get("PULSEBEAM_BASELINE_ROOT")
+        if baseline:
+            shutil.copyfile(__file__, Path(temporary) / "witness.py")
+            shutil.copyfile(os.environ["PULSEBEAM_BASELINE_CA_FILE"], Path(temporary) / "ca.pem")
+            python_root = Path(sys.executable).resolve().parent.parent
+            subprocess.run([
+                "/usr/bin/bwrap", "--die-with-parent", "--ro-bind", baseline, "/", "--dev", "/dev", "--proc", "/proc",
+                "--ro-bind", temporary, "/home", "--ro-bind", str(python_root), "/opt",
+                "--ro-bind", str(site), "/opt/lib/python3.12/site-packages", "--chdir", "/home",
+                "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
+                "--setenv", "SSL_CERT_FILE", "/home/ca.pem", "--",
+                "/opt/bin/python3.12", "/home/witness.py", "--witness", *sys.argv[1:],
+            ], check=True, timeout=30)
+        else:
+            sys.path.insert(0, str(site))
+            package = importlib.import_module("pulsebeam_agent")
+            assert Path(package.__file__).is_relative_to(site)
+            asyncio.run(asyncio.wait_for(witness(sys.argv[1], sys.argv[2], package.__name__), timeout=25))
 
 
 if __name__ == "__main__":

@@ -3,11 +3,15 @@
 import argparse
 from contextlib import contextmanager
 import fcntl
+import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 from urllib.parse import urlparse
 
 
@@ -91,12 +95,73 @@ def repository_sources(value):
     return source
 
 
+def write_notices(gn, root, build, source, env, notices, manifest):
+    # Reuse the pinned upstream mapping, but invoke the exact GN binary used for
+    # this build instead of its depot_tools wrapper.
+    sys.modules["find_depot_tools"] = types.ModuleType("find_depot_tools")
+    script = source / "tools_webrtc/libs/generate_licenses.py"
+    spec = importlib.util.spec_from_file_location("webrtc_license_generator", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    builder = module.LicenseBuilder([str(build)], ["//pulsebeam:native"])
+    def describe(target):
+        result = subprocess.run(
+            [str(gn), "desc", "--all", "--format=json", "--root-target=//pulsebeam:native", str(build), target],
+            cwd=root, env=env, text=True, stdout=subprocess.PIPE,
+        )
+        if result.returncode:
+            raise RuntimeError(f"GN license graph query failed:\n{result.stdout}")
+        return json.loads(result.stdout)
+
+    graph = describe("//pulsebeam:native")
+    libraries = {}
+    for target in graph.values():
+        for dependency in target["deps"]:
+            name = builder._parse_library(dependency)
+            if name:
+                libraries.setdefault(name, set()).add(dependency)
+    if not libraries:
+        raise RuntimeError("WebRTC GN license closure is empty")
+    # GN's cxxbridge and its Rust dependencies are host-only build tools.
+    host_toolchain = "(//build/toolchain/linux:clang_x64_for_rust_host_build_tools)"
+    if "rust" in libraries:
+        if any(not label.endswith(host_toolchain) for label in libraries["rust"]):
+            raise RuntimeError(f"unmapped GN Rust runtime dependency: {sorted(libraries['rust'])}")
+        builder.common_licenses_dict["rust"] = []
+    # The overlay compiles cxx.cc directly, so it has no third-party GN target.
+    cxx_source = "//third_party/rust/chromium_crates_io/vendor/cxx-v1/src/cxx.cc"
+    direct_sources = {item for target in describe("//pulsebeam:pulsebeam").values()
+                      for item in target.get("sources", []) if item.startswith("//third_party/")}
+    if direct_sources != {cxx_source}:
+        raise RuntimeError(f"unmapped direct third-party GN sources: {sorted(direct_sources)}")
+    libraries["cxx-source"] = direct_sources
+    builder.common_licenses_dict["cxx-source"] = [
+        "third_party/rust/chromium_crates_io/vendor/cxx-v1/LICENSE-APACHE",
+        "third_party/rust/chromium_crates_io/vendor/cxx-v1/LICENSE-MIT",
+    ]
+    missing = sorted(set(libraries) - set(builder.common_licenses_dict))
+    if missing:
+        raise RuntimeError(f"WebRTC GN libraries without upstream license mapping: {[(name, sorted(libraries[name])) for name in missing]}")
+    entries = [{"library": name, "targets": sorted(targets), "licenses": builder.common_licenses_dict[name]}
+               for name, targets in sorted(libraries.items())]
+    Path(manifest).write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n")
+    pieces = ["# WebRTC and configured GN dependencies\n"]
+    license_paths = [("WebRTC", "LICENSE"), ("WebRTC patent grant", "PATENTS")]
+    license_paths.extend((entry["library"], path) for entry in entries for path in entry["licenses"])
+    for name, relative in license_paths:
+        text = (source / relative).read_text()
+        if not text.strip():
+            raise RuntimeError(f"empty WebRTC license: {relative}")
+        pieces.append(f"\n## {name}: {relative}\n\n{text.rstrip()}\n")
+    Path(notices).write_text("".join(pieces))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sources = parser.add_mutually_exclusive_group(required=True)
     sources.add_argument("--source-root")
     sources.add_argument("--source-manifest", dest="source_root", type=repository_sources)
-    for name in ("bridge", "overlay", "host-bin", "build", "flavor", "pulsebeam", "webrtc", "runtime"):
+    for name in ("bridge", "overlay", "host-bin", "build", "flavor", "pulsebeam", "webrtc", "runtime", "notices", "license-manifest"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--asan", action="store_true")
     parser.add_argument("--executor", choices=("local", "cache", "reapi"), default="local")
@@ -167,6 +232,7 @@ def build(args, lock_fd=None):
         gn = root / "buildtools/linux64/gn"
         siso = root / "third_party/siso/cipd/siso"
         run([gn, "gen", build, f"--root={root}", "--root-target=//pulsebeam:native", "--args=" + config], cwd=root, env=env, lock_fd=lock_fd)
+        write_notices(gn, root, build, source, env, args.notices, args.license_manifest)
         run(siso_command(siso, build, args.executor, args.reapi), cwd=root, env=env, lock_fd=lock_fd)
         for name, relative in {
             "pulsebeam": "obj/pulsebeam/libpulsebeam.a",

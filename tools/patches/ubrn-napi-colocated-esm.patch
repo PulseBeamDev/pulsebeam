@@ -1,0 +1,102 @@
+diff -ruN a/src/bindings/gen_typescript/templates/index.ts b/src/bindings/gen_typescript/templates/index.ts
+--- a/src/bindings/gen_typescript/templates/index.ts	2026-11-05 06:13:42.067747598 -0500
++++ b/src/bindings/gen_typescript/templates/index.ts	2026-11-05 06:26:34.495673880 -0500
+@@ -6,19 +6,21 @@
+ // @ts-nocheck
+ {%- endif %}
+ {%- for m in modules %}
+-export * from './{{ m.ts() }}';
++export * from './{{ m.ts() }}{% if flavor.supports_player() && !flavor.is_wasm2() %}.js{% endif %}';
+ {%- endfor %}
+ 
+ {%- for m in modules %}
+-import * as {{ m.ts() }} from './{{ m.ts() }}';
++import * as {{ m.ts() }} from './{{ m.ts() }}{% if flavor.supports_player() && !flavor.is_wasm2() %}.js{% endif %}';
+ {%- endfor %}
+ 
+ {% if flavor.supports_sync_initialization() %}
+ let initialized = false;
+ if (!initialized) {
++  {%- if !flavor.supports_player() %}
+   {%- for m in modules %}
+   {{ m.ts() }}.default.initialize();
+   {%- endfor %}
++  {%- endif %}
+   initialized = true;
+ }
+ 
+diff -ruN a/src/bindings/gen_typescript/templates/wrapper-ffi-player.ts b/src/bindings/gen_typescript/templates/wrapper-ffi-player.ts
+--- a/src/bindings/gen_typescript/templates/wrapper-ffi-player.ts	2026-11-05 06:22:28.984528107 -0500
++++ b/src/bindings/gen_typescript/templates/wrapper-ffi-player.ts	2026-11-05 06:22:28.995144669 -0500
+@@ -14,7 +14,21 @@
+ import { FfiType, type ModuleDefinitions } from "@ubjs/wasm/core";
+ {%- else %}
+ import lib from "@ubjs/node";
+-const { UniffiNativeModule, FfiType, resolveLibPath } = lib;
++// @ubjs/node 0.31.0-5 exports these from lib.js but omits them from index.d.ts.
++type FfiDescriptor = { tag: string; name?: string; inner?: FfiDescriptor };
++type ScalarFfiType = "UInt8" | "Int8" | "UInt16" | "Int16" | "UInt32" | "Int32" |
++  "UInt64" | "Int64" | "Float32" | "Float64" | "Handle" | "RustBuffer" |
++  "ForeignBytes" | "RustCallStatus" | "VoidPointer" | "Void";
++const { UniffiNativeModule, FfiType, resolveLibPath } = lib as typeof lib & {
++  FfiType: Record<ScalarFfiType, FfiDescriptor> & {
++    Callback(name: string): FfiDescriptor;
++    Struct(name: string): FfiDescriptor;
++    Reference(inner: FfiDescriptor): FfiDescriptor;
++    MutReference(inner: FfiDescriptor): FfiDescriptor;
++  };
++  resolveLibPath(options: { crateName: string; callerUrl: string; override?: string;
++    npmPackageBase?: string; tripleStyle?: string }): string;
++};
+ {%- endif %}
+ 
+ import {
+diff -ruN a/src/bindings/gen_typescript/templates/wrapper.ts b/src/bindings/gen_typescript/templates/wrapper.ts
+--- a/src/bindings/gen_typescript/templates/wrapper.ts	2026-11-05 06:13:42.067716255 -0500
++++ b/src/bindings/gen_typescript/templates/wrapper.ts	2026-11-05 06:26:34.495630719 -0500
+@@ -19,7 +19,7 @@
+ {%- endif %}
+ 
+ {%- if module.flavor.supports_globalthis_native_module() || module.flavor.supports_player() %}
+-import nativeModule from "./{{ module.module_name }}-ffi";
++import nativeModule from "./{{ module.module_name }}-ffi{% if module.flavor.supports_player() && !module.flavor.is_wasm2() %}.js{% endif %}";
+ {%- else %}
+ import * as wasmBundle from "./wasm-bindgen/index.js";
+ {%- endif %}
+@@ -27,11 +27,11 @@
+ import {
+ {%-   for t in imp.types %} type {{ t }},{%- endfor %}
+ {%-   for v in imp.values %} {{ v }},{%- endfor %}
+-} from "{{ imp.path }}";
++} from "{{ imp.path }}{% if module.flavor.supports_player() && !module.flavor.is_wasm2() && imp.path.starts_with("./") %}.js{% endif %}";
+ {%- endfor %}
+ 
+ {%- for conv in module.converter_imports %}
+-import {{ conv.default_name }} from "{{ conv.path }}";
++import {{ conv.default_name }} from "{{ conv.path }}{% if module.flavor.supports_player() && !module.flavor.is_wasm2() %}.js{% endif %}";
+ const { {{ conv.converters|join(", ") }} } = {{ conv.default_name }}.converters;
+ {%- endfor %}
+ 
+@@ -93,6 +93,10 @@
+ 
+ {% call init::initialization(module.initialization) %}
+ 
++{%- if module.flavor.supports_player() && !module.flavor.is_wasm2() %}
++uniffiEnsureInitialized();
++{%- endif %}
++
+ export default Object.freeze({
+   initialize: uniffiEnsureInitialized,
+   {%- if !module.exported_converters.is_empty() %}
+diff -ruN a/src/cli.rs b/src/cli.rs
+--- a/src/cli.rs	2026-11-05 06:13:42.066756189 -0500
++++ b/src/cli.rs	2026-11-05 06:13:42.082432188 -0500
+@@ -335,7 +335,7 @@
+                         "napi codegen requires a LibResolution; pass --lib-colocated, --lib-absolute, or --lib-package-base"
+                     )
+                 })?;
+-                let crate_name = namespace.crate_name.clone();
++                let crate_name = root.cdylib.clone().unwrap_or_else(|| namespace.crate_name.clone());
+                 let player_module =
+                     gen_typescript::ffi_module_player::PlayerFfiModule::from_general(
+                         namespace,

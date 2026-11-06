@@ -1,12 +1,13 @@
 //! One production constructor/HTTP/kernel-socket witness, not a media matrix.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, ConnectionState, DesiredState, Generation, TrackSelector, TrackSpec,
-    VideoObservation,
+    AgentConfig, ConnectionState, DesiredState, Generation, Notification, TopicMode,
+    TopicNotification, TopicPublisher, TopicRegistrations, TopicSend, TopicSubscriber,
+    TrackSelector, TrackSpec, VideoObservation,
 };
 use pulsebeam_agent_native::{
-    Agent, Config, Host, I420Frame, InputFrame, MediaStreamUpdate, OutputFrame, PublicationInput,
-    ReceiveMode,
+    Agent, AgentEvent, Config, Host, I420Frame, InputFrame, MediaStreamUpdate, OutputFrame,
+    PublicationInput, ReceiveMode, StreamUpdate,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -78,6 +79,35 @@ async fn produce_i420(camera: PublicationInput) -> Result<()> {
 
 #[tokio::test]
 async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
+    if let Some(root) = std::env::var_os("PULSEBEAM_BASELINE_ROOT") {
+        let release = std::fs::read_to_string(std::path::Path::new(&root).join("etc/os-release"))?;
+        ensure!(
+            release.lines().any(|line| line == "ID=ubuntu"),
+            "baseline is not Ubuntu"
+        );
+        ensure!(
+            release.lines().any(|line| line == "VERSION_ID=\"24.04\""),
+            "baseline is not Ubuntu 24.04"
+        );
+        let output = std::process::Command::new("/usr/bin/bwrap")
+            .arg("--ro-bind")
+            .arg(&root)
+            .arg("/")
+            .args([
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--",
+                "/usr/bin/getconf",
+                "GNU_LIBC_VERSION",
+            ])
+            .output()?;
+        ensure!(
+            output.status.success() && output.stdout == b"glibc 2.39\n",
+            "baseline is not glibc 2.39"
+        );
+    }
     let server = destination::DestinationServer::start()
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
@@ -164,27 +194,21 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
                         ensure!(luma.iter().all(|sample| sample.abs_diff(180) <= 12), "native decoded pixels do not match submitted content");
                         break anyhow::Ok(pixels);
                     }
-                    MediaStreamUpdate::Track { .. } => {},
-                    MediaStreamUpdate::Lagged { skipped } | MediaStreamUpdate::NativeDropped { skipped } | MediaStreamUpdate::NativeDecodedDropped { skipped } => bail!("production video observation lost {skipped} frames"),
+                    MediaStreamUpdate::Track { .. } | MediaStreamUpdate::NativeDropped { .. } | MediaStreamUpdate::NativeDecodedDropped { .. } => {},
+                    MediaStreamUpdate::Lagged { skipped } => bail!("production observation lagged by {skipped} updates"),
                     MediaStreamUpdate::Closed => bail!("production video closed before delivery"),
                 }
             }
         }
     }).await.with_context(|| format!("production decoded-media deadline: publisher={:?}, subscriber={:?}", publisher.snapshot(), subscriber.snapshot()));
-    producer.abort();
-    let _ = producer.await;
     let retained = media
         .as_ref()
         .ok()
         .and_then(|result| result.as_ref().ok())
         .cloned();
-    let close = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::try_join!(publisher.close(), subscriber.close())?;
-        anyhow::Ok(())
-    })
-    .await;
+    let close = tokio::time::timeout(Duration::from_secs(5), subscriber.close()).await;
     if !matches!(&close, Ok(Ok(()))) {
-        let _ = tokio::join!(publisher.abort(), subscriber.abort());
+        let _ = subscriber.abort().await;
     }
     let pixels = media.context("production decoded media did not arrive")??;
     close.context("production agents did not close")??;
@@ -202,16 +226,14 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
         subscription.is_closed(),
         "named subscription release did not close its owner"
     );
-    for agent in [&publisher, &subscriber] {
-        ensure!(
-            agent.snapshot().connection == ConnectionState::Disconnected,
-            "production graceful close did not disconnect"
-        );
-        ensure!(
-            agent.statistics().borrow().is_none(),
-            "production native graph not retired"
-        );
-    }
+    ensure!(
+        subscriber.snapshot().connection == ConnectionState::Disconnected,
+        "production graceful close did not disconnect"
+    );
+    ensure!(
+        subscriber.statistics().borrow().is_none(),
+        "production native graph not retired"
+    );
     ensure!(
         Some(&pixels) == retained.as_ref(),
         "owning production pixels changed after close"
@@ -219,22 +241,140 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
     println!(
         "production native raw-I420 encode/real HTTP+SFU+Linux sockets/native decode/owned-close PASS"
     );
-    // The same bounded server also proves the emitted Python API and cdylib,
-    // without adding a second server fixture or claiming another media matrix.
+    if std::env::var_os("PULSEBEAM_FOREIGN_SMOKE").is_none() {
+        producer.abort();
+        let _ = producer.await;
+        tokio::time::timeout(Duration::from_secs(5), publisher.close()).await??;
+        ensure!(
+            publisher.statistics().borrow().is_none(),
+            "publisher native graph not retired"
+        );
+        return Ok(());
+    }
+    let topic_publisher = TopicPublisher {
+        topic: "foreign-exchange".into(),
+        mode: TopicMode::Ordered,
+    };
+    let events = publisher.events();
+    publisher
+        .replace_desired(DesiredState {
+            revision: 2,
+            connected: true,
+            topics: TopicRegistrations {
+                publishers: vec![topic_publisher.clone()],
+                subscribers: vec![TopicSubscriber {
+                    topic: "foreign-exchange".into(),
+                    mode: TopicMode::Ordered,
+                }],
+            },
+            ..Default::default()
+        })
+        .await?;
+    let peer = publisher.clone();
+    let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut responder = tokio::spawn(async move {
+        while !received_tx.is_closed() {
+            match events.next().await {
+                StreamUpdate::Value(AgentEvent::Core(Notification::Topic(
+                    TopicNotification::Message(message),
+                ))) if message.topic == "foreign-exchange" => {
+                    if message.payload != b"python-bytes-\0\xff"
+                        && message.payload != b"node-bytes-\0\xff"
+                    {
+                        continue;
+                    }
+                    received_tx.send(message.payload.clone())?;
+                    let mut snapshots = peer.snapshots();
+                    loop {
+                        let ready = snapshots.borrow().topics.publishers.iter().any(|status| {
+                            status.registration == topic_publisher
+                                && status.channel.is_some()
+                                && status.data_track_id.is_some()
+                        });
+                        if ready {
+                            break;
+                        }
+                        snapshots.changed().await?;
+                    }
+                    let mut payload = b"rust-ack:".to_vec();
+                    payload.extend(message.payload);
+                    peer.send_topic(TopicSend {
+                        publisher: topic_publisher.clone(),
+                        payload,
+                    })
+                    .await?;
+                }
+                StreamUpdate::Lagged { skipped } => bail!("topic event stream lagged by {skipped}"),
+                StreamUpdate::Closed => bail!("topic event stream closed before exchange"),
+                other => {
+                    if let StreamUpdate::Value(AgentEvent::Core(Notification::Topic(event))) = other
+                    {
+                        eprintln!("Rust peer topic event: {event:?}");
+                    }
+                }
+            }
+        }
+        anyhow::Ok(())
+    });
+
+    // Reuse the bounded server and live Rust publisher for both installed consumers.
     let foreign = config(&endpoint, "foreign")?;
     let mut command = tokio::process::Command::new(std::env::var("PULSEBEAM_FOREIGN_SMOKE")?);
     command
         .arg(&endpoint)
         .arg(&foreign.session.token)
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
         .kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(20), command.output())
-        .await
-        .context("generated foreign RTC witness did not finish")??;
+    let output = tokio::select! {
+        result = &mut responder => bail!("topic responder stopped before Python completed: {result:?}"),
+        output = tokio::time::timeout(Duration::from_secs(35), command.output()) => output.context("generated foreign RTC witness did not finish")??,
+    };
     ensure!(
         output.status.success(),
         "generated foreign RTC witness failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     print!("{}", String::from_utf8_lossy(&output.stdout));
+
+    let node = config(&endpoint, "foreign-node")?;
+    let mut command = tokio::process::Command::new(std::env::var("PULSEBEAM_NODE_WITNESS")?);
+    command
+        .arg(&endpoint)
+        .arg(&node.session.token)
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    let status = tokio::select! {
+        result = &mut responder => bail!("topic responder stopped before Node completed: {result:?}"),
+        status = tokio::time::timeout(Duration::from_secs(60), command.status()) => status.context("installed Node RTC witness did not finish")??,
+    };
+    ensure!(
+        status.success(),
+        "installed Node RTC witness failed: {status}"
+    );
+    responder.abort();
+    let _ = responder.await;
+    let mut received = std::collections::BTreeSet::new();
+    while let Ok(payload) = received_rx.try_recv() {
+        received.insert(payload);
+    }
+    ensure!(
+        received.contains(b"python-bytes-\0\xff".as_slice()),
+        "Rust peer missed Python topic bytes"
+    );
+    ensure!(
+        received.contains(b"node-bytes-\0\xff".as_slice()),
+        "Rust peer missed Node topic bytes"
+    );
+    producer.abort();
+    let _ = producer.await;
+    tokio::time::timeout(Duration::from_secs(5), publisher.close()).await??;
+    ensure!(
+        publisher.statistics().borrow().is_none(),
+        "publisher native graph not retired"
+    );
     Ok(())
 }

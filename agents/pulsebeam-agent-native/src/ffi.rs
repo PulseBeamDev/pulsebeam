@@ -112,6 +112,11 @@ impl Agent {
             .session
             .into_core()
             .map_err(|error| NativeError::Core { error })?;
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|error| NativeError::Native {
+                message: format!("failed to initialize HTTP client: {error}"),
+            })?;
         let runtime = RuntimeAgent::spawn(
             Config {
                 session,
@@ -119,7 +124,7 @@ impl Agent {
                 decoded_video_observer: None,
                 encoded_video_observer: None,
             },
-            Host::new(Box::new(reqwest::Client::new())),
+            Host::new(Box::new(client)),
         )
         .await?;
         Ok(Self::from_runtime(runtime))

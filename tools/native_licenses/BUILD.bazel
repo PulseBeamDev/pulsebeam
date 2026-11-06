@@ -1,0 +1,57 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load(":inventory.bzl", "native_license_inventory")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "inventory.bzl",
+    "repositories.bzl",
+    # Crates.io omits these upstream root licenses from the published crates.
+    # uniffi-rs@309762f55db3f0548194a9ceba3027fa64b18a93/LICENSE
+    "supplemental/uniffi-MPL-2.0.txt",
+    # influxdata/pbjson@48ee5989564e0ace82ad71b87736d3d1b2e0e1cd/LICENSE
+    "supplemental/pbjson-MIT.txt",
+])
+
+py_binary(
+    name = "generator",
+    srcs = ["generator.py"],
+    main = "generator.py",
+    python_version = "PY3",
+)
+
+# The selected alias reaches real deps and proc macros without compiling Rust.
+config_setting(
+    name = "alternate",
+    define_values = {"license_inventory_test": "alternate"},
+)
+
+alias(
+    name = "smoke_root",
+    actual = select({
+        ":alternate": "@crates//:anyhow",
+        "//conditions:default": "@crates//:arrayvec",
+    }),
+)
+
+native_license_inventory(
+    name = "smoke",
+    roots = [":smoke_root"],
+)
+
+py_test(
+    name = "aspect_test",
+    size = "small",
+    srcs = ["aspect_check.py"],
+    main = "aspect_check.py",
+    data = [":smoke"],
+)
+
+py_test(
+    name = "generator_test",
+    size = "small",
+    srcs = ["generator.py", "generator_test.py"],
+    main = "generator_test.py",
+    python_version = "PY3",
+    env = {"PYTHONDONTWRITEBYTECODE": "1"},
+)

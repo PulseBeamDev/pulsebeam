@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulsebeam-agent"
+version = "0.3.2"
+description = "Generated native PulseBeam agent API"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "RUST_STANDARD_LIBRARY_NOTICES.html"]
+
+[project.urls]
+Repository = "https://github.com/PulseBeamDev/pulsebeam"
+
+[tool.setuptools]
+packages = ["pulsebeam_agent"]
+
+[tool.setuptools.package-data]
+pulsebeam_agent = ["*.so"]

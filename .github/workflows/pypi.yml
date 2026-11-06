@@ -1,0 +1,65 @@
+name: Validate or publish Python agent SDK
+on:
+  push:
+    tags: ['pypi-agent-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing pypi-agent-v tag to validate
+        required: true
+        type: string
+      publish:
+        description: Publish the validated wheel to PyPI
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: pypi-agent-publication
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Verify dispatched ref matches the tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF_NAME" = "$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: ./.github/actions/setup-ci
+      - name: Validate release identity and wheel
+        run: |
+          ./bazel run //release/pypi:plan -- --tag "$RELEASE_TAG"
+          ./bazel run //release/pypi:validate -- --tag "$RELEASE_TAG"
+      - name: Complete acceptance
+        run: ./bazel test //:test --test_output=errors
+      - name: Retain validated wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-agent-wheel
+          path: bazel-bin/agents/pulsebeam-agent-native/python-wheel/*.whl
+          if-no-files-found: error
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: validate
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-agent-wheel
+          path: dist
+      - name: Publish the validated wheel using PyPI trusted publishing
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+        with:
+          packages-dir: dist/

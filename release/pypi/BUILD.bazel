@@ -1,0 +1,32 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+
+py_binary(
+    name = "release",
+    srcs = ["release.py"],
+    main = "release.py",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "plan",
+    srcs = ["release.py"],
+    main = "release.py",
+    data = ["//agents/pulsebeam-agent-native:pyproject.toml"],
+    args = ["plan", "--pyproject", "$(rootpath //agents/pulsebeam-agent-native:pyproject.toml)"],
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "validate",
+    srcs = ["release.py"],
+    main = "release.py",
+    data = ["//agents/pulsebeam-agent-native:pyproject.toml", "//agents/pulsebeam-agent-native:python_wheel"],
+    args = ["validate", "--pyproject", "$(rootpath //agents/pulsebeam-agent-native:pyproject.toml)", "--wheel", "$(rootpath //agents/pulsebeam-agent-native:python_wheel)"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "contract_test",
+    srcs = ["release.py", "release_test.py"],
+    main = "release_test.py",
+)

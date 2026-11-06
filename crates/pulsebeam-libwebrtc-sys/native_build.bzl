@@ -21,6 +21,8 @@ def _native_build_impl(ctx):
     identity = flavor + ("-asan" if asan else "")
     directory = ctx.actions.declare_directory(ctx.label.name + "/" + identity + "/build")
     libraries = {name: ctx.actions.declare_file(ctx.label.name + "/" + identity + "/lib" + name + ".a") for name in ["pulsebeam", "webrtc", "runtime"]}
+    notices = ctx.actions.declare_file(ctx.label.name + "/" + identity + "/THIRD_PARTY_WEBRTC.md")
+    manifest = ctx.actions.declare_file(ctx.label.name + "/" + identity + "/webrtc_license_manifest.json")
     args = ctx.actions.args()
     args.add("--source-manifest", ctx.file._source_manifest)
     args.add("--bridge", ctx.file.bridge)
@@ -30,6 +32,8 @@ def _native_build_impl(ctx):
     args.add("--flavor", flavor)
     args.add("--executor", executor)
     args.add("--reapi", endpoint)
+    args.add("--notices", notices)
+    args.add("--license-manifest", manifest)
     if asan:
         args.add("--asan")
     for name, library in libraries.items():
@@ -45,16 +49,19 @@ def _native_build_impl(ctx):
             direct = [ctx.file.bridge, ctx.file._runner, ctx.file._source_manifest] + ctx.files.adapters + ctx.files._overlay_files,
             transitive = [ctx.attr._host_tools[DefaultInfo].files],
         ),
-        outputs = [directory] + libraries.values(),
+        outputs = [directory, notices, manifest] + libraries.values(),
         env = {"PYTHONDONTWRITEBYTECODE": "1"},
         resource_set = _client_resources if executor == "reapi" else _resources,
         mnemonic = "WebRtcGn",
         progress_message = "GN/Siso WebRTC " + identity + " (" + executor + ")",
         execution_requirements = requirements,
     )
+    groups = {name: depset([library]) for name, library in libraries.items()}
+    groups["notices"] = depset([notices])
+    groups["license_manifest"] = depset([manifest])
     return [
         DefaultInfo(files = depset([directory] + libraries.values())),
-        OutputGroupInfo(**{name: depset([library]) for name, library in libraries.items()}),
+        OutputGroupInfo(**groups),
     ]
 
 native_build = rule(

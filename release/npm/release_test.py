@@ -147,6 +147,18 @@ class ReleaseContract(unittest.TestCase):
             names.add(name)
         self.assertEqual(names, set(release.PACKAGES.values()))
 
+    def test_agent_release_contract_is_wired(self):
+        manifest = MANIFESTS["@pulsebeam/agent"]
+        self.assertEqual(release.plan("npm-agent-v" + manifest["version"], MANIFESTS)["name"], manifest["name"])
+        self.assertIn("publish_agent", {path.name for path in args.publisher})
+        archives = []
+        for path in args.archive:
+            with tarfile.open(path) as archive:
+                if json.load(archive.extractfile("package/package.json"))["name"] == manifest["name"]:
+                    archives.append(path)
+        self.assertEqual(len(archives), 1)
+        release.validate_archive(archives[0], manifest)
+
     def test_rejects_missing_export(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bad.tgz"

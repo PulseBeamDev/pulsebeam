@@ -40,7 +40,7 @@ use_repo(go_sdk, go_default_sdk = "pulsebeam_go_sdk")
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 python.toolchain(python_version = "3.12.11")
-use_repo(python, "python_3_12_11")
+use_repo(python, "python_3_12_11", "python_3_12_11_host")
 
 pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
 pip.parse(
@@ -48,7 +48,12 @@ pip.parse(
     python_version = "3.12.11",
     requirements_lock = "//server/python:requirements.lock",
 )
-use_repo(pip, "server_pypi")
+pip.parse(
+    hub_name = "native_agent_pypi",
+    python_version = "3.12.11",
+    requirements_lock = "//agents/pulsebeam-agent-native:requirements.lock",
+)
+use_repo(pip, "server_pypi", "native_agent_pypi")
 
 node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
 node.toolchain(node_version = "22.14.0")
@@ -61,6 +66,7 @@ use_repo(pnpm, "pnpm", "pnpm__links")
 
 npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
 npm.npm_translate_lock(name = "web_npm", pnpm_lock = "//agents/pulsebeam-agent-web:pnpm-lock.yaml")
+npm.npm_translate_lock(name = "native_agent_npm", pnpm_lock = "//agents/pulsebeam-agent-native:pnpm-lock.yaml")
 npm.npm_translate_lock(name = "react_npm", pnpm_lock = "//agents/react:pnpm-lock.yaml", npm_package_target_name = "package")
 npm.npm_translate_lock(name = "consumer_npm", pnpm_lock = "//agents/react/tests/consumer:pnpm-lock.yaml", npm_package_target_name = "package")
 npm.npm_translate_lock(name = "meet_npm", pnpm_lock = "//apps/meet:pnpm-lock.yaml", npm_package_target_name = "package")
@@ -68,7 +74,7 @@ npm.npm_translate_lock(name = "meet_npm", pnpm_lock = "//apps/meet:pnpm-lock.yam
 # Preserve pnpm's compatibility hoist using the existing locked version.
 npm.npm_translate_lock(name = "docs_npm", pnpm_lock = "//docs:pnpm-lock.yaml", public_hoist_packages = {"vscode-languageserver-types": ["docs"], "vscode-languageserver-protocol": ["docs"], "vscode-jsonrpc": ["docs"], "@chevrotain/regexp-to-ast": ["docs"], "@chevrotain/types": ["docs"]})
 npm.npm_translate_lock(name = "server_npm", pnpm_lock = "//server/typescript:pnpm-lock.yaml", npm_package_target_name = "package")
-use_repo(npm, "web_npm", "react_npm", "consumer_npm", "meet_npm", "docs_npm", "server_npm")
+use_repo(npm, "web_npm", "native_agent_npm", "react_npm", "consumer_npm", "meet_npm", "docs_npm", "server_npm")
 
 browsers = use_extension("//tools:browsers.bzl", "browsers")
 use_repo(browsers, "browser_chrome", "browser_chromedriver", "browser_firefox", "browser_geckodriver")
@@ -112,6 +118,15 @@ sh_binary(name = "bin", srcs = ["nativelink"], visibility = ["//visibility:publi
 """,
 )
 
+# auditwheel uses a pinned patchelf executable when validating/repairing native wheels.
+http_archive(
+    name = "native_agent_patchelf",
+    urls = ["https://files.pythonhosted.org/packages/7e/19/f7821ef31aab01fa7dc8ebe697ece88ec4f7a0fdd3155dab2dfee4b00e5c/patchelf-0.17.2.4-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.musllinux_1_1_x86_64.whl"],
+    sha256 = "d9b35ebfada70c02679ad036407d9724ffe1255122ba4ac5e4be5868618a5689",
+    type = "zip",
+    build_file_content = 'exports_files(["patchelf-0.17.2.4.data/scripts/patchelf"], visibility = ["//visibility:public"])',
+)
+
 # npm >=11.5.1 supports GitHub OIDC trusted publishing. Its bundled dependencies
 # are provisioned with the CLI, independently of application package lockfiles.
 http_archive(
@@ -127,6 +142,22 @@ use_repo(webrtc, "webrtc_upstream", "webrtc_host", "webrtc_test_tools")
 include("//crates/pulsebeam-libwebrtc-sys:deps.MODULE.bazel")
 
 include("//tools:rust-pins.MODULE.bazel")
+
+rust_std_notices = use_repo_rule("//tools/native_licenses:repositories.bzl", "rust_std_notices")
+rust_std_notices(
+    name = "native_agent_rust_std_notices",
+    host_build = "@pulsebeam_rust_host_tools//:BUILD.bazel",
+    version_file = "//:rust-toolchain.toml",
+)
+
+addon_sources = use_repo_rule("//tools/native_addon_licenses:repositories.bzl", "addon_sources")
+addon_sources(
+    name = "native_agent_node_addon_sources",
+    graph = "//tools/native_addon_licenses:graph.py",
+    inventory = "//tools/native_addon_licenses:inventory.py",
+    mpl = "//tools/native_licenses:supplemental/uniffi-MPL-2.0.txt",
+    python = "@python_3_12_11_host//:python",
+)
 
 oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
 oci.pull(

@@ -2,15 +2,35 @@
 
 Native Rust and generated foreign APIs for caller-fed media and PulseBeam session control. The shared actor executes `agent-core` effects through libwebrtc; applications own capture, device permissions and rendering.
 
-This is an unpublished, not fully qualified Linux x86_64 integration. Bazel builds the [local WebRTC bindings](../../crates/pulsebeam-libwebrtc-sys/README.md) from pinned sources; no source/native candidate archives or separate preparation are needed. Contributor proofs cover controlled real-SFU media/topics/reconnect, native decoded marker-only simulcast, simulated TCP recovery, and a bounded production raw-I420 encode/decode witness. The production witness also calls the generated Python API through the native dynamic library. See [support and verification scope](QUALIFICATION.md) for the proof owners and limits. Swift/Kotlin binding generation does not qualify mobile runtime execution; hardware qualification and release publication are separate.
+This is an unpublished, not fully qualified Linux x86_64 integration. The generated Node and Python archives target glibc 2.39 or newer, Node 22 and Python 3.12 respectively. Other platforms, Node versions and Python versions are not qualified. Bazel builds the [local WebRTC bindings](../../crates/pulsebeam-libwebrtc-sys/README.md) from pinned sources. See [support and verification scope](QUALIFICATION.md) for proof owners and limits. Swift/Kotlin binding generation does not qualify mobile runtime execution; hardware qualification and release publication are separate.
 
-For source builds, generated library outputs, and crates.io release requirements, see [Build and publish](BUILDING.md). Standalone Cargo builds are not supported yet.
+For source builds, generated archives and release requirements, see [Build and publish](BUILDING.md). Standalone Cargo builds are not supported yet.
+
+## Install the generated archives
+
+The packages are not published to npm or PyPI. Obtain the archives from a trusted build before installing them. Use a Linux x86_64 host with glibc 2.39 or newer.
+
+With Node 22, install the npm archive in your application. npm resolves its pinned `@ubjs` dependencies from the registry:
+
+```sh
+npm install --ignore-scripts /path/to/node_package.tgz
+node --input-type=module -e 'import { Agent } from "@pulsebeam/agent/native"; console.log(typeof Agent.create)'
+```
+
+With Python 3.12, install the wheel in your virtual environment:
+
+```sh
+python -m pip install /path/to/pulsebeam_agent-0.3.2-py3-none-manylinux_2_39_x86_64.whl
+python -c 'from pulsebeam_agent import pulsebeam_agent_native as native; print(native.Agent)'
+```
+
+The commands print the generated constructor or class, confirming that the package and native library load. They do not establish a session. Use an application-issued session endpoint and participant token to connect; applications must keep signing secrets on their backend. The Node namespaces are `@pulsebeam/agent/core` and `@pulsebeam/agent/native`; Python uses `pulsebeam_agent.pulsebeam_agent_core` and `pulsebeam_agent.pulsebeam_agent_native`.
 
 ## Configure and connect
 
 Rust callers supply a core `AgentConfig`, native `MediaConfig`, and an HTTP `Host`, then call `Agent::spawn`. This selects `ThreadedRuntime` with normal native sockets. Submit a complete core `DesiredState` for connection and topic intent; use owned publications and subscriptions for media. Core remains the owner of topology, authorization, topics and recovery policy.
 
-Swift, Kotlin and Python use the generated named async constructor `ffi::Agent::create(NativeAgentConfig)` (Python: `await Agent.create(config)`). It creates the same actor with a production HTTP client. Native configuration contains `session` and `media`, not application-owned UDP/TCP sockets. Foreign `replace_desired` accepts a complete core-owned desired state; the shared actor assigns its revision in control-command order, including close and Rust-originated changes.
+Swift, Kotlin, Python and Node use the generated named async constructor `ffi::Agent::create(NativeAgentConfig)` (Python and Node: `await Agent.create(config)`). It creates the same actor with a production HTTP client. Native configuration contains `session` and `media`, not application-owned UDP/TCP sockets. Foreign `replace_desired` accepts a complete core-owned desired state; the shared actor assigns its revision in control-command order, including close and Rust-originated changes.
 
 Factory input choices are independent for audio and video:
 
@@ -29,7 +49,7 @@ Factory input choices are independent for audio and video:
 
 Claim `Agent::publication(TrackSpec::Audio { label })` or
 `TrackSpec::Video { label }`, then register a caller-fed input with
-`Publication::input`. Generated Swift, Kotlin and Python APIs expose the same
+`Publication::input`. Generated Swift, Kotlin, Python and Node APIs expose the same
 operations using the shared core `TrackSpec`. Keep the `Publication` handle alive while publishing.
 Calling `input` again replaces the previous logical input; it preserves the
 publication's mute setting. Use `Publication::set_muted` to change that setting.
