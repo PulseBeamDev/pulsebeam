@@ -35,9 +35,7 @@ def browser_test(name, source, assets, env, contracts = [], live = False, featur
         # At most two Chrome sessions and one Tokio worker per case. The live
         # destination uses one dedicated current-thread runtime per session.
         args = ["--test-threads=2"],
-        # Chrome excludes the worker's only network interface (loopback) from
-        # ICE gathering. Retain the real-browser witness and shared cache, but
-        # execute it where a usable host interface exists.
-        tags = ["slow", "cpu:4", "no-remote-exec"],
+        tags = ["slow", "cpu:4"],
+        exec_properties = {"cpu_count": "4", "memory_kb": str(4 * 1024 * 1024)},
         size = "large",
     )
