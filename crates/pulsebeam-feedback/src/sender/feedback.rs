@@ -65,7 +65,18 @@ impl Sender {
                     batch.path_epoch,
                     received_at,
                 );
-                None
+                self.inputs
+                    .feedback
+                    .iter()
+                    .skip(prior_evidence)
+                    .filter(|sample| sample.received)
+                    .filter_map(|sample| self.entry(sample.sent_id))
+                    .filter_map(|entry| entry.feedback_sequence)
+                    .filter_map(|packet| packet.checked_sub(base_sequence.0))
+                    .filter_map(|offset| usize::try_from(offset).ok())
+                    .filter_map(|offset| statuses.get(offset))
+                    .filter_map(|status| status.hold)
+                    .min()
             }
             SendReport::Independent { reports } => {
                 self.process_independent(reports, batch.path_epoch, received_at)
@@ -233,7 +244,6 @@ impl Sender {
         }
         let reference = reference_micros;
         let count = generation;
-        let arrivals: Vec<_> = statuses.iter().map(|status| status.arrival).collect();
         let old_edge = self.highest_feedback_acked;
         let received_edge = statuses
             .iter()
@@ -312,7 +322,7 @@ impl Sender {
         }
         self.inputs.fresh_network_feedback |= fresh;
         if let Some(edge) = received_edge {
-            self.advance_continuous_edge(base, statuses, &arrivals, edge, epoch, received_at);
+            self.advance_continuous_edge(base, statuses, edge, epoch, received_at);
         }
         for (offset, status) in statuses.iter().enumerate() {
             let sequence = base.saturating_add(offset as u64);
@@ -332,7 +342,7 @@ impl Sender {
                     report_is_new,
                 )
             {
-                self.recover(sent_id, epoch, arrivals[offset], None, received_at);
+                self.recover(sent_id, epoch, status.arrival, status.ecn, received_at);
             }
         }
         if let Some(edge) = received_edge {
@@ -344,7 +354,6 @@ impl Sender {
         &mut self,
         base: u64,
         statuses: &[SendStatus],
-        arrivals: &[Option<ReceiverTime>],
         edge: u64,
         epoch: Epoch,
         received_at: Duration,
@@ -383,11 +392,14 @@ impl Sender {
                 continue;
             };
             let received = status.received;
-            let arrival = offset
-                .and_then(|index| arrivals.get(index))
-                .copied()
-                .flatten();
-            self.advance_entry(sent_id, epoch, received, arrival, None, received_at);
+            self.advance_entry(
+                sent_id,
+                epoch,
+                received,
+                status.arrival,
+                status.ecn,
+                received_at,
+            );
         }
         self.highest_feedback_acked = Some(edge);
     }
@@ -443,14 +455,10 @@ impl Sender {
             }
             let timestamp = report.generation;
             let report_is_new = previous_timestamp.is_none_or(|previous| timestamp > previous);
-            let normalized: Vec<_> = report
-                .statuses
-                .iter()
-                .map(|status| (status.received, status.arrival, status.ecn, status.hold))
-                .collect();
+            let normalized = report.statuses;
             let late_receipt = normalized.iter().enumerate().any(|(offset, status)| {
                 base.saturating_add(offset as u64) >= floor
-                    && status.0
+                    && status.received
                     && self
                         .lookup_packet(space, base.saturating_add(offset as u64))
                         .and_then(|id| self.entry(id))
@@ -467,7 +475,9 @@ impl Sender {
             let received_edge = normalized
                 .iter()
                 .enumerate()
-                .rposition(|(offset, value)| base.saturating_add(offset as u64) >= floor && value.0)
+                .rposition(|(offset, value)| {
+                    base.saturating_add(offset as u64) >= floor && value.received
+                })
                 .map(|offset| base.saturating_add(offset as u64));
             if !report.statuses.is_empty() {
                 let edge = received_edge.unwrap_or(last_reported);
@@ -502,9 +512,9 @@ impl Sender {
                     self.add_unknown(unresolved_reported + unresolved_advance);
                     continue;
                 }
-                for (offset, (received, _, _, hold)) in normalized.iter().enumerate() {
-                    if *received
-                        && let Some(hold) = hold
+                for (offset, status) in normalized.iter().enumerate() {
+                    if status.received
+                        && let Some(hold) = status.hold
                         && self
                             .lookup_packet(space, base.saturating_add(offset as u64))
                             .and_then(|id| self.entry(id))
@@ -513,7 +523,7 @@ impl Sender {
                                     || self.recovery_is_fresh(entry, received_at, report_is_new)
                             })
                     {
-                        minimum_hold = Some(minimum_hold.map_or(*hold, |known| known.min(*hold)));
+                        minimum_hold = Some(minimum_hold.map_or(hold, |known| known.min(hold)));
                     }
                 }
                 if received_edge.is_some() && edge >= start {
@@ -523,10 +533,10 @@ impl Sender {
                         let offset = sequence
                             .checked_sub(base)
                             .and_then(|value| usize::try_from(value).ok());
-                        let (received, arrival, ecn, _) = offset
+                        let (received, arrival, ecn) = offset
                             .and_then(|index| normalized.get(index))
-                            .copied()
-                            .unwrap_or((false, None, None, None));
+                            .map(|status| (status.received, status.arrival, status.ecn))
+                            .unwrap_or((false, None, None));
                         self.advance_entry(sent_id, epoch, received, arrival, ecn, received_at);
                     }
                     if let Some(state) = self.spaces.get_mut(&space) {
@@ -543,7 +553,13 @@ impl Sender {
             {
                 state.last_report_generation = Some((epoch, timestamp));
             }
-            for (offset, (received, arrival, ecn, _)) in normalized.iter().copied().enumerate() {
+            for (offset, status) in normalized.iter().enumerate() {
+                let SendStatus {
+                    received,
+                    arrival,
+                    ecn,
+                    ..
+                } = *status;
                 let sequence = base.saturating_add(offset as u64);
                 if sequence < floor {
                     continue;

@@ -83,9 +83,10 @@ impl CommitCoordinator {
     fn new(
         feedback: impl Into<Option<PacketFeedbackKind>>,
         max_history_bytes: usize,
+        origin: Instant,
     ) -> Result<Self, HistoryError> {
         Ok(Self {
-            history: SentHistory::with_limit(feedback, max_history_bytes)?,
+            history: SentHistory::with_limit(feedback, max_history_bytes, origin)?,
             counters: CommitCounters::default(),
         })
     }
@@ -110,7 +111,7 @@ impl CommitCoordinator {
         {
             return Err(HistoryError::InvalidCommit);
         }
-        self.history.commit_preflighted(context);
+        self.history.commit_preflighted(context)?;
         if let Some(egress) = egress {
             egress.commit(
                 at,
@@ -699,7 +700,7 @@ impl RtcConnection {
             inputs
                 .feedback
                 .iter()
-                .chain(&inputs.synthetic)
+                .chain(inputs.synthetic.iter())
                 .map(|feedback| feedback.controller_sample(received_at, origin)),
         );
         let path_change = inputs
@@ -1111,7 +1112,7 @@ impl RtcConnection {
             controller_feedback: Vec::new(),
             sctp,
             service: ServiceArbiter::default(),
-            commit: CommitCoordinator::new(feedback, config.limits.max_sent_history_bytes)
+            commit: CommitCoordinator::new(feedback, config.limits.max_sent_history_bytes, at)
                 .map_err(|_| AcceptError::SessionLimitExceeded)?,
             lifecycle: Lifecycle::Open,
             _not_sync: PhantomData,
@@ -1851,7 +1852,7 @@ mod tests {
             .test_active_epoch()
             .expect("connected path");
         // Parsed report injection does not claim native RFC 8888 interoperability.
-        fixture.connection.commit.history = SentHistory::new(kind);
+        fixture.connection.commit.history = SentHistory::new(kind, fixture.at());
         fixture.connection.commit.history.path_changed(epoch, true);
         let _ = fixture.connection.poll(fixture.at());
         for sequence in 1..=16 {
@@ -1884,7 +1885,8 @@ mod tests {
                 .connection
                 .commit
                 .history
-                .commit_preflighted(context);
+                .commit_preflighted(context)
+                .expect("preflighted history commit");
         }
         assert_eq!(
             fixture

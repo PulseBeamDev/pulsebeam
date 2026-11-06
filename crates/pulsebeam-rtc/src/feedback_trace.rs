@@ -34,7 +34,7 @@ fn checkpoint(
         inputs.bytes_in_flight, inputs.fresh_network_feedback, inputs.exhausted
     )
     .unwrap();
-    let samples = inputs.feedback.iter().chain(&inputs.synthetic).map(|feedback| {
+    let samples = inputs.feedback.iter().chain(inputs.synthetic.iter()).map(|feedback| {
         writeln!(trace, "  packet={:?} ssrc={} service={:?} ledger_lost={} first_loss={} recovery={} origin={:?} receiver={:?} sample={:?}", feedback.sent_id, feedback.ssrc, feedback.service, feedback.lost, feedback.reported_lost_for_the_first_time, feedback.recovered, feedback.loss_origin, feedback.receiver_arrival, feedback.controller_sample(now, origin)).unwrap();
         feedback.controller_sample(now, origin)
     }).collect::<Vec<_>>();
@@ -97,7 +97,7 @@ fn feedback_wire_accounting_and_controller_baseline() {
         let epoch = PathEpoch::from_value(1);
         let mut receiver = ReceiveFeedback::new(Some(mode), origin);
         receiver.reserve(usize::MAX).unwrap();
-        let mut history = SentHistory::new(mode);
+        let mut history = SentHistory::new(mode, origin);
         history.path_changed(epoch, true);
         let mut controller = ScreamController::new(2_000_000, Some(1200));
         checkpoint(
@@ -127,7 +127,7 @@ fn feedback_wire_accounting_and_controller_baseline() {
             };
             history.prepare_commit(context).unwrap();
             history.preflight_commit(context).unwrap();
-            history.commit_preflighted(context);
+            history.commit_preflighted(context).unwrap();
             controller.note_send(context.at.saturating_duration_since(origin));
         }
         controller.observe_bytes_in_flight(history.controller_inputs().bytes_in_flight);

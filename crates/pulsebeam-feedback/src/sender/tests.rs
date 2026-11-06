@@ -1,6 +1,8 @@
 use super::*;
 use crate::allocation::allocations;
 
+mod adversarial;
+
 const EPOCH: Epoch = Epoch(70);
 const SPACE: SpaceId = SpaceId(1_u64 << 40);
 const OTHER: SpaceId = SpaceId((1_u64 << 40) + 1);
@@ -135,8 +137,17 @@ fn independent_spaces_and_span_credit_keep_receipt_and_loss_distinct() {
             RECEIVED.arrival
         );
         assert_eq!(
+            inputs
+                .feedback
+                .iter()
+                .find(|item| item.received)
+                .unwrap()
+                .ecn,
+            RECEIVED.ecn
+        );
+        assert_eq!(
             inputs.timing.unwrap().feedback_hold,
-            (mode == FeedbackMode::Independent).then_some(Duration::from_millis(2))
+            Some(Duration::from_millis(2))
         );
         assert_eq!(
             sender.next_deadline(Duration::from_millis(10)),

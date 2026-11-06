@@ -1795,12 +1795,13 @@ mod tests {
         left.transmissions.assert_storage();
         drop(caller_owned);
         drop(caller_clone);
-        let probe = crate::sent_history::SentHistory::new(crate::PacketFeedbackKind::Rfc8888);
+        let probe = crate::sent_history::SentHistory::new(crate::PacketFeedbackKind::Rfc8888, now);
         let fixed_bytes = probe.assert_storage();
         drop(probe);
         let mut blocked = crate::sent_history::SentHistory::with_limit(
             crate::PacketFeedbackKind::Rfc8888,
             fixed_bytes,
+            now,
         )
         .unwrap();
         let epoch = left.selected.as_ref().unwrap().epoch.unwrap();
@@ -1829,7 +1830,8 @@ mod tests {
             assert!(left.poll_prepared().is_none());
         }
         drop(blocked);
-        let mut history = crate::sent_history::SentHistory::new(crate::PacketFeedbackKind::Rfc8888);
+        let mut history =
+            crate::sent_history::SentHistory::new(crate::PacketFeedbackKind::Rfc8888, now);
         history.path_changed(epoch, true);
         let mut admitted_context = None;
         left.send_rtp_with_info(
@@ -1855,7 +1857,7 @@ mod tests {
         assert_eq!(admitted_context.wire_len, prepared.wire_len);
         history.preflight_commit(admitted_context).unwrap();
         let prepared_bytes = history.assert_storage();
-        history.commit_preflighted(admitted_context);
+        history.commit_preflighted(admitted_context).unwrap();
         assert_eq!(history.assert_storage(), prepared_bytes);
         assert_eq!(
             history.controller_inputs().bytes_in_flight,

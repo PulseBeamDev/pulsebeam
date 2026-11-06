@@ -145,6 +145,8 @@ pub struct AvailabilityChange {
 pub struct SenderInputs {
     pub feedback: Vec<SentObservation>,
     pub synthetic: Vec<SentObservation>,
+    /// Observation funding failed. Facts are incomplete: stop consuming this
+    /// lifetime and clear or abort before reuse.
     pub exhausted: bool,
     pub timing: Option<FeedbackTiming>,
     pub fresh_network_feedback: bool,
@@ -863,8 +865,8 @@ impl Sender {
         self.feedback_generation = None;
         self.highest_feedback_acked = None;
         self.oldest_feedback = None;
-        // Keep the connection-wide unwrap anchor across a route change, including
-        // a 16-bit rollover. The cleared path floor fences all earlier receipts.
+        // Keep the instance-wide submission high-water mark across epochs.
+        // The cleared active floor fences all earlier receipts.
         self.missing.clear();
         self.reordering_window = self.config.initial_reordering_window;
         self.observed_reordering_window = self.config.initial_reordering_window;
@@ -914,6 +916,22 @@ impl Sender {
 
     pub fn active_epoch(&self) -> Option<Epoch> {
         self.active_epoch
+    }
+
+    /// Accounts for feedback an adapter cannot map into normalized identities.
+    /// Rejection cannot change credit, timing, or outstanding sends.
+    pub fn reject_unmapped_feedback(&mut self, epoch: Epoch, statuses: usize) {
+        if self.inputs.exhausted {
+            return;
+        }
+        if self.active_epoch == Some(epoch) {
+            self.add_unknown(statuses);
+        } else {
+            self.counters.wrong_path_feedback = self
+                .counters
+                .wrong_path_feedback
+                .saturating_add(u64::try_from(statuses).unwrap_or(u64::MAX));
+        }
     }
 
     pub const fn counters(&self) -> HistoryCounters {
