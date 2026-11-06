@@ -12,7 +12,7 @@ def _os_impl(ctx):
         name = "nix_sdk",
         nix_file = Label("//tools/host:sdk.nix"),
         repository = "@nixpkgs",
-        build_file_content = 'package(default_visibility = ["//visibility:public"])\nfilegroup(name = "sysroot", srcs = glob(["include/**", "lib/**", "usr/include/**", "usr/lib/**"]) + ["mold-path"])\nfilegroup(name = "linker", srcs = ["bin/mold", "mold-path"])\nexports_files(["mold-path"])\n',
+        build_file_content = 'package(default_visibility = ["//visibility:public"])\nfilegroup(name = "sysroot", srcs = ["."])\nfilegroup(name = "linker", srcs = ["bin/mold", "mold-path"])\nexports_files(["mold-path"])\n',
     )
     nixpkgs_package(
         name = "host_runtime",
