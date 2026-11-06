@@ -37,10 +37,14 @@ def _upstream_impl(ctx):
     python = ctx.which("python3")
     if not git or not python:
         fail("WebRTC acquisition requires git and python3 on PATH.")
+    # Resolve label dependencies before starting long-running acquisition: Bazel
+    # can restart a repository rule when a previously unseen label is resolved.
+    patches = [str(ctx.path(patch)) for patch in ctx.attr.patches]
+    libvpx_patch = str(ctx.path(ctx.attr.libvpx_patch))
     _run(ctx, [git, "init", "depot_tools"])
     _run(ctx, [git, "-C", "depot_tools", "fetch", "--depth=1", "https://chromium.googlesource.com/chromium/tools/depot_tools.git", _DEPOT_TOOLS])
     _run(ctx, [git, "-C", "depot_tools", "checkout", "--detach", "FETCH_HEAD"])
-    ctx.file("checkout/.gclient", "solutions = [{'name': 'src', 'url': 'https://github.com/webrtc-sdk/webrtc.git', 'deps_file': 'DEPS', 'managed': False, 'custom_deps': {}, 'custom_vars': {'checkout_instrumented_libraries': False}}]\n")
+    ctx.file("checkout/.gclient", "solutions = [{'name': 'src', 'url': 'https://github.com/webrtc-sdk/webrtc.git', 'deps_file': 'DEPS', 'managed': False, 'custom_deps': {}, 'custom_vars': {'checkout_instrumented_libraries': False}, 'custom_hooks': [{'name': ''}, {'name': 'sysroot_x86'}]}]\n")
     env = {
         "PATH": str(ctx.path("depot_tools")) + ":" + ctx.os.environ.get("PATH", ""),
         "DEPOT_TOOLS_UPDATE": "0",
@@ -63,12 +67,15 @@ def _upstream_impl(ctx):
     ctx.download_and_extract(url = sysroot_url, sha256 = sysroot_hash, output = sysroot, type = "tar.xz")
     ctx.file(sysroot + "/.stamp", sysroot_url)
     _run(ctx, [python, gclient, "runhooks"], str(ctx.path("checkout")), env)
+    # Bootstrap virtualenvs contain absolute output-base paths and are not GN
+    # inputs. Keeping them prevents Bazel from sharing the repository contents.
+    ctx.delete("vpython")
     result = ctx.execute([git, "-C", "checkout/src/third_party/libvpx/source/libvpx", "rev-parse", "HEAD"])
     if result.return_code or result.stdout.strip() != _LIBVPX:
         fail("WebRTC DEPS libvpx pin differs from the qualified revision " + _LIBVPX)
-    for patch in ctx.attr.patches:
-        _run(ctx, [git, "apply", str(ctx.path(patch))], str(ctx.path("checkout/src")))
-    _run(ctx, [git, "apply", str(ctx.path(ctx.attr.libvpx_patch))], str(ctx.path("checkout/src/third_party/libvpx/source/libvpx")))
+    for patch in patches:
+        _run(ctx, [git, "apply", patch], str(ctx.path("checkout/src")))
+    _run(ctx, [git, "apply", libvpx_patch], str(ctx.path("checkout/src/third_party/libvpx/source/libvpx")))
     # Foreign Bazel metadata must not create subpackage holes in the GN input tree.
     _run(ctx, [python, "-c", "from pathlib import Path; [(p.rename(p.with_name(p.name + '.upstream'))) for p in Path('checkout/src').rglob('*') if p.name in ('BUILD', 'BUILD.bazel') and p.is_file()]"])
     ctx.file("BUILD.bazel", '''package(default_visibility = ["//visibility:public"])
