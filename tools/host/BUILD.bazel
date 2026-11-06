@@ -1,1 +1,1 @@
-exports_files(["flake.nix", "flake.lock", "sdk.nix", "browser.nix", "runtime.nix"])
+exports_files(["flake.nix", "flake.lock", "sdk.nix", "browser.nix", "runtime.nix", "test-tools.nix"])

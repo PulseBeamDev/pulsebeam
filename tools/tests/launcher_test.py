@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -30,8 +31,17 @@ class LauncherContractTest(unittest.TestCase):
         self.binary.chmod(0o755)
         home = self.root / "home"
         home.mkdir()
-        self.env = dict(os.environ, HOME=str(home), XDG_CACHE_HOME=str(cache),
-                        PULSEBEAM_NATIVELINK_AUTOSTART="1", AUTOSTART_LOG=str(self.root / "autostart.log"))
+        runtime = self.root / "runtime-bin"
+        runtime.mkdir()
+        (runtime / "python3").symlink_to(sys.executable)
+        tools = Path(options.bash).absolute().parent
+        self.env = {
+            "HOME": str(home),
+            "PATH": str(runtime) + os.pathsep + str(tools),
+            "XDG_CACHE_HOME": str(cache),
+            "PULSEBEAM_NATIVELINK_AUTOSTART": "1",
+            "AUTOSTART_LOG": str(self.root / "autostart.log"),
+        }
         helper = self.root / "tools/nativelink/autostart.py"
         helper.parent.mkdir(parents=True)
         helper.write_text("import os, sys\nfrom pathlib import Path\n"
@@ -211,5 +221,6 @@ class LauncherContractTest(unittest.TestCase):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--launcher", required=True)
+    parser.add_argument("--bash", required=True)
     options, arguments = parser.parse_known_args()
     unittest.main(argv=[__file__, *arguments])

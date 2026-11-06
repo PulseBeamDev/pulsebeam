@@ -40,10 +40,16 @@ py_test(
     name = "simulation_runner_contract",
     srcs = ["tests/run_simulations_test.py"],
     main = "tests/run_simulations_test.py",
-    data = ["simulation-status.sh", "//crates/pulsebeam-simulator:candidate"],
-    args = ["--candidate", "$(rootpath //crates/pulsebeam-simulator:candidate)"],
+    data = [
+        "simulation-status.sh", "//crates/pulsebeam-simulator:candidate",
+        "@contract_test_tools//:bin/git", "@contract_test_tools//:bin/bash",
+        "@contract_test_tools//:bin/readlink", "@contract_test_tools//:bin/stat", "@contract_test_tools//:bin/sha256sum",
+    ],
+    args = [
+        "--candidate", "$(rootpath //crates/pulsebeam-simulator:candidate)",
+        "--git", "$(rootpath @contract_test_tools//:bin/git)",
+    ],
     env = {"PYTHONDONTWRITEBYTECODE": "1"},
-    tags = ["local"],
     deps = [":simulation_runner_lib"],
 )
 
@@ -98,8 +104,12 @@ py_test(
     name = "launcher_contract",
     srcs = ["tests/launcher_test.py"],
     main = "tests/launcher_test.py",
-    args = ["--launcher", "$(rootpath //:bazel)"],
-    data = ["//:bazel"],
+    args = ["--launcher", "$(rootpath //:bazel)", "--bash", "$(rootpath @contract_test_tools//:bin/bash)"],
+    data = [
+        "//:bazel", "@contract_test_tools//:bin/bash", "@contract_test_tools//:bin/dirname",
+        "@contract_test_tools//:bin/flock", "@contract_test_tools//:bin/mkdir",
+        "@contract_test_tools//:bin/readlink", "@contract_test_tools//:bin/sha256sum", "@contract_test_tools//:bin/uname",
+    ],
 )
 
 py_test(

@@ -575,12 +575,25 @@ class SimulationProvenanceContract(unittest.TestCase):
         script = Path(RUNNER.__file__).with_name("simulation-status.sh")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            tools = Path(OPTIONS.git).absolute().parent
+            home = root / ".home"
+            home.mkdir()
+            env = {
+                "PATH": str(tools),
+                "HOME": str(home),
+                "LC_ALL": "C.UTF-8",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TEMPLATE_DIR": "",
+            }
 
             def git(*args):
-                return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=True)
+                return subprocess.run([str(tools / "git"), *args], cwd=root, env=env,
+                                      capture_output=True, text=True, check=True)
 
             def status():
-                result = subprocess.run(["bash", str(script)], cwd=root, capture_output=True, text=True, check=True)
+                result = subprocess.run([str(tools / "bash"), str(script)], cwd=root, env=env,
+                                        capture_output=True, text=True, check=True)
                 path = root / "metadata"
                 path.write_text(result.stdout)
                 return RUNNER.candidate(path)
@@ -621,5 +634,6 @@ class SimulationProvenanceContract(unittest.TestCase):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate", required=True)
+    parser.add_argument("--git", required=True)
     OPTIONS, arguments = parser.parse_known_args()
     unittest.main(argv=[__file__, *arguments])
