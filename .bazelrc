@@ -1,6 +1,9 @@
 startup --max_idle_secs=300
 startup --shutdown_on_low_sys_mem
-startup --host_jvm_args=-Xmx2g
+startup --host_jvm_args=-XX:+UseZGC
+startup --host_jvm_args=-Xmx4g
+startup --host_jvm_args=-XX:SoftMaxHeapSize=1g
+startup --host_jvm_args=-XX:ZUncommitDelay=30
 
 common --enable_bzlmod
 common --lockfile_mode=error

@@ -5,10 +5,12 @@ interfaces, language-server project discovery and standard artifact operations.
 Repository scripts are bounded adapters for uncovered contracts, not a general
 build framework or an alternative package compilation pipeline.
 
-`.bazelrc` shuts down Bazel servers after five minutes of inactivity and enables
-idle shutdown under low system memory. This limits memory retained across
-worktrees while preserving server reuse during active development. Each worktree
-needs the updated configuration; disk caches remain available after shutdown.
+`.bazelrc` selects ZGC with a soft heap target and a larger safety ceiling.
+Unused heap can return to the OS during editing pauses without discarding live
+incremental state. The ceiling limits Java heap, not total process memory or
+aggregate memory across worktrees. Servers also shut down after five minutes of
+inactivity or when idle under low system memory. Each worktree needs the updated
+configuration; disk caches remain available after shutdown.
 The launcher keeps disposable output state inside each checkout's ignored
 `.bazel/` directory, so deleting the worktree deletes those outputs. Shared
 caches stay outside the checkout. See [cache ownership and legacy output cleanup](../docs/build.md#shared-local-caches).
