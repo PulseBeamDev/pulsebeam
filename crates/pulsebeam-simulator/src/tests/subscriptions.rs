@@ -104,11 +104,29 @@ fn one_slot_track_replacement_keeps_media_flow_test() {
                 description: "Publishers establish flow and signal both tracks",
                 duration: Duration::from_secs(5),
             },
+            Step::BeginControllerStall {
+                duration: Duration::from_secs(5),
+            },
             Step::SubscribeToQos {
-                description: "Subscribe the only slot to both publishers with pub1 preferred",
+                description: "Request pub2 while controller service is held",
+                participant: "sub",
+                targets: &[("pub2", 720, 0, 100)],
+            },
+            Step::Run {
+                description: "Allow the first native request to cross the held handoff",
+                duration: Duration::from_millis(500),
+            },
+            Step::SubscribeToQos {
+                description: "Replace the pending intent with pub1 preferred",
                 participant: "sub",
                 targets: &[("pub1", 720, 0, 100), ("pub2", 720, 0, 10)],
             },
+            Step::Run {
+                description: "Allow the latest native intent to progress while control is held",
+                duration: Duration::from_millis(500),
+            },
+            Step::CheckNativeInputDuringControllerStall,
+            Step::WaitForControllerStallEnd,
             Step::BeginNativePlayback {
                 description: "Observe the preferred publisher's actual native playback",
                 participant: "sub",

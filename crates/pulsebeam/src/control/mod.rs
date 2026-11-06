@@ -1,12 +1,15 @@
 pub mod api;
 pub mod controller;
 pub(crate) mod core;
+mod egress;
 pub(crate) mod lifecycle;
+pub(crate) mod native;
 mod negotiator;
 pub(crate) mod placement;
 mod registry;
 mod room;
 mod router;
+pub(crate) mod rtp;
 pub(crate) mod stats_aggregator;
 pub mod steering;
 pub(crate) mod topology;
@@ -18,5 +21,5 @@ pub use negotiator::MAX_SEND_AUDIO_SLOTS;
 pub(crate) use negotiator::{NegotiatedMedia, NegotiatedResources};
 #[cfg(test)]
 pub(crate) use negotiator::{
-    application_only_test_connection, application_only_test_connection_and_binding,
+    Negotiator, application_only_test_connection, application_only_test_connection_and_binding,
 };

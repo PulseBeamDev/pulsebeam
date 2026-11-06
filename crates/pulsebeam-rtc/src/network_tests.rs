@@ -23,7 +23,7 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
     const PACKETS: u64 = 4_000;
     let origin = std::time::Instant::now();
     let mut fixture = PeerFixture::connected_at(origin).without_egress_observation();
-    fixture.observe_pacing_profile(crate::Connection::test_pacing_profile);
+    fixture.observe_pacing_profile(crate::RtcConnection::test_pacing_profile);
     fixture.configure_network(
         SEED,
         NetworkPolicy {
@@ -109,7 +109,7 @@ fn production_connection_bottleneck_emits_measured_transport_bytes() {
 #[test]
 fn production_capacity_steps_recover_stable_transport_service() {
     let mut fixture = PeerFixture::connected_with_senders(2).without_egress_observation();
-    fixture.observe_pacing_profile(crate::Connection::test_pacing_profile);
+    fixture.observe_pacing_profile(crate::RtcConnection::test_pacing_profile);
     fixture.configure_network(
         0x6601,
         NetworkPolicy {
@@ -203,7 +203,7 @@ fn production_homogeneous_shared_bottleneck_competition() {
         PeerFixture::connected().without_egress_observation(),
     ];
     for (index, flow) in flows.iter_mut().enumerate() {
-        flow.observe_pacing_profile(crate::Connection::test_pacing_profile);
+        flow.observe_pacing_profile(crate::RtcConnection::test_pacing_profile);
         flow.configure_network(
             0x3301 + index as u64,
             NetworkPolicy {

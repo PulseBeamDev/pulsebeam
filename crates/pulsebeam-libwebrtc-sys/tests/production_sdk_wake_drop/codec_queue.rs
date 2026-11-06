@@ -75,11 +75,23 @@ impl Call {
         let operation = actor.create_offer(peers[0], false).unwrap();
         let offer = self.finish(actor, peers, peers[0], operation).unwrap();
         let offer = self.gather(actor, peers, 0, offer);
+        let offer_candidates: Vec<_> = offer
+            .sdp
+            .lines()
+            .filter(|line| line.starts_with("a=candidate:"))
+            .map(str::to_owned)
+            .collect();
         let operation = actor.set_remote_description(peers[1], offer).unwrap();
         self.finish(actor, peers, peers[1], operation);
         let operation = actor.create_answer(peers[1]).unwrap();
         let answer = self.finish(actor, peers, peers[1], operation).unwrap();
         let answer = self.gather(actor, peers, 1, answer);
+        let answer_candidates: Vec<_> = answer
+            .sdp
+            .lines()
+            .filter(|line| line.starts_with("a=candidate:"))
+            .map(str::to_owned)
+            .collect();
         let operation = actor.set_remote_description(peers[0], answer).unwrap();
         self.finish(actor, peers, peers[0], operation);
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -87,7 +99,9 @@ impl Call {
             self.drain(actor, peers);
             assert!(
                 Instant::now() < deadline,
-                "real native video peers did not connect"
+                "real native video peers did not connect: connected={:?}, ice={:?}, offer_candidates={offer_candidates:?}, answer_candidates={answer_candidates:?}",
+                self.connected,
+                peers.map(|peer| actor.peer_ice_connection_state(peer))
             );
             std::thread::yield_now();
         }

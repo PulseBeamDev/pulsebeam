@@ -1,128 +1,36 @@
 use super::*;
-use crate::participant::rtp::{failure_code, receiving_binding};
-use crate::rtp::{AUDIO_FREQUENCY, RtpPacket, timeline::Timeline};
-use pulsebeam_rtc::{RtpBinding, RtpConfigurationPatch};
+use crate::participant::policy::{ReceiverRtpConfiguration, VideoPolicy};
+use pulsebeam_rtc::{
+    CompiledRtpBinding, CompiledRtpConfigurationPatch, MediaKind, RtpConfigurationError,
+};
 
 pub(super) struct RtpReceiver {
-    pub(super) binding: RtpBinding,
-    pub(super) video_options: Option<wire::VideoReceiveOptions>,
+    pub(super) video_options: Option<VideoPolicy>,
+    pub(super) kind: MediaKind,
+    pub(super) supports_playout_delay: bool,
+    pending: Option<CompiledRtpBinding>,
     mid: Mid,
     rid: Option<crate::media::Rid>,
     ssrc: Ssrc,
-    timeline: Timeline,
-    started: bool,
+    payload_type: Pt,
 }
 
 impl RtpReceiver {
-    pub(super) fn prepare(
-        spec: &wire::ResourceSpec,
-        source: &Track,
-        capabilities: &wire::RtpCapabilities,
-    ) -> Result<Self, wire::FailureCode> {
-        let Some(resource_spec::Declaration::Subscription(subscription)) = &spec.declaration else {
-            return Err(wire::FailureCode::InvalidConfiguration);
-        };
-        let Some(wire::track_binding::Transport::Rtp(parameters)) = subscription
-            .binding
-            .as_ref()
-            .and_then(|binding| binding.transport.as_ref())
-        else {
-            return Err(wire::FailureCode::Incompatible);
-        };
-        let kind = wire::TrackKind::try_from(subscription.kind)
-            .map_err(|_| wire::FailureCode::InvalidConfiguration)?;
-        let binding = receiving_binding(parameters, kind, capabilities)?;
-        let [encoding] = binding.encodings.as_slice() else {
-            return Err(wire::FailureCode::InvalidConfiguration);
-        };
-        let ssrc = encoding.primary.into();
-        let rid = encoding
-            .rid
-            .as_deref()
-            .map(crate::media::Rid::new)
-            .transpose()
-            .map_err(|_| wire::FailureCode::Unsupported)?;
-        if matches!(source, Track::Audio(_))
-            && (binding.codec.parameters.name != "opus" || encoding.rid.is_some())
-        {
-            return Err(wire::FailureCode::Unsupported);
+    pub(super) fn new(configuration: ReceiverRtpConfiguration) -> Self {
+        Self {
+            video_options: configuration.video,
+            kind: configuration.kind,
+            supports_playout_delay: configuration.supports_playout_delay,
+            pending: Some(configuration.binding),
+            mid: configuration.mid,
+            rid: configuration.rid,
+            ssrc: configuration.primary,
+            payload_type: configuration.payload_type,
         }
-        let format = parameters
-            .codec
-            .as_ref()
-            .and_then(|codec| codec.format.as_ref())
-            .ok_or(wire::FailureCode::InvalidConfiguration)?;
-        let source_format = match source {
-            Track::Audio(audio) if kind == wire::TrackKind::Audio => audio.format.as_ref(),
-            Track::Video(video) if kind == wire::TrackKind::Video => video.format.as_ref(),
-            _ => return Err(wire::FailureCode::Unsupported),
-        };
-        if source_format.is_none_or(|source| {
-            !pulsebeam_proto::state::validation::formats_equivalent(source, format)
-        }) {
-            return Err(wire::FailureCode::Incompatible);
-        }
-        Self::validate_settings(&binding, spec)?;
-        let video_options = Self::video_options(&binding, spec);
-        let mid = Mid::new(&binding.mid).map_err(|_| wire::FailureCode::Unsupported)?;
-        Ok(Self {
-            binding,
-            video_options,
-            mid,
-            rid,
-            ssrc,
-            timeline: Timeline::new(AUDIO_FREQUENCY),
-            started: false,
-        })
-    }
-
-    pub(super) fn video_options(
-        binding: &RtpBinding,
-        spec: &wire::ResourceSpec,
-    ) -> Option<wire::VideoReceiveOptions> {
-        (binding.kind == pulsebeam_rtc::MediaKind::Video).then(|| {
-            match spec
-                .settings
-                .as_ref()
-                .and_then(|settings| settings.receive.as_ref())
-            {
-                Some(wire::resource_settings::Receive::Video(video)) => *video,
-                _ => wire::VideoReceiveOptions::default(),
-            }
-        })
-    }
-
-    pub(super) fn validate_settings(
-        binding: &RtpBinding,
-        spec: &wire::ResourceSpec,
-    ) -> Result<(), wire::FailureCode> {
-        if let Some(receive) = spec
-            .settings
-            .as_ref()
-            .and_then(|settings| settings.receive.as_ref())
-        {
-            match receive {
-                wire::resource_settings::Receive::Audio(audio)
-                    if binding.kind == pulsebeam_rtc::MediaKind::Audio
-                        && audio.playout_delay.is_none() => {}
-                wire::resource_settings::Receive::Video(video)
-                    if binding.kind == pulsebeam_rtc::MediaKind::Video
-                        && (video.playout_delay.is_none()
-                            || binding.extensions.iter().any(|extension| {
-                                extension.uri
-                                    == "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
-                            })) => {}
-                _ => return Err(wire::FailureCode::Unsupported),
-            }
-        }
-        Ok(())
     }
 
     pub(super) fn playout_delay(&self) -> Option<(crate::rtp::MediaTime, crate::rtp::MediaTime)> {
-        let delay = self.video_options.as_ref()?.playout_delay?;
-        let rounded =
-            |ms: u32| crate::rtp::MediaTime::from_hundredths(u64::from(ms.saturating_add(5) / 10));
-        Some((rounded(delay.min_ms), rounded(delay.max_ms)))
+        self.video_options.as_ref()?.playout_delay
     }
 
     pub(super) fn mid(&self) -> Mid {
@@ -137,56 +45,36 @@ impl RtpReceiver {
         self.ssrc
     }
 
+    pub(super) fn payload_type(&self) -> Pt {
+        self.payload_type
+    }
+
     pub(super) fn install(
-        &self,
-        transport: &mut Transport,
-        active: bool,
-    ) -> Result<(), wire::FailureCode> {
-        let mut binding = self.binding.clone();
-        for encoding in &mut binding.encodings {
-            encoding.active = active;
-        }
-        transport
-            .update_rtp(RtpConfigurationPatch {
-                outbound: vec![binding],
-                ..Default::default()
-            })
-            .map_err(failure_code)
-    }
-
-    pub(super) fn remove(&self, transport: &mut Transport) -> Result<(), wire::FailureCode> {
-        transport
-            .update_rtp(RtpConfigurationPatch {
-                remove_encodings: self
-                    .binding
-                    .encodings
-                    .iter()
-                    .map(|encoding| encoding.primary)
-                    .collect(),
-                ..Default::default()
-            })
-            .map_err(failure_code)
-    }
-
-    pub(super) fn forward_audio(
         &mut self,
-        source: TrackId,
-        packet: &RtpPacket,
-        writer: &mut StreamWriter,
-    ) {
-        if !self.started {
-            self.timeline.rebase_audio(packet);
-            self.started = true;
-        }
-        let mut packet = packet.clone();
-        if self.timeline.rewrite_audio(&mut packet) {
-            writer.write_audio_owned(
-                packet,
-                source,
-                self.mid(),
-                self.ssrc,
-                self.binding.codec.payload_type.into(),
-            );
-        }
+        transport: &mut RtcDriver,
+    ) -> Result<(), RtpConfigurationError> {
+        let binding = self
+            .pending
+            .take()
+            .ok_or(RtpConfigurationError::ConnectionState)?;
+        transport.update_compiled_rtp(CompiledRtpConfigurationPatch {
+            outbound: vec![binding],
+            ..Default::default()
+        })
+    }
+
+    pub(super) fn set_active(
+        &self,
+        transport: &mut RtcDriver,
+        active: bool,
+    ) -> Result<(), RtpConfigurationError> {
+        transport.set_rtp_encoding_active(u32::from(self.ssrc), active)
+    }
+
+    pub(super) fn remove(&self, transport: &mut RtcDriver) -> Result<(), RtpConfigurationError> {
+        transport.update_compiled_rtp(CompiledRtpConfigurationPatch {
+            remove_encodings: [u32::from(self.ssrc)].into_iter().collect(),
+            ..Default::default()
+        })
     }
 }

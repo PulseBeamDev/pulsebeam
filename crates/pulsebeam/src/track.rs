@@ -1331,19 +1331,6 @@ mod data_track {
                 negotiated: true,
             }
         }
-
-        pub(crate) fn is_native_signaling_channel(
-            id: DataChannelId,
-            config: &ChannelConfig,
-        ) -> bool {
-            id.value() == 0
-                && config.id == Some(id)
-                && config.negotiated
-                && config.ordered
-                && config.reliability == Reliability::Reliable
-                && config.label.as_ref() == "v1/sys/signaling"
-                && config.protocol.is_empty()
-        }
     }
 
     impl TryFrom<&ChannelConfig> for DataTrackIntent {
@@ -1452,42 +1439,6 @@ mod data_track {
         fn test_modern_system_routing() {
             let res = DataTrackIntent::try_from(&cfg("v1/sys/signaling")).unwrap();
             assert!(matches!(res, DataTrackIntent::InternalSignaling));
-            let zero = DataChannelId::from_value(0);
-            let other = DataChannelId::from_value(2);
-            let expected = DataTrackIntent::native_signaling_config();
-            assert!(DataTrackIntent::is_native_signaling_channel(
-                zero, &expected
-            ));
-            assert!(!DataTrackIntent::is_native_signaling_channel(
-                other, &expected
-            ));
-            for invalid in [
-                ChannelConfig {
-                    id: Some(other),
-                    ..expected.clone()
-                },
-                ChannelConfig {
-                    negotiated: false,
-                    ..expected.clone()
-                },
-                ChannelConfig {
-                    ordered: false,
-                    ..expected.clone()
-                },
-                ChannelConfig {
-                    reliability: Reliability::MaxRetransmits(0),
-                    ..expected.clone()
-                },
-                ChannelConfig {
-                    protocol: "other".into(),
-                    ..expected
-                },
-                cfg("v1/sys/signaling"),
-            ] {
-                assert!(!DataTrackIntent::is_native_signaling_channel(
-                    zero, &invalid
-                ));
-            }
         }
 
         #[test]

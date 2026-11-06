@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+pub(crate) mod policy;
+
 use pulsebeam_proto::state::{self as wire, validation};
 #[cfg(test)]
 use pulsebeam_rtc::RtpConfigurationPatch;
@@ -78,7 +80,7 @@ pub(crate) fn capabilities() -> wire::RtpCapabilities {
 
 #[cfg(test)]
 pub(crate) fn initialize(
-    connection: &mut pulsebeam_rtc::Connection,
+    connection: &mut pulsebeam_rtc::RtcConnection,
     capabilities: &wire::RtpCapabilities,
 ) -> Result<(), RtpConfigurationError> {
     connection.set_rtp_capabilities(transport_capabilities(capabilities)?)?;
@@ -145,7 +147,7 @@ fn extension_uri(value: &str) -> Result<&str, RtpConfigurationError> {
     wire::sdp::extension_uri(value).map_err(|_| RtpConfigurationError::Invalid)
 }
 
-pub(super) fn publication_binding(
+pub(crate) fn publication_binding(
     parameters: &wire::RtpParameters,
     kind: wire::TrackKind,
     capabilities: &wire::RtpCapabilities,
@@ -153,7 +155,7 @@ pub(super) fn publication_binding(
     binding(parameters, kind, capabilities, true)
 }
 
-pub(super) fn receiving_binding(
+pub(crate) fn receiving_binding(
     parameters: &wire::RtpParameters,
     kind: wire::TrackKind,
     capabilities: &wire::RtpCapabilities,
@@ -273,16 +275,8 @@ fn binding(
     })
 }
 
-pub(super) fn failure_code(error: RtpConfigurationError) -> wire::FailureCode {
-    match error {
-        RtpConfigurationError::Invalid => wire::FailureCode::InvalidConfiguration,
-        RtpConfigurationError::Unsupported => wire::FailureCode::Unsupported,
-        RtpConfigurationError::Collision => wire::FailureCode::Incompatible,
-        RtpConfigurationError::Capacity => wire::FailureCode::CapacityExceeded,
-        RtpConfigurationError::CapabilityState | RtpConfigurationError::ConnectionState => {
-            wire::FailureCode::InternalFailure
-        }
-    }
+pub(crate) fn failure_code(error: RtpConfigurationError) -> wire::FailureCode {
+    crate::participant::policy::ExecutionFailureKind::from(error).into()
 }
 
 #[cfg(test)]

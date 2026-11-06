@@ -1,4 +1,8 @@
-use super::native::{NativeSession, failure};
+use super::signaling::SignalingWrite;
+use crate::control::native::OutputError;
+#[cfg(test)]
+use crate::control::native::failure;
+use crate::control::native::handoff::{EndpointHandoff, Fact, Opened};
 mod native_data;
 mod native_receiver;
 mod native_rtp;
@@ -10,7 +14,7 @@ use pulsebeam_runtime::net::{self};
 use pulsebeam_runtime::time::Instant;
 use std::time::Duration;
 
-use crate::control::{NegotiatedResources, controller::ConnectionProfile};
+use crate::control::{NegotiatedResources, controller::SignalingProtocol};
 use crate::entity::{self, TrackId, TrackKind};
 use crate::id::ShardId;
 use crate::keys::TrackHandle;
@@ -22,18 +26,16 @@ use crate::participant::event::ParticipantSink;
 use crate::participant::reverse::{ReverseInput, ReversePacket};
 
 #[cfg(test)]
-use crate::participant::upstream::{
-    MAX_UPSTREAM_ENCODED_STREAMS, UpstreamRouteTable, UpstreamSlotKey,
-};
+use crate::participant::upstream::{MAX_UPSTREAM_ENCODED_STREAMS, UpstreamRouteTable};
 use crate::participant::{TrackPacket, TrackPacketRef};
 use crate::participant::{
     batcher::NetworkEgress,
     downstream::DownstreamAllocator,
     transport::{
-        AppliedMutation, IngressResult, RtpWriteCommand, Transport, TransportMutation,
+        AppliedMutation, IngressResult, RtcDriver, RtpWriteCommand, TransportMutation,
         TransportPollOutput,
     },
-    upstream::{IncomingRtpRoute, UpstreamAllocator},
+    upstream::{IncomingRtpRoute, UpstreamAllocator, UpstreamSlotKey},
 };
 use crate::rtp::cache::TrackStreamCache;
 use crate::track::{
@@ -43,6 +45,7 @@ use crate::track::{
 
 const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const POLL_WORK_BUDGET: usize = 256;
+const NATIVE_PREPARATION_BUDGET: usize = 32;
 
 enum RtcDrainResult {
     Quiescent(Instant),
@@ -93,21 +96,22 @@ pub enum DisconnectReason {
     SystemTerminated,
 }
 
-pub struct ParticipantConfig {
+pub struct ConnectionConfig {
     pub manual_sub: bool,
     pub room_id: entity::RoomId,
     pub participant_id: entity::ParticipantId,
     pub participant_external_id: entity::ParticipantExternalId,
     pub connection_id: entity::ConnectionId,
-    pub profile: ConnectionProfile,
+    pub profile: SignalingProtocol,
+    pub allow_topic_channels: bool,
     pub authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
     pub rtc: pulsebeam_rtc::AcceptedConnection,
     pub resources: NegotiatedResources,
 }
 
-impl std::fmt::Debug for ParticipantConfig {
+impl std::fmt::Debug for ConnectionConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParticipantConfig")
+        f.debug_struct("ConnectionConfig")
             .field("participant_id", &self.participant_id)
             .field("connection_id", &self.connection_id)
             .field("profile", &self.profile)
@@ -141,23 +145,23 @@ pub(crate) enum ParticipantInput<'a> {
     },
 }
 
-impl ParticipantConfig {
+impl ConnectionConfig {
     pub fn ufrag(&self) -> String {
         self.resources.local_ufrag.clone()
     }
 }
 
-pub struct Participant {
+/// Shard-owned media execution for one participant connection incarnation.
+pub struct Connection {
     // Hot: touched on every packet
-    transport: Transport,
+    transport: RtcDriver,
     downstream: DownstreamAllocator,
     stream_writer: StreamWriter,
     // Warm: touched per poll cycle
     upstream: UpstreamAllocator,
     negotiated: NegotiatedResources,
-    profile: ConnectionProfile,
+    allow_topic_channels: bool,
     pub(crate) participant_id: entity::ParticipantId,
-    participant_external_id: entity::ParticipantExternalId,
     pub(crate) connection_id: entity::ConnectionId,
     last_keyframe_request: HashMap<(Mid, SourceEncoding), Instant>,
     pending_keyframe_requests: HashSet<(Mid, SourceEncoding)>,
@@ -169,6 +173,8 @@ pub struct Participant {
     /// packet.
     data: DataState,
     native_data: native_data::NativeData,
+    native_execution: native_data::NativeExecution,
+    native_preparation_budget: usize,
     native_receivers: native_receiver::NativeReceivers,
     native_rtp: native_rtp::NativeRtp,
 
@@ -186,7 +192,8 @@ pub struct Participant {
     /// unwarranted for something only a human reading a trace benefits from.
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
-    signaling: NativeSession,
+    native_handoff: Option<EndpointHandoff>,
+    native_channel: Option<crate::media::ChannelId>,
     renewal_pending: bool,
     playout_reconnect_sent: bool,
     authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
@@ -196,16 +203,14 @@ pub struct Participant {
     pub(crate) shard_id: ShardId,
 }
 
-pub type ParticipantCore = Participant;
-
-impl Participant {
-    pub fn new(cfg: ParticipantConfig, shard_id: ShardId, udp_gso_size: usize) -> Self {
+impl Connection {
+    pub fn new(mut cfg: ConnectionConfig, shard_id: ShardId, udp_gso_size: usize) -> Self {
         let rtc = cfg.rtc;
         let ctx = LogCtx {
             room_id: cfg.room_id,
             participant_id: cfg.participant_id,
         };
-        let signaling = NativeSession::default();
+        let native_handoff = cfg.resources.native_handoff.take();
         let now = Instant::now();
         #[cfg(feature = "sim")]
         let sim_span = tracing::info_span!(
@@ -214,7 +219,7 @@ impl Participant {
             room_id = %cfg.room_id
         );
         let mut participant = Self {
-            transport: Transport::new(
+            transport: RtcDriver::new(
                 rtc,
                 udp_gso_size,
                 now,
@@ -223,17 +228,14 @@ impl Participant {
             ),
             stream_writer: StreamWriter::new(),
             participant_id: cfg.participant_id,
-            participant_external_id: cfg.participant_external_id,
             connection_id: cfg.connection_id,
-            profile: cfg.profile,
+            allow_topic_channels: cfg.allow_topic_channels,
             upstream: UpstreamAllocator::new(ctx, cfg.connection_id),
             negotiated: cfg.resources,
-            downstream: DownstreamAllocator::new(
-                ctx,
-                cfg.manual_sub || cfg.profile == ConnectionProfile::Native,
-            ),
+            downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
             disconnect_reason: None,
-            signaling,
+            native_handoff,
+            native_channel: None,
             renewal_pending: false,
             playout_reconnect_sent: false,
             authorization_expiry: cfg.authorization_expiry,
@@ -243,31 +245,21 @@ impl Participant {
             pending_keyframe_requests: HashSet::new(),
             data: DataState::new(),
             native_data: native_data::NativeData::default(),
+            native_execution: native_data::NativeExecution::default(),
+            native_preparation_budget: NATIVE_PREPARATION_BUDGET,
             native_receivers: native_receiver::NativeReceivers::default(),
             native_rtp: native_rtp::NativeRtp::default(),
             room_id: cfg.room_id,
             shard_id,
         };
-        if participant.profile == ConnectionProfile::Native {
-            let self_descriptor = pulsebeam_proto::state::Participant {
-                participant_id: participant.participant_id.as_str(),
-                participant_external_id: participant.participant_external_id.as_str().to_owned(),
-            };
-            if let Err(error) = participant.signaling.observe_participant(self_descriptor) {
-                tracing::warn!(?error, participant_id = %participant.participant_id, "native self observation failed");
-                participant.disconnect(DisconnectReason::SignalingOutput);
-            }
-            if let Some(expiry) = participant.authorization_expiry {
-                match i64::try_from(expiry.unix_seconds()) {
-                    Ok(expiry) => participant.send_authorization_result(Some(expiry)),
-                    Err(_) => participant.disconnect(DisconnectReason::SignalingOutput),
-                }
-            }
+        if participant.negotiated.signaling_channel.is_some()
+            && participant.native_handoff.is_none()
+        {
+            participant.disconnect(DisconnectReason::SignalingOutput);
         }
-        if participant.profile != ConnectionProfile::Native {
-            for media in participant.negotiated.media_sections().to_vec() {
-                participant.handle_media_added(media);
-            }
+        for media in participant.negotiated.media_sections().to_vec() {
+            let label = whip_media_label(cfg.profile, media.kind);
+            participant.install_sdp_media(media, label);
         }
         participant
     }
@@ -297,14 +289,7 @@ impl Participant {
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
         match effect {
-            ParticipantEffect::ParticipantsChanged { added, removed } => {
-                if self.profile == ConnectionProfile::Native
-                    && let Err(error) = self.signaling.apply_participants(added, removed)
-                {
-                    tracing::warn!(?error, participant_id = %self.participant_id, "native participant observation failed");
-                    self.disconnect(DisconnectReason::SignalingOutput);
-                }
-            }
+            ParticipantEffect::ParticipantsChanged { .. } => {}
             ParticipantEffect::TrackCandidateAdded { track } => {
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
@@ -313,9 +298,7 @@ impl Participant {
                 self.add_track_candidate(key, track);
             }
             ParticipantEffect::TrackCandidateRemoved { track_id, reason } => {
-                if self.profile == ConnectionProfile::Native {
-                    self.native_source_removed(track_id, reason);
-                }
+                self.native_source_removed(track_id, reason);
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
@@ -327,39 +310,40 @@ impl Participant {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                if self.profile == ConnectionProfile::Native {
+                if self.native_receivers.contains_source(track_id) {
                     self.native_source_binding(track_id, key, true);
-                    return;
+                } else {
+                    self.activate_track_binding(key, track_id);
                 }
-                self.activate_track_binding(key, track_id);
             }
             ParticipantEffect::TrackUnsubscribed { track_id } => {
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                if self.profile == ConnectionProfile::Native {
+                if self.native_receivers.contains_source(track_id) {
                     self.native_source_binding(track_id, key, false);
-                    return;
+                } else {
+                    self.deactivate_track_binding(key, track_id);
                 }
-                self.deactivate_track_binding(key, track_id);
             }
             ParticipantEffect::TrackPublished { track_id } => {
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                if self.profile == ConnectionProfile::Native {
-                    if track_id.kind() == TrackKind::Data {
-                        self.native_data.bind_source(track_id, key);
-                    } else {
-                        self.native_rtp.bind_source(track_id, key);
+                if track_id.kind() != TrackKind::Data {
+                    if self.native_rtp.bind_source(track_id, key)
+                        || (!self.upstream.owns_managed_track(track_id)
+                            && self.upstream.mid_for_track_id(track_id).is_some())
+                    {
+                        self.upstream.bind_track_handle(track_id, key);
                     }
                     return;
                 }
-                self.upstream.bind_track_handle(track_id, key);
-                if track_id.kind() == TrackKind::Data {
-                    self.upstream.data.bind_source(track_id, key);
+                self.native_data.bind_source(track_id, key);
+                if self.data.bind_source(track_id, key) {
+                    self.upstream.bind_track_handle(track_id, key);
                 }
             }
             ParticipantEffect::TrackUnpublished { track_id } => {
@@ -367,13 +351,14 @@ impl Participant {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                if self.profile == ConnectionProfile::Native {
+                if track_id.kind() != TrackKind::Data {
+                    if !self.upstream.owns_managed_track(track_id) {
+                        self.upstream.unbind_track_handle(track_id, key);
+                    }
                     return;
                 }
                 self.upstream.unbind_track_handle(track_id, key);
-                if track_id.kind() == TrackKind::Data {
-                    self.upstream.data.unpublish(track_id);
-                }
+                self.data.unpublish(track_id, key);
             }
         }
     }
@@ -399,13 +384,11 @@ impl Participant {
                         ),
                     );
                     self.renewal_pending = false;
-                    self.send_authorization_result(Some(expiry));
                 } else if revision == self.authorization_revision
                     && expiry.is_none()
                     && self.renewal_pending
                 {
                     self.renewal_pending = false;
-                    self.send_authorization_result(None);
                 }
             }
             ParticipantInput::PublicationCutoff { reference, success } => {
@@ -421,28 +404,14 @@ impl Participant {
     fn add_track_candidate(&mut self, key: TrackHandle, track: Track) {
         let track_id = track.id();
         let participant_id = track.meta().origin;
-        if self.profile == ConnectionProfile::Native
-            && self.signaling.observe_candidate(&track).is_err()
-        {
-            self.disconnect(DisconnectReason::SignalingOutput);
-            return;
-        }
         debug_assert_eq!(track_id.kind(), track.kind());
-        if self.profile == ConnectionProfile::Native {
-            if self.downstream.register_candidate(key, &track) {
-                if track.kind() == TrackKind::Video {
-                    self.downstream.install_track(key, track.clone());
-                }
-                self.native_source_added(key, &track);
-            }
+        if !self.downstream.register_candidate(key, &track) {
             return;
         }
-        if !self
-            .downstream
-            .add_track_candidate(key, &track, &self.data.channels_snapshot())
-        {
-            return;
+        if self.native_receivers.contains_source(track_id) {
+            self.native_source_added(key, &track);
         }
+        self.data.add_candidate(key, &track);
         debug_assert_ne!(participant_id, self.participant_id);
         if track.kind() != TrackKind::Data {
             self.on_track_published(key, track);
@@ -455,9 +424,7 @@ impl Participant {
             return;
         };
         debug_assert_eq!(candidate.track_id, track_id);
-        if track_id.kind() != TrackKind::Data {
-            self.downstream.activate_track_binding(key, track_id);
-        }
+        self.downstream.activate_track_binding(key, track_id);
     }
 
     fn deactivate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
@@ -466,9 +433,7 @@ impl Participant {
             return;
         };
         debug_assert_eq!(candidate.track_id, track_id);
-        if track_id.kind() != TrackKind::Data {
-            self.downstream.deactivate_track_binding(key, track_id);
-        }
+        self.downstream.deactivate_track_binding(key, track_id);
     }
 
     fn remove_track_candidate(&mut self, key: TrackHandle, track_id: TrackId) {
@@ -477,12 +442,8 @@ impl Participant {
         };
         debug_assert_eq!(candidate.track_id, track_id);
         debug_assert_ne!(candidate.participant_id, self.participant_id);
-        if self.profile == ConnectionProfile::Native
-            && self.signaling.remove_track(track_id.as_str()).is_err()
-        {
-            self.disconnect(DisconnectReason::SignalingOutput);
-        }
-        if self.profile == ConnectionProfile::Native && track_id.kind() == TrackKind::Video {
+        self.data.remove_candidate(key);
+        if self.native_receivers.contains_source(track_id) && track_id.kind() == TrackKind::Video {
             self.downstream.video.forget_owned_track(key, track_id);
             self.downstream.dirty_allocation = true;
         } else if track_id.kind() != TrackKind::Data {
@@ -504,12 +465,11 @@ impl Participant {
                     return;
                 }
             };
-            if self.profile == ConnectionProfile::Native {
-                self.native_data_delivery(stream, lane, bytes);
+            self.native_data_delivery(stream, lane, bytes);
+            if self.disconnect_reason.is_some() {
                 return;
             }
-            let Some(channel) = self.downstream.data.forwarding(stream) else {
-                debug_assert!(false, "a data forwarding plan must have a receiver binding");
+            let Some(channel) = self.data.forwarding(stream) else {
                 return;
             };
             let required = if matches!(lane, DataLane::Ordered) {
@@ -523,7 +483,6 @@ impl Participant {
             } else {
                 false
             };
-            self.downstream.data.record_delivery(stream, bytes.len());
             self.enqueue_fanout(TransportMutation::Data {
                 channel,
                 bytes: bytes.to_vec(),
@@ -546,12 +505,9 @@ impl Participant {
         let kind = entry.track_id.kind();
         let participant_id = entry.participant_id;
         let track_id = entry.track_id;
-        if self.profile == ConnectionProfile::Native {
-            self.native_rtp_delivery(key, packet, cache);
-            return;
-        }
+        self.native_rtp_delivery(key, packet, cache);
         match kind {
-            TrackKind::Video => {
+            TrackKind::Video if self.downstream.video.has_negotiated_slots() => {
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_forwarded_media_for(
                     self.participant_id,
@@ -565,7 +521,7 @@ impl Participant {
                 );
                 let _ = promoted;
             }
-            TrackKind::Audio => {
+            TrackKind::Audio if self.downstream.audio.has_negotiated_slots() => {
                 debug_assert!(cache.is_none(), "audio forwarding has no video cache");
                 let origin = crate::entity::AudioOrigin {
                     participant: participant_id,
@@ -576,6 +532,7 @@ impl Participant {
                 self.downstream.take_audio_speakers_changed();
             }
             TrackKind::Data => debug_assert!(false, "data tracks carry bytes, not RTP"),
+            TrackKind::Audio | TrackKind::Video => {}
         }
     }
 
@@ -637,11 +594,7 @@ impl Participant {
     fn on_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
         match packet.decode() {
             Some(ReverseInput::Keyframe { encoding, kind }) => {
-                let Some(track_id) = (if self.profile == ConnectionProfile::Native {
-                    self.native_rtp.track_for_fanout(stream)
-                } else {
-                    self.upstream.track_for_fanout(stream)
-                }) else {
+                let Some(track_id) = self.upstream.track_for_fanout(stream) else {
                     debug_assert!(
                         false,
                         "a reverse keyframe route must name a published track"
@@ -651,15 +604,11 @@ impl Participant {
                 self.enqueue_remote_keyframe((track_id, encoding), kind);
             }
             Some(ReverseInput::ReliableControl(bytes)) => {
-                if self.profile == ConnectionProfile::Native {
+                if self.native_data.owns_fanout(stream) {
                     self.native_data_reverse(stream, bytes);
                     return;
                 }
-                let Some(channel) = self.upstream.data.source(stream) else {
-                    debug_assert!(
-                        false,
-                        "a reliable control stream must have a publisher channel"
-                    );
+                let Some(channel) = self.data.source(stream) else {
                     return;
                 };
                 let Ok(frame) = TopicFrame::decode_bounded(&bytes) else {
@@ -686,7 +635,7 @@ impl Participant {
     }
 
     fn enqueue_remote_keyframe(&mut self, stream_id: StreamId, kind: KeyframeRequestKind) {
-        let Some(mid) = (if self.profile == ConnectionProfile::Native {
+        let Some(mid) = (if self.upstream.owns_managed_track(stream_id.0) {
             self.native_rtp.keyframe_mid(stream_id.0, stream_id.1)
         } else {
             self.upstream.mid_for_track_id(stream_id.0)
@@ -727,7 +676,7 @@ impl Participant {
         // Measure before allocating: the monitors produce this tick's numbers,
         // and running the allocator first would decide against last tick's.
         self.upstream.poll_slow(now);
-        self.native_rtp.poll_stats(now);
+        self.native_rtp.poll_stats(&mut self.upstream, now);
         let assignments_changed = self.downstream.poll_slow(now, events);
         self.transport
             .set_desired_bitrate(self.downstream.desired_bitrate());
@@ -735,10 +684,9 @@ impl Participant {
     }
 
     fn apply_one_rtc_mutation(&mut self, now: Instant) -> bool {
-        if self.profile == ConnectionProfile::Native
-            && self
-                .authorization_expiry
-                .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
+        if self
+            .authorization_expiry
+            .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
         {
             // A controller renewal may be in flight; fence old work without declaring expiry terminal.
             self.stream_writer.discard();
@@ -765,7 +713,7 @@ impl Participant {
                 } => (pkt, track_id, mid, None, ssrc, pt, MediaKind::Audio),
             };
             let seq_no = pkt.seq_no;
-            let playout_delay = if self.profile == ConnectionProfile::Native {
+            let playout_delay = if self.native_receivers.owns_mid(mid) {
                 if !self.native_receivers.can_write_rtp(mid, track_id, ssrc, pt) {
                     return true;
                 }
@@ -806,12 +754,13 @@ impl Participant {
             }
             return true;
         }
-        let native = self.profile == ConnectionProfile::Native;
+        let signaling = self.native_channel_id();
+        let topics = &self.data;
         let data = &self.native_data;
         let receivers = &self.native_receivers;
         let applied = self.transport.apply_next_mutation(now, |channel| {
-            !native
-                || channel.value() == 0
+            Some(channel) == signaling
+                || topics.channel(channel).is_some()
                 || data.can_write(channel)
                 || receivers.can_write(channel)
         });
@@ -853,7 +802,7 @@ impl Participant {
         let _sim_guard = sim_span.enter();
 
         self.advance_rtc_clock(now, now);
-        self.expire_native_data(now, events);
+        self.begin_native_control_turn(now, events);
         let mut work_budget = POLL_WORK_BUDGET;
         let mut control_blocked = false;
         'drain: loop {
@@ -866,30 +815,18 @@ impl Participant {
             // Offer control before media draining can exhaust this turn. Drain RTC after
             // each batch so continuous control churn cannot starve packet service either.
             let mut control_progress = false;
-            if !control_blocked && self.signaling.needs_poll() {
-                let enumeration_progress = self.signaling.enumeration_progress();
-                match self.signaling.poll() {
-                    Ok(Some(output)) => {
-                        if self
-                            .transport
-                            .write_channel(output.cid, true, &output.bytes)
-                        {
-                            self.signaling.commit_sent();
-                        } else {
-                            control_blocked = true;
-                        }
-                        self.transport.mark_needs_drain();
-                        control_progress = true;
-                    }
-                    Ok(None) => {
-                        control_progress =
-                            self.signaling.enumeration_progress() != enumeration_progress;
+            if !control_blocked && self.native_handoff.is_some() {
+                match self.poll_native_signaling() {
+                    Ok(result) => {
+                        control_blocked = matches!(result, SignalingWrite::Blocked);
+                        control_progress = !matches!(result, SignalingWrite::Idle);
                     }
                     Err(err) => {
                         plog_warn!(self.log_ctx(), ?err, "native signaling output failed");
                         tracing::warn!(?err, participant_id = %self.participant_id, "native signaling output failed");
                         self.disconnect(DisconnectReason::SignalingOutput);
-                        return None;
+                        // Drain the aborted RTC below to emit its terminal lifecycle event.
+                        control_blocked = true;
                     }
                 }
             }
@@ -968,10 +905,9 @@ impl Participant {
                 .unwrap_or(next_slow_poll)
                 .min(next_slow_poll);
             let deadline = self
-                .signaling
+                .native_data
                 .deadline()
                 .into_iter()
-                .chain(self.native_data.deadline())
                 .chain(self.native_receivers.deadline())
                 .fold(deadline, Instant::min);
 
@@ -981,8 +917,36 @@ impl Participant {
                 continue;
             }
 
-            return Some(deadline);
+            return Some(
+                self.native_preparation_deadline(now)
+                    .map_or(deadline, |next| next.min(deadline)),
+            );
         }
+    }
+
+    fn begin_native_control_turn(&mut self, now: Instant, events: &mut impl ParticipantSink) {
+        self.native_preparation_budget = NATIVE_PREPARATION_BUDGET;
+        if self
+            .native_handoff
+            .as_ref()
+            .is_some_and(EndpointHandoff::failed)
+        {
+            self.disconnect(DisconnectReason::SignalingOutput);
+            return;
+        }
+        self.evaluate_native_preparations(events);
+        self.expire_native_data(now, events);
+    }
+
+    fn native_preparation_deadline(&mut self, now: Instant) -> Option<Instant> {
+        if self
+            .native_handoff
+            .as_mut()
+            .is_some_and(EndpointHandoff::commands_pending)
+        {
+            return Some(now.checked_add(Duration::from_micros(1)).unwrap_or(now));
+        }
+        None
     }
 
     fn advance_rtc_clock(&mut self, candidate: Instant, wall_now: Instant) {
@@ -1039,13 +1003,11 @@ impl Participant {
                 let Ok(mid) = Mid::new(&info.mid) else {
                     return;
                 };
-                if self.profile == ConnectionProfile::Native {
-                    if self.native_rtp.owns_encoding(info.ssrc)
-                        && let Some(report) = self.transport.register_owned_encoding(info)
-                    {
+                if self.native_rtp.owns_encoding(info.ssrc) {
+                    if let Some(report) = self.transport.register_owned_encoding(info) {
                         self.handle_sender_report(report);
                     }
-                } else {
+                } else if self.upstream.slot_for_mid(mid).is_some() {
                     if let Some(report) = self.transport.register_encoding(info) {
                         self.handle_sender_report(report);
                     }
@@ -1053,7 +1015,7 @@ impl Participant {
                 }
             }
             Event::EncodingRetired { ssrc, .. } => {
-                self.native_rtp_ended(ssrc, events);
+                self.native_rtp_ended(ssrc);
                 self.transport.retire_encoding(ssrc);
                 self.upstream.clear_routes();
             }
@@ -1079,8 +1041,34 @@ impl Participant {
                 channel: cid,
                 config: cfg,
             }) => {
-                if self.profile == ConnectionProfile::Native && cid.value() != 0 {
+                if let Some(channel) = self
+                    .negotiated
+                    .signaling_channel
+                    .as_ref()
+                    .filter(|channel| channel.designates(cid))
+                {
+                    if !channel.matches(cid, &cfg) {
+                        self.disconnect(DisconnectReason::SignalingInput);
+                        return;
+                    }
+                    plog_info!(self.log_ctx(), "internal media signaling is opened");
+                    self.native_channel = Some(cid);
+                    if let Some(handoff) = self.native_handoff.as_mut() {
+                        if !handoff.opened(Opened {
+                            channel: cid,
+                            at: self.transport.clock(),
+                        }) {
+                            self.disconnect(DisconnectReason::SignalingOutput);
+                        }
+                    }
+                    return;
+                }
+                if self.owns_data_channel(cid) {
                     self.native_data_opened(cid, cfg, events);
+                    return;
+                }
+                if !self.allow_topic_channels {
+                    self.transport.close_native_data(cid);
                     return;
                 }
                 let intent = match DataTrackIntent::try_from(&cfg) {
@@ -1092,29 +1080,9 @@ impl Participant {
                 };
 
                 match intent {
-                    DataTrackIntent::InternalSignaling => {
-                        if self.profile == ConnectionProfile::Native {
-                            if !DataTrackIntent::is_native_signaling_channel(cid, &cfg) {
-                                self.disconnect(DisconnectReason::SignalingInput);
-                                return;
-                            }
-                            plog_info!(self.log_ctx(), "internal media signaling is opened");
-                            self.signaling.set_cid(cid);
-                            if let Some(expiry) = self.authorization_expiry
-                                && let Ok(expiry) = i64::try_from(expiry.unix_seconds())
-                            {
-                                self.send_authorization_result(Some(expiry));
-                            }
-                        }
-                    }
-
+                    DataTrackIntent::InternalSignaling => {}
                     DataTrackIntent::UserTopic(channel) => {
-                        if self.profile == ConnectionProfile::Native {
-                            return;
-                        }
                         if let Some(previous) = self.data.close(cid) {
-                            self.downstream.data.close(cid);
-                            self.upstream.data.close(cid);
                             self.release_data_channel(previous, events);
                         }
                         let publication = if channel.direction == DataTrackDirection::Publish {
@@ -1155,7 +1123,6 @@ impl Participant {
                             return;
                         }
                         if let Some(track) = publication {
-                            self.upstream.data.publish(cid, &track);
                             events.publish_track(track);
                         } else {
                             events.subscribe_tracks(
@@ -1166,32 +1133,27 @@ impl Participant {
                     }
                 }
             }
-            Event::DataChannel(DataChannelEvent::ResetComplete { channel })
-                if self.profile == ConnectionProfile::Native =>
-            {
-                self.native_data_reset(channel, true, events);
+            Event::DataChannel(
+                DataChannelEvent::ResetComplete { .. } | DataChannelEvent::ResetFailed { .. },
+            ) => {
                 self.evaluate_native_preparations(events);
             }
-            Event::DataChannel(DataChannelEvent::ResetFailed { channel })
-                if self.profile == ConnectionProfile::Native =>
-            {
-                self.native_data_reset(channel, false, events);
+            Event::DataChannel(DataChannelEvent::InstallationFailed { installation }) => {
+                self.native_data_installation_failed(installation);
                 self.evaluate_native_preparations(events);
             }
             Event::DataChannel(DataChannelEvent::Closed { channel: cid }) => {
-                if Some(cid) == self.signaling.cid {
+                if Some(cid) == self.native_channel_id() {
                     self.disconnect(DisconnectReason::SignalingClosed);
                     return;
                 }
-                if self.profile == ConnectionProfile::Native {
+                if self.owns_data_channel(cid) {
                     self.native_data_closed(cid, events);
                     return;
                 }
                 let Some(channel) = self.data.close(cid) else {
                     return;
                 };
-                self.downstream.data.close(cid);
-                self.upstream.data.close(cid);
                 self.release_data_channel(channel, events);
             }
             Event::DataChannel(DataChannelEvent::Message {
@@ -1199,16 +1161,27 @@ impl Participant {
                 message,
             }) => {
                 let DataMessage::Binary(bytes) = message else {
-                    if Some(cid) == self.signaling.cid {
+                    if Some(cid) == self.native_channel_id() {
                         self.disconnect(DisconnectReason::SignalingClosed);
                     }
                     return;
                 };
-                if Some(cid) == self.signaling.cid {
-                    self.handle_native_signaling(&bytes, events);
+                if Some(cid) == self.native_channel_id() {
+                    if let Some(handoff) = &self.native_handoff {
+                        if !handoff.input(bytes) {
+                            self.disconnect(DisconnectReason::SignalingInput);
+                        }
+                        return;
+                    }
                     return;
                 }
-                if self.profile == ConnectionProfile::Native {
+                if self
+                    .authorization_expiry
+                    .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
+                {
+                    return;
+                }
+                if self.owns_data_channel(cid) {
                     self.native_data_message(cid, &bytes, events);
                     return;
                 }
@@ -1224,7 +1197,7 @@ impl Participant {
                             return;
                         }
                         events.publish_track_packet(
-                            self.upstream.data.published_stream(cid),
+                            self.data.published_stream(cid),
                             TrackPacket::Data {
                                 lane,
                                 bytes: bytes.to_vec(),
@@ -1244,15 +1217,7 @@ impl Participant {
                         else {
                             return;
                         };
-                        if let Some(stream) =
-                            self.downstream
-                                .data
-                                .subscribed_stream(cid, &track_id, &|key| {
-                                    self.downstream
-                                        .track_candidate(key)
-                                        .map(|entry| entry.track_id)
-                                })
-                        {
+                        if let Some(stream) = self.data.subscribed_stream(cid, track_id) {
                             events.request_reverse(
                                 stream,
                                 ReversePacket::reliable_control(bytes.to_vec()),
@@ -1268,46 +1233,23 @@ impl Participant {
         }
     }
 
-    fn handle_native_signaling(&mut self, bytes: &[u8], events: &mut impl ParticipantSink) {
-        let input = match self.signaling.apply_input(bytes) {
-            Ok(input) => input,
-            Err(error) => {
-                plog_warn!(self.log_ctx(), ?error, "native signaling input rejected");
-                self.disconnect(DisconnectReason::SignalingInput);
-                return;
-            }
-        };
-        for reference in input.cutoffs {
-            self.retire_native_resource(reference, events);
-        }
-        for (reference, report) in input.executions {
-            self.apply_native_receiver_execution(reference, report.failure, events);
-        }
-        self.evaluate_native_preparations(events);
-    }
-
     fn evaluate_native_preparations(&mut self, events: &mut impl ParticipantSink) {
-        loop {
-            if !self
-                .signaling
-                .authorization_current(native_data::unix_now())
-            {
-                return;
-            }
-            let work = match self.signaling.take_preparation() {
-                Ok(Some(work)) => work,
-                Ok(None) => break,
-                Err(_) => {
-                    self.disconnect(DisconnectReason::SignalingOutput);
-                    return;
+        if self.native_handoff.is_some() {
+            while self.native_preparation_budget > 0 {
+                let Some(command) = self
+                    .native_handoff
+                    .as_mut()
+                    .and_then(EndpointHandoff::command)
+                else {
+                    break;
+                };
+                self.native_preparation_budget = self.native_preparation_budget.saturating_sub(1);
+                self.execute_native_command(command, events);
+                if self.disconnect_reason.is_some() {
+                    break;
                 }
-            };
-            if let Some(work) = self.current_native_preparation(work) {
-                self.prepare_native_resource(work, events);
             }
-            if self.disconnect_reason.is_some() {
-                return;
-            }
+            return;
         }
     }
 
@@ -1316,21 +1258,15 @@ impl Participant {
             return;
         }
         self.playout_reconnect_sent = true;
-        let _ = self
-            .signaling
-            .close(pulsebeam_proto::state::CloseReason::ReconstructionRequired);
+        if let Some(handoff) = &self.native_handoff {
+            let _ = handoff.fact(Fact::ReconstructionRequired);
+        }
         self.disconnect(DisconnectReason::SignalingOutput);
     }
 
-    fn send_authorization_result(&mut self, expiry: Option<i64>) {
-        if let Some(expiry) = expiry
-            && let Err(error) = self
-                .signaling
-                .authorization(expiry, self.authorization_revision)
-        {
-            tracing::warn!(?error, participant_id = %self.participant_id, "native authorization observation failed");
-            self.disconnect(DisconnectReason::SignalingOutput);
-        }
+    fn owns_data_channel(&self, channel: crate::media::ChannelId) -> bool {
+        self.native_data.channels.contains_key(&channel)
+            || self.native_receivers.channels.contains_key(&channel)
     }
 
     fn release_data_channel(&mut self, state: DataChannelState, events: &mut impl ParticipantSink) {
@@ -1373,15 +1309,13 @@ impl Participant {
     }
 
     fn handle_stream_paused(&mut self, mid: Mid, paused: bool, events: &mut impl ParticipantSink) {
-        // WHIP has no native Intent: unpaused is its implicit publish signal.
-        // Native tracks wait for a labeled Intent before becoming visible.
-        // Paused never unpublishes; explicit state owns stop transitions.
-        if !paused && self.profile == ConnectionProfile::Whip {
+        // SDP-configured upstream slots publish on activity; pausing does not unpublish.
+        if !paused {
             self.handle_upstream_track_state(mid, true, events);
         }
     }
 
-    fn handle_media_added(&mut self, media: crate::control::NegotiatedMedia) {
+    fn install_sdp_media(&mut self, media: crate::control::NegotiatedMedia, label: Option<&str>) {
         let Some(resource) = self.negotiated.media(media.mid) else {
             self.disconnect(DisconnectReason::InvalidMediaDirection);
             return;
@@ -1396,7 +1330,6 @@ impl Participant {
                     MediaKind::Audio => TrackKind::Audio,
                     MediaKind::Video => TrackKind::Video,
                 };
-                let label = whip_media_label(self.profile, media.kind);
                 let track_id = self
                     .connection_id
                     .derive_track_id(kind, label.unwrap_or(&media.mid));
@@ -1482,16 +1415,36 @@ impl Participant {
         rid: Option<crate::media::Rid>,
         events: &mut impl ParticipantSink,
     ) {
-        if self.profile == ConnectionProfile::Native {
-            self.handle_native_rtp(rtp, mid, rid, events);
+        if self.disconnect_reason.is_some()
+            || self
+                .authorization_expiry
+                .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
+        {
+            return;
+        }
+        if self.native_rtp.owns_encoding(rtp.header.ssrc) {
+            if self.authorization_expiry.is_none() {
+                return;
+            }
+            let Some(route) = self.native_rtp.ingress_route(rtp.header.ssrc, mid, rid) else {
+                return;
+            };
+            if let Some(incoming) = self.transport.convert_rtp(rtp, mid, rid) {
+                self.handle_incoming_rtp_after_lookup(route, incoming, events);
+            }
+            return;
+        }
+        if self.upstream.slot_for_mid(mid).is_none() {
             return;
         }
         plog_trace!(self.log_ctx(), "tracing:rtp_event={}", rtp.header.sequence);
         let ssrc: Ssrc = rtp.header.ssrc.into();
-        let incoming = if let Some(route) = self.upstream.route_for_ssrc(ssrc) {
-            if route.mid != mid || route.rid != rid {
-                return;
-            }
+        let cached = self.upstream.route_for_ssrc(ssrc);
+        if cached.is_some_and(|route| route.mid != mid || (route.rid.is_some() && route.rid != rid))
+        {
+            return;
+        }
+        let incoming = if let Some(route) = cached.filter(|route| route.rid == rid) {
             self.transport
                 .convert_rtp(rtp, route.mid, route.rid)
                 .map(|incoming| (route, incoming))
@@ -1509,6 +1462,7 @@ impl Participant {
                         ssrc,
                         mid: incoming.mid,
                         rid: incoming.rid,
+                        encoding: incoming.rid.into(),
                         upstream_slot,
                         track_id,
                         fanout: self.upstream.track_fanout(track_id),
@@ -1540,50 +1494,108 @@ impl Participant {
             self.upstream.remove_route(route.ssrc);
             return;
         }
+        self.forward_processed_rtp(
+            route.track_id,
+            route.encoding,
+            route.fanout,
+            processed,
+            events,
+        );
+    }
+
+    fn forward_processed_rtp(
+        &mut self,
+        track_id: TrackId,
+        encoding: SourceEncoding,
+        fanout: Option<TrackHandle>,
+        processed: track::ProcessedRtp,
+        events: &mut impl ParticipantSink,
+    ) {
         if processed.request_keyframe {
-            self.enqueue_remote_keyframe(
-                (route.track_id, route.rid.into()),
-                KeyframeRequestKind::Pli,
-            );
+            self.enqueue_remote_keyframe((track_id, encoding), KeyframeRequestKind::Pli);
         }
         if let Some(packet) = processed.first {
-            events.publish_track_packet(route.fanout, TrackPacket::Rtp(packet));
+            events.publish_track_packet(fanout, TrackPacket::Rtp(packet));
         }
         for packet in processed.remaining {
-            events.publish_track_packet(route.fanout, TrackPacket::Rtp(packet));
+            events.publish_track_packet(fanout, TrackPacket::Rtp(packet));
         }
     }
 
     fn handle_sender_report(&mut self, report: pulsebeam_rtc::SenderReport) {
-        if self.profile == ConnectionProfile::Native && !self.native_rtp.owns_encoding(report.ssrc)
+        let owned = self.native_rtp.owns_encoding(report.ssrc);
+        if !owned
+            && !self
+                .negotiated
+                .media_sections()
+                .iter()
+                .any(|media| self.upstream.slot_for_mid(media.mid).is_some())
         {
             return;
         }
         let arrival = report.arrival.into();
         if let Some((mid, report)) = self.transport.sender_report(report) {
-            if self.profile == ConnectionProfile::Native {
-                self.native_rtp.sender_report(mid, report, arrival);
+            if owned {
+                if let Some(slot) = self.native_rtp.slot_for_mid(mid)
+                    && let Some(track) = self.upstream.track_mut(slot)
+                {
+                    track.sender_report(report, arrival);
+                }
             } else {
                 self.upstream.sender_report(mid, report, arrival);
             }
         }
     }
 
+    fn poll_native_signaling(&mut self) -> Result<SignalingWrite, OutputError> {
+        if let Some(handoff) = &mut self.native_handoff {
+            if handoff.failed() {
+                return Err(OutputError::InvalidObservation);
+            }
+            if !self.transport.signaling_pending()
+                && let Some(output) = handoff.output()
+                && self.transport.offer_signaling(output).is_err()
+            {
+                return Err(OutputError::InvalidObservation);
+            }
+            let result = self.transport.poll_signaling();
+            match result {
+                SignalingWrite::Admitted(progress) if !handoff.progress(progress) => {
+                    return Err(OutputError::InvalidObservation);
+                }
+                SignalingWrite::Expired => return Err(OutputError::ProgressExpired),
+                _ => {}
+            }
+            return Ok(result);
+        }
+        Ok(SignalingWrite::Idle)
+    }
+
+    pub(crate) fn native_ready(&mut self) {
+        if let Some(handoff) = &self.native_handoff {
+            handoff.acknowledge_wakeup();
+        }
+    }
+
+    fn native_channel_id(&self) -> Option<crate::media::ChannelId> {
+        self.native_channel
+    }
+
     fn disconnect(&mut self, reason: DisconnectReason) {
         if self.disconnect_reason.is_some() {
             return;
         }
-        plog_info!(self.log_ctx(), %reason, "Participant core disconnecting");
+        plog_info!(self.log_ctx(), %reason, "Connection disconnecting");
         self.disconnect_reason = Some(reason);
         self.stream_writer.discard();
         self.transport.disconnect();
     }
 }
 
-fn whip_media_label(profile: ConnectionProfile, kind: MediaKind) -> Option<&'static str> {
+fn whip_media_label(profile: SignalingProtocol, kind: MediaKind) -> Option<&'static str> {
     match (profile, kind) {
-        (ConnectionProfile::Whip, MediaKind::Audio) => Some("audio"),
-        (ConnectionProfile::Whip, MediaKind::Video) => Some("video"),
+        (SignalingProtocol::Whip, MediaKind::Audio) => Some("audio"),
+        (SignalingProtocol::Whip, MediaKind::Video) => Some("video"),
         _ => None,
     }
 }
@@ -1592,6 +1604,19 @@ fn whip_media_label(profile: ConnectionProfile, kind: MediaKind) -> Option<&'sta
 mod rtc_clock_tests {
     use super::*;
 
+    fn execution_handoff(
+        resources: &mut NegotiatedResources,
+    ) -> (
+        entity::ConnectionId,
+        crate::control::native::handoff::ControllerHandoff,
+        pulsebeam_queue::Receiver<entity::ConnectionId>,
+    ) {
+        let connection = entity::ConnectionId::new();
+        let (controller, receiver) =
+            crate::control::native::fixture::execution_handoff(resources, connection);
+        (connection, controller, receiver)
+    }
+
     #[test]
     fn whip_uses_fixed_track_labels_independent_of_mid() {
         let connection = entity::ConnectionId::new();
@@ -1599,13 +1624,126 @@ mod rtc_clock_tests {
             (MediaKind::Audio, TrackKind::Audio, "audio"),
             (MediaKind::Video, TrackKind::Video, "video"),
         ] {
-            let label = whip_media_label(ConnectionProfile::Whip, kind).unwrap();
+            let label = whip_media_label(SignalingProtocol::Whip, kind).unwrap();
             assert_eq!(label, expected);
             assert_eq!(
                 connection.derive_track_id(track_kind, label),
                 connection.derive_track_id(track_kind, expected)
             );
-            assert!(whip_media_label(ConnectionProfile::Native, kind).is_none());
+            assert!(whip_media_label(SignalingProtocol::State, kind).is_none());
+        }
+    }
+
+    #[test]
+    fn sdp_resources_bootstrap_with_or_without_optional_control() {
+        for profile in [SignalingProtocol::Whip, SignalingProtocol::State] {
+            for control in [false, true] {
+                let mut peer = str0m::RtcConfig::new().build(std::time::Instant::now());
+                let mut changes = peer.sdp_api();
+                changes.add_media(
+                    str0m::media::MediaKind::Audio,
+                    str0m::media::Direction::SendOnly,
+                    None,
+                    None,
+                    None,
+                );
+                changes.add_media(
+                    str0m::media::MediaKind::Audio,
+                    str0m::media::Direction::RecvOnly,
+                    None,
+                    None,
+                    None,
+                );
+                changes.add_channel("test".into());
+                let offer = changes.apply().unwrap().0.to_sdp_string();
+                let (mut rtc, _, mut resources) =
+                    crate::control::Negotiator::new(vec![pulsebeam_rtc::LocalCandidate::Udp(
+                        "127.0.0.1:6000".parse().unwrap(),
+                    )])
+                    .create_answer(
+                        offer,
+                        crate::control::ufrag::test_credentials(),
+                        pulsebeam_runtime::net::ReceiveTime::now(),
+                        control.then(|| {
+                            crate::control::rtp::transport_capabilities(
+                                &crate::control::rtp::capabilities(),
+                            )
+                            .unwrap()
+                        }),
+                    )
+                    .unwrap();
+                let media = resources.media_sections().to_vec();
+                let (connection_id, _control) = if control {
+                    rtc.connection
+                        .update_rtp(pulsebeam_rtc::RtpConfigurationPatch::default())
+                        .unwrap();
+                    let (id, controller, ready) = execution_handoff(&mut resources);
+                    (id, Some((controller, ready)))
+                } else {
+                    (entity::ConnectionId::new(), None)
+                };
+                let offered = rtc.session.offered_media.clone();
+                let config = crate::control::core::ControllerCore::with_placement(
+                    16,
+                    crate::control::core::RoomPartitionPlacement::Balanced,
+                )
+                .prepare_participant(
+                    rtc,
+                    resources,
+                    crate::control::controller::ParticipantState {
+                        manual_sub: true,
+                        room_id: entity::RoomId::from_external(
+                            &entity::RoomExternalId::new("sdp-bootstrap").unwrap(),
+                        ),
+                        participant_id: entity::ParticipantId::new(),
+                        participant_external_id: entity::ParticipantExternalId::new("peer")
+                            .unwrap(),
+                        connection_id,
+                        old_connection_id: None,
+                        authorization: None,
+                        profile,
+                        rtp_capabilities: None,
+                    },
+                );
+                assert_eq!(config.rtc.session.offered_media, offered);
+                assert_eq!(
+                    config.resources.media_sections().len(),
+                    if profile == SignalingProtocol::State {
+                        0
+                    } else {
+                        media.len()
+                    }
+                );
+                let connection = Connection::new(config, ShardId::new(0), 8);
+                assert!(connection.disconnect_reason.is_none());
+                for section in media {
+                    if profile == SignalingProtocol::State {
+                        assert!(connection.upstream.slot_for_mid(section.mid).is_none());
+                        assert!(
+                            connection
+                                .receiver_index(section.kind, section.mid)
+                                .is_none()
+                        );
+                        continue;
+                    }
+                    match section.direction {
+                        Direction::RecvOnly => {
+                            let label = whip_media_label(profile, section.kind);
+                            let id = connection_id
+                                .derive_track_id(TrackKind::Audio, label.unwrap_or(&section.mid));
+                            assert_eq!(
+                                connection.upstream.slot_for_mid(section.mid).unwrap().1,
+                                id
+                            );
+                        }
+                        Direction::SendOnly => assert_eq!(
+                            connection.receiver_index(section.kind, section.mid),
+                            Some(section.media_index)
+                        ),
+                        _ => panic!("unidirectional SDP resource"),
+                    }
+                }
+            }
         }
     }
 
@@ -1617,8 +1755,9 @@ mod rtc_clock_tests {
                 let now = Instant::now();
                 let remote = "127.0.0.1:5000".parse().unwrap();
                 let local = "127.0.0.1:6000".parse().unwrap();
-                let (rtc, resources, valid) =
+                let (rtc, mut resources, valid) =
                     crate::control::application_only_test_connection_and_binding();
+                let (connection_id, _controller, _ready) = execution_handoff(&mut resources);
                 let received_at = net::ReceiveTime {
                     monotonic: now,
                     wall: std::time::SystemTime::UNIX_EPOCH,
@@ -1626,8 +1765,8 @@ mod rtc_clock_tests {
                 assert_eq!(valid.get(4..8), Some([0x21, 0x12, 0xa4, 0x42].as_slice()));
                 let mut invalid = valid.clone();
                 invalid.get_mut(20..).unwrap().fill(0);
-                let mut participant = Participant::new(
-                    ParticipantConfig {
+                let mut participant = Connection::new(
+                    ConnectionConfig {
                         manual_sub: false,
                         room_id: entity::RoomId::from_external(
                             &entity::RoomExternalId::new("route-proof").unwrap(),
@@ -1635,8 +1774,9 @@ mod rtc_clock_tests {
                         participant_id: entity::ParticipantId::new(),
                         participant_external_id: entity::ParticipantExternalId::new("peer")
                             .unwrap(),
-                        connection_id: entity::ConnectionId::new(),
-                        profile: ConnectionProfile::Native,
+                        connection_id,
+                        profile: SignalingProtocol::State,
+                        allow_topic_channels: false,
                         authorization_expiry: None,
                         rtc,
                         resources,
@@ -1680,18 +1820,63 @@ mod rtc_clock_tests {
     }
 
     #[test]
+    fn native_readiness_overflow_emits_one_terminal_exit() {
+        let (rtc, mut resources, _) =
+            crate::control::application_only_test_connection_and_binding();
+        let connection_id = entity::ConnectionId::new();
+        let (sender, mut ready) = pulsebeam_queue::bounded(std::num::NonZeroUsize::MIN);
+        let unrelated = entity::ConnectionId::new();
+        sender.try_send(unrelated).unwrap();
+        let (controller, endpoint) = crate::control::native::handoff::pair(connection_id, sender);
+        resources.native_handoff = Some(endpoint);
+        let mut participant = Connection::new(
+            ConnectionConfig {
+                manual_sub: false,
+                room_id: entity::RoomId::from_external(
+                    &entity::RoomExternalId::new("native-overflow").unwrap(),
+                ),
+                participant_id: entity::ParticipantId::new(),
+                participant_external_id: entity::ParticipantExternalId::new("peer").unwrap(),
+                connection_id,
+                profile: SignalingProtocol::State,
+                allow_topic_channels: false,
+                authorization_expiry: None,
+                rtc,
+                resources,
+            },
+            ShardId::new(0),
+            8,
+        );
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+
+        participant.send_playout_reconnect();
+        assert!(controller.failed());
+        assert_eq!(ready.try_recv().unwrap(), unrelated);
+        assert!(ready.try_recv().is_err());
+        let now = Instant::now();
+        assert_eq!(participant.poll(now, &mut sink), None);
+        assert_eq!(sink.exit_count, 1);
+        assert!(participant.transport.is_exited());
+        assert_eq!(participant.poll(now, &mut sink), None);
+        assert_eq!(sink.exit_count, 1);
+    }
+
+    #[test]
     fn grant_replacement_updates_without_in_band_request_and_fences_stale_completions() {
-        let (rtc, resources, _) = crate::control::application_only_test_connection_and_binding();
-        let mut participant = Participant::new(
-            ParticipantConfig {
+        let (rtc, mut resources, _) =
+            crate::control::application_only_test_connection_and_binding();
+        let (connection_id, _controller, _ready) = execution_handoff(&mut resources);
+        let mut participant = Connection::new(
+            ConnectionConfig {
                 manual_sub: false,
                 room_id: entity::RoomId::from_external(
                     &entity::RoomExternalId::new("grant-proof").unwrap(),
                 ),
                 participant_id: entity::ParticipantId::new(),
                 participant_external_id: entity::ParticipantExternalId::new("peer").unwrap(),
-                connection_id: entity::ConnectionId::new(),
-                profile: ConnectionProfile::Native,
+                connection_id,
+                profile: SignalingProtocol::State,
+                allow_topic_channels: false,
                 authorization_expiry: Some(
                     pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(200),
                 ),
@@ -1702,6 +1887,13 @@ mod rtc_clock_tests {
             8,
         );
         assert!(!participant.renewal_pending);
+        let old_scope = crate::participant::policy::ExecutionScope {
+            binding: 1,
+            sequence: 1,
+            authorization: 1,
+        };
+        assert!(participant.native_execution.begin(old_scope));
+        assert!(participant.native_execution_current(old_scope, 100));
         participant.input(ParticipantInput::Authorization {
             revision: 2,
             expiry: Some(150),
@@ -1731,6 +1923,101 @@ mod rtc_clock_tests {
             160
         );
         assert!(!participant.renewal_pending);
+        assert!(!participant.native_execution_current(old_scope, 100));
+        let current = crate::participant::policy::ExecutionScope {
+            sequence: 2,
+            authorization: 3,
+            ..old_scope
+        };
+        assert!(participant.native_execution.begin(current));
+        participant.native_execution.finish(old_scope);
+        assert!(participant.native_execution_current(current, 159));
+        assert!(!participant.native_execution_current(current, 160));
+        assert!(!participant.native_callback_fenced(current.binding));
+        let other = crate::participant::policy::ExecutionScope {
+            binding: 2,
+            sequence: 3,
+            ..current
+        };
+        assert!(participant.native_execution.begin(other));
+        assert!(participant.native_execution_current(current, 100));
+        assert!(participant.native_execution_current(other, 100));
+        let retired = crate::participant::policy::ExecutionScope {
+            sequence: 4,
+            authorization: 1,
+            ..other
+        };
+        assert!(participant.native_execution.retire(retired));
+        assert!(!participant.native_execution.retire(retired));
+        assert!(!participant.native_execution_current(other, 100));
+        assert!(participant.native_execution_current(current, 100));
+        participant.native_execution.finish(current);
+        assert!(!participant.native_execution_current(current, 100));
+        assert!(!participant.native_callback_fenced(current.binding));
+        assert!(!participant.native_execution.begin(old_scope));
+        assert!(!participant.native_execution.begin(other));
+        let unadmitted = crate::participant::policy::ExecutionScope {
+            binding: 3,
+            sequence: 5,
+            ..current
+        };
+        let retired = crate::participant::policy::ExecutionScope {
+            sequence: 6,
+            ..unadmitted
+        };
+        assert!(participant.native_execution.retire(retired));
+        assert!(!participant.native_execution.begin(unadmitted));
+        let replacement = crate::participant::policy::ExecutionScope {
+            sequence: 7,
+            ..unadmitted
+        };
+        assert!(participant.native_execution.begin(replacement));
+        assert!(!participant.native_execution.retire(retired));
+        assert!(participant.native_execution_current(replacement, 100));
+        participant.native_execution.fence(replacement.binding);
+        participant.native_execution.finish(replacement);
+        assert!(!participant.native_execution_current(replacement, 100));
+        assert!(participant.native_callback_fenced(replacement.binding));
+        let late = crate::participant::policy::ExecutionScope {
+            sequence: 8,
+            ..replacement
+        };
+        assert!(!participant.native_execution.begin(late));
+        let unrelated = crate::participant::policy::ExecutionScope {
+            binding: 4,
+            sequence: 9,
+            ..replacement
+        };
+        assert!(participant.native_execution.begin(unrelated));
+        assert!(participant.native_execution_current(unrelated, 100));
+        assert!(!participant.native_execution.retire(retired));
+        let retry = crate::participant::policy::ExecutionScope {
+            sequence: 10,
+            ..replacement
+        };
+        assert!(!participant.native_execution.begin(retry));
+        let retirement = crate::participant::policy::ExecutionScope {
+            sequence: 11,
+            ..replacement
+        };
+        assert!(participant.native_execution.retire(retirement));
+        assert!(participant.native_execution_current(unrelated, 100));
+        let observation = crate::participant::policy::ExecutionScope {
+            sequence: 12,
+            ..unrelated
+        };
+        assert!(participant.native_execution.advance(observation));
+        participant.native_execution.finish(observation);
+        assert!(participant.native_execution_current(unrelated, 100));
+        participant.native_execution.fence(replacement.binding);
+        let observation = crate::participant::policy::ExecutionScope {
+            sequence: 13,
+            ..replacement
+        };
+        assert!(!participant.native_execution.advance(observation));
+        assert!(participant.native_execution_current(unrelated, 100));
+        participant.disconnect(DisconnectReason::SignalingOutput);
+        assert!(participant.native_callback_fenced(unrelated.binding));
     }
 
     #[test]
@@ -1768,10 +2055,133 @@ mod upstream_route_table_tests {
             ssrc: Ssrc::from(ssrc),
             mid: Mid::from("0"),
             rid: None,
+            encoding: SourceEncoding::Rid(None),
             upstream_slot: UpstreamSlotKey::Audio(0),
             track_id: track_id("t"),
             fanout: None,
         }
+    }
+
+    #[test]
+    fn late_rid_and_authorization_fences_preserve_current_fanout() {
+        let now = Instant::now();
+        let participant_id = entity::ParticipantId::new();
+        let connection_id = entity::ConnectionId::new();
+        let mut connection = Connection::new(
+            ConnectionConfig {
+                manual_sub: false,
+                room_id: entity::RoomId::from_external(
+                    &entity::RoomExternalId::new("late-rid").unwrap(),
+                ),
+                participant_id,
+                participant_external_id: entity::ParticipantExternalId::new("peer").unwrap(),
+                connection_id,
+                profile: SignalingProtocol::Whip,
+                allow_topic_channels: true,
+                authorization_expiry: None,
+                rtc: crate::control::application_only_test_connection(),
+                resources: NegotiatedResources::empty_for_test(),
+            },
+            ShardId::new(0),
+            8,
+        );
+        let mid = Mid::from("video");
+        let rid = crate::media::Rid::from("q");
+        let (track, descriptor) = track::test_utils::make_video_track(
+            participant_id,
+            connection_id,
+            mid,
+            vec![crate::media::SimulcastLayer { rid }],
+        );
+        let track_id = descriptor.id();
+        assert!(
+            connection
+                .upstream
+                .add_published_track(0, mid, track, descriptor)
+        );
+        let slot = connection.upstream.slot_for_mid(mid).unwrap().0;
+        let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
+        let old = handles.insert(());
+        let current = handles.insert(());
+        connection.apply(ParticipantEffect::TrackPublished { track_id }, Some(old));
+        connection.upstream.cache_route(IncomingRtpRoute {
+            ssrc: 77u32.into(),
+            mid,
+            rid: None,
+            encoding: SourceEncoding::Rid(None),
+            upstream_slot: slot,
+            track_id,
+            fanout: Some(old),
+        });
+        connection
+            .transport
+            .register_encoding(pulsebeam_rtc::EncodingInfo {
+                mid: mid.as_str().into(),
+                ssrc: 77,
+                kind: MediaKind::Video,
+                rid: None,
+                payloads: Box::new([pulsebeam_rtc::RtpPayloadInfo {
+                    payload_type: 96,
+                    name: "h264".into(),
+                    clock_rate: 90_000,
+                }]),
+            });
+        let mut sink = crate::participant::event::test_utils::MockParticipantSink::new();
+        let mut builder = crate::rtp::test_utils::H264StreamBuilder::new(77, 1000, 90_000, now);
+        for authorized in [true, false, true] {
+            connection.authorization_expiry = (!authorized)
+                .then(|| pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(0));
+            let before = sink.publish_track_packet_calls.len();
+            for packet in builder.keyframe(2) {
+                let incoming = pulsebeam_rtc::RtpPacket {
+                    arrival: packet.arrival_ts.into(),
+                    header: pulsebeam_rtc::RtpHeader {
+                        sequence: u16::try_from(*packet.seq_no).unwrap(),
+                        timestamp: u32::try_from(packet.rtp_ts.numer()).unwrap(),
+                        ssrc: 77,
+                        payload_type: 96,
+                        marker: packet.marker,
+                    },
+                    payload: bytes::Bytes::copy_from_slice(&packet.payload),
+                    extensions: Vec::new(),
+                };
+                connection.handle_incoming_rtp(incoming, mid, Some(rid), &mut sink);
+            }
+            if authorized {
+                assert!(sink.publish_track_packet_calls.len() > before);
+            } else {
+                assert_eq!(sink.publish_track_packet_calls.len(), before);
+            }
+        }
+        let cached = connection.upstream.route_for_ssrc(77u32.into()).unwrap();
+        assert_eq!(cached.rid, Some(rid));
+        assert_eq!(cached.encoding, SourceEncoding::Rid(Some(rid)));
+        assert!(!sink.publish_track_packet_calls.is_empty());
+        assert!(
+            sink.publish_track_packet_calls
+                .iter()
+                .all(|handle| *handle == old)
+        );
+
+        connection.apply(
+            ParticipantEffect::TrackPublished { track_id },
+            Some(current),
+        );
+        connection.apply(ParticipantEffect::TrackUnpublished { track_id }, Some(old));
+        assert_eq!(connection.upstream.track_fanout(track_id), Some(current));
+        assert_eq!(connection.upstream.track_for_fanout(old), None);
+        assert_eq!(
+            connection.upstream.track_for_fanout(current),
+            Some(track_id)
+        );
+        assert_eq!(
+            connection
+                .upstream
+                .route_for_ssrc(77u32.into())
+                .unwrap()
+                .fanout,
+            Some(current)
+        );
     }
 
     /// The table used to be direct-mapped on `ssrc % MAX_UPSTREAM_ENCODED_STREAMS`,

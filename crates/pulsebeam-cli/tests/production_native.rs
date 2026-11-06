@@ -170,7 +170,7 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
                 }
             }
         }
-    }).await;
+    }).await.with_context(|| format!("production decoded-media deadline: publisher={:?}, subscriber={:?}", publisher.snapshot(), subscriber.snapshot()));
     producer.abort();
     let _ = producer.await;
     let retained = media

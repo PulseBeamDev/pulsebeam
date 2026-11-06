@@ -435,19 +435,7 @@ impl IngressOwner {
             }
         }
         for (key, active) in update.active {
-            if active {
-                self.active.insert(key);
-            } else {
-                self.active.remove(&key);
-            }
-            if let Some(owned) = self.encodings_by_media.get(&key) {
-                for ssrc in owned {
-                    if let Some(encoding) = self.encodings.get_mut(ssrc) {
-                        encoding.retired = !active;
-                    }
-                }
-            }
-            self.index_media(key);
+            self.set_media_active(key, active);
         }
         for (ssrc, charge) in update.runtime {
             if let Some(charge) = charge {
@@ -462,6 +450,36 @@ impl IngressOwner {
         self.strict = true;
         self.mid_extension_id = self.mid_candidates.first_key_value().map(|(_, id)| *id);
         retired.into_iter().collect()
+    }
+
+    pub(crate) fn set_encoding_active(
+        &mut self,
+        primary: u32,
+        active: bool,
+    ) -> Result<(), crate::RtpConfigurationError> {
+        let key = *self
+            .declared_primary
+            .get(&primary)
+            .ok_or(crate::RtpConfigurationError::ConnectionState)?;
+        self.unindex_media(key);
+        self.set_media_active(key, active);
+        Ok(())
+    }
+
+    fn set_media_active(&mut self, key: u64, active: bool) {
+        if active {
+            self.active.insert(key);
+        } else {
+            self.active.remove(&key);
+        }
+        if let Some(owned) = self.encodings_by_media.get(&key) {
+            for ssrc in owned {
+                if let Some(encoding) = self.encodings.get_mut(ssrc) {
+                    encoding.retired = !active;
+                }
+            }
+        }
+        self.index_media(key);
     }
 
     fn remove_media_owner(index: &mut BTreeMap<u32, u64>, ssrc: u32, media: u64) {

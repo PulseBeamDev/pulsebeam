@@ -71,6 +71,7 @@ pub struct VideoAllocator {
     routes: SecondaryMap<TrackHandle, DownstreamSlotKey>,
     slots: SlotMap<DownstreamSlotKey, Slot>,
     owned_slots: HashMap<Mid, DownstreamSlotKey>,
+    negotiated_slots: usize,
 
     // Cold
     ctx: LogCtx,
@@ -134,6 +135,7 @@ impl VideoAllocator {
             slots: slotmap::SlotMap::with_capacity_and_key(VIDEO_MAX_SLOTS),
             routes: SecondaryMap::new(),
             owned_slots: HashMap::new(),
+            negotiated_slots: 0,
             last_reconciled: HashSet::new(),
             desired_ctrl,
             current_allocation: Bitrate::ZERO,
@@ -359,7 +361,12 @@ impl VideoAllocator {
         }
         let slot = Slot::new(self.ctx, config);
         self.slots.insert(slot);
+        self.negotiated_slots = self.negotiated_slots.saturating_add(1);
         self.rebalance();
+    }
+
+    pub(crate) fn has_negotiated_slots(&self) -> bool {
+        self.negotiated_slots > 0
     }
 
     fn rebalance(&mut self) {

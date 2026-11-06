@@ -1,4 +1,5 @@
 use std::array;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ahash::{HashSet, HashSetExt};
@@ -38,6 +39,7 @@ pub struct AudioAllocator {
     ctx: LogCtx,
     /// M ≤ N provisioned slots; `None` entries are unfilled.
     slots: [Option<Slot>; SELECTOR_SLOTS],
+    owned_slots: BTreeMap<Mid, Slot>,
     speakers_changed: bool,
     /// What the client asked for. Auto with no pins until it says otherwise,
     /// which is what the SFU did before a client could say anything about audio.
@@ -55,6 +57,10 @@ impl DownstreamAudio {
         Self {
             allocator: AudioAllocator::new(ctx, manual_sub),
         }
+    }
+
+    pub(crate) fn owned_slot_bytes() -> usize {
+        std::mem::size_of::<(Mid, Slot)>()
     }
 }
 
@@ -74,7 +80,7 @@ impl DerefMut for DownstreamAudio {
 
 /// A subscriber's audio selection policy.
 pub struct Slot {
-    media_index: u32,
+    media_index: Option<u32>,
     pt: Pt,
     mid: Mid,
     ssrc: Ssrc,
@@ -98,6 +104,21 @@ pub struct Slot {
 }
 
 impl Slot {
+    fn new(media_index: Option<u32>, mid: Mid, ssrc: Ssrc, pt: Pt) -> Self {
+        Self {
+            media_index,
+            pt,
+            mid,
+            ssrc,
+            pending_marker: media_index.is_some(),
+            occupant: None,
+            last_arrival_ts: None,
+            immunity_expiry: Instant::now(),
+            last_power: 0.0,
+            timeline: Timeline::new(AUDIO_FREQUENCY),
+        }
+    }
+
     /// No owner, or an owner silent for longer than [`DEAD_TIMEOUT`].
     fn is_dead(&self, now: Instant) -> bool {
         match (self.occupant, self.last_arrival_ts) {
@@ -131,6 +152,7 @@ impl AudioAllocator {
         Self {
             ctx,
             slots: array::from_fn(|_| None),
+            owned_slots: BTreeMap::new(),
             speakers_changed: false,
             // Manual means the client drives everything, audio included: it
             // hears nothing until it asks, exactly as it sees no video until it
@@ -222,18 +244,12 @@ impl AudioAllocator {
         }
         for entry in &mut self.slots {
             if entry.is_none() {
-                *entry = Some(Slot {
-                    media_index: slot.media_index,
-                    mid: slot.mid,
-                    pt: slot.pt,
-                    ssrc: slot.ssrc,
-                    pending_marker: true,
-                    occupant: None,
-                    last_arrival_ts: None,
-                    immunity_expiry: Instant::now(),
-                    last_power: 0.0,
-                    timeline: Timeline::new(AUDIO_FREQUENCY),
-                });
+                *entry = Some(Slot::new(
+                    Some(slot.media_index),
+                    slot.mid,
+                    slot.ssrc,
+                    slot.pt,
+                ));
                 return;
             }
         }
@@ -268,7 +284,44 @@ impl AudioAllocator {
     }
 
     pub fn has_slot(&self, mid: Mid) -> bool {
-        self.slots.iter().flatten().any(|slot| slot.mid == mid)
+        self.owned_slots.contains_key(&mid)
+            || self.slots.iter().flatten().any(|slot| slot.mid == mid)
+    }
+
+    pub(crate) fn has_negotiated_slots(&self) -> bool {
+        self.slots.iter().any(Option::is_some)
+    }
+
+    pub(crate) fn install_owned_slot(&mut self, mid: Mid, ssrc: Ssrc, pt: Pt) -> bool {
+        if self.has_slot(mid) {
+            return false;
+        }
+        self.owned_slots.insert(mid, Slot::new(None, mid, ssrc, pt));
+        true
+    }
+
+    pub(crate) fn remove_owned_slot(&mut self, mid: Mid) {
+        self.owned_slots.remove(&mid);
+    }
+
+    pub(crate) fn on_owned_rtp(
+        &mut self,
+        mid: Mid,
+        source: TrackId,
+        packet: &RtpPacket,
+        writer: &mut StreamWriter,
+    ) {
+        let Some(slot) = self.owned_slots.get_mut(&mid) else {
+            return;
+        };
+        if slot.last_arrival_ts.is_none() {
+            slot.timeline.rebase_audio(packet);
+        }
+        slot.last_arrival_ts = Some(packet.arrival_ts);
+        let mut packet = packet.clone();
+        if slot.timeline.rewrite_audio(&mut packet) {
+            writer.write_audio_owned(packet, source, slot.mid, slot.ssrc, slot.pt);
+        }
     }
 
     pub(crate) fn receiver_index(&self, mid: Mid) -> Option<u32> {
@@ -276,7 +329,7 @@ impl AudioAllocator {
             .iter()
             .flatten()
             .find(|slot| slot.mid == mid)
-            .map(|slot| slot.media_index)
+            .and_then(|slot| slot.media_index)
     }
 
     /// Whether someone new took over a slot since this was last asked.
@@ -524,6 +577,69 @@ mod tests {
 
     fn heard_origins(alloc: &AudioAllocator) -> Vec<AudioOrigin> {
         alloc.assignments().into_iter().map(|h| h.origin).collect()
+    }
+
+    #[test]
+    fn owned_audio_preserves_fixed_forwarding_without_joining_contest() {
+        let mut alloc = allocator_with(1);
+        let mid = Mid::from("owned");
+        let source = origin(7).track;
+        assert!(alloc.install_owned_slot(mid, 42u32.into(), 109u8.into()));
+        assert!(!alloc.install_owned_slot(mid, 43u32.into(), 109u8.into()));
+        let mut packet = RtpPacket::default();
+        packet.seq_no = 1000u64.into();
+        packet.rtp_ts = crate::rtp::MediaTime::new(48_000, AUDIO_FREQUENCY);
+        packet.marker = false;
+        assert!(packet.ext_vals.audio_level.is_none());
+        let mut writer = StreamWriter::new();
+        alloc.on_owned_rtp(mid, source, &packet, &mut writer);
+        let Some(crate::track::StreamWrite::Audio {
+            pkt: first,
+            track_id,
+            mid: written_mid,
+            ssrc,
+            pt,
+        }) = writer.pop()
+        else {
+            panic!("fixed receiver must forward audio without an audio-level extension");
+        };
+        assert_eq!(
+            (track_id, written_mid, ssrc, pt),
+            (source, mid, 42u32.into(), 109u8.into())
+        );
+        assert!(!first.marker);
+        assert!(alloc.assignments().is_empty());
+        assert!(!alloc.take_speakers_changed());
+
+        packet.seq_no = 1001u64.into();
+        packet.rtp_ts = crate::rtp::MediaTime::new(48_960, AUDIO_FREQUENCY);
+        alloc.on_owned_rtp(mid, source, &packet, &mut writer);
+        let Some(crate::track::StreamWrite::Audio { pkt: second, .. }) = writer.pop() else {
+            panic!("fixed receiver must keep forwarding its source");
+        };
+        assert_eq!(*second.seq_no, first.seq_no.checked_add(1).unwrap());
+        assert_eq!(
+            second.rtp_ts.numer(),
+            first.rtp_ts.numer().checked_add(960).unwrap()
+        );
+        assert!(!second.marker);
+
+        packet.seq_no = 1002u64.into();
+        packet.rtp_ts = crate::rtp::MediaTime::new(49_920, AUDIO_FREQUENCY);
+        packet.ext_vals.audio_level = Some(-30);
+        alloc.on_owned_rtp(mid, source, &packet, &mut writer);
+        alloc.on_rtp(origin(7), &packet, &mut writer).unwrap();
+        assert!(
+            matches!(writer.pop(), Some(crate::track::StreamWrite::Audio { mid: written, .. }) if written == mid)
+        );
+        assert!(
+            matches!(writer.pop(), Some(crate::track::StreamWrite::Audio { mid: written, .. }) if written == Mid::from("a0"))
+        );
+        assert_eq!(alloc.assignments().len(), 1);
+
+        alloc.remove_owned_slot(mid);
+        alloc.on_owned_rtp(mid, source, &packet, &mut writer);
+        assert!(writer.pop().is_none());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::{
-    control::controller::ConnectionProfile,
+    control::controller::SignalingProtocol,
     entity::{ConnectionId, RoomExternalId},
 };
 use pulsebeam_runtime::rt::WorkerSnapshot;
@@ -27,7 +27,7 @@ fn commit(
             slot,
             transport,
             ConnectionId::new(),
-            ConnectionProfile::Native,
+            SignalingProtocol::State,
             None,
         )
         .unwrap();

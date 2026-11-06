@@ -8,7 +8,7 @@ use slotmap::SlotMap;
 use crate::{
     entity::ParticipantId,
     id::ShardId,
-    participant::{ParticipantConfig, ParticipantCore},
+    participant::{Connection, ConnectionConfig},
     route::NodeTransportAddress,
     shard::demux::Demuxer,
 };
@@ -16,22 +16,22 @@ use crate::{
 pub(crate) use crate::keys::ParticipantHandle;
 
 pub(crate) struct ParticipantMeta {
-    core: ParticipantCore,
+    connection: Connection,
     pub(super) queued_dirty: bool,
     pub(super) ingress: NodeTransportAddress,
 }
 
 impl Deref for ParticipantMeta {
-    type Target = ParticipantCore;
+    type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        &self.core
+        &self.connection
     }
 }
 
 impl DerefMut for ParticipantMeta {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.core
+        &mut self.connection
     }
 }
 
@@ -67,7 +67,7 @@ impl ParticipantRegistry {
 
     pub fn insert(
         &mut self,
-        cfg: ParticipantConfig,
+        cfg: ConnectionConfig,
         ingress: NodeTransportAddress,
     ) -> ParticipantHandle {
         debug_assert_eq!(ingress.shard(), self.shard_id);
@@ -75,9 +75,9 @@ impl ParticipantRegistry {
         if let Some(previous) = self.by_id.get(&participant_id).copied() {
             let _ = self.remove_handle(previous);
         }
-        let core = ParticipantCore::new(cfg, self.shard_id, self.max_gso_segments);
+        let connection = Connection::new(cfg, self.shard_id, self.max_gso_segments);
         let handle = self.participants.insert(Box::new(ParticipantMeta {
-            core,
+            connection,
             queued_dirty: false,
             ingress,
         }));

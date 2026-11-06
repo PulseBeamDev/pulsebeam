@@ -118,11 +118,6 @@ impl NegotiatedSessionFacts {
         self.feedback
     }
 
-    pub(crate) fn set_feedback_profile(&mut self, profile: PacketFeedbackKind) {
-        self.feedback = Some(profile);
-        self.inbound_feedback = Some(profile);
-    }
-
     pub(crate) const fn inbound_feedback(&self) -> Option<PacketFeedbackKind> {
         self.inbound_feedback
     }
@@ -1973,7 +1968,7 @@ fn format_answer(mids: &[String], sections: &[String], allow_mixed: bool) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Connection, ConnectionEntropy};
+    use crate::{ConnectionEntropy, RtcConnection};
     use std::{net::SocketAddr, time::Instant};
 
     fn at() -> Instant {
@@ -2007,7 +2002,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\r\n");
             assert!(!value.contains("a=candidate:"));
-            let result = Connection::accept(
+            let result = RtcConnection::accept(
                 config(),
                 SdpOffer::new(value),
                 at(),
@@ -2089,7 +2084,7 @@ mod tests {
         for repair in [false, true] {
             let mut capabilities = capabilities.clone();
             capabilities.codecs[1].repair = repair;
-            let mut accepted = Connection::accept(
+            let mut accepted = RtcConnection::accept(
                 ConnectionConfig {
                     rtp_capabilities: Some(capabilities.clone()),
                     ..config()
@@ -2263,7 +2258,7 @@ mod tests {
         let mut local = config();
         local.limits.max_inbound_data_message_bytes = 0;
         local.limits.max_buffered_data_bytes = 0;
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             local,
             offer,
             at(),
@@ -2296,7 +2291,7 @@ mod tests {
             ("chrome", None),
             ("firefox", Some(PacketFeedbackKind::TransportWide)),
         ] {
-            let result = Connection::accept(
+            let result = RtcConnection::accept(
                 config(),
                 fixture(name),
                 at(),
@@ -2369,7 +2364,7 @@ mod tests {
                 .replace("a=mid:1", "a=mid:videoOut")
                 .replace("a=mid:2", "a=mid:data"),
         );
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             config(),
             offer,
             at(),
@@ -2394,7 +2389,7 @@ mod tests {
     #[test]
     fn acceptance_requires_candidates_before_offer_parsing() {
         assert_eq!(
-            Connection::accept(
+            RtcConnection::accept(
                 ConnectionConfig::default(),
                 SdpOffer::new("not an SDP offer"),
                 at(),
@@ -2483,7 +2478,7 @@ mod tests {
             local_candidates: vec![configured[1]],
             ..ConnectionConfig::default()
         };
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             tcp_only,
             fixture("chrome"),
             at(),
@@ -2501,7 +2496,7 @@ mod tests {
                 .collect(),
             ..ConnectionConfig::default()
         };
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             sixteen,
             fixture("firefox"),
             at(),
@@ -2575,7 +2570,7 @@ mod tests {
             "a=sendonly",
             &format!("a=sendonly\na=extmap:6/recvonly {PLAYOUT_DELAY_URI}"),
         ));
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             config(),
             offer,
             at(),
@@ -2676,7 +2671,7 @@ mod tests {
                 &format!("a=extmap:3/{direction} http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01"),
             ));
             assert_eq!(
-                Connection::accept(
+                RtcConnection::accept(
                     config(),
                     without_fallback,
                     at(),
@@ -2701,7 +2696,7 @@ mod tests {
                     &format!("a=extmap:3/{direction} http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01"),
                 ),
             );
-            let accepted = Connection::accept(
+            let accepted = RtcConnection::accept(
                 config(),
                 with_fallback,
                 at(),
@@ -2717,7 +2712,7 @@ mod tests {
             "a=extmap:3/sendonly http://www.webrtc.org/experiments/rtp-hdrext/transport-wide-cc-01",
         ));
         assert_eq!(
-            Connection::accept(
+            RtcConnection::accept(
                 config(),
                 incompatible,
                 at(),
@@ -2744,7 +2739,7 @@ mod tests {
                     1,
                 ),
         );
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             config(),
             one_ineligible,
             at(),
@@ -2760,7 +2755,7 @@ mod tests {
                 .replace("a=sendonly", "a=inactive"),
         );
         assert_eq!(
-            Connection::accept(
+            RtcConnection::accept(
                 config(),
                 no_active_rtp,
                 at(),
@@ -2817,7 +2812,7 @@ mod tests {
 
     #[test]
     fn rid_and_every_simulcast_direction_group_are_inverted_by_syntax() {
-        let chrome = Connection::accept(
+        let chrome = RtcConnection::accept(
             config(),
             fixture("chrome"),
             at(),
@@ -2850,7 +2845,7 @@ mod tests {
                     "a=simulcast:recv sender_recv send ~receiver_send",
                 ),
         );
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             config(),
             two_directions,
             at(),
@@ -2880,7 +2875,7 @@ mod tests {
 
     #[test]
     fn deterministic_entropy_produces_deterministic_secret_safe_answers() {
-        let first_result = Connection::accept(
+        let first_result = RtcConnection::accept(
             config(),
             fixture("chrome"),
             at(),
@@ -2891,7 +2886,7 @@ mod tests {
             Ok(accepted) => accepted,
             Err(error) => panic!("first acceptance failed: {error}"),
         };
-        let second_result = Connection::accept(
+        let second_result = RtcConnection::accept(
             config(),
             fixture("chrome"),
             at(),
@@ -2902,7 +2897,7 @@ mod tests {
             Ok(accepted) => accepted,
             Err(error) => panic!("second acceptance failed: {error}"),
         };
-        let different_result = Connection::accept(
+        let different_result = RtcConnection::accept(
             config(),
             fixture("chrome"),
             at(),
@@ -2992,7 +2987,7 @@ mod tests {
             "a=rtcp-fb:120 transport-cc",
             "a=rtcp-fb:120 transport-cc\r\na=rtcp-fb:120 ccfb",
         ));
-        let both_result = Connection::accept(
+        let both_result = RtcConnection::accept(
             config(),
             both,
             at(),
@@ -3012,7 +3007,7 @@ mod tests {
                 .as_str()
                 .replace("a=rtcp-fb:120 transport-cc", "a=rtcp-fb:120 ccfb"),
         );
-        let rfc_result = Connection::accept(
+        let rfc_result = RtcConnection::accept(
             config(),
             rfc,
             at(),
@@ -3031,7 +3026,7 @@ mod tests {
         let source = fixture("chrome");
         assert!(source.as_str().contains("m=video 9 "));
         let offer = SdpOffer::new(source.as_str().replace("m=video 9 ", "m=video 0 "));
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             config(),
             offer,
             at(),
@@ -3052,7 +3047,7 @@ mod tests {
             "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\nc=IN IP4 0.0.0.0",
             "m=application 0 UDP/DTLS/SCTP webrtc-datachannel\nc=IN IP4 0.0.0.0\na=bundle-only",
         ));
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             config(),
             offer,
             at(),
@@ -3089,7 +3084,7 @@ mod tests {
                 + "\r\n",
         );
         assert_eq!(
-            Connection::accept(
+            RtcConnection::accept(
                 config(),
                 no_feedback,
                 at(),
@@ -3101,7 +3096,7 @@ mod tests {
         );
         let no_bundle = SdpOffer::new(source.as_str().replace("a=group:BUNDLE 0 1 2", ""));
         assert!(matches!(
-            Connection::accept(
+            RtcConnection::accept(
                 config(),
                 no_bundle,
                 at(),
@@ -3116,7 +3111,7 @@ mod tests {
                 .replace("a=setup:actpass", "a=setup:actpass\r\na=ice-lite"),
         );
         assert!(matches!(
-            Connection::accept(
+            RtcConnection::accept(
                 config(),
                 remote_lite,
                 at(),
@@ -3131,7 +3126,7 @@ mod tests {
     fn input_bounds_are_enforced() {
         let oversized = SdpOffer::new("x".repeat(MAX_SDP_BYTES + 1));
         assert!(matches!(
-            Connection::accept(
+            RtcConnection::accept(
                 config(),
                 oversized,
                 at(),
@@ -3147,7 +3142,7 @@ mod tests {
         let source = fixture("chrome");
         let no_mux = SdpOffer::new(source.as_str().replacen("a=rtcp-mux", "", 1));
         assert_eq!(
-            Connection::accept(
+            RtcConnection::accept(
                 config(),
                 no_mux,
                 at(),
@@ -3163,7 +3158,7 @@ mod tests {
                 .replace("a=fingerprint:sha-256 01:02:03:04:05:06:07:08:09:0a:0b:0c:0d:0e:0f:10:11:12:13:14:15:16:17:18:19:1a:1b:1c:1d:1e:1f:20", ""),
         );
         assert_eq!(
-            Connection::accept(
+            RtcConnection::accept(
                 config(),
                 no_fingerprint,
                 at(),

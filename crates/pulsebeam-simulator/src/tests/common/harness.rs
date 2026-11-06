@@ -550,6 +550,7 @@ pub enum Step {
         duration: Duration,
     },
     WaitForControllerStallEnd,
+    CheckNativeInputDuringControllerStall,
     ReconnectThroughForeignShard {
         description: &'static str,
         participant: &'static str,
@@ -1769,6 +1770,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::WaitForVideoAtResolution { .. } => "WaitForVideoAtResolution",
         Step::BeginControllerStall { .. } => "BeginControllerStall",
         Step::WaitForControllerStallEnd => "WaitForControllerStallEnd",
+        Step::CheckNativeInputDuringControllerStall => "CheckNativeInputDuringControllerStall",
         Step::ReconnectThroughForeignShard { .. } => "ReconnectThroughForeignShard",
         Step::FailNextMaterialization { .. } => "FailNextMaterialization",
         Step::Partition { .. } => "Partition",
@@ -2342,6 +2344,17 @@ async fn execute_plan(
                     "media checkpoint did not precede hold end"
                 );
                 tokio::time::sleep(until.saturating_duration_since(Instant::now())).await;
+            }
+
+            Step::CheckNativeInputDuringControllerStall => {
+                anyhow::ensure!(
+                    controller_stall_until.is_some_and(|until| Instant::now() < until),
+                    "native input checkpoint must occur while the controller is held"
+                );
+                anyhow::ensure!(
+                    pulsebeam::sim_metrics::stalled_native_inputs() > 0,
+                    "no native input was admitted during the controller hold"
+                );
             }
 
             Step::ReconnectThroughForeignShard {

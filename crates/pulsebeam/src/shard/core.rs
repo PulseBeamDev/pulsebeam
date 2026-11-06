@@ -9,7 +9,7 @@ use crate::shard::events::{ParticipantBindingEvent, ParticipantEvent, Participan
 use crate::{
     keys::ParticipantHandle,
     participant::{
-        ParticipantConfig,
+        ConnectionConfig,
         batcher::{AppendStatus, GsoSendBatch, NetworkEgress, OwnedPacketQueue},
     },
     shard::{
@@ -74,7 +74,7 @@ pub(crate) struct ShardExecution {
     pub(crate) shard_id: crate::id::ShardId,
     registry: ParticipantRegistry,
     pending_replacements:
-        std::collections::VecDeque<(crate::route::NodeTransportAddress, ParticipantConfig)>,
+        std::collections::VecDeque<(crate::route::NodeTransportAddress, ConnectionConfig)>,
     pub(super) runtime: ShardRuntime,
     plans: SecondaryMap<crate::keys::TrackHandle, crate::shard::router::InstalledTrackPlan>,
     timers: TimerWheel,
@@ -714,6 +714,18 @@ impl ShardExecution {
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_routing_counter("demux_flow_authenticated");
             }
+            ShardCommand::NativeReady {
+                participant,
+                connection_id,
+            } => {
+                if let Some(key) = self.registry.resolve(&participant)
+                    && let Some(current) = self.registry.resolve_mut(key)
+                    && current.connection_id == connection_id
+                {
+                    current.native_ready();
+                    self.dirty.mark(key, current);
+                }
+            }
             ShardCommand::PublicationCutoffResult {
                 participant,
                 connection_id,
@@ -827,7 +839,7 @@ impl ShardExecution {
     fn add_participant(
         &mut self,
         transport: crate::route::NodeTransportAddress,
-        cfg: ParticipantConfig,
+        cfg: ConnectionConfig,
     ) -> bool {
         debug_assert_eq!(transport.shard(), self.shard_id);
         if let Some(previous) = self.registry.resolve(&cfg.participant_id) {
@@ -1094,12 +1106,20 @@ mod wrong_owner_tests {
                 &crate::entity::RoomExternalId::new("connected-flow").unwrap(),
             );
             let address = NodeTransportAddress::new(TransportRoute::new(owner, 51), 7);
+            let handoffs = std::cell::RefCell::new(Vec::new());
             let materialize = |core: &mut ShardCore| {
+                let mut resources = crate::control::NegotiatedResources::empty_for_test();
+                handoffs
+                    .borrow_mut()
+                    .push(crate::control::native::fixture::execution_handoff(
+                        &mut resources,
+                        connection_id,
+                    ));
                 let (ack, received) = pulsebeam_runtime::sync::oneshot::channel();
                 core.on_command(
                     ShardCommand::MaterializeParticipant {
                         transport: address,
-                        config: Box::new(ParticipantConfig {
+                        config: Box::new(ConnectionConfig {
                             manual_sub: false,
                             room_id,
                             participant_id,
@@ -1108,10 +1128,11 @@ mod wrong_owner_tests {
                             )
                             .unwrap(),
                             connection_id,
-                            profile: crate::control::controller::ConnectionProfile::Native,
+                            profile: crate::control::controller::SignalingProtocol::State,
+                            allow_topic_channels: false,
                             authorization_expiry: None,
                             rtc: crate::control::application_only_test_connection(),
-                            resources: crate::control::NegotiatedResources::empty_for_test(),
+                            resources,
                         }),
                         ack,
                     },
@@ -1188,18 +1209,31 @@ mod wrong_owner_tests {
             let participant = crate::entity::ParticipantId::new();
             let old_address = NodeTransportAddress::new(TransportRoute::new(shard, 51), 1);
             let new_address = NodeTransportAddress::new(TransportRoute::new(shard, 52), 1);
-            let config = || ParticipantConfig {
-                manual_sub: false,
-                room_id: crate::entity::RoomId::from_external(
-                    &crate::entity::RoomExternalId::new("room").unwrap(),
-                ),
-                participant_id: participant,
-                participant_external_id: crate::entity::ParticipantExternalId::new("peer").unwrap(),
-                connection_id: crate::entity::ConnectionId::new(),
-                profile: crate::control::controller::ConnectionProfile::Native,
-                authorization_expiry: None,
-                rtc: crate::control::application_only_test_connection(),
-                resources: crate::control::NegotiatedResources::empty_for_test(),
+            let handoffs = std::cell::RefCell::new(Vec::new());
+            let config = || {
+                let connection_id = crate::entity::ConnectionId::new();
+                let mut resources = crate::control::NegotiatedResources::empty_for_test();
+                handoffs
+                    .borrow_mut()
+                    .push(crate::control::native::fixture::execution_handoff(
+                        &mut resources,
+                        connection_id,
+                    ));
+                ConnectionConfig {
+                    manual_sub: false,
+                    room_id: crate::entity::RoomId::from_external(
+                        &crate::entity::RoomExternalId::new("room").unwrap(),
+                    ),
+                    participant_id: participant,
+                    participant_external_id: crate::entity::ParticipantExternalId::new("peer")
+                        .unwrap(),
+                    connection_id,
+                    profile: crate::control::controller::SignalingProtocol::State,
+                    allow_topic_channels: false,
+                    authorization_expiry: None,
+                    rtc: crate::control::application_only_test_connection(),
+                    resources,
+                }
             };
             let materialize = |core: &mut ShardCore, address, config| {
                 let (ack, received) = pulsebeam_runtime::sync::oneshot::channel();

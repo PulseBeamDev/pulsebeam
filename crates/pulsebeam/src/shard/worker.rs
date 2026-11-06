@@ -25,7 +25,7 @@ use pulsebeam_runtime::time::Instant;
 use crate::{
     entity::ParticipantId,
     id::ShardId,
-    participant::{ParticipantConfig, RoutedTrackPacket},
+    participant::{ConnectionConfig, RoutedTrackPacket},
     shard::metrics::ShardMetrics,
     shard::recorder::{ShardRecorder, ShardStatsReport},
     track::Track,
@@ -100,6 +100,7 @@ const STATS_DEADLINE_SLACK: Duration = STATS_REPORT_INTERVAL;
 /// shard always reports. Repeating these per tick would be harmless but
 /// pointless; the recorder ignores a description it already has.
 fn describe_shard_metrics() {
+    crate::control::native::handoff::describe_metrics();
     metrics::describe_gauge!(
         "participants_live",
         "participants this shard currently owns"
@@ -159,12 +160,16 @@ pub(crate) enum ShardError {
 pub(crate) enum ShardCommand {
     MaterializeParticipant {
         transport: crate::route::NodeTransportAddress,
-        config: Box<ParticipantConfig>,
+        config: Box<ConnectionConfig>,
         ack: pulsebeam_runtime::sync::oneshot::Sender<bool>,
     },
     AuthenticateTransport {
         source: std::net::SocketAddr,
         address: crate::route::NodeTransportAddress,
+    },
+    NativeReady {
+        participant: ParticipantId,
+        connection_id: crate::entity::ConnectionId,
     },
     PublicationCutoffResult {
         participant: ParticipantId,

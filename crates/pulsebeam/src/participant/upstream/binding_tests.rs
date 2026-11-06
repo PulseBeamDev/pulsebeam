@@ -26,6 +26,50 @@ fn add_audio(
 }
 
 #[test]
+fn managed_slots_share_storage_without_reusing_keys_or_consuming_sdp_capacity() {
+    let (mut upstream, participant, connection) = publisher();
+    let managed_mid = Mid::from("managed");
+    let (managed, _) = track::test_utils::make_audio_track(participant, connection, managed_mid);
+    let managed_id = managed.meta.id;
+    let old = upstream.insert_managed_track(managed_mid, managed).unwrap();
+
+    for index in 0..MAX_UPSTREAM_SLOT_PER_TYPE {
+        add_audio(
+            &mut upstream,
+            participant,
+            connection,
+            u32::try_from(index).unwrap(),
+            &format!("sdp{index}"),
+        );
+    }
+    upstream
+        .bind_sender_labels_atomically(&[(0, TrackKind::Audio, "microphone")])
+        .unwrap();
+    let first = upstream.slot_for_mid(Mid::from("sdp0")).unwrap();
+    assert_eq!(
+        first.1,
+        connection.derive_track_id(TrackKind::Audio, "microphone")
+    );
+    let overflow_mid = Mid::from("overflow");
+    let (overflow, descriptor) =
+        track::test_utils::make_audio_track(participant, connection, overflow_mid);
+    assert!(!upstream.add_published_track(32, overflow_mid, overflow, descriptor));
+    assert!(upstream.track_mut(old).is_some());
+
+    upstream.remove_managed_track(old, managed_id);
+    assert!(upstream.track_mut(old).is_none());
+    let (replacement, _) =
+        track::test_utils::make_audio_track(participant, connection, managed_mid);
+    let new = upstream
+        .insert_managed_track(managed_mid, replacement)
+        .unwrap();
+    assert_ne!(old, new);
+    assert_eq!(upstream.slot_for_mid(Mid::from("sdp0")), Some(first));
+    upstream.remove_managed_track(old, managed_id);
+    assert!(upstream.track_mut(new).is_some());
+}
+
+#[test]
 fn sender_labels_replace_provisional_mid_identity_once() {
     let (mut upstream, participant, connection) = publisher();
     add_audio(&mut upstream, participant, connection, 0, "offer-mid");
@@ -145,6 +189,49 @@ fn sender_label_batch_rejects_all_on_late_failure_and_permits_identity_swap() {
         .unwrap();
     assert_eq!(upstream.track_for_sender_index(0), provisional_b);
     assert_eq!(upstream.track_for_sender_index(1), provisional_a);
+}
+
+#[test]
+fn fanout_lookup_distinguishes_track_kinds_with_equal_identity_bytes() {
+    let (mut upstream, _, _) = publisher();
+    let bytes = [7; 16];
+    let audio = TrackId::Audio(entity::AudioTrackId::from_bytes(bytes));
+    let video = TrackId::Video(entity::VideoTrackId::from_bytes(bytes));
+    let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
+    let audio_handle = handles.insert(());
+    let video_handle = handles.insert(());
+
+    upstream.bind_track_handle(audio, audio_handle);
+    upstream.bind_track_handle(video, video_handle);
+    assert_eq!(upstream.track_fanout(audio), Some(audio_handle));
+    assert_eq!(upstream.track_fanout(video), Some(video_handle));
+    assert_eq!(upstream.track_for_fanout(audio_handle), Some(audio));
+    assert_eq!(upstream.track_for_fanout(video_handle), Some(video));
+    upstream.unbind_track_handle(audio, audio_handle);
+    assert_eq!(upstream.track_fanout(video), Some(video_handle));
+}
+
+#[test]
+fn fanout_rebinding_and_stale_unbind_preserve_current_track() {
+    let (mut upstream, _, connection) = publisher();
+    let first = connection.derive_track_id(TrackKind::Audio, "first");
+    let second = connection.derive_track_id(TrackKind::Audio, "second");
+    let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
+    let old = handles.insert(());
+    let current = handles.insert(());
+
+    upstream.bind_track_handle(first, old);
+    upstream.bind_track_handle(first, current);
+    upstream.unbind_track_handle(first, old);
+    assert_eq!(upstream.track_for_fanout(old), None);
+    assert_eq!(upstream.track_for_fanout(current), Some(first));
+
+    upstream.bind_track_handle(second, current);
+    upstream.unbind_track_handle(first, current);
+    assert_eq!(upstream.track_fanout(first), None);
+    assert_eq!(upstream.track_for_fanout(current), Some(second));
+    upstream.unbind_track_handle(second, current);
+    assert_eq!(upstream.track_for_fanout(current), None);
 }
 
 #[test]

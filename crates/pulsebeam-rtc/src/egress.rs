@@ -594,31 +594,51 @@ impl MediaEgress {
             })
     }
 
+    pub(crate) fn set_encoding_active(
+        &mut self,
+        primary: u32,
+        active: bool,
+    ) -> Result<(), crate::RtpConfigurationError> {
+        let key = *self
+            .by_ssrc
+            .get(&primary)
+            .ok_or(crate::RtpConfigurationError::ConnectionState)?;
+        self.set_sender_active(key, active);
+        Ok(())
+    }
+
+    fn set_sender_active(&mut self, key: u64, active: bool) {
+        let Some(sender) = self.senders.get_mut(&key) else {
+            return;
+        };
+        sender.active = active;
+        if !active {
+            sender.keyframe_requested = false;
+            self.keyframe_ready.remove(&key);
+            self.rtcp_senders.remove(&key);
+            self.padding_senders.remove(&key);
+            self.cancel_sender_work(key);
+        } else {
+            if sender.committed_packets > 0 {
+                self.rtcp_senders.insert(key);
+            }
+            if sender.facts.retransmission_payload_type.is_some() {
+                self.padding_senders.insert(key);
+            }
+        }
+    }
+
     pub(crate) fn commit_configuration(&mut self, update: EgressUpdate) {
         for key in update.removed {
             self.retire_sender(key);
         }
         for (&key, &active) in &update.active {
-            if let Some(sender) = self.senders.get_mut(&key) {
-                if update.adopted.contains(&key) {
-                    sender.bootstrap = false;
-                }
-                sender.active = active;
-                if !active {
-                    sender.keyframe_requested = false;
-                    self.keyframe_ready.remove(&key);
-                    self.rtcp_senders.remove(&key);
-                    self.padding_senders.remove(&key);
-                    self.cancel_sender_work(key);
-                } else {
-                    if sender.committed_packets > 0 {
-                        self.rtcp_senders.insert(key);
-                    }
-                    if sender.facts.retransmission_payload_type.is_some() {
-                        self.padding_senders.insert(key);
-                    }
-                }
+            if let Some(sender) = self.senders.get_mut(&key)
+                && update.adopted.contains(&key)
+            {
+                sender.bootstrap = false;
             }
+            self.set_sender_active(key, active);
         }
         for (key, sender) in update.new_senders {
             self.by_ssrc.insert(sender.ssrc, key);
@@ -1452,6 +1472,13 @@ impl MediaEgress {
             self.envelope
                 .is_some_and(|envelope| envelope.application_limited),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_has_repair_senders(&self) -> bool {
+        self.senders
+            .values()
+            .any(|sender| sender.facts.retransmission_payload_type.is_some())
     }
 
     #[cfg(test)]

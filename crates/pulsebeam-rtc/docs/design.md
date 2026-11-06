@@ -10,7 +10,7 @@ defines the private controller profile and quantitative proof.
 
 ## Ownership and scope
 
-One `Connection` owns one peer's initial negotiation, current RTP bindings and transport
+One `RtcConnection` owns one peer's initial negotiation, current RTP bindings and transport
 state: ICE, DTLS, SRTP/SRTCP, RTP/RTCP, SCTP, feedback, congestion control,
 pacing, ordinary retransmission, protocol timers, and mechanical resource
 bounds. Protocol progress is explicit and connection-local. There is no hidden
@@ -29,7 +29,7 @@ wiring. Neither side depends on completing a cutover first.
 
 ## Initial negotiation
 
-`Connection::accept(config, offer, instant, system_time, entropy)` returns the
+`RtcConnection::accept(config, offer, instant, system_time, entropy)` returns the
 connection, SDP answer, and `SessionInfo`. The caller sends that answer through
 its signaling mechanism. Supply valid local candidates and fresh cryptographic
 entropy for every peer. Reusing entropy across peers is not an identity or key
@@ -80,6 +80,15 @@ incomplete repair associations, unsupported formats and capacity failures are
 rejected before any active binding changes. Typed configuration is direct Rust
 API data, not a new signaling protocol or hidden server SDP negotiation.
 
+`RtpBindingCompiler` owns an immutable validated capability context, not an
+installed-registry snapshot. It compiles static codec/FMTP/extension facts before
+handoff. `update_compiled_rtp` applies complete descriptions for addressed MID
+groups and explicit primary removals. `configure_compiled_rtp` replaces the
+complete set. Both verify the capability context and stage all live constraints
+under the connection's single runtime owner. Compilation and submission do not
+establish installation. The direct APIs compile locally over this same path;
+connection/binding revision and incarnation fencing remain caller-owned.
+
 Bootstrap and typed bindings feed the same ingress, egress, protection, feedback,
 pacing and repair engines. Typed ingress requires configured SSRC/PT/MID/RID
 associations; discovering a native sender's runtime identities is not admission.
@@ -88,7 +97,10 @@ same write contract. Multiple outbound encodings use `write_rtp_encoding`;
 `write_rtp` rejects ambiguous MID-only writes.
 
 Inactivation rejects new writes/admission and discards outbound queued originals,
-but cannot retract a returned `Transmit`. Reactivating an owned physical binding
+but cannot retract a returned `Transmit`. `set_rtp_encoding_active` changes an
+installed primary's operational gate and shared payload admission indexes without
+recompiling or reconstructing its binding. Unknown, repair and retired SSRCs are
+rejected without mutation. Reactivating an owned physical binding
 preserves protocol state and independent primary/repair indices. Omission is
 terminal in both directions: live declaration and sender/receiver runtime are
 removed, declared and observed SSRCs remain fenced, and pending buffers stay
@@ -261,6 +273,20 @@ its configuration; a send rejection returns its message. Count, message, and
 buffer bounds apply before consuming application work. Channel open/message/
 close facts are events, with ordinary reliability and ordering settings. RTP and
 SCTP share bounded service without sharing acknowledgment or capacity accounting.
+
+`install_data_channel` accepts an exact explicitly identified negotiated config
+with finite prepaid channel/config/reset/notification storage. RTC owns waiting
+through connection establishment and the previous SID's reset barrier. Its
+association- and lifetime-fenced token is not an application resource reference.
+Ordinary channel events wake the caller, which correlates actual state using
+`data_channel_installation`; `Open { at }` records the runtime activation time.
+`InstallationFailed` retains the exact token for a pre-admission terminal result,
+without depending on an older physical occupant's callback eligibility. Stopped
+associations reclaim pending requests and publish those facts in bounded turns.
+Cancellation before admission releases the request; cancellation after admission
+fences delivery while preserving the complete physical reuse barrier. Old tokens
+cannot close a replacement. Pending work yields within existing SCTP service
+quanta and cannot retain an unrelated ordered application command.
 
 ## TCP adapter responsibilities
 

@@ -33,7 +33,7 @@ fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, fixed: bool) -> wire::Res
 }
 
 fn feed(
-    participant: &mut Participant,
+    participant: &mut NativeParticipant,
     handle: TrackHandle,
     tx: &mut track::UpstreamTrack,
     cache: &mut TrackStreamCache,
@@ -78,7 +78,7 @@ fn feed(
     tx.poll_stats(last_arrival);
 }
 
-fn outputs(participant: &mut Participant, id: TrackId) -> std::collections::BTreeSet<Mid> {
+fn outputs(participant: &mut NativeParticipant, id: TrackId) -> std::collections::BTreeSet<Mid> {
     let mut mids = std::collections::BTreeSet::new();
     while let Some(write) = participant.stream_writer.pop() {
         let StreamWrite::Video {
@@ -95,7 +95,7 @@ fn outputs(participant: &mut Participant, id: TrackId) -> std::collections::BTre
 }
 
 pub(super) fn check(
-    participant: &mut Participant,
+    participant: &mut NativeParticipant,
     sink: &mut MockParticipantSink,
     handles: &mut slotmap::SlotMap<TrackHandle, TrackId>,
     audio: &Track,
@@ -135,7 +135,7 @@ pub(super) fn check(
     participant.add_track_candidate(handle, video);
     for (reference, spec) in [
         (5, first.clone()),
-        (7, receiver_spec(id, "video-b", 802, false)),
+        (7, receiver_spec(id, "video-b", 803, false)),
     ] {
         pulsebeam_proto::state::validation::validate_spec(&spec).unwrap();
         desire(participant, sink, reference, reference, Some(spec));
@@ -143,6 +143,32 @@ pub(super) fn check(
             last_live_for(participant, reference).1.execution,
             wire::ExecutionStatus::WaitingForSource as i32
         );
+        if reference == 5 {
+            let blocked = Mid::from("blocked");
+            assert!(participant.downstream.video.install_owned_slot(
+                blocked,
+                None,
+                803.into(),
+                96u8.into()
+            ));
+            desire(
+                participant,
+                sink,
+                6,
+                6,
+                Some(receiver_spec(id, "blocked", 803, false)),
+            );
+            let rejected = native_data::tests::confirmations_for(participant, 6)
+                .pop()
+                .unwrap();
+            assert_eq!(
+                rejected.rejection.unwrap().code,
+                wire::FailureCode::Incompatible as i32
+            );
+            assert!(participant.transport.stream_tx_ssrc(blocked).is_none());
+            assert!(participant.downstream.video.has_slot(blocked));
+            participant.downstream.video.remove_owned_slot(blocked);
+        }
     }
     participant.native_source_binding(id, handle, true);
     for _ in 0..16 {
@@ -166,7 +192,7 @@ pub(super) fn check(
     assert!(
         !participant
             .native_receivers
-            .can_write_rtp(a, id, 802.into(), 96u8.into())
+            .can_write_rtp(a, id, 803.into(), 96u8.into())
     );
     assert!(
         !participant
@@ -269,7 +295,7 @@ pub(super) fn check(
     assert!(
         !participant
             .native_receivers
-            .can_write_rtp(b, id, 802.into(), 96u8.into())
+            .can_write_rtp(b, id, 803.into(), 96u8.into())
     );
     desire(participant, sink, 7, 12, None);
     assert!(!participant.downstream.video.has_slot(b));

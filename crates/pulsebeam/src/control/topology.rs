@@ -122,11 +122,18 @@ impl TrackTopology {
     }
 
     pub(crate) fn track(&self, identity: TrackAncestry) -> Option<&Track> {
+        self.source(identity.room_id, identity.track_id)
+    }
+
+    pub(crate) fn source(&self, room_id: RoomId, track: TrackId) -> Option<&Track> {
+        Some(&self.rooms.get(&room_id)?.tracks.get(&track)?.track)
+    }
+
+    pub(super) fn sources_in_room(&self, room_id: RoomId) -> impl Iterator<Item = &Track> {
         self.rooms
-            .get(&identity.room_id)?
-            .tracks
-            .get(&identity.track_id)
-            .map(|publication| &publication.track)
+            .get(&room_id)
+            .into_iter()
+            .flat_map(|room| room.tracks.values().map(|publication| &publication.track))
     }
 
     pub(crate) fn track_mut(&mut self, identity: TrackAncestry) -> Option<&mut Track> {

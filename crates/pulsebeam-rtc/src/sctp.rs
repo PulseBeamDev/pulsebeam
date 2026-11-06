@@ -22,6 +22,27 @@ use crate::{
     negotiation::{DtlsRole, SctpSessionFacts},
 };
 
+/// One RTC-owned installation lifetime. Copying this token does not grant SID reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataChannelInstallation {
+    context: [u8; 32],
+    channel: DataChannelId,
+    lifetime: u64,
+}
+
+impl DataChannelInstallation {
+    pub const fn channel(self) -> DataChannelId {
+        self.channel
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataChannelInstallationState {
+    Pending,
+    Open { at: Instant },
+    Closed,
+}
+
 const DCEP_PPID: PpId = PpId(50);
 const TEXT_PPID: PpId = PpId(51);
 const BINARY_PPID: PpId = PpId(53);
@@ -81,8 +102,10 @@ pub(crate) const fn buffer_limits(limits: ConnectionLimits) -> Option<BufferLimi
 }
 
 pub(crate) struct Association {
+    context: [u8; 32],
     socket: Socket,
     origin: Instant,
+    now: Instant,
     local_stream_parity: u16,
     max_inbound_sctp_message_bytes: usize,
     max_inbound_message_bytes: usize,
@@ -94,6 +117,8 @@ pub(crate) struct Association {
     outgoing_packet_bytes: usize,
     future_events: usize,
     channels: BTreeMap<StreamId, Channel>,
+    pending_installations: BTreeMap<StreamId, Channel>,
+    installation_cursor: Option<StreamId>,
     outgoing: VecDeque<Vec<u8>>,
     events: VecDeque<QueuedEvent>,
     lifecycles: BTreeMap<u64, BufferedMessage>,
@@ -140,6 +165,7 @@ struct Channel {
     state: ChannelState,
     reserved_events: u8,
     opened_emitted: bool,
+    opened_at: Option<Instant>,
     closed_emitted: bool,
     sent_messages: u64,
     received_messages: u64,
@@ -177,6 +203,7 @@ impl Association {
         facts: SctpSessionFacts,
         limits: ConnectionLimits,
         accepted_at: Instant,
+        context: [u8; 32],
     ) -> Result<Self, AcceptError> {
         let buffers = buffer_limits(limits).ok_or(AcceptError::InvalidConfiguration)?;
         let peer_max_message_bytes = if facts.unlimited_message_size {
@@ -202,8 +229,10 @@ impl Association {
             ..Options::default()
         };
         Ok(Self {
+            context,
             socket: Socket::new("pulsebeam-datachannels", &options),
             origin: accepted_at,
+            now: accepted_at,
             local_stream_parity: u16::from(facts.local_dtls_role == DtlsRole::Passive),
             max_inbound_sctp_message_bytes: receive_message_bytes(limits),
             max_inbound_message_bytes: limits.max_inbound_data_message_bytes,
@@ -215,6 +244,8 @@ impl Association {
             outgoing_packet_bytes: 0,
             future_events: 0,
             channels: BTreeMap::new(),
+            pending_installations: BTreeMap::new(),
+            installation_cursor: None,
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
             lifecycles: BTreeMap::new(),
@@ -281,24 +312,13 @@ impl Association {
             {
                 return Err(WriteError::ResetPending);
             }
-            if self.channels.contains_key(&stream) || self.resetting.contains_key(&stream) {
-                return Err(WriteError::InvalidState);
-            }
-            let open_bytes = DCEP_OPEN_HEADER_BYTES
-                .saturating_add(config.label.len())
-                .saturating_add(config.protocol.len());
-            if config.label.len() > usize::from(u16::MAX)
-                || config.protocol.len() > usize::from(u16::MAX)
-                || open_bytes > MAX_DCEP_MESSAGE_BYTES
-                || (!config.negotiated && open_bytes > self.peer_max_message_bytes)
-                || matches!(
-                    config.reliability,
-                    DataReliability::MaxLifetime(lifetime)
-                        if lifetime.as_millis() > u128::from(u32::MAX)
-                )
+            if self.channels.contains_key(&stream)
+                || self.pending_installations.contains_key(&stream)
+                || self.resetting.contains_key(&stream)
             {
                 return Err(WriteError::InvalidState);
             }
+            self.validate_channel_config(&config)?;
             let (config_bytes, events) = self
                 .prepare_channel(&config)
                 .ok_or(WriteError::WouldBlock)?;
@@ -347,6 +367,7 @@ impl Association {
                 },
                 reserved_events: CHANNEL_NOTIFICATIONS,
                 opened_emitted: false,
+                opened_at: None,
                 closed_emitted: false,
                 sent_messages: 0,
                 received_messages: 0,
@@ -361,6 +382,242 @@ impl Association {
             );
         } else {
             self.drain_socket();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install(
+        &mut self,
+        at: Instant,
+        config: DataChannelConfig,
+    ) -> Result<DataChannelInstallation, (WriteError, DataChannelConfig)> {
+        let admission = (|| {
+            if self.stopped
+                || self.shutdown_deadline.is_some()
+                || self.reset_all_cursor.is_some()
+                || !config.negotiated
+            {
+                return Err(WriteError::InvalidState);
+            }
+            let stream = StreamId(config.id.ok_or(WriteError::InvalidState)?.value());
+            if stream.0 == u16::MAX
+                || self
+                    .stream_capacity()
+                    .is_some_and(|capacity| stream.0 >= capacity)
+                || self.pending_installations.contains_key(&stream)
+                || self
+                    .resetting
+                    .get(&stream)
+                    .is_some_and(|reset| reset.failed)
+                || (self.channels.contains_key(&stream) && !self.resetting.contains_key(&stream))
+            {
+                return Err(WriteError::InvalidState);
+            }
+            self.validate_channel_config(&config)?;
+            let (config_bytes, events) = self
+                .prepare_channel(&config)
+                .ok_or(WriteError::WouldBlock)?;
+            let lifetime = self.allocate_channel_lifetime()?;
+            Ok((stream, lifetime, config_bytes, events))
+        })();
+        let (stream, lifetime, config_bytes, events) = match admission {
+            Ok(admission) => admission,
+            Err(reason) => return Err((reason, config)),
+        };
+        self.advance_time(at);
+        self.reset_runtime_bytes += RESET_BYTES;
+        self.config_runtime_bytes += config_bytes;
+        events.commit(&mut self.events);
+        self.future_events += usize::from(CHANNEL_NOTIFICATIONS);
+        let channel = DataChannelId::from_value(stream.0);
+        self.pending_installations.insert(
+            stream,
+            Channel {
+                lifetime,
+                id: channel,
+                stream,
+                config,
+                config_lease: Arc::new(ConfigLease {
+                    bytes: config_bytes,
+                }),
+                state: ChannelState::Opening,
+                reserved_events: CHANNEL_NOTIFICATIONS,
+                opened_emitted: false,
+                opened_at: None,
+                closed_emitted: false,
+                sent_messages: 0,
+                received_messages: 0,
+            },
+        );
+        if self.socket.state() != SocketState::Connected {
+            self.installation_cursor = Some(
+                self.installation_cursor
+                    .map_or(stream, |cursor| cursor.min(stream)),
+            );
+        }
+        self.activate_installation(stream);
+        Ok(DataChannelInstallation {
+            context: self.context,
+            channel,
+            lifetime,
+        })
+    }
+
+    pub(crate) fn installation_state(
+        &self,
+        installation: DataChannelInstallation,
+    ) -> Option<DataChannelInstallationState> {
+        if self.stopped
+            || self.shutdown_deadline.is_some()
+            || self.reset_all_cursor.is_some()
+            || self.context != installation.context
+        {
+            return None;
+        }
+        let stream = StreamId(installation.channel.value());
+        if self
+            .pending_installations
+            .get(&stream)
+            .is_some_and(|channel| channel.lifetime == installation.lifetime)
+        {
+            return Some(DataChannelInstallationState::Pending);
+        }
+        let channel = self
+            .channels
+            .get(&stream)
+            .filter(|channel| channel.lifetime == installation.lifetime)?;
+        Some(match channel.state {
+            ChannelState::Opening => DataChannelInstallationState::Pending,
+            ChannelState::Open => DataChannelInstallationState::Open {
+                at: channel.opened_at?,
+            },
+            ChannelState::Closing => DataChannelInstallationState::Closed,
+        })
+    }
+
+    pub(crate) fn cancel_installation(
+        &mut self,
+        at: Instant,
+        installation: DataChannelInstallation,
+    ) -> Result<(), WriteError> {
+        if self.context != installation.context {
+            return Ok(());
+        }
+        let stream = StreamId(installation.channel.value());
+        if self
+            .pending_installations
+            .get(&stream)
+            .is_some_and(|channel| channel.lifetime == installation.lifetime)
+        {
+            self.discard_installation(stream, false);
+            return Ok(());
+        }
+        if self
+            .channels
+            .get(&stream)
+            .is_some_and(|channel| channel.lifetime == installation.lifetime)
+        {
+            self.advance_time(at);
+            let result = self.begin_reset(stream);
+            self.drain_socket();
+            return result;
+        }
+        Ok(())
+    }
+
+    fn activate_installation(&mut self, stream: StreamId) {
+        if self.stopped
+            || self.shutdown_deadline.is_some()
+            || self.reset_all_cursor.is_some()
+            || self.socket.state() != SocketState::Connected
+            || self.resetting.contains_key(&stream)
+        {
+            return;
+        }
+        if self
+            .stream_capacity()
+            .is_none_or(|capacity| stream.0 >= capacity)
+        {
+            self.discard_installation(stream, true);
+            return;
+        }
+        let Some(mut channel) = self.pending_installations.remove(&stream) else {
+            return;
+        };
+        self.socket
+            .set_stream_priority(stream, channel.config.priority.weight());
+        channel.state = ChannelState::Open;
+        self.channels.insert(stream, channel);
+        if self.pending_installations.is_empty() {
+            self.installation_cursor = None;
+        }
+        self.emit_opened(stream);
+    }
+
+    fn visit_installation(&mut self) {
+        let Some(cursor) = self.installation_cursor else {
+            return;
+        };
+        if self.socket.state() != SocketState::Connected && self.shutdown_deadline.is_none() {
+            return;
+        }
+        let Some(stream) = self
+            .pending_installations
+            .range(cursor..)
+            .next()
+            .map(|(&stream, _)| stream)
+        else {
+            self.installation_cursor = None;
+            return;
+        };
+        self.installation_cursor = stream.0.checked_add(1).map(StreamId);
+        if self.shutdown_deadline.is_some() {
+            self.discard_installation(stream, true);
+        } else {
+            self.activate_installation(stream);
+        }
+    }
+
+    fn discard_installation(&mut self, stream: StreamId, notify: bool) {
+        let Some(channel) = self.pending_installations.remove(&stream) else {
+            return;
+        };
+        self.future_events -= usize::from(channel.reserved_events);
+        self.reset_runtime_bytes -= RESET_BYTES;
+        self.release_config(channel.config_lease);
+        if self.pending_installations.is_empty() {
+            self.installation_cursor = None;
+        }
+        if notify {
+            // The queued installation prepaid its terminal notification, even if
+            // an older physical lifetime on this SID is still resetting.
+            self.events.push_back(QueuedEvent {
+                lifetime: channel.lifetime,
+                event: DataChannelEvent::InstallationFailed {
+                    installation: DataChannelInstallation {
+                        context: self.context,
+                        channel: channel.id,
+                        lifetime: channel.lifetime,
+                    },
+                },
+                retained_payload_bytes: 0,
+                config_lease: None,
+            });
+        }
+        self.release_idle_events();
+    }
+
+    fn validate_channel_config(&self, config: &DataChannelConfig) -> Result<(), WriteError> {
+        let open_bytes = DCEP_OPEN_HEADER_BYTES
+            .saturating_add(config.label.len())
+            .saturating_add(config.protocol.len());
+        if config.label.len() > usize::from(u16::MAX)
+            || config.protocol.len() > usize::from(u16::MAX)
+            || open_bytes > MAX_DCEP_MESSAGE_BYTES
+            || (!config.negotiated && open_bytes > self.peer_max_message_bytes)
+            || matches!(config.reliability, DataReliability::MaxLifetime(lifetime) if lifetime.as_millis() > u128::from(u32::MAX))
+        {
+            return Err(WriteError::InvalidState);
         }
         Ok(())
     }
@@ -440,8 +697,14 @@ impl Association {
         id: DataChannelId,
     ) -> Result<(), WriteError> {
         let stream = StreamId(id.value());
+        let pending = self.pending_installations.contains_key(&stream);
+        self.discard_installation(stream, true);
         if self.channel(stream).is_none() {
-            return Err(WriteError::UnknownDataChannel(id));
+            return if pending {
+                Ok(())
+            } else {
+                Err(WriteError::UnknownDataChannel(id))
+            };
         }
         self.advance_time(at);
         let result = self.begin_reset(stream);
@@ -464,6 +727,9 @@ impl Association {
             self.drain_socket();
             self.enforce_shutdown_deadline(at);
         }
+        if self.stopped {
+            self.retire_pending_installations();
+        }
         for _ in 0..MAX_WORK_PER_CALL {
             let mut queued = self.events.pop_front()?;
             self.release_idle_events();
@@ -479,6 +745,9 @@ impl Association {
                 DataChannelEvent::Closed { channel }
                 | DataChannelEvent::ResetComplete { channel }
                 | DataChannelEvent::ResetFailed { channel } => (*channel, false),
+                DataChannelEvent::InstallationFailed { .. } => {
+                    return Some(Event::DataChannel(queued.event));
+                }
             };
             let channel = self.channel(StreamId(id.value()));
             let eligible = if delivery {
@@ -498,7 +767,13 @@ impl Association {
     }
 
     pub(crate) fn has_pending_events(&self) -> bool {
-        !self.events.is_empty() || (!self.stopped && self.native_drain_exhausted)
+        !self.events.is_empty()
+            || (self.stopped && !self.pending_installations.is_empty())
+            || (!self.stopped
+                && (self.native_drain_exhausted
+                    || (self.installation_cursor.is_some()
+                        && (self.socket.state() == SocketState::Connected
+                            || self.shutdown_deadline.is_some()))))
     }
 
     pub(crate) fn has_packet(&self) -> bool {
@@ -567,6 +842,10 @@ impl Association {
             return;
         }
         self.advance_time(at);
+        self.installation_cursor = self
+            .pending_installations
+            .first_key_value()
+            .map(|(&stream, _)| stream);
         self.shutdown_deadline = Some(deadline);
         self.socket.shutdown();
         self.drain_socket();
@@ -616,6 +895,11 @@ impl Association {
             committed_transport_bytes: self.committed_transport_bytes,
             channels: self.channels.len(),
         }
+    }
+
+    pub(crate) fn channel_queued_payload_bytes(&self, channel: DataChannelId) -> Option<usize> {
+        self.channel(StreamId(channel.value()))
+            .map(|channel| self.socket.buffered_amount(channel.stream))
     }
 
     pub(crate) fn channel_stats(&self) -> Vec<DataChannelStats> {
@@ -719,11 +1003,14 @@ impl Association {
             .step_by(2)
             .map(StreamId)
             .find(|stream| {
-                !self.channels.contains_key(stream) && !self.resetting.contains_key(stream)
+                !self.channels.contains_key(stream)
+                    && !self.pending_installations.contains_key(stream)
+                    && !self.resetting.contains_key(stream)
             })
     }
 
     fn advance_time(&mut self, now: Instant) {
+        self.now = self.now.max(now);
         self.socket
             .advance_time(SocketTime::zero() + now.saturating_duration_since(self.origin));
     }
@@ -732,6 +1019,7 @@ impl Association {
         self.native_drain_exhausted = false;
         for _ in 0..MAX_WORK_PER_CALL {
             self.visit_reset_all();
+            self.visit_installation();
             self.visit_declared();
             let event = self.socket.poll_event();
             let progressed = event.is_some();
@@ -799,6 +1087,9 @@ impl Association {
                 self.handle_message(message);
             } else if !progressed {
                 if self.reset_all_cursor.is_some()
+                    || (self.installation_cursor.is_some()
+                        && (self.socket.state() == SocketState::Connected
+                            || self.shutdown_deadline.is_some()))
                     || (self.declared_cursor.is_some()
                         && self.socket.state() == SocketState::Connected)
                 {
@@ -831,6 +1122,7 @@ impl Association {
                 }
             }
             TEXT_PPID | BINARY_PPID | EMPTY_TEXT_PPID | EMPTY_BINARY_PPID => {
+                self.activate_installation(stream);
                 if self.declared_cursor.is_some() {
                     self.activate_declared(stream);
                 }
@@ -878,6 +1170,7 @@ impl Association {
         if self.reset_all_cursor.is_some() {
             return;
         }
+        self.activate_installation(stream);
         match payload.first().copied() {
             Some(DCEP_ACK) if payload == [DCEP_ACK] => {
                 if let Some(channel) = self.channel_mut(stream)
@@ -939,6 +1232,7 @@ impl Association {
                         state: ChannelState::Open,
                         reserved_events: CHANNEL_NOTIFICATIONS,
                         opened_emitted: false,
+                        opened_at: None,
                         closed_emitted: false,
                         sent_messages: 0,
                         received_messages: 0,
@@ -1033,9 +1327,18 @@ impl Association {
                     .next()
                     .map(|(&stream, _)| stream),
             )
+            .chain(
+                self.pending_installations
+                    .range(cursor..)
+                    .next()
+                    .map(|(&stream, _)| stream),
+            )
             .min();
         if let Some(stream) = next {
-            self.incoming_reset(stream);
+            self.discard_installation(stream, true);
+            if self.channels.contains_key(&stream) || self.resetting.contains_key(&stream) {
+                self.incoming_reset(stream);
+            }
             self.reset_all_cursor = stream.0.checked_add(1).map(StreamId);
         } else {
             self.reset_all_cursor = None;
@@ -1050,6 +1353,7 @@ impl Association {
             reset.failed = true;
             self.ready_resets.remove(&stream);
             self.push_reset_outcome(stream, false);
+            self.discard_installation(stream, true);
         }
     }
 
@@ -1102,6 +1406,7 @@ impl Association {
             }
             self.resetting.remove(&stream);
             self.reset_runtime_bytes -= RESET_BYTES;
+            self.activate_installation(stream);
             self.release_idle_events();
             self.release_idle_packets();
         }
@@ -1109,6 +1414,7 @@ impl Association {
     }
 
     fn emit_opened(&mut self, stream: StreamId) {
+        let at = self.now;
         let Some(channel) = self.channel_mut(stream) else {
             return;
         };
@@ -1116,6 +1422,7 @@ impl Association {
             return;
         }
         channel.opened_emitted = true;
+        channel.opened_at = Some(at);
         let id = channel.id;
         let mut config = channel.config.clone();
         config.id = Some(id);
@@ -1143,7 +1450,21 @@ impl Association {
         self.push_event(DataChannelEvent::Closed { channel: id }, 0);
     }
 
+    fn retire_pending_installations(&mut self) {
+        for _ in 0..MAX_WORK_PER_CALL {
+            let Some((&stream, _)) = self.pending_installations.first_key_value() else {
+                self.installation_cursor = None;
+                return;
+            };
+            self.discard_installation(stream, true);
+        }
+        if self.pending_installations.is_empty() {
+            self.installation_cursor = None;
+        }
+    }
+
     fn close_all_channels(&mut self) {
+        self.retire_pending_installations();
         let streams: Vec<_> = self.channels.keys().copied().collect();
         for stream in streams {
             self.emit_closed(stream);
@@ -1177,7 +1498,13 @@ impl Association {
 
     fn clear_channels(&mut self) {
         self.declared_cursor = None;
-        for (_, channel) in std::mem::take(&mut self.channels) {
+        self.installation_cursor = None;
+        let pending = std::mem::take(&mut self.pending_installations);
+        self.reset_runtime_bytes -= pending.len() * RESET_BYTES;
+        for (_, channel) in pending
+            .into_iter()
+            .chain(std::mem::take(&mut self.channels))
+        {
             self.future_events -= usize::from(channel.reserved_events);
             self.release_config(channel.config_lease);
         }
@@ -1237,7 +1564,12 @@ impl Association {
         self.lifecycles
             .len()
             .checked_mul(LIFECYCLE_BYTES)?
-            .checked_add(self.channels.len().checked_mul(CHANNEL_BYTES)?)?
+            .checked_add(
+                self.channels
+                    .len()
+                    .checked_add(self.pending_installations.len())?
+                    .checked_mul(CHANNEL_BYTES)?,
+            )?
             .checked_add(self.reset_runtime_bytes)?
             .checked_add(self.config_runtime_bytes)?
             .checked_add(self.events.capacity().checked_mul(EVENT_BYTES)?)
@@ -1264,6 +1596,7 @@ impl Association {
         let configs: BTreeMap<_, _> = self
             .channels
             .values()
+            .chain(self.pending_installations.values())
             .map(|channel| &channel.config_lease)
             .chain(
                 self.events
@@ -1274,7 +1607,7 @@ impl Association {
             .collect();
         assert_eq!(self.config_runtime_bytes, configs.values().sum::<usize>());
         let bytes = self.lifecycles.len() * LIFECYCLE_BYTES
-            + self.channels.len() * CHANNEL_BYTES
+            + (self.channels.len() + self.pending_installations.len()) * CHANNEL_BYTES
             + self.reset_runtime_bytes
             + self.config_runtime_bytes
             + self.events.capacity() * EVENT_BYTES;
@@ -1282,6 +1615,7 @@ impl Association {
             self.future_events,
             self.channels
                 .values()
+                .chain(self.pending_installations.values())
                 .map(|channel| usize::from(channel.reserved_events))
                 .sum::<usize>()
                 + self
@@ -1299,7 +1633,10 @@ impl Association {
     #[cfg(test)]
     fn test_reset_runtime_bytes(&self) -> usize {
         let identities: BTreeSet<_> = self.channels.keys().chain(self.resetting.keys()).collect();
-        assert_eq!(self.reset_runtime_bytes, identities.len() * RESET_BYTES);
+        assert_eq!(
+            self.reset_runtime_bytes,
+            (identities.len() + self.pending_installations.len()) * RESET_BYTES
+        );
         assert!(
             self.ready_resets
                 .iter()
@@ -1323,7 +1660,10 @@ impl Association {
         | DataChannelEvent::Message { channel, .. }
         | DataChannelEvent::Closed { channel }
         | DataChannelEvent::ResetComplete { channel }
-        | DataChannelEvent::ResetFailed { channel }) = &event;
+        | DataChannelEvent::ResetFailed { channel }) = &event
+        else {
+            return false;
+        };
         let Some(entry) = self.channel(StreamId(channel.value())) else {
             return false;
         };
@@ -1603,8 +1943,8 @@ mod tests {
     ) -> (Association, Association, Instant, Instant) {
         let start = Instant::now();
         let mut now = start;
-        let mut left = Association::new(left_facts, left_limits, start).unwrap();
-        let mut right = Association::new(right_facts, right_limits, start).unwrap();
+        let mut left = Association::new(left_facts, left_limits, start, [1; 32]).unwrap();
+        let mut right = Association::new(right_facts, right_limits, start, [2; 32]).unwrap();
         left.connect(at(now, start));
         right.connect(at(now, start));
         drive(
@@ -1661,13 +2001,15 @@ mod tests {
         ] {
             assert_eq!(invalid.validate(), Err(AcceptError::InvalidConfiguration));
             assert_eq!(
-                Association::new(facts(DtlsRole::Active), invalid, start).err(),
+                Association::new(facts(DtlsRole::Active), invalid, start, [1; 32]).err(),
                 Some(AcceptError::InvalidConfiguration)
             );
         }
         let mut now = start;
-        let mut left = Association::new(facts(DtlsRole::Active), left_limits, start).unwrap();
-        let mut right = Association::new(facts(DtlsRole::Passive), right_limits, start).unwrap();
+        let mut left =
+            Association::new(facts(DtlsRole::Active), left_limits, start, [1; 32]).unwrap();
+        let mut right =
+            Association::new(facts(DtlsRole::Passive), right_limits, start, [2; 32]).unwrap();
         right.socket = Socket::new(
             "bounded-peer",
             &Options {
@@ -1710,6 +2052,9 @@ mod tests {
         declared.id = Some(DataChannelId::from_value(8));
         left.open(now, declared.clone())
             .expect("peer capacity is not known yet");
+        let mut managed = declared.clone();
+        managed.id = Some(DataChannelId::from_value(10));
+        let outside_peer_capacity = left.install(now, managed).unwrap();
         declared.id = Some(DataChannelId::from_value(9));
         left.open(now, declared.clone())
             .expect("pending cancellation");
@@ -1783,6 +2128,9 @@ mod tests {
         );
         assert_eq!(opened_channel(&left_events), Some(zero));
         assert_eq!(opened_channel(&right_events), Some(zero));
+        assert_eq!(left.installation_state(outside_peer_capacity), None);
+        assert!(!left.pending_installations.contains_key(&StreamId(10)));
+        assert!(!left.resetting.contains_key(&StreamId(10)));
         assert!(left.channel(StreamId(8)).is_none());
         assert!(
             left.resetting
@@ -2200,6 +2548,185 @@ mod tests {
         assert!(right_events.iter().any(|event| matches!(event, Event::DataChannel(DataChannelEvent::Message { channel, message: DataMessage::Binary(bytes) }) if channel.value() == 2 && bytes.as_ref() == b"healthy")));
         left.test_runtime_bytes();
         right.test_runtime_bytes();
+    }
+
+    #[test]
+    fn managed_installation_owns_funded_waiting_cancellation_and_reset_progress() {
+        let limits = ConnectionLimits::default();
+        let start = Instant::now();
+        let mut now = start;
+        let mut left = Association::new(facts(DtlsRole::Active), limits, start, [1; 32]).unwrap();
+        let mut right = Association::new(facts(DtlsRole::Passive), limits, start, [2; 32]).unwrap();
+        let mut declaration = config(DataReliability::Reliable, true);
+        declaration.negotiated = true;
+        let id = DataChannelId::from_value(0);
+        let stream = StreamId(id.value());
+        declaration.id = Some(id);
+        left.max_runtime_bytes = 0;
+        let lifetime = left.next_channel_lifetime;
+        assert_eq!(
+            left.install(now, declaration.clone()),
+            Err((WriteError::WouldBlock, declaration.clone()))
+        );
+        assert_eq!(left.next_channel_lifetime, lifetime);
+        assert_eq!(left.test_runtime_bytes(), 0);
+        left.max_runtime_bytes = limits.max_data_runtime_bytes;
+        let canceled = left.install(now, declaration.clone()).unwrap();
+        assert_eq!(
+            left.installation_state(canceled),
+            Some(DataChannelInstallationState::Pending)
+        );
+        assert_eq!(left.test_reset_runtime_bytes(), RESET_BYTES);
+        assert!(left.outgoing.is_empty() && !left.has_pending_events());
+        left.cancel_installation(now, canceled).unwrap();
+        assert_eq!(left.installation_state(canceled), None);
+        assert_eq!(left.test_runtime_bytes(), 0);
+        let original = left.install(now, declaration.clone()).unwrap();
+        left.cancel_installation(now, canceled).unwrap();
+        assert_eq!(
+            left.installation_state(original),
+            Some(DataChannelInstallationState::Pending)
+        );
+        right.open(now, declaration.clone()).unwrap();
+        left.connect(now);
+        right.connect(now);
+        let mut left_events = Vec::new();
+        let mut right_events = Vec::new();
+        drive(
+            &mut left,
+            &mut right,
+            &mut now,
+            start,
+            &mut left_events,
+            &mut right_events,
+        );
+        let Some(DataChannelInstallationState::Open { at: opened_at }) =
+            left.installation_state(original)
+        else {
+            panic!("managed channel did not activate")
+        };
+        assert!(opened_at >= start && opened_at <= now);
+        assert_eq!(right.installation_state(original), None);
+        right.cancel_installation(now, original).unwrap();
+        assert!(right.channel(stream).unwrap().state == ChannelState::Open);
+        left.cancel_installation(now, original).unwrap();
+        assert_eq!(
+            left.installation_state(original),
+            Some(DataChannelInstallationState::Closed)
+        );
+        let replacement = left.install(now, declaration.clone()).unwrap();
+        assert_eq!(
+            left.installation_state(replacement),
+            Some(DataChannelInstallationState::Pending)
+        );
+        assert_eq!(left.test_reset_runtime_bytes(), 2 * RESET_BYTES);
+        left.cancel_installation(now, original).unwrap();
+        assert_eq!(
+            left.installation_state(replacement),
+            Some(DataChannelInstallationState::Pending)
+        );
+        left.resetting.get_mut(&stream).unwrap().outgoing = true;
+        left.queue_reset_completion(stream);
+        assert!(left.ready_resets.is_empty());
+        assert_eq!(
+            left.installation_state(replacement),
+            Some(DataChannelInstallationState::Pending)
+        );
+        drive(
+            &mut left,
+            &mut right,
+            &mut now,
+            start,
+            &mut left_events,
+            &mut right_events,
+        );
+        assert!(matches!(
+            left.installation_state(replacement),
+            Some(DataChannelInstallationState::Open { .. })
+        ));
+        assert_eq!(left.installation_state(original), None);
+        left.cancel_installation(now, original).unwrap();
+        right.open(now, declaration.clone()).unwrap();
+        left.send(
+            now,
+            id,
+            DataMessage::Binary(Bytes::from_static(b"replacement")),
+        )
+        .unwrap();
+        drive(
+            &mut left,
+            &mut right,
+            &mut now,
+            start,
+            &mut left_events,
+            &mut right_events,
+        );
+        assert!(right_events.iter().any(|event| matches!(event, Event::DataChannel(DataChannelEvent::Message { message: DataMessage::Binary(bytes), .. }) if bytes.as_ref() == b"replacement")));
+        left.cancel_installation(now, replacement).unwrap();
+        let failed = left.install(now, declaration.clone()).unwrap();
+        left.fail_reset(stream);
+        assert_eq!(left.installation_state(failed), None);
+        assert!(
+            left.channel(stream).is_some(),
+            "the old failed-reset lifetime still owns the SID"
+        );
+        let mut reported = false;
+        while let Some(event) = left.poll_event(now) {
+            reported |= matches!(event, Event::DataChannel(DataChannelEvent::InstallationFailed { installation }) if installation == failed);
+        }
+        assert!(
+            reported,
+            "an old SID occupant cannot suppress the managed failure fact"
+        );
+        assert_eq!(
+            left.install(now, declaration.clone()),
+            Err((WriteError::InvalidState, declaration))
+        );
+        left.test_reset_runtime_bytes();
+        left.abort();
+        assert_eq!(left.test_runtime_bytes(), 0);
+        assert_eq!(left.installation_state(replacement), None);
+    }
+
+    #[test]
+    fn stopped_association_reclaims_pending_installations_in_bounded_turns() {
+        let now = Instant::now();
+        let mut association = Association::new(
+            facts(DtlsRole::Active),
+            ConnectionLimits::default(),
+            now,
+            [9; 32],
+        )
+        .unwrap();
+        let mut installations = Vec::new();
+        for index in 0..=MAX_WORK_PER_CALL {
+            let mut declaration = config(DataReliability::Reliable, true);
+            declaration.negotiated = true;
+            declaration.id = Some(DataChannelId::from_value(u16::try_from(index).unwrap()));
+            installations.push(association.install(now, declaration).unwrap());
+        }
+        association.abort_association();
+        assert_eq!(
+            association.pending_installations.len(),
+            1,
+            "terminal reclamation must yield"
+        );
+        assert!(association.has_pending_events());
+        let mut failed = Vec::new();
+        while let Some(event) = association.poll_event(now) {
+            let Event::DataChannel(DataChannelEvent::InstallationFailed { installation }) = event
+            else {
+                panic!("an unadmitted channel produced a physical event")
+            };
+            failed.push(installation);
+        }
+        assert_eq!(failed, installations);
+        assert!(association.pending_installations.is_empty());
+        assert_eq!(association.installation_cursor, None);
+        assert_eq!(association.test_runtime_bytes(), 0);
+        assert!(!association.has_pending_events());
+        association.abort();
+        assert_eq!(association.test_runtime_bytes(), 0);
     }
 
     #[test]
@@ -2741,13 +3268,17 @@ mod tests {
     fn predeclared_activation_is_bounded_and_fenced_by_reset_all() {
         let start = Instant::now();
         let limits = ConnectionLimits::default();
-        let mut left = Association::new(facts(DtlsRole::Active), limits, start).unwrap();
-        let mut right = Association::new(facts(DtlsRole::Passive), limits, start).unwrap();
+        let mut left = Association::new(facts(DtlsRole::Active), limits, start, [1; 32]).unwrap();
+        let mut right = Association::new(facts(DtlsRole::Passive), limits, start, [2; 32]).unwrap();
         for index in 0..=MAX_WORK_PER_CALL {
             let mut declared = config(DataReliability::Reliable, true);
             declared.id = Some(DataChannelId::from_value(u16::try_from(index).unwrap()));
             declared.negotiated = true;
-            left.open(start, declared).unwrap();
+            left.open(start, declared.clone()).unwrap();
+            declared.id = Some(DataChannelId::from_value(
+                u16::try_from(index + MAX_WORK_PER_CALL + 1).unwrap(),
+            ));
+            left.install(start, declared).unwrap();
         }
         left.connect(start);
         right.connect(start);
@@ -2761,6 +3292,10 @@ mod tests {
                 if !fenced && left.socket.state() == SocketState::Connected {
                     let last = StreamId(u16::try_from(MAX_WORK_PER_CALL).unwrap());
                     left.reset_all_cursor = Some(StreamId(0));
+                    let last_installation =
+                        StreamId(u16::try_from(2 * MAX_WORK_PER_CALL + 1).unwrap());
+                    left.activate_installation(last_installation);
+                    assert!(left.pending_installations.contains_key(&last_installation));
                     left.activate_declared(last);
                     assert!(
                         left.channel(last)
@@ -2782,11 +3317,17 @@ mod tests {
                 assert!(matches!(
                     event,
                     Event::DataChannel(
-                        DataChannelEvent::Closed { .. } | DataChannelEvent::ResetFailed { .. }
+                        DataChannelEvent::Closed { .. }
+                            | DataChannelEvent::ResetFailed { .. }
+                            | DataChannelEvent::InstallationFailed { .. }
                     )
                 ));
             }
-            if fenced && left.reset_all_cursor.is_none() && left.declared_cursor.is_none() {
+            if fenced
+                && left.reset_all_cursor.is_none()
+                && left.declared_cursor.is_none()
+                && left.installation_cursor.is_none()
+            {
                 break;
             }
         }
@@ -2806,15 +3347,27 @@ mod tests {
         let mut declared = config(DataReliability::Reliable, true);
         declared.id = Some(DataChannelId::from_value(0));
         declared.negotiated = true;
-        let mut pending = Association::new(facts(DtlsRole::Active), limits, start).unwrap();
-        pending.open(start, declared).unwrap();
+        let mut pending =
+            Association::new(facts(DtlsRole::Active), limits, start, [1; 32]).unwrap();
+        pending.open(start, declared.clone()).unwrap();
+        declared.id = Some(DataChannelId::from_value(1));
+        let installation = pending.install(start, declared).unwrap();
         pending.begin_shutdown(start, start);
         assert!(pending.is_stopped());
-        assert!(matches!(
-            pending.poll_event(start),
-            Some(Event::DataChannel(DataChannelEvent::Closed { .. }))
-        ));
-        assert!(pending.poll_event(start).is_none());
+        let mut closed = Vec::new();
+        while let Some(event) = pending.poll_event(start) {
+            let channel = match event {
+                Event::DataChannel(DataChannelEvent::Closed { channel }) => channel,
+                Event::DataChannel(DataChannelEvent::InstallationFailed { installation }) => {
+                    installation.channel()
+                }
+                _ => panic!("shutdown admitted a pending declaration"),
+            };
+            closed.push(channel.value());
+        }
+        closed.sort_unstable();
+        assert_eq!(closed, [0, 1]);
+        assert_eq!(pending.installation_state(installation), None);
         pending.abort();
         assert_eq!(pending.test_runtime_bytes(), 0);
         assert_eq!(pending.declared_cursor, None);
@@ -2901,6 +3454,7 @@ mod tests {
             DataMessage::Binary(Bytes::from_static(&[1; 48])),
         )
         .expect("fits the native send window");
+        assert_eq!(left.channel_queued_payload_bytes(channel), Some(0));
         assert_eq!(left.channel_stats()[0].queued_payload_bytes, 0);
         assert_eq!(left.channel_stats()[0].buffered_amount, 48);
         left.send(
@@ -2910,8 +3464,13 @@ mod tests {
         )
         .expect("bounded fragmented message");
         let queued = left.channel_stats()[0].queued_payload_bytes;
+        assert_eq!(left.channel_queued_payload_bytes(channel), Some(queued));
         assert!(queued > 0 && queued <= 65_536);
         assert_eq!(left.channel_stats()[0].buffered_amount, 65_584);
+        assert_eq!(
+            left.channel_queued_payload_bytes(DataChannelId::from_value(u16::MAX)),
+            None
+        );
     }
 
     #[test]

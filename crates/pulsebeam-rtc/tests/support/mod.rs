@@ -19,11 +19,10 @@ use std::{
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    Connection, ConnectionConfig, ConnectionEntropy, ConnectionLimits, DataChannelConfig,
-    DataChannelEvent, DataChannelId, DataChannelPriority, DataMessage, DataReliability,
-    Event as ConnectionEvent, LocalCandidate, MediaPayloadBitrate, NetworkInput,
-    Output as ConnectionOutput, RejectedRtp, RtpPacket, RtpWrite, SdpOffer, TransmitTarget,
-    WriteError,
+    ConnectionConfig, ConnectionEntropy, ConnectionLimits, DataChannelConfig, DataChannelEvent,
+    DataChannelId, DataChannelPriority, DataMessage, DataReliability, Event as ConnectionEvent,
+    LocalCandidate, MediaPayloadBitrate, NetworkInput, Output as ConnectionOutput, RejectedRtp,
+    RtcConnection, RtpPacket, RtpWrite, SdpOffer, TransmitTarget, WriteError,
 };
 use pulsebeam_rtc_simulation::*;
 
@@ -31,11 +30,11 @@ pub struct MediaFixture {
     pub sender_mid: String,
 }
 
-type PacingProfileReader = fn(&Connection) -> (u64, u64);
+type PacingProfileReader = fn(&RtcConnection) -> (u64, u64);
 
 pub struct PeerFixture<M = MediaFixture> {
     media: M,
-    pub connection: Connection,
+    pub connection: RtcConnection,
     pub senders: Vec<String>,
     peer: PeerConnection,
     audio_source: Option<EncodedAudioSource>,
@@ -68,7 +67,7 @@ pub struct PeerFixture<M = MediaFixture> {
     pub source_repair_packets: usize,
     pub receiver_report: Option<pulsebeam_rtc::ReceiverReport>,
     network: DeterministicNetwork,
-    native_target: Option<fn(&Connection) -> Duration>,
+    native_target: Option<fn(&RtcConnection) -> Duration>,
     pacing_profile: Option<PacingProfileReader>,
     world: std::rc::Rc<SimulationWorld>,
 }
@@ -768,7 +767,7 @@ impl<M> PeerFixture<M> {
             config.limits = limits;
         }
         let now = world.monotonic_now();
-        let mut accepted = Connection::accept(
+        let mut accepted = RtcConnection::accept(
             config,
             SdpOffer::new(offer.sdp),
             now,
@@ -915,7 +914,7 @@ impl<M> PeerFixture<M> {
         self.network.configure(seed, policy);
     }
 
-    pub fn observe_native_target(&mut self, reader: fn(&Connection) -> Duration) {
+    pub fn observe_native_target(&mut self, reader: fn(&RtcConnection) -> Duration) {
         self.native_target = Some(reader);
     }
 

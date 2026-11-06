@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    control::controller::ConnectionProfile,
+    control::controller::SignalingProtocol,
     control::room::RoomShard,
     entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId},
     id::ShardId,
@@ -24,7 +24,7 @@ pub struct ParticipantMeta {
     /// to.
     pub transport: Option<NodeTransportAddress>,
     pub connection_id: ConnectionId,
-    pub profile: ConnectionProfile,
+    pub profile: SignalingProtocol,
     pub authorization: Option<super::controller::AuthorizationLease>,
     pub materialized: bool,
 }
@@ -46,6 +46,50 @@ impl RoomRegistry {
         self.room_shards.get(room_id)
     }
 
+    pub fn reserve_partition(
+        &mut self,
+        room: RoomId,
+        participant: ParticipantId,
+        connection: ConnectionId,
+        shard: ShardId,
+        index: usize,
+    ) {
+        self.room_shards
+            .entry(room)
+            .or_insert_with(RoomShard::new)
+            .reserve(participant, connection, shard, index);
+    }
+
+    pub fn partition_reserved(
+        &self,
+        room: RoomId,
+        participant: ParticipantId,
+        connection: ConnectionId,
+        shard: ShardId,
+        index: usize,
+    ) -> bool {
+        self.room_shards
+            .get(&room)
+            .is_some_and(|room| room.reserved(participant, connection, shard, index))
+    }
+
+    pub fn release_partition(
+        &mut self,
+        room_id: RoomId,
+        participant: ParticipantId,
+        connection: ConnectionId,
+    ) {
+        let empty = if let Some(room) = self.room_shards.get_mut(&room_id) {
+            room.release(participant, connection);
+            room.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            self.room_shards.remove(&room_id);
+        }
+    }
+
     #[cfg(test)]
     pub fn add_participant(
         &mut self,
@@ -62,7 +106,7 @@ impl RoomRegistry {
                 participant_external_id: None,
                 transport,
                 connection_id: ConnectionId::new(),
-                profile: ConnectionProfile::Native,
+                profile: SignalingProtocol::State,
                 authorization: None,
                 materialized: false,
             },
@@ -112,7 +156,7 @@ impl RoomRegistry {
         partition_index: usize,
         transport: NodeTransportAddress,
         connection_id: ConnectionId,
-        profile: ConnectionProfile,
+        profile: SignalingProtocol,
         participant_external_id: Option<ParticipantExternalId>,
     ) -> Result<Option<ParticipantMeta>, CommitCandidateError> {
         if let Some(current) = self.participants.get(&participant_id)
@@ -207,7 +251,7 @@ impl RoomRegistry {
     ) {
         let empty = if let Some(room) = self.room_shards.get_mut(room_id) {
             room.remove_participant(participant_id, shard_id);
-            room.participant_count() == 0
+            room.is_empty()
         } else {
             false
         };
@@ -381,7 +425,7 @@ mod tests {
             0,
             transport(0, 1),
             current,
-            ConnectionProfile::Native,
+            SignalingProtocol::State,
             None,
         )
         .unwrap();
@@ -407,7 +451,7 @@ mod tests {
             0,
             transport(0, 1),
             current,
-            ConnectionProfile::Native,
+            SignalingProtocol::State,
             None,
         )
         .unwrap();
@@ -435,7 +479,7 @@ mod tests {
             0,
             transport(0, 2),
             newer,
-            ConnectionProfile::Native,
+            SignalingProtocol::State,
             None,
         )
         .unwrap();
@@ -447,7 +491,7 @@ mod tests {
                 0,
                 transport(0, 1),
                 older,
-                ConnectionProfile::Native,
+                SignalingProtocol::State,
                 None,
             ),
             Err(CommitCandidateError::Superseded)
@@ -473,7 +517,7 @@ mod tests {
             0,
             transport(0, 1),
             old,
-            ConnectionProfile::Native,
+            SignalingProtocol::State,
             None,
         )
         .unwrap();
@@ -484,7 +528,7 @@ mod tests {
             0,
             transport(0, 2),
             current,
-            ConnectionProfile::Native,
+            SignalingProtocol::State,
             None,
         )
         .unwrap();
@@ -514,7 +558,7 @@ mod tests {
                 0,
                 transport(0, 1),
                 connection_id(1),
-                ConnectionProfile::Native,
+                SignalingProtocol::State,
                 None,
             )
             .unwrap();

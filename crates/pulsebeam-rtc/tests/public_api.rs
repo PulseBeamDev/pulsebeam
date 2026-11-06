@@ -4,9 +4,9 @@ use std::{
 };
 
 use pulsebeam_rtc::{
-    AcceptError, Connection, ConnectionConfig, ConnectionLimits, LocalCandidate,
-    LocalIceCredentials, NetworkInput, Output, PlayoutDelay, PlayoutDelayError, ReceiveError,
-    RtpPacket, RtpWrite, StatsSnapshot,
+    AcceptError, ConnectionConfig, ConnectionLimits, LocalCandidate, LocalIceCredentials,
+    NetworkInput, Output, PlayoutDelay, PlayoutDelayError, ReceiveError, RtcConnection, RtpPacket,
+    RtpWrite, StatsSnapshot,
 };
 
 fn assert_send<T: Send>() {}
@@ -29,25 +29,29 @@ macro_rules! assert_not_impl {
     };
 }
 
-assert_not_impl!(Connection, Sync);
+assert_not_impl!(RtcConnection, Sync);
 
 #[test]
 fn direct_values_are_send_but_the_connection_is_not_sync() {
-    assert_send::<Connection>();
+    assert_send::<RtcConnection>();
     assert_send::<RtpPacket>();
     assert_send::<RtpWrite>();
 }
 
 #[test]
 fn connection_runtime_methods_have_the_public_sans_io_signatures() {
-    let _: fn(&mut Connection, Instant, Instant, NetworkInput) -> Result<(), ReceiveError> =
-        Connection::receive;
-    let _: fn(&mut Connection, Instant) -> Output = Connection::poll;
-    let _: fn(&mut Connection, Instant, &str, RtpWrite) -> Result<(), pulsebeam_rtc::RejectedRtp> =
-        Connection::write_rtp;
-    let _: fn(&mut Connection, Option<pulsebeam_rtc::MediaPayloadBitrate>) =
-        Connection::set_desired_bitrate;
-    let _: fn(&Connection) -> StatsSnapshot = Connection::stats;
+    let _: fn(&mut RtcConnection, Instant, Instant, NetworkInput) -> Result<(), ReceiveError> =
+        RtcConnection::receive;
+    let _: fn(&mut RtcConnection, Instant) -> Output = RtcConnection::poll;
+    let _: fn(
+        &mut RtcConnection,
+        Instant,
+        &str,
+        RtpWrite,
+    ) -> Result<(), pulsebeam_rtc::RejectedRtp> = RtcConnection::write_rtp;
+    let _: fn(&mut RtcConnection, Option<pulsebeam_rtc::MediaPayloadBitrate>) =
+        RtcConnection::set_desired_bitrate;
+    let _: fn(&RtcConnection) -> StatsSnapshot = RtcConnection::stats;
 }
 
 #[test]
@@ -56,7 +60,7 @@ fn negotiated_codec_facts_are_public_and_directional() {
     let at = Instant::now();
     let offer =
         include_str!("fixtures/chrome-representative.sdp").replacen("a=sendonly", "a=recvonly", 1);
-    let accepted = Connection::accept(
+    let accepted = RtcConnection::accept(
         ConnectionConfig {
             local_candidates: vec![LocalCandidate::Udp(SocketAddr::from((
                 [192, 0, 2, 1],
@@ -136,7 +140,7 @@ fn offer_facts_retain_inactive_disabled_and_bidirectional_sections() {
         if disabled {
             offer = offer.replace("m=video 9 ", "m=video 0 ");
         }
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             ConnectionConfig {
                 local_candidates: vec![LocalCandidate::Udp("192.0.2.1:5000".parse().unwrap())],
                 ..ConnectionConfig::default()

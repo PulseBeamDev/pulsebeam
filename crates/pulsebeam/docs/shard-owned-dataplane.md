@@ -234,9 +234,26 @@ When coherence matters, publish one snapshot.
 
 ## Controller boundary
 
-The controller owns coordination decisions such as placement and topology reconciliation.
+The controller owns placement, canonical topology, native signaling sessions,
+logical source resolution and authorization, and per-stream policy. It compiles
+static transport descriptions; RTC validates and atomically installs them against
+its actual live registry under the shard's single execution owner.
 
-It must not become part of the per-packet critical path.
+The shard retains applied policy and binding revisions, eligible source
+descriptors, route handles, local allocation, and active/staging/draining state.
+It does not retain native declarations, signaling rows, or a room-wide visibility
+catalog. Policy updates do not move bandwidth filtering or per-layer decisions to
+control. Mandatory disable, revocation, and expiry gates remain effective locally
+without waiting for controller confirmation or transport retirement.
+
+Native signaling crosses a finite per-connection handoff. Opaque payload input
+has separate capacity from required lifecycle and actual-admission progress
+facts. The shard's single opaque writer transfers timestamped RTC admission back
+to the controller before the native projection commits. Handoff is not admission;
+admission is not peer delivery. Application media and topic payloads do not cross
+this boundary.
+
+The controller must not become part of the per-packet critical path.
 
 Controller-to-shard state arrives as values or explicit operations that the destination shard incorporates into its own state.
 

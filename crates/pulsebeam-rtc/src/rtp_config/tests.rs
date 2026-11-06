@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Connection, ConnectionConfig, ConnectionEntropy, LocalCandidate, SdpOffer};
+use crate::{ConnectionConfig, ConnectionEntropy, LocalCandidate, RtcConnection, SdpOffer};
 use std::time::Instant;
 
 fn codec() -> RtpCodecParameters {
@@ -80,10 +80,10 @@ fn beyond_encoding_count() -> RtpConfiguration {
         outbound: bindings("out", 20_000),
     }
 }
-fn connection() -> Connection {
+fn connection() -> RtcConnection {
     connection_with_limits(crate::ConnectionLimits::default())
 }
-fn connection_with_limits(limits: crate::ConnectionLimits) -> Connection {
+fn connection_with_limits(limits: crate::ConnectionLimits) -> RtcConnection {
     let source = include_str!("../../tests/fixtures/chrome-representative.sdp");
     let (header, _) = source.split_once("m=audio").unwrap();
     let (_, application) = source.split_once("m=application").unwrap();
@@ -92,7 +92,7 @@ fn connection_with_limits(limits: crate::ConnectionLimits) -> Connection {
         header.replace("BUNDLE audio video data", "BUNDLE data"),
         application
     );
-    Connection::accept(
+    RtcConnection::accept(
         ConnectionConfig {
             local_candidates: vec![LocalCandidate::Udp("192.0.2.2:41000".parse().unwrap())],
             limits,
@@ -177,6 +177,7 @@ fn data_only_start_declares_feedback_and_atomic_duplex_encoding_configuration() 
         .map(|(binding, outbound)| {
             storage::live_bytes(&CurrentBinding {
                 binding: binding.clone(),
+                extension_order: extension_order(binding),
                 outbound,
                 order: 0,
             })
@@ -606,6 +607,7 @@ fn identity_storage_is_bounded_and_failed_updates_do_not_consume_it() {
     let opposite = CurrentBinding {
         outbound: false,
         order: next,
+        extension_order: extension_order(&opposite),
         binding: opposite,
     };
     assert!(matches!(
@@ -692,6 +694,7 @@ fn metadata_storage_and_guard_budgets_replace_binding_and_lifetime_quotas() {
         outbound: false,
         order: 0,
         binding: light.clone(),
+        extension_order: extension_order(&light),
     })
     .unwrap();
     let physical = PhysicalBinding {
@@ -1776,11 +1779,7 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
     egress.admit(now, "other", packet()).unwrap();
     let charge = egress.stats().0.queued_transport_bytes;
     assert_eq!(egress.stats().1[0].queued_packets, 1);
-    let update = egress
-        .stage_configuration(&[(physical.clone(), false)], &[7; 32], &[], false)
-        .unwrap();
-    assert_eq!(egress.retiring_ssrcs(&update).count(), 0);
-    egress.commit_configuration(update);
+    egress.set_encoding_active(0, false).unwrap();
     assert_eq!(egress.stats().1[0].queued_packets, 0);
     assert_eq!(egress.stats().1[1].ssrc, 200);
     assert_eq!(egress.stats().1[1].queued_packets, 1);
@@ -1808,10 +1807,7 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
         .unwrap();
     drop(staged);
     assert_eq!(egress.stats().1.len(), 2);
-    let update = egress
-        .stage_configuration(&[(physical.clone(), true)], &[7; 32], &[], false)
-        .unwrap();
-    egress.commit_configuration(update);
+    egress.set_encoding_active(0, true).unwrap();
     assert_eq!(egress.stats().1.len(), 2);
     assert_eq!(egress.stats().1[0].ssrc, 0);
     let mut next = packet();
@@ -1889,6 +1885,168 @@ fn pause_preserves_egress_but_terminal_omission_requires_a_fresh_identity() {
     assert_eq!(egress.stats().1[0].queued_packets, 2);
     assert_eq!(egress.stats().1[256].ssrc, 20_512);
     assert_eq!(egress.stats().1[256].queued_packets, 1);
+}
+
+#[test]
+fn compiled_bindings_share_static_validation_but_not_live_admission() {
+    let caps = capabilities();
+    let compiler = RtpBindingCompiler::new(caps.clone()).unwrap();
+    let mut direct = connection();
+    let mut compiled = connection();
+    direct.set_rtp_capabilities(caps.clone()).unwrap();
+    compiled.set_rtp_capabilities(caps).unwrap();
+    let mut inbound = binding("in", 100);
+    inbound.encodings.push(RtpEncoding {
+        primary: 102,
+        repair: Some(103),
+        rid: None,
+        active: true,
+    });
+    let mut desired = RtpConfiguration {
+        inbound: vec![inbound],
+        outbound: vec![binding("out", 200), binding("unrelated", 300)],
+    };
+    let mut description = compiler.compile_configuration(desired.clone()).unwrap();
+    for active in [false, true] {
+        description.inbound[0].set_active(active);
+        for encoding in &mut desired.inbound[0].encodings {
+            encoding.active = active;
+        }
+        direct.configure_rtp(desired.clone()).unwrap();
+        compiled
+            .configure_compiled_rtp(description.clone())
+            .unwrap();
+        assert_eq!(compiled.rtp_configuration(), Some(desired.clone()));
+        assert_eq!(compiled.rtp_configuration(), direct.rtp_configuration());
+    }
+
+    let mut unsupported = binding("bad", 400);
+    unsupported
+        .codec
+        .parameters
+        .fmtp
+        .insert("unknown".into(), "1".into());
+    assert!(matches!(
+        compiler.compile(unsupported),
+        Err(RtpConfigurationError::Unsupported)
+    ));
+    let before = compiled.rtp_configuration();
+    let mut different = capabilities();
+    different.limits.max_identity_guard_bytes /= 2;
+    let wrong_context = RtpBindingCompiler::new(different).unwrap();
+    let mut wrong_context = wrong_context.compile(binding("out", 400)).unwrap();
+    wrong_context.set_active(false);
+    assert_eq!(
+        compiled.update_compiled_rtp(CompiledRtpConfigurationPatch {
+            outbound: vec![wrong_context],
+            ..Default::default()
+        }),
+        Err(RtpConfigurationError::CapabilityState)
+    );
+    assert_eq!(compiled.rtp_configuration(), before);
+
+    // Compilation cannot know whether a physical identity has already been issued.
+    let mut collision = binding("out", 300);
+    collision.encodings[0].repair = Some(301);
+    let collision = compiler.compile(collision).unwrap();
+    assert_eq!(
+        compiled.update_compiled_rtp(CompiledRtpConfigurationPatch {
+            outbound: vec![collision],
+            ..Default::default()
+        }),
+        Err(RtpConfigurationError::Collision)
+    );
+    assert_eq!(compiled.rtp_configuration(), before);
+
+    let mut replacement = binding("out", 400);
+    replacement.extensions.reverse();
+    let replacement = compiler.compile(replacement).unwrap();
+    assert!(replacement.extension_order.windows(2).all(|pair| {
+        replacement.description().extensions[pair[0]].id
+            < replacement.description().extensions[pair[1]].id
+    }));
+    compiled
+        .update_compiled_rtp(CompiledRtpConfigurationPatch {
+            outbound: vec![replacement.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+    let installed = compiled.rtp_configuration().unwrap();
+    assert_eq!(installed.outbound[0], *replacement.description());
+    assert_eq!(installed.outbound[1], binding("unrelated", 300));
+    compiled
+        .update_compiled_rtp(CompiledRtpConfigurationPatch {
+            remove_encodings: BTreeSet::from([400]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        compiled.update_compiled_rtp(CompiledRtpConfigurationPatch {
+            outbound: vec![replacement],
+            ..Default::default()
+        }),
+        Err(RtpConfigurationError::Collision)
+    );
+}
+
+#[test]
+fn installed_encoding_activity_updates_only_operational_membership() {
+    let mut connection = connection();
+    connection.set_rtp_capabilities(capabilities()).unwrap();
+    let mut inbound = binding("in", 100);
+    inbound.encodings.push(RtpEncoding {
+        primary: 102,
+        repair: Some(103),
+        rid: None,
+        active: true,
+    });
+    connection
+        .update_rtp(RtpConfigurationPatch {
+            inbound: vec![inbound],
+            outbound: vec![binding("out", 200), binding("unrelated", 300)],
+            ..Default::default()
+        })
+        .unwrap();
+    let before = connection.rtp_configuration().unwrap();
+    for primary in [100, 102, 200] {
+        connection.set_rtp_encoding_active(primary, false).unwrap();
+        connection.set_rtp_encoding_active(primary, false).unwrap();
+    }
+    let paused = connection.rtp_configuration().unwrap();
+    assert!(
+        paused.inbound[0]
+            .encodings
+            .iter()
+            .all(|encoding| !encoding.active)
+    );
+    assert!(!paused.outbound[0].encodings[0].active);
+    assert_eq!(paused.outbound[1], before.outbound[1]);
+    assert_eq!(
+        connection.set_rtp_encoding_active(101, true),
+        Err(RtpConfigurationError::Invalid)
+    );
+    assert_eq!(
+        connection.set_rtp_encoding_active(999, true),
+        Err(RtpConfigurationError::Invalid)
+    );
+    assert_eq!(connection.rtp_configuration(), Some(paused));
+    for primary in [100, 102, 200] {
+        connection.set_rtp_encoding_active(primary, true).unwrap();
+    }
+    assert_eq!(connection.rtp_configuration(), Some(before));
+    connection
+        .update_rtp(RtpConfigurationPatch {
+            remove_encodings: BTreeSet::from([100]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        connection.set_rtp_encoding_active(100, true),
+        Err(RtpConfigurationError::Invalid)
+    );
+    assert!(connection.rtp_ssrc_reserved(100));
+    connection.set_rtp_encoding_active(102, false).unwrap();
+    connection.set_rtp_encoding_active(102, true).unwrap();
 }
 
 #[test]

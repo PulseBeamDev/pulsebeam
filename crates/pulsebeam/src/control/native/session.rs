@@ -3,7 +3,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use pulsebeam_proto::prelude::Message;
 use pulsebeam_proto::state::{self as wire, codec, validation};
 
+use crate::entity::TrackId;
 use crate::media::ChannelId;
+use crate::participant::signaling::{SignalingOutput, SignalingProgress};
+use crate::track::Track;
+
+use super::{ExecutionDisposition, ResourceExecution};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Key {
@@ -35,6 +40,8 @@ pub(crate) enum InputError {
     Revision,
     #[error("retained control work exhausted")]
     Capacity,
+    #[error("native execution command failed: {0}")]
+    Output(#[from] OutputError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,34 +58,89 @@ pub(crate) enum OutputError {
     AuthorizationExpired,
 }
 
-pub(crate) struct NativeOutput {
-    pub(crate) cid: ChannelId,
-    pub(crate) bytes: Vec<u8>,
-}
-
 #[derive(Default)]
 pub(crate) struct NativeInput {
     pub(crate) cutoffs: Vec<u64>,
     pub(crate) executions: Vec<(u64, wire::ExecutionReport)>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Preparation {
     pub(crate) reference: u64,
     pub(crate) revision: u64,
-    pub(crate) spec: wire::ResourceSpec,
     grant_revision: u64,
+    sequence: u64,
+    started_at: pulsebeam_runtime::time::Instant,
+}
+
+impl Preparation {
+    pub(crate) fn scope(self) -> crate::participant::policy::ExecutionScope {
+        crate::participant::policy::ExecutionScope {
+            binding: self.reference,
+            sequence: self.sequence,
+            authorization: self.grant_revision,
+        }
+    }
+
+    fn stamp(self) -> (u64, u64, u64) {
+        (self.revision, self.grant_revision, self.sequence)
+    }
+
+    fn bytes() -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(crate::participant::Connection::native_execution_metadata_bytes())
+    }
+}
+
+pub(crate) struct ExecutionCommand(ExecutionAction);
+
+pub(crate) enum ExecutionAction {
+    Prepare {
+        work: Preparation,
+        resource: crate::control::native::PreparedResource,
+    },
+    Retire(crate::participant::policy::ExecutionScope),
+    FailReceiver(crate::participant::policy::ExecutionScope),
+}
+
+impl ExecutionCommand {
+    pub(crate) fn into_action(self) -> ExecutionAction {
+        self.0
+    }
+}
+
+struct ProjectedExecution {
+    work: Preparation,
+    live: wire::LiveResource,
+}
+
+struct ReceiverSource {
+    participant: wire::Participant,
+    track: wire::Track,
+}
+
+impl ReceiverSource {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.participant.encoded_len())
+            .saturating_add(self.track.encoded_len())
+    }
 }
 
 struct Owned {
+    receiver_source: Option<Box<ReceiverSource>>,
+    receiver_binding: Option<crate::participant::policy::ReceiverBinding>,
+    receiver_failure: Option<Box<wire::Failure>>,
     declaration: wire::ResourceSpec,
     target: wire::DesiredState,
-    active: Option<(u64, u64)>,
-    active_bytes: usize,
+    active: Option<(u64, u64, u64)>,
     queued: bool,
     retired: bool,
     cutoff_pending: bool,
     cutoff_reason: wire::AbsenceReason,
     execution_bytes: usize,
+    // Paid command ownership, not an installed or applied revision.
+    storage_sequence: u64,
 }
 
 struct Row {
@@ -92,11 +154,17 @@ struct Row {
     represented: bool,
 }
 
+mod source_wait;
+use source_wait::SourceWait;
+
 struct Pending {
-    output: NativeOutput,
+    output: Option<SignalingOutput>,
+    sequence: u64,
+    cid: ChannelId,
     selected: Vec<(Key, u64)>,
     initial_cursor: u64,
     initial_complete: bool,
+    selected_at: pulsebeam_runtime::time::Instant,
     deadline: pulsebeam_runtime::time::Instant,
 }
 
@@ -112,7 +180,14 @@ pub(crate) struct NativeSession {
     publications: BTreeMap<(i32, String), u64>,
     dirty: BTreeMap<u64, Key>,
     preparations: VecDeque<u64>,
+    source_waits: BTreeMap<u64, SourceWait>,
+    source_deadlines: BTreeSet<(pulsebeam_runtime::time::Instant, u64)>,
+    source_scan: bool,
+    source_rescan: bool,
+    source_cursor: Option<u64>,
     pending: Option<Pending>,
+    output_sequence: u64,
+    execution_sequence: u64,
     last_revision: u64,
     version: u64,
     ordinal: u64,
@@ -158,6 +233,9 @@ impl NativeSession {
         if self.rows.get(&key).is_some_and(|row| row.value == value) {
             return Ok(());
         }
+        if matches!(&key, Key::Track(_) | Key::Participant(_) | Key::Session) {
+            self.source_wait_changed();
+        }
         let previous = self.rows.get(&key).map_or(0, |row| row.value.encoded_len());
         let overhead = if self.rows.contains_key(&key) {
             0
@@ -199,15 +277,16 @@ impl NativeSession {
         Ok(())
     }
 
-    pub(crate) fn set_cid(&mut self, cid: ChannelId) {
+    pub(crate) fn set_cid(&mut self, cid: ChannelId, at: pulsebeam_runtime::time::Instant) {
         self.cid = Some(cid);
         self.initial_end.get_or_insert(self.ordinal);
-        self.initial_deadline.get_or_insert_with(progress_deadline);
+        self.initial_deadline
+            .get_or_insert_with(|| progress_deadline(at));
     }
 
     pub(crate) fn apply_participants(
         &mut self,
-        added: impl IntoIterator<Item = super::effect::RoomPeer>,
+        added: impl IntoIterator<Item = crate::participant::effect::RoomPeer>,
         removed: impl IntoIterator<Item = crate::entity::ParticipantId>,
     ) -> Result<(), OutputError> {
         for peer in added {
@@ -323,11 +402,138 @@ impl NativeSession {
         self.put(key, value)
     }
 
-    pub(crate) fn observe_activity(
+    fn observe_receiver_failure(
         &mut self,
         reference: u64,
-        active: bool,
+        error: Option<wire::Failure>,
     ) -> Result<(), OutputError> {
+        let key = Key::Owned(reference);
+        let Some(row) = self.rows.get(&key) else {
+            return Ok(());
+        };
+        if row.owned.as_ref().is_none_or(|owned| owned.retired)
+            || self.receiver_failure(reference).is_some()
+        {
+            return Ok(());
+        }
+        let error = error.unwrap_or_else(|| failure(wire::FailureCode::InvalidConfiguration));
+        if matches!(
+            row.value.value,
+            Some(wire::confirmed_state::Value::Owned(_))
+        ) {
+            return self.observe_execution_result(
+                reference,
+                wire::ExecutionStatus::Failed,
+                Some(error),
+            );
+        }
+        self.charge(0, receiver_failure_bytes(&error))?;
+        if let Some(owned) = self.rows.get_mut(&key).and_then(|row| row.owned.as_mut()) {
+            owned.receiver_failure = Some(Box::new(error));
+        }
+        Ok(())
+    }
+
+    fn receiver_failure(&self, reference: u64) -> Option<&wire::Failure> {
+        let row = self.rows.get(&Key::Owned(reference))?;
+        row.owned
+            .as_ref()?
+            .receiver_failure
+            .as_deref()
+            .or_else(|| match &row.value.value {
+                Some(wire::confirmed_state::Value::Owned(live)) => live.execution_failure.as_ref(),
+                _ => None,
+            })
+    }
+
+    fn receiver_result(
+        &self,
+        reference: u64,
+        execution: &crate::participant::policy::ReceiverExecution,
+    ) -> Result<(wire::ExecutionStatus, Option<wire::Failure>), OutputError> {
+        let error = if execution.failed {
+            Some(
+                self.receiver_failure(reference)
+                    .ok_or(OutputError::InvalidObservation)?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let status = if execution.failed {
+            wire::ExecutionStatus::Failed
+        } else if !execution.enabled {
+            wire::ExecutionStatus::Disabled
+        } else if execution.ready {
+            wire::ExecutionStatus::Installed
+        } else {
+            wire::ExecutionStatus::WaitingForSource
+        };
+        Ok((status, error))
+    }
+
+    fn observe_receiver_execution(
+        &mut self,
+        reference: u64,
+        execution: &crate::participant::policy::ReceiverExecution,
+    ) -> Result<(), OutputError> {
+        if self
+            .rows
+            .get(&Key::Owned(reference))
+            .and_then(|row| row.owned.as_ref())
+            .is_none_or(|owned| owned.retired)
+        {
+            return Ok(());
+        }
+        let (status, error) = self.receiver_result(reference, execution)?;
+        self.observe_execution_result(reference, status, error)
+    }
+
+    pub(crate) fn observe_resource(
+        &mut self,
+        observation: crate::participant::policy::ResourceObservation,
+    ) -> Result<Option<ExecutionCommand>, OutputError> {
+        use crate::participant::policy::ResourceObservation;
+        match observation {
+            ResourceObservation::Activity { binding, active } => {
+                self.observe_activity(binding, active)?;
+            }
+            ResourceObservation::Receiver { binding, execution } => {
+                self.observe_receiver_execution(binding, &execution)?;
+            }
+            ResourceObservation::ReceiverBinding { binding, state } => {
+                if let Some(owned) = self
+                    .rows
+                    .get_mut(&Key::Owned(binding))
+                    .and_then(|row| row.owned.as_mut())
+                {
+                    owned.receiver_binding = if owned.retired { None } else { state };
+                }
+            }
+            ResourceObservation::Ended { binding } => {
+                self.source_ended(binding)?;
+                return self.retirement_command(binding).map(Some);
+            }
+            ResourceObservation::Released { binding } => {
+                self.reserve_execution(binding, 0)?;
+                self.cutoff_complete(binding)?;
+            }
+            ResourceObservation::StorageReleased { binding, sequence } => {
+                if sequence != 0
+                    && self
+                        .rows
+                        .get(&Key::Owned(binding))
+                        .and_then(|row| row.owned.as_ref())
+                        .is_some_and(|owned| owned.storage_sequence == sequence)
+                {
+                    self.reserve_execution(binding, 0)?;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn observe_activity(&mut self, reference: u64, active: bool) -> Result<(), OutputError> {
         let key = Key::Owned(reference);
         let Some(row) = self.rows.get(&key) else {
             return Ok(());
@@ -391,7 +597,56 @@ impl NativeSession {
         )
     }
 
+    pub(crate) fn receive_input(
+        &mut self,
+        bytes: &[u8],
+        unix_now: u64,
+    ) -> Result<Vec<ExecutionCommand>, InputError> {
+        let input = self.apply_input(bytes)?;
+        let mut commands =
+            Vec::with_capacity(input.cutoffs.len().saturating_add(input.executions.len()));
+        for reference in input.cutoffs {
+            commands.push(self.retirement_command(reference)?);
+        }
+        for (reference, report) in input.executions {
+            if !self.authorization_current(unix_now) || self.receiver_failure(reference).is_some() {
+                continue;
+            }
+            let eligible = self.rows.get(&Key::Owned(reference)).is_some_and(|row| {
+                let Some(owned) = &row.owned else {
+                    return false;
+                };
+                let Some(wire::resource_spec::Declaration::Subscription(subscription)) =
+                    &owned.declaration.declaration
+                else {
+                    return false;
+                };
+                !owned.retired
+                    && matches!(
+                        row.value.value,
+                        Some(wire::confirmed_state::Value::Owned(_))
+                    )
+                    && matches!(
+                        subscription
+                            .binding
+                            .as_ref()
+                            .and_then(|binding| binding.transport.as_ref()),
+                        Some(wire::track_binding::Transport::Rtp(_))
+                    )
+            });
+            if !eligible {
+                continue;
+            }
+            self.observe_receiver_failure(reference, report.failure)?;
+            commands.push(ExecutionCommand(ExecutionAction::FailReceiver(
+                self.execution_scope(reference)?,
+            )));
+        }
+        Ok(commands)
+    }
+
     pub(crate) fn apply_input(&mut self, bytes: &[u8]) -> Result<NativeInput, InputError> {
+        self.source_wait_changed();
         let batch = codec::decode_client(bytes).map_err(InputError::Decode)?;
         let mut effects = NativeInput::default();
         for record in batch.records {
@@ -521,15 +776,18 @@ impl NativeSession {
                 let declaration = spec.as_ref().clone();
                 let row = self.rows.get_mut(&key).ok_or(InputError::Capacity)?;
                 row.owned = Some(Owned {
+                    receiver_source: None,
+                    receiver_binding: None,
+                    receiver_failure: None,
                     declaration,
                     target,
                     active: None,
-                    active_bytes: 0,
                     queued: false,
                     retired: false,
                     cutoff_pending: false,
                     cutoff_reason: wire::AbsenceReason::Removed,
                     execution_bytes: 0,
+                    storage_sequence: 0,
                 });
                 // Pending entries have no authoritative absence to send.
                 row.dirty = false;
@@ -597,6 +855,38 @@ impl NativeSession {
         }
     }
 
+    fn next_execution_sequence(&self) -> Result<u64, OutputError> {
+        self.execution_sequence
+            .checked_add(1)
+            .ok_or(OutputError::Capacity)
+    }
+
+    fn execution_scope(
+        &mut self,
+        reference: u64,
+    ) -> Result<crate::participant::policy::ExecutionScope, OutputError> {
+        let sequence = self.next_execution_sequence()?;
+        self.execution_sequence = sequence;
+        Ok(crate::participant::policy::ExecutionScope {
+            binding: reference,
+            sequence,
+            authorization: self.grant_revision,
+        })
+    }
+
+    pub(crate) fn retirement_command(
+        &mut self,
+        reference: u64,
+    ) -> Result<ExecutionCommand, OutputError> {
+        Ok(ExecutionCommand(ExecutionAction::Retire(
+            self.execution_scope(reference)?,
+        )))
+    }
+
+    pub(crate) fn preparation_pending(&self, unix_now: u64) -> bool {
+        self.source_scan || (!self.preparations.is_empty() && self.authorization_current(unix_now))
+    }
+
     pub(crate) fn take_preparation(&mut self) -> Result<Option<Preparation>, OutputError> {
         if self.closed || self.grant_revision == 0 {
             return Ok(None);
@@ -605,40 +895,42 @@ impl NativeSession {
             let Some(reference) = self.preparations.pop_front() else {
                 break;
             };
-            let bytes = self
-                .rows
-                .get(&Key::Owned(reference))
-                .and_then(|row| row.owned.as_ref())
-                .map_or(0, |owned| owned.target.encoded_len());
-            self.charge(0, bytes)?;
-            let Some(row) = self.rows.get_mut(&Key::Owned(reference)) else {
-                self.charge(bytes, 0)?;
+            let key = Key::Owned(reference);
+            let Some(row) = self.rows.get_mut(&key) else {
                 continue;
             };
             let Some(owned) = &mut row.owned else {
-                self.charge(bytes, 0)?;
                 continue;
             };
             owned.queued = false;
             if owned.retired
                 || owned.active.is_some()
                 || row.value.evaluated_revision >= owned.target.revision
+                || !matches!(
+                    &owned.target.value,
+                    Some(wire::desired_state::Value::Present(_))
+                )
             {
-                self.charge(bytes, 0)?;
                 continue;
             }
-            let Some(wire::desired_state::Value::Present(spec)) = &owned.target.value else {
-                self.charge(bytes, 0)?;
-                continue;
-            };
-            owned.active = Some((owned.target.revision, self.grant_revision));
-            owned.active_bytes = bytes;
-            return Ok(Some(Preparation {
+            let revision = owned.target.revision;
+            let sequence = self.next_execution_sequence()?;
+            let work = Preparation {
                 reference,
-                revision: owned.target.revision,
-                spec: spec.as_ref().clone(),
+                revision,
                 grant_revision: self.grant_revision,
-            }));
+                sequence,
+                started_at: pulsebeam_runtime::time::Instant::now(),
+            };
+            self.charge(0, Preparation::bytes())?;
+            let owned = self
+                .rows
+                .get_mut(&key)
+                .and_then(|row| row.owned.as_mut())
+                .ok_or(OutputError::InvalidObservation)?;
+            owned.active = Some(work.stamp());
+            self.execution_sequence = sequence;
+            return Ok(Some(work));
         }
         Ok(None)
     }
@@ -660,23 +952,181 @@ impl NativeSession {
                 })
     }
 
-    pub(crate) fn defer_preparation(&mut self, work: Preparation) -> Result<(), OutputError> {
+    fn defer_preparation(&mut self, work: Preparation) -> Result<(), OutputError> {
         let key = Key::Owned(work.reference);
         let Some(owned) = self.rows.get(&key).and_then(|row| row.owned.as_ref()) else {
             return Ok(());
         };
-        if owned.active != Some((work.revision, work.grant_revision)) {
+        if owned.active != Some(work.stamp()) {
             return Ok(());
         }
-        let bytes = owned.active_bytes;
-        self.charge(bytes, 0)?;
+        self.charge(Preparation::bytes(), 0)?;
         if let Some(owned) = self.rows.get_mut(&key).and_then(|row| row.owned.as_mut()) {
             owned.active = None;
-            owned.active_bytes = 0;
         }
         self.queue_preparation(work.reference);
         self.collect(&key);
         Ok(())
+    }
+
+    pub(crate) fn preparation_spec(&self, work: &Preparation) -> Option<&wire::ResourceSpec> {
+        let owned = self.rows.get(&Key::Owned(work.reference))?.owned.as_ref()?;
+        if self.closed
+            || owned.retired
+            || owned.active != Some(work.stamp())
+            || owned.target.revision != work.revision
+            || self.grant_revision != work.grant_revision
+        {
+            return None;
+        }
+        let wire::desired_state::Value::Present(spec) = owned.target.value.as_ref()? else {
+            return None;
+        };
+        Some(spec)
+    }
+
+    pub(crate) fn prepare_execution<'a>(
+        &mut self,
+        work: &Preparation,
+        unix_now: u64,
+        capabilities: Option<&wire::RtpCapabilities>,
+        source: impl FnOnce(TrackId) -> Option<&'a Track>,
+    ) -> Result<Option<ExecutionCommand>, OutputError> {
+        match self.compile_execution(work, capabilities, source) {
+            Ok(ExecutionCommand(ExecutionAction::Prepare {
+                work,
+                resource:
+                    super::PreparedResource::Receiver(super::ReceiverPreparation::Waiting(source)),
+            })) => {
+                self.retain_source_wait(work, source)?;
+                Ok(None)
+            }
+            Ok(command) => Ok(Some(command)),
+            Err(error) => {
+                self.complete_projected(*work, Err(error), unix_now)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn compile_execution<'a>(
+        &mut self,
+        work: &Preparation,
+        capabilities: Option<&wire::RtpCapabilities>,
+        source: impl FnOnce(TrackId) -> Option<&'a Track>,
+    ) -> Result<ExecutionCommand, wire::Failure> {
+        use crate::control::native::PreparedResource;
+        let resource = if let Some(publication) = self.prepare_publication(work, capabilities)? {
+            PreparedResource::Publication(publication)
+        } else {
+            PreparedResource::Receiver(self.prepare_receiver(work, capabilities, source)?)
+        };
+        if let Some(owned) = self
+            .rows
+            .get_mut(&Key::Owned(work.reference))
+            .and_then(|row| row.owned.as_mut())
+            && owned.execution_bytes != 0
+        {
+            owned.storage_sequence = work.scope().sequence;
+        }
+        Ok(ExecutionCommand(ExecutionAction::Prepare {
+            work: *work,
+            resource,
+        }))
+    }
+
+    fn prepare_publication(
+        &mut self,
+        work: &Preparation,
+        capabilities: Option<&wire::RtpCapabilities>,
+    ) -> Result<Option<crate::control::native::Publication>, wire::Failure> {
+        let spec = self
+            .preparation_spec(work)
+            .ok_or_else(|| failure(wire::FailureCode::ResourceGone))?;
+        let Some((plan, bytes)) =
+            crate::control::native::publication(spec, capabilities).map_err(failure)?
+        else {
+            return Ok(None);
+        };
+        let reserved = self
+            .rows
+            .get(&Key::Owned(work.reference))
+            .and_then(|row| row.owned.as_ref())
+            .is_some_and(|owned| owned.execution_bytes != 0);
+        if !reserved {
+            self.reserve_execution(work.reference, bytes)
+                .map_err(|_| failure(wire::FailureCode::CapacityExceeded))?;
+        }
+        Ok(Some(plan))
+    }
+
+    fn prepare_receiver<'a>(
+        &mut self,
+        work: &Preparation,
+        capabilities: Option<&wire::RtpCapabilities>,
+        source: impl FnOnce(TrackId) -> Option<&'a Track>,
+    ) -> Result<crate::control::native::ReceiverPreparation, wire::Failure> {
+        use crate::control::native::{ReceiveTransport, Receiver, ReceiverPreparation};
+        let spec = self
+            .preparation_spec(work)
+            .ok_or_else(|| failure(wire::FailureCode::ResourceGone))?;
+        let target = crate::control::native::receiver_target(spec).map_err(failure)?;
+        if let Some(binding) = self
+            .rows
+            .get(&Key::Owned(work.reference))
+            .and_then(|row| row.owned.as_ref())
+            .and_then(|owned| owned.receiver_binding)
+        {
+            if !binding.available {
+                return Err(failure(wire::FailureCode::Incompatible));
+            }
+            let policy =
+                crate::control::native::receiver_policy(spec, binding.rtp).map_err(failure)?;
+            let preview = crate::participant::policy::ReceiverExecution {
+                source: target.source,
+                enabled: policy.enabled,
+                ready: false,
+                failed: false,
+            };
+            self.project_receiver(work, &preview)?;
+            return Ok(ReceiverPreparation::Policy(policy));
+        }
+        let Some((participant, track)) = self.source(target.key) else {
+            if !target.wait_for_source {
+                return Err(failure(wire::FailureCode::ResourceGone));
+            }
+            let source = target.source;
+            self.reserve_execution(work.reference, 4096)
+                .map_err(|_| failure(wire::FailureCode::CapacityExceeded))?;
+            return Ok(ReceiverPreparation::Waiting(source));
+        };
+        let (source, (transport, policy)) = source(target.source)
+            .ok_or(wire::FailureCode::Incompatible)
+            .and_then(|source| {
+                crate::control::native::receiver(spec, source, &track, capabilities)
+                    .map(|prepared| (source, prepared))
+            })
+            .map_err(|code| wire::Failure {
+                diagnostic: "native receiver transport preparation failed".to_owned(),
+                ..failure(code)
+            })?;
+        let plan = Receiver {
+            source: source.clone(),
+            source_id: track.track_id.clone(),
+            transport,
+            policy,
+        };
+        let bytes = crate::participant::Connection::native_receiver_execution_bytes(
+            &track.label,
+            &plan.source_id,
+            match &plan.transport {
+                ReceiveTransport::Rtp(rtp) => Some(rtp.kind),
+                ReceiveTransport::Sctp { .. } => None,
+            },
+        );
+        self.reserve_receiver_source(work, bytes, participant, track)
+            .map_err(|_| failure(wire::FailureCode::CapacityExceeded))?;
+        Ok(ReceiverPreparation::Ready(Box::new(plan)))
     }
 
     pub(crate) fn preparation_current(
@@ -684,27 +1134,7 @@ impl NativeSession {
         work: &Preparation,
         unix_now: u64,
     ) -> Result<bool, OutputError> {
-        let Some(owned) = self
-            .rows
-            .get(&Key::Owned(work.reference))
-            .and_then(|row| row.owned.as_ref())
-        else {
-            return Ok(false);
-        };
-        if self.closed
-            || owned.retired
-            || owned.active != Some((work.revision, work.grant_revision))
-            || owned.target.revision != work.revision
-            || self.grant_revision != work.grant_revision
-        {
-            return Ok(false);
-        }
-        let Some(wire::desired_state::Value::Present(target)) = owned.target.value.as_ref() else {
-            return Ok(false);
-        };
-        if !validation::declarations_equivalent(target, &work.spec)
-            || !matches!((&target.settings, &work.spec.settings), (Some(target), Some(work)) if validation::settings_equivalent(target, work))
-        {
+        if self.preparation_spec(work).is_none() {
             return Ok(false);
         }
         if !self.authorization_current(unix_now) {
@@ -713,7 +1143,130 @@ impl NativeSession {
         Ok(true)
     }
 
-    pub(crate) fn complete(
+    // Disposal belongs to the paid attempt, not merely the binding.
+    fn release_preparation_storage(
+        &mut self,
+        work: Preparation,
+        released: bool,
+    ) -> Result<(), OutputError> {
+        if released
+            && self
+                .rows
+                .get(&Key::Owned(work.reference))
+                .and_then(|row| row.owned.as_ref())
+                .is_some_and(|owned| {
+                    owned.active == Some(work.stamp())
+                        || owned.storage_sequence == work.scope().sequence
+                })
+        {
+            self.reserve_execution(work.reference, 0)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_deferral(
+        &mut self,
+        deferral: super::ExecutionDeferral,
+    ) -> Result<(), OutputError> {
+        metrics::histogram!("native_signaling_execution_observation_us").record(
+            pulsebeam_runtime::time::Instant::now()
+                .saturating_duration_since(deferral.work.started_at)
+                .as_micros() as f64,
+        );
+        if let Some(sequence) = deferral.retained_sequence {
+            if let Some(owned) = self
+                .rows
+                .get_mut(&Key::Owned(deferral.work.reference))
+                .and_then(|row| row.owned.as_mut())
+                && owned.active == Some(deferral.work.stamp())
+                && owned.execution_bytes != 0
+            {
+                // Rejected admission leaves the surviving object's storage with its previous owner.
+                owned.storage_sequence = sequence;
+            }
+        } else {
+            self.release_preparation_storage(deferral.work, true)?;
+        }
+        self.defer_preparation(deferral.work)
+    }
+
+    pub(crate) fn observe_completion(
+        &mut self,
+        completion: super::ExecutionCompletion,
+        external_id: &crate::entity::ParticipantExternalId,
+    ) -> Result<(), OutputError> {
+        let super::ExecutionCompletion {
+            work,
+            result,
+            released,
+            unix_now,
+        } = completion;
+        let executed = result.is_ok();
+        metrics::histogram!("native_signaling_execution_observation_us").record(
+            pulsebeam_runtime::time::Instant::now()
+                .saturating_duration_since(work.started_at)
+                .as_micros() as f64,
+        );
+        if executed && released {
+            return Err(OutputError::InvalidObservation);
+        }
+        self.release_preparation_storage(work, released)?;
+        let rejected = matches!(
+            self.complete_execution(work, result, external_id, unix_now)?,
+            ExecutionDisposition::Rejected
+        );
+        if executed && rejected {
+            // A prepaid, scoped execution fact cannot be rejected as an ordinary proposal.
+            return Err(OutputError::InvalidObservation);
+        }
+        Ok(())
+    }
+
+    fn complete_execution(
+        &mut self,
+        work: Preparation,
+        result: Result<ResourceExecution, crate::participant::policy::ExecutionFailure>,
+        external_id: &crate::entity::ParticipantExternalId,
+        unix_now: u64,
+    ) -> Result<ExecutionDisposition, OutputError> {
+        let projected = result
+            .map_err(super::execution_failure)
+            .and_then(|execution| match execution {
+                ResourceExecution::Publication(execution) => {
+                    self.project_publication(&work, &execution, external_id)
+                }
+                ResourceExecution::Receiver(execution) => self.project_receiver(&work, &execution),
+            });
+        let rejected = projected.is_err();
+        if !self.complete_projected(work, projected, unix_now)? {
+            return Ok(ExecutionDisposition::Deferred);
+        }
+        Ok(if rejected {
+            ExecutionDisposition::Rejected
+        } else {
+            ExecutionDisposition::Accepted
+        })
+    }
+
+    fn complete_projected(
+        &mut self,
+        work: Preparation,
+        result: Result<ProjectedExecution, wire::Failure>,
+        now: u64,
+    ) -> Result<bool, OutputError> {
+        let result = match result {
+            Ok(projected) => {
+                if projected.work != work {
+                    return Err(OutputError::InvalidObservation);
+                }
+                Ok(projected.live)
+            }
+            Err(error) => Err(error),
+        };
+        self.complete(work, result, now)
+    }
+
+    fn complete(
         &mut self,
         work: Preparation,
         result: Result<wire::LiveResource, wire::Failure>,
@@ -723,17 +1276,27 @@ impl NativeSession {
         let Some(owned) = self.rows.get(&key).and_then(|row| row.owned.as_ref()) else {
             return Ok(false);
         };
-        if owned.active != Some((work.revision, work.grant_revision)) {
+        if owned.active != Some(work.stamp()) {
             return Ok(false);
         }
-        let active_bytes = owned.active_bytes;
         let current = self.preparation_current(&work, unix_now);
         if matches!(current, Ok(false) | Err(OutputError::AuthorizationExpired)) {
             self.defer_preparation(work)?;
             return Ok(false);
         }
         current?;
-        self.charge(active_bytes, 0)?;
+        if let Ok(live) = &result {
+            let target = self
+                .preparation_spec(&work)
+                .ok_or(OutputError::InvalidObservation)?;
+            if live.spec.as_ref().is_none_or(|spec| {
+                !validation::declarations_equivalent(target, spec)
+                    || !matches!((&target.settings, &spec.settings), (Some(requested), Some(accepted)) if validation::settings_equivalent(requested, accepted))
+            }) {
+                return Err(OutputError::InvalidObservation);
+            }
+        }
+        self.charge(Preparation::bytes(), 0)?;
         let Some(row) = self.rows.get_mut(&key) else {
             return Ok(false);
         };
@@ -741,7 +1304,6 @@ impl NativeSession {
             return Ok(false);
         };
         owned.active = None;
-        owned.active_bytes = 0;
         let Some(row) = self.rows.get_mut(&key) else {
             return Ok(false);
         };
@@ -749,19 +1311,11 @@ impl NativeSession {
             return Ok(false);
         };
         let value = match result {
-            Ok(live) => {
-                if live.spec.as_ref().is_none_or(|spec| {
-                    !validation::declarations_equivalent(&work.spec, spec)
-                        || !matches!((&work.spec.settings, &spec.settings), (Some(requested), Some(accepted)) if validation::settings_equivalent(requested, accepted))
-                }) {
-                    return Err(OutputError::InvalidObservation);
-                }
-                wire::ConfirmedState {
-                    evaluated_revision: work.revision,
-                    rejection: None,
-                    value: Some(wire::confirmed_state::Value::Owned(Box::new(live))),
-                }
-            }
+            Ok(live) => wire::ConfirmedState {
+                evaluated_revision: work.revision,
+                rejection: None,
+                value: Some(wire::confirmed_state::Value::Owned(Box::new(live))),
+            },
             Err(rejection) => {
                 let mut value = row.value.clone();
                 value.evaluated_revision = work.revision;
@@ -776,40 +1330,209 @@ impl NativeSession {
             }
         };
         self.put(key, value)?;
+        self.release_receiver_source(work.reference)?;
+        self.release_receiver_failure(work.reference)?;
         self.release_label(work.reference);
         Ok(true)
     }
 
-    pub(crate) fn owns_lifetime(&self, reference: u64) -> bool {
-        !self.closed
-            && self
-                .rows
-                .get(&Key::Owned(reference))
-                .and_then(|row| row.owned.as_ref())
-                .is_some_and(|owned| !owned.retired)
-    }
-
-    pub(crate) fn reserve_execution(
-        &mut self,
-        reference: u64,
-        bytes: usize,
-    ) -> Result<(), OutputError> {
+    fn reserve_execution(&mut self, reference: u64, bytes: usize) -> Result<(), OutputError> {
         let key = Key::Owned(reference);
-        let previous = self
+        let owned = self
             .rows
             .get(&key)
             .and_then(|row| row.owned.as_ref())
-            .ok_or(OutputError::InvalidObservation)?
-            .execution_bytes;
+            .ok_or(OutputError::InvalidObservation)?;
+        let source_bytes = if bytes == 0 {
+            owned
+                .receiver_source
+                .as_ref()
+                .map_or(0, |source| source.bytes())
+        } else {
+            0
+        };
+        let failure_bytes = if bytes == 0 {
+            owned
+                .receiver_failure
+                .as_deref()
+                .map_or(0, receiver_failure_bytes)
+        } else {
+            0
+        };
+        let previous = owned
+            .execution_bytes
+            .saturating_add(source_bytes)
+            .saturating_add(failure_bytes);
         self.charge(previous, bytes)?;
         if let Some(owned) = self.rows.get_mut(&key).and_then(|row| row.owned.as_mut()) {
             owned.execution_bytes = bytes;
+            if bytes == 0 {
+                owned.storage_sequence = 0;
+                owned.receiver_source = None;
+                owned.receiver_binding = None;
+                owned.receiver_failure = None;
+            }
         }
         self.collect(&key);
         Ok(())
     }
 
-    pub(crate) fn source_ended(&mut self, reference: u64) -> Result<(), OutputError> {
+    fn reserve_receiver_source(
+        &mut self,
+        work: &Preparation,
+        bytes: usize,
+        participant: wire::Participant,
+        track: wire::Track,
+    ) -> Result<(), OutputError> {
+        let preview = wire::LiveResource {
+            spec: Some(
+                self.preparation_spec(work)
+                    .ok_or(OutputError::InvalidObservation)?
+                    .clone(),
+            ),
+            participant: Some(participant.clone()),
+            track: Some(track.clone()),
+            ..Default::default()
+        };
+        if !execution_fits(&preview) {
+            return Err(OutputError::Capacity);
+        }
+        let key = Key::Owned(work.reference);
+        let owned = self
+            .rows
+            .get(&key)
+            .and_then(|row| row.owned.as_ref())
+            .ok_or(OutputError::InvalidObservation)?;
+        let previous = owned.execution_bytes.saturating_add(
+            owned
+                .receiver_source
+                .as_ref()
+                .map_or(0, |source| source.bytes()),
+        );
+        let source = ReceiverSource { participant, track };
+        self.charge(previous, bytes.saturating_add(source.bytes()))?;
+        if let Some(owned) = self.rows.get_mut(&key).and_then(|row| row.owned.as_mut()) {
+            owned.execution_bytes = bytes;
+            owned.receiver_source = Some(Box::new(source));
+        }
+        Ok(())
+    }
+
+    fn release_receiver_source(&mut self, reference: u64) -> Result<(), OutputError> {
+        let key = Key::Owned(reference);
+        let bytes = self
+            .rows
+            .get(&key)
+            .and_then(|row| row.owned.as_ref())
+            .and_then(|owned| owned.receiver_source.as_ref())
+            .map_or(0, |source| source.bytes());
+        self.charge(bytes, 0)?;
+        if let Some(owned) = self.rows.get_mut(&key).and_then(|row| row.owned.as_mut()) {
+            owned.receiver_source = None;
+        }
+        Ok(())
+    }
+
+    fn release_receiver_failure(&mut self, reference: u64) -> Result<(), OutputError> {
+        let key = Key::Owned(reference);
+        let bytes = self
+            .rows
+            .get(&key)
+            .and_then(|row| row.owned.as_ref())
+            .and_then(|owned| owned.receiver_failure.as_deref())
+            .map_or(0, receiver_failure_bytes);
+        self.charge(bytes, 0)?;
+        if let Some(owned) = self.rows.get_mut(&key).and_then(|row| row.owned.as_mut()) {
+            owned.receiver_failure = None;
+        }
+        Ok(())
+    }
+
+    fn project_publication(
+        &self,
+        work: &Preparation,
+        execution: &crate::participant::policy::PublicationExecution,
+        external_id: &crate::entity::ParticipantExternalId,
+    ) -> Result<ProjectedExecution, wire::Failure> {
+        let spec = self
+            .preparation_spec(work)
+            .ok_or_else(|| failure(wire::FailureCode::ResourceGone))?;
+        if !matches!(
+            spec.declaration,
+            Some(wire::resource_spec::Declaration::Publication(_))
+        ) {
+            return Err(failure(wire::FailureCode::InvalidConfiguration));
+        }
+        let live = wire::LiveResource {
+            spec: Some(spec.clone()),
+            participant: Some(wire::Participant {
+                participant_id: execution.track.meta().origin.as_str(),
+                participant_external_id: external_id.as_str().to_owned(),
+            }),
+            track: track_descriptor(&execution.track),
+            execution: if execution.enabled {
+                wire::ExecutionStatus::Installed
+            } else {
+                wire::ExecutionStatus::Disabled
+            } as i32,
+            execution_failure: None,
+            activity: if matches!(execution.track, Track::Data(_)) {
+                None
+            } else {
+                Some(if execution.active {
+                    wire::MediaActivity::Active
+                } else {
+                    wire::MediaActivity::Idle
+                } as i32)
+            },
+        };
+        Ok(ProjectedExecution { work: *work, live })
+    }
+
+    fn project_receiver(
+        &self,
+        work: &Preparation,
+        execution: &crate::participant::policy::ReceiverExecution,
+    ) -> Result<ProjectedExecution, wire::Failure> {
+        let (participant, track) = self
+            .rows
+            .get(&Key::Owned(work.reference))
+            .and_then(|row| {
+                row.owned
+                    .as_ref()
+                    .and_then(|owned| owned.receiver_source.as_ref())
+                    .map(|source| (&source.participant, &source.track))
+                    .or_else(|| match &row.value.value {
+                        Some(wire::confirmed_state::Value::Owned(live)) => {
+                            live.participant.as_ref().zip(live.track.as_ref())
+                        }
+                        _ => None,
+                    })
+            })
+            .filter(|(_, track)| track.track_id == execution.source.as_str())
+            .ok_or_else(|| failure(wire::FailureCode::ResourceGone))?;
+        let (status, execution_failure) = self
+            .receiver_result(work.reference, execution)
+            .map_err(|_| failure(wire::FailureCode::InternalFailure))?;
+        let live = wire::LiveResource {
+            spec: Some(
+                self.preparation_spec(work)
+                    .ok_or_else(|| failure(wire::FailureCode::ResourceGone))?
+                    .clone(),
+            ),
+            participant: Some(participant.clone()),
+            track: Some(track.clone()),
+            execution: status as i32,
+            execution_failure,
+            activity: None,
+        };
+        if !execution_fits(&live) {
+            return Err(failure(wire::FailureCode::CapacityExceeded));
+        }
+        Ok(ProjectedExecution { work: *work, live })
+    }
+
+    fn source_ended(&mut self, reference: u64) -> Result<(), OutputError> {
         let Some(owned) = self
             .rows
             .get_mut(&Key::Owned(reference))
@@ -825,7 +1548,7 @@ impl NativeSession {
         Ok(())
     }
 
-    pub(crate) fn cutoff_complete(&mut self, reference: u64) -> Result<(), OutputError> {
+    fn cutoff_complete(&mut self, reference: u64) -> Result<(), OutputError> {
         let Some(row) = self.rows.get_mut(&Key::Owned(reference)) else {
             return Ok(());
         };
@@ -871,7 +1594,15 @@ impl NativeSession {
     pub(crate) fn needs_poll(&self) -> bool {
         self.cid.is_some()
             && self.grant_revision != 0
-            && (self.pending.is_some() || !self.dirty.is_empty() || !self.initial_complete)
+            && self.pending.as_ref().map_or_else(
+                || !self.dirty.is_empty() || !self.initial_complete,
+                |pending| {
+                    pending.output.is_some()
+                        || self.deadline().is_some_and(|deadline| {
+                            pulsebeam_runtime::time::Instant::now() >= deadline
+                        })
+                },
+            )
     }
 
     pub(crate) fn enumeration_progress(&self) -> u64 {
@@ -879,6 +1610,13 @@ impl NativeSession {
     }
 
     pub(crate) fn deadline(&self) -> Option<pulsebeam_runtime::time::Instant> {
+        self.progress_deadline()
+            .into_iter()
+            .chain(self.source_deadlines.first().map(|(deadline, _)| *deadline))
+            .min()
+    }
+
+    fn progress_deadline(&self) -> Option<pulsebeam_runtime::time::Instant> {
         self.pending
             .as_ref()
             .map(|pending| pending.deadline)
@@ -887,15 +1625,18 @@ impl NativeSession {
             .min()
     }
 
-    pub(crate) fn poll(&mut self) -> Result<Option<&NativeOutput>, OutputError> {
+    pub(crate) fn poll(&mut self) -> Result<Option<&SignalingOutput>, OutputError> {
         if self
-            .deadline()
+            .progress_deadline()
             .is_some_and(|deadline| pulsebeam_runtime::time::Instant::now() >= deadline)
         {
             return Err(OutputError::ProgressExpired);
         }
         if self.pending.is_some() {
-            return Ok(self.pending.as_ref().map(|pending| &pending.output));
+            return Ok(self
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.output.as_ref()));
         }
         let Some(cid) = self.cid else { return Ok(None) };
         if self.grant_revision == 0 {
@@ -1022,14 +1763,35 @@ impl NativeSession {
             return Ok(None);
         }
         let bytes = codec::encode_server(&batch).map_err(OutputError::Encode)?;
+        let sequence = self
+            .output_sequence
+            .checked_add(1)
+            .ok_or(OutputError::Capacity)?;
+        let selected_at = pulsebeam_runtime::time::Instant::now();
+        let deadline = progress_deadline(selected_at);
+        let deadline = self
+            .initial_deadline
+            .map_or(deadline, |initial| initial.min(deadline));
+        self.output_sequence = sequence;
         self.pending = Some(Pending {
-            output: NativeOutput { cid, bytes },
+            output: Some(SignalingOutput {
+                sequence,
+                cid,
+                bytes,
+                deadline,
+            }),
+            sequence,
+            cid,
             selected,
             initial_cursor: selected_cursor,
             initial_complete: batch.initial_complete,
-            deadline: progress_deadline(),
+            selected_at,
+            deadline,
         });
-        Ok(self.pending.as_ref().map(|pending| &pending.output))
+        Ok(self
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.output.as_ref()))
     }
 
     fn requeue(&mut self, key: &Key) {
@@ -1041,10 +1803,47 @@ impl NativeSession {
         }
     }
 
-    pub(crate) fn commit_sent(&mut self) {
-        let Some(pending) = self.pending.take() else {
-            return;
+    pub(crate) fn take_output(&mut self) -> Option<SignalingOutput> {
+        self.pending.as_mut()?.output.take()
+    }
+
+    pub(crate) fn restore_output(&mut self, output: SignalingOutput) -> Result<(), OutputError> {
+        let Some(pending) = self.pending.as_mut() else {
+            return Err(OutputError::InvalidObservation);
         };
+        if pending.sequence != output.sequence
+            || pending.cid != output.cid
+            || pending.deadline != output.deadline
+            || pending.output.is_some()
+        {
+            return Err(OutputError::InvalidObservation);
+        }
+        pending.output = Some(output);
+        Ok(())
+    }
+
+    pub(crate) fn commit_sent(&mut self, progress: SignalingProgress) -> Result<bool, OutputError> {
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(false);
+        };
+        if pending.sequence != progress.sequence
+            || pending.cid != progress.cid
+            || pending.output.is_some()
+        {
+            return Ok(false);
+        }
+        if progress.at >= pending.deadline {
+            return Err(OutputError::ProgressExpired);
+        }
+        let Some(pending) = self.pending.take() else {
+            return Ok(false);
+        };
+        metrics::histogram!("native_signaling_output_admission_us").record(
+            progress
+                .at
+                .saturating_duration_since(pending.selected_at)
+                .as_micros() as f64,
+        );
         self.initial_cursor = pending.initial_cursor;
         self.initial_complete |= pending.initial_complete;
         if self.initial_complete {
@@ -1066,8 +1865,9 @@ impl NativeSession {
             self.collect(&key);
         }
         if initial_progress && !self.initial_complete {
-            self.initial_deadline = Some(progress_deadline());
+            self.initial_deadline = Some(progress_deadline(progress.at));
         }
+        Ok(true)
     }
 
     fn collect(&mut self, key: &Key) {
@@ -1094,8 +1894,13 @@ impl NativeSession {
                     .declaration
                     .encoded_len()
                     .saturating_add(owned.target.encoded_len())
-                    .saturating_add(owned.active_bytes)
                     .saturating_add(owned.execution_bytes)
+                    .saturating_add(
+                        owned
+                            .receiver_source
+                            .as_ref()
+                            .map_or(0, |source| source.bytes()),
+                    )
             });
             let bytes = key_cost(key)
                 .saturating_add(row.value.encoded_len())
@@ -1105,10 +1910,9 @@ impl NativeSession {
     }
 }
 
-fn progress_deadline() -> pulsebeam_runtime::time::Instant {
-    let now = pulsebeam_runtime::time::Instant::now();
-    now.checked_add(std::time::Duration::from_secs(30))
-        .unwrap_or(now)
+fn progress_deadline(at: pulsebeam_runtime::time::Instant) -> pulsebeam_runtime::time::Instant {
+    at.checked_add(std::time::Duration::from_secs(30))
+        .unwrap_or(at)
 }
 
 fn key_cost(key: &Key) -> usize {
@@ -1255,6 +2059,10 @@ pub(crate) fn track_descriptor(track: &crate::track::Track) -> Option<wire::Trac
         label: track.meta().label.clone()?,
         kind: Some(kind),
     })
+}
+
+fn receiver_failure_bytes(error: &wire::Failure) -> usize {
+    std::mem::size_of::<wire::Failure>().saturating_add(error.encoded_len())
 }
 
 pub(crate) fn failure(code: wire::FailureCode) -> wire::Failure {

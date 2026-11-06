@@ -210,7 +210,7 @@ struct Pump<'a> {
     world: &'a ControlledWorld,
     network: &'a ControlledSimulatedNetwork,
     socket: &'a SimulatedUdpSocket,
-    connection: Connection,
+    connection: RtcConnection,
     start: Instant,
     origin: Duration,
     echo_mids: BTreeMap<String, String>,
@@ -401,7 +401,7 @@ fn sctp_bootstrap_reconciles_dynamic_media_and_repair_without_server_sdp() {
             .all(|m| m.kind == client::Kind::Application)
     );
     let local = socket.local_address();
-    let accepted = Connection::accept(
+    let accepted = RtcConnection::accept(
         ConnectionConfig {
             local_candidates: vec![LocalCandidate::Udp(SocketAddr::new(
                 local.ip(),

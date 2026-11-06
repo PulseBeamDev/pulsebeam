@@ -1,11 +1,13 @@
 use super::*;
-use pulsebeam_proto::state::VideoReceiveOptions;
+use crate::participant::policy::VideoPolicy;
 
-impl VideoAllocator {
-    pub(crate) fn owned_slot_bytes(&self) -> usize {
+impl DownstreamVideo {
+    pub(crate) fn owned_slot_bytes() -> usize {
         std::mem::size_of::<Slot>()
     }
+}
 
+impl VideoAllocator {
     pub(crate) fn install_owned_slot(
         &mut self,
         mid: Mid,
@@ -27,7 +29,7 @@ impl VideoAllocator {
         &mut self,
         mid: Mid,
         source: TrackId,
-        options: &VideoReceiveOptions,
+        options: &VideoPolicy,
         active: bool,
     ) {
         let Some(slot) = self
@@ -38,13 +40,13 @@ impl VideoAllocator {
             return;
         };
         let previous_ceiling = slot.height_ceiling;
-        slot.height_ceiling = options.max_height;
+        slot.height_ceiling = options.height_ceiling;
         let intent = Intent {
             track_id: source,
-            target_height: options.max_height.unwrap_or(u32::MAX),
-            min_height: options.min_height.unwrap_or(0),
-            min_fps: options.min_fps.unwrap_or(0),
-            priority: options.priority.unwrap_or(1),
+            target_height: options.height_ceiling.unwrap_or(u32::MAX),
+            min_height: options.minimum_height,
+            min_fps: options.minimum_fps,
+            priority: options.priority,
         };
         Self::configure_slot(
             &self.tracks,

@@ -4,8 +4,8 @@ use std::{
 };
 
 use pulsebeam_rtc::{
-    Connection, ConnectionConfig, ConnectionEntropy, Event, LocalCandidate, MediaPayloadBitrate,
-    NetworkInput, Output, RtpWrite, SdpOffer, TransmitTarget,
+    ConnectionConfig, ConnectionEntropy, Event, LocalCandidate, MediaPayloadBitrate, NetworkInput,
+    Output, RtcConnection, RtpWrite, SdpOffer, TransmitTarget,
 };
 use pulsebeam_webrtc_sys::*;
 
@@ -132,7 +132,7 @@ fn exercise(seed: u64, start: Instant) -> (u64, u64, usize) {
         local_candidates: vec![LocalCandidate::Udp(local)],
         ..ConnectionConfig::default()
     };
-    let accepted = Connection::accept(
+    let accepted = RtcConnection::accept(
         config,
         SdpOffer::new(offer.sdp),
         point(world.now()),
@@ -422,7 +422,7 @@ fn controlled_libwebrtc_acknowledges_rtx_padding_before_primary_media() {
         local_candidates: vec![LocalCandidate::Udp(local)],
         ..ConnectionConfig::default()
     };
-    let accepted = Connection::accept(
+    let accepted = RtcConnection::accept(
         config,
         SdpOffer::new(offer.sdp),
         point(world.now()),

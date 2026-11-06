@@ -19,7 +19,7 @@ use crate::{
     RejectedRtp, RtpWrite, SdpAnswer, SdpOffer, SessionInfo, StatsSnapshot, Transmit, WriteError,
     egress::{MediaEgress, PrepareResult},
     ingress::IngressOwner,
-    negotiation::{self, NegotiatedSessionFacts},
+    negotiation,
     scheduler::{ServiceArbiter, UserLane},
     sctp::Association,
     sent_history::{HistoryError, MAX_EXPIRATIONS_PER_POLL, SentHistory},
@@ -30,8 +30,11 @@ use crate::{
     },
 };
 
-pub struct Connection {
-    session: NegotiatedSessionFacts,
+pub struct RtcConnection {
+    feedback: Option<PacketFeedbackKind>,
+    inbound_feedback: Option<PacketFeedbackKind>,
+    protocol_randomness: [u8; 32],
+    has_negotiated_rtp: bool,
     rtp_configuration: crate::rtp_config::RtpConfigurationState,
     time: MonotonicObserver,
     transport: Transport,
@@ -152,12 +155,12 @@ impl CommitCoordinator {
 }
 
 pub struct AcceptedConnection {
-    pub connection: Connection,
+    pub connection: RtcConnection,
     pub answer: SdpAnswer,
     pub session: SessionInfo,
 }
 
-impl Connection {
+impl RtcConnection {
     /// Declare bounded ongoing RTP support once, even after an SCTP-only start.
     /// This selects the connection-wide feedback profile without rebuilding its
     /// transport, receive feedback or committed send history. Receipt-history
@@ -183,7 +186,7 @@ impl Connection {
                 Err(Error::CapabilityState)
             };
         }
-        if [self.session.feedback(), self.session.inbound_feedback()]
+        if [self.feedback, self.inbound_feedback]
             .into_iter()
             .flatten()
             .any(|feedback| feedback != capabilities.feedback)
@@ -199,9 +202,10 @@ impl Connection {
                 HistoryError::InvalidCommit => Error::ConnectionState,
             })?;
         self.ingress.set_feedback_profile(capabilities.feedback)?;
-        self.session.set_feedback_profile(capabilities.feedback);
+        self.feedback = Some(capabilities.feedback);
+        self.inbound_feedback = Some(capabilities.feedback);
         sent_profile.commit();
-        if self.session.ingress_media().is_empty() && self.session.egress_senders().is_empty() {
+        if !self.has_negotiated_rtp {
             self.transport
                 .configure_rtp_mappings(Box::new([]), Box::new([]), []);
         }
@@ -234,6 +238,67 @@ impl Connection {
         self.apply_rtp_configuration(update)
     }
 
+    /// Pause or resume an installed primary without compiling a replacement or
+    /// retiring its physical identity. Pausing cancels only that sender's queued
+    /// work; sequence, replay, repair and feedback history remain installed.
+    pub fn set_rtp_encoding_active(
+        &mut self,
+        primary: u32,
+        active: bool,
+    ) -> Result<(), crate::RtpConfigurationError> {
+        self.check_writable()
+            .map_err(|_| crate::RtpConfigurationError::ConnectionState)?;
+        let Some(update) = self.rtp_configuration.stage_activity(primary, active)? else {
+            return Ok(());
+        };
+        if update.outbound {
+            self.egress.set_encoding_active(primary, active)?;
+        } else {
+            self.ingress.set_encoding_active(primary, active)?;
+        }
+        self.transport.configure_rtp_mappings(
+            self.rtp_configuration
+                .activity_payload_types(&update, false),
+            self.rtp_configuration.activity_payload_types(&update, true),
+            std::iter::once(update.primary)
+                .chain(update.repair)
+                .filter(|_| !update.outbound)
+                .map(|ssrc| (ssrc, update.active)),
+        );
+        self.rtp_configuration.commit_activity(update);
+        Ok(())
+    }
+
+    /// Clone the immutable compilation context without sharing a live runtime.
+    pub fn rtp_binding_compiler(
+        &self,
+    ) -> Result<crate::RtpBindingCompiler, crate::RtpConfigurationError> {
+        self.rtp_configuration.compiler()
+    }
+
+    /// Apply static descriptions against this connection's current registry.
+    /// Wrong capability contexts and live conflicts leave all installed state unchanged.
+    pub fn configure_compiled_rtp(
+        &mut self,
+        configuration: crate::CompiledRtpConfiguration,
+    ) -> Result<(), crate::RtpConfigurationError> {
+        self.check_writable()
+            .map_err(|_| crate::RtpConfigurationError::ConnectionState)?;
+        let update = self.rtp_configuration.stage_compiled(configuration)?;
+        self.apply_rtp_configuration(update)
+    }
+
+    /// Replace only the addressed groups, preserving all unrelated bindings.
+    pub fn update_compiled_rtp(
+        &mut self,
+        patch: crate::CompiledRtpConfigurationPatch,
+    ) -> Result<(), crate::RtpConfigurationError> {
+        self.check_writable()
+            .map_err(|_| crate::RtpConfigurationError::ConnectionState)?;
+        let update = self.rtp_configuration.stage_compiled_patch(patch)?;
+        self.apply_rtp_configuration(update)
+    }
+
     fn apply_rtp_configuration(
         &mut self,
         update: crate::rtp_config::RtpConfigurationUpdate,
@@ -263,7 +328,7 @@ impl Connection {
         )?;
         let egress = self.egress.stage_configuration(
             staged,
-            self.session.protocol_randomness(),
+            &self.protocol_randomness,
             &update.removed_outbound.iter().copied().collect::<Vec<_>>(),
             update.scope,
         )?;
@@ -415,6 +480,13 @@ impl Connection {
         self.sctp.as_ref().and_then(Association::stream_capacity)
     }
 
+    /// Unsent SCTP payload bytes for one known channel, without a stats snapshot.
+    /// Excludes payload already in flight and is not the retained send-credit charge.
+    /// Returns None when the association or channel is absent.
+    pub fn data_channel_queued_payload_bytes(&self, channel: DataChannelId) -> Option<usize> {
+        self.sctp.as_ref()?.channel_queued_payload_bytes(channel)
+    }
+
     /// Reserve an explicitly identified negotiated channel even before SCTP connects.
     /// `Opened` reports activation after peer stream-capacity checks; admission alone
     /// does not permit sending. In-band channels still require connected SCTP.
@@ -433,6 +505,49 @@ impl Connection {
             return Err((WriteError::InvalidState, config));
         };
         sctp.open(at, config)
+    }
+
+    /// Install an exact explicitly identified negotiated channel. RTC retains a
+    /// funded request while SCTP connects or the prior SID lifetime resets.
+    /// Admission consumes no caller retry loop and does not imply usability.
+    pub fn install_data_channel(
+        &mut self,
+        at: Instant,
+        config: DataChannelConfig,
+    ) -> Result<crate::DataChannelInstallation, (WriteError, DataChannelConfig)> {
+        let at = self.time.observe(at);
+        if let Err(reason) = self.check_writable() {
+            return Err((reason, config));
+        }
+        let Some(sctp) = self.sctp.as_mut() else {
+            return Err((WriteError::InvalidState, config));
+        };
+        sctp.install(at, config)
+    }
+
+    /// Read the actual state of this installation lifetime, not the current SID
+    /// occupant. Existing channel events wake the caller; query this token before
+    /// attaching a completion. None means canceled, failed, retired or unavailable.
+    pub fn data_channel_installation(
+        &self,
+        installation: crate::DataChannelInstallation,
+    ) -> Option<crate::DataChannelInstallationState> {
+        self.sctp.as_ref()?.installation_state(installation)
+    }
+
+    /// Cancel only this installation. Before physical admission no reset is
+    /// needed; after admission closure still retains RTC's full reuse barrier.
+    /// Stale tokens are no-ops and cannot close a replacement.
+    pub fn cancel_data_channel_installation(
+        &mut self,
+        at: Instant,
+        installation: crate::DataChannelInstallation,
+    ) -> Result<(), WriteError> {
+        let at = self.time.observe(at);
+        self.sctp
+            .as_mut()
+            .ok_or(WriteError::InvalidState)?
+            .cancel_installation(at, installation)
     }
 
     pub fn send_data(
@@ -818,7 +933,7 @@ impl Connection {
                     arrival,
                     bytes,
                     path_epoch,
-                    self.session.feedback(),
+                    self.feedback,
                     self.transport.smoothed_rtt(),
                 );
                 self.transport.retire_inbound_ssrcs(retired);
@@ -888,7 +1003,7 @@ impl Connection {
         StatsSnapshot {
             connection: ConnectionStats {
                 state,
-                feedback: self.session.feedback(),
+                feedback: self.feedback,
                 close_reason,
                 clock_regressions: self.time.regressions(),
                 rtp_bytes_in_flight: self.commit.history.controller_inputs().bytes_in_flight,
@@ -948,34 +1063,46 @@ impl Connection {
         }
         let mut entropy = EntropyConsumer::new(entropy);
         let negotiated = negotiation::negotiate(&config, &offer, at, &mut entropy)?;
-        let session = negotiated.session.clone();
+        let session = negotiated.session;
         let transport = Transport::from_session(&negotiated.facts, config.limits, at)
             .map_err(|_| AcceptError::CryptographicFailure)?;
+        let ingress_media = negotiated.facts.ingress_media();
+        let egress_senders = negotiated.facts.egress_senders();
+        let has_negotiated_rtp = !ingress_media.is_empty() || !egress_senders.is_empty();
+        let protocol_randomness = *negotiated.facts.protocol_randomness();
+        let feedback = negotiated.facts.feedback();
+        let inbound_feedback = negotiated.facts.inbound_feedback();
         let ingress = IngressOwner::new(
-            negotiated.facts.ingress_media(),
+            ingress_media,
             config.limits.max_queued_media_bytes,
             config.limits.max_receive_runtime_bytes,
             u32::from_be_bytes(entropy.take(b"receive-rtcp-ssrc")).max(1),
             negotiated.facts.local_cname(),
-            crate::receive_feedback::ReceiveFeedback::new(negotiated.facts.inbound_feedback(), at),
+            crate::receive_feedback::ReceiveFeedback::new(inbound_feedback, at),
         )?;
         let egress = MediaEgress::new(
-            negotiated.facts.egress_senders(),
-            negotiated.facts.protocol_randomness(),
+            egress_senders,
+            &protocol_randomness,
             config.limits.max_queued_media_bytes,
             config.limits.max_retransmission_bytes,
             config.limits.max_send_runtime_bytes,
             at,
             crate::time::ProtocolClock::new(at, wallclock),
         )?;
-        let feedback = negotiated.facts.feedback();
+        let mut installation_context = Sha256::new();
+        installation_context.update(b"pulsebeam.rtc.channel-installation.v1");
+        installation_context.update(protocol_randomness);
+        let installation_context = installation_context.finalize().into();
         let sctp = negotiated
             .facts
             .sctp()
-            .map(|facts| Association::new(facts, config.limits, at))
+            .map(|facts| Association::new(facts, config.limits, at, installation_context))
             .transpose()?;
         let mut connection = Self {
-            session: negotiated.facts,
+            feedback,
+            inbound_feedback,
+            protocol_randomness,
+            has_negotiated_rtp,
             rtp_configuration: crate::rtp_config::RtpConfigurationState::default(),
             time: MonotonicObserver::starting_at(at),
             transport,
@@ -1058,7 +1185,7 @@ mod tests {
     #[test]
     fn retired_sender_cleanup_progresses_without_transport_send_readiness() {
         let now = Instant::now();
-        let mut connection = Connection::accept(
+        let mut connection = RtcConnection::accept(
             ConnectionConfig {
                 local_candidates: vec![crate::LocalCandidate::Udp(
                     "192.0.2.2:41000".parse().unwrap(),
@@ -1125,7 +1252,7 @@ mod tests {
     #[test]
     fn aggregate_demand_obtains_native_rtx_feedback_without_primary_media() {
         let mut fixture = PeerFixture::connected_video().without_egress_observation();
-        fixture.observe_pacing_profile(Connection::test_pacing_profile);
+        fixture.observe_pacing_profile(RtcConnection::test_pacing_profile);
         fixture.configure_rtc_wakeup_quantum(Duration::from_millis(1));
         fixture.configure_network(
             0x6602,
@@ -1264,7 +1391,7 @@ mod tests {
     #[test]
     fn production_no_rtx_feedback_outage_path_replacement_and_pause_recover() {
         let mut fixture = PeerFixture::connected().without_egress_observation();
-        fixture.observe_pacing_profile(Connection::test_pacing_profile);
+        fixture.observe_pacing_profile(RtcConnection::test_pacing_profile);
         fixture.configure_network(
             0x6601,
             NetworkPolicy {
@@ -1274,14 +1401,7 @@ mod tests {
         );
         fixture.configure_bottleneck(2_000_000);
         fixture.configure_time_quantum(Duration::from_millis(5));
-        assert!(
-            fixture
-                .connection
-                .session
-                .egress_senders()
-                .iter()
-                .all(|sender| sender.retransmission_payload_type.is_none())
-        );
+        assert!(!fixture.connection.egress.test_has_repair_senders());
         fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(2_000_000)));
         let mid = fixture.sender_mid.clone();
         let mut frame = 0;
@@ -1532,7 +1652,7 @@ mod tests {
     #[test]
     fn production_two_megabit_capacity_and_native_window() {
         let mut fixture = PeerFixture::connected().without_egress_observation();
-        fixture.observe_pacing_profile(Connection::test_pacing_profile);
+        fixture.observe_pacing_profile(RtcConnection::test_pacing_profile);
         fixture.configure_network(
             0x2201,
             NetworkPolicy {

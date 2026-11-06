@@ -36,7 +36,7 @@ fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, enabled: bool) -> wire::R
 }
 
 fn desire(
-    participant: &mut Participant,
+    participant: &mut NativeParticipant,
     sink: &mut MockParticipantSink,
     reference: u64,
     revision: u64,
@@ -52,6 +52,43 @@ fn desire(
         }
     }
     assert!(participant.disconnect_reason.is_none());
+}
+
+pub(super) fn check_prebound(source: &Track) {
+    let mut participant =
+        participant_with_capabilities(native_data::unix_now() + 60, Some(capabilities()));
+    let mut sink = MockParticipantSink::new();
+    let id = source.id();
+    participant
+        .signaling
+        .observe_participant(wire::Participant {
+            participant_id: source.meta().origin.as_str(),
+            participant_external_id: "source".into(),
+        })
+        .unwrap();
+    let mut handles = slotmap::SlotMap::<TrackHandle, _>::with_key();
+    let handle = handles.insert(id);
+    participant.add_track_candidate(handle, source.clone());
+    participant.apply(
+        crate::participant::effect::ParticipantEffect::TrackSubscribed { track_id: id },
+        Some(handle),
+    );
+    assert!(!participant.native_receivers.contains_source(id));
+    desire(
+        &mut participant,
+        &mut sink,
+        1,
+        1,
+        Some(receiver_spec(id, "prebound", 321, true)),
+    );
+    let (_, live) = last_live(&mut participant);
+    assert_eq!(live.execution, wire::ExecutionStatus::Installed as i32);
+    assert!(participant.native_receivers.can_write_rtp(
+        Mid::from("prebound"),
+        id,
+        321.into(),
+        111u8.into()
+    ));
 }
 
 pub(super) fn check(source: &Track) {
@@ -85,6 +122,7 @@ pub(super) fn check(source: &Track) {
     );
     assert!(live.activity.is_none());
     let mid = Mid::from("listen");
+    assert!(participant.downstream.audio.has_slot(mid));
     assert_eq!(participant.transport.stream_tx_ssrc(mid), Some(321.into()));
     assert_eq!(
         participant
@@ -139,17 +177,18 @@ pub(super) fn check(source: &Track) {
     let mut outputs = Vec::new();
     while let Some(write) = participant.stream_writer.pop() {
         let StreamWrite::Audio {
+            pkt,
             track_id,
             mid,
             ssrc,
             pt,
-            ..
         } = write
         else {
             panic!("audio output")
         };
         assert_eq!(track_id, id);
         assert_eq!(pt, 111u8.into());
+        assert!(!pkt.marker);
         outputs.push((mid, ssrc));
     }
     assert_eq!(
@@ -179,6 +218,12 @@ pub(super) fn check(source: &Track) {
             .transport
             .stream_tx_ssrc(Mid::from("collision"))
             .is_none()
+    );
+    assert!(
+        !participant
+            .downstream
+            .audio
+            .has_slot(Mid::from("collision"))
     );
     assert_eq!(
         participant.transport.stream_tx_ssrc(Mid::from("second")),
@@ -219,6 +264,8 @@ pub(super) fn check(source: &Track) {
             .can_write_rtp(mid, id, 321.into(), 111u8.into())
     );
     desire(&mut participant, &mut sink, 1, 15, None);
+    assert!(!participant.downstream.audio.has_slot(mid));
+    assert!(participant.downstream.audio.has_slot(Mid::from("second")));
     assert!(participant.transport.stream_tx_ssrc(mid).is_none());
     assert!(
         participant
@@ -254,6 +301,21 @@ pub(super) fn check(source: &Track) {
         failed.execution_failure.unwrap().code,
         wire::FailureCode::InternalFailure as i32
     );
+    participant.handle_native_signaling(
+        &wire::codec::encode_client(&wire::ClientStateBatch {
+            records: vec![wire::ClientStateRecord {
+                owned: 3,
+                desired: None,
+                execution: Some(wire::ExecutionReport {
+                    revision: 17,
+                    failure: Some(failure(wire::FailureCode::Unsupported)),
+                }),
+            }],
+        })
+        .unwrap(),
+        &mut sink,
+    );
+    assert!(native_data::tests::confirmations_for(&mut participant, 3).is_empty());
     participant.native_source_binding(id, handle, false);
     participant.native_source_binding(id, handle, true);
     for _ in 0..16 {
@@ -279,6 +341,7 @@ pub(super) fn check(source: &Track) {
             .stream_tx_ssrc(Mid::from("second"))
             .is_none()
     );
+    assert!(!participant.downstream.audio.has_slot(Mid::from("second")));
     assert_eq!(sink.owned_unsubscribes, vec![5, 7, 1, 3]);
     assert!(participant.disconnect_reason.is_none());
 }

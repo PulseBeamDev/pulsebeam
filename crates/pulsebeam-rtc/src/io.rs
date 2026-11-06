@@ -183,6 +183,11 @@ pub enum DataChannelEvent {
         channel: DataChannelId,
         message: DataMessage,
     },
+    /// A managed request failed before physical admission. This exact-token fact
+    /// is independent of an older lifetime still resetting on the same SID.
+    InstallationFailed {
+        installation: crate::DataChannelInstallation,
+    },
     /// Local delivery is fenced. This alone does not permit stream-ID reuse.
     Closed { channel: DataChannelId },
     /// Both reset directions completed and the native receive queue was drained.

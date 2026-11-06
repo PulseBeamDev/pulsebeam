@@ -7,8 +7,8 @@
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    Connection, ConnectionConfig, ConnectionEntropy, Event, LocalCandidate, LocalIceCredentials,
-    NetworkInput, Output, SdpOffer, Transmit, TransmitTarget,
+    ConnectionConfig, ConnectionEntropy, Event, LocalCandidate, LocalIceCredentials, NetworkInput,
+    Output, RtcConnection, SdpOffer, Transmit, TransmitTarget,
 };
 use std::{net::SocketAddr, time::Instant};
 
@@ -38,9 +38,9 @@ fn request_with_nomination(username: &str, password: Option<&[u8]>, nominate: bo
     Bytes::copy_from_slice(bytes.get(..length).expect("serialized STUN length"))
 }
 
-fn connection(local: SocketAddr, tcp: bool) -> (Connection, Instant) {
+fn connection(local: SocketAddr, tcp: bool) -> (RtcConnection, Instant) {
     let at = Instant::now();
-    let accepted = Connection::accept(
+    let accepted = RtcConnection::accept(
         ConnectionConfig {
             local_candidates: vec![if tcp {
                 LocalCandidate::TcpPassive(local)
@@ -96,7 +96,7 @@ fn input(local: SocketAddr, remote: SocketAddr, tcp: bool, payload: Bytes) -> Ne
 }
 
 fn replies(
-    connection: &mut Connection,
+    connection: &mut RtcConnection,
     at: Instant,
 ) -> (Vec<Transmit>, Vec<pulsebeam_rtc::AuthenticatedPath>) {
     let mut replies = Vec::new();

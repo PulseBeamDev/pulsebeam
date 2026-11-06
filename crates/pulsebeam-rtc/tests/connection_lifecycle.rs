@@ -4,16 +4,16 @@ mod support;
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    AcceptError, CloseReason, Connection, ConnectionConfig, ConnectionEntropy, ConnectionState,
-    LocalCandidate, NetworkInput, Output, ReceiveError, SdpOffer, WriteError,
+    AcceptError, CloseReason, ConnectionConfig, ConnectionEntropy, ConnectionState, LocalCandidate,
+    NetworkInput, Output, ReceiveError, RtcConnection, SdpOffer, WriteError,
 };
 use std::{
     net::SocketAddr,
     time::{Instant, UNIX_EPOCH},
 };
 
-fn connection(start: Instant) -> Result<Connection, AcceptError> {
-    Ok(Connection::accept(
+fn connection(start: Instant) -> Result<RtcConnection, AcceptError> {
+    Ok(RtcConnection::accept(
         ConnectionConfig {
             local_candidates: vec![LocalCandidate::Udp(SocketAddr::from((
                 [192, 0, 2, 1],

@@ -79,6 +79,8 @@ struct ControllerStall {
 thread_local! {
     static SAMPLES: RefCell<Samples> = RefCell::new(Samples::default());
     static CONTROLLER_STALL: RefCell<Option<ControllerStall>> = const { RefCell::new(None) };
+    static CONTROLLER_STALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STALLED_NATIVE_INPUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FAIL_NEXT_MATERIALIZATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -91,6 +93,7 @@ pub fn take_materialization_failure() -> bool {
 }
 
 pub fn request_controller_stall(duration: Duration) -> (std::time::Instant, oneshot::Receiver<()>) {
+    STALLED_NATIVE_INPUTS.with(|count| count.set(0));
     let until = std::time::Instant::now()
         .checked_add(duration)
         .unwrap_or_else(std::time::Instant::now);
@@ -104,10 +107,22 @@ pub fn request_controller_stall(duration: Duration) -> (std::time::Instant, ones
 pub async fn wait_controller_stall() {
     let request = CONTROLLER_STALL.with_borrow_mut(Option::take);
     if let Some(ControllerStall { until, begun }) = request {
+        CONTROLLER_STALLED.with(|stalled| stalled.set(true));
         let _ = begun.send(());
         pulsebeam_runtime::time::sleep(until.saturating_duration_since(std::time::Instant::now()))
             .await;
+        CONTROLLER_STALLED.with(|stalled| stalled.set(false));
     }
+}
+
+pub(crate) fn record_stalled_native_input() {
+    if CONTROLLER_STALLED.with(std::cell::Cell::get) {
+        STALLED_NATIVE_INPUTS.with(|count| count.set(count.get().saturating_add(1)));
+    }
+}
+
+pub fn stalled_native_inputs() -> u64 {
+    STALLED_NATIVE_INPUTS.with(std::cell::Cell::get)
 }
 
 /// Record one downstream allocation pass. Called from the allocator's reporting path.

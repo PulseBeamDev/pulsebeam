@@ -26,7 +26,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
     control::controller::{
-        self, ConnectionProfile, ControllerSender, CreateParticipantReply, ParticipantState,
+        self, ControllerSender, CreateParticipantReply, ParticipantState, SignalingProtocol,
     },
     entity::{ConnectionId, IdValidationError, ParticipantId, RoomId},
 };
@@ -413,7 +413,7 @@ async fn create_native(
     )?;
     lease.native_expiry()?;
     let connection_id = ConnectionId::new();
-    let rtp_capabilities = crate::participant::rtp::capabilities();
+    let rtp_capabilities = crate::control::rtp::capabilities();
     let participant_state = ParticipantState {
         manual_sub: true,
         room_id: authorization.room_id,
@@ -422,7 +422,7 @@ async fn create_native(
         connection_id,
         old_connection_id: None,
         authorization: Some(lease),
-        profile: ConnectionProfile::Native,
+        profile: SignalingProtocol::State,
         rtp_capabilities: Some(rtp_capabilities.clone()),
     };
     let (reply_tx, reply_rx) = pulsebeam_runtime::sync::oneshot::channel();
@@ -611,7 +611,7 @@ async fn delete_native(
 async fn create_sdp_profile(
     state: AppState,
     request: Request,
-    profile: ConnectionProfile,
+    profile: SignalingProtocol,
     required_direction: &'static str,
     resource: &'static str,
 ) -> Result<Response, ApiError> {
@@ -703,7 +703,7 @@ async fn create_whip(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    create_sdp_profile(state, request, ConnectionProfile::Whip, "sendonly", "whip").await
+    create_sdp_profile(state, request, SignalingProtocol::Whip, "sendonly", "whip").await
 }
 
 #[utoipa::path(
@@ -728,7 +728,7 @@ async fn create_whep(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    create_sdp_profile(state, request, ConnectionProfile::Whep, "recvonly", "whep").await
+    create_sdp_profile(state, request, SignalingProtocol::Whep, "recvonly", "whep").await
 }
 
 fn verify_discovery(state: &AppState, headers: &HeaderMap) -> Result<StatusCode, ApiError> {
@@ -846,7 +846,7 @@ async fn delete_sdp_profile(
     state: AppState,
     connection_id: String,
     headers: HeaderMap,
-    profile: ConnectionProfile,
+    profile: SignalingProtocol,
 ) -> Result<StatusCode, ApiError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -902,13 +902,13 @@ delete_handler!(
     delete_whip,
     "/whip/{connection_id}",
     "whip",
-    ConnectionProfile::Whip
+    SignalingProtocol::Whip
 );
 delete_handler!(
     delete_whep,
     "/whep/{connection_id}",
     "whep",
-    ConnectionProfile::Whep
+    SignalingProtocol::Whep
 );
 
 async fn method_not_allowed() -> StatusCode {
@@ -1196,11 +1196,11 @@ mod tests {
                 panic!("expected create command")
             };
             assert!(message.state.manual_sub);
-            assert_eq!(message.state.profile, ConnectionProfile::Native);
+            assert_eq!(message.state.profile, SignalingProtocol::State);
             assert!(message.state.authorization.is_some());
             assert_eq!(
                 message.state.rtp_capabilities,
-                Some(crate::participant::rtp::capabilities())
+                Some(crate::control::rtp::capabilities())
             );
             assert_eq!(message.offer, expected_offer);
             let answer = message.offer;
@@ -1222,7 +1222,7 @@ mod tests {
         );
         assert_eq!(
             body["rtp_capabilities"],
-            serde_json::to_value(crate::participant::rtp::capabilities()).unwrap()
+            serde_json::to_value(crate::control::rtp::capabilities()).unwrap()
         );
         assert_eq!(body["room_external_id"], "general");
         assert_eq!(body["participant_external_id"], "alice");
@@ -1514,8 +1514,8 @@ mod tests {
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn strict_sdp_posts_return_raw_answers_and_opaque_locations() {
         for (resource, direction, profile) in [
-            ("whip", Direction::SendOnly, ConnectionProfile::Whip),
-            ("whep", Direction::RecvOnly, ConnectionProfile::Whep),
+            ("whip", Direction::SendOnly, SignalingProtocol::Whip),
+            ("whep", Direction::RecvOnly, SignalingProtocol::Whep),
         ] {
             let (controller, mut commands) =
                 pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
@@ -1584,8 +1584,8 @@ mod tests {
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn whip_and_whep_delete_use_claim_identity_path_and_profile() {
         for (resource, profile) in [
-            ("whip", ConnectionProfile::Whip),
-            ("whep", ConnectionProfile::Whep),
+            ("whip", SignalingProtocol::Whip),
+            ("whep", SignalingProtocol::Whep),
         ] {
             let (controller, mut commands) =
                 pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });

@@ -10,7 +10,8 @@ use std::{
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    Connection, ConnectionConfig, ConnectionEntropy, LocalCandidate, NetworkInput, Output, SdpOffer,
+    ConnectionConfig, ConnectionEntropy, LocalCandidate, NetworkInput, Output, RtcConnection,
+    SdpOffer,
 };
 
 use pulsebeam_rtc_simulation::{RtcStatsClass, RtcStatsValues};
@@ -75,7 +76,7 @@ fn mixed_direction_native_publisher_recovers_loss_as_primary_media() {
 #[test]
 fn unauthenticated_rtp_never_creates_a_semantic_media_event() {
     let start = Instant::now();
-    let mut connection = Connection::accept(
+    let mut connection = RtcConnection::accept(
         ConnectionConfig {
             local_candidates: vec![LocalCandidate::Udp(SocketAddr::from((
                 [192, 0, 2, 1],

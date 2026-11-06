@@ -55,6 +55,34 @@ and virtual time, without launching native dataplane threads. Cross-reactor
 migration requires Linux. The default cutover is qualified by correctness;
 comparative latency and efficiency have not been measured.
 
+## Native signaling ownership
+
+The controller owns each connection's native session, resource declarations,
+source resolution, authorization, and signaling projection. It compiles transport
+bindings and per-stream policy before sending bounded execution commands to the
+shard. Native participants use the controller's canonical room topology rather
+than an endpoint visibility catalog or default room-wide subscriptions.
+
+The shard owns applied bindings, eligible source descriptors, actual routes, and
+adaptive allocation. Layer selection, bandwidth filtering, demand, and physical
+handover remain local. Route activation and retirement reflect actual active,
+staging, draining, and desired streams, not merely a new controller assignment.
+RTC remains the sole owner of installed transport state, physical identity reuse,
+and cancellable data-channel progression.
+
+Only the designated native signaling channel crosses into control. Application
+media and topic payloads retain their direct dataplane path. Per-connection
+handoff is finite and nonblocking, with native input separated from required
+lifecycle and progress facts. Capacity failure terminates the affected connection
+rather than blocking the shard or silently discarding accepted signaling.
+
+The opaque shard writer owns at most one pending output batch. Handoff does not
+advance the native cursor: the controller commits row versions only after actual,
+timestamped RTC send admission. Delayed observation does not restart the original
+progress deadline. Pending materialization and full shard destinations are
+serviced independently so one blocked connection does not stop unrelated control
+work. These are ownership and progress contracts, not a throughput guarantee.
+
 ## Media TCP fallback
 
 UDP is the optimized dataplane. Passive ICE-TCP uses one optional
@@ -83,7 +111,7 @@ a larger frame cap explicitly for endpoints that require it. These are finite
 defaults, not deployment capacity guarantees; configure them to fit the
 node's resource budget.
 
-The controller is not in the connection or packet path. First-STUN ufrags are
+TCP frames do not pass through the controller. First-STUN ufrags are
 untrusted routing hints; the destination shard checks the current route epoch
 and RTC performs authentication. Adoption precedes subsequent input, and flow
 incarnations fence delayed frames, replies and close events. Full ingress or

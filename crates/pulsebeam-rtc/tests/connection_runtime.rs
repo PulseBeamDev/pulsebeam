@@ -10,16 +10,16 @@ use std::{
 
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    AcceptError, Connection, ConnectionConfig, ConnectionEntropy, LocalCandidate, NetworkInput,
-    Output, SdpOffer,
+    AcceptError, ConnectionConfig, ConnectionEntropy, LocalCandidate, NetworkInput, Output,
+    RtcConnection, SdpOffer,
 };
 
 fn at(monotonic: Instant) -> Instant {
     monotonic
 }
 
-fn connection(start: Instant) -> Result<Connection, AcceptError> {
-    Ok(Connection::accept(
+fn connection(start: Instant) -> Result<RtcConnection, AcceptError> {
+    Ok(RtcConnection::accept(
         ConnectionConfig {
             local_candidates: vec![LocalCandidate::Udp(SocketAddr::from((
                 [192, 0, 2, 1],
@@ -39,7 +39,7 @@ fn connection(start: Instant) -> Result<Connection, AcceptError> {
     clippy::panic,
     reason = "bounded test fixture stops at the first protocol invariant violation"
 )]
-fn next_deadline(connection: &mut Connection, at: Instant) -> Instant {
+fn next_deadline(connection: &mut RtcConnection, at: Instant) -> Instant {
     for _ in 0..16 {
         match connection.poll(at) {
             Output::Idle {

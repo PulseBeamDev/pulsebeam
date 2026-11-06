@@ -1,8 +1,7 @@
-use super::super::native_data::tests::{
-    confirmations, frame, participant, participant_with_expiry,
-};
+use super::super::native_data::tests::{NativeParticipant, confirmations, frame, participant};
 use super::*;
 use crate::participant::{effect::TrackRemoval, event::test_utils::MockParticipantSink};
+use pulsebeam_proto::state::resource_spec;
 use std::num::NonZeroU64;
 
 fn subscription(source: TrackId, channel: u32, enabled: bool) -> wire::ResourceSpec {
@@ -26,7 +25,7 @@ fn subscription(source: TrackId, channel: u32, enabled: bool) -> wire::ResourceS
 }
 
 fn target(
-    participant: &mut Participant,
+    participant: &mut NativeParticipant,
     revision: u64,
     spec: wire::ResourceSpec,
     sink: &mut MockParticipantSink,
@@ -40,7 +39,7 @@ fn target(
     );
 }
 
-fn drain_sources(participant: &mut Participant, sink: &mut MockParticipantSink) {
+fn drain_sources(participant: &mut NativeParticipant, sink: &mut MockParticipantSink) {
     for _ in 0..16 {
         if !participant.advance_native_source(sink) {
             return;
@@ -92,12 +91,47 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         ))
         .unwrap();
     let work = participant.signaling.take_preparation().unwrap().unwrap();
-    participant.signaling.reserve_execution(1, 8192).unwrap();
-    let (owner, descriptor) = participant.signaling.source(&id.as_str()).unwrap();
+    assert!(participant.admit_native_preparation(work));
+    let crate::control::native::ExecutionAction::Prepare {
+        work: issued,
+        resource:
+            crate::control::native::PreparedResource::Receiver(ReceiverPreparation::Ready(plan)),
+    } = participant
+        .signaling
+        .prepare_execution(&work, unix_now(), None, |source| {
+            assert_eq!(source, id);
+            Some(&track)
+        })
+        .unwrap()
+        .unwrap()
+        .into_action()
+    else {
+        panic!("compiled receiver")
+    };
+    assert!(issued == work);
+    let crate::control::native::Receiver {
+        source,
+        source_id,
+        transport,
+        policy,
+    } = *plan;
+    assert_eq!(source.id(), id);
+    assert_eq!(source_id, id.as_str());
+    assert!(policy.enabled && policy.video.is_none());
+    assert!(
+        matches!(transport, ReceivePlan::Sctp { channel, lane: DataLane::Ordered } if channel == crate::media::ChannelId::from_value(1))
+    );
     let channel = crate::media::ChannelId::from_value(1);
     // Structural binding fixture only. The connected simulator owns the real Opened/plan witness.
     let deadline = Instant::now() + Duration::from_secs(30);
     participant.native_receivers.deadlines.insert((deadline, 1));
+    let installation = participant
+        .transport
+        .install_data_channel(crate::participant::transport::native_data_config(
+            channel,
+            DataLane::Ordered,
+        ))
+        .unwrap();
     participant.native_receivers.receivers.insert(
         1,
         Receiver {
@@ -106,15 +140,15 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
                 lane: DataLane::Ordered,
             },
             source: id,
-            participant: owner,
-            track: descriptor,
+            source_id,
             handle: None,
             enabled: false,
-            client_failure: None,
+            failed: false,
             opened: false,
-            reset_pending: false,
+            installation: Some(installation),
             retiring: false,
-            preparation: Some(work),
+            preparation: Some((work, policy)),
+            storage_sequence: work.scope().sequence,
             deadline: Some(deadline),
         },
     );
@@ -123,12 +157,6 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         .native_receivers
         .source_refs
         .insert((*id.as_bytes(), 1));
-    participant
-        .native_receivers
-        .receivers
-        .get_mut(&1)
-        .unwrap()
-        .reset_pending = true;
     participant.native_data_closed(channel, &mut sink);
     participant.native_receiver_opened(
         1,
@@ -138,12 +166,16 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     let pending = participant.native_receivers.receivers.get_mut(&1).unwrap();
     assert!(!pending.opened && !pending.retiring && pending.preparation.is_some());
     assert_eq!(pending.deadline, Some(deadline));
-    pending.reset_pending = false;
-    participant.native_receiver_opened(
-        1,
-        crate::participant::transport::native_data_config(channel, DataLane::Ordered),
-        &mut sink,
-    );
+    // Continue the structural route fixture without inventing RTC usability.
+    pending.opened = true;
+    pending.deadline = None;
+    let (work, policy) = pending.preparation.take().unwrap();
+    participant
+        .native_receivers
+        .deadlines
+        .remove(&(deadline, 1));
+    participant.record_native_receiver_binding(1);
+    participant.commit_native_receiver(work, policy, &mut sink);
     drain_sources(&mut participant, &mut sink);
     assert!(participant.native_receivers.deadlines.is_empty());
     assert!(matches!(
@@ -154,17 +186,40 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     assert!(confirmations(&mut participant).is_empty());
     assert!(participant.native_receivers.can_write(channel));
     target(&mut participant, 2, subscription(id, 1, false), &mut sink);
+    let disabled_storage = participant.native_receivers.receivers[&1].storage_sequence;
+    assert!(disabled_storage > work.scope().sequence);
     assert!(participant.native_receivers.sources[id.as_bytes()].bound);
     assert!(!participant.native_receivers.can_write(channel));
     target(&mut participant, 3, spec.clone(), &mut sink);
+    let enabled_storage = participant.native_receivers.receivers[&1].storage_sequence;
+    assert!(enabled_storage > disabled_storage);
     assert!(participant.native_receivers.can_write(channel));
-    target(&mut participant, 4, subscription(id, 2, true), &mut sink);
+    participant.handle_native_signaling(
+        &wire::codec::encode_client(&wire::ClientStateBatch {
+            records: vec![wire::ClientStateRecord {
+                owned: 1,
+                desired: None,
+                execution: Some(wire::ExecutionReport {
+                    revision: 4,
+                    failure: Some(failure(wire::FailureCode::Unsupported)),
+                }),
+            }],
+        })
+        .unwrap(),
+        &mut sink,
+    );
+    assert!(participant.native_receivers.can_write(channel));
+    target(&mut participant, 5, subscription(id, 2, true), &mut sink);
+    assert_eq!(
+        participant.native_receivers.receivers[&1].storage_sequence,
+        enabled_storage
+    );
     participant.native_source_removed(id, TrackRemoval::Withdrawn);
     assert!(!participant.native_receivers.can_write(channel));
     drain_sources(&mut participant, &mut sink);
     let values = confirmations(&mut participant);
     let value = values.last().unwrap();
-    assert_eq!(value.evaluated_revision, 4);
+    assert_eq!(value.evaluated_revision, 5);
     assert_eq!(
         value.rejection.as_ref().unwrap().code,
         wire::FailureCode::InvalidConfiguration as i32
@@ -194,7 +249,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
             .contains(&(replacement.data().as_ffi(), 1))
     );
     let values = confirmations(&mut participant);
-    assert_eq!(values.last().unwrap().evaluated_revision, 4);
+    assert_eq!(values.last().unwrap().evaluated_revision, 5);
     assert!(values.last().unwrap().rejection.is_some());
     participant.native_source_removed(id, TrackRemoval::SourceEnded);
     assert!(!participant.native_receivers.can_write(channel));
@@ -209,7 +264,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     participant.complete_native_data_cutoff(1, true);
     let values = confirmations(&mut participant);
     let value = values.last().unwrap();
-    assert_eq!(value.evaluated_revision, 4);
+    assert_eq!(value.evaluated_revision, 5);
     assert!(value.rejection.is_some());
     assert!(
         matches!(&value.value, Some(wire::confirmed_state::Value::Absent(absent)) if absent.reason == wire::AbsenceReason::SourceEnded as i32)
@@ -219,107 +274,4 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     assert!(participant.native_receivers.received.is_empty());
     assert!(participant.native_receivers.sources.is_empty());
     assert!(participant.disconnect_reason.is_none());
-}
-
-#[test]
-fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_the_source() {
-    enum Outcome {
-        Expire,
-        Cancel,
-        SourceArrives,
-    }
-    for outcome in [Outcome::Expire, Outcome::Cancel, Outcome::SourceArrives] {
-        let mut participant = participant_with_expiry(unix_now().saturating_sub(1));
-        let mut sink = MockParticipantSink::new();
-        let connection = entity::ConnectionId::new();
-        let id = connection.derive_publication_track_id(
-            TrackKind::Data,
-            "not-yet-observed",
-            NonZeroU64::new(1).unwrap(),
-        );
-        target(&mut participant, 1, subscription(id, 1, true), &mut sink);
-        assert!(participant.native_receivers.waiting.is_empty());
-        assert!(participant.disconnect_reason.is_none());
-        participant.input(ParticipantInput::Authorization {
-            revision: 2,
-            expiry: Some(i64::try_from(unix_now() + 60).unwrap()),
-        });
-        let before = Instant::now();
-        participant.evaluate_native_preparations(&mut sink);
-        let deadline = participant.native_receivers.waiting[&1].deadline;
-        assert!(deadline >= before + Duration::from_secs(30));
-        assert!(deadline <= Instant::now() + Duration::from_secs(30));
-        participant.expire_native_data(deadline - Duration::from_nanos(1), &mut sink);
-        assert!(participant.native_receivers.waiting.contains_key(&1));
-        assert!(participant.native_receivers.channels.is_empty());
-        assert!(sink.owned_subscriptions.is_empty());
-        assert!(
-            confirmations(&mut participant)
-                .iter()
-                .all(|value| !matches!(value.value, Some(wire::confirmed_state::Value::Owned(_))))
-        );
-        let rejection = match outcome {
-            Outcome::Expire => {
-                participant.expire_native_data(deadline, &mut sink);
-                Some(wire::FailureCode::InternalFailure)
-            }
-            Outcome::Cancel => {
-                participant.handle_native_signaling(
-                    &frame(2, wire::desired_state::Value::Absent(true)),
-                    &mut sink,
-                );
-                None
-            }
-            Outcome::SourceArrives => {
-                let owner = entity::ParticipantId::new();
-                let track = Track::data_publication(
-                    track::TrackMeta {
-                        room_id: participant.room_id,
-                        shard_id: ShardId::new(0),
-                        id,
-                        origin: owner,
-                        connection_id: connection,
-                        label: Some("not-yet-observed".into()),
-                    },
-                    DataLane::Ordered,
-                );
-                participant
-                    .signaling
-                    .observe_participant(wire::Participant {
-                        participant_id: owner.as_str(),
-                        participant_external_id: "source".into(),
-                    })
-                    .unwrap();
-                participant.signaling.observe_candidate(&track).unwrap();
-                let mut handles = slotmap::SlotMap::<TrackHandle, _>::with_key();
-                let handle = handles.insert(id);
-                participant.native_source_added(handle, &track);
-                drain_sources(&mut participant, &mut sink);
-                // Metadata resolved; the unconnected fixture cannot open SCTP.
-                Some(wire::FailureCode::Incompatible)
-            }
-        };
-        assert!(participant.native_receivers.waiting.is_empty());
-        assert!(participant.native_receivers.deadlines.is_empty());
-        assert!(participant.native_receivers.source_refs.is_empty());
-        assert!(sink.owned_subscriptions.is_empty());
-        assert!(sink.owned_unsubscribes.is_empty());
-        let values = confirmations(&mut participant);
-        let value = values.last().unwrap();
-        assert_eq!(
-            value.rejection.as_ref().map(|failure| failure.code),
-            rejection.map(|code| code as i32)
-        );
-        let reason = if rejection.is_some() {
-            wire::AbsenceReason::CreateRejected
-        } else {
-            wire::AbsenceReason::Removed
-        };
-        assert!(
-            matches!(&value.value, Some(wire::confirmed_state::Value::Absent(absent)) if absent.reason == reason as i32)
-        );
-        participant.expire_native_data(deadline, &mut sink);
-        assert!(confirmations(&mut participant).is_empty());
-        assert!(participant.disconnect_reason.is_none());
-    }
 }

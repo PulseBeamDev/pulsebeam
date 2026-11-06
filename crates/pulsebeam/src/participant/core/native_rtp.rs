@@ -1,22 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
-use pulsebeam_proto::prelude::Message;
-use slotmap::Key as _;
-
 use super::*;
-use crate::participant::native::{Preparation, track_descriptor};
-use crate::participant::rtp::{failure_code, publication_binding};
-use pulsebeam_proto::state::{self as wire, resource_spec};
-use pulsebeam_rtc::{RtpBinding, RtpConfigurationPatch};
+use crate::control::native::Preparation;
+use crate::control::native::RtpPublication as RtpPublicationPlan;
+use crate::participant::policy::{ExecutionFailureKind, PublicationExecution};
+#[cfg(test)]
+use pulsebeam_proto::state as wire;
+use pulsebeam_rtc::{CompiledRtpBinding, CompiledRtpConfigurationPatch};
 
 #[cfg(test)]
 mod tests;
 
 struct RtpPublication {
     track: Track,
-    upstream: track::UpstreamTrack,
-    binding: RtpBinding,
+    slot: UpstreamSlotKey,
+    binding: CompiledRtpBinding,
     enabled: bool,
     demanded: bool,
     retiring: bool,
@@ -29,32 +28,52 @@ pub(super) struct NativeRtp {
     tracks: BTreeMap<[u8; 16], u64>,
     mids: BTreeMap<Mid, u64>,
     ssrcs: BTreeMap<u32, u64>,
-    fanouts: BTreeMap<u64, u64>,
     active: BTreeSet<u64>,
 }
 
 impl NativeRtp {
+    pub(super) fn owns_reference(&self, reference: u64) -> bool {
+        self.publications.contains_key(&reference)
+    }
+
     pub(super) fn owns_encoding(&self, ssrc: u32) -> bool {
         self.ssrcs.contains_key(&ssrc)
     }
 
-    pub(super) fn bind_source(&mut self, track: TrackId, handle: TrackHandle) {
-        let Some(reference) = self.tracks.get(track.as_bytes()).copied() else {
-            return;
-        };
-        let Some(source) = self.publications.get_mut(&reference) else {
-            return;
-        };
-        if let Some(previous) = source.fanout {
-            self.fanouts.remove(&previous.data().as_ffi());
+    pub(super) fn ingress_route(
+        &self,
+        ssrc: u32,
+        mid: Mid,
+        rid: Option<crate::media::Rid>,
+    ) -> Option<IncomingRtpRoute> {
+        let reference = self.ssrcs.get(&ssrc)?;
+        let source = self.publications.get(reference)?;
+        if !source.enabled || !source.demanded || source.retiring || source.fanout.is_none() {
+            return None;
         }
-        source.fanout = Some(handle);
-        self.fanouts.insert(handle.data().as_ffi(), reference);
+        Some(IncomingRtpRoute {
+            ssrc: ssrc.into(),
+            mid,
+            rid,
+            encoding: crate::track::SourceEncoding::Ssrc(ssrc.into()),
+            upstream_slot: source.slot,
+            track_id: source.track.id(),
+            fanout: source.fanout,
+        })
     }
 
-    pub(super) fn track_for_fanout(&self, handle: TrackHandle) -> Option<TrackId> {
-        let reference = self.fanouts.get(&handle.data().as_ffi())?;
-        Some(self.publications.get(reference)?.track.id())
+    pub(super) fn bind_source(&mut self, track: TrackId, handle: TrackHandle) -> bool {
+        let Some(reference) = self.tracks.get(track.as_bytes()).copied() else {
+            return false;
+        };
+        let Some(source) = self.publications.get_mut(&reference) else {
+            return false;
+        };
+        if source.track.id() != track {
+            return false;
+        }
+        source.fanout = Some(handle);
+        true
     }
 
     pub(super) fn keyframe_mid(
@@ -63,82 +82,69 @@ impl NativeRtp {
         encoding: crate::track::SourceEncoding,
     ) -> Option<Mid> {
         let source = self.publications.get(self.tracks.get(track.as_bytes())?)?;
-        if !source.enabled
+        if source.track.id() != track
+            || !source.enabled
             || !source.demanded
             || source.retiring
             || !source
                 .binding
+                .description()
                 .encodings
                 .iter()
                 .any(|bound| matches!(encoding, crate::track::SourceEncoding::Ssrc(ssrc) if bound.primary == *ssrc))
         {
             return None;
         }
-        Mid::new(&source.binding.mid).ok()
+        Mid::new(&source.binding.description().mid).ok()
     }
 
-    pub(super) fn sender_report(
-        &mut self,
-        mid: Mid,
-        report: crate::rtp::sync::SenderInfo,
-        arrival: Instant,
-    ) {
-        if let Some(reference) = self.mids.get(&mid)
-            && let Some(source) = self.publications.get_mut(reference)
-        {
-            source.upstream.sender_report(report, arrival);
-        }
+    pub(super) fn slot_for_mid(&self, mid: Mid) -> Option<UpstreamSlotKey> {
+        let reference = self.mids.get(&mid)?;
+        Some(self.publications.get(reference)?.slot)
     }
 
-    pub(super) fn poll_stats(&mut self, now: Instant) {
+    pub(super) fn poll_stats(&self, upstream: &mut UpstreamAllocator, now: Instant) {
         for reference in &self.active {
-            if let Some(source) = self.publications.get_mut(reference) {
-                source.upstream.poll_stats(now);
+            if let Some(source) = self.publications.get(reference)
+                && let Some(track) = upstream.track_mut(source.slot)
+            {
+                track.poll_stats(now);
             }
         }
     }
 
-    fn detach(&mut self, reference: u64) {
-        let Some(source) = self.publications.get_mut(&reference) else {
-            return;
-        };
+    fn detach(&mut self, reference: u64) -> Option<(TrackId, Option<TrackHandle>)> {
+        let source = self.publications.get_mut(&reference)?;
         self.active.remove(&reference);
-        self.tracks.remove(source.track.id().as_bytes());
-        if let Ok(mid) = Mid::new(&source.binding.mid) {
+        let track_id = source.track.id();
+        if self.tracks.get(track_id.as_bytes()) == Some(&reference) {
+            self.tracks.remove(track_id.as_bytes());
+        }
+        if let Ok(mid) = Mid::new(&source.binding.description().mid)
+            && self.mids.get(&mid) == Some(&reference)
+        {
             self.mids.remove(&mid);
         }
-        for encoding in &source.binding.encodings {
-            self.ssrcs.remove(&encoding.primary);
+        for encoding in &source.binding.description().encodings {
+            if self.ssrcs.get(&encoding.primary) == Some(&reference) {
+                self.ssrcs.remove(&encoding.primary);
+            }
         }
-        if let Some(handle) = source.fanout.take() {
-            self.fanouts.remove(&handle.data().as_ffi());
-        }
+        Some((track_id, source.fanout.take()))
     }
 }
 
-fn declaration(spec: &wire::ResourceSpec) -> Option<(&str, wire::TrackKind, &wire::RtpParameters)> {
-    let resource_spec::Declaration::Publication(publication) = spec.declaration.as_ref()? else {
-        return None;
-    };
-    let (kind, binding) = match publication.kind.as_ref()? {
-        wire::publication_spec::Kind::Audio(audio) => {
-            (wire::TrackKind::Audio, audio.binding.as_ref()?)
-        }
-        wire::publication_spec::Kind::Video(video) => {
-            (wire::TrackKind::Video, video.binding.as_ref()?)
-        }
-        _ => return None,
-    };
-    let wire::track_binding::Transport::Rtp(parameters) = binding.transport.as_ref()? else {
-        return None;
-    };
-    Some((&publication.label, kind, parameters))
-}
-
-fn execution_bytes(work: &Preparation, encodings: usize) -> usize {
+fn execution_bytes(spec_bytes: usize, encodings: usize) -> usize {
     // Prepay sparse B-tree/hash backing, monitor state, transport encoding caches
     // and cloned immutable binding/descriptor storage, including cutoff retention.
     std::mem::size_of::<RtpPublication>()
+        .saturating_add(std::mem::size_of::<(
+            usize,
+            crate::participant::upstream::UpstreamSlot,
+        )>())
+        .saturating_add(std::mem::size_of::<((u8, [u8; 16]), UpstreamSlotKey)>())
+        .saturating_add(std::mem::size_of::<((u8, [u8; 16]), TrackHandle)>())
+        .saturating_add(std::mem::size_of::<(u64, TrackId)>())
         .saturating_add(256)
         .saturating_mul(12)
         .saturating_add(
@@ -149,23 +155,31 @@ fn execution_bytes(work: &Preparation, encodings: usize) -> usize {
                     .saturating_mul(12),
             ),
         )
-        .saturating_add(work.spec.encoded_len().saturating_mul(16))
+        .saturating_add(spec_bytes.saturating_mul(16))
+        .saturating_add(Connection::native_execution_metadata_bytes())
 }
 
-impl Participant {
+impl Connection {
+    pub(crate) fn native_rtp_execution_bytes(spec_bytes: usize, encodings: usize) -> usize {
+        execution_bytes(spec_bytes, encodings)
+    }
+
     pub(super) fn prepare_native_rtp(
         &mut self,
         work: Preparation,
+        plan: RtpPublicationPlan,
         events: &mut impl ParticipantSink,
     ) {
-        let result = self.native_rtp_binding(&work);
-        let (label, kind, mut binding) = match result {
-            Ok(value) => value,
-            Err(code) => {
-                self.complete_native_preparation(work, Err(failure(code)));
-                return;
-            }
+        let Some(work) = self.current_native_preparation(work) else {
+            return;
         };
+        let RtpPublicationPlan {
+            label,
+            kind,
+            mut binding,
+            format,
+            enabled,
+        } = plan;
         tracing::debug!(
             participant = ?self.participant_id,
             connection = ?self.connection_id,
@@ -174,28 +188,31 @@ impl Participant {
             %label,
             "native RTP publication preparation"
         );
-        let enabled = work
-            .spec
-            .settings
-            .as_ref()
-            .is_some_and(|settings| settings.enabled == Some(true));
         let reference = work.reference;
         if let Some(source) = self.native_rtp.publications.get(&reference) {
             let active = enabled && source.demanded;
-            for encoding in &mut binding.encodings {
-                encoding.active = active;
-            }
+            binding.set_active(active);
             let previous = source.binding.clone();
-            let descriptor = track_descriptor(&source.track);
-            if let Err(error) = self.transport.update_rtp(RtpConfigurationPatch {
-                inbound: vec![binding.clone()],
-                ..Default::default()
-            }) {
-                self.complete_native_preparation(work, Err(failure(failure_code(error))));
+            let track = source.track.clone();
+            if let Err(error) = self
+                .transport
+                .update_compiled_rtp(CompiledRtpConfigurationPatch {
+                    inbound: vec![binding.clone()],
+                    ..Default::default()
+                })
+            {
+                self.complete_native_preparation(
+                    work,
+                    Err(ExecutionFailureKind::from(error).into()),
+                );
                 return;
             }
-            let live = self.native_rtp_live(&work, descriptor, enabled, active);
-            if self.complete_native_preparation(work, Ok(live)) {
+            let execution = PublicationExecution {
+                track,
+                enabled,
+                active,
+            };
+            if let Some(now) = self.finish_native_preparation(work) {
                 if let Some(source) = self.native_rtp.publications.get_mut(&reference) {
                     source.enabled = enabled;
                     source.binding = binding;
@@ -208,9 +225,10 @@ impl Participant {
                 if !active {
                     self.discard_native_keyframes(reference);
                 }
+                self.record_native_publication(work, execution, now);
             } else if self
                 .transport
-                .update_rtp(RtpConfigurationPatch {
+                .update_compiled_rtp(CompiledRtpConfigurationPatch {
                     inbound: vec![previous],
                     ..Default::default()
                 })
@@ -221,44 +239,26 @@ impl Participant {
             return;
         }
         let Some(incarnation) = NonZeroU64::new(reference) else {
-            self.complete_native_preparation(
-                work,
-                Err(failure(wire::FailureCode::InvalidConfiguration)),
-            );
+            self.complete_native_preparation(work, Err(ExecutionFailureKind::Invalid.into()));
             return;
         };
-        let Ok(mid) = Mid::new(&binding.mid) else {
-            self.complete_native_preparation(work, Err(failure(wire::FailureCode::Unsupported)));
+        let Ok(mid) = Mid::new(&binding.description().mid) else {
+            self.complete_native_preparation(work, Err(ExecutionFailureKind::Unsupported.into()));
             return;
         };
         if self.native_rtp.mids.contains_key(&mid)
             || binding
+                .description()
                 .encodings
                 .iter()
                 .any(|encoding| self.native_rtp.ssrcs.contains_key(&encoding.primary))
         {
-            self.complete_native_preparation(work, Err(failure(wire::FailureCode::Incompatible)));
+            self.complete_native_preparation(work, Err(ExecutionFailureKind::Conflict.into()));
             return;
         }
-        if self
-            .signaling
-            .reserve_execution(reference, execution_bytes(&work, binding.encodings.len()))
-            .is_err()
-        {
-            self.complete_native_preparation(
-                work,
-                Err(failure(wire::FailureCode::CapacityExceeded)),
-            );
-            return;
-        }
-        let track_kind = if kind == wire::TrackKind::Audio {
-            TrackKind::Audio
-        } else {
-            TrackKind::Video
-        };
         let id = self
             .connection_id
-            .derive_publication_track_id(track_kind, &label, incarnation);
+            .derive_publication_track_id(kind, &label, incarnation);
         let meta = track::TrackMeta {
             room_id: self.room_id,
             shard_id: self.shard_id,
@@ -267,10 +267,11 @@ impl Participant {
             connection_id: self.connection_id,
             label: Some(label),
         };
-        let (upstream, mut track) = if kind == wire::TrackKind::Audio {
+        let (upstream, mut track) = if kind == TrackKind::Audio {
             track::new_audio(mid, meta)
         } else {
             let encodings = binding
+                .description()
                 .encodings
                 .iter()
                 .map(|encoding| {
@@ -283,43 +284,43 @@ impl Participant {
                 })
                 .collect::<Result<Vec<_>, _>>();
             let Ok(encodings) = encodings else {
-                let _ = self.signaling.reserve_execution(reference, 0);
                 self.complete_native_preparation(
                     work,
-                    Err(failure(wire::FailureCode::Unsupported)),
+                    Err(ExecutionFailureKind::Unsupported.into()),
                 );
                 return;
             };
             track::new_video_ssrcs(mid, meta, encodings)
         };
-        let format = declaration(&work.spec)
-            .and_then(|(_, _, parameters)| parameters.codec.as_ref()?.format.clone());
         match &mut track {
             Track::Audio(audio) => audio.format = format,
             Track::Video(video) => video.format = format,
             Track::Data(_) => {
-                let _ = self.signaling.reserve_execution(reference, 0);
-                self.complete_native_preparation(
-                    work,
-                    Err(failure(wire::FailureCode::InternalFailure)),
-                );
+                self.complete_native_preparation(work, Err(ExecutionFailureKind::Internal.into()));
                 return;
             }
         }
-        if let Err(error) = self.transport.update_rtp(RtpConfigurationPatch {
-            inbound: vec![binding.clone()],
-            ..Default::default()
-        }) {
-            let _ = self.signaling.reserve_execution(reference, 0);
-            self.complete_native_preparation(work, Err(failure(failure_code(error))));
+        if let Err(error) = self
+            .transport
+            .update_compiled_rtp(CompiledRtpConfigurationPatch {
+                inbound: vec![binding.clone()],
+                ..Default::default()
+            })
+        {
+            self.complete_native_preparation(work, Err(ExecutionFailureKind::from(error).into()));
             return;
         }
-        let live = self.native_rtp_live(&work, track_descriptor(&track), enabled, false);
-        if !self.complete_native_preparation(work, Ok(live)) {
+        let execution = PublicationExecution {
+            track: track.clone(),
+            enabled,
+            active: false,
+        };
+        let Some(now) = self.native_preparation_time(work) else {
             if self
                 .transport
-                .update_rtp(RtpConfigurationPatch {
+                .update_compiled_rtp(CompiledRtpConfigurationPatch {
                     remove_encodings: binding
+                        .description()
                         .encodings
                         .iter()
                         .map(|encoding| encoding.primary)
@@ -330,20 +331,41 @@ impl Participant {
             {
                 self.disconnect(DisconnectReason::SignalingOutput);
             } else {
-                let _ = self.signaling.reserve_execution(reference, 0);
+                self.defer_native_preparation(work);
             }
             return;
-        }
+        };
+        let Some(slot) = self.upstream.insert_managed_track(mid, upstream) else {
+            if self
+                .transport
+                .update_compiled_rtp(CompiledRtpConfigurationPatch {
+                    remove_encodings: binding
+                        .description()
+                        .encodings
+                        .iter()
+                        .map(|encoding| encoding.primary)
+                        .collect(),
+                    ..Default::default()
+                })
+                .is_err()
+            {
+                self.disconnect(DisconnectReason::SignalingOutput);
+            } else {
+                self.complete_native_preparation(work, Err(ExecutionFailureKind::Conflict.into()));
+            }
+            return;
+        };
+        self.native_execution.finish(work.scope());
         self.native_rtp.tracks.insert(*id.as_bytes(), reference);
         self.native_rtp.mids.insert(mid, reference);
-        for encoding in &binding.encodings {
+        for encoding in &binding.description().encodings {
             self.native_rtp.ssrcs.insert(encoding.primary, reference);
         }
         self.native_rtp.publications.insert(
             reference,
             RtpPublication {
                 track: track.clone(),
-                upstream,
+                slot,
                 binding,
                 enabled,
                 demanded: false,
@@ -359,74 +381,7 @@ impl Participant {
             "native RTP publication advertised"
         );
         events.publish_track(track);
-    }
-
-    fn native_rtp_binding(
-        &self,
-        work: &Preparation,
-    ) -> Result<(String, wire::TrackKind, RtpBinding), wire::FailureCode> {
-        let (label, kind, parameters) =
-            declaration(&work.spec).ok_or(wire::FailureCode::Unsupported)?;
-        let capabilities = self
-            .negotiated
-            .native_rtp_capabilities
-            .as_ref()
-            .ok_or(wire::FailureCode::Unsupported)?;
-        let binding = publication_binding(parameters, kind, capabilities)?;
-        // These are the existing production packet processors. Do not classify
-        // opaque VP8/VP9 as H.264 or invent RID lanes. Temporal H.264 requires
-        // its declared dependency descriptor, not guessed temporal-layer facts.
-        let dependency_descriptor = parameters.header_extensions.iter().any(|extension| {
-            extension.uri
-                == wire::RtpHeaderExtensionType::RtpHeaderExtensionDependencyDescriptor.as_str()
-        });
-        if !matches!(binding.codec.parameters.name.as_str(), "opus" | "h264")
-            || kind == wire::TrackKind::Audio
-                && (binding.encodings.len() != 1
-                    || binding
-                        .encodings
-                        .iter()
-                        .any(|encoding| encoding.rid.is_some()))
-            || parameters.encodings.iter().any(|encoding| {
-                encoding.scalability_mode.as_deref().is_some_and(|mode| {
-                    mode != wire::RtpScalabilityMode::L1t1.as_str()
-                        && (mode != wire::RtpScalabilityMode::L1t3.as_str()
-                            || binding.codec.parameters.name != "h264"
-                            || !dependency_descriptor)
-                })
-            })
-        {
-            return Err(wire::FailureCode::Unsupported);
-        }
-        Ok((label.to_owned(), kind, binding))
-    }
-
-    fn native_rtp_live(
-        &self,
-        work: &Preparation,
-        track: Option<wire::Track>,
-        enabled: bool,
-        active: bool,
-    ) -> wire::LiveResource {
-        wire::LiveResource {
-            spec: Some(work.spec.clone()),
-            participant: Some(wire::Participant {
-                participant_id: self.participant_id.as_str(),
-                participant_external_id: self.participant_external_id.as_str().to_owned(),
-            }),
-            track,
-            execution: if enabled {
-                wire::ExecutionStatus::Installed
-            } else {
-                wire::ExecutionStatus::Disabled
-            } as i32,
-            execution_failure: None,
-            activity: Some(if active {
-                wire::MediaActivity::Active
-            } else {
-                wire::MediaActivity::Idle
-            } as i32),
-        }
+        self.record_native_publication(work, execution, now);
     }
 
     pub(crate) fn native_rtp_demand(&mut self, track: TrackId, demanded: bool) {
@@ -436,26 +391,24 @@ impl Participant {
         let Some(source) = self.native_rtp.publications.get(&reference) else {
             return;
         };
-        let active = source.enabled && demanded;
-        let mut binding = source.binding.clone();
-        for encoding in &mut binding.encodings {
-            encoding.active = active;
-        }
-        if binding != source.binding
-            && self
-                .transport
-                .update_rtp(RtpConfigurationPatch {
-                    inbound: vec![binding.clone()],
-                    ..Default::default()
-                })
-                .is_err()
-        {
-            self.disconnect(DisconnectReason::SignalingOutput);
+        if source.track.id() != track {
             return;
+        }
+        let active = source.enabled && demanded;
+        for encoding in &source.binding.description().encodings {
+            if encoding.active != active
+                && self
+                    .transport
+                    .set_rtp_encoding_active(encoding.primary, active)
+                    .is_err()
+            {
+                self.disconnect(DisconnectReason::SignalingOutput);
+                return;
+            }
         }
         if let Some(source) = self.native_rtp.publications.get_mut(&reference) {
             source.demanded = demanded;
-            source.binding = binding;
+            source.binding.set_active(active);
         }
         if active {
             self.native_rtp.active.insert(reference);
@@ -463,75 +416,38 @@ impl Participant {
             self.native_rtp.active.remove(&reference);
             self.discard_native_keyframes(reference);
         }
-        if self.signaling.observe_activity(reference, active).is_err() {
-            self.disconnect(DisconnectReason::SignalingOutput);
-        }
-    }
-
-    pub(super) fn handle_native_rtp(
-        &mut self,
-        packet: pulsebeam_rtc::RtpPacket,
-        mid: Mid,
-        rid: Option<crate::media::Rid>,
-        events: &mut impl ParticipantSink,
-    ) {
-        if self.disconnect_reason.is_some()
-            || self
-                .authorization_expiry
-                .is_none_or(|expiry| expiry.is_expired_at(native_data::unix_now()))
-        {
-            return;
-        }
-        let Some(reference) = self.native_rtp.ssrcs.get(&packet.header.ssrc).copied() else {
-            return;
-        };
-        let Some(source) = self.native_rtp.publications.get(&reference) else {
-            return;
-        };
-        if !source.enabled || !source.demanded || source.retiring || source.fanout.is_none() {
-            return;
-        }
-        let Some(incoming) = self.transport.convert_rtp(packet, mid, rid) else {
-            return;
-        };
-        let Some(source) = self.native_rtp.publications.get_mut(&reference) else {
-            return;
-        };
-        let encoding = crate::track::SourceEncoding::Ssrc(incoming.packet.ssrc);
-        let processed = source.upstream.process(rid.as_ref(), incoming.packet, None);
-        let fanout = source.fanout;
-        let track = source.track.id();
-        if processed.request_keyframe {
-            self.enqueue_remote_keyframe((track, encoding), KeyframeRequestKind::Pli);
-        }
-        if let Some(packet) = processed.first {
-            events.publish_track_packet(fanout, TrackPacket::Rtp(packet));
-        }
-        for packet in processed.remaining {
-            events.publish_track_packet(fanout, TrackPacket::Rtp(packet));
-        }
+        self.record_native_resource_observation(
+            crate::participant::policy::ResourceObservation::Activity {
+                binding: reference,
+                active,
+            },
+        );
     }
 
     fn discard_native_keyframes(&mut self, reference: u64) {
         let Some(source) = self.native_rtp.publications.get(&reference) else {
             return;
         };
-        let Ok(mid) = Mid::new(&source.binding.mid) else {
+        let Ok(mid) = Mid::new(&source.binding.description().mid) else {
             return;
         };
         self.transport.discard_keyframes(mid);
-        for encoding in &source.binding.encodings {
+        for encoding in &source.binding.description().encodings {
             let encoding = crate::track::SourceEncoding::Ssrc(encoding.primary.into());
             self.last_keyframe_request.remove(&(mid, encoding));
             self.pending_keyframe_requests.remove(&(mid, encoding));
         }
     }
 
-    pub(super) fn retire_native_resource(
+    pub(super) fn apply_native_retirement(
         &mut self,
-        reference: u64,
+        scope: crate::participant::policy::ExecutionScope,
         events: &mut impl ParticipantSink,
     ) {
+        if !self.native_execution.retire(scope) {
+            return;
+        }
+        let reference = scope.binding;
         if !self.native_rtp.publications.contains_key(&reference) {
             self.retire_native_data(reference, events);
             return;
@@ -545,7 +461,7 @@ impl Participant {
             return;
         }
         self.discard_native_keyframes(reference);
-        self.native_rtp.detach(reference);
+        self.detach_native_rtp(reference);
         let Some(source) = self.native_rtp.publications.get_mut(&reference) else {
             return;
         };
@@ -553,17 +469,18 @@ impl Participant {
         source.enabled = false;
         let remove_encodings = source
             .binding
+            .description()
             .encodings
             .iter()
             .map(|encoding| encoding.primary)
             .collect();
         let meta = source.track.meta().clone();
-        for encoding in &source.binding.encodings {
+        for encoding in &source.binding.description().encodings {
             self.transport.retire_encoding(encoding.primary);
         }
         if self
             .transport
-            .update_rtp(RtpConfigurationPatch {
+            .update_compiled_rtp(CompiledRtpConfigurationPatch {
                 remove_encodings,
                 ..Default::default()
             })
@@ -575,15 +492,41 @@ impl Participant {
         events.unpublish_owned_track(meta, reference);
     }
 
-    pub(super) fn native_rtp_ended(&mut self, ssrc: u32, events: &mut impl ParticipantSink) {
+    fn detach_native_rtp(&mut self, reference: u64) {
+        if let Some((track, Some(handle))) = self.native_rtp.detach(reference) {
+            self.upstream.unbind_track_handle(track, handle);
+        }
+    }
+
+    pub(super) fn fence_native_resource(&mut self, reference: u64) {
+        self.native_execution.fence(reference);
+        self.fence_native_data(reference);
+        self.fence_native_receiver(reference);
+        self.discard_native_keyframes(reference);
+        self.detach_native_rtp(reference);
+        if let Some(source) = self.native_rtp.publications.get_mut(&reference) {
+            source.enabled = false;
+            for encoding in &source.binding.description().encodings {
+                self.transport.retire_encoding(encoding.primary);
+            }
+        }
+    }
+
+    pub(super) fn native_resource_ended(&mut self, reference: u64) {
+        self.fence_native_resource(reference);
+        if self.disconnect_reason.is_some() {
+            return;
+        }
+        self.record_native_resource_observation(
+            crate::participant::policy::ResourceObservation::Ended { binding: reference },
+        );
+    }
+
+    pub(super) fn native_rtp_ended(&mut self, ssrc: u32) {
         let Some(reference) = self.native_rtp.ssrcs.get(&ssrc).copied() else {
             return;
         };
-        if self.signaling.source_ended(reference).is_err() {
-            self.disconnect(DisconnectReason::SignalingOutput);
-            return;
-        }
-        self.retire_native_resource(reference, events);
+        self.native_resource_ended(reference);
     }
 
     pub(super) fn complete_native_resource_cutoff(&mut self, reference: u64, success: bool) {
@@ -598,11 +541,12 @@ impl Participant {
             self.disconnect(DisconnectReason::SignalingOutput);
             return;
         }
+        let track_id = source.track.id();
+        let slot = source.slot;
         self.native_rtp.publications.remove(&reference);
-        if self.signaling.reserve_execution(reference, 0).is_err()
-            || self.signaling.cutoff_complete(reference).is_err()
-        {
-            self.disconnect(DisconnectReason::SignalingOutput);
-        }
+        self.upstream.remove_managed_track(slot, track_id);
+        self.record_native_resource_observation(
+            crate::participant::policy::ResourceObservation::Released { binding: reference },
+        );
     }
 }

@@ -1,7 +1,3 @@
-mod audio;
-mod data;
-mod video;
-
 #[cfg(test)]
 mod binding_tests;
 
@@ -14,11 +10,10 @@ use crate::{
     rtp::RtpPacket,
     track::UpstreamTrack,
 };
-use ahash::{HashMap, HashMapExt, HashSetExt};
-pub(crate) use audio::UpstreamAudio;
-pub(crate) use data::UpstreamData;
+use ahash::HashSetExt;
 use pulsebeam_runtime::time::Instant;
-pub(crate) use video::UpstreamVideo;
+use slotmap::Key as _;
+use std::collections::BTreeMap;
 
 pub(crate) const MAX_UPSTREAM_SLOT_PER_TYPE: usize = 32;
 pub(crate) const MAX_UPSTREAM_ENCODED_STREAMS: usize =
@@ -29,6 +24,7 @@ pub(crate) struct IncomingRtpRoute {
     pub(crate) ssrc: Ssrc,
     pub(crate) mid: Mid,
     pub(crate) rid: Option<crate::media::Rid>,
+    pub(crate) encoding: crate::track::SourceEncoding,
     pub(crate) upstream_slot: UpstreamSlotKey,
     pub(crate) track_id: TrackId,
     pub(crate) fanout: Option<TrackHandle>,
@@ -115,10 +111,10 @@ pub(crate) enum SenderLabelError {
 }
 
 pub(crate) struct UpstreamSlot {
-    media_index: u32,
+    media_index: Option<u32>,
     mid: Mid,
     track: UpstreamTrack,
-    descriptor: crate::track::Track,
+    descriptor: Option<Box<crate::track::Track>>,
     in_topology: bool,
     published_once: bool,
 }
@@ -127,11 +123,13 @@ impl UpstreamSlot {
     fn bind_label(&mut self, id: TrackId, label: &str) {
         self.track.meta.id = id;
         self.track.meta.label = Some(label.to_owned());
-        self.descriptor.meta_mut().id = id;
-        self.descriptor.meta_mut().label = Some(label.to_owned());
-        if let crate::track::Track::Video(video) = &mut self.descriptor {
-            for layer in &mut video.layers {
-                layer.meta = video.meta.clone();
+        if let Some(descriptor) = &mut self.descriptor {
+            descriptor.meta_mut().id = id;
+            descriptor.meta_mut().label = Some(label.to_owned());
+            if let crate::track::Track::Video(video) = descriptor.as_mut() {
+                for layer in &mut video.layers {
+                    layer.meta = video.meta.clone();
+                }
             }
         }
     }
@@ -141,7 +139,9 @@ pub(crate) struct UpstreamMedia {
     ctx: LogCtx,
     kind: TrackKind,
     connection_id: ConnectionId,
-    published_tracks: Vec<UpstreamSlot>,
+    published_tracks: BTreeMap<usize, UpstreamSlot>,
+    next_slot: usize,
+    negotiated_slots: Vec<usize>,
 }
 
 impl UpstreamMedia {
@@ -150,7 +150,9 @@ impl UpstreamMedia {
             ctx,
             kind,
             connection_id,
-            published_tracks: Vec::new(),
+            published_tracks: BTreeMap::new(),
+            next_slot: 0,
+            negotiated_slots: Vec::new(),
         }
     }
     fn add_published_track(
@@ -163,36 +165,64 @@ impl UpstreamMedia {
         debug_assert_eq!(track.meta.id.kind(), self.kind);
         if self
             .published_tracks
-            .iter()
-            .any(|s| s.mid == mid || s.track.meta.id == track.meta.id)
+            .values()
+            .any(|s| s.media_index.is_some() && (s.mid == mid || s.track.meta.id == track.meta.id))
         {
             plog_warn!(self.ctx, "duplicated publisher slot mid={}.", mid);
             return false;
         }
-        if self.published_tracks.len() >= MAX_UPSTREAM_SLOT_PER_TYPE {
+        if self.negotiated_slots.len() >= MAX_UPSTREAM_SLOT_PER_TYPE {
             return false;
         }
-        self.published_tracks.push(UpstreamSlot {
-            media_index,
-            mid,
-            track,
-            descriptor,
-            in_topology: false,
-            published_once: false,
-        });
+        let Some(index) = self.allocate_slot() else {
+            return false;
+        };
+        self.published_tracks.insert(
+            index,
+            UpstreamSlot {
+                media_index: Some(media_index),
+                mid,
+                track,
+                descriptor: Some(Box::new(descriptor)),
+                in_topology: false,
+                published_once: false,
+            },
+        );
+        self.negotiated_slots.push(index);
         true
     }
+
+    fn allocate_slot(&mut self) -> Option<usize> {
+        let index = self.next_slot;
+        self.next_slot = self.next_slot.checked_add(1)?;
+        Some(index)
+    }
+
+    fn add_managed_track(&mut self, mid: Mid, track: UpstreamTrack) -> Option<usize> {
+        let index = self.allocate_slot()?;
+        self.published_tracks.insert(
+            index,
+            UpstreamSlot {
+                media_index: None,
+                mid,
+                track,
+                descriptor: None,
+                in_topology: false,
+                published_once: false,
+            },
+        );
+        Some(index)
+    }
     fn slot_for_mid(&self, mid: Mid) -> Option<(usize, TrackId)> {
-        self.published_tracks
-            .iter()
-            .enumerate()
-            .find(|(_, slot)| slot.mid == mid)
-            .map(|(index, slot)| (index, slot.track.meta.id))
+        self.negotiated_slots.iter().find_map(|&index| {
+            let slot = self.published_tracks.get(&index)?;
+            (slot.mid == mid).then_some((index, slot.track.meta.id))
+        })
     }
     fn track_for_sender_index(&self, media_index: u32) -> Option<TrackId> {
         self.published_tracks
-            .iter()
-            .find(|slot| slot.media_index == media_index)
+            .values()
+            .find(|slot| slot.media_index == Some(media_index))
             .map(|slot| slot.track.meta.id)
     }
 
@@ -204,11 +234,11 @@ impl UpstreamMedia {
         let slot_index = self
             .published_tracks
             .iter()
-            .position(|slot| slot.media_index == media_index)
+            .find_map(|(&index, slot)| (slot.media_index == Some(media_index)).then_some(index))
             .ok_or(SenderLabelError::UnknownSender)?;
         let slot = self
             .published_tracks
-            .get(slot_index)
+            .get(&slot_index)
             .ok_or(SenderLabelError::UnknownSender)?;
         if let Some(bound) = &slot.track.meta.label {
             return (bound == label)
@@ -219,17 +249,14 @@ impl UpstreamMedia {
             return Err(SenderLabelError::AlreadyPublished);
         }
         let id = self.connection_id.derive_track_id(self.kind, label);
-        if self
-            .published_tracks
-            .iter()
-            .enumerate()
-            .any(|(index, other)| index != slot_index && other.track.meta.id == id)
-        {
+        if self.published_tracks.iter().any(|(&index, other)| {
+            other.media_index.is_some() && index != slot_index && other.track.meta.id == id
+        }) {
             return Err(SenderLabelError::DuplicateLabel);
         }
         let slot = self
             .published_tracks
-            .get_mut(slot_index)
+            .get_mut(&slot_index)
             .ok_or(SenderLabelError::UnknownSender)?;
         let previous = slot.track.meta.id;
         slot.bind_label(id, label);
@@ -241,16 +268,14 @@ impl UpstreamMedia {
     ) -> Result<Vec<(usize, TrackId, String)>, SenderLabelError> {
         let mut replacements = Vec::new();
         for &(media_index, label) in labels {
-            let Some(index) = self
-                .published_tracks
-                .iter()
-                .position(|slot| slot.media_index == media_index)
-            else {
+            let Some(index) = self.published_tracks.iter().find_map(|(&index, slot)| {
+                (slot.media_index == Some(media_index)).then_some(index)
+            }) else {
                 continue;
             };
             let slot = self
                 .published_tracks
-                .get(index)
+                .get(&index)
                 .ok_or(SenderLabelError::UnknownSender)?;
             if let Some(bound) = &slot.track.meta.label {
                 if bound != label {
@@ -271,7 +296,11 @@ impl UpstreamMedia {
             ));
         }
         let mut identities = ahash::HashSet::new();
-        for (index, slot) in self.published_tracks.iter().enumerate() {
+        for (&index, slot) in self
+            .published_tracks
+            .iter()
+            .filter(|(_, slot)| slot.media_index.is_some())
+        {
             let id = replacements
                 .iter()
                 .find(|(other, _, _)| *other == index)
@@ -286,7 +315,7 @@ impl UpstreamMedia {
     fn apply_sender_labels(&mut self, replacements: Vec<(usize, TrackId, String)>) -> bool {
         let changed = !replacements.is_empty();
         for (index, id, label) in replacements {
-            let Some(slot) = self.published_tracks.get_mut(index) else {
+            let Some(slot) = self.published_tracks.get_mut(&index) else {
                 return false;
             };
             slot.bind_label(id, &label);
@@ -297,8 +326,8 @@ impl UpstreamMedia {
     fn sender_report(&mut self, mid: Mid, report: SenderInfo, arrival: Instant) {
         if let Some(slot) = self
             .published_tracks
-            .iter_mut()
-            .find(|slot| slot.mid == mid)
+            .values_mut()
+            .find(|slot| slot.media_index.is_some() && slot.mid == mid)
         {
             slot.track.sender_report(report, arrival);
         }
@@ -312,7 +341,7 @@ impl UpstreamMedia {
         rtp: RtpPacket,
         sr: Option<SenderInfo>,
     ) -> crate::track::ProcessedRtp {
-        let Some(slot) = self.published_tracks.get_mut(index) else {
+        let Some(slot) = self.published_tracks.get_mut(&index) else {
             debug_assert!(false, "cached upstream slot index is out of bounds");
             return crate::track::ProcessedRtp {
                 first: None,
@@ -340,42 +369,58 @@ impl UpstreamMedia {
         mid: Mid,
         active: bool,
     ) -> Option<(&crate::track::Track, &mut bool)> {
-        let slot = self.published_tracks.iter_mut().find(|s| s.mid == mid)?;
+        let slot = self
+            .published_tracks
+            .values_mut()
+            .find(|s| s.media_index.is_some() && s.mid == mid)?;
         if active {
             slot.published_once = true;
         }
-        Some((&slot.descriptor, &mut slot.in_topology))
+        Some((slot.descriptor.as_deref()?, &mut slot.in_topology))
     }
     fn mid_for_track_id(&self, track_id: TrackId) -> Option<Mid> {
         self.published_tracks
-            .iter()
-            .find(|t| t.track.meta.id == track_id)
+            .values()
+            .find(|t| t.media_index.is_some() && t.track.meta.id == track_id)
             .map(|t| t.mid)
     }
     fn poll_slow(&mut self, now: Instant) {
-        for slot in &mut self.published_tracks {
-            slot.track.poll_stats(now);
+        for index in &self.negotiated_slots {
+            if let Some(slot) = self.published_tracks.get_mut(index) {
+                slot.track.poll_stats(now);
+            }
         }
     }
 }
 
+fn track_key(track_id: TrackId) -> (u8, [u8; 16]) {
+    let kind = match track_id.kind() {
+        TrackKind::Audio => 0,
+        TrackKind::Video => 1,
+        TrackKind::Data => 2,
+    };
+    (kind, *track_id.as_bytes())
+}
+
 pub struct Upstream {
-    pub(crate) audio: UpstreamAudio,
-    pub(crate) video: UpstreamVideo,
-    pub(crate) data: UpstreamData,
+    audio: UpstreamMedia,
+    video: UpstreamMedia,
     pub(crate) routes: UpstreamRouteTable,
-    track_handles: HashMap<TrackId, TrackHandle>,
+    managed_slots: BTreeMap<(u8, [u8; 16]), UpstreamSlotKey>,
+    track_handles: BTreeMap<(u8, [u8; 16]), TrackHandle>,
+    fanouts: BTreeMap<u64, TrackId>,
 }
 pub type UpstreamAllocator = Upstream;
 
 impl Upstream {
     pub(crate) fn new(ctx: LogCtx, connection_id: ConnectionId) -> Self {
         Self {
-            audio: UpstreamAudio::new(ctx, connection_id),
-            video: UpstreamVideo::new(ctx, connection_id),
-            data: UpstreamData::new(),
+            audio: UpstreamMedia::new(ctx, TrackKind::Audio, connection_id),
+            video: UpstreamMedia::new(ctx, TrackKind::Video, connection_id),
             routes: UpstreamRouteTable::default(),
-            track_handles: HashMap::new(),
+            managed_slots: BTreeMap::new(),
+            track_handles: BTreeMap::new(),
+            fanouts: BTreeMap::new(),
         }
     }
     pub fn add_published_track(
@@ -494,21 +539,85 @@ impl Upstream {
         self.video.poll_slow(now);
     }
 
+    pub(crate) fn insert_managed_track(
+        &mut self,
+        mid: Mid,
+        track: UpstreamTrack,
+    ) -> Option<UpstreamSlotKey> {
+        let id = track_key(track.meta.id);
+        if self.managed_slots.contains_key(&id) {
+            return None;
+        }
+        let slot = match track.meta.id.kind() {
+            TrackKind::Audio => self
+                .audio
+                .add_managed_track(mid, track)
+                .map(UpstreamSlotKey::Audio),
+            TrackKind::Video => self
+                .video
+                .add_managed_track(mid, track)
+                .map(UpstreamSlotKey::Video),
+            TrackKind::Data => None,
+        }?;
+        self.managed_slots.insert(id, slot);
+        Some(slot)
+    }
+
+    pub(crate) fn remove_managed_track(&mut self, key: UpstreamSlotKey, track_id: TrackId) {
+        let slots = match key {
+            UpstreamSlotKey::Audio(_) => &mut self.audio.published_tracks,
+            UpstreamSlotKey::Video(_) => &mut self.video.published_tracks,
+        };
+        let index = match key {
+            UpstreamSlotKey::Audio(index) | UpstreamSlotKey::Video(index) => index,
+        };
+        if slots
+            .get(&index)
+            .is_some_and(|slot| slot.media_index.is_none() && slot.track.meta.id == track_id)
+            && self.managed_slots.get(&track_key(track_id)) == Some(&key)
+        {
+            slots.remove(&index);
+            self.managed_slots.remove(&track_key(track_id));
+            self.routes.remove_track(track_id);
+        }
+    }
+
+    pub(crate) fn owns_managed_track(&self, track_id: TrackId) -> bool {
+        self.managed_slots.contains_key(&track_key(track_id))
+    }
+
+    pub(crate) fn track_mut(&mut self, key: UpstreamSlotKey) -> Option<&mut UpstreamTrack> {
+        let slot = match key {
+            UpstreamSlotKey::Audio(index) => self.audio.published_tracks.get_mut(&index),
+            UpstreamSlotKey::Video(index) => self.video.published_tracks.get_mut(&index),
+        }?;
+        Some(&mut slot.track)
+    }
+
     pub(crate) fn track_fanout(&self, track_id: TrackId) -> Option<TrackHandle> {
-        self.track_handles.get(&track_id).copied()
+        self.track_handles.get(&track_key(track_id)).copied()
     }
     pub(crate) fn track_for_fanout(&self, fanout: TrackHandle) -> Option<TrackId> {
-        self.track_handles
-            .iter()
-            .find_map(|(track_id, key)| (*key == fanout).then_some(*track_id))
+        self.fanouts.get(&fanout.data().as_ffi()).copied()
     }
     pub(crate) fn bind_track_handle(&mut self, track_id: TrackId, key: TrackHandle) {
-        self.track_handles.insert(track_id, key);
+        if let Some(previous) = self.track_handles.insert(track_key(track_id), key)
+            && previous != key
+        {
+            self.fanouts.remove(&previous.data().as_ffi());
+        }
+        if let Some(previous) = self.fanouts.insert(key.data().as_ffi(), track_id)
+            && previous != track_id
+        {
+            self.track_handles.remove(&track_key(previous));
+            self.routes.remove_track(previous);
+        }
         self.routes.bind_fanout(track_id, key);
     }
     pub(crate) fn unbind_track_handle(&mut self, track_id: TrackId, key: TrackHandle) {
-        if self.track_handles.get(&track_id) == Some(&key) {
-            self.track_handles.remove(&track_id);
+        if self.track_handles.get(&track_key(track_id)) == Some(&key) {
+            self.track_handles.remove(&track_key(track_id));
+            self.fanouts.remove(&key.data().as_ffi());
             self.routes.remove_track(track_id);
         }
     }

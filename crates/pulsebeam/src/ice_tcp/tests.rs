@@ -121,7 +121,7 @@ fn frame_quota_follows_deferred_input_and_egress_full_retires_flow() {
                 .is_err()
         );
         let (accepted, _, _) = crate::control::application_only_test_connection_and_binding();
-        let mut transport = crate::participant::transport::Transport::new(
+        let mut transport = crate::participant::transport::RtcDriver::new(
             accepted,
             8,
             pulsebeam_runtime::time::Instant::now(),

@@ -362,12 +362,45 @@ impl TrackLifecycle {
         self.reconcile_all(identities, registry, now)
     }
 
+    pub(super) fn sources_in_room(&self, room_id: RoomId) -> impl Iterator<Item = &Track> {
+        self.topology.sources_in_room(room_id)
+    }
+
+    pub(crate) fn source(
+        &self,
+        room_id: RoomId,
+        subscriber: ParticipantId,
+        track: TrackId,
+        registry: &RoomRegistry,
+    ) -> Option<&Track> {
+        ParticipantLocation::bound_in_room(registry, &subscriber, room_id)?;
+        let source = self.topology.source(room_id, track)?;
+        let meta = source.meta();
+        if meta.origin == subscriber {
+            return None;
+        }
+        let publisher = registry.get_participant(&meta.origin)?;
+        if !publisher.materialized
+            || publisher.room_id != room_id
+            || publisher.connection_id != meta.connection_id
+        {
+            return None;
+        }
+        Some(source)
+    }
+
     pub(crate) fn set_owned_subscription(
         &mut self,
         request: super::topology::OwnedSubscription,
         registry: &RoomRegistry,
         now: Instant,
     ) -> Vec<TrackLifecycleOutcome> {
+        if self
+            .source(request.room_id, request.subscriber, request.track, registry)
+            .is_none()
+        {
+            return Vec::new();
+        }
         let identities = self
             .topology
             .matching_tracks(request.room_id, &TrackSelector::track(request.track));
@@ -1823,8 +1856,54 @@ mod tests {
 
     #[test]
     fn removing_last_remote_candidate_releases_its_reserved_placement() {
-        let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
-        let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
+        let (mut lifecycle, mut registry) = setup(2, &[(1, 1, 0), (2, 1, 1), (3, 2, 1)]);
+        let mut publication = track(TrackKind::Audio, 1, 1, "audio");
+        let connection = registry
+            .get_participant(&participant(1))
+            .unwrap()
+            .connection_id;
+        publication.meta_mut().connection_id = connection;
+        publication.meta_mut().id = connection.derive_track_id(TrackKind::Audio, "audio");
+        let identity = TrackAncestry::from_track(&publication);
+        let _ = lifecycle.publish(publication, &registry, Instant::now());
+        assert!(
+            lifecycle
+                .source(room(1), participant(2), identity.track_id, &registry)
+                .is_some()
+        );
+        assert!(
+            lifecycle
+                .source(room(1), participant(1), identity.track_id, &registry)
+                .is_none()
+        );
+        assert!(
+            lifecycle
+                .source(room(2), participant(3), identity.track_id, &registry)
+                .is_none()
+        );
+        assert!(
+            lifecycle
+                .source(room(1), participant(9), identity.track_id, &registry)
+                .is_none()
+        );
+        let denied = super::super::topology::OwnedSubscription {
+            room_id: room(2),
+            subscriber: participant(3),
+            reference: 1,
+            track: identity.track_id,
+            enabled: true,
+        };
+        assert!(
+            lifecycle
+                .set_owned_subscription(denied, &registry, Instant::now())
+                .is_empty()
+        );
+        assert!(
+            lifecycle
+                .topology
+                .remove_owned(room(2), participant(3), 1)
+                .is_none()
+        );
         let _ = lifecycle.subscribe(
             room(1),
             participant(2),
@@ -1855,6 +1934,42 @@ mod tests {
         assert!(lifecycle.candidates[&identity].is_empty());
         assert!(plan_updates_on(&outcome, 1).contains(&(remote_track_id, false)));
         assert_internal_invariants(&lifecycle, &registry);
+        assert!(
+            lifecycle
+                .source(room(1), participant(2), identity.track_id, &registry)
+                .is_some()
+        );
+        registry.add_participant(participant(2), room(1), ShardId::new(1), None);
+        assert!(
+            lifecycle
+                .source(room(1), participant(2), identity.track_id, &registry)
+                .is_none()
+        );
+        registry.mark_materialized(&participant(2));
+        assert!(
+            lifecycle
+                .source(room(1), participant(2), identity.track_id, &registry)
+                .is_some()
+        );
+        registry.add_participant(participant(1), room(1), ShardId::new(0), None);
+        registry.mark_materialized(&participant(1));
+        assert!(
+            lifecycle
+                .source(room(1), participant(2), identity.track_id, &registry)
+                .is_none()
+        );
+        let _ = lifecycle.unpublish(
+            identity.publisher,
+            identity.track_id,
+            &registry,
+            Instant::now(),
+        );
+        assert!(
+            lifecycle
+                .topology
+                .source(room(1), identity.track_id)
+                .is_none()
+        );
     }
 
     #[test]

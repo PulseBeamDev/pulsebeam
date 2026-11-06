@@ -1,5 +1,4 @@
 mod audio;
-mod data;
 mod video;
 
 use std::time::Duration;
@@ -20,7 +19,6 @@ use crate::rtp::RtpPacket;
 use crate::track::{StreamWriter, Track, TrackLayer, TrackMeta};
 use ahash::{HashMap, HashMapExt};
 pub use audio::DownstreamAudio;
-pub(crate) use data::DownstreamData;
 use indexmap::IndexMap;
 use pulsebeam_runtime::time::Instant;
 use slotmap::SecondaryMap;
@@ -122,7 +120,6 @@ pub struct Downstream {
     pub dirty_allocation: bool,
     pub video: DownstreamVideo,
     pub(crate) audio: DownstreamAudio,
-    pub(crate) data: DownstreamData,
     catalog: SecondaryMap<TrackHandle, TrackCatalogEntry>,
     /// Audio publications in the room, whether or not anyone is hearing them.
     ///
@@ -144,6 +141,7 @@ pub struct Downstream {
 pub(crate) struct TrackCatalogEntry {
     pub(crate) participant_id: ParticipantId,
     pub(crate) track_id: TrackId,
+    bound: bool,
 }
 
 pub type DownstreamAllocator = Downstream;
@@ -154,7 +152,6 @@ impl Downstream {
             ctx,
             video: DownstreamVideo::new(ctx, manual_sub),
             audio: DownstreamAudio::new(ctx, manual_sub),
-            data: DownstreamData::new(),
             catalog: SecondaryMap::new(),
             audio_tracks: IndexMap::new(),
             dirty_allocation: false,
@@ -166,23 +163,11 @@ impl Downstream {
         }
     }
 
-    pub(crate) fn add_track_candidate(
-        &mut self,
-        key: TrackHandle,
-        track: &Track,
-        channels: &[(crate::media::ChannelId, crate::track::DataTopicChannel)],
-    ) -> bool {
-        if !self.register_candidate(key, track) {
-            return false;
-        }
-        self.data.add_candidate(key, track, channels);
-        true
-    }
-
     pub(crate) fn register_candidate(&mut self, key: TrackHandle, track: &Track) -> bool {
         let entry = TrackCatalogEntry {
             participant_id: track.meta().origin,
             track_id: track.id(),
+            bound: false,
         };
         if let Some(previous) = self.catalog.get(key) {
             debug_assert_eq!(previous.track_id, entry.track_id);
@@ -195,12 +180,17 @@ impl Downstream {
     }
 
     pub(crate) fn remove_track_candidate(&mut self, key: TrackHandle) -> Option<TrackCatalogEntry> {
-        self.data.remove_candidate(key);
         self.catalog.remove(key)
     }
 
     pub(crate) fn track_candidate(&self, key: TrackHandle) -> Option<TrackCatalogEntry> {
         self.catalog.get(key).copied()
+    }
+
+    pub(crate) fn candidate_binding(&self, track: TrackId) -> Option<(TrackHandle, bool)> {
+        self.catalog
+            .iter()
+            .find_map(|(handle, entry)| (entry.track_id == track).then_some((handle, entry.bound)))
     }
 
     /// A fixed receiver cannot return to native defaults during this transport generation.
@@ -268,12 +258,18 @@ impl Downstream {
     }
 
     pub(crate) fn activate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
+        if let Some(entry) = self.catalog.get_mut(key) {
+            entry.bound = true;
+        }
         if track_id.kind() == TrackKind::Video {
             self.video.activate_track_binding(key, track_id);
         }
     }
 
     pub(crate) fn deactivate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
+        if let Some(entry) = self.catalog.get_mut(key) {
+            entry.bound = false;
+        }
         if track_id.kind() == TrackKind::Video {
             self.video.deactivate_track_binding(key, track_id);
         }
@@ -282,15 +278,6 @@ impl Downstream {
     /// Apply the client's audio selection policy.
     pub fn set_audio_intent(&mut self, intent: AudioIntent) {
         self.audio.set_intent(intent);
-    }
-
-    pub(crate) fn native_publications(&self) -> Vec<crate::track::TrackMeta> {
-        self.video
-            .tracks()
-            .chain(self.audio_tracks.values())
-            .chain(self.data.publications())
-            .cloned()
-            .collect()
     }
 
     pub(crate) fn native_assignments(&self) -> (Vec<(u32, TrackId)>, Vec<(u32, TrackId)>) {

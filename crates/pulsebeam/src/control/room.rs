@@ -1,17 +1,24 @@
 use indexmap::IndexMap;
+use std::collections::{BTreeSet, HashMap};
 
-use crate::entity::ParticipantId;
+use crate::entity::{ConnectionId, ParticipantId};
 use crate::id::ShardId;
 
 struct RoomPartition {
     shard_id: ShardId,
-    participants: usize,
+    occupants: usize,
+}
+
+struct PendingPlacement {
+    partition_index: usize,
+    connections: BTreeSet<ConnectionId>,
 }
 
 /// Node-owned portion of a logical room. Its partitions are placement
 /// groups on local execution shards. Cluster synchronization is separate.
 pub struct RoomShard {
     participants: IndexMap<ParticipantId, usize>,
+    reservations: HashMap<ParticipantId, PendingPlacement>,
     partitions: Vec<RoomPartition>,
 }
 
@@ -19,6 +26,7 @@ impl RoomShard {
     pub fn new() -> Self {
         Self {
             participants: IndexMap::new(),
+            reservations: HashMap::new(),
             partitions: Vec::new(),
         }
     }
@@ -31,16 +39,15 @@ impl RoomShard {
         if let Some(index) = self.participants.get(participant_id) {
             return *index;
         }
+        if let Some(pending) = self.reservations.get(participant_id) {
+            return pending.partition_index;
+        }
         self.partitions
             .iter()
-            .position(|partition| partition.participants < capacity)
+            .position(|partition| partition.occupants < capacity)
             .unwrap_or(self.partitions.len())
     }
 
-    #[allow(
-        clippy::expect_used,
-        reason = "a controller-selected partition index must exist or be the next index"
-    )]
     pub fn add_participant(
         &mut self,
         participant_id: &ParticipantId,
@@ -54,26 +61,15 @@ impl RoomShard {
         if self.participants.contains_key(participant_id) {
             return;
         }
-        if partition_index == self.partitions.len() {
-            self.partitions.push(RoomPartition {
-                shard_id,
-                participants: 0,
-            });
+        let reserved = self.reservations.get(participant_id);
+        if let Some(pending) = reserved {
+            assert_eq!(pending.partition_index, partition_index);
         }
-        let partition = self
-            .partitions
-            .get_mut(partition_index)
-            .expect("partition indices must be allocated in order");
-        // An emptied partition can be reassigned if the node-local placement
-        // policy changes. A nonempty partition cannot switch owners.
-        if partition.participants == 0 {
-            partition.shard_id = shard_id;
+        let held = reserved.is_some();
+        let partition = self.partition_mut(shard_id, partition_index);
+        if !held {
+            partition.occupants = partition.occupants.saturating_add(1);
         }
-        assert_eq!(
-            partition.shard_id, shard_id,
-            "a live room partition cannot change execution shard"
-        );
-        partition.participants = partition.participants.saturating_add(1);
         self.participants.insert(*participant_id, partition_index);
     }
 
@@ -88,16 +84,106 @@ impl RoomShard {
                 .get_mut(index)
                 .expect("a participant must reference a known partition");
             debug_assert_eq!(partition.shard_id, shard_id);
-            debug_assert!(partition.participants > 0);
-            partition.participants = partition.participants.saturating_sub(1);
+            debug_assert!(partition.occupants > 0);
+            if !self.reservations.contains_key(participant_id) {
+                partition.occupants = partition.occupants.saturating_sub(1);
+            }
         }
     }
 
-    pub(super) fn partition_owner(&self, index: usize) -> Option<ShardId> {
+    #[allow(
+        clippy::expect_used,
+        reason = "a reserved partition is allocated before materialization"
+    )]
+    fn partition_mut(&mut self, shard_id: ShardId, index: usize) -> &mut RoomPartition {
+        if index == self.partitions.len() {
+            self.partitions.push(RoomPartition {
+                shard_id,
+                occupants: 0,
+            });
+        }
+        let partition = self
+            .partitions
+            .get_mut(index)
+            .expect("partition indices must be allocated in order");
+        if partition.occupants == 0 {
+            partition.shard_id = shard_id;
+        }
+        assert_eq!(
+            partition.shard_id, shard_id,
+            "a held room partition cannot change execution shard"
+        );
+        partition
+    }
+
+    pub fn partition_owner(&self, index: usize) -> Option<ShardId> {
         self.partitions
             .get(index)
-            .filter(|partition| partition.participants != 0)
+            .filter(|partition| partition.occupants > 0)
             .map(|partition| partition.shard_id)
+    }
+
+    pub fn reserve(
+        &mut self,
+        participant: ParticipantId,
+        connection: ConnectionId,
+        shard: ShardId,
+        index: usize,
+    ) {
+        if let Some(existing) = self.participants.get(&participant) {
+            assert_eq!(*existing, index);
+        }
+        if let Some(pending) = self.reservations.get(&participant) {
+            assert_eq!(pending.partition_index, index);
+        }
+        let held = self.participants.contains_key(&participant)
+            || self.reservations.contains_key(&participant);
+        let partition = self.partition_mut(shard, index);
+        if !held {
+            partition.occupants = partition.occupants.saturating_add(1);
+        }
+        self.reservations
+            .entry(participant)
+            .or_insert_with(|| PendingPlacement {
+                partition_index: index,
+                connections: BTreeSet::new(),
+            })
+            .connections
+            .insert(connection);
+    }
+
+    pub fn reserved(
+        &self,
+        participant: ParticipantId,
+        connection: ConnectionId,
+        shard: ShardId,
+        index: usize,
+    ) -> bool {
+        self.reservations.get(&participant).is_some_and(|pending| {
+            pending.partition_index == index
+                && pending.connections.contains(&connection)
+                && self.partition_owner(index) == Some(shard)
+        })
+    }
+
+    pub fn release(&mut self, participant: ParticipantId, connection: ConnectionId) {
+        let Some(pending) = self.reservations.get_mut(&participant) else {
+            return;
+        };
+        if !pending.connections.remove(&connection) || !pending.connections.is_empty() {
+            return;
+        }
+        let index = pending.partition_index;
+        self.reservations.remove(&participant);
+        if !self.participants.contains_key(&participant)
+            && let Some(partition) = self.partitions.get_mut(index)
+        {
+            partition.occupants = partition.occupants.saturating_sub(1);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.participants.is_empty() && self.reservations.is_empty()
     }
 
     pub fn participant_count(&self) -> usize {
@@ -112,6 +198,58 @@ impl RoomShard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_claims_hold_capacity_through_out_of_order_commit_and_departure() {
+        let mut room = RoomShard::new();
+        let first = ParticipantId::new();
+        let second = ParticipantId::new();
+        let a = ConnectionId::new();
+        let b = ConnectionId::new();
+        room.reserve(first, a, ShardId::new(0), 0);
+        assert_eq!(room.next_partition_index(&second, 1), 1);
+        room.reserve(second, b, ShardId::new(1), 1);
+        assert_eq!(room.participant_count(), 0);
+        room.add_participant(&second, ShardId::new(1), 1);
+        room.release(second, b);
+        assert!(room.reserved(first, a, ShardId::new(0), 0));
+        assert!(!room.reserved(first, a, ShardId::new(1), 0));
+        room.remove_participant(&second, ShardId::new(1));
+        assert!(!room.is_empty());
+        assert_eq!(room.partition_owner(0), Some(ShardId::new(0)));
+        room.release(first, a);
+        assert!(room.is_empty());
+        assert_eq!(room.next_partition_index(&ParticipantId::new(), 1), 0);
+        room.reserve(second, b, ShardId::new(2), 0);
+        assert!(!room.reserved(first, a, ShardId::new(0), 0));
+        assert!(room.reserved(second, b, ShardId::new(2), 0));
+        room.release(second, b);
+        assert!(room.is_empty());
+    }
+
+    #[test]
+    fn pending_replacements_share_one_placement_until_commit_or_cancellation() {
+        let mut room = RoomShard::new();
+        let participant = ParticipantId::new();
+        let a = ConnectionId::new();
+        let b = ConnectionId::new();
+        let shard = ShardId::new(0);
+        room.add_participant(&participant, shard, 0);
+        room.reserve(participant, a, shard, 0);
+        room.reserve(participant, b, shard, 0);
+        assert_eq!(room.next_partition_index(&ParticipantId::new(), 1), 1);
+        room.remove_participant(&participant, shard);
+        room.release(participant, a);
+        assert_eq!(room.participant_count(), 0);
+        assert!(room.reserved(participant, b, shard, 0));
+        room.add_participant(&participant, shard, 0);
+        room.release(participant, b);
+        room.release(participant, a);
+        assert_eq!(room.next_partition_index(&ParticipantId::new(), 1), 1);
+        room.remove_participant(&participant, shard);
+        assert!(room.is_empty());
+        assert_eq!(room.partition_owner(0), None);
+    }
 
     #[test]
     fn partition_capacity_survives_departures_and_reconnects() {

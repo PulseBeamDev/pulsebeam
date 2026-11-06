@@ -38,8 +38,8 @@ workspace API; it does not create sockets or obtain entropy:
 ```rust
 use std::{net::SocketAddr, time::{Instant, SystemTime}};
 use pulsebeam_rtc::{
-    AcceptError, AcceptedConnection, Connection, ConnectionConfig,
-    ConnectionEntropy, LocalCandidate, SdpOffer,
+    AcceptError, AcceptedConnection, ConnectionConfig, ConnectionEntropy, LocalCandidate,
+    RtcConnection, SdpOffer,
 };
 
 fn accept_peer(
@@ -49,7 +49,7 @@ fn accept_peer(
     wallclock: SystemTime,
     fresh_entropy: [u8; 32],
 ) -> Result<AcceptedConnection, AcceptError> {
-    Connection::accept(
+    RtcConnection::accept(
         ConnectionConfig {
             local_candidates: vec![LocalCandidate::Udp(local)],
             ..ConnectionConfig::default()
@@ -110,6 +110,29 @@ or unrepresentable never-opened declaration reports closure/reset failure and
 releases its full configuration, retaining only a funded non-reuse guard until
 teardown because no reset barrier completed. In-band and automatically assigned
 channels still require connected SCTP.
+
+For an exact explicitly identified negotiated configuration, use
+`install_data_channel(now, config)` instead of a caller-owned reset/reopen loop.
+The returned `DataChannelInstallation` fences both the association and the
+installation lifetime. RTC prepays the pending configuration, channel, reset and
+notification storage before accepting it, then waits locally for SCTP connection
+and the previous SID's complete reset barrier. Rejected admission returns the
+unchanged configuration. Pending installations cannot send and do not hold up
+other application operations. In-band and automatically assigned channels keep
+the direct `open_data_channel` API.
+
+Use ordinary channel events as wakeups and query `data_channel_installation(token)`
+before attaching a completion. An `InstallationFailed` event retains the exact
+token when a request fails before admission, independently of an older lifetime
+still resetting on that SID. `Pending`, `Open { at }` and `Closed` describe that
+exact lifetime; `at` is actual RTC activation time. `None` means failed, canceled,
+retired or unavailable, including a token from another association. Peer-capacity
+rejection, failed reset, reset-all and shutdown fence activation. Progress shares
+the existing bounded SCTP service turns, with no spin or pending-map scan while
+waiting on a reset. `cancel_data_channel_installation` releases a not-yet-admitted
+request or closes the exact installed lifetime. Stale cancellation cannot close a
+replacement; `Closed` still does not permit SID reuse. Terminal pending-request
+reclamation and its retained failure facts also progress in bounded polling turns.
 
 SDP `max-message-size` is directional: our answer advertises our receive ceiling,
 not the offer's value. That ceiling is the larger of the configured application
@@ -291,7 +314,19 @@ unknown until supplied by preparation. Adopting a MID retires unused bootstrap
 identities in that group. `configure_rtp` instead retires all omitted bootstrap
 candidates. Both paths preserve actual indices and replay state on adoption.
 
-Both APIs validate and stage both directions together before commit. Unknown
+For preparation outside the runtime owner, obtain `rtp_binding_compiler()` from
+the connection or construct `RtpBindingCompiler` from the same validated
+`RtpCapabilities`. `compile` returns an opaque immutable binding description;
+`compile_patch` and `compile_configuration` prepare addressed or complete sets.
+Apply them with `update_compiled_rtp` or `configure_compiled_rtp`. Compilation
+validates static codec/FMTP/extension facts and prepares extension ordering, not
+live admission. A compiled description can be reused, but cannot reserve an SSRC,
+prove installation or bypass current capacity and cross-binding constraints.
+Installation rejects a different capability envelope, including different limits.
+The direct APIs compile locally and use the same runtime transaction. Callers
+remain responsible for connection/binding incarnation and revision fencing.
+
+Both paths stage both directions together before commit. Unknown
 identities are not admitted by sender discovery. Invalid formats, inconsistent
 mappings, collisions and capacity errors preserve the prior accepted set.
 Accepted bindings are owned in indexed records. `rtp_configuration()` explicitly
@@ -306,6 +341,10 @@ Before the first typed update,
 the snapshot contains only accepted typed groups, not paused bootstrap candidates.
 
 An encoding's `active` flag pauses admission without changing its identity.
+Use `set_rtp_encoding_active(primary, active)` for local operational changes to
+an installed encoding without compiling or rebuilding a binding. Repair SSRCs,
+unknown primaries and retired identities are not activity selectors. This updates
+only the addressed runtime and admission indexes, preserving unrelated bindings.
 Pausing an outbound encoding discards queued originals. Both directions preserve
 physical state, primary/RTX numbering, protection and connection-wide feedback
 history for resumption.
@@ -326,7 +365,7 @@ codec/FMTP/feedback payloads and extension URI entries/string capacities. Format
 choices and supported URI sets have no separate count ceiling; actual packet
 payload types and extension mappings still obey their wire namespaces. The live
 declaration charge includes string/vector capacities (including CNAME), format
-key/value payloads and the separate MID key contents. Each ingress/egress fact-owned CNAME copy is
+key/value payloads, the compiled extension-order index and the separate MID key contents. Each ingress/egress fact-owned CNAME copy is
 also charged to that owner's existing runtime allowance. Removing a binding
 releases its declaration charge; pausing retains it. The immutable capability
 charge remains until the connection is dropped. An over-budget capability

@@ -6,7 +6,7 @@ use crate::{
     },
     entity::{ParticipantId, RoomId},
     id::ShardId,
-    participant::ParticipantConfig,
+    participant::ConnectionConfig,
     route::{NodeTransportAddress, PackedRoute, SlotAllocator, TransportRoute},
 };
 use pulsebeam_rtc::AcceptedConnection;
@@ -114,19 +114,26 @@ impl ControllerCore {
         rtc: AcceptedConnection,
         resources: NegotiatedResources,
         state: ParticipantState,
-    ) -> ParticipantConfig {
-        ParticipantConfig {
-            manual_sub: state.manual_sub,
+    ) -> ConnectionConfig {
+        ConnectionConfig {
+            manual_sub: state.manual_sub
+                || state.profile == super::controller::SignalingProtocol::State,
             room_id: state.room_id,
             participant_id: state.participant_id,
             participant_external_id: state.participant_external_id,
             connection_id: state.connection_id,
             profile: state.profile,
+            allow_topic_channels: state.profile != super::controller::SignalingProtocol::State,
             authorization_expiry: state
                 .authorization
                 .map(super::controller::AuthorizationLease::expiry),
             rtc,
-            resources,
+            resources: if state.profile == super::controller::SignalingProtocol::State {
+                // State SDP declares transport capacity; resource declarations admit media.
+                resources.without_bootstrap_media()
+            } else {
+                resources
+            },
         }
     }
 

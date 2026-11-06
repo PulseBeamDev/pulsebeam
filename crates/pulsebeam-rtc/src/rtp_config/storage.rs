@@ -31,6 +31,7 @@ pub(super) fn live_bytes(record: &CurrentBinding) -> Option<usize> {
     // The MID index owns a separate copy of the string contents.
     size.add(binding.mid.len())?;
     size.array::<RtpExtensionMapping>(binding.extensions.capacity())?;
+    size.array::<usize>(record.extension_order.len())?;
     size.array::<RtpEncoding>(binding.encodings.capacity())?;
     size.array::<(u32, CurrentEncodingLocation)>(binding.encodings.len())?;
     for extension in &binding.extensions {

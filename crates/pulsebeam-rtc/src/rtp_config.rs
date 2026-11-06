@@ -84,6 +84,128 @@ pub struct RtpConfigurationPatch {
     pub remove_encodings: BTreeSet<u32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "immutable capability backing is shared only at configuration rate"
+)]
+pub(crate) struct CapabilityContext(std::sync::Arc<RtpCapabilities>);
+
+#[allow(
+    clippy::disallowed_types,
+    reason = "immutable capability backing is shared only at configuration rate"
+)]
+impl CapabilityContext {
+    fn new(capabilities: RtpCapabilities) -> Result<(Self, usize), RtpConfigurationError> {
+        let bytes = capabilities.validate()?;
+        Ok((Self(std::sync::Arc::new(capabilities)), bytes))
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || self == other
+    }
+}
+
+impl std::ops::Deref for CapabilityContext {
+    type Target = RtpCapabilities;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Validated immutable capability context, reusable outside the runtime owner.
+#[derive(Clone, Debug)]
+pub struct RtpBindingCompiler {
+    capabilities: CapabilityContext,
+}
+
+/// Static validation only. Admission, physical identity and capacity checks run
+/// against the installed connection when this description is applied.
+#[derive(Clone, Debug)]
+pub struct CompiledRtpBinding {
+    capabilities: CapabilityContext,
+    binding: RtpBinding,
+    extension_order: Box<[usize]>,
+}
+
+impl CompiledRtpBinding {
+    pub fn description(&self) -> &RtpBinding {
+        &self.binding
+    }
+
+    /// Set initial activity for every encoding without repeating static validation.
+    /// This only changes the description; applying it still requires live admission.
+    pub fn set_active(&mut self, active: bool) {
+        for encoding in &mut self.binding.encodings {
+            encoding.active = active;
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CompiledRtpConfiguration {
+    pub inbound: Vec<CompiledRtpBinding>,
+    pub outbound: Vec<CompiledRtpBinding>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CompiledRtpConfigurationPatch {
+    pub inbound: Vec<CompiledRtpBinding>,
+    pub outbound: Vec<CompiledRtpBinding>,
+    pub remove_encodings: BTreeSet<u32>,
+}
+
+impl RtpBindingCompiler {
+    pub fn new(capabilities: RtpCapabilities) -> Result<Self, RtpConfigurationError> {
+        let (capabilities, _) = CapabilityContext::new(capabilities)?;
+        Ok(Self { capabilities })
+    }
+
+    pub fn compile(
+        &self,
+        binding: RtpBinding,
+    ) -> Result<CompiledRtpBinding, RtpConfigurationError> {
+        validate_binding(&self.capabilities, &binding)?;
+        Ok(CompiledRtpBinding {
+            capabilities: self.capabilities.clone(),
+            extension_order: extension_order(&binding),
+            binding,
+        })
+    }
+
+    pub fn compile_configuration(
+        &self,
+        configuration: RtpConfiguration,
+    ) -> Result<CompiledRtpConfiguration, RtpConfigurationError> {
+        Ok(CompiledRtpConfiguration {
+            inbound: self.compile_bindings(configuration.inbound)?,
+            outbound: self.compile_bindings(configuration.outbound)?,
+        })
+    }
+
+    pub fn compile_patch(
+        &self,
+        patch: RtpConfigurationPatch,
+    ) -> Result<CompiledRtpConfigurationPatch, RtpConfigurationError> {
+        Ok(CompiledRtpConfigurationPatch {
+            inbound: self.compile_bindings(patch.inbound)?,
+            outbound: self.compile_bindings(patch.outbound)?,
+            remove_encodings: patch.remove_encodings,
+        })
+    }
+
+    fn compile_bindings(
+        &self,
+        bindings: Vec<RtpBinding>,
+    ) -> Result<Vec<CompiledRtpBinding>, RtpConfigurationError> {
+        bindings
+            .into_iter()
+            .map(|binding| self.compile(binding))
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RtpConfigurationLimits {
     /// Retained capability backing/payloads, live typed declaration backing
@@ -237,7 +359,7 @@ impl PhysicalBinding {
 
 #[derive(Default)]
 pub(crate) struct RtpConfigurationState {
-    pub(crate) capabilities: Option<RtpCapabilities>,
+    pub(crate) capabilities: Option<CapabilityContext>,
     initialized: bool,
     records: BTreeMap<u64, CurrentBinding>,
     by_mid: BTreeMap<(bool, String), u64>,
@@ -263,6 +385,7 @@ struct CurrentBinding {
     outbound: bool,
     order: u64,
     binding: RtpBinding,
+    extension_order: Box<[usize]>,
 }
 
 // Record identities are monotonic; encoding locations never identify media runtime.
@@ -286,6 +409,16 @@ pub(crate) struct RtpConfigurationUpdate {
     active_payloads: UsageChanges<(bool, u8), ()>,
     extension_ids: UsageChanges<u8, String>,
     extension_uris: UsageChanges<String, u8>,
+}
+
+pub(crate) struct RtpActivityUpdate {
+    pub(crate) primary: u32,
+    pub(crate) repair: Option<u32>,
+    pub(crate) outbound: bool,
+    pub(crate) active: bool,
+    record: u64,
+    encoding_index: usize,
+    payloads: UsageChanges<(bool, u8), ()>,
 }
 
 impl RtpCapabilities {
@@ -328,7 +461,7 @@ impl RtpConfigurationState {
     pub(crate) fn with_capabilities(
         capabilities: RtpCapabilities,
     ) -> Result<Self, RtpConfigurationError> {
-        let live_metadata_bytes = capabilities.validate()?;
+        let (capabilities, live_metadata_bytes) = CapabilityContext::new(capabilities)?;
         Ok(Self {
             capabilities: Some(capabilities),
             live_metadata_bytes,
@@ -340,9 +473,47 @@ impl RtpConfigurationState {
         &self,
         configuration: RtpConfiguration,
     ) -> Result<RtpConfigurationUpdate, RtpConfigurationError> {
-        self.capabilities
+        self.stage_compiled(self.compiler()?.compile_configuration(configuration)?)
+    }
+
+    pub(crate) fn compiler(&self) -> Result<RtpBindingCompiler, RtpConfigurationError> {
+        Ok(RtpBindingCompiler {
+            capabilities: self
+                .capabilities
+                .as_ref()
+                .ok_or(RtpConfigurationError::CapabilityState)?
+                .clone(),
+        })
+    }
+
+    fn unpack(
+        &self,
+        bindings: Vec<CompiledRtpBinding>,
+    ) -> Result<Vec<CompiledRtpBinding>, RtpConfigurationError> {
+        let capabilities = self
+            .capabilities
             .as_ref()
             .ok_or(RtpConfigurationError::CapabilityState)?;
+        bindings
+            .into_iter()
+            .map(|compiled| {
+                if capabilities.matches(&compiled.capabilities) {
+                    Ok(compiled)
+                } else {
+                    Err(RtpConfigurationError::CapabilityState)
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn stage_compiled(
+        &self,
+        configuration: CompiledRtpConfiguration,
+    ) -> Result<RtpConfigurationUpdate, RtpConfigurationError> {
+        let configuration = CompiledRtpConfiguration {
+            inbound: self.unpack(configuration.inbound)?,
+            outbound: self.unpack(configuration.outbound)?,
+        };
         let changes = self.records.keys().map(|&key| (key, None)).collect();
         self.stage_bindings(configuration, changes, true)
     }
@@ -351,15 +522,20 @@ impl RtpConfigurationState {
         &self,
         patch: RtpConfigurationPatch,
     ) -> Result<RtpConfigurationUpdate, RtpConfigurationError> {
-        let RtpConfigurationPatch {
-            inbound,
-            outbound,
-            remove_encodings,
-        } = patch;
+        self.stage_compiled_patch(self.compiler()?.compile_patch(patch)?)
+    }
+
+    pub(crate) fn stage_compiled_patch(
+        &self,
+        patch: CompiledRtpConfigurationPatch,
+    ) -> Result<RtpConfigurationUpdate, RtpConfigurationError> {
+        let inbound = self.unpack(patch.inbound)?;
+        let outbound = self.unpack(patch.outbound)?;
+        let remove_encodings = patch.remove_encodings;
         if inbound
             .iter()
             .chain(&outbound)
-            .flat_map(|binding| &binding.encodings)
+            .flat_map(|compiled| &compiled.binding.encodings)
             .any(|encoding| remove_encodings.contains(&encoding.primary))
         {
             return Err(RtpConfigurationError::Invalid);
@@ -381,12 +557,16 @@ impl RtpConfigurationState {
                 .retain(|encoding| !remove_encodings.contains(&encoding.primary));
             *value = (!record.binding.encodings.is_empty()).then_some(record);
         }
-        self.stage_bindings(RtpConfiguration { inbound, outbound }, changes, false)
+        self.stage_bindings(
+            CompiledRtpConfiguration { inbound, outbound },
+            changes,
+            false,
+        )
     }
 
     fn stage_bindings(
         &self,
-        configuration: RtpConfiguration,
+        configuration: CompiledRtpConfiguration,
         mut changes: BTreeMap<u64, Option<CurrentBinding>>,
         reorder: bool,
     ) -> Result<RtpConfigurationUpdate, RtpConfigurationError> {
@@ -400,7 +580,8 @@ impl RtpConfigurationState {
             (false, configuration.inbound),
             (true, configuration.outbound),
         ] {
-            for (order, binding) in bindings.into_iter().enumerate() {
+            for (order, compiled) in bindings.into_iter().enumerate() {
+                let binding = compiled.binding;
                 let mid = (outbound, binding.mid.clone());
                 if !mids.insert(mid.clone()) {
                     return Err(RtpConfigurationError::Invalid);
@@ -422,6 +603,7 @@ impl RtpConfigurationState {
                             self.records.get(&key).map_or(key, |record| record.order)
                         },
                         binding,
+                        extension_order: compiled.extension_order,
                     }),
                 );
             }
@@ -526,7 +708,6 @@ impl RtpConfigurationState {
             .iter()
             .filter_map(|(key, record)| record.as_ref().map(|record| (key, record)))
         {
-            validate_binding(caps, &record.binding)?;
             let mid = (record.outbound, record.binding.mid.clone());
             if mids.insert(mid.clone(), key).is_some()
                 || self
@@ -605,15 +786,18 @@ impl RtpConfigurationState {
                 }
                 let mut identity = encoding.clone();
                 identity.active = true;
-                let mut physical = RtpBinding {
+                let physical = RtpBinding {
                     mid: record.binding.mid.clone(),
                     kind: record.binding.kind,
                     codec: record.binding.codec.clone(),
                     rtcp: record.binding.rtcp.clone(),
-                    extensions: record.binding.extensions.clone(),
+                    extensions: record
+                        .extension_order
+                        .iter()
+                        .filter_map(|&index| record.binding.extensions.get(index).cloned())
+                        .collect(),
                     encodings: vec![identity],
                 };
-                physical.extensions.sort_by_key(|extension| extension.id);
                 let physical = PhysicalBinding {
                     outbound: record.outbound,
                     binding: physical,
@@ -689,6 +873,83 @@ impl RtpConfigurationState {
                     .and_then(|index| physical.binding.extensions.get(index))
                     .is_some_and(|new| old.uri == new.uri)
             })
+    }
+
+    pub(crate) fn stage_activity(
+        &self,
+        primary: u32,
+        active: bool,
+    ) -> Result<Option<RtpActivityUpdate>, RtpConfigurationError> {
+        use RtpConfigurationError as Error;
+        let location = self.live.get(&primary).ok_or(Error::Invalid)?;
+        let record = self
+            .records
+            .get(&location.record)
+            .ok_or(Error::ConnectionState)?;
+        let encoding = record
+            .binding
+            .encodings
+            .get(location.encoding_index)
+            .ok_or(Error::ConnectionState)?;
+        if encoding.active == active {
+            return Ok(None);
+        }
+        let was_active = record
+            .binding
+            .encodings
+            .iter()
+            .any(|encoding| encoding.active);
+        let will_be_active = active
+            || record
+                .binding
+                .encodings
+                .iter()
+                .enumerate()
+                .any(|(index, encoding)| index != location.encoding_index && encoding.active);
+        let mut payloads = UsageChanges::default();
+        if was_active != will_be_active {
+            for pt in std::iter::once(record.binding.codec.payload_type)
+                .chain(record.binding.codec.repair_payload_type)
+            {
+                if will_be_active {
+                    payloads.claim(&self.active_payloads, (record.outbound, pt), ())?;
+                } else {
+                    payloads.release(&self.active_payloads, &(record.outbound, pt))?;
+                }
+            }
+        }
+        Ok(Some(RtpActivityUpdate {
+            primary,
+            repair: encoding.repair,
+            outbound: record.outbound,
+            active,
+            record: location.record,
+            encoding_index: location.encoding_index,
+            payloads,
+        }))
+    }
+
+    pub(crate) fn activity_payload_types(
+        &self,
+        update: &RtpActivityUpdate,
+        outbound: bool,
+    ) -> Box<[u8]> {
+        update
+            .payloads
+            .keys(&self.active_payloads)
+            .filter_map(|&(direction, pt)| (direction == outbound).then_some(pt))
+            .collect()
+    }
+
+    pub(crate) fn commit_activity(&mut self, update: RtpActivityUpdate) {
+        if let Some(encoding) = self
+            .records
+            .get_mut(&update.record)
+            .and_then(|record| record.binding.encodings.get_mut(update.encoding_index))
+        {
+            encoding.active = update.active;
+        }
+        update.payloads.commit(&mut self.active_payloads);
     }
 
     pub(crate) fn payload_types(
@@ -776,6 +1037,13 @@ impl RtpConfigurationState {
             outbound: bindings(true),
         })
     }
+}
+
+fn extension_order(binding: &RtpBinding) -> Box<[usize]> {
+    let mut order: Vec<_> = (0..binding.extensions.len()).collect();
+    order
+        .sort_unstable_by_key(|&index| binding.extensions.get(index).map(|extension| extension.id));
+    order.into_boxed_slice()
 }
 
 fn validate_binding(

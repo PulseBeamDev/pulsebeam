@@ -4,8 +4,8 @@ use ahash::{HashMap, HashMapExt};
 #[cfg(test)]
 use bytes::Bytes;
 use pulsebeam_rtc::{
-    AcceptedConnection, AuthenticatedPath, Connection, DataMessage, Event, NetworkInput,
-    NetworkProtocol, Output, RtpExtension, RtpWrite, SessionInfo, TransmitTarget,
+    AcceptedConnection, AuthenticatedPath, DataMessage, Event, NetworkInput, NetworkProtocol,
+    Output, RtcConnection, RtpExtension, RtpWrite, SessionInfo, TransmitTarget,
 };
 use pulsebeam_runtime::net::RecvPacketBatch;
 use pulsebeam_runtime::time::Instant;
@@ -17,6 +17,7 @@ use crate::media::{
     ChannelId, KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SeqNo, Ssrc,
 };
 use crate::participant::batcher::{NetworkEgress, OwnedPacketQueue};
+use crate::participant::signaling::{SignalingOutput, SignalingWrite, SignalingWriter};
 use crate::rtp::{Codec as RtpCodec, Frequency, MediaTime, RtpExtensions, RtpPacket};
 use crate::track::SourceEncoding;
 
@@ -44,12 +45,6 @@ fn extend_serial(previous: Option<u64>, value: u64, bits: u32) -> u64 {
 )]
 fn rtc_bytes(value: &[u8]) -> bytes::Bytes {
     bytes::Bytes::copy_from_slice(value)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum NativeDataOpen {
-    Opening,
-    ResetPending,
 }
 
 pub(super) fn native_data_config(
@@ -259,8 +254,8 @@ impl Sender {
     }
 }
 
-pub(crate) struct Transport {
-    rtc: Connection,
+pub(crate) struct RtcDriver {
+    rtc: RtcConnection,
     session: SessionInfo,
     senders: HashMap<Mid, Sender>,
     encodings: HashMap<Ssrc, Encoding>,
@@ -272,6 +267,7 @@ pub(crate) struct Transport {
     pending_ingress: VecDeque<PendingIngress>,
     pending_timeout: Option<Instant>,
     pending_mutations: VecDeque<TransportMutation>,
+    signaling: SignalingWriter,
     rtc_deadline: Option<Instant>,
     rtc_clock: Instant,
     rtc_needs_drain: bool,
@@ -282,7 +278,7 @@ pub(crate) struct Transport {
     pub(crate) sim_span: tracing::Span,
 }
 
-impl Transport {
+impl RtcDriver {
     pub(crate) fn new(
         accepted: AcceptedConnection,
         udp_gso_size: usize,
@@ -326,6 +322,7 @@ impl Transport {
             pending_ingress: VecDeque::new(),
             pending_timeout: None,
             pending_mutations: VecDeque::new(),
+            signaling: SignalingWriter::default(),
             rtc_deadline: None,
             rtc_clock: now,
             rtc_needs_drain: true,
@@ -431,11 +428,11 @@ impl Transport {
                 }
                 // Best-effort payload must not build a stale FIFO behind a blocked
                 // SCTP send window. Required control keeps the bounded native queue.
-                let queued =
-                    !required
-                        && self.rtc.stats().data_channels.iter().any(|stats| {
-                            stats.channel == channel && stats.queued_payload_bytes > 0
-                        });
+                let queued = !required
+                    && self
+                        .rtc
+                        .data_channel_queued_payload_bytes(channel)
+                        .is_some_and(|bytes| bytes > 0);
                 if queued {
                     metrics::counter!("participant_fanout_shed").increment(1);
                     AppliedMutation::DataNotWritten
@@ -544,11 +541,11 @@ impl Transport {
         &mut self,
         cid: ChannelId,
         lane: crate::track::DataLane,
-    ) -> Result<NativeDataOpen, pulsebeam_proto::state::FailureCode> {
-        use pulsebeam_proto::state::FailureCode;
+    ) -> Result<pulsebeam_rtc::DataChannelInstallation, super::policy::ExecutionFailureKind> {
+        use super::policy::ExecutionFailureKind;
         let Some(capacity) = self.rtc.data_channel_capacity() else {
             tracing::debug!(?cid, "native data association capacity unavailable");
-            return Err(FailureCode::Incompatible);
+            return Err(ExecutionFailureKind::Conflict);
         };
         if cid.value() == 0 || cid.value() >= capacity {
             tracing::debug!(
@@ -556,20 +553,16 @@ impl Transport {
                 capacity,
                 "native data stream outside association capacity"
             );
-            return Err(FailureCode::Incompatible);
+            return Err(ExecutionFailureKind::Conflict);
         }
         let config = native_data_config(cid, lane);
-        match self.rtc.open_data_channel(self.rtc_clock.into(), config) {
-            Ok(()) => {
-                self.rtc_needs_drain = true;
-                Ok(NativeDataOpen::Opening)
-            }
-            Err((pulsebeam_rtc::WriteError::ResetPending, _)) => Ok(NativeDataOpen::ResetPending),
-            Err((reason, _)) => {
+        match self.install_data_channel(config) {
+            Ok(installation) => Ok(installation),
+            Err(reason) => {
                 tracing::debug!(?cid, ?reason, "native data RTC open rejected");
                 Err(match reason {
-                    pulsebeam_rtc::WriteError::WouldBlock => FailureCode::CapacityExceeded,
-                    _ => FailureCode::Incompatible,
+                    pulsebeam_rtc::WriteError::WouldBlock => ExecutionFailureKind::Capacity,
+                    _ => ExecutionFailureKind::Conflict,
                 })
             }
         }
@@ -579,16 +572,47 @@ impl Transport {
         self.pending_mutations.clear();
     }
 
+    pub(crate) fn install_data_channel(
+        &mut self,
+        config: pulsebeam_rtc::DataChannelConfig,
+    ) -> Result<pulsebeam_rtc::DataChannelInstallation, pulsebeam_rtc::WriteError> {
+        let installation = self
+            .rtc
+            .install_data_channel(self.rtc_clock.into(), config)
+            .map_err(|(reason, _)| reason)?;
+        self.rtc_needs_drain = true;
+        Ok(installation)
+    }
+
+    pub(crate) fn data_channel_installation(
+        &self,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+    ) -> Option<pulsebeam_rtc::DataChannelInstallationState> {
+        self.rtc.data_channel_installation(installation)
+    }
+
+    pub(crate) fn cancel_data_channel_installation(
+        &mut self,
+        installation: pulsebeam_rtc::DataChannelInstallation,
+    ) {
+        if self.rtc.data_channel_installation(installation).is_some() {
+            self.discard_channel_mutations(installation.channel());
+        }
+        let _ = self
+            .rtc
+            .cancel_data_channel_installation(self.rtc_clock.into(), installation);
+        self.rtc_needs_drain = true;
+    }
+
     pub(crate) fn discard_channel_mutations(&mut self, cid: ChannelId) {
         self.pending_mutations.retain(|mutation| !matches!(mutation, TransportMutation::Data { channel, .. } if *channel == cid));
     }
 
-    pub(crate) fn update_rtp(
-        &mut self,
-        patch: pulsebeam_rtc::RtpConfigurationPatch,
-    ) -> Result<(), pulsebeam_rtc::RtpConfigurationError> {
-        let mut outbound = Vec::with_capacity(patch.outbound.len());
-        for binding in &patch.outbound {
+    fn prepare_rtp_senders<'a>(
+        bindings: impl ExactSizeIterator<Item = &'a pulsebeam_rtc::RtpBinding>,
+    ) -> Result<Vec<(Mid, Sender)>, pulsebeam_rtc::RtpConfigurationError> {
+        let mut outbound = Vec::with_capacity(bindings.len());
+        for binding in bindings {
             let [encoding] = binding.encodings.as_slice() else {
                 return Err(pulsebeam_rtc::RtpConfigurationError::Unsupported);
             };
@@ -618,8 +642,14 @@ impl Transport {
                 },
             ));
         }
-        let removed = patch.remove_encodings.clone();
-        self.rtc.update_rtp(patch)?;
+        Ok(outbound)
+    }
+
+    fn apply_rtp_senders(
+        &mut self,
+        outbound: Vec<(Mid, Sender)>,
+        removed: &std::collections::BTreeSet<u32>,
+    ) {
         self.senders
             .retain(|_, sender| !removed.contains(&u32::from(sender.ssrc)));
         for (mid, sender) in outbound {
@@ -632,6 +662,31 @@ impl Transport {
                 self.senders.insert(mid, sender);
             }
         }
+        self.rtc_needs_drain = true;
+    }
+
+    pub(crate) fn update_compiled_rtp(
+        &mut self,
+        patch: pulsebeam_rtc::CompiledRtpConfigurationPatch,
+    ) -> Result<(), pulsebeam_rtc::RtpConfigurationError> {
+        let outbound = Self::prepare_rtp_senders(
+            patch
+                .outbound
+                .iter()
+                .map(pulsebeam_rtc::CompiledRtpBinding::description),
+        )?;
+        let removed = patch.remove_encodings.clone();
+        self.rtc.update_compiled_rtp(patch)?;
+        self.apply_rtp_senders(outbound, &removed);
+        Ok(())
+    }
+
+    pub(crate) fn set_rtp_encoding_active(
+        &mut self,
+        primary: u32,
+        active: bool,
+    ) -> Result<(), pulsebeam_rtc::RtpConfigurationError> {
+        self.rtc.set_rtp_encoding_active(primary, active)?;
         self.rtc_needs_drain = true;
         Ok(())
     }
@@ -648,6 +703,26 @@ impl Transport {
         self.discard_channel_mutations(cid);
         let _ = self.rtc.close_data_channel(self.rtc_clock.into(), cid);
         self.rtc_needs_drain = true;
+    }
+
+    pub(crate) fn signaling_pending(&self) -> bool {
+        self.signaling.has_pending()
+    }
+
+    pub(crate) fn offer_signaling(
+        &mut self,
+        output: SignalingOutput,
+    ) -> Result<(), SignalingOutput> {
+        self.signaling.offer(output)
+    }
+
+    pub(crate) fn poll_signaling(&mut self) -> SignalingWrite {
+        let result = self.signaling.poll(&mut self.rtc, self.rtc_clock);
+        self.rtc_needs_drain |= matches!(
+            result,
+            SignalingWrite::Admitted(_) | SignalingWrite::Blocked
+        );
+        result
     }
 
     pub(crate) fn write_channel(&mut self, cid: ChannelId, binary: bool, bytes: &[u8]) -> bool {
@@ -745,7 +820,7 @@ impl Transport {
         rid: Option<Rid>,
     ) -> Option<RtpIngress> {
         let encoding = self.encodings.get_mut(&rtp.header.ssrc.into())?;
-        if encoding.mid != mid || encoding.rid != rid {
+        if encoding.mid != mid || encoding.rid.is_some_and(|known| Some(known) != rid) {
             return None;
         }
         let payload = encoding
@@ -758,11 +833,11 @@ impl Transport {
         let timestamp = extend_serial(encoding.timestamp, u64::from(rtp.header.timestamp), 32);
         encoding.sequence = Some(encoding.sequence.unwrap_or(sequence).max(sequence));
         encoding.timestamp = Some(encoding.timestamp.unwrap_or(timestamp).max(timestamp));
-        Some(RtpIngress {
-            mid,
-            rid,
-            packet: RtpPacket::from_rtc(rtp, kind, frequency, sequence, timestamp, rid)?,
-        })
+        let packet = RtpPacket::from_rtc(rtp, kind, frequency, sequence, timestamp, rid)?;
+        if encoding.rid.is_none() {
+            encoding.rid = rid;
+        }
+        Some(RtpIngress { mid, rid, packet })
     }
     pub(crate) fn sender_report(
         &mut self,
@@ -1043,6 +1118,7 @@ impl Transport {
         self.rtc_needs_drain = true;
     }
     pub(crate) fn disconnect(&mut self) {
+        self.signaling.clear();
         self.pending_ingress.clear();
         self.pending_mutations.clear();
         self.pending_timeout = None;
@@ -1071,7 +1147,7 @@ mod tests {
                 crate::route::TransportRoute::new(crate::id::ShardId::new(0), 7),
                 1,
             );
-            let mut transport = Transport::new(
+            let mut transport = RtcDriver::new(
                 accepted,
                 8,
                 Instant::now(),
@@ -1084,7 +1160,7 @@ mod tests {
             for _ in 0..2 {
                 assert!(transport.enqueue_tcp(TcpPacket::fixture(original, &binding)));
             }
-            let receive_and_drain = |transport: &mut Transport| {
+            let receive_and_drain = |transport: &mut RtcDriver| {
                 let now = Instant::now();
                 transport.advance_clock(now, now);
                 assert!(matches!(
@@ -1148,7 +1224,7 @@ mod tests {
     #[test]
     fn ingress_uses_accepted_encoding_formats_not_bootstrap_media() {
         let accepted = crate::control::application_only_test_connection();
-        let mut transport = Transport::new(
+        let mut transport = RtcDriver::new(
             accepted,
             8,
             Instant::now(),
@@ -1210,7 +1286,18 @@ mod tests {
         );
         let mut wrong_pt = packet.clone();
         wrong_pt.header.payload_type = 112;
-        assert!(transport.convert_rtp(wrong_pt, mid, None).is_none());
+        let rid = Rid::new("late").unwrap();
+        assert!(transport.convert_rtp(wrong_pt, mid, Some(rid)).is_none());
+        let ingress = transport
+            .convert_rtp(packet.clone(), mid, Some(rid))
+            .unwrap();
+        assert_eq!(ingress.rid, Some(rid));
+        assert!(transport.convert_rtp(packet.clone(), mid, None).is_none());
+        assert!(
+            transport
+                .convert_rtp(packet.clone(), mid, Some(Rid::new("other").unwrap()))
+                .is_none()
+        );
         transport.retire_encoding(0);
         transport.register_encoding(info(1, 112, "opus", MediaKind::Audio));
         assert!(transport.convert_rtp(packet.clone(), mid, None).is_none());

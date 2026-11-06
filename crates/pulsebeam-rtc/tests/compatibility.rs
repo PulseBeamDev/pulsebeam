@@ -1,15 +1,15 @@
 use std::{net::SocketAddr, time::Instant};
 
 use pulsebeam_rtc::{
-    AcceptError, Connection, ConnectionConfig, ConnectionEntropy, LocalCandidate,
-    PacketFeedbackKind, SdpOffer,
+    AcceptError, ConnectionConfig, ConnectionEntropy, LocalCandidate, PacketFeedbackKind,
+    RtcConnection, SdpOffer,
 };
 
 fn accepts(
     offer: &'static str,
     expected_feedback: Option<PacketFeedbackKind>,
 ) -> Result<(), AcceptError> {
-    let accepted = Connection::accept(
+    let accepted = RtcConnection::accept(
         ConnectionConfig {
             local_candidates: vec![LocalCandidate::Udp(SocketAddr::from((
                 [192, 0, 2, 1],

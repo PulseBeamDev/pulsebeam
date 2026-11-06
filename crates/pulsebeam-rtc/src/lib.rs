@@ -28,10 +28,11 @@ mod network_tests;
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 
-pub use connection::{AcceptedConnection, Connection};
+pub use connection::{AcceptedConnection, RtcConnection};
 pub use id::DataChannelId;
 pub use io::*;
 pub use rtp::{RtpExtension, RtpHeader, RtpPacket, RtpWrite, SenderReport};
+pub use sctp::{DataChannelInstallation, DataChannelInstallationState};
 pub use session::{
     CodecInfo, CodecProfile, ConnectionConfig, ConnectionLimits, DataChannelConfig,
     DataChannelConfigError, DataChannelPriority, DataMessage, DataReliability, InboundMediaInfo,

@@ -62,7 +62,23 @@ TrackId + current placement
 ```
 
 `RoomId` and `ParticipantId` are deterministic hierarchical UUIDv8 identities.
-`ConnectionId` is minted UUIDv7. `ConnectionId::derive_publication_track_id`
+`ConnectionId` is minted UUIDv7. The controller tracks participant identity and
+room resources alongside the current connection ID. A shard's `Connection` owns
+media execution for one participant connection incarnation; replacing that
+incarnation constructs a new runtime. The shard currently keeps at most one
+runtime per participant. Its `RtcDriver` drives the lower-level
+`pulsebeam_rtc::RtcConnection` WebRTC engine.
+
+SDP bootstrap installs admitted initial publications and receiver slots into that
+runtime. WHIP/WHEP admit those resources from SDP; the State adapter retains SDP
+transport facts but admits media through resource declarations. Optional state
+control updates installed resources through the same connection.
+Protocol identity is bootstrap information, not a packet-dispatch mode: MID and
+channel ownership select execution. Subscription defaults and permission to open
+legacy topic channels are explicit connection policy. Authorization expiry fences
+negotiated ingress as well as configured resources.
+
+`ConnectionId::derive_publication_track_id`
 derives a UUIDv8 `TrackId` from the connection, track kind, immutable label and
 nonzero publication incarnation. For desired/confirmed resources, the incarnation
 is the first desired revision (owned ref), not each later settings revision.

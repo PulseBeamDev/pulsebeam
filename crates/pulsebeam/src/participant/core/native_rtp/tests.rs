@@ -1,7 +1,9 @@
 use super::*;
+use pulsebeam_proto::state::resource_spec;
 mod receiver;
+use crate::control::native::track_descriptor;
 use crate::participant::core::native_data::tests::{
-    confirmations, frame, participant_with_capabilities,
+    NativeParticipant, confirmations, frame, participant_with_capabilities,
 };
 use crate::participant::event::test_utils::MockParticipantSink;
 
@@ -12,7 +14,7 @@ fn opus() -> wire::CodecFormat {
 }
 
 fn capabilities() -> wire::RtpCapabilities {
-    let video = crate::participant::rtp::capabilities()
+    let video = crate::control::rtp::capabilities()
         .codecs
         .into_iter()
         .find(|codec| {
@@ -154,13 +156,13 @@ fn video_spec(
 }
 
 #[track_caller]
-fn last_live(participant: &mut Participant) -> (wire::ConfirmedState, wire::LiveResource) {
+fn last_live(participant: &mut NativeParticipant) -> (wire::ConfirmedState, wire::LiveResource) {
     last_live_for(participant, 1)
 }
 
 #[track_caller]
 fn last_live_for(
-    participant: &mut Participant,
+    participant: &mut NativeParticipant,
     reference: u64,
 ) -> (wire::ConfirmedState, wire::LiveResource) {
     let value = native_data::tests::confirmations_for(participant, reference)
@@ -276,16 +278,36 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
             format: Some(opus())
         }))
     );
-    assert!(!source.binding.encodings[0].active);
+    let (_, _, compiled) =
+        crate::control::rtp::policy::publication(&spec(true), &capabilities()).unwrap();
+    assert_eq!(source.binding.description(), compiled.description());
+    assert!(!source.binding.description().encodings[0].active);
     receiver::check(&source.track);
+    receiver::check_prebound(&source.track);
     assert_eq!(sink.publish_track_calls, vec![id]);
     assert_eq!(participant.upstream.mid_for_track_id(id), None);
     assert!(participant.native_rtp.owns_encoding(0));
+    let mut source_handles = slotmap::SlotMap::<TrackHandle, TrackId>::with_key();
+    let source_fanout = source_handles.insert(id);
+    participant.apply(
+        ParticipantEffect::TrackPublished { track_id: id },
+        Some(source_fanout),
+    );
+    assert_eq!(
+        participant.upstream.track_for_fanout(source_fanout),
+        Some(id)
+    );
 
     participant.native_rtp_demand(id, true);
     let (_, live) = last_live(&mut participant);
     assert_eq!(live.activity, Some(wire::MediaActivity::Active as i32));
-    assert!(participant.native_rtp.publications[&1].binding.encodings[0].active);
+    assert!(
+        participant.native_rtp.publications[&1]
+            .binding
+            .description()
+            .encodings[0]
+            .active
+    );
     participant.handle_native_signaling(
         &frame(
             2,
@@ -296,7 +318,13 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     let (_, live) = last_live(&mut participant);
     assert_eq!(live.execution, wire::ExecutionStatus::Disabled as i32);
     assert_eq!(live.activity, Some(wire::MediaActivity::Idle as i32));
-    assert!(!participant.native_rtp.publications[&1].binding.encodings[0].active);
+    assert!(
+        !participant.native_rtp.publications[&1]
+            .binding
+            .description()
+            .encodings[0]
+            .active
+    );
     assert_eq!(participant.native_rtp.publications[&1].track.id(), id);
     participant.handle_native_signaling(
         &frame(3, wire::desired_state::Value::Present(Box::new(spec(true)))),
@@ -304,7 +332,13 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     );
     let (_, live) = last_live(&mut participant);
     assert_eq!(live.activity, Some(wire::MediaActivity::Active as i32));
-    assert!(participant.native_rtp.publications[&1].binding.encodings[0].active);
+    assert!(
+        participant.native_rtp.publications[&1]
+            .binding
+            .description()
+            .encodings[0]
+            .active
+    );
     assert_eq!(sink.publish_track_calls, vec![id]);
 
     let mut incompatible = spec(true);
@@ -329,8 +363,17 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     assert_eq!(updated.evaluated_revision, rejected.evaluated_revision);
     assert_eq!(updated.rejection, rejected.rejection);
     assert_eq!(live.activity, Some(wire::MediaActivity::Idle as i32));
-    assert!(!participant.native_rtp.publications[&1].binding.encodings[0].active);
+    assert!(
+        !participant.native_rtp.publications[&1]
+            .binding
+            .description()
+            .encodings[0]
+            .active
+    );
 
+    let expiry = participant.authorization_expiry;
+    participant.authorization_expiry =
+        Some(pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(1));
     participant.handle_native_signaling(
         &frame(5, wire::desired_state::Value::Absent(true)),
         &mut sink,
@@ -340,15 +383,29 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         participant.native_rtp.tracks.is_empty()
             && participant.native_rtp.mids.is_empty()
             && participant.native_rtp.ssrcs.is_empty()
-            && participant.native_rtp.fanouts.is_empty()
             && participant.native_rtp.active.is_empty()
     );
+    assert_eq!(participant.upstream.track_for_fanout(source_fanout), None);
     assert_eq!(sink.unpublish_track_calls, vec![id]);
     participant.retire_native_resource(1, &mut sink);
     assert_eq!(sink.unpublish_track_calls, vec![id]);
     assert!(participant.native_rtp.publications.contains_key(&1));
+    let retired_slot = participant.native_rtp.publications[&1].slot;
+    assert!(participant.upstream.track_mut(retired_slot).is_some());
     participant.native_rtp_demand(id, true);
     assert!(participant.native_rtp.publications[&1].retiring);
+    let retired_binding = participant.native_rtp.publications[&1]
+        .binding
+        .description();
+    let retired_mid = Mid::new(&retired_binding.mid).unwrap();
+    let retired_ssrc = retired_binding.encodings[0].primary;
+    participant.native_rtp.mids.insert(retired_mid, 2);
+    participant.native_rtp.ssrcs.insert(retired_ssrc, 2);
+    participant.native_rtp.detach(1);
+    assert_eq!(participant.native_rtp.mids.get(&retired_mid), Some(&2));
+    assert_eq!(participant.native_rtp.ssrcs.get(&retired_ssrc), Some(&2));
+    participant.native_rtp.mids.remove(&retired_mid);
+    participant.native_rtp.ssrcs.remove(&retired_ssrc);
     participant.complete_native_resource_cutoff(1, true);
     let absent = confirmations(&mut participant).pop().unwrap();
     assert!(matches!(
@@ -356,7 +413,9 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         Some(wire::confirmed_state::Value::Absent(_))
     ));
     assert!(participant.native_rtp.publications.is_empty());
+    assert!(participant.upstream.track_mut(retired_slot).is_none());
     assert!(participant.disconnect_reason.is_none());
+    participant.authorization_expiry = expiry;
 
     for (revision, descriptor) in [(6, false), (7, true)] {
         participant.handle_native_signaling(
@@ -410,14 +469,42 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     );
     let mut handles = slotmap::SlotMap::<TrackHandle, TrackId>::with_key();
     let fanout = handles.insert(video_id);
-    participant.native_rtp.bind_source(video_id, fanout);
+    participant.apply(
+        ParticipantEffect::TrackPublished { track_id: video_id },
+        Some(fanout),
+    );
+    assert_eq!(
+        participant.upstream.track_for_fanout(fanout),
+        Some(video_id)
+    );
     participant.native_rtp_demand(video_id, true);
+    let other_kind = TrackId::Audio(entity::AudioTrackId::from_bytes(*video_id.as_bytes()));
+    participant.native_rtp_demand(other_kind, false);
+    assert!(participant.native_rtp.publications[&7].demanded);
+    assert!(!participant.native_rtp.bind_source(other_kind, fanout));
+    assert_eq!(
+        participant
+            .native_rtp
+            .keyframe_mid(other_kind, track::SourceEncoding::Ssrc(77.into()),),
+        None
+    );
+    let route = participant
+        .native_rtp
+        .ingress_route(77, Mid::from("camera"), None)
+        .unwrap();
+    assert_eq!(
+        route.upstream_slot,
+        participant.native_rtp.publications[&7].slot
+    );
+    assert_eq!(route.encoding, track::SourceEncoding::Ssrc(77.into()));
     let mut cache = crate::rtp::cache::TrackStreamCache::with_encodings(&encodings);
     let now = Instant::now();
     for ssrc in [81, 77, 79] {
         // The RTC emits this notice before its first authenticated packet. Use
         // the committed binding, not bootstrap SDP or guessed source facts.
-        let binding = &participant.native_rtp.publications[&7].binding;
+        let binding = participant.native_rtp.publications[&7]
+            .binding
+            .description();
         let info = pulsebeam_rtc::EncodingInfo {
             mid: binding.mid.as_str().into(),
             ssrc,
@@ -452,7 +539,7 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
                 payload: bytes::Bytes::copy_from_slice(&packet.payload),
                 extensions: Vec::new(),
             };
-            participant.handle_native_rtp(incoming, Mid::from("camera"), None, &mut sink);
+            participant.handle_incoming_rtp(incoming, Mid::from("camera"), None, &mut sink);
             cache.push_encoding(encoding, packet);
         }
         assert!(
@@ -461,11 +548,10 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         );
         participant.enqueue_remote_keyframe((video_id, encoding), KeyframeRequestKind::Pli);
     }
-    let source = participant.native_rtp.publications.get_mut(&7).unwrap();
-    source
-        .upstream
-        .poll_stats(now + std::time::Duration::from_millis(50));
-    let states = source.upstream.monitor.layer_states();
+    let video_slot = participant.native_rtp.publications[&7].slot;
+    let source = participant.upstream.track_mut(video_slot).unwrap();
+    source.poll_stats(now + std::time::Duration::from_millis(50));
+    let states = source.monitor.layer_states();
     assert_eq!(states.len(), 3);
     for encoding in &encodings {
         assert!(
@@ -505,7 +591,10 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
             .all(|handle| *handle == fanout)
     );
     assert!(!sink.publish_track_packet_calls.is_empty());
-    let video_binding = participant.native_rtp.publications[&7].binding.clone();
+    let video_binding = participant.native_rtp.publications[&7]
+        .binding
+        .description()
+        .clone();
     assert_eq!(sink.publish_track_calls, vec![id, video_id]);
     participant.handle_native_signaling(
         &native_data::tests::frame_for(
@@ -530,7 +619,9 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     assert!(!participant.native_rtp.publications.contains_key(&8));
     assert_eq!(participant.native_rtp.publications[&7].track.id(), video_id);
     assert_eq!(
-        participant.native_rtp.publications[&7].binding,
+        *participant.native_rtp.publications[&7]
+            .binding
+            .description(),
         video_binding
     );
     assert_eq!(sink.publish_track_calls, vec![id, video_id]);
@@ -538,6 +629,10 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         &native_data::tests::frame_for(7, 9, wire::desired_state::Value::Absent(true)),
         &mut sink,
     );
+    assert!(participant.upstream.owns_managed_track(video_id));
+    assert!(participant.pending_keyframe_requests.is_empty());
+    participant.enqueue_remote_keyframe((video_id, encodings[0]), KeyframeRequestKind::Pli);
+    assert!(participant.pending_keyframe_requests.is_empty());
     participant.complete_native_resource_cutoff(7, true);
     assert!(participant.native_rtp.publications.is_empty());
     assert!(participant.pending_keyframe_requests.is_empty());

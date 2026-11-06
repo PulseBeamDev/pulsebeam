@@ -1,8 +1,9 @@
 use crate::control::ufrag::IceCredentials;
 use crate::media::{Direction, MediaKind, Mid};
+use crate::participant::signaling::SignalingChannel;
 use pulsebeam_rtc::{
-    AcceptError, AcceptedConnection, Connection, ConnectionConfig, ConnectionEntropy,
-    LocalCandidate, LocalIceCredentials, MediaSectionKind, SessionInfo,
+    AcceptError, AcceptedConnection, ConnectionConfig, ConnectionEntropy, LocalCandidate,
+    LocalIceCredentials, MediaSectionKind, RtcConnection, SessionInfo,
 };
 use pulsebeam_runtime::net::ReceiveTime;
 use pulsebeam_runtime::rand::RngCore;
@@ -71,7 +72,9 @@ pub struct NegotiatedMedia {
 pub struct NegotiatedResources {
     media: Vec<NegotiatedMedia>,
     pub(crate) local_ufrag: String,
+    pub(crate) signaling_channel: Option<SignalingChannel>,
     pub(crate) native_rtp_capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
+    pub(crate) native_handoff: Option<super::native::handoff::EndpointHandoff>,
 }
 
 impl NegotiatedResources {
@@ -80,7 +83,9 @@ impl NegotiatedResources {
         Self {
             media: Vec::new(),
             local_ufrag: "test".to_owned(),
+            signaling_channel: None,
             native_rtp_capabilities: None,
+            native_handoff: None,
         }
     }
     pub fn media(&self, mid: Mid) -> Option<NegotiatedMedia> {
@@ -88,6 +93,10 @@ impl NegotiatedResources {
     }
     pub(crate) fn media_sections(&self) -> &[NegotiatedMedia] {
         &self.media
+    }
+    pub(crate) fn without_bootstrap_media(mut self) -> Self {
+        self.media.clear();
+        self
     }
     #[cfg(test)]
     fn as_slice(&self) -> &[NegotiatedMedia] {
@@ -116,7 +125,7 @@ impl Negotiator {
             .map_err(NegotiatorError::Initialization)?;
         let mut seed = [0; 32];
         pulsebeam_runtime::rand::os_rng().fill_bytes(&mut seed);
-        let accepted = Connection::accept(
+        let accepted = RtcConnection::accept(
             ConnectionConfig {
                 local_candidates: self.candidates.clone(),
                 local_ice_credentials: Some(credentials),
@@ -199,7 +208,9 @@ impl Negotiator {
         Ok(NegotiatedResources {
             media,
             local_ufrag,
+            signaling_channel: None,
             native_rtp_capabilities: None,
+            native_handoff: None,
         })
     }
 
