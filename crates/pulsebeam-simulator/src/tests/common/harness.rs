@@ -1723,13 +1723,17 @@ async fn run_participant(
                     }
                     *shared.discovered_tracks.lock().unwrap() = client.ctx.discovered_tracks.clone();
                     *shared.media_kinds.lock().unwrap() = client.ctx.media_kinds.clone();
-                    shared.record_statistics(client.ctx.statistics()?)?;
+                    if let Some(sample) = client.ctx.take_statistics()? {
+                        shared.record_statistics(sample)?;
+                    }
                     *shared.connected.lock().unwrap() = client.ctx.connected();
                 }
             }
         };
 
-        shared.record_statistics(client.ctx.statistics()?)?;
+        if let Some(sample) = client.ctx.take_statistics()? {
+            shared.record_statistics(sample)?;
+        }
         *shared.connected.lock().unwrap() = false;
         match command {
             None | Some(ParticipantCmd::Done) => {

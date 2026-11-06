@@ -31,7 +31,7 @@ class ScoreboardContract(unittest.TestCase):
             root = Path(temp)
             runner = root / "runner.py"
             runner.write_text(RUNNER)
-            replay_args = ["fake-libtest", "--mode", "all", "--jobs", "1", "--skip", "tests::exception"]
+            replay_args = ["fake-libtest", "--jobs", "1", "--skip", "tests::exception"]
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "--runner", sys.executable,
                  "--parser", str(PARSER), "--output", "baseline",

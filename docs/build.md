@@ -152,9 +152,9 @@ execution from disk-cache hits and internal materialization.
 
 | Gate | Purpose |
 | --- | --- |
-| `//:fast` | Focused Rust unit/integration and fast isolated simulation behavior, source auth/Go conformance, source formatting and inexpensive tool contracts. No distribution assembly, browser fixtures, Meet export or docs site. |
+| `//:fast` | Focused Rust unit/integration and complete ordinary isolated simulation behavior, source auth/Go conformance, source formatting and inexpensive tool contracts. No distribution assembly, browser fixtures, Meet export or docs site. |
 | `//:check` | Broad compiler, architectural, generated-interface, package-consumer and artifact contracts. This is not the cheap feedback loop. |
-| `//:slow` | Committed slow simulations, controlled native RTC interoperability, and existing Web/React/Meet browser acceptance. |
+| `//:slow` | Controlled native RTC interoperability and required Web browser acceptance. Ordinary simulator coverage is entirely in `//:fast`. |
 | `//:test` | Complete non-privileged acceptance: the union of all three gates, including Rust-pin validation. |
 
 Owner targets are authoritative for selection and dependencies. An owner's
@@ -170,7 +170,7 @@ Targeted selection uses the owning target and its harness:
 
 ```sh
 ./bazel test //crates/pulsebeam-routing:unit_tests --test_arg=--exact --test_arg=tests::example
-./bazel test //crates/pulsebeam-simulator:fast --test_arg=--filter --test_arg=tests::bwe
+./bazel test //crates/pulsebeam-simulator:media_fast --test_arg=--filter --test_arg=tests::bwe
 ```
 
 Replace the example Rust name with a real test name. Simulation libraries retain

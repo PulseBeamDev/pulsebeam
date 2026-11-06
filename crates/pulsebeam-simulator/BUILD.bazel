@@ -100,25 +100,14 @@ py_test(
     name = "media_fast",
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :sim_binary)", "--mode", "fast", "--jobs", str(SIMULATION_JOBS)] + CANDIDATE_ARGS,
+    args = ["$(rootpath :sim_binary)", "--jobs", str(SIMULATION_JOBS)] + CANDIDATE_ARGS,
     data = [":sim_binary", ":candidate"],
     size = "large",
     tags = ["cpu:%s" % SIMULATION_JOBS],
     exec_properties = {"cpu_count": str(SIMULATION_JOBS), "memory_kb": str(SIMULATION_JOBS * 1024 * 1024)},
 )
 
-py_test(
-    name = "slow",
-    srcs = ["//tools:run-simulations.py"],
-    main = "//tools:run-simulations.py",
-    args = ["$(rootpath :sim_binary)", "--mode", "slow", "--jobs", str(SIMULATION_JOBS)] + CANDIDATE_ARGS,
-    data = [":sim_binary", ":candidate"],
-    size = "enormous",
-    tags = ["slow", "cpu:%s" % SIMULATION_JOBS],
-    exec_properties = {"cpu_count": str(SIMULATION_JOBS), "memory_kb": str(SIMULATION_JOBS * 1024 * 1024)},
-)
-
-REPLAY_ARGS = ["$(rootpath :sim_binary)", "--mode", "all"] + CANDIDATE_ARGS
+REPLAY_ARGS = ["$(rootpath :sim_binary)"] + CANDIDATE_ARGS
 
 py_binary(
     name = "replay",
@@ -134,7 +123,7 @@ py_binary(
     testonly = True,
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :sim_binary)", "--mode", "all", "--seeds", "20", "--from-seed", "1"] + CANDIDATE_ARGS,
+    args = ["$(rootpath :sim_binary)", "--seeds", "20", "--from-seed", "1"] + CANDIDATE_ARGS,
     data = [":sim_binary", ":candidate"],
 )
 
@@ -209,7 +198,7 @@ py_test(
     name = "membership_fast",
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :membership_sim_binary)", "--mode", "fast", "--jobs", "1"] + CANDIDATE_ARGS,
+    args = ["$(rootpath :membership_sim_binary)", "--jobs", "1", "--replay-target", "//crates/pulsebeam-simulator:membership_replay"] + CANDIDATE_ARGS,
     data = [":membership_sim_binary", ":candidate"],
 )
 
@@ -218,7 +207,7 @@ py_binary(
     testonly = True,
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
-    args = ["$(rootpath :membership_sim_binary)", "--mode", "all"] + CANDIDATE_ARGS,
+    args = ["$(rootpath :membership_sim_binary)", "--replay-target", "//crates/pulsebeam-simulator:membership_replay"] + CANDIDATE_ARGS,
     data = [":membership_sim_binary", ":candidate"],
 )
 

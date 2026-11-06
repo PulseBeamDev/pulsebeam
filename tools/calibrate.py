@@ -133,17 +133,20 @@ def classify(claim, variant, record, events):
 
 
 class CalibrationBundle(runner.Bundle):
-    replay_version = 2
+    replay_version = 4
+    replay_target = OWNER
 
     def __init__(self, args, identity):
         self.identity = identity
         super().__init__(args)
-        self.manifest.update(version=2, variant=identity)
+        self.manifest.update(variant=identity)
 
     def prepare(self, args):
         if args.replay_bundle:
             replay = json.loads((Path(args.replay_bundle) / "replay.json").read_text())
-            if replay.get("version") != 2 or replay.get("variant") != self.identity:
+            if replay.get("version") != self.replay_version:
+                raise ValueError("unsupported calibration replay bundle version; use its original source candidate")
+            if replay.get("variant") != self.identity:
                 raise ValueError("calibration replay requires the same finite target, transform and executable checksum")
         super().prepare(args)
 
@@ -151,7 +154,7 @@ class CalibrationBundle(runner.Bundle):
         super().replay(directory, selection, history)
         path = directory / "replay.json"
         replay = json.loads(path.read_text())
-        runner.write_json(path, replay | {"version": 2, "variant": self.identity})
+        runner.write_json(path, replay | {"variant": self.identity})
         return shlex.join(["./bazel", "run", OWNER, "--", "--replay-bundle", str(directory)])
 
 
@@ -194,7 +197,7 @@ def main():
                         "target": "//crates/pulsebeam-simulator:sim_binary" + ("" if variant == "control" else "_" + variant),
                         "binary_sha256": sha256(binary), "transform": provenance}
             args = argparse.Namespace(binary=binary, candidate=options.candidate, artifacts_dir=options.artifacts_dir,
-                                      replay_bundle=options.replay_bundle, mode="all", filter="tests::calibration::" + CASES[claim],
+                                      replay_bundle=options.replay_bundle, filter="tests::calibration::" + CASES[claim],
                                       exact=True, skip=[], run_skipped=False, seeds=1, from_seed=options.seed, jobs=1,
                                       discovery_timeout=30, case_timeout=options.case_timeout, show_output=False,
                                       history_search="off")

@@ -170,9 +170,10 @@ allocation-free. Review this behavior patch when updating the upstream revision.
   derivation. Upstream autoPatchelfHook handles all ELF helpers and shared
   libraries without a process-wide library override or FHS runtime. Kernel
   namespace/sandbox support remains an explicit host prerequisite.
-- `run-simulations.py` preserves nextest-style per-case process isolation and
-  slow namespace selection with libtest, including seed replay and advisory
-  windows. It runs actual Bazel-built test binaries, not Cargo commands.
+- `run-simulations.py` preserves nextest-style per-case process isolation with
+  libtest, including exact selection, seed replay and advisory windows. All
+  ordinary simulator cases share one mode; media and membership retain separate
+  owners and replay targets. It runs actual Bazel-built test binaries, not Cargo commands.
   Its owned bundles retain host timing and checksummed failure artifacts,
   including concrete history inputs. Evidence-retention errors remain separate
   from the child failure phase. See the [evidence and replay contract](../crates/pulsebeam-simulator/docs/simulation.md#retain-and-replay-generated-failures).

@@ -160,11 +160,8 @@ impl Path {
         }
     }
 
-    /// How long this path needs before a claim about a settled stream is fair.
-    ///
-    /// Generated as 30..45s for every case before: fifteen values that all mean "settled", each
-    /// costing simulated seconds to distinguish nothing. A path that stabilises quickly should
-    /// not pay for the worst case.
+    /// Path-specific bound for establishing delivery and discovery, not a mandatory dwell.
+    /// Fault, retirement and the full thirty-second measurement windows remain separate.
     fn settle(self) -> Duration {
         match self {
             Path::Fiber => Duration::from_secs(12),
@@ -634,9 +631,11 @@ impl Scenario {
                 participant: "viewer",
                 targets,
             },
-            Step::Run {
-                description: "Settle",
-                duration: self.path.settle(),
+            Step::WaitForVideo {
+                description: "Establish fresh publisher delivery and complete subscription convergence",
+                participant: "viewer",
+                publishers: &["publisher"],
+                timeout: self.path.settle(),
             },
         ];
         plan.extend(self.fault.steps(self.path.settle()));
@@ -1004,70 +1003,6 @@ mod slow {
         );
     }
 
-    /// Shared samples correlate decode, layer-stability and estimate claims across
-    /// twenty qualifying cases. Missing observations fail rather than discarding the case.
-    #[test]
-    fn peer_churn_preserves_decoding_layers_and_estimate() {
-        check(
-            SPACIOUS,
-            scenarios(Demand::any(), Budget::Ample, PEER_CHURN),
-            |scenario| {
-                let report = scenario.run("decodable");
-                prop_assert!(
-                    report.samples > 0 && report.received_bytes.is_some_and(|bytes| bytes > 0),
-                    "missing allocation or media is a failed scenario, not a discarded input ({scenario:?}, {report:?})"
-                );
-                prop_assert_ne!(
-                    report.qoe.experience(scenario.content()),
-                    Experience::Blank,
-                    "media arrived but nothing rendered ({:?}, {:?})",
-                    scenario,
-                    report.qoe,
-                );
-                prop_assert_eq!(
-                    report.qoe.undecodable_keyframes,
-                    0,
-                    "keyframes arrived without their parameter sets ({:?})",
-                    scenario,
-                );
-                // A static source can legitimately wait before producing its first frame.
-                if let (Content::Motion, Some(ttff)) =
-                    (scenario.content(), report.qoe.time_to_first_frame)
-                {
-                    prop_assert!(
-                        ttff <= MAX_TIME_TO_FIRST_FRAME,
-                        "the viewer waited {ttff:?} to see anything after subscribing ({:?})",
-                        scenario
-                    );
-                }
-                for (publisher, reversals) in &report.quality_reversals {
-                    prop_assert!(
-                        *reversals <= 2,
-                        "{publisher}'s layer reversed direction {reversals} times on a {} bps link ({scenario:?}, estimate {} bps, drawdown {:.1}%)",
-                        scenario.capacity_bps,
-                        report.estimate_last_bps,
-                        report.worst_drawdown_percent
-                    );
-                }
-                if report.capacity_fixed {
-                    prop_assert!(
-                        report.worst_drawdown_percent < 75.0,
-                        "the estimate fell {:.1}% on a fixed link, ending at {} bps against {} bps of demand ({scenario:?})",
-                        report.worst_drawdown_percent,
-                        report.estimate_last_bps,
-                        report.demand_last_bps
-                    );
-                }
-                // Capacity is fixed by the input, not an outcome-based qualifying condition.
-                prop_assert!(
-                    report.capacity_fixed,
-                    "a generated fixed-capacity link was not measured as fixed ({scenario:?})"
-                );
-                Ok(())
-            },
-        );
-    }
-
     #[test]
     fn cellular_peer_churn_preserves_publication_discovery() {
         let scenario = Scenario {
@@ -1121,11 +1056,11 @@ mod slow {
         );
     }
 
-    /// The final conjunction retains twenty qualifying cases for both demand and underused-loss
-    /// claims. Delivery is checked on every sample, including those rejected by either premise.
-    /// Sharing these scenarios correlates the claims rather than adding independent samples.
+    /// Each accepted report qualifies demand, underused loss and non-outage peer-churn
+    /// claims. All applicable assertions also run before a sibling premise rejects a sample.
+    /// Shared worlds correlate these claims; each retains twenty qualifying generated cases.
     #[test]
-    fn ample_links_deliver_track_demand_and_avoid_congestion_loss() {
+    fn ample_links_preserve_delivery_allocation_and_peer_churn() {
         check(
             SPACIOUS,
             scenarios(Demand::any(), Budget::Ample, ANY_FAULT),
@@ -1164,8 +1099,57 @@ mod slow {
                         report.max_backlog
                     );
                 }
-                // Retain the original twenty qualifying cases for both conditional claims.
-                // The delivery and other applicable assertions also run on rejected cases.
+                // Capacity is an input premise, including during an outage.
+                prop_assert!(
+                    report.capacity_fixed,
+                    "a generated fixed-capacity link was not measured as fixed ({scenario:?})"
+                );
+                if scenario.fault != Fault::Outage {
+                    prop_assert_ne!(
+                        report.qoe.experience(scenario.content()),
+                        Experience::Blank,
+                        "media arrived but nothing rendered ({:?}, {:?})",
+                        scenario,
+                        report.qoe,
+                    );
+                    prop_assert_eq!(
+                        report.qoe.undecodable_keyframes,
+                        0,
+                        "keyframes arrived without their parameter sets ({:?})",
+                        scenario,
+                    );
+                    // A static source can legitimately wait before producing its first frame.
+                    if let (Content::Motion, Some(ttff)) =
+                        (scenario.content(), report.qoe.time_to_first_frame)
+                    {
+                        prop_assert!(
+                            ttff <= MAX_TIME_TO_FIRST_FRAME,
+                            "the viewer waited {ttff:?} to see anything after subscribing ({:?})",
+                            scenario
+                        );
+                    }
+                    for (publisher, reversals) in &report.quality_reversals {
+                        prop_assert!(
+                            *reversals <= 2,
+                            "{publisher}'s layer reversed direction {reversals} times on a {} bps link ({scenario:?}, estimate {} bps, drawdown {:.1}%)",
+                            scenario.capacity_bps,
+                            report.estimate_last_bps,
+                            report.worst_drawdown_percent
+                        );
+                    }
+                    if report.capacity_fixed {
+                        prop_assert!(
+                            report.worst_drawdown_percent < 75.0,
+                            "the estimate fell {:.1}% on a fixed link, ending at {} bps against {} bps of demand ({scenario:?})",
+                            report.worst_drawdown_percent,
+                            report.estimate_last_bps,
+                            report.demand_last_bps
+                        );
+                    }
+                }
+                // Outages still exercise delivery/demand/loss, but cannot qualify the
+                // uninterrupted peer-churn claims. Bound rejection with the existing runner.
+                prop_assume!(scenario.fault != Fault::Outage);
                 prop_assume!(need > 0);
                 prop_assume!(utilisation.is_some_and(|utilisation| utilisation < 50.0));
                 Ok(())

@@ -168,7 +168,7 @@ class CalibrationContract(unittest.TestCase):
             external = root / "external"
             external.write_text("not an owned artifact")
             args = argparse.Namespace(binary="fake-libtest", candidate=str(candidate), artifacts_dir=None, show_output=False,
-                replay_bundle=None, mode="all", filter="tests::calibration::local_fanout", exact=True,
+                replay_bundle=None, filter="tests::calibration::local_fanout", exact=True,
                 skip=[], run_skipped=False, seeds=1, from_seed=1, jobs=1, discovery_timeout=30, case_timeout=120, history_search="off")
             bundle = runner.Bundle(args)
             bundle.prepare(args)
@@ -195,13 +195,13 @@ class CalibrationContract(unittest.TestCase):
             self.assertIn("inside owned outputs", record["evidence_error"])
             self.assertIn("complete child failure trace", (bundle.root / record["directory"] / "trace.log").read_text())
 
-    def test_variant_replay_is_owned_and_ordinary_v1_still_has_meaning(self):
+    def test_variant_replay_is_owned_and_retired_mode_bundles_are_rejected(self):
         runner = CALIBRATE.runner
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"TEST_UNDECLARED_OUTPUTS_DIR": temp}), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
             root = Path(temp)
             candidate = root / "candidate"
             candidate.write_text("STABLE_SIM_REVISION " + "a" * 40 + "\nSTABLE_SIM_DIRTY false\nSTABLE_SIM_FINGERPRINT " + "b" * 64 + "\n")
-            args = argparse.Namespace(candidate=str(candidate), artifacts_dir=None, replay_bundle=None, mode="all", filter="tests::calibration::local_fanout", exact=True, skip=[], run_skipped=False, seeds=1, from_seed=1, jobs=1, discovery_timeout=30, case_timeout=120, history_search="off")
+            args = argparse.Namespace(candidate=str(candidate), artifacts_dir=None, replay_bundle=None, filter="tests::calibration::local_fanout", exact=True, skip=[], run_skipped=False, seeds=1, from_seed=1, jobs=1, discovery_timeout=30, case_timeout=120, history_search="off")
             identity = {"id": "local-fanout", "binary_sha256": "exact-binary", "transform": "exact-transform"}
             bundle = CALIBRATE.CalibrationBundle(args, identity)
             bundle.prepare(args)
@@ -211,6 +211,12 @@ class CalibrationContract(unittest.TestCase):
                 ordinary.prepare(args)
             replay = CALIBRATE.CalibrationBundle(args, identity)
             replay.prepare(args)
+            self.assertEqual(replay.manifest["version"], 4)
+            retained = json.loads((bundle.root / "replay.json").read_text())
+            runner.write_json(bundle.root / "replay.json", retained | {"version": 2})
+            with self.assertRaisesRegex(ValueError, "unsupported calibration replay bundle version"):
+                CALIBRATE.CalibrationBundle(args, identity).prepare(args)
+            runner.write_json(bundle.root / "replay.json", retained)
             changed = CALIBRATE.CalibrationBundle(args, identity | {"binary_sha256": "different"})
             with self.assertRaisesRegex(ValueError, "same finite target"):
                 changed.prepare(args)
@@ -220,7 +226,8 @@ class CalibrationContract(unittest.TestCase):
             ordinary = runner.Bundle(args)
             ordinary.prepare(args)
             ordinary_replay = json.loads((ordinary.root / "replay.json").read_text())
-            self.assertEqual(ordinary_replay["version"], 1)
+            self.assertEqual(ordinary_replay["version"], 3)
+            self.assertNotIn("mode", ordinary_replay["selection"])
             self.assertEqual(ordinary_replay["selection"]["history_search"], "off")
 
 

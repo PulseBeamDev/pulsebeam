@@ -104,12 +104,17 @@ optimize runtime dependencies.
 ## Commands
 
 See the [contributor testing contract](../../docs/build.md#testing-contract) for
-workspace gates and evidence reuse. Native media/topics/reconnect/close runs
-in the ordinary fast gate and replay. The
+workspace gates and evidence reuse. `//crates/pulsebeam-simulator:fast` runs all
+ordinary simulator cases through separate media and membership owners. There is
+no fast/slow workload selector; historical `::slow::` case names are ordinary
+cases too. Native media/topics/reconnect/close runs in this gate and replay. The
 [historical native-str0m DTLS exception](docs/native-dtls-exception.md) is retired;
 focused controlled proof does not replace shared browser or production evidence.
 
-- `./bazel run //:replay -- --seed <seed> --exact --filter <name>` reproduces one case.
+- `./bazel test //crates/pulsebeam-simulator:fast` runs the complete simulator gate.
+  For a media-only filter, use `:media_fast`; membership has its own `:membership_fast`
+  and `:membership_replay` targets without native-media dependencies.
+- `./bazel run //:replay -- --seed <seed> --exact --filter <name>` reproduces one media case.
   Add `--jobs <count>` to select workers or `--show-output` for grouped full traces;
   `RUST_LOG` controls diagnostic detail. Each invocation prints an owned bundle
   directory. Bazel tests retain it in undeclared outputs; standalone replay can
@@ -166,9 +171,11 @@ arbitrary operators, edit worktrees or patch generated output.
 Calibration retains candidate identity, executable target/checksum, transform
 checksum and per-file hashes, case/seed, reached premise, requests, receipts,
 first public violation and full trace for controls as well as variants. Version
-2 replay bundles belong to `calibration_replay`; ordinary replay rejects them.
-Unmodified version 1 bundles retain their ordinary passing-test interpretation.
-Replay requires the recorded actual candidate, finite transform and executable.
+4 replay bundles belong to `calibration_replay`; ordinary version 3 replay rejects
+them. Versions 1 and 2 retain their old mode-dependent meaning only on their
+original source candidate and owner. Current runners reject them rather than
+silently changing their workload. Replay requires the recorded actual candidate,
+finite transform and executable.
 Moving a bundle does not package dirty source or the toolchain.
 
 Classification distinguishes `control-pass`, `control-failure`,

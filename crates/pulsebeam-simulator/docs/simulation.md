@@ -39,10 +39,21 @@ the user's operation rather than an earlier connection-setup step.
 
 ## Share reports without losing claims
 
-The ample-link family checks delivery, demand tracking and underused-link loss
-on one report. The peer-churn family shares decode, layer-stability and estimate
-checks. Shared scenarios correlate those claims; they are not independent
-samples of each claim's original generator.
+The ample-link campaign checks delivery, demand tracking and underused-link loss
+on every report, plus decode, layer-stability and estimate preservation whenever
+the generated fault is not an outage. Shared scenarios correlate those claims;
+they are not independent samples of each former generator.
+
+| Former case or phase | Current proof | Preserved budget and inputs |
+| --- | --- | --- |
+| `ample_links_deliver_track_demand_and_avoid_congestion_loss` and `peer_churn_preserves_decoding_layers_and_estimate` | `ample_links_preserve_delivery_allocation_and_peer_churn` | 20 qualifying generated cases for each claim; committed RNG states; camera/screenshare, requested height, contention, capacity, path and placement axes. All fault kinds remain; non-outage checks use the ample generator's fault weighting rather than a separate peer-churn draw. |
+| Property setup dwell | Bounded fresh publisher decode and complete subscription convergence | Same path-specific 12/25/35-second deadlines. Fault, outage, retirement and 30-second measurement windows are unchanged. First output establishes setup, not stability. |
+| Joint minimum/priority settling | Bounded source-authenticated native visibility | Same four QoS seeds, input-load premises, two 60-second windows and 15 × 59 native-frame floors. |
+| Priority reconfiguration and droppable-background convergence | Bounded fresh decode at the requested resolution | Same four QoS seeds and subscription transitions; reconfiguration retains its separate 30-second soak. Hidden-stream negative observation remains unchanged. |
+
+Removed exact case names fail selection rather than aliasing a different campaign.
+Replay the new family with the same whole-run seed to select its current strategy;
+old bundles remain tied to the original source candidate.
 
 Preserve each claim's configured qualifying-case budget. Check every applicable
 assertion before rejecting a report for a sibling's premise, then require the
@@ -109,6 +120,13 @@ parent unless you pass `--artifacts-dir /absolute/path/outside/checkout`; the
 runner creates a unique child there, including for overlapping invocations.
 Keep output outside the checkout, or in an ignored directory, so generating
 evidence does not itself change the recorded source candidate.
+
+The runner selects every non-ignored case by default. `--filter`, `--exact` and
+seed replay remain supported; `--mode` and the separate simulator `:slow` target
+are retired. Ordinary version 3 and calibration version 4 bundles omit workload
+modes and retain the owning replay target. Membership bundles point to
+`:membership_replay`, not the media executable; a wrong-owner replay fails before
+discovery. Earlier versions are rejected before discovery, not widened to all cases.
 
 The run retains:
 

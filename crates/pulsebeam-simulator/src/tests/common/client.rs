@@ -786,6 +786,7 @@ impl SimClientBuilder {
             agent: agent.clone(),
             admission: self.admission,
             current_admission: None,
+            statistics: NativeTrafficUpdates::new(agent.statistics()),
             desired,
             video_capacity: self.video_slots,
             audio_capacity: self.audio_slots,
@@ -2852,6 +2853,49 @@ mod tests {
     }
 
     #[test]
+    fn native_traffic_updates_preserve_publication_reset_and_freshness() {
+        let report = pulsebeam_agent_native::NativeStatistics {
+            generation: 7,
+            timestamp_us: 123,
+            report_json: br#"[{"type":"transport","bytesSent":10,"bytesReceived":42}]"#.to_vec(),
+        };
+        let (sender, receiver) = tokio::sync::watch::channel(Some(report.clone()));
+        let mut updates = NativeTrafficUpdates::new(receiver);
+        let first = updates.take_changed().unwrap().unwrap().unwrap();
+        assert_eq!((first.generation, first.timestamp_us), (7, 123));
+        assert!(updates.take_changed().unwrap().is_none());
+        sender.send_replace(Some(report.clone()));
+        let repeated = updates.take_changed().unwrap().unwrap().unwrap();
+        assert!(
+            repeated
+                .interval_delta(Some(&first), |stats| stats.bytes_received)
+                .is_err()
+        );
+        assert!(updates.take_changed().unwrap().is_none());
+        sender.send_replace(None);
+        assert!(updates.take_changed().unwrap().unwrap().is_none());
+        assert!(updates.take_changed().unwrap().is_none());
+        sender.send_replace(Some(pulsebeam_agent_native::NativeStatistics {
+            generation: 8,
+            timestamp_us: 124,
+            ..report.clone()
+        }));
+        let replacement = updates.take_changed().unwrap().unwrap().unwrap();
+        assert!(
+            replacement
+                .interval_delta(Some(&first), |stats| stats.bytes_received)
+                .is_err()
+        );
+        sender.send_replace(Some(pulsebeam_agent_native::NativeStatistics {
+            report_json: b"malformed".to_vec(),
+            ..report
+        }));
+        assert!(updates.take_changed().is_err());
+        drop(sender);
+        assert!(updates.take_changed().is_err());
+    }
+
+    #[test]
     fn native_video_witness_needs_old_source_frames_not_transport_padding_or_new_ssrc() {
         // Statistics projection only, never synthesized as RTC input.
         let baseline = NativeTrafficStatistics::from_report(&pulsebeam_agent_native::NativeStatistics {
@@ -3177,6 +3221,33 @@ impl NativeTrafficBaseline {
     }
 }
 
+struct NativeTrafficUpdates {
+    reports: tokio::sync::watch::Receiver<Option<pulsebeam_agent_native::NativeStatistics>>,
+}
+
+impl NativeTrafficUpdates {
+    fn new(
+        mut reports: tokio::sync::watch::Receiver<Option<pulsebeam_agent_native::NativeStatistics>>,
+    ) -> Self {
+        reports.mark_changed();
+        Self { reports }
+    }
+
+    // Outer None means no publication; Some(None) is an explicit generation reset.
+    fn take_changed(&mut self) -> anyhow::Result<Option<Option<NativeTrafficStatistics>>> {
+        if !self.reports.has_changed()? {
+            return Ok(None);
+        }
+        let sample = self.reports.borrow_and_update();
+        Ok(Some(
+            sample
+                .as_ref()
+                .map(NativeTrafficStatistics::from_report)
+                .transpose()?,
+        ))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeTrafficStatistics {
     pub generation: u64,
@@ -3497,6 +3568,7 @@ pub struct ClientContext {
     pub agent: Agent,
     admission: Arc<Mutex<AdmissionRecords>>,
     current_admission: Option<(u64, pulsebeam::entity::ConnectionId)>,
+    statistics: NativeTrafficUpdates,
     desired: DesiredState,
     video_capacity: usize,
     audio_capacity: usize,
@@ -3555,13 +3627,8 @@ impl ClientContext {
         self.agent.snapshot().participant_id
     }
 
-    pub fn statistics(&self) -> anyhow::Result<Option<NativeTrafficStatistics>> {
-        self.agent
-            .statistics()
-            .borrow()
-            .as_ref()
-            .map(NativeTrafficStatistics::from_report)
-            .transpose()
+    pub fn take_statistics(&mut self) -> anyhow::Result<Option<Option<NativeTrafficStatistics>>> {
+        self.statistics.take_changed()
     }
 
     pub fn connected(&self) -> bool {

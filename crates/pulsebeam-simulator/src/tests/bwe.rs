@@ -244,9 +244,10 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
                     .with_participant(Participant::manual_subscriber("viewer", 2).with_native_playback()),
             )
             .run(vec![
-                Step::Run {
+                Step::WaitForPublication {
                     description: "Discover both independently stamped genuine three-rung T3 sources",
-                    duration: Duration::from_secs(5),
+                    publisher: "protected",
+                    timeout: Duration::from_secs(5),
                 },
                 Step::SetCapacity {
                     description: "Only viewer egress is constrained; publisher uplinks remain clean",
@@ -269,9 +270,10 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
                     participant: "viewer", publisher: "protected", min_resolution: (1280, 720),
                     timeout: Duration::from_secs(30),
                 },
-                Step::Run {
-                    description: "Retain the existing 45-second allocation settling phase before steady measurement",
-                    duration: Duration::from_secs(45),
+                Step::WaitForSourceVideo {
+                    description: "Both protected sources are visible before measuring sustained service",
+                    participant: "viewer", publisher: "camera", min_resolution: (320, 180),
+                    timeout: Duration::from_secs(45),
                 },
                 Step::Run {
                     description: "Measure fresh source progress throughout sustained joint contention",
@@ -319,10 +321,6 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
                     timeout: Duration::from_secs(30),
                 },
                 Step::Run {
-                    description: "Use the same allocation settling horizon for the distinct priority-scarcity phase",
-                    duration: Duration::from_secs(45),
-                },
-                Step::Run {
                     description: "Measure a fresh sixty-second interval with competing protected minimums",
                     duration: Duration::from_secs(60),
                 },
@@ -355,36 +353,40 @@ mod slow {
             .with_bandwidth(3_500_000)
             .with_room(screen_camera_viewer_room())
             .run(vec![
-                Step::Run {
+                Step::WaitForPublication {
                     description: "Establish connections and discover the camera",
-                    duration: Duration::from_secs(5),
+                    publisher: "camera",
+                    timeout: Duration::from_secs(5),
                 },
                 Step::SubscribeToQos {
                     description: "Viewer starts with the camera at low quality",
                     participant: "viewer",
                     targets: &[("camera", 180, 90, 10)],
                 },
-                Step::Run {
-                    description: "Let the initial camera subscription settle",
-                    duration: Duration::from_secs(10),
+                Step::WaitForVideoAtResolution {
+                    description: "Establish the initial camera subscription",
+                    participant: "viewer", publishers: &["camera"], min_resolution: (1, 180),
+                    timeout: Duration::from_secs(10),
                 },
                 Step::SubscribeToQos {
                     description: "Viewer adds the screen share at equal low priority",
                     participant: "viewer",
                     targets: &[("camera", 180, 90, 10), ("screen", 1080, 90, 10)],
                 },
-                Step::Run {
-                    description: "Let both subscriptions settle before reconfiguration",
-                    duration: Duration::from_secs(15),
+                Step::WaitForVideo {
+                    description: "Establish both subscriptions before reconfiguration",
+                    participant: "viewer", publishers: &["camera", "screen"],
+                    timeout: Duration::from_secs(15),
                 },
                 Step::SubscribeToQos {
                     description: "Viewer protects the focused camera and removes screen protection",
                     participant: "viewer",
                     targets: &[("camera", 720, 360, 200), ("screen", 1080, 0, 10)],
                 },
-                Step::Run {
+                Step::WaitForVideoAtResolution {
                     description: "Require the focused camera to reach top quality after reconfiguration",
-                    duration: Duration::from_secs(30),
+                    participant: "viewer", publishers: &["camera"], min_resolution: (1, 720),
+                    timeout: Duration::from_secs(30),
                 },
                 Step::CheckVideoDecodedFromInterval {
                     description: "The focused high-priority camera reaches its requested full-height video",
@@ -431,9 +433,10 @@ mod slow {
                     participant: "viewer",
                     targets: &[("camera", 720, 360, 200), ("screen", 1080, 0, 10)],
                 },
-                Step::Run {
+                Step::WaitForVideoAtResolution {
                     description: "Let the allocator resolve the contention",
-                    duration: Duration::from_secs(45),
+                    participant: "viewer", publishers: &["camera"], min_resolution: (1, 720),
+                    timeout: Duration::from_secs(45),
                 },
                 Step::CheckVideoDecodedFromInterval {
                     description: "The focused camera reaches its full-height video over a droppable stream",

@@ -92,13 +92,28 @@ class SimulationRunnerContract(unittest.TestCase):
         self.assertGreaterEqual(self.results[0]["evidence_wall_seconds"], 0)
         self.assertIn("[simulation-timing]", output)
 
-    def test_exact_exception_does_not_exclude_other_fast_cases(self):
+    def test_exact_exception_does_not_exclude_other_cases(self):
         status, executed, output = self.invoke("--skip", EXCEPTION)
         self.assertEqual(status, 0)
-        self.assertEqual([item[0] for item in executed], [FAST])
+        self.assertEqual([item[0] for item in executed], [FAST, SLOW])
         self.assertIn(f"SKIP {EXCEPTION}", output)
         self.assertIn("explicit --skip selection", output)
         self.assertEqual(executed[0][2][1:], ["--exact", FAST, "--nocapture", "--test-threads=1"])
+
+    def test_membership_bundles_keep_their_replay_owner(self):
+        owner = "//crates/pulsebeam-simulator:membership_replay"
+        status, _, output = self.invoke("--replay-target", owner)
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.manifest["replay_target"], owner)
+        self.assertTrue(all(replay["replay_target"] == owner for replay in self.replays))
+        self.assertTrue(all(owner in case["replay"] for case in self.manifest["cases"]))
+
+    def test_retired_modes_fail_instead_of_silently_changing_selection(self):
+        for mode in ["fast", "slow", "all"]:
+            status, executed, output = self.invoke("--mode", mode)
+            self.assertEqual(status, 2, output)
+            self.assertEqual(executed, [])
+            self.assertIn("unrecognized arguments", output)
 
     def test_explicit_opt_in_runs_exception_and_propagates_failure(self):
         status, executed, output = self.invoke(
@@ -119,15 +134,16 @@ class SimulationRunnerContract(unittest.TestCase):
         self.assertEqual(executed, [])
         self.assertIn("no non-ignored simulations", output)
 
-    def test_slow_selection_and_seed_window_remain_intact(self):
-        status, executed, _ = self.invoke("--skip", EXCEPTION, "--mode", "slow", "--seed", "0", "--seeds", "2")
+    def test_exact_selection_and_seed_window_remain_intact(self):
+        status, executed, _ = self.invoke("--skip", EXCEPTION, "--exact", "--filter", SLOW, "--seed", "0", "--seeds", "2")
         self.assertEqual(status, 0)
         self.assertEqual([(item[0], item[1]) for item in executed], [(SLOW, "0"), (SLOW, "1")])
 
     def test_without_exception_configuration_native_case_is_selected(self):
         status, executed, output = self.invoke()
         self.assertEqual(status, 0)
-        self.assertEqual({item[0] for item in executed}, {FAST, EXCEPTION})
+        self.assertEqual({item[0] for item in executed}, {FAST, SLOW, EXCEPTION})
+        self.assertNotIn("mode", self.manifest["selection"])
         self.assertNotIn("SKIP ", output)
         self.assertTrue(all(item["seed_selection"] == "authored-default" and item["seed"] is None
                             for item in self.manifest["cases"]))
@@ -480,7 +496,7 @@ class SimulationProcessesContract(unittest.TestCase):
             result = self.run_fixture(root, "--exact", "--filter", "tests::first")
             self.assertEqual(result.returncode, 0, result.stderr)
             bundle = next(root.glob("simulations/run-*"))
-            for version in [2, True]:
+            for version in [1, 2, 4, True]:
                 replay = json.loads((bundle / "replay.json").read_text())
                 replay["version"] = version
                 (bundle / "replay.json").write_text(json.dumps(replay))
@@ -491,6 +507,26 @@ class SimulationProcessesContract(unittest.TestCase):
                                      if line.startswith("[simulation-artifacts] "))
                 manifest = json.loads((Path(artifact_root) / "manifest.json").read_text())
                 self.assertEqual(manifest["status"], "infrastructure")
+                self.assertEqual(manifest["discovery"], [])
+
+    def test_replay_rejects_wrong_owner_or_retired_selection_before_discovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = self.run_fixture(root, "--exact", "--filter", "tests::first")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            bundle = next(root.glob("simulations/run-*"))
+            original = json.loads((bundle / "replay.json").read_text())
+            for changes, message in [
+                ({"replay_target": "//crates/pulsebeam-simulator:membership_replay"}, "recorded simulator owner"),
+                ({"selection": original["selection"] | {"mode": "fast"}}, "unsupported replay selection"),
+            ]:
+                (bundle / "replay.json").write_text(json.dumps(original | changes))
+                result = self.run_fixture(root, "--replay-bundle", str(bundle))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(message, result.stderr)
+                artifact_root = next(line.split(" ", 1)[1] for line in result.stdout.splitlines()
+                                     if line.startswith("[simulation-artifacts] "))
+                manifest = json.loads((Path(artifact_root) / "manifest.json").read_text())
                 self.assertEqual(manifest["discovery"], [])
 
     def test_provenance_input_and_evidence_errors_are_infrastructure_failures(self):

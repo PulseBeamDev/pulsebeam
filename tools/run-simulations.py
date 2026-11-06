@@ -25,7 +25,7 @@ SETTINGS = ("RUST_LOG", "PROPTEST_CASES", "PROPTEST_MAX_LOCAL_REJECTS",
             "PROPTEST_MAX_DEFAULT_SIZE_RANGE", "PROPTEST_RNG_ALGORITHM",
             "PROPTEST_RNG_SEED", "PROPTEST_VERBOSE", "PROPTEST_FORK",
             "PROPTEST_TIMEOUT", "PROPTEST_DISABLE_FAILURE_PERSISTENCE")
-SELECTION = ("mode", "filter", "exact", "skip", "run_skipped", "seeds", "from_seed",
+SELECTION = ("filter", "exact", "skip", "run_skipped", "seeds", "from_seed",
              "jobs", "discovery_timeout", "case_timeout", "history_search")
 REPLAY_LIMITS = ("Requires the same actual source candidate and supported toolchain. "
                  "Dirty fingerprints attribute sources but do not package them. "
@@ -74,16 +74,19 @@ def run_process(command, trace, *, timeout, env=None):
 
 
 class Bundle:
-    replay_version = 1
+    replay_version = 3
+    replay_target = "//:replay"
 
     def __init__(self, args):
+        self.replay_target = getattr(args, "replay_target", self.replay_target)
         # Even an explicit destination is a parent, never a shared mutable run.
         base = os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")
         base = Path(base) / "simulations" if base else Path(args.artifacts_dir or tempfile.gettempdir())
         base.mkdir(parents=True, exist_ok=True)
         self.root = Path(tempfile.mkdtemp(prefix="run-", dir=base)).resolve()
-        self.manifest = {"version": 1, "status": "running", "candidate": None,
-                         "replay_limits": REPLAY_LIMITS, "cases": [], "discovery": []}
+        self.manifest = {"version": self.replay_version, "status": "running", "candidate": None,
+                         "replay_limits": REPLAY_LIMITS, "replay_target": self.replay_target,
+                         "cases": [], "discovery": []}
         self.save()
         print(f"[simulation-artifacts] {self.root}", flush=True)
 
@@ -103,7 +106,11 @@ class Bundle:
             source = Path(args.replay_bundle).resolve()
             replay = json.loads((source / "replay.json").read_text())
             if type(replay["version"]) is not int or replay["version"] != self.replay_version:
-                raise ValueError("unsupported replay bundle version; SFU variants require //crates/pulsebeam-simulator:calibration_replay")
+                raise ValueError("unsupported replay bundle version; use its original source candidate and owner (ordinary replay or calibration_replay)")
+            if replay["replay_target"] != self.replay_target:
+                raise ValueError("replay requires the recorded simulator owner target")
+            if set(replay["selection"]) != set(SELECTION):
+                raise ValueError("unsupported replay selection fields; workload modes are retired")
             if replay["candidate"] != self.manifest["candidate"]:
                 raise ValueError("replay requires the recorded actual source candidate (revision, dirty state and fingerprint)")
             for key in SELECTION:
@@ -158,9 +165,10 @@ class Bundle:
         history = self.manifest["history"] if history is None else history
         if history:
             history = history | {"path": os.path.relpath(self.root / history["path"], directory)}
-        write_json(directory / "replay.json", {"version": 1, "candidate": self.manifest["candidate"],
-                   "selection": selection, "settings": self.manifest["settings"], "input": captured, "history": history})
-        return shlex.join(["./bazel", "run", "//:replay", "--", "--replay-bundle", str(directory)])
+        write_json(directory / "replay.json", {"version": self.replay_version, "candidate": self.manifest["candidate"],
+                   "replay_target": self.replay_target, "selection": selection,
+                   "settings": self.manifest["settings"], "input": captured, "history": history})
+        return shlex.join(["./bazel", "run", self.replay_target, "--", "--replay-bundle", str(directory)])
 
     def infrastructure_error(self, error):
         self.manifest.update(status="infrastructure", error=str(error))
@@ -192,7 +200,7 @@ def names(binary, bundle, seed_label, timeout, *flags):
         bundle.save()
         print(f"[simulation-discovery] FAIL seed={seed_label} category={category}; "
               f"command={shlex.join(command)}\nFailure trace: {log}", file=sys.stderr, flush=True)
-        print(f"Replay: ./bazel run //:replay -- --replay-bundle {shlex.quote(str(bundle.root))}", flush=True)
+        print(f"Replay: ./bazel run {bundle.replay_target} -- --replay-bundle {shlex.quote(str(bundle.root))}", flush=True)
         return None
     selected = [line.removesuffix(": test") for line in log.read_text().splitlines()
                 if line.endswith(": test")]
@@ -211,8 +219,7 @@ def execute(args, bundle, assess=None):
     if listed is None:
         return 1
     selected = [name for name in listed if name not in ignored
-                and (name == args.filter if args.exact else args.filter in name)
-                and (args.mode == "all" or ("::slow::" in name) == (args.mode == "slow"))]
+                and (name == args.filter if args.exact else args.filter in name)]
     if not args.run_skipped:
         for name in args.skip:
             if name in selected:
@@ -336,10 +343,11 @@ def execute(args, bundle, assess=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary")
+    parser.add_argument("--replay-target", choices=["//:replay", "//crates/pulsebeam-simulator:membership_replay"],
+                        default="//:replay", help="Bazel owner for retained replay commands")
     parser.add_argument("--candidate", help="declared Bazel workspace-status metadata (required)")
     parser.add_argument("--artifacts-dir", help="persistent parent for a unique owned run; Bazel test outputs take precedence")
     parser.add_argument("--replay-bundle", help="retained run or case directory containing replay.json")
-    parser.add_argument("--mode", choices=["fast", "slow", "all"], default="fast")
     parser.add_argument("--filter", default="")
     parser.add_argument("--exact", action="store_true", help="match the complete filtered case name")
     parser.add_argument("--history-search", choices=["off", "guided", "unguided", "compare"], default="off",
