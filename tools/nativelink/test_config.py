@@ -30,7 +30,8 @@ def modified(properties, modifications):
 
 class ConfigTest(unittest.TestCase):
     def setUp(self):
-        self.config = config.make_config("/tmp/pulsebeam-test", 8, 8_388_608, 1, 1_048_576, 50051, 50061)
+        self.cache_bytes = 32 * 1024**3
+        self.config = config.make_config("/tmp/pulsebeam-test", 8, 8_388_608, 1, 1_048_576, 50051, 50061, cache_bytes=self.cache_bytes)
 
     def test_topology_and_bounds(self):
         c = self.config
@@ -40,8 +41,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(set(c["servers"][1]["services"]), {"worker_api", "health"})
         cas, ac, fast = c["stores"]
         cas_bytes = cas["filesystem"]["eviction_policy"]["max_bytes"]
-        self.assertEqual(cas_bytes, 64 * 1024**3)
-        self.assertEqual(ac["completeness_checking"]["backend"]["filesystem"]["eviction_policy"]["max_bytes"], 1024**3)
+        self.assertEqual(cas_bytes, self.cache_bytes)
+        self.assertEqual(ac["completeness_checking"]["backend"]["filesystem"]["eviction_policy"]["max_bytes"], cas_bytes // 100)
         self.assertEqual(fast["fast_slow"]["fast"]["filesystem"]["eviction_policy"]["max_bytes"], cas_bytes)
         self.assertEqual(fast["fast_slow"]["slow"]["ref_store"]["name"], cas["name"])
         self.assertEqual(len(c["workers"]), 1)
@@ -79,12 +80,12 @@ class ConfigTest(unittest.TestCase):
                 self.assertEqual(modified(initial, edits), expected)
 
     def test_invalid_parameters(self):
-        args = ["/tmp/state", 2, 100, 1, 10, 50051, 50061]
-        for index, value in [(0, "relative"), (0, "/tmp/$HOME"), (1, 0), (2, -1), (3, 3), (4, 101), (5, 0), (6, 65536), (6, 50051)]:
+        args = ["/tmp/state", 2, 100, 1, 10, 50051, 50061, self.cache_bytes]
+        for index, value in [(0, "relative"), (0, "/tmp/$HOME"), (1, 0), (2, -1), (3, 3), (4, 101), (5, 0), (6, 65536), (6, 50051), (7, 0), (7, -1)]:
             candidate = args.copy()
             candidate[index] = value
             with self.subTest(index=index, value=value), self.assertRaises(ValueError):
-                config.make_config(*candidate)
+                config.make_config(*candidate[:7], cache_bytes=candidate[7])
 
     def test_worker_sandbox_denies_network_and_undeclared_host_files(self):
         script = sandbox_script(Path("/nix/store/tools/bin"), Path("/private/work"))
@@ -121,7 +122,7 @@ class StartupTest(unittest.TestCase):
             first, second = unused_port(), unused_port()
             while second == first:
                 second = unused_port()
-            cfg = config.make_config(tmp, 2, 2_097_152, 1, 1_048_576, first, second)
+            cfg = config.make_config(tmp, 2, 2_097_152, 1, 1_048_576, first, second, cache_bytes=8 * 1024**2)
             config_path = Path(tmp) / "config.json"
             config_path.write_text(json.dumps(cfg))
             log_path = Path(tmp) / "nativelink.log"

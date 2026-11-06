@@ -50,9 +50,10 @@ the foreground service with Ctrl-C when it is no longer needed.
 The REAPI endpoint defaults to `127.0.0.1:50051` and the worker endpoint to
 `127.0.0.1:50061`. State defaults to `~/.cache/pulsebeam/nativelink/v1`, with
 mode `0700`. By default the scheduler advertises all CPUs in the service's
-CPU affinity and the host's total memory. Bazel submits up to twice the CPU
-capacity (minimum 8, maximum 128 jobs) to hide scheduling and CAS latency;
-explicit client `--jobs` overrides this. The shared capacity is fixed at
+CPU affinity and 75% of the host's total memory, leaving RAM headroom for local
+Bazel analysis, agents and the coordinator. Linux handles CPU fairness; there
+is no separate CPU percentage cap. Bazel submits twice the CPU capacity to hide
+scheduling and CAS latency; explicit client `--jobs` overrides this. The shared capacity is fixed at
 service startup. The worker shares a pool of 64 input-blob downloads across
 all actions, rather than multiplying download fan-out with each client's
 cold build. This does not limit cached-input hardlinking or action processes.
@@ -91,8 +92,9 @@ reports completed backend cache outcomes and queue times. Matching digests
 alone do not prove that concurrent requests were joined.
 
 The server accepts `--state` (an absolute path), `--cpu` (positive),
-`--memory-kb` (positive), `--reapi-port` and `--worker-port` to configure
-a foreground service. For example:
+`--memory-kb` (positive), `--cache-bytes` (positive, per CAS tier), `--reapi-port`
+and `--worker-port` to configure a foreground service. Explicit CPU, memory and
+cache values override automatic sizing. For example:
 
 ```sh
 ./bazel run --config=local //tools/nativelink:server -- --cpu 4 --reapi-port 50052
@@ -127,11 +129,13 @@ included in that budget. The outer WebRTC GN action and
 Siso's local-only generators and archiving remain client-local, with two local
 Siso jobs per client. Tests and generators may also stay local when their
 contracts require it. The service does not govern every process on the machine.
-The CAS and worker CAS each target 64 GiB for eviction, and the action cache
-1 GiB. Matching the two CAS targets avoids a smaller worker tier repeatedly
-evicting and refetching inputs while staging large concurrent builds. These
-are not hard disk quotas; executable copies and active action files can consume
-additional space. Leave disk headroom.
+At startup, each CAS tier targets 10% of the capacity of the filesystem
+containing the state directory; the action cache targets 1% of one CAS tier.
+Matching the two CAS targets avoids a smaller worker tier repeatedly evicting
+and refetching inputs while staging large concurrent builds. These targets do
+not preallocate space and are not hard disk quotas; executable copies and active
+action files can consume additional space. Leave disk headroom and use
+`--cache-bytes` to reduce the targets on a nearly full filesystem.
 
 NativeLink is licensed under FSL-1.1-Apache-2.0, which explicitly permits
 internal use.

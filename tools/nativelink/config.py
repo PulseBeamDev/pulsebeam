@@ -20,11 +20,11 @@ def port(value):
     return number
 
 
-def make_config(state, cpu, memory_kb, action_cpu, action_memory_kb, reapi_port, worker_port):
+def make_config(state, cpu, memory_kb, action_cpu, action_memory_kb, reapi_port, worker_port, *, cache_bytes):
     state = Path(state)
     if not state.is_absolute() or "$" in str(state):
         raise ValueError("state must be an absolute path without '$'")
-    if min(cpu, memory_kb, action_cpu, action_memory_kb) <= 0:
+    if min(cpu, memory_kb, action_cpu, action_memory_kb, cache_bytes) <= 0:
         raise ValueError("capacities and reservations must be positive")
     if action_cpu > cpu or action_memory_kb > memory_kb:
         raise ValueError("default reservation exceeds worker capacity")
@@ -51,18 +51,17 @@ def make_config(state, cpu, memory_kb, action_cpu, action_memory_kb, reapi_port,
         ])
 
     cas, ac, fast, scheduler = "CAS_MAIN_STORE", "AC_MAIN_STORE", "WORKER_FAST_SLOW_STORE", "MAIN_SCHEDULER"
-    cas_bytes = 64 * 1024**3
     return {
         "stores": [
-            {"name": cas, **filesystem("cas", cas_bytes)},
+            {"name": cas, **filesystem("cas", cache_bytes)},
             {"name": ac, "completeness_checking": {
-                "backend": filesystem("ac", 1024**3),
+                "backend": filesystem("ac", max(1, cache_bytes // 100)),
                 "cas_store": {"ref_store": {"name": cas}},
             }},
             {"name": fast, "fast_slow": {
                 # A smaller tier can evict resolved input paths before staging
                 # finishes, repeatedly copying them back from the local CAS.
-                "fast": filesystem("worker-cas", cas_bytes),
+                "fast": filesystem("worker-cas", cache_bytes),
                 "slow": {"ref_store": {"name": cas}},
             }},
         ],
@@ -116,6 +115,7 @@ def main():
     parser.add_argument("--state", required=True, help="private absolute state directory")
     parser.add_argument("--cpu", type=positive, required=True, help="worker CPU capacity")
     parser.add_argument("--memory-kb", type=positive, required=True, help="worker memory capacity in KiB")
+    parser.add_argument("--cache-bytes", type=positive, required=True, help="eviction target per CAS tier in bytes")
     parser.add_argument("--action-cpu", type=positive, default=1)
     parser.add_argument("--action-memory-kb", type=positive, default=1_048_576)
     parser.add_argument("--reapi-port", type=port, default=50051)
@@ -123,7 +123,7 @@ def main():
     args = parser.parse_args()
     try:
         config = make_config(args.state, args.cpu, args.memory_kb, args.action_cpu,
-                             args.action_memory_kb, args.reapi_port, args.worker_port)
+                             args.action_memory_kb, args.reapi_port, args.worker_port, cache_bytes=args.cache_bytes)
     except ValueError as error:
         parser.error(str(error))
     print(json.dumps(config, indent=2))

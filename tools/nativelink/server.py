@@ -9,7 +9,7 @@ import shlex
 import stat
 
 from config import make_config, port, positive
-from resources import machine_budget
+from resources import cache_budget, machine_budget
 
 
 def sandbox_script(host, work):
@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--state", type=Path, default=Path.home() / ".cache/pulsebeam/nativelink/v1")
     parser.add_argument("--cpu", type=positive)
     parser.add_argument("--memory-kb", type=positive)
+    parser.add_argument("--cache-bytes", type=positive, help="eviction target per CAS tier; default: 10%% of the state filesystem")
     parser.add_argument("--reapi-port", type=port, default=50051)
     parser.add_argument("--worker-port", type=port, default=50061)
     args = parser.parse_args()
@@ -48,6 +49,8 @@ def main():
             cpu, memory_kb = machine_budget()
             args.cpu = cpu if args.cpu is None else args.cpu
             args.memory_kb = memory_kb if args.memory_kb is None else args.memory_kb
+        if args.cache_bytes is None:
+            args.cache_bytes = cache_budget(state)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     lock = os.open(state / "server.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -62,7 +65,7 @@ def main():
     entrypoint.write_text(sandbox_script(host, work))
     entrypoint.chmod(0o700)
     config = make_config(str(state), args.cpu, args.memory_kb, 1, 1_048_576,
-                         args.reapi_port, args.worker_port)
+                         args.reapi_port, args.worker_port, cache_bytes=args.cache_bytes)
     worker = config["workers"][0]["local"]
     worker["entrypoint"] = str(entrypoint)
     worker["platform_properties"]["OSFamily"] = {"values": ["Linux"]}
@@ -73,6 +76,7 @@ def main():
     config_path.write_text(json.dumps(config, indent=2))
     os.set_inheritable(lock, True)
     print(f"NativeLink REAPI grpc://127.0.0.1:{args.reapi_port}, scheduler capacity {args.cpu} CPU / {args.memory_kb} KiB", flush=True)
+    print(f"Cache eviction targets: {args.cache_bytes} bytes per CAS tier, {max(1, args.cache_bytes // 100)} bytes for action results", flush=True)
     print(f"State: {state}. Stop with Ctrl-C. Trusted local clients only.", flush=True)
     os.execve(os.path.abspath(args.binary), [args.binary, str(config_path)],
               {**os.environ, "PATH": str(host)})
