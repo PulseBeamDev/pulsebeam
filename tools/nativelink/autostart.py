@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import re
-import secrets
 import socket
 import stat
 import subprocess
@@ -16,7 +15,7 @@ import sys
 import tempfile
 import time
 
-from resources import client_jobs, machine_budget, _cgroup_mounts
+from resources import client_jobs
 
 PORTS = (50051, 50061)
 TIMEOUT = 30.0
@@ -198,169 +197,10 @@ def wait_ready(state, marker, child=None):
     raise StartupError(f"NativeLink did not become ready within {TIMEOUT:g}s; inspect {state / 'autostart.log'} and stop the service before retrying")
 
 
-def isolation_budget():
-    try:
-        cpu, memory_kb = machine_budget()
-    except (OSError, ValueError) as error:
-        raise StartupError(f"Cannot determine isolation budget: {error}") from error
-    cpu = max(4, cpu * 3 // 4) if cpu >= 4 else max(1, cpu * 3 // 4)
-    limit_kb = memory_kb * 3 // 4
-    scheduler_kb = limit_kb - 2 * 1024 * 1024
-    if scheduler_kb < 5 * 1024 * 1024:
-        raise StartupError("Isolation needs at least 5 GiB scheduler memory after reserving 2 GiB overhead; increase available memory or disable isolation")
-    return cpu, limit_kb, scheduler_kb
-
-
-def unit_info(unit):
-    try:
-        result = subprocess.run(["systemctl", "--user", "show", unit,
-                                 "--property=LoadState,ActiveState,MainPID,ControlGroup,Description,InvocationID"],
-                                text=True, capture_output=True, check=False)
-    except OSError as error:
-        raise StartupError(f"Isolation requires systemctl and a working systemd user manager: {error}") from error
-    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-    if fields.get("LoadState") == "not-found":
-        return None
-    if result.returncode or not fields.get("LoadState"):
-        raise StartupError(f"Isolation requires a working systemd user manager: {result.stderr.strip()}")
-    return fields
-
-
-def verify_isolation(unit, token, pid, cpu, limit_kb):
-    info = unit_info(unit)
-    if (not info or info.get("ActiveState") != "active"
-            or info.get("Description") != token or info.get("MainPID") != str(pid)):
-        raise StartupError(f"Isolation unit {unit} is not the expected active service; inspect journalctl --user -u {unit}")
-    group = info.get("ControlGroup", "")
-    if not group.startswith("/") or ".." in Path(group).parts:
-        raise StartupError(f"Invalid cgroup for {unit}: {group!r}")
-    try:
-        membership = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
-        if f"0::{group}" not in membership:
-            raise ValueError("MainPID is not in the unit cgroup")
-        paths = [mount / str(Path(group).relative_to(str(root)))
-                 for mount, root, _ in _cgroup_mounts() if Path(group).is_relative_to(str(root))]
-        if not paths:
-            raise ValueError("unit cgroup is not visible")
-        for path in paths:
-            quota, period = (path / "cpu.max").read_text().split()
-            memory = (path / "memory.max").read_text().strip()
-            if quota == "max" or int(quota) != cpu * int(period) or int(memory) != limit_kb * 1024:
-                raise ValueError(f"actual limits differ at {path}: cpu.max={quota} {period}, memory.max={memory}")
-    except (OSError, ValueError) as error:
-        raise StartupError(f"Cannot verify isolation for {unit}: {error}; check user cgroup controller delegation") from error
-    return info
-
-
-def start_isolated(workspace, bazelisk, output_base, state):
-    cpu, limit_kb, scheduler_kb = isolation_budget()
-    expected = identity(workspace) + f":systemd-service-v1:{cpu}:{limit_kb}:{scheduler_kb}"
-    unit = "pulsebeam-nativelink-" + hashlib.sha256(os.fsencode(str(state))).hexdigest()[:24] + ".service"
-    marker = read_marker(state)
-    if marker and alive(marker):
-        if marker["identity"] != expected or marker.get("unit") != unit or not marker.get("token"):
-            raise StartupError(f"Incompatible NativeLink service (pid {marker['pid']}); stop it and retry. State: {state}")
-        verify_isolation(unit, marker["token"], marker["pid"], cpu, limit_kb)
-        try:
-            wait_ready(state, marker)
-        except StartupError as error:
-            raise StartupError(f"{error}; also inspect journalctl --user -u {unit}") from error
-        verify_isolation(unit, marker["token"], marker["pid"], cpu, limit_kb)
-        return
-    if server_locked(state):
-        raise StartupError(f"An unrecognized service holds {state / 'server.lock'}; identify it with fuser {state / 'server.lock'} (it will not be killed)")
-    ports_free()
-    # A private intent survives a crash before the PID marker is installed.
-    intent_path = state / "isolation-intent.json"
-    try:
-        fd = open_private(intent_path, os.O_RDONLY)
-    except FileNotFoundError:
-        intent = {}
-    else:
-        try:
-            with os.fdopen(fd) as stream:
-                intent = json.load(stream)
-        except (ValueError, UnicodeError):
-            intent = {}
-    info = unit_info(unit)
-    if info:
-        if (not isinstance(intent, dict) or not intent.get("token")
-                or info.get("Description") != intent["token"]
-                or info.get("ActiveState") not in ("failed", "inactive")):
-            raise StartupError(f"Unrecognized or active unit {unit}; it will not be stopped. Inspect systemctl --user status {unit}")
-        subprocess.run(["systemctl", "--user", "reset-failed", unit], check=True, capture_output=True)
-        if unit_info(unit):
-            raise StartupError(f"Stale unit {unit} remains loaded; inspect systemctl --user status {unit}")
-    subprocess.run([str(bazelisk), f"--output_base={output_base}", "build", "--config=local", "//tools/nativelink:server"], cwd=workspace, check=True, stdout=sys.stderr)
-    if identity(workspace) + f":systemd-service-v1:{cpu}:{limit_kb}:{scheduler_kb}" != expected:
-        raise StartupError("NativeLink inputs changed during bootstrap; retry")
-    binary = output_base / "external/+http_archive+nativelink/nativelink"
-    host_file = output_base / "external/+webrtc+webrtc_host/host-bin"
-    if not binary.is_file() or not host_file.is_file():
-        raise StartupError(f"Bazel did not produce NativeLink or host-bin in {output_base}")
-    ports_free()
-    token = "pulsebeam-nativelink-" + secrets.token_hex(16)
-    fd, name = tempfile.mkstemp(prefix=".isolation-", dir=state)
-    try:
-        with os.fdopen(fd, "w") as stream:
-            json.dump({"token": token}, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(name, intent_path)
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
-    command = ["systemd-run", "--user", "--service-type=exec", f"--unit={unit}",
-               f"--description={token}", f"--working-directory={state}",
-               f"--property=CPUQuota={cpu * 100}%", f"--property=MemoryMax={limit_kb * 1024}",
-               sys.executable, str(workspace / "tools/nativelink/server.py"),
-               "--binary", str(binary), "--host-bin-file", str(host_file), "--state", str(state),
-               "--cpu", str(cpu), "--memory-kb", str(scheduler_kb)]
-    try:
-        try:
-            result = subprocess.run(command, text=True, capture_output=True, check=False)
-        except OSError as error:
-            raise StartupError(f"Isolation requires systemd-run: {error}") from error
-        if result.returncode:
-            raise StartupError(f"Could not launch isolated NativeLink: {result.stderr.strip()}; inspect journalctl --user -u {unit}")
-        info = unit_info(unit)
-        if not info or info.get("Description") != token:
-            raise StartupError(f"Cannot identify the new unit {unit}; inspect journalctl --user -u {unit}")
-        try:
-            pid = int(info.get("MainPID", "0"))
-        except ValueError:
-            pid = 0
-        start_time = process_start(pid) if pid > 0 else None
-        if start_time is None:
-            raise StartupError(f"NativeLink exited during startup; inspect journalctl --user -u {unit}")
-        marker = {"pid": pid, "start": start_time, "boot": boot_id(), "identity": expected, "unit": unit, "token": token}
-        write_marker(state, marker)
-        verify_isolation(unit, token, pid, cpu, limit_kb)
-        try:
-            wait_ready(state, marker)
-        except StartupError as error:
-            raise StartupError(f"{error}; also inspect journalctl --user -u {unit}") from error
-        verify_isolation(unit, token, pid, cpu, limit_kb)
-    except BaseException:
-        # Never stop an existing or replaced unit, including on systemd-run errors.
-        try:
-            info = unit_info(unit)
-            if info and info.get("Description") == token:
-                subprocess.run(["systemctl", "--user", "stop", unit], check=False, capture_output=True)
-        except (OSError, StartupError):
-            pass
-        if marker and marker.get("token") == token:
-            (state / "autostart.json").unlink(missing_ok=True)
-        raise
-
-
 def start(workspace, bazelisk, output_base, state):
     fd = open_private(state / "autostart.lock", os.O_RDWR | os.O_CREAT)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        if os.environ.get("PULSEBEAM_NATIVELINK_ISOLATION") == "1":
-            start_isolated(workspace, bazelisk, output_base, state)
-            return
         expected = identity(workspace)
         marker = read_marker(state)
         if marker and alive(marker):
