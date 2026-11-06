@@ -266,6 +266,14 @@ copy_to_directory(
     },
 )
 
+# The pinned WebDriver manager has no hook for driver command-line arguments.
+py_binary(
+    name = "logged_chromedriver",
+    srcs = ["tests/chromedriver.py"],
+    main = "tests/chromedriver.py",
+    testonly = True,
+)
+
 browser_test(
     name = "web_runtime_browser",
     source = "tests/browser.rs",

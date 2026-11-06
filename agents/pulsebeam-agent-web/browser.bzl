@@ -20,6 +20,7 @@ def browser_test(name, source, assets, env, contracts = [], live = False, featur
             "//server/rust:pulsebeam-server",
         ] + (["//crates/pulsebeam:pulsebeam", "//crates/pulsebeam-runtime:pulsebeam-runtime"] if live else []),
         data = assets + [
+            ":logged_chromedriver",
             "@browser_chrome//:files",
             "@browser_chrome//:executable",
             "@browser_chromedriver//:files",
@@ -27,7 +28,8 @@ def browser_test(name, source, assets, env, contracts = [], live = False, featur
         ],
         env = dict(env, **{
             "PULSEBEAM_BROWSER_BINARY": "$(rootpath @browser_chrome//:executable)",
-            "PULSEBEAM_DRIVER_BINARY": "$(rootpath @browser_chromedriver//:executable)",
+            "PULSEBEAM_DRIVER_BINARY": "$(rootpath :logged_chromedriver)",
+            "PULSEBEAM_CHROMEDRIVER_BINARY": "$(rootpath @browser_chromedriver//:executable)",
             # Chromium creates a Unix socket under TMPDIR, whose path is limited
             # to 108 bytes. Remote action temp paths can exceed that limit.
             "TMPDIR": "/tmp",
