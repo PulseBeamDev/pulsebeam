@@ -54,8 +54,9 @@ CPU affinity, host memory and visible cgroup v2 limits. Bazel submits up to twic
 the CPU capacity (minimum 8, maximum 128 jobs) to hide scheduling and CAS
 latency; explicit client `--jobs` overrides this. The shared capacity is fixed
 at service startup. Worker input staging is bounded across concurrent actions.
-These limits do not account for frontend processes or provide a hard resource
-limit on actions.
+Cgroup ancestors hidden by a namespace or mount cannot be detected. These
+limits do not account for frontend processes or provide a hard resource limit
+on actions.
 
 To verify in-flight deduplication with two isolated Siso clients and a temporary
 service, run the focused integration test:

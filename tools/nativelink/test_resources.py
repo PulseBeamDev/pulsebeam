@@ -37,6 +37,7 @@ class ResourceTests(unittest.TestCase):
     def limits(self, relative, cpu="max 100000", memory="max"):
         directory = self.mount / relative
         directory.mkdir(parents=True, exist_ok=True)
+        (directory / "cgroup.controllers").write_text("cpu memory\n")
         (directory / "cpu.max").write_text(cpu + "\n")
         (directory / "memory.max").write_text(memory + "\n")
 
@@ -77,6 +78,7 @@ class ResourceTests(unittest.TestCase):
         other = self.base / "other"
         (other / "parent" / "child").mkdir(parents=True)
         for directory in (other / "parent", other / "parent" / "child"):
+            (directory / "cgroup.controllers").write_text("cpu memory\n")
             (directory / "cpu.max").write_text("max 100000")
             (directory / "memory.max").write_text("max")
         (other / "parent" / "memory.max").write_text("1024000")
@@ -100,6 +102,23 @@ class ResourceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "invalid cgroup limit"):
                     resources.machine_budget()
 
+    def test_disabled_controllers_do_not_hide_ancestor_limits(self):
+        self.hierarchy()
+        self.limits("parent", "300000 100000", "8192000")
+        self.limits("parent/child")
+        child = self.mount / "parent/child"
+        (child / "cgroup.controllers").write_text("io\n")
+        (child / "cpu.max").unlink()
+        (child / "memory.max").unlink()
+        self.assertEqual(resources.machine_budget(), (3, 8000))
+
+    def test_sub_kib_memory_limit_fails_with_clear_error(self):
+        self.hierarchy()
+        self.limits("parent")
+        self.limits("parent/child", memory="1023")
+        with self.assertRaisesRegex(ValueError, "less than 1 KiB"):
+            resources.machine_budget()
+
     def test_missing_non_root_limit_is_an_error(self):
         self.hierarchy()
         self.limits("parent")
@@ -111,7 +130,7 @@ class ResourceTests(unittest.TestCase):
     def test_missing_mount_is_not_treated_as_unlimited_root(self):
         self.hierarchy("/")
         (self.mount / "cgroup.controllers").unlink()
-        with self.assertRaisesRegex(ValueError, "cannot read cgroup root"):
+        with self.assertRaisesRegex(ValueError, "cannot read cgroup directory"):
             resources.machine_budget()
 
     def test_inaccessible_limit_is_an_error(self):

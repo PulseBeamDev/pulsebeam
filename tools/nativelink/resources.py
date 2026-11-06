@@ -60,13 +60,14 @@ def _limit_text(directory, name, root_without_parent):
     try:
         return path.read_text().strip()
     except FileNotFoundError:
-        # The actual cgroup v2 root has no cpu.max or memory.max files.
-        # Require a cgroup interface to distinguish it from a missing mount.
-        if root_without_parent:
-            try:
-                (directory / "cgroup.controllers").read_text()
-            except OSError as error:
-                raise ValueError(f"cannot read cgroup root {directory}: {error}") from error
+        # A controller not enabled by the parent has no interface here; its
+        # ancestors may still impose limits and are checked separately.
+        try:
+            controllers = (directory / "cgroup.controllers").read_text().split()
+        except OSError as error:
+            raise ValueError(f"cannot read cgroup directory {directory}: {error}") from error
+        controller = name.split(".", 1)[0]
+        if root_without_parent or controller not in controllers:
             return "max" if name == "memory.max" else "max 100000"
         raise ValueError(f"missing cgroup limit: {path}") from None
     except OSError as error:
@@ -98,7 +99,10 @@ def _cgroup_budget(cpu, memory_kb):
             if memory != "max":
                 if not re.fullmatch(r"[0-9]+", memory):
                     raise ValueError(f"invalid cgroup limit in {memory_path}: {memory!r}")
-                memory_kb = min(memory_kb, int(memory) // 1024)
+                limit_kb = int(memory) // 1024
+                if limit_kb == 0:
+                    raise ValueError(f"cgroup memory limit is less than 1 KiB: {memory_path}")
+                memory_kb = min(memory_kb, limit_kb)
             if directory == mountpoint:
                 break
             directory = directory.parent
