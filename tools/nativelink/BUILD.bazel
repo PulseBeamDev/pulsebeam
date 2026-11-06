@@ -36,6 +36,21 @@ py_test(
 )
 
 py_test(
+    name = "reapi_integration_test",
+    srcs = ["test_reapi_integration.py"],
+    main = "test_reapi_integration.py",
+    args = [
+        "--server", "$(rootpath :server.py)",
+        "--binary", "$(rootpath @nativelink//:bin)",
+        "--host-bin-file", "$(rootpath @webrtc_host//:host-bin)",
+        "--siso", "$(rootpath @webrtc_upstream//:checkout/src/third_party/siso/cipd/siso)",
+    ],
+    data = ["analyze.py", "config.py", "resources.py", "server.py", "@nativelink//:bin", "@webrtc_host//:tools", "@webrtc_host//:host-bin", "@webrtc_upstream//:checkout/src/third_party/siso/cipd/siso"],
+    size = "medium",
+    tags = ["local", "manual"],
+)
+
+py_test(
     name = "resources_test",
     srcs = ["test_resources.py", "resources.py"],
     main = "test_resources.py",
