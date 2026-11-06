@@ -223,6 +223,7 @@ impl<'a> RtpExtension<'a> {
     }
 }
 
+#[derive(Clone)]
 pub struct ExtensionIter<'a> {
     bytes: &'a [u8],
     offset: usize,

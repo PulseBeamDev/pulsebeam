@@ -2,7 +2,7 @@
 // Rust adaptation of modules/pacing/pacing_controller.cc at libwebrtc
 // 326fd06bb4d93900ed6947205b94cefd2413afca. See congestion/screamv2/LICENSE and PATENTS.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MAX_DEBT: Duration = Duration::from_millis(500);
 const MAX_ELAPSED: Duration = Duration::from_secs(2);
@@ -15,7 +15,7 @@ const DEBT_PER_BYTE: u128 = 8_000_000_000;
 
 #[derive(Debug, Default)]
 pub(crate) struct Pacer {
-    processed_at: Option<Instant>,
+    processed_at: Option<Duration>,
     media_debt: u128,
     padding_debt: u128,
     data_rate: u64,
@@ -23,7 +23,7 @@ pub(crate) struct Pacer {
     padding_rate: u64,
     burst_window: Duration,
     padding_remaining: usize,
-    charged_bytes: u64,
+    charged_bytes: u128,
 }
 
 impl Pacer {
@@ -37,13 +37,15 @@ impl Pacer {
 
     pub(crate) fn configure(
         &mut self,
-        now: Instant,
+        now: Duration,
         data_rate: u64,
         padding_rate: u64,
         burst_window: Duration,
     ) {
         let padding_rate = padding_rate.min(data_rate);
-        // SetPacerConfig changes rates, not the last processed time or byte debt.
+        // Pinned SetPacerConfig changes rates, not the processing cursor or
+        // byte debt. A later deadline reprices the outstanding debt at the new
+        // rate from that cursor, which can make it due sooner than before.
         self.data_rate = data_rate;
         self.configured_data_rate = data_rate;
         self.padding_rate = padding_rate;
@@ -71,11 +73,11 @@ impl Pacer {
         self.data_rate
     }
 
-    pub(crate) fn eligible(&self, now: Instant) -> bool {
+    pub(crate) fn eligible(&self, now: Duration) -> bool {
         self.next_deadline().is_some_and(|deadline| deadline <= now)
     }
 
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+    pub(crate) fn next_deadline(&self) -> Option<Duration> {
         if self.data_rate == 0 {
             return None;
         }
@@ -90,7 +92,7 @@ impl Pacer {
         at.checked_add(if drain < burst { Duration::ZERO } else { drain })
     }
 
-    pub(crate) fn padding_deadline(&self) -> Option<Instant> {
+    pub(crate) fn padding_deadline(&self) -> Option<Duration> {
         if self.padding_quantum_bytes() == 0 {
             return None;
         }
@@ -105,7 +107,7 @@ impl Pacer {
 
     /// One native GeneratePadding request, served incrementally through the
     /// caller's bounded prepare/commit loop, never through a second pacer.
-    pub(crate) fn prepare_padding(&mut self, now: Instant) -> Option<usize> {
+    pub(crate) fn prepare_padding(&mut self, now: Duration) -> Option<usize> {
         let Some(due) = self.padding_deadline() else {
             self.process_idle(now);
             return None;
@@ -115,26 +117,26 @@ impl Pacer {
             return None;
         }
         if self.padding_remaining == 0 {
-            let earliest = now.checked_sub(MAX_PADDING_REPLAY).unwrap_or(now);
+            let earliest = now.saturating_sub(MAX_PADDING_REPLAY);
             self.advance(due.max(earliest));
             self.padding_remaining = self.padding_quantum_bytes();
         }
         Some(self.padding_remaining)
     }
 
-    pub(crate) fn process_idle(&mut self, now: Instant) {
+    pub(crate) fn process_idle(&mut self, now: Duration) {
         self.advance(now);
     }
 
-    pub(crate) fn commit(&mut self, now: Instant, wire_bytes: usize) {
+    pub(crate) fn commit(&mut self, now: Duration, wire_bytes: usize) {
         self.padding_remaining = 0;
         // Newly arriving media cannot bank unlimited idle-time credit.
         self.advance(now);
         self.charge_sent(wire_bytes);
     }
 
-    pub(crate) fn commit_padding(&mut self, now: Instant, wire_bytes: usize) {
-        let earliest = now.checked_sub(MAX_PADDING_REPLAY).unwrap_or(now);
+    pub(crate) fn commit_padding(&mut self, now: Duration, wire_bytes: usize) {
+        let earliest = now.saturating_sub(MAX_PADDING_REPLAY);
         self.advance(earliest);
         self.padding_remaining = self.padding_remaining.saturating_sub(wire_bytes);
         self.charge_sent(wire_bytes);
@@ -147,15 +149,12 @@ impl Pacer {
         self.padding_remaining = 0;
     }
 
-    fn advance(&mut self, at: Instant) {
+    fn advance(&mut self, at: Duration) {
         let previous = *self.processed_at.get_or_insert(at);
         if at <= previous {
             return;
         }
-        let elapsed = at
-            .saturating_duration_since(previous)
-            .min(MAX_ELAPSED)
-            .as_nanos();
+        let elapsed = at.saturating_sub(previous).min(MAX_ELAPSED).as_nanos();
         self.media_debt = self
             .media_debt
             .saturating_sub(u128::from(self.data_rate).saturating_mul(elapsed));
@@ -163,6 +162,14 @@ impl Pacer {
             .padding_debt
             .saturating_sub(u128::from(self.padding_rate).saturating_mul(elapsed));
         self.processed_at = Some(at);
+    }
+
+    pub(crate) fn padding_request_bytes(&self) -> usize {
+        if self.padding_remaining > 0 {
+            self.padding_remaining
+        } else {
+            self.padding_quantum_bytes()
+        }
     }
 
     fn padding_quantum_bytes(&self) -> usize {
@@ -177,11 +184,9 @@ impl Pacer {
         self.media_debt = self
             .media_debt
             .saturating_add((bytes as u128).saturating_mul(DEBT_PER_BYTE))
-            .min(u128::from(self.data_rate).saturating_mul(MAX_DEBT.as_nanos()));
+            .min(debt_limit(self.data_rate));
         self.charge_padding(bytes);
-        self.charged_bytes = self
-            .charged_bytes
-            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        self.charged_bytes = self.charged_bytes.saturating_add(bytes as u128);
     }
 
     fn charge_padding(&mut self, bytes: usize) {
@@ -191,9 +196,18 @@ impl Pacer {
             .min(u128::from(self.padding_rate).saturating_mul(MAX_DEBT.as_nanos()));
     }
 
-    #[cfg(test)]
-    pub(crate) const fn charged_bytes(&self) -> u64 {
+    pub(crate) const fn charged_bytes(&self) -> u128 {
         self.charged_bytes
+    }
+}
+
+fn debt_limit(rate: u64) -> u128 {
+    // A zero rate cannot be used as a zero-byte accounting cap: accepted
+    // departures may arrive before configuration or while the path is down.
+    if rate == 0 {
+        u128::MAX
+    } else {
+        u128::from(rate).saturating_mul(MAX_DEBT.as_nanos())
     }
 }
 
@@ -205,22 +219,45 @@ fn drain_time(debt: u128, rate: u64) -> Duration {
             Duration::MAX
         };
     }
-    Duration::from_nanos(u64::try_from(debt.div_ceil(u128::from(rate))).unwrap_or(u64::MAX))
+    let nanos = debt.div_ceil(u128::from(rate));
+    let seconds = nanos / 1_000_000_000;
+    let remainder = nanos % 1_000_000_000;
+    match u64::try_from(seconds) {
+        Ok(seconds) => Duration::new(seconds, u32::try_from(remainder).unwrap_or(999_999_999)),
+        Err(_) => Duration::MAX,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn pacer(at: Instant, data: u64, padding: u64, window_ms: u64) -> Pacer {
+    fn pacer(at: Duration, data: u64, padding: u64, window_ms: u64) -> Pacer {
         let mut pacer = Pacer::default();
         pacer.configure(at, data, padding, Duration::from_millis(window_ms));
         pacer
     }
 
     #[test]
+    fn large_debt_does_not_truncate_drain_deadline() {
+        let nanos = u128::from(u64::MAX).saturating_add(1);
+        let drain = drain_time(nanos, 1);
+        assert_eq!(drain.as_nanos(), nanos);
+    }
+
+    #[test]
+    fn accepted_bytes_before_configuration_survive_a_zero_rate() {
+        let mut pacer = Pacer::default();
+        pacer.commit(Duration::ZERO, 10_000);
+        assert_eq!(pacer.charged_bytes(), 10_000);
+        pacer.configure(Duration::ZERO, 80_000, 0, Duration::ZERO);
+        assert!(!pacer.eligible(Duration::ZERO));
+        assert_eq!(pacer.next_deadline(), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn long_queue_drains_at_native_rate_without_padding_or_debt_refund() {
-        let now = Instant::now();
+        let now = Duration::from_secs(100);
         let mut pacer = pacer(now, 80_000, 40_000, 40);
         pacer.commit(now, 100);
         let media_debt = pacer.media_debt;
@@ -240,7 +277,7 @@ mod tests {
 
     #[test]
     fn every_committed_rtp_byte_charges_both_native_debts_once() {
-        let now = Instant::now();
+        let now = Duration::from_secs(100);
         let mut pacer = pacer(now, 80_000, 40_000, 40);
         pacer.commit(now, 100);
         assert_eq!(pacer.media_debt, 100 * DEBT_PER_BYTE);
@@ -257,7 +294,7 @@ mod tests {
 
     #[test]
     fn burst_can_overshoot_by_one_packet_then_drains_fully() {
-        let now = Instant::now();
+        let now = Duration::from_secs(100);
         let mut pacer = pacer(now, 80_000, 0, 40);
         pacer.commit(now, 300);
         assert!(pacer.eligible(now));
@@ -273,7 +310,7 @@ mod tests {
 
     #[test]
     fn rate_changes_reprice_byte_debt_without_clearing_it() {
-        let now = Instant::now();
+        let now = Duration::from_secs(100);
         for (data, padding, media_ms, padding_ms) in
             [(160_000, 80_000, 50, 100), (40_000, 20_000, 200, 400)]
         {
@@ -300,7 +337,7 @@ mod tests {
 
     #[test]
     fn disabled_padding_freezes_debt_until_a_send_applies_the_zero_rate_cap() {
-        let now = Instant::now();
+        let now = Duration::from_secs(100);
         for send in [false, true] {
             let mut pacer = pacer(now, 80_000, 40_000, 0);
             pacer.commit(now, 500);
@@ -326,7 +363,7 @@ mod tests {
 
     #[test]
     fn padding_generation_is_a_five_ms_quantum_not_a_second_pacer() {
-        let now = Instant::now();
+        let now = Duration::from_secs(100);
         let mut pacer = pacer(now, 8_800_000, 8_000_000, 40);
         let mut packets = 0;
         while pacer.prepare_padding(now).is_some() {
@@ -346,7 +383,7 @@ mod tests {
 
     #[test]
     fn failed_generation_only_charges_padding_budget_not_wire_bytes() {
-        let now = Instant::now();
+        let now = Duration::from_secs(100);
         let mut pacer = pacer(now, 8_800_000, 8_000_000, 40);
         assert_eq!(pacer.prepare_padding(now), Some(5_000));
         pacer.padding_unavailable();
@@ -361,7 +398,7 @@ mod tests {
 
     #[test]
     fn stale_padding_processing_replays_at_most_fifty_ms_and_one_quantum() {
-        let now = Instant::now();
+        let now = Duration::from_secs(100);
         let mut pacer = pacer(now, 880_000, 800_000, 40);
         assert_eq!(pacer.prepare_padding(now), Some(500));
         pacer.commit_padding(now, 500);
@@ -381,7 +418,7 @@ mod tests {
 
     #[test]
     fn idle_media_does_not_bank_credit_and_debts_are_capped_on_send() {
-        let now = Instant::now();
+        let now = Duration::from_secs(100);
         let mut pacer = pacer(now, 80_000, 40_000, 0);
         pacer.commit(now, 500);
         pacer.commit(now + Duration::from_secs(1), 500);

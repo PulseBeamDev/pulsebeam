@@ -81,11 +81,11 @@ mod tests {
         }
         assert!(loss.congested());
         loss.update(Duration::from_millis(100), 0, 0, Duration::ZERO, DEFAULT);
-        assert_eq!(loss.congestion_level, 0.5);
+        assert_eq!(loss.congestion_level.to_bits(), 0.5_f64.to_bits());
         loss.update(Duration::from_millis(125), 1, 0, Duration::ZERO, DEFAULT);
         assert!((loss.congestion_level - (0.5 + 1.0 / 3.0)).abs() < 1e-9);
         loss.update(Duration::from_millis(126), 0, 1, Duration::ZERO, DEFAULT);
-        assert_eq!(loss.congestion_level, 0.0);
+        assert_eq!(loss.congestion_level.to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub struct Connection {
     transport: Transport,
     ingress: IngressOwner,
     egress: MediaEgress,
+    controller_feedback: Vec<crate::congestion::FeedbackSample>,
     sctp: Option<Association>,
     service: ServiceArbiter,
     commit: CommitCoordinator,
@@ -108,7 +109,11 @@ impl CommitCoordinator {
         }
         self.history.commit_preflighted(context);
         if let Some(egress) = egress {
-            egress.commit(at, &prepared);
+            egress.commit(
+                at,
+                &prepared,
+                self.history.controller_inputs().bytes_in_flight,
+            );
         }
         let bytes = u64::try_from(context.wire_len).unwrap_or(u64::MAX);
         match context.kind {
@@ -571,36 +576,37 @@ impl Connection {
                 .request_repair(repair.media_ssrc, repair.sequence);
         }
 
-        let (path_change, feedback, feedback_hold, fresh_network_feedback, bytes_in_flight) = {
-            let inputs = self.commit.history.controller_inputs();
-            let received_at = inputs.timing.map_or(at, |timing| timing.received_at);
-            let origin = self.egress.controller_origin();
-            (
-                inputs
-                    .path_change
-                    .map(|change| (change.epoch.value(), change.available)),
-                inputs
-                    .feedback
-                    .iter()
-                    .chain(&inputs.synthetic)
-                    .map(|feedback| feedback.controller_sample(received_at, origin))
-                    .collect::<Vec<_>>(),
-                inputs
-                    .timing
-                    .and_then(|timing| timing.feedback_hold)
-                    .unwrap_or_default(),
-                inputs.fresh_network_feedback,
-                inputs.bytes_in_flight,
-            )
-        };
-        let application_limited = self.egress.update_controller(
+        let inputs = self.commit.history.controller_inputs();
+        let received_at = inputs.timing.map_or(at, |timing| timing.received_at);
+        let origin = self.egress.controller_origin();
+        self.controller_feedback.clear();
+        self.controller_feedback.extend(
+            inputs
+                .feedback
+                .iter()
+                .chain(&inputs.synthetic)
+                .map(|feedback| feedback.controller_sample(received_at, origin)),
+        );
+        let path_change = inputs
+            .path_change
+            .map(|change| (change.epoch.value(), change.available));
+        let feedback_hold = inputs
+            .timing
+            .and_then(|timing| timing.feedback_hold)
+            .unwrap_or_default();
+        let fresh_network_feedback = inputs.fresh_network_feedback;
+        let bytes_in_flight = inputs.bytes_in_flight;
+        let Ok(application_limited) = self.egress.update_controller(
             at,
             path_change,
-            &feedback,
+            &self.controller_feedback,
             feedback_hold,
             fresh_network_feedback,
             bytes_in_flight,
-        );
+        ) else {
+            self.lifecycle = Lifecycle::Closed(CloseReason::TransportFailure);
+            return Output::Closed(CloseReason::TransportFailure);
+        };
         self.commit.history.clear_controller_inputs();
         self.commit
             .history
@@ -975,6 +981,7 @@ impl Connection {
             transport,
             ingress,
             egress,
+            controller_feedback: Vec::new(),
             sctp,
             service: ServiceArbiter::default(),
             commit: CommitCoordinator::new(feedback, config.limits.max_sent_history_bytes)
@@ -1115,6 +1122,27 @@ mod tests {
         assert_eq!(connection.stats().connection.queued_media_bytes, 0);
     }
 
+    fn cc_checkpoint(label: &str, fixture: &PeerFixture) {
+        let connection = &fixture.connection;
+        let now = fixture.at();
+        eprintln!(
+            "CC_TRACE {label} commits={:016x} pacing={} nominal={} flight={} peak={} wake={:?} envelope={:?}",
+            connection.egress.test_commit_trace(),
+            connection.egress.test_effective_pacing_rate(),
+            connection.egress.test_nominal_pacing_rate(),
+            connection.stats().connection.rtp_bytes_in_flight,
+            connection.egress.test_flight_peak(),
+            connection
+                .egress
+                .next_deadline(now)
+                .map(|at| at.saturating_duration_since(now)),
+            connection
+                .egress
+                .test_envelope()
+                .expect("controller envelope"),
+        );
+    }
+
     #[test]
     fn aggregate_demand_obtains_native_rtx_feedback_without_primary_media() {
         let mut fixture = PeerFixture::connected_video().without_egress_observation();
@@ -1177,6 +1205,7 @@ mod tests {
                 !envelope.feedback_stale && envelope.delivered_rtp_transport_rate > 0;
             if tick % 20 == 0 {
                 trace.push((tick / 20, envelope));
+                cc_checkpoint(&format!("padding-{}", tick / 20), &fixture);
             }
         }
         let stats = fixture.connection.stats().connection;
@@ -1198,6 +1227,7 @@ mod tests {
             "aggregate-demand feedback: stats={stats:?} trace={trace:?}",
         );
         fixture.drive_for(Duration::from_secs(22));
+        cc_checkpoint("bootstrap", &fixture);
         let bootstrap = fixture.connection.stats().connection;
         assert_eq!(bootstrap.transmitted_rtp_bytes, 0);
         assert!(
@@ -1224,6 +1254,37 @@ mod tests {
                 .transmitted_padding_bytes,
             padding
         );
+        cc_checkpoint("padding-paused", &fixture);
+
+        fixture.record_transmits();
+        let mid = fixture.sender_mid.clone();
+        let at = fixture.at();
+        fixture
+            .connection
+            .write_rtp(at, &mid, sample(at, 42, 200, 90_000))
+            .expect("primary for repair");
+        fixture.drive_for(Duration::from_millis(100));
+        cc_checkpoint("repair-original", &fixture);
+        let ssrc = fixture
+            .connection
+            .stats()
+            .senders
+            .iter()
+            .find(|sender| sender.mid.as_ref() == mid.as_str())
+            .expect("video sender")
+            .ssrc;
+        fixture.connection.egress.request_repair(ssrc, 42);
+        fixture.drive_for(Duration::from_millis(100));
+        assert_eq!(
+            fixture
+                .take_transmit_observations()
+                .iter()
+                .filter(|(_, kind)| matches!(kind, crate::TransmitKind::Repair { .. }))
+                .count(),
+            1,
+            "one requested repair must commit through the shared RTP budget"
+        );
+        cc_checkpoint("repair", &fixture);
     }
 
     #[test]
@@ -1292,6 +1353,10 @@ mod tests {
                 fixture.connection.stats().connection
             );
             assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > before);
+            cc_checkpoint(
+                &format!("no-rtx-{feedback_enabled}-{replace_path}"),
+                &fixture,
+            );
         }
         fixture
             .connection
@@ -1314,6 +1379,7 @@ mod tests {
             .egress
             .test_envelope()
             .expect("quiet native output");
+        cc_checkpoint("no-rtx-paused", &fixture);
         assert!(quiet.feedback_stale);
         // No packets means no new native ALR or window evidence. Polling must
         // neither manufacture classification nor decay nominal capacity.
@@ -1338,6 +1404,7 @@ mod tests {
                 Err(error) => panic!("unexpected media error: {error:?}"),
             }
         }
+        cc_checkpoint("no-rtx-resumed", &fixture);
         assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > paused);
         assert!(
             !fixture
@@ -1535,6 +1602,7 @@ mod tests {
             fixture.drive_for(Duration::from_millis(2));
         }
         let end = fixture.at();
+        cc_checkpoint("capacity-queued", &fixture);
         let stable_start = start + Duration::from_secs(2);
         let cohort = fixture
             .emitted_rtp()
@@ -1620,6 +1688,7 @@ mod tests {
         );
         // Native transport pacing exceeds the payload estimate. The removed payload
         // pacer imposed the old 10 ms excess-sojourn bound, not SCReAM itself.
+        cc_checkpoint("capacity-drained", &fixture);
     }
 
     #[test]
@@ -1666,10 +1735,22 @@ mod tests {
             fixture.connection.egress.test_envelope()
         );
         assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > 0);
+        cc_checkpoint("sparse-alr", &fixture);
     }
     #[test]
     fn poll_observes_committed_flight_before_batched_ack_retirement() {
-        use crate::rtcp::{FeedbackBatch, FeedbackReport, TwccStatus};
+        for kind in [
+            PacketFeedbackKind::TransportWide,
+            PacketFeedbackKind::Rfc8888,
+        ] {
+            batched_feedback_retires_committed_flight(kind);
+        }
+    }
+
+    fn batched_feedback_retires_committed_flight(kind: PacketFeedbackKind) {
+        use crate::rtcp::{
+            ArrivalOffset, FeedbackBatch, FeedbackReport, Rfc8888Report, Rfc8888Status, TwccStatus,
+        };
         use crate::transport::{PreparedRtpIdentity, RtpService};
 
         let mut fixture = PeerFixture::connected();
@@ -1680,8 +1761,8 @@ mod tests {
             .history
             .test_active_epoch()
             .expect("connected path");
-        fixture.connection.commit.history =
-            SentHistory::new(crate::PacketFeedbackKind::TransportWide);
+        // Parsed report injection does not claim native RFC 8888 interoperability.
+        fixture.connection.commit.history = SentHistory::new(kind);
         fixture.connection.commit.history.path_changed(epoch, true);
         let _ = fixture.connection.poll(fixture.at());
         for sequence in 1..=16 {
@@ -1694,7 +1775,7 @@ mod tests {
                     ssrc: 7,
                     index: u64::from(sequence),
                     sequence,
-                    twcc_sequence: Some(sequence),
+                    twcc_sequence: (kind == PacketFeedbackKind::TransportWide).then_some(sequence),
                     service: RtpService::Padding,
                 }),
             };
@@ -1726,6 +1807,7 @@ mod tests {
             19_200
         );
         assert!(fixture.connection.egress.test_flight_peak() < 19_200);
+        cc_checkpoint(&format!("batched-{kind:?}-before"), &fixture);
         fixture.advance_clock_without_poll(Duration::from_millis(50));
         for feedback_count in 1..=8 {
             fixture
@@ -1735,16 +1817,34 @@ mod tests {
                     received_at: fixture.at(),
                     path_epoch: epoch,
                     sender_ssrc: 9,
-                    report: FeedbackReport::Twcc {
-                        media_ssrc: 7,
-                        base_sequence: 1,
-                        reference_time: 0,
-                        feedback_count,
-                        statuses: vec![TwccStatus::Received { delta_250us: 1 }; 16].into(),
+                    report: match kind {
+                        PacketFeedbackKind::TransportWide => FeedbackReport::Twcc {
+                            media_ssrc: 7,
+                            base_sequence: 1,
+                            reference_time: 0,
+                            feedback_count,
+                            statuses: vec![TwccStatus::Received { delta_250us: 1 }; 16].into(),
+                        },
+                        PacketFeedbackKind::Rfc8888 => FeedbackReport::Rfc8888 {
+                            reports: vec![Rfc8888Report {
+                                ssrc: 7,
+                                begin_sequence: 1,
+                                report_count: 16,
+                                statuses: (1..=16)
+                                    .rev()
+                                    .map(|ticks| Rfc8888Status::Received {
+                                        ecn: 0,
+                                        arrival_offset: ArrivalOffset::Ticks(ticks),
+                                    })
+                                    .collect(),
+                            }]
+                            .into(),
+                            report_timestamp: u32::from(feedback_count),
+                        },
                     },
                 });
         }
-        let mut immediate_yields = 0;
+        let mut immediate_yields = 0_usize;
         for _ in 0..32 {
             let output = fixture.connection.poll(fixture.at());
             assert!(
@@ -1755,7 +1855,7 @@ mod tests {
                 && let Output::Idle { next_wakeup } = output
             {
                 assert_eq!(next_wakeup, Some(fixture.at()));
-                immediate_yields += 1;
+                immediate_yields = immediate_yields.saturating_add(1);
             }
             if fixture.connection.commit.history.counters().received == 16
                 && !fixture.connection.ingress.has_pending_output()
@@ -1783,5 +1883,6 @@ mod tests {
                 < 19_200
         );
         assert_eq!(fixture.connection.egress.test_flight_peak(), 19_200);
+        cc_checkpoint(&format!("batched-{kind:?}-after"), &fixture);
     }
 }

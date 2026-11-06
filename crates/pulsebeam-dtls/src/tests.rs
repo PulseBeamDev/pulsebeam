@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use super::*;
 
+mod cc;
+
 fn test_start() -> Instant {
     Instant::now()
 }

@@ -19,32 +19,41 @@ use feedback::Feedback;
 use loss::LossEstimator;
 pub(super) use parameters::{DEFAULT as PARAMETERS, Parameters};
 
+/// ECN codepoint observed by the receiver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EcnMark {
+pub enum EcnMark {
     NotEct,
     Ect1,
     Ect0,
     Ce,
 }
 
+/// Origin of transport-history loss evidence, retained for host mappings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LossOrigin {
+pub enum LossOrigin {
     Reordering,
     HistoryExpiry,
 }
 
+/// Authenticated, normalized transport feedback for one sent packet.
+/// `sent_at` and `received_at` are host-relative send and feedback receipt
+/// times. Receiver arrival is a separate signed receiver-relative clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FeedbackSample {
-    pub(crate) sent_at: Duration,
-    pub(crate) received_at: Duration,
-    pub(crate) transport_bytes: u32,
-    pub(crate) received: bool,
-    pub(crate) newly_acked: bool,
+pub struct FeedbackSample {
+    pub sent_at: Duration,
+    pub received_at: Duration,
+    pub transport_bytes: u32,
+    pub received: bool,
+    /// First ACK-edge credit, which may include a nonreceived gap.
+    pub newly_acked: bool,
     /// First network loss report, distinct from final transport-history expiry.
-    pub(crate) lost: bool,
-    pub(crate) recovered: bool,
-    pub(crate) receiver_arrival_micros: Option<i64>,
-    pub(crate) ecn: Option<EcnMark>,
+    pub lost: bool,
+    /// A late receipt already credited at an earlier ACK edge.
+    pub recovered: bool,
+    /// Receiver-relative arrival time, or none when timing is ambiguous.
+    pub receiver_arrival_micros: Option<i64>,
+    /// Receiver ECN mark, present only for received packets.
+    pub ecn: Option<EcnMark>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +107,7 @@ pub(crate) struct Output {
 
 pub(crate) struct ScreamV2 {
     params: Parameters,
+    feedback_scratch: Vec<(FeedbackSample, i64, usize)>,
     target_bitrate: u64,
     ref_window: u64,
     ref_window_i: u64,
@@ -136,6 +146,7 @@ impl ScreamV2 {
     fn with_start(start: u64, params: Parameters) -> Self {
         Self {
             params,
+            feedback_scratch: Vec::new(),
             target_bitrate: start,
             ref_window: params.min_ref_window,
             ref_window_i: 1,
@@ -187,8 +198,7 @@ impl ScreamV2 {
         self.reason = ControllerReason::PathChanged;
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_flight_peak(&self) -> u64 {
+    pub(crate) fn flight_peak(&self) -> u64 {
         self.max_flight_this_rtt.max(self.max_flight_prev_rtt)
     }
 
@@ -208,7 +218,7 @@ impl ScreamV2 {
             .max()
             .unwrap_or(now)
             .min(now);
-        let feedback = Feedback::parse(now, input, self.params);
+        let feedback = Feedback::parse_reusing(now, input, self.params, &mut self.feedback_scratch);
         if feedback.num_received == 0 {
             return self.snapshot(input.target_bitrate_max);
         }
@@ -364,14 +374,14 @@ impl ScreamV2 {
                 backoff = self.scale_backoff(self.delay.virtual_alpha(self.params) / 2.0, flight);
                 self.reason = ControllerReason::Delay;
             }
-            if self.allow_initial_ref_window_clamping {
-                if let Some(received) = self.received_rate {
-                    let clamped =
-                        rate_bytes(received, self.delay.rtt.saturating_add(self.feedback_hold))
-                            .clamp(self.params.min_ref_window, self.ref_window);
-                    backoff = backoff.max(1.0 - clamped as f64 / self.ref_window as f64);
-                    self.allow_initial_ref_window_clamping = false;
-                }
+            if self.allow_initial_ref_window_clamping
+                && let Some(received) = self.received_rate
+            {
+                let clamped =
+                    rate_bytes(received, self.delay.rtt.saturating_add(self.feedback_hold))
+                        .clamp(self.params.min_ref_window, self.ref_window);
+                backoff = backoff.max(1.0 - clamped as f64 / self.ref_window as f64);
+                self.allow_initial_ref_window_clamping = false;
             }
             self.ref_window = scale(self.ref_window, 1.0 - backoff);
         }
@@ -628,7 +638,7 @@ mod tests {
         let mut core = ScreamV2::new(100_000_000, None);
         core.observe_bytes_in_flight(12_000);
         core.update(Duration::from_millis(100), input(&[sample(0, 50_000)]));
-        assert_eq!(core.test_flight_peak(), 12_000);
+        assert_eq!(core.flight_peak(), 12_000);
         let before = core.snapshot(100_000_000);
         core.update(Duration::from_secs(1), input(&[]));
         assert_eq!(core.snapshot(100_000_000), before);
@@ -687,7 +697,10 @@ mod tests {
         let mut args = input(&data);
         args.ecn_mode = EcnMode::L4s;
         core.update(Duration::from_millis(100), args);
-        assert_eq!(core.l4s_alpha, PARAMETERS.l4s_avg_g / 4.0);
+        assert_eq!(
+            core.l4s_alpha.to_bits(),
+            (PARAMETERS.l4s_avg_g / 4.0).to_bits()
+        );
         let reaction = core.last_congestion_reaction;
         core.update(Duration::from_millis(101), input(&[sample(1, 51_000)]));
         assert_eq!(core.last_congestion_reaction, reaction);

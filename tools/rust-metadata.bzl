@@ -8,6 +8,7 @@ CARGO_METADATA_INPUTS = [
     "//crates/pulsebeam-proto:cargo_metadata_inputs",
     "//crates/pulsebeam-steer:cargo_metadata_inputs",
     "//crates/pulsebeam-rtc:cargo_metadata_inputs",
+    "//crates/pulsebeam-cc:cargo_metadata_inputs",
     "//crates/pulsebeam-libwebrtc-sys:cargo_metadata_inputs",
     "//crates/pulsebeam-rtc/simulation:cargo_metadata_inputs",
     "//crates/pulsebeam-runtime:cargo_metadata_inputs",

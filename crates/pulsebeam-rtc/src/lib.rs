@@ -6,7 +6,6 @@ mod id;
 mod ingress;
 mod io;
 mod negotiation;
-mod pacer;
 mod packet;
 mod receive_feedback;
 mod receive_stream;

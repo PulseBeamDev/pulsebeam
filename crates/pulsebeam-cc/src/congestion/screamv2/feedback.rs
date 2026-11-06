@@ -4,7 +4,9 @@
 
 use std::time::Duration;
 
-use super::{ControllerInput, EcnMark, EcnMode, micros_i128, parameters::Parameters};
+use super::{
+    ControllerInput, EcnMark, EcnMode, FeedbackSample, micros_i128, parameters::Parameters,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DelayMetrics {
@@ -27,10 +29,20 @@ pub(super) struct Feedback {
 }
 
 impl Feedback {
+    #[cfg(test)]
     pub fn parse(now: Duration, input: ControllerInput<'_>, params: Parameters) -> Self {
+        Self::parse_reusing(now, input, params, &mut Vec::new())
+    }
+
+    pub fn parse_reusing(
+        now: Duration,
+        input: ControllerInput<'_>,
+        params: Parameters,
+        timed: &mut Vec<(FeedbackSample, i64, usize)>,
+    ) -> Self {
         let mut parsed = Self::default();
-        let mut timed = Vec::new();
-        for sample in input.feedback {
+        timed.clear();
+        for (index, sample) in input.feedback.iter().enumerate() {
             let ce = input.ecn_mode != EcnMode::Disabled && sample.ecn == Some(EcnMark::Ce);
             // SentHistory already owns ACK-edge credit, including unreported gaps.
             // A late recovery must not grant that same transport credit a second time.
@@ -51,7 +63,7 @@ impl Feedback {
                 parsed.num_received = parsed.num_received.saturating_add(1);
                 parsed.num_ce = parsed.num_ce.saturating_add(u64::from(ce));
                 if let Some(arrival) = sample.receiver_arrival_micros {
-                    timed.push((sample, arrival));
+                    timed.push((*sample, arrival, index));
                 }
             }
         }
@@ -60,21 +72,22 @@ impl Feedback {
         }
         // Native PacketResults are in send order. RFC 8888 can join several
         // SSRC reports, so normalize that private adapter boundary here.
-        timed.sort_by_key(|(sample, _)| sample.sent_at);
+        // Original index preserves stable send-time ties without sorting scratch allocation.
+        timed.sort_unstable_by_key(|(sample, _, index)| (sample.sent_at, *index));
         let first = timed
             .iter()
-            .min_by_key(|(sample, arrival)| (*arrival, sample.sent_at));
+            .min_by_key(|(sample, arrival, _)| (*arrival, sample.sent_at));
         let last = timed
             .iter()
-            .max_by_key(|(sample, arrival)| (*arrival, sample.sent_at));
+            .max_by_key(|(sample, arrival, _)| (*arrival, sample.sent_at));
         let latest_send = timed
             .last()
-            .map(|(sample, _)| sample.sent_at)
+            .map(|(sample, _, _)| sample.sent_at)
             .unwrap_or_default();
         let mut newer_send = latest_send;
         let mut min_delay = i128::MAX;
         let mut max_delay = i128::MIN;
-        for (sample, arrival) in timed.iter().rev() {
+        for (sample, arrival, _) in timed.iter().rev() {
             let delta = latest_send.saturating_sub(sample.sent_at);
             let gap = newer_send.saturating_sub(sample.sent_at);
             if delta > params.burst_window_min
@@ -87,7 +100,7 @@ impl Feedback {
             max_delay = max_delay.max(delay);
             newer_send = sample.sent_at;
         }
-        if let (Some((_, first_arrival)), Some((last_sample, last_arrival))) = (first, last) {
+        if let (Some((_, first_arrival, _)), Some((last_sample, last_arrival, _))) = (first, last) {
             let span = Duration::from_micros(
                 u64::try_from(i128::from(*last_arrival) - i128::from(*first_arrival))
                     .unwrap_or(u64::MAX),

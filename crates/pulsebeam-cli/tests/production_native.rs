@@ -1,5 +1,5 @@
 //! One production constructor/HTTP/kernel-socket witness, not a media matrix.
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use pulsebeam_agent_native::agent_core::{
     AgentConfig, ConnectionState, DesiredState, Generation, TrackSelector, TrackSpec,
     VideoObservation,
@@ -136,7 +136,14 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
         tokio::try_join!(connected(&publisher), connected(&subscriber))?;
         anyhow::Ok(())
     })
-    .await??;
+    .await
+    .with_context(|| {
+        format!(
+            "production agents did not connect: publisher={:?}, subscriber={:?}",
+            publisher.snapshot().connection,
+            subscriber.snapshot().connection,
+        )
+    })??;
 
     camera.ready().await?;
     let mut producer = tokio::spawn(produce_i420(camera));
@@ -179,8 +186,8 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
     if !matches!(&close, Ok(Ok(()))) {
         let _ = tokio::join!(publisher.abort(), subscriber.abort());
     }
-    let pixels = media??;
-    close??;
+    let pixels = media.context("production decoded media did not arrive")??;
+    close.context("production agents did not close")??;
     let observation = observation.ok_or_else(|| anyhow!("missing production observation"))?;
     ensure!(
         matches!(observation.next().await, MediaStreamUpdate::Closed),
@@ -220,7 +227,9 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
         .arg(&endpoint)
         .arg(&foreign.session.token)
         .kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(20), command.output()).await??;
+    let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+        .await
+        .context("generated foreign RTC witness did not finish")??;
     ensure!(
         output.status.success(),
         "generated foreign RTC witness failed: {}",

@@ -14,10 +14,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     Event, MediaKind, MediaPayloadBitrate, RtpWrite, SenderStats, WriteError,
     congestion::{
-        ControllerInput, EcnValidation, FeedbackSample, SafeRtpEnvelope, ScreamController,
+        Config, ControllerInput, EcnValidation, FeedbackSample, Readiness, SafeRtpEnvelope,
+        ScreamController, UpdateError,
     },
     negotiation::EgressSenderFacts,
-    pacer::Pacer,
     packet::RtpPacket,
     scheduler::SenderScheduler,
     time::ProtocolClock,
@@ -66,7 +66,8 @@ pub(crate) struct MediaEgress {
     next_repair_request: Option<u64>,
     next_twcc: u64,
     pending: Option<PendingTransmit>,
-    pacer: Pacer,
+    #[cfg(test)]
+    commit_trace: std::collections::hash_map::DefaultHasher,
     last_send_attempt: Option<Instant>,
     scheduler: SenderScheduler,
     controller: ScreamController,
@@ -232,7 +233,6 @@ impl MediaEgress {
                 )
             })
             .collect();
-        let desired = 0;
         let twcc_seed = sender_seed(randomness, u64::MAX);
         let next_sender = senders
             .last_key_value()
@@ -291,10 +291,12 @@ impl MediaEgress {
             next_repair_request: Some(0),
             next_twcc: u64::from(u16::from_be_bytes([twcc_seed[0], twcc_seed[1]])),
             pending: None,
-            pacer: Pacer::default(),
+            #[cfg(test)]
+            commit_trace: std::collections::hash_map::DefaultHasher::new(),
             last_send_attempt: None,
             scheduler: SenderScheduler::default(),
-            controller: ScreamController::new(desired, None),
+            controller: ScreamController::new(Config::default())
+                .map_err(|_| crate::AcceptError::InvalidConfiguration)?,
             controller_origin: accepted_at,
             envelope: None,
             active_path: None,
@@ -312,12 +314,7 @@ impl MediaEgress {
             offered_rate: 0,
             rtp_bytes_in_flight: 0,
         };
-        owner.update_estimate(
-            owner
-                .controller
-                .snapshot(desired, 0, 0)
-                .target_media_payload_rate,
-        );
+        owner.update_estimate(owner.controller.snapshot().target_media_payload_rate);
         owner.estimate_changed = None;
         Ok(owner)
     }
@@ -792,7 +789,23 @@ impl MediaEgress {
 
     #[cfg(test)]
     pub(crate) fn test_flight_peak(&self) -> u64 {
-        self.controller.test_flight_peak()
+        self.controller.diagnostics().flight_peak
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_nominal_pacing_rate(&self) -> u64 {
+        self.controller.snapshot().nominal_pacing_transport_rate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_effective_pacing_rate(&self) -> u64 {
+        self.controller.snapshot().pacing_transport_rate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_commit_trace(&self) -> u64 {
+        use std::hash::Hasher;
+        self.commit_trace.finish()
     }
 
     pub(crate) fn observe_bytes_in_flight(&mut self, bytes: u64) {
@@ -807,11 +820,8 @@ impl MediaEgress {
         feedback_hold: Duration,
         fresh_network_feedback: bool,
         bytes_in_flight: u64,
-    ) -> bool {
+    ) -> Result<bool, UpdateError> {
         if let Some((epoch, available)) = path_change {
-            if self.active_path.is_some_and(|previous| previous != epoch) {
-                self.pacer.reset();
-            }
             self.active_path = Some(epoch);
             self.path_available = available;
             self.offer_window_started = at;
@@ -842,21 +852,15 @@ impl MediaEgress {
                 desired_media_rate: desired,
                 ecn: EcnValidation::default(),
             },
-        );
+        )?;
         self.advance_queue_time(at);
         self.queue_paused =
             !self.path_available || bytes_in_flight >= output.max_rtp_bytes_in_flight;
-        self.pacer.configure(
-            at,
-            output.pacing_transport_rate,
-            output.padding_transport_rate,
-            output.pacing_window,
-        );
         self.rtp_bytes_in_flight = bytes_in_flight;
         self.envelope = Some(output);
         self.refresh_pacer_queue(at);
         self.update_estimate(output.target_media_payload_rate);
-        output.application_limited
+        Ok(output.application_limited)
     }
 
     pub(crate) fn request_keyframe(&mut self, request: crate::rtcp::KeyframeRequest) {
@@ -1036,7 +1040,6 @@ impl MediaEgress {
             .runtime_bytes
             .saturating_sub(self.original_workspace.capacity());
         self.original_workspace = Vec::new();
-        self.pacer.reset();
     }
 
     pub(crate) fn stats(&self) -> (EgressStats, Vec<SenderStats>) {
@@ -1087,8 +1090,9 @@ impl MediaEgress {
             return result;
         }
         self.last_send_attempt = Some(at);
-        if !self.pacer.eligible(at) {
-            self.pacer.process_idle(at);
+        let now = at.saturating_duration_since(self.controller_origin);
+        if self.controller.ready(now, bytes_in_flight, 1) != Readiness::Ready {
+            self.controller.process_idle(now);
             return PrepareResult::Blocked;
         }
         if let Some(envelope) = self.envelope
@@ -1175,11 +1179,13 @@ impl MediaEgress {
 
     pub(crate) fn preflight_commit(&self, prepared: &PreparedTransmit) -> bool {
         if prepared.kind == DatagramKind::Rtp
-            && self.envelope.is_some_and(|envelope| {
-                self.rtp_bytes_in_flight
-                    .saturating_add(prepared.wire_len as u64)
-                    > envelope.max_rtp_bytes_in_flight
-            })
+            && self.controller.ready(
+                self.last_send_attempt
+                    .unwrap_or(self.controller_origin)
+                    .saturating_duration_since(self.controller_origin),
+                self.rtp_bytes_in_flight,
+                prepared.wire_len,
+            ) != Readiness::Ready
         {
             return false;
         }
@@ -1232,18 +1238,38 @@ impl MediaEgress {
         prepared.rtp == Some(expected)
     }
 
-    pub(crate) fn commit(&mut self, at: Instant, prepared: &PreparedTransmit) {
+    pub(crate) fn commit(
+        &mut self,
+        at: Instant,
+        prepared: &PreparedTransmit,
+        post_send_flight: u64,
+    ) {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        match &pending {
-            PendingTransmit::Control => {}
-            PendingTransmit::Padding { .. } => self.pacer.commit_padding(at, prepared.wire_len),
-            _ => self.pacer.commit(at, prepared.wire_len),
+        #[cfg(test)]
+        if let Some(identity) = prepared.rtp {
+            use std::hash::Hash;
+            let service = match identity.service {
+                RtpService::Original => 0_u8,
+                RtpService::Repair => 1,
+                RtpService::Padding => 2,
+            };
+            (
+                at.saturating_duration_since(self.controller_origin),
+                service,
+                prepared.wire_len,
+            )
+                .hash(&mut self.commit_trace);
         }
         if !matches!(pending, PendingTransmit::Control) {
-            self.controller
-                .note_send(at.saturating_duration_since(self.controller_origin));
+            self.controller.commit_send(
+                at.saturating_duration_since(self.controller_origin),
+                prepared.wire_len,
+                post_send_flight,
+                matches!(pending, PendingTransmit::Padding { .. }),
+            );
+            self.rtp_bytes_in_flight = post_send_flight;
         }
         match pending {
             PendingTransmit::Original {
@@ -1353,31 +1379,99 @@ impl MediaEgress {
 
     pub(crate) fn next_deadline(&self, at: Instant) -> Option<Instant> {
         let queue_idle = self.queued_packets == 0 && self.repair_requests.is_empty();
+        let candidate = self
+            .next_packet_transport_bytes()
+            .map(|bytes| (self.rtp_bytes_in_flight, bytes));
+        let padding = queue_idle
+            .then(|| self.padding_transport_bytes())
+            .flatten()
+            .map(|bytes| (self.rtp_bytes_in_flight, bytes));
         [
             self.maintenance_deadline(at),
             (self.scheduler.deferred()
                 && !self.eligible.is_empty()
-                && self.pacer.eligible(at)
+                && candidate.is_some_and(|(flight, bytes)| {
+                    self.controller.ready(
+                        at.saturating_duration_since(self.controller_origin),
+                        flight,
+                        bytes,
+                    ) == Readiness::Ready
+                })
                 && self
                     .envelope
                     .is_some_and(|e| self.rtp_bytes_in_flight < e.max_rtp_bytes_in_flight))
             .then_some(at),
-            (!queue_idle)
-                .then(|| self.pacer.next_deadline())
-                .flatten()
-                .filter(|deadline| self.send_deadline_unattempted(*deadline)),
-            (queue_idle && self.path_available && self.padding_candidate().is_some())
-                .then(|| self.pacer.padding_deadline())
-                .flatten()
+            self.controller
+                .next_deadline(
+                    at.saturating_duration_since(self.controller_origin),
+                    candidate,
+                    padding,
+                )
+                .and_then(|deadline| self.controller_origin.checked_add(deadline))
                 .filter(|deadline| self.send_deadline_unattempted(*deadline)),
             (!self.rtcp_senders.is_empty()).then_some(self.next_rtcp),
             self.controller
-                .next_deadline()
+                .next_deadline(
+                    at.saturating_duration_since(self.controller_origin),
+                    None,
+                    None,
+                )
                 .and_then(|deadline| self.controller_origin.checked_add(deadline)),
         ]
         .into_iter()
         .flatten()
         .min()
+    }
+
+    fn next_packet_transport_bytes(&self) -> Option<usize> {
+        if let Some((_, key)) = self.repair_requests.first_key_value() {
+            let retained = self.retained_packet(*key)?;
+            let sender = self.senders.get(&key.sender)?;
+            let original = RtpPacket::parse(&retained.packet).ok()?;
+            let forwarded = original
+                .extensions()
+                .into_iter()
+                .flatten()
+                .filter(|extension| {
+                    sender.facts.dependency_extension_id == Some(extension.id())
+                        || sender
+                            .facts
+                            .forwarded_extensions
+                            .iter()
+                            .any(|(id, _)| *id == extension.id())
+                })
+                .map(|extension| (extension.id(), extension.value().len()));
+            let layout = layout::PacketLayout::new(
+                original.payload().len().checked_add(2)?,
+                forwarded.chain(repair_header_extensions(sender)),
+                sender_uses_one_byte_extensions(sender),
+            )?;
+            return layout.bytes.checked_add(RTP_TRANSPORT_ALLOWANCE);
+        }
+        let sender = self
+            .senders
+            .get(&self.scheduler.candidate(&self.eligible)?)?;
+        layout::PacketLayout::original(sender, &sender.queue.front()?.media)?
+            .bytes
+            .checked_add(RTP_TRANSPORT_ALLOWANCE)
+    }
+
+    fn padding_transport_bytes(&self) -> Option<usize> {
+        let sender = self.senders.get(&self.padding_candidate()?)?;
+        let header = layout::PacketLayout::new(
+            0,
+            repair_header_extensions(sender),
+            sender_uses_one_byte_extensions(sender),
+        )?
+        .bytes;
+        let padding = self
+            .controller
+            .padding_request_bytes()
+            .saturating_sub(header)
+            .clamp(1, 255);
+        header
+            .checked_add(padding)?
+            .checked_add(RTP_TRANSPORT_ALLOWANCE)
     }
 
     fn send_deadline_unattempted(&self, deadline: Instant) -> bool {
@@ -1419,7 +1513,8 @@ impl MediaEgress {
     #[cfg(test)]
     pub(crate) fn test_initial_probe_started_at(&self) -> Option<Instant> {
         self.controller
-            .initial_probe_started()
+            .diagnostics()
+            .initial_probe_started
             .and_then(|started| self.controller_origin.checked_add(started))
     }
 
@@ -1481,12 +1576,12 @@ impl MediaEgress {
         let average = age_sum
             .checked_div(self.queued_packets as u128)
             .unwrap_or_default();
-        self.pacer.update_queue(
+        self.controller.update_queue(
             self.queued_transport_bytes as u64,
             Duration::from_nanos(u64::try_from(average).unwrap_or(u64::MAX)),
         );
         if let Some(envelope) = &mut self.envelope {
-            envelope.pacing_transport_rate = self.pacer.transport_rate();
+            envelope.pacing_transport_rate = self.controller.snapshot().pacing_transport_rate;
         }
     }
 
@@ -1847,10 +1942,8 @@ impl MediaEgress {
 
     fn fits_send_window(&self, bytes_in_flight: u64, packet_len: usize) -> bool {
         self.envelope.is_some_and(|envelope| {
-            bytes_in_flight.saturating_add(
-                u64::try_from(packet_len.saturating_add(RTP_TRANSPORT_ALLOWANCE))
-                    .unwrap_or(u64::MAX),
-            ) <= envelope.max_rtp_bytes_in_flight
+            u128::from(bytes_in_flight) + packet_len as u128 + RTP_TRANSPORT_ALLOWANCE as u128
+                <= u128::from(envelope.max_rtp_bytes_in_flight)
         })
     }
 
@@ -1871,10 +1964,14 @@ impl MediaEgress {
             return PrepareResult::Blocked;
         }
         let Some(sender_index) = self.padding_candidate() else {
-            self.pacer.process_idle(at);
+            self.controller
+                .process_idle(at.saturating_duration_since(self.controller_origin));
             return PrepareResult::Blocked;
         };
-        let Some(requested) = self.pacer.prepare_padding(at) else {
+        let Some(requested) = self
+            .controller
+            .prepare_padding(at.saturating_duration_since(self.controller_origin))
+        else {
             return PrepareResult::Blocked;
         };
         let Some(sender) = self.senders.get(&sender_index) else {
@@ -1898,7 +1995,7 @@ impl MediaEgress {
             true,
             &[],
         ) else {
-            self.pacer.padding_unavailable();
+            self.controller.padding_unavailable();
             return PrepareResult::Fatal;
         };
         packet.pop();
@@ -1928,6 +2025,19 @@ impl MediaEgress {
             Err(_) => PrepareResult::Fatal,
         }
     }
+}
+
+fn repair_header_extensions(sender: &Sender) -> impl Iterator<Item = (u8, usize)> + Clone {
+    let mid = sender
+        .facts
+        .mid_extension_id
+        .map(|id| (id, sender.facts.mid.len()));
+    let rid = sender
+        .repaired_rid_extension_id
+        .zip(sender.rid.as_ref())
+        .map(|(id, rid)| (id, rid.len()));
+    let twcc = sender.facts.twcc_extension_id.map(|id| (id, 2));
+    mid.into_iter().chain(rid).chain(twcc)
 }
 
 fn padding_source(sender: &Sender) -> (u16, u8, u32) {
@@ -2226,6 +2336,8 @@ fn sender_report(sender: &Sender, at: Instant, clock: &ProtocolClock) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod cc;
     use std::time::UNIX_EPOCH;
 
     fn audio_egress(start: Instant) -> MediaEgress {
@@ -3482,8 +3594,10 @@ mod tests {
     fn admitted_queue_age_drains_native_media_without_changing_estimate() {
         let start = Instant::now();
         let mut egress = audio_egress(start);
-        egress.update_controller(start, Some((1, true)), &[], Duration::ZERO, false, 0);
-        let configured_rate = egress.pacer.transport_rate();
+        egress
+            .update_controller(start, Some((1, true)), &[], Duration::ZERO, false, 0)
+            .unwrap();
+        let configured_rate = egress.controller.snapshot().pacing_transport_rate;
         let nominal = egress.bandwidth_estimate;
         for sequence in 0..4 {
             egress
@@ -3501,21 +3615,26 @@ mod tests {
                 )
                 .unwrap();
         }
-        egress.update_controller(
-            start + Duration::from_millis(1_995),
-            None,
-            &[],
-            Duration::ZERO,
-            false,
-            0,
-        );
+        egress
+            .update_controller(
+                start + Duration::from_millis(1_995),
+                None,
+                &[],
+                Duration::ZERO,
+                false,
+                0,
+            )
+            .unwrap();
         let required = u64::try_from(egress.queued_transport_bytes).unwrap() * 1_600;
-        assert_eq!(egress.pacer.transport_rate(), required);
+        assert_eq!(egress.controller.snapshot().pacing_transport_rate, required);
         assert_eq!(egress.envelope.unwrap().pacing_transport_rate, required);
         assert_eq!(egress.bandwidth_estimate, nominal);
-        assert_eq!(egress.pacer.charged_bytes(), 0);
+        assert_eq!(egress.controller.diagnostics().charged_bytes, 0);
         egress.discard_pending("audio").unwrap();
-        assert_eq!(egress.pacer.transport_rate(), configured_rate);
+        assert_eq!(
+            egress.controller.snapshot().pacing_transport_rate,
+            configured_rate
+        );
         assert_eq!(egress.queue_enqueued_time_sum, 0);
     }
 
@@ -3523,8 +3642,10 @@ mod tests {
     fn queue_age_excludes_congestion_pause_and_averages_admission_times() {
         let start = Instant::now();
         let mut egress = audio_egress(start);
-        egress.update_controller(start, Some((1, true)), &[], Duration::ZERO, false, 0);
-        let configured_rate = egress.pacer.transport_rate();
+        egress
+            .update_controller(start, Some((1, true)), &[], Duration::ZERO, false, 0)
+            .unwrap();
+        let configured_rate = egress.controller.snapshot().pacing_transport_rate;
         let write = |sequence, at| RtpWrite {
             sequence,
             timestamp: 0,
@@ -3535,30 +3656,39 @@ mod tests {
         };
         egress.admit(start, "audio", write(0, start)).unwrap();
         let window = egress.envelope.unwrap().max_rtp_bytes_in_flight;
-        egress.update_controller(
-            start + Duration::from_millis(10),
-            None,
-            &[],
-            Duration::ZERO,
-            false,
-            window,
-        );
+        egress
+            .update_controller(
+                start + Duration::from_millis(10),
+                None,
+                &[],
+                Duration::ZERO,
+                false,
+                window,
+            )
+            .unwrap();
         let resumed = start + Duration::from_secs(10);
-        egress.update_controller(resumed, None, &[], Duration::ZERO, false, 0);
-        assert_eq!(egress.pacer.transport_rate(), configured_rate);
-        egress.admit(resumed, "audio", write(1, resumed)).unwrap();
-        egress.update_controller(
-            resumed + Duration::from_millis(1_989),
-            None,
-            &[],
-            Duration::ZERO,
-            false,
-            0,
+        egress
+            .update_controller(resumed, None, &[], Duration::ZERO, false, 0)
+            .unwrap();
+        assert_eq!(
+            egress.controller.snapshot().pacing_transport_rate,
+            configured_rate
         );
+        egress.admit(resumed, "audio", write(1, resumed)).unwrap();
+        egress
+            .update_controller(
+                resumed + Duration::from_millis(1_989),
+                None,
+                &[],
+                Duration::ZERO,
+                false,
+                0,
+            )
+            .unwrap();
         let required =
             u64::try_from(u128::try_from(egress.queued_transport_bytes).unwrap() * 8_000 / 6)
                 .unwrap();
-        assert_eq!(egress.pacer.transport_rate(), required);
+        assert_eq!(egress.controller.snapshot().pacing_transport_rate, required);
     }
 
     #[test]
@@ -3566,24 +3696,38 @@ mod tests {
         let start = Instant::now();
         let mut egress = audio_egress(start);
         egress.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(2_000_000)));
-        egress.update_controller(start, Some((1, true)), &[], Duration::ZERO, false, 0);
-        assert_eq!(egress.pacer.prepare_padding(start), Some(187));
-        egress.pacer.commit_padding(start, 200);
+        egress
+            .update_controller(start, Some((1, true)), &[], Duration::ZERO, false, 0)
+            .unwrap();
+        assert_eq!(egress.controller.prepare_padding(Duration::ZERO), Some(187));
+        egress
+            .controller
+            .commit_send(Duration::ZERO, 200, 200, true);
         egress.set_desired_bitrate(None);
-        egress.update_controller(
-            start + Duration::from_millis(1),
-            Some((1, false)),
-            &[],
-            Duration::ZERO,
-            false,
-            0,
-        );
+        egress
+            .update_controller(
+                start + Duration::from_millis(1),
+                Some((1, false)),
+                &[],
+                Duration::ZERO,
+                false,
+                0,
+            )
+            .unwrap();
         egress.discard_pending("audio").unwrap();
         egress.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(3_000_000)));
         let resumed = start + Duration::from_millis(2);
-        egress.update_controller(resumed, Some((1, true)), &[], Duration::ZERO, false, 0);
-        assert_eq!(egress.pacer.charged_bytes(), 200);
-        assert!(egress.pacer.padding_deadline().unwrap() > resumed);
+        egress
+            .update_controller(resumed, Some((1, true)), &[], Duration::ZERO, false, 0)
+            .unwrap();
+        assert_eq!(egress.controller.diagnostics().charged_bytes, 200);
+        assert!(
+            egress
+                .controller
+                .next_deadline(resumed.duration_since(start), None, Some((0, 200)))
+                .unwrap()
+                > resumed.duration_since(start)
+        );
         assert_eq!(egress.test_initial_probe_started_at(), Some(start));
     }
 

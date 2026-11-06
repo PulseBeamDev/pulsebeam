@@ -1,8 +1,10 @@
 # Congestion control and aggregate demand
 
-This contributor reference describes the private Rust SCReAMv2 implementation in
-`pulsebeam-rtc`. To review its provenance, run
-`crates/pulsebeam-rtc/scripts/verify-scream-profile.sh` from the repository root,
+This contributor reference describes RTC's integration with the transport-neutral
+Rust SCReAMv2 controller and single debt pacer in [pulsebeam-cc](../../pulsebeam-cc/README.md).
+RTC owns normalization, history, packet choice, encryption and accepted-transmit accounting.
+To review engine provenance, run
+`crates/pulsebeam-cc/scripts/verify-scream-profile.sh` from the repository root,
 then use the [owner verification targets](../README.md#contributor-verification).
 The script checks source identity, not Rust behavioral conformance.
 
@@ -33,7 +35,8 @@ Review authority is:
 3. the pinned native implementation, defaults and implementation-difference notes;
 4. the cited protocol specifications.
 
-The source map is:
+The source map is below. Controller and pacer paths are relative to
+`crates/pulsebeam-cc`; history and egress paths remain under `crates/pulsebeam-rtc`:
 
 | Pinned source | Rust owner |
 | --- | --- |
@@ -44,7 +47,7 @@ The source map is:
 | `loss_estimator.{cc,h}` | `src/congestion/screamv2/loss.rs` |
 | `scream_network_controller.{cc,h}` | `src/congestion.rs` |
 | `modules/congestion_controller/rtp/transport_feedback_adapter.cc` and `api/transport/network_types.h` | `src/sent_history/feedback.rs` |
-| `modules/pacing/pacing_controller.{cc,h}` | `src/pacer.rs` and `src/egress.rs` |
+| `modules/pacing/pacing_controller.{cc,h}` | CC `src/pacer.rs`; RTC `src/egress.rs` |
 
 SCReAM sources are under `modules/congestion_controller/scream/` upstream. The
 verification script pins their byte lengths and SHA-256 digests, the corresponding
@@ -54,6 +57,13 @@ the pacer sources, caller bitrate-allocation rules, and root `LICENSE`/`PATENTS`
 to verify the same artifacts without network access. Neither mode compiles C++.
 
 ## Demand, target and units
+
+RTC configures no application rate cap. The former 100 Mb/s policy is removed
+from construction, feedback updates, snapshots, route resets and padding demand
+history. Native startup remains 300 kb/s, with congestion-driven growth, window
+admission and pacing. Absence of demand is still zero speculative-padding demand,
+not unbounded demand or a target ceiling. CC separately supports an explicit
+positive finite maximum for other callers.
 
 `set_desired_bitrate(Option<MediaPayloadBitrate>)` is one aggregate application-
 demand hint. It is not an allocation, source binding, reservation or observation
@@ -148,7 +158,7 @@ the contemporaneous send window. Queue limits and transport accounting do not
 add a second delivery-feasibility or payload-rate budget.
 
 The complete private defaults live in
-[`parameters.rs`](../src/congestion/screamv2/parameters.rs). Important review
+[`parameters.rs`](../../pulsebeam-cc/src/congestion/screamv2/parameters.rs). Important review
 anchors are 60 ms queue-delay target, 25 ms virtual RTT, 1,280-byte MSS, three
 loss rounds before loss backoff, native 0.9 ALR threshold, three-second periodic
 padding duration and interval, and one-second post-congestion padding cooldown.
@@ -198,8 +208,10 @@ combined-capacity estimator.
 
 ## Verification scope
 
-The owner suite covers pinned core/default/adapter behavior, normalized feedback
-and history adversaries, native pacer debt and commit accounting, actual sparse
+CC owns pinned core/default/adapter and debt-pacer proof, bounded transactional
+feedback validation, numerical edges and virtual datagram-network behavior. DTLS
+owns a small real authenticated-ciphertext acceptance witness. RTC's owner suite
+covers normalized feedback and history adversaries, commit accounting, actual sparse
 media ALR, pre-ACK flight observation, and production connection/network paths.
 Controlled connection proof includes capacity steps, shared-bottleneck fairness,
 source-free RTX growth, no-RTX feedback outage, selected-path replacement, caller

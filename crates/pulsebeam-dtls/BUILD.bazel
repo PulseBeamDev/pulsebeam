@@ -26,7 +26,7 @@ rust_test(
     crate = ":pulsebeam-dtls",
     lint_config = ":lints",
     aliases = aliases(normal_dev = True),
-    deps = all_crate_deps(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True) + ["//crates/pulsebeam-cc:pulsebeam-cc"],
 )
 
 rustfmt_test(name = "format", targets = [":pulsebeam-dtls"])

@@ -24,6 +24,14 @@ impl SenderScheduler {
         self.deferred
     }
 
+    pub(crate) fn candidate(&self, eligible: &BTreeMap<u64, usize>) -> Option<u64> {
+        eligible
+            .range(self.cursor..)
+            .next()
+            .or_else(|| eligible.first_key_value())
+            .map(|(&sender, _)| sender)
+    }
+
     pub(crate) fn select(&mut self, eligible: &BTreeMap<u64, usize>) -> Option<u64> {
         self.deferred = false;
         for _ in 0..WORK_BUDGET {
