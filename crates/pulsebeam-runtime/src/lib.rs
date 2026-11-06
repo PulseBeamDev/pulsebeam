@@ -27,6 +27,7 @@ pub mod fatal;
 pub mod net;
 pub mod prelude;
 pub mod rand;
+pub mod role;
 pub mod rt;
 pub mod sync;
 pub mod system;

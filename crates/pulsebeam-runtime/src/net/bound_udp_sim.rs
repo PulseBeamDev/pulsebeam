@@ -1,13 +1,14 @@
 use super::{ReceiveTime, UdpMode};
 use crate::sync::Arc;
 use pulsebeam_steer::{FlowKey, FlowLookup, Verdict, steer_flow};
-use pulsebeam_udp::{BindOptions, BoundUdpSocket, Mode};
+use pulsebeam_udp::{BindOptions, BoundUdpSocket, Mode, simulation::Readiness};
 
 const SIM_FLOW_CAPACITY: usize = 4096;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 use std::sync::{Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::{
     io,
     net::{IpAddr, SocketAddr},
@@ -389,26 +390,38 @@ struct ReuseportGroup {
 pub(crate) struct ReuseportMember {
     group: Rc<ReuseportGroup>,
     index: usize,
+    readiness: RefCell<Option<Readiness<'static>>>,
 }
 
 impl ReuseportMember {
-    /// Resolve once the member's inbox has something in it.
-    pub(crate) async fn readable(&self) -> io::Result<()> {
+    /// Keep the notification registered while the owning service is parked.
+    pub(crate) fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut readiness = self.readiness.borrow_mut();
         loop {
             let ready = {
                 let inboxes = self.group.steering.inboxes.borrow();
                 let Some(Some(inbox)) = inboxes.get(self.index) else {
-                    return Err(io::Error::new(
+                    return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
                         "this socket's reuseport slot is gone",
-                    ));
+                    )));
                 };
                 if !inbox.queue.is_empty() {
-                    return Ok(());
+                    *readiness = None;
+                    return Poll::Ready(Ok(()));
                 }
                 inbox.ready.clone()
             };
-            ready.notified().await;
+            let wait = readiness.get_or_insert_with(|| {
+                Box::pin(async move {
+                    ready.notified().await;
+                    Ok(())
+                })
+            });
+            if wait.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            *readiness = None;
         }
     }
 
@@ -526,6 +539,7 @@ pub async fn bind_udp_socket(
     let member = ReuseportMember {
         group,
         index: usize::from(shard_index),
+        readiness: RefCell::new(None),
     };
     let mut options = BindOptions::new(socket.local_addr()?);
     options.mode = match mode {

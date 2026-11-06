@@ -1,13 +1,13 @@
 # `pulsebeam`
 
 The PulseBeam WebRTC SFU server. The control plane owns topology and compiles
-owned routing updates; work-stealing shards own participants, transports,
+owned routing updates; logical shards own participants, transports,
 packet buffers, routes, and forwarding state outright.
 
 Read these contracts before changing the corresponding subsystem:
 
 - [Naming boundaries](docs/naming.md)
-- [Shard-owned work-stealing dataplane](docs/shard-owned-dataplane.md)
+- [Shard-owned movable dataplane](docs/shard-owned-dataplane.md)
 - [Routing and compiled plans](docs/routing.md)
 - [Cluster topology and ownership (proposed)](docs/cluster.md)
 - [Linux server requirements](docs/linux-only.md)
@@ -16,6 +16,44 @@ Read these contracts before changing the corresponding subsystem:
 Shared mutable packet state, cross-shard handles, blocking calls, and
 multi-atomic snapshots are architectural regressions. Cross-shard and
 cross-node coordination uses owned messages.
+
+## Runtime profiles
+
+`--rt adaptive` is the process default. Each dataplane worker has a current-thread
+runtime and normally hosts several logical shards. The server defaults to
+16 shards per worker; `--shards` changes that factor. The library default remains
+one worker and one shard. `NodeBuilder::adaptive`, `runtime_profile`,
+`work_stealing`, `thread_per_core`, `data_threads` and `workers` are explicit
+configuration operations backed by `pulsebeam-runtime`.
+
+Restart with `--rt work-stealing` to use the dedicated multithreaded scheduler,
+or `--rt thread-per-core` for one shard per dedicated worker. The latter defaults
+to one shard per worker and rejects an explicit incompatible `--shards` value.
+Profiles cannot change in a running process. Control and optional TCP roles
+remain separate from dataplane execution.
+
+The node controller owns initial placement and conservative continuous balancing.
+Its placement module reads the existing room registry and runtime observations,
+without a second placement registry. Existing room partitions keep their logical
+shard. New partitions prefer measured worker occupancy, with participant counts
+as a fallback or tie-breaker, not an assumption of equal media cost. Explicit
+round-robin placement remains available for simulations.
+Adaptive balancing uses elapsed-time-normalized shard busy time across five
+two-second windows. A candidate must remain strongly beneficial for ten seconds,
+including pessimistic destination headroom and a migration reserve. At most one
+whole-shard move is outstanding. Every attempt is followed by a thirty-second
+observation-only hold and entirely fresh measurement history. These thresholds
+are conservative heuristics, not measured migration-cost or latency guarantees.
+Runtime-owned handoff preserves the same pinned service
+allocation, UDP descriptor and queued input, logical identity and TCP inbox.
+Every bounded shard tick returns to the executor, including under continuous
+readiness. Registration failures roll back once; unsafe restoration shuts down
+the node rather than rebuilding or abandoning a shard.
+
+Simulation retains `with_current_runtime()` with synthetic thread-local sockets
+and virtual time, without launching native dataplane threads. Cross-reactor
+migration requires Linux. The default cutover is qualified by correctness;
+comparative latency and efficiency have not been measured.
 
 ## Media TCP fallback
 
@@ -79,10 +117,11 @@ output will be sent; there is no socket receipt or rollback API into RTC.
 
 Run focused crate tests while iterating. Before handoff, run root `./bazel test //:check`
 and `./bazel test //:test`. The production-configured owner target
-`//crates/pulsebeam:transport_conformance` uses one once-bound dual-stack UDP
-listener and two concurrent threaded native SDK peers per UDP/TCP witness. It requires actual
-IPv4/IPv6 HTTP candidate advertisements, selected-pair statistics and distinct
-bidirectional application topic payloads, followed by owned graph/node cleanup.
+`//crates/pulsebeam:transport_conformance` reuses two concurrent threaded native
+SDK peers per UDP/TCP witness. It requires actual IPv4/IPv6 HTTP candidate
+advertisements, selected-pair statistics, completed adaptive moves and distinct
+bidirectional application topic payloads before, during and after handoff,
+followed by owned graph/node cleanup. UDP descriptors remain once-bound.
 Its explicit loopback interface enumeration is test-only, not qualification of
 default deployed interface discovery. See [Linux host requirements](docs/linux-only.md#ci).
 UDP steering is an extension point: higher layers can provide

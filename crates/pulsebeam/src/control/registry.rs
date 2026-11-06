@@ -80,6 +80,10 @@ impl RoomRegistry {
         room.add_participant(&participant_id, shard_id, partition_index);
     }
 
+    pub(super) fn participants(&self) -> impl Iterator<Item = &ParticipantMeta> {
+        self.participants.values()
+    }
+
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
         self.participants.get(participant_id)
     }

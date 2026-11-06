@@ -15,7 +15,7 @@ pub const DEFAULT_ROOM_PARTITION_SIZE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomPartitionPlacement {
-    Hashed,
+    Balanced,
     RoundRobin,
 }
 

@@ -71,6 +71,9 @@ impl Socket {
     pub(crate) async fn readable(&self) -> io::Result<()> {
         self.socket.readable().await
     }
+    pub(crate) fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket.poll_recv_ready(cx)
+    }
     pub(crate) async fn writable(&self) -> io::Result<()> {
         self.socket.writable().await
     }

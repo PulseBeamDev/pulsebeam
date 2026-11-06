@@ -173,6 +173,11 @@ impl Socket {
     pub(crate) async fn readable(&self) -> io::Result<()> {
         self.socket.readable().await.map(|_| ())
     }
+    pub(crate) fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket
+            .poll_read_ready(cx)
+            .map(|result| result.map(|_| ()))
+    }
     pub(crate) async fn writable(&self) -> io::Result<()> {
         self.socket.writable().await.map(|_| ())
     }
@@ -281,7 +286,7 @@ impl Socket {
                 .and_then(|entry| entry.gso_segment_size)
                 .map(NonZeroU16::get);
             let cmsg = segment.as_ref().map(ControlMessage::UdpGsoSegments);
-            self.socket.try_io(tokio::io::Interest::WRITABLE, |socket| {
+            let mut transmit = |socket: &socket2::Socket| {
                 // nix retains cmsg storage between calls. Separate ordinary
                 // headers prevent a previous GSO cmsg bleeding into a send.
                 let headers = if segment.is_some() {
@@ -302,7 +307,19 @@ impl Socket {
                     Errno::EAGAIN => io::Error::from(io::ErrorKind::WouldBlock),
                     other => io::Error::from(other),
                 })
-            })
+            };
+            let mut attempted = false;
+            let result = self.socket.try_io(tokio::io::Interest::WRITABLE, |socket| {
+                attempted = true;
+                transmit(socket)
+            });
+            if attempted {
+                result
+            } else {
+                // A new reactor has no cached readiness yet. Probe once instead
+                // of turning that cache miss into a blocked submission.
+                transmit(self.socket.get_ref())
+            }
         })
     }
 }

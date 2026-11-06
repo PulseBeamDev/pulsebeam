@@ -2,11 +2,10 @@
 //! before any shard runs. See `shard::metrics`.
 
 use anyhow::{Context, Result};
-use core_affinity::get_core_ids;
 use pulsebeam_core::auth::KeyRegistry;
-use pulsebeam_core::net::TcpListener;
 use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::net::UdpMode;
+use pulsebeam_runtime::net::tcp::TcpListener;
 use pulsebeam_runtime::rand;
 use pulsebeam_runtime::rand::{RngCore, SeedableRng};
 use std::collections::HashSet;
@@ -21,8 +20,8 @@ use std::time::Duration;
 
 use crate::clock::WallAnchor;
 use pulsebeam_rtc::LocalCandidate;
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
+use pulsebeam_runtime::sync::CancellationToken;
+use pulsebeam_runtime::task::JoinSet;
 use tower_http::compression::CompressionLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 
@@ -42,385 +41,8 @@ enum ListenerSource {
     PreBound(TcpListener),
 }
 
-/// How logical shards are executed.
-///
-/// A shard remains the ownership, routing, socket, and metrics unit in every
-/// mode. This enum changes only how shard futures receive CPU time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShardRuntime {
-    /// One logical shard on one dedicated current-thread Tokio runtime.
-    ThreadPerCore,
-
-    /// Many logical shards scheduled by a Tokio multi-thread work-stealing runtime.
-    WorkStealing {
-        /// Number of logical shards created for every Tokio scheduler worker.
-        shards_per_worker: usize,
-    },
-
-    /// Run every shard as a local task on the caller's runtime.
-    ///
-    /// This exists for simulation, whose synthetic reuseport sockets are
-    /// deliberately thread-local. It is not the production work-stealing mode.
-    CurrentRuntime,
-}
-
-impl ShardRuntime {
-    fn shard_count(self, data_threads: usize) -> usize {
-        match self {
-            Self::ThreadPerCore | Self::CurrentRuntime => data_threads,
-            #[allow(clippy::expect_used, reason = "too many shards")]
-            Self::WorkStealing { shards_per_worker } => data_threads
-                .checked_mul(shards_per_worker)
-                .expect("configured shard count overflowed usize"),
-        }
-    }
-}
-
-mod platform {
-    use super::*;
-
-    #[cfg(not(feature = "sim"))]
-    mod imp {
-        use super::*;
-
-        pub(crate) async fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
-            let socket = socket2::Socket::new(
-                socket2::Domain::for_address(addr),
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )?;
-
-            if addr.is_ipv6() {
-                // Prefer dual-stack listeners so a single IPv6 socket can
-                // accept IPv4-mapped peers.
-                socket.set_only_v6(false)?;
-            }
-
-            socket.set_nonblocking(true)?;
-            socket.set_reuse_address(true)?;
-            socket.bind(&addr.into())?;
-            socket.listen(1024)?;
-
-            tokio::net::TcpListener::from_std(socket.into())
-        }
-    }
-
-    #[cfg(feature = "sim")]
-    mod imp {
-        use super::*;
-
-        pub(crate) async fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
-            TcpListener::bind(addr).await
-        }
-    }
-
-    pub(crate) use imp::bind_tcp_listener;
-}
-
-mod shard_executor {
-    use super::*;
-
-    #[cfg(not(feature = "sim"))]
-    mod imp {
-        use super::*;
-        #[allow(
-            clippy::disallowed_types,
-            reason = "one independent thread-start sequence counter, not a multi-atomic snapshot"
-        )]
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::atomic::Ordering;
-
-        /// Owns the dedicated Tokio runtime used only by data-plane shard tasks.
-        ///
-        /// The runtime is deliberately separate from the caller/control runtime:
-        /// controller, HTTP, metrics, and other control-plane tasks never run here.
-        struct WorkStealingRuntime {
-            runtime: Option<tokio::runtime::Runtime>,
-        }
-
-        impl WorkStealingRuntime {
-            fn build(data_threads: usize, cpu_cores: &[core_affinity::CoreId]) -> Result<Self> {
-                #[allow(
-                    clippy::disallowed_types,
-                    reason = "one independent thread-start sequence counter, not a multi-atomic snapshot"
-                )]
-                let next_worker = AtomicUsize::new(0);
-                let worker_cores = cpu_cores.to_vec();
-
-                let mut builder = tokio::runtime::Builder::new_multi_thread();
-                // TODO: tune these with real benchmark. Default seems good
-                builder
-                    .worker_threads(data_threads)
-                    .thread_name("pb-data")
-                    .enable_all()
-                    .disable_lifo_slot()
-                    .enable_alt_timer();
-
-                // Apply exactly the same OS tuning as thread-per-core, but to
-                // Tokio's physical scheduler workers rather than logical shards.
-                // `on_thread_start` can also observe later blocking-pool threads;
-                // the scheduler workers are created with the runtime, so only the
-                // first `data_threads` callbacks are data workers we tune/pin.
-                builder.on_thread_start(move || {
-                    let worker_idx = next_worker.fetch_add(1, Ordering::Relaxed);
-                    if worker_idx >= data_threads {
-                        return;
-                    }
-
-                    let core_id = worker_idx
-                        .checked_rem(worker_cores.len())
-                        .and_then(|index| worker_cores.get(index))
-                        .copied();
-
-                    let realtime = tune_current_data_thread(core_id);
-                    metrics::gauge!(
-                        "data_worker_realtime",
-                        "worker" => worker_idx.to_string()
-                    )
-                    .set(f64::from(realtime));
-                });
-
-                let runtime = builder
-                    .build()
-                    .context("building Tokio work-stealing data runtime")?;
-
-                Ok(Self {
-                    runtime: Some(runtime),
-                })
-            }
-
-            fn handle(&self) -> Result<&tokio::runtime::Handle> {
-                self.runtime
-                    .as_ref()
-                    .map(tokio::runtime::Runtime::handle)
-                    .context("work-stealing data runtime is not alive")
-            }
-        }
-
-        impl Drop for WorkStealingRuntime {
-            fn drop(&mut self) {
-                if let Some(runtime) = self.runtime.take() {
-                    // `NodeBuilder::run` itself is async on the control runtime.
-                    // A normal nested Runtime drop may block and panic there;
-                    // background shutdown cancels its data tasks without doing so.
-                    runtime.shutdown_background();
-                }
-            }
-        }
-
-        enum Execution {
-            /// Compatibility/local-test path. Production deployments should use
-            /// one of the two dedicated data-plane execution modes below.
-            CurrentRuntime,
-
-            ThreadPerCore {
-                cpu_cores: Vec<core_affinity::CoreId>,
-                threads: Vec<std::thread::JoinHandle<()>>,
-            },
-
-            WorkStealing {
-                runtime: WorkStealingRuntime,
-            },
-        }
-
-        pub(in crate::node) struct Executor {
-            execution: Execution,
-        }
-
-        impl Executor {
-            pub(in crate::node) fn new(
-                mode: ShardRuntime,
-                data_threads: usize,
-                cpu_cores: Vec<core_affinity::CoreId>,
-            ) -> Result<Self> {
-                let execution = match mode {
-                    ShardRuntime::CurrentRuntime => Execution::CurrentRuntime,
-                    ShardRuntime::ThreadPerCore => Execution::ThreadPerCore {
-                        cpu_cores,
-                        threads: Vec::with_capacity(data_threads),
-                    },
-                    ShardRuntime::WorkStealing { shards_per_worker } => {
-                        tracing::info!(
-                            data_threads,
-                            shards_per_worker,
-                            shards = data_threads.saturating_mul(shards_per_worker),
-                            "starting dedicated Tokio work-stealing data runtime"
-                        );
-
-                        Execution::WorkStealing {
-                            runtime: WorkStealingRuntime::build(data_threads, &cpu_cores)?,
-                        }
-                    }
-                };
-
-                Ok(Self { execution })
-            }
-
-            /// Start one logical shard on the configured data-plane executor.
-            ///
-            /// `control_tasks` is used only by the compatibility CurrentRuntime
-            /// path. In both production modes shard execution is completely
-            /// separate from the caller/control runtime.
-            pub(in crate::node) fn spawn<F>(
-                &mut self,
-                shard_id: ShardId,
-                launch: F,
-                control_tasks: &mut JoinSet<()>,
-            ) -> Result<()>
-            where
-                F: FnOnce() -> Result<ShardWorker> + Send + 'static,
-            {
-                match &mut self.execution {
-                    Execution::CurrentRuntime => {
-                        let shard = launch()?;
-                        control_tasks.spawn_local(ignore(shard.run()));
-                    }
-                    Execution::WorkStealing { runtime } => {
-                        let shard = launch()?;
-                        // Dropping a Tokio JoinHandle detaches the task; the
-                        // dedicated Runtime remains its owner and shuts it down.
-                        drop(runtime.handle()?.spawn(ignore(shard.run())));
-                    }
-                    Execution::ThreadPerCore { cpu_cores, threads } => {
-                        let core_id = shard_id
-                            .index()
-                            .checked_rem(cpu_cores.len())
-                            .and_then(|index| cpu_cores.get(index))
-                            .copied();
-
-                        let handle = std::thread::Builder::new()
-                            .name(format!("pb-w-{shard_id}"))
-                            .spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .enable_alt_timer()
-                                    .build_local(tokio::runtime::LocalOptions::default())
-                                    .unwrap_or_else(|err| {
-                                        pulsebeam_runtime::fatal!(
-                                            "shard {shard_id} cannot build its runtime: {err}"
-                                        )
-                                    });
-
-                                let realtime = tune_current_data_thread(core_id);
-                                metrics::gauge!(
-                                    "shard_realtime",
-                                    "shard" => shard_id.index().to_string()
-                                )
-                                .set(f64::from(realtime));
-
-                                #[allow(
-                                    clippy::disallowed_methods,
-                                    reason = "the shard's dedicated OS thread enters its async runtime exactly once, here"
-                                )]
-                                rt.block_on(async move {
-                                    let shard = launch().unwrap_or_else(|err| {
-                                        pulsebeam_runtime::fatal!(
-                                            "shard {shard_id} cannot start: {err}"
-                                        )
-                                    });
-
-                                    // Nothing else competes for this executor,
-                                    // so Tokio's cooperative budget is unnecessary.
-                                    tokio::task::unconstrained(shard.run()).await;
-                                });
-                            })
-                            .with_context(|| {
-                                format!("cannot spawn the thread for shard {shard_id}")
-                            })?;
-
-                        threads.push(handle);
-                    }
-                }
-
-                Ok(())
-            }
-
-            /// The caller/control runtime may be deprioritized only after all
-            /// physical data threads have been created, otherwise they could
-            /// inherit the control thread's scheduling policy.
-            pub(in crate::node) fn should_tune_control_thread(&self) -> bool {
-                !matches!(self.execution, Execution::CurrentRuntime)
-            }
-
-            /// Join data execution off the control runtime. Returning acknowledges
-            /// task/socket retirement, not just initiation of background shutdown.
-            pub(in crate::node) async fn finish(self) -> Result<()> {
-                let execution = self.execution;
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "node shutdown joins owned native executors, never on a shard or control thread"
-                )]
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    match execution {
-                        Execution::CurrentRuntime => {}
-                        Execution::ThreadPerCore { threads, .. } => {
-                            for handle in threads {
-                                handle
-                                    .join()
-                                    .map_err(|_| anyhow::anyhow!("data thread panicked"))?;
-                            }
-                        }
-                        Execution::WorkStealing { mut runtime } => {
-                            drop(runtime.runtime.take());
-                        }
-                    }
-                    Ok(())
-                })
-                .await
-                .context("joining data executor")?
-            }
-        }
-    }
-
-    #[cfg(feature = "sim")]
-    mod imp {
-        use super::*;
-
-        pub(in crate::node) struct Executor;
-
-        impl Executor {
-            pub(in crate::node) fn new(
-                mode: ShardRuntime,
-                _data_threads: usize,
-                _cpu_cores: Vec<core_affinity::CoreId>,
-            ) -> Result<Self> {
-                if !matches!(mode, ShardRuntime::CurrentRuntime) {
-                    return Err(anyhow::anyhow!(
-                        "a simulated node must use `.with_current_runtime()`"
-                    ));
-                }
-
-                Ok(Self)
-            }
-
-            pub(in crate::node) fn spawn<F>(
-                &mut self,
-                _shard_id: ShardId,
-                launch: F,
-                control_tasks: &mut JoinSet<()>,
-            ) -> Result<()>
-            where
-                F: FnOnce() -> Result<ShardWorker> + 'static,
-            {
-                let shard = launch()?;
-                control_tasks.spawn_local(ignore(shard.run()));
-                Ok(())
-            }
-
-            pub(in crate::node) fn should_tune_control_thread(&self) -> bool {
-                false
-            }
-
-            pub(in crate::node) async fn finish(self) -> Result<()> {
-                Ok(())
-            }
-        }
-    }
-
-    pub(super) use imp::Executor;
-}
-
-pub(crate) use platform::bind_tcp_listener;
+pub(crate) use pulsebeam_runtime::net::tcp::bind as bind_tcp_listener;
+use pulsebeam_runtime::rt::{DataExecutor, ExecutionConfig, Profile};
 
 type SteeringFactory =
     Box<dyn FnOnce(&[pulsebeam_udp::BoundUdpSocket]) -> Result<Box<dyn Steering>> + Send>;
@@ -438,14 +60,17 @@ pub enum IceTcpConfig {
 }
 
 pub struct NodeBuilder {
+    #[cfg(test)]
+    runtime_control:
+        Option<pulsebeam_runtime::sync::oneshot::Sender<pulsebeam_runtime::rt::MigrationHandle>>,
     #[cfg(feature = "sim")]
-    sim_startup_notification: Option<tokio::sync::mpsc::Sender<()>>,
+    sim_startup_notification: Option<pulsebeam_runtime::sync::mpsc::Sender<()>>,
     // Data-plane topology
     //
     // `data_threads` is physical executor width. Logical shard count is derived
     // from it and `shard_runtime`.
     data_threads: usize,
-    shard_runtime: ShardRuntime,
+    shard_runtime: ExecutionConfig,
 
     // Configuration
     local_addr: Option<SocketAddr>,
@@ -489,10 +114,12 @@ impl Default for NodeBuilder {
 impl NodeBuilder {
     pub fn new() -> Self {
         Self {
+            #[cfg(test)]
+            runtime_control: None,
             #[cfg(feature = "sim")]
             sim_startup_notification: None,
             data_threads: 1,
-            shard_runtime: ShardRuntime::ThreadPerCore,
+            shard_runtime: ExecutionConfig::default(),
             local_addr: None,
             external_addrs: Vec::new(),
             advertise_bound_udp: false,
@@ -515,15 +142,24 @@ impl NodeBuilder {
             udp_only: false,
             ice_tcp: None,
             room_partition_size: crate::control::core::DEFAULT_ROOM_PARTITION_SIZE,
-            room_placement: crate::control::core::RoomPartitionPlacement::Hashed,
+            room_placement: crate::control::core::RoomPartitionPlacement::Balanced,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_runtime_control(
+        mut self,
+        control: pulsebeam_runtime::sync::oneshot::Sender<pulsebeam_runtime::rt::MigrationHandle>,
+    ) -> Self {
+        self.runtime_control = Some(control);
+        self
     }
 
     /// Notify when the controller mailbox exists, before controller spawn and HTTP binding.
     #[cfg(feature = "sim")]
     pub fn with_sim_startup_notification(
         mut self,
-        notification: tokio::sync::mpsc::Sender<()>,
+        notification: pulsebeam_runtime::sync::mpsc::Sender<()>,
     ) -> Self {
         self.sim_startup_notification = Some(notification);
         self
@@ -562,6 +198,7 @@ impl NodeBuilder {
     pub fn data_threads(mut self, data_threads: usize) -> Self {
         assert!(data_threads > 0, "a node needs at least one data thread");
         self.data_threads = data_threads;
+        self.shard_runtime.workers = data_threads;
         self
     }
 
@@ -575,7 +212,7 @@ impl NodeBuilder {
 
     /// Execute one logical shard per dedicated OS thread/current-thread runtime.
     pub fn thread_per_core(mut self) -> Self {
-        self.shard_runtime = ShardRuntime::ThreadPerCore;
+        self.shard_runtime = ExecutionConfig::new(Profile::ThreadPerCore, self.data_threads, 1);
         self
     }
 
@@ -588,7 +225,8 @@ impl NodeBuilder {
             shards_per_worker > 0,
             "a work-stealing worker must own at least one shard"
         );
-        self.shard_runtime = ShardRuntime::WorkStealing { shards_per_worker };
+        self.shard_runtime =
+            ExecutionConfig::new(Profile::WorkStealing, self.data_threads, shards_per_worker);
         self
     }
 
@@ -597,12 +235,22 @@ impl NodeBuilder {
     /// This is retained for simulation. It deliberately does not mean
     /// work-stealing: `spawn_local` tasks stay on the local executor thread.
     pub fn with_current_runtime(mut self) -> Self {
-        self.shard_runtime = ShardRuntime::CurrentRuntime;
+        self.shard_runtime = ExecutionConfig::on_current_runtime(self.data_threads);
         self
     }
 
-    fn configured_shard_count(&self) -> usize {
-        self.shard_runtime.shard_count(self.data_threads)
+    /// Select a restart-time process runtime profile and logical oversharding.
+    pub fn runtime_profile(mut self, profile: Profile, shards_per_worker: usize) -> Self {
+        self.shard_runtime = ExecutionConfig::new(profile, self.data_threads, shards_per_worker);
+        self
+    }
+
+    pub fn adaptive(self, shards_per_worker: usize) -> Self {
+        self.runtime_profile(Profile::Adaptive, shards_per_worker)
+    }
+
+    fn configured_shard_count(&self) -> std::io::Result<usize> {
+        self.shard_runtime.shard_count()
     }
 
     /// Set the local bind address for UDP/TCP transports.
@@ -652,8 +300,8 @@ impl NodeBuilder {
 
     /// Configure the HTTP Signaling API to use a pre-bound listener.
     /// Useful for testing with port 0 (ephemeral ports).
-    pub fn with_http_api_listener(mut self, listener: TcpListener) -> Self {
-        self.http_api = Some(ListenerSource::PreBound(listener));
+    pub fn with_http_api_listener(mut self, listener: impl Into<TcpListener>) -> Self {
+        self.http_api = Some(ListenerSource::PreBound(listener.into()));
         self
     }
 
@@ -664,8 +312,8 @@ impl NodeBuilder {
     }
 
     /// Configure the Internal Metrics server to use a pre-bound listener.
-    pub fn with_internal_metrics_listener(mut self, listener: TcpListener) -> Self {
-        self.internal_metrics = Some(ListenerSource::PreBound(listener));
+    pub fn with_internal_metrics_listener(mut self, listener: impl Into<TcpListener>) -> Self {
+        self.internal_metrics = Some(ListenerSource::PreBound(listener.into()));
         self
     }
 
@@ -723,7 +371,7 @@ impl NodeBuilder {
         let udp_sockets = bind_udp_sockets(
             local_addr,
             advertised_addrs.first().copied(),
-            self.configured_shard_count(),
+            self.configured_shard_count()?,
             self.udp_mode,
         )
         .await?;
@@ -782,7 +430,7 @@ impl NodeBuilder {
     ) -> Result<()> {
         let data_threads = self.data_threads;
         let shard_runtime = self.shard_runtime;
-        let requested_shard_count = self.configured_shard_count();
+        let requested_shard_count = self.configured_shard_count()?;
         let local_addr = self
             .local_addr
             .unwrap_or_else(|| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0));
@@ -805,17 +453,7 @@ impl NodeBuilder {
             None => None,
         };
 
-        let cpu_cores = get_core_ids().unwrap_or_default();
-        if cpu_cores.is_empty() {
-            tracing::warn!(
-                "no CPU cores detected for thread affinity; dedicated data threads will not be pinned"
-            );
-        } else {
-            tracing::info!(
-                count = cpu_cores.len(),
-                "detected CPU cores for data-plane affinity"
-            );
-        }
+        let spare_core = pulsebeam_runtime::rt::spare_core(data_threads);
 
         debug_assert!(!udp_sockets.is_empty());
         let shard_count = udp_sockets.len();
@@ -833,6 +471,19 @@ impl NodeBuilder {
             None => None,
         };
 
+        // This is the only owner of data-plane execution. The caller runtime
+        // remains the control runtime for controller/API/metrics tasks.
+        tracing::info!(profile = %shard_runtime.profile, workers = data_threads, shards = shard_count, "starting node runtime");
+        let mut shard_executor = DataExecutor::new(shard_runtime, shutdown.clone()).await?;
+        #[cfg(test)]
+        if let Some(control) = self.runtime_control {
+            if let Some(handle) = shard_executor.migration_handle() {
+                let _ = control.send(handle);
+            }
+        }
+
+        let mut tcp_service = None;
+        let result: Result<()> = async {
         let mut tcp_rxs = Vec::with_capacity(shard_count);
         let mut tcp_txs = Vec::new();
         let tcp_config = self.ice_tcp.unwrap_or_else(|| {
@@ -849,7 +500,7 @@ impl NodeBuilder {
         if self.tcp_only {
             candidates.clear();
         }
-        let tcp_service = match tcp_config {
+        tcp_service = match tcp_config {
             IceTcpConfig::Disabled => {
                 tcp_rxs.resize_with(shard_count, || None);
                 None
@@ -862,7 +513,6 @@ impl NodeBuilder {
                     tcp_txs.push(tx);
                     tcp_rxs.push(Some(rx));
                 }
-                let spare_core = cpu_cores.get(data_threads).copied();
                 let (service, bound) = crate::ice_tcp::Service::start(
                     bind,
                     advertised_addrs.clone(),
@@ -874,7 +524,7 @@ impl NodeBuilder {
                     limits,
                     tcp_txs,
                     spare_core,
-                    shutdown.child_token(),
+                    shutdown.clone(),
                 )
                 .await
                 .context("starting passive ICE-TCP")?;
@@ -888,10 +538,6 @@ impl NodeBuilder {
             }
         };
 
-        // This is the only owner of data-plane execution. The caller runtime
-        // remains the control runtime for controller/API/metrics tasks.
-        let mut shard_executor =
-            shard_executor::Executor::new(shard_runtime, data_threads, cpu_cores.clone())?;
 
         let (shard_event_tx, shard_event_rx) = mailbox::bounded(
             const { core::num::NonZeroUsize::new(crate::shard::worker::SHARD_EVENT_CAPACITY).unwrap() },
@@ -969,24 +615,28 @@ impl NodeBuilder {
             let worker_occupancy = occupancy.clone();
             let shard_stats_tx = stats_tx.clone();
 
-            let launch = move || -> Result<ShardWorker> {
-                let udp_sock = udp_sock.activate()?;
-                Ok(ShardWorker::new(
-                    shard_id,
-                    udp_sock,
-                    tcp_rx,
-                    shard_command_rx,
-                    update_reader,
-                    shard_event_tx,
-                    frame_rx,
-                    frame_txs,
-                    worker_occupancy,
-                    shard_stats_tx,
-                    wall_anchor,
-                ))
-            };
+            let launch =
+                move || -> std::io::Result<pulsebeam_runtime::rt::ManagedService<ShardWorker>> {
+                    let udp_sock = udp_sock.activate()?;
+                    let shard = ShardWorker::new(
+                        shard_id,
+                        udp_sock.capabilities().max_gso_segments,
+                        tcp_rx,
+                        shard_command_rx,
+                        update_reader,
+                        shard_event_tx,
+                        frame_rx,
+                        frame_txs,
+                        worker_occupancy,
+                        shard_stats_tx,
+                        wall_anchor,
+                    );
+                    Ok(pulsebeam_runtime::rt::ManagedService::new(shard, udp_sock))
+                };
 
-            shard_executor.spawn(shard_id, launch, &mut control_tasks)?;
+            let worker = crate::control::placement::initial_worker(shard_id, shard_executor.worker_count())
+                .context("missing dataplane workers")?;
+            shard_executor.spawn_on(shard_id.index(), worker, launch).await?;
 
             shard_contexts.push(ShardContext {
                 command_tx: shard_command_tx,
@@ -1016,6 +666,7 @@ impl NodeBuilder {
             self.room_placement,
             view_writers,
         );
+        controller.set_execution(shard_executor.migration_handle());
         controller.set_steering(steering);
         controller.set_key_registry(self.key_registry.clone());
         // intentionally small so backpressure is applied early
@@ -1064,8 +715,8 @@ impl NodeBuilder {
                 .layer(cors);
             // https://github.com/tokio-rs/axum/issues/3112
             // missing graceful shutdown will cause task leaks
-            let api_server = axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown.child_token().cancelled_owned());
+            let api_server =
+                pulsebeam_runtime::net::tcp::serve_http(listener, router, shutdown.child_token().cancelled_owned());
 
             control_tasks.spawn(async move {
                 if let Err(e) = api_server.await {
@@ -1075,20 +726,40 @@ impl NodeBuilder {
         }
 
         // Wait for shutdown
-        tokio::select! {
-            _ = control_tasks.join_all() => {}
-            _ = shutdown.cancelled() => {
-                tracing::info!("node received shutdown");
+        loop {
+            pulsebeam_runtime::select! {
+                result = control_tasks.join_next() => match result {
+                    Some(result) => { result.context("control service task failed")?; }
+                    None => break,
+                },
+                _ = shutdown.cancelled() => {
+                    tracing::info!("node received shutdown");
+                    break;
+                }
             }
         }
 
-        // At this point the control task set has been consumed/dropped by the
-        // select above. Finish the independently-owned data executor afterwards.
-        if let Some(service) = tcp_service {
-            service.finish().await?;
+        Ok(())
+        }.await;
+        shutdown.cancel();
+        let mut control_error = None;
+        while let Some(result) = control_tasks.join_next().await {
+            if let Err(error) = result {
+                control_error.get_or_insert(error);
+            }
         }
-        shard_executor.finish().await?;
-
+        let tcp_result = if let Some(service) = tcp_service {
+            service.finish().await
+        } else {
+            Ok(())
+        };
+        let data_result = shard_executor.finish().await;
+        result?;
+        tcp_result?;
+        data_result?;
+        if let Some(error) = control_error {
+            return Err(error.into());
+        }
         Ok(())
     }
 }
@@ -1185,95 +856,10 @@ pub async fn ignore<T>(fut: impl Future<Output = T>) {
     let _ = fut.await;
 }
 
-pub fn tune_current_control_thread() {
-    #[cfg(unix)]
-    {
-        use thread_priority::{
-            NormalThreadSchedulePolicy, ThreadPriority, ThreadSchedulePolicy, thread_native_id,
-        };
-
-        let current_thread_id = thread_native_id();
-
-        #[cfg(target_os = "linux")]
-        let policy = ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch);
-
-        #[cfg(not(target_os = "linux"))]
-        let policy = ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Other);
-
-        let result = thread_priority::set_thread_priority_and_policy(
-            current_thread_id,
-            ThreadPriority::Min,
-            policy,
-        );
-
-        if let Err(e) = result {
-            tracing::warn!("Failed to lower Control Thread priority: {:?}", e);
-        } else {
-            tracing::debug!("Control thread tuned: Minimum Priority");
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        // Fallback for Windows or other non-Unix targets if necessary
-        tracing::debug!("Thread tuning is a no-op on non-Unix platforms.");
-    }
-}
-
-pub fn tune_current_data_thread(core_id: Option<core_affinity::CoreId>) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        use rustix::thread::{current_timer_slack, set_current_timer_slack};
-        use std::num::NonZero;
-        use thread_priority::{
-            RealtimeThreadSchedulePolicy, ScheduleParams, ThreadPriority, ThreadSchedulePolicy,
-            thread_native_id,
-        };
-
-        let current_thread_id = thread_native_id();
-        // small enough priority to avoid inversion with IRQ
-        let policy = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
-        let priority = ThreadPriority::from_posix(ScheduleParams { sched_priority: 10 });
-        let realtime = if let Err(e) =
-            thread_priority::set_thread_priority_and_policy(current_thread_id, priority, policy)
-        {
-            tracing::warn!(
-                "Failed to set Data Thread to SCHED_FIFO at priority 10 (requires CAP_SYS_NICE): {:?}",
-                e
-            );
-            false
-        } else {
-            tracing::debug!("Data thread successfully elevated to SCHED_FIFO (Priority 10)");
-            true
-        };
-
-        // attempt to get closer to SCHED_FIFO without CAP_SYS_ADMIN
-        let slack_value = NonZero::new(1);
-        if let Err(err) = set_current_timer_slack(slack_value) {
-            tracing::warn!(?err, "Failed to set timer slack on data thread");
-        } else {
-            let current_slack = current_timer_slack().unwrap_or(0);
-            tracing::debug!(current_slack, "Data thread timer slack successfully tuned");
-        }
-
-        // https://developers.redhat.com/articles/2025/03/26/rhel-real-time-cpu-throttling-and-risks#is_that_a_bug_
-        // set higher priority first before pinning to avoid a potential lockup
-        if let Some(core) = core_id {
-            if core_affinity::set_for_current(core) {
-                tracing::debug!(?core, "Data thread pinned to CPU core");
-            } else {
-                tracing::warn!(?core, "Failed to pin Data thread to CPU core");
-            }
-        }
-        realtime
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = core_id;
-        false
-    }
-}
+pub use pulsebeam_runtime::rt::{
+    tune_control_thread as tune_current_control_thread,
+    tune_data_thread as tune_current_data_thread,
+};
 
 mod internal {
     use super::*;
@@ -1288,13 +874,12 @@ mod internal {
         StatusCode,
         header::{CONTENT_DISPOSITION, CONTENT_TYPE},
     };
-    use metrics::{Unit, describe_gauge, gauge};
+
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
     use pprof::ProfilerGuard;
     use pprof::protos::Message;
+    use pulsebeam_runtime::sync::oneshot;
     use serde::Deserialize;
-    use tokio::runtime::Handle;
-    use tokio::sync::oneshot;
 
     #[derive(Deserialize)]
     pub struct ProfileParams {
@@ -1364,7 +949,8 @@ mod internal {
             // several callers the same numbers a moment apart.
             let (scrape_tx, scrape_rx) =
                 mailbox::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
-            let aggregator_join = tokio::spawn(crate::control::stats_aggregator::run(
+            let mut services = JoinSet::new();
+            services.spawn(crate::control::stats_aggregator::run(
                 shard_count,
                 stats_rx,
                 scrape_rx,
@@ -1389,26 +975,36 @@ mod internal {
                         }),
                     )
             };
-            let rt_monitor_join = tokio::spawn(rt_background_monitor(self.prometheus));
+            services.spawn(pulsebeam_runtime::rt::monitor(
+                move || self.prometheus.run_upkeep(),
+                shutdown.child_token(),
+            ));
 
             tracing::info!(
                 "internal metrics listening on {:?}",
                 self.listener.local_addr().ok()
             );
 
-            tokio::select! {
-                res = axum::serve(self.listener, router) => {
-                    if let Err(e) = res {
-                        tracing::error!("internal http server error: {e}");
-                    }
+            let stop = shutdown.child_token();
+            services.spawn(async move {
+                if let Err(error) = pulsebeam_runtime::net::tcp::serve_http(
+                    self.listener,
+                    router,
+                    stop.cancelled_owned(),
+                )
+                .await
+                {
+                    tracing::error!(?error, "internal http server error");
                 }
-                _ = aggregator_join => {}
-                _ = rt_monitor_join => {}
-                _ = shutdown.cancelled() => {
-                    tracing::info!("internal http server shutting down");
-                }
+            });
+            pulsebeam_runtime::select! {
+                _ = services.join_next() => {},
+                _ = shutdown.cancelled() => {},
             }
-
+            shutdown.cancel();
+            while let Some(result) = services.join_next().await {
+                result.context("joining internal service")?;
+            }
             Ok(())
         }
     }
@@ -1424,126 +1020,6 @@ mod internal {
             return String::new();
         }
         rx.await.unwrap_or_default()
-    }
-
-    async fn rt_background_monitor(prometheus: PrometheusHandle) {
-        // This task is spawned on the caller/control runtime, and these metric
-        // names have always described that runtime. Data-runtime metrics, if
-        // added, should use a separate prefix rather than changing this meaning.
-        let metrics = Handle::current().metrics();
-
-        describe_gauge!(
-            "tokio_active_tasks",
-            Unit::Count,
-            "Current number of active tasks"
-        );
-        describe_gauge!(
-            "tokio_injection_queue_depth",
-            Unit::Count,
-            "Current depth of the global injection queue"
-        );
-        describe_gauge!(
-            "tokio_worker_count",
-            Unit::Count,
-            "Total number of worker threads"
-        );
-        describe_gauge!(
-            "tokio_blocking_threads",
-            Unit::Count,
-            "Current number of blocking threads"
-        );
-        describe_gauge!(
-            "tokio_idle_blocking_threads",
-            Unit::Count,
-            "Current number of idle blocking threads"
-        );
-        describe_gauge!(
-            "tokio_spawned_tasks_total",
-            Unit::Count,
-            "Total number of tasks spawned since runtime start"
-        );
-
-        // Worker specific
-        describe_gauge!(
-            "tokio_worker_park_count",
-            Unit::Count,
-            "Total number of times this worker parked"
-        );
-        describe_gauge!(
-            "tokio_worker_steal_count",
-            Unit::Count,
-            "Total number of times this worker stole tasks"
-        );
-        describe_gauge!(
-            "tokio_worker_poll_count",
-            Unit::Count,
-            "Total number of times this worker polled"
-        );
-        describe_gauge!(
-            "tokio_worker_busy_duration_seconds",
-            Unit::Seconds,
-            "Total duration this worker has been busy"
-        );
-        describe_gauge!(
-            "tokio_worker_local_queue_depth",
-            Unit::Count,
-            "Current depth of this worker's local queue"
-        );
-        describe_gauge!(
-            "tokio_worker_mean_poll_time_us",
-            Unit::Microseconds,
-            "Mean poll time for this worker"
-        );
-
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-
-        loop {
-            interval.tick().await;
-
-            // Current State (Gauges)
-            gauge!("tokio_num_alive_tasks").set(metrics.num_alive_tasks() as f64);
-            gauge!("tokio_injection_queue_depth",).set(metrics.global_queue_depth() as f64);
-            gauge!("tokio_blocking_queue_depth",).set(metrics.blocking_queue_depth() as f64);
-            gauge!("tokio_worker_count").set(metrics.num_workers() as f64);
-            gauge!("tokio_blocking_threads").set(metrics.num_blocking_threads() as f64);
-            gauge!("tokio_idle_blocking_threads").set(metrics.num_idle_blocking_threads() as f64);
-
-            // Cumulative Totals (Technically Counters, but we emit as Gauges because
-            // Tokio gives us the absolute total, not the delta).
-            gauge!("tokio_spawned_tasks_total").set(metrics.spawned_tasks_count() as f64);
-            gauge!("tokio_remote_schedule_total").set(metrics.remote_schedule_count() as f64);
-            gauge!("tokio_budget_forced_yield_total")
-                .set(metrics.budget_forced_yield_count() as f64);
-
-            gauge!("tokio_io_driver_ready_total").set(metrics.io_driver_ready_count() as f64);
-
-            for i in 0..metrics.num_workers() {
-                let labels = [("worker", i.to_string())];
-
-                gauge!("tokio_worker_local_queue_depth", &labels,)
-                    .set(metrics.worker_local_queue_depth(i) as f64);
-
-                gauge!("tokio_worker_park_count", &labels).set(metrics.worker_park_count(i) as f64);
-
-                gauge!("tokio_worker_noop_count", &labels).set(metrics.worker_noop_count(i) as f64);
-
-                gauge!("tokio_worker_steal_count", &labels)
-                    .set(metrics.worker_steal_count(i) as f64);
-
-                gauge!("tokio_worker_poll_count", &labels).set(metrics.worker_poll_count(i) as f64);
-
-                gauge!("tokio_worker_overflow_count", &labels)
-                    .set(metrics.worker_overflow_count(i) as f64);
-
-                gauge!("tokio_worker_busy_duration_seconds", &labels)
-                    .set(metrics.worker_total_busy_duration(i).as_secs_f64());
-
-                gauge!("tokio_worker_mean_poll_time_us", &labels)
-                    .set(metrics.worker_mean_poll_time(i).as_micros() as f64);
-            }
-
-            prometheus.run_upkeep();
-        }
     }
 
     // pub async fn heap_profile(
@@ -1614,7 +1090,7 @@ mod internal {
             )
         })?;
 
-        tokio::time::sleep(Duration::from_secs(params.seconds)).await;
+        pulsebeam_runtime::time::sleep(Duration::from_secs(params.seconds)).await;
 
         let resp = match guard.report().build() {
             Ok(report) => {
@@ -1685,7 +1161,7 @@ mod tests {
         let builder = NodeBuilder::new();
 
         assert_eq!(builder.data_threads, 1);
-        assert_eq!(builder.configured_shard_count(), 1);
+        assert_eq!(builder.configured_shard_count().unwrap(), 1);
         assert!(builder.local_addr.is_none());
         assert!(builder.external_addrs.is_empty());
         assert!(builder.http_api.is_none(), "no API is exposed unless asked");
@@ -1697,10 +1173,10 @@ mod tests {
         assert!(builder.steering.is_some());
         #[cfg(not(feature = "sim"))]
         assert!(builder.steering.is_none());
-        assert_eq!(builder.shard_runtime, ShardRuntime::ThreadPerCore);
+        assert_eq!(builder.shard_runtime.profile, Profile::Adaptive);
         assert!(matches!(
             builder.room_placement,
-            crate::control::core::RoomPartitionPlacement::Hashed
+            crate::control::core::RoomPartitionPlacement::Balanced
         ));
         assert_eq!(
             builder.room_partition_size,
@@ -1717,7 +1193,7 @@ mod tests {
                 .await
                 .unwrap();
             let media = occupied.local_addr().unwrap();
-            let (notification, mut ready) = tokio::sync::mpsc::channel(1);
+            let (notification, mut ready) = pulsebeam_runtime::sync::mpsc::channel(1);
             let shutdown = CancellationToken::new();
             let builder = NodeBuilder::new()
                 .with_current_runtime()
@@ -1726,8 +1202,8 @@ mod tests {
                 .ice_tcp(IceTcpConfig::Disabled)
                 .rng(rand::Rng::seed_from_u64(9))
                 .with_sim_startup_notification(notification);
-            let mut node = tokio::task::spawn_local(builder.run(shutdown.clone()));
-            tokio::select! {
+            let mut node = pulsebeam_runtime::task::spawn_local(builder.run(shutdown.clone()));
+            pulsebeam_runtime::select! {
                 notification = ready.recv() => assert!(notification.is_some()),
                 result = &mut node => panic!("disabled node failed startup: {result:?}"),
             }
@@ -1738,17 +1214,29 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_and_current_runtime_preserve_explicit_topology() {
+        let adaptive = NodeBuilder::new().data_threads(2).adaptive(16);
+        assert_eq!(adaptive.shard_runtime.profile, Profile::Adaptive);
+        assert_eq!(adaptive.configured_shard_count().unwrap(), 32);
+        let current = adaptive.with_current_runtime();
+        assert!(current.shard_runtime.is_current_runtime());
+        assert_eq!(current.configured_shard_count().unwrap(), 2);
+        assert!(
+            NodeBuilder::new()
+                .runtime_profile(Profile::ThreadPerCore, 16)
+                .configured_shard_count()
+                .is_err()
+        );
+    }
+
+    #[test]
     fn work_stealing_overshards_each_scheduler_worker() {
         let builder = NodeBuilder::new().data_threads(4).work_stealing(16);
 
         assert_eq!(builder.data_threads, 4);
-        assert_eq!(builder.configured_shard_count(), 64);
-        assert_eq!(
-            builder.shard_runtime,
-            ShardRuntime::WorkStealing {
-                shards_per_worker: 16,
-            }
-        );
+        assert_eq!(builder.configured_shard_count().unwrap(), 64);
+        assert_eq!(builder.shard_runtime.profile, Profile::WorkStealing);
+        assert_eq!(builder.shard_runtime.shards_per_worker, 16);
     }
 
     #[test]
@@ -1756,7 +1244,7 @@ mod tests {
         let builder = NodeBuilder::new().data_threads(8).thread_per_core();
 
         assert_eq!(builder.data_threads, 8);
-        assert_eq!(builder.configured_shard_count(), 8);
+        assert_eq!(builder.configured_shard_count().unwrap(), 8);
     }
 
     #[test]
@@ -1764,7 +1252,7 @@ mod tests {
         let builder = NodeBuilder::new().workers(6);
 
         assert_eq!(builder.data_threads, 6);
-        assert_eq!(builder.configured_shard_count(), 6);
+        assert_eq!(builder.configured_shard_count().unwrap(), 6);
     }
 
     #[test]

@@ -58,7 +58,7 @@ fn first_stun_is_delivered_once_and_ack_fences_following_frames() {
         };
         let (service, bound, mut inbox) = start(limits).await;
         let client = TcpStream::connect(bound).await.unwrap();
-        let (mut read, mut write) = pulsebeam_tcp::split(client, 128).unwrap();
+        let (mut read, mut write) = pulsebeam_runtime::net::tcp::split(client, 128).unwrap();
         let binding = stun(address(1));
         write.send(&[]).await.unwrap();
         write.send(&binding).await.unwrap();
@@ -161,7 +161,7 @@ fn full_inbox_releases_socket_before_fifo_close_and_shutdown_cancels_notice_wait
             };
             let (service, bound, mut inbox) = start(limits).await;
             let client = TcpStream::connect(bound).await.unwrap();
-            let (mut read, mut write) = pulsebeam_tcp::split(client, 128).unwrap();
+            let (mut read, mut write) = pulsebeam_runtime::net::tcp::split(client, 128).unwrap();
             write.send(&stun(address(1))).await.unwrap();
             let Some(TcpIngress::Adopt {
                 flow,
@@ -213,7 +213,8 @@ fn admission_caps_and_first_stun_deadline_release_capacity() {
             };
             let (service, bound, mut inbox) = start(limits).await;
             let client = TcpStream::connect(bound).await.unwrap();
-            let (mut first_read, mut first_write) = pulsebeam_tcp::split(client, 128).unwrap();
+            let (mut first_read, mut first_write) =
+                pulsebeam_runtime::net::tcp::split(client, 128).unwrap();
             let flow = if active_cap == 1 {
                 first_write.send(&stun(address(1))).await.unwrap();
                 let Some(TcpIngress::Adopt {
@@ -233,7 +234,8 @@ fn admission_caps_and_first_stun_deadline_release_capacity() {
                 None
             };
             let second = TcpStream::connect(bound).await.unwrap();
-            let (mut second_read, mut second_write) = pulsebeam_tcp::split(second, 128).unwrap();
+            let (mut second_read, mut second_write) =
+                pulsebeam_runtime::net::tcp::split(second, 128).unwrap();
             let _ = second_write.send(&stun(address(1))).await;
             assert!(matches!(second_read.recv().await, Ok(None) | Err(_)));
             if active_cap == 1 {
@@ -246,7 +248,7 @@ fn admission_caps_and_first_stun_deadline_release_capacity() {
                 assert!(matches!(first_read.recv().await, Ok(None) | Err(_)));
             }
             let third = TcpStream::connect(bound).await.unwrap();
-            let (_, mut third_write) = pulsebeam_tcp::split(third, 128).unwrap();
+            let (_, mut third_write) = pulsebeam_runtime::net::tcp::split(third, 128).unwrap();
             third_write.send(&stun(address(2))).await.unwrap();
             let Some(TcpIngress::Adopt {
                 first_stun,
@@ -306,7 +308,7 @@ fn routing_hint_and_pre_auth_nulls_are_untrusted_and_bounded() {
         );
         for excess_nulls in [false, true] {
             let client = TcpStream::connect(bound).await.unwrap();
-            let (mut read, mut write) = pulsebeam_tcp::split(client, 128).unwrap();
+            let (mut read, mut write) = pulsebeam_runtime::net::tcp::split(client, 128).unwrap();
             if excess_nulls {
                 for _ in 0..9 {
                     let _ = write.send(&[]).await;

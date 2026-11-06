@@ -16,8 +16,8 @@ impl Io for Device {
     fn capabilities(&self) -> Capabilities {
         self.caps
     }
-    fn readable(&self) -> Readiness<'_> {
-        Box::pin(async { Ok(()) })
+    fn poll_readable(&self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
     fn writable(&self) -> Readiness<'_> {
         Box::pin(async { Ok(()) })

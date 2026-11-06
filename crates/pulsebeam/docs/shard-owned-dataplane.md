@@ -1,10 +1,15 @@
-# Shard-Owned Work-Stealing Dataplane
+# Shard-Owned Movable Dataplane
 
-PulseBeam uses a **shard-owned work-stealing dataplane**.
+PulseBeam uses a **shard-owned dataplane** with runtime-managed execution.
 
-It borrows the important discipline of thread-per-core systems—partition hot state, preserve locality, avoid cross-core synchronization on the packet path—but it is not a strict thread-per-core architecture.
+It borrows the discipline of thread-per-core systems: partition hot state,
+preserve locality and avoid cross-core synchronization on the packet path.
+It is not a strict thread-per-core architecture.
 
-A worker executes many shards. Runnable shards may move between workers through work stealing. The invariant is therefore not that a shard belongs to a core; it is that the shard owns its dataplane state regardless of which worker currently executes it.
+An adaptive worker normally executes multiple logical shards. The node controller
+chooses placement; the runtime transfers a whole service at an explicit quiescent
+poll boundary. The restart-time work-stealing profile retains the dedicated scheduler
+fallback. A shard owns its state regardless of which worker currently executes it.
 
 The design goal is:
 
@@ -54,7 +59,7 @@ Placement is nevertheless an optimization.
 The dataplane must remain correct when:
 
 * communicating shards are placed on different workers;
-* a shard is stolen by another worker;
+* a shard migrates to another worker;
 * load causes placement to change; or
 * ideal colocation cannot be achieved.
 
@@ -62,11 +67,39 @@ Do not encode correctness assumptions into current placement.
 
 A design that is only correct because two shards normally happen to run on the same worker is incorrect.
 
-## Work stealing
+## Runtime execution and movement
 
-Work stealing exists to recover utilization when static placement becomes imbalanced.
+`pulsebeam-runtime` owns process profiles, worker runtimes, task lifecycle,
+readiness and timer resources. The SFU supplies budgeted shard logic, logical
+identities, queues and absolute deadlines, not backend builders or handles.
+Simulation stays on its caller's virtual-time runtime.
 
-Stealing happens at the shard ownership boundary. It does not split one shard's mutable runtime across multiple workers.
+The node controller's placement module uses the existing room registry for
+initial admission and borrows complete low-rate runtime observations for worker
+residency and execution pressure. It holds observation history and cooldowns,
+not another room or residency registry. The runtime executes explicit worker
+assignments and move requests, without an autonomous balancing policy.
+Busy time is normalized by each service's actual sampling interval, then
+aggregated over multiple settled windows. Participant counts are only an admission
+fallback or tie-breaker; room costs are not assumed equal. Candidate moves must
+provide substantial relief across the observed demand range while retaining
+destination headroom. A fixed reserve is a heuristic, not a measured warmup bound.
+Continuous balancing permits only one outstanding move. Every attempt fences
+history through an observation-only hold, followed by fresh windows and candidate
+persistence. It moves only an independently useful whole service, not a lone
+indivisible hot shard. Every bounded tick explicitly yields before
+another tick, even when input remains ready.
+
+Native Linux handoff cancels reactor-bound waits, retains absolute deadlines,
+deregisters the same UDP descriptor and transfers exclusive ownership of the
+same pinned inner service allocation. The destination registers that descriptor
+and initially polls all current input and overdue deadlines with its own waker.
+No application-state extraction, socket clone or close/rebind is involved.
+Bounded destination capacity is reserved before transfer. Registration failure
+retains ownership for one rollback; unsafe restoration or worker failure is a
+fatal node error. Shutdown fences new moves and joins resident and queued work.
+
+Movement does not split one shard's mutable runtime across multiple workers.
 
 The scheduler must preserve:
 
@@ -260,7 +293,7 @@ A shard is not permanently pinned to one thread or CPU.
 
 It is not shared-everything work stealing.
 
-Work stealing changes where an ownership domain executes; it does not dissolve that ownership domain.
+Scheduling and migration change where an ownership domain executes; they do not dissolve that ownership domain.
 
 It is not "no atomics."
 

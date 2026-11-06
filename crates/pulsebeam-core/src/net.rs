@@ -19,6 +19,11 @@ mod sim {
     pub struct TurmoilListener(InnerListener);
 
     impl TurmoilListener {
+        /// Transfer this legacy listener to an owning runtime adapter.
+        pub fn into_inner(self) -> InnerListener {
+            self.0
+        }
+
         pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
             let inner = InnerListener::bind(addr).await?;
             Ok(Self(inner))

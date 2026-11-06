@@ -1,24 +1,25 @@
-use std::time::Duration;
+//! Owned process execution and movable shard services.
 
-pub use tokio::runtime::Handle;
-pub use tokio::task::JoinSet;
+mod config;
+mod executor;
+mod managed;
+mod monitor;
+pub use monitor::monitor;
+mod process;
 
-mod spawn;
-pub use spawn::{
-    RuntimeSpawner, SpawnError, TaskFactory, TaskHandle, set_global_runtime_spawner, spawn,
-    spawn_control, spawn_data,
+pub use config::{ExecutionConfig, Profile};
+pub use executor::{
+    DataExecutor, ExecutionSnapshot, Migration, MigrationHandle, ServiceSnapshot, WorkerSnapshot,
 };
+pub use managed::{ManagedIo, ManagedService, Service};
+pub use process::{available_workers, block_on, spare_core, tune_control_thread, tune_data_thread};
 
-pub type Runtime = tokio::runtime::Runtime;
-
-pub fn current() -> Handle {
-    Handle::current()
-}
+pub use tokio::task::JoinSet;
 
 pub async fn yield_now() {
     tokio::task::yield_now().await;
 }
 
-pub async fn sleep(duration: Duration) {
+pub async fn sleep(duration: std::time::Duration) {
     tokio::time::sleep(duration).await;
 }

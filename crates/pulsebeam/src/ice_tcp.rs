@@ -322,25 +322,21 @@ impl Service {
         routing: Routing,
         limits: Limits,
         inboxes: Vec<InboxSender>,
-        spare_core: Option<core_affinity::CoreId>,
+        spare_core: Option<usize>,
         shutdown: CancellationToken,
     ) -> io::Result<(Self, SocketAddr)> {
         limits.validate(routing.shard_count)?;
         let stop = shutdown.clone();
-        let (role, bound) = IdleRole::start(
-            "pb-ice-tcp",
-            spare_core.map(|core| core.id),
-            shutdown,
-            move || async move {
+        let (role, bound) =
+            IdleRole::start("pb-ice-tcp", spare_core, shutdown, move || async move {
                 let listener = tcp::bind(bind).await?;
                 let bound = listener.local_addr()?;
                 Ok((
                     bound,
                     accept_loop(listener, advertised, routing, limits, inboxes, stop),
                 ))
-            },
-        )
-        .await?;
+            })
+            .await?;
         Ok((Self { role }, bound))
     }
 

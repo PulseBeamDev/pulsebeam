@@ -5,6 +5,7 @@ use pulsebeam_udp::{
     Capabilities, SendDatagram,
     simulation::{Io, Metadata, Readiness},
 };
+use std::task::{Context, Poll};
 use std::{io, net::SocketAddr, rc::Rc};
 use turmoil::net::UdpSocket;
 
@@ -119,14 +120,12 @@ impl Io for HostIo {
             },
         }
     }
-    fn readable(&self) -> Readiness<'_> {
-        Box::pin(async {
-            if self.pending.is_some() {
-                Ok(())
-            } else {
-                self.member.readable().await
-            }
-        })
+    fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.pending.is_some() {
+            Poll::Ready(Ok(()))
+        } else {
+            self.member.poll_readable(cx)
+        }
     }
     fn writable(&self) -> Readiness<'_> {
         Box::pin(std::future::ready(Ok(())))

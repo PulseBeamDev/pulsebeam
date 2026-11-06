@@ -157,6 +157,13 @@ py_binary(
 )
 
 py_test(
+    name = "runtime_boundary_contract",
+    srcs = ["tests/runtime_boundary_test.py"],
+    main = "tests/runtime_boundary_test.py",
+    data = ["//crates/pulsebeam:Cargo.toml"],
+)
+
+py_test(
     name = "rust_pins_contract",
     srcs = ["tests/rust_pins_test.py", "update-rust-pins.py"],
     main = "tests/rust_pins_test.py",

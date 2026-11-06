@@ -3,6 +3,13 @@
 use std::{future::Future, io};
 use tokio_util::sync::CancellationToken;
 
+struct CancelOnExit(CancellationToken);
+impl Drop for CancelOnExit {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// An owned role. Dropping it requests shutdown; `finish` also joins it.
 pub struct IdleRole {
     shutdown: CancellationToken,
@@ -37,7 +44,11 @@ impl IdleRole {
         {
             let _ = (name, spare_core);
             let (ready, run) = init().await?;
-            let task = tokio::spawn(run);
+            let stop = shutdown.clone();
+            let task = tokio::spawn(async move {
+                let _cancel = CancelOnExit(stop);
+                run.await;
+            });
             Ok((
                 Self {
                     shutdown,
@@ -49,9 +60,11 @@ impl IdleRole {
         #[cfg(not(feature = "sim"))]
         {
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let stop = shutdown.clone();
             let thread = std::thread::Builder::new()
                 .name(name.into())
                 .spawn(move || {
+                    let _cancel = CancelOnExit(stop);
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
@@ -150,6 +163,7 @@ pub fn thread_cpu_nanos() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]

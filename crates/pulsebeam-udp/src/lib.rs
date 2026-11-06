@@ -3,6 +3,7 @@
 mod simulation_tests;
 #[cfg(test)]
 mod tests;
+use std::task::{Context, Poll};
 use std::{io, net::SocketAddr, num::NonZeroU16, time::SystemTime};
 use tokio::time::Instant;
 
@@ -299,6 +300,10 @@ impl UdpSocket {
     }
     pub async fn readable(&self) -> io::Result<()> {
         self.inner.readable().await
+    }
+    /// Register the single receiver's waker until the next poll or socket deregistration.
+    pub fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_readable(cx)
     }
     pub async fn writable(&self) -> io::Result<()> {
         self.inner.writable().await

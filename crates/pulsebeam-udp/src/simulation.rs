@@ -3,7 +3,7 @@
 //! An adapter accepts a whole entry atomically. Loss/delay/duplication after
 //! that boundary is network behavior, not a failed local submission.
 use super::*;
-use std::{future::Future, pin::Pin};
+use std::{cell::RefCell, future::Future, pin::Pin, rc::Rc};
 
 pub type Readiness<'a> = Pin<Box<dyn Future<Output = io::Result<()>> + 'a>>;
 
@@ -20,7 +20,10 @@ pub struct Metadata {
 pub trait Io {
     fn local_addr(&self) -> SocketAddr;
     fn capabilities(&self) -> Capabilities;
-    fn readable(&self) -> Readiness<'_>;
+    fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+    fn readable(&self) -> Readiness<'_> {
+        Box::pin(std::future::poll_fn(|cx| self.poll_readable(cx)))
+    }
     fn writable(&self) -> Readiness<'_>;
     fn receive(&mut self, payload: &mut [u8]) -> io::Result<Metadata>;
     fn submit(&mut self, entry: &SendDatagram<'_>) -> io::Result<()>;
@@ -73,7 +76,11 @@ pub(crate) async fn bind(options: &BindOptions) -> io::Result<Bound> {
         ));
     }
     Ok(Bound {
-        io: Box::new(Turmoil { socket, local_addr }),
+        io: Box::new(Turmoil {
+            socket: Rc::new(socket),
+            local_addr,
+            readiness: RefCell::new(None),
+        }),
     })
 }
 
@@ -90,6 +97,9 @@ impl Socket {
     }
     pub(crate) async fn readable(&self) -> io::Result<()> {
         self.io.readable().await
+    }
+    pub(crate) fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.io.poll_readable(cx)
     }
     pub(crate) async fn writable(&self) -> io::Result<()> {
         self.io.writable().await
@@ -150,8 +160,9 @@ impl Socket {
 }
 
 struct Turmoil {
-    socket: turmoil::net::UdpSocket,
+    socket: Rc<turmoil::net::UdpSocket>,
     local_addr: SocketAddr,
+    readiness: RefCell<Option<Readiness<'static>>>,
 }
 impl Io for Turmoil {
     fn local_addr(&self) -> SocketAddr {
@@ -164,8 +175,17 @@ impl Io for Turmoil {
             max_gso_segments: 1,
         }
     }
-    fn readable(&self) -> Readiness<'_> {
-        Box::pin(self.socket.readable())
+    fn poll_readable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut readiness = self.readiness.borrow_mut();
+        let wait = readiness.get_or_insert_with(|| {
+            let socket = self.socket.clone();
+            Box::pin(async move { socket.readable().await })
+        });
+        let result = wait.as_mut().poll(cx);
+        if result.is_ready() {
+            *readiness = None;
+        }
+        result
     }
     fn writable(&self) -> Readiness<'_> {
         Box::pin(self.socket.writable())

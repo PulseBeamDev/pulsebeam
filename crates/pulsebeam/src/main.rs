@@ -8,13 +8,11 @@ use pulsebeam_core::auth::{
     KeyRegistryEntry,
 };
 use pulsebeam_runtime::rand;
+use pulsebeam_runtime::{rt::Profile, sync::CancellationToken};
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    num::NonZeroUsize,
     path::Path,
 };
-use tokio::runtime::LocalOptions;
-use tokio_util::sync::CancellationToken;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
 
@@ -65,8 +63,12 @@ struct Args {
     /// Pin to a specific network interface name (e.g., enp0s13f0u1u2)
     #[arg(short = 'i', long = "iface")]
     iface: Option<String>,
-    #[arg(short, long, default_value_t = 16)]
-    shards: usize,
+    /// Process runtime profile. Changing profiles requires a restart.
+    #[arg(long = "rt", default_value_t = Profile::Adaptive)]
+    runtime: Profile,
+    /// Logical shards per worker (default 16, or 1 for thread-per-core).
+    #[arg(short, long)]
+    shards: Option<usize>,
 }
 
 fn main() {
@@ -93,7 +95,7 @@ fn main() {
     tracing::info!(project_id = %registry.project_id(), "configured authentication project");
 
     // Control thread is floating between threads
-    let total_cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let total_cores = pulsebeam_runtime::rt::available_workers();
     let workers = total_cores;
     tracing::info!(
         "using {} data plane worker threads ({} total cores)",
@@ -101,25 +103,31 @@ fn main() {
         total_cores
     );
 
-    let mut rt_builder = tokio::runtime::Builder::new_current_thread();
-    let rt = rt_builder
-        .enable_all()
-        // .worker_threads(workers)
-        // .disable_lifo_slot()
-        // https://github.com/tokio-rs/tokio/issues/7745
-        .enable_alt_timer()
-        .build_local(LocalOptions::default())
-        .unwrap_or_else(|err| pulsebeam_runtime::fatal!("cannot build the node runtime: {err}"));
+    let shards = args
+        .shards
+        .unwrap_or(if args.runtime == Profile::ThreadPerCore {
+            1
+        } else {
+            16
+        });
+    if let Err(error) =
+        pulsebeam_runtime::rt::ExecutionConfig::new(args.runtime, workers, shards).shard_count()
+    {
+        pulsebeam_runtime::fatal!("invalid runtime configuration: {error}");
+    }
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    if let Err(err) = rt.block_on(run(
+    if let Err(err) = pulsebeam_runtime::rt::block_on(run(
         shutdown.clone(),
         workers,
         rtc_port,
         args.iface,
-        args.shards,
+        args.runtime,
+        shards,
         registry,
-    )) {
+    ))
+    .unwrap_or_else(|error| pulsebeam_runtime::fatal!("cannot build the node runtime: {error}"))
+    {
         pulsebeam_runtime::fatal!("server failed: {err:#}");
     }
     shutdown.cancel();
@@ -145,6 +153,7 @@ pub async fn run(
     workers: usize,
     rtc_port: u16,
     network_interface: Option<String>,
+    profile: Profile,
     shards_per_worker: usize,
     key_registry: KeyRegistry,
 ) -> Result<()> {
@@ -170,7 +179,7 @@ pub async fn run(
         .local_addr(local_addr)
         .external_addrs(external_addrs)
         .rng(rng)
-        .work_stealing(shards_per_worker)
+        .runtime_profile(profile, shards_per_worker)
         .with_http_api(http_api_addr)
         .with_key_registry(key_registry)
         .with_internal_metrics(metrics_addr);
@@ -179,18 +188,19 @@ pub async fn run(
     // Not `spawn`: under `--features sim` a bound socket belongs to a
     // thread-local `SO_REUSEPORT` group, which makes the node future `!Send`.
     // It runs on this thread either way, so nothing is lost by saying so.
-    let node_handle = tokio::task::spawn_local(node);
+    let mut node_handle = pulsebeam_runtime::task::spawn_local(node);
 
     tracing::info!("starting server...");
 
-    tokio::select! {
-        result = node_handle => {
+    pulsebeam_runtime::select! {
+        result = &mut node_handle => {
             result.context("node task failed")??;
             tracing::warn!("node stopped");
         }
         _ = pulsebeam_runtime::system::wait_for_signal() => {
             tracing::info!("shutting down gracefully...");
             shutdown.cancel();
+            node_handle.await.context("joining node shutdown")??;
         }
     }
 
@@ -228,6 +238,18 @@ mod tests {
             "pulsebeam-server-key-registry-{}.json",
             ApiKeyId::new()
         ))
+    }
+
+    #[test]
+    fn runtime_profile_selection_has_an_adaptive_restart_default() {
+        let default = Args::try_parse_from(["pulsebeam"]).unwrap();
+        assert_eq!(default.runtime, Profile::Adaptive);
+        assert!(default.shards.is_none());
+        let fallback =
+            Args::try_parse_from(["pulsebeam", "--rt", "work-stealing", "--shards", "32"]).unwrap();
+        assert_eq!(fallback.runtime, Profile::WorkStealing);
+        assert_eq!(fallback.shards, Some(32));
+        assert!(Args::try_parse_from(["pulsebeam", "--rt", "unknown"]).is_err());
     }
 
     #[test]

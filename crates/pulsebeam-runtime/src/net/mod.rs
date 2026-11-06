@@ -1,3 +1,5 @@
+pub mod tcp;
+
 #[cfg(feature = "sim")]
 #[path = "bound_udp_sim.rs"]
 mod bound_udp;

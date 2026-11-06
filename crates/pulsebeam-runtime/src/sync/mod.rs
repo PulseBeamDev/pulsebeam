@@ -1,6 +1,6 @@
 //! Synchronization primitives and channels.
 
-pub use tokio::sync::{Notify, Semaphore, broadcast, mpsc, oneshot, watch};
+pub use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 pub use tokio_util::sync::CancellationToken;
 
 mod primitives {

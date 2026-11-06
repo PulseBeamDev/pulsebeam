@@ -2,7 +2,12 @@
 //! startup and never again. Carries the sanctioned exception in
 //! `shard::metrics`; nothing else here may share.
 
-use std::{collections::VecDeque, pin::Pin};
+use pulsebeam_runtime::rt::{ManagedIo, Service};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    task::{Context, Poll},
+};
 
 #[allow(
     clippy::disallowed_types,
@@ -15,7 +20,7 @@ use crate::route::Envelope;
 
 use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::net::{self, RecvPacketBatch};
-use tokio::time::{Instant, Sleep};
+use pulsebeam_runtime::time::Instant;
 
 use crate::{
     entity::ParticipantId,
@@ -155,7 +160,7 @@ pub(crate) enum ShardCommand {
     MaterializeParticipant {
         transport: crate::route::NodeTransportAddress,
         config: Box<ParticipantConfig>,
-        ack: tokio::sync::oneshot::Sender<bool>,
+        ack: pulsebeam_runtime::sync::oneshot::Sender<bool>,
     },
     AuthenticateTransport {
         source: std::net::SocketAddr,
@@ -332,7 +337,7 @@ pub(crate) struct ShardWorker {
     core: ShardCore,
     recv_batch: Vec<RecvPacketBatch>,
     tcp_inbox: Option<crate::ice_tcp::Inbox>,
-    udp_socket: pulsebeam_udp::UdpSocket,
+    loop_start: Instant,
     command_rx: mailbox::Receiver<ShardCommand>,
     event_tx: mailbox::Sender<ShardEventMessage>,
     shard_event_backlog: VecDeque<ShardEvent>,
@@ -347,7 +352,7 @@ pub(crate) struct ShardWorker {
     health_metrics: ShardHealthMetrics,
     #[allow(
         clippy::disallowed_types,
-        reason = "Arc<ShardRecorder>, only cloned at init"
+        reason = "shard-owned recorder; temporary clones never escape a poll"
     )]
     recorder: Arc<ShardRecorder>,
     stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
@@ -386,6 +391,47 @@ impl ShardHealthMetrics {
     }
 }
 
+impl Service for ShardWorker {
+    fn poll_service(
+        &mut self,
+        io: &mut ManagedIo,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let ready = {
+            let wait = self.wait_for_inputs(io);
+            pulsebeam_runtime::pin!(wait);
+            wait.as_mut().poll(cx)
+        };
+        match ready {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(std::io::Error::other(error))),
+            Poll::Ready(Ok(())) => {}
+        }
+        let at = pulsebeam_runtime::net::ReceiveTime::now();
+        let busy_start = at.monotonic;
+        self.metrics
+            .record_idle(busy_start.saturating_duration_since(self.loop_start));
+        let previous_busy = self.last_busy;
+        let recorder = self.recorder.clone();
+        let result = metrics::with_local_recorder(&*recorder, || {
+            self.observe_health(previous_busy);
+            self.tick(at, io.socket());
+            self.flush_shard_events()
+        });
+        if let Err(error) = result {
+            return Poll::Ready(Err(std::io::Error::other(error)));
+        }
+        let end = Instant::now();
+        self.loop_start = end;
+        self.last_busy = end.saturating_duration_since(busy_start);
+        self.metrics.record_busy(self.last_busy);
+        self.report_stats(end, self.last_busy);
+        // End every bounded tick at an explicit poll boundary, even under permanent readiness.
+        io.yield_after_tick(cx);
+        Poll::Pending
+    }
+}
+
 impl ShardWorker {
     // Every argument is a distinct resource the worker takes ownership of —
     // two sockets, three channel ends, metrics, RNG, clock. Grouping them into
@@ -398,7 +444,7 @@ impl ShardWorker {
     )]
     pub(crate) fn new(
         shard_id: ShardId,
-        udp_socket: pulsebeam_udp::UdpSocket,
+        max_gso_segments: usize,
         tcp_inbox: Option<crate::ice_tcp::Inbox>,
         command_rx: mailbox::Receiver<ShardCommand>,
         update_rx: mailbox::Receiver<Box<crate::shard_update::ShardUpdate>>,
@@ -410,13 +456,7 @@ impl ShardWorker {
         wall: WallAnchor,
     ) -> Self {
         let shard_count = frame_txs.len();
-        let core = ShardCore::new(
-            shard_id,
-            udp_socket.capabilities().max_gso_segments,
-            shard_count,
-            wall,
-            update_rx,
-        );
+        let core = ShardCore::new(shard_id, max_gso_segments, shard_count, wall, update_rx);
         let router = ChannelTransport {
             shard_id,
             frame_txs,
@@ -429,7 +469,7 @@ impl ShardWorker {
             core,
             recv_batch: Vec::with_capacity(net::BATCH_SIZE),
             tcp_inbox,
-            udp_socket,
+            loop_start: Instant::now(),
             command_rx,
             event_tx,
             shard_event_backlog: VecDeque::new(),
@@ -444,43 +484,6 @@ impl ShardWorker {
                 .checked_add(STATS_REPORT_INTERVAL)
                 .unwrap_or_else(Instant::now),
             last_busy: Duration::ZERO,
-        }
-    }
-
-    #[tracing::instrument(skip(self), fields(shard_id = %self.router.shard_id))]
-    pub async fn run(self) {
-        let res = self.run_inner().await;
-        tracing::info!("shard exited: {:?}", res);
-    }
-
-    async fn run_inner(mut self) -> Result<(), ShardError> {
-        let recorder = &self.recorder.clone();
-        let sleep = tokio::time::sleep(tokio::time::Duration::MAX);
-        tokio::pin!(sleep);
-
-        let mut loop_start = Instant::now();
-        loop {
-            self.wait_for_inputs(sleep.as_mut()).await?;
-
-            let at = pulsebeam_runtime::net::ReceiveTime::now();
-            let busy_start = at.monotonic;
-            self.metrics
-                .record_idle(busy_start.saturating_duration_since(loop_start));
-
-            let previous_busy = self.last_busy;
-            metrics::with_local_recorder(recorder, || {
-                self.observe_health(previous_busy);
-                self.tick(at);
-                self.flush_shard_events()
-            })?;
-
-            let busy_end = Instant::now();
-            loop_start = busy_end;
-            let busy_duration = busy_end.duration_since(busy_start);
-            self.metrics.record_busy(busy_duration);
-            self.last_busy = busy_duration;
-
-            self.report_stats(busy_end, busy_duration);
         }
     }
 
@@ -537,23 +540,17 @@ impl ShardWorker {
         }
     }
 
-    async fn wait_for_inputs(&mut self, mut sleep: Pin<&mut Sleep>) -> Result<(), ShardError> {
+    async fn wait_for_inputs(&mut self, io: &mut ManagedIo) -> Result<(), ShardError> {
         if !self.shard_event_backlog.is_empty() {
             return Ok(());
         }
         let deadline = self.next_wait_deadline();
-        let has_timer = if let Some(d) = deadline {
-            sleep.as_mut().reset(d);
-            true
-        } else {
-            false
-        };
 
         // Block until at least one source is ready.
-        tokio::select! {
+        pulsebeam_runtime::select! {
             biased;
             true = self.core.update_readable() => {}
-            Ok(_) = self.udp_socket.readable() => {}
+            ready = io.readable(deadline) => { ready?; }
             true = self.frame_rx.readable() => {}
             true = async {
                 match self.tcp_inbox.as_mut() {
@@ -562,14 +559,17 @@ impl ShardWorker {
                 }
             }, if self.tcp_inbox.is_some() => {}
             true = self.command_rx.readable() => {}
-            _ = sleep.as_mut(), if has_timer => {}
             else => return Err(ShardError::ManagerDisconnected),
         }
 
         Ok(())
     }
 
-    fn tick(&mut self, at: pulsebeam_runtime::net::ReceiveTime) {
+    fn tick(
+        &mut self,
+        at: pulsebeam_runtime::net::ReceiveTime,
+        udp_socket: &mut pulsebeam_udp::UdpSocket,
+    ) {
         let now = self.core.observe_execution_time(at).monotonic;
         // phase 1: input
         let mut commands: usize = 0;
@@ -601,12 +601,12 @@ impl ShardWorker {
             self.tick_budget_hit("frames");
         }
         if self.recv_batch.is_empty() {
-            let mode = if self.udp_socket.capabilities().max_batch_messages > 1 {
+            let mode = if udp_socket.capabilities().max_batch_messages > 1 {
                 net::UdpMode::Batch
             } else {
                 net::UdpMode::Scalar
             };
-            if let Ok(batch) = self.udp_socket.try_recv_batch() {
+            if let Ok(batch) = udp_socket.try_recv_batch() {
                 // Routing can transfer packets to another shard. Ownership is
                 // materialized here, not imposed on immediate socket inspection.
                 for datagram in batch.iter() {
@@ -627,7 +627,7 @@ impl ShardWorker {
 
         if self
             .core
-            .poll_and_flush_dirty(&mut self.udp_socket, SHARD_PARTICIPANT_BUDGET)
+            .poll_and_flush_dirty(udp_socket, SHARD_PARTICIPANT_BUDGET)
             == SHARD_PARTICIPANT_BUDGET
         {
             self.tick_budget_hit("participants");
@@ -641,7 +641,7 @@ impl ShardWorker {
         }
         if self
             .core
-            .poll_and_flush_dirty(&mut self.udp_socket, SHARD_PARTICIPANT_BUDGET)
+            .poll_and_flush_dirty(udp_socket, SHARD_PARTICIPANT_BUDGET)
             == SHARD_PARTICIPANT_BUDGET
         {
             self.tick_budget_hit("participants");

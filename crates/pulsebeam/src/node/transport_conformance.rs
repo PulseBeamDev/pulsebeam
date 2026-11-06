@@ -423,7 +423,13 @@ fn config(endpoint: &str, participant: &str) -> Result<Config> {
     Ok(Config::new(session))
 }
 
-async fn witness(a: &Agent, b: &Agent, port: u16, protocol: Protocol) -> Result<()> {
+async fn witness(
+    a: &Agent,
+    b: &Agent,
+    port: u16,
+    protocol: Protocol,
+    migration: &pulsebeam_runtime::rt::MigrationHandle,
+) -> Result<()> {
     let events_a = a.events();
     let events_b = b.events();
     let (pair_a, pair_b) = pulsebeam_runtime::time::timeout(CONNECT, async {
@@ -458,6 +464,78 @@ async fn witness(a: &Agent, b: &Agent, port: u16, protocol: Protocol) -> Result<
             received(&events_a, &sender_b, B_TO_A)
         )?;
         tracing::info!("EXERCISED both recipient application payloads");
+        let during_a = b"IPv4 application delivery during shard handoff";
+        let during_b = b"IPv6 application delivery during shard handoff";
+        pulsebeam_runtime::try_join!(
+            async {
+                tracing::info!(
+                    ?protocol,
+                    service = 0,
+                    destination = 1,
+                    "requesting managed-shard move"
+                );
+                migration
+                    .move_service(0, 1)
+                    .await
+                    .context("first managed-shard move")?;
+                tracing::info!(
+                    ?protocol,
+                    service = 0,
+                    destination = 1,
+                    "completed managed-shard move"
+                );
+                migration
+                    .move_service(1, 0)
+                    .await
+                    .context("second managed-shard move")?;
+                tracing::info!(
+                    ?protocol,
+                    service = 1,
+                    destination = 0,
+                    "completed managed-shard move"
+                );
+                anyhow::Ok(())
+            },
+            async {
+                a.send_topic(TopicSend {
+                    publisher: publisher(),
+                    payload: during_a.to_vec(),
+                })
+                .await?;
+                received(&events_b, &sender_a, during_a).await?;
+                tracing::info!(?protocol, "EXERCISED IPv4-to-IPv6 delivery during handoff");
+                anyhow::Ok(())
+            },
+            async {
+                b.send_topic(TopicSend {
+                    publisher: publisher(),
+                    payload: during_b.to_vec(),
+                })
+                .await?;
+                received(&events_a, &sender_b, during_b).await?;
+                tracing::info!(?protocol, "EXERCISED IPv6-to-IPv4 delivery during handoff");
+                anyhow::Ok(())
+            },
+        )?;
+        let after_a = b"IPv4 application delivery after completed shard move";
+        let after_b = b"IPv6 application delivery after completed shard move";
+        pulsebeam_runtime::try_join!(
+            a.send_topic(TopicSend {
+                publisher: publisher(),
+                payload: after_a.to_vec()
+            }),
+            b.send_topic(TopicSend {
+                publisher: publisher(),
+                payload: after_b.to_vec()
+            }),
+        )?;
+        pulsebeam_runtime::try_join!(
+            received(&events_b, &sender_a, after_a),
+            received(&events_a, &sender_b, after_b)
+        )?;
+        tracing::info!(
+            "EXERCISED two completed same-future adaptive moves and fresh delivery on both families"
+        );
         pulsebeam_runtime::try_join!(
             ready(a, pair_a.remote, Some(&pair_a), protocol),
             ready(b, pair_b.remote, Some(&pair_b), protocol)
@@ -485,7 +563,7 @@ async fn run(protocol: Protocol) -> Result<()> {
         DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID,
         KeyRegistryEntry,
     };
-    let sockets = bind_udp_sockets("[::]:0".parse()?, None, 1, UdpMode::Batch)
+    let mut sockets = bind_udp_sockets("[::]:0".parse()?, None, 1, UdpMode::Batch)
         .await
         .context(
             "UNSUPPORTED: dual-stack IPv6 listener; enable IPv6 loopback on this Linux test host",
@@ -495,11 +573,22 @@ async fn run(protocol: Protocol) -> Result<()> {
         .context("no owned UDP listener")?
         .local_addr()
         .port();
+    sockets.extend(
+        bind_udp_sockets(
+            SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port),
+            None,
+            1,
+            UdpMode::Batch,
+        )
+        .await?,
+    );
     let http = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}", http.local_addr()?);
+    let (control, runtime_control) = pulsebeam_runtime::sync::oneshot::channel();
     let builder = NodeBuilder::new()
-        .data_threads(1)
-        .work_stealing(1)
+        .data_threads(2)
+        .adaptive(1)
+        .with_runtime_control(control)
         .local_addr(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))
         .external_addrs(vec![Family::V4.address(port), Family::V6.address(port)])
         .rng(pulsebeam_runtime::rand::os_rng())
@@ -526,26 +615,33 @@ async fn run(protocol: Protocol) -> Result<()> {
     let mut agents = Vec::new();
     let mut answers = Vec::new();
     let result = async {
-        for (family, name) in [(Family::V4, "v4"), (Family::V6, "v6")] {
-            let (answer, evidence) = watch::channel(None);
-            let agent = Agent::spawn(
-                config(&endpoint, name)?,
-                Host::new(Box::new(FamilyHttp {
-                    client: reqwest::Client::new(),
-                    family,
-                    port,
-                    protocol,
-                    answer,
-                })),
-            )
-            .await?;
-            agents.push(agent);
-            answers.push(evidence);
-        }
+        let migration = pulsebeam_runtime::time::timeout(CONNECT, async {
+            for (family, name) in [(Family::V4, "v4"), (Family::V6, "v6")] {
+                let (answer, evidence) = watch::channel(None);
+                let agent = Agent::spawn(
+                    config(&endpoint, name)?,
+                    Host::new(Box::new(FamilyHttp {
+                        client: reqwest::Client::new(),
+                        family,
+                        port,
+                        protocol,
+                        answer,
+                    })),
+                )
+                .await?;
+                agents.push(agent);
+                answers.push(evidence);
+            }
+            runtime_control
+                .await
+                .context("adaptive runtime control missing")
+        })
+        .await
+        .context("FAILED: 30s owned SDK/node startup deadline")??;
         let a = agents.first().context("IPv4 agent missing")?;
         let b = agents.get(1).context("IPv6 agent missing")?;
         pulsebeam_runtime::select! {
-            result = witness(a, b, port, protocol) => result?,
+            result = witness(a, b, port, protocol, &migration) => result?,
             result = &mut node => {
                 node_observed = true;
                 bail!("production node exited before qualification: {result:?}");

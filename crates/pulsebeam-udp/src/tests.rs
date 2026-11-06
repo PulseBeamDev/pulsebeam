@@ -161,6 +161,7 @@ fn detached_socket_moves_between_reactors_and_recovers_failed_registration() {
     let fd = detached.as_fd().as_raw_fd();
     drop(first);
     let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    sender.set_nonblocking(true).unwrap();
     sender.send_to(b"queued", address).unwrap();
 
     let failed_runtime = runtime();
@@ -186,6 +187,18 @@ fn detached_socket_moves_between_reactors_and_recovers_failed_registration() {
         };
         assert_eq!(socket.local_addr(), address);
         assert_eq!(socket.capabilities(), caps);
+        // No reactor poll has populated readiness since reactivation.
+        let report = socket.try_send_batch(&[SendDatagram {
+            destination: sender.local_addr().unwrap(),
+            payload: b"reactivated",
+            gso_segment_size: None,
+        }]);
+        assert_eq!(report.accepted, 1);
+        assert!(report.stop.is_none());
+        let mut reply = [0; 16];
+        let (len, source) = sender.recv_from(&mut reply).unwrap();
+        assert_eq!(&reply[..len], b"reactivated");
+        assert_eq!(source, address);
         tokio::time::timeout(Duration::from_secs(2), socket.readable())
             .await
             .unwrap()

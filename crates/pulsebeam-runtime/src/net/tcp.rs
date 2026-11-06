@@ -13,6 +13,13 @@ pub use turmoil::net::TcpStream;
 pub struct TcpListener(turmoil::net::TcpListener);
 
 #[cfg(feature = "sim")]
+impl From<pulsebeam_core::net::TcpListener> for TcpListener {
+    fn from(listener: pulsebeam_core::net::TcpListener) -> Self {
+        Self(listener.into_inner())
+    }
+}
+
+#[cfg(feature = "sim")]
 impl TcpListener {
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
         turmoil::net::TcpListener::bind(addr).await.map(Self)

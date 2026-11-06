@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use super::MAX_NATIVE_SDP_BYTES;
+use super::{MAX_NATIVE_SDP_BYTES, placement};
 use crate::control::steering::Steering;
 use crate::track::{DataTrackIntent, SelectionPolicy, TrackSelector};
 use crate::{
@@ -28,6 +28,7 @@ use pulsebeam_core::auth::{
 };
 use pulsebeam_queue as mailbox;
 use pulsebeam_rtc::LocalCandidate;
+use pulsebeam_runtime::rt::{Migration, MigrationHandle};
 use pulsebeam_runtime::sync::CancellationToken;
 use pulsebeam_runtime::sync::oneshot;
 
@@ -294,6 +295,9 @@ enum MaterializationReply {
 pub struct ControllerActor {
     router: crate::control::router::ShardRouter,
     core: ControllerCore,
+    placement: placement::Placement,
+    execution: Option<MigrationHandle>,
+    migration: Option<(placement::ShardMove, Migration)>,
     negotiator: Negotiator,
     clock: crate::clock::WallAnchor,
     cluster_id: u16,
@@ -332,6 +336,9 @@ impl ControllerActor {
         Self {
             router: crate::control::router::ShardRouter::new(shard_contexts),
             core: ControllerCore::with_shards(shard_count, room_partition_size, placement),
+            placement: placement::Placement::default(),
+            execution: None,
+            migration: None,
             negotiator: Negotiator::new(candidates),
             clock: crate::clock::WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now()),
             cluster_id: 0,
@@ -352,6 +359,47 @@ impl ControllerActor {
             deletion_rx,
             deletion_bytes: 0,
             steering: None,
+        }
+    }
+
+    pub(crate) fn set_execution(&mut self, execution: Option<MigrationHandle>) {
+        self.execution = execution;
+    }
+
+    fn maintain_placement(&mut self, now: pulsebeam_runtime::time::Instant) {
+        if let Some((_, migration)) = self.migration.as_mut() {
+            match migration.try_complete() {
+                Ok(false) => return,
+                result => {
+                    if let Some((movement, _)) = self.migration.take() {
+                        self.placement.attempted(now);
+                        if let Err(error) = result {
+                            tracing::warn!(?movement, %error, "shard move failed");
+                        }
+                    }
+                }
+            }
+        }
+        let Some(execution) = self.execution.as_ref() else {
+            return;
+        };
+        let decision = execution.with_snapshot(|snapshot| {
+            snapshot.and_then(|snapshot| {
+                self.placement.rebalance(
+                    pulsebeam_runtime::time::Instant::now(),
+                    snapshot,
+                    self.router.shard_count(),
+                )
+            })
+        });
+        if let Some(movement) = decision {
+            match execution.try_move_service(movement.shard, movement.destination) {
+                Ok(migration) => self.migration = Some((movement, migration)),
+                Err(error) => {
+                    self.placement.attempted(now);
+                    tracing::warn!(?movement, %error, "shard move unavailable");
+                }
+            }
         }
     }
 
@@ -450,6 +498,7 @@ impl ControllerActor {
 
         if maintenance_due {
             self.router.poll_loads();
+            self.maintain_placement(pulsebeam_runtime::time::Instant::now());
         }
 
         let mut action = None;
@@ -1487,34 +1536,22 @@ impl ControllerActor {
             }
         }
         let participant_id = state.participant_id;
-        let (slot, placement) = self
-            .core
-            .next_room_partition(&state.room_id, &state.participant_id);
-        // A replacement (native POST or fenced PATCH) changes the transport,
-        // not placement. Counting an already-live participant as a new admission
-        // would collapse room reconfigurations onto one shard.
-        let current_owner = self
-            .core
-            .registry
-            .get_participant(&participant_id)
-            .map(|meta| meta.shard_id);
-        let shard = match current_owner {
-            Some(shard) => shard,
-            None => match placement {
-                RoomPartitionPlacement::Hashed => self
-                    .router
-                    .stable_room_partition(&state.room_id, slot)
-                    .ok_or(ControllerError::ServiceUnavailable)?,
-                RoomPartitionPlacement::RoundRobin => {
-                    let shard_count = self.router.shard_count();
-                    debug_assert_ne!(shard_count, 0);
-                    ShardId::new(
-                        slot.checked_rem(shard_count)
-                            .ok_or(ControllerError::ServiceUnavailable)?,
-                    )
-                }
-            },
+        let choose = |snapshot: Option<&pulsebeam_runtime::rt::ExecutionSnapshot>| {
+            self.placement.admit(
+                &self.core,
+                &state.room_id,
+                &participant_id,
+                self.router.shard_count(),
+                snapshot,
+                pulsebeam_runtime::time::Instant::now(),
+            )
         };
+        let selected = if let Some(execution) = self.execution.as_ref() {
+            execution.with_snapshot(choose)
+        } else {
+            choose(None)
+        };
+        let (slot, shard) = selected.ok_or(ControllerError::ServiceUnavailable)?;
         let at = self
             .clock
             .observe_execution(pulsebeam_runtime::net::ReceiveTime::now());
@@ -1985,7 +2022,10 @@ mod replacement_tests {
         }
         ControllerActor {
             router: crate::control::router::ShardRouter::new(contexts),
-            core: ControllerCore::with_shards(shard_count, 1, RoomPartitionPlacement::Hashed),
+            core: ControllerCore::with_shards(shard_count, 1, RoomPartitionPlacement::Balanced),
+            placement: placement::Placement::default(),
+            execution: None,
+            migration: None,
             negotiator: Negotiator::new(Vec::new()),
             clock: crate::clock::WallAnchor::from(pulsebeam_runtime::net::ReceiveTime::now()),
             cluster_id: 0,
@@ -2256,7 +2296,7 @@ mod replacement_tests {
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn owned_publication_cutoff_waits_for_only_affected_shards_and_fences_replacements() {
         let mut actor = actor();
-        actor.core = ControllerCore::with_shards(3, 1, RoomPartitionPlacement::Hashed);
+        actor.core = ControllerCore::with_shards(3, 1, RoomPartitionPlacement::Balanced);
         actor.lifecycle = TrackLifecycle::new(3);
         actor.updates.clear();
         actor.update_touched = vec![false; 3];

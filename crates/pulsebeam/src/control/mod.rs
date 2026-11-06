@@ -3,6 +3,7 @@ pub mod controller;
 pub(crate) mod core;
 pub(crate) mod lifecycle;
 mod negotiator;
+pub(crate) mod placement;
 mod registry;
 mod room;
 mod router;

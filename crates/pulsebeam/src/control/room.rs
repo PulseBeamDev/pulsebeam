@@ -93,6 +93,13 @@ impl RoomShard {
         }
     }
 
+    pub(super) fn partition_owner(&self, index: usize) -> Option<ShardId> {
+        self.partitions
+            .get(index)
+            .filter(|partition| partition.participants != 0)
+            .map(|partition| partition.shard_id)
+    }
+
     pub fn participant_count(&self) -> usize {
         self.participants.len()
     }

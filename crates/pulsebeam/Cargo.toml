@@ -23,7 +23,6 @@ axum-extra = { version = "0.12.6", features = ["typed-header"] }
 base32 = "0.5.1"
 bytes = { workspace = true }
 clap = { version = "4.6.1", features = ["derive"] }
-core_affinity = "0.8.3"
 derive_more = { workspace = true }
 futures-lite = { workspace = true }
 hyper = "1.10.1"
@@ -41,22 +40,16 @@ pulsebeam-queue = { path = "../pulsebeam-queue" }
 pulsebeam-rtc = { path = "../pulsebeam-rtc" }
 pulsebeam-proto = { path = "../pulsebeam-proto", features = ["json"] }
 pulsebeam-steer = { path = "../pulsebeam-steer" }
-pulsebeam-runtime = { path = "../pulsebeam-runtime" }
-pulsebeam-tcp = { path = "../pulsebeam-tcp" }
+pulsebeam-runtime = { path = "../pulsebeam-runtime", features = ["http"] }
 pulsebeam-udp = { path = "../pulsebeam-udp" }
 rand = { workspace = true }
 # Swagger's generated folder must resolve the compiler action's OUT_DIR.
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
-rustix = { version = "1.1.4", features = ["param", "process", "thread", "time"] }
 serde = { workspace = true }
 serde_json = "1.0.150"
 sha3 = "0.12.0"
 slotmap = "1.1.1"
-socket2 = "0.6.4"
 thiserror = { workspace = true }
-thread-priority = "3.0.0"
-tokio = { workspace = true }
-tokio-util = { workspace = true, features = ["time"] }
 tower-http = { version = "0.7.0", features = [
   "compression-zstd",
   "cors",

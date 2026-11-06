@@ -16,6 +16,12 @@ workspace = true
 [lib]
 
 [dependencies]
+axum = { version = "0.8.9", features = ["macros"], optional = true }
+core_affinity = "0.8.3"
+pulsebeam-tcp = { path = "../pulsebeam-tcp" }
+rustix = { version = "1.1.4", features = ["param", "process", "thread", "time"] }
+socket2 = "0.6.4"
+thread-priority = "3.0.0"
 backtrace = "0.3.76"
 bytes = { workspace = true }
 futures = "0.3.32"
@@ -31,7 +37,7 @@ rand = { workspace = true }
 systemstat = "0.2.7"
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-util = "0.7.18"
+tokio-util = { version = "0.7.18", features = ["time"] }
 tracing = { workspace = true }
 turmoil = { workspace = true, optional = true }
 zerocopy = { version = "0.8.54", default-features = false, features = [
@@ -47,5 +53,6 @@ futures-test = "0.3.32"
 
 [features]
 default = ["parking_lot"]
+http = ["dep:axum"]
 parking_lot = ["dep:parking_lot", "once_cell/parking_lot"]
 sim = ["pulsebeam-core/sim", "pulsebeam-udp/sim", "dep:turmoil", "dep:pulsebeam-steer"]
