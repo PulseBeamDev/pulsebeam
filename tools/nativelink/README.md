@@ -127,8 +127,11 @@ included in that budget. The outer WebRTC GN action and
 Siso's local-only generators and archiving remain client-local, with two local
 Siso jobs per client. Tests and generators may also stay local when their
 contracts require it. The service does not govern every process on the machine.
-The CAS targets 64 GiB for eviction, the worker CAS 8 GiB, and the action cache
-1 GiB; these are not hard disk quotas. Leave disk headroom.
+The CAS and worker CAS each target 64 GiB for eviction, and the action cache
+1 GiB. Matching the two CAS targets avoids a smaller worker tier repeatedly
+evicting and refetching inputs while staging large concurrent builds. These
+are not hard disk quotas; executable copies and active action files can consume
+additional space. Leave disk headroom.
 
 NativeLink is licensed under FSL-1.1-Apache-2.0, which explicitly permits
 internal use.

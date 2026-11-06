@@ -39,13 +39,17 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(set(c["servers"][0]["services"]), {"cas", "ac", "bytestream", "execution", "capabilities"})
         self.assertEqual(set(c["servers"][1]["services"]), {"worker_api", "health"})
         cas, ac, fast = c["stores"]
-        self.assertEqual([cas["filesystem"]["eviction_policy"]["max_bytes"], ac["completeness_checking"]["backend"]["filesystem"]["eviction_policy"]["max_bytes"], fast["fast_slow"]["fast"]["filesystem"]["eviction_policy"]["max_bytes"]], [64 * 1024**3, 1024**3, 8 * 1024**3])
+        cas_bytes = cas["filesystem"]["eviction_policy"]["max_bytes"]
+        self.assertEqual(cas_bytes, 64 * 1024**3)
+        self.assertEqual(ac["completeness_checking"]["backend"]["filesystem"]["eviction_policy"]["max_bytes"], 1024**3)
+        self.assertEqual(fast["fast_slow"]["fast"]["filesystem"]["eviction_policy"]["max_bytes"], cas_bytes)
         self.assertEqual(fast["fast_slow"]["slow"]["ref_store"]["name"], cas["name"])
         self.assertEqual(len(c["workers"]), 1)
         worker = c["workers"][0]["local"]
         self.assertEqual(worker["worker_api_endpoint"]["uri"], "grpc://127.0.0.1:50061")
         self.assertEqual(worker["cas_fast_slow_store"], fast["name"])
         self.assertEqual(worker["max_concurrent_input_downloads"], 64)
+        self.assertNotIn("experimental_active_input_leases", worker)
         self.assertEqual(worker["upload_action_result"]["ac_store"], ac["name"])
         self.assertEqual(worker["platform_properties"]["cpu_count"]["values"], ["8"])
         self.assertEqual(worker["platform_properties"]["memory_kb"]["values"], ["8388608"])

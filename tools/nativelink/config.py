@@ -51,15 +51,18 @@ def make_config(state, cpu, memory_kb, action_cpu, action_memory_kb, reapi_port,
         ])
 
     cas, ac, fast, scheduler = "CAS_MAIN_STORE", "AC_MAIN_STORE", "WORKER_FAST_SLOW_STORE", "MAIN_SCHEDULER"
+    cas_bytes = 64 * 1024**3
     return {
         "stores": [
-            {"name": cas, **filesystem("cas", 64 * 1024**3)},
+            {"name": cas, **filesystem("cas", cas_bytes)},
             {"name": ac, "completeness_checking": {
                 "backend": filesystem("ac", 1024**3),
                 "cas_store": {"ref_store": {"name": cas}},
             }},
             {"name": fast, "fast_slow": {
-                "fast": filesystem("worker-cas", 8 * 1024**3),
+                # A smaller tier can evict resolved input paths before staging
+                # finishes, repeatedly copying them back from the local CAS.
+                "fast": filesystem("worker-cas", cas_bytes),
                 "slow": {"ref_store": {"name": cas}},
             }},
         ],
