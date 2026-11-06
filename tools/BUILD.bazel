@@ -37,6 +37,7 @@ py_test(
     data = ["simulation-status.sh", "//crates/pulsebeam-simulator:candidate"],
     args = ["--candidate", "$(rootpath //crates/pulsebeam-simulator:candidate)"],
     env = {"PYTHONDONTWRITEBYTECODE": "1"},
+    tags = ["local"],
 )
 
 py_test(
