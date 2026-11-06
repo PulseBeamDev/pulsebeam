@@ -1,4 +1,4 @@
-load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen_toolchain")
 
 package(default_visibility = ["//visibility:public"])
@@ -22,22 +22,29 @@ py_binary(
     main = "calibration-transform.py",
 )
 
+py_library(
+    name = "simulation_runner_lib",
+    srcs = ["run-simulations.py"],
+)
+
 py_test(
     name = "calibration_contract",
-    srcs = ["tests/calibration_test.py", "calibrate.py", "calibration-transform.py", "run-simulations.py"],
+    srcs = ["tests/calibration_test.py", "calibrate.py", "calibration-transform.py"],
     main = "tests/calibration_test.py",
     data = ["//crates/pulsebeam:calibration_inputs", "//crates/pulsebeam-simulator:BUILD.bazel", "//:BUILD.bazel"],
     env = {"PYTHONDONTWRITEBYTECODE": "1"},
+    deps = [":simulation_runner_lib"],
 )
 
 py_test(
     name = "simulation_runner_contract",
-    srcs = ["tests/run_simulations_test.py", "run-simulations.py"],
+    srcs = ["tests/run_simulations_test.py"],
     main = "tests/run_simulations_test.py",
     data = ["simulation-status.sh", "//crates/pulsebeam-simulator:candidate"],
     args = ["--candidate", "$(rootpath //crates/pulsebeam-simulator:candidate)"],
     env = {"PYTHONDONTWRITEBYTECODE": "1"},
     tags = ["local"],
+    deps = [":simulation_runner_lib"],
 )
 
 py_test(
