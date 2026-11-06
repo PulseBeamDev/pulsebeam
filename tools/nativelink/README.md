@@ -49,17 +49,14 @@ the foreground service with Ctrl-C when it is no longer needed.
 
 The REAPI endpoint defaults to `127.0.0.1:50051` and the worker endpoint to
 `127.0.0.1:50061`. State defaults to `~/.cache/pulsebeam/nativelink/v1`, with
-mode `0700`. By default the scheduler advertises capacity based on the service's
-CPU affinity, host memory and visible cgroup v2 limits. Bazel submits up to twice
-the CPU capacity (minimum 8, maximum 128 jobs) to hide scheduling and CAS
-latency; explicit client `--jobs` overrides this. The shared capacity is fixed
-at service startup. Worker input staging is bounded across concurrent actions.
-Cgroup ancestors hidden by a namespace or mount cannot be detected. These
-limits do not account for frontend processes or provide a hard resource limit
-on actions.
+mode `0700`. By default the scheduler advertises all CPUs in the service's
+CPU affinity and the host's total memory. Bazel submits up to twice the CPU
+capacity (minimum 8, maximum 128 jobs) to hide scheduling and CAS latency;
+explicit client `--jobs` overrides this. The shared capacity is fixed at
+service startup.
 
-To verify in-flight deduplication with two isolated Siso clients and a temporary
-service, run the focused integration test:
+To verify in-flight deduplication and subsequent cache reuse with isolated Siso
+clients and a temporary service, run the focused integration test:
 
 ```sh
 ./bazel test --config=local //tools/nativelink:reapi_integration_test

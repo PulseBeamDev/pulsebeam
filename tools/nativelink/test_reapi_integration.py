@@ -156,19 +156,24 @@ def prepare_client(root, name, host, siso, reapi_port):
 
 
 def client_evidence(info):
-    digests = re.findall(r"digest: ([0-9a-f]{64}/\d+), skipCacheLookup:(\w+) opName: (\S+)", info)
-    if len(digests) != 1 or digests[0][1] != "false":
+    digests = re.findall(r"\] ([0-9a-f-]{36}) digest: ([0-9a-f]{64}/\d+), skipCacheLookup:(\w+) opName: (\S+)", info)
+    if len(digests) != 1 or digests[0][2] != "false":
         raise AssertionError(f"expected one cacheable remote action: {digests}")
+    request, digest, _, operation = digests[0]
+    # Siso logs this stage only after receiving a non-completed operation from
+    # the server. A late completed-cache hit cannot satisfy this assertion.
+    if not re.search(r"exec\.go:\d+\] " + re.escape(request) + r" operation stage: \w+ -> EXECUTING\b", info):
+        raise AssertionError(f"request {request} never observed an executing operation")
     events = {}
     for kind in ("starts", "done"):
         matches = re.findall(
             r"^\s*I(\d{4}) (\d\d:\d\d:\d\d\.\d+)\s+\d+ "
             r"exec\.go:\d+\].*?operation " + kind + r": (\S+)", info, re.M)
-        if len(matches) != 1 or matches[0][2] != digests[0][2]:
+        if len(matches) != 1 or matches[0][2] != operation:
             raise AssertionError(f"expected one matching operation {kind}: {matches}")
         events[kind] = datetime.strptime("2000" + matches[0][0] + " " + matches[0][1],
                                           "%Y%m%d %H:%M:%S.%f")
-    return digests[0][0], events
+    return digest, events
 
 
 def check_evidence(infos, server_log, analyze):
@@ -233,7 +238,24 @@ def run(args, root):
                 raise AssertionError(f"unexpected output: {outputs}")
             infos = [(out / "siso.INFO").read_text() for _, out, _, _ in clients]
             digest = check_evidence(infos, (root / "server.log").read_text(), analyze)
-            print(f"PASS: overlapping Siso operations, digest {digest}, one successful worker execution")
+
+            workspace, out, client_env, command = prepare_client(root, "cached", host, args.siso, reapi_port)
+            with (root / "cached.log").open("w") as client_log:
+                cached = subprocess.Popen(command, cwd=workspace, env=client_env,
+                                          stdout=client_log, stderr=subprocess.STDOUT,
+                                          start_new_session=True)
+                processes.append(cached)
+                cached.wait(timeout=CLIENT_TIMEOUT)
+            if cached.returncode or (out / "result.txt").read_bytes() != b"shared":
+                raise AssertionError(f"cached client failed: exit={cached.returncode}")
+            info = (out / "siso.INFO").read_text()
+            cached_digests = re.findall(r"cmd\.go:\d+\] [0-9a-f-]{36} action: ([0-9a-f]{64}/\d+)", info)
+            if cached_digests != [digest] or not re.search(r"exec-remote-cache: n=1\b", info):
+                raise AssertionError(f"expected a completed cache hit for {digest}: {cached_digests}")
+            summary = analyze(ANSI.sub("", (root / "server.log").read_text()))
+            if summary["starts"] != 1 or summary["completions"] != 1 or summary["nonzero_exits"]:
+                raise AssertionError(f"cache hit unexpectedly executed work: {summary}")
+            print(f"PASS: two executing Siso requests share digest {digest}; one execution and a subsequent cache hit")
     finally:
         for process in processes:
             stop_group(process)

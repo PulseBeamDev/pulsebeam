@@ -76,8 +76,6 @@ def make_config(state, cpu, memory_kb, action_cpu, action_memory_kb, reapi_port,
         "workers": [{"local": {
             "worker_api_endpoint": {"uri": f"grpc://127.0.0.1:{worker_port}"},
             "cas_fast_slow_store": fast,
-            # Bound aggregate input staging across actions, not per directory.
-            "max_concurrent_input_downloads": min(64, max(8, cpu * 4)),
             "upload_action_result": {"ac_store": ac},
             "work_directory": str(state / "work"),
             "platform_properties": {
