@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Focused real-REAPI deduplication proof; requires Linux and the pinned tools.
 
-Pass --server, --binary, --host-bin-file, --runtime-root-file and --siso (or set the corresponding
-REAPI_TEST_SERVER, REAPI_TEST_BINARY, REAPI_TEST_HOST_BIN_FILE, REAPI_TEST_SISO
-environment variables). Include server.py, config.py, resources.py and
+Pass --server, --binary, --host-bin-file, --runtime-root-file and --source-manifest
+(or set the corresponding REAPI_TEST_* environment variables).
+Include server.py, config.py, resources.py and
 analyze.py together in the runfiles. The host-bin file must contain the
 absolute pinned host-tools directory. No existing service or checkout is used.
 
@@ -36,16 +36,21 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("server", "binary", "host-bin-file", "runtime-root-file", "siso"):
+    for name in ("server", "binary", "host-bin-file", "runtime-root-file", "source-manifest"):
         env = "REAPI_TEST_" + name.upper().replace("-", "_")
         parser.add_argument("--" + name, default=os.environ.get(env),
                             required=not os.environ.get(env), type=Path)
     args = parser.parse_args()
-    for name in ("server", "binary", "host_bin_file", "runtime_root_file", "siso"):
+    for name in ("server", "binary", "host_bin_file", "runtime_root_file", "source_manifest"):
         path = getattr(args, name).resolve(strict=True)
         if not path.is_file():
             parser.error(f"{name} is not a file: {path}")
         setattr(args, name, path)
+    # This local-only integration uses the same immutable checkout identity as
+    # native_build, without restoring a recursive source-file dependency graph.
+    args.siso = (args.source_manifest.parent / "checkout/src/third_party/siso/cipd/siso").resolve(strict=True)
+    if not args.siso.is_file():
+        parser.error(f"Siso is not a file: {args.siso}")
     return args
 
 
@@ -139,9 +144,31 @@ def prepare_client(root, name, host, runtime, siso, reapi_port):
         'handlers = {}, filegroups = {})\n'
     )
     (out / "runtime_check.py").write_text(
-        "import shutil, socket, ssl, subprocess\n"
+        "import errno, json, os, shutil, socket, ssl, subprocess\n"
+        "from pathlib import Path\n"
         "assert ssl.create_default_context().cert_store_stats()['x509_ca'] > 0, 'no CA roots'\n"
-        "for family, address in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')):\n"
+        f"assert os.readlink('/proc/self/ns/net') != {os.readlink('/proc/self/ns/net')!r}, 'host network namespace exposed'\n"
+        "assert set(name for _, name in socket.if_nameindex()) == {'lo', 'pb0'}\n"
+        "status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)\n"
+        "assert all(int(status[name].strip(), 16) == 0 for name in ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb'))\n"
+        "assert status['NoNewPrivs'].strip() == '1'\n"
+        "ip = '/usr/bin/ip'\n"
+        "link = json.loads(subprocess.check_output([ip, '-j', 'address', 'show', 'pb0']))[0]\n"
+        "assert 'UP' in link['flags'] and 'LOOPBACK' not in link['flags']\n"
+        "assert {'192.0.2.1', 'fd00:7062::1'} <= {address['local'] for address in link['addr_info']}\n"
+        "mutation = subprocess.run([ip, 'link', 'add', 'forbidden', 'type', 'dummy'], capture_output=True)\n"
+        "assert mutation.returncode != 0 and b'permitted' in mutation.stderr, mutation\n"
+        "for version in ('-4', '-6'):\n"
+        "    assert json.loads(subprocess.check_output([ip, version, '-j', 'route', 'show', 'default'])) == []\n"
+        "for family, address in ((socket.AF_INET, '203.0.113.1'), (socket.AF_INET6, '2001:db8::1')):\n"
+        "    with socket.socket(family, socket.SOCK_DGRAM) as sock:\n"
+        "        try:\n"
+        "            sock.connect((address, 9))\n"
+        "        except OSError as error:\n"
+        "            assert error.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH), error\n"
+        "        else:\n"
+        "            raise AssertionError('external route available')\n"
+        "for family, address in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1'), (socket.AF_INET, '192.0.2.1'), (socket.AF_INET6, 'fd00:7062::1')):\n"
         "    assert socket.getaddrinfo('localhost', 80, family, socket.SOCK_STREAM)\n"
         "    with socket.socket(family, socket.SOCK_DGRAM) as sock:\n"
         "        sock.settimeout(1)\n"

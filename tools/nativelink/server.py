@@ -2,6 +2,7 @@
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,8 @@ from resources import cache_budget, machine_budget
 
 def sandbox_script(host, work, runtime):
     command = [
-        str(host / "bwrap"), "--unshare-net", "--unshare-pid", "--die-with-parent",
+        str(host / "bwrap"), "--share-net", "--unshare-pid", "--die-with-parent",
+        "--cap-drop", "ALL",
         "--ro-bind", "/nix/store", "/nix/store",
         "--ro-bind", "/usr/lib", "/usr/lib",
         "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
@@ -24,11 +26,26 @@ def sandbox_script(host, work, runtime):
         "--tmpfs", "/tmp",
         "--bind", str(work), str(work), "--proc", "/proc", "--dev", "/dev",
     ]
-    # Bazel may set PWD=/proc/self/cwd; that resolves differently after /proc
-    # is remounted in the worker's PID namespace.
+    command = [str(host / "setpriv"), "--bounding-set=-all", "--inh-caps=-all",
+               "--ambient-caps=-all", "--no-new-privs", "--"] + command
+    ip = str(runtime / "bin/ip")
+    # Initialize the private link in the user namespace that owns the network.
+    # Clear bootstrap capabilities before bwrap joins that network, not the host's.
+    # Resolve PWD before bwrap remounts /proc in its PID namespace.
+    bootstrap = "\n".join([
+        "set -euo pipefail",
+        shlex.join([ip, "link", "set", "lo", "up"]),
+        shlex.join([ip, "link", "add", "pb0", "type", "dummy"]),
+        shlex.join([ip, "address", "add", "192.0.2.1/32", "dev", "pb0"]),
+        shlex.join([ip, "-6", "address", "add", "fd00:7062::1/128", "dev", "pb0", "nodad"]),
+        shlex.join([ip, "link", "set", "pb0", "up"]),
+        f'exec {shlex.join(command)} --chdir "$(pwd -P)" -- "$@"',
+    ])
+    setup = [str(host / "unshare"), "--user", "--map-current-user", "--keep-caps", "--net",
+             "--", str(host / "bash"), "-c", bootstrap, "worker-network"]
     return (f'#!{host / "bash"}\n'
             'export SSL_CERT_FILE="${SSL_CERT_FILE-/etc/ssl/certs/ca-certificates.crt}"\n'
-            f'exec {shlex.join(command)} --chdir "$(pwd -P)" -- "$@"\n')
+            f'exec {shlex.join(setup)} "$@"\n')
 
 
 def main():
@@ -64,6 +81,9 @@ def main():
         parser.error("NativeLink is already using this state directory")
     host = Path(Path(args.host_bin_file).read_text().strip())
     runtime = Path(Path(args.runtime_root_file).read_text().strip())
+    policy = runtime / "sandbox-policy.sha256"
+    if not policy.is_file() or policy.read_text().strip() != hashlib.sha256(Path(__file__).read_bytes()).hexdigest():
+        parser.error("worker runtime does not match its sandbox policy; rebuild the pinned runtime")
     work = state / "work"
     work.mkdir(exist_ok=True)
     entrypoint = state / "sandbox.sh"

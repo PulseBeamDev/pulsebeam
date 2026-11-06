@@ -121,13 +121,19 @@ port is occupied, stop the other service or select distinct free ports. Use
 
 Both loopback endpoints are unauthenticated. Other local users able to connect
 can submit work or poison the cache, so use this only on a trusted single-user
-machine. The pinned Nix bubblewrap entrypoint isolates each action's network
-to IPv4/IPv6 loopback. It exposes the action work tree, Nix store, host loader
+machine. The pinned Nix entrypoint creates an action-owned user/network namespace before
+bubblewrap's filesystem/PID isolation. Each action gets IPv4/IPv6 loopback and a
+namespace-local dummy interface. The dummy interface
+provides non-loopback addresses for stock WebRTC discovery and communication
+within the action; it has no host-connected peer or external/default route.
+Bootstrap network-administration capabilities are dropped before executing the
+action. The entrypoint exposes the action work tree, Nix store, host loader
 libraries and a separately pinned OS runtime. That runtime supplies `curl`,
 `file`, `tar`, `xz`, CA roots and deterministic `localhost` entries without mounting the
 host's `/etc` or home directories. `SSL_CERT_FILE` defaults to the runtime's CA
-bundle; an explicit action override is preserved. Updating this runtime does
-not change the WebRTC compiler host-tools identity. This is a local setup; a
+bundle; an explicit action override is preserved. The runtime identity includes the sandbox policy as well as its packages, so
+isolation changes cannot reuse results from an older worker environment. Updating
+this runtime does not change the WebRTC compiler host-tools identity. This is a local setup; a
 remote host fleet has not been verified.
 
 Bazel actions reserve 1 CPU and 2 GiB by default; Siso actions reserve 1 CPU

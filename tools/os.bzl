@@ -17,8 +17,9 @@ def _os_impl(ctx):
     nixpkgs_package(
         name = "host_runtime",
         nix_file = Label("//tools/host:runtime.nix"),
+        nix_file_deps = [str(Label("//tools/nativelink:server.py"))],
         repository = "@nixpkgs",
-        build_file_content = 'package(default_visibility = ["//visibility:public"])\nfilegroup(name = "tools", srcs = glob(["bin/**", "etc/**"]) + ["runtime-root"])\nexports_files(["runtime-root"])\n',
+        build_file_content = 'package(default_visibility = ["//visibility:public"])\nfilegroup(name = "tools", srcs = glob(["bin/**", "etc/**"]) + ["runtime-root", "sandbox-policy.sha256"])\nexports_files(["runtime-root", "sandbox-policy.sha256"])\n',
     )
     return ctx.extension_metadata(reproducible = True)
 

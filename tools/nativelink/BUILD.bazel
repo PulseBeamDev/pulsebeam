@@ -1,6 +1,7 @@
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 
 package(default_visibility = ["//visibility:public"])
+exports_files(["server.py"])
 
 py_binary(
     name = "server",
@@ -45,9 +46,9 @@ py_test(
         "--binary", "$(rootpath @nativelink//:bin)",
         "--host-bin-file", "$(rootpath @webrtc_host//:host-bin)",
         "--runtime-root-file", "$(rootpath @host_runtime//:runtime-root)",
-        "--siso", "$(rootpath @webrtc_upstream//:checkout/src/third_party/siso/cipd/siso)",
+        "--source-manifest", "$(rootpath @webrtc_upstream//:sources.sha256)",
     ],
-    data = ["analyze.py", "config.py", "resources.py", "server.py", "@nativelink//:bin", "@webrtc_host//:tools", "@webrtc_host//:host-bin", "@host_runtime//:tools", "@host_runtime//:runtime-root", "@webrtc_upstream//:checkout/src/third_party/siso/cipd/siso"],
+    data = ["analyze.py", "config.py", "resources.py", "server.py", "@nativelink//:bin", "@webrtc_host//:tools", "@webrtc_host//:host-bin", "@host_runtime//:tools", "@host_runtime//:runtime-root", "@webrtc_upstream//:sources.sha256"],
     size = "medium",
     tags = ["local", "manual"],
 )

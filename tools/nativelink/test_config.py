@@ -87,11 +87,23 @@ class ConfigTest(unittest.TestCase):
             with self.subTest(index=index, value=value), self.assertRaises(ValueError):
                 config.make_config(*candidate[:7], cache_bytes=candidate[7])
 
-    def test_worker_sandbox_provides_runtime_without_network_or_host_files(self):
+    def test_worker_sandbox_provides_runtime_without_host_network_or_files(self):
         script = sandbox_script(Path("/nix/store/tools/bin"), Path("/private/work"), Path("/nix/store/runtime"))
-        self.assertIn("--unshare-net", script)
+        self.assertIn("unshare --user --map-current-user --keep-caps --net --", script)
+        self.assertIn("bwrap --share-net", script)
+        self.assertIn("--cap-drop ALL", script)
+        self.assertIn("setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs", script)
+        self.assertLess(script.index("unshare --user"), script.index("setpriv --bounding"))
+        self.assertLess(script.index("setpriv --bounding"), script.index("bwrap --share-net"))
         self.assertIn("--unshare-pid", script)
         self.assertIn("--die-with-parent", script)
+        self.assertIn("ip link set lo up", script)
+        self.assertIn("/nix/store/runtime/bin/ip link add pb0 type dummy", script)
+        self.assertIn("192.0.2.1/32 dev pb0", script)
+        self.assertIn("fd00:7062::1/128 dev pb0 nodad", script)
+        self.assertIn("ip link set pb0 up", script)
+        self.assertIn("set -euo pipefail", script)
+        self.assertNotIn("--cap-add", script)
         self.assertIn("--bind /private/work /private/work", script)
         self.assertIn("--ro-bind /nix/store /nix/store", script)
         self.assertIn("--ro-bind /nix/store/tools/bin /bin", script)
