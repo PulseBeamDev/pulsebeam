@@ -28,10 +28,16 @@ def browser_test(name, source, assets, env, contracts = [], live = False, featur
         env = dict(env, **{
             "PULSEBEAM_BROWSER_BINARY": "$(rootpath @browser_chrome//:executable)",
             "PULSEBEAM_DRIVER_BINARY": "$(rootpath @browser_chromedriver//:executable)",
+            # Chromium creates a Unix socket under TMPDIR, whose path is limited
+            # to 108 bytes. Remote action temp paths can exceed that limit.
+            "TMPDIR": "/tmp",
         }),
         # At most two Chrome sessions and one Tokio worker per case. The live
         # destination uses one dedicated current-thread runtime per session.
         args = ["--test-threads=2"],
-        tags = ["slow", "cpu:4"],
+        # Chrome excludes the worker's only network interface (loopback) from
+        # ICE gathering. Retain the real-browser witness and shared cache, but
+        # execute it where a usable host interface exists.
+        tags = ["slow", "cpu:4", "no-remote-exec"],
         size = "large",
     )
