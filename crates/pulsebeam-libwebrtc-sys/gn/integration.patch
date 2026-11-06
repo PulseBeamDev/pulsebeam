@@ -56,3 +56,12 @@ diff --git a/build/toolchain/gcc_toolchain.gni b/build/toolchain/gcc_toolchain.g
 -        command = "rm -f {{output}} && $command"
 +        command = "\"$pulsebeam_rm\" -f {{output}} && $command"
          inputs =
+diff --git a/build/config/siso/rust.star b/build/config/siso/rust.star
+--- a/build/config/siso/rust.star
++++ b/build/config/siso/rust.star
+@@ -160 +160 @@
+-    remote = config.get(ctx, "googlechrome")
++    remote = config.get(ctx, "googlechrome") or config.get(ctx, "remote-link")
+@@ -163 +163 @@
+-    remote_link = False
++    remote_link = config.get(ctx, "remote-link") and gn.args(ctx).get("target_cpu") == '"x64"'

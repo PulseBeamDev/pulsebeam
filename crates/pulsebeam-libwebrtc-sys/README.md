@@ -117,7 +117,9 @@ NativeLink service](../../tools/nativelink/README.md). Siso uses pinned upstream
 Chromium configs and package-local backend properties for `OSFamily=Linux` and
 the exact Nix host-tools identity. REAPI's `strict_remote` prevents silent local
 compile fallback. Siso's `remote-link` policy synthesizes deterministic thin
-archives and remotely executes or caches eligible full archives and links. GN
+archives and remotely executes or caches eligible full archives and links. The
+owned Linux/x64 overlay also permits caching the Rust host CXX generator and
+its dependencies instead of rebuilding them in each temporary GN directory. GN
 and Siso's local-only generators still run on the client, with two local Siso
 jobs per client. Bazel tests and generators
 may also stay local when their contracts require it. The service is not a

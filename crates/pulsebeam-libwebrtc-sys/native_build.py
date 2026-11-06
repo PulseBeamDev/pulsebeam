@@ -143,7 +143,7 @@ def build(args, lock_fd=None):
         (owned / "native").symlink_to(bridge.parent.parent / "native", target_is_directory=True)
         # rustfmt resolves ignore patterns relative to the real config path; a
         # symlink into the upstream checkout puts generated files outside it.
-        for relative in (".gn", ".rustfmt.toml", "BUILD.gn", "buildtools/third_party/libc++/BUILD.gn", "buildtools/third_party/libc++abi/BUILD.gn", "build/toolchain/gcc_toolchain.gni", "build/config/siso/nasm_linux.star"):
+        for relative in (".gn", ".rustfmt.toml", "BUILD.gn", "buildtools/third_party/libc++/BUILD.gn", "buildtools/third_party/libc++abi/BUILD.gn", "build/toolchain/gcc_toolchain.gni", "build/config/siso/nasm_linux.star", "build/config/siso/rust.star"):
             writable_file(root, relative)
         for patch in ("integration.patch", "strict-fp.patch"):
             run([host / "patch", "--batch", "--fuzz=0", "-p1", "-i", overlay / patch], cwd=root, env=env, lock_fd=lock_fd)
