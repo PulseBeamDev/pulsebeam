@@ -186,6 +186,7 @@ macro_rules! canonical_id {
 }
 
 canonical_id!(ProjectId, "p", Version::SortRand);
+canonical_id!(NodeId, "n", Version::SortRand);
 canonical_id!(RoomId, "rm", Version::Custom);
 canonical_id!(ParticipantId, "pa", Version::Custom);
 canonical_id!(ConnectionId, "c", Version::SortRand);
@@ -211,6 +212,7 @@ macro_rules! minted_id {
 }
 
 minted_id!(ProjectId);
+minted_id!(NodeId);
 minted_id!(ConnectionId);
 minted_id!(ApiKeyId);
 
@@ -647,6 +649,39 @@ mod tests {
             assert!(RoomExternalId::new(invalid).is_err());
             assert!(ParticipantExternalId::new(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn node_identity_uses_the_shared_v0_v7_codec() {
+        let id = NodeId::new();
+        let next = NodeId::new();
+        assert!(next > id);
+        let encoded = id.to_string();
+        assert!(encoded.starts_with("n_0"));
+        assert_eq!(encoded.parse::<NodeId>().unwrap(), id);
+        assert_eq!(
+            serde_json::from_str::<NodeId>(&serde_json::to_string(&id).unwrap()).unwrap(),
+            id
+        );
+        assert!(encoded.parse::<ProjectId>().is_err());
+        assert!(ProjectId::new().to_string().parse::<NodeId>().is_err());
+        assert!(encoded.replacen("n_0", "n_1", 1).parse::<NodeId>().is_err());
+        let mut bytes = *id.as_bytes();
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        assert!(
+            NodeId::from_bytes(bytes)
+                .to_string()
+                .parse::<NodeId>()
+                .is_err()
+        );
+        bytes[6] = (bytes[6] & 0x0f) | 0x70;
+        bytes[8] = 0;
+        assert!(
+            NodeId::from_bytes(bytes)
+                .to_string()
+                .parse::<NodeId>()
+                .is_err()
+        );
     }
 
     #[test]

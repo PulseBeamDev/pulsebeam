@@ -97,7 +97,7 @@ simulation_provenance(name = "candidate")
 CANDIDATE_ARGS = ["--candidate", "$(rootpath :candidate)"]
 
 py_test(
-    name = "fast",
+    name = "media_fast",
     srcs = ["//tools:run-simulations.py"],
     main = "//tools:run-simulations.py",
     args = ["$(rootpath :sim_binary)", "--mode", "fast", "--jobs", str(SIMULATION_JOBS)] + CANDIDATE_ARGS,
@@ -180,5 +180,50 @@ py_binary(
     tags = ["manual"],
 )
 
-rustfmt_test(name = "format", targets = [":test_binary"])
-rust_clippy_test(name = "clippy", targets = [":test_binary"])
+# Membership has no native-media dependency. Keep its feedback loop independent
+# while reusing the same process isolation, virtual clocks and replay ownership.
+rust_test(
+    name = "membership_binary",
+    crate_root = "src/membership_main.rs",
+    srcs = ["src/membership_main.rs", "src/sim_clock.rs", "src/sim_rand.rs", "src/tests/membership.rs"],
+    edition = crate_edition(),
+    lint_config = ":lints",
+    deps = [
+        "@crates//:chitchat", "@crates//:rand", "@crates//:tokio",
+        "@crates//:turmoil", "@crates//:libc", "@crates//:anyhow",
+        "@crates//:tokio-util",
+        "//crates/pulsebeam-membership",
+    ],
+    proc_macro_deps = ["@crates//:async-trait"],
+    tags = ["manual"],
+)
+
+filegroup(
+    name = "membership_sim_binary",
+    testonly = True,
+    srcs = [":membership_binary"],
+    tags = ["manual"],
+)
+
+py_test(
+    name = "membership_fast",
+    srcs = ["//tools:run-simulations.py"],
+    main = "//tools:run-simulations.py",
+    args = ["$(rootpath :membership_sim_binary)", "--mode", "fast", "--jobs", "1"] + CANDIDATE_ARGS,
+    data = [":membership_sim_binary", ":candidate"],
+)
+
+py_binary(
+    name = "membership_replay",
+    testonly = True,
+    srcs = ["//tools:run-simulations.py"],
+    main = "//tools:run-simulations.py",
+    args = ["$(rootpath :membership_sim_binary)", "--mode", "all"] + CANDIDATE_ARGS,
+    data = [":membership_sim_binary", ":candidate"],
+)
+
+test_suite(name = "fast", tests = [":media_fast", ":membership_fast"])
+rustfmt_test(name = "format", targets = [":test_binary", ":membership_binary"])
+rust_clippy_test(name = "media_clippy", targets = [":test_binary"])
+rust_clippy_test(name = "membership_clippy", targets = [":membership_binary"])
+test_suite(name = "clippy", tests = [":media_clippy", ":membership_clippy"])

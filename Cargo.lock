@@ -725,6 +725,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "chitchat"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "473eddded9fefd4df26abdf2aebd8b0c352fc5cb77fe12b4d3cf2f84fcc686bb"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "itertools 0.15.0",
+ "lru",
+ "rand 0.10.2",
+ "serde",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2081,6 +2100,9 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "headers"
@@ -2493,6 +2515,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2713,6 +2744,15 @@ dependencies = [
  "scoped-tls",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lru"
+version = "0.18.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+dependencies = [
+ "hashbrown 0.17.0",
 ]
 
 [[package]]
@@ -3655,10 +3695,12 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "arrayvec",
+ "async-trait",
  "axum",
  "axum-extra",
  "base32",
  "bytes",
+ "chitchat",
  "clap",
  "ctor",
  "derive_more",
@@ -3675,6 +3717,7 @@ dependencies = [
  "proptest",
  "pulsebeam-agent-native",
  "pulsebeam-core",
+ "pulsebeam-membership",
  "pulsebeam-proto",
  "pulsebeam-queue",
  "pulsebeam-rtc",
@@ -3691,7 +3734,9 @@ dependencies = [
  "sha3",
  "slotmap",
  "str0m 0.22.0",
+ "tempfile",
  "thiserror 2.0.20",
+ "toml",
  "tower",
  "tower-http 0.7.0",
  "tracing",
@@ -3846,6 +3891,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-membership"
+version = "0.3.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chitchat",
+ "pulsebeam-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "pulsebeam-proto"
 version = "0.3.2"
 dependencies = [
@@ -3950,7 +4008,9 @@ name = "pulsebeam-simulator"
 version = "0.3.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
+ "chitchat",
  "ctor",
  "fastrand",
  "futures",
@@ -3968,6 +4028,7 @@ dependencies = [
  "pulsebeam-agent-core",
  "pulsebeam-agent-native",
  "pulsebeam-core",
+ "pulsebeam-membership",
  "pulsebeam-proto",
  "pulsebeam-rtc-simulation",
  "pulsebeam-runtime",

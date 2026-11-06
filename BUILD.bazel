@@ -11,7 +11,7 @@ filegroup(
 )
 
 RUST_OWNERS = [
-    "crates/pulsebeam", "crates/pulsebeam-cli", "crates/pulsebeam-auth", "crates/pulsebeam-core", "crates/pulsebeam-dtls",
+    "crates/pulsebeam", "crates/pulsebeam-cli", "crates/pulsebeam-auth", "crates/pulsebeam-core", "crates/pulsebeam-membership", "crates/pulsebeam-dtls",
     "crates/pulsebeam-proto", "crates/pulsebeam-steer", "crates/pulsebeam-rtc", "crates/pulsebeam-cc", "crates/pulsebeam-libwebrtc-sys",
     "crates/pulsebeam-runtime", "crates/pulsebeam-queue", "crates/pulsebeam-tcp", "crates/pulsebeam-udp", "crates/pulsebeam-testdata",
     "agents/pulsebeam-agent-core", "agents/pulsebeam-agent-native", "agents/pulsebeam-agent-web",
@@ -46,6 +46,7 @@ test_suite(
 test_suite(
     name = "fast",
     tests = ["//%s:unit_tests" % owner for owner in RUST_OWNERS] + [
+        "//crates/pulsebeam:cluster_tests", "//crates/pulsebeam:cli_tests",
         "//crates/pulsebeam-rtc:integration_tests",
         "//crates/pulsebeam-runtime:steering_tests",
         "//crates/pulsebeam-udp:simulation_tests",

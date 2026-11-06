@@ -21,7 +21,7 @@ rust_library(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime", "//crates/pulsebeam-membership"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
@@ -42,7 +42,7 @@ sfu_variant_sources(glob(["README.md", "src/**"], exclude = ["src/bin/**"]))
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp-sim", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime-sim"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp-sim", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core-sim", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime-sim", "//crates/pulsebeam-membership:pulsebeam-membership-sim"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
 ) for variant in ["control"] + VARIANTS]
 
@@ -68,8 +68,17 @@ rust_binary(
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime"] + [":pulsebeam"],
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-udp:pulsebeam-udp", "//crates/pulsebeam-queue:pulsebeam-queue", "//crates/pulsebeam-core:pulsebeam-core", "//crates/pulsebeam-proto:pulsebeam-proto-json", "//crates/pulsebeam-rtc:pulsebeam-rtc", "//crates/pulsebeam-steer:pulsebeam-steer", "//crates/pulsebeam-runtime:pulsebeam-runtime", "//crates/pulsebeam-membership"] + [":pulsebeam"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "cli_tests",
+    crate = ":server",
+    lint_config = ":lints",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
 )
 
 rust_test(
@@ -88,5 +97,26 @@ rust_test(
     tags = ["cpu:2"],
 )
 
-rustfmt_test(name = "format", targets = [":pulsebeam", ":transport_conformance"])
-rust_clippy_test(name = "clippy", targets = [":pulsebeam", ":unit_tests", ":server", ":transport_conformance"])
+rust_test(
+    name = "cluster_tests",
+    crate_root = "src/cluster_tests.rs",
+    srcs = ["src/cluster_tests.rs"] + glob(["src/cluster/**/*.rs"]),
+    crate_features = ["cluster-tests"],
+    # Fork briefly inherits other tests' flock descriptors until exec. Isolate
+    # the process fixture from immediate drop/relock proofs in sibling tests.
+    args = ["--test-threads=1"],
+    edition = crate_edition(),
+    lint_config = ":lints",
+    deps = [
+        "@crates//:anyhow", "@crates//:chitchat", "@crates//:serde",
+        "@crates//:serde_json", "@crates//:tempfile",
+        "@crates//:toml", "@crates//:tracing",
+        "//crates/pulsebeam-membership", "//crates/pulsebeam-runtime",
+    ],
+    proc_macro_deps = ["@crates//:async-trait"],
+)
+
+rustfmt_test(name = "format", targets = [":pulsebeam", ":transport_conformance", ":cluster_tests"])
+rust_clippy_test(name = "server_clippy", targets = [":pulsebeam", ":unit_tests", ":server", ":cli_tests", ":transport_conformance"])
+rust_clippy_test(name = "cluster_clippy", targets = [":cluster_tests"])
+test_suite(name = "clippy", tests = [":server_clippy", ":cluster_clippy"])

@@ -5,6 +5,7 @@ members = [
   "crates/pulsebeam-cli",
   "crates/pulsebeam-auth",
   "crates/pulsebeam-core",
+  "crates/pulsebeam-membership",
   "crates/pulsebeam-dtls",
   "crates/pulsebeam-proto",
   "crates/pulsebeam-steer",

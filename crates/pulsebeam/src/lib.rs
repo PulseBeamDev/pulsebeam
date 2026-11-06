@@ -32,6 +32,7 @@ compile_error!(
 
 mod bitrate;
 pub mod clock;
+pub mod cluster;
 pub mod control;
 pub mod entity;
 mod ice_tcp;

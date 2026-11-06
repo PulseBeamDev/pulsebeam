@@ -8,10 +8,13 @@ use pulsebeam_core::auth::{
     KeyRegistryEntry,
 };
 use pulsebeam_runtime::rand;
-use pulsebeam_runtime::{rt::Profile, sync::CancellationToken};
+use pulsebeam_runtime::{
+    rt::{ExecutionConfig, Profile},
+    sync::CancellationToken,
+};
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
 };
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
@@ -69,6 +72,12 @@ struct Args {
     /// Logical shards per worker (default 16, or 1 for thread-per-core).
     #[arg(short, long)]
     shards: Option<usize>,
+    /// Optional TOML configuration. Gossip is trusted-network-only and opt-in.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Persistent node identity directory, required when [cluster] is configured.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 }
 
 fn main() {
@@ -110,22 +119,31 @@ fn main() {
         } else {
             16
         });
-    if let Err(error) =
-        pulsebeam_runtime::rt::ExecutionConfig::new(args.runtime, workers, shards).shard_count()
-    {
+    let execution = ExecutionConfig::new(args.runtime, workers, shards);
+    if let Err(error) = execution.shard_count() {
         pulsebeam_runtime::fatal!("invalid runtime configuration: {error}");
     }
+    let config =
+        pulsebeam::cluster::ServerConfig::read(args.config.as_deref()).unwrap_or_else(|error| {
+            pulsebeam_runtime::fatal!("invalid server configuration: {error:#}")
+        });
     let rtc_port: u16 = if args.dev { 3478 } else { 443 };
     let shutdown = CancellationToken::new();
-    if let Err(err) = pulsebeam_runtime::rt::block_on(run(
-        shutdown.clone(),
-        workers,
-        rtc_port,
-        args.iface,
-        args.runtime,
-        shards,
-        registry,
-    ))
+    if let Err(err) = pulsebeam_runtime::rt::block_on(async {
+        let cluster = config
+            .resolve(args.data_dir)
+            .await
+            .context("invalid cluster configuration")?;
+        run(
+            shutdown.clone(),
+            execution,
+            rtc_port,
+            args.iface,
+            registry,
+            cluster,
+        )
+        .await
+    })
     .unwrap_or_else(|error| pulsebeam_runtime::fatal!("cannot build the node runtime: {error}"))
     {
         pulsebeam_runtime::fatal!("server failed: {err:#}");
@@ -150,12 +168,11 @@ fn configured_key_registry(args: &Args, path: &Path) -> Result<KeyRegistry> {
 
 pub async fn run(
     shutdown: CancellationToken,
-    workers: usize,
+    execution: ExecutionConfig,
     rtc_port: u16,
     network_interface: Option<String>,
-    profile: Profile,
-    shards_per_worker: usize,
     key_registry: KeyRegistry,
+    cluster: Option<pulsebeam::cluster::Options>,
 ) -> Result<()> {
     let external_ips =
         pulsebeam_runtime::system::select_host_addresses(network_interface.as_deref());
@@ -175,15 +192,19 @@ pub async fn run(
     );
     let rng = rand::os_rng();
     let node_builder = NodeBuilder::new()
-        .workers(workers)
+        .workers(execution.workers)
         .local_addr(local_addr)
         .external_addrs(external_addrs)
         .rng(rng)
-        .runtime_profile(profile, shards_per_worker)
+        .runtime_profile(execution.profile, execution.shards_per_worker)
         .with_http_api(http_api_addr)
         .with_key_registry(key_registry)
         .with_internal_metrics(metrics_addr);
 
+    let node_builder = match cluster {
+        Some(options) => node_builder.with_cluster(options),
+        None => node_builder,
+    };
     let node = node_builder.run(shutdown.child_token());
     // Not `spawn`: under `--features sim` a bound socket belongs to a
     // thread-local `SO_REUSEPORT` group, which makes the node future `!Send`.
@@ -256,6 +277,16 @@ mod tests {
     fn authentication_only_needs_explicit_dev_mode() {
         assert!(Args::try_parse_from(["pulsebeam", "--dev"]).is_ok());
         assert!(Args::try_parse_from(["pulsebeam"]).is_ok());
+        let clustered = Args::try_parse_from([
+            "pulsebeam",
+            "--config",
+            "cluster.toml",
+            "--data-dir",
+            "state",
+        ])
+        .unwrap();
+        assert_eq!(clustered.config, Some(PathBuf::from("cluster.toml")));
+        assert_eq!(clustered.data_dir, Some(PathBuf::from("state")));
         assert!(
             Args::try_parse_from(["pulsebeam", "--project-registry", "registry.json"]).is_err()
         );

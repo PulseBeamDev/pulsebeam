@@ -83,6 +83,66 @@ progress deadline. Pending materialization and full shard destinations are
 serviced independently so one blocked connection does not stop unrelated control
 work. These are ownership and progress contracts, not a throughput guarantee.
 
+## Experimental cluster membership
+
+Clustering is opt-in and currently provides local membership observations only.
+It does not change room placement or enable cross-node rooms/media. The broader
+[cluster coordination design](docs/cluster.md) remains proposed.
+
+**Use gossip only on a trusted, access-restricted network.** It is neither
+authenticated nor encrypted; `cluster.id` is not an authentication credential.
+Allow the dedicated gossip UDP port between peers, never on an untrusted network.
+
+With an existing server authentication configuration (`key-registry.json` in the
+working directory), save `cluster.toml` with this node's peer-reachable address:
+
+```toml
+[cluster]
+id = "production"
+advertise_host = "10.0.1.12"
+seeds = ["10.0.1.11:7946", "10.0.1.13:7946"]
+
+[cluster.gossip]
+listen = "0.0.0.0:7946"
+```
+
+Start the server binary built from this branch with a private, writable data
+directory dedicated to this logical node:
+
+```sh
+pulsebeam --config ./cluster.toml --data-dir ./state/node-a
+```
+
+The startup log reports the stable `node_id`, committed `generation`, and advertised
+gossip address. `seeds` may be empty; seeds are ordinary peers, not leaders.
+The listen default is `0.0.0.0:7946`; the advertised address uses that port and
+must not be a wildcard. Hostnames must resolve unambiguously to one address;
+configure an explicit IP if DNS returns multiple addresses. No automatic interface
+selection or NAT advertised-port override is provided for gossip.
+
+No `[cluster]`, including startup without `--config`, means standalone operation:
+no gossip bind, membership task, or identity-state mutation. Existing CLI flags,
+authentication configuration, and listener/media settings remain unchanged.
+Programmatic callers opt in with `NodeBuilder::with_cluster`; the default builder
+remains standalone. Snapshot and metadata APIs are described by
+[`pulsebeam-membership`](../pulsebeam-membership/README.md).
+
+The data directory contains a stable lifetime lock and crash-safely replaced node
+identity state. Concurrent use is rejected. Corruption, unsupported state, write/
+sync failure, and generation exhaustion fail startup rather than reset identity.
+Do not clone or roll back identity state from another host or backup to claim an
+old node. Losing state creates a new logical ID. Local locking cannot detect
+cross-host clones and supplies no global fencing guarantee.
+
+Suspicion is a local observation, not proof of a crash. The highest retained
+generation remains current even when unreachable; older live generations are not
+promoted. Generation history is retained for 48 hours after the highest record
+was last observed in protocol state. History can be forgotten and observers can
+restart, so consumers must validate incarnations rather than treat NodeId as
+fencing. Graceful shutdown stops gossip without a reliable leave announcement;
+peers eventually suspect/remove the incarnation. Fatal membership failure shuts
+down the node. No deployment/provisioning automation is included.
+
 ## Media TCP fallback
 
 UDP is the optimized dataplane. Passive ICE-TCP uses one optional

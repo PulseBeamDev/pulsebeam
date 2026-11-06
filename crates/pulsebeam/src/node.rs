@@ -82,6 +82,7 @@ pub struct NodeBuilder {
     udp_mode: UdpMode,
 
     // Services
+    cluster: Option<crate::cluster::Options>,
     http_api: Option<ListenerSource>,
     key_registry: Option<KeyRegistry>,
     internal_metrics: Option<ListenerSource>,
@@ -125,6 +126,7 @@ impl NodeBuilder {
             advertise_bound_udp: false,
             rng: None,
             udp_mode: UdpMode::Batch,
+            cluster: None,
             http_api: None,
             key_registry: None,
             internal_metrics: None,
@@ -287,6 +289,12 @@ impl NodeBuilder {
         self
     }
 
+    /// Opt into trusted-network membership. This does not change room placement.
+    pub fn with_cluster(mut self, options: crate::cluster::Options) -> Self {
+        self.cluster = Some(options);
+        self
+    }
+
     /// Configure the HTTP Signaling API to bind to the specified address.
     pub fn with_http_api(mut self, addr: SocketAddr) -> Self {
         self.http_api = Some(ListenerSource::Bind(addr));
@@ -361,7 +369,17 @@ impl NodeBuilder {
     }
 
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
-    pub async fn run(self, shutdown: CancellationToken) -> Result<()> {
+    pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
+        let Some(options) = self.cluster.take() else {
+            return self.run_media(shutdown).await;
+        };
+        let membership = crate::cluster::Service::start(options).await?;
+        membership
+            .supervise(self.run_media(shutdown.clone()), shutdown)
+            .await
+    }
+
+    async fn run_media(self, shutdown: CancellationToken) -> Result<()> {
         // Default to an IPv6-any listener and disable v6-only mode so one socket can serve
         // both IPv6 and IPv4 peers.
         let local_addr = self

@@ -14,6 +14,9 @@ publish = false
 workspace = true
 
 [dev-dependencies]
+async-trait = "0.1"
+chitchat = "=0.13.0"
+pulsebeam-membership = { path = "../pulsebeam-membership" }
 pulsebeam-server = { path = "../../server/rust" }
 anyhow.workspace = true
 bytes = "1"

@@ -1,0 +1,23 @@
+[package]
+name = "pulsebeam-membership"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait = "0.1"
+chitchat = "=0.13.0"
+pulsebeam-core = { path = "../pulsebeam-core", default-features = false }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[features]
+sim = ["pulsebeam-core/sim"]
+
+[dev-dependencies]

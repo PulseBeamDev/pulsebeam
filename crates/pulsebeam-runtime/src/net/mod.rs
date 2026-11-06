@@ -12,6 +12,7 @@ pub use bound_udp::{bind_udp_socket, install_steering_flow, set_wrong_owner_inje
 
 pub use pulsebeam_udp::{BATCH_SIZE, ReceiveTime};
 use std::net::SocketAddr;
+pub use tokio::net::lookup_host;
 
 pub const CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_UDP_PAYLOAD_SIZE: usize = 1500;

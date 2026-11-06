@@ -1,0 +1,35 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_clippy_test", "rustfmt_test")
+
+package(default_visibility = ["//visibility:public"])
+filegroup(name = "workflow_inputs", srcs = glob(["*.md"], allow_empty = True))
+exports_files(["Cargo.toml"])
+filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "src/**/*.rs"]))
+cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
+extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Cargo.toml")
+
+[rust_library(
+    name = "pulsebeam-membership" + variant,
+    crate_name = "pulsebeam_membership",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    edition = crate_edition(),
+    crate_features = ["sim"] if variant else [],
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True) + ["//crates/pulsebeam-core:pulsebeam-core-sim" if variant else "//crates/pulsebeam-core"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+) for variant in ["", "-sim"]]
+
+rust_test(
+    name = "unit_tests",
+    crate = ":pulsebeam-membership",
+    lint_config = ":lints",
+    aliases = aliases(normal_dev = True, proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+rustfmt_test(name = "format", targets = [":pulsebeam-membership"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-membership", ":unit_tests"])
