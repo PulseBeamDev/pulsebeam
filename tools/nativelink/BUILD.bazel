@@ -7,10 +7,11 @@ py_binary(
     srcs = ["server.py", "config.py", "resources.py"],
     main = "server.py",
     imports = ["."],
-    data = ["@nativelink//:bin", "@webrtc_host//:tools", "@webrtc_host//:host-bin"],
+    data = ["@nativelink//:bin", "@webrtc_host//:tools", "@webrtc_host//:host-bin", "@host_runtime//:tools", "@host_runtime//:runtime-root"],
     args = [
         "--binary", "$(rootpath @nativelink//:bin)",
         "--host-bin-file", "$(rootpath @webrtc_host//:host-bin)",
+        "--runtime-root-file", "$(rootpath @host_runtime//:runtime-root)",
     ],
 )
 
@@ -43,9 +44,10 @@ py_test(
         "--server", "$(rootpath :server.py)",
         "--binary", "$(rootpath @nativelink//:bin)",
         "--host-bin-file", "$(rootpath @webrtc_host//:host-bin)",
+        "--runtime-root-file", "$(rootpath @host_runtime//:runtime-root)",
         "--siso", "$(rootpath @webrtc_upstream//:checkout/src/third_party/siso/cipd/siso)",
     ],
-    data = ["analyze.py", "config.py", "resources.py", "server.py", "@nativelink//:bin", "@webrtc_host//:tools", "@webrtc_host//:host-bin", "@webrtc_upstream//:checkout/src/third_party/siso/cipd/siso"],
+    data = ["analyze.py", "config.py", "resources.py", "server.py", "@nativelink//:bin", "@webrtc_host//:tools", "@webrtc_host//:host-bin", "@host_runtime//:tools", "@host_runtime//:runtime-root", "@webrtc_upstream//:checkout/src/third_party/siso/cipd/siso"],
     size = "medium",
     tags = ["local", "manual"],
 )

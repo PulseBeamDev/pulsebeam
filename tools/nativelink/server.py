@@ -12,26 +12,30 @@ from config import make_config, port, positive
 from resources import cache_budget, machine_budget
 
 
-def sandbox_script(host, work):
+def sandbox_script(host, work, runtime):
     command = [
         str(host / "bwrap"), "--unshare-net", "--unshare-pid", "--die-with-parent",
         "--ro-bind", "/nix/store", "/nix/store",
         "--ro-bind", "/usr/lib", "/usr/lib",
         "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
         "--ro-bind", str(host), "/bin",
-        "--ro-bind", str(host / "env"), "/usr/bin/env",
+        "--ro-bind", str(runtime / "bin"), "/usr/bin",
+        "--ro-bind", str(runtime / "etc"), "/etc",
         "--tmpfs", "/tmp",
         "--bind", str(work), str(work), "--proc", "/proc", "--dev", "/dev",
     ]
     # Bazel may set PWD=/proc/self/cwd; that resolves differently after /proc
     # is remounted in the worker's PID namespace.
-    return f'#!{host / "bash"}\nexec {shlex.join(command)} --chdir "$(pwd -P)" -- "$@"\n'
+    return (f'#!{host / "bash"}\n'
+            'export SSL_CERT_FILE="${SSL_CERT_FILE-/etc/ssl/certs/ca-certificates.crt}"\n'
+            f'exec {shlex.join(command)} --chdir "$(pwd -P)" -- "$@"\n')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--host-bin-file", required=True)
+    parser.add_argument("--runtime-root-file", required=True)
     parser.add_argument("--state", type=Path, default=Path.home() / ".cache/pulsebeam/nativelink/v1")
     parser.add_argument("--cpu", type=positive)
     parser.add_argument("--memory-kb", type=positive)
@@ -59,10 +63,11 @@ def main():
     except BlockingIOError:
         parser.error("NativeLink is already using this state directory")
     host = Path(Path(args.host_bin_file).read_text().strip())
+    runtime = Path(Path(args.runtime_root_file).read_text().strip())
     work = state / "work"
     work.mkdir(exist_ok=True)
     entrypoint = state / "sandbox.sh"
-    entrypoint.write_text(sandbox_script(host, work))
+    entrypoint.write_text(sandbox_script(host, work, runtime))
     entrypoint.chmod(0o700)
     config = make_config(str(state), args.cpu, args.memory_kb, 1, 1_048_576,
                          args.reapi_port, args.worker_port, cache_bytes=args.cache_bytes)
@@ -70,8 +75,9 @@ def main():
     worker["entrypoint"] = str(entrypoint)
     worker["platform_properties"]["OSFamily"] = {"values": ["Linux"]}
     worker["platform_properties"]["pulsebeam-host-tools"] = {"values": [str(host)]}
+    worker["platform_properties"]["pulsebeam-runtime"] = {"values": [str(runtime)]}
     properties = config["schedulers"][0]["property_modifier"]["scheduler"]["cache_lookup"]["scheduler"]["simple"]["supported_platform_properties"]
-    properties.update({"OSFamily": "exact", "pulsebeam-host-tools": "exact"})
+    properties.update({"OSFamily": "exact", "pulsebeam-host-tools": "exact", "pulsebeam-runtime": "exact"})
     config_path = state / "config.json"
     config_path.write_text(json.dumps(config, indent=2))
     os.set_inheritable(lock, True)

@@ -107,16 +107,20 @@ if [[ "$remote_executor" == grpc://127.0.0.1:50051 || "$remote_cache" == grpc://
   needs_service=1
 fi
 host_tools=
+runtime=
 client_jobs=
 if [[ "$arch" == amd64 && -n "$command_name" && "$needs_service" == 1 && \
       ! ( "$command_name" == run && "$manual_server" == 1 ) && \
       "${PULSEBEAM_NATIVELINK_AUTOSTART:-1}" != 0 ]]; then
   service_info=$(python3 "$workspace/tools/nativelink/autostart.py" \
     --workspace "$workspace" --bazelisk "$launcher" --output-base "$workspace/.bazel/output" --print-host-tools)
-  [[ "$service_info" == *$'\n'* ]] || { echo 'NativeLink returned incomplete service information' >&2; exit 1; }
-  host_tools=${service_info%%$'\n'*}
-  client_jobs=${service_info#*$'\n'}
+  mapfile -t service_fields <<< "$service_info"
+  [[ ${#service_fields[@]} == 3 ]] || { echo 'NativeLink returned incomplete service information' >&2; exit 1; }
+  host_tools=${service_fields[0]}
+  runtime=${service_fields[1]}
+  client_jobs=${service_fields[2]}
   [[ "$host_tools" == /nix/store/*/bin ]] || { echo 'NativeLink returned an invalid host-tools identity' >&2; exit 1; }
+  [[ "$runtime" == /nix/store/*-pulsebeam-worker-runtime ]] || { echo 'NativeLink returned an invalid runtime identity' >&2; exit 1; }
   [[ "$client_jobs" =~ ^[0-9]+$ ]] && ((client_jobs > 0 && client_jobs <= 128)) || { echo 'NativeLink returned an invalid client job limit' >&2; exit 1; }
 fi
 if [[ -n "$command_name" && ( -n "$host_tools" || "$arch" != amd64 || ( "$command_name" == run && "$manual_server" == 1 ) ) ]]; then
@@ -127,7 +131,7 @@ if [[ -n "$command_name" && ( -n "$host_tools" || "$arch" != amd64 || ( "$comman
     arguments+=("$arg")
     if ((index == command_index)); then
       if [[ -n "$host_tools" ]]; then
-        arguments+=("--remote_default_exec_properties=pulsebeam-host-tools=$host_tools" "--jobs=$client_jobs")
+        arguments+=("--remote_default_exec_properties=pulsebeam-host-tools=$host_tools" "--remote_default_exec_properties=pulsebeam-runtime=$runtime" "--jobs=$client_jobs")
       else
         arguments+=(--config=local)
       fi

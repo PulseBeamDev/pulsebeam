@@ -87,15 +87,18 @@ class ConfigTest(unittest.TestCase):
             with self.subTest(index=index, value=value), self.assertRaises(ValueError):
                 config.make_config(*candidate[:7], cache_bytes=candidate[7])
 
-    def test_worker_sandbox_denies_network_and_undeclared_host_files(self):
-        script = sandbox_script(Path("/nix/store/tools/bin"), Path("/private/work"))
+    def test_worker_sandbox_provides_runtime_without_network_or_host_files(self):
+        script = sandbox_script(Path("/nix/store/tools/bin"), Path("/private/work"), Path("/nix/store/runtime"))
         self.assertIn("--unshare-net", script)
         self.assertIn("--unshare-pid", script)
         self.assertIn("--die-with-parent", script)
         self.assertIn("--bind /private/work /private/work", script)
         self.assertIn("--ro-bind /nix/store /nix/store", script)
         self.assertIn("--ro-bind /nix/store/tools/bin /bin", script)
-        self.assertIn("--ro-bind /nix/store/tools/bin/env /usr/bin/env", script)
+        self.assertIn("--ro-bind /nix/store/runtime/bin /usr/bin", script)
+        self.assertIn("--ro-bind /nix/store/runtime/etc /etc", script)
+        self.assertIn('SSL_CERT_FILE="${SSL_CERT_FILE-/etc/ssl/certs/ca-certificates.crt}"', script)
+        self.assertNotIn("--ro-bind /etc /etc", script)
         self.assertNotIn("--ro-bind / /", script)
         self.assertNotIn("/home", script)
         self.assertNotIn("/usr/include", script)

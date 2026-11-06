@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Focused real-REAPI deduplication proof; requires Linux and the pinned tools.
 
-Pass --server, --binary, --host-bin-file and --siso (or set the corresponding
+Pass --server, --binary, --host-bin-file, --runtime-root-file and --siso (or set the corresponding
 REAPI_TEST_SERVER, REAPI_TEST_BINARY, REAPI_TEST_HOST_BIN_FILE, REAPI_TEST_SISO
 environment variables). Include server.py, config.py, resources.py and
 analyze.py together in the runfiles. The host-bin file must contain the
@@ -36,12 +36,12 @@ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("server", "binary", "host-bin-file", "siso"):
+    for name in ("server", "binary", "host-bin-file", "runtime-root-file", "siso"):
         env = "REAPI_TEST_" + name.upper().replace("-", "_")
         parser.add_argument("--" + name, default=os.environ.get(env),
                             required=not os.environ.get(env), type=Path)
     args = parser.parse_args()
-    for name in ("server", "binary", "host_bin_file", "siso"):
+    for name in ("server", "binary", "host_bin_file", "runtime_root_file", "siso"):
         path = getattr(args, name).resolve(strict=True)
         if not path.is_file():
             parser.error(f"{name} is not a file: {path}")
@@ -121,7 +121,7 @@ def stop_group(process):
     process.wait(timeout=STOP_TIMEOUT)
 
 
-def prepare_client(root, name, host, siso, reapi_port):
+def prepare_client(root, name, host, runtime, siso, reapi_port):
     workspace = root / name
     out = workspace / "out" / "Default"
     config = out / "build/config/siso/main.star"
@@ -131,17 +131,33 @@ def prepare_client(root, name, host, siso, reapi_port):
         'load("@builtin//encoding.star", "json")\n\n'
         'def init(ctx):\n'
         '    step_config = {"platforms": {"default": {"OSFamily": "Linux", '
-        '"pulsebeam-host-tools": ' + json.dumps(str(host)) + '}}, '
+        '"pulsebeam-host-tools": ' + json.dumps(str(host)) + ', '
+        '"pulsebeam-runtime": ' + json.dumps(str(runtime)) + '}}, '
         '"rules": [{"name": "shared", "action": "cc", "remote": True, '
         '"use_system_input": True}]}\n'
         '    return module("config", step_config = json.encode(step_config), '
         'handlers = {}, filegroups = {})\n'
     )
+    (out / "runtime_check.py").write_text(
+        "import shutil, socket, ssl, subprocess\n"
+        "assert ssl.create_default_context().cert_store_stats()['x509_ca'] > 0, 'no CA roots'\n"
+        "for family, address in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')):\n"
+        "    assert socket.getaddrinfo('localhost', 80, family, socket.SOCK_STREAM)\n"
+        "    with socket.socket(family, socket.SOCK_DGRAM) as sock:\n"
+        "        sock.settimeout(1)\n"
+        "        sock.bind((address, 0))\n"
+        "        sock.sendto(b'loopback', sock.getsockname())\n"
+        "        assert sock.recv(8) == b'loopback'\n"
+        "for name in ('curl', 'file', 'tar', 'xz'):\n"
+        "    tool = shutil.which(name, path='/usr/bin:/bin')\n"
+        "    assert tool, name + ' is missing'\n"
+        "    subprocess.run([tool, '--version'], check=True, stdout=subprocess.DEVNULL)\n"
+    )
     (out / "build.ninja").write_text(
         f"host = {host}\nrule cc\n"
-        '  command = /bin/sh -c "${host}/sleep 8; printf shared > result.txt"\n'
+        '  command = /bin/sh -c "${host}/python3 runtime_check.py && ${host}/sleep 8 && printf shared > result.txt"\n'
         "  description = CXX result.txt\n"
-        "build result.txt: cc\ndefault result.txt\n"
+        "build result.txt: cc runtime_check.py\ndefault result.txt\n"
     )
     (out / "gn_logs.txt").write_text("use_remoteexec=true\nuse_reclient=false\n")
     (out / "build.ninja.d").write_text("build.ninja:\n")
@@ -198,6 +214,7 @@ def check_evidence(infos, server_log, analyze):
 
 def run(args, root):
     host = Path(args.host_bin_file.read_text().strip())
+    runtime = Path(args.runtime_root_file.read_text().strip())
     if not host.is_absolute() or not host.is_dir() or not re.fullmatch(r"[a-zA-Z0-9_./+\-]+", str(host)):
         raise ValueError(f"host-bin must name an absolute, shell-safe directory: {host}")
     # analyze.py is the maintained parser for the pinned NativeLink log format.
@@ -210,10 +227,11 @@ def run(args, root):
     env = {"PATH": str(host), "HOME": str(root), "TMPDIR": str(root),
            "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "RUST_LOG": "info"}
     server_command = [sys.executable, str(args.server), "--binary", str(args.binary),
-                      "--host-bin-file", str(args.host_bin_file), "--state", str(state),
+                      "--host-bin-file", str(args.host_bin_file),
+                      "--runtime-root-file", str(args.runtime_root_file), "--state", str(state),
                       "--cpu", "2", "--memory-kb", str(2 * 1024**2),
                       "--reapi-port", str(reapi_port), "--worker-port", str(worker_port)]
-    clients = [prepare_client(root, name, host, args.siso, reapi_port) for name in ("a", "b")]
+    clients = [prepare_client(root, name, host, runtime, args.siso, reapi_port) for name in ("a", "b")]
     processes = []
     server = None
     try:
@@ -239,7 +257,7 @@ def run(args, root):
             infos = [(out / "siso.INFO").read_text() for _, out, _, _ in clients]
             digest = check_evidence(infos, (root / "server.log").read_text(), analyze)
 
-            workspace, out, client_env, command = prepare_client(root, "cached", host, args.siso, reapi_port)
+            workspace, out, client_env, command = prepare_client(root, "cached", host, runtime, args.siso, reapi_port)
             with (root / "cached.log").open("w") as client_log:
                 cached = subprocess.Popen(command, cwd=workspace, env=client_env,
                                           stdout=client_log, stderr=subprocess.STDOUT,

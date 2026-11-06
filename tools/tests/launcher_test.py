@@ -36,7 +36,7 @@ class LauncherContractTest(unittest.TestCase):
         helper.parent.mkdir(parents=True)
         helper.write_text("import os, sys\nfrom pathlib import Path\n"
                           "Path(os.environ['AUTOSTART_LOG']).write_text('\\n'.join(sys.argv[1:]))\n"
-                          "print('/nix/store/pinned-tools/bin')\nprint('36')\n")
+                          "print('/nix/store/pinned-tools/bin')\nprint('/nix/store/pinned-pulsebeam-worker-runtime')\nprint('36')\n")
 
     def run_launcher(self, *arguments, cwd=None, launcher=None):
         return subprocess.run([str(launcher or self.launcher), *arguments], env=self.env,
@@ -52,7 +52,8 @@ class LauncherContractTest(unittest.TestCase):
 
     @property
     def service_properties(self):
-        return ["--remote_default_exec_properties=pulsebeam-host-tools=/nix/store/pinned-tools/bin", "--jobs=36"]
+        return ["--remote_default_exec_properties=pulsebeam-host-tools=/nix/store/pinned-tools/bin",
+                "--remote_default_exec_properties=pulsebeam-runtime=/nix/store/pinned-pulsebeam-worker-runtime", "--jobs=36"]
 
     def test_default_output_stays_in_checkout_from_nested_directory(self):
         nested = self.root / "package"
@@ -182,7 +183,7 @@ class LauncherContractTest(unittest.TestCase):
 
     def test_invalid_worker_identity_stops_bazel(self):
         helper = self.root / "tools/nativelink/autostart.py"
-        helper.write_text("print('bad-identity')\nprint('36')\n")
+        helper.write_text("print('bad-identity')\nprint('/nix/store/pinned-pulsebeam-worker-runtime')\nprint('36')\n")
         result = self.run_launcher("build", "//:example")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"invalid host-tools identity", result.stderr)

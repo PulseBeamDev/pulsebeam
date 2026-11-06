@@ -74,7 +74,7 @@ browsers = use_extension("//tools:browsers.bzl", "browsers")
 use_repo(browsers, "browser_chrome", "browser_chromedriver", "browser_firefox", "browser_geckodriver")
 
 os_inputs = use_extension("//tools:os.bzl", "os_inputs")
-use_repo(os_inputs, "nixpkgs", "nix_sdk")
+use_repo(os_inputs, "nixpkgs", "nix_sdk", "host_runtime")
 
 native = use_extension("//tools:native.bzl", "native")
 native.toolchain(llvm_version = "20.1.8")

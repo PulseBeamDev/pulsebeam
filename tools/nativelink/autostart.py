@@ -25,6 +25,8 @@ INPUTS = (
     "tools/nativelink/resources.py",
     "crates/pulsebeam-libwebrtc-sys/gn/host.nix",
     "tools/host/flake.lock",
+    "tools/host/runtime.nix",
+    "tools/os.bzl",
 )
 
 
@@ -216,13 +218,15 @@ def start(workspace, bazelisk, output_base, state):
             raise StartupError("NativeLink inputs changed during bootstrap; retry")
         binary = output_base / "external/+http_archive+nativelink/nativelink"
         host_file = output_base / "external/+webrtc+webrtc_host/host-bin"
-        if not binary.is_file() or not host_file.is_file():
-            raise StartupError(f"Bazel did not produce NativeLink or host-bin in {output_base}")
+        runtime_file = output_base / "external/+os_inputs+host_runtime/runtime-root"
+        if not binary.is_file() or not host_file.is_file() or not runtime_file.is_file():
+            raise StartupError(f"Bazel did not produce NativeLink, host-bin or runtime-root in {output_base}")
         ports_free()
         log = open_private(state / "autostart.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND)
         try:
             child = subprocess.Popen([sys.executable, str(workspace / "tools/nativelink/server.py"),
                                       "--binary", str(binary), "--host-bin-file", str(host_file),
+                                      "--runtime-root-file", str(runtime_file),
                                       "--state", str(state)], cwd=state, stdin=subprocess.DEVNULL,
                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
         finally:
@@ -265,6 +269,7 @@ def main():
             config = json.loads((state / "config.json").read_text())
             properties = config["workers"][0]["local"]["platform_properties"]
             print(properties["pulsebeam-host-tools"]["values"][0])
+            print(properties["pulsebeam-runtime"]["values"][0])
             print(client_jobs(int(properties["cpu_count"]["values"][0])))
     except (StartupError, OSError, subprocess.CalledProcessError) as error:
         print(f"NativeLink autostart failed: {error}", file=sys.stderr)

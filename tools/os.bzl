@@ -14,6 +14,12 @@ def _os_impl(ctx):
         repository = "@nixpkgs",
         build_file_content = 'package(default_visibility = ["//visibility:public"])\nfilegroup(name = "sysroot", srcs = glob(["include/**", "lib/**", "usr/include/**", "usr/lib/**"]) + ["mold-path"])\nfilegroup(name = "linker", srcs = ["bin/mold", "mold-path"])\nexports_files(["mold-path"])\n',
     )
+    nixpkgs_package(
+        name = "host_runtime",
+        nix_file = Label("//tools/host:runtime.nix"),
+        repository = "@nixpkgs",
+        build_file_content = 'package(default_visibility = ["//visibility:public"])\nfilegroup(name = "tools", srcs = glob(["bin/**", "etc/**"]) + ["runtime-root"])\nexports_files(["runtime-root"])\n',
+    )
     return ctx.extension_metadata(reproducible = True)
 
 

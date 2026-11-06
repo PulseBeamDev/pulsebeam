@@ -23,7 +23,8 @@ class StartupTests(unittest.TestCase):
         self.workspace = self.root / "checkout"
         self.output = self.root / "output"
         self.bazelisk = self.root / "bazelisk"
-        for name in ("external/+http_archive+nativelink/nativelink", "external/+webrtc+webrtc_host/host-bin"):
+        for name in ("external/+http_archive+nativelink/nativelink", "external/+webrtc+webrtc_host/host-bin",
+                     "external/+os_inputs+host_runtime/runtime-root"):
             path = self.output / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("fake")
@@ -59,6 +60,7 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(args[0][1:], [str(self.workspace / "tools/nativelink/server.py"),
                          "--binary", str(self.output / "external/+http_archive+nativelink/nativelink"),
                          "--host-bin-file", str(self.output / "external/+webrtc+webrtc_host/host-bin"),
+                         "--runtime-root-file", str(self.output / "external/+os_inputs+host_runtime/runtime-root"),
                          "--state", str(self.state)])
         self.assertTrue(kwargs["start_new_session"])
         self.assertEqual(autostart.read_marker(self.state), self.marker())
@@ -146,6 +148,7 @@ class ProbeTests(unittest.TestCase):
             state = Path(directory)
             config = {"workers": [{"local": {"platform_properties": {
                 "pulsebeam-host-tools": {"values": ["/nix/store/pinned-tools/bin"]},
+                "pulsebeam-runtime": {"values": ["/nix/store/pinned-pulsebeam-worker-runtime"]},
                 "cpu_count": {"values": ["18"]},
             }}}]}
             (state / "config.json").write_text(json.dumps(config))
@@ -154,7 +157,7 @@ class ProbeTests(unittest.TestCase):
                  mock.patch.object(sys, "argv", ["autostart", "--workspace", "/repo", "--bazelisk", "/bazelisk", "--output-base", "/output", "--print-host-tools"]), \
                  mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output:
                 self.assertEqual(autostart.main(), 0)
-                self.assertEqual(output.getvalue(), "/nix/store/pinned-tools/bin\n36\n")
+                self.assertEqual(output.getvalue(), "/nix/store/pinned-tools/bin\n/nix/store/pinned-pulsebeam-worker-runtime\n36\n")
                 start.assert_called_once()
 
     def test_readiness_requires_both_owned_listeners_and_lock(self):
