@@ -44,3 +44,15 @@ diff --git a/build/config/siso/nasm_linux.star b/build/config/siso/nasm_linux.st
      rules = []
      for toolchain in ["", "clang_x64"]:
          nasm_path = path.join(toolchain, "nasm")
+diff --git a/build/toolchain/gcc_toolchain.gni b/build/toolchain/gcc_toolchain.gni
+--- a/build/toolchain/gcc_toolchain.gni
++++ b/build/toolchain/gcc_toolchain.gni
+@@ -17,2 +17,3 @@
+ declare_args() {
++  pulsebeam_rm = "rm"
+   # Enables allowlist generation for IDR_ grit defines seen by the compiler.
+@@ -410,3 +411,3 @@
+       } else {
+-        command = "rm -f {{output}} && $command"
++        command = "\"$pulsebeam_rm\" -f {{output}} && $command"
+         inputs =

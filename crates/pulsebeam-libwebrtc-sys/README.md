@@ -116,8 +116,10 @@ By default Siso uses shared REAPI through the automatically started [local
 NativeLink service](../../tools/nativelink/README.md). Siso uses pinned upstream
 Chromium configs and package-local backend properties for `OSFamily=Linux` and
 the exact Nix host-tools identity. REAPI's `strict_remote` prevents silent local
-compile fallback. GN and Siso's local-only generators and archiving still run
-on the client, with two local Siso jobs per client. Bazel tests and generators
+compile fallback. Siso's `remote-link` policy synthesizes deterministic thin
+archives and remotely executes or caches eligible full archives and links. GN
+and Siso's local-only generators still run on the client, with two local Siso
+jobs per client. Bazel tests and generators
 may also stay local when their contracts require it. The service is not a
 governor for all machine processes.
 

@@ -56,7 +56,7 @@ def siso_command(siso, build, executor, endpoint):
         if executor == "cache":
             command += ["-re_exec_enable=false", "-re_cache_enable_write"]
         else:
-            command += ["-strict_remote"]
+            command += ["-strict_remote", "-config=remote-link"]
     return command + ["pulsebeam:native"]
 
 
@@ -162,6 +162,7 @@ def build(args, lock_fd=None):
         if args.asan:
             config += "is_asan = true\ndcheck_always_on = true\n"
         config += f'pkg_config = "{host / "pkg-config"}"\n'
+        config += f'pulsebeam_rm = "{host / "rm"}"\n'
         config += f"use_remoteexec = {str(args.executor != 'local').lower()}\n"
         gn = root / "buildtools/linux64/gn"
         siso = root / "third_party/siso/cipd/siso"

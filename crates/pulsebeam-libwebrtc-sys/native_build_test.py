@@ -53,11 +53,13 @@ class SisoCommandTest(unittest.TestCase):
     def test_local_has_no_reapi_or_fallback(self):
         command = siso_command("siso", "out/Default", "local", "127.0.0.1:50051")
         self.assertIn("-offline", command)
+        self.assertNotIn("-config=remote-link", command)
         self.assertFalse(any(arg.startswith("-reapi_") for arg in command))
 
     def test_execution_requires_scheduler_no_silent_local_fallback(self):
         command = siso_command("siso", "out/Default", "reapi", "127.0.0.1:50051")
         self.assertIn("-strict_remote", command)
+        self.assertIn("-config=remote-link", command)
         self.assertIn("-reapi_address=127.0.0.1:50051", command)
         self.assertNotIn("-offline", command)
         self.assertNotIn("-re_cache_enable_write", command)
@@ -66,6 +68,7 @@ class SisoCommandTest(unittest.TestCase):
         command = siso_command("siso", "out/Default", "cache", "127.0.0.1:50051")
         self.assertIn("-re_exec_enable=false", command)
         self.assertIn("-re_cache_enable_write", command)
+        self.assertNotIn("-config=remote-link", command)
 
     def test_endpoint_is_explicitly_loopback_only(self):
         self.assertEqual(reapi_address("grpc://127.0.0.1:50051"), "127.0.0.1:50051")
