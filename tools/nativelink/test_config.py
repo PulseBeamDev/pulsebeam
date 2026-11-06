@@ -45,6 +45,7 @@ class ConfigTest(unittest.TestCase):
         worker = c["workers"][0]["local"]
         self.assertEqual(worker["worker_api_endpoint"]["uri"], "grpc://127.0.0.1:50061")
         self.assertEqual(worker["cas_fast_slow_store"], fast["name"])
+        self.assertEqual(worker["max_concurrent_input_downloads"], 64)
         self.assertEqual(worker["upload_action_result"]["ac_store"], ac["name"])
         self.assertEqual(worker["platform_properties"]["cpu_count"]["values"], ["8"])
         self.assertEqual(worker["platform_properties"]["memory_kb"]["values"], ["8388608"])
@@ -54,7 +55,11 @@ class ConfigTest(unittest.TestCase):
         lookup = scheduler["property_modifier"]["scheduler"]["cache_lookup"]
         self.assertEqual(lookup["ac_store"], ac["name"])
         self.assertEqual(ac["completeness_checking"]["cas_store"]["ref_store"]["name"], cas["name"])
-        props = lookup["scheduler"]["simple"]["supported_platform_properties"]
+        simple = lookup["scheduler"]["simple"]
+        self.assertEqual(simple["worker_timeout_s"], 120)
+        self.assertNotIn("max_action_executing_timeout_s", simple)
+        self.assertNotIn("timeout", worker["worker_api_endpoint"])
+        props = simple["supported_platform_properties"]
         self.assertEqual((props["cpu_count"], props["memory_kb"]), ("minimum", "minimum"))
 
     def test_default_and_explicit_reservations(self):

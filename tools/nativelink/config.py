@@ -67,15 +67,24 @@ def make_config(state, cpu, memory_kb, action_cpu, action_memory_kb, reapi_port,
             "modifications": modifications,
             "scheduler": {"cache_lookup": {
                 "ac_store": ac,
-                "scheduler": {"simple": {"supported_platform_properties": {
-                    "cpu_count": "minimum", "memory_kb": "minimum",
-                    "OSFamily": "priority", "container-image": "priority",
-                }}},
+                "scheduler": {"simple": {
+                    # The default 10s lease can expire during loaded-host pauses,
+                    # requeueing operations the worker is still running. Keep
+                    # the default 2.5s heartbeat, allowing 48 missed intervals.
+                    "worker_timeout_s": 120,
+                    "supported_platform_properties": {
+                        "cpu_count": "minimum", "memory_kb": "minimum",
+                        "OSFamily": "priority", "container-image": "priority",
+                    },
+                }},
             }},
         }}],
         "workers": [{"local": {
             "worker_api_endpoint": {"uri": f"grpc://127.0.0.1:{worker_port}"},
             "cas_fast_slow_store": fast,
+            # One pool across all actions, instead of 64 fetches per directory
+            # per action competing with the worker's control-plane tasks.
+            "max_concurrent_input_downloads": 64,
             "upload_action_result": {"ac_store": ac},
             "work_directory": str(state / "work"),
             "platform_properties": {
