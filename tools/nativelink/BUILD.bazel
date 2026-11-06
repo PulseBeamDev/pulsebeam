@@ -29,6 +29,13 @@ py_test(
 )
 
 py_test(
+    name = "siso_summary_test",
+    srcs = ["test_siso_summary.py", "siso_summary.py"],
+    main = "test_siso_summary.py",
+    imports = ["."],
+)
+
+py_test(
     name = "resources_test",
     srcs = ["test_resources.py", "resources.py"],
     main = "test_resources.py",
