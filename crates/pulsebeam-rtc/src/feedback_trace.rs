@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     EcnCodepoint, PacketFeedbackKind,
-    congestion::{ControllerInput, EcnValidation, ScreamController},
+    congestion::{Config, ControllerInput, EcnValidation, ScreamController},
     connection::TransmitCommitContext,
     receive_feedback::ReceiveFeedback,
     rtcp,
@@ -51,23 +51,25 @@ fn checkpoint(
         history.counters()
     )
     .unwrap();
-    let envelope = controller.update(
-        Duration::from_millis(millis),
-        ControllerInput {
-            path_epoch: Some(1),
-            path_available: true,
-            feedback: &samples,
-            feedback_hold: inputs
-                .timing
-                .and_then(|timing| timing.feedback_hold)
-                .unwrap_or_default(),
-            fresh_network_feedback: inputs.fresh_network_feedback,
-            bytes_in_flight: inputs.bytes_in_flight,
-            paced_queue_bytes: 0,
-            desired_media_rate: 2_000_000,
-            ecn: EcnValidation::default(),
-        },
-    );
+    let envelope = controller
+        .update(
+            Duration::from_millis(millis),
+            ControllerInput {
+                path_epoch: Some(1),
+                path_available: true,
+                feedback: &samples,
+                feedback_hold: inputs
+                    .timing
+                    .and_then(|timing| timing.feedback_hold)
+                    .unwrap_or_default(),
+                fresh_network_feedback: inputs.fresh_network_feedback,
+                bytes_in_flight: inputs.bytes_in_flight,
+                paced_queue_bytes: 0,
+                desired_media_rate: 2_000_000,
+                ecn: EcnValidation::default(),
+            },
+        )
+        .unwrap();
     writeln!(trace, "  controller={envelope:?}").unwrap();
     writeln!(
         trace,
@@ -78,8 +80,8 @@ fn checkpoint(
         history
             .next_deadline(now)
             .map(|deadline| deadline.saturating_duration_since(origin)),
-        controller.next_deadline(),
-        controller.test_flight_peak()
+        controller.next_deadline(Duration::from_millis(millis), None, None),
+        controller.diagnostics().flight_peak
     )
     .unwrap();
     history.clear_controller_inputs();
@@ -99,7 +101,7 @@ fn feedback_wire_accounting_and_controller_baseline() {
         receiver.reserve(usize::MAX).unwrap();
         let mut history = SentHistory::new(mode, origin);
         history.path_changed(epoch, true);
-        let mut controller = ScreamController::new(2_000_000, Some(1200));
+        let mut controller = ScreamController::new(Config::default()).unwrap();
         checkpoint(
             &mut trace,
             "initial",
@@ -128,7 +130,12 @@ fn feedback_wire_accounting_and_controller_baseline() {
             history.prepare_commit(context).unwrap();
             history.preflight_commit(context).unwrap();
             history.commit_preflighted(context).unwrap();
-            controller.note_send(context.at.saturating_duration_since(origin));
+            controller.commit_send(
+                context.at.saturating_duration_since(origin),
+                context.wire_len,
+                history.controller_inputs().bytes_in_flight,
+                false,
+            );
         }
         controller.observe_bytes_in_flight(history.controller_inputs().bytes_in_flight);
         for (millis, sequence, ecn) in [

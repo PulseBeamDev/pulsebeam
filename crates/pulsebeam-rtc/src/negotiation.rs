@@ -3035,7 +3035,7 @@ mod tests {
     fn rfc8888_uses_standard_ack_feedback_including_wildcard() {
         let source = fixture("firefox");
         let accept = |feedback: &str| {
-            Connection::accept(
+            RtcConnection::accept(
                 config(),
                 SdpOffer::new(
                     source
