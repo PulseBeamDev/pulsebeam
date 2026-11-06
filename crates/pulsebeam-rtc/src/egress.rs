@@ -66,8 +66,6 @@ pub(crate) struct MediaEgress {
     next_repair_request: Option<u64>,
     next_twcc: u64,
     pending: Option<PendingTransmit>,
-    #[cfg(test)]
-    commit_trace: std::collections::hash_map::DefaultHasher,
     last_send_attempt: Option<Instant>,
     scheduler: SenderScheduler,
     controller: ScreamController,
@@ -291,8 +289,6 @@ impl MediaEgress {
             next_repair_request: Some(0),
             next_twcc: u64::from(u16::from_be_bytes([twcc_seed[0], twcc_seed[1]])),
             pending: None,
-            #[cfg(test)]
-            commit_trace: std::collections::hash_map::DefaultHasher::new(),
             last_send_attempt: None,
             scheduler: SenderScheduler::default(),
             controller: ScreamController::new(Config::default())
@@ -792,22 +788,6 @@ impl MediaEgress {
         self.controller.diagnostics().flight_peak
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_nominal_pacing_rate(&self) -> u64 {
-        self.controller.snapshot().nominal_pacing_transport_rate
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_effective_pacing_rate(&self) -> u64 {
-        self.controller.snapshot().pacing_transport_rate
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_commit_trace(&self) -> u64 {
-        use std::hash::Hasher;
-        self.commit_trace.finish()
-    }
-
     pub(crate) fn observe_bytes_in_flight(&mut self, bytes: u64) {
         self.controller.observe_bytes_in_flight(bytes);
     }
@@ -1247,21 +1227,6 @@ impl MediaEgress {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        #[cfg(test)]
-        if let Some(identity) = prepared.rtp {
-            use std::hash::Hash;
-            let service = match identity.service {
-                RtpService::Original => 0_u8,
-                RtpService::Repair => 1,
-                RtpService::Padding => 2,
-            };
-            (
-                at.saturating_duration_since(self.controller_origin),
-                service,
-                prepared.wire_len,
-            )
-                .hash(&mut self.commit_trace);
-        }
         if !matches!(pending, PendingTransmit::Control) {
             self.controller.commit_send(
                 at.saturating_duration_since(self.controller_origin),

@@ -35,8 +35,6 @@ def runtime_tests(sources, support, fixtures):
         if not is_fixture:
             names.append(":" + name)
         tools = name in ["turn", "controlled_turn_tls", "installed_packet_socket"]
-        # Real SDK ICE peers need a host interface outside the worker loopback.
-        host_interface = name == "production_sdk_wake_drop"
         rust_test(
             name = name,
             crate_root = source,
@@ -44,7 +42,7 @@ def runtime_tests(sources, support, fixtures):
             compile_data = fixtures + (["//crates/pulsebeam-testdata:quality_zero_video_inputs"] if name == "production_session" else []) + select({":asan_selected": ["@webrtc_upstream//:clang_tools", "@webrtc_upstream//:clang++"], "//conditions:default": []}),
             edition = "2024",
             args = ["--test-threads=1"],
-            tags = (["manual", "external-network"] if is_fixture else []) + (["no-remote-exec"] if host_interface else []),
+            tags = ["manual", "external-network"] if is_fixture else [],
             data = ["@webrtc_test_tools//:tools"] if tools else [],
             env = {"PULSEBEAM_TEST_TOOLS": "../" + Label("@webrtc_test_tools//:bin/openssl").workspace_name + "/bin"} if tools else {},
             rustc_flags = select({":asan_selected": ASAN_FLAGS, "//conditions:default": []}),

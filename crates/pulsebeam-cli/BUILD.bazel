@@ -59,8 +59,7 @@ rust_test(
     ],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     size = "medium",
-    # Native ICE gathering needs a usable host interface, like the browser witness.
-    tags = ["cpu:2", "no-remote-exec"],
+    tags = ["cpu:2"],
 )
 
 rustfmt_test(name = "format", targets = [":pulsebeam-cli", ":production_native"])

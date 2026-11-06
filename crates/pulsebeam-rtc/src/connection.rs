@@ -1122,27 +1122,6 @@ mod tests {
         assert_eq!(connection.stats().connection.queued_media_bytes, 0);
     }
 
-    fn cc_checkpoint(label: &str, fixture: &PeerFixture) {
-        let connection = &fixture.connection;
-        let now = fixture.at();
-        eprintln!(
-            "CC_TRACE {label} commits={:016x} pacing={} nominal={} flight={} peak={} wake={:?} envelope={:?}",
-            connection.egress.test_commit_trace(),
-            connection.egress.test_effective_pacing_rate(),
-            connection.egress.test_nominal_pacing_rate(),
-            connection.stats().connection.rtp_bytes_in_flight,
-            connection.egress.test_flight_peak(),
-            connection
-                .egress
-                .next_deadline(now)
-                .map(|at| at.saturating_duration_since(now)),
-            connection
-                .egress
-                .test_envelope()
-                .expect("controller envelope"),
-        );
-    }
-
     #[test]
     fn aggregate_demand_obtains_native_rtx_feedback_without_primary_media() {
         let mut fixture = PeerFixture::connected_video().without_egress_observation();
@@ -1205,7 +1184,6 @@ mod tests {
                 !envelope.feedback_stale && envelope.delivered_rtp_transport_rate > 0;
             if tick % 20 == 0 {
                 trace.push((tick / 20, envelope));
-                cc_checkpoint(&format!("padding-{}", tick / 20), &fixture);
             }
         }
         let stats = fixture.connection.stats().connection;
@@ -1227,7 +1205,6 @@ mod tests {
             "aggregate-demand feedback: stats={stats:?} trace={trace:?}",
         );
         fixture.drive_for(Duration::from_secs(22));
-        cc_checkpoint("bootstrap", &fixture);
         let bootstrap = fixture.connection.stats().connection;
         assert_eq!(bootstrap.transmitted_rtp_bytes, 0);
         assert!(
@@ -1254,7 +1231,6 @@ mod tests {
                 .transmitted_padding_bytes,
             padding
         );
-        cc_checkpoint("padding-paused", &fixture);
 
         fixture.record_transmits();
         let mid = fixture.sender_mid.clone();
@@ -1264,7 +1240,6 @@ mod tests {
             .write_rtp(at, &mid, sample(at, 42, 200, 90_000))
             .expect("primary for repair");
         fixture.drive_for(Duration::from_millis(100));
-        cc_checkpoint("repair-original", &fixture);
         let ssrc = fixture
             .connection
             .stats()
@@ -1284,7 +1259,6 @@ mod tests {
             1,
             "one requested repair must commit through the shared RTP budget"
         );
-        cc_checkpoint("repair", &fixture);
     }
 
     #[test]
@@ -1353,10 +1327,6 @@ mod tests {
                 fixture.connection.stats().connection
             );
             assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > before);
-            cc_checkpoint(
-                &format!("no-rtx-{feedback_enabled}-{replace_path}"),
-                &fixture,
-            );
         }
         fixture
             .connection
@@ -1379,7 +1349,6 @@ mod tests {
             .egress
             .test_envelope()
             .expect("quiet native output");
-        cc_checkpoint("no-rtx-paused", &fixture);
         assert!(quiet.feedback_stale);
         // No packets means no new native ALR or window evidence. Polling must
         // neither manufacture classification nor decay nominal capacity.
@@ -1404,7 +1373,6 @@ mod tests {
                 Err(error) => panic!("unexpected media error: {error:?}"),
             }
         }
-        cc_checkpoint("no-rtx-resumed", &fixture);
         assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > paused);
         assert!(
             !fixture
@@ -1602,7 +1570,6 @@ mod tests {
             fixture.drive_for(Duration::from_millis(2));
         }
         let end = fixture.at();
-        cc_checkpoint("capacity-queued", &fixture);
         let stable_start = start + Duration::from_secs(2);
         let cohort = fixture
             .emitted_rtp()
@@ -1688,7 +1655,6 @@ mod tests {
         );
         // Native transport pacing exceeds the payload estimate. The removed payload
         // pacer imposed the old 10 ms excess-sojourn bound, not SCReAM itself.
-        cc_checkpoint("capacity-drained", &fixture);
     }
 
     #[test]
@@ -1735,7 +1701,6 @@ mod tests {
             fixture.connection.egress.test_envelope()
         );
         assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > 0);
-        cc_checkpoint("sparse-alr", &fixture);
     }
     #[test]
     fn poll_observes_committed_flight_before_batched_ack_retirement() {
@@ -1807,7 +1772,6 @@ mod tests {
             19_200
         );
         assert!(fixture.connection.egress.test_flight_peak() < 19_200);
-        cc_checkpoint(&format!("batched-{kind:?}-before"), &fixture);
         fixture.advance_clock_without_poll(Duration::from_millis(50));
         for feedback_count in 1..=8 {
             fixture
@@ -1883,6 +1847,5 @@ mod tests {
                 < 19_200
         );
         assert_eq!(fixture.connection.egress.test_flight_peak(), 19_200);
-        cc_checkpoint(&format!("batched-{kind:?}-after"), &fixture);
     }
 }
