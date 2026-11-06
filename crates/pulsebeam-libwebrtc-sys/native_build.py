@@ -76,9 +76,27 @@ def writable_file(root, relative):
     target.write_bytes(content)
 
 
+def repository_sources(value):
+    # Linux sandbox inputs retain the source-file symlink into the immutable
+    # repository cache. Its content manifest identifies the sibling checkout.
+    try:
+        source = Path(value).resolve(strict=True).parent / "checkout/src"
+    except OSError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    if not source.is_dir():
+        raise argparse.ArgumentTypeError(
+            "WebRTC sources are missing beside their repository manifest; "
+            "copied/hardlinked sandbox input staging is unsupported: " + str(source)
+        )
+    return source
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("source-root", "bridge", "overlay", "host-bin", "build", "flavor", "pulsebeam", "webrtc", "runtime"):
+    sources = parser.add_mutually_exclusive_group(required=True)
+    sources.add_argument("--source-root")
+    sources.add_argument("--source-manifest", dest="source_root", type=repository_sources)
+    for name in ("bridge", "overlay", "host-bin", "build", "flavor", "pulsebeam", "webrtc", "runtime"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--asan", action="store_true")
     parser.add_argument("--executor", choices=("local", "cache", "reapi"), default="local")
@@ -125,7 +143,7 @@ def build(args, lock_fd=None):
         (owned / "native").symlink_to(bridge.parent.parent / "native", target_is_directory=True)
         # rustfmt resolves ignore patterns relative to the real config path; a
         # symlink into the upstream checkout puts generated files outside it.
-        for relative in (".gn", ".rustfmt.toml", "BUILD.gn", "buildtools/third_party/libc++/BUILD.gn", "buildtools/third_party/libc++abi/BUILD.gn", "build/toolchain/gcc_toolchain.gni"):
+        for relative in (".gn", ".rustfmt.toml", "BUILD.gn", "buildtools/third_party/libc++/BUILD.gn", "buildtools/third_party/libc++abi/BUILD.gn", "build/toolchain/gcc_toolchain.gni", "build/config/siso/nasm_linux.star"):
             writable_file(root, relative)
         for patch in ("integration.patch", "strict-fp.patch"):
             run([host / "patch", "--batch", "--fuzz=0", "-p1", "-i", overlay / patch], cwd=root, env=env, lock_fd=lock_fd)

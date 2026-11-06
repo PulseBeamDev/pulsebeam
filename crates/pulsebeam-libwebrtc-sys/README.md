@@ -78,13 +78,19 @@ instrumented by this native lifetime configuration.
 
 `repositories.bzl` acquires the pinned WebRTC and depot_tools revisions, their
 DEPS inputs, prebuilt tools and Bullseye amd64 sysroot, then applies the tracked
-patches. Acquisition can use the network. The locked Nixpkgs dependency
+patches. It materializes safe source aliases and hashes the filtered compiler
+view once as a deterministic source manifest. Acquisition can use the network.
+The locked Nixpkgs dependency
 provisions package-local host tools, separate from the upstream target sysroot
 and native desktop libraries.
 
-`native_build.bzl` declares the whole native build action. It stages an
-editable action-owned source view of declared upstream GN sources, adapters and
-bridge, then invokes GN and Siso. The GN overlay compiles WebRTC, the owned
+`native_build.bzl` declares the whole native build action. Its source-content
+input is the manifest, avoiding recursive checkout tracking on each build. The
+GN client locates the immutable checkout through the manifest’s repository
+symlink and stages an editable action-owned view with adapters and bridge.
+Bazel’s normal symlinked Linux sandbox and standalone execution are supported;
+copied or hardlinked sandbox input staging is not. The client then invokes GN
+and Siso. The GN overlay compiles WebRTC, the owned
 adapters and CXX-generated C++, with PIC, the software codec policy, protobuf
 events and strict x86_64 floating-point behavior. `strict-fp.patch` preserves
 all compile flags at the tail without a compiler wrapper. Bazel consumes fixed GN

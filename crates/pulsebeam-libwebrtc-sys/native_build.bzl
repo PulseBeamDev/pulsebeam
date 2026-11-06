@@ -22,7 +22,7 @@ def _native_build_impl(ctx):
     directory = ctx.actions.declare_directory(ctx.label.name + "/" + identity + "/build")
     libraries = {name: ctx.actions.declare_file(ctx.label.name + "/" + identity + "/lib" + name + ".a") for name in ["pulsebeam", "webrtc", "runtime"]}
     args = ctx.actions.args()
-    args.add("--source-root", ctx.file._dotgn.dirname)
+    args.add("--source-manifest", ctx.file._source_manifest)
     args.add("--bridge", ctx.file.bridge)
     args.add("--overlay", ctx.file._overlay.dirname)
     args.add("--host-bin", ctx.file._python.dirname)
@@ -42,8 +42,8 @@ def _native_build_impl(ctx):
         executable = ctx.file._python,
         arguments = [ctx.file._runner.path, args],
         inputs = depset(
-            direct = [ctx.file.bridge, ctx.file._runner, ctx.file._dotgn] + ctx.files.adapters + ctx.files._overlay_files,
-            transitive = [ctx.attr._sources[DefaultInfo].files, ctx.attr._host_tools[DefaultInfo].files],
+            direct = [ctx.file.bridge, ctx.file._runner, ctx.file._source_manifest] + ctx.files.adapters + ctx.files._overlay_files,
+            transitive = [ctx.attr._host_tools[DefaultInfo].files],
         ),
         outputs = [directory] + libraries.values(),
         env = {"PYTHONDONTWRITEBYTECODE": "1"},
@@ -71,8 +71,7 @@ native_build = rule(
         "_runner": attr.label(default = ":native_build.py", allow_single_file = True),
         "_overlay": attr.label(default = ":gn/BUILD.gn", allow_single_file = True),
         "_overlay_files": attr.label_list(default = [":gn/BUILD.gn", ":gn/args.gn", ":gn/integration.patch", ":gn/bridge.py", ":gn/strict-fp.patch", ":gn/backend.star", ":gn/rust/cxx.h"], allow_files = True),
-        "_sources": attr.label(default = "@webrtc_upstream//:sources"),
-        "_dotgn": attr.label(default = "@webrtc_upstream//:checkout/src/.gn", allow_single_file = True),
+        "_source_manifest": attr.label(default = "@webrtc_upstream//:sources.sha256", allow_single_file = True),
         "_host_tools": attr.label(default = "@webrtc_host//:tools", cfg = "exec"),
         "_python": attr.label(default = "@webrtc_host//:bin/python3", allow_single_file = True, cfg = "exec"),
     },

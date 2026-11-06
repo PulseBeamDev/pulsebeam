@@ -33,3 +33,14 @@ diff --git a/buildtools/third_party/libc++abi/BUILD.gn b/buildtools/third_party/
  
    # Fuchsia builds don't link against any libraries that provide stack
    # unwinding symbols, unlike Linux does with glibc (same applies for Android).
+diff --git a/build/config/siso/nasm_linux.star b/build/config/siso/nasm_linux.star
+--- a/build/config/siso/nasm_linux.star
++++ b/build/config/siso/nasm_linux.star
+@@ -17,5 +17,6 @@
+ def __step_config(ctx, step_config):
+-    remote_run = config.get(ctx, "googlechrome")  # Turn this to False when you do file access trace.
++    # PulseBeam provides the interpreter and native toolchain on its Linux worker.
++    remote_run = True
+     rules = []
+     for toolchain in ["", "clang_x64"]:
+         nasm_path = path.join(toolchain, "nasm")

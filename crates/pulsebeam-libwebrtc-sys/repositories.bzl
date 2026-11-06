@@ -41,6 +41,8 @@ def _upstream_impl(ctx):
     # does not include file contents in the shared repository cache identity.
     for patch in ctx.attr.patches + [ctx.attr.libvpx_patch]:
         ctx.read(patch)
+    ctx.read(ctx.attr.source_manifest)
+    source_manifest = ctx.path(ctx.attr.source_manifest)
     patches = [str(ctx.path(patch)) for patch in ctx.attr.patches]
     libvpx_patch = str(ctx.path(ctx.attr.libvpx_patch))
     _run(ctx, [git, "init", "depot_tools"])
@@ -80,13 +82,10 @@ def _upstream_impl(ctx):
     _run(ctx, [git, "apply", libvpx_patch], str(ctx.path("checkout/src/third_party/libvpx/source/libvpx")))
     # Foreign Bazel metadata must not create subpackage holes in the GN input tree.
     _run(ctx, [python, "-c", "from pathlib import Path; [(p.rename(p.with_name(p.name + '.upstream'))) for p in Path('checkout/src').rglob('*') if p.name in ('BUILD', 'BUILD.bazel') and p.is_file()]"])
+    _run(ctx, [python, source_manifest, "checkout/src", "sources.sha256"])
     ctx.file("BUILD.bazel", '''package(default_visibility = ["//visibility:public"])
-# Service units are not compiler inputs and include filenames illegal in Bazel labels.
-filegroup(
-    name = "sources",
-    srcs = glob(["checkout/src/**"], exclude = ["**/.git/**", "**/__pycache__/**", "**/*.pyc", "**/lib/systemd/**", "checkout/src/resources/**"]),
-)
-exports_files(["checkout/src/.gn"])
+# The manifest identifies the immutable compiler checkout without a file glob.
+exports_files(["checkout/src", "sources.sha256", "checkout/src/.gn"])
 filegroup(name = "clang++", srcs = ["checkout/src/third_party/llvm-build/Release+Asserts/bin/clang++"])
 filegroup(name = "clang_tools", srcs = glob(["checkout/src/third_party/llvm-build/Release+Asserts/**"]))
 ''')
@@ -126,6 +125,7 @@ _upstream = repository_rule(
     attrs = {
         "patches": attr.label_list(allow_files = [".patch"]),
         "libvpx_patch": attr.label(allow_single_file = [".patch"], mandatory = True),
+        "source_manifest": attr.label(default = Label("//crates/pulsebeam-libwebrtc-sys:source_manifest.py"), allow_single_file = True),
     },
 )
 
