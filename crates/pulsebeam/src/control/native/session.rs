@@ -597,6 +597,10 @@ impl NativeSession {
         )
     }
 
+    pub(crate) fn terminal_sent(&self) -> bool {
+        self.closed && self.rows.get(&Key::Session).is_some_and(|row| !row.dirty)
+    }
+
     pub(crate) fn receive_input(
         &mut self,
         bytes: &[u8],

@@ -1477,10 +1477,13 @@ impl Agent {
                             ) => Failure::transient(session.diagnostic.clone()),
                             Some(
                                 state::CloseReason::AuthorizationExpired
-                                | state::CloseReason::AuthorizationRevoked
-                                | state::CloseReason::ParticipantReplaced,
+                                | state::CloseReason::AuthorizationRevoked,
                             ) => Failure {
                                 class: FailureClass::Authorization,
+                                message: session.diagnostic.clone(),
+                            },
+                            Some(state::CloseReason::ParticipantReplaced) => Failure {
+                                class: FailureClass::ParticipantSuperseded,
                                 message: session.diagnostic.clone(),
                             },
                             _ => Failure::protocol(session.diagnostic.clone()),

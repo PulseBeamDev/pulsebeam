@@ -764,6 +764,76 @@ fn churn_test() {
 }
 
 #[test]
+fn duplicate_participant_notice_stops_the_displaced_agent() {
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("terminal-takeover")
+                .with_participant(
+                    Participant::data_participant("incumbent").with_external_id("same-user"),
+                )
+                .with_participant(
+                    Participant::data_participant("replacement")
+                        .with_external_id("same-user")
+                        .starts_disconnected(),
+                )
+                .with_participant(
+                    Participant::data_participant("fresh-agent")
+                        .with_external_id("same-user")
+                        .starts_disconnected(),
+                ),
+        )
+        .run(vec![
+            Step::Run {
+                description: "Establish the incumbent signaling channel",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckConnected {
+                description: "Incumbent is connected before takeover",
+                participant: "incumbent",
+            },
+            Step::Join {
+                description: "Another Agent deliberately claims the identity",
+                participant: "replacement",
+            },
+            Step::Run {
+                description: "Deliver terminal state and tear down the old incarnation",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckParticipantSuperseded {
+                description: "Displaced Agent is terminal without a second POST",
+                participant: "incumbent",
+                create_requests: 1,
+            },
+            Step::CheckConnected {
+                description: "Replacement owns the connection",
+                participant: "replacement",
+            },
+            Step::Join {
+                description: "A fresh deliberate Agent may claim the identity again",
+                participant: "fresh-agent",
+            },
+            Step::Run {
+                description: "Allow teardown callbacks and retry timers to settle",
+                duration: Duration::from_secs(12),
+            },
+            Step::CheckParticipantSuperseded {
+                description: "Original Agent remains terminal without retrying",
+                participant: "incumbent",
+                create_requests: 1,
+            },
+            Step::CheckParticipantSuperseded {
+                description: "Second Agent also stops on its eviction notice",
+                participant: "replacement",
+                create_requests: 1,
+            },
+            Step::CheckConnected {
+                description: "Fresh Agent stays connected",
+                participant: "fresh-agent",
+            },
+        ]);
+}
+
+#[test]
 fn clean_departure_and_rejoin_converges_without_a_ghost() {
     LocalNodeSim::new()
         .with_room(

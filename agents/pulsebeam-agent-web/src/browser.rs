@@ -2642,6 +2642,7 @@ fn failure_class_name(class: FailureClass) -> &'static str {
     match class {
         FailureClass::InvalidConfiguration => "invalid-configuration",
         FailureClass::Authorization => "authorization",
+        FailureClass::ParticipantSuperseded => "participant-superseded",
         FailureClass::Protocol => "protocol",
         FailureClass::Transient => "transient",
         FailureClass::ResourceExpired => "resource-expired",

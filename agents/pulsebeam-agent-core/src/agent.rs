@@ -981,7 +981,17 @@ impl Agent {
         Ok(())
     }
 
+    fn participant_superseded(&self) -> bool {
+        self.snapshot
+            .terminal_failure
+            .as_ref()
+            .is_some_and(|failure| failure.class == FailureClass::ParticipantSuperseded)
+    }
+
     fn reconnect(&mut self) {
+        if self.participant_superseded() {
+            return;
+        }
         if !self.desired.connected || self.closing.is_some() || self.attempt.is_some() {
             return;
         }
@@ -1980,6 +1990,7 @@ impl Agent {
             }
             FailureClass::InvalidConfiguration
             | FailureClass::Authorization
+            | FailureClass::ParticipantSuperseded
             | FailureClass::Protocol
             | FailureClass::ResourceExpired
             | FailureClass::RetryExhausted => self.fail_terminal(failure),
@@ -2006,6 +2017,14 @@ impl Agent {
         }
         if let Some(active) = self.active.as_ref() {
             self.fence_signaling(active.generation);
+        }
+        if failure.class == FailureClass::ParticipantSuperseded {
+            if let Some(active) = self.active.as_ref() {
+                self.effects.push_back(Effect::Rtc(RtcEffect::Close {
+                    generation: active.generation,
+                }));
+            }
+            self.clear_observed_state();
         }
         self.notify_failure(failure.clone());
         self.snapshot.terminal_failure = Some(failure);
@@ -2285,7 +2304,9 @@ impl Agent {
             self.finish_disconnected();
         } else {
             self.closing = Some(closing);
-            self.set_connection_state(ConnectionState::Closing);
+            if !self.participant_superseded() {
+                self.set_connection_state(ConnectionState::Closing);
+            }
         }
     }
 
@@ -2342,6 +2363,10 @@ impl Agent {
         self.snapshot.room_external_id = None;
         self.snapshot.authorization_expires_at = None;
         self.clear_observed_state();
+        if self.participant_superseded() {
+            self.set_connection_state(ConnectionState::TerminalFailure);
+            return;
+        }
         self.snapshot.terminal_failure = None;
         self.set_connection_state(ConnectionState::Disconnected);
         if self.desired.connected {
@@ -2519,8 +2544,12 @@ fn classify_http_failure(status: u16) -> Option<Failure> {
     }
     let (class, message) = match status {
         401 | 403 => (FailureClass::Authorization, "server rejected authorization"),
+        409 => (
+            FailureClass::ParticipantSuperseded,
+            "participant session was superseded",
+        ),
         408 | 425 | 429 | 500..=599 => (FailureClass::Transient, "transient HTTP failure"),
-        400 | 404 | 409 | 410 | 412 | 422 => (
+        400 | 404 | 410 | 412 | 422 => (
             FailureClass::InvalidConfiguration,
             "server rejected session configuration",
         ),

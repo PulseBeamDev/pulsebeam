@@ -31,6 +31,7 @@ use std::time::Instant;
 
 pub struct SimClientBuilder {
     ip: IpAddr,
+    participant_external_id: Option<&'static str>,
     admission: Arc<Mutex<AdmissionRecords>>,
     bootstrap_hold: BootstrapHold,
     native_host: NativeHost,
@@ -212,6 +213,7 @@ impl SimClientBuilder {
         let admission = Arc::new(Mutex::new(AdmissionRecords::default()));
         Ok(Self {
             ip,
+            participant_external_id: None,
             admission,
             bootstrap_hold: BootstrapHold::default(),
             native_host,
@@ -244,6 +246,11 @@ impl SimClientBuilder {
             quality_references: Arc::new(Mutex::new(BTreeMap::new())),
             h264_publishers: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+
+    pub fn with_participant_external_id(mut self, external_id: Option<&'static str>) -> Self {
+        self.participant_external_id = external_id;
+        self
     }
 
     pub fn with_bootstrap_hold(mut self, hold: BootstrapHold) -> Self {
@@ -421,10 +428,13 @@ impl SimClientBuilder {
     }
 
     pub(crate) async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
-        let participant = match self.ip {
-            IpAddr::V4(ip) => format!("sim-{}", u32::from(ip)),
-            IpAddr::V6(ip) => format!("sim-{ip:032X}", ip = u128::from(ip)),
-        };
+        let participant = self
+            .participant_external_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| match self.ip {
+                IpAddr::V4(ip) => format!("sim-{}", u32::from(ip)),
+                IpAddr::V6(ip) => format!("sim-{ip:032X}", ip = u128::from(ip)),
+            });
         let room = RoomExternalId::new(room)?;
         let participant = ParticipantExternalId::new(&participant)?;
         let expires_at = SystemTime::now()
@@ -3485,6 +3495,7 @@ impl Drop for ReceiverObservation {
 
 #[derive(Clone, Debug, Default)]
 pub struct ClientObservation {
+    pub create_requests: u64,
     pub admission: Option<pulsebeam::entity::ConnectionId>,
     pub snapshot: pulsebeam_agent_native::agent_core::Snapshot,
     pub owned_receivers: Vec<OwnedReceiverEvidence>,
@@ -3607,6 +3618,7 @@ impl ClientContext {
             })
             .map(|(_, connection)| connection);
         ClientObservation {
+            create_requests: self.admission.lock().unwrap().create_requests,
             admission,
             snapshot,
             owned_receivers: self
@@ -4998,6 +5010,7 @@ impl BootstrapHold {
 // schema. Missing/ambiguous ICE identity fails instead of guessing an admission.
 #[derive(Default)]
 struct AdmissionRecords {
+    create_requests: u64,
     by_offer: BTreeMap<String, pulsebeam::entity::ConnectionId>,
 }
 
@@ -5139,6 +5152,7 @@ impl AsyncHttpClient for AdmissionClient {
         Box::pin(async move {
             let offer = if request.method() == http::Method::POST {
                 self.bootstrap_hold.wait().await?;
+                self.admission.lock().unwrap().create_requests += 1;
                 let body: serde_json::Value =
                     serde_json::from_slice(request.body()).expect("native HTTP request is JSON");
                 Some(

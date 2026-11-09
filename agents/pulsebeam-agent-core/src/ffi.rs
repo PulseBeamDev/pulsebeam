@@ -251,6 +251,7 @@ pub enum ConnectionState {
 pub enum FailureClass {
     InvalidConfiguration,
     Authorization,
+    ParticipantSuperseded,
     Protocol,
     Transient,
     ResourceExpired,
@@ -819,6 +820,7 @@ impl From<model::FailureClass> for FailureClass {
         match value {
             model::FailureClass::InvalidConfiguration => Self::InvalidConfiguration,
             model::FailureClass::Authorization => Self::Authorization,
+            model::FailureClass::ParticipantSuperseded => Self::ParticipantSuperseded,
             model::FailureClass::Protocol => Self::Protocol,
             model::FailureClass::Transient => Self::Transient,
             model::FailureClass::ResourceExpired => Self::ResourceExpired,
@@ -1547,6 +1549,7 @@ mod tests {
         for value in [
             FailureClass::InvalidConfiguration,
             FailureClass::Authorization,
+            FailureClass::ParticipantSuperseded,
             FailureClass::Protocol,
             FailureClass::Transient,
             FailureClass::ResourceExpired,

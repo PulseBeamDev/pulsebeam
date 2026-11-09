@@ -66,6 +66,45 @@ impl StateProtocolHandler {
         transferred
     }
 
+    pub(in crate::control) fn service_terminal(&mut self) -> Result<bool, InputError> {
+        if self.handoff.failed() {
+            return Err(OutputError::InvalidObservation.into());
+        }
+        self.commands.clear();
+        if let Some(progress) = self.handoff.progress() {
+            self.model.commit_sent(progress)?;
+        }
+        if let Some(opened) = self.handoff.opened() {
+            self.model.set_cid(opened.channel, opened.at);
+        }
+        // A displaced endpoint may still report old execution and client input.
+        // Drain those bounded lanes without applying any more resource mutations.
+        for _ in 0..FACT_BUDGET {
+            if self.handoff.fact().is_none() {
+                break;
+            }
+        }
+        let _ = self.handoff.input();
+        if self.model.terminal_sent() {
+            if !self.handoff.rearm_for(false) {
+                return Err(OutputError::Capacity.into());
+            }
+            return Ok(false);
+        }
+        self.model.poll()?;
+        let mut wake = false;
+        if let Some(output) = self.model.take_output() {
+            match self.handoff.output(output) {
+                Ok(()) => wake = true,
+                Err(output) => self.model.restore_output(output)?,
+            }
+        }
+        if !self.handoff.rearm_for(false) {
+            return Err(OutputError::Capacity.into());
+        }
+        Ok(wake && self.handoff.wake_endpoint())
+    }
+
     // Returns whether a coalesced endpoint wake is needed. Queue admission is not execution.
     pub(in crate::control) fn service<'a>(
         &mut self,

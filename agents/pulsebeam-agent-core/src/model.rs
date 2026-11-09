@@ -255,6 +255,8 @@ impl Default for Snapshot {
 pub enum FailureClass {
     InvalidConfiguration,
     Authorization,
+    /// This Agent lost participant ownership. Start a new Agent to reclaim it.
+    ParticipantSuperseded,
     Protocol,
     Transient,
     ResourceExpired,

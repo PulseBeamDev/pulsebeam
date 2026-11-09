@@ -2,6 +2,14 @@ use super::*;
 use crate::participant::ParticipantEffect;
 
 const NATIVE_BUDGET: usize = 32;
+const MAX_TERMINAL_HANDOFFS: usize = 256;
+const TERMINAL_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
+
+pub(super) struct RetiringNative {
+    handler: StateProtocolHandler,
+    meta: crate::control::registry::ParticipantMeta,
+    deadline: pulsebeam_runtime::time::Instant,
+}
 
 impl ControllerActor {
     pub(super) fn service_native_connections(&mut self) {
@@ -24,6 +32,10 @@ impl ControllerActor {
     }
 
     fn service_native_connection(&mut self, connection: ConnectionId) {
+        if let Some(retiring) = self.retiring_native.remove(&connection) {
+            self.service_native_retirement(connection, retiring);
+            return;
+        }
         let Some(NativeService {
             handler: mut native,
             deadline,
@@ -93,12 +105,78 @@ impl ControllerActor {
         }
     }
 
-    pub(super) fn retire_native_connection(&mut self, connection: ConnectionId) {
-        if let Some(native) = self.native_connections.remove(&connection)
-            && let Some(deadline) = native.deadline
-        {
+    pub(super) fn retire_native_connection(
+        &mut self,
+        connection: ConnectionId,
+    ) -> Option<NativeService> {
+        let native = self.native_connections.remove(&connection)?;
+        if let Some(deadline) = native.deadline {
             self.native_deadlines.remove(&(deadline, connection));
         }
+        Some(native)
+    }
+
+    pub(super) fn begin_native_retirement(
+        &mut self,
+        participant: ParticipantId,
+        meta: crate::control::registry::ParticipantMeta,
+        mut handler: StateProtocolHandler,
+    ) -> bool {
+        if self.retiring_native.len() >= MAX_TERMINAL_HANDOFFS
+            || meta.transport.is_none()
+            || handler
+                .model
+                .close(pulsebeam_proto::state::CloseReason::ParticipantReplaced)
+                .is_err()
+        {
+            return false;
+        }
+        debug_assert_eq!(handler.participant, participant);
+        let connection = meta.connection_id;
+        let now = pulsebeam_runtime::time::Instant::now();
+        let deadline = now.checked_add(TERMINAL_HANDOFF_TIMEOUT).unwrap_or(now);
+        self.native_deadlines.insert((deadline, connection));
+        self.service_native_retirement(
+            connection,
+            RetiringNative {
+                handler,
+                meta,
+                deadline,
+            },
+        );
+        true
+    }
+
+    fn service_native_retirement(
+        &mut self,
+        connection: ConnectionId,
+        mut retiring: RetiringNative,
+    ) {
+        let now = pulsebeam_runtime::time::Instant::now();
+        // Ownership and media plans have already been revoked. Only the old
+        // session's bounded output handoff survives, never a retry/admission fence.
+        let result = retiring.handler.service_terminal();
+        // RTC admission is not a network flush. Keep the handoff alive for the
+        // bounded grace period so dropping it cannot abort queued terminal bytes.
+        let finished = result.is_err() || now >= retiring.deadline;
+        if finished {
+            self.native_deadlines
+                .remove(&(retiring.deadline, connection));
+            self.retire_participant_transport(retiring.handler.participant, &retiring.meta);
+            return;
+        }
+        if matches!(result, Ok(true)) {
+            // The registry now names the replacement. Wake the displaced
+            // endpoint by its retained shard and exact connection incarnation.
+            self.command_backlog.push_back((
+                retiring.meta.shard_id,
+                ShardCommand::NativeReady {
+                    participant: retiring.handler.participant,
+                    connection_id: connection,
+                },
+            ));
+        }
+        self.retiring_native.insert(connection, retiring);
     }
 
     pub(super) fn observe_native_effect(

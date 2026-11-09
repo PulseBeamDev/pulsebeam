@@ -44,6 +44,7 @@ pub enum Role {
 #[derive(Clone, Debug)]
 pub struct Participant {
     pub name: &'static str,
+    pub external_id: Option<&'static str>,
     pub role: Role,
     pub rids: Vec<&'static str>,
     pub quality_video: Option<(QualityVideoSource, QualityVideoLayer)>,
@@ -93,6 +94,7 @@ impl Participant {
     pub fn publisher(name: &'static str, rids: &[&'static str]) -> Self {
         Self {
             name,
+            external_id: None,
             role: Role::Publisher,
             rids: rids.to_vec(),
             native_video_fixture: None,
@@ -122,6 +124,7 @@ impl Participant {
     pub fn single_publisher(name: &'static str) -> Self {
         Self {
             name,
+            external_id: None,
             native_video_fixture: None,
             role: Role::Publisher,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
@@ -166,6 +169,7 @@ impl Participant {
     pub fn subscriber(name: &'static str) -> Self {
         Self {
             name,
+            external_id: None,
             native_video_fixture: None,
             role: Role::Subscriber,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
@@ -196,6 +200,7 @@ impl Participant {
     pub fn multi_subscriber(name: &'static str, slots: usize) -> Self {
         Self {
             name,
+            external_id: None,
             native_video_fixture: None,
             role: Role::Subscriber,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
@@ -234,6 +239,7 @@ impl Participant {
     pub fn data_participant(name: &'static str) -> Self {
         Self {
             name,
+            external_id: None,
             native_video_fixture: None,
             role: Role::DataOnly,
             video_receive_mode: pulsebeam_agent_native::ReceiveMode::Encoded,
@@ -322,6 +328,11 @@ impl Participant {
     /// Offset the fixture speech cycle while keeping each source's receiver independent.
     pub fn taking_turns_after(mut self, packets: u64) -> Self {
         self.audio_phase_offset = packets;
+        self
+    }
+
+    pub fn with_external_id(mut self, external_id: &'static str) -> Self {
+        self.external_id = Some(external_id);
         self
     }
 
@@ -910,6 +921,11 @@ pub enum Step {
         description: &'static str,
         participant: &'static str,
     },
+    CheckParticipantSuperseded {
+        description: &'static str,
+        participant: &'static str,
+        create_requests: u64,
+    },
     /// Assert the participant has NO active peer connection.
     CheckNotConnected {
         description: &'static str,
@@ -1327,6 +1343,7 @@ impl ParticipantShared {
 }
 
 struct ParticipantHandle {
+    external_id: Option<&'static str>,
     shared: Arc<ParticipantShared>,
     cmd_tx: mpsc::Sender<ParticipantCmd>,
     room_name: &'static str,
@@ -1540,6 +1557,7 @@ async fn run_participant(
         } else {
             SimClientBuilder::bind(ip, server_ip).await?
         }
+        .with_participant_external_id(config.external_id)
         .with_bootstrap_hold(shared.bootstrap_hold.clone())
         .with_quality_references(shared.quality_references.clone())
         .with_h264_publishers(shared.h264_publishers.clone())
@@ -1826,6 +1844,7 @@ fn step_name(step: &Step) -> &'static str {
         Step::CheckIdentityStable { .. } => "CheckIdentityStable",
         Step::CheckConnected { .. } => "CheckConnected",
         Step::CheckNotConnected { .. } => "CheckNotConnected",
+        Step::CheckParticipantSuperseded { .. } => "CheckParticipantSuperseded",
         Step::CheckRxBytes { .. } => "CheckRxBytes",
         Step::CheckNativeAudioDecoded { .. } => "CheckNativeAudioDecoded",
         Step::WaitForNativeAudioRecovery { .. } => "WaitForNativeAudioRecovery",
@@ -2544,6 +2563,20 @@ async fn execute_plan(
                 }
                 handle.present = true;
                 handle.send_command(ParticipantCmd::Reconnect);
+                let (room, external_id) = (handle.room_name, handle.external_id);
+                if let Some(external_id) = external_id {
+                    // The authored join deliberately replaces the other client,
+                    // but leaves it running to observe terminal state and retries.
+                    for (name, previous) in handles.iter_mut() {
+                        if *name != *participant
+                            && previous.room_name == room
+                            && previous.external_id == Some(external_id)
+                        {
+                            previous.present = false;
+                            previous.retirement_deadline = None;
+                        }
+                    }
+                }
             }
 
             Step::Disconnect {
@@ -3992,6 +4025,34 @@ async fn execute_plan(
                 assert!(
                     handle.connected(),
                     "\nassertion failed\n  plan step:   {n}/{total} {kind}\n  description: \"{description}\"\n  participant:  {participant}\n  expected:     peer connection active\n  actual:       not connected"
+                );
+            }
+
+            Step::CheckParticipantSuperseded {
+                description,
+                participant,
+                create_requests,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let observation = handle.shared.observation.lock().unwrap();
+                let observation = observation.as_ref().expect("participant observation");
+                assert_eq!(
+                    observation.create_requests, *create_requests,
+                    "{description}: unexpected automatic create request"
+                );
+                let snapshot = &observation.snapshot;
+                assert_eq!(
+                    snapshot.connection,
+                    pulsebeam_agent_native::agent_core::ConnectionState::TerminalFailure,
+                    "{description}"
+                );
+                assert_eq!(
+                    snapshot
+                        .terminal_failure
+                        .as_ref()
+                        .map(|failure| failure.class),
+                    Some(pulsebeam_agent_native::agent_core::FailureClass::ParticipantSuperseded),
+                    "{description}"
                 );
             }
 
@@ -6193,6 +6254,7 @@ impl LocalNodeSim {
                 handles.insert(
                     participant.name,
                     ParticipantHandle {
+                        external_id: participant.external_id,
                         shared: shared.clone(),
                         cmd_tx,
                         room_name: room.name,

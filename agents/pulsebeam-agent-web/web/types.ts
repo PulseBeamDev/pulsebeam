@@ -130,6 +130,7 @@ export type FailureClass =
   | "initialization"
   | "invalid-configuration"
   | "authorization"
+  | "participant-superseded"
   | "protocol"
   | "transient"
   | "resource-expired"

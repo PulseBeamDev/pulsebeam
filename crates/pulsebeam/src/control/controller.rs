@@ -352,6 +352,7 @@ pub struct ControllerActor {
     steering: Option<Box<dyn Steering>>,
     materializations: VecDeque<MaterializationWork>,
     native_connections: std::collections::HashMap<ConnectionId, NativeService>,
+    retiring_native: std::collections::HashMap<ConnectionId, native_service::RetiringNative>,
     native_ready_tx: mailbox::Sender<ConnectionId>,
     native_ready_rx: mailbox::Receiver<ConnectionId>,
     native_deadlines: BTreeSet<(pulsebeam_runtime::time::Instant, ConnectionId)>,
@@ -419,6 +420,7 @@ impl ControllerActor {
             steering: None,
             materializations: VecDeque::new(),
             native_connections: std::collections::HashMap::new(),
+            retiring_native: std::collections::HashMap::new(),
             native_ready_tx,
             native_ready_rx,
             native_deadlines: BTreeSet::new(),
@@ -2156,7 +2158,7 @@ impl ControllerActor {
         meta: crate::control::registry::ParticipantMeta,
         remove_current: bool,
     ) {
-        self.retire_native_connection(meta.connection_id);
+        let native = self.retire_native_connection(meta.connection_id);
         if let Some(lease) = meta.authorization {
             self.authorization_expiries
                 .remove(&AuthorizationExpiryWork {
@@ -2202,6 +2204,20 @@ impl ControllerActor {
         for outcome in outcomes {
             self.publish_track_lifecycle(outcome);
         }
+        if !remove_current
+            && let Some(native) = native
+            && self.begin_native_retirement(participant, meta.clone(), native.handler)
+        {
+            return;
+        }
+        self.retire_participant_transport(participant, &meta);
+    }
+
+    fn retire_participant_transport(
+        &mut self,
+        participant: ParticipantId,
+        meta: &crate::control::registry::ParticipantMeta,
+    ) {
         let Some(address) = meta.transport else {
             return;
         };
@@ -2454,6 +2470,7 @@ mod replacement_tests {
                 steering: None,
                 materializations: VecDeque::new(),
                 native_connections: std::collections::HashMap::new(),
+                retiring_native: std::collections::HashMap::new(),
                 native_ready_tx,
                 native_ready_rx,
                 native_deadlines: BTreeSet::new(),
@@ -2513,6 +2530,140 @@ mod replacement_tests {
         assert!(!actor.native_connections.contains_key(&connection));
         assert!(actor.core.registry.get_participant(&participant).is_none());
         assert!(actor.native_deadlines.is_empty());
+    }
+
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
+    async fn replacement_terminal_handoff_preserves_output_until_bounded_teardown() {
+        use crate::participant::signaling::SignalingProgress;
+        use pulsebeam_proto::state::{self, codec};
+
+        for acknowledge in [true, false] {
+            let mut actor = actor();
+            let participant = ParticipantId::new();
+            let room = RoomId::from_external(&RoomExternalId::new("terminal-replacement").unwrap());
+            let external = crate::entity::ParticipantExternalId::new("alice").unwrap();
+            let shard = ShardId::new(0);
+            let old = connection_id(1);
+            let winner = connection_id(2);
+            let transport = actor
+                .core
+                .reserve_transport(shard, pulsebeam_runtime::time::Instant::now());
+            actor
+                .commit_reserved_candidate(
+                    participant,
+                    room,
+                    shard,
+                    0,
+                    transport,
+                    old,
+                    None,
+                    SignalingProtocol::State,
+                    external.clone(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let (handoff, mut endpoint) =
+                super::super::native::handoff::pair(old, actor.native_ready_tx.clone());
+            let mut native =
+                StateProtocolHandler::new(participant, room, external.clone(), None, handoff)
+                    .unwrap();
+            native.model.authorization(10_000, 1).unwrap();
+            native.model.set_cid(
+                crate::media::ChannelId::from_value(0),
+                pulsebeam_runtime::time::Instant::now(),
+            );
+            native.service(0, |_| None).unwrap();
+            let initial = endpoint.output().expect("initial session output in flight");
+            endpoint.acknowledge_wakeup();
+            actor.native_connections.insert(
+                old,
+                NativeService {
+                    handler: native,
+                    deadline: None,
+                },
+            );
+
+            let replacement = actor
+                .core
+                .reserve_transport(shard, pulsebeam_runtime::time::Instant::now());
+            let previous = actor
+                .commit_reserved_candidate(
+                    participant,
+                    room,
+                    shard,
+                    0,
+                    replacement,
+                    winner,
+                    None,
+                    SignalingProtocol::State,
+                    external,
+                    SystemTime::now(),
+                )
+                .unwrap()
+                .unwrap();
+            actor.terminate_incarnation(participant, previous, false);
+            assert!(!actor.native_connections.contains_key(&old));
+            assert!(actor.retiring_native.contains_key(&old));
+            assert!(
+                !endpoint.failed(),
+                "keep the old endpoint alive while handing off terminal output"
+            );
+
+            assert!(endpoint.progress(SignalingProgress {
+                sequence: initial.sequence,
+                cid: initial.cid,
+                at: pulsebeam_runtime::time::Instant::now()
+            }));
+            actor.service_native_connections();
+            assert!(
+                actor.retiring_native.contains_key(&old),
+                "an earlier send is not terminal progress"
+            );
+            let terminal = endpoint.output().expect("terminal session output");
+            let batch = codec::decode_server(&terminal.bytes).unwrap();
+            assert!(batch.records.iter().any(|record| matches!(
+                record.confirmed.as_ref().and_then(|value| value.value.as_ref()),
+                Some(state::confirmed_state::Value::Session(session))
+                    if session.closed == Some(state::CloseReason::ParticipantReplaced as i32)
+            )));
+            if acknowledge {
+                assert!(endpoint.progress(SignalingProgress {
+                    sequence: terminal.sequence,
+                    cid: terminal.cid,
+                    at: pulsebeam_runtime::time::Instant::now()
+                }));
+            }
+            actor.service_native_connections();
+            assert!(
+                !endpoint.failed(),
+                "RTC admission must not abort buffered network output"
+            );
+            assert!(actor.retiring_native.contains_key(&old));
+            pulsebeam_runtime::time::advance(Duration::from_millis(100)).await;
+            actor.service_native_connections();
+            assert!(actor.retiring_native.is_empty());
+            assert!(actor.native_deadlines.is_empty());
+            assert!(endpoint.failed());
+            assert_eq!(
+                actor
+                    .core
+                    .registry
+                    .get_participant(&participant)
+                    .unwrap()
+                    .connection_id,
+                winner
+            );
+            actor.remove_incarnation(participant, old);
+            assert_eq!(
+                actor
+                    .core
+                    .registry
+                    .get_participant(&participant)
+                    .unwrap()
+                    .connection_id,
+                winner
+            );
+        }
     }
 
     #[test]

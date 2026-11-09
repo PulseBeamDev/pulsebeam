@@ -1857,6 +1857,246 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
 }
 
 #[test]
+fn participant_superseded_notice_is_typed_and_requires_a_new_agent() {
+    use pulsebeam_proto::state;
+
+    let (mut agent, generation, control) = native_connection::connected(Default::default());
+    agent
+        .command(AgentCommand::RenewAuthorization("pending-token".into()))
+        .unwrap();
+    let Effect::Http(HttpEffect::Request { operation, .. }) = next_effect(&mut agent) else {
+        panic!("authorization request")
+    };
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![native_connection::confirmed(
+            state::resource_key::Key::Session(true),
+            0,
+            state::confirmed_state::Value::Session(state::SessionState {
+                authorization: Some(state::Authorization {
+                    expires_at_unix_seconds: 10_001,
+                    revision: 1,
+                }),
+                closed: Some(state::CloseReason::ParticipantReplaced as i32),
+                diagnostic: "opaque diagnostic, not a policy input".into(),
+            }),
+        )],
+    );
+    let failure = agent.snapshot().terminal_failure.clone().unwrap();
+    assert_eq!(failure.class, FailureClass::ParticipantSuperseded);
+    assert_eq!(
+        crate::ffi::FailureClass::from(failure.class),
+        crate::ffi::FailureClass::ParticipantSuperseded
+    );
+    let mut closed = false;
+    let mut cancelled = false;
+    while let Some(effect) = agent.next_effect_after_turn() {
+        match effect {
+            Effect::Rtc(RtcEffect::Close {
+                generation: closed_generation,
+            }) => {
+                assert_eq!(closed_generation, generation);
+                closed = true;
+            }
+            Effect::Http(HttpEffect::Cancel {
+                operation: cancelled_operation,
+            }) => {
+                assert_eq!(cancelled_operation, operation);
+                cancelled = true;
+            }
+            Effect::Timer(TimerEffect::Cancel { timer }) => {
+                agent
+                    .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+                    .unwrap();
+            }
+            effect => panic!("unexpected terminal effect: {effect:?}"),
+        }
+    }
+    assert!(closed && cancelled);
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    for event in [
+        RtcEvent::Disconnected { generation },
+        RtcEvent::Failed {
+            generation,
+            message: "late failure".into(),
+        },
+        RtcEvent::Closed { generation },
+    ] {
+        agent.handle(HostEvent::Rtc(event)).unwrap();
+    }
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            connected: true,
+            topics: TopicRegistrations {
+                publishers: vec![publisher("chat", TopicMode::Ordered)],
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .unwrap();
+    agent.command(AgentCommand::Reconnect).unwrap();
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(agent.next_effect_after_turn().is_none());
+    assert_eq!(agent.snapshot().terminal_failure.as_ref(), Some(&failure));
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+
+    // Explicit disconnect cleans up resources, but cannot reset ownership loss.
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 3,
+            ..Default::default()
+        }))
+        .unwrap();
+    while let Some(effect) = agent.next_effect_after_turn() {
+        match effect {
+            Effect::Rtc(RtcEffect::Close { generation }) => {
+                agent
+                    .handle(HostEvent::Rtc(RtcEvent::Closed { generation }))
+                    .unwrap();
+            }
+            Effect::Http(HttpEffect::Request {
+                operation, request, ..
+            }) => {
+                assert_eq!(request.method, HttpMethod::Delete);
+                agent
+                    .handle(HostEvent::Http(HttpEvent::Response {
+                        operation,
+                        response: HttpResponse {
+                            status: 204,
+                            headers: vec![],
+                            body: vec![],
+                        },
+                    }))
+                    .unwrap();
+            }
+            effect => panic!("unexpected cleanup effect: {effect:?}"),
+        }
+    }
+    agent.command(AgentCommand::Connect).unwrap();
+    agent.command(AgentCommand::Reconnect).unwrap();
+    assert!(agent.next_effect_after_turn().is_none());
+    assert_eq!(agent.snapshot().terminal_failure.as_ref(), Some(&failure));
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+    let mut fresh = Agent::new(config()).unwrap();
+    fresh.command(AgentCommand::Connect).unwrap();
+    assert!(matches!(
+        next_effect(&mut fresh),
+        Effect::Rtc(RtcEffect::CreateOffer { .. })
+    ));
+}
+
+#[test]
+fn superseded_admission_cancels_recovery_and_ignores_late_completions() {
+    let mut agent = Agent::new(config()).unwrap();
+    let (generation, operation) = begin_connect(&mut agent, desired(1), channel(12));
+    agent
+        .handle(HostEvent::Http(HttpEvent::Failed {
+            operation,
+            message: "transient network failure".into(),
+        }))
+        .unwrap();
+    assert!(matches!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { .. })
+    ));
+    let Effect::Timer(TimerEffect::Schedule { timer, .. }) = next_effect(&mut agent) else {
+        panic!("retry timer")
+    };
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    let Effect::Rtc(RtcEffect::CreateOffer {
+        generation: retry, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("retry offer")
+    };
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation: retry,
+            offer: native_connection::OFFER.into(),
+            resources: OfferResources {
+                slots: vec![],
+                signaling_channel: channel(13),
+                data_channels: vec![],
+            },
+        }))
+        .unwrap();
+    let Effect::Http(HttpEffect::Request {
+        operation: retry_operation,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("retry request")
+    };
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: retry_operation,
+            response: HttpResponse {
+                status: 409,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation: retry })
+    );
+    for generation in [generation, retry] {
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::Disconnected { generation }))
+            .unwrap();
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::Failed {
+                generation,
+                message: "late".into(),
+            }))
+            .unwrap();
+    }
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    for operation in [operation, retry_operation] {
+        agent
+            .handle(HostEvent::Http(HttpEvent::Failed {
+                operation,
+                message: "late".into(),
+            }))
+            .unwrap();
+    }
+    agent.command(AgentCommand::Reconnect).unwrap();
+    agent.command(AgentCommand::Connect).unwrap();
+    assert!(agent.next_effect_after_turn().is_none());
+    assert_eq!(
+        agent.snapshot().connection,
+        ConnectionState::TerminalFailure
+    );
+    assert_eq!(
+        agent.snapshot().terminal_failure.as_ref().unwrap().class,
+        FailureClass::ParticipantSuperseded
+    );
+}
+
+#[test]
 fn explicit_connect_retries_terminal_intent_but_not_an_in_flight_attempt() {
     let mut agent = Agent::new(config()).unwrap();
     let (failed_generation, operation) = begin_connect(&mut agent, desired(1), channel(12));
