@@ -150,6 +150,15 @@ struct AuthorizationExpiryWork {
 
 #[derive(Debug, derive_more::From)]
 pub enum ControllerCommand {
+    OpenLink(crate::link::OpenPeer),
+    InspectLinks(oneshot::Sender<Result<crate::link::HostHealth, pulsebeam_link::LinkError>>),
+    LinkDestinations(crate::link::Destinations),
+    CloseLink(pulsebeam_link::NetworkId),
+    BindLinkReceive(crate::link::BindReceive),
+    BindLinkSend(crate::link::BindSend),
+    BindLinkReverse(crate::link::BindReverse),
+    UnbindLinkSend(crate::link::UnbindSend),
+    UnbindLinkReceive(pulsebeam_link::BindingId),
     CreateParticipant(
         CreateParticipant,
         oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
@@ -315,6 +324,7 @@ struct NativeService {
 }
 
 pub struct ControllerActor {
+    links: Option<super::link::Links>,
     router: crate::control::router::ShardRouter,
     core: ControllerCore,
     placement: placement::Placement,
@@ -348,6 +358,24 @@ pub struct ControllerActor {
 }
 
 impl ControllerActor {
+    pub(crate) fn set_links(
+        &mut self,
+        links: pulsebeam_link::LinkControl<crate::shard::worker::ShardFrame>,
+        ports: Vec<pulsebeam_link::PortId>,
+        origin: pulsebeam_runtime::time::Instant,
+    ) {
+        self.links = Some(super::link::Links::new(links, ports, origin));
+    }
+
+    pub(crate) fn set_link_host(
+        &mut self,
+        host: pulsebeam_queue::Sender<crate::link::host::Command>,
+    ) {
+        if let Some(links) = &mut self.links {
+            links.set_host(host);
+        }
+    }
+
     pub(crate) fn with_placement(
         _rng: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
@@ -363,6 +391,7 @@ impl ControllerActor {
         let (renewal_tx, renewal_rx) = pulsebeam_runtime::sync::mpsc::channel(MAX_PENDING_RENEWALS);
         let (deletion_tx, deletion_rx) = pulsebeam_runtime::sync::mpsc::channel(API_COMMAND_BUDGET);
         Self {
+            links: None,
             router: crate::control::router::ShardRouter::new(shard_contexts),
             core: ControllerCore::with_shards(shard_count, room_partition_size, placement),
             placement: placement::Placement::default(),
@@ -488,6 +517,7 @@ impl ControllerActor {
                     true = shard_event_rx.readable() => false,
                     true = self.native_ready_rx.readable() => false,
                     () = poll_fn(|cx| Self::poll_materializations(&mut self.materializations, cx)) => false,
+                    () = poll_fn(|cx| self.links.as_mut().map_or(Poll::Pending, |links| links.poll_ready(cx))) => false,
                     Some(bytes) = self.deletion_rx.recv() => {
                         self.release_deletion(bytes);
                         false
@@ -523,6 +553,9 @@ impl ControllerActor {
         }
         self.expire_authorizations(started, SystemTime::now());
         self.advance_materializations();
+        if let Some(links) = &mut self.links {
+            links.reap();
+        }
         let mut shard_events: usize = 0;
         for _ in 0..SHARD_EVENT_BUDGET {
             let Ok(event) = shard_event_rx.try_recv() else {
@@ -559,6 +592,131 @@ impl ControllerActor {
 
     fn process_command(&mut self, command: ControllerCommand) -> Option<RequiredAction> {
         match command {
+            ControllerCommand::LinkDestinations(command) => {
+                let result = self
+                    .lifecycle
+                    .network_source(command.room, command.track, &self.core.registry)
+                    .ok_or(pulsebeam_link::BindError::Closed)
+                    .and_then(|_| {
+                        self.links
+                            .as_mut()
+                            .ok_or(pulsebeam_link::BindError::Closed)
+                            .map(|links| links.destinations(command.track))
+                    });
+                let _ = command.reply.send(result);
+                None
+            }
+            ControllerCommand::InspectLinks(reply) => {
+                if let Some(links) = &self.links {
+                    links.inspect(reply);
+                } else {
+                    let _ = reply.send(Err(pulsebeam_link::LinkError::Closed));
+                }
+                None
+            }
+            ControllerCommand::OpenLink(command) => {
+                let result = self
+                    .links
+                    .as_mut()
+                    .ok_or(pulsebeam_link::LinkError::Closed)
+                    .and_then(|links| links.open_peer(command.peer));
+                if let Err(Ok(peer)) = command.reply.send(result) {
+                    if let Some(links) = &mut self.links {
+                        let _ = links.close_peer(peer);
+                    }
+                }
+                None
+            }
+            ControllerCommand::BindLinkSend(command) => {
+                let result = self
+                    .lifecycle
+                    .network_source(command.room, command.track, &self.core.registry)
+                    .ok_or(pulsebeam_link::BindError::Closed)
+                    .and_then(|shard| {
+                        let (binding, plan) = self
+                            .links
+                            .as_mut()
+                            .ok_or(pulsebeam_link::BindError::Closed)?
+                            .bind_send(shard, command.track, command.peer, command.address)?;
+                        let generation = self.lifecycle.next_generation();
+                        self.stage_plans_at(shard, generation, vec![plan]);
+                        self.publish_staged();
+                        Ok(binding)
+                    });
+                if let Err(Ok(binding)) = command.reply.send(result) {
+                    self.retire_network_send(binding);
+                }
+                None
+            }
+            ControllerCommand::BindLinkReverse(command) => {
+                let allowed = self.lifecycle.allows_network_reverse(
+                    command.room,
+                    command.track,
+                    command.shard,
+                    &self.core.registry,
+                );
+                let result = allowed
+                    .then_some(())
+                    .ok_or(pulsebeam_link::BindError::Closed)
+                    .and_then(|()| {
+                        let (binding, plan) = self
+                            .links
+                            .as_mut()
+                            .ok_or(pulsebeam_link::BindError::Closed)?
+                            .bind_reverse(
+                                command.shard,
+                                command.track,
+                                command.peer,
+                                command.address,
+                            )?;
+                        let generation = self.lifecycle.next_generation();
+                        self.stage_plans_at(command.shard, generation, vec![plan]);
+                        self.publish_staged();
+                        Ok(binding)
+                    });
+                if let Err(Ok(binding)) = command.reply.send(result) {
+                    self.retire_network_send(binding);
+                }
+                None
+            }
+            ControllerCommand::UnbindLinkSend(command) => {
+                self.retire_network_send(command.0);
+                None
+            }
+            ControllerCommand::BindLinkReceive(command) => {
+                let result = self
+                    .links
+                    .as_mut()
+                    .ok_or(pulsebeam_link::BindError::Closed)
+                    .and_then(|links| links.bind_receive(command.peer, command.destinations));
+                if let Err(Ok(route)) = command.reply.send(result) {
+                    if let Some(links) = &mut self.links {
+                        links.unbind_receive(route.binding);
+                    }
+                }
+                None
+            }
+            ControllerCommand::UnbindLinkReceive(binding) => {
+                if let Some(links) = &mut self.links {
+                    links.unbind_receive(binding);
+                }
+                None
+            }
+            ControllerCommand::CloseLink(peer) => {
+                let plans = self
+                    .links
+                    .as_mut()
+                    .map(|links| links.close_peer(peer))
+                    .unwrap_or_default();
+                if !plans.is_empty() {
+                    let generation = self.lifecycle.next_generation();
+                    for (shard, plan) in plans {
+                        self.stage_plans_at(shard, generation, vec![plan]);
+                    }
+                    self.publish_staged();
+                }
+                None
+            }
             ControllerCommand::CreateParticipant(message, reply) => {
                 if self.materializations.len() >= MAX_PENDING_MATERIALIZATIONS {
                     let _ = reply.send(Err(ControllerError::ServiceUnavailable));
@@ -1397,7 +1555,27 @@ impl ControllerActor {
             debug_assert!(false, "an update must target a live shard");
             return;
         };
+        let retired = match &op {
+            crate::shard_update::ShardUpdateOp::RetireRoute { address } => Some(*address),
+            _ => None,
+        };
+        let installed = match &op {
+            crate::shard_update::ShardUpdateOp::InstallRoute { address, action } => {
+                Some((*address, *action))
+            }
+            _ => None,
+        };
         update.stage(generation, op);
+        if let (Some((address, action)), Some(links)) = (installed, self.links.as_mut())
+            && links.network_enabled()
+        {
+            links.install_after(address, action, update.stage_cutoff(generation));
+        }
+        if let (Some(address), Some(links)) = (retired, self.links.as_mut())
+            && links.contains(address)
+        {
+            links.retire_after(address, update.stage_cutoff(generation));
+        }
         self.mark_update_touched(shard);
     }
 
@@ -1405,14 +1583,43 @@ impl ControllerActor {
         &mut self,
         shard: ShardId,
         generation: u64,
-        plans: Vec<crate::shard_update::TrackPlanUpdate>,
+        mut plans: Vec<crate::shard_update::TrackPlanUpdate>,
     ) {
+        let mut retired = Vec::new();
+        if let Some(links) = &mut self.links {
+            for update in &mut plans {
+                retired.extend(links.prepare_plan(shard, update));
+            }
+        }
         let Some(update) = self.updates.get_mut(shard.index()) else {
             debug_assert!(false, "plans must target a live shard");
             return;
         };
         update.stage_plans(generation, plans);
+        if !retired.is_empty() {
+            if let Some(links) = &mut self.links {
+                links.retire_bindings_after(retired, update.stage_cutoff(generation));
+            }
+        }
         self.mark_update_touched(shard);
+    }
+
+    fn retire_network_send(&mut self, binding: pulsebeam_link::BindingId) {
+        let Some((shard, plan)) = self
+            .links
+            .as_mut()
+            .and_then(|links| links.remove_send(binding))
+        else {
+            return;
+        };
+        let generation = self.lifecycle.next_generation();
+        self.stage_plans_at(shard, generation, vec![plan]);
+        if let (Some(update), Some(links)) =
+            (self.updates.get_mut(shard.index()), self.links.as_mut())
+        {
+            links.retire_bindings_after(vec![binding], update.stage_cutoff(generation));
+        }
+        self.publish_staged();
     }
 
     fn stage_participant_at(
@@ -2219,6 +2426,7 @@ mod replacement_tests {
         }
         (
             ControllerActor {
+                links: None,
                 router: crate::control::router::ShardRouter::new(contexts),
                 core: ControllerCore::with_shards(shard_count, 1, RoomPartitionPlacement::Balanced),
                 placement: placement::Placement::default(),
@@ -2617,7 +2825,9 @@ mod replacement_tests {
             actor.deletion_tx.clone(),
             bytes,
         ));
-        current.cutoff_ack.take().unwrap().send(()).unwrap();
+        for ack in current.cutoff_acks.drain(..) {
+            ack.send(()).unwrap();
+        }
         pulsebeam_runtime::task::yield_now().await;
         assert!(matches!(
             response.try_recv(),
@@ -2637,7 +2847,9 @@ mod replacement_tests {
                 .unwrap(),
             2
         );
-        former.cutoff_ack.take().unwrap().send(()).unwrap();
+        for ack in former.cutoff_acks.drain(..) {
+            ack.send(()).unwrap();
+        }
         assert!(response.await.unwrap().is_ok());
         task.await.unwrap();
         let released = actor.deletion_rx.recv().await.unwrap();
@@ -2817,10 +3029,14 @@ mod replacement_tests {
         assert_eq!(origin.generation, destination.generation);
         pulsebeam_runtime::task::yield_now().await;
         assert!(actor.deletion_rx.try_recv().is_err());
-        origin.cutoff_ack.take().unwrap().send(()).unwrap();
+        for ack in origin.cutoff_acks.drain(..) {
+            ack.send(()).unwrap();
+        }
         pulsebeam_runtime::task::yield_now().await;
         assert!(actor.deletion_rx.try_recv().is_err());
-        destination.cutoff_ack.take().unwrap().send(()).unwrap();
+        for ack in destination.cutoff_acks.drain(..) {
+            ack.send(()).unwrap();
+        }
         let completed = actor.deletion_rx.recv().await.unwrap();
         actor.release_deletion(completed);
         assert!(
@@ -2863,10 +3079,14 @@ mod replacement_tests {
         let mut origin = receivers[0].try_recv().unwrap();
         let mut destination = receivers[1].try_recv().unwrap();
         assert!(receivers[2].try_recv().is_err());
-        origin.cutoff_ack.take().unwrap().send(()).unwrap();
+        for ack in origin.cutoff_acks.drain(..) {
+            ack.send(()).unwrap();
+        }
         pulsebeam_runtime::task::yield_now().await;
         assert!(actor.deletion_rx.try_recv().is_err());
-        destination.cutoff_ack.take().unwrap().send(()).unwrap();
+        for ack in destination.cutoff_acks.drain(..) {
+            ack.send(()).unwrap();
+        }
         for _ in 0..2 {
             let completed = actor.deletion_rx.recv().await.unwrap();
             actor.release_deletion(completed);
@@ -2955,7 +3175,7 @@ mod replacement_tests {
             .unwrap();
         for receiver in &mut receivers {
             while let Ok(mut update) = receiver.try_recv() {
-                if let Some(ack) = update.cutoff_ack.take() {
+                for ack in update.cutoff_acks.drain(..) {
                     ack.send(()).unwrap();
                 }
             }

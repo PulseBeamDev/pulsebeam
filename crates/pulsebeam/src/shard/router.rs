@@ -3,7 +3,7 @@ use crate::id::ShardId;
 use crate::keys::ParticipantHandle;
 use crate::participant::reverse::ReversePacket;
 use crate::participant::{ParticipantInput, RoutedTrackPacket, TrackPacket, TrackPacketRef};
-use crate::route::{Envelope, RouteAction, RouteRuntime};
+use crate::route::{MediaDelivery, RouteAction, RouteRuntime};
 use crate::rtp::{RtpPacket, cache::TrackStreamCache};
 use slotmap::SlotMap;
 use std::collections::HashMap;
@@ -24,16 +24,14 @@ impl Origin {
     }
 }
 
-pub(crate) trait ShardTransport {
-    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload);
+pub(crate) trait IngressTransport {
     fn send_frame(&self, dst: ShardId, frame: ShardFrame);
 }
 
-pub(crate) struct ForwardingContext<'a, R> {
+pub(crate) struct ForwardingContext<'a> {
     pub registry: &'a mut super::participants::ParticipantRegistry,
     pub dirty: &'a mut super::dirty::DirtyTracker,
     pub wall: &'a WallAnchor,
-    pub router: &'a R,
 }
 
 struct TrackRuntime {
@@ -41,14 +39,13 @@ struct TrackRuntime {
     origin: Option<ParticipantHandle>,
     cache: Option<TrackStreamCache>,
     publisher: Option<ParticipantHandle>,
-    link_seq: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InstalledTrackPlan {
     pub local: Vec<ParticipantHandle>,
-    pub remote: Vec<crate::route::NodeRouteAddress>,
-    pub reverse_route: Option<crate::route::NodeRouteAddress>,
+    pub remote: Vec<crate::shard_update::CompiledRoute>,
+    pub reverse_route: Option<crate::shard_update::CompiledRoute>,
 }
 
 /// Hand a packet to every destination-local recipient in an owned track plan.
@@ -58,24 +55,30 @@ fn fanout_local(plan: &InstalledTrackPlan, mut deliver: impl FnMut(ParticipantHa
     }
 }
 
-/// Forward a packet to the shards a plan routes to, numbering each hop so the
-/// destination can tell loss from reordering.
+/// Forward media through the destinations installed in the track plan.
 fn fanout_remote(
     plan: &InstalledTrackPlan,
-    link_seq: &mut u32,
     playout: u32,
     mut payload: impl FnMut() -> MediaPayload,
-    ctx: &impl ShardTransport,
 ) {
     for remote in &plan.remote {
-        let env = Envelope::media(*remote, *link_seq, playout);
-        *link_seq = link_seq.wrapping_add(1);
-        ctx.send_media(remote.shard(), env, payload());
+        let delivery = MediaDelivery {
+            address: remote.address,
+            playout_ntp32: playout,
+        };
+        let _ = super::worker::send_link_frame(
+            &remote.tx,
+            remote.clock_origin,
+            ShardFrame::Media {
+                delivery,
+                payload: payload(),
+            },
+        );
     }
 }
 
 fn forward_track(
-    ctx: &mut ForwardingContext<'_, impl ShardTransport>,
+    ctx: &mut ForwardingContext<'_>,
     subscriber: ParticipantHandle,
     fanout: TrackHandle,
     pkt: TrackPacketRef<'_>,
@@ -158,7 +161,6 @@ impl ShardRuntime {
             origin,
             cache,
             publisher,
-            link_seq: 0,
         });
         self.track_handles.insert(track_id, handle);
         handle
@@ -171,7 +173,7 @@ impl ShardRuntime {
         origin: Origin,
         pkt: RtpPacket,
         plan: &InstalledTrackPlan,
-        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
+        ctx: &mut ForwardingContext<'_>,
     ) {
         let Some(runtime) = self.tracks.get_mut(key) else {
             debug_assert!(false, "an RTP packet must resolve to a live track");
@@ -202,16 +204,10 @@ impl ShardRuntime {
         if origin.is_local() {
             let playout = ctx.wall.to_ntp(packet.playout_time);
             let track_id = runtime.id;
-            fanout_remote(
-                plan,
-                &mut runtime.link_seq,
-                playout.middle32(),
-                || RoutedTrackPacket {
-                    track_id,
-                    packet: TrackPacket::Rtp(packet.to_transit()),
-                },
-                ctx.router,
-            );
+            fanout_remote(plan, playout.middle32(), || RoutedTrackPacket {
+                track_id,
+                packet: TrackPacket::Rtp(packet.to_transit()),
+            });
         }
     }
 
@@ -221,7 +217,7 @@ impl ShardRuntime {
         origin: Origin,
         packet: TrackPacket,
         plan: &InstalledTrackPlan,
-        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
+        ctx: &mut ForwardingContext<'_>,
     ) {
         match packet {
             TrackPacket::Rtp(packet) => self.route_rtp_with_plan(key, origin, packet, plan, ctx),
@@ -231,14 +227,18 @@ impl ShardRuntime {
         }
     }
 
+    #[allow(
+        clippy::disallowed_types,
+        reason = "RFC254 clones immutable data storage for local Link fanout; cross-node peers serialize"
+    )]
     pub fn route_data_with_plan(
         &mut self,
         stream: TrackHandle,
         origin: Origin,
         lane: crate::track::DataLane,
-        packet: Vec<u8>,
+        packet: bytes::Bytes,
         plan: &InstalledTrackPlan,
-        ctx: &mut ForwardingContext<'_, impl ShardTransport>,
+        ctx: &mut ForwardingContext<'_>,
     ) {
         let Some(runtime) = self.tracks.get_mut(stream) else {
             debug_assert!(false, "data key must resolve to runtime state");
@@ -259,36 +259,26 @@ impl ShardRuntime {
         if origin.is_local() {
             let playout = ctx.wall.ntp();
             let track_id = runtime.id;
-            fanout_remote(
-                plan,
-                &mut runtime.link_seq,
-                playout.middle32(),
-                || RoutedTrackPacket {
-                    track_id,
-                    packet: TrackPacket::Data {
-                        lane,
-                        bytes: packet.clone(),
-                    },
+            fanout_remote(plan, playout.middle32(), || RoutedTrackPacket {
+                track_id,
+                packet: TrackPacket::Data {
+                    lane,
+                    bytes: packet.clone(),
                 },
-                ctx.router,
-            );
+            });
         }
     }
 
-    pub fn route_reverse(
-        &self,
-        packet: ReversePacket,
-        plan: &InstalledTrackPlan,
-        router: &impl ShardTransport,
-    ) {
-        let Some(target) = plan.reverse_route else {
+    pub fn route_reverse(&self, packet: ReversePacket, plan: &InstalledTrackPlan) {
+        let Some(target) = &plan.reverse_route else {
             debug_assert!(false, "reverse packet has no compiled reverse route");
             return;
         };
-        router.send_frame(
-            target.shard(),
+        let _ = super::worker::send_link_frame(
+            &target.tx,
+            target.clock_origin,
             ShardFrame::Reverse {
-                env: Envelope::feedback(target),
+                address: target.address,
                 packet,
             },
         );
@@ -310,20 +300,6 @@ mod tests {
     use super::*;
     use crate::id::ShardId;
     use slotmap::SlotMap;
-    use std::cell::RefCell;
-
-    struct CaptureTransport {
-        frames: RefCell<Vec<ShardFrame>>,
-    }
-
-    impl ShardTransport for CaptureTransport {
-        fn send_media(&self, _: ShardId, _: Envelope, _: MediaPayload) {}
-
-        fn send_frame(&self, _: ShardId, frame: ShardFrame) {
-            self.frames.borrow_mut().push(frame);
-        }
-    }
-
     fn track_id(kind: crate::entity::TrackKind, label: &str) -> crate::entity::TrackId {
         crate::entity::ConnectionId::new().derive_track_id(kind, label)
     }
@@ -341,7 +317,7 @@ mod tests {
         };
         let track_id = track_id(crate::entity::TrackKind::Video, "video");
         let key = runtime.install_track(track_id, Some(&descriptor), Some(origin_key), None);
-        runtime.tracks.get_mut(key).unwrap().link_seq = 7;
+        let origin_before = runtime.tracks.get(key).unwrap().origin;
         let descriptor = crate::shard_update::TrackDescriptor {
             origin: descriptor.origin,
             kind: crate::entity::TrackKind::Video,
@@ -352,7 +328,8 @@ mod tests {
             key
         );
 
-        assert_eq!(runtime.tracks.get(key).unwrap().link_seq, 7);
+        assert_eq!(runtime.tracks.get(key).unwrap().origin, origin_before);
+        assert!(runtime.tracks.get(key).unwrap().cache.is_some());
     }
 
     #[test]
@@ -410,39 +387,44 @@ mod tests {
     }
 
     #[test]
-    fn reinserting_a_live_data_runtime_preserves_hop_state() {
+    fn reinserting_a_live_data_runtime_preserves_cache_state() {
         let mut runtime = ShardRuntime::new(ShardId::new(0));
         let track_id = track_id(crate::entity::TrackKind::Data, "data");
         let key = runtime.install_track(track_id, None, None, None);
-        runtime.tracks.get_mut(key).unwrap().link_seq = 17;
         runtime.tracks.get_mut(key).unwrap().cache = Some(TrackStreamCache::new());
         assert_eq!(runtime.install_track(track_id, None, None, None), key);
 
-        assert_eq!(runtime.tracks.get(key).unwrap().link_seq, 17);
         assert!(runtime.tracks.get(key).unwrap().cache.is_some());
     }
 
     #[test]
     fn reverse_packet_uses_the_generic_reverse_route() {
-        let transport = CaptureTransport {
-            frames: RefCell::new(Vec::new()),
-        };
+        let mut links =
+            pulsebeam_link::LinkControl::new(|| pulsebeam_link::LinkTime::from_nanos(0)).unwrap();
+        let (port, mut rx) = links.create_port().unwrap();
+        let (_, tx) = links
+            .bind_send(pulsebeam_link::Destination::Local {
+                port,
+                tag: pulsebeam_link::DeliveryTag::from_raw(0),
+            })
+            .unwrap();
         let target =
             crate::route::NodeRouteAddress::new(crate::route::RouteId::new(ShardId::new(2), 9), 1);
         let plan = InstalledTrackPlan {
-            reverse_route: Some(target),
+            reverse_route: Some(crate::shard_update::CompiledRoute {
+                address: target,
+                tx,
+                clock_origin: pulsebeam_runtime::time::Instant::now(),
+            }),
             ..Default::default()
         };
-        ShardRuntime::new(ShardId::new(0)).route_reverse(
-            ReversePacket::reliable_control(vec![4, 5]),
-            &plan,
-            &transport,
-        );
+        ShardRuntime::new(ShardId::new(0))
+            .route_reverse(ReversePacket::reliable_control(vec![4, 5]), &plan);
 
-        assert!(matches!(
-            transport.frames.borrow().first(),
-            Some(ShardFrame::Reverse { env, .. })
-                if *env == crate::route::Envelope::feedback(target)
-        ));
+        let mut frames = Vec::new();
+        assert_eq!(rx.try_recv_batch(&mut frames, 1), 1);
+        assert!(
+            matches!(&frames[0].packet, ShardFrame::Reverse { address, .. } if *address == target)
+        );
     }
 }

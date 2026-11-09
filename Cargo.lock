@@ -3717,6 +3717,7 @@ dependencies = [
  "proptest",
  "pulsebeam-agent-native",
  "pulsebeam-core",
+ "pulsebeam-link",
  "pulsebeam-membership",
  "pulsebeam-proto",
  "pulsebeam-queue",
@@ -3893,6 +3894,17 @@ dependencies = [
 [[package]]
 name = "pulsebeam-feedback"
 version = "0.3.2"
+
+[[package]]
+name = "pulsebeam-link"
+version = "0.3.2"
+dependencies = [
+ "futures-lite",
+ "pulsebeam-cc",
+ "pulsebeam-dtls",
+ "pulsebeam-feedback",
+ "pulsebeam-queue",
+]
 
 [[package]]
 name = "pulsebeam-membership"

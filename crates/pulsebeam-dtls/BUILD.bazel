@@ -21,6 +21,19 @@ rust_library(
     deps = all_crate_deps(normal = True),
 )
 
+rust_library(
+    name = "test_utils",
+    crate_name = "pulsebeam_dtls",
+    crate_root = "src/lib.rs",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["test-utils"],
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+)
+
 rust_test(
     name = "unit_tests",
     crate = ":pulsebeam-dtls",

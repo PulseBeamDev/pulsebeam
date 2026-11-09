@@ -366,6 +366,36 @@ impl TrackLifecycle {
         self.topology.sources_in_room(room_id)
     }
 
+    pub(crate) fn network_source(
+        &self,
+        room_id: RoomId,
+        track: TrackId,
+        registry: &RoomRegistry,
+    ) -> Option<ShardId> {
+        let source = self.topology.source(room_id, track)?;
+        let meta = source.meta();
+        let publisher = registry.get_participant(&meta.origin)?;
+        (publisher.materialized
+            && publisher.room_id == room_id
+            && publisher.connection_id == meta.connection_id)
+            .then_some(publisher.shard_id)
+    }
+
+    pub(crate) fn allows_network_reverse(
+        &self,
+        room: RoomId,
+        track: TrackId,
+        shard: ShardId,
+        registry: &RoomRegistry,
+    ) -> bool {
+        self.network_source(room, track, registry)
+            .is_some_and(|origin| origin != shard)
+            && self
+                .topology
+                .source(room, track)
+                .is_some_and(crate::track::Track::requires_reverse_route)
+    }
+
     pub(crate) fn source(
         &self,
         room_id: RoomId,
@@ -1852,6 +1882,42 @@ mod tests {
             ]
         );
         assert_internal_invariants(&lifecycle, &registry);
+    }
+
+    #[test]
+    fn network_branches_require_a_current_publication_and_reverse_capability() {
+        let (mut lifecycle, registry) = setup(2, &[(1, 1, 0), (2, 1, 1)]);
+        let connection = registry
+            .get_participant(&participant(1))
+            .unwrap()
+            .connection_id;
+        for kind in [TrackKind::Audio, TrackKind::Video] {
+            let mut publication = track(kind, 1, 1, "network");
+            publication.meta_mut().connection_id = connection;
+            publication.meta_mut().id = connection.derive_track_id(kind, "network");
+            let id = publication.id();
+            assert!(
+                lifecycle
+                    .publish(publication, &registry, Instant::now())
+                    .is_some()
+            );
+            assert_eq!(
+                lifecycle.network_source(room(1), id, &registry),
+                Some(ShardId::new(0))
+            );
+            assert_eq!(lifecycle.network_source(room(2), id, &registry), None);
+            assert!(!lifecycle.allows_network_reverse(room(1), id, ShardId::new(0), &registry));
+            assert_eq!(
+                lifecycle.allows_network_reverse(room(1), id, ShardId::new(1), &registry),
+                kind == TrackKind::Video
+            );
+            assert!(
+                lifecycle
+                    .unpublish(participant(1), id, &registry, Instant::now())
+                    .is_some()
+            );
+            assert_eq!(lifecycle.network_source(room(1), id, &registry), None);
+        }
     }
 
     #[test]

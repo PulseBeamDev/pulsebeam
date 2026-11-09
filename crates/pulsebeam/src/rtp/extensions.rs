@@ -3,14 +3,14 @@ use pulsebeam_core::dd::{DependencyDescriptor, RawDependencyDescriptor};
 use pulsebeam_core::vla::VideoLayersAllocation;
 #[allow(
     clippy::disallowed_types,
-    reason = "immutable extension snapshots stay shard-local; transit copies storage"
+    reason = "immutable packet storage is shared across Link fanout; no mutable state crosses owners"
 )]
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[allow(
     clippy::disallowed_types,
-    reason = "immutable extension snapshots stay shard-local; transit copies storage"
+    reason = "immutable packet storage is shared across Link fanout; no mutable state crosses owners"
 )]
 pub struct RtpExtensions {
     pub rid: Option<Rid>,
@@ -18,7 +18,7 @@ pub struct RtpExtensions {
     pub raw_dependency_descriptor: Option<Arc<RawDependencyDescriptor>>,
     pub dependency_descriptor: Option<Arc<DependencyDescriptor>>,
     pub video_layers_allocation: Option<Arc<VideoLayersAllocation>>,
-    pub opaque: Vec<pulsebeam_rtc::RtpExtension>,
+    pub opaque: Arc<[pulsebeam_rtc::RtpExtension]>,
 }
 
 impl RtpExtensions {
@@ -84,27 +84,9 @@ impl RtpExtensions {
         self.video_layers_allocation = Some(Arc::new(value));
     }
 
-    #[allow(
-        clippy::disallowed_types,
-        reason = "re-anchor immutable snapshots on the receiving shard"
-    )]
-    pub fn rehome(&mut self) {
-        if let Some(dd) = &mut self.dependency_descriptor {
-            *dd = Arc::new((**dd).clone());
-        }
-        if let Some(raw) = &mut self.raw_dependency_descriptor {
-            *raw = Arc::new((**raw).clone());
-        }
-        for extension in &mut self.opaque {
-            extension.uri = Arc::from(extension.uri.as_ref());
-            extension.value = bytes::Bytes::copy_from_slice(&extension.value);
-        }
-    }
-
     pub fn to_transit(&self) -> Self {
         let mut owned = self.clone();
         owned.video_layers_allocation = None;
-        owned.rehome();
         owned
     }
 }

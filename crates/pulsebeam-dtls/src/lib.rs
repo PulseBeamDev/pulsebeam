@@ -140,17 +140,18 @@ impl fmt::Debug for Association {
     clippy::disallowed_types,
     reason = "dimpl requires Arc<Config>; this is immutable, cold-path configuration, not shared packet state."
 )]
-fn config(mtu: usize) -> Result<std::sync::Arc<Config>, dimpl::Error> {
-    Ok(std::sync::Arc::new(
-        Config::builder()
-            .with_crypto_provider(dimpl::crypto::aws_lc_rs::default_provider())
-            .dtls12_cipher_suites(&[])
-            .require_client_certificate(true)
-            .mtu(mtu)
-            .max_queue_rx(32)
-            .max_queue_tx(32)
-            .build()?,
-    ))
+fn config(mtu: usize, key_limit: Option<u64>) -> Result<std::sync::Arc<Config>, dimpl::Error> {
+    let mut builder = Config::builder()
+        .with_crypto_provider(dimpl::crypto::aws_lc_rs::default_provider())
+        .dtls12_cipher_suites(&[])
+        .require_client_certificate(true)
+        .mtu(mtu)
+        .max_queue_rx(32)
+        .max_queue_tx(32);
+    if let Some(limit) = key_limit {
+        builder = builder.aead_encryption_limit(limit);
+    }
+    Ok(std::sync::Arc::new(builder.build()?))
 }
 
 impl Association {
@@ -163,8 +164,33 @@ impl Association {
         mtu: usize,
         now: Instant,
     ) -> Result<Self, Error> {
+        Self::with_key_limit(role, local, expected_peer, mtu, now, None)
+    }
+
+    /// Exercise automatic key rotation with real cryptography and a reduced
+    /// record-use limit. Production construction retains the upstream default.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_test_key_limit(
+        role: Role,
+        local: &LocalIdentity,
+        expected_peer: Fingerprint,
+        mtu: usize,
+        now: Instant,
+        limit: u64,
+    ) -> Result<Self, Error> {
+        Self::with_key_limit(role, local, expected_peer, mtu, now, Some(limit))
+    }
+
+    fn with_key_limit(
+        role: Role,
+        local: &LocalIdentity,
+        expected_peer: Fingerprint,
+        mtu: usize,
+        now: Instant,
+        key_limit: Option<u64>,
+    ) -> Result<Self, Error> {
         // Only static certificate credentials are copied, never live traffic state.
-        let mut inner = Dtls::new_13(config(mtu)?, local.0.clone(), now);
+        let mut inner = Dtls::new_13(config(mtu, key_limit)?, local.0.clone(), now);
         inner.set_active(role == Role::Client);
         Ok(Self {
             inner: Some(inner),
@@ -262,6 +288,15 @@ impl Association {
         } else {
             Output::Progress
         })
+    }
+
+    /// Application records in the immediately preceding `Output::Datagram`.
+    /// This local provenance excludes handshake, ACK and KeyUpdate records.
+    /// Read before polling or mutating the association again.
+    pub fn last_output_application_records(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, Dtls::last_output_application_records)
     }
 
     /// Immediately discard local association state, without a peer-close guarantee.

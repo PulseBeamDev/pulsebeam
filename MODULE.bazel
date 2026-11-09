@@ -167,6 +167,15 @@ crate.annotation(
 # Cargo's custom tokio_unstable cfg is applied by .bazelrc, but crate-universe
 # does not include cfg-gated edges in its generated platform selects.
 crate.annotation(crate = "tokio", deps = ["@crates//tracing"], repositories = ["crates"])
+# Link credits actual UDP departures, not security-control records. Preserve
+# application-record provenance without changing DTLS wire bytes or cryptography.
+crate.annotation(
+    crate = "dimpl",
+    version = "=0.9.0",
+    repositories = ["crates"],
+    patches = ["//tools:patches/dimpl-application-provenance.patch"],
+    patch_args = ["-p1"],
+)
 # Readiness must not prefetch outside the bounded ring. Keep the existing
 # tachyonix send/pop path and expose its slot predicate with its native waker.
 crate.annotation(

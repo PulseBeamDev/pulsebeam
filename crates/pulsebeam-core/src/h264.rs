@@ -40,6 +40,14 @@ impl NalFlags {
         Self(0)
     }
 
+    pub const fn from_components(sps: bool, pps: bool, idr: bool) -> Self {
+        Self(
+            (if sps { FLAG_SPS } else { 0 })
+                | (if pps { FLAG_PPS } else { 0 })
+                | (if idr { FLAG_IDR } else { 0 }),
+        )
+    }
+
     #[inline]
     pub const fn sps(self) -> bool {
         self.0 & FLAG_SPS != 0

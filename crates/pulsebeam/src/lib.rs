@@ -38,6 +38,7 @@ pub mod entity;
 mod ice_tcp;
 pub mod id;
 pub(crate) mod keys;
+pub mod link;
 pub(crate) mod log;
 pub mod media;
 pub mod message;

@@ -352,7 +352,7 @@ mod tests {
             Some(TrackHandle::default()),
             TrackPacket::Data {
                 lane: DataLane::Latest,
-                bytes: vec![1],
+                bytes: vec![1].into(),
             },
         );
         sink.exit();
@@ -408,14 +408,14 @@ mod tests {
                 Some(TrackHandle::default()),
                 TrackPacket::Data {
                     lane: DataLane::Latest,
-                    bytes: vec![n],
+                    bytes: vec![n].into(),
                 },
             );
         }
 
         let drained: Vec<Vec<u8>> = std::iter::from_fn(|| pipeline.pop_packet())
             .map(|event| match event.1 {
-                TrackPacket::Data { bytes, .. } => bytes,
+                TrackPacket::Data { bytes, .. } => bytes.to_vec(),
                 _ => unreachable!(),
             })
             .collect();
@@ -432,21 +432,21 @@ mod tests {
             Some(key),
             TrackPacket::Data {
                 lane: DataLane::Latest,
-                bytes: vec![1],
+                bytes: vec![1].into(),
             },
         );
         sink.publish_track_packet(
             Some(key),
             TrackPacket::Data {
                 lane: DataLane::Ordered,
-                bytes: vec![2],
+                bytes: vec![2].into(),
             },
         );
         sink.publish_track_packet(
             Some(key),
             TrackPacket::Data {
                 lane: DataLane::Latest,
-                bytes: vec![3],
+                bytes: vec![3].into(),
             },
         );
         #[allow(

@@ -1,0 +1,127 @@
+diff --git a/src/buffer.rs b/src/buffer.rs
+--- a/src/buffer.rs
++++ b/src/buffer.rs
+@@ -59,6 +59,7 @@
+ pub struct Buf {
+     data: Vec<u8>,
+     from_pool: bool,
++    pub(crate) application_records: usize,
+ }
+ 
+ impl Buf {
+@@ -73,6 +74,7 @@
+     /// Clear the buffer, removing all data.
+     pub fn clear(&mut self) {
+         self.data.clear();
++        self.application_records = 0;
+     }
+ 
+     /// Extend the buffer with a slice of bytes.
+@@ -148,6 +150,7 @@
+         Buf {
+             data: self,
+             from_pool: false,
++            application_records: 0,
+         }
+     }
+ }
+diff --git a/src/dtls13/engine.rs b/src/dtls13/engine.rs
+--- a/src/dtls13/engine.rs
++++ b/src/dtls13/engine.rs
+@@ -40,6 +40,7 @@
+ const MAX_SEQUENCE_NUMBER: u64 = (1u64 << 48) - 1;
+ 
+ pub struct Engine {
++    pub(crate) last_output_application_records: usize,
+     /// Configuration options.
+     config: Arc<Config>,
+ 
+@@ -216,6 +217,7 @@
+         let transcript = buffers_free.pop();
+ 
+         Self {
++            last_output_application_records: 0,
+             config,
+             certificate,
+             rng,
+@@ -582,6 +584,7 @@
+     }
+ 
+     pub fn poll_output<'a>(&mut self, buf: &'a mut [u8], now: Instant) -> Output<'a> {
++        self.last_output_application_records = 0;
+         self.purge_handled_queue_rx();
+ 
+         let buf = match self.poll_app_data(buf) {
+@@ -672,6 +675,7 @@
+             .queue_tx
+             .pop_front()
+             .expect("queue front checked above");
++        self.last_output_application_records = p.application_records;
+         let len = p.len();
+         buf[..len].copy_from_slice(&p);
+ 
+@@ -1173,6 +1177,7 @@
+             let last = self.queue_tx.back_mut().unwrap();
+             let header_start = last.len();
+             record.serialize(&fragment, last);
++            last.application_records += usize::from(content_type == ContentType::ApplicationData);
+             // Apply record number encryption: XOR mask over seq bytes
+             // Seq bytes are at offset header_start+1..header_start+3
+             last[header_start + 1] ^= sn_mask[0];
+@@ -1182,6 +1187,7 @@
+             let mut buffer = self.buffers_free.pop();
+             buffer.clear();
+             record.serialize(&fragment, &mut buffer);
++            buffer.application_records = usize::from(content_type == ContentType::ApplicationData);
+             // Apply record number encryption: XOR mask over seq bytes
+             buffer[1] ^= sn_mask[0];
+             buffer[2] ^= sn_mask[1];
+diff --git a/src/dtls13/client.rs b/src/dtls13/client.rs
+--- a/src/dtls13/client.rs
++++ b/src/dtls13/client.rs
+@@ -135,6 +135,10 @@
+ }
+ 
+ impl Client {
++    pub(crate) fn last_output_application_records(&self) -> usize {
++        self.engine.last_output_application_records
++    }
++
+     pub(crate) fn new_with_engine(mut engine: Engine, now: Instant) -> Client {
+         engine.set_client(true);
+         let extension_data = engine.pop_buffer();
+diff --git a/src/dtls13/server.rs b/src/dtls13/server.rs
+--- a/src/dtls13/server.rs
++++ b/src/dtls13/server.rs
+@@ -164,6 +164,10 @@
+ }
+ 
+ impl Server {
++    pub(crate) fn last_output_application_records(&self) -> usize {
++        self.engine.last_output_application_records
++    }
++
+     /// Create a new DTLS 1.3 server.
+     pub fn new(config: Arc<Config>, certificate: DtlsCertificate, now: Instant) -> Server {
+         let engine = Engine::new(config, certificate);
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -815,6 +815,17 @@
+         }
+     }
+ 
++    /// Number of application records in the last emitted DTLS 1.3 packet.
++    /// Read immediately after `poll_output` returns `Output::Packet`. Other
++    /// versions return zero. This is local provenance, never wire metadata.
++    pub fn last_output_application_records(&self) -> usize {
++        match self.inner.as_ref() {
++            Some(Inner::Client13(client)) => client.last_output_application_records(),
++            Some(Inner::Server13(server)) => server.last_output_application_records(),
++            _ => 0,
++        }
++    }
++
+     /// Handle time-based events such as retransmission timers.
+     ///
+     /// Advances the logical clock for subsequent operations, even when no timer

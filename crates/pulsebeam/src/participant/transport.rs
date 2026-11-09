@@ -79,9 +79,10 @@ fn egress_extensions(
     writer: &mut pulsebeam_core::dd::DependencyDescriptorWriter,
     mappings: &[pulsebeam_rtc::RtpExtensionInfo],
 ) -> Result<Vec<RtpExtension>, pulsebeam_rtc::WriteError> {
-    let mut values = values;
-    let mut extensions = std::mem::take(&mut values.opaque)
-        .into_iter()
+    let mut extensions = values
+        .opaque
+        .iter()
+        .cloned()
         .filter(|extension| mappings.iter().any(|mapping| mapping.uri == extension.uri))
         .filter(|extension| {
             !matches!(
@@ -1326,7 +1327,8 @@ mod tests {
             opaque: vec![RtpExtension {
                 uri: "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay".into(),
                 value: Bytes::from_static(&[0, 0, 20]),
-            }],
+            }]
+            .into(),
             ..Default::default()
         };
         assert!(extensions(ingress.clone(), None).is_empty());
@@ -1345,7 +1347,8 @@ mod tests {
             opaque: vec![RtpExtension {
                 uri: "urn:ietf:params:rtp-hdrext:sdes:mid".into(),
                 value: Bytes::from_static(b"source"),
-            }],
+            }]
+            .into(),
             ..Default::default()
         };
         assert!(extensions(ingress, None).is_empty());

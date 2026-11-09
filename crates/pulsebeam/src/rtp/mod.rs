@@ -1,4 +1,4 @@
-//! Shard-local media packets. Owned shard handoffs copy payloads and extension snapshots.
+//! Owner-local media metadata with immutable payload and extension storage shared by Link fanout.
 
 pub mod cache;
 mod extensions;
@@ -16,12 +16,14 @@ pub mod timeline;
 
 #[cfg(test)]
 pub mod conformance;
+#[cfg(test)]
+mod fanout_storage;
 
 use crate::media::{Rid, SeqNo, Ssrc};
 use pulsebeam_runtime::time::Instant;
 #[allow(
     clippy::disallowed_types,
-    reason = "immutable payload snapshots stay shard-local; transit copies storage"
+    reason = "immutable packet storage is shared across Link fanout; no mutable state crosses owners"
 )]
 use std::sync::Arc;
 pub use time::{Frequency, MediaTime};
@@ -54,7 +56,7 @@ pub struct AudioRtpPacket {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(
     clippy::disallowed_types,
-    reason = "immutable payload snapshots stay shard-local; transit copies storage"
+    reason = "immutable packet storage is shared across Link fanout; no mutable state crosses owners"
 )]
 pub struct RtpPacket {
     pub ssrc: Ssrc,
@@ -92,7 +94,7 @@ pub struct RtpPacket {
 impl Default for RtpPacket {
     #[allow(
         clippy::disallowed_types,
-        reason = "immutable payload snapshots stay shard-local; transit copies storage"
+        reason = "immutable packet storage is shared across Link fanout; no mutable state crosses owners"
     )]
     fn default() -> Self {
         Self {
@@ -133,6 +135,7 @@ impl RtpPacket {
             rid,
             ..Default::default()
         };
+        let mut opaque = Vec::new();
         for extension in rtp.extensions {
             match extension.uri.as_ref() {
                 pulsebeam_core::dd::URI
@@ -157,12 +160,13 @@ impl RtpPacket {
                         .first()
                         .and_then(|level| i8::try_from(level & 0x7f).ok())
                         .map(i8::saturating_neg);
-                    ext_vals.opaque.push(extension);
+                    opaque.push(extension);
                 }
                 "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay" => {}
-                _ => ext_vals.opaque.push(extension),
+                _ => opaque.push(extension),
             }
         }
+        ext_vals.opaque = opaque.into();
         Some(Self {
             ssrc: rtp.header.ssrc.into(),
             marker: rtp.header.marker,
@@ -179,20 +183,12 @@ impl RtpPacket {
         })
     }
 
-    #[allow(
-        clippy::disallowed_types,
-        reason = "fresh payload storage for an owned shard handoff"
-    )]
     pub fn to_transit(&self) -> Self {
         Self {
-            payload: Arc::from(self.payload.as_ref()),
+            payload: self.payload.clone(),
             ext_vals: self.ext_vals.to_transit(),
             ..self.clone()
         }
-    }
-
-    pub fn rehome_extensions(&mut self) {
-        self.ext_vals.rehome();
     }
 
     pub fn with_playout_time(mut self, playout_time: Instant) -> Self {

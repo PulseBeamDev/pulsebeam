@@ -12,6 +12,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+test-utils = []
+
 [dependencies]
 aws-lc-rs = { version = "1.16", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 dimpl = { version = "=0.9.0", default-features = false, features = ["aws-lc-rs", "rcgen"] }

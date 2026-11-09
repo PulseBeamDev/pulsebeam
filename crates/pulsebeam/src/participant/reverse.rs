@@ -30,9 +30,13 @@ impl ReverseDedup {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ReversePacket {
-    payload: Vec<u8>,
+    #[allow(
+        clippy::disallowed_types,
+        reason = "RFC254 reverse envelopes are immutable snapshots shared by local Link fanout"
+    )]
+    payload: bytes::Bytes,
     dedup: ReverseDedup,
 }
 
@@ -84,9 +88,26 @@ impl ReversePacket {
         debug_assert!(!window.is_zero(), "reverse deduplication must expire");
         let key = Sha3_256::digest(&payload).into();
         Self {
-            payload,
+            payload: payload.into(),
             dedup: ReverseDedup { key, window },
         }
+    }
+
+    pub(crate) fn wire(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub(crate) fn from_wire(wire: &[u8]) -> Option<Self> {
+        let (&tag, body) = wire.split_first()?;
+        let window = match tag {
+            KEYFRAME => {
+                Self::decode_keyframe(body)?;
+                KEYFRAME_DEDUP_WINDOW
+            }
+            RELIABLE_CONTROL => RELIABLE_CONTROL_DEDUP_WINDOW,
+            _ => return None,
+        };
+        Some(Self::new(wire.to_vec(), window))
     }
 
     pub(crate) fn dedup(&self) -> ReverseDedup {
@@ -156,10 +177,14 @@ mod tests {
                 matches!(packet.decode(), Some(ReverseInput::Keyframe { encoding: actual, kind: KeyframeRequestKind::Pli }) if actual == encoding)
             );
             let mut packet = ReversePacket::keyframe(encoding, KeyframeRequestKind::Pli);
-            packet.payload.push(0);
+            let mut extended = packet.payload.to_vec();
+            extended.push(0);
+            packet.payload = extended.into();
             assert!(packet.decode().is_none());
             let mut packet = ReversePacket::keyframe(encoding, KeyframeRequestKind::Pli);
-            packet.payload.pop();
+            packet
+                .payload
+                .truncate(packet.payload.len().saturating_sub(1));
             assert!(packet.decode().is_none());
         }
     }

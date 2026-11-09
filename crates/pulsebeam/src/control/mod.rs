@@ -3,6 +3,7 @@ pub mod controller;
 pub(crate) mod core;
 mod egress;
 pub(crate) mod lifecycle;
+mod link;
 pub(crate) mod native;
 mod negotiator;
 pub(crate) mod placement;

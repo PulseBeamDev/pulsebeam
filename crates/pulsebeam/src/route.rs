@@ -265,97 +265,11 @@ impl std::fmt::Display for NodeTransportAddress {
     }
 }
 
-mod envelope;
-
-pub use envelope::{ENVELOPE_LEN, ENVELOPE_VERSION, EnvelopeError, EnvelopeType, ROUTE_OFFSET};
-
-/// Read a plaintext frame's destination shard without validating its header.
-/// This is not suitable for classifying encrypted link traffic.
-pub fn peek_shard(buf: &[u8]) -> Option<ShardId> {
-    envelope::peek_route(buf).map(RouteId::shard)
-}
-
-/// The one typed view of the fixed wire header.
+/// Destination-local media dispatch metadata, not a transport wire header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Envelope {
-    pub ty: EnvelopeType,
+pub(crate) struct MediaDelivery {
     pub address: NodeRouteAddress,
-    pub extension: u64,
-}
-
-/// The extension interpretation selected by the envelope type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameBody {
-    Media { link_seq: u32, playout_ntp32: u32 },
-    Feedback,
-    Telemetry,
-}
-
-impl Envelope {
-    pub fn media(address: NodeRouteAddress, link_seq: u32, playout_ntp32: u32) -> Self {
-        Self {
-            ty: EnvelopeType::Media,
-            address,
-            extension: (u64::from(link_seq) << 32) | u64::from(playout_ntp32),
-        }
-    }
-
-    pub fn feedback(address: NodeRouteAddress) -> Self {
-        Self {
-            ty: EnvelopeType::Feedback,
-            address,
-            extension: 0,
-        }
-    }
-
-    pub fn telemetry(address: NodeRouteAddress) -> Self {
-        Self {
-            ty: EnvelopeType::Telemetry,
-            address,
-            extension: 0,
-        }
-    }
-
-    pub fn encode(self) -> [u8; ENVELOPE_LEN] {
-        envelope::Envelope {
-            ty: self.ty,
-            epoch: self.address.epoch,
-            route: self.address.route,
-            extension: self.extension,
-        }
-        .encode()
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
-        let wire = envelope::Envelope::decode(buf)?;
-        Ok(Self {
-            ty: wire.ty,
-            address: NodeRouteAddress::new(wire.route, wire.epoch),
-            extension: wire.extension,
-        })
-    }
-}
-
-/// Decode the shared header and its type-specific extension in one operation.
-pub fn decode_frame(buf: &[u8]) -> Result<(Envelope, FrameBody), EnvelopeError> {
-    let env = Envelope::decode(buf)?;
-    let body = match env.ty {
-        EnvelopeType::Media => FrameBody::Media {
-            #[allow(clippy::cast_possible_truncation)]
-            link_seq: (env.extension >> 32) as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            playout_ntp32: env.extension as u32,
-        },
-        EnvelopeType::Feedback => FrameBody::Feedback,
-        EnvelopeType::Telemetry => FrameBody::Telemetry,
-    };
-    Ok((env, body))
-}
-
-/// Read the type tag of an encoded frame, which is what says how to interpret
-/// its `extension` and its payload.
-pub fn peek_type(buf: &[u8]) -> Result<EnvelopeType, EnvelopeError> {
-    Envelope::decode(buf).map(|env| env.ty)
+    pub playout_ntp32: u32,
 }
 
 /// What the destination does with a frame that arrives on a route.
@@ -391,57 +305,15 @@ pub(crate) enum RouteAction {
     },
 }
 
-/// The shard-owned route slot. Its epoch rejects stale control messages while
-/// the action and packet accounting stay in the same cache line.
+/// Destination-owned semantic dispatch and media timeline state. Link owns
+/// transport receipt, loss and transmission identity.
 #[derive(Debug)]
 pub(crate) struct RouteRuntimeEntry {
     pub epoch: u16,
     pub action: RouteAction,
     /// Expands the envelope's middle-32 against this route's own reference.
     pub expander: NtpExpander,
-    /// Last `link_seq` seen, for hop-local loss/reorder/duplicate accounting.
-    pub last_link_seq: Option<u32>,
-    pub stats: RouteStats,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RouteStats {
-    pub received: u64,
-    pub lost: u64,
-    pub reordered: u64,
-    pub duplicated: u64,
-}
-
-impl RouteRuntimeEntry {
-    /// Fold a frame's `link_seq` into hop-local counters.
-    ///
-    /// Comparison is wrapping: `link_seq` is modulo 2^32, so "newer" means a
-    /// positive signed delta, not a larger integer.
-    pub fn observe(&mut self, link_seq: u32) {
-        self.stats.received = self.stats.received.saturating_add(1);
-        let Some(last) = self.last_link_seq else {
-            self.last_link_seq = Some(link_seq);
-            return;
-        };
-        // The link sequence is modular; the wrap is how reordering reads as negative.
-        let delta = link_seq.wrapping_sub(last).cast_signed();
-        match delta {
-            0 => self.stats.duplicated = self.stats.duplicated.saturating_add(1),
-            d if d > 0 => {
-                self.stats.lost = self
-                    .stats
-                    .lost
-                    .saturating_add(u64::from(d.unsigned_abs().saturating_sub(1)));
-                self.last_link_seq = Some(link_seq);
-            }
-            _ => {
-                self.stats.reordered = self.stats.reordered.saturating_add(1);
-                // A late frame does not move the high-water mark, and its gap
-                // was already counted when the newer frame advanced past it.
-                self.stats.lost = self.stats.lost.saturating_sub(1);
-            }
-        }
-    }
+    timing_initialized: bool,
 }
 
 /// Hands out `(slot, epoch)` pairs within one shard's slot namespace.
@@ -636,8 +508,9 @@ impl RouteRuntime {
         let Some(Some(entry)) = self.slots.get_mut(idx) else {
             pulsebeam_runtime::fatal!("route accounting must exist after installing it")
         };
-        if entry.last_link_seq.is_none() {
+        if !entry.timing_initialized {
             entry.expander = NtpExpander::new(ntp_ref);
+            entry.timing_initialized = true;
         }
         entry
     }
@@ -661,8 +534,7 @@ impl RouteRuntime {
                 target: crate::keys::TrackHandle::default(),
             },
             expander: NtpExpander::new(ntp_ref),
-            last_link_seq: None,
-            stats: RouteStats::default(),
+            timing_initialized: false,
         });
     }
 
@@ -696,8 +568,7 @@ impl RouteRuntime {
             epoch: address.epoch,
             action,
             expander: NtpExpander::new(NtpTime::ZERO),
-            last_link_seq: None,
-            stats: RouteStats::default(),
+            timing_initialized: false,
         });
     }
 
@@ -826,10 +697,6 @@ mod tests {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
 
-    fn envelope(route: RouteId, epoch: u16) -> Envelope {
-        Envelope::media(NodeRouteAddress::new(route, epoch), 0, 0)
-    }
-
     #[test]
     fn route_id_shard_and_slot_round_trip() {
         let id = RouteId::new(ShardId::new(0xABC), 0xF_FFFF);
@@ -866,145 +733,6 @@ mod tests {
         let id = RouteId::new(ShardId::new(3), 100);
         assert_eq!(RouteId::from_raw(id.get()), id);
     }
-
-    #[test]
-    fn envelope_is_exactly_sixteen_bytes() {
-        assert_eq!(ENVELOPE_LEN, 16);
-        assert_eq!(envelope(RouteId::from_raw(1), 1).encode().len(), 16);
-    }
-
-    #[test]
-    fn envelope_encodes_big_endian_at_documented_offsets() {
-        let env = Envelope {
-            ty: EnvelopeType::Media,
-            address: NodeRouteAddress::new(RouteId::from_raw(0x3344_5566), 0x1122),
-            extension: (u64::from(0x7788_99AAu32) << 32) | u64::from(0xBBCC_DDEE_u32),
-        };
-        let bytes = env.encode();
-        assert_eq!(
-            bytes,
-            [
-                ENVELOPE_VERSION,
-                EnvelopeType::Media.as_u8(),
-                0x11,
-                0x22,
-                0x33,
-                0x44,
-                0x55,
-                0x66,
-                0x77,
-                0x88,
-                0x99,
-                0xAA,
-                0xBB,
-                0xCC,
-                0xDD,
-                0xEE,
-            ]
-        );
-    }
-
-    /// The reverse lane shares the one header rather than paying for a
-    /// second: what used to be a shorter frame is now the same 16 bytes with
-    /// an unused `extension`, which is the trade that leaves exactly one
-    /// route offset on the wire for the steering program to read.
-    #[test]
-    fn a_timeline_free_frame_uses_the_same_sixteen_byte_header() {
-        let encoded = Envelope::feedback(NodeRouteAddress::new(RouteId::from_raw(1), 1)).encode();
-        assert_eq!(encoded.len(), ENVELOPE_LEN);
-        assert_eq!(
-            crate::route::peek_shard(&encoded),
-            Some(RouteId::from_raw(1).shard()),
-            "the route sits at the same offset as it does on a media frame"
-        );
-    }
-
-    #[test]
-    fn reverse_envelope_round_trips() {
-        for env in [
-            Envelope::feedback(NodeRouteAddress::new(RouteId::from_raw(u32::MAX), u16::MAX)),
-            Envelope::telemetry(NodeRouteAddress::new(RouteId::from_raw(0), 0)),
-        ] {
-            assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
-        }
-    }
-
-    /// Cross-node every payload family shares one socket and one header, so a
-    /// receiver tells them apart by the `type` byte rather than by guessing a
-    /// header length. That is what lets the steering program read `route`
-    /// without knowing what the payload is.
-    #[test]
-    fn the_payload_families_are_distinguishable_on_the_wire() {
-        let media = envelope(RouteId::from_raw(3), 4).encode();
-        let feedback = Envelope::feedback(NodeRouteAddress::new(RouteId::from_raw(3), 4)).encode();
-        let telemetry =
-            Envelope::telemetry(NodeRouteAddress::new(RouteId::from_raw(3), 4)).encode();
-
-        assert_eq!(peek_type(&media).unwrap(), EnvelopeType::Media);
-        assert_eq!(peek_type(&feedback).unwrap(), EnvelopeType::Feedback);
-        assert_eq!(peek_type(&telemetry).unwrap(), EnvelopeType::Telemetry);
-
-        // The route is at one offset for all of them, whatever the type.
-        for encoded in [&media, &feedback, &telemetry] {
-            assert_eq!(
-                crate::route::peek_shard(encoded),
-                Some(RouteId::from_raw(3).shard())
-            );
-        }
-
-        assert_eq!(
-            decode_frame(&media).unwrap().1,
-            FrameBody::Media {
-                link_seq: 0,
-                playout_ntp32: 0
-            }
-        );
-        assert_eq!(decode_frame(&feedback).unwrap().1, FrameBody::Feedback);
-        assert_eq!(decode_frame(&telemetry).unwrap().1, FrameBody::Telemetry);
-    }
-
-    #[test]
-    fn envelope_round_trips() {
-        let env = Envelope {
-            ty: EnvelopeType::Media,
-            address: NodeRouteAddress::new(RouteId::from_raw(u32::MAX), 65_535),
-            extension: u64::MAX,
-        };
-        assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
-    }
-
-    #[test]
-    fn decode_rejects_truncated_input() {
-        let full = envelope(RouteId::from_raw(1), 1).encode();
-        for len in 0..ENVELOPE_LEN {
-            assert_eq!(
-                Envelope::decode(&full[..len]),
-                Err(EnvelopeError::Truncated { len })
-            );
-        }
-    }
-
-    #[test]
-    fn decode_rejects_unknown_version_and_unknown_type() {
-        let mut bytes = envelope(RouteId::from_raw(1), 1).encode();
-        bytes[0] = ENVELOPE_VERSION + 1;
-        assert_eq!(
-            Envelope::decode(&bytes),
-            Err(EnvelopeError::UnsupportedVersion {
-                ver: ENVELOPE_VERSION + 1
-            })
-        );
-
-        let mut bytes = envelope(RouteId::from_raw(1), 1).encode();
-        bytes[1] = 0xff;
-        assert_eq!(
-            Envelope::decode(&bytes),
-            Err(EnvelopeError::UnknownType { ty: 0xff }),
-            "an unrecognised payload family is rejected, not skipped past"
-        );
-    }
-
-    // ── allocation, quarantine, and the accounting behind a route ────────
 
     fn alloc(shard: usize) -> SlotAllocator {
         SlotAllocator::with_max_slots(ShardId::new(shard), PackedRoute::MAX_SLOT.saturating_add(1))
@@ -1086,7 +814,7 @@ mod tests {
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
-    async fn same_epoch_action_updates_preserve_packet_accounting() {
+    async fn same_epoch_action_updates_preserve_media_timing() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let route = address(0, 0, 7);
         runtime.install_action(
@@ -1095,12 +823,7 @@ mod tests {
                 target: crate::keys::TrackHandle::default(),
             },
         );
-        {
-            let entry = runtime.entry_mut(route).unwrap();
-            entry.observe(100);
-            entry.observe(103);
-        }
-        let before = runtime.entry(route).unwrap().stats;
+        runtime.accounting_mut(route, NtpTime::ZERO);
         let expander_before = runtime.entry(route).unwrap().expander;
         runtime.install_action(
             route,
@@ -1116,8 +839,7 @@ mod tests {
                 target: crate::keys::TrackHandle::default()
             }
         );
-        assert_eq!(entry.stats, before);
-        assert_eq!(entry.last_link_seq, Some(103));
+        assert!(entry.timing_initialized);
         assert_eq!(entry.expander.reference(), expander_before.reference());
     }
 
@@ -1179,7 +901,7 @@ mod tests {
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
-    async fn a_new_epoch_restarts_packet_accounting() {
+    async fn a_new_epoch_restarts_media_timing() {
         let mut runtime = RouteRuntime::new(ShardId::new(0));
         let old = address(0, 0, 7);
         runtime.install_action(
@@ -1188,7 +910,7 @@ mod tests {
                 target: crate::keys::TrackHandle::default(),
             },
         );
-        runtime.entry_mut(old).unwrap().observe(100);
+        runtime.accounting_mut(old, NtpTime::ZERO);
 
         let replacement = address(0, 0, 8);
         runtime.install_action(
@@ -1199,8 +921,7 @@ mod tests {
         );
 
         let entry = runtime.entry(replacement).unwrap();
-        assert_eq!(entry.stats, RouteStats::default());
-        assert_eq!(entry.last_link_seq, None);
+        assert!(!entry.timing_initialized);
         assert!(runtime.entry(old).is_none());
     }
 
@@ -1221,24 +942,6 @@ mod tests {
             "a redelivered teardown is a no-op"
         );
         assert_eq!(runtime.len(), 0);
-    }
-
-    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
-    async fn link_seq_detects_loss_duplication_and_reorder() {
-        let mut runtime = RouteRuntime::new(ShardId::new(0));
-        let route = address(0, 0, 0);
-        runtime.install(route, NtpTime::ZERO);
-
-        for seq in [10u32, 11, 14, 14, 13] {
-            let entry = runtime.entry_mut(route).unwrap();
-            entry.observe(seq);
-        }
-
-        let stats = runtime.entry(route).unwrap().stats;
-        assert_eq!(stats.received, 5);
-        assert_eq!(stats.duplicated, 1, "14 seen twice");
-        assert_eq!(stats.reordered, 1, "13 arrived after 14");
-        assert_eq!(stats.lost, 1, "12 never arrived; 13 was late, not lost");
     }
 
     // ── Phase 1: packed route primitives ─────────────────────────────────

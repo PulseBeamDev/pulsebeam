@@ -16,7 +16,7 @@ use std::{
 use std::{sync::Arc, time::Duration};
 
 use crate::clock::WallAnchor;
-use crate::route::Envelope;
+use crate::route::MediaDelivery;
 
 use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::net::{self, RecvPacketBatch};
@@ -31,7 +31,7 @@ use crate::{
     track::Track,
 };
 
-use super::core::{ShardCore, ShardTransport};
+use super::core::{IngressTransport, ShardCore};
 
 /// Depth of the shard -> controller topology queue.
 ///
@@ -57,8 +57,6 @@ pub(crate) const SHARD_COMMAND_CAPACITY: usize = 1024;
 /// backlog — deep enough to absorb one scheduling hiccup on the receiving
 /// core, shallow enough that a stalled shard sheds load promptly instead of
 /// holding a second of stale video.
-pub(crate) const SHARD_FRAME_CAPACITY: usize = 1024;
-
 pub(crate) const SHARD_UPDATE_CAPACITY: usize = 1024;
 
 pub(crate) const SHARD_COMMAND_BUDGET: usize = 64;
@@ -196,6 +194,7 @@ pub(crate) type MediaPayload = RoutedTrackPacket;
     clippy::large_enum_variant,
     reason = "the payload enum carries materialized TrackPacket values and owned SCTP bytes so cross-shard payloads remain core-local"
 )]
+#[derive(Clone, Debug)]
 pub(crate) enum ShardFrame {
     Ingress {
         batch: RecvPacketBatch,
@@ -206,11 +205,11 @@ pub(crate) enum ShardFrame {
     /// validates that the route still names the intended stable entity; the
     /// destination resolves its own local handle from the route entry.
     Media {
-        env: Envelope,
+        delivery: MediaDelivery,
         payload: MediaPayload,
     },
     Reverse {
-        env: Envelope,
+        address: crate::route::NodeRouteAddress,
         packet: crate::participant::reverse::ReversePacket,
     },
 }
@@ -296,15 +295,13 @@ pub(crate) struct ShardContext {
     pub(crate) metrics: Arc<ShardMetrics>,
 }
 
-/// Carries the best-effort lane over in-process channels. Cross-node this
-/// becomes a UDP datagram of `[envelope || payload]`; it is the only
-/// implementation until then.
-struct ChannelTransport {
+struct LinkTransport {
     shard_id: ShardId,
-    frame_txs: Vec<mailbox::Sender<ShardFrame>>,
+    frame_txs: Vec<pulsebeam_link::LinkTx<ShardFrame>>,
+    clock_origin: Instant,
 }
 
-impl ChannelTransport {
+impl LinkTransport {
     fn enqueue(&self, dst: ShardId, ev: ShardFrame) -> bool {
         let Some(tx) = self.frame_txs.get(dst.index()) else {
             debug_assert!(
@@ -314,17 +311,41 @@ impl ChannelTransport {
             );
             return false;
         };
-        tx.try_send(ev).is_ok()
+        send_link_frame(tx, self.clock_origin, ev)
     }
 }
 
-impl ShardTransport for ChannelTransport {
-    fn send_media(&self, dst: ShardId, env: Envelope, payload: MediaPayload) {
-        // Dropping under backpressure is the media contract: this lane is
-        // lossy by design, and `link_seq` makes the loss visible downstream.
-        let _ = self.enqueue(dst, ShardFrame::Media { env, payload });
-    }
+pub(crate) fn send_link_frame(
+    tx: &pulsebeam_link::LinkTx<ShardFrame>,
+    clock_origin: Instant,
+    ev: ShardFrame,
+) -> bool {
+    let (monotonic, wall) = match &ev {
+        ShardFrame::Ingress { batch, .. } => {
+            (batch.received_at.monotonic, Some(batch.received_at.wall))
+        }
+        ShardFrame::Media { payload, .. } => match &payload.packet {
+            crate::participant::TrackPacket::Rtp(packet) => (packet.arrival_ts, None),
+            crate::participant::TrackPacket::Data { .. } => (Instant::now(), None),
+        },
+        ShardFrame::Reverse { .. } => (Instant::now(), None),
+    };
+    let received_at = pulsebeam_link::ReceiveTime {
+        monotonic: pulsebeam_link::LinkTime::from_nanos(
+            u64::try_from(monotonic.saturating_duration_since(clock_origin).as_nanos())
+                .unwrap_or(u64::MAX),
+        ),
+        wall,
+    };
+    tx.try_send_received(
+        ev,
+        received_at,
+        pulsebeam_link::LinkTime::from_nanos(u64::MAX),
+    )
+    .is_ok()
+}
 
+impl IngressTransport for LinkTransport {
     fn send_frame(&self, dst: ShardId, frame: ShardFrame) {
         // Same best-effort contract as media, but these are rare enough that a
         // drop is worth seeing: it means the queue is saturated by media.
@@ -346,9 +367,9 @@ pub(crate) struct ShardWorker {
     command_rx: mailbox::Receiver<ShardCommand>,
     event_tx: mailbox::Sender<ShardEventMessage>,
     shard_event_backlog: VecDeque<ShardEvent>,
-    frame_rx: mailbox::Receiver<ShardFrame>,
-    frame_batch: Vec<ShardFrame>,
-    router: ChannelTransport,
+    frame_rx: pulsebeam_link::LinkRx<ShardFrame>,
+    frame_batch: Vec<pulsebeam_link::Received<ShardFrame>>,
+    router: LinkTransport,
     #[allow(
         clippy::disallowed_types,
         reason = "Arc<ShardMetrics>, one per shard, see module note"
@@ -454,17 +475,19 @@ impl ShardWorker {
         command_rx: mailbox::Receiver<ShardCommand>,
         update_rx: mailbox::Receiver<Box<crate::shard_update::ShardUpdate>>,
         event_tx: mailbox::Sender<ShardEventMessage>,
-        frame_rx: mailbox::Receiver<ShardFrame>,
-        frame_txs: Vec<mailbox::Sender<ShardFrame>>,
+        frame_rx: pulsebeam_link::LinkRx<ShardFrame>,
+        frame_txs: Vec<pulsebeam_link::LinkTx<ShardFrame>>,
+        clock_origin: Instant,
         metrics: Arc<ShardMetrics>,
         stats_tx: Option<mailbox::Sender<Box<ShardStatsReport>>>,
         wall: WallAnchor,
     ) -> Self {
         let shard_count = frame_txs.len();
         let core = ShardCore::new(shard_id, max_gso_segments, shard_count, wall, update_rx);
-        let router = ChannelTransport {
+        let router = LinkTransport {
             shard_id,
             frame_txs,
+            clock_origin,
         };
         let recorder = ShardRecorder::shared();
         metrics::with_local_recorder(&*recorder, describe_shard_metrics);
@@ -591,17 +614,47 @@ impl ShardWorker {
         if self.core.apply_updates(SHARD_UPDATE_OP_BUDGET) >= SHARD_UPDATE_OP_BUDGET {
             self.tick_budget_hit("shard_update");
         }
-        let mut frames: usize = 0;
         self.frame_batch.clear();
-        for _ in 0..SHARD_FRAME_BUDGET {
-            let Ok(ev) = self.frame_rx.try_recv() else {
-                break;
+        let frames = self
+            .frame_rx
+            .try_recv_batch(&mut self.frame_batch, SHARD_FRAME_BUDGET);
+        for mut received in self.frame_batch.drain(..) {
+            match &mut received.packet {
+                ShardFrame::Media { delivery, .. } => {
+                    let Some(address) = crate::link::delivery_address(received.tag) else {
+                        continue;
+                    };
+                    if address.shard() != self.router.shard_id {
+                        continue;
+                    }
+                    delivery.address = address;
+                }
+                ShardFrame::Reverse { address, .. } => {
+                    let Some(destination) = crate::link::delivery_address(received.tag) else {
+                        continue;
+                    };
+                    if destination.shard() != self.router.shard_id {
+                        continue;
+                    }
+                    *address = destination;
+                }
+                ShardFrame::Ingress { .. } => {}
+            }
+            let at = if matches!(&received.packet, ShardFrame::Media { .. }) {
+                self.router
+                    .clock_origin
+                    .checked_add(Duration::from_nanos(
+                        received.received_at.monotonic.as_nanos(),
+                    ))
+                    .unwrap_or(now)
+            } else {
+                // Reverse deduplication uses execution time; socket ingress
+                // already carries its original observation in the owned batch.
+                now
             };
-            frames = frames.saturating_add(1);
-            self.frame_batch.push(ev);
+            self.core
+                .on_shard_frames(std::iter::once(received.packet), at, &self.router);
         }
-        self.core
-            .on_shard_frames(self.frame_batch.drain(..), now, &self.router);
         if frames == SHARD_FRAME_BUDGET {
             self.tick_budget_hit("frames");
         }

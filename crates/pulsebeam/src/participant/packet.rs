@@ -7,7 +7,14 @@ use crate::track::DataLane;
 )]
 #[derive(Debug, Clone)]
 pub enum TrackPacket {
-    Data { lane: DataLane, bytes: Vec<u8> },
+    Data {
+        lane: DataLane,
+        #[allow(
+            clippy::disallowed_types,
+            reason = "RFC254 local Link fanout shares immutable payload storage; network peers serialize it"
+        )]
+        bytes: bytes::Bytes,
+    },
     Rtp(RtpPacket),
 }
 
@@ -17,6 +24,15 @@ pub enum TrackPacketRef<'a> {
 }
 
 impl TrackPacket {
+    pub(crate) fn data(lane: DataLane, payload: &[u8]) -> Self {
+        #[allow(
+            clippy::disallowed_types,
+            reason = "RFC254 snapshots data once before shallow immutable local fanout"
+        )]
+        let bytes = bytes::Bytes::copy_from_slice(payload);
+        Self::Data { lane, bytes }
+    }
+
     pub fn as_ref(&self) -> TrackPacketRef<'_> {
         match self {
             Self::Data { lane, bytes } => TrackPacketRef::Data { lane: *lane, bytes },
@@ -40,7 +56,6 @@ impl RoutedTrackPacket {
         if let TrackPacket::Rtp(packet) = &mut self.packet {
             packet.playout_time = playout;
             packet.arrival_ts = arrival;
-            packet.rehome_extensions();
         }
     }
 

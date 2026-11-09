@@ -18,6 +18,8 @@ struct Trace {
     packets: Vec<Vec<u8>>,
     application: Vec<Vec<u8>>,
     connected: usize,
+    application_records: usize,
+    control_packets: usize,
     wake: Option<Instant>,
 }
 
@@ -25,7 +27,12 @@ fn drain(association: &mut Association, trace: &mut Trace) -> Result<(), Error> 
     let mut buffer = vec![0; 4096];
     for _ in 0..128 {
         match association.poll_output(&mut buffer)? {
-            Output::Datagram(bytes) => trace.packets.push(bytes.to_vec()),
+            Output::Datagram(bytes) => {
+                let records = association.last_output_application_records();
+                trace.application_records += records;
+                trace.control_packets += usize::from(records == 0);
+                trace.packets.push(bytes.to_vec());
+            }
             Output::ApplicationData(bytes) => trace.application.push(bytes.to_vec()),
             Output::Connected => trace.connected += 1,
             Output::Timeout(at) => {
@@ -142,6 +149,14 @@ fn public_associations_authenticate_retransmit_and_preserve_datagrams() -> Resul
     )?;
     assert_eq!((client_trace.connected, server_trace.connected), (1, 1));
     assert!(client_trace.application.is_empty() && server_trace.application.is_empty());
+    assert_eq!(
+        (
+            client_trace.application_records,
+            server_trace.application_records
+        ),
+        (0, 0)
+    );
+    assert!(client_trace.control_packets > 0 && server_trace.control_packets > 0);
 
     for payload in [Vec::new(), b"client payload".to_vec(), vec![0xa5; 3072]] {
         client.send_application_data(&payload)?;
@@ -166,6 +181,13 @@ fn public_associations_authenticate_retransmit_and_preserve_datagrams() -> Resul
         [Vec::new(), b"client payload".to_vec(), vec![0xa5; 3072]]
     );
     assert_eq!(client_trace.application, [vec![0x5a; 6144]]);
+    assert_eq!(
+        (
+            client_trace.application_records,
+            server_trace.application_records
+        ),
+        (3, 1)
+    );
     assert!(matches!(
         client.handle_timeout(origin),
         Err(Error::TimeWentBackwards)

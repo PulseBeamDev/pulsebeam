@@ -823,13 +823,7 @@ impl Connection {
             && publication.published
             && let Some(fanout) = publication.fanout
         {
-            events.publish_track_packet(
-                Some(fanout),
-                TrackPacket::Data {
-                    lane: data.lane,
-                    bytes: bytes.to_vec(),
-                },
-            );
+            events.publish_track_packet(Some(fanout), TrackPacket::data(data.lane, bytes));
         }
     }
 }

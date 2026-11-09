@@ -83,6 +83,8 @@ pub struct NodeBuilder {
 
     // Services
     cluster: Option<crate::cluster::Options>,
+    link_listen: Option<SocketAddr>,
+    link_control: Option<pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>>,
     http_api: Option<ListenerSource>,
     key_registry: Option<KeyRegistry>,
     internal_metrics: Option<ListenerSource>,
@@ -127,6 +129,8 @@ impl NodeBuilder {
             rng: None,
             udp_mode: UdpMode::Batch,
             cluster: None,
+            link_listen: None,
+            link_control: None,
             http_api: None,
             key_registry: None,
             internal_metrics: None,
@@ -286,6 +290,25 @@ impl NodeBuilder {
     /// Set either scalar or batch mode. Default to batch.
     pub fn with_udp_mode(mut self, mode: UdpMode) -> Self {
         self.udp_mode = mode;
+        self
+    }
+
+    /// Enable one Link UDP socket. Peers require explicit trusted controller provisioning.
+    pub fn with_link_listener(mut self, address: SocketAddr) -> Self {
+        self.link_listen = Some(address);
+        self
+    }
+
+    /// Enable Link hosting and hand a restricted provisioning capability to the
+    /// trusted process owner once the controller mailbox exists. This is not an
+    /// HTTP administration endpoint and does not authorize tenant-supplied peers.
+    pub fn with_link_control(
+        mut self,
+        address: SocketAddr,
+        ready: pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>,
+    ) -> Self {
+        self.link_listen = Some(address);
+        self.link_control = Some(ready);
         self
     }
 
@@ -501,6 +524,7 @@ impl NodeBuilder {
         }
 
         let mut tcp_service = None;
+        let mut link_result = None;
         let result: Result<()> = async {
         let mut tcp_rxs = Vec::with_capacity(shard_count);
         let mut tcp_txs = Vec::new();
@@ -560,17 +584,24 @@ impl NodeBuilder {
         let (shard_event_tx, shard_event_rx) = mailbox::bounded(
             const { core::num::NonZeroUsize::new(crate::shard::worker::SHARD_EVENT_CAPACITY).unwrap() },
         );
+        let clock_origin = pulsebeam_runtime::time::Instant::now();
+        let mut links = pulsebeam_link::LinkControl::new(move || {
+            pulsebeam_link::LinkTime::from_nanos(u64::try_from(
+                pulsebeam_runtime::time::Instant::now().saturating_duration_since(clock_origin).as_nanos(),
+            ).unwrap_or(u64::MAX))
+        }).map_err(|error| anyhow::anyhow!("creating Link owner: {error:?}"))?;
         let mut frame_txs = Vec::with_capacity(shard_count);
         let mut frame_rxs = Vec::with_capacity(shard_count);
-        for _ in 0..shard_count {
-            let (tx, rx) = mailbox::bounded(
-                const {
-                    core::num::NonZeroUsize::new(crate::shard::worker::SHARD_FRAME_CAPACITY)
-                        .unwrap()
-                },
-            );
+        let mut frame_ports = Vec::with_capacity(shard_count);
+        for shard in 0..shard_count {
+            let (port, rx) = links.create_port().map_err(|error| anyhow::anyhow!("creating Link port: {error:?}"))?;
+            let (_, tx) = links.bind_send(pulsebeam_link::Destination::Local {
+                port,
+                tag: pulsebeam_link::DeliveryTag::from_raw(u64::try_from(shard).unwrap_or(u64::MAX)),
+            }).map_err(|error| anyhow::anyhow!("binding Link port: {error:?}"))?;
             frame_txs.push(tx);
             frame_rxs.push(rx);
+            frame_ports.push(port);
         }
 
         let mut rng = self.rng.ok_or_else(|| {
@@ -645,6 +676,7 @@ impl NodeBuilder {
                         shard_event_tx,
                         frame_rx,
                         frame_txs,
+                        clock_origin,
                         worker_occupancy,
                         shard_stats_tx,
                         wall_anchor,
@@ -684,6 +716,24 @@ impl NodeBuilder {
             self.room_placement,
             view_writers,
         );
+        controller.set_links(links, frame_ports, clock_origin);
+        if let Some(address) = self.link_listen {
+            let (host, installs) = crate::link::host::Host::bind(address, clock_origin).await.context("binding Link UDP")?;
+            controller.set_link_host(installs);
+            let cancellation = shutdown.child_token();
+            let node_shutdown = shutdown.clone();
+            let (report, result) = pulsebeam_runtime::sync::oneshot::channel();
+            link_result = Some(result);
+            let task = async move {
+                let result = host.run(cancellation).await;
+                if result.is_err() { node_shutdown.cancel(); }
+                let _ = report.send(result);
+            };
+            #[cfg(feature = "sim")]
+            control_tasks.spawn_local(task);
+            #[cfg(not(feature = "sim"))]
+            control_tasks.spawn(task);
+        }
         controller.set_execution(shard_executor.migration_handle());
         controller.set_steering(steering);
         controller.set_key_registry(self.key_registry.clone());
@@ -691,6 +741,9 @@ impl NodeBuilder {
         // with 62.5 ms pacing rate, at most we get 1s latency here.
         let (controller_command_tx, controller_command_rx) =
             mailbox::bounded(const { core::num::NonZeroUsize::new(16).unwrap() });
+        if let Some(ready) = self.link_control {
+            let _ = ready.send(crate::link::Control::new(controller_command_tx.clone()));
+        }
         #[cfg(feature = "sim")]
         if let Some(notification) = self.sim_startup_notification {
             let _ = notification.try_send(());
@@ -775,6 +828,12 @@ impl NodeBuilder {
         result?;
         tcp_result?;
         data_result?;
+        if let Some(result) = link_result {
+            result
+                .await
+                .context("Link host task stopped without reporting")?
+                .context("Link UDP host failed")?;
+        }
         if let Some(error) = control_error {
             return Err(error.into());
         }
@@ -1162,6 +1221,10 @@ mod internal {
 #[cfg(all(test, feature = "transport-conformance"))]
 #[path = "node/transport_conformance.rs"]
 mod transport_conformance;
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "node/link_conformance.rs"]
+mod link_conformance;
 
 #[cfg(test)]
 mod tests {

@@ -8,11 +8,22 @@ use crate::id::ShardId;
 use crate::route::{NodeRouteAddress, NodeTransportAddress};
 use pulsebeam_queue as mailbox;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompiledRoute {
+    pub address: NodeRouteAddress,
+    pub tx: pulsebeam_link::LinkTx<crate::shard::worker::ShardFrame>,
+    pub clock_origin: pulsebeam_runtime::time::Instant,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TrackPlan {
     pub local: Vec<ParticipantId>,
     pub remote: Vec<NodeRouteAddress>,
     pub reverse_route: Option<NodeRouteAddress>,
+    pub compiled_remote: Vec<CompiledRoute>,
+    pub compiled_reverse: Option<CompiledRoute>,
+    pub compiled_network: Vec<CompiledRoute>,
+    pub compiled_network_reverse: Option<CompiledRoute>,
 }
 
 impl TrackPlan {
@@ -25,6 +36,10 @@ impl TrackPlan {
             local: unique(local, "local"),
             remote: unique(remote, "remote"),
             reverse_route,
+            compiled_remote: Vec::new(),
+            compiled_reverse: None,
+            compiled_network: Vec::new(),
+            compiled_network_reverse: None,
         }
     }
 
@@ -130,7 +145,7 @@ pub(crate) struct ShardUpdate {
     pub participant_effects: Vec<(ParticipantId, crate::participant::ParticipantEffect)>,
     pub lifecycle: Vec<ShardUpdateOp>,
     pub plans: Vec<TrackPlanUpdate>,
-    pub cutoff_ack: Option<pulsebeam_runtime::sync::oneshot::Sender<()>>,
+    pub cutoff_acks: Vec<pulsebeam_runtime::sync::oneshot::Sender<()>>,
 }
 
 impl ShardUpdate {
@@ -141,7 +156,7 @@ impl ShardUpdate {
             participant_effects: Vec::new(),
             lifecycle: Vec::new(),
             plans: Vec::new(),
-            cutoff_ack: None,
+            cutoff_acks: Vec::new(),
         }
     }
 
@@ -149,7 +164,7 @@ impl ShardUpdate {
         self.participant_effects.is_empty()
             && self.lifecycle.is_empty()
             && self.plans.is_empty()
-            && self.cutoff_ack.is_none()
+            && self.cutoff_acks.is_empty()
     }
 
     pub(crate) fn validate_for(&self, shard: ShardId, current_revision: u64) -> bool {
@@ -179,11 +194,11 @@ impl ShardUpdateWriter {
         let commit = self
             .staged
             .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
-        if commit.generation != generation || commit.cutoff_ack.is_some() {
+        if commit.generation != generation {
             pulsebeam_runtime::fatal!("a cutoff fence must have its own shard generation");
         }
         let (tx, rx) = pulsebeam_runtime::sync::oneshot::channel();
-        commit.cutoff_ack = Some(tx);
+        commit.cutoff_acks.push(tx);
         rx
     }
     pub fn stage(&mut self, generation: u64, op: ShardUpdateOp) {
@@ -414,7 +429,9 @@ mod tests {
             cutoff.try_recv(),
             Err(pulsebeam_runtime::sync::oneshot::error::TryRecvError::Empty)
         ));
-        fence.cutoff_ack.take().unwrap().send(()).unwrap();
+        for ack in fence.cutoff_acks.drain(..) {
+            ack.send(()).unwrap();
+        }
         assert_eq!(cutoff.try_recv(), Ok(()));
     }
 

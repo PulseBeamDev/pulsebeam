@@ -1198,10 +1198,7 @@ impl Connection {
                         }
                         events.publish_track_packet(
                             self.data.published_stream(cid),
-                            TrackPacket::Data {
-                                lane,
-                                bytes: bytes.to_vec(),
-                            },
+                            TrackPacket::data(lane, bytes.as_ref()),
                         );
                     }
                     (DataLane::Ordered, DataTrackDirection::Subscribe) => {

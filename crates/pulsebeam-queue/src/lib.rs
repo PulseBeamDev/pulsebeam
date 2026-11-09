@@ -21,6 +21,12 @@ impl<T> Clone for Sender<T> {
 }
 
 impl<T> Sender<T> {
+    /// Rejects further admission and wakes the receiver. Accepted values remain
+    /// available to drain; every sender clone observes the closure.
+    pub fn close(&self) {
+        self.inner.close();
+    }
+
     /// Immediately accepts the value or returns ownership as Full/Closed.
     ///
     /// Does not wait for receiver progress. Use this on realtime paths.

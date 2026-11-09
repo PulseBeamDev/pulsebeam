@@ -4,7 +4,7 @@ use pulsebeam_runtime::time::Instant;
 use slotmap::SecondaryMap;
 
 use crate::clock::WallAnchor;
-use crate::route::{Envelope, NodeTransportAddress};
+use crate::route::{MediaDelivery, NodeTransportAddress};
 use crate::shard::events::{ParticipantBindingEvent, ParticipantEvent, ParticipantLifecycleEvent};
 use crate::{
     keys::ParticipantHandle,
@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-pub(crate) use super::router::ShardTransport;
+pub(crate) use super::router::IngressTransport;
 use super::worker::{MediaPayload, ShardCommand, ShardEvent, ShardFrame};
 
 const PARTICIPANT_CAPACITY_HINT: usize = 64;
@@ -114,7 +114,7 @@ impl ShardCore {
     pub(crate) fn on_command(
         &mut self,
         cmd: ShardCommand,
-        router: &impl ShardTransport,
+        router: &impl IngressTransport,
     ) -> Option<()> {
         let result = self.execution.on_command(cmd, router);
         self.updates
@@ -126,7 +126,7 @@ impl ShardCore {
         &mut self,
         frames: impl IntoIterator<Item = ShardFrame>,
         now: Instant,
-        router: &impl ShardTransport,
+        router: &impl IngressTransport,
     ) {
         self.execution.on_shard_frames(frames, now, router);
     }
@@ -134,7 +134,7 @@ impl ShardCore {
     pub(crate) fn on_udp_batch_routed(
         &mut self,
         batch: net::RecvPacketBatch,
-        router: &impl ShardTransport,
+        router: &impl IngressTransport,
     ) {
         self.execution.on_udp_batch_routed(batch, router);
     }
@@ -175,7 +175,7 @@ impl ShardCore {
 
     pub(crate) fn flush_stream_buffers(
         &mut self,
-        router: &impl ShardTransport,
+        router: &impl IngressTransport,
         budget: usize,
     ) -> usize {
         self.execution.flush_stream_buffers(router, budget)
@@ -183,7 +183,7 @@ impl ShardCore {
 
     pub(crate) fn flush_participant_events(
         &mut self,
-        router: &impl ShardTransport,
+        router: &impl IngressTransport,
         budget: usize,
     ) -> usize {
         self.execution.flush_participant_events(router, budget)
@@ -393,6 +393,16 @@ impl ShardExecution {
         let cost = match &operation.plan {
             Some(plan) => {
                 debug_assert!(plan.is_valid());
+                debug_assert_eq!(
+                    plan.remote.len(),
+                    plan.compiled_remote.len(),
+                    "remote plans must be compiled by the controller"
+                );
+                debug_assert_eq!(
+                    plan.reverse_route.is_some(),
+                    plan.compiled_reverse.is_some(),
+                    "reverse plans must be compiled by the controller"
+                );
                 let local = plan
                     .local
                     .iter()
@@ -409,14 +419,26 @@ impl ShardExecution {
                     track_handle,
                     crate::shard::router::InstalledTrackPlan {
                         local,
-                        remote: plan.remote.clone(),
-                        reverse_route: plan.reverse_route,
+                        remote: plan
+                            .compiled_remote
+                            .iter()
+                            .chain(&plan.compiled_network)
+                            .cloned()
+                            .collect(),
+                        reverse_route: plan
+                            .compiled_network_reverse
+                            .as_ref()
+                            .or(plan.compiled_reverse.as_ref())
+                            .cloned(),
                     },
                 );
                 plan.local
                     .len()
-                    .saturating_add(plan.remote.len())
-                    .saturating_add(usize::from(plan.reverse_route.is_some()))
+                    .saturating_add(plan.compiled_remote.len())
+                    .saturating_add(plan.compiled_network.len())
+                    .saturating_add(usize::from(
+                        plan.compiled_network_reverse.is_some() || plan.compiled_reverse.is_some(),
+                    ))
             }
             None => {
                 debug_assert!(self.plans.contains_key(track_handle));
@@ -439,22 +461,19 @@ impl ShardExecution {
 
     fn on_media_frame(
         &mut self,
-        env: Envelope,
+        delivery: MediaDelivery,
         payload: MediaPayload,
         now: Instant,
-        router: &impl ShardTransport,
+        _router: &impl IngressTransport,
     ) {
-        debug_assert_eq!(env.ty, crate::route::EnvelopeType::Media);
-        #[allow(clippy::cast_possible_truncation)]
-        let link_seq = (env.extension >> 32) as u32;
-        #[allow(clippy::cast_possible_truncation)]
-        let playout_ntp32 = env.extension as u32;
-        let address = env.address;
+        let MediaDelivery {
+            address,
+            playout_ntp32,
+        } = delivery;
         let Some(action) = self.runtime.routes.resolve(address) else {
             return;
         };
         let entry = self.runtime.routes.accounting_mut(address, self.wall.ntp());
-        entry.observe(link_seq);
         let Ok(playout) = entry.expander.expand(playout_ntp32) else {
             return;
         };
@@ -477,7 +496,6 @@ impl ShardExecution {
             registry: &mut self.registry,
             dirty: &mut self.dirty,
             wall: &self.wall,
-            router,
         };
         self.runtime
             .route_packet_with_plan(key, Origin::Remote, payload.packet, plan, &mut ctx);
@@ -504,7 +522,7 @@ impl ShardExecution {
     pub(crate) fn on_udp_batch_routed(
         &mut self,
         batch: net::RecvPacketBatch,
-        router: &impl ShardTransport,
+        router: &impl IngressTransport,
     ) {
         let Some(address) = self.registry.demux(&batch) else {
             return;
@@ -549,7 +567,7 @@ impl ShardExecution {
 
     pub(crate) fn flush_stream_buffers(
         &mut self,
-        router: &impl ShardTransport,
+        _router: &impl IngressTransport,
         budget: usize,
     ) -> usize {
         debug_assert!(budget > 0);
@@ -568,7 +586,6 @@ impl ShardExecution {
                 registry: &mut self.registry,
                 dirty: &mut self.dirty,
                 wall: &self.wall,
-                router,
             };
             self.runtime.route_packet_with_plan(
                 track_handle,
@@ -583,7 +600,7 @@ impl ShardExecution {
 
     pub(crate) fn flush_participant_events(
         &mut self,
-        router: &impl ShardTransport,
+        _router: &impl IngressTransport,
         budget: usize,
     ) -> usize {
         debug_assert!(budget > 0);
@@ -658,7 +675,7 @@ impl ShardExecution {
                             debug_assert!(false, "reverse packet has no owned track plan");
                             continue;
                         };
-                        self.runtime.route_reverse(packet, plan, router);
+                        self.runtime.route_reverse(packet, plan);
                     }
                 },
             }
@@ -677,7 +694,7 @@ impl ShardExecution {
     pub(crate) fn on_command(
         &mut self,
         cmd: ShardCommand,
-        router: &impl ShardTransport,
+        router: &impl IngressTransport,
     ) -> Option<()> {
         match cmd {
             ShardCommand::MaterializeParticipant {
@@ -769,14 +786,14 @@ impl ShardExecution {
         &mut self,
         frames: impl IntoIterator<Item = ShardFrame>,
         now: Instant,
-        router: &impl ShardTransport,
+        router: &impl IngressTransport,
     ) {
         for frame in frames {
             self.on_shard_frame(frame, now, router);
         }
     }
 
-    fn on_shard_frame(&mut self, frame: ShardFrame, now: Instant, router: &impl ShardTransport) {
+    fn on_shard_frame(&mut self, frame: ShardFrame, now: Instant, router: &impl IngressTransport) {
         match frame {
             ShardFrame::Ingress {
                 batch,
@@ -800,28 +817,27 @@ impl ShardExecution {
                 }
                 self.on_owned_udp_batch(batch, address, source_shard);
             }
-            ShardFrame::Media { env, payload } => {
-                self.on_media_frame(env, payload, now, router);
+            ShardFrame::Media { delivery, payload } => {
+                self.on_media_frame(delivery, payload, now, router);
             }
-            ShardFrame::Reverse { env, packet } => self.on_reverse_frame(env, packet, now),
+            ShardFrame::Reverse { address, packet } => self.on_reverse_frame(address, packet, now),
         }
     }
 
     fn on_reverse_frame(
         &mut self,
-        env: Envelope,
+        address: crate::route::NodeRouteAddress,
         packet: crate::participant::reverse::ReversePacket,
         now: Instant,
     ) {
-        debug_assert_eq!(env.ty, crate::route::EnvelopeType::Feedback);
         if !self
             .runtime
             .routes
-            .accept_reverse(env.address, packet.dedup(), now)
+            .accept_reverse(address, packet.dedup(), now)
         {
             return;
         }
-        let Some(action) = self.runtime.routes.resolve(env.address) else {
+        let Some(action) = self.runtime.routes.resolve(address) else {
             return;
         };
         let Some((origin, target)) = self.runtime.resolve_reverse(action) else {
@@ -988,9 +1004,7 @@ mod wrong_owner_tests {
         frames: std::cell::RefCell<Vec<(ShardId, ShardFrame)>>,
     }
 
-    impl ShardTransport for CaptureTransport {
-        fn send_media(&self, _dst: ShardId, _env: Envelope, _payload: MediaPayload) {}
-
+    impl IngressTransport for CaptureTransport {
         fn send_frame(&self, dst: ShardId, frame: ShardFrame) {
             self.frames.borrow_mut().push((dst, frame));
         }
@@ -1372,6 +1386,69 @@ mod wrong_owner_tests {
             );
             assert!(core.next_timer_deadline().is_some());
         });
+    }
+
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
+    async fn compiled_network_branches_are_installed_and_counted_separately_from_local_routes() {
+        let shard = ShardId::new(0);
+        let (_, update_rx) = crate::shard_update::new_shard_update(shard);
+        let origin = Instant::now();
+        let mut core = ShardCore::new(
+            shard,
+            4,
+            1,
+            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, origin),
+            update_rx,
+        );
+        let track_id = crate::entity::ConnectionId::from_bytes([6; 16])
+            .derive_track_id(crate::entity::TrackKind::Video, "compiled");
+        let handle = core
+            .execution
+            .runtime
+            .install_track(track_id, None, None, None);
+        let mut control =
+            pulsebeam_link::LinkControl::new(|| pulsebeam_link::LinkTime::from_nanos(0)).unwrap();
+        let (port, _rx) = control.create_port().unwrap();
+        // Plan installation treats compiled handles opaquely; transport behavior
+        // is covered by Link's two-association tests, not duplicated here.
+        let mut compiled = |slot| {
+            let address =
+                crate::route::NodeRouteAddress::new(crate::route::RouteId::new(shard, slot), 1);
+            let (_, tx) = control
+                .bind_send(pulsebeam_link::Destination::Local {
+                    port,
+                    tag: crate::link::delivery_tag(address),
+                })
+                .unwrap();
+            crate::shard_update::CompiledRoute {
+                address,
+                tx,
+                clock_origin: origin,
+            }
+        };
+        let local = compiled(1);
+        let network = compiled(2);
+        let reverse = compiled(3);
+        let plan = crate::shard_update::TrackPlan {
+            remote: vec![local.address],
+            reverse_route: Some(local.address),
+            compiled_remote: vec![local.clone()],
+            compiled_reverse: Some(local.clone()),
+            compiled_network: vec![network.clone()],
+            compiled_network_reverse: Some(reverse.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            core.execution
+                .apply_plan(&crate::shard_update::TrackPlanUpdate {
+                    track_id,
+                    plan: Some(plan)
+                }),
+            3
+        );
+        let installed = core.execution.plans.get(handle).unwrap();
+        assert_eq!(installed.remote, vec![local, network]);
+        assert_eq!(installed.reverse_route, Some(reverse));
     }
 
     #[cfg(debug_assertions)]
