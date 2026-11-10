@@ -316,7 +316,7 @@ copy_to_directory(
 js_test(
     name = "generated_node_contract",
     entry_point = "tests/generated_contract.mjs",
-    data = [":contract_runtime", ":node_modules", "package.json"],
+    data = [":contract_runtime", ":native_library", ":node_modules", "package.json"],
     no_copy_to_bin = ["package.json"],
     timeout = "short",
 )

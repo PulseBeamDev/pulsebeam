@@ -160,15 +160,19 @@ async def witness():
 
 
 def main():
-    bindings, library = (Path(arg).resolve(strict=True) for arg in sys.argv[1:])
+    bindings = Path(sys.argv[1]).resolve(strict=True)
+    library = Path(sys.argv[2]).absolute()
     with tempfile.TemporaryDirectory(prefix="pulsebeam-python-contract-") as temporary:
-        package = Path(temporary) / "contract"
-        package.mkdir()
+        root = Path(temporary)
+        package = root / "bindings" / "contract"
+        package.mkdir(parents=True)
+        for solib in library.parents[2].glob("_solib_*"):
+            (root / solib.name).symlink_to(solib, target_is_directory=True)
         (package / "__init__.py").touch()
         for namespace in ("pulsebeam_agent_core", "pulsebeam_agent_native"):
             shutil.copyfile(bindings / f"{namespace}.py", package / f"{namespace}.py")
         (package / "libpulsebeam_agent_native.so").symlink_to(library)
-        sys.path.insert(0, temporary)
+        sys.path.insert(0, str(package.parent))
         asyncio.run(asyncio.wait_for(witness(), timeout=5))
 
 

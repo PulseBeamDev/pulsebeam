@@ -116,8 +116,28 @@ filegroup(name = "clang_tools", srcs = glob(["checkout/src/third_party/llvm-buil
     # ELF RUNPATH is not transitive: retain the declared closure as direct dependencies.
     link_files = ["desktop_runtime/" + library for library in desktop]
     linkopts = ["-Wl,--push-state,--no-as-needed"] + ["$(location %s)" % library for library in link_files] + ["-Wl,--pop-state"]
-    build += '\ncc_library(name = "desktop", deps = %s, additional_linker_inputs = %s, linkopts = %s)\n' % (repr(imports), repr(link_files), repr(linkopts))
-    ctx.file("BUILD.bazel", 'load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")\n' + build)
+    ctx.file("desktop_runtime.bzl", '''load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
+
+def _desktop_runtime_files_impl(ctx):
+    # cc_import exposes CcInfo only. Rust tests need its actual solib artifacts
+    # in default runfiles, at the paths already embedded in their RUNPATH.
+    files = depset([
+        library.dynamic_library
+        for dep in ctx.attr.deps
+        for linker_input in dep[CcInfo].linking_context.linker_inputs.to_list()
+        for library in linker_input.libraries
+        if library.dynamic_library
+    ])
+    return [DefaultInfo(files = files, runfiles = ctx.runfiles(transitive_files = files))]
+
+desktop_runtime_files = rule(
+    implementation = _desktop_runtime_files_impl,
+    attrs = {"deps": attr.label_list(providers = [CcInfo])},
+)
+''')
+    build += '\ndesktop_runtime_files(name = "desktop_runtime_files", deps = %s)\n' % repr(imports)
+    build += '\ncc_library(name = "desktop", deps = %s, data = [":desktop_runtime_files"], additional_linker_inputs = %s, linkopts = %s)\n' % (repr(imports), repr(link_files), repr(linkopts))
+    ctx.file("BUILD.bazel", 'load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")\nload(":desktop_runtime.bzl", "desktop_runtime_files")\n' + build)
     return ctx.repo_metadata(reproducible = True)
 
 _upstream = repository_rule(
