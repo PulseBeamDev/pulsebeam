@@ -2,7 +2,7 @@ use crate::control::controller::{ControllerCommand, ControllerSender};
 use crate::entity::{RoomId, TrackId};
 use crate::id::ShardId;
 use crate::route::NodeRouteAddress;
-use pulsebeam_link::{BindError, BindingId, LinkError, NetworkId, NetworkPeer, NodeRouteKey};
+use pulsebeam_link::{BindError, BindingId, LinkError, NetworkId, NodeRouteKey, PeerConfig};
 use pulsebeam_runtime::sync::oneshot;
 
 use super::{BindReceive, BindReverse, BindSend, OpenPeer, ReceiveRoute, UnbindSend};
@@ -40,8 +40,9 @@ impl Control {
         result.await.map_err(|_| LinkError::Closed)?
     }
 
-    /// Admits a pinned peer. DTLS readiness is asynchronous, not implied by this reply.
-    pub async fn open_peer(&self, peer: NetworkPeer) -> Result<NetworkId, LinkError> {
+    /// Admits a pinned datagram peer. Security readiness is asynchronous.
+    pub async fn open_peer(&self, peer: impl Into<PeerConfig>) -> Result<NetworkId, LinkError> {
+        let peer = peer.into();
         let (reply, result) = oneshot::channel();
         self.submit(ControllerCommand::OpenLink(OpenPeer { peer, reply }))?;
         result.await.map_err(|_| LinkError::Closed)?

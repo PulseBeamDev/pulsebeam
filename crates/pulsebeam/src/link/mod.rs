@@ -13,7 +13,7 @@ use pulsebeam_link::DeliveryTag;
 /// Trusted process-control input, not a tenant-facing signaling command.
 /// Successful provisioning admits an association; readiness remains asynchronous.
 pub struct OpenPeer {
-    pub peer: pulsebeam_link::NetworkPeer,
+    pub peer: pulsebeam_link::PeerConfig,
     pub reply: pulsebeam_runtime::sync::oneshot::Sender<
         Result<pulsebeam_link::NetworkId, pulsebeam_link::LinkError>,
     >,
@@ -23,7 +23,7 @@ impl std::fmt::Debug for OpenPeer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OpenPeer")
-            .field("endpoint", &self.peer.endpoint)
+            .field("endpoint", &self.peer.endpoint())
             .finish_non_exhaustive()
     }
 }

@@ -20,9 +20,7 @@ rust_library(
     aliases = aliases(),
     deps = all_crate_deps(normal = True) + [
         "//crates/pulsebeam-queue:pulsebeam-queue",
-        "//crates/pulsebeam-dtls:pulsebeam-dtls",
-        "//crates/pulsebeam-cc:pulsebeam-cc",
-        "//crates/pulsebeam-feedback:pulsebeam-feedback",
+        "//crates/pulsebeam-transport:pulsebeam-transport",
     ],
 )
 
@@ -37,9 +35,7 @@ rust_test(
     aliases = aliases(normal = True, normal_dev = True),
     deps = all_crate_deps(normal = True, normal_dev = True) + [
         "//crates/pulsebeam-queue:pulsebeam-queue",
-        "//crates/pulsebeam-dtls:test_utils",
-        "//crates/pulsebeam-cc:pulsebeam-cc",
-        "//crates/pulsebeam-feedback:pulsebeam-feedback",
+        "//crates/pulsebeam-transport:test_utils",
     ],
 )
 

@@ -1,0 +1,31 @@
+[package]
+name = "pulsebeam-transport"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+test-utils = ["pulsebeam-dtls/test-utils"]
+
+[dependencies]
+pulsebeam-dtls = { path = "../pulsebeam-dtls" }
+pulsebeam-cc = { path = "../pulsebeam-cc" }
+pulsebeam-feedback = { path = "../pulsebeam-feedback" }
+noq-proto = { version = "=1.4.0", default-features = false, features = ["rustls", "aws-lc-rs"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs"] }
+bytes.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+pulsebeam-rtc = { path = "../pulsebeam-rtc" }
+str0m = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd4246d9e7faf0ad4ca099c1bc", default-features = false, features = ["aws-lc-rs"] }
+pulsebeam-dtls = { path = "../pulsebeam-dtls", features = ["test-utils"] }

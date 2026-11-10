@@ -16,7 +16,9 @@ use crate::shard::worker::ShardFrame;
 mod tests;
 
 const WORK: usize = 64;
-const INBOUND: usize = 64;
+const BATCH: usize = 64;
+const PER_PEER_INBOUND: usize = BATCH;
+const INBOUND: usize = PEERS * PER_PEER_INBOUND;
 pub(crate) const PEERS: usize = 64;
 const DATAGRAM: usize = 1200;
 
@@ -38,6 +40,7 @@ pub(crate) struct Install {
 struct Peer {
     id: NetworkId,
     driver: NetworkDriver<ShardFrame>,
+    queued_input: usize,
 }
 
 struct Pending {
@@ -79,6 +82,43 @@ fn remember_closed(history: &mut VecDeque<super::PeerHealth>, health: super::Pee
         history.pop_front();
     }
     history.push_back(health);
+}
+
+fn drain_pending(
+    pending: &mut VecDeque<Pending>,
+    peers: &mut HashMap<SocketAddr, Peer>,
+    closed: &mut VecDeque<super::PeerHealth>,
+) {
+    for _ in 0..pending.len().min(WORK) {
+        let Some(packet) = pending.pop_front() else {
+            break;
+        };
+        let result = packet.receive(peers);
+        if matches!(result, Some(Err(pulsebeam_link::io::Error::Busy))) {
+            pending.push_back(packet);
+            continue;
+        }
+        if let Some(peer) = peers
+            .get_mut(&packet.source)
+            .filter(|peer| peer.id == packet.peer)
+        {
+            peer.queued_input = peer.queued_input.saturating_sub(1);
+        }
+        if let Some(Err(error)) = result
+            && let Some(mut peer) = peers.remove(&packet.source)
+        {
+            peer.driver.close();
+            remember_closed(
+                closed,
+                super::PeerHealth {
+                    peer: peer.id,
+                    endpoint: packet.source,
+                    transport: peer.driver.health(),
+                    failure: Some(error),
+                },
+            );
+        }
+    }
 }
 
 impl Host {
@@ -167,6 +207,7 @@ impl Host {
                                 Peer {
                                     id: install.id,
                                     driver: install.driver,
+                                    queued_input: 0,
                                 },
                             );
                         }
@@ -190,42 +231,21 @@ impl Host {
             }
         }
 
-        for _ in 0..WORK {
-            let Some(packet) = self.pending.front() else {
-                break;
-            };
-            let result = packet.receive(&mut self.peers);
-            if matches!(result, Some(Err(pulsebeam_link::io::Error::Busy))) {
-                break;
-            }
-            if let Some(Err(error)) = result {
-                if let Some(mut peer) = self.peers.remove(&packet.source) {
-                    peer.driver.close();
-                    remember_closed(
-                        &mut self.closed,
-                        super::PeerHealth {
-                            peer: peer.id,
-                            endpoint: packet.source,
-                            transport: peer.driver.health(),
-                            failure: Some(error),
-                        },
-                    );
-                }
-            }
-            self.pending.pop_front();
-        }
-        // Finish processing the retained batch before reading another. Copies
-        // release the receive arena so DTLS output can use this same socket.
-        if self.pending.is_empty() {
+        drain_pending(&mut self.pending, &mut self.peers, &mut self.closed);
+        // Keep reading other peers even when one peer retains blocked input.
+        {
             let origin = self.origin;
             match self.socket.try_recv_batch() {
                 Ok(batch) => {
                     let mut packets = batch.iter();
-                    for packet in packets.by_ref().take(INBOUND) {
-                        let Some(peer) = self.peers.get(&packet.source) else {
+                    for packet in packets.by_ref().take(BATCH) {
+                        let Some(peer) = self.peers.get_mut(&packet.source) else {
                             continue;
                         };
-                        if self.pending.len() == INBOUND || packet.payload.len() > DATAGRAM {
+                        if self.pending.len() == INBOUND
+                            || packet.payload.len() > DATAGRAM
+                            || peer.queued_input == PER_PEER_INBOUND
+                        {
                             self.overflow = self.overflow.saturating_add(1);
                             continue;
                         }
@@ -235,6 +255,7 @@ impl Host {
                             continue;
                         };
                         destination.copy_from_slice(packet.payload);
+                        peer.queued_input = peer.queued_input.saturating_add(1);
                         self.pending.push_back(Pending {
                             peer: peer.id,
                             source: packet.source,
@@ -286,7 +307,11 @@ impl Host {
     }
 
     async fn ready(&mut self) -> std::io::Result<()> {
-        if !self.pending.is_empty() {
+        if self.pending.iter().any(|packet| {
+            self.peers
+                .get(&packet.source)
+                .is_none_or(|peer| peer.id != packet.peer || peer.driver.input_ready())
+        }) {
             return Ok(());
         }
         let deadline = self

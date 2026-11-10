@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::time::SystemTime;
 
 pub mod io;
 mod network;
@@ -12,6 +11,9 @@ mod wire;
 pub use network::{
     CodecError, LinkError, NetworkClass, NetworkId, NetworkPeer, NodeRouteKey, PeerFingerprint,
     PeerRole, SecretCredential, WireCodec,
+};
+pub use pulsebeam_transport::{
+    PeerConfig, QuicCredential, QuicPeer, QuicTuning, ReceiveTime, Time as LinkTime,
 };
 
 // Only provisioning writes these independent lifecycle words. Packet paths read
@@ -31,25 +33,6 @@ use lifecycle::{Fence, Ordering, Shared};
 const QUEUE_CAPACITY: NonZeroUsize = const { NonZeroUsize::new(1024).unwrap() };
 const MAX_BINDINGS: usize = 65_536;
 const MAX_PORTS: usize = 256;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LinkTime(u64);
-
-impl LinkTime {
-    pub const fn from_nanos(ticks: u64) -> Self {
-        Self(ticks)
-    }
-
-    pub const fn as_nanos(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceiveTime {
-    pub monotonic: LinkTime,
-    pub wall: Option<SystemTime>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeliveryTag(u64);
@@ -484,5 +467,3 @@ impl<P> LinkRx<P> {
 mod network_tests;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod wire_tests;

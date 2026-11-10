@@ -10,6 +10,7 @@ use super::*;
 use futures_lite::future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::SystemTime;
 
 fn fixture<P>() -> (LinkControl<P>, Arc<AtomicU64>) {
     let ticks = Arc::new(AtomicU64::new(1));

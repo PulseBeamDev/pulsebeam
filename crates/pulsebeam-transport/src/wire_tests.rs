@@ -12,15 +12,16 @@ use pulsebeam_feedback::{PacketId, ReceiverTime};
 #[test]
 fn data_framing_preserves_opaque_payload_and_rejects_truncated_headers() {
     let mut bytes = [0u8; DATA_HEADER + 3];
-    data_header(&mut bytes, 0x01020304, u32::MAX).unwrap();
+    data_header(&mut bytes, [1, 2, 3, 4], u32::MAX).unwrap();
     bytes[DATA_HEADER..].copy_from_slice(&[9, 8, 7]);
+    assert_eq!(bytes, [1, 0, 1, 2, 3, 4, 255, 255, 255, 255, 9, 8, 7]);
     for length in 0..DATA_HEADER {
         assert!(decode(&bytes[..length]).is_err());
     }
     assert!(matches!(
         decode(&bytes),
         Ok(Frame::Data {
-            route: 0x01020304,
+            context: [1, 2, 3, 4],
             attempt: u32::MAX,
             payload: [9, 8, 7]
         })
@@ -31,7 +32,7 @@ fn data_framing_preserves_opaque_payload_and_rejects_truncated_headers() {
     bytes[1] = 255;
     assert!(decode(&bytes).is_err());
     let mut oversize = vec![0u8; DATA_HEADER + PAYLOAD_BUDGET + 1];
-    data_header(&mut oversize, 1, 1).unwrap();
+    data_header(&mut oversize, [0, 0, 0, 1], 1).unwrap();
     assert!(decode(&oversize).is_err());
 }
 
@@ -42,6 +43,13 @@ fn feedback_preserves_received_and_missing_statuses_with_exact_bounded_lengths()
     let first = encode_status(&mut bytes[header..], Some(42)).unwrap();
     let second = encode_status(&mut bytes[header + first..], None).unwrap();
     let length = header + first + second;
+    assert_eq!(
+        &bytes[..length],
+        &[
+            1, 1, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 13, 0, 2, 1, 0, 0, 0, 0, 0,
+            0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]
+    );
     let Ok(Frame::Feedback {
         base,
         generation,

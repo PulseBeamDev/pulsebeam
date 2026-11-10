@@ -24,42 +24,21 @@ impl NodeRouteKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PeerFingerprint([u8; 32]);
-
-impl PeerFingerprint {
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-    pub const fn to_bytes(self) -> [u8; 32] {
-        self.0
-    }
-}
+pub use pulsebeam_transport::{NetworkClass, PeerFingerprint, PeerRole};
 
 #[derive(Clone)]
-pub struct SecretCredential(Shared<pulsebeam_dtls::LocalIdentity>);
+pub struct SecretCredential(pulsebeam_transport::Credential);
 
 impl SecretCredential {
     pub fn generate() -> Result<Self, LinkError> {
-        pulsebeam_dtls::LocalIdentity::generate()
-            .map(|identity| Self(Shared::new(identity)))
+        pulsebeam_transport::Credential::generate()
+            .map(Self)
             .map_err(|_| LinkError::Security)
     }
 
     pub fn fingerprint(&self) -> PeerFingerprint {
-        PeerFingerprint(self.0.fingerprint().to_bytes())
+        self.0.fingerprint()
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum NetworkClass {
-    Lan,
-    Wan,
-}
-#[derive(Clone, Copy, Debug)]
-pub enum PeerRole {
-    Initiator,
-    Responder,
 }
 
 pub struct NetworkPeer {
@@ -71,48 +50,26 @@ pub struct NetworkPeer {
 }
 
 impl NetworkPeer {
-    #[cfg(test)]
-    pub(crate) fn association_with_test_key_limit(
-        &self,
-        now: std::time::Instant,
-        limit: u64,
-    ) -> Result<pulsebeam_dtls::Association, LinkError> {
-        let role = match self.role {
-            PeerRole::Initiator => pulsebeam_dtls::Role::Client,
-            PeerRole::Responder => pulsebeam_dtls::Role::Server,
-        };
-        pulsebeam_dtls::Association::with_test_key_limit(
-            role,
-            &self.credential.0,
-            pulsebeam_dtls::Fingerprint::from_bytes(self.expected_peer.0),
-            wire::UDP_BUDGET,
-            now,
-            limit,
-        )
-        .map_err(|_| LinkError::Security)
+    pub(crate) fn into_transport(self) -> pulsebeam_transport::Peer {
+        pulsebeam_transport::Peer {
+            endpoint: self.endpoint,
+            credential: self.credential.0,
+            expected_peer: self.expected_peer,
+            role: self.role,
+            class: self.class,
+        }
     }
+}
 
-    pub(crate) fn association(
-        &self,
-        now: std::time::Instant,
-    ) -> Result<pulsebeam_dtls::Association, LinkError> {
-        let role = match self.role {
-            PeerRole::Initiator => pulsebeam_dtls::Role::Client,
-            PeerRole::Responder => pulsebeam_dtls::Role::Server,
-        };
-        pulsebeam_dtls::Association::new(
-            role,
-            &self.credential.0,
-            pulsebeam_dtls::Fingerprint::from_bytes(self.expected_peer.0),
-            wire::UDP_BUDGET,
-            now,
-        )
-        .map_err(|_| LinkError::Security)
+impl From<NetworkPeer> for pulsebeam_transport::PeerConfig {
+    fn from(peer: NetworkPeer) -> Self {
+        peer.into_transport().into()
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkError {
+    UnsupportedProfile,
     Capacity,
     Security,
     Closed,
@@ -240,18 +197,19 @@ impl<P> NetworkTx<P> {
 impl<P: Clone + Send + 'static> LinkControl<P> {
     pub fn open_network<C: WireCodec<P> + 'static>(
         &mut self,
-        peer: NetworkPeer,
+        peer: impl Into<pulsebeam_transport::PeerConfig>,
         codec: C,
     ) -> Result<NetworkId, LinkError> {
+        let peer = peer.into();
         if self.networks.len() >= MAX_PORTS {
             return Err(LinkError::Capacity);
         }
         if self.networks.values().any(|entry| {
-            entry.peer == peer.expected_peer && entry.state.load(Ordering::Acquire) != CLOSED
+            entry.peer == peer.expected_peer() && entry.state.load(Ordering::Acquire) != CLOSED
         }) {
             return Err(LinkError::AlreadyOpen);
         }
-        let expected_peer = peer.expected_peer;
+        let expected_peer = peer.expected_peer();
         let serial = self
             .next_network
             .checked_add(1)

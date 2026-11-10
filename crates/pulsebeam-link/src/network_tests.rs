@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug)]
 enum Packet {
@@ -55,12 +55,13 @@ struct Pair {
     aout: VecDeque<Vec<u8>>,
     bout: VecDeque<Vec<u8>>,
     ticks: Arc<AtomicU64>,
-    a_credential: SecretCredential,
-    b_credential: SecretCredential,
+    a_peer: PeerConfig,
+    b_peer: PeerConfig,
     a_epochs: [bool; 4],
     reject_a: bool,
     short_a: bool,
     drop_b: bool,
+    budget: usize,
 }
 
 impl Pair {
@@ -69,39 +70,68 @@ impl Pair {
     }
 
     fn with_key_limit(key_limit: Option<u64>) -> Self {
+        Self::configured(key_limit, false)
+    }
+
+    fn with_backend(quic: bool) -> Self {
+        Self::configured(None, quic)
+    }
+
+    fn configured(key_limit: Option<u64>, quic: bool) -> Self {
         let ticks = Arc::new(AtomicU64::new(0));
         let clock = ticks.clone();
         let mut a = LinkControl::new(move || LinkTime(clock.load(Ordering::Relaxed))).unwrap();
         let clock = ticks.clone();
         let mut b = LinkControl::new(move || LinkTime(clock.load(Ordering::Relaxed))).unwrap();
-        let ca = SecretCredential::generate().unwrap();
-        let cb = SecretCredential::generate().unwrap();
         let aa = "127.0.0.1:4000".parse().unwrap();
         let ba = "127.0.0.1:4001".parse().unwrap();
-        let aid = a
-            .open_network(
+        let (a_peer, b_peer): (PeerConfig, PeerConfig) = if quic {
+            let ca = QuicCredential::generate().unwrap();
+            let cb = QuicCredential::generate().unwrap();
+            (
+                QuicPeer {
+                    endpoint: ba,
+                    credential: ca.clone(),
+                    expected_peer: cb.fingerprint(),
+                    role: PeerRole::Initiator,
+                    class: NetworkClass::Lan,
+                    tuning: QuicTuning::default(),
+                }
+                .into(),
+                QuicPeer {
+                    endpoint: aa,
+                    credential: cb,
+                    expected_peer: ca.fingerprint(),
+                    role: PeerRole::Responder,
+                    class: NetworkClass::Wan,
+                    tuning: QuicTuning::default(),
+                }
+                .into(),
+            )
+        } else {
+            let ca = SecretCredential::generate().unwrap();
+            let cb = SecretCredential::generate().unwrap();
+            (
                 NetworkPeer {
                     endpoint: ba,
                     credential: ca.clone(),
                     expected_peer: cb.fingerprint(),
                     role: PeerRole::Initiator,
                     class: NetworkClass::Lan,
-                },
-                Codec,
-            )
-            .unwrap();
-        let bid = b
-            .open_network(
+                }
+                .into(),
                 NetworkPeer {
                     endpoint: aa,
-                    credential: cb.clone(),
+                    credential: cb,
                     expected_peer: ca.fingerprint(),
                     role: PeerRole::Responder,
                     class: NetworkClass::Wan,
-                },
-                Codec,
+                }
+                .into(),
             )
-            .unwrap();
+        };
+        let aid = a.open_network(a_peer.clone(), Codec).unwrap();
+        let bid = b.open_network(b_peer.clone(), Codec).unwrap();
         let mut ad = a.take_network_driver(aid).unwrap();
         let mut bd = b.take_network_driver(bid).unwrap();
         if let Some(limit) = key_limit {
@@ -123,12 +153,13 @@ impl Pair {
             aout: VecDeque::new(),
             bout: VecDeque::new(),
             ticks,
-            a_credential: ca,
-            b_credential: cb,
+            a_peer,
+            b_peer,
             a_epochs: [false; 4],
             reject_a: false,
             short_a: false,
             drop_b: false,
+            budget: 256,
         }
     }
 
@@ -137,32 +168,8 @@ impl Pair {
         self.b.close_network(self.bid);
         self.aout.clear();
         self.bout.clear();
-        self.aid = self
-            .a
-            .open_network(
-                NetworkPeer {
-                    endpoint: self.ba,
-                    credential: self.a_credential.clone(),
-                    expected_peer: self.b_credential.fingerprint(),
-                    role: PeerRole::Initiator,
-                    class: NetworkClass::Lan,
-                },
-                Codec,
-            )
-            .unwrap();
-        self.bid = self
-            .b
-            .open_network(
-                NetworkPeer {
-                    endpoint: self.aa,
-                    credential: self.b_credential.clone(),
-                    expected_peer: self.a_credential.fingerprint(),
-                    role: PeerRole::Responder,
-                    class: NetworkClass::Wan,
-                },
-                Codec,
-            )
-            .unwrap();
+        self.aid = self.a.open_network(self.a_peer.clone(), Codec).unwrap();
+        self.bid = self.b.open_network(self.b_peer.clone(), Codec).unwrap();
         self.ad = self.a.take_network_driver(self.aid).unwrap();
         self.bd = self.b.take_network_driver(self.bid).unwrap();
         let now = LinkTime(self.ticks.load(Ordering::Relaxed));
@@ -173,7 +180,7 @@ impl Pair {
 
     fn poll_a(&mut self, now: LinkTime) {
         self.ad
-            .poll(now, 256, |datagram| {
+            .poll(now, self.budget, |datagram| {
                 assert_eq!(datagram.destination, self.ba);
                 assert!(datagram.payload.len() <= wire::UDP_BUDGET);
                 if self.reject_a {
@@ -201,7 +208,7 @@ impl Pair {
 
     fn poll_b(&mut self, now: LinkTime) {
         self.bd
-            .poll(now, 256, |datagram| {
+            .poll(now, self.budget, |datagram| {
                 assert_eq!(datagram.destination, self.aa);
                 assert!(datagram.payload.len() <= wire::UDP_BUDGET);
                 if !self.drop_b {
@@ -277,7 +284,13 @@ impl Pair {
 
 #[test]
 fn one_authenticated_wire_copy_fans_out_and_feedback_ignores_local_overload() {
-    let mut pair = Pair::new();
+    for quic in [false, true] {
+        one_authenticated_wire_copy_fans_out_and_feedback_ignores_local_overload_case(quic);
+    }
+}
+
+fn one_authenticated_wire_copy_fans_out_and_feedback_ignores_local_overload_case(quic: bool) {
+    let mut pair = Pair::with_backend(quic);
     assert_eq!(pair.ad.health().feedback_interval, Duration::from_millis(5));
     assert_eq!(
         pair.bd.health().feedback_interval,
@@ -334,6 +347,31 @@ fn one_authenticated_wire_copy_fans_out_and_feedback_ignores_local_overload() {
 }
 
 #[test]
+fn one_unit_poll_budgets_preserve_outbound_and_feedback_progress() {
+    for quic in [false, true] {
+        one_unit_poll_budgets_preserve_outbound_and_feedback_progress_case(quic);
+    }
+}
+
+fn one_unit_poll_budgets_preserve_outbound_and_feedback_progress_case(quic: bool) {
+    let mut pair = Pair::with_backend(quic);
+    let (port, mut rx) = pair.b.create_port().unwrap();
+    let (_, tx) = pair.route(&[(port, DeliveryTag(1))]);
+    pair.budget = 1;
+    pair.connect();
+    tx.try_send(Packet::Wire(Arc::from([42u8])), LinkTime(u64::MAX))
+        .unwrap();
+    for _ in 0..100 {
+        pair.step();
+    }
+    let mut batch = Vec::new();
+    assert_eq!(rx.try_recv_batch(&mut batch, 1), 1);
+    assert!(matches!(&batch[0].packet, Packet::Wire(bytes) if bytes.as_ref() == [42]));
+    assert_eq!(pair.ad.health().sent, 1);
+    assert_eq!(pair.ad.health().bytes_in_flight, 0);
+}
+
+#[test]
 fn rejected_udp_attempt_is_not_committed_and_stale_queued_work_is_fenced() {
     let mut pair = Pair::new();
     let (port, mut rx) = pair.b.create_port().unwrap();
@@ -386,7 +424,15 @@ fn rejected_udp_attempt_is_not_committed_and_stale_queued_work_is_fenced() {
 
 #[test]
 fn receive_retirement_fences_queued_payloads_without_withholding_transport_feedback() {
-    let mut pair = Pair::new();
+    for quic in [false, true] {
+        receive_retirement_fences_queued_payloads_without_withholding_transport_feedback_case(quic);
+    }
+}
+
+fn receive_retirement_fences_queued_payloads_without_withholding_transport_feedback_case(
+    quic: bool,
+) {
+    let mut pair = Pair::with_backend(quic);
     let (port, mut rx) = pair.b.create_port().unwrap();
     let (binding, key) = pair
         .b
@@ -470,7 +516,17 @@ fn automatic_key_updates_preserve_link_identity_and_flight_accounting() {
 
 #[test]
 fn association_replacement_reuses_pinned_identities_but_not_bindings_or_queued_packets() {
-    let mut pair = Pair::new();
+    for quic in [false, true] {
+        association_replacement_reuses_pinned_identities_but_not_bindings_or_queued_packets_case(
+            quic,
+        );
+    }
+}
+
+fn association_replacement_reuses_pinned_identities_but_not_bindings_or_queued_packets_case(
+    quic: bool,
+) {
+    let mut pair = Pair::with_backend(quic);
     let (port, mut rx) = pair.b.create_port().unwrap();
     let (_, key) = pair
         .b
@@ -532,7 +588,13 @@ fn association_replacement_reuses_pinned_identities_but_not_bindings_or_queued_p
 
 #[test]
 fn attempt_wrap_with_reordered_ciphertext_keeps_extended_feedback_identity() {
-    let mut pair = Pair::new();
+    for quic in [false, true] {
+        attempt_wrap_with_reordered_ciphertext_keeps_extended_feedback_identity_case(quic);
+    }
+}
+
+fn attempt_wrap_with_reordered_ciphertext_keeps_extended_feedback_identity_case(quic: bool) {
+    let mut pair = Pair::with_backend(quic);
     let (port, mut rx) = pair.b.create_port().unwrap();
     let (_, tx) = pair.route(&[(port, DeliveryTag(1))]);
     pair.connect();
@@ -550,8 +612,12 @@ fn attempt_wrap_with_reordered_ciphertext_keeps_extended_feedback_identity() {
         let now = LinkTime(pair.ticks.fetch_add(1_000_000, Ordering::Relaxed) + 1_000_000);
         pair.poll_a(now);
     }
-    assert_eq!(pair.aout.len(), 3);
-    pair.aout.swap(0, 2);
+    assert_eq!(pair.ad.health().sent, 3);
+    assert!(
+        pair.aout.len() >= 3,
+        "QUIC may additionally emit control packets"
+    );
+    pair.aout.make_contiguous().reverse();
     for _ in 0..100 {
         pair.step();
     }
@@ -566,7 +632,13 @@ fn attempt_wrap_with_reordered_ciphertext_keeps_extended_feedback_identity() {
 
 #[test]
 fn queued_expiry_and_lost_feedback_leave_no_unbounded_in_flight_state() {
-    let mut pair = Pair::new();
+    for quic in [false, true] {
+        queued_expiry_and_lost_feedback_leave_no_unbounded_in_flight_state_case(quic);
+    }
+}
+
+fn queued_expiry_and_lost_feedback_leave_no_unbounded_in_flight_state_case(quic: bool) {
+    let mut pair = Pair::with_backend(quic);
     let (port, mut rx) = pair.b.create_port().unwrap();
     let (_, tx) = pair.route(&[(port, DeliveryTag(1))]);
     pair.connect();
@@ -586,6 +658,27 @@ fn queued_expiry_and_lost_feedback_leave_no_unbounded_in_flight_state() {
     assert!(pair.ad.health().bytes_in_flight > 0);
     let mut batch = Vec::new();
     assert_eq!(rx.try_recv_batch(&mut batch, 10), 1);
+    if quic {
+        let now = LinkTime(
+            pair.ticks
+                .load(Ordering::Relaxed)
+                .saturating_add(2_500_000_000),
+        );
+        assert_eq!(
+            pair.ad.poll(now, 256, |_| io::SendOutcome::Rejected),
+            Err(io::Error::FeedbackUnavailable)
+        );
+        assert!(!pair.ad.health().ready);
+        assert_eq!(pair.ad.health().bytes_in_flight, 0);
+        assert!(matches!(
+            tx.try_send(Packet::Wire(Arc::from([3u8])), LinkTime(u64::MAX)),
+            Err(SendError {
+                kind: SendErrorKind::Closed,
+                ..
+            })
+        ));
+        return;
+    }
     for _ in 0..2500 {
         pair.step();
     }

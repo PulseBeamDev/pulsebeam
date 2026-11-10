@@ -17,6 +17,7 @@ members = [
   "crates/pulsebeam-runtime",
   "crates/pulsebeam-queue",
   "crates/pulsebeam-link",
+  "crates/pulsebeam-transport",
   "crates/pulsebeam-tcp",
   "crates/pulsebeam-udp",
   "crates/pulsebeam-simulator",

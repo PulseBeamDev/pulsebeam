@@ -88,8 +88,9 @@ impl Links {
 
     pub(super) fn open_peer(
         &mut self,
-        peer: pulsebeam_link::NetworkPeer,
+        peer: impl Into<pulsebeam_link::PeerConfig>,
     ) -> Result<pulsebeam_link::NetworkId, pulsebeam_link::LinkError> {
+        let peer = peer.into();
         let host = self
             .host
             .as_ref()
@@ -97,14 +98,14 @@ impl Links {
         if self
             .peers
             .values()
-            .any(|endpoint| *endpoint == peer.endpoint)
+            .any(|endpoint| *endpoint == peer.endpoint())
         {
             return Err(pulsebeam_link::LinkError::AlreadyOpen);
         }
         if self.peers.len() >= crate::link::host::PEERS {
             return Err(pulsebeam_link::LinkError::Capacity);
         }
-        let endpoint = peer.endpoint;
+        let endpoint = peer.endpoint();
         let id = self.control.open_network(
             peer,
             crate::link::ShardCodec {

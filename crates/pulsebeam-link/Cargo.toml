@@ -14,11 +14,9 @@ workspace = true
 
 [dependencies]
 pulsebeam-queue = { path = "../pulsebeam-queue" }
-pulsebeam-dtls = { path = "../pulsebeam-dtls" }
-pulsebeam-cc = { path = "../pulsebeam-cc" }
-pulsebeam-feedback = { path = "../pulsebeam-feedback" }
+pulsebeam-transport = { path = "../pulsebeam-transport" }
 
 futures-lite.workspace = true
 
 [dev-dependencies]
-pulsebeam-dtls = { path = "../pulsebeam-dtls", features = ["test-utils"] }
+pulsebeam-transport = { path = "../pulsebeam-transport", features = ["test-utils"] }
