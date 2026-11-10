@@ -1,8 +1,25 @@
 # pulsebeam-transport
 
-Authenticated, unreliable datagrams with swappable DTLS 1.3 and native Noq QUIC DATAGRAM backends. The host owns UDP, receive timestamps, time and scheduling. Transport owns protection, attempt identity, bounded feedback history, SCReAM and outer pacing. Link owns routing, application encoding, caller queues and local fanout.
+Caller-driven secure transport for native datagram services and WebRTC. The datagram service has swappable DTLS 1.3 and native Noq QUIC DATAGRAM backends. The host owns UDP, receive timestamps, time and scheduling. Transport owns protection, attempt identity, bounded feedback history, SCReAM and outer pacing. Link owns routing, application encoding, caller queues and local fanout.
 
 This implements the native datagram service from [RFC #290](https://github.com/PulseBeamDev/pulsebeam/issues/290). Noq is an unpatched, pinned `noq-proto` dependency. This is raw QUIC with a PulseBeam ALPN, not HTTP/3 or browser WebTransport.
+
+## Select a transport profile
+
+- The default `datagram` feature exposes the native application service described
+  below. It owns SCReAM, outer pacing and attempt feedback for both backends.
+- The opt-in `dtls-srtp` feature exposes `dtls_srtp::Transport`: ICE-selected
+  UDP/passive-TCP paths, authenticated DTLS, SRTP/SRTCP replay/protection and
+  bounded prepared outputs. Use `default-features = false` when only this profile
+  is needed. It does not pull in Noq or own SDP, SCTP associations, RTP routing,
+  RTCP feedback policy, congestion control or pacing. `pulsebeam-rtc` supplies
+  negotiated facts and retains those connection-level responsibilities.
+
+Both DTLS profiles use `pulsebeam-dtls::Association`. DTLS-SRTP prepares output
+only after caller admission succeeds, and returns exact protected bytes and
+identity/path metadata for the RTC send commit. It does not commit RTC flight
+history or decide when media should be sent. The datagram service's socket
+acceptance contract below is separate from RTC's commit-on-return contract.
 
 ## Drive a provisioned association
 
@@ -73,5 +90,10 @@ Run owner checks from the repository root:
 ```sh
 ./bazel test //crates/pulsebeam-transport:unit_tests //crates/pulsebeam-transport:shared_port_test //crates/pulsebeam-transport:format //crates/pulsebeam-transport:clippy //crates/pulsebeam-link:unit_tests
 ```
+
+Unit tests cover both features, including the moved ICE, SRTP/replay and
+prepared-output tests. The RTC owner retains the real history-admission proof
+and native media/channel interoperability tests. Bazel's `dtls_srtp` library
+builds the RTC-only profile without the datagram controller or Noq dependencies.
 
 The crate and native smoke are registered in `//:fast`; formatting and lint checks are in `//:check`. Deterministic tests exercise production engines with injected time. The single loopback smoke covers actual UDP/demux behavior without browser automation or sleeps. See the [contributor testing contract](../../docs/build.md#testing-contract).

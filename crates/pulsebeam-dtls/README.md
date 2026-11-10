@@ -1,8 +1,9 @@
 # PulseBeam DTLS
 
-Native, caller-driven authenticated datagrams using **dimpl 0.9.0, DTLS 1.3
-only, and AWS-LC only**. The public API has no protocol, provider or fallback
-selector. No sockets, runtime, CID migration or shared-PSK API are included.
+Native, caller-driven DTLS using **dimpl 0.9.0 and AWS-LC**. The default
+association provides pinned DTLS 1.3 datagrams. An explicit DTLS-SRTP profile
+supports WebRTC protection through the same authenticated engine. No sockets,
+runtime, CID migration, provider selection or shared-PSK API are included.
 
 ## Authenticate a peer
 
@@ -31,8 +32,23 @@ leaf certificate. `Output::Connected` and application sends/receives are gated
 on both handshake completion and the matching pin. A mismatch destroys the
 association. Reuse the local identity to keep its pin stable across associations;
 traffic state is independent. Identity generation uses AWS-LC-backed ECDSA P-256.
-Identities are in-memory only: process restart requires regenerating the identity
-and updating its provisioned pin. There is no persistence/import API.
+Generated identities are in-memory. `LocalIdentity::from_der` also imports a
+caller-owned DER certificate and matching P-256 PKCS#8 private key. The caller
+owns secure persistence and must supply a matching pair; the wrapper does not
+store keys externally or expose a private-key accessor.
+
+## Select the DTLS-SRTP profile
+
+`Association::new` remains DTLS 1.3-only and never exports SRTP keys.
+`Association::dtls_srtp` selects `SrtpVersion::Auto`, `Dtls12` or `Dtls13` for
+WebRTC. Auto prefers DTLS 1.3 with DTLS 1.2 compatibility. Its
+`Output::KeyingMaterial(material, profile)` is released only after both the
+handshake and expected certificate pin are verified. It is a purpose-specific
+DTLS-SRTP exporter, not a general TLS exporter API.
+
+The [transport DTLS-SRTP profile](../pulsebeam-transport/README.md#select-a-transport-profile)
+owns ICE-selected paths and SRTP/SRTCP protection. This crate owns neither ICE,
+SDP negotiation, SRTP packet state nor an SCTP association.
 
 ## Drive datagrams and time
 
@@ -41,6 +57,8 @@ After every operation, drain `poll_output(buffer)` until `Output::Timeout(at)`:
 - `Datagram(bytes)`: send to the association's selected peer path.
 - `ApplicationData(bytes)`: deliver one authenticated application datagram.
 - `Connected`: the authenticated association is ready for application traffic.
+- `KeyingMaterial(material, profile)`: install authenticated SRTP keys; emitted
+  only by the explicit DTLS-SRTP profile. Never log the material.
 - `Progress`: continue polling; there is no application-visible payload.
 - `BufferTooSmall { needed }`: enlarge the caller buffer and retry polling.
 - `Timeout(at)`: schedule the next wake-up.
@@ -71,8 +89,9 @@ configured queues; this is not a total pre-authentication memory qualification.
 
 Protocol errors are fatal and discard the engine. Pre-authentication send and
 backwards-time errors leave it intact. `close()` immediately discards
-local state; it does not guarantee peer notification. The wrapper exposes no
-traffic keys or SRTP keying material. Dimpl manages retransmissions, replay
+local state; it does not guarantee peer notification. `notify_close()` instead
+queues close-notify for the caller to drain before discarding state; this is not
+a delivery guarantee. There is no raw DTLS traffic-key API. Dimpl manages retransmissions, replay
 handling and automatic KeyUpdate using its default key-use limit; manual
 KeyUpdate is not exposed. This crate is not a production-security or high-rate
 performance qualification of the upstream engine.

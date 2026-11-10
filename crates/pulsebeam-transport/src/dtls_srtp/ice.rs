@@ -6,7 +6,6 @@ use is::{Candidate, IceAgent, IceAgentEvent, IceConnectionState, IceCreds};
 #[derive(Debug, PartialEq, Eq)]
 pub enum IceError {
     InvalidPacket,
-    InvalidState,
 }
 
 #[derive(Debug, PartialEq, Eq)]

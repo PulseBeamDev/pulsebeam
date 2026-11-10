@@ -21,7 +21,11 @@ The public Rust definitions in `src/lib.rs`, `src/rtp.rs`, `src/io.rs`, and
 RTC owns negotiation, ICE, DTLS, SRTP/SRTCP, RTP/RTCP, SCTP, packet feedback,
 congestion control, transport pacing, ordinary repair, timers, and mechanical
 resource limits. Each connection is `Send`, not `Sync`, with explicit protocol
-progress and owned outputs.
+progress and owned outputs. ICE paths, DTLS-SRTP protection/replay and bounded
+prepared outputs are supplied by [pulsebeam-transport](../pulsebeam-transport/README.md#select-a-transport-profile).
+Its DTLS engine is the shared `pulsebeam-dtls` association. RTC translates SDP
+facts into that profile and retains SCTP, feedback, pacing and send-history
+commit policy.
 
 The caller owns sockets and scheduling, routing and bandwidth allocation,
 source/layer selection, receiver sequence/timestamp translation, DD/frame
@@ -736,7 +740,9 @@ opaque values. See [extension ownership](docs/design.md#rtp-extension-ownership)
 ## Contributor verification
 
 The RTC owner suite includes controlled native libwebrtc peers, public boundary
-tests, and private protocol/congestion proofs. Its Linux x86_64 client uses the
+tests, and private protocol/congestion proofs. Low-level ICE, protection/replay
+and output-queue tests live in `//crates/pulsebeam-transport:unit_tests`; RTC
+retains the private history-admission integration proof. Its Linux x86_64 client uses the
 same pinned source build and tracked WebRTC patches as the native agent. Bazel
 acquires and builds the SDK; follow the [host prerequisites](../../docs/build.md#host-prerequisites)
 and [SDK build ownership](../pulsebeam-libwebrtc-sys/README.md#build-ownership-and-caching).

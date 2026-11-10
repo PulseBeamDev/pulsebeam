@@ -13,11 +13,130 @@ fn test_start() -> Instant {
     Instant::now()
 }
 
+#[test]
+fn dtls_srtp_exports_only_after_mutual_pinned_authentication() -> Result<(), Error> {
+    for version in [SrtpVersion::Dtls12, SrtpVersion::Dtls13] {
+        for (wrong_client, wrong_server) in [(false, false), (true, false), (false, true)] {
+            let client_identity = LocalIdentity::generate()?;
+            let server_identity = LocalIdentity::generate()?;
+            let mut now = test_start();
+            let mut client = Association::dtls_srtp(
+                Role::Client,
+                &client_identity,
+                if wrong_server {
+                    client_identity.fingerprint()
+                } else {
+                    server_identity.fingerprint()
+                },
+                1200,
+                now,
+                SrtpVersion::Auto,
+            )?;
+            let mut server = Association::dtls_srtp(
+                Role::Server,
+                &server_identity,
+                if wrong_client {
+                    server_identity.fingerprint()
+                } else {
+                    client_identity.fingerprint()
+                },
+                1200,
+                now,
+                version,
+            )?;
+            let mut client_trace = Trace::default();
+            let mut server_trace = Trace::default();
+            advance(
+                &mut client,
+                &mut server,
+                &mut client_trace,
+                &mut server_trace,
+                now,
+            )?;
+            let result = drive(
+                &mut client,
+                &mut server,
+                &mut client_trace,
+                &mut server_trace,
+                &mut now,
+            );
+            if wrong_client || wrong_server {
+                assert!(matches!(result, Err(Error::PeerMismatch)));
+                let (rejected, trace) = if wrong_client {
+                    (&server, &server_trace)
+                } else {
+                    (&client, &client_trace)
+                };
+                assert!(!rejected.is_connected());
+                assert_eq!(trace.connected, 0);
+                assert!(trace.material.is_none());
+                continue;
+            }
+            result?;
+            let (client_keys, client_profile) = client_trace
+                .material
+                .take()
+                .expect("authenticated client exporter");
+            let (server_keys, server_profile) = server_trace
+                .material
+                .take()
+                .expect("authenticated server exporter");
+            assert_eq!(&*client_keys, &*server_keys);
+            assert_eq!(client_profile, server_profile);
+            assert_eq!(client.negotiated_srtp_profile(), Some(client_profile));
+            assert_eq!(
+                client.protocol_version(),
+                Some(match version {
+                    SrtpVersion::Dtls12 => ProtocolVersion::DTLS1_2,
+                    _ => ProtocolVersion::DTLS1_3,
+                })
+            );
+            client.send_application_data(b"SCTP payload")?;
+            deliver(
+                &mut client,
+                &mut server,
+                &mut client_trace,
+                &mut server_trace,
+            )?;
+            assert_eq!(server_trace.application, [b"SCTP payload".to_vec()]);
+            client.shutdown()?;
+            deliver(
+                &mut client,
+                &mut server,
+                &mut client_trace,
+                &mut server_trace,
+            )?;
+            assert!(!server.is_connected());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn imported_identity_preserves_the_public_pin_and_rejects_invalid_keys() -> Result<(), Error> {
+    let generated = LocalIdentity::generate()?;
+    let imported = LocalIdentity::from_der(
+        generated.certificate_der().to_vec(),
+        generated.0.private_key.clone(),
+    )?;
+    assert_eq!(imported.fingerprint(), generated.fingerprint());
+    assert!(matches!(
+        LocalIdentity::from_der(Vec::new(), Vec::new()),
+        Err(Error::InvalidIdentity)
+    ));
+    assert!(matches!(
+        LocalIdentity::from_der(vec![1], vec![1]),
+        Err(Error::InvalidIdentity)
+    ));
+    Ok(())
+}
+
 #[derive(Default)]
 struct Trace {
     packets: Vec<Vec<u8>>,
     application: Vec<Vec<u8>>,
     connected: usize,
+    material: Option<(KeyingMaterial, SrtpProfile)>,
     application_records: usize,
     control_packets: usize,
     wake: Option<Instant>,
@@ -35,6 +154,12 @@ fn drain(association: &mut Association, trace: &mut Trace) -> Result<(), Error> 
             }
             Output::ApplicationData(bytes) => trace.application.push(bytes.to_vec()),
             Output::Connected => trace.connected += 1,
+            Output::KeyingMaterial(material, profile) => {
+                assert!(association.is_connected());
+                assert_eq!(trace.connected, 1);
+                assert!(trace.material.is_none());
+                trace.material = Some((material, profile));
+            }
             Output::Timeout(at) => {
                 trace.wake = Some(at);
                 return Ok(());

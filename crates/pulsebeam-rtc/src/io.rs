@@ -7,63 +7,13 @@ use crate::{
     DataChannelConfig, DataChannelId, DataChannelPriority, DataMessage, DataReliability, MediaKind,
     MediaPayloadBitrate, RtpPacket, RtpWrite, SenderReport,
 };
-use bytes::Bytes;
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EcnCodepoint {
-    NotEct,
-    Ect0,
-    Ect1,
-    Ce,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NetworkInput {
-    Udp {
-        local: SocketAddr,
-        remote: SocketAddr,
-        ecn: Option<EcnCodepoint>,
-        payload: Bytes,
-    },
-    /// One complete RFC4571 frame. The caller filters retired socket incarnations.
-    IceTcp {
-        local: SocketAddr,
-        remote: SocketAddr,
-        frame: Bytes,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TransmitTarget {
-    Udp {
-        local: SocketAddr,
-        remote: SocketAddr,
-        ecn: Option<EcnCodepoint>,
-    },
-    /// Bytes belong to the currently selected socket at this tuple and must not
-    /// be redirected to a replacement stream after partial writes.
-    IceTcp {
-        local: SocketAddr,
-        remote: SocketAddr,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NetworkProtocol {
-    Udp,
-    IceTcp,
-}
-
-/// A tuple authenticated by ICE, attributed to the input that proved it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AuthenticatedPath {
-    pub protocol: NetworkProtocol,
-    pub local: SocketAddr,
-    pub remote: SocketAddr,
-    pub arrival: Instant,
-}
+pub use pulsebeam_transport::dtls_srtp::{
+    AuthenticatedPath, EcnCodepoint, NetworkInput, NetworkProtocol, Transmit, TransmitKind,
+    TransmitTarget,
+};
 
 /// Authenticated SR/RR reception progress for a negotiated primary sender.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,21 +23,6 @@ pub struct ReceiverReport {
     pub arrival: Instant,
     /// RFC 3550 extended highest sequence, modulo 2^32. Not a local send counter.
     pub extended_highest_sequence: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransmitKind {
-    Original { ssrc: u32 },
-    Repair { ssrc: u32 },
-    Padding { ssrc: u32 },
-    Control,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Transmit {
-    pub kind: TransmitKind,
-    pub target: TransmitTarget,
-    pub payload: Bytes,
 }
 
 #[derive(Debug, Error)]

@@ -5,7 +5,7 @@ use str0m::crypto::dtls::{KeyingMaterial, SrtpProfile};
 use str0m::rtp::RtpHeader;
 use str0m::rtp_::{SrtpContext, extend_u16};
 
-use crate::packet::RtpPacket;
+use super::packet::RtpPacket;
 
 const MAX_RTP_EXTENSION_BYTES: usize = 16 * 1024;
 const SRTCP_INDEX_MASK: u64 = 0x7fff_ffff;
@@ -220,16 +220,16 @@ pub(crate) const RTP_REPLAY_STATE_BYTES: usize = std::mem::size_of::<(u32, RtpRe
 pub(crate) const RTCP_REPLAY_STATE_BYTES: usize = std::mem::size_of::<(u32, ReplayWindow)>();
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ReplayLimits {
-    pub(crate) rtp_bytes: usize,
-    pub(crate) rtcp_bytes: usize,
+pub struct ReplayLimits {
+    pub rtp_bytes: usize,
+    pub rtcp_bytes: usize,
 }
 
 impl Default for ReplayLimits {
     fn default() -> Self {
         Self {
-            rtp_bytes: crate::ConnectionLimits::DEFAULT_MAX_RTP_REPLAY_STATE_BYTES,
-            rtcp_bytes: crate::ConnectionLimits::DEFAULT_MAX_RTCP_REPLAY_STATE_BYTES,
+            rtp_bytes: super::DEFAULT_MAX_RTP_REPLAY_STATE_BYTES,
+            rtcp_bytes: super::DEFAULT_MAX_RTCP_REPLAY_STATE_BYTES,
         }
     }
 }

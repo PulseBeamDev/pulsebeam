@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
+use super::Reservation;
 use super::SelectedPath;
-use crate::event_buffer::Reservation;
 
 type Packet = (SelectedPath, Vec<u8>);
 

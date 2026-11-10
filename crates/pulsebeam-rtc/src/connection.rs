@@ -1065,7 +1065,7 @@ impl RtcConnection {
         let mut entropy = EntropyConsumer::new(entropy);
         let negotiated = negotiation::negotiate(&config, &offer, at, &mut entropy)?;
         let session = negotiated.session;
-        let transport = Transport::from_session(&negotiated.facts, config.limits, at)
+        let transport = crate::transport::from_session(&negotiated.facts, config.limits, at)
             .map_err(|_| AcceptError::CryptographicFailure)?;
         let ingress_media = negotiated.facts.ingress_media();
         let egress_senders = negotiated.facts.egress_senders();
@@ -1827,6 +1827,84 @@ mod tests {
         );
         assert!(fixture.connection.stats().connection.transmitted_rtp_bytes > 0);
     }
+    #[test]
+    fn secure_transport_history_admission_precedes_crypto_commit() {
+        use crate::TransmitKind;
+
+        let mut fixture = PeerFixture::connected();
+        fixture.drive_for(Duration::from_millis(5));
+        let now = fixture.at();
+        let epoch = fixture
+            .connection
+            .commit
+            .history
+            .test_active_epoch()
+            .unwrap();
+        let left = &mut fixture.connection.transport;
+        assert!(left.poll_prepared().is_none());
+        let original = [0x80, 111, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7, 0x55];
+        let probe = SentHistory::new(PacketFeedbackKind::Rfc8888, now);
+        let fixed_bytes = probe.assert_storage();
+        drop(probe);
+        let mut blocked =
+            SentHistory::with_limit(PacketFeedbackKind::Rfc8888, fixed_bytes, now).unwrap();
+        blocked.path_changed(epoch, true);
+        let context = |rtp, epoch, wire_len| TransmitCommitContext {
+            at: now,
+            kind: DatagramKind::Rtp,
+            wire_len,
+            path_epoch: Some(epoch),
+            rtp: Some(rtp),
+        };
+        assert_eq!(
+            left.send_rtp_with_info(
+                &original,
+                0,
+                TransmitKind::Original { ssrc: 7 },
+                None,
+                &mut |rtp, epoch, bytes| blocked
+                    .prepare_commit(context(rtp, epoch, bytes))
+                    .map_err(|_| TransportError::Admission),
+            ),
+            Err(TransportError::Admission)
+        );
+        assert_eq!(blocked.assert_storage(), fixed_bytes);
+        assert!(left.poll_prepared().is_none());
+        drop(blocked);
+        let mut history = SentHistory::new(PacketFeedbackKind::Rfc8888, now);
+        history.path_changed(epoch, true);
+        let mut admitted_context = None;
+        left.send_rtp_with_info(
+            &original,
+            0,
+            TransmitKind::Original { ssrc: 7 },
+            None,
+            &mut |rtp, epoch, bytes| {
+                let context = context(rtp, epoch, bytes);
+                history
+                    .prepare_commit(context)
+                    .map_err(|_| TransportError::Admission)?;
+                admitted_context = Some(context);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let prepared = left.poll_prepared().unwrap();
+        assert_eq!(prepared.rtp.unwrap().index, 0);
+        let admitted_context = admitted_context.unwrap();
+        assert_eq!(admitted_context.rtp, prepared.rtp);
+        assert_eq!(admitted_context.path_epoch, prepared.path_epoch);
+        assert_eq!(admitted_context.wire_len, prepared.wire_len);
+        history.preflight_commit(admitted_context).unwrap();
+        let prepared_bytes = history.assert_storage();
+        history.commit_preflighted(admitted_context).unwrap();
+        assert_eq!(history.assert_storage(), prepared_bytes);
+        assert_eq!(
+            history.controller_inputs().bytes_in_flight,
+            prepared.wire_len as u64
+        );
+    }
+
     #[test]
     fn poll_observes_committed_flight_before_batched_ack_retirement() {
         for kind in [

@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 use std::ops::RangeInclusive;
 use std::time::Instant;
 
-use str0m::crypto::dtls::{
-    DtlsCert, DtlsOutput, DtlsVersion, KeyingMaterial, ProtocolVersion, SrtpProfile,
-};
+use pulsebeam_dtls::{Association, LocalIdentity, Output, Role, SrtpVersion};
+#[cfg(test)]
+use str0m::crypto::dtls::ProtocolVersion;
+use str0m::crypto::dtls::{DtlsCert, DtlsVersion, KeyingMaterial, SrtpProfile};
 use str0m::crypto::{CryptoProvider, Fingerprint};
 
 const DTLS_MTU: RangeInclusive<usize> = 1200..=1500;
@@ -28,10 +29,10 @@ pub enum DtlsEvent {
     CloseNotify,
 }
 
+// Bounded transport output ownership only; all DTLS/authentication policy lives
+// in pulsebeam-dtls, including the SRTP exporter authentication gate.
 pub(crate) struct DtlsLayer {
-    instance: Box<dyn str0m::crypto::dtls::DtlsInstance>,
-    remote_fingerprint: Fingerprint,
-    negotiated_profile: Option<SrtpProfile>,
+    instance: Association,
     connected: bool,
     closing: bool,
     closed: bool,
@@ -64,21 +65,37 @@ impl DtlsLayer {
         remote_fingerprint: Fingerprint,
         active: bool,
         now: Instant,
-        provider: &CryptoProvider,
+        _provider: &CryptoProvider,
         version: DtlsVersion,
     ) -> Result<Self, DtlsError> {
-        let mut instance = provider
-            .dtls_provider
-            .new_dtls(&certificate, now, version, Some(*DTLS_MTU.start()))
-            .map_err(|_| DtlsError::Crypto)?;
-        instance.set_active(active);
-        instance
-            .handle_timeout(now)
-            .map_err(|_| DtlsError::Crypto)?;
+        if remote_fingerprint.hash_func != "sha-256" {
+            return Err(DtlsError::InvalidState);
+        }
+        let pin = remote_fingerprint
+            .bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| DtlsError::InvalidState)?;
+        let local = LocalIdentity::from_der(certificate.certificate, certificate.private_key)
+            .map_err(map_error)?;
+        let version = match version {
+            DtlsVersion::Auto => SrtpVersion::Auto,
+            DtlsVersion::Dtls12 => SrtpVersion::Dtls12,
+            DtlsVersion::Dtls13 => SrtpVersion::Dtls13,
+            _ => return Err(DtlsError::InvalidState),
+        };
+        let mut instance = Association::dtls_srtp(
+            if active { Role::Client } else { Role::Server },
+            &local,
+            pulsebeam_dtls::Fingerprint::from_bytes(pin),
+            *DTLS_MTU.start(),
+            now,
+            version,
+        )
+        .map_err(map_error)?;
+        instance.handle_timeout(now).map_err(map_error)?;
         let mut layer = Self {
             instance,
-            remote_fingerprint,
-            negotiated_profile: None,
             connected: false,
             closing: false,
             closed: false,
@@ -87,65 +104,66 @@ impl DtlsLayer {
             poll_buffer: vec![0; DTLS_POLL_BUFFER],
             next_deadline: None,
         };
-        layer.drive(now)?;
+        layer.drive()?;
         Ok(layer)
     }
 
     pub(crate) fn connected(&self) -> bool {
         self.connected
     }
-
+    #[cfg(test)]
     pub(crate) fn protocol_version(&self) -> Option<ProtocolVersion> {
-        self.instance.protocol_version()
+        self.instance
+            .protocol_version()
+            .and_then(|version| match version {
+                pulsebeam_dtls::ProtocolVersion::DTLS1_2 => Some(ProtocolVersion::DTLS1_2),
+                pulsebeam_dtls::ProtocolVersion::DTLS1_3 => Some(ProtocolVersion::DTLS1_3),
+                _ => None,
+            })
     }
-
+    #[cfg(test)]
     pub(crate) fn negotiated_profile(&self) -> Option<SrtpProfile> {
-        self.negotiated_profile
+        self.instance
+            .negotiated_srtp_profile()
+            .and_then(|profile| convert_profile(profile).ok())
     }
-
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.next_deadline
     }
-
+    fn tick(&mut self, now: Instant) -> Result<(), DtlsError> {
+        self.instance.handle_timeout(now).map_err(map_error)?;
+        self.drive()
+    }
     pub(crate) fn handle_packet(&mut self, packet: &[u8], now: Instant) -> Result<(), DtlsError> {
-        let Some(&content_type) = packet.first() else {
+        let Some(&kind) = packet.first() else {
             return Err(DtlsError::InvalidState);
         };
-        if self.closed || self.closing || packet.len() < 13 || !(20..=64).contains(&content_type) {
+        if self.closed || self.closing || packet.len() < 13 || !(20..=64).contains(&kind) {
             return Err(DtlsError::InvalidState);
         }
-        self.instance
-            .handle_packet(packet)
-            .map_err(|_| DtlsError::Crypto)?;
-        self.drive(now)
+        self.tick(now)?;
+        self.instance.handle_packet(packet).map_err(map_error)?;
+        self.drive()
     }
-
     pub(crate) fn handle_timeout(&mut self, now: Instant) -> Result<(), DtlsError> {
         if self.closed || self.closing {
             return Ok(());
         }
-        let Some(deadline) = self.next_deadline else {
-            return Err(DtlsError::InvalidState);
-        };
-        if now < deadline {
+        if self.next_deadline.is_none_or(|at| at > now) {
             return Err(DtlsError::InvalidState);
         }
-        self.instance
-            .handle_timeout(now)
-            .map_err(|_| DtlsError::Crypto)?;
-        self.drive(now)
+        self.tick(now)
     }
-
     pub(crate) fn close(&mut self, now: Instant) -> Result<(), DtlsError> {
         if self.closed {
             return Ok(());
         }
-        self.instance.close().map_err(|_| DtlsError::Crypto)?;
+        self.tick(now)?;
+        self.instance.shutdown().map_err(map_error)?;
         self.closing = true;
         self.next_deadline = None;
-        self.drive(now)
+        self.drive()
     }
-
     pub(crate) fn send_application_data(
         &mut self,
         data: &[u8],
@@ -154,111 +172,106 @@ impl DtlsLayer {
         if !self.connected || self.closing || self.closed {
             return Err(DtlsError::InvalidState);
         }
+        self.tick(now)?;
         self.instance
             .send_application_data(data)
-            .map_err(|_| DtlsError::Crypto)?;
-        self.drive(now)
+            .map_err(map_error)?;
+        self.drive()
     }
-
     pub(crate) fn poll_packet(&mut self) -> Option<Vec<u8>> {
-        let packet = self.packets.pop_front();
-        debug_assert!(self.packets.len() <= MAX_OUTPUT);
-        packet
+        self.packets.pop_front()
     }
-
     pub(crate) fn poll_event(&mut self) -> Option<DtlsEvent> {
         self.events.pop_front()
     }
-
     pub(crate) fn clear_pending(&mut self) {
         self.packets.clear();
         self.events.clear();
     }
 
-    fn drive(&mut self, now: Instant) -> Result<(), DtlsError> {
-        let mut poll_buffer = std::mem::take(&mut self.poll_buffer);
-        let result = self.drive_with_buffer(now, &mut poll_buffer);
-        self.poll_buffer = poll_buffer;
+    fn drive(&mut self) -> Result<(), DtlsError> {
+        let mut buffer = std::mem::take(&mut self.poll_buffer);
+        let result = self.drive_with_buffer(&mut buffer);
+        self.poll_buffer = buffer;
         result
     }
-
-    fn drive_with_buffer(
-        &mut self,
-        _now: Instant,
-        poll_buffer: &mut [u8],
-    ) -> Result<(), DtlsError> {
+    fn drive_with_buffer(&mut self, buffer: &mut [u8]) -> Result<(), DtlsError> {
         for _ in 0..MAX_OUTPUT {
-            let output = self.instance.poll_output(poll_buffer);
-            match output {
-                DtlsOutput::Packet(packet) => {
-                    let packet = packet.to_vec();
-                    self.enqueue_packet(&packet)?;
+            match self.instance.poll_output(buffer).map_err(map_error)? {
+                Output::Datagram(packet) => {
+                    if packet.is_empty()
+                        || packet.len() > *DTLS_MTU.end()
+                        || self.packets.len() >= MAX_OUTPUT
+                    {
+                        return Err(DtlsError::OutputFull);
+                    }
+                    self.packets.push_back(packet.to_vec());
                 }
-                DtlsOutput::BufferTooSmall { .. } => return Err(DtlsError::BufferTooSmall),
-                DtlsOutput::Timeout(deadline) => {
-                    self.next_deadline = (!self.connected && !self.closing).then_some(deadline);
+                Output::BufferTooSmall { .. } => return Err(DtlsError::BufferTooSmall),
+                Output::Timeout(at) => {
+                    self.next_deadline = (!self.connected && !self.closing).then_some(at);
                     return Ok(());
                 }
-                DtlsOutput::Connected => {
-                    if !self.connected {
-                        self.connected = true;
-                        self.enqueue_event(DtlsEvent::Connected)?;
-                    }
+                Output::Connected => {
+                    self.connected = true;
+                    self.enqueue_event(DtlsEvent::Connected)?;
                     self.next_deadline = None;
                 }
-                DtlsOutput::PeerCert(certificate) => {
-                    let provider = str0m::crypto::from_feature_flags();
-                    let actual = Fingerprint {
-                        hash_func: "sha-256".to_owned(),
-                        bytes: provider.sha256_provider.sha256(certificate).to_vec(),
-                    };
-                    if actual != self.remote_fingerprint {
-                        return Err(DtlsError::FingerprintMismatch);
-                    }
+                Output::KeyingMaterial(material, profile) => {
+                    let material = KeyingMaterial::new(&material);
+                    self.enqueue_event(DtlsEvent::KeyingMaterial(
+                        material,
+                        convert_profile(profile)?,
+                    ))?;
                 }
-                DtlsOutput::KeyingMaterial(material, profile) => {
-                    self.negotiated_profile = Some(profile);
-                    self.enqueue_event(DtlsEvent::KeyingMaterial(material, profile))?;
+                Output::ApplicationData(bytes) => {
+                    let bytes = bytes.to_vec();
+                    self.enqueue_event(DtlsEvent::ApplicationData(bytes))?;
                 }
-                DtlsOutput::ApplicationData(data) => {
-                    self.enqueue_event(DtlsEvent::ApplicationData(data.to_vec()))?;
-                }
-                DtlsOutput::CloseNotify => {
+                Output::Progress => {}
+                Output::Closed => {
+                    self.connected = false;
                     self.closing = true;
                     self.closed = true;
                     self.next_deadline = None;
                     self.enqueue_event(DtlsEvent::CloseNotify)?;
                     return Ok(());
                 }
-                _ => return Err(DtlsError::Crypto),
             }
         }
         Err(DtlsError::OutputFull)
     }
-
-    fn enqueue_packet(&mut self, packet: &[u8]) -> Result<(), DtlsError> {
-        if packet.is_empty() || packet.len() > *DTLS_MTU.end() || self.packets.len() >= MAX_OUTPUT {
-            return Err(DtlsError::OutputFull);
-        }
-        self.packets.push_back(packet.to_vec());
-        debug_assert!(self.packets.len() <= MAX_OUTPUT);
-        Ok(())
-    }
-
     fn enqueue_event(&mut self, event: DtlsEvent) -> Result<(), DtlsError> {
         if self.events.len() >= MAX_OUTPUT {
             return Err(DtlsError::OutputFull);
         }
         self.events.push_back(event);
-        debug_assert!(self.events.len() <= MAX_OUTPUT);
         Ok(())
     }
 }
 
+fn map_error(error: pulsebeam_dtls::Error) -> DtlsError {
+    match error {
+        pulsebeam_dtls::Error::PeerMismatch => DtlsError::FingerprintMismatch,
+        pulsebeam_dtls::Error::TimeWentBackwards
+        | pulsebeam_dtls::Error::NotConnected
+        | pulsebeam_dtls::Error::Closed => DtlsError::InvalidState,
+        _ => DtlsError::Crypto,
+    }
+}
+fn convert_profile(profile: pulsebeam_dtls::SrtpProfile) -> Result<SrtpProfile, DtlsError> {
+    Ok(match profile {
+        pulsebeam_dtls::SrtpProfile::AES128_CM_SHA1_80 => SrtpProfile::AES128_CM_SHA1_80,
+        pulsebeam_dtls::SrtpProfile::AEAD_AES_128_GCM => SrtpProfile::AEAD_AES_128_GCM,
+        pulsebeam_dtls::SrtpProfile::AEAD_AES_256_GCM => SrtpProfile::AEAD_AES_256_GCM,
+        _ => return Err(DtlsError::Crypto),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::srtp::SrtpLayer;
     use super::*;
-    use crate::transport::srtp::SrtpLayer;
 
     struct ConnectedPair {
         client: DtlsLayer,
@@ -267,6 +280,7 @@ mod tests {
         server_material: Option<KeyingMaterial>,
         profile: SrtpProfile,
         server_packets: Vec<Vec<u8>>,
+        now: Instant,
     }
 
     fn fingerprint(certificate: &DtlsCert, provider: &CryptoProvider) -> Fingerprint {
@@ -349,6 +363,7 @@ mod tests {
                     server_material,
                     profile: profile.expect("negotiated SRTP profile"),
                     server_packets,
+                    now,
                 };
             }
             if !progress {
@@ -435,7 +450,7 @@ mod tests {
             rtcp
         );
 
-        let now = Instant::now();
+        let now = pair.now;
         pair.client
             .send_application_data(b"data channel", now)
             .expect("send DTLS application data");

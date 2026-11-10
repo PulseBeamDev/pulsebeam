@@ -216,6 +216,7 @@ impl ReceiveStream {
 mod tests {
     use super::*;
     use crate::packet::RtcpCompound;
+    use crate::rtcp::RtcpPacketExt;
 
     #[test]
     fn reorder_repair_and_wrap_share_one_bounded_primary_history() {

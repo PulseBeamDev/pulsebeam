@@ -3996,10 +3996,10 @@ dependencies = [
  "dcsctp",
  "is 0.11.0 (git+https://github.com/algesten/str0m.git?rev=120401c9affd97fd4246d9e7faf0ad4ca099c1bc)",
  "p256",
- "proptest",
  "pulsebeam-cc",
  "pulsebeam-core",
  "pulsebeam-feedback",
+ "pulsebeam-transport",
  "rcgen",
  "sha2",
  "str0m 0.23.1",
@@ -4135,7 +4135,9 @@ name = "pulsebeam-transport"
 version = "0.3.2"
 dependencies = [
  "bytes",
+ "is 0.11.0 (git+https://github.com/algesten/str0m.git?rev=120401c9affd97fd4246d9e7faf0ad4ca099c1bc)",
  "noq-proto",
+ "proptest",
  "pulsebeam-cc",
  "pulsebeam-dtls",
  "pulsebeam-feedback",

@@ -496,6 +496,7 @@ impl Transport {
                     }
                 }
                 Output::Progress => {}
+                Output::KeyingMaterial(_, _) => return Err(Error::Security),
                 Output::BufferTooSmall { .. } => return Err(Error::Capacity),
                 Output::Closed => return Err(Error::Closed),
             }

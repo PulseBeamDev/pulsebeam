@@ -13,19 +13,25 @@ publish = false
 workspace = true
 
 [features]
+default = ["datagram"]
+datagram = ["dep:pulsebeam-cc", "dep:pulsebeam-feedback", "dep:noq-proto", "dep:rustls", "dep:rcgen", "dep:sha2"]
+dtls-srtp = ["dep:is", "dep:str0m"]
 test-utils = ["pulsebeam-dtls/test-utils"]
 
 [dependencies]
 pulsebeam-dtls = { path = "../pulsebeam-dtls" }
-pulsebeam-cc = { path = "../pulsebeam-cc" }
-pulsebeam-feedback = { path = "../pulsebeam-feedback" }
-noq-proto = { version = "=1.4.0", default-features = false, features = ["rustls", "aws-lc-rs"] }
-rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
-rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs"] }
+pulsebeam-cc = { path = "../pulsebeam-cc", optional = true }
+pulsebeam-feedback = { path = "../pulsebeam-feedback", optional = true }
+noq-proto = { version = "=1.4.0", default-features = false, features = ["rustls", "aws-lc-rs"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"], optional = true }
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs"], optional = true }
 bytes.workspace = true
-sha2.workspace = true
+sha2 = { workspace = true, optional = true }
+is = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd4246d9e7faf0ad4ca099c1bc", optional = true }
+str0m = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd4246d9e7faf0ad4ca099c1bc", default-features = false, features = ["aws-lc-rs"], optional = true }
 
 [dev-dependencies]
+proptest = "1.11.0"
 pulsebeam-rtc = { path = "../pulsebeam-rtc" }
 str0m = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd4246d9e7faf0ad4ca099c1bc", default-features = false, features = ["aws-lc-rs"] }
 pulsebeam-dtls = { path = "../pulsebeam-dtls", features = ["test-utils"] }

@@ -13,9 +13,12 @@ defines the private controller profile and quantitative proof.
 One `RtcConnection` owns one peer's initial negotiation, current RTP bindings and transport
 state: ICE, DTLS, SRTP/SRTCP, RTP/RTCP, SCTP, feedback, congestion control,
 pacing, ordinary retransmission, protocol timers, and mechanical resource
-bounds. Protocol progress is explicit and connection-local. There is no hidden
-transport task, cross-connection controller, global registry, or socket retry
-queue.
+bounds. Its ICE-selected paths, DTLS-SRTP protection/replay and bounded prepared
+outputs live in `pulsebeam-transport`'s `dtls-srtp` profile; DTLS uses the shared
+`pulsebeam-dtls` association. RTC passes negotiated facts into that profile and
+retains SDP, SCTP, RTP/RTCP policy, feedback, pacing and the irrevocable send commit.
+Protocol progress is explicit and connection-local. There is no hidden transport
+task, cross-connection controller, global registry, or socket retry queue.
 
 The caller owns routing, allocation, source/layer selection, receiver sequence
 and timestamp translation, frame/DD interpretation and rewriting, keyframe

@@ -393,9 +393,12 @@ impl ConnectionLimits {
     pub const DEFAULT_MAX_RECEIVE_RUNTIME_BYTES: usize = 64 * 1024 * 1024;
     pub const DEFAULT_MAX_SEND_RUNTIME_BYTES: usize = 64 * 1024 * 1024;
     pub const DEFAULT_MAX_SENT_HISTORY_BYTES: usize = 8 * 1024 * 1024;
-    pub const DEFAULT_MAX_TRANSPORT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-    pub const DEFAULT_MAX_RTP_REPLAY_STATE_BYTES: usize = 1024 * 1024;
-    pub const DEFAULT_MAX_RTCP_REPLAY_STATE_BYTES: usize = 1024 * 1024;
+    pub const DEFAULT_MAX_TRANSPORT_OUTPUT_BYTES: usize =
+        pulsebeam_transport::dtls_srtp::DEFAULT_MAX_TRANSPORT_OUTPUT_BYTES;
+    pub const DEFAULT_MAX_RTP_REPLAY_STATE_BYTES: usize =
+        pulsebeam_transport::dtls_srtp::DEFAULT_MAX_RTP_REPLAY_STATE_BYTES;
+    pub const DEFAULT_MAX_RTCP_REPLAY_STATE_BYTES: usize =
+        pulsebeam_transport::dtls_srtp::DEFAULT_MAX_RTCP_REPLAY_STATE_BYTES;
 
     pub const fn validate(self) -> Result<Self, AcceptError> {
         if crate::sctp::buffer_limits(self).is_none() {

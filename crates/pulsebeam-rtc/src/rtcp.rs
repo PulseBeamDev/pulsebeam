@@ -1131,43 +1131,54 @@ impl<'a> Bye<'a> {
     }
 }
 
-impl<'a> RtcpPacket<'a> {
-    pub fn sender_report(&self) -> Result<Option<SenderReport<'a>>, PacketError> {
+pub(crate) trait RtcpPacketExt<'a> {
+    fn sender_report(&self) -> Result<Option<SenderReport<'a>>, PacketError>;
+    fn receiver_report(&self) -> Result<Option<ReceiverReport<'a>>, PacketError>;
+    fn sdes(&self) -> Result<Option<Sdes<'a>>, PacketError>;
+    fn bye(&self) -> Result<Option<Bye<'a>>, PacketError>;
+    fn nack(&self) -> Result<Option<Nack<'a>>, PacketError>;
+    fn pli(&self) -> Result<Option<Pli<'a>>, PacketError>;
+    fn fir(&self) -> Result<Option<Fir<'a>>, PacketError>;
+    fn twcc(&self) -> Result<Option<Twcc<'a>>, PacketError>;
+}
+
+impl<'a> RtcpPacketExt<'a> for RtcpPacket<'a> {
+    fn sender_report(&self) -> Result<Option<SenderReport<'a>>, PacketError> {
         (self.packet_type() == 200)
             .then(|| SenderReport::parse(*self))
             .transpose()
     }
-    pub fn receiver_report(&self) -> Result<Option<ReceiverReport<'a>>, PacketError> {
+    fn receiver_report(&self) -> Result<Option<ReceiverReport<'a>>, PacketError> {
         (self.packet_type() == 201)
             .then(|| ReceiverReport::parse(*self))
             .transpose()
     }
-    pub fn sdes(&self) -> Result<Option<Sdes<'a>>, PacketError> {
+    fn sdes(&self) -> Result<Option<Sdes<'a>>, PacketError> {
         (self.packet_type() == 202)
             .then(|| Sdes::parse(*self))
             .transpose()
     }
-    pub fn bye(&self) -> Result<Option<Bye<'a>>, PacketError> {
+    fn bye(&self) -> Result<Option<Bye<'a>>, PacketError> {
         (self.packet_type() == 203)
             .then(|| Bye::parse(*self))
             .transpose()
     }
-    pub fn nack(&self) -> Result<Option<Nack<'a>>, PacketError> {
+    fn nack(&self) -> Result<Option<Nack<'a>>, PacketError> {
         (self.packet_type() == 205 && self.count() == 1)
             .then(|| Nack::parse(*self))
             .transpose()
     }
-    pub fn pli(&self) -> Result<Option<Pli<'a>>, PacketError> {
+    fn pli(&self) -> Result<Option<Pli<'a>>, PacketError> {
         (self.packet_type() == 206 && self.count() == 1)
             .then(|| Pli::parse(*self))
             .transpose()
     }
-    pub fn fir(&self) -> Result<Option<Fir<'a>>, PacketError> {
+    fn fir(&self) -> Result<Option<Fir<'a>>, PacketError> {
         (self.packet_type() == 206 && self.count() == 4)
             .then(|| Fir::parse(*self))
             .transpose()
     }
-    pub fn twcc(&self) -> Result<Option<Twcc<'a>>, PacketError> {
+    fn twcc(&self) -> Result<Option<Twcc<'a>>, PacketError> {
         (self.packet_type() == 205 && self.count() == 15)
             .then(|| Twcc::parse(*self))
             .transpose()

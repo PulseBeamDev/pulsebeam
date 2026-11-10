@@ -8,7 +8,10 @@ exports_files(["Cargo.toml"])
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
 
 CORE_DEPS = ["//crates/pulsebeam-core:pulsebeam-core-portable", "//crates/pulsebeam-cc:pulsebeam-cc", "//crates/pulsebeam-feedback:pulsebeam-feedback"]
-TEST_DEPS = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + CORE_DEPS + [":pulsebeam-rtc", "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"]
+TRANSPORT_DEPS = ["//crates/pulsebeam-transport:dtls_srtp"]
+RTC_SRCS = glob(["src/**/*.rs", "tests/support/**/*.rs"], exclude = ["src/bin/**"])
+RTC_COMPILE_DATA = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]) + glob(["tests/fixtures/**", "tests/traces/**"])
+TEST_DEPS = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + CORE_DEPS + TRANSPORT_DEPS + [":pulsebeam-rtc", "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"]
 TEST_ALIASES = aliases(normal_dev = True, proc_macro_dev = True) | aliases()
 
 cargo_toml_env_vars(name = "cargo_env", src = "Cargo.toml", workspace = "//:Cargo.toml")
@@ -17,26 +20,31 @@ extract_cargo_lints(name = "lints", manifest = "Cargo.toml", workspace = "//:Car
 rust_library(
     name = "pulsebeam-rtc",
     crate_root = "src/lib.rs",
-    srcs = glob(["src/**/*.rs", "tests/support/**/*.rs"], exclude = ["src/bin/**"]),
-    compile_data = glob(["README.md", "src/**"], exclude = ["src/**/*.rs"]) + glob(["tests/fixtures/**", "tests/traces/**"]),
+    srcs = RTC_SRCS,
+    compile_data = RTC_COMPILE_DATA,
     edition = crate_edition(),
     crate_features = [],
     rustc_env_files = [":cargo_env"],
     lint_config = ":lints",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True) + CORE_DEPS,
+    deps = all_crate_deps(normal = True) + CORE_DEPS + TRANSPORT_DEPS,
     proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
 rust_test(
     name = "unit_tests",
-    crate = ":pulsebeam-rtc",
+    crate_name = "pulsebeam_rtc",
+    crate_root = "src/lib.rs",
+    srcs = RTC_SRCS,
+    compile_data = RTC_COMPILE_DATA,
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
     # Native controlled worlds are process-exclusive; parallel harness threads only wait on the lease.
     args = ["--test-threads=1"],
     lint_config = ":lints",
     aliases = TEST_ALIASES,
-    deps = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + CORE_DEPS + ["//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"],
-    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = depset(all_crate_deps(normal = True, normal_dev = True)).to_list() + CORE_DEPS + ["//crates/pulsebeam-transport:dtls_srtp_test_utils", "//crates/pulsebeam-rtc/simulation:pulsebeam-rtc-simulation"],
+    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     
 )
 

@@ -1432,6 +1432,7 @@ fn extension_value<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtcp::RtcpPacketExt;
 
     fn rid_ingress(now: Instant) -> IngressOwner {
         IngressOwner::new(

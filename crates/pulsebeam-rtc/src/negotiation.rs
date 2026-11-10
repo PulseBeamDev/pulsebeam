@@ -303,11 +303,7 @@ pub(crate) struct Fingerprint {
     pub(crate) value: Box<[u8]>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum DtlsRole {
-    Active,
-    Passive,
-}
+pub(crate) use pulsebeam_transport::dtls_srtp::DtlsRole;
 
 impl Direction {
     const fn allows_send(self) -> bool {
