@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rfc xmlns:xi="http://www.w3.org/2001/XInclude" version="3" docName="draft-pulsebeam-cluster-meta-00" category="info" submissionType="independent" ipr="trust200902">
+  <front>
+    <title>PulseBeam Cluster Routing: Problem Decomposition</title>
+    <author><organization>PulseBeamDev</organization></author>
+    <date year="2026" month="November" day="16"/>
+    <abstract>
+      <t>This internal working draft divides cluster routing into eight high-level problem areas. It defines their scope and expected design outcomes without selecting a cluster architecture.</t>
+    </abstract>
+  </front>
+  <middle>
+    <section anchor="introduction"><name>Introduction</name>
+      <t>PulseBeam needs a way to locate resources and deliver packets between participants connected to different nodes. This document identifies the problems that a cluster routing design needs to address and provides boundaries for designing them separately.</t>
+      <t>This is a proposed scope for further design, not a description of implemented behavior or an IETF submission. It does not select a topology, routing algorithm, consistency model, protocol, or set of node roles. It defines no wire protocol and changes no compatibility contract.</t>
+    </section>
+    <section anchor="areas"><name>Problem Areas</name>
+      <section anchor="membership"><name>Cluster Membership</name>
+        <t>Which nodes exist and are available? Define node identity, capabilities, availability, and the membership-view contract.</t>
+      </section>
+      <section anchor="placement"><name>Resource Placement and Ownership</name>
+        <t>Where do participants and publications reside, and who is authoritative for them? Define placement and ownership semantics, including changes of ownership.</t>
+      </section>
+      <section anchor="discovery"><name>Resource Discovery</name>
+        <t>How are participants and publications located? Define the semantics for resolving, enumerating, and watching resources.</t>
+      </section>
+      <section anchor="subscriptions"><name>Subscription Management</name>
+        <t>How is receiver demand tracked and propagated? Define the subscription lifecycle and representation of demand.</t>
+      </section>
+      <section anchor="computation"><name>Route Computation</name>
+        <t>How are packet-forwarding paths selected? Define routing inputs, constraints, and the contract for expressing forwarding paths.</t>
+      </section>
+      <section anchor="execution"><name>Route Execution</name>
+        <t>How are forwarding paths installed and packets forwarded? Define local forwarding state and the contract for updating it.</t>
+      </section>
+      <section anchor="transport"><name>Inter-Node Transport</name>
+        <t>How do nodes communicate and exchange packets? Define the contracts for peer communication and packet transfer.</t>
+      </section>
+      <section anchor="recovery"><name>Failure Recovery</name>
+        <t>How are failures detected and correct routing restored? Define failure detection, reconciliation, and recovery semantics across the affected areas.</t>
+      </section>
+    </section>
+    <section anchor="boundaries"><name>Design Boundaries</name>
+      <t>Each area needs a design contract describing its inputs, outputs, invariants, failure semantics, and dependencies. Decisions in one area should not unnecessarily prescribe implementation choices in another.</t>
+      <t>These areas are logically separable, but they interact at runtime. Their interfaces and shared invariants need to be reconciled. This decomposition does not require separate services, crates, processes, or RFCs.</t>
+      <t>Security, admission, scalability, observability, and performance are cross-cutting concerns to evaluate across the areas. No particular allocation of these responsibilities is implied.</t>
+    </section>
+    <section anchor="completion"><name>Completion Criteria</name>
+      <ol>
+        <li>Each area has an explicit design contract and defined boundaries.</li>
+        <li>Dependencies and shared invariants are documented.</li>
+        <li>Alternative designs can be evaluated without assuming a preferred cluster topology.</li>
+        <li>The resulting architecture has no unresolved ownership gaps or conflicting responsibilities.</li>
+      </ol>
+    </section>
+    <section anchor="security"><name>Security Considerations</name>
+      <t>Cluster design affects who can join, advertise resources, request subscriptions, install routes, and receive traffic. Incorrect or conflicting authority across these boundaries can enable unauthorized disclosure, misrouting, or denial of service. The designs for the individual areas need to define their trust assumptions, authorization boundaries, and resource limits together; this document selects no security mechanism.</t>
+    </section>
+    <section anchor="open"><name>Open Questions</name>
+      <t>The design of each problem area and the contracts between them remain open. Existing proposals are candidates for evaluation, not decisions imposed by this document.</t>
+    </section>
+  </middle>
+  <back>
+    <references><name>Informative References</name>
+      <reference anchor="PB295" target="https://github.com/PulseBeamDev/pulsebeam/issues/295"><front><title>Meta RFC: Cluster Routing</title><author><organization>PulseBeamDev</organization></author><date/></front></reference>
+      <reference anchor="PB291" target="https://github.com/PulseBeamDev/pulsebeam/issues/291"><front><title>Integrated Cluster Protocol Proposal</title><author><organization>PulseBeamDev</organization></author><date/></front></reference>
+      <reference anchor="PB280" target="https://github.com/PulseBeamDev/pulsebeam/issues/280"><front><title>Cluster Membership</title><author><organization>PulseBeamDev</organization></author><date/></front></reference>
+      <reference anchor="PB281" target="https://github.com/PulseBeamDev/pulsebeam/issues/281"><front><title>Cluster Discovery and Routing Requirements</title><author><organization>PulseBeamDev</organization></author><date/></front></reference>
+      <reference anchor="PB292" target="https://github.com/PulseBeamDev/pulsebeam/issues/292"><front><title>Presence and Discovery Requirements</title><author><organization>PulseBeamDev</organization></author><date/></front></reference>
+    </references>
+  </back>
+</rfc>
