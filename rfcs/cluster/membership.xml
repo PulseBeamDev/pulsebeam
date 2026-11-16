@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rfc xmlns:xi="http://www.w3.org/2001/XInclude" version="3" docName="draft-pulsebeam-cluster-membership-00" category="info" submissionType="independent" ipr="trust200902">
+  <front>
+    <title>PulseBeam Cluster Membership</title>
+    <author><organization>PulseBeamDev</organization></author>
+    <date year="2026" month="November" day="16"/>
+    <abstract><t>This document defines the local cluster membership contract for PulseBeam: node identity and incarnation, gossip-based observations, and a proposed lifecycle advertisement for selecting nodes for new work. Membership provides an eventually consistent local view, not authority over work or proof of reachability.</t></abstract>
+  </front>
+  <middle>
+    <section anchor="introduction"><name>Introduction</name>
+      <t>Each PulseBeam cluster maintains its own node membership using Chitchat. Consumers need to identify nodes, observe their apparent liveness, and distinguish a live node from one that is ready to accept new work. This document specifies the boundary and the intended lifecycle contract. It is an internal architecture draft, not an IETF submission or a new gossip wire protocol.</t>
+      <t>The membership engine, durable incarnation allocation, and snapshot interface exist today. The lifecycle metadata and admission behavior described below are proposed additions; existing servers start membership with empty metadata. Their inclusion here does not imply that they are implemented.</t>
+      <t>Inter-cluster peer discovery and connectivity, resource discovery, placement, routing, and the draining of actual sessions are outside this design. There is no global node membership. The cluster-routing problem decomposition is described in <xref target="META"/>.</t>
+    </section>
+    <section anchor="model"><name>Membership Model</name>
+      <t>A cluster ID identifies a gossip domain. Each node has a durable node ID and a positive generation. An incarnation consists of that ID, generation, and advertised gossip socket address. A restart retains the node ID and allocates a greater generation before sending gossip. Configured local seed addresses bootstrap gossip; seeds are ordinary peers and are not authorities or permanent coordinators.</t>
+      <t>Each node maintains its own observation. Chitchat disseminates state and detects apparent failures; network delay, loss, or partitions can cause views to differ. A suspected node may be alive. A live node may be unreachable or unable to accept work. After communication resumes and updates continue to propagate, views can converge; this design promises no fixed detection or convergence deadline.</t>
+      <t>Membership does not confer exclusive ownership, fence a process, or authorize a request. Systems requiring those properties need their own contracts.</t>
+    </section>
+    <section anchor="observations"><name>Observation Contract</name>
+      <t>The membership interface exposes complete local snapshots, each with a local revision, incarnation records, highest observed generations, and changes since the preceding revision. Watch notifications can coalesce. A consumer that misses updates reads the latest complete snapshot rather than reconstructing state from the change list. Revisions are local to an observer and are not globally comparable.</t>
+      <t>Each record has a liveness of known, live, or suspected, plus supported, superseded, and conflicting status. A record is usable only when it is supported, live, not superseded, and not conflicting. A higher observed generation supersedes lower generations even if the higher one is suspected. Different advertised addresses for the same node ID and generation mark that generation conflicting; a higher generation clears that conflict in the observer's history.</t>
+      <t>Generation and conflict history is retained for 48 hours after the highest generation disappears from protocol state. It is local and bounded, not permanent fencing: an observer that has forgotten the history can accept old evidence. Deployments must not clone identity state between running nodes or restore an older identity state as though it were current.</t>
+    </section>
+    <section anchor="lifecycle"><name>Lifecycle and Eligibility</name>
+      <t>Node lifecycle owns readiness and admission. Membership only disseminates its state. The proposed metadata key is <tt>lifecycle</tt>, represented as <tt>meta.lifecycle</tt> in Chitchat, with case-sensitive values <tt>starting</tt>, <tt>ready</tt>, and <tt>draining</tt>. The local metadata API exposes the key without the <tt>meta.</tt> prefix.</t>
+      <ul>
+        <li><tt>starting</tt>: the node is not accepting new work.</li>
+        <li><tt>ready</tt>: the node is prepared to accept new work, subject to its local admission decision.</li>
+        <li><tt>draining</tt>: the node has stopped accepting new work and is completing or terminating existing work.</li>
+      </ul>
+      <t>Each incarnation starts non-ready. Once the node can accept work, lifecycle enables local admission and publishes <tt>ready</tt>. For graceful shutdown, lifecycle first disables local admission, then publishes <tt>draining</tt>, finishes or terminates existing work within the node's shutdown deadline, and stops membership. The deadline and session-specific behavior belong to the node lifecycle design. An unexpected failure need not publish a final state, and no reliable leave handshake is required.</t>
+      <t>A remote consumer considers an incarnation eligible for new work only if its membership record is usable and its lifecycle value is exactly <tt>ready</tt>. Missing, unknown, or invalid values are non-ready. This is a selection hint, not a reservation: a target independently checks local admission when a request arrives and can reject it. A stale <tt>ready</tt> advertisement during shutdown therefore cannot override local admission. Selection and retry policy are owned by the consumer.</t>
+      <t>The normal lifecycle proceeds from starting to ready to draining; a new incarnation begins non-ready. This document does not require a node to re-enter service after draining or specify readiness flapping. If readiness is lost, local admission must first stop and the advertised state must become non-ready. The choice of a recovery policy belongs to lifecycle management.</t>
+    </section>
+    <section anchor="metadata"><name>Metadata and Compatibility</name>
+      <t>The existing schema uses <tt>pb.schema=1</tt> and carries application metadata under <tt>meta.</tt>. Metadata replacement is a complete replacement, so the lifecycle owner must preserve other fields it intends to retain and coordinate concurrent writers. An acknowledged replacement means the local update was applied; it does not mean that any remote peer has observed it.</t>
+      <t>The current implementation accepts at most 16 metadata entries, keys of 1 to 64 ASCII letters, digits, dots, underscores, or hyphens, values of at most 1024 bytes, and at most 8192 bytes in aggregate key and value data. Unsupported schemas or invalid metadata produce an unsupported, unusable record. This document standardizes only the lifecycle field; endpoints, capacity, and routing state require separate contracts.</t>
+      <t>Existing nodes with no lifecycle field are non-ready to upgraded consumers. Rollout therefore requires upgrading and enabling lifecycle publication before relying on this eligibility rule for new work. This fail-closed behavior can reduce available capacity during a mixed-version rollout; it does not change the existing membership usability predicate.</t>
+    </section>
+    <section anchor="operations"><name>Operations and Validation</name>
+      <t>Configure a unique cluster ID, durable identity directory, reachable advertised gossip address, and suitable local seeds. A single seed can bootstrap a node but multiple seeds improve bootstrap availability. Losing all seeds does not itself invalidate already established gossip relationships. Identity allocation failure or unexpected membership task failure prevents continued normal operation; the current server supervises membership and shuts down the node on such failure.</t>
+      <t>Validation should exercise starting, readiness, draining, stale advertisements rejected by local admission, crash and suspicion, restart with a higher generation, and partition recovery. Existing simulation covers membership convergence, partitions, restarts, and stale gossip; lifecycle-specific tests remain to be added. Measure propagation latency, false suspicions, and recovery under representative loss and churn before declaring operational readiness. No numerical service-level objective is established here.</t>
+    </section>
+    <section anchor="security"><name>Security Considerations</name>
+      <t>Gossip operates on a trusted network. Cluster ID isolates protocol domains but is not authentication, and membership does not provide confidentiality or protect against a malicious network participant. An attacker able to inject gossip can impersonate nodes, advertise misleading readiness or generations, and disrupt selection. Operators must restrict access to the gossip network; deployments requiring protection on an untrusted network need a separately designed security boundary.</t>
+      <t>Readiness is not authorization, and a remote observation must not bypass local admission or other access controls. Bounded metadata limits individual records but does not by itself prevent resource exhaustion by a malicious peer.</t>
+    </section>
+    <section anchor="open"><name>Open Questions</name>
+      <t>Lifecycle integration, the shutdown deadline, readiness recovery policy, and production measurement thresholds remain to be specified by their respective owners. They do not change the membership boundary defined here.</t>
+    </section>
+  </middle>
+  <back><references><name>Informative References</name>
+    <reference anchor="META" target="https://github.com/PulseBeamDev/pulsebeam/blob/main/rfcs/cluster/meta.xml"><front><title>PulseBeam Cluster Routing: Problem Decomposition</title><author><organization>PulseBeamDev</organization></author><date/></front></reference>
+    <reference anchor="IMPLEMENTATION" target="https://github.com/PulseBeamDev/pulsebeam/tree/main/crates/pulsebeam-membership"><front><title>PulseBeam Membership Implementation</title><author><organization>PulseBeamDev</organization></author><date/></front></reference>
+  </references></back>
+</rfc>
