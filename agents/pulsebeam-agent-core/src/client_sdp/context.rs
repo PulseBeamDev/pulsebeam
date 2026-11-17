@@ -835,19 +835,20 @@ impl Context {
                 })
                 .collect();
             media.section.direction = offered_direction.inverse();
-            media.section.rtcp = bindings
+            // A direction pause gates admission, not the established sender declaration.
+            let declared_reception = bindings
                 .receptions
                 .iter()
                 .find(|b| b.mid == mid)
-                .map(|b| b.rtcp.clone())
-                .unwrap_or(RtcpParameters {
-                    cname: None,
-                    reduced_size,
-                });
-            media.section.encodings = bindings
-                .receptions
-                .iter()
-                .find(|b| b.mid == mid)
+                .or(reception_prior.as_ref());
+            media.section.rtcp =
+                declared_reception
+                    .map(|b| b.rtcp.clone())
+                    .unwrap_or(RtcpParameters {
+                        cname: None,
+                        reduced_size,
+                    });
+            media.section.encodings = declared_reception
                 .map(|b| b.encodings.clone())
                 .unwrap_or_default();
             media.transport = self.remote_transport.clone();

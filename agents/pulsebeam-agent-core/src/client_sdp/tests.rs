@@ -1240,18 +1240,47 @@ fn inactivation_retains_identity_and_stopped_mid_reuse_allocates_fresh_identity(
         .encodings
         .clone();
     assert_eq!(original[0].primary, Some(0));
+    let declarations = |answer: &str| {
+        answer
+            .lines()
+            .filter(|line| {
+                line.starts_with("a=msid:")
+                    || line.starts_with("a=ssrc:")
+                    || line.starts_with("a=ssrc-group:")
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let established = declarations(&answer);
+    assert!(!established.is_empty());
     let inactive = ctx
         .prepare(&actual.replace("a=recvonly", "a=inactive"), &[])
         .unwrap();
     assert!(inactive.bindings().receptions.is_empty());
+    assert!(inactive.bindings().publications.is_empty());
+    assert_eq!(declarations(inactive.answer()), established);
     ctx.finish(inactive.id(), ApplyOutcome::Applied).unwrap();
+    let sendonly = ctx
+        .prepare(
+            &actual.replace("a=recvonly", "a=sendonly"),
+            &[request("v", true, false)],
+        )
+        .unwrap();
+    assert!(sendonly.bindings().receptions.is_empty());
+    assert_eq!(sendonly.bindings().publications.len(), 1);
+    assert_eq!(declarations(sendonly.answer()), established);
+    ctx.finish(sendonly.id(), ApplyOutcome::AppliedButCancelled)
+        .unwrap();
+    assert!(ctx.bindings().is_none());
     let active = ctx.prepare(&actual, &[]).unwrap();
+    assert_eq!(declarations(active.answer()), established);
     assert_eq!(active.bindings().receptions[0].encodings, original);
     ctx.finish(active.id(), ApplyOutcome::Applied).unwrap();
     let stopped = ctx
         .prepare(&actual.replace("a=bundle-only\r\n", ""), &[])
         .unwrap();
     assert!(stopped.bindings().receptions.is_empty());
+    assert!(declarations(stopped.answer()).is_empty());
     ctx.finish(stopped.id(), ApplyOutcome::Applied).unwrap();
     assert!(matches!(
         ctx.prepare(&actual, &[]),
@@ -1269,6 +1298,15 @@ fn inactivation_retains_identity_and_stopped_mid_reuse_allocates_fresh_identity(
     );
     let fresh = ctx.prepare(&actual, &[request("v", false, true)]).unwrap();
     assert_ne!(fresh.bindings().receptions[0].encodings, original);
+    assert_ne!(declarations(fresh.answer()), established);
+
+    let mut never_established = context();
+    let inactive = never_established
+        .prepare(&actual.replace("a=recvonly", "a=inactive"), &[])
+        .unwrap();
+    assert!(declarations(inactive.answer()).is_empty());
+    assert!(inactive.bindings().receptions.is_empty());
+    assert!(inactive.bindings().publications.is_empty());
 }
 
 #[test]
