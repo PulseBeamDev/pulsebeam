@@ -57,11 +57,22 @@ fn fingerprint(cert: &CertificateDer<'_>) -> PeerFingerprint {
     PeerFingerprint::from_bytes(Sha256::digest(cert.as_ref()).into())
 }
 
+/// Inner QUIC controller. Adaptive modes retain real QUIC congestion response.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QuicCongestion {
+    #[default]
+    OuterControlled,
+    Cubic,
+    Bbr3,
+}
+
 /// Finite inner safety ceilings, not a measured link capacity. The outer
-/// controller remains authoritative. These can still block and are not an
-/// advertised pacing-disable switch.
+/// controller remains authoritative in the default `OuterControlled` mode.
+/// Its ceilings can still block and are not an advertised pacing-disable switch.
+/// Adaptive modes use upstream QUIC congestion control instead of these ceilings.
 #[derive(Clone, Copy, Debug)]
 pub struct QuicTuning {
+    pub congestion: QuicCongestion,
     pub inner_window_bytes: u64,
     pub inner_pacing_bytes_per_second: u64,
     /// Reject this backend when the caller requires cancellation inside Noq's queue.
@@ -70,6 +81,7 @@ pub struct QuicTuning {
 impl Default for QuicTuning {
     fn default() -> Self {
         Self {
+            congestion: QuicCongestion::OuterControlled,
             inner_window_bytes: 32 * 1024 * 1024,
             inner_pacing_bytes_per_second: 1_000_000_000,
             require_queue_cancellation: false,
@@ -78,6 +90,17 @@ impl Default for QuicTuning {
 }
 
 impl QuicTuning {
+    /// Adaptive QUIC proxy for experiments, not an HTTP/3 or browser implementation.
+    pub fn webtransport_like(congestion: QuicCongestion) -> Result<Self, Error> {
+        if congestion == QuicCongestion::OuterControlled {
+            return Err(Error::UnsupportedProfile);
+        }
+        Ok(Self {
+            congestion,
+            ..Self::default()
+        })
+    }
+
     pub const fn queue_cancellation_supported(&self) -> bool {
         false
     }
@@ -319,8 +342,22 @@ impl Quic {
             .max_idle_timeout(Some(IDLE.try_into().map_err(|_| Error::Capacity)?))
             .datagram_receive_buffer_size(Some(RECEIVE_BYTES))
             .datagram_send_buffer_size(UDP_BUDGET)
-            .enable_segmentation_offload(false)
-            .congestion_controller_factory(Shared::new(Ceiling(tuning)));
+            .enable_segmentation_offload(false);
+        match tuning.congestion {
+            QuicCongestion::OuterControlled => {
+                transport.congestion_controller_factory(Shared::new(Ceiling(tuning)));
+            }
+            QuicCongestion::Cubic => {
+                transport.congestion_controller_factory(Shared::new(
+                    noq_proto::congestion::CubicConfig::default(),
+                ));
+            }
+            QuicCongestion::Bbr3 => {
+                transport.congestion_controller_factory(Shared::new(
+                    noq_proto::congestion::Bbr3Config::default(),
+                ));
+            }
+        }
         let transport = Shared::new(transport);
         let certificates = vec![peer.credential.0.certificate.clone()];
         let mut endpoint_config = EndpointConfig::default();

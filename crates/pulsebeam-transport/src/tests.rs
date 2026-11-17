@@ -12,15 +12,15 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
-struct Pair {
-    a: Transport,
-    b: Transport,
+pub(super) struct Pair {
+    pub(super) a: Transport,
+    pub(super) b: Transport,
     aa: SocketAddr,
     ba: SocketAddr,
     ab: VecDeque<Vec<u8>>,
     ba_out: VecDeque<Vec<u8>>,
     received: Vec<(Vec<u8>, [u8; 4], ReceiveTime)>,
-    now: Time,
+    pub(super) now: Time,
 }
 
 impl Pair {
@@ -69,7 +69,7 @@ impl Pair {
         }
     }
 
-    fn quic(wrong_pin: bool) -> Self {
+    pub(super) fn quic(wrong_pin: bool) -> Self {
         Self::quic_profile(wrong_pin, false)
     }
 
@@ -195,7 +195,7 @@ impl Pair {
         Ok(())
     }
 
-    fn connect(&mut self) {
+    pub(super) fn connect(&mut self) {
         self.start();
         for _ in 0..5000 {
             self.step().unwrap();
@@ -235,6 +235,73 @@ fn standalone_datagrams_preserve_context_boundaries_and_original_observations_ca
     assert_eq!(pair.a.health().bytes_in_flight, 0);
     assert_eq!(pair.a.health().sent, 1);
     assert_eq!(pair.b.health().received, 1);
+}
+
+#[test]
+fn adaptive_quic_profiles_preserve_datagrams_and_outer_feedback() {
+    assert!(matches!(
+        QuicTuning::webtransport_like(QuicCongestion::OuterControlled),
+        Err(Error::UnsupportedProfile)
+    ));
+    assert_eq!(
+        QuicTuning::default().congestion,
+        QuicCongestion::OuterControlled
+    );
+    for congestion in [QuicCongestion::Cubic, QuicCongestion::Bbr3] {
+        let mut pair = Pair::quic_config(
+            false,
+            false,
+            QuicTuning::webtransport_like(congestion).unwrap(),
+        );
+        pair.connect();
+        pair.a
+            .try_submit([0; 4], b"adaptive", Time(pair.now.0 + 1_000_000_000))
+            .unwrap();
+        for _ in 0..100 {
+            pair.step().unwrap();
+        }
+        assert_eq!(pair.received.len(), 1);
+        assert_eq!(pair.received[0].0, b"adaptive");
+        assert_eq!(pair.a.health().bytes_in_flight, 0);
+        assert!(pair.a.health().quic.unwrap().acks_received > 0);
+    }
+}
+
+#[test]
+fn expiry_between_committed_packets_does_not_poison_later_feedback() {
+    for quic in [false, true] {
+        let mut pair = Pair::with_backend(false, quic);
+        pair.connect();
+        pair.a
+            .try_submit([0; 4], b"first", Time(pair.now.0 + 1_000_000_000))
+            .unwrap();
+        for _ in 0..100 {
+            pair.step().unwrap();
+        }
+        assert_eq!(pair.a.health().bytes_in_flight, 0);
+        pair.a
+            .try_submit([0; 4], b"expired", Time(pair.now.0 + 1))
+            .unwrap();
+        pair.now = Time(pair.now.0 + 1);
+        pair.poll(256).unwrap();
+        assert_eq!(pair.a.health().expired, 1);
+        for _ in 0..100 {
+            pair.step().unwrap();
+        }
+        pair.a
+            .try_submit([0; 4], b"later", Time(pair.now.0 + 1_000_000_000))
+            .unwrap();
+        for _ in 0..200 {
+            pair.step().unwrap();
+        }
+        assert_eq!(pair.a.health().sent, 2);
+        assert_eq!(pair.received.len(), 2);
+        assert_eq!(
+            pair.a.health().bytes_in_flight,
+            0,
+            "feedback stalled after unsent sequence: quic={quic}"
+        );
+    }
 }
 
 #[test]

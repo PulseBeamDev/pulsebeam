@@ -20,6 +20,12 @@
     )
 )]
 
+mod quality_source;
+pub use quality_source::{
+    QUALITY_COMMON_VIEW_POLICY, QualityCaptureIdentity, QualitySourceCapture,
+    QualitySourceSequence, quality_common_view,
+};
+
 pub const RAW_H264_FULL_CBR: &[u8] = include_bytes!("full_f_cbr.h264");
 pub const RAW_H264_HALF_CBR: &[u8] = include_bytes!("half_h_cbr.h264");
 pub const RAW_H264_QUARTER_CBR: &[u8] = include_bytes!("quarter_q_cbr.h264");

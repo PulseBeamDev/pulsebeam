@@ -16,11 +16,13 @@ mod wire;
 #[cfg(feature = "datagram")]
 pub use datagram::*;
 #[cfg(feature = "datagram")]
-pub use quic::{QuicCredential, QuicPeer, QuicStats, QuicTuning};
+pub use quic::{QuicCongestion, QuicCredential, QuicPeer, QuicStats, QuicTuning};
 #[cfg(feature = "datagram")]
 pub use service::{Application, Datagram, Error, Health, SendOutcome, Staging, Transport};
 #[cfg(feature = "dtls-srtp")]
 pub mod dtls_srtp;
+#[cfg(all(feature = "datagram", feature = "test-utils"))]
+pub mod experiment;
 
 #[cfg(all(test, feature = "datagram"))]
 mod tests;

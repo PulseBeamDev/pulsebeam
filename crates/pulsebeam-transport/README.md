@@ -83,12 +83,43 @@ Link places its receiver-issued route key in that context; transport neither int
 
 A browser WebTransport adapter would expose only the service-facing datagram boundary. Browser congestion control and hidden queues remain authoritative. That adapter and reliable control services are outside this native implementation.
 
+## WebRTC/UDP comparison
+
+The [corpus uplink comparison](./experiments/README.md) uses native q/h/f senders
+into receiver-only production RTC, and our Rust SCReAM over direct DTLS/UDP and
+QUIC `OuterControlled`/CUBIC/BBR3. All six arms use the same offered corpus and a
+shared experimental decoder/selection/presentation pipeline. The separate
+full-native single-stream codec control is test-only, not a comparison row.
+This does not compare stock native receive/playout against the custom receiver.
+
+`Transport::health()` exposes nominal `source_target_bps` and pushback-adjusted
+`encoder_target_bps` for caller-owned adaptation. These are payload-rate
+guidance, not physical throughput guarantees. The custom source funds all
+active rungs from one aggregate target, retains produced pictures through
+blocked sends, and requests keyframes over the modeled reverse path. Native
+retains its real allocation and omission policy. Whole-offered coverage,
+startup/held/blank time, freezes, displayed age, image error and wire cost are
+reported separately; decoder-only quality is conditional diagnostic evidence.
+
+The selected Google WebRTC revision and Rust SCReAM source profile now both
+identify `7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499`. This baseline was updated;
+the [source/profile and native differential proof](../pulsebeam-cc/README.md#provenance-and-verification)
+remains distinct from experiment representativeness. It is not a claim that
+these complete media engines behave identically or that the pin is latest.
+Old workload percentages are not current-baseline rankings.
+
+`QuicTuning::webtransport_like` selects Noq CUBIC or BBR3 while preserving the
+outer Rust SCReAM and production `OuterControlled` defaults. Noq is not browser
+WebTransport or HTTP/3, and no browser ECN/L4S benefit is qualified. Synthetic
+codec simulation does not qualify camera workloads, physical display latency,
+codec CPU performance or blanket production parity.
+
 ## Validate changes
 
 Run owner checks from the repository root:
 
 ```sh
-./bazel test //crates/pulsebeam-transport:unit_tests //crates/pulsebeam-transport:shared_port_test //crates/pulsebeam-transport:format //crates/pulsebeam-transport:clippy //crates/pulsebeam-link:unit_tests
+./bazel test //crates/pulsebeam-transport:unit_tests //crates/pulsebeam-transport:experiment_controls //crates/pulsebeam-transport:shared_port_test //crates/pulsebeam-transport:format //crates/pulsebeam-transport:clippy //crates/pulsebeam-link:unit_tests
 ```
 
 Unit tests cover both features, including the moved ICE, SRTP/replay and
@@ -96,4 +127,4 @@ prepared-output tests. The RTC owner retains the real history-admission proof
 and native media/channel interoperability tests. Bazel's `dtls_srtp` library
 builds the RTC-only profile without the datagram controller or Noq dependencies.
 
-The crate and native smoke are registered in `//:fast`; formatting and lint checks are in `//:check`. Deterministic tests exercise production engines with injected time. The single loopback smoke covers actual UDP/demux behavior without browser automation or sleeps. See the [contributor testing contract](../../docs/build.md#testing-contract).
+The crate, experiment correctness controls and native smoke are registered in `//:fast`; formatting and lint checks are in `//:check`. Deterministic tests exercise production engines with injected time. The single loopback smoke covers actual UDP/demux behavior without browser automation or sleeps. See the [contributor testing contract](../../docs/build.md#testing-contract).

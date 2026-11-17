@@ -13,6 +13,10 @@ const SPACE: feedback::SpaceId = feedback::SpaceId(0);
 const HISTORY: usize = 8192;
 const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Closed,
@@ -59,6 +63,10 @@ pub struct Health {
     pub expired: u64,
     pub invalid: u64,
     pub bytes_in_flight: u64,
+    /// Nominal source payload target, not an estimate of physical link capacity.
+    pub source_target_bps: u64,
+    /// Native encoder guidance, including congestion-induced pause to zero.
+    pub encoder_target_bps: u64,
     pub closed: Option<Error>,
     pub staging: Staging,
     pub pending_udp_bytes: usize,
@@ -76,7 +84,7 @@ pub struct Staging {
 
 enum Protected {
     Data { attempt: u64, expires_at: Time },
-    Feedback(feedback::ReportWindow),
+    Feedback(Option<feedback::ReportWindow>),
 }
 
 struct SocketOutput {
@@ -111,6 +119,8 @@ pub struct Transport {
     protocol_deadline: Option<Time>,
     #[cfg(any(test, feature = "test-utils"))]
     test_key_limit: Option<u64>,
+    #[cfg(any(test, feature = "test-utils"))]
+    audit_error: Option<String>,
     health: Health,
 }
 
@@ -189,7 +199,43 @@ impl Transport {
             },
             #[cfg(any(test, feature = "test-utils"))]
             test_key_limit: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            audit_error: None,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn audit_state(&self) -> String {
+        format!(
+            "now={:?} protocol={:?} drained={} protected={} demand={} feedback_wait={:?} ack={:?} received={:?} health={:?} envelope={:?} error={:?}",
+            self.now,
+            self.protocol_time,
+            self.drained,
+            match self.protected {
+                Some(Protected::Data { .. }) => "data",
+                Some(Protected::Feedback(_)) => "feedback",
+                None => "none",
+            },
+            self.demand,
+            self.feedback_wait,
+            self.highest_acknowledged,
+            self.highest_received,
+            self.health(),
+            self.controller.snapshot(),
+            self.audit_error
+        )
+    }
+
+    fn capacity_error(&mut self, site: &'static str, cause: impl std::fmt::Debug) -> Error {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            self.audit_error = Some(format!("{site}: {cause:?}"));
+        }
+        #[cfg(not(any(test, feature = "test-utils")))]
+        {
+            let _ = (site, cause);
+        }
+        Error::Capacity
     }
 
     /// Anchor the upstream engine's Instant domain to the host's Time.
@@ -237,7 +283,10 @@ impl Transport {
     }
 
     pub fn health(&self) -> Health {
+        let envelope = self.controller.snapshot();
         Health {
+            source_target_bps: envelope.target_media_payload_rate,
+            encoder_target_bps: envelope.encoder_target_media_payload_rate,
             quic: self.association.as_ref().and_then(Engine::quic_stats),
             bytes_in_flight: self.sender.observations().bytes_in_flight,
             pending_udp_bytes: self
@@ -531,35 +580,37 @@ impl Transport {
                 };
                 self.sender
                     .prepare_commit(context)
-                    .map_err(|_| Error::Capacity)?;
+                    .map_err(|cause| self.capacity_error("sender.prepare_commit", cause))?;
                 self.sender
                     .preflight_commit(context)
-                    .map_err(|_| Error::Capacity)?;
-                Some(context)
+                    .map_err(|cause| self.capacity_error("sender.preflight_commit", cause))?;
+                let next_attempt = attempt.checked_add(1).ok_or(Error::SequenceWindow)?;
+                Some((context, next_attempt))
             }
             _ => None,
         };
         let accepted = matches!(send(Datagram { destination: self.peer.endpoint(), payload: bytes }), SendOutcome::Accepted { bytes: submitted } if submitted == bytes.len());
         if accepted {
-            if let Some(context) = commit {
+            if let Some((context, next_attempt)) = commit {
                 self.sender
                     .commit_preflighted(context)
-                    .map_err(|_| Error::Capacity)?;
+                    .map_err(|cause| self.capacity_error("sender.commit", cause))?;
                 self.controller.commit_send(
                     elapsed,
                     bytes.len(),
                     self.sender.observations().bytes_in_flight,
                     false,
                 );
+                self.attempt = next_attempt;
                 self.health.sent = self.health.sent.saturating_add(1);
                 if self.peer.is_quic() {
                     self.feedback_wait.get_or_insert(self.now);
                 }
             }
-            if let Some(Protected::Feedback(report)) = protected {
+            if let Some(Protected::Feedback(Some(report))) = protected {
                 self.receiver
                     .accept(*report, report.count, elapsed)
-                    .map_err(|_| Error::Capacity)?;
+                    .map_err(|cause| self.capacity_error("receiver.accept", cause))?;
             }
             return Ok(true);
         }
@@ -616,6 +667,16 @@ impl Transport {
                 .as_mut()
                 .ok_or(Error::NotStarted)?
                 .send_application_data(plain.get(..length).ok_or(Error::Capacity)?)?;
+            // Noq owns the serialized report after enqueue. Retire the receiver
+            // token here, not on its later UDP submission.
+            let report = if self.peer.is_quic() {
+                self.receiver
+                    .accept(report, report.count, now)
+                    .map_err(|cause| self.capacity_error("receiver.accept_queued", cause))?;
+                None
+            } else {
+                Some(report)
+            };
             self.protected = Some(Protected::Feedback(report));
             self.staged = Some((self.now, length));
             self.drained = false;
@@ -669,7 +730,6 @@ impl Transport {
             return Err(Error::SequenceWindow);
         }
         let attempt = self.attempt;
-        self.attempt = self.attempt.checked_add(1).ok_or(Error::SequenceWindow)?;
         let wire_attempt =
             u32::try_from(attempt & u64::from(u32::MAX)).map_err(|_| Error::SequenceWindow)?;
         wire::data_header(&mut plain, context, wire_attempt).map_err(|_| Error::Codec)?;
@@ -799,7 +859,7 @@ impl Transport {
                             tag: extended,
                         },
                     )
-                    .map_err(|_| Error::Capacity)?;
+                    .map_err(|cause| self.capacity_error("receiver.observe", cause))?;
                 self.highest_received = Some(
                     self.highest_received
                         .map_or(extended, |highest| highest.max(extended)),
@@ -821,7 +881,7 @@ impl Transport {
     fn update_controller(&mut self, now: Duration) -> Result<(), Error> {
         let input = self.sender.observations();
         if input.exhausted {
-            return Err(Error::Capacity);
+            return Err(self.capacity_error("sender.observations", "exhausted"));
         }
         if self.peer.is_quic()
             && input

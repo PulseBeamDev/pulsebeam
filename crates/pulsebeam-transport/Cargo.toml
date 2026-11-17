@@ -31,6 +31,9 @@ is = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd424
 str0m = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd4246d9e7faf0ad4ca099c1bc", default-features = false, features = ["aws-lc-rs"], optional = true }
 
 [dev-dependencies]
+serde_json = "1.0.150"
+pulsebeam-testdata = { path = "../pulsebeam-testdata" }
+pulsebeam-webrtc-sys = { path = "../pulsebeam-libwebrtc-sys" }
 proptest = "1.11.0"
 pulsebeam-rtc = { path = "../pulsebeam-rtc" }
 str0m = { git = "https://github.com/algesten/str0m.git", rev = "120401c9affd97fd4246d9e7faf0ad4ca099c1bc", default-features = false, features = ["aws-lc-rs"] }

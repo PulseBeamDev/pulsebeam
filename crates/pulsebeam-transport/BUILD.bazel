@@ -1,9 +1,9 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps", "crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars", "extract_cargo_lints")
-load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_clippy_test", "rust_library", "rust_test", "rustfmt_test")
 
 package(default_visibility = ["//visibility:public"])
-filegroup(name = "workflow_inputs", srcs = glob(["*.md"], allow_empty = True))
+filegroup(name = "workflow_inputs", srcs = glob(["*.md", "experiments/*.md"], allow_empty = True))
 exports_files(["Cargo.toml"])
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "src/**/*.rs", "tests/**/*.rs"]))
 
@@ -102,5 +102,59 @@ rust_test(
     ],
 )
 
-rustfmt_test(name = "format", targets = [":pulsebeam-transport", ":dtls_srtp", ":shared_port_test"])
-rust_clippy_test(name = "clippy", targets = [":pulsebeam-transport", ":dtls_srtp", ":dtls_srtp_test_utils", ":unit_tests", ":shared_port_test"])
+rust_binary(
+    name = "webtransport_poc",
+    testonly = True,
+    crate_root = "experiments/webtransport_poc.rs",
+    srcs = glob(["experiments/*.rs"]),
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(normal = True, normal_dev = True),
+    deps = all_crate_deps(normal = True, normal_dev = True) + [
+        ":test_utils",
+        "//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys",
+        "//crates/pulsebeam-rtc:pulsebeam-rtc",
+        "//crates/pulsebeam-testdata:pulsebeam-testdata",
+        ":presentation",
+    ],
+)
+
+rust_test(
+    name = "experiment_controls",
+    # Native controlled worlds own process-wide hooks for their full lifetime.
+    args = ["--test-threads=1"],
+    crate_root = "experiments/webtransport_poc.rs",
+    srcs = glob(["experiments/*.rs"]),
+    size = "small",
+    edition = crate_edition(),
+    rustc_env_files = [":cargo_env"],
+    lint_config = ":lints",
+    aliases = aliases(normal = True, normal_dev = True),
+    deps = all_crate_deps(normal = True, normal_dev = True) + [
+        ":test_utils",
+        "//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys",
+        "//crates/pulsebeam-rtc:pulsebeam-rtc",
+        "//crates/pulsebeam-testdata:pulsebeam-testdata",
+        ":presentation",
+    ],
+)
+
+rust_library(
+    name = "presentation",
+    testonly = True,
+    crate_root = "experiments/presentation.rs",
+    srcs = ["experiments/presentation.rs"],
+    edition = crate_edition(),
+    lint_config = ":lints",
+)
+
+rust_test(
+    name = "presentation_tests",
+    crate = ":presentation",
+    size = "small",
+    lint_config = ":lints",
+)
+
+rustfmt_test(name = "format", targets = [":pulsebeam-transport", ":dtls_srtp", ":shared_port_test", ":webtransport_poc", ":experiment_controls", ":presentation_tests"])
+rust_clippy_test(name = "clippy", targets = [":pulsebeam-transport", ":dtls_srtp", ":dtls_srtp_test_utils", ":unit_tests", ":shared_port_test", ":webtransport_poc", ":experiment_controls", ":presentation_tests"])

@@ -4143,8 +4143,11 @@ dependencies = [
  "pulsebeam-dtls",
  "pulsebeam-feedback",
  "pulsebeam-rtc",
+ "pulsebeam-testdata",
+ "pulsebeam-webrtc-sys",
  "rcgen",
  "rustls",
+ "serde_json",
  "sha2",
  "str0m 0.23.1",
 ]
