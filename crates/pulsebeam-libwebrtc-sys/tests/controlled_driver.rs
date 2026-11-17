@@ -573,14 +573,17 @@ fn peers_share_a_caller_pumped_thread_and_reject_threaded_configurations() {
 }
 
 trait PacketDelivery {
-    fn deliver_ready(&self);
+    fn deliver_ready(&self) -> usize;
 }
 
 impl PacketDelivery for ControlledSimulatedNetwork {
-    fn deliver_ready(&self) {
+    fn deliver_ready(&self) -> usize {
+        let mut delivered = 0;
         while let Some(packet) = self.next_packet() {
             self.deliver(packet.id).unwrap();
+            delivered += 1;
         }
+        delivered
     }
 }
 
@@ -598,8 +601,10 @@ impl std::ops::Deref for FirstDtlsFlightLoss {
 }
 
 impl PacketDelivery for FirstDtlsFlightLoss {
-    fn deliver_ready(&self) {
+    fn deliver_ready(&self) -> usize {
+        let mut delivered = 0;
         while let Some(packet) = self.network.next_packet() {
+            delivered += 1;
             // DTLS handshake record, not STUN. Fault injection never substitutes
             // a handshake response: recovery must come from native retransmission.
             if packet.kind == OutboundKind::Udp
@@ -611,6 +616,7 @@ impl PacketDelivery for FirstDtlsFlightLoss {
                 self.network.deliver(packet.id).unwrap();
             }
         }
+        delivered
     }
 }
 
@@ -620,18 +626,22 @@ fn pump(
     clock: &ManualClock,
     network: &impl PacketDelivery,
 ) {
-    assert!(driver.run_ready());
-    queues.run_ready();
-    network.deliver_ready();
-    let next = [driver.next_deadline(), queues.next_deadline()]
+    let turn = driver.pump(1_024);
+    assert!(!turn.blocked);
+    let queued = queues.run_ready();
+    let delivered = network.deliver_ready();
+    // Let callers consume events before moving to a future timer.
+    if turn.dispatched > 0 || queued > 0 || delivered > 0 {
+        return;
+    }
+    if let Some(deadline) = [driver.next_deadline(), queues.next_deadline()]
         .into_iter()
         .flatten()
-        .min();
-    let delta = next
-        .and_then(|deadline| deadline.checked_sub(clock.now()))
-        .filter(|duration| !duration.is_zero())
-        .unwrap_or(Duration::from_millis(1));
-    clock.advance(delta).unwrap();
+        .min()
+        && deadline > clock.now()
+    {
+        clock.advance(deadline - clock.now()).unwrap();
+    }
 }
 
 fn completed(

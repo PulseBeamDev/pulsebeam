@@ -1,6 +1,6 @@
 // Copyright 2026 The WebRTC Project Authors. All rights reserved.
 // Rust port of loss_estimator.{cc,h} at libwebrtc
-// 326fd06bb4d93900ed6947205b94cefd2413afca. See LICENSE and PATENTS.
+// 7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499. See LICENSE and PATENTS.
 
 use std::time::Duration;
 

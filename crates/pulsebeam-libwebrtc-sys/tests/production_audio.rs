@@ -35,12 +35,6 @@ fn encoded_selection_is_explicit_and_preserves_the_pcm_default() {
         .encoded_audio()
         .build()
         .unwrap();
-    assert!(
-        !encoded
-            .audio_processing_state()
-            .unwrap()
-            .has_software_module
-    );
     assert!(encoded.create_pcm_source().is_err());
     let encoded_source = encoded.create_opus_source(1).unwrap();
     assert!(
@@ -54,26 +48,36 @@ fn encoded_selection_is_explicit_and_preserves_the_pcm_default() {
         .audio_processing(AudioProcessingConfig::default())
         .build()
         .unwrap();
-    assert!(raw.audio_processing_state().unwrap().has_software_module);
     assert!(raw.create_opus_source(1).is_err());
     assert!(raw.push_pcm(encoded_source, &pcm(0)).is_err());
     let source = raw.create_pcm_source().unwrap();
+    let peer = raw.create_peer(PeerConfiguration::default()).unwrap();
+    assert_eq!(
+        raw.publish_pcm(
+            peer,
+            source,
+            "unsupported-processing",
+            RtpTransceiverDirection::SendOnly,
+            Some(AudioProcessingOptions {
+                gain_control: ProcessingChoice::Software,
+                ..Default::default()
+            }),
+        )
+        .unwrap_err()
+        .kind,
+        PeerErrorKind::UnsupportedOperation
+    );
     let foreign_peer = encoded.create_peer(PeerConfiguration::default()).unwrap();
-    let before = raw.audio_processing_state().unwrap();
     assert!(
         raw.publish_pcm(
             foreign_peer,
             source,
             "foreign",
             RtpTransceiverDirection::SendOnly,
-            Some(AudioProcessingOptions {
-                gain_control: ProcessingChoice::Software,
-                ..Default::default()
-            })
+            None
         )
         .is_err()
     );
-    assert_eq!(raw.audio_processing_state().unwrap(), before);
     let closed_peer = raw.create_peer(PeerConfiguration::default()).unwrap();
     raw.close_peer(closed_peer).unwrap();
     assert_eq!(
@@ -94,9 +98,9 @@ fn encoded_selection_is_explicit_and_preserves_the_pcm_default() {
     raw.push_pcm(source, &pcm(0)).unwrap();
     raw.close_source(source).unwrap();
     raw.close_source(source).unwrap();
+    raw.close_peer(peer).unwrap();
     assert!(raw.push_pcm(source, &pcm(0)).is_err());
     raw.shutdown().unwrap();
-    assert!(raw.audio_processing_state().is_err());
     // Explicit factories are not replaced by pcm_audio's absent-choice default.
     assert!(
         ProductionSession::builder(ProductionSessionConfig::default())
@@ -245,7 +249,7 @@ fn migrated_actor_processes_real_pcm_and_retires_its_selected_audio_graph() {
         session.create_peer(PeerConfiguration::default()).unwrap(),
         session.create_peer(PeerConfiguration::default()).unwrap(),
     ];
-    let (session, source, sender) = thread::spawn(move || {
+    let (session, source) = thread::spawn(move || {
         let source = session.create_pcm_source().unwrap();
         let transceiver = session
             .publish_pcm(
@@ -253,15 +257,15 @@ fn migrated_actor_processes_real_pcm_and_retires_its_selected_audio_graph() {
                 source,
                 "pcm",
                 RtpTransceiverDirection::SendOnly,
-                Some(AudioProcessingOptions::default()),
+                None,
             )
             .unwrap();
-        let sender = session.sender(transceiver).unwrap();
-        (session, source, sender)
+        let _sender = session.sender(transceiver).unwrap();
+        (session, source)
     })
     .join()
     .unwrap();
-    let (session, receiver, baseline, timestamp) = thread::spawn(move || {
+    let (session, receiver, timestamp) = thread::spawn(move || {
         let mut session = session;
         let mut events = Events::default();
         let operation = session.create_offer(peers[0], false).unwrap();
@@ -285,27 +289,15 @@ fn migrated_actor_processes_real_pcm_and_retires_its_selected_audio_graph() {
         let mut timestamp = 0;
         let (baseline, _) = measure(&mut session, source, receiver, &mut timestamp);
         assert!(baseline > 20.0, "PCM did not traverse the negotiated call");
-        (session, receiver, baseline, timestamp)
+        (session, receiver, timestamp)
     })
     .join()
     .unwrap();
     let retained = thread::spawn(move || {
         let mut session = session;
-        session
-            .set_audio_processing_options(
-                sender,
-                AudioProcessingOptions {
-                    gain_control: ProcessingChoice::Software,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
         let mut timestamp = timestamp;
-        let (processed, retained) = measure(&mut session, source, receiver, &mut timestamp);
-        assert!(
-            processed > baseline * 1.5,
-            "selected fixed digital processing did not affect real audio: {baseline} -> {processed}"
-        );
+        let (received, retained) = measure(&mut session, source, receiver, &mut timestamp);
+        assert!(received > 20.0, "PCM did not traverse the negotiated call");
         let deadline = Instant::now() + Duration::from_secs(5);
         while failure.failure().is_none() {
             assert!(
@@ -324,25 +316,17 @@ fn migrated_actor_processes_real_pcm_and_retires_its_selected_audio_graph() {
                 error: AudioEncoderError::UnsafeClock,
             })
         );
-        let state = session.audio_processing_state().unwrap();
+        // Rejected SDK controls are observable, not a source-poisoning latch.
+        session.push_pcm(source, &pcm(timestamp)).unwrap();
+        timestamp += 10_000;
+        let (continued, _) = measure(&mut session, source, receiver, &mut timestamp);
+        assert!(continued > 20.0, "PCM stopped after a rejected control");
         assert_eq!(
-            state.gain_control.effective,
-            ProcessingImplementation::Software
-        );
-        assert!(!state.gain_control.platform_available);
-        session
-            .set_audio_processing_options(
-                sender,
-                AudioProcessingOptions {
-                    echo_cancellation: ProcessingChoice::Software,
-                    gain_control: ProcessingChoice::Software,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            session.push_pcm(source, &pcm(timestamp)).unwrap_err().kind,
-            PeerErrorKind::UnsupportedOperation
+            failure.failure(),
+            Some(AudioEncoderSdkFailure {
+                operation: AudioEncoderSdkOperation::PACKET_LOSS,
+                error: AudioEncoderError::UnsafeClock,
+            })
         );
         session.detach_audio(receiver).unwrap();
         session.attach_encoded_audio(receiver).unwrap();

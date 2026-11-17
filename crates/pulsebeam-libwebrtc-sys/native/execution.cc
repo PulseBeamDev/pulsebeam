@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "api/candidate.h"
 #include "api/environment/environment.h"
 #include "api/environment/environment_factory.h"
 #include "api/field_trials.h"
@@ -27,26 +28,11 @@
 #include "rtc_base/crypto_random.h"
 #include "rtc_base/event.h"
 #include "rtc_base/null_socket_server.h"
+#include "rtc_base/ssl_stream_adapter.h"
 #include "rtc_base/synchronization/yield_policy.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/time_utils.h"
 #include "system_wrappers/include/clock.h"
-
-#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
-#include <cerrno>
-#include <climits>
-#include <new>
-#include <pthread.h>
-#include <semaphore.h>
-#include <sys/mman.h>
-#include <ucontext.h>
-#include <unistd.h>
-#include "third_party/libvpx/source/libvpx/vpx_util/vpx_thread.h"
-#if __has_feature(address_sanitizer)
-#define PULSEBEAM_ASAN_FIBERS 1
-#include <sanitizer/common_interface_defs.h>
-#endif
-#endif
 
 namespace pulsebeam::webrtc_sys {
 namespace {
@@ -67,6 +53,8 @@ class SharedClock final : public webrtc::Clock {
  public:
   explicit SharedClock(std::shared_ptr<NativeManualClock::State> state) noexcept
       : state_(std::move(state)) {}
+  explicit SharedClock(std::shared_ptr<SharedClock> identity) noexcept
+      : state_(identity->state_), retained_identity_(std::move(identity)) {}
 
   webrtc::Timestamp CurrentTime() override;
   webrtc::NtpTime ConvertTimestampToNtpTime(
@@ -74,6 +62,7 @@ class SharedClock final : public webrtc::Clock {
 
  private:
   std::shared_ptr<NativeManualClock::State> state_;
+  std::shared_ptr<SharedClock> retained_identity_;
 };
 
 class CooperativeTaskQueue;
@@ -235,6 +224,8 @@ struct NativeManualClock::State {
 
   webrtc::SimulatedClock clock;
   std::mutex advance_mutex;
+  std::mutex shared_clock_mutex;
+  std::weak_ptr<SharedClock> shared_clock;
   std::mutex factories_mutex;
   std::vector<std::weak_ptr<NativeTaskQueueFactory::State>> factories;
   std::atomic<std::uint64_t> next_sequence{0};
@@ -443,8 +434,6 @@ std::size_t PumpClock(const std::shared_ptr<NativeManualClock::State>& clock,
 std::int64_t ClockDeadline(
     const std::shared_ptr<NativeManualClock::State>& clock);
 
-#include "pulsebeam-webrtc-sys/native/vpx_execution.inc"
-
 // Intercept thread posts rather than using upstream's elapsed-time pump,
 // which has no finite dispatch bound at frozen virtual time.
 class ControlledThread final : public webrtc::Thread {
@@ -512,14 +501,14 @@ struct NativeDriverThread::State : webrtc::YieldInterface {
         bool seeded = false)
       : thread(std::move(value)), clock(std::move(clock_state)), seeded(seeded) {
     webrtc::SetClockForTesting(&clock);
+    // Controlled drivers exclusively own native test hooks. This public switch
+    // makes BoringSSL use each adapter's Environment clock for DTLS timers too.
+    webrtc::SSLStreamAdapter::EnableTimeCallbackForTesting();
     yield_policy = std::make_unique<webrtc::ScopedYieldPolicy>(this);
     {
       std::lock_guard lock(clock.state->retirement_mutex);
       clock.state->retirement = retirement;
     }
-#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
-    vpx_runtime = std::make_unique<NativeVpxRuntime>(retirement);
-#endif
   }
   void YieldExecution() override {
     // Supported Event waits have finite engine-owned ready dependencies.
@@ -550,9 +539,6 @@ struct NativeDriverThread::State : webrtc::YieldInterface {
       if (retirement->empty()) break;
       if (progress == 0) retirement->Wait(generation);
     }
-#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
-    vpx_runtime.reset();
-#endif
     controlled_driver_identity = nullptr;
     thread->UnwrapCurrent();
     thread.reset();
@@ -572,17 +558,16 @@ struct NativeDriverThread::State : webrtc::YieldInterface {
   std::shared_ptr<NativeRuntimeRetirement> retirement =
       std::make_shared<NativeRuntimeRetirement>();
   std::unique_ptr<webrtc::ScopedYieldPolicy> yield_policy;
-#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__)
-  std::unique_ptr<NativeVpxRuntime> vpx_runtime;
-#endif
 };
 
 struct NativeThread::State {
   explicit State(std::unique_ptr<webrtc::Thread> value) noexcept
       : owned(std::move(value)), thread(owned.get()) {}
+  explicit State(std::shared_ptr<webrtc::Thread> value) noexcept
+      : owned(std::move(value)), thread(owned.get()) {}
   explicit State(webrtc::Thread* value) noexcept : thread(value) {}
 
-  std::unique_ptr<webrtc::Thread> owned;
+  std::shared_ptr<webrtc::Thread> owned;
   webrtc::Thread* thread;
 };
 
@@ -596,6 +581,25 @@ webrtc::NtpTime SharedClock::ConvertTimestampToNtpTime(
   if (!timestamp.IsFinite()) return webrtc::NtpTime();
   return state_->clock.ConvertTimestampToNtpTime(timestamp);
 }
+
+namespace {
+void SetManualClock(webrtc::EnvironmentFactory& factory,
+    const std::shared_ptr<NativeManualClock::State>& state) {
+  std::shared_ptr<SharedClock> clock;
+  {
+    std::lock_guard lock(state->shared_clock_mutex);
+    clock = state->shared_clock.lock();
+    if (!clock) {
+      clock = std::make_shared<SharedClock>(state);
+      state->shared_clock = clock;
+    }
+  }
+  // Pin the canonical guarded clock in SDK-owned storage without a State cycle.
+  // SSL timers require one identity across all Environments on this timeline.
+  factory.Set(std::make_unique<SharedClock>(clock));
+  factory.Set(clock.get());
+}
+}  // namespace
 
 void CooperativeTaskQueue::PostCaptured(absl::AnyInvocable<void() &&> task, CapturedDriverTasks::State& group) {
   std::lock_guard lock(state_->mutex);
@@ -1175,7 +1179,7 @@ std::unique_ptr<NativeEnvironment> create_environment(
   if (custom_clock != nullptr) {
     environment_factory.Set(clock_reference(*custom_clock));
   } else if (clock != nullptr) {
-    environment_factory.Set(std::make_unique<SharedClock>(clock->state()));
+    SetManualClock(environment_factory, clock->state());
   }
   if (factory.environment()) {
     environment_factory.Set(std::make_unique<EnvironmentTaskQueueFactory>(*factory.environment(), factory.production_lease()));
@@ -1213,7 +1217,7 @@ void environment_factory_set_trials(NativeEnvironmentFactory& factory, rust::Box
   factory.state()->factory.Set(field_trials_adapter(std::move(trials)));
 }
 void environment_factory_set_manual_clock(NativeEnvironmentFactory& factory, const NativeManualClock& clock, FfiClockTimeBounds bounds) noexcept {
-  factory.state()->factory.Set(std::make_unique<SharedClock>(clock.state()));
+  SetManualClock(factory.state()->factory, clock.state());
   factory.state()->bounds = bounds;
 }
 void environment_factory_set_clock(NativeEnvironmentFactory& factory, const NativeClock& clock, FfiClockTimeBounds bounds) noexcept {
@@ -1454,6 +1458,11 @@ std::unique_ptr<NativeDriverThread> new_seeded_driver_thread(
   if (!queues) return nullptr;
   auto thread = std::make_unique<ControlledThread>(std::move(queues));
   if (!thread->WrapCurrent()) return nullptr;
+  // The SDK lazily creates one process-wide secret for ICE candidate
+  // foundations. Initialize it with the system CSPRNG before a per-world seed
+  // is installed, so that first-use-only entropy does not shift replay RNG.
+  webrtc::Candidate candidate;
+  candidate.ComputeFoundation(webrtc::SocketAddress(), 0);
   driver_active.store(true);
   controlled_driver_identity = thread.get();
   randomness_active = true;
@@ -1525,6 +1534,15 @@ bool thread_is_owned(const NativeThread& thread) noexcept {
 }
 bool thread_is_current(const NativeThread& thread) noexcept {
   return thread.thread() && thread.thread()->IsCurrent() && webrtc::TaskQueueBase::Current() == thread.thread();
+}
+bool native_threads_same(const NativeThread& left,
+                         const NativeThread& right) noexcept {
+  return left.thread() != nullptr && left.thread() == right.thread();
+}
+std::unique_ptr<NativeThread> thread_alias(const NativeThread& thread) noexcept {
+  if (!thread.thread() || !thread.state() || !thread.state()->owned) return nullptr;
+  return std::make_unique<NativeThread>(
+      std::make_unique<NativeThread::State>(thread.state()->owned));
 }
 bool thread_requires_retirement(const NativeThread& thread) noexcept {
   return webrtc::TaskQueueBase::Current() || (thread.thread() && thread.thread()->IsCurrent());

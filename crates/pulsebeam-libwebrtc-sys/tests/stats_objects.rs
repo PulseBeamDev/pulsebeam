@@ -1330,7 +1330,6 @@ fn every_public_stats_field_is_observed_through_independent_native_attributes() 
             frames_encoded: Some(u32::MAX - 16),
             key_frames_encoded: Some(u32::MAX - 17),
             total_encode_time: Some(18.25),
-            total_encoded_bytes_target: Some(u64::MAX - 19),
             frame_width: Some(u32::MAX - 20),
             frame_height: Some(u32::MAX - 21),
             frames_per_second: Some(22.25),
@@ -1430,10 +1429,6 @@ fn every_public_stats_field_is_observed_through_independent_native_attributes() 
             (
                 b"totalEncodeTime".to_vec(),
                 RtcStatsValue::Double(Some(18.25)),
-            ),
-            (
-                b"totalEncodedBytesTarget".to_vec(),
-                RtcStatsValue::Uint64(Some(u64::MAX - 19)),
             ),
             (
                 b"frameWidth".to_vec(),
@@ -1906,6 +1901,7 @@ fn every_public_stats_field_is_observed_through_independent_native_attributes() 
             ice_local_username_fragment: Some(vec![0xff, 0, 16]),
             ice_state: Some(vec![0xff, 0, 17]),
             ccfb_messages_received: Some(i32::MIN + 18),
+            ccfb_messages_sent: Some(i32::MIN + 19),
         });
         assert!(stat.set_values(values.clone()));
         assert_eq!(stat.values(), values);
@@ -1986,6 +1982,10 @@ fn every_public_stats_field_is_observed_through_independent_native_attributes() 
             (
                 b"ccfbMessagesReceived".to_vec(),
                 RtcStatsValue::Int32(Some(i32::MIN + 18)),
+            ),
+            (
+                b"ccfbMessagesSent".to_vec(),
+                RtcStatsValue::Int32(Some(i32::MIN + 19)),
             ),
         ];
         assert_eq!(

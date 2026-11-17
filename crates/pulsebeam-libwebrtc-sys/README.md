@@ -1,10 +1,20 @@
 # PulseBeam WebRTC bindings
 
 `pulsebeam-webrtc-sys` owns PulseBeam's low-level Rust bindings, CXX bridge,
-C++ adapters and WebRTC behavior patches. Use the higher-level
+C++ adapters and native build integration. Use the higher-level
 [native agent](../../agents/pulsebeam-agent-native/README.md) for application code.
 Bazel is the supported build and test entry point. Cargo metadata supports
 workspace dependency maintenance and IDE discovery, not standalone compilation.
+
+The selected unmodified Google WebRTC revision
+`7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499` is the Linux x86_64 baseline.
+The shared SDP integration retains established sender declarations through
+nonterminal direction pauses while keeping media admission direction-gated.
+The original receive-continuity witness passes in core and native flavors.
+No downstream WebRTC or libvpx patches are applied.
+Qualification covers the core/native fast and focused SDK suites, deterministic
+media replay and the native-agent consumer path. Physical-device behavior and
+other platforms require separate qualification.
 
 ## Build and test
 
@@ -43,6 +53,13 @@ feature unification and per-dependency flavor labels do not select native code.
 Tests requiring physical devices or external services are not default acceptance.
 Other target platforms are not yet supported by the Bazel integration.
 
+Owned audio encoders use the selected stock factory implementation. The unused
+custom audio network adaptor (ANA) integration and its private controller-state
+access have been removed, including the encoder/product ANA enable/disable APIs.
+Production PCM and encoded-Opus paths retain their owned encoder lifetimes and
+report rejected SDK controls through the encoder failure observer without
+poisoning unrelated source submissions.
+
 ## Prepared media facts
 
 `RtpTransceiver::applied_local_cname_bytes()` reads the exact sender's CNAME
@@ -70,16 +87,16 @@ with AddressSanitizer in either flavor:
   --//crates/pulsebeam-libwebrtc-sys:flavor=native --test_output=errors
 ```
 
-These test targets use the matching declared Chromium Clang 23 linker and ASan
+These test targets use the matching declared Chromium Clang 24 linker and ASan
 runtime. The application toolchain is unchanged. Rust code itself is not
 instrumented by this native lifetime configuration.
 
 ## Build ownership and caching
 
 `repositories.bzl` acquires the pinned WebRTC and depot_tools revisions, their
-DEPS inputs, prebuilt tools and Bullseye amd64 sysroot, then applies the tracked
-patches. It materializes safe source aliases and hashes the filtered compiler
-view once as a deterministic source manifest. Acquisition can use the network.
+DEPS inputs, prebuilt tools and Bullseye amd64 sysroot. After normal upstream
+hooks, it hashes the unpatched compiler view once as a deterministic source
+manifest. Acquisition can use the network.
 The locked Nixpkgs dependency
 provisions package-local host tools, separate from the upstream target sysroot
 and native desktop libraries.
@@ -87,14 +104,18 @@ and native desktop libraries.
 `native_build.bzl` declares the whole native build action. Its source-content
 input is the manifest, avoiding recursive checkout tracking on each build. The
 GN client locates the immutable checkout through the manifest’s repository
-symlink and stages an editable action-owned view with adapters and bridge.
+symlink and stages an action-owned tree of upstream symlinks, owned adapters
+and generated bridge outputs. Staged upstream file copies retain their bytes.
 Bazel’s normal symlinked Linux sandbox and standalone execution are supported;
 copied or hardlinked sandbox input staging is not. The client then invokes GN
 and Siso. The GN overlay compiles WebRTC, the owned
 adapters and CXX-generated C++, with PIC, the software codec policy, protobuf
-events and strict x86_64 floating-point behavior. `strict-fp.patch` preserves
-all compile flags at the tail without a compiler wrapper. Bazel consumes fixed GN
+events and strict x86_64 floating-point behavior. An owned GN toolchain selects
+floating-point flags through the supported compiler configuration. Bazel consumes fixed GN
 archives for WebRTC, the bridge/additional roots and libc++/libc++abi.
+The supported `rtc_rust=false` configuration selects the SDK's C++ corruption-
+detection parser, avoiding a second CXX Rust runtime in monorepo consumers.
+The SDK host CXX generator still uses its declared Rust build toolchain.
 The pinned Bullseye sysroot supplies target headers and link metadata, but its
 shared libraries are stripped link-only stubs. Native desktop runtime libraries
 come from checksum-pinned original packages in that sysroot's Debian snapshot,
@@ -102,14 +123,16 @@ with matching package versions and declared Bazel runtime dependencies.
 There is no source/native candidate archive, SDK staging step, persistent Ninja
 work directory or independently published native artifact.
 
-CXX is pinned to 1.0.194 throughout. GN owns its host generator and C++ runtime;
+CXX is pinned to 1.0.205 throughout. GN owns its host generator and C++ runtime;
 Bazel compiles the upstream registry Rust runtime and proc macro with the
-monorepo's Rust toolchain. Package-local dependency annotations disable Cargo's
-native compiler and C++ linker-helper build scripts.
+monorepo's Rust toolchain. Before GN compilation, the native helper checks the
+owned Rust CXX pin against both SDK generator and runtime manifests.
+Package-local dependency annotations disable Cargo's native compiler and C++
+linker-helper build scripts.
 
 The outer `WebRtcGn` action stays local (`no-remote-exec`) and retains Bazel
 outputs and whole-build caching. Bridge declarations in `src/bridge.rs`,
-adapters, patches, pins, native tooling or GN configuration changes can rebuild
+adapters, dependency pins, native tooling or GN configuration changes can rebuild
 the native graph. Core, native and ASan retain distinct action/output identities.
 
 By default Siso uses shared REAPI through the automatically started [local

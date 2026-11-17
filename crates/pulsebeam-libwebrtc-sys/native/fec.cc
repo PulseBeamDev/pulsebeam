@@ -27,20 +27,16 @@ NativeFecProtectionCallback::State& NativeFecProtectionCallback::state() const n
   return *state_;
 }
 namespace {
-enum class LoanKind { None, Controller, Rates, Scheduled };
 thread_local const NativeFecProtectionCallback* current_loan = nullptr;
-thread_local LoanKind current_kind = LoanKind::None;
 class Loan final {
  public:
-  Loan(const NativeFecProtectionCallback* source, LoanKind kind)
-      : previous_(current_loan), kind_(current_kind) {
+  explicit Loan(const NativeFecProtectionCallback* source)
+      : previous_(current_loan) {
     current_loan = source;
-    current_kind = kind;
   }
-  ~Loan() { current_loan = previous_; current_kind = kind_; }
+  ~Loan() { current_loan = previous_; }
  private:
   const NativeFecProtectionCallback* previous_;
-  LoanKind kind_;
 };
 FfiFecProtectionResult Failure(std::uint8_t status) {
   FfiFecProtectionResult value{};
@@ -99,21 +95,21 @@ class ControllerAdapter final : public webrtc::FecController {
       previous = std::exchange(callback_, next);
     }
     if (previous) previous->Retire();
-    Loan loan(next.get(), LoanKind::Controller);
+    Loan loan(next.get());
     fec_controller_set_callback(*source_, std::move(next));
   }
   void SetProtectionMethod(bool fec, bool nack) override {
-    auto callback = Callback(); Loan loan(callback.get(), LoanKind::Controller);
+    auto callback = Callback(); Loan loan(callback.get());
     fec_controller_set_method(*source_, fec, nack);
   }
   void SetEncodingData(std::size_t width, std::size_t height,
                        std::size_t temporal_layers, std::size_t payload) override {
-    auto callback = Callback(); Loan loan(callback.get(), LoanKind::Controller);
+    auto callback = Callback(); Loan loan(callback.get());
     fec_controller_set_encoding(*source_, width, height, temporal_layers, payload);
   }
   std::uint32_t UpdateFecRates(std::uint32_t bitrate, int framerate,
       std::uint8_t lost, std::vector<bool> mask, std::int64_t rtt) override {
-    auto callback = Callback(); Loan loan(callback.get(), LoanKind::Rates);
+    auto callback = Callback(); Loan loan(callback.get());
     rust::Vec<std::uint8_t> values;
     values.reserve(mask.size());
     for (bool value : mask) values.push_back(value ? 1 : 0);
@@ -122,11 +118,11 @@ class ControllerAdapter final : public webrtc::FecController {
   }
   void UpdateWithEncodedData(std::size_t length,
                             webrtc::VideoFrameType type) override {
-    auto callback = Callback(); Loan loan(callback.get(), LoanKind::Controller);
+    auto callback = Callback(); Loan loan(callback.get());
     fec_controller_update_encoded(*source_, length, static_cast<std::int32_t>(type));
   }
   bool UseLossVectorMask() override {
-    auto callback = Callback(); Loan loan(callback.get(), LoanKind::Controller);
+    auto callback = Callback(); Loan loan(callback.get());
     return fec_controller_use_mask(*source_);
   }
  private:
@@ -175,17 +171,6 @@ FfiFecProtectionResult fec_protection_request(
       &native_key, &result.video_bps, &result.nack_bps, &result.fec_bps);
   return result;
 }
-std::uint8_t fec_set_retransmission_mode(
-    const NativeFecProtectionCallback& source, std::int32_t mode) noexcept {
-  auto& state = source.state();
-  std::lock_guard<std::mutex> lock(state.mutex);
-  if (auto status = LoanStatus(source)) return status;
-  // RtpVideoSender::OnBitrateUpdated holds its own nonrecursive mutex across
-  // UpdateFecRates; SetRetransmissionMode would try to take that same mutex.
-  if (current_kind == LoanKind::Rates) return 5;
-  state.callback->SetRetransmissionMode(mode);
-  return 0;
-}
 void fec_protection_request_async(
     std::shared_ptr<NativeFecProtectionCallback> source,
     FfiFecProtectionParams delta, FfiFecProtectionParams key,
@@ -204,27 +189,8 @@ void fec_protection_request_async(
   }
   state.queue->PostTask([source = std::move(source), delta, key, finish]() mutable {
     FfiFecProtectionResult result;
-    { Loan loan(source.get(), LoanKind::Scheduled);
+    { Loan loan(source.get());
       result = fec_protection_request(*source, delta, key); }
-    finish->Complete(result);
-  });
-}
-void fec_set_retransmission_mode_async(
-    std::shared_ptr<NativeFecProtectionCallback> source, std::int32_t mode,
-    rust::Box<RustFecCompletion> completion) noexcept {
-  auto& state = source->state();
-  auto finish = std::make_shared<QueuedCompletion>(std::move(completion));
-  std::unique_lock<std::mutex> lock(state.mutex);
-  if (!state.callback || !state.queue) {
-    auto result = Failure(state.callback ? 2 : 1);
-    lock.unlock();
-    finish->Complete(result);
-    return;
-  }
-  state.queue->PostTask([source = std::move(source), mode, finish]() mutable {
-    FfiFecProtectionResult result;
-    { Loan loan(source.get(), LoanKind::Scheduled);
-      result = Failure(fec_set_retransmission_mode(*source, mode)); }
     finish->Complete(result);
   });
 }
@@ -238,10 +204,8 @@ std::uint32_t fec_native_probe(const NativeEnvironment& environment,
       *video = delta->fec_rate;
       *nack = key->max_fec_frames;
       *fec = static_cast<std::uint32_t>(key->fec_mask_type);
-      return last_mode;
+      return -17;
     }
-    void SetRetransmissionMode(int mode) override { last_mode = mode; }
-    int last_mode = 0;
   } protection;
   auto factory = fec_factory_adapter(std::move(source));
   if (!factory) return 0;

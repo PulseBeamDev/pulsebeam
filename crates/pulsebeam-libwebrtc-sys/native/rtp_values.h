@@ -5,7 +5,7 @@
 #include <utility>
 #include "api/priority.h"
 #include "api/crypto/frame_decryptor_interface.h"
-#include "api/sframe/sframe_encrypter_interface.h"
+#include "api/sframe/sframe_encryptor_interface.h"
 #include "api/rtp_parameters.h"
 #include "api/transport/rtp/rtp_source.h"
 #include <vector>
@@ -16,11 +16,11 @@ namespace pulsebeam::webrtc_sys {
 struct FfiSframeInit;
 class NativeSframeEncrypterInit final {
  public:
-  explicit NativeSframeEncrypterInit(webrtc::SframeEncrypterInit value) : value_(value) {}
-  const webrtc::SframeEncrypterInit& value() const noexcept { return value_; }
-  webrtc::SframeEncrypterInit& value() noexcept { return value_; }
+  explicit NativeSframeEncrypterInit(webrtc::SframeEncryptorInit value) : value_(value) {}
+  const webrtc::SframeEncryptorInit& value() const noexcept { return value_; }
+  webrtc::SframeEncryptorInit& value() noexcept { return value_; }
  private:
-  webrtc::SframeEncrypterInit value_;
+  webrtc::SframeEncryptorInit value_;
 };
 std::unique_ptr<NativeSframeEncrypterInit> sframe_init_new(std::int32_t mode, std::int32_t suite) noexcept;
 std::unique_ptr<NativeSframeEncrypterInit> sframe_init_clone(const NativeSframeEncrypterInit& source) noexcept;
@@ -320,17 +320,10 @@ bool rtp_header_id_valid(const NativeRtpHeaderExtensionId& value) noexcept;
 bool rtp_header_id_is_set(const NativeRtpHeaderExtensionId& value) noexcept;
 rust::Vec<std::uint8_t> rtp_header_id_string(const NativeRtpHeaderExtensionId& value) noexcept;
 std::size_t rtp_header_id_hash(const NativeRtpHeaderExtensionId& value) noexcept;
-const std::int32_t& rtp_header_id_ref(const NativeRtpHeaderExtensionId& value) noexcept;
-std::int32_t& rtp_header_id_ref_mut(NativeRtpHeaderExtensionId& value) noexcept;
-const std::int32_t& rtp_header_id_deref(const NativeRtpHeaderExtensionId& value) noexcept;
-std::int32_t& rtp_header_id_deref_mut(NativeRtpHeaderExtensionId& value) noexcept;
-const std::int32_t& rtp_header_id_arrow(const NativeRtpHeaderExtensionId& value) noexcept;
-std::int32_t& rtp_header_id_arrow_mut(NativeRtpHeaderExtensionId& value) noexcept;
-const std::int32_t& rtp_header_id_conversion(const NativeRtpHeaderExtensionId& value) noexcept;
+std::int32_t rtp_header_id_value(const NativeRtpHeaderExtensionId& value) noexcept;
+bool rtp_header_id_set_value(NativeRtpHeaderExtensionId& value, std::int32_t input) noexcept;
 std::int32_t rtp_header_id_into_value(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept;
 std::int32_t rtp_header_id_into_const_value(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept;
-std::int32_t rtp_header_id_into_deref(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept;
-std::int32_t rtp_header_id_into_const_deref(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept;
 bool rtp_header_id_equal(const NativeRtpHeaderExtensionId& lhs, const NativeRtpHeaderExtensionId& rhs) noexcept;
 bool rtp_header_id_not_equal(const NativeRtpHeaderExtensionId& lhs, const NativeRtpHeaderExtensionId& rhs) noexcept;
 bool rtp_header_id_less(const NativeRtpHeaderExtensionId& lhs, const NativeRtpHeaderExtensionId& rhs) noexcept;

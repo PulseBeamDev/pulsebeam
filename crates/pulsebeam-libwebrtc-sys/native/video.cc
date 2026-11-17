@@ -40,7 +40,8 @@
 #include "api/media_stream_interface.h"
 #include "api/peer_connection_interface.h"
 #include "api/rtp_receiver_interface.h"
-#include "api/sframe/sframe_decrypter_interface.h"
+#include "api/sframe/sframe_decryptor_interface.h"
+#include "api/sframe/sframe_encryptor_interface.h"
 #include "api/rtp_parameters.h"
 #include "api/rtp_sender_interface.h"
 #include "api/rtp_transceiver_interface.h"
@@ -49,7 +50,7 @@
 #include "api/video_codecs/scalability_mode.h"
 #include "api/video/video_frame.h"
 #include "api/video/video_sink_interface.h"
-#include "media/base/video_broadcaster.h"
+#include "api/video/video_broadcaster.h"
 #if defined(PULSEBEAM_WEBRTC_NATIVE_AUDIO) && !defined(WEBRTC_ANDROID) && !defined(WEBRTC_IOS)
 #include "modules/video_capture/video_capture.h"
 #include "modules/video_capture/video_capture_factory.h"
@@ -214,15 +215,15 @@ std::unique_ptr<NativeFrameDecryptor> rtp_receiver_frame_decryptor(const NativeR
   state->receiver = receiver.receiver();
   return std::make_unique<NativeFrameDecryptor>(std::move(state));
 }
-// This SDK pin returns native SFrame creation errors, after possible owner
-// mutation. Keep actual returned-interface dispatch rather than fake handles.
+// Preserve actual SFrame interface products and native creation errors. The SDK
+// may update transceiver negotiation state before returning an error.
 struct NativeSframeEncrypter::State {
-  webrtc::scoped_refptr<webrtc::SframeEncrypterInterface> value;
+  webrtc::scoped_refptr<webrtc::SframeEncryptorInterface> value;
   webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> owner;
   webrtc::Thread* signaling;
 };
 struct NativeSframeDecrypter::State {
-  webrtc::scoped_refptr<webrtc::SframeDecrypterInterface> value;
+  webrtc::scoped_refptr<webrtc::SframeDecryptorInterface> value;
   webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> owner;
   webrtc::Thread* signaling;
 };
@@ -241,7 +242,7 @@ FfiSframeEncrypterCreation rtp_sender_create_sframe(const NativeRtpSender& sende
   // Peer retention alone is insufficient after negotiation/rollback removal.
   auto owner = sender.sframe_owner();
   if (!owner) return {nullptr, nullptr, true};
-  auto result = sender.sender()->CreateSframeEncrypterOrError(init.value());
+  auto result = sender.sender()->CreateSframeEncryptorOrError(init.value());
   if (!result.ok()) return {nullptr, std::make_unique<NativeRtcError>(result.MoveError()), false};
   auto state = std::make_unique<NativeSframeEncrypter::State>();
   state->value = result.MoveValue();
@@ -250,7 +251,7 @@ FfiSframeEncrypterCreation rtp_sender_create_sframe(const NativeRtpSender& sende
   if (!state->value) return {nullptr, nullptr, false};
   return {std::make_unique<NativeSframeEncrypter>(std::move(state)), nullptr, false};
 }
-FfiSframeDecrypterCreation rtp_receiver_create_sframe(const NativeRtpReceiver& receiver, const NativePeerConnection& peer, std::int32_t suite) noexcept {
+FfiSframeDecrypterCreation rtp_receiver_create_sframe(const NativeRtpReceiver& receiver, const NativePeerConnection& peer, std::int32_t suite, rust::Box<RustSframeDecryptErrorObserver> observer) noexcept {
   auto owner = receiver.sframe_owner();
   const bool unified = peer.peer()->GetConfiguration().sdp_semantics == webrtc::SdpSemantics::kUnifiedPlan;
   if (!owner && unified) {
@@ -261,8 +262,26 @@ FfiSframeDecrypterCreation rtp_receiver_create_sframe(const NativeRtpReceiver& r
     }
     if (!owner) return {nullptr, nullptr, true};
   }
-  // Plan B endpoints have no owner callback and safely return INTERNAL_ERROR.
-  auto result = receiver.receiver()->CreateSframeDecrypterOrError(static_cast<webrtc::SframeCipherSuite>(suite));
+  // The upstream receiver implementation determines creation errors and product availability.
+  auto error_callback = webrtc::SframeDecryptErrorCallback(
+      [observer = std::move(observer)](webrtc::SframeDecryptError error) mutable {
+        FfiSframeDecryptError converted{};
+        converted.error_type = static_cast<std::int32_t>(error.error_type);
+        converted.has_key_id = error.key_id.has_value();
+        converted.key_id = error.key_id.value_or(0);
+        if (error.frame) {
+          converted.has_frame = true;
+          const auto data = error.frame->GetData();
+          converted.frame_data.reserve(data.size());
+          for (std::uint8_t byte : data) converted.frame_data.push_back(byte);
+          converted.payload_type = error.frame->GetPayloadType();
+          converted.ssrc = error.frame->GetSsrc();
+          converted.mime_type = rust::String(error.frame->GetMimeType());
+        }
+        sframe_decrypt_error_observed(*observer, std::move(converted));
+      });
+  auto result = receiver.receiver()->CreateSframeDecryptorOrError(
+      static_cast<webrtc::SframeCipherSuite>(suite), std::move(error_callback));
   if (!result.ok()) return {nullptr, std::make_unique<NativeRtcError>(result.MoveError()), false};
   auto state = std::make_unique<NativeSframeDecrypter::State>();
   state->value = result.MoveValue();
@@ -282,14 +301,21 @@ std::unique_ptr<NativeRtcError> sframe_set_encryption_key(const NativeSframeEncr
     return std::make_unique<NativeRtcError>(value.state()->value->SetEncryptionKey(id, {key.data(), key.size()}));
   });
 }
-std::unique_ptr<NativeRtcError> sframe_add_decryption_key(const NativeSframeDecrypter& value, std::uint64_t id, rust::Slice<const std::uint8_t> key) noexcept {
-  return value.state()->signaling->BlockingCall([&] {
-    return std::make_unique<NativeRtcError>(value.state()->value->AddDecryptionKey(id, {key.data(), key.size()}));
+void sframe_add_decryption_key(const NativeSframeDecrypter& value, std::uint64_t id, rust::Slice<const std::uint8_t> key, rust::Box<RustSframeKeyCompletion> completion) noexcept {
+  // The SDK copies the borrowed material before returning from submission.
+  value.state()->signaling->BlockingCall([&] {
+    value.state()->value->AddDecryptionKey(id, {key.data(), key.size()},
+        webrtc::SframeKeyUpdateCallback([completion = std::move(completion)](webrtc::RTCError error) mutable {
+          sframe_key_update_complete(*completion, std::make_unique<NativeRtcError>(std::move(error)));
+        }));
   });
 }
-std::unique_ptr<NativeRtcError> sframe_remove_decryption_key(const NativeSframeDecrypter& value, std::uint64_t id) noexcept {
-  return value.state()->signaling->BlockingCall([&] {
-    return std::make_unique<NativeRtcError>(value.state()->value->RemoveDecryptionKey(id));
+void sframe_remove_decryption_key(const NativeSframeDecrypter& value, std::uint64_t id, rust::Box<RustSframeKeyCompletion> completion) noexcept {
+  value.state()->signaling->BlockingCall([&] {
+    value.state()->value->RemoveDecryptionKey(id,
+        webrtc::SframeKeyUpdateCallback([completion = std::move(completion)](webrtc::RTCError error) mutable {
+          sframe_key_update_complete(*completion, std::make_unique<NativeRtcError>(std::move(error)));
+        }));
   });
 }
 namespace {
@@ -493,7 +519,7 @@ class CameraFrameSink final : public webrtc::VideoSinkInterface<webrtc::VideoFra
 
 // Raw interception consumes receiver frames before native reference finding.
 // Ordered observation snapshots metadata and forwards the original unchanged;
-// the recordable-frame callback then releases its exact native RTP identity.
+// decoder ingress then selects snapshots using the SDK stream and RTP identity.
 // Keep one transformer per receiver lifetime: replacing upstream's delegate
 // does not reset the old callback registration in this pinned revision.
 // Dispatch owned observations only after releasing collector locks. Shared
@@ -509,8 +535,7 @@ struct EncodedObserverNotification {
 };
 
 class EncodedFrameCollector
-    : public webrtc::FrameTransformerInterface,
-      public webrtc::VideoSinkInterface<webrtc::RecordableEncodedFrame> {
+    : public webrtc::FrameTransformerInterface {
  public:
   EncodedFrameCollector(std::shared_ptr<ReadinessSignal> readiness, bool ordered,
       std::optional<rust::Box<RustEncodedVideoObserver>> observer = std::nullopt)
@@ -577,39 +602,32 @@ class EncodedFrameCollector
       if (it != callbacks_.end()) callback = it->second;
     }
     // Native reference finding, frame buffering, and decode scheduling remain
-    // authoritative. The recordable-frame sink below observes only after that
-    // path has selected the next encoded frame.
+    // authoritative. The decoder observer selects only inputs reaching that path.
     if (callback) callback->OnTransformedFrame(std::move(frame));
   }
 
-  void OnFrame(const webrtc::RecordableEncodedFrame& frame) override {
+  void OnSelected(const webrtc::EncodedImage& frame, std::uint32_t ssrc) {
     ReadinessNotification notify{};
     EncodedObserverNotification observation;
-    const auto buffer = frame.encoded_buffer();
     {
       std::lock_guard lock(mutex_);
-      if (!active_) return;
+      if (!active_ || !ordered_ || !callbacks_.contains(ssrc)) return;
       observation.observer = observer_;
-      if (!buffer) {
-        observation.dropped = 1;
-        return;
-      }
-      const auto rtp_timestamp = frame.rtp_timestamp();
-      const auto ssrc = frame.ssrc();
-      if (!rtp_timestamp || !ssrc) {
+      if (!frame.data() || frame.size() == 0) {
         Lost();
         observation.dropped = 1;
         return;
       }
+      const auto rtp_timestamp = frame.RtpTimestamp();
       const auto match = std::find_if(
           pending_frames_.begin(), pending_frames_.end(), [&](const StoredFrame& candidate) {
-            return candidate.rtp_timestamp == *rtp_timestamp &&
-                   candidate.ssrc == *ssrc;
+            return candidate.rtp_timestamp == rtp_timestamp &&
+                   candidate.ssrc == ssrc;
           });
       if (match == pending_frames_.end() ||
-          match->key_frame != frame.is_key_frame() ||
-          match->data.size() != buffer->size() ||
-          !std::equal(match->data.begin(), match->data.end(), buffer->data())) {
+          match->key_frame != (frame.frame_type() == webrtc::VideoFrameType::kVideoFrameKey) ||
+          match->data.size() != frame.size() ||
+          !std::equal(match->data.begin(), match->data.end(), frame.data())) {
         Lost();
         observation.dropped = 1;
         return;
@@ -1672,8 +1690,7 @@ void local_media_stream_observer_close(const NativeLocalMediaStreamObserver& obs
 
 struct NativeEncodedVideoSink::State {
   webrtc::scoped_refptr<EncodedFrameCollector> collector;
-  webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> source;
-  webrtc::Thread* worker = nullptr;
+  std::shared_ptr<EncodedFrameSelection> selection;
   std::atomic<bool> closed{false};
 };
 
@@ -2830,12 +2847,6 @@ std::uint8_t video_track_state(const NativeVideoTrack& track) noexcept {
 rust::String video_track_kind(const NativeVideoTrack& track) noexcept {
   return track.state()->track->kind();
 }
-bool video_track_should_receive(const NativeVideoTrack& track) noexcept {
-  return track.state()->track->should_receive();
-}
-void video_track_set_should_receive(const NativeVideoTrack& track, bool receive) noexcept {
-  track.state()->track->set_should_receive(receive);
-}
 std::uint8_t video_track_content_hint(const NativeVideoTrack& track) noexcept {
   return static_cast<std::uint8_t>(track.state()->track->content_hint());
 }
@@ -3061,16 +3072,21 @@ static std::unique_ptr<NativeEncodedVideoSink> AttachEncodedVideoSink(
       receivers.end()) return nullptr;
   if (!peer.reserve_encoded_receiver(receiver.state()->receiver->id())) return nullptr;
   auto track = VideoTrack(receiver.state()->receiver->track());
-  if (!track || !track->GetSource() || !track->GetSource()->remote() ||
-      (ordered && !track->GetSource()->SupportsEncodedOutput())) return nullptr;
+  if (!track || !track->GetSource() || !track->GetSource()->remote()) return nullptr;
   auto state = std::make_unique<NativeEncodedVideoSink::State>();
   state->collector = webrtc::make_ref_counted<EncodedFrameCollector>(
       peer.readiness(), ordered, std::move(observer));
-  if (ordered) state->source = track->GetSource();
-  state->worker = peer.worker_thread();
+  if (ordered) {
+    state->selection = peer.observe_encoded_frames(
+        [collector = state->collector](const webrtc::EncodedImage& frame,
+                                        std::uint32_t ssrc) {
+          collector->OnSelected(frame, ssrc);
+        });
+    if (!state->selection) return nullptr;
+  }
   peer.worker_thread()->BlockingCall([&] {
     peer.frame_transformer_hosts().Receiver(peer, receiver.state()->receiver)->SetCollector(state->collector);
-    if (state->source) state->source->AddEncodedSink(state->collector.get());
+    if (ordered) track->GetSource()->GenerateKeyFrame();
   });
   return std::make_unique<NativeEncodedVideoSink>(std::move(state));
 }
@@ -3097,11 +3113,7 @@ std::uint64_t encoded_video_sink_dropped_frames(
 bool close_encoded_video_sink(const NativeEncodedVideoSink& sink) noexcept {
   auto& state = *sink.state();
   if (state.closed.exchange(true)) return true;
-  if (state.worker && state.source) {
-    state.worker->BlockingCall([&] {
-      state.source->RemoveEncodedSink(state.collector.get());
-    });
-  }
+  state.selection.reset();
   state.collector->Deactivate();
   return true;
 }
@@ -3360,7 +3372,8 @@ rust::Vec<FfiRtpHeaderExtension> rtp_transceiver_header_extensions(
   rust::Vec<FfiRtpHeaderExtension> result;
   for (const auto& extension : extensions) {
     result.push_back(FfiRtpHeaderExtension{
-        extension.uri, extension.preferred_id.value_or(-1),
+        extension.uri,
+        extension.preferred_id ? static_cast<int>(*extension.preferred_id) : -1,
         extension.preferred_encrypt, static_cast<std::uint8_t>(extension.direction)});
   }
   return result;
@@ -3443,7 +3456,7 @@ bool rtp_transceiver_set_video_codec_preferences(
   });
   std::vector<webrtc::RtpCodecCapability> selected;
   for (const auto& format : formats) {
-    std::map<std::string, std::string> parameters;
+    webrtc::CodecParameterMap parameters;
     for (const auto& item : format.parameters) {
       if (!parameters.emplace(std::string(item.key), std::string(item.value)).second) {
         error_type = static_cast<std::uint8_t>(webrtc::RTCErrorType::INVALID_PARAMETER);
@@ -3492,7 +3505,7 @@ bool rtp_transceiver_set_audio_codec_preferences(
   });
   std::vector<webrtc::RtpCodecCapability> selected;
   for (const auto& format : formats) {
-    std::map<std::string, std::string> parameters;
+    webrtc::CodecParameterMap parameters;
     for (const auto& item : format.parameters) {
       if (!parameters.emplace(std::string(item.key), std::string(item.value)).second) {
         error_type = static_cast<std::uint8_t>(webrtc::RTCErrorType::INVALID_PARAMETER);
@@ -3661,7 +3674,8 @@ bool media_type_to_string(std::int32_t kind, rust::String& name) noexcept {
   // UNSUPPORTED/ANY are real enum alternatives but the pinned converter's
   // default branch asserts. Guard at the actual converter consumption.
   if (kind < 0 || kind > 2) return false;
-  name = webrtc::MediaTypeToString(static_cast<webrtc::MediaType>(kind));
+  const auto value = webrtc::MediaTypeToString(static_cast<webrtc::MediaType>(kind));
+  name = rust::String(value.data(), value.size());
   return true;
 }
 std::unique_ptr<NativeRtpEncodingList> rtp_sender_initial_encodings(const NativeRtpSender& sender) noexcept {

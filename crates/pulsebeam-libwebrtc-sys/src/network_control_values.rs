@@ -140,7 +140,6 @@ impl Default for StreamsConfig {
     }
 }
 impl StreamsConfig {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcStreamsConfig {
         ffi::FfiNcStreamsConfig {
             at_time: self.at_time.native_microsecond_bits(),
@@ -238,7 +237,6 @@ impl Default for TargetRateConstraints {
     }
 }
 impl TargetRateConstraints {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcTargetRateConstraints {
         ffi::FfiNcTargetRateConstraints {
             at_time: self.at_time.native_microsecond_bits(),
@@ -308,7 +306,6 @@ impl Default for NetworkAvailability {
     }
 }
 impl NetworkAvailability {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcNetworkAvailability {
         ffi::FfiNcNetworkAvailability {
             at_time: self.at_time.native_microsecond_bits(),
@@ -340,7 +337,6 @@ impl Default for NetworkRouteChange {
     }
 }
 impl NetworkRouteChange {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcNetworkRouteChange {
         ffi::FfiNcNetworkRouteChange {
             at_time: self.at_time.native_microsecond_bits(),
@@ -378,7 +374,6 @@ impl Default for PacedPacketInfo {
     }
 }
 impl PacedPacketInfo {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcPacedPacketInfo {
         ffi::FfiNcPacedPacketInfo {
             send_bitrate: rate_native(self.send_bitrate),
@@ -424,7 +419,6 @@ impl Default for SentPacket {
     }
 }
 impl SentPacket {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcSentPacket {
         ffi::FfiNcSentPacket {
             send_time: self.send_time.native_microsecond_bits(),
@@ -472,7 +466,6 @@ impl Default for ReceivedPacket {
     }
 }
 impl ReceivedPacket {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcReceivedPacket {
         ffi::FfiNcReceivedPacket {
             send_time: self.send_time.native_microsecond_bits(),
@@ -504,7 +497,6 @@ impl Default for RemoteBitrateReport {
     }
 }
 impl RemoteBitrateReport {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcRemoteBitrateReport {
         ffi::FfiNcRemoteBitrateReport {
             receive_time: self.receive_time.native_microsecond_bits(),
@@ -536,7 +528,6 @@ impl Default for RoundTripTimeUpdate {
     }
 }
 impl RoundTripTimeUpdate {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcRoundTripTimeUpdate {
         ffi::FfiNcRoundTripTimeUpdate {
             receive_time: self.receive_time.native_microsecond_bits(),
@@ -574,7 +565,6 @@ impl Default for TransportLossReport {
     }
 }
 impl TransportLossReport {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcTransportLossReport {
         ffi::FfiNcTransportLossReport {
             receive_time: self.receive_time.native_microsecond_bits(),
@@ -603,7 +593,6 @@ pub struct RtpPacketInfo {
     pub is_retransmission: bool,
 }
 impl RtpPacketInfo {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcRtpPacketInfo {
         ffi::FfiNcRtpPacketInfo {
             ssrc: self.ssrc,
@@ -647,7 +636,6 @@ impl Default for PacketResult {
     }
 }
 impl PacketResult {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcPacketResult {
         ffi::FfiNcPacketResult {
             sent_packet: self.sent_packet.native(),
@@ -715,7 +703,6 @@ impl Default for TransportPacketsFeedback {
     }
 }
 impl TransportPacketsFeedback {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcTransportPacketsFeedback {
         ffi::FfiNcTransportPacketsFeedback {
             feedback_time: self.feedback_time.native_microsecond_bits(),
@@ -761,7 +748,6 @@ pub struct NetworkEstimate {
     pub at_time: Timestamp,
     pub bandwidth: DataRate,
     pub round_trip_time: TimeDelta,
-    pub bwe_period: TimeDelta,
     pub loss_rate_ratio: f32,
 }
 impl Default for NetworkEstimate {
@@ -770,7 +756,6 @@ impl Default for NetworkEstimate {
             at_time: Timestamp::plus_infinity(),
             bandwidth: DataRate::PositiveInfinity,
             round_trip_time: TimeDelta::plus_infinity(),
-            bwe_period: TimeDelta::plus_infinity(),
             loss_rate_ratio: 0.0,
         }
     }
@@ -781,17 +766,14 @@ impl NetworkEstimate {
             at_time: self.at_time.native_microsecond_bits(),
             bandwidth: rate_native(self.bandwidth),
             round_trip_time: self.round_trip_time.native_microsecond_bits(),
-            bwe_period: self.bwe_period.native_microsecond_bits(),
             loss_rate_ratio: self.loss_rate_ratio,
         }
     }
-    #[cfg(test)]
     pub(crate) fn from_native(value: ffi::FfiNcNetworkEstimate) -> Self {
         Self {
             at_time: Timestamp::from_native_microsecond_bits(value.at_time),
             bandwidth: DataRate::from_native(value.bandwidth.value, value.bandwidth.kind),
             round_trip_time: TimeDelta::from_native_microsecond_bits(value.round_trip_time),
-            bwe_period: TimeDelta::from_native_microsecond_bits(value.bwe_period),
             loss_rate_ratio: value.loss_rate_ratio,
         }
     }
@@ -824,7 +806,6 @@ impl PacerConfig {
             pad_window: size_native(self.pad_window),
         }
     }
-    #[cfg(test)]
     pub(crate) fn from_native(value: ffi::FfiNcPacerConfig) -> Self {
         Self {
             at_time: Timestamp::from_native_microsecond_bits(value.at_time),
@@ -868,7 +849,6 @@ impl ProbeClusterConfig {
             id: self.id,
         }
     }
-    #[cfg(test)]
     pub(crate) fn from_native(value: ffi::FfiNcProbeClusterConfig) -> Self {
         Self {
             at_time: Timestamp::from_native_microsecond_bits(value.at_time),
@@ -911,7 +891,6 @@ impl TargetTransferRate {
             cwnd_reduce_ratio: self.cwnd_reduce_ratio,
         }
     }
-    #[cfg(test)]
     pub(crate) fn from_native(value: ffi::FfiNcTargetTransferRate) -> Self {
         Self {
             at_time: Timestamp::from_native_microsecond_bits(value.at_time),
@@ -959,7 +938,6 @@ impl NetworkControlUpdate {
             failed: false,
         }
     }
-    #[cfg(test)]
     pub(crate) fn from_native(value: ffi::FfiNcNetworkControlUpdate) -> Self {
         Self {
             congestion_window: if value.has_congestion_window {
@@ -978,7 +956,7 @@ impl NetworkControlUpdate {
             probe_cluster_configs: value
                 .probe_cluster_configs
                 .into_iter()
-                .map(|value| ProbeClusterConfig::from_native(value))
+                .map(ProbeClusterConfig::from_native)
                 .collect(),
             target_rate: if value.has_target_rate {
                 Some(TargetTransferRate::from_native(value.target_rate))
@@ -1004,7 +982,6 @@ impl Default for ProcessInterval {
     }
 }
 impl ProcessInterval {
-    #[cfg(test)]
     pub(crate) fn native(&self) -> ffi::FfiNcProcessInterval {
         ffi::FfiNcProcessInterval {
             at_time: self.at_time.native_microsecond_bits(),

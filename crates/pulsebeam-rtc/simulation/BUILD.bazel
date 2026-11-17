@@ -32,6 +32,15 @@ rust_test(
 )
 
 rust_test(
+    name = "scream_differential",
+    args = ["--test-threads=1"],
+    crate_root = "tests/scream_differential.rs",
+    srcs = ["tests/scream_differential.rs"],
+    edition = "2024",
+    deps = ["//crates/pulsebeam-cc:pulsebeam-cc", "//crates/pulsebeam-libwebrtc-sys:pulsebeam-webrtc-sys"],
+)
+
+rust_test(
     name = "interop",
     tags = ["slow", "cpu:2"],
     # ControlledWorld exclusively owns process-global clock and randomness hooks.

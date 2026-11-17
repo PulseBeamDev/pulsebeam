@@ -52,8 +52,9 @@ fn actor_factory_retains_both_providers_through_migration() {
 }
 
 #[test]
-fn native_factory_retires_providers_on_the_supplied_worker() {
-    let worker = WorkerThread::start().unwrap();
+fn native_factory_retires_providers_on_the_supplied_network_worker_role() {
+    let network = NetworkThread::start().unwrap();
+    let worker = network.worker_alias();
     let (tx, rx) = std::sync::mpsc::channel();
     assert!(worker.post(move || tx.send(std::thread::current().id()).unwrap()));
     let worker_id = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
@@ -62,6 +63,7 @@ fn native_factory_retires_providers_on_the_supplied_worker() {
     let encode_handle = Metronome::from_provider(Source(encode.clone()));
     let decode_handle = Metronome::from_provider(Source(decode.clone()));
     let factory = PeerConnectionFactory::builder()
+        .network_thread(network)
         .worker_thread(worker)
         .encode_metronome(&encode_handle)
         .decode_metronome(&decode_handle)

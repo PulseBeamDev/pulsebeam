@@ -5,7 +5,6 @@ use crate::ffi;
 /// Binding admission errors, not an invented result of the SDK's void setters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioSourceControlError {
-    UnknownProcessingMode,
     InvalidVolume,
     MissingAudioTrack,
     UnknownStatus(u8),
@@ -14,7 +13,6 @@ impl AudioSourceControlError {
     pub(crate) fn result(code: u8) -> Result<(), Self> {
         match code {
             0 => Ok(()),
-            1 => Err(Self::UnknownProcessingMode),
             2 => Err(Self::InvalidVolume),
             3 => Err(Self::MissingAudioTrack),
             code => Err(Self::UnknownStatus(code)),
@@ -24,9 +22,6 @@ impl AudioSourceControlError {
 impl std::fmt::Display for AudioSourceControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownProcessingMode => {
-                f.write_str("processing mode is outside the pinned native enum")
-            }
             Self::InvalidVolume => f.write_str("native volume must be finite and in 0..=10"),
             Self::MissingAudioTrack => f.write_str("sender has no installed audio track"),
             Self::UnknownStatus(code) => write!(f, "unknown native source control status {code}"),
@@ -35,34 +30,6 @@ impl std::fmt::Display for AudioSourceControlError {
 }
 impl std::error::Error for AudioSourceControlError {}
 
-/// Implementation choice for an enabled native processing component.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioProcessingMode {
-    Automatic,
-    Platform,
-    Software,
-    /// Preserves an unrecognized native value without substituting a mode.
-    Unknown(i32),
-}
-impl AudioProcessingMode {
-    fn native(self) -> i32 {
-        match self {
-            Self::Automatic => 0,
-            Self::Platform => 1,
-            Self::Software => 2,
-            Self::Unknown(value) => value,
-        }
-    }
-    fn from_native(value: i32) -> Self {
-        match value {
-            0 => Self::Automatic,
-            1 => Self::Platform,
-            2 => Self::Software,
-            value => Self::Unknown(value),
-        }
-    }
-}
-
 /// Full Linux `AudioOptions` values. Absence differs from explicit false/zero.
 /// These are source options, not a report of effective voice-engine settings.
 /// In particular, carrying an ANA configuration does not enable an unavailable
@@ -70,13 +37,9 @@ impl AudioProcessingMode {
 #[derive(Clone, Debug)]
 pub struct AudioSourceOptions {
     pub echo_cancellation: Option<bool>,
-    pub echo_cancellation_mode: Option<AudioProcessingMode>,
     pub auto_gain_control: Option<bool>,
-    pub auto_gain_control_mode: Option<AudioProcessingMode>,
     pub noise_suppression: Option<bool>,
-    pub noise_suppression_mode: Option<AudioProcessingMode>,
     pub highpass_filter: Option<bool>,
-    pub highpass_filter_mode: Option<AudioProcessingMode>,
     pub stereo_swapping: Option<bool>,
     pub audio_jitter_buffer_max_packets: Option<i32>,
     pub audio_jitter_buffer_fast_accelerate: Option<bool>,
@@ -118,18 +81,11 @@ impl AudioSourceOptions {
                 value: value.unwrap_or(0),
             }
         }
-        fn mode(value: Option<AudioProcessingMode>) -> ffi::FfiOptionalI32 {
-            integer(value.map(AudioProcessingMode::native))
-        }
         ffi::FfiAudioSourceOptions {
             echo_cancellation: boolean(self.echo_cancellation),
-            echo_cancellation_mode: mode(self.echo_cancellation_mode),
             auto_gain_control: boolean(self.auto_gain_control),
-            auto_gain_control_mode: mode(self.auto_gain_control_mode),
             noise_suppression: boolean(self.noise_suppression),
-            noise_suppression_mode: mode(self.noise_suppression_mode),
             highpass_filter: boolean(self.highpass_filter),
-            highpass_filter_mode: mode(self.highpass_filter_mode),
             stereo_swapping: boolean(self.stereo_swapping),
             audio_jitter_buffer_max_packets: integer(self.audio_jitter_buffer_max_packets),
             audio_jitter_buffer_fast_accelerate: boolean(self.audio_jitter_buffer_fast_accelerate),
@@ -150,18 +106,11 @@ impl AudioSourceOptions {
         fn integer(value: ffi::FfiOptionalI32) -> Option<i32> {
             value.present.then_some(value.value)
         }
-        fn mode(value: ffi::FfiOptionalI32) -> Option<AudioProcessingMode> {
-            integer(value).map(AudioProcessingMode::from_native)
-        }
         Self {
             echo_cancellation: boolean(value.echo_cancellation),
-            echo_cancellation_mode: mode(value.echo_cancellation_mode),
             auto_gain_control: boolean(value.auto_gain_control),
-            auto_gain_control_mode: mode(value.auto_gain_control_mode),
             noise_suppression: boolean(value.noise_suppression),
-            noise_suppression_mode: mode(value.noise_suppression_mode),
             highpass_filter: boolean(value.highpass_filter),
-            highpass_filter_mode: mode(value.highpass_filter_mode),
             stereo_swapping: boolean(value.stereo_swapping),
             audio_jitter_buffer_max_packets: integer(value.audio_jitter_buffer_max_packets),
             audio_jitter_buffer_fast_accelerate: boolean(value.audio_jitter_buffer_fast_accelerate),
@@ -181,7 +130,6 @@ pub struct AudioTrackStatus {
     pub kind: String,
     pub enabled: bool,
     pub state: AudioTrackState,
-    pub volume: f64,
     pub signal_level: Option<i32>,
 }
 impl AudioTrackStatus {
@@ -191,7 +139,6 @@ impl AudioTrackStatus {
             kind: value.kind,
             enabled: value.enabled,
             state: AudioTrackState::from_native(value.state),
-            volume: value.volume,
             signal_level: value
                 .signal_level
                 .present

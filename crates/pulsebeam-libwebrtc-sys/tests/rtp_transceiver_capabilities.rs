@@ -168,7 +168,7 @@ fn full_capability_preferences_preserve_metadata_errors_and_migrated_ownership()
         .unwrap();
     let requested = &mut configured[index];
     requested.set_direction(RtpTransceiverDirectionValue::Other(i32::MIN));
-    requested.set_preferred_id(Some(&RtpHeaderExtensionId::new(i32::MIN)));
+    requested.set_preferred_id(Some(&RtpHeaderExtensionId::new(255)));
     requested.set_preferred_encrypt(!defaults[index].preferred_encrypt());
     session
         .set_header_extension_capabilities_to_negotiate(transceiver, &configured)
@@ -183,7 +183,7 @@ fn full_capability_preferences_preserve_metadata_errors_and_migrated_ownership()
         actual[index].preferred_encrypt(),
         defaults[index].preferred_encrypt()
     );
-    assert_eq!(configured[index].preferred_id().unwrap().value(), i32::MIN);
+    assert_eq!(configured[index].preferred_id().unwrap().value(), 255);
     assert!(
         session
             .negotiated_header_extension_capabilities(transceiver)

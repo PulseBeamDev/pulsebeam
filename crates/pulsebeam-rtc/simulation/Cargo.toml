@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 pulsebeam-webrtc-sys.workspace = true
 [dev-dependencies]
+pulsebeam-cc = { path = "../../pulsebeam-cc" }
 pulsebeam-agent-core = { path = "../../../agents/pulsebeam-agent-core" }
 pulsebeam-rtc = { path = ".." }
 bytes = "1.11.1"

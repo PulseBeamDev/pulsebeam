@@ -6,7 +6,7 @@ load(":native_build.bzl", "native_build")
 load(":tests.bzl", "ASAN_FLAGS", "runtime_tests")
 
 package(default_visibility = ["//visibility:public"])
-exports_files(glob(["patches/*.patch", "gn/**"]) + ["Cargo.toml", "repositories.bzl", "deps.MODULE.bazel", "source_manifest.py"])
+exports_files(glob(["gn/**"]) + ["Cargo.toml", "repositories.bzl", "deps.MODULE.bazel", "source_manifest.py"])
 filegroup(name = "cargo_metadata_inputs", srcs = ["Cargo.toml"] + glob(["src/**/*.rs", "examples/*.rs"]))
 filegroup(name = "workflow_inputs", srcs = ["README.md"])
 

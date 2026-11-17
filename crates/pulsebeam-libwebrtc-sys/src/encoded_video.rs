@@ -153,11 +153,7 @@ impl Pending {
             .collect()
     }
 
-    fn check_keyframe_requests(
-        &self,
-        frame_types: &[VideoFrameType],
-        selected: &[bool],
-    ) -> Result<(), CodecError> {
+    fn reject_missing_keyframes(&self, frame_types: &[VideoFrameType], selected: &[bool]) -> bool {
         let mut missing_keyframe = false;
         for (index, unit) in self
             .frames
@@ -173,10 +169,12 @@ impl Pending {
             }
         }
         if missing_keyframe {
-            Err(self.reject(CodecError::InvalidFrame))
-        } else {
-            Ok(())
+            // This is a rejected producer image, not a fatal encoder failure.
+            // Keep the SDK encoder alive so a subsequent supplied keyframe can
+            // be consumed on its own real capture callback.
+            self.reject(CodecError::InvalidFrame);
         }
+        missing_keyframe
     }
 
     fn reject(&self, error: CodecError) -> CodecError {
@@ -1107,9 +1105,27 @@ impl InputEncoder {
         if let Some(rates) = self.rates {
             pending.feedback.set_rates(rates);
         }
+        // Only the final selected layer completes this capture's temporal unit.
+        let last_selected = selected.iter().rposition(|selected| *selected);
         // Validate every selected image before the first callback. Callback
         // publication is still non-atomic, exactly like the native interface.
-        pending.check_keyframe_requests(frame_types, &selected)?;
+        if pending.reject_missing_keyframes(frame_types, &selected) {
+            // Report each selected capture as dropped through the real SDK
+            // callback. Never emit its delta payload as a requested keyframe.
+            for (index, is_selected) in selected.iter().enumerate() {
+                if *is_selected
+                    && let Err(error) = callback.frame_dropped(
+                        context.rtp_timestamp,
+                        index as i32,
+                        Some(index) == last_selected,
+                    )
+                {
+                    pending.feedback.record_error(error);
+                    return Err(error);
+                }
+            }
+            return Ok(());
+        }
         let decodable = pending.decodable_units(previous, &selected);
         let count = pending.frames.len();
         for (index, unit) in pending.frames.into_iter().enumerate() {
@@ -1126,9 +1142,11 @@ impl InputEncoder {
                     ),
                 );
                 pending.dropped.fetch_add(1, Ordering::Relaxed);
-                if let Err(error) =
-                    callback.frame_dropped(context.rtp_timestamp, index as i32, true)
-                {
+                if let Err(error) = callback.frame_dropped(
+                    context.rtp_timestamp,
+                    index as i32,
+                    Some(index) == last_selected,
+                ) {
                     pending
                         .dropped
                         .fetch_add((count - index - 1) as u64, Ordering::Relaxed);
@@ -1494,10 +1512,7 @@ mod tests {
             feedback: Arc::new(SourceFeedback::default()),
             frames,
         };
-        assert_eq!(
-            pending.check_keyframe_requests(&[VideoFrameType::Key; 3], &[true; 3]),
-            Err(CodecError::InvalidFrame)
-        );
+        assert!(pending.reject_missing_keyframes(&[VideoFrameType::Key; 3], &[true; 3]));
         assert_eq!(
             pending.feedback.encoding_keyframes.load(Ordering::Acquire),
             0b111
@@ -1519,9 +1534,8 @@ mod tests {
             feedback: Arc::new(SourceFeedback::default()),
             frames: broker_batch(1),
         };
-        assert_eq!(
-            pending.check_keyframe_requests(&[VideoFrameType::Key; 3], &[true, true, false]),
-            Ok(())
+        assert!(
+            !pending.reject_missing_keyframes(&[VideoFrameType::Key; 3], &[true, true, false],)
         );
         assert_eq!(
             pending.feedback.encoding_keyframes.load(Ordering::Acquire),

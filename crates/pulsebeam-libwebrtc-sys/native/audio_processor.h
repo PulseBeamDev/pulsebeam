@@ -179,7 +179,6 @@ std::int32_t audio_processor_initialize_formats(NativeAudioProcessingModule&, co
 std::uint8_t audio_processor_configure(NativeAudioProcessingModule&, const FfiAudioProcessingConfig&) noexcept;
 FfiAudioProcessingFormatState audio_processor_format(const NativeAudioProcessingModule&) noexcept;
 void audio_processor_set_muted(NativeAudioProcessingModule&, bool) noexcept;
-bool audio_processor_muted(NativeAudioProcessingModule&) noexcept;
 std::int32_t audio_processor_set_delay(NativeAudioProcessingModule&, std::int32_t) noexcept;
 std::int32_t audio_processor_delay(const NativeAudioProcessingModule&) noexcept;
 void audio_processor_set_analog_level(NativeAudioProcessingModule&, std::int32_t) noexcept;

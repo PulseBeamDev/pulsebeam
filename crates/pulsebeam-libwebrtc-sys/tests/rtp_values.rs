@@ -536,7 +536,7 @@ fn native_rtcp_parameters_defaults_optional_zero_bytes_copy_and_template_streams
 }
 
 #[test]
-fn native_header_extension_id_full_signed_domain_and_strong_alias_loans() {
+fn native_header_extension_id_typed_domain_and_value_semantics() {
     use pulsebeam_webrtc_sys::RtpHeaderExtensionId as Id;
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Id>();
@@ -547,31 +547,30 @@ fn native_header_extension_id_full_signed_domain_and_strong_alias_loans() {
     assert_eq!(Id::min_id().value(), 1);
     assert_eq!(Id::max_id().value(), 255);
     assert_eq!(Id::one_byte_max_id().value(), 14);
-    for raw in [i32::MIN, -1, 0, 1, 14, 255, 256, i32::MAX] {
+    for raw in [0, 1, 14, 255] {
         let value = Id::new(raw);
         assert_eq!(value.value(), raw);
         assert_eq!(value.to_int(), raw);
         assert_eq!(value.is_set(), raw != 0);
         assert_eq!(value.is_valid(), (1..=255).contains(&raw));
         assert_eq!(value.native_string_bytes(), raw.to_string().as_bytes());
-        assert!(std::ptr::eq(value.value_ref(), value.as_underlying()));
-        assert!(std::ptr::eq(value.value_ref(), &*value));
-        assert!(std::ptr::eq(value.value_ref(), value.arrow_value_ref()));
         let copy = value.clone();
         assert_eq!(value, copy);
         assert_eq!(value.native_hash(), copy.native_hash());
         assert_eq!(value.into_value(), raw);
         assert_eq!(copy.into_const_value(), raw);
-        assert_eq!(Id::new(raw).into_deref(), raw);
-        assert_eq!(Id::new(raw).into_const_deref(), raw);
+        assert_eq!(Id::try_new(raw).unwrap().value(), raw);
+    }
+    for raw in [i32::MIN, -1, 256, i32::MAX] {
+        assert!(Id::try_new(raw).is_none());
     }
     let mut value = Id::new(1);
-    *value.value_mut() = i32::MIN;
-    *value.arrow_value_mut() = i32::MAX;
-    *value = -9;
-    assert_eq!(value.to_int(), -9);
-    assert!(!value.is_valid());
-    assert!(value.is_set());
+    assert!(!value.set_value(-1));
+    assert_eq!(value.value(), 1);
+    assert!(!value.set_value(256));
+    assert_eq!(value.value(), 1);
+    assert!(value.set_value(255));
+    assert_eq!(value.value(), 255);
     value.clone_from(&Id::max_id());
     assert_eq!(value, Id::max_id());
     assert!(Id::min_id() < value);
@@ -592,9 +591,9 @@ fn native_rtp_extension_constructors_fields_constants_and_sdk_formatters() {
     assert!(!value.encrypt());
     assert_eq!(value.native_string_bytes(), b"[0 ]");
     assert_eq!(value.to_string_bytes(), b"{uri: , id: 0}");
+    assert!(E::new(b"x", &Id::not_set()).is_none());
+    assert!(E::new_encrypted(b"x", &Id::not_set(), true).is_none());
     for id in [i32::MIN, -1, 0, 256, i32::MAX] {
-        assert!(E::new(b"x", &Id::new(id)).is_none());
-        assert!(E::new_encrypted(b"x", &Id::new(id), true).is_none());
         assert!(E::new_int(b"x", id).is_none());
         assert!(E::new_int_encrypted(b"x", id, false).is_none());
     }
@@ -620,10 +619,10 @@ fn native_rtp_extension_constructors_fields_constants_and_sdk_formatters() {
     assert_eq!(E::max_value_size(), 255);
     assert_eq!(E::one_byte_max_value_size(), 16);
     value.set_uri(b"raw\0\xff");
-    value.set_id(&Id::new(i32::MIN));
+    value.set_id(&Id::new(255));
     value.set_encrypt(true);
     assert_eq!(value.uri_bytes(), b"raw\0\xff");
-    assert_eq!(value.id().value(), i32::MIN);
+    assert_eq!(value.id().value(), 255);
     assert!(value.encrypt());
     let mut copy = value.clone();
     value.set_uri(b"changed");
@@ -755,7 +754,7 @@ fn native_header_extension_typed_streams_match_sdk_stringify() {
         RtcError, RtcErrorType, RtpExtension, RtpExtensionFilter, RtpExtensions,
         RtpHeaderExtensionId, StringBuilder,
     };
-    let id = RtpHeaderExtensionId::new(-9);
+    let id = RtpHeaderExtensionId::new(9);
     let mut extension = RtpExtension::default();
     extension.set_uri(b"x\0\xff");
     extension.set_id(&id);
@@ -774,8 +773,10 @@ fn native_header_extension_typed_streams_match_sdk_stringify() {
     builder.append_rtp_extension(&extension);
     builder.append_rtp_extension_ref(&loan);
     assert_eq!(builder.as_bytes(), expected);
-    // Native RTCError exposes its message as a C string, unlike the builder.
-    let message = &expected[..expected.iter().position(|byte| *byte == 0).unwrap()];
+    assert_eq!(extension.uri_bytes(), b"x\0\xff");
+    assert_eq!(loan.uri_bytes(), b"x\0\xff");
+    assert_eq!(extension.native_string_bytes(), br"[9 x\000\377 (encrypted)]");
+    assert!(!expected.contains(&0));
     let mut error = RtcError::new(RtcErrorType::InvalidState);
     {
         let mut stream = error.string_builder();
@@ -783,15 +784,14 @@ fn native_header_extension_typed_streams_match_sdk_stringify() {
         stream.append_rtp_extension(&extension);
         stream.append_rtp_extension_ref(&loan);
     }
-    // SDK message() is a const-char* view; the mutable SDK builder retains
-    // the full length-aware storage. Do not confuse the two public contracts.
-    assert_eq!(error.message_bytes(), b"-9[-9 x");
+    // The SDK escapes URI bytes before either string stream receives them.
+    assert_eq!(error.message_bytes(), expected);
     assert_eq!(error.string_builder().as_bytes(), expected);
     let mut error = RtcError::new(RtcErrorType::InvalidState)
         .with_appended_header_extension_id(&id)
         .with_appended_rtp_extension(&extension)
         .with_appended_rtp_extension_ref(&loan);
-    assert_eq!(error.message_bytes(), b"-9[-9 x");
+    assert_eq!(error.message_bytes(), expected);
     assert_eq!(error.string_builder().as_bytes(), expected);
     assert_eq!(error.kind(), RtcErrorType::InvalidState);
 }

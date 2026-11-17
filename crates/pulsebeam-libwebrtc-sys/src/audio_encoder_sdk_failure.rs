@@ -11,7 +11,6 @@ impl AudioEncoderSdkOperation {
     pub const UPLINK_ALLOCATION: Self = Self(4);
     pub const PACKET_LOSS: Self = Self(5);
     pub const RECOVERABLE_PACKET_LOSS: Self = Self(6);
-    pub const ENABLE_ADAPTOR: Self = Self(7);
     pub const QUERY_ENCODER: Self = Self(8);
     pub const CREATE_ENCODER: Self = Self(9);
     pub const ENCODE_ADAPTATION: Self = Self(10);
@@ -50,7 +49,6 @@ impl AudioEncoderSdkFailureObserver {
                 1 => AudioEncoderError::InvalidControl,
                 2 => AudioEncoderError::UnsafeClock,
                 3 => AudioEncoderError::UnsupportedControl,
-                4 => AudioEncoderError::UnsafeAdaptor,
                 _ => AudioEncoderError::NativeInvariant,
             },
         })

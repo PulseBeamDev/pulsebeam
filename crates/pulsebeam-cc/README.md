@@ -72,10 +72,18 @@ physical-capacity estimate. The host owns media allocation and authentication.
 
 The Rust sources originate from `pulsebeam-rtc` at repository commit
 `14fd653774f61c7bb6de261d306b362fc0be39b4`. They adapt libwebrtc revision
-`326fd06bb4d93900ed6947205b94cefd2413afca`. Upstream `LICENSE` and `PATENTS`
+`7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499`. Upstream `LICENSE` and `PATENTS`
 are retained in `src/congestion/screamv2/`. `scripts/verify-scream-profile.sh`
 checks pinned upstream artifacts and retained notices, not behavioral
-conformance. The copied native scenario is a rate-throttled adapter proof, not
+conformance. The native differential lives in `pulsebeam-rtc/simulation` and
+compares the actual SDK controller with Rust at real virtual callback times,
+with positive SCReAM selection and a GCC-negative control. Run it separately:
+
+```sh
+./bazel test //crates/pulsebeam-rtc/simulation:scream_differential --//crates/pulsebeam-libwebrtc-sys:flavor=native --test_output=errors
+```
+
+It is a narrow controller proof, not media or throughput qualification. The copied native scenario is a rate-throttled adapter proof, not
 a faithful network simulation of this pacer. The separate packet-level virtual-link
 fixture drives real readiness, accepted-size commit, bounded host history, receipt
 normalization and independent directions. The DTLS owner exercises real ciphertext
@@ -88,6 +96,14 @@ From the repository root, run:
 ./bazel test //crates/pulsebeam-cc:test //crates/pulsebeam-cc:format //crates/pulsebeam-cc:clippy
 ```
 
-Use `scripts/verify-scream-profile.sh [pinned-libwebrtc-source-root]` for source
-identity. Missing sources or failed downloads are missing provenance evidence,
-not passing behavioral conformance.
+Use `crates/pulsebeam-cc/scripts/verify-scream-profile.sh [pinned-libwebrtc-source-root]`
+from the repository root for source identity. Missing sources or failed downloads
+are missing provenance evidence, not passing behavioral conformance.
+
+After an intentional port update, record the selected source profile with
+`python3 crates/pulsebeam-cc/scripts/update-scream-profile.py <qualified-source-root>`.
+Replace `<qualified-source-root>` with the qualified libwebrtc `src` directory.
+This records its exact Git revision, recomputes the verifier's artifact hashes and
+retains its license notices. It does not update the Rust algorithm or prove
+conformance. Review the port and provenance comments, then run source verification
+and the native differential proof separately.

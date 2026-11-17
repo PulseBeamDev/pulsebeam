@@ -3516,6 +3516,24 @@ pub struct ClientObservation {
     pub audio_capacity: usize,
 }
 
+impl ClientObservation {
+    pub fn owned_receiver_publication(
+        &self,
+        media_index: u32,
+        publication_id: &str,
+    ) -> Option<&CatalogPublication> {
+        let generation = self.snapshot.generation?.get();
+        self.owned_receivers
+            .iter()
+            .find(|evidence| {
+                evidence.track.generation == generation
+                    && evidence.track.media_index == media_index
+                    && evidence.publication.id == publication_id
+            })
+            .map(|evidence| &evidence.publication)
+    }
+}
+
 #[derive(Default)]
 struct NativeEventLog {
     topics: Vec<TopicNotification>,

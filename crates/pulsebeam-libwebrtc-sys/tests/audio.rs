@@ -319,7 +319,6 @@ fn decoded_audio_sink_receives_headless_pcm_over_negotiated_peer() {
         .observe_volume(std::num::NonZeroUsize::new(2).unwrap())
         .unwrap();
     remote_source.set_volume(0.25).unwrap();
-    assert_eq!(remote_alias.volume(), 0.25);
     assert_eq!(
         volume_events.try_next_event(),
         Some(pulsebeam_webrtc_sys::AudioObserverEvent::Volume(0.25))

@@ -9,7 +9,7 @@ publish = false
 native = []
 
 [dependencies]
-cxx = "=1.0.194"
+cxx = "=1.0.205"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

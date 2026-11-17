@@ -66,6 +66,8 @@
 #include "api/video_codecs/video_decoder_factory.h"
 #include "api/video_codecs/video_encoder_factory.h"
 #include "pulsebeam-webrtc-sys/native/codec.h"
+#include "pulsebeam-webrtc-sys/native/codec_resources.h"
+#include "pulsebeam-webrtc-sys/native/encoded_frame_selection.h"
 #include "pulsebeam-webrtc-sys/native/data_channel.h"
 #include "pulsebeam-webrtc-sys/native/transport.h"
 #include "pulsebeam-webrtc-sys/native/execution.h"
@@ -999,6 +1001,8 @@ std::optional<webrtc::SdpType> SdpType(std::uint8_t value) {
 // API exposes MediaFactory or the borrowed native Call/PacketReceiver.
 struct CallObservation {
   std::mutex mutex;
+  std::shared_ptr<EncodedFrameSelections> encoded_frames =
+      std::make_shared<EncodedFrameSelections>();
   std::optional<webrtc::Environment> creation_environment;
   FfiClockTimeBounds clock_bounds{};  // Exact retained SDK creation clock only.
   bool live = false;
@@ -1063,8 +1067,8 @@ class ObservedCall final : public webrtc::Call, public webrtc::PacketReceiver {
     actual_->DestroyAudioSendStream(stream);
   }
   webrtc::AudioReceiveStreamInterface* CreateAudioReceiveStream(
-      const webrtc::AudioReceiveStreamInterface::Config& config) override {
-    return actual_->CreateAudioReceiveStream(config);
+      webrtc::AudioReceiveStreamInterface::Config config) override {
+    return actual_->CreateAudioReceiveStream(std::move(config));
   }
   void DestroyAudioReceiveStream(
       webrtc::AudioReceiveStreamInterface* stream) override {
@@ -1091,11 +1095,21 @@ class ObservedCall final : public webrtc::Call, public webrtc::PacketReceiver {
   }
   webrtc::VideoReceiveStreamInterface* CreateVideoReceiveStream(
       webrtc::VideoReceiveStreamInterface::Config config) override {
-    return actual_->CreateVideoReceiveStream(std::move(config));
+    std::unique_ptr<SelectedFrameDecoderFactory> factory;
+    if (config.decoder_factory) {
+      factory = std::make_unique<SelectedFrameDecoderFactory>(
+          *config.decoder_factory, observation_->encoded_frames,
+          config.rtp.remote_ssrc);
+      config.decoder_factory = factory.get();
+    }
+    auto* stream = actual_->CreateVideoReceiveStream(std::move(config));
+    if (stream && factory) decoder_factories_.emplace(stream, std::move(factory));
+    return stream;
   }
   void DestroyVideoReceiveStream(
       webrtc::VideoReceiveStreamInterface* stream) override {
     actual_->DestroyVideoReceiveStream(stream);
+    decoder_factories_.erase(stream);
   }
   webrtc::FlexfecReceiveStream* CreateFlexfecReceiveStream(
       const webrtc::FlexfecReceiveStream::Config config) override {
@@ -1132,9 +1146,6 @@ class ObservedCall final : public webrtc::Call, public webrtc::PacketReceiver {
                                  webrtc::NetworkState state) override {
     actual_->SignalChannelNetworkState(media, state);
   }
-  void OnAudioTransportOverheadChanged(int overhead) override {
-    actual_->OnAudioTransportOverheadChanged(overhead);
-  }
   void OnUpdateSyncGroup(webrtc::AudioReceiveStreamInterface& stream,
                          absl::string_view sync_group) override {
     actual_->OnUpdateSyncGroup(stream, sync_group);
@@ -1168,6 +1179,9 @@ class ObservedCall final : public webrtc::Call, public webrtc::PacketReceiver {
  private:
   std::unique_ptr<webrtc::Call> actual_;
   std::shared_ptr<CallObservation> observation_;
+  // Config borrows this factory through asynchronous decoder retirement.
+  std::unordered_map<webrtc::VideoReceiveStreamInterface*,
+                     std::unique_ptr<SelectedFrameDecoderFactory>> decoder_factories_;
 };
 
 class ObservedMediaFactory final : public webrtc::MediaFactory {
@@ -1182,6 +1196,16 @@ class ObservedMediaFactory final : public webrtc::MediaFactory {
   std::unique_ptr<webrtc::MediaEngineInterface> CreateMediaEngine(
       const webrtc::Environment& environment,
       webrtc::PeerConnectionFactoryDependencies& dependencies) override {
+    if (codec_core_budget_) {
+      if (dependencies.video_encoder_factory) {
+        dependencies.video_encoder_factory = std::make_unique<CoreBudgetEncoderFactory>(
+            std::move(dependencies.video_encoder_factory), *codec_core_budget_);
+      }
+      if (dependencies.video_decoder_factory) {
+        dependencies.video_decoder_factory = std::make_unique<CoreBudgetDecoderFactory>(
+            std::move(dependencies.video_decoder_factory), *codec_core_budget_);
+      }
+    }
     return selected_->CreateMediaEngine(environment, dependencies);
   }
   std::unique_ptr<webrtc::Call> CreateCall(webrtc::CallConfig config) override {
@@ -1193,9 +1217,6 @@ class ObservedMediaFactory final : public webrtc::MediaFactory {
     // Capture before delegation, without holding the context mutex across any
     // selected provider. Never synchronously query signaling from this worker.
     const auto environment = retain_environment_from_sdk(config.env, selected_environment_.get());
-    // Runtime selection supplies a default, never overwrites an explicit
-    // native CallConfig value or standalone codec initialization settings.
-    if (!config.codec_core_budget) config.codec_core_budget = codec_core_budget_;
     auto actual = selected_->CreateCall(std::move(config));
     if (!actual || !observation) return actual;
     return std::make_unique<ObservedCall>(
@@ -1261,7 +1282,6 @@ struct NativePeerConnectionFactory::State {
   webrtc::scoped_refptr<webrtc::FrameTransformerInterface> opus_transformer;
   std::shared_ptr<ReadinessSignal> readiness;
   webrtc::scoped_refptr<HeadlessAudioDevice> headless_audio_device;
-  std::vector<std::unique_ptr<NativeAudioDeviceObserver>> device_observers;
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> audio_device;
   std::unique_ptr<NativeAudioDevice> selected_audio_device;
   webrtc::scoped_refptr<webrtc::AudioProcessing> audio_processing;
@@ -1330,7 +1350,7 @@ NativePeerConnectionFactory::factory() const noexcept {
 bool factory_requires_deferred_teardown(const NativePeerConnectionFactory& factory) noexcept {
   auto* thread = webrtc::Thread::Current();
   const auto& state = *factory.state();
-  if (thread && (thread == state.network_thread || thread == state.worker_thread ||
+  if (thread && (thread == state.network_thread ||
                  thread == state.signaling_thread)) return true;
   // Ordinary auto-wrapped caller Threads remain callers. Codec/custom SDK
   // queues can run off those threads and still prohibit reentrant teardown.
@@ -1342,7 +1362,7 @@ webrtc::Thread* NativePeerConnectionFactory::signaling_thread() const noexcept {
   return state_->signaling_thread;
 }
 webrtc::Thread* NativePeerConnectionFactory::worker_thread() const noexcept {
-  return state_->worker_thread;
+  return state_->network_thread;
 }
 webrtc::scoped_refptr<webrtc::AudioProcessing>
 NativePeerConnectionFactory::audio_processing() const noexcept {
@@ -1393,7 +1413,7 @@ webrtc::Thread* NativePeerConnection::signaling_thread() const noexcept {
   return state_->signaling_thread;
 }
 webrtc::Thread* NativePeerConnection::worker_thread() const noexcept {
-  return state_->worker_thread;
+  return state_->network_thread;
 }
 webrtc::scoped_refptr<webrtc::FrameTransformerInterface>
 NativePeerConnection::opus_transformer() const noexcept {
@@ -1403,6 +1423,11 @@ NativeFrameTransformerHosts& NativePeerConnection::frame_transformer_hosts() con
 std::shared_ptr<ReadinessSignal>
 NativePeerConnection::readiness() const noexcept {
   return state_->events->readiness;
+}
+std::shared_ptr<EncodedFrameSelection> NativePeerConnection::observe_encoded_frames(
+    std::function<void(const webrtc::EncodedImage&, std::uint32_t)> callback) const {
+  if (!state_->call_observation) return nullptr;
+  return state_->call_observation->encoded_frames->Register(std::move(callback));
 }
 bool NativePeerConnection::reserve_encoded_receiver(
     const std::string& id) const noexcept {
@@ -1420,7 +1445,6 @@ void NativePeerConnection::release_audio_receiver(
 std::unique_ptr<NativePeerConnectionFactory> new_peer_connection_factory(
     const NativeEnvironment& environment,
     const NativeThread& network_thread,
-    const NativeThread& worker_thread,
     const NativeThread& signaling_thread,
     const NativeNetworkManagerProvider* network_manager,
     rust::Box<RustNetworkManagerFactory> network_manager_factory,
@@ -1466,10 +1490,9 @@ std::unique_ptr<NativePeerConnectionFactory> new_peer_connection_factory(
     dependencies.event_log_factory = shared_builtin_event_log_factory(std::move(event_log_retention));
   }
   dependencies.network_thread = network_thread.thread();
-  dependencies.worker_thread = worker_thread.thread();
   dependencies.signaling_thread = signaling_thread.thread();
-  if (!dependencies.network_thread || !dependencies.worker_thread ||
-      !dependencies.signaling_thread) {
+  webrtc::Thread* worker_thread = dependencies.network_thread;
+  if (!dependencies.network_thread || !dependencies.signaling_thread) {
     error = "a required WebRTC thread is closed";
     return nullptr;
   }
@@ -1477,7 +1500,7 @@ std::unique_ptr<NativePeerConnectionFactory> new_peer_connection_factory(
   // initialization on network). Reject a forbidden source-role edge before any
   // SDK BlockingCall can enter its fatal invocation-policy check.
   if (auto* current = webrtc::Thread::Current()) {
-    for (auto* target : {dependencies.network_thread, dependencies.worker_thread,
+    for (auto* target : {dependencies.network_thread,
                          dependencies.signaling_thread}) {
       if (target != current && !current->IsInvokeToThreadAllowed(target)) {
         error = "current native role cannot synchronously construct a factory on the selected roles";
@@ -1538,39 +1561,35 @@ std::unique_ptr<NativePeerConnectionFactory> new_peer_connection_factory(
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_audio_device;
   if (native_audio) {
 #if defined(PULSEBEAM_WEBRTC_NATIVE_AUDIO)
-    if (!audio_device_module && !native_audio_creation.helper) {
-      error = "native ADM static Create is declaration-only at the pinned SDK; no entry point is linked and no helper substitution is made";
-      return nullptr;
-    }
-    dependencies.worker_thread->BlockingCall([&] {
+    worker_thread->BlockingCall([&] {
       if (audio_device_module) {
-        if (audio_device_module->worker() == dependencies.worker_thread) platform_audio_device = audio_device_module->module();
+        if (audio_device_module->worker() == worker_thread) platform_audio_device = audio_device_module->module();
       } else {
         const auto layer = static_cast<webrtc::AudioDeviceModule::AudioLayer>(native_audio_creation.layer);
-        platform_audio_device = webrtc::CreateAudioDeviceModule(*dependencies.env, layer, native_audio_creation.bypass);
+        platform_audio_device = webrtc::CreateAudioDeviceModule(*dependencies.env, layer);
       }
     });
     if (!platform_audio_device && audio_device_module) { error = "owning ADM admission: missing module or construction worker mismatch"; return nullptr; }
     if (!platform_audio_device) {
-      error = "native audio device module unavailable: selected SDK factory returned null (layer=" + std::to_string(native_audio_creation.layer) + (native_audio_creation.helper ? ", helper)" : ", Module::Create)");
+      error = "native audio device module unavailable: selected SDK factory returned null (layer=" + std::to_string(native_audio_creation.layer) + ")";
       return nullptr;
     }
     // WebRtcVoiceEngine::Init calls adm_helpers::Init on the worker and
     // RTC_CHECKs the result. Fail gracefully before constructing a peer on
     // hosts without a usable sound service instead of aborting the process.
     std::int32_t initialization_status = -1; bool active_handoff = false;
-    dependencies.worker_thread->BlockingCall([&] {
+    worker_thread->BlockingCall([&] {
       active_handoff = audio_device_module && platform_audio_device->Initialized() &&
           (platform_audio_device->Playing() || platform_audio_device->Recording());
       if (!active_handoff) initialization_status = platform_audio_device->Initialized() ? 0 : platform_audio_device->Init();
     });
     if (active_handoff) {
-      dependencies.worker_thread->BlockingCall([&] { platform_audio_device = nullptr; });
+      worker_thread->BlockingCall([&] { platform_audio_device = nullptr; });
       error = "owning ADM admission: stop recording and playout before engine transport handoff"; return nullptr;
     }
     if (initialization_status != 0) {
       // The PulseAudio backend checks destructor thread affinity as well.
-      dependencies.worker_thread->BlockingCall([&] {
+      worker_thread->BlockingCall([&] {
         platform_audio_device = nullptr;
       });
       error = "native audio device module initialization failed: " + std::to_string(initialization_status);
@@ -1664,21 +1683,21 @@ std::unique_ptr<NativePeerConnectionFactory> new_peer_connection_factory(
       webrtc::CreateModularPeerConnectionFactory(std::move(dependencies));
   if (!factory) {
     if (platform_audio_device) {
-      worker_thread.thread()->BlockingCall([&] { platform_audio_device = nullptr; });
+      worker_thread->BlockingCall([&] { platform_audio_device = nullptr; });
     }
     error = "CreateModularPeerConnectionFactory failed";
     return nullptr;
   }
   if (audio_processor) {
     std::uint8_t admission_error = 0;
-    worker_thread.thread()->BlockingCall([&] { admission_error = installed_audio_processor_restore(audio_processor->state()); });
+    worker_thread->BlockingCall([&] { admission_error = installed_audio_processor_restore(audio_processor->state()); });
     if (admission_error) {
       signaling_thread.thread()->BlockingCall([&] { factory = nullptr; });
       error = "owning APM admission: " + std::to_string(admission_error); return nullptr;
     }
   }
   if (requested_processing && processing_selection->module) {
-    worker_thread.thread()->BlockingCall([&] {
+    worker_thread->BlockingCall([&] {
       processing_selection->module->ApplyConfig(*requested_processing);
     });
   }
@@ -1701,8 +1720,8 @@ std::unique_ptr<NativePeerConnectionFactory> new_peer_connection_factory(
   state->call_creation = std::move(call_creation);
   state->network_thread = network_thread.thread();
   state->signaling_thread = signaling_thread.thread();
+  state->worker_thread = state->network_thread;
   state->certificate_generator_scope = std::make_unique<CertificateGeneratorScope>(state->signaling_thread);
-  state->worker_thread = worker_thread.thread();
   return std::make_unique<NativePeerConnectionFactory>(std::move(state));
 }
 
@@ -1971,72 +1990,6 @@ std::int32_t factory_audio_processor_reverse(const NativePeerConnectionFactory& 
 std::int32_t factory_audio_processor_delay(const NativePeerConnectionFactory& factory, std::int32_t delay, std::uint8_t& error) noexcept {
   std::int32_t status = 0; factory.worker_thread()->BlockingCall([&] { status = installed_audio_processor_delay(factory.installed_audio_processing(), delay, error); }); return status;
 }
-FfiAudioProcessingState factory_audio_processing_state(
-    const NativePeerConnectionFactory& factory) noexcept {
-  FfiAudioProcessingState result{};
-  result.echo_software = result.echo_reported_software = result.echo_platform = -1;
-  result.noise_software = result.noise_platform = -1;
-  result.gain_software = result.gain_platform = -1;
-  result.highpass_software = result.highpass_platform = -1;
-  if (!factory.factory() || !factory.state()->worker_thread) return result;
-  const auto encode = [](const std::optional<bool>& value) -> std::int8_t {
-    return value ? (*value ? 1 : 0) : -1;
-  };
-  factory.state()->worker_thread->BlockingCall([&] {
-    if (installed_audio_processor_reentry(factory.installed_audio_processing())) {
-      result.binding_error = 21; result.has_module = bool(factory.audio_processing()); return;
-    }
-    bool selected_echo_factory = false;
-    if (factory.installed_audio_processing()) {
-      selected_echo_factory = installed_audio_processor_has_echo_factory(factory.installed_audio_processing(), result.binding_error);
-      if (result.binding_error) { result.has_module = bool(factory.audio_processing()); return; }
-    }
-    const auto state = factory.factory()->GetAudioProcessingState();
-    result.has_module = state.has_audio_processing_module;
-    const auto fill = [&](const webrtc::AudioProcessingComponentState& component,
-                          std::int8_t& software, bool& available,
-                          std::int8_t& platform, std::uint8_t& effective) {
-      software = encode(component.software_active);
-      available = component.platform_available;
-      platform = encode(component.platform_active);
-      effective = static_cast<std::uint8_t>(component.effective);
-    };
-    fill(state.echo_cancellation, result.echo_software,
-         result.echo_platform_available, result.echo_platform,
-         result.echo_effective);
-    result.echo_reported_software = result.echo_software;
-    result.echo_reported_effective = result.echo_effective;
-    if (selected_echo_factory && result.has_module) {
-      // The pin's controller report reads only Config.enabled, whereas APM's
-      // NeedEchoController also includes the actual unique factory input. Keep
-      // the SDK report above and expose the selected software path accurately.
-      result.echo_software = 1;
-      const auto& echo = state.echo_cancellation;
-      const bool platform_on = echo.platform_active.value_or(
-          echo.platform_available && echo.platform_resolved.value_or(false));
-      result.echo_effective = static_cast<std::uint8_t>(platform_on
-          ? webrtc::AudioProcessingImplementation::kSoftwareAndPlatform
-          : webrtc::AudioProcessingImplementation::kSoftware);
-    }
-    fill(state.noise_suppression, result.noise_software,
-         result.noise_platform_available, result.noise_platform,
-         result.noise_effective);
-    fill(state.auto_gain_control, result.gain_software,
-         result.gain_platform_available, result.gain_platform,
-         result.gain_effective);
-    fill(state.high_pass_filter, result.highpass_software,
-         result.highpass_platform_available, result.highpass_platform,
-         result.highpass_effective);
-  });
-  return result;
-}
-
-std::int32_t factory_register_audio_device_observer(const NativePeerConnectionFactory& factory, std::unique_ptr<NativeAudioDeviceObserver> observer) noexcept {
-  auto module = factory.audio_device(); if (!module) return -1;
-  std::int32_t status = -1;
-  factory.worker_thread()->BlockingCall([&] { status = module->SetObserver(observer.get()); if (!status && observer) factory.state()->device_observers.push_back(std::move(observer)); });
-  return status;
-}
 bool factory_audio_devices(const NativePeerConnectionFactory& factory,
                            bool recording, rust::Vec<FfiAudioDevice>& devices,
                            rust::String& error) noexcept {
@@ -2211,7 +2164,6 @@ static void ApplyPeerOptions(webrtc::PeerConnectionInterface::RTCConfiguration& 
     c.pacer_burst_interval = us == INT64_MAX ? webrtc::TimeDelta::PlusInfinity() :
       us == INT64_MIN ? webrtc::TimeDelta::MinusInfinity() : webrtc::TimeDelta::Micros(us);
   }
-  c.enable_any_address_ports = v.enable_any_address_ports;
   c.max_sctp_streams = v.max_sctp_streams;
   c.enable_sctp_snap = v.enable_sctp_snap;
   c.set_dscp(v.dscp);
@@ -2270,7 +2222,6 @@ static FfiPeerConnectionOptions PeerOptionsSnapshot(const webrtc::PeerConnection
   v.pacer_burst_interval.present = c.pacer_burst_interval.has_value();
   if (c.pacer_burst_interval) v.pacer_burst_interval.value = c.pacer_burst_interval->IsPlusInfinity() ? INT64_MAX :
     c.pacer_burst_interval->IsMinusInfinity() ? INT64_MIN : c.pacer_burst_interval->us();
-  v.enable_any_address_ports = c.enable_any_address_ports;
   v.max_sctp_streams = c.max_sctp_streams;
   v.enable_sctp_snap = c.enable_sctp_snap;
   v.dscp = c.dscp();
@@ -2468,7 +2419,7 @@ std::unique_ptr<NativePeerConnection> create_peer_connection(
   state->call_observation = std::move(call_observation);
   state->network_thread = factory.state()->network_thread;
   state->signaling_thread = factory.state()->signaling_thread;
-  state->worker_thread = factory.state()->worker_thread;
+  state->worker_thread = state->network_thread;
   return std::make_unique<NativePeerConnection>(std::move(state));
 }
 
@@ -2993,21 +2944,20 @@ bool factory_in_native_execution_context(const NativePeerConnectionFactory& fact
   const auto& state = factory.state();
   // Current() may be a private codec queue. Synchronous destruction can wait
   // on that queue even when it is not one of the three public role threads.
-  return state && (webrtc::TaskQueueBase::Current() || state->network_thread->IsCurrent() || state->worker_thread->IsCurrent() || state->signaling_thread->IsCurrent());
+  return state && (webrtc::TaskQueueBase::Current() || state->network_thread->IsCurrent() || state->signaling_thread->IsCurrent());
 }
 bool factory_control_call_allowed(const NativePeerConnectionFactory& factory) noexcept {
   const auto& state = factory.state();
   if (!state || state->signaling_thread->IsCurrent()) return true;
-  if (state->network_thread->IsCurrent() || state->worker_thread->IsCurrent()) return false;
+  if (state->network_thread->IsCurrent()) return false;
   auto* current = webrtc::Thread::Current();
   return !current || current->IsInvokeToThreadAllowed(state->signaling_thread);
 }
 bool peer_control_call_allowed(const NativePeerConnection& peer) noexcept {
   const auto& state = peer.state();
   if (!state || state->signaling_thread->IsCurrent()) return true;
-  // ConnectionContext allows worker -> network, never worker/network ->
-  // signaling. Do not enter the SDK's blocking-call CHECK/deadlock path.
-  if (state->network_thread->IsCurrent() || state->worker_thread->IsCurrent()) return false;
+  // The merged network/worker role cannot synchronously control signaling.
+  if (state->network_thread->IsCurrent()) return false;
   auto* current = webrtc::Thread::Current();
   return !current || current->IsInvokeToThreadAllowed(state->signaling_thread);
 }

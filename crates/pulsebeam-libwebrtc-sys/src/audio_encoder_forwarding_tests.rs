@@ -131,11 +131,6 @@ fn sdk_void_controls_keep_actual_opus_guards_and_first_failure_after_retirement(
     assert!(!ffi::audio_encoder_set_target_bitrate(native, 6000));
     ffi::audio_encoder_forward_loss_sdk(native, f32::NAN);
     assert_eq!(observer.failure(), Some(failure));
-    assert!(!ffi::audio_encoder_forward_adaptor_sdk(
-        native,
-        b"arbitrary\0\xff"
-    ));
-    assert_eq!(observer.failure(), Some(failure));
     let clone = observer.clone();
     drop(forwarded);
     drop(factory);
@@ -146,7 +141,7 @@ fn sdk_void_controls_keep_actual_opus_guards_and_first_failure_after_retirement(
 }
 
 #[test]
-fn missing_clock_and_pending_ana_admission_are_not_silent_sdk_success() {
+fn missing_clock_is_not_silent_sdk_success() {
     // A default system environment now retains its actual safe clock proof.
     // Use an explicitly unbounded, non-monotonic provider for this refusal.
     struct UnprovenClock;
@@ -174,28 +169,13 @@ fn missing_clock_and_pending_ana_admission_are_not_silent_sdk_success() {
             error: AudioEncoderError::UnsafeClock,
         })
     );
-    let ana = forward(create(&factory, &env, &format, 111));
-    let observer = AudioEncoderSdkFailureObserver::from_native(
-        ffi::audio_encoder_sdk_failure_observer(ana.as_ref().unwrap()),
-    );
-    assert!(!ffi::audio_encoder_forward_adaptor_sdk(
-        ana.as_ref().unwrap(),
-        b""
-    ));
-    assert_eq!(
-        observer.failure(),
-        Some(AudioEncoderSdkFailure {
-            operation: AudioEncoderSdkOperation::ENABLE_ADAPTOR,
-            error: AudioEncoderError::UnsafeClock,
-        })
-    );
     // The actual underlying encoder continues to produce real codec output;
     // rejection does not reset it or inject synthetic EncodedInfo.
-    let shape = ffi::audio_encoder_info(ana.as_ref().unwrap());
+    let shape = ffi::audio_encoder_info(loss.as_ref().unwrap());
     let audio = vec![0; shape.sample_rate_hz as usize / 100 * shape.num_channels];
-    let first = ffi::audio_encoder_forward_encode_sdk(ana.as_ref().unwrap(), 100, &audio, &[]);
+    let first = ffi::audio_encoder_forward_encode_sdk(loss.as_ref().unwrap(), 100, &audio, &[]);
     assert_eq!(first.status, 0);
-    let second = ffi::audio_encoder_forward_encode_sdk(ana.as_ref().unwrap(), 580, &audio, &[]);
+    let second = ffi::audio_encoder_forward_encode_sdk(loss.as_ref().unwrap(), 580, &audio, &[]);
     assert_eq!(second.status, 0);
     assert!(!second.bytes.is_empty());
 }

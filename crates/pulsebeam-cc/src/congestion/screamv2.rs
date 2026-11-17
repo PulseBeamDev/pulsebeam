@@ -1,6 +1,6 @@
 // Copyright 2025 The WebRTC Project Authors. All rights reserved.
 // Rust port of modules/congestion_controller/scream at libwebrtc
-// 326fd06bb4d93900ed6947205b94cefd2413afca. See screamv2/LICENSE and PATENTS.
+// 7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499. See screamv2/LICENSE and PATENTS.
 #![allow(
     clippy::arithmetic_side_effects,
     clippy::cast_precision_loss,
@@ -48,7 +48,8 @@ pub struct FeedbackSample {
     pub newly_acked: bool,
     /// First network loss report, distinct from final transport-history expiry.
     pub lost: bool,
-    /// A late receipt already credited at an earlier ACK edge.
+    /// A receipt retracting an earlier network-loss report. Independent of
+    /// ACK-edge credit: a previously missing tail can also be newly acknowledged.
     pub recovered: bool,
     /// Receiver-relative arrival time, or none when timing is ambiguous.
     pub receiver_arrival_micros: Option<i64>,
@@ -350,8 +351,10 @@ impl ScreamV2 {
             } else if ce {
                 backoff = self.scale_backoff(self.l4s_alpha / 2.0, flight);
                 if !queue_detected {
-                    backoff *= self.inflection_scale().max(0.25);
-                    backoff *= self.delay.min_delay_scale(false, self.params).max(0.1);
+                    backoff *= self.inflection_scale();
+                    if !self.params.reduce_jitter {
+                        backoff *= self.delay.min_delay_scale(false, self.params).max(0.1);
+                    }
                 }
                 if since_reaction
                     > self.params.virtual_rtt.max(self.delay.rtt).saturating_mul(
@@ -402,14 +405,8 @@ impl ScreamV2 {
                 increase_scale *=
                     rtt_with_hold.as_secs_f64() / self.params.virtual_rtt.as_secs_f64();
             }
-            increase_scale *= self.inflection_scale().max(0.25);
-            let min_delay_scale = self.delay.min_delay_scale(false, self.params);
+            increase_scale *= self.inflection_scale();
             let latency_scale = self.delay.latency_difference_scale(self.params);
-            increase_scale *= if self.params.use_min_delay_scale_on_increase {
-                min_delay_scale.min(latency_scale)
-            } else {
-                min_delay_scale * latency_scale
-            };
             let post_congestion_scale = (elapsed(now, self.last_congestion_reaction).as_secs_f64()
                 / self
                     .params
@@ -418,8 +415,21 @@ impl ScreamV2 {
                     .saturating_mul(self.params.post_congestion_delay_rtts)
                     .as_secs_f64())
             .clamp(0.0, 1.0);
-            let multiplicative = self.params.multiplicative_increase_factor
-                * self.ref_window as f64
+            let post_congestion_scale = if self.params.reduce_jitter {
+                increase_scale *= 1.0 / (4.0 - 3.0 * latency_scale);
+                post_congestion_scale * latency_scale
+            } else {
+                let min_delay_scale = self.delay.min_delay_scale(false, self.params);
+                increase_scale *= if self.params.use_min_delay_scale_on_increase {
+                    min_delay_scale.min(latency_scale)
+                } else {
+                    min_delay_scale * latency_scale
+                };
+                post_congestion_scale
+            };
+            // Native rounds the scaled DataSize before forming this ratio.
+            let multiplicative = scale(self.ref_window, self.params.multiplicative_increase_factor)
+                as f64
                 / self.params.max_segment_size as f64;
             increase_scale *= 1.0 + multiplicative * post_congestion_scale;
             let maximum = self.max_allowed_ref_window();
@@ -432,13 +442,20 @@ impl ScreamV2 {
         }
         if previous_window > self.ref_window {
             self.last_window_decrease = Some(now);
-            if previous_window as f64 > self.ref_window_lowest as f64 * 1.05
-                || elapsed(now, self.last_ref_window_i_update)
+            if (if self.params.reduce_jitter {
+                (previous_window
                     > self
-                        .params
-                        .virtual_rtt
-                        .max(self.delay.rtt)
-                        .saturating_mul(self.params.ref_window_i_update_max_hold_rtts)
+                        .ref_window_lowest
+                        .saturating_add(self.params.max_segment_size))
+                    && (previous_window as f64 > self.ref_window_lowest as f64 * 1.05)
+            } else {
+                previous_window as f64 > self.ref_window_lowest as f64 * 1.05
+            }) || elapsed(now, self.last_ref_window_i_update)
+                > self
+                    .params
+                    .virtual_rtt
+                    .max(self.delay.rtt)
+                    .saturating_mul(self.params.ref_window_i_update_max_hold_rtts)
             {
                 self.ref_window_i = previous_window;
                 self.last_ref_window_i_update = Some(now);
@@ -462,10 +479,18 @@ impl ScreamV2 {
 
     fn inflection_scale(&self) -> f64 {
         let difference = self.ref_window.abs_diff(self.ref_window_i) as f64;
-        (self.params.backoff_scale_factor_close_to_ref_window_i * difference
+        let scale = (self.params.backoff_scale_factor_close_to_ref_window_i * difference
             / self.ref_window_i.max(1) as f64)
-            .powi(2)
-            .clamp(0.1, 1.0)
+            .powi(2);
+        if self.params.reduce_jitter {
+            let mut scale = scale.clamp(0.2, 1.0);
+            if self.ref_window > self.ref_window_i && scale < 1.0 {
+                scale = (scale * self.delay.latency_difference_scale(self.params)).max(0.2);
+            }
+            scale
+        } else {
+            scale.clamp(0.25, 1.0)
+        }
     }
 
     fn update_target_rate(&mut self, now: Duration, maximum: u64) {
@@ -517,9 +542,14 @@ impl ScreamV2 {
 
     pub(crate) fn snapshot(&self, target_bitrate_max: u64) -> Output {
         let target = self.target_bitrate.min(target_bitrate_max);
+        let window_delay_scale = if self.params.reduce_jitter {
+            self.delay.latency_difference_scale(self.params)
+        } else {
+            self.delay.min_delay_scale(true, self.params)
+        };
         let overhead = self.params.ref_window_overhead_min
             + (self.params.ref_window_overhead_max - self.params.ref_window_overhead_min)
-                * self.delay.min_delay_scale(true, self.params);
+                * window_delay_scale;
         let pacing = scale(target, self.params.pacing_factor).max(
             self.received_rate.map_or(0, |received| {
                 scale(received, self.params.pacing_rate_received_factor)
@@ -631,6 +661,53 @@ mod tests {
         assert_eq!(output.target_bitrate, 300_000);
         assert_eq!(output.pacing_rate, 330_000);
         assert_eq!(output.smoothed_rtt, Duration::ZERO);
+        assert_eq!(
+            PARAMETERS.number_of_rtts_between_reset_ref_window_i_on_congestion,
+            100_000_000
+        );
+        assert_eq!(PARAMETERS.queue_delay_avg_g, 0.5);
+        const { assert!(PARAMETERS.reduce_jitter) };
+        assert_eq!(PARAMETERS.queue_delay_short_avg_g, 0.2);
+        assert_eq!(PARAMETERS.queue_delay_long_avg_g, 0.02);
+        assert_eq!(PARAMETERS.latency_diff_margin_1, Duration::from_millis(1));
+        assert_eq!(PARAMETERS.latency_diff_margin_2, Duration::from_millis(10));
+        assert_eq!(PARAMETERS.latency_diff_up_gain, 20.0);
+        assert_eq!(PARAMETERS.latency_diff_down_gain, 2.0);
+    }
+
+    #[test]
+    fn first_feedback_growth_rounds_scaled_bytes_before_mss_division() {
+        let mut core = ScreamV2::new(100_000_000, None);
+        core.observe_bytes_in_flight(1_200);
+        let samples = [FeedbackSample {
+            transport_bytes: 1_200,
+            received_at: Duration::from_millis(40),
+            ..sample(10, 30_000)
+        }];
+        let output = core.update(
+            Duration::from_millis(40),
+            ControllerInput {
+                feedback_hold: Duration::from_millis(10),
+                ..input(&samples)
+            },
+        );
+        assert_eq!(output.reference_window, 2_347);
+        assert_eq!(output.target_bitrate, 500_693);
+    }
+
+    #[test]
+    fn reduce_jitter_inflection_scale_uses_delay_trend() {
+        let mut core = ScreamV2::new(100_000_000, None);
+        core.ref_window_i = 10_000;
+        core.ref_window = 14_000;
+        core.delay.queue_delay_trend = 0.5;
+        // Native squared inflection scale is 0.64, then trend attenuation applies.
+        assert!((core.inflection_scale() - 0.32).abs() < 1e-12);
+        // The same latency scale attenuates post-congestion window growth.
+        assert_eq!(core.delay.latency_difference_scale(PARAMETERS), 0.5);
+        core.delay.queue_delay_trend = 1.0;
+        assert_eq!(core.inflection_scale(), 0.2);
+        assert_eq!(core.delay.latency_difference_scale(PARAMETERS), 0.0);
     }
 
     #[test]

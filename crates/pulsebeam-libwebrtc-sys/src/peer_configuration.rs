@@ -317,7 +317,6 @@ pub struct PeerConnectionOptions {
     pub vpn_list: Vec<NetworkMask>,
     pub port_allocator: PortAllocatorOptions,
     pub pacer_burst_interval: Option<NativeTimeDelta>,
-    pub enable_any_address_ports: bool,
     pub max_sctp_streams: i32,
     pub enable_sctp_snap: bool,
     pub dscp: bool,
@@ -410,7 +409,6 @@ impl PeerConnectionOptions {
                 present: self.pacer_burst_interval.is_some(),
                 value: self.pacer_burst_interval.map_or(0, |v| v.0),
             },
-            enable_any_address_ports: self.enable_any_address_ports,
             max_sctp_streams: self.max_sctp_streams,
             enable_sctp_snap: self.enable_sctp_snap,
             dscp: self.dscp,
@@ -522,7 +520,6 @@ impl PeerConnectionOptions {
                 .pacer_burst_interval
                 .present
                 .then_some(NativeTimeDelta(v.pacer_burst_interval.value)),
-            enable_any_address_ports: v.enable_any_address_ports,
             max_sctp_streams: v.max_sctp_streams,
             enable_sctp_snap: v.enable_sctp_snap,
             dscp: v.dscp,

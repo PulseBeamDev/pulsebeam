@@ -268,12 +268,12 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
                 Step::WaitForSourceVideo {
                     description: "The protected source becomes genuine native 720p within convergence bound",
                     participant: "viewer", publisher: "protected", min_resolution: (1280, 720),
-                    timeout: Duration::from_secs(30),
+                    temporal_index: None, timeout: Duration::from_secs(30),
                 },
                 Step::WaitForSourceVideo {
                     description: "Both protected sources are visible before measuring sustained service",
                     participant: "viewer", publisher: "camera", min_resolution: (320, 180),
-                    timeout: Duration::from_secs(45),
+                    temporal_index: None, timeout: Duration::from_secs(45),
                 },
                 Step::Run {
                     description: "Measure fresh source progress throughout sustained joint contention",
@@ -318,7 +318,7 @@ fn low_priority_minimum_precedes_high_priority_target_test() {
                 Step::WaitForSourceVideo {
                     description: "The higher-priority source reaches genuine native 720p after reconfiguration",
                     participant: "viewer", publisher: "camera", min_resolution: (1280, 720),
-                    timeout: Duration::from_secs(30),
+                    temporal_index: None, timeout: Duration::from_secs(30),
                 },
                 Step::Run {
                     description: "Measure a fresh sixty-second interval with competing protected minimums",
@@ -1087,6 +1087,7 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
     use super::common::harness::VideoSubscription;
     use pulsebeam_agent_native::agent_core::PlayoutDelay;
     let camera_fixture = native_temporal_ladder();
+    let full_temporal_index = camera_fixture.temporal_layers() - 1;
     let mut plan = vec![Step::WaitForPublication {
         description: "Establish the existing conference sources on clean fiber",
         publisher: "camera",
@@ -1105,8 +1106,9 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
                 }],
             },
             Step::WaitForSourceVideo {
-                description: "A newly supplied capture becomes genuine native output within five seconds plus fixed buffering",
-                participant: "screen", publisher: "camera", min_resolution: (1280, 720), timeout: Duration::from_secs(5),
+                description: "Actual upper-temporal native output establishes full-rate dependency readiness within five seconds plus fixed buffering",
+                participant: "screen", publisher: "camera", min_resolution: (1280, 720),
+                temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(5),
             },
             Step::MeasureSourceWindow {
                 description: "Every full-rate capture reaches actual native pixels exactly once by its declared deadline",
@@ -1127,7 +1129,7 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
                 Step::WaitForSourceVideo {
                     description: "The owner being replaced has an actual established native receiver",
                     participant: "replacement", publisher: "camera", min_resolution: (1280, 720),
-                    timeout: Duration::from_secs(5),
+                    temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(5),
                 },
                 Step::BeginHeldReconnect {
                     description: "Keep the replacement native bootstrap HTTP future pending",
@@ -1154,7 +1156,7 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
                 Step::WaitForSourceVideo {
                     description: "A first current native picture returns within the thirty-second restoration budget",
                     participant: "replacement", publisher: "camera", min_resolution: (1280, 720),
-                    timeout: Duration::from_secs(30),
+                    temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(30),
                 },
                 Step::WaitSinceBootstrapRelease {
                     description: "End the declared restoration phase exactly thirty seconds after release, not thirty seconds after first output",
@@ -1184,7 +1186,8 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
         },
         Step::WaitForSourceVideo {
             description: "A genuine new uniform source picture is valid native output",
-            participant: "camera", publisher: "screen", min_resolution: (320, 180), timeout: Duration::from_secs(5),
+            participant: "camera", publisher: "screen", min_resolution: (320, 180),
+            temporal_index: None, timeout: Duration::from_secs(5),
         },
         Step::MeasureSourceWindow {
             description: "One-fps uniform input has one-fps obligations, not a camera rate floor",
@@ -1217,7 +1220,8 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
         },
         Step::WaitForSourceVideo {
             description: "The explicit light update, not a later dark receipt, reaches native pixels within five seconds plus buffering",
-            participant: "camera", publisher: "screen", min_resolution: (320, 180), timeout: Duration::from_secs(5),
+            participant: "camera", publisher: "screen", min_resolution: (320, 180),
+            temporal_index: None, timeout: Duration::from_secs(5),
         },
         Step::MeasureSourceWindow {
             description: "The updated uniform picture sustains its supplied low cadence",

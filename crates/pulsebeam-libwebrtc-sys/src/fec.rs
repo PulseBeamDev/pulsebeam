@@ -34,28 +34,6 @@ impl FecProtectionParams {
         }
     }
 }
-/// Bitwise native retransmission policy. Unknown bits and signed values are
-/// retained: the protection callback takes int, not a closed enum parameter.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct FecRetransmissionMode(i32);
-impl FecRetransmissionMode {
-    pub const OFF: Self = Self(0);
-    pub const BASE_LAYER: Self = Self(2);
-    pub const HIGHER_LAYERS: Self = Self(4);
-    pub const ALL_LAYERS: Self = Self(6);
-    pub const fn from_bits_retain(bits: i32) -> Self {
-        Self(bits)
-    }
-    pub const fn bits(self) -> i32 {
-        self.0
-    }
-}
-impl std::ops::BitOr for FecRetransmissionMode {
-    type Output = Self;
-    fn bitor(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-}
 /// Full scoped native frame-type domain. The existing encoded-input
 /// VideoFrameType describes only key/delta access units; this controller value
 /// also preserves empty frames and unknown signed SDK frame types.
@@ -112,7 +90,6 @@ pub enum FecProtectionCallbackError {
     WrongSequence,
     OutsideInvocation,
     InvalidParameters,
-    ReentrantNativeLock,
     Cancelled,
 }
 impl std::fmt::Display for FecProtectionCallbackError {
@@ -122,18 +99,15 @@ impl std::fmt::Display for FecProtectionCallbackError {
             Self::WrongSequence => "FEC protection callback requires its native sequence",
             Self::OutsideInvocation => "FEC callback requires a live native invocation borrow",
             Self::InvalidParameters => "invalid native FEC protection parameters",
-            Self::ReentrantNativeLock => "FEC callback would reenter the native sender lock",
             Self::Cancelled => "FEC callback task was cancelled before execution",
         })
     }
 }
 impl std::error::Error for FecProtectionCallbackError {}
 /// Retainable, expiring capability for the SDK's borrowed protection callback.
-/// Synchronous calls require a live native controller invocation borrow;
-/// protection requests additionally require its captured worker sequence.
-/// Retransmission mutation rejects UpdateFecRates' nonrecursive sender lock.
-/// Async variants dispatch on that existing worker and establish a new borrow
-/// only if the sender is still alive when the task runs. Retained handles never
+/// Calls require a live native controller invocation borrow and its captured
+/// worker sequence. Async variants dispatch on that worker and establish a new
+/// borrow only if the sender is still alive when the task runs. Retained handles never
 /// extend sender lifetime, and cannot access a partially torn-down sender.
 #[derive(Clone)]
 pub struct FecProtectionCallback {
@@ -151,7 +125,6 @@ impl FecProtectionCallback {
             2 => Err(FecProtectionCallbackError::WrongSequence),
             3 => Err(FecProtectionCallbackError::OutsideInvocation),
             4 => Err(FecProtectionCallbackError::InvalidParameters),
-            5 => Err(FecProtectionCallbackError::ReentrantNativeLock),
             _ => Err(FecProtectionCallbackError::Cancelled),
         }
     }
@@ -173,15 +146,6 @@ impl FecProtectionCallback {
             sent_fec_rate_bps: value.fec_bps,
         })
     }
-    pub fn set_retransmission_mode(
-        &self,
-        mode: FecRetransmissionMode,
-    ) -> Result<(), FecProtectionCallbackError> {
-        Self::result(ffi::fec_set_retransmission_mode(
-            self.native.as_ref().expect("retained FEC callback state"),
-            mode.bits(),
-        ))
-    }
     /// Dispatch on the existing native worker queue. No thread or runtime is
     /// created. Controlled execution progresses it through the caller's world.
     pub fn request_async(
@@ -196,17 +160,6 @@ impl FecProtectionCallback {
             key.native(),
             completion,
         );
-        operation
-    }
-    /// Safe alternative when the current controller call holds the native
-    /// sender lock (notably UpdateFecRates). Completion follows the actual
-    /// native call. Do not wait for it inside a synchronous provider callback.
-    pub fn set_retransmission_mode_async(
-        &self,
-        mode: FecRetransmissionMode,
-    ) -> FecCallbackOperation<()> {
-        let (operation, completion) = FecCallbackOperation::new(|value| value.map(|_| ()));
-        ffi::fec_set_retransmission_mode_async(self.native.clone(), mode.bits(), completion);
         operation
     }
 }
@@ -586,9 +539,6 @@ mod tests {
                 .unwrap()
                 .push(Call::Callback(callback.is_some()));
             if let Some(callback) = &callback {
-                callback
-                    .set_retransmission_mode(FecRetransmissionMode::from_bits_retain(-17))
-                    .unwrap();
                 *self.0.response.lock().unwrap() = Some(
                     callback
                         .request(
@@ -626,8 +576,14 @@ mod tests {
             assert_eq!(self.0.factory_drops.load(Ordering::SeqCst), 1);
             let callback = self.0.callback.lock().unwrap().clone().unwrap();
             assert_eq!(
-                callback.set_retransmission_mode(FecRetransmissionMode::ALL_LAYERS),
-                Err(FecProtectionCallbackError::ReentrantNativeLock)
+                callback
+                    .request(
+                        FecProtectionParams::default(),
+                        FecProtectionParams::default()
+                    )
+                    .unwrap()
+                    .native_result,
+                -17
             );
             self.0.calls.lock().unwrap().push(Call::Rates(update));
             73_212
@@ -719,16 +675,6 @@ mod tests {
             ),
             Err(FecProtectionCallbackError::Retired)
         );
-        assert_eq!(
-            retained.set_retransmission_mode(FecRetransmissionMode::OFF),
-            Err(FecProtectionCallbackError::Retired)
-        );
-        assert_eq!(
-            retained
-                .set_retransmission_mode_async(FecRetransmissionMode::OFF)
-                .try_take(),
-            Some(Err(FecProtectionCallbackError::Retired))
-        );
         let environment = observations.environment.lock().unwrap().take().unwrap();
         let _ = environment.timestamp();
         let _ = environment.field_trials();
@@ -814,11 +760,6 @@ mod tests {
         shared::<FecControllerEnvironment>();
         shared::<FecProtectionCallback>();
         send::<FecCallbackOperation<FecProtectionResponse>>();
-        send::<FecCallbackOperation<()>>();
-        assert_eq!(
-            (FecRetransmissionMode::BASE_LAYER | FecRetransmissionMode::HIGHER_LAYERS).bits(),
-            FecRetransmissionMode::ALL_LAYERS.bits()
-        );
         assert_eq!(FecEncodedFrameType::from(4), FecEncodedFrameType::Delta);
         assert!(!fec_factory_present(&RustFecControllerFactory(None, None)));
         let (mut operation, completion) = FecCallbackOperation::new(|value| value.map(|_| ()));

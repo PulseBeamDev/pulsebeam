@@ -195,7 +195,7 @@ fn owning_pcm_encoder_preserves_packet_state_metadata_and_environment() {
 }
 
 #[test]
-fn opus_bitrate_trial_and_unsigned_overhead_guards_are_operation_specific() {
+fn opus_bitrate_trial_guard_rejects_only_the_affected_targets() {
     let trials = pulsebeam_webrtc_sys::FieldTrials::parse(
         "WebRTC-Audio-OpusBitrateMultipliers/Enabled-1-1e35/",
     )
@@ -221,22 +221,9 @@ fn opus_bitrate_trial_and_unsigned_overhead_guards_are_operation_specific() {
         Err(AudioEncoderError::InvalidControl)
     );
     assert_eq!(encoder.target_bitrate_bps(), original);
-    // With no overhead and ANA disabled, native uplink bandwidth does not set bitrate.
-    encoder
-        .on_received_uplink_bandwidth(6000, Some(i64::MIN))
-        .unwrap();
-    assert_eq!(encoder.target_bitrate_bps(), original);
-    encoder.on_received_overhead(0).unwrap();
-    assert_eq!(
-        encoder.on_received_uplink_bandwidth(6000, None),
-        Err(AudioEncoderError::InvalidControl)
-    );
-    encoder.on_received_overhead(usize::MAX).unwrap();
-    assert_eq!(
-        encoder.on_received_uplink_bandwidth(i32::MAX, None),
-        Err(AudioEncoderError::InvalidControl)
-    );
-    assert_eq!(encoder.target_bitrate_bps(), original);
+    // The neighboring target has no overflowing multiplier and remains usable.
+    encoder.on_received_target_audio_bitrate(7000).unwrap();
+    assert_eq!(encoder.target_bitrate_bps(), 7000);
 }
 
 #[test]
@@ -358,7 +345,7 @@ fn opus_loss_requires_a_durable_native_clock_contract() {
 }
 
 #[test]
-fn allocation_retains_unused_fields_and_checks_consumed_units_only() {
+fn allocation_preserves_current_sdk_fields_and_checks_target_domain() {
     use pulsebeam_webrtc_sys::{BitrateAllocationUpdate, DataRate, TimeDelta};
     let environment = Environment::builder().build().unwrap();
     let factory = AudioEncoderFactory::builtin().unwrap();
@@ -371,17 +358,11 @@ fn allocation_retains_unused_fields_and_checks_consumed_units_only() {
         .create(&environment, &format, &options)
         .unwrap()
         .unwrap();
-    encoder.disable_audio_network_adaptor();
-    encoder.disable_audio_network_adaptor();
     let mut allocation = BitrateAllocationUpdate::default();
-    assert_eq!(
-        encoder.on_received_uplink_allocation(allocation),
-        Err(AudioEncoderError::InvalidControl)
-    );
-    allocation.bwe_period = TimeDelta::zero();
     allocation.round_trip_time = TimeDelta::minus_infinity();
     allocation.packet_loss_ratio = f64::NAN;
     allocation.cwnd_reduce_ratio = f64::INFINITY;
+    allocation.packet_overhead = pulsebeam_webrtc_sys::DataSize::PositiveInfinity;
     encoder.on_received_uplink_allocation(allocation).unwrap();
     allocation.target_bitrate = DataRate::BitsPerSecond(-1);
     assert_eq!(
@@ -389,6 +370,12 @@ fn allocation_retains_unused_fields_and_checks_consumed_units_only() {
         Err(AudioEncoderError::InvalidControl)
     );
     allocation.target_bitrate = DataRate::PositiveInfinity;
+    assert_eq!(
+        encoder.on_received_uplink_allocation(allocation),
+        Err(AudioEncoderError::InvalidControl)
+    );
+    allocation.target_bitrate = DataRate::BitsPerSecond(0);
+    allocation.packet_overhead = pulsebeam_webrtc_sys::DataSize::NegativeInfinity;
     assert_eq!(
         encoder.on_received_uplink_allocation(allocation),
         Err(AudioEncoderError::InvalidControl)

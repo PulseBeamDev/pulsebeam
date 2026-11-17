@@ -2,7 +2,7 @@
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.annotation(
     crate = "cxx",
-    version = "=1.0.194",
+    version = "=1.0.205",
     gen_build_script = "off",
     # Bzlmod drops empty overrides; forward the upstream native target to GN.
     additive_build_file_content = """

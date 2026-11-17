@@ -17,7 +17,7 @@ _CLANG_ROOT = Label("@webrtc_upstream//:clang++").workspace_root + "/checkout/sr
 
 ASAN_FLAGS = [
     "-Clinker=$(location @webrtc_upstream//:clang++)",
-    "-Clink-arg=-resource-dir=" + _CLANG_ROOT + "/lib/clang/23",
+    "-Clink-arg=-resource-dir=" + _CLANG_ROOT + "/lib/clang/24",
     "-Clink-arg=--ld-path=" + _CLANG_ROOT + "/bin/ld.lld",
     # Clang still discovers CRTs in the declared SDK; Nix linker scripts use absolute store paths.
     "-Clink-arg=-Wl,--sysroot=",

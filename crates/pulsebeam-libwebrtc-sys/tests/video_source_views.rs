@@ -33,7 +33,6 @@ fn native_video_views_preserve_defaults_change_notifications_and_exact_origin_li
         );
     }
     assert_eq!(track.kind(), "video");
-    assert!(track.should_receive());
     assert_eq!(track.content_hint(), VideoContentHint::None);
     let cap = NonZeroUsize::new(2).unwrap();
     let source_events = installed.observe_changes(cap).unwrap();
@@ -50,14 +49,6 @@ fn native_video_views_preserve_defaults_change_notifications_and_exact_origin_li
     }
     track.request_refresh_frame();
     assert_eq!(source_events.try_next_event(), None);
-    assert_eq!(track_events.try_next_event(), None);
-    track.set_should_receive(false);
-    track.set_should_receive(false);
-    assert!(!track.should_receive());
-    assert_eq!(
-        track_events.try_next_event(),
-        Some(VideoObserverEvent::Changed)
-    );
     assert_eq!(track_events.try_next_event(), None);
     for hint in [
         VideoContentHint::Fluid,
@@ -146,12 +137,6 @@ fn actor_video_view_and_closed_observer_survive_retired_ids_and_migration() {
     let session = std::thread::spawn(move || {
         let mut session = session;
         session
-            .set_video_track_should_receive(track, false)
-            .unwrap();
-        session
-            .set_video_track_should_receive(track, false)
-            .unwrap();
-        session
             .set_video_track_content_hint(track, VideoContentHint::Text)
             .unwrap();
         session
@@ -175,7 +160,6 @@ fn actor_video_view_and_closed_observer_survive_retired_ids_and_migration() {
         session.request_video_track_refresh(track).unwrap();
         let status = session.video_track_status(track).unwrap();
         assert_eq!(status.kind, "video");
-        assert!(!status.should_receive);
         assert_eq!(status.content_hint, VideoContentHint::Text);
         session.close_video_observer(track_events).unwrap();
         session.release_media_stream_track(track);
@@ -202,12 +186,10 @@ fn actor_video_view_and_closed_observer_survive_retired_ids_and_migration() {
         session
             .process_video_source_constraints(alias, VideoSourceConstraints::default())
             .unwrap();
-        for _ in 0..2 {
-            assert_eq!(
-                session.try_video_observer_event(track_events).unwrap(),
-                Some(VideoObserverEvent::Changed)
-            );
-        }
+        assert_eq!(
+            session.try_video_observer_event(track_events).unwrap(),
+            Some(VideoObserverEvent::Changed)
+        );
         assert_eq!(
             session.try_video_observer_event(track_events).unwrap(),
             None

@@ -58,7 +58,7 @@ fn complete_parameters_children_are_full_independently_owned_sdk_copies() {
     value.set_rtcp(&rtcp);
     let mut extension = RtpExtension::default();
     extension.set_uri(b"uri\xff\0");
-    extension.set_id(&RtpHeaderExtensionId::new(i32::MIN));
+    extension.set_id(&RtpHeaderExtensionId::new(255));
     let mut extensions = RtpExtensions::default();
     extensions.push(&extension);
     value.set_header_extensions(&extensions);
@@ -88,10 +88,7 @@ fn complete_parameters_children_are_full_independently_owned_sdk_copies() {
         copy.header_extensions().get(0).unwrap().uri_bytes(),
         b"uri\xff\0"
     );
-    assert_eq!(
-        copy.header_extensions().get(0).unwrap().id().value(),
-        i32::MIN
-    );
+    assert_eq!(copy.header_extensions().get(0).unwrap().id().value(), 255);
     assert_eq!(
         copy.degradation_preference(),
         Some(Degradation::Other(i32::MIN))

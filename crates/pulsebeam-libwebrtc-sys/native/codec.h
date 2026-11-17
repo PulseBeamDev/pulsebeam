@@ -89,9 +89,6 @@ AudioFormatToFfi(const webrtc::SdpAudioFormat &value) noexcept;
 struct FfiAudioCodecInfo;
 struct FfiAudioCodecSpec;
 struct FfiAudioDecoderCreation;
-struct FfiAudioEncoderBitrateStep;
-struct FfiAudioEncoderBitrateProbe;
-struct FfiAudioEncoderSmoothingProbe;
 struct FfiAudioEncoderQuery;
 struct FfiAudioEncoderCreation;
 struct FfiAudioEncoderInfo;
@@ -378,7 +375,6 @@ FfiAudioEncoderOutput audio_encoder_forward_encode_sdk(const NativeAudioEncoder 
     std::uint32_t timestamp, rust::Slice<const std::int16_t> audio, rust::Slice<const std::uint8_t> prefix) noexcept;
 void audio_encoder_forward_target_sdk(const NativeAudioEncoder &, std::int32_t bitrate) noexcept;
 void audio_encoder_forward_loss_sdk(const NativeAudioEncoder &, float fraction) noexcept;
-bool audio_encoder_forward_adaptor_sdk(const NativeAudioEncoder &, rust::Slice<const std::uint8_t> config) noexcept;
 
 class NativeAudioDecoderFactory final {
 public:
@@ -762,56 +758,6 @@ FfiAudioEncoderCreation audio_encoder_create(
 FfiAudioEncoderCreation audio_encoder_create_with_options(
     const NativeAudioEncoderFactory &factory, const NativeEnvironment &environment,
     const FfiSdpAudioFormat &format, const NativeAudioEncoderOptions &options) noexcept;
-// Exact default allocation->bandwidth arguments; guard only compiled SDK
-// constructor/getter assertions, retaining NDEBUG infinity/narrowing behavior.
-void audio_encoder_default_allocation_arguments(std::int64_t target, std::int8_t kind,
-    std::int64_t period, bool &valid, std::int32_t &bitrate, std::int64_t &milliseconds) noexcept;
-// Internal smoothing-input predicate only; does not authorize ANA enablement.
-bool audio_encoder_adaptor_smoothing_inputs_safe(std::int32_t bitrate,
-                                                 bool has_period,
-                                                 std::int64_t period) noexcept;
-// Internal initialization witness under a caller-supplied lifetime millisecond
-// span, not proof of native clock identity, bounds, or signed time arithmetic.
-bool audio_encoder_adaptor_initialization_safe(
-    std::int32_t duration, std::uint64_t clock_span_ms) noexcept;
-// Internal isolated native-controller exercise, not adaptor enablement. Status:
-// 0 success, 1 metrics, 2 occupied slot, 3 arithmetic, 4 invalid construction.
-FfiAudioEncoderBitrateProbe audio_encoder_adaptor_bitrate_probe(
-    std::int32_t initial_frame, std::int32_t increase, std::int32_t decrease,
-    rust::Slice<const FfiAudioEncoderBitrateStep> steps) noexcept;
-// Internal isolated native-filter exercise using retained clock evidence. No
-// encoder/adaptor mutation and no clock reads. Status: 0 success, 1 clock,
-// 2 floating context, 3 initialization, 4 sample, 5 time constant, 6 average.
-FfiAudioEncoderSmoothingProbe audio_encoder_adaptor_smoothing_probe(
-    const NativeAudioEncoder &encoder, std::int32_t first_sample,
-    std::int32_t sample, std::int64_t first_time_us,
-    std::int64_t sample_time_us, std::int64_t average_time_us,
-    bool has_duration, std::int32_t duration) noexcept;
-// Internal comparator-domain preflight for supplied hypothetical metrics.
-// Does not track native reorder history or authorize ANA enablement.
-std::uint8_t audio_encoder_check_network_adaptor_scoring(
-    const NativeAudioEncoder &encoder, rust::Slice<const std::uint8_t> bytes,
-    bool has_bandwidth, std::int32_t bandwidth, bool has_loss,
-    float loss) noexcept;
-// Internal smoother preflight using retained environment clock evidence;
-// does not authorize ANA enablement or cover controller/scoring consumption.
-std::uint8_t audio_encoder_check_network_adaptor_smoothing(
-    const NativeAudioEncoder &encoder,
-    rust::Slice<const std::uint8_t> bytes) noexcept;
-// Internal universal-state controller arithmetic preflight only.
-// Caller-supplied metrics/bounds are not native state evidence; clock, scoring
-// and smoothing obligations remain separate. Status: 0 arithmetic safe, 1
-// invalid construction, 2 unsafe arithmetic, 3 unavailable capability.
-std::uint8_t audio_encoder_check_network_adaptor_arithmetic(
-    const NativeAudioEncoder &encoder, rust::Slice<const std::uint8_t> bytes,
-    bool has_overhead, std::size_t overhead, bool has_target,
-    std::int32_t target, bool has_uplink, std::int32_t uplink_min,
-    std::int32_t uplink_max) noexcept;
-// Internal non-mutating construction preflight, not an ANA enable operation.
-// 0: constructible, 1: invalid construction, 3: unavailable artifact/product.
-std::uint8_t audio_encoder_check_network_adaptor_config(
-    const NativeAudioEncoder &encoder,
-    rust::Slice<const std::uint8_t> bytes) noexcept;
 FfiAudioEncoderInfo
 audio_encoder_info(const NativeAudioEncoder &encoder) noexcept;
 FfiAudioEncoderRange
@@ -830,19 +776,12 @@ bool audio_encoder_set_dtx(const NativeAudioEncoder &encoder,
                            bool enable) noexcept;
 bool audio_encoder_set_application(const NativeAudioEncoder &encoder,
                                    bool speech) noexcept;
-bool audio_encoder_enable_network_adaptor(const NativeAudioEncoder &encoder,
-    rust::Slice<const std::uint8_t> config, std::uint8_t &error) noexcept;
-void audio_encoder_disable_network_adaptor(
-    const NativeAudioEncoder &encoder) noexcept;
 void audio_encoder_set_max_playback_rate(const NativeAudioEncoder &encoder,
                                          std::int32_t frequency) noexcept;
 bool audio_encoder_set_target_bitrate(const NativeAudioEncoder &encoder,
                                       std::int32_t bitrate) noexcept;
 bool audio_encoder_on_target_bitrate(const NativeAudioEncoder &encoder,
                                      std::int32_t bitrate) noexcept;
-bool audio_encoder_on_bandwidth(const NativeAudioEncoder &encoder,
-                                std::int32_t bitrate, bool has_period,
-                                std::int64_t period) noexcept;
 bool audio_encoder_on_allocation(
     const NativeAudioEncoder &encoder,
     const FfiBitrateAllocationUpdate &update) noexcept;

@@ -15,22 +15,12 @@ fn native_source_aliases_notifications_and_closed_queues_retain_origins() {
     let track_changes = track
         .observe_changes(NonZeroUsize::new(1).unwrap())
         .unwrap();
-    let mut options = AudioSourceOptions::default();
-    options.stereo_swapping = Some(false);
-    for _ in 0..3 {
-        view.set_options(&options).unwrap();
-    }
-    assert_eq!(source.options(), options);
-    assert_eq!(changes.take_dropped_events(), 1);
-    assert_eq!(changes.take_dropped_events(), 0);
-    assert_eq!(changes.try_next_event(), Some(AudioObserverEvent::Changed));
-    assert_eq!(changes.try_next_event(), Some(AudioObserverEvent::Changed));
+    assert_eq!(source.options(), AudioSourceOptions::default());
     assert_eq!(changes.try_next_event(), None);
     // Native OnChanged only forwards real track-state transitions.
     assert_eq!(track_changes.try_next_event(), None);
     view.set_volume(0.0).unwrap();
-    assert_eq!(view.volume(), 1.0);
-    assert_eq!(volume.try_next_event(), None); // Native local implementation is a no-op.
+    assert_eq!(volume.try_next_event(), None); // The local source has no volume observer implementation.
     assert!(track.set_enabled(false));
     assert!(!track.set_enabled(false));
     assert!(track.set_enabled(true));
@@ -53,7 +43,6 @@ fn native_source_aliases_notifications_and_closed_queues_retain_origins() {
         track_changes.try_next_event(),
         Some(AudioObserverEvent::Changed)
     );
-    view.set_options(&AudioSourceOptions::default()).unwrap();
     drop((
         factory,
         source,

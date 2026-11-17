@@ -3,9 +3,9 @@
 load("@rules_nixpkgs_core//:nixpkgs.bzl", "nixpkgs_package")
 load(":runtime_deps.bzl", "DESKTOP_RUNTIME_SHA256")
 
-_WEBRTC = "ba469aa2093ba950066258ca0a59a6fbd1295582"
+_WEBRTC = "7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499"
 _DEPOT_TOOLS = "ed9c87f6f12f6b87210e7025d4a36a5a72a2ccd4"
-_LIBVPX = "31af37b1bd2774d11a932c1cd9a3849328375f64"
+_LIBVPX = "fb0a26ad923b58c3663aaa9523992cf779b1563b"
 
 def _run(ctx, args, cwd = "", env = {}):
     result = ctx.execute(args, working_directory = cwd, environment = env, timeout = 3600, quiet = False)
@@ -37,18 +37,12 @@ def _upstream_impl(ctx):
     python = ctx.which("python3")
     if not git or not python:
         fail("WebRTC acquisition requires git and python3 on PATH.")
-    # Register patch contents before acquisition. Passing only ctx.path() to git
-    # does not include file contents in the shared repository cache identity.
-    for patch in ctx.attr.patches + [ctx.attr.libvpx_patch]:
-        ctx.read(patch)
     ctx.read(ctx.attr.source_manifest)
     source_manifest = ctx.path(ctx.attr.source_manifest)
-    patches = [str(ctx.path(patch)) for patch in ctx.attr.patches]
-    libvpx_patch = str(ctx.path(ctx.attr.libvpx_patch))
     _run(ctx, [git, "init", "depot_tools"])
     _run(ctx, [git, "-C", "depot_tools", "fetch", "--depth=1", "https://chromium.googlesource.com/chromium/tools/depot_tools.git", _DEPOT_TOOLS])
     _run(ctx, [git, "-C", "depot_tools", "checkout", "--detach", "FETCH_HEAD"])
-    ctx.file("checkout/.gclient", "solutions = [{'name': 'src', 'url': 'https://github.com/webrtc-sdk/webrtc.git', 'deps_file': 'DEPS', 'managed': False, 'custom_deps': {}, 'custom_vars': {'checkout_instrumented_libraries': False}, 'custom_hooks': [{'name': ''}, {'name': 'sysroot_x86'}]}]\n")
+    ctx.file("checkout/.gclient", "solutions = [{'name': 'src', 'url': 'https://webrtc.googlesource.com/src', 'deps_file': 'DEPS', 'managed': False, 'custom_deps': {}, 'custom_vars': {'checkout_instrumented_libraries': False}, 'custom_hooks': [{'name': ''}, {'name': 'sysroot_x86'}]}]\n")
     env = {
         "PATH": str(ctx.path("depot_tools")) + ":" + ctx.os.environ.get("PATH", ""),
         "DEPOT_TOOLS_UPDATE": "0",
@@ -58,14 +52,14 @@ def _upstream_impl(ctx):
     gclient = str(ctx.path("depot_tools/gclient.py"))
     _run(ctx, [python, gclient, "sync", "--no-history", "--shallow", "--nohooks", "--revision", "src@" + _WEBRTC], str(ctx.path("checkout")), env)
     clang = "checkout/src/third_party/llvm-build/Release+Asserts"
-    clang_version = "llvmorg-23-init-10931-g20b6ec66-11"
+    clang_version = "llvmorg-24-init-17044-gc3223914-1"
     ctx.download_and_extract(
         url = "https://commondatastorage.googleapis.com/chromium-browser-clang/Linux_x64/clang-" + clang_version + ".tar.xz",
-        sha256 = "de584381536aa5ba2403033c4f8b70f3c39c2e5d7fa87c953b7fd8bfbba0ee2a",
+        sha256 = "4312432fd57f94766b62264161ec4afabeaca066fc812cf038efa88c154ef4da",
         output = clang,
     )
     ctx.file(clang + "/cr_build_revision", clang_version + "\n")
-    sysroot_hash = "52d61d4446ffebfaa3dda2cd02da4ab4876ff237853f46d273e7f9b666652e1d"
+    sysroot_hash = "f851add76bdae472fb6c94b4f920bc4a132d85ac607951391297f636af7e934e"
     sysroot_url = "https://commondatastorage.googleapis.com/chrome-linux-sysroot/" + sysroot_hash
     sysroot = "checkout/src/build/linux/debian_bullseye_amd64-sysroot"
     ctx.download_and_extract(url = sysroot_url, sha256 = sysroot_hash, output = sysroot, type = "tar.xz")
@@ -77,15 +71,10 @@ def _upstream_impl(ctx):
     result = ctx.execute([git, "-C", "checkout/src/third_party/libvpx/source/libvpx", "rev-parse", "HEAD"])
     if result.return_code or result.stdout.strip() != _LIBVPX:
         fail("WebRTC DEPS libvpx pin differs from the qualified revision " + _LIBVPX)
-    for patch in patches:
-        _run(ctx, [git, "apply", patch], str(ctx.path("checkout/src")))
-    _run(ctx, [git, "apply", libvpx_patch], str(ctx.path("checkout/src/third_party/libvpx/source/libvpx")))
-    # Foreign Bazel metadata must not create subpackage holes in the GN input tree.
-    _run(ctx, [python, "-c", "from pathlib import Path; [(p.rename(p.with_name(p.name + '.upstream'))) for p in Path('checkout/src').rglob('*') if p.name in ('BUILD', 'BUILD.bazel') and p.is_file()]"])
     _run(ctx, [python, source_manifest, "checkout/src", "sources.sha256"])
     ctx.file("BUILD.bazel", '''package(default_visibility = ["//visibility:public"])
 # The manifest identifies the immutable compiler checkout without a file glob.
-exports_files(["checkout/src", "sources.sha256", "checkout/src/.gn"])
+exports_files(["sources.sha256"])
 filegroup(name = "clang++", srcs = ["checkout/src/third_party/llvm-build/Release+Asserts/bin/clang++"])
 filegroup(name = "clang_tools", srcs = glob(["checkout/src/third_party/llvm-build/Release+Asserts/**"]))
 ''')
@@ -143,25 +132,12 @@ desktop_runtime_files = rule(
 _upstream = repository_rule(
     implementation = _upstream_impl,
     attrs = {
-        "patches": attr.label_list(allow_files = [".patch"]),
-        "libvpx_patch": attr.label(allow_single_file = [".patch"], mandatory = True),
         "source_manifest": attr.label(default = Label("//crates/pulsebeam-libwebrtc-sys:source_manifest.py"), allow_single_file = True),
     },
 )
 
 def _webrtc_impl(ctx):
-    _upstream(
-        name = "webrtc_upstream",
-        patches = [Label("//crates/pulsebeam-libwebrtc-sys:patches/" + name + ".patch") for name in [
-            "core-ios-remove-framework-objc",
-            "encoder-preference-order-fallback",
-            "runtime-codec-core-budget",
-            "recordable-encoded-frame-rtp-identity",
-            "receiver-rebind-same-ssrc",
-            "data-channel-transport-reapply-preserves-reset",
-        ]],
-        libvpx_patch = Label("//crates/pulsebeam-libwebrtc-sys:patches/runtime-libvpx-workers.patch"),
-    )
+    _upstream(name = "webrtc_upstream")
     nixpkgs_package(
         name = "webrtc_host",
         nix_file = Label("//crates/pulsebeam-libwebrtc-sys:gn/host.nix"),

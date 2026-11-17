@@ -56,12 +56,6 @@ pub trait AudioEncoderProvider: Send + 'static {
     fn set_target_bitrate(&mut self, _bitrate: i32) -> Result<(), AudioEncoderError> {
         Ok(())
     }
-    fn enable_audio_network_adaptor(&mut self, _config: &[u8]) -> Result<bool, AudioEncoderError> {
-        Ok(false)
-    }
-    fn disable_audio_network_adaptor(&mut self) -> Result<(), AudioEncoderError> {
-        Ok(())
-    }
     fn on_received_uplink_packet_loss_fraction(
         &mut self,
         _fraction: f32,
@@ -75,40 +69,16 @@ pub trait AudioEncoderProvider: Send + 'static {
         Err(AudioEncoderError::UnsupportedControl)
     }
     fn on_received_target_audio_bitrate(&mut self, bitrate: i32) -> Result<(), AudioEncoderError> {
-        self.on_received_uplink_bandwidth(bitrate, None)
-    }
-    fn on_received_uplink_bandwidth(
-        &mut self,
-        _bitrate: i32,
-        _period: Option<i64>,
-    ) -> Result<(), AudioEncoderError> {
-        Ok(())
+        self.on_received_uplink_allocation(BitrateAllocationUpdate {
+            target_bitrate: DataRate::BitsPerSecond(i64::from(bitrate)),
+            ..BitrateAllocationUpdate::default()
+        })
     }
     fn on_received_uplink_allocation(
         &mut self,
-        update: BitrateAllocationUpdate,
+        _update: BitrateAllocationUpdate,
     ) -> Result<(), AudioEncoderError> {
-        // Default delegation only: an override receives the complete untouched
-        // update. Use actual SDK getters and artifact-local assertion guards,
-        // including native release infinity and narrowing behavior.
-        let (target, kind) = match update.target_bitrate {
-            DataRate::BitsPerSecond(value) => (value, 0),
-            DataRate::PositiveInfinity => (0, 1),
-            DataRate::NegativeInfinity => (0, -1),
-        };
-        let (mut valid, mut bitrate, mut period) = (false, 0, 0);
-        crate::ffi::audio_encoder_default_allocation_arguments(
-            target,
-            kind,
-            update.bwe_period.native_microsecond_bits(),
-            &mut valid,
-            &mut bitrate,
-            &mut period,
-        );
-        if !valid {
-            return Err(AudioEncoderError::InvalidControl);
-        }
-        self.on_received_uplink_bandwidth(bitrate, Some(period))
+        Ok(())
     }
     fn on_received_rtt(&mut self, _rtt: i32) -> Result<(), AudioEncoderError> {
         Ok(())
@@ -147,12 +117,9 @@ pub enum AudioEncoderProductOperation {
     SetApplication,
     SetPlaybackRate,
     SetTargetBitrate,
-    EnableAdaptor,
-    DisableAdaptor,
     PacketLoss,
     RecoverablePacketLoss,
     ReceivedTargetBitrate,
-    UplinkBandwidth,
     UplinkAllocation,
     Rtt,
     Overhead,
@@ -432,23 +399,6 @@ impl CallerAudioEncoder {
                     .map_err(AudioEncoderProductFailureKind::Provider)
             })
     }
-    pub fn enable_audio_network_adaptor(
-        &self,
-        config: &[u8],
-    ) -> Result<bool, AudioEncoderProductError> {
-        self.0
-            .invoke(AudioEncoderProductOperation::EnableAdaptor, |p| {
-                p.enable_audio_network_adaptor(config)
-                    .map_err(AudioEncoderProductFailureKind::Provider)
-            })
-    }
-    pub fn disable_audio_network_adaptor(&self) -> Result<(), AudioEncoderProductError> {
-        self.0
-            .invoke(AudioEncoderProductOperation::DisableAdaptor, |p| {
-                p.disable_audio_network_adaptor()
-                    .map_err(AudioEncoderProductFailureKind::Provider)
-            })
-    }
     pub fn on_received_uplink_packet_loss_fraction(
         &self,
         value: f32,
@@ -476,17 +426,6 @@ impl CallerAudioEncoder {
         self.0
             .invoke(AudioEncoderProductOperation::ReceivedTargetBitrate, |p| {
                 p.on_received_target_audio_bitrate(value)
-                    .map_err(AudioEncoderProductFailureKind::Provider)
-            })
-    }
-    pub fn on_received_uplink_bandwidth(
-        &self,
-        value: i32,
-        period: Option<i64>,
-    ) -> Result<(), AudioEncoderProductError> {
-        self.0
-            .invoke(AudioEncoderProductOperation::UplinkBandwidth, |p| {
-                p.on_received_uplink_bandwidth(value, period)
                     .map_err(AudioEncoderProductFailureKind::Provider)
             })
     }

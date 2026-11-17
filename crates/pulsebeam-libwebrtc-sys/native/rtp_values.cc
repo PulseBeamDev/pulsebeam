@@ -8,7 +8,7 @@
 namespace pulsebeam::webrtc_sys {
 static_assert(std::numeric_limits<int>::digits == 31);
 std::unique_ptr<NativeSframeEncrypterInit> sframe_init_new(std::int32_t mode, std::int32_t suite) noexcept {
-  return std::make_unique<NativeSframeEncrypterInit>(webrtc::SframeEncrypterInit{
+  return std::make_unique<NativeSframeEncrypterInit>(webrtc::SframeEncryptorInit{
       static_cast<webrtc::SframeMode>(mode), static_cast<webrtc::SframeCipherSuite>(suite)});
 }
 std::unique_ptr<NativeSframeEncrypterInit> sframe_init_clone(const NativeSframeEncrypterInit& source) noexcept { return std::make_unique<NativeSframeEncrypterInit>(source.value()); }
@@ -341,26 +341,19 @@ std::unique_ptr<NativeRtcError> rtc_error_stream_rtcp_parameters(std::unique_ptr
 
 std::unique_ptr<NativeRtpHeaderExtensionId> rtp_header_id_default() noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId()); }
 std::unique_ptr<NativeRtpHeaderExtensionId> rtp_header_id_not_set() noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId::NotSet()); }
-std::unique_ptr<NativeRtpHeaderExtensionId> rtp_header_id_new(std::int32_t value) noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId(value)); }
+std::unique_ptr<NativeRtpHeaderExtensionId> rtp_header_id_new(std::int32_t value) noexcept { if (value < 0 || value > 255) return nullptr; return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId(value)); }
 std::unique_ptr<NativeRtpHeaderExtensionId> rtp_header_id_constant(std::uint32_t index) noexcept { switch (index) { case 0: return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId::kMinId); case 1: return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId::kMaxId); case 2: return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId::kOneByteHeaderExtensionMaxId); default: return nullptr; } }
 std::unique_ptr<NativeRtpHeaderExtensionId> rtp_header_id_clone(const NativeRtpHeaderExtensionId& source) noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(source.value()); }
 void rtp_header_id_assign(NativeRtpHeaderExtensionId& target, const NativeRtpHeaderExtensionId& source) noexcept { target.value() = source.value(); }
-std::int32_t rtp_header_id_to_int(const NativeRtpHeaderExtensionId& value) noexcept { return value.value().operator int(); }
+std::int32_t rtp_header_id_to_int(const NativeRtpHeaderExtensionId& value) noexcept { return static_cast<int>(value.value()); }
 bool rtp_header_id_valid(const NativeRtpHeaderExtensionId& value) noexcept { return value.value().Valid(); }
 bool rtp_header_id_is_set(const NativeRtpHeaderExtensionId& value) noexcept { return value.value().IsSet(); }
 rust::Vec<std::uint8_t> rtp_header_id_string(const NativeRtpHeaderExtensionId& value) noexcept { return RtpBytes(absl::StrFormat("%v", value.value())); }
 std::size_t rtp_header_id_hash(const NativeRtpHeaderExtensionId& value) noexcept { return absl::Hash<webrtc::RtpHeaderExtensionId>{}(value.value()); }
-const std::int32_t& rtp_header_id_ref(const NativeRtpHeaderExtensionId& value) noexcept { return value.value().value(); }
-std::int32_t& rtp_header_id_ref_mut(NativeRtpHeaderExtensionId& value) noexcept { return value.value().value(); }
-const std::int32_t& rtp_header_id_deref(const NativeRtpHeaderExtensionId& value) noexcept { return *value.value(); }
-std::int32_t& rtp_header_id_deref_mut(NativeRtpHeaderExtensionId& value) noexcept { return *value.value(); }
-const std::int32_t& rtp_header_id_arrow(const NativeRtpHeaderExtensionId& value) noexcept { return *value.value().operator->(); }
-std::int32_t& rtp_header_id_arrow_mut(NativeRtpHeaderExtensionId& value) noexcept { return *value.value().operator->(); }
-const std::int32_t& rtp_header_id_conversion(const NativeRtpHeaderExtensionId& value) noexcept { return value.value().operator const int&(); }
-std::int32_t rtp_header_id_into_value(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept { return std::move(value->value()).value(); }
-std::int32_t rtp_header_id_into_const_value(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept { return std::move(std::as_const(value->value())).value(); }
-std::int32_t rtp_header_id_into_deref(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept { return *std::move(value->value()); }
-std::int32_t rtp_header_id_into_const_deref(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept { return *std::move(std::as_const(value->value())); }
+std::int32_t rtp_header_id_value(const NativeRtpHeaderExtensionId& value) noexcept { return value.value().value(); }
+bool rtp_header_id_set_value(NativeRtpHeaderExtensionId& value, std::int32_t input) noexcept { if (input < 0 || input > 255) return false; value.value() = webrtc::RtpHeaderExtensionId(input); return true; }
+std::int32_t rtp_header_id_into_value(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept { return value->value().value(); }
+std::int32_t rtp_header_id_into_const_value(std::unique_ptr<NativeRtpHeaderExtensionId> value) noexcept { return std::as_const(value->value()).value(); }
 bool rtp_header_id_equal(const NativeRtpHeaderExtensionId& lhs, const NativeRtpHeaderExtensionId& rhs) noexcept { return lhs.value() == rhs.value(); }
 bool rtp_header_id_not_equal(const NativeRtpHeaderExtensionId& lhs, const NativeRtpHeaderExtensionId& rhs) noexcept { return lhs.value() != rhs.value(); }
 bool rtp_header_id_less(const NativeRtpHeaderExtensionId& lhs, const NativeRtpHeaderExtensionId& rhs) noexcept { return lhs.value() < rhs.value(); }
@@ -373,7 +366,7 @@ bool rtp_header_id_greater_equal(const NativeRtpHeaderExtensionId& lhs, const Na
 
 std::unique_ptr<NativeRtpExtension> rtp_extension_default() noexcept { return std::make_unique<NativeRtpExtension>(webrtc::RtpExtension()); }
 std::unique_ptr<NativeRtpExtension> rtp_extension_new(rust::Slice<const std::uint8_t> uri, const NativeRtpHeaderExtensionId& id, bool explicit_encrypt, bool encrypt) noexcept { if (!id.value().Valid()) return nullptr; if (explicit_encrypt) return std::make_unique<NativeRtpExtension>(webrtc::RtpExtension(RtpView(uri), id.value(), encrypt)); return std::make_unique<NativeRtpExtension>(webrtc::RtpExtension(RtpView(uri), id.value())); }
-std::unique_ptr<NativeRtpExtension> rtp_extension_new_int(rust::Slice<const std::uint8_t> uri, std::int32_t id, bool explicit_encrypt, bool encrypt) noexcept { if (!webrtc::RtpHeaderExtensionId(id).Valid()) return nullptr; if (explicit_encrypt) return std::make_unique<NativeRtpExtension>(webrtc::RtpExtension(RtpView(uri), id, encrypt)); return std::make_unique<NativeRtpExtension>(webrtc::RtpExtension(RtpView(uri), id)); }
+std::unique_ptr<NativeRtpExtension> rtp_extension_new_int(rust::Slice<const std::uint8_t> uri, std::int32_t id, bool explicit_encrypt, bool encrypt) noexcept { const auto typed_id = webrtc::RtpHeaderExtensionId::Create(id); if (!typed_id) return nullptr; if (explicit_encrypt) return std::make_unique<NativeRtpExtension>(webrtc::RtpExtension(RtpView(uri), *typed_id, encrypt)); return std::make_unique<NativeRtpExtension>(webrtc::RtpExtension(RtpView(uri), *typed_id)); }
 std::unique_ptr<NativeRtpExtension> rtp_extension_clone(const NativeRtpExtension& value) noexcept { return std::make_unique<NativeRtpExtension>(value.value()); }
 void rtp_extension_assign(NativeRtpExtension& target, const NativeRtpExtension& source) noexcept { target.value() = source.value(); }
 bool rtp_extension_equal(const NativeRtpExtension& lhs, const NativeRtpExtension& rhs) noexcept { return lhs.value() == rhs.value(); }
@@ -424,9 +417,9 @@ rust::Vec<std::uint8_t> rtp_extension_repaired_rid_uri() noexcept { return RtpBy
 rust::Vec<std::uint8_t> rtp_extension_video_frame_tracking_id_uri() noexcept { return RtpBytes(webrtc::RtpExtension::kVideoFrameTrackingIdUri); }
 rust::Vec<std::uint8_t> rtp_extension_csrc_audio_levels_uri() noexcept { return RtpBytes(webrtc::RtpExtension::kCsrcAudioLevelsUri); }
 rust::Vec<std::uint8_t> rtp_extension_corruption_detection_uri() noexcept { return RtpBytes(webrtc::RtpExtension::kCorruptionDetectionUri); }
-std::unique_ptr<NativeRtpHeaderExtensionId> rtp_extension_min_id() noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpExtension::kMinId); }
-std::unique_ptr<NativeRtpHeaderExtensionId> rtp_extension_max_id() noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpExtension::kMaxId); }
-std::unique_ptr<NativeRtpHeaderExtensionId> rtp_extension_one_byte_max_id() noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpExtension::kOneByteHeaderExtensionMaxId); }
+std::unique_ptr<NativeRtpHeaderExtensionId> rtp_extension_min_id() noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId::kMinId); }
+std::unique_ptr<NativeRtpHeaderExtensionId> rtp_extension_max_id() noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId::kMaxId); }
+std::unique_ptr<NativeRtpHeaderExtensionId> rtp_extension_one_byte_max_id() noexcept { return std::make_unique<NativeRtpHeaderExtensionId>(webrtc::RtpHeaderExtensionId::kOneByteHeaderExtensionMaxId); }
 std::int32_t rtp_extension_max_value_size() noexcept { return webrtc::RtpExtension::kMaxValueSize; }
 std::int32_t rtp_extension_one_byte_max_value_size() noexcept { return webrtc::RtpExtension::kOneByteHeaderExtensionMaxValueSize; }
 

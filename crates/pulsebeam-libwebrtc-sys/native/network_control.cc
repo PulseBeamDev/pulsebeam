@@ -12,6 +12,12 @@ namespace pulsebeam::webrtc_sys {
 namespace {
 constexpr auto kPlus = std::numeric_limits<std::int64_t>::max();
 constexpr auto kMinus = std::numeric_limits<std::int64_t>::min();
+bool AdvanceReplayClock(const NativeManualClock* clock, std::int64_t time_us) {
+  if (!clock) return true;
+  const auto now = manual_clock_time_us(*clock);
+  if (time_us < now || time_us < 0 || time_us == kPlus) return false;
+  return advance_manual_clock(*clock, time_us - now);
+}
 std::int64_t Pack(webrtc::Timestamp value) { return value.IsPlusInfinity() ? kPlus : value.IsMinusInfinity() ? kMinus : value.us(); }
 std::int64_t Pack(webrtc::TimeDelta value) { return value.IsPlusInfinity() ? kPlus : value.IsMinusInfinity() ? kMinus : value.us(); }
 FfiNcMagnitude Pack(webrtc::DataRate value) { return {value.IsFinite() ? value.bps() : 0, static_cast<std::int8_t>(value.IsPlusInfinity() ? 1 : value.IsMinusInfinity() ? -1 : 0)}; }
@@ -281,7 +287,6 @@ FfiNcNetworkEstimate Pack(const webrtc::NetworkEstimate& value) {
   result.at_time = Pack(value.at_time);
   result.bandwidth = Pack(value.bandwidth);
   result.round_trip_time = Pack(value.round_trip_time);
-  result.bwe_period = Pack(value.bwe_period);
   result.loss_rate_ratio = value.loss_rate_ratio;
   return result;
 }
@@ -290,7 +295,6 @@ webrtc::NetworkEstimate Unpack(const FfiNcNetworkEstimate& value, bool& valid) {
   result.at_time = NativeTimestamp(value.at_time);
   result.bandwidth = NativeRate(value.bandwidth, valid);
   result.round_trip_time = NativeDelta(value.round_trip_time);
-  result.bwe_period = NativeDelta(value.bwe_period);
   result.loss_rate_ratio = value.loss_rate_ratio;
   return result;
 }
@@ -430,7 +434,6 @@ webrtc::NetworkControlUpdate Reject(const webrtc::Environment& env) {
   target.network_estimate.at_time = target.at_time;
   target.network_estimate.bandwidth = webrtc::DataRate::Zero();
   target.network_estimate.round_trip_time = webrtc::TimeDelta::Zero();
-  target.network_estimate.bwe_period = webrtc::TimeDelta::Zero();
   target.target_rate = webrtc::DataRate::Zero();
   result.target_rate = target;
   // Keep the engine's last valid pacing configuration for packets it already
@@ -636,21 +639,68 @@ bool network_controller_injection_enabled(const NativeEnvironment& environment) 
   return environment.environment().field_trials().IsEnabled("WebRTC-Bwe-InjectedCongestionController");
 }
 
-rust::Vec<FfiNcNetworkControlUpdate> network_controller_native_probe(
-    const NativeEnvironment& environment, rust::Box<RustNetworkControllerFactory> source,
-    rust::Slice<const FfiNcMessage> messages, rust::Slice<const std::uint8_t> kinds) noexcept {
+namespace {
+rust::Vec<FfiNcNetworkControlUpdate> NetworkControllerNativeProbe(
+    const NativeEnvironment& environment, const NativeManualClock* clock,
+    rust::Box<RustNetworkControllerFactory> source, FfiNcConfig initial_config,
+    rust::Slice<const FfiNcMessage> messages,
+    rust::Slice<const std::uint8_t> kinds) noexcept {
   rust::Vec<FfiNcNetworkControlUpdate> result;
-  if (messages.size() != kinds.size()) return result;
+  const auto fail = [&result]() {
+    FfiNcNetworkControlUpdate invalid{};
+    invalid.failed = true;
+    result.push_back(std::move(invalid));
+  };
+  if (messages.size() != kinds.size() || messages.size() > 4096) {
+    fail();
+    return result;
+  }
   auto factory = network_controller_factory_adapter(std::move(source));
-  if (!factory) return result;
+  if (!factory) {
+    fail();
+    return result;
+  }
   webrtc::NetworkControllerConfig config{environment.environment()};
+  bool config_valid = true;
+  config.constraints = Unpack(initial_config.constraints, config_valid);
+  config.stream_based_config = Unpack(initial_config.stream_based_config, config_valid);
+  config.default_pacing_time_window = NativeDelta(initial_config.default_pacing_time_window);
+  if (!config_valid ||
+      !AdvanceReplayClock(clock, initial_config.constraints.at_time)) {
+    fail();
+    return result;
+  }
   auto controller = factory->Create(std::move(config));
+  if (!controller) {
+    fail();
+    return result;
+  }
   (void)factory->GetProcessInterval();
   factory.reset();
   for (std::size_t index = 0; index < messages.size(); ++index) {
     bool valid = true;
     webrtc::NetworkControlUpdate update;
     const auto& value = messages[index];
+    std::int64_t event_time = kPlus;
+    switch (kinds[index]) {
+      case 0: event_time = value.network_availability.at_time; break;
+      case 1: event_time = value.network_route_change.at_time; break;
+      case 2: event_time = value.process_interval.at_time; break;
+      case 3: event_time = value.remote_bitrate_report.receive_time; break;
+      case 4: event_time = value.round_trip_time_update.receive_time; break;
+      case 5: event_time = value.sent_packet.send_time; break;
+      case 6: event_time = value.received_packet.receive_time; break;
+      case 7: event_time = value.streams_config.at_time; break;
+      case 8: event_time = value.target_rate_constraints.at_time; break;
+      case 9: event_time = value.transport_loss_report.receive_time; break;
+      case 10: event_time = value.transport_packets_feedback.feedback_time; break;
+      case 11: event_time = value.network_state_estimate.update_time; break;
+      default: valid = false; break;
+    }
+    if (!valid || !AdvanceReplayClock(clock, event_time)) {
+      fail();
+      return result;
+    }
     switch (kinds[index]) {
       case 0: { auto input = Unpack(value.network_availability, valid); if (valid) update = controller->OnNetworkAvailability(std::move(input)); break; }
       case 1: { auto input = Unpack(value.network_route_change, valid); if (valid) update = controller->OnNetworkRouteChange(std::move(input)); break; }
@@ -664,11 +714,6 @@ rust::Vec<FfiNcNetworkControlUpdate> network_controller_native_probe(
       case 9: { auto input = Unpack(value.transport_loss_report, valid); if (valid) update = controller->OnTransportLossReport(std::move(input)); break; }
       case 10: { auto input = Unpack(value.transport_packets_feedback, valid); if (valid) update = controller->OnTransportPacketsFeedback(std::move(input)); break; }
       case 11: { auto input = Unpack(value.network_state_estimate, valid); if (valid) update = controller->OnNetworkStateEstimate(std::move(input)); break; }
-      case 12: {
-        update = Reject(environment.environment());
-        update.target_rate->target_rate = webrtc::DataRate::BitsPerSec(controller->SupportsEcnAdaptation() ? 1 : 0);
-        break;
-      }
       default: valid = false; break;
     }
     auto packed = Pack(update);
@@ -676,5 +721,21 @@ rust::Vec<FfiNcNetworkControlUpdate> network_controller_native_probe(
     result.push_back(std::move(packed));
   }
   return result;
+}
+}  // namespace
+rust::Vec<FfiNcNetworkControlUpdate> network_controller_native_probe(
+    const NativeEnvironment& environment, rust::Box<RustNetworkControllerFactory> source,
+    FfiNcConfig initial_config, rust::Slice<const FfiNcMessage> messages,
+    rust::Slice<const std::uint8_t> kinds) noexcept {
+  return NetworkControllerNativeProbe(environment, nullptr, std::move(source),
+                                       std::move(initial_config), messages, kinds);
+}
+rust::Vec<FfiNcNetworkControlUpdate> network_controller_native_probe_controlled(
+    const NativeEnvironment& environment, const NativeManualClock& clock,
+    rust::Box<RustNetworkControllerFactory> source, FfiNcConfig initial_config,
+    rust::Slice<const FfiNcMessage> messages,
+    rust::Slice<const std::uint8_t> kinds) noexcept {
+  return NetworkControllerNativeProbe(environment, &clock, std::move(source),
+                                       std::move(initial_config), messages, kinds);
 }
 }  // namespace pulsebeam::webrtc_sys

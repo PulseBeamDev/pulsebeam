@@ -136,7 +136,7 @@ impl SdpVideoFormat {
             true,
         ))
     }
-    /// SDK copy-with-modes overload retains both optional protocol fields.
+    /// SDK copy-with-modes overload resets packetization and tx_mode to absent.
     pub fn with_scalability_modes(&self, scalability_modes: &[ScalabilityMode]) -> Self {
         Self::from_native(ffi::sdp_video_format_with_modes(
             self.native(),

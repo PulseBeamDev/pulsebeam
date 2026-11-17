@@ -1,7 +1,11 @@
-//! Native SFrame source fixtures. Stock creation preserves errors/side effects;
-//! these do not claim that the SDK has implemented an encryption pipeline.
+//! Native SFrame key-management and SDK negotiation proof. Key callbacks are
+//! exercised independently of live encrypted-media delivery.
 use pulsebeam_webrtc_sys::*;
-use std::{sync::Arc, thread};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+};
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 fn send_sync<T: Send + Sync>() {}
 
 #[test]
@@ -19,6 +23,9 @@ fn native_init_preserves_complete_enum_domain_copy_assignment_and_migration() {
             SframeCipherSuite::Aes128CtrHmacSha256_32,
             SframeCipherSuite::Aes128GcmSha256_128,
             SframeCipherSuite::Aes256GcmSha512_128,
+            SframeCipherSuite::Aes256CtrHmacSha512_80,
+            SframeCipherSuite::Aes256CtrHmacSha512_64,
+            SframeCipherSuite::Aes256CtrHmacSha512_32,
             SframeCipherSuite::Other(i32::MIN),
             SframeCipherSuite::Other(i32::MAX),
         ] {
@@ -46,18 +53,9 @@ fn native_init_preserves_complete_enum_domain_copy_assignment_and_migration() {
         }
     }
 }
-fn unsupported(error: SframeCreateError, message: &str) {
-    match error {
-        SframeCreateError::Native(error) => {
-            assert_eq!(error.kind(), RtcErrorType::UnsupportedOperation);
-            assert!(!error.is_ok());
-            assert_eq!(error.message(), message);
-        }
-        error => panic!("expected pinned SDK error, got {error:?}"),
-    }
-}
 #[test]
-fn migrated_actor_preserves_native_creation_errors_and_owner_side_effects() {
+fn migrated_actor_preserves_native_sframe_creation_side_effects() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let mut session = ProductionSession::builder(ProductionSessionConfig::default())
         .encoded_audio()
         .build()
@@ -82,32 +80,80 @@ fn migrated_actor_preserves_native_creation_errors_and_owner_side_effects() {
     ));
     drop(second);
     assert_eq!(session.sframe_enabled(transceiver).unwrap(), None);
-    unsupported(
-        session.create_sframe_encrypter(sender, &init).unwrap_err(),
-        "Sframe encrypter not yet implemented",
-    );
+    let encrypter = session.create_sframe_encrypter(sender, &init).unwrap();
     assert_eq!(session.sframe_enabled(transceiver).unwrap(), Some(true));
-    // Native TryToEnableSframe was invoked even though creation failed.
+    drop(encrypter);
+    // Native TryToEnableSframe succeeds and creates a native key-management
+    // product for the actual SDK transceiver.
     let mut session = thread::spawn(move || {
         let mut session = session;
-        unsupported(
-            session
-                .create_sframe_decrypter(receiver, SframeCipherSuite::Aes256GcmSha512_128)
-                .unwrap_err(),
-            "Sframe decrypter not yet implemented",
-        );
+        let decrypter = session
+            .create_sframe_decrypter(receiver, SframeCipherSuite::Aes256GcmSha512_128)
+            .unwrap();
         assert_eq!(session.sframe_enabled(transceiver).unwrap(), Some(true));
+        drop(decrypter);
         session
     })
     .join()
     .unwrap();
     session.close_peer(peer).unwrap();
-    // Close stops media but does not clear the SDK's owning transceiver graph.
-    unsupported(
-        session.create_sframe_encrypter(sender, &init).unwrap_err(),
-        "Sframe encrypter not yet implemented",
-    );
     thread::spawn(move || drop(session)).join().unwrap();
+}
+
+#[test]
+fn native_decryption_key_updates_complete_asynchronously() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let world = ControlledWorld::acquire(0x5f4a, std::time::Duration::from_secs(1)).unwrap();
+    let network = world.create_network().unwrap();
+    let endpoint = network
+        .register_endpoint("10.0.0.1".parse().unwrap())
+        .unwrap();
+    let runtime = world.runtime().unwrap().with_endpoint(&endpoint).unwrap();
+    let mut session = Session::with_runtime(runtime, SessionConfig::default())
+        .encoded_audio()
+        .build()
+        .unwrap();
+    let peer = session.create_peer(PeerConfiguration::default()).unwrap();
+    let source = session.create_opus_source(1).unwrap();
+    let transceiver = session
+        .publish_opus(
+            peer,
+            source,
+            "sframe-key",
+            RtpTransceiverDirection::SendReceive,
+        )
+        .unwrap();
+    let receiver = session.receiver(transceiver).unwrap();
+    let decrypter = session
+        .create_sframe_decrypter(receiver, SframeCipherSuite::Aes128GcmSha256_128)
+        .unwrap();
+    let key = [0x5a; 16];
+    let mut add = session
+        .sframe_add_decryption_key(decrypter, 7, &key)
+        .unwrap();
+    let add_result = (0..64).find_map(|_| {
+        assert!(
+            !world.pump(256).blocked,
+            "controlled SFrame add-key pump blocked"
+        );
+        add.try_take()
+    });
+    add_result
+        .expect("native SFrame add-key callback did not arrive within 64 bounded pumps")
+        .unwrap();
+
+    let mut remove = session.sframe_remove_decryption_key(decrypter, 7).unwrap();
+    let remove_result = (0..64).find_map(|_| {
+        assert!(
+            !world.pump(256).blocked,
+            "controlled SFrame remove-key pump blocked"
+        );
+        remove.try_take()
+    });
+    remove_result
+        .expect("native SFrame remove-key callback did not arrive within 64 bounded pumps")
+        .unwrap();
+    session.release_sframe_decrypter(decrypter).unwrap();
 }
 
 fn complete_local(
@@ -152,21 +198,19 @@ fn negotiate_local(alice: &PeerConnection, bob: &PeerConnection, removed: &mut V
         removed,
     );
 }
-fn disabled(error: SframeCreateError) {
+fn stopped(error: SframeCreateError, expected_message: &str) {
     match error {
         SframeCreateError::Native(error) => {
-            assert_eq!(error.kind(), RtcErrorType::InvalidModification);
-            assert_eq!(
-                error.message(),
-                "Cannot enable Sframe after it has been disabled by a completed negotiation."
-            );
+            assert_eq!(error.kind(), RtcErrorType::InvalidState);
+            assert_eq!(error.message(), expected_message);
         }
-        error => panic!("expected native disabled error, got {error:?}"),
+        error => panic!("expected native stopped-endpoint error, got {error:?}"),
     }
 }
 #[test]
 fn surviving_endpoint_and_queued_remove_receiver_retain_sdk_transceiver_after_negotiation_removal()
 {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let factory = PeerConnectionFactory::builder()
         .audio_encoder_factory(AudioEncoderFactory::with_opus_frames().unwrap())
         .build()
@@ -200,19 +244,24 @@ fn surviving_endpoint_and_queued_remove_receiver_retain_sdk_transceiver_after_ne
     assert!(bob.audio_transceivers().unwrap().is_empty());
     let init =
         SframeEncrypterInit::new(SframeMode::PerFrame, SframeCipherSuite::Aes128GcmSha256_128);
-    disabled(sender.create_sframe_encrypter(&init).unwrap_err());
-    disabled(
+    stopped(
+        sender.create_sframe_encrypter(&init).unwrap_err(),
+        "Cannot create an Sframe encryptor on a stopped sender.",
+    );
+    stopped(
         receiver
             .create_sframe_decrypter(init.cipher_suite())
             .unwrap_err(),
+        "Cannot create an Sframe decryptor on a stopped receiver.",
     );
     // OnRemoveTrack retained the owner while it was still in the SDK list.
     assert!(!removed.is_empty());
     for receiver in removed {
-        disabled(
+        stopped(
             receiver
                 .create_sframe_decrypter(init.cipher_suite())
                 .unwrap_err(),
+            "Cannot create an Sframe decryptor on a stopped receiver.",
         );
     }
 }

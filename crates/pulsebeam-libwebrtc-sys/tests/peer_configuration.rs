@@ -85,7 +85,6 @@ fn owned_native_configuration_roundtrips_application_values() {
         flags: 0,
     };
     v.pacer_burst_interval = Some(NativeTimeDelta::from_microseconds(12500));
-    v.enable_any_address_ports = true;
     v.max_sctp_streams = 123;
     v.enable_sctp_snap = true;
     v.dscp = false;

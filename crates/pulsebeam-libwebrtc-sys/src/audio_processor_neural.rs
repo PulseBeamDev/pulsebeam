@@ -139,6 +139,7 @@ pub struct NeuralEchoEstimate {
     pub unbounded: Vec<[f32; 65]>,
 }
 pub trait NeuralResidualEchoEstimatorProvider: Send + 'static {
+    fn is_initialized(&mut self) -> Result<bool, String>;
     fn estimate(
         &mut self,
         input: NeuralEchoEstimateInput<'_>,
@@ -243,6 +244,14 @@ pub(crate) fn apm_neural_invalid(module: &RustApmCustomModule) {
         AudioProcessingCustomOperation::Estimate,
         AudioProcessingCustomFailureKind::InvalidBridgeValue,
     );
+}
+pub(crate) fn apm_neural_is_initialized(module: &RustApmCustomModule, valid: &mut bool) -> bool {
+    let value = module.call(AudioProcessingCustomOperation::IsInitialized, |p| match p {
+        Provider::Neural(p) => p.is_initialized(),
+        _ => Err("neural estimator kind mismatch".into()),
+    });
+    *valid = value.is_some();
+    value.unwrap_or(false)
 }
 pub(crate) fn apm_neural_reset(module: &RustApmCustomModule) -> bool {
     module

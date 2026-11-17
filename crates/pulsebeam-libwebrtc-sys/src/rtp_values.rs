@@ -221,8 +221,8 @@ impl std::fmt::Debug for RtcpFeedback {
     }
 }
 
-/// Lossless entry snapshot of the native std::map string/string field.
-/// Setters use native map assignment; later duplicate keys replace earlier ones.
+/// Lossless byte snapshot of the native sorted CodecParameterMap string pairs.
+/// Setters assign that native map; later duplicate keys replace earlier ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RtpCodecParameter {
     pub key: Vec<u8>,
@@ -904,13 +904,12 @@ impl std::fmt::Debug for RtcpParameters {
     }
 }
 
-/// Owns the SDK signed-int strong alias. All i32 metadata is constructible;
-/// Valid checks 1..=255, and zero is unset. No construction range gate is invented.
+/// Owns an SDK RTP extension ID, whose stored value is a byte. Zero is unset;
+/// only 1..=255 is valid. Construction accepts exactly the SDK's 0..=255 domain.
 pub struct RtpHeaderExtensionId {
     native: cxx::UniquePtr<ffi::NativeRtpHeaderExtensionId>,
 }
-// SAFETY: SDK RtpHeaderExtensionId contains only an owned int. Borrowed scalar
-// views remain tied to this owner; mutable views require exclusive access.
+// SAFETY: SDK RtpHeaderExtensionId contains only an owned byte-sized value.
 unsafe impl Send for RtpHeaderExtensionId {}
 unsafe impl Sync for RtpHeaderExtensionId {}
 impl RtpHeaderExtensionId {
@@ -922,7 +921,12 @@ impl RtpHeaderExtensionId {
         self.native.as_ref().unwrap()
     }
     pub fn new(value: i32) -> Self {
-        Self::from_native(ffi::rtp_header_id_new(value))
+        Self::try_new(value).expect("RTP header extension ID must be in 0..=255")
+    }
+    /// Creates an ID only when representable by the SDK's 0..=255 value domain.
+    pub fn try_new(value: i32) -> Option<Self> {
+        let native = ffi::rtp_header_id_new(value);
+        (!native.is_null()).then(|| Self::from_native(native))
     }
     pub fn not_set() -> Self {
         Self::from_native(ffi::rtp_header_id_not_set())
@@ -936,7 +940,7 @@ impl RtpHeaderExtensionId {
     pub fn one_byte_max_id() -> Self {
         Self::from_native(ffi::rtp_header_id_constant(2))
     }
-    /// Calls the SDK implicit int conversion, distinct from the borrowed base conversion.
+    /// Converts the strong ID using the SDK's explicit int conversion.
     pub fn to_int(&self) -> i32 {
         ffi::rtp_header_id_to_int(self.native())
     }
@@ -950,34 +954,17 @@ impl RtpHeaderExtensionId {
         ffi::rtp_header_id_string(self.native())
     }
     pub fn value(&self) -> i32 {
-        *self.value_ref()
+        ffi::rtp_header_id_value(self.native())
     }
-    pub fn value_ref(&self) -> &i32 {
-        ffi::rtp_header_id_ref(self.native())
-    }
-    pub fn value_mut(&mut self) -> &mut i32 {
-        ffi::rtp_header_id_ref_mut(self.native.pin_mut())
-    }
-    pub fn arrow_value_ref(&self) -> &i32 {
-        ffi::rtp_header_id_arrow(self.native())
-    }
-    pub fn arrow_value_mut(&mut self) -> &mut i32 {
-        ffi::rtp_header_id_arrow_mut(self.native.pin_mut())
-    }
-    pub fn as_underlying(&self) -> &i32 {
-        ffi::rtp_header_id_conversion(self.native())
+    /// Replaces the value only when it is representable by the SDK's byte domain.
+    pub fn set_value(&mut self, value: i32) -> bool {
+        ffi::rtp_header_id_set_value(self.native.pin_mut(), value)
     }
     pub fn into_value(self) -> i32 {
         ffi::rtp_header_id_into_value(self.native)
     }
     pub fn into_const_value(self) -> i32 {
         ffi::rtp_header_id_into_const_value(self.native)
-    }
-    pub fn into_deref(self) -> i32 {
-        ffi::rtp_header_id_into_deref(self.native)
-    }
-    pub fn into_const_deref(self) -> i32 {
-        ffi::rtp_header_id_into_const_deref(self.native)
     }
     /// Calls SDK AbslHashValue via absl::Hash. Process-local, not serialization.
     pub fn native_hash(&self) -> usize {
@@ -990,17 +977,6 @@ impl Clone for RtpHeaderExtensionId {
     }
     fn clone_from(&mut self, source: &Self) {
         ffi::rtp_header_id_assign(self.native.pin_mut(), source.native());
-    }
-}
-impl std::ops::Deref for RtpHeaderExtensionId {
-    type Target = i32;
-    fn deref(&self) -> &i32 {
-        ffi::rtp_header_id_deref(self.native())
-    }
-}
-impl std::ops::DerefMut for RtpHeaderExtensionId {
-    fn deref_mut(&mut self) -> &mut i32 {
-        ffi::rtp_header_id_deref_mut(self.native.pin_mut())
     }
 }
 impl PartialEq for RtpHeaderExtensionId {
@@ -1047,7 +1023,7 @@ impl Ord for RtpHeaderExtensionId {
 impl std::fmt::Debug for RtpHeaderExtensionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("RtpHeaderExtensionId")
-            .field(self.value_ref())
+            .field(&self.value())
             .finish()
     }
 }

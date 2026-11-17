@@ -358,17 +358,9 @@ fn check_mapping(
             .get(id)
             .or_else(|| {
                 let (observation, allowed) = live?;
-                let generation = observation.snapshot.generation?.get();
                 observation
-                    .owned_receivers
-                    .iter()
-                    .find(|evidence| {
-                        evidence.track.generation == generation
-                            && evidence.track.media_index == *index
-                            && evidence.publication.id == *id
-                            && allowed.contains(&evidence.publication.participant_id)
-                    })
-                    .map(|evidence| &evidence.publication)
+                    .owned_receiver_publication(*index, id)
+                    .filter(|publication| allowed.contains(&publication.participant_id))
             })
             .ok_or_else(|| anyhow::anyhow!("assignment references missing publication {id}"))?;
         ensure!(publication.kind == kind, "assignment has wrong media kind");

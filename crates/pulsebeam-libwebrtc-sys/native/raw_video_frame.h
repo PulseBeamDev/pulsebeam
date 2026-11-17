@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -45,7 +46,7 @@ class NativeWritableI420 final {
   webrtc::scoped_refptr<webrtc::I420Buffer> Freeze() { return std::move(value_); }
  private:
   webrtc::scoped_refptr<webrtc::I420Buffer> value_;
-  bool initialized_[3];
+  std::array<bool, 3> initialized_;
 };
 class NativeVideoBufferPreparation final {
  public:

@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "api/video/video_source_interface.h"
-#include "media/base/video_broadcaster.h"
+#include "api/video/video_broadcaster.h"
 #include "pulsebeam-webrtc-sys/native/raw_video_source.h"
 #include "pulsebeam-webrtc-sys/src/lib.rs.h"
 #include "rtc_base/synchronization/mutex.h"
@@ -61,8 +61,7 @@ inline FfiVideoSinkWants FromVideoSinkWants(const webrtc::VideoSinkWants& v) {
 class RemoteBroadcasterObservation : private webrtc::VideoBroadcaster {
   template <typename Reader>
   static auto Read(webrtc::VideoBroadcaster& actual, Reader&& reader) {
-    using Pairs = const std::vector<SinkPair>& (webrtc::VideoSourceBase::*)() const;
-    Pairs pairs = &RemoteBroadcasterObservation::sink_pairs;
+    auto pairs = &RemoteBroadcasterObservation::sink_pairs;
     webrtc::Mutex webrtc::VideoBroadcaster::* mutex = &RemoteBroadcasterObservation::sinks_and_wants_lock_;
     webrtc::MutexLock lock(&(actual.*mutex));
     return std::forward<Reader>(reader)((actual.*pairs)());

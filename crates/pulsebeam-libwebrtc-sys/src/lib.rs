@@ -15,8 +15,8 @@ mod audio;
 mod audio_source_options;
 mod audio_source_view;
 pub use audio_source_options::{
-    AudioProcessingMode, AudioSourceControlError, AudioSourceOptions, AudioSourceState,
-    AudioTrackState, AudioTrackStatus,
+    AudioSourceControlError, AudioSourceOptions, AudioSourceState, AudioTrackState,
+    AudioTrackStatus,
 };
 pub use audio_source_view::{AudioObserver, AudioObserverEvent, AudioSourceView};
 mod audio_processing;
@@ -62,26 +62,24 @@ pub use audio_processor_neural::{
 };
 use audio_processor_neural::{
     apm_neural_adjust, apm_neural_adjust_invalid, apm_neural_estimate, apm_neural_invalid,
-    apm_neural_reset,
+    apm_neural_is_initialized, apm_neural_reset,
 };
 mod audio_device_callbacks;
 pub use audio_device_callbacks::{
     AudioDeviceCallbackFailure, AudioDeviceCallbackFailureKind, AudioDeviceCallbackFailureObserver,
-    AudioDeviceCallbackOperation, AudioDeviceCapture, AudioDeviceCaptureResult,
-    AudioDeviceObserver, AudioDeviceObserverProvider, AudioDevicePcmSpec, AudioDevicePlayoutResult,
-    AudioDeviceRenderTiming, AudioDeviceSpeechActivity, AudioTransport, AudioTransportProvider,
+    AudioDeviceCallbackOperation, AudioDeviceCapture, AudioDeviceCaptureResult, AudioDevicePcmSpec,
+    AudioDevicePlayoutResult, AudioDeviceRenderTiming, AudioTransport, AudioTransportProvider,
 };
 use audio_device_callbacks::{
     RustAudioDeviceCallbacks, audio_device_callbacks_dispose, audio_device_callbacks_invalid,
-    audio_device_observed, audio_device_recorded, audio_device_render,
+    audio_device_recorded, audio_device_render,
 };
 #[cfg(all(feature = "native", target_os = "linux"))]
 mod audio_device;
 #[cfg(all(feature = "native", target_os = "linux"))]
 pub use audio_device::{
-    AudioDeviceCreationConfig, AudioDeviceCreationMethod, AudioDeviceError, AudioDeviceLayer,
-    AudioDeviceModule, AudioDeviceName, AudioDeviceStatistics, InstalledAudioDevice,
-    PlatformAudioProcessingState, PlatformAudioProcessingTopology,
+    AudioDeviceCreationConfig, AudioDeviceError, AudioDeviceLayer, AudioDeviceModule,
+    AudioDeviceName, AudioDeviceStatistics, InstalledAudioDevice,
 };
 use audio_processor::RustInstalledApmEnvironment;
 pub use audio_processor::{
@@ -179,7 +177,7 @@ pub use fec::{
     FecCallbackOperation, FecController, FecControllerCreation, FecControllerEnvironment,
     FecControllerFactory, FecControllerFactoryProvider, FecEncodedFrameType, FecEncodingData,
     FecMaskType, FecProtectionCallback, FecProtectionCallbackError, FecProtectionParams,
-    FecProtectionResponse, FecRateUpdate, FecRetransmissionMode,
+    FecProtectionResponse, FecRateUpdate,
 };
 pub(crate) use fec::{
     RustFecCompletion, RustFecController, RustFecControllerFactory, fec_async_complete,
@@ -191,6 +189,8 @@ mod network_control;
 pub use network_control::{
     GoogCcFactoryConfig, NetworkController, NetworkControllerConfig, NetworkControllerEnvironment,
     NetworkControllerFactory, NetworkControllerFactoryProvider, NetworkControllerFailure,
+    NetworkControllerReplayConfig, NetworkControllerReplayError, NetworkControllerReplayEvent,
+    network_controller_replay_for_test,
 };
 pub(crate) use network_control::{
     RustNetworkController, RustNetworkControllerFactory, network_controller_create,
@@ -404,8 +404,14 @@ mod configuration;
 mod crypto;
 mod data_channel;
 mod sframe;
+pub(crate) use sframe::{
+    RustSframeDecryptErrorObserver, RustSframeKeyCompletion, sframe_decrypt_error_observed,
+    sframe_key_update_complete,
+};
 pub use sframe::{
-    SframeCipherSuite, SframeCreateError, SframeDecrypter, SframeEncrypter, SframeEncrypterInit,
+    SframeCipherSuite, SframeCreateError, SframeDecryptError, SframeDecryptErrorDropCounts,
+    SframeDecryptErrorType, SframeDecrypter, SframeEncryptedFrame, SframeEncrypter,
+    SframeEncrypterInit, SframeEncryptorInit, SframeKeyUpdateError, SframeKeyUpdateOperation,
     SframeMode,
 };
 mod video_encoder_selector;
@@ -655,8 +661,7 @@ pub use media_track::{MediaTrack, MediaTrackKind, MediaTrackState};
 mod media_stream;
 pub use media_stream::{
     AudioProcessor, AudioProcessorStats, AudioTrackSource, MediaChange, MediaObserver,
-    MediaSourceState, MediaStream, MediaTrackSource, TrackAudioOptionsCode,
-    TrackAudioOptionsResult, VideoSourceInfo, VideoTrackSource,
+    MediaSourceState, MediaStream, MediaTrackSource, VideoSourceInfo, VideoTrackSource,
 };
 mod legacy_stats;
 pub use legacy_stats::*;
@@ -847,8 +852,7 @@ pub use audio::{
     ReceivedAudioFrame,
 };
 pub use audio_processing::{
-    AudioProcessingConfig, AudioProcessingOptions, AudioProcessingState, GainControl,
-    NoiseSuppression, ProcessingChoice, ProcessingComponentState, ProcessingImplementation,
+    AudioProcessingConfig, AudioProcessingOptions, GainControl, NoiseSuppression, ProcessingChoice,
 };
 pub use certificate::{
     Certificate, CertificateCurve, CertificateData, CertificateFingerprint, CertificateKeyParams,

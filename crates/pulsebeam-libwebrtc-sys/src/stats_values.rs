@@ -1,4 +1,4 @@
-// Pinned ba469aa stats objects, including inherited and deprecated public fields.
+// Selected upstream stats objects, including inherited and deprecated public fields.
 // Field order matches native/stats_objects.h, not a protocol/JSON ordering.
 stats_objects! {
     CertificateStats = 1, RtcCertificateStatsValues {
@@ -239,7 +239,6 @@ stats_objects! {
         frames_encoded: u32,
         key_frames_encoded: u32,
         total_encode_time: f64,
-        total_encoded_bytes_target: u64,
         frame_width: u32,
         frame_height: u32,
         frames_per_second: f64,
@@ -335,6 +334,7 @@ stats_objects! {
         ice_local_username_fragment: Vec<u8>,
         ice_state: Vec<u8>,
         ccfb_messages_received: i32,
+        ccfb_messages_sent: i32,
     }
     AudioPlayoutStats = 20, RtcAudioPlayoutStatsValues {
         kind: Vec<u8>,

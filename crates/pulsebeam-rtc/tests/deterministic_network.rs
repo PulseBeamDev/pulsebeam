@@ -18,6 +18,205 @@ use support::{NetworkPolicy, PeerFixture, rtp_write};
 const PAYLOAD_BYTES: usize = 1_000;
 const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 
+#[test]
+fn rate_controlled_bursts_resume_after_feedback_outage_and_uncommitted_discard() {
+    use pulsebeam_rtc::{MediaPayloadBitrate, PacketFeedbackKind};
+
+    for mode in [
+        PacketFeedbackKind::TransportWide,
+        PacketFeedbackKind::Rfc8888,
+    ] {
+        let mut fixture = PeerFixture::connected_with_feedback(mode);
+        fixture.configure_network(
+            0x2910,
+            NetworkPolicy {
+                delay: Duration::from_millis(100),
+                drop_every: None,
+                duplicate_every: Some(5),
+                reorder_every: None,
+            },
+        );
+        fixture.configure_bottleneck(600_000);
+        let mut sequence = 1;
+        for (phase, payload_bytes, demand) in
+            [(0, 400, 160_000), (1, 600, 240_000), (2, 400, 160_000)]
+        {
+            fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(demand)));
+            let before = fixture.connection.stats();
+            for frame in 0..10 {
+                for packet in 0..2 {
+                    let mut write = support::sample(fixture.at(), sequence, payload_bytes, 48_000);
+                    write.timestamp = (phase * 10 + frame) * 1_920;
+                    write.marker = packet == 1;
+                    fixture
+                        .write_rtp(write)
+                        .expect("bounded encoder burst admission");
+                    sequence += 1;
+                }
+                fixture.drive_for(Duration::from_millis(40));
+            }
+            if phase == 1 {
+                let committed = fixture.connection.stats();
+                assert!(
+                    committed.connection.rtp_bytes_in_flight > 0,
+                    "feedback outage must exercise outstanding flight: {mode:?}"
+                );
+                for _ in 0..3 {
+                    fixture
+                        .write_rtp(support::sample(fixture.at(), sequence, 600, 48_000))
+                        .expect("discardable admission");
+                    sequence += 1;
+                }
+                let queued = fixture.connection.stats();
+                let mid = fixture.sender_mid.clone();
+                fixture
+                    .connection
+                    .discard_pending_rtp(&mid)
+                    .expect("discard uncommitted burst");
+                let discarded = fixture.connection.stats();
+                assert!(queued.connection.queued_media_bytes > 0);
+                assert_eq!(discarded.connection.queued_media_bytes, 0);
+                assert_eq!(
+                    discarded.connection.transmitted_rtp_bytes,
+                    committed.connection.transmitted_rtp_bytes
+                );
+                assert_eq!(
+                    discarded.connection.rtp_bytes_in_flight,
+                    committed.connection.rtp_bytes_in_flight
+                );
+                fixture.set_feedback_enabled(true);
+            } else {
+                fixture.set_desired_bitrate(None);
+                fixture.drive_for(Duration::from_secs(2));
+                let drained = fixture.connection.stats();
+                assert_eq!(
+                    drained.senders[0].transmitted_packets - before.senders[0].transmitted_packets,
+                    20,
+                    "finite burst train must drain after valid feedback: {mode:?}"
+                );
+                assert_eq!(drained.connection.queued_media_bytes, 0);
+                assert_eq!(
+                    drained.connection.rtp_bytes_in_flight, 0,
+                    "authenticated feedback must retire the tail before history expiry: {mode:?}: {drained:?}"
+                );
+                assert_eq!(drained.connection.wrong_path_feedback, 0);
+            }
+            if phase == 0 {
+                fixture.set_feedback_enabled(false);
+                fixture.drive_for(Duration::from_millis(300));
+            }
+        }
+        assert!(
+            fixture.network_counters().2 > 0,
+            "duplicate wire traffic exercised"
+        );
+        assert!(fixture.bottleneck_samples().1 > 0);
+        assert_eq!(fixture.connection.stats().connection.feedback, Some(mode));
+    }
+}
+
+#[test]
+fn adaptive_frame_source_tracks_public_estimate_through_impaired_capacity_steps() {
+    for mode in [
+        pulsebeam_rtc::PacketFeedbackKind::TransportWide,
+        pulsebeam_rtc::PacketFeedbackKind::Rfc8888,
+    ] {
+        adaptive_frame_source(mode);
+    }
+}
+
+fn adaptive_frame_source(mode: pulsebeam_rtc::PacketFeedbackKind) {
+    use pulsebeam_rtc::MediaPayloadBitrate;
+
+    let mut fixture = PeerFixture::connected_with_feedback(mode);
+    fixture.configure_network(
+        0x2905,
+        NetworkPolicy {
+            delay: Duration::from_millis(40),
+            drop_every: Some(97),
+            duplicate_every: Some(41),
+            reorder_every: Some(31),
+        },
+    );
+    fixture.configure_bottleneck(1_500_000);
+    let demand = 1_000_000_u64;
+    fixture.set_desired_bitrate(Some(MediaPayloadBitrate::from_bps(demand)));
+    let mut sequence = 1;
+    let mut credit = 0_u64;
+    let mut admitted = 0_u64;
+    let mut phase_rates = [0_u64; 3];
+    for frame in 0..450_u32 {
+        if frame == 150 {
+            fixture.set_bottleneck_rate(180_000);
+        } else if frame == 300 {
+            fixture.set_bottleneck_rate(1_000_000);
+        } else if frame == 220 {
+            fixture.set_feedback_enabled(false);
+        } else if frame == 233 {
+            fixture.set_feedback_enabled(true);
+        }
+        let stats = fixture.connection.stats();
+        let rate = stats.connection.bandwidth_estimate.as_bps().min(demand);
+        if frame % 150 >= 125 {
+            *phase_rates
+                .get_mut((frame / 150) as usize)
+                .expect("three bounded capacity phases") += rate;
+        }
+        credit += rate;
+        let frame_bytes = credit / 200;
+        credit %= 200;
+        let mut remaining = frame_bytes;
+        while remaining > 0 {
+            let bytes = remaining.min(1_000) as usize;
+            let mut packet = support::sample(fixture.at(), sequence, bytes, 48_000);
+            packet.timestamp = frame * 1_920;
+            packet.marker = remaining <= 1_000;
+            fixture.write_rtp(packet).expect("bounded frame admission");
+            sequence += 1;
+            admitted += 1;
+            remaining -= bytes as u64;
+        }
+        fixture.drive_for(Duration::from_millis(40));
+        let stats = fixture.connection.stats();
+        assert!(stats.connection.queued_media_bytes <= 8 * 1024 * 1024);
+        assert!(stats.connection.rtp_bytes_in_flight <= 8 * 1024 * 1024);
+        assert!(
+            stats
+                .senders
+                .first()
+                .expect("configured sender")
+                .transmitted_packets
+                <= admitted
+        );
+    }
+    assert!(
+        phase_rates[1] < phase_rates[0] && phase_rates[2] > phase_rates[1],
+        "source must reduce its nominal budget after the capacity step and recover after relief: {mode:?}: {phase_rates:?}"
+    );
+    assert!(
+        fixture.connection.stats().connection.rtp_bytes_in_flight > 0,
+        "recent tail must exercise authenticated retirement: {mode:?}"
+    );
+    fixture.set_desired_bitrate(None);
+    fixture.drive_for(Duration::from_secs(2));
+    let stats = fixture.connection.stats();
+    assert_eq!(stats.connection.state, pulsebeam_rtc::ConnectionState::Open);
+    assert_eq!(stats.connection.close_reason, None);
+    assert_eq!(
+        stats
+            .senders
+            .first()
+            .expect("configured sender")
+            .transmitted_packets,
+        admitted
+    );
+    assert_eq!(stats.connection.queued_media_bytes, 0);
+    assert_eq!(stats.connection.rtp_bytes_in_flight, 0);
+    assert!(fixture.bottleneck_samples().1 > 0);
+    let (_, dropped, duplicated, reordered) = fixture.network_counters();
+    assert!(dropped > 0 && duplicated > 0 && reordered > 0);
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Scenario {
     name: &'static str,

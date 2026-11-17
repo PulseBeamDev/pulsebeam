@@ -738,26 +738,6 @@ pub(super) mod ffi {
         info: FfiAudioCodecInfo,
     }
 
-    struct FfiAudioEncoderBitrateStep {
-        has_target: bool,
-        target: i32,
-        has_overhead: bool,
-        overhead: usize,
-        has_frame: bool,
-        frame: i32,
-        increasing: bool,
-        occupied: bool,
-    }
-    struct FfiAudioEncoderBitrateProbe {
-        status: u8,
-        bitrates: Vec<i32>,
-    }
-    struct FfiAudioEncoderSmoothingProbe {
-        status: u8,
-        duration_applied: bool,
-        has_average: bool,
-        average: f32,
-    }
     struct FfiAudioEncoderQuery {
         valid: bool,
         present: bool,
@@ -772,7 +752,8 @@ pub(super) mod ffi {
         target_kind: i8,
         packet_loss_ratio: f64,
         round_trip_time: i64,
-        bwe_period: i64,
+        packet_overhead: i64,
+        packet_overhead_kind: i8,
         cwnd_reduce_ratio: f64,
     }
     struct FfiAudioEncodedInfoLeaf {
@@ -984,7 +965,6 @@ pub(super) mod ffi {
         at_time: i64,
         bandwidth: FfiNcMagnitude,
         round_trip_time: i64,
-        bwe_period: i64,
         loss_rate_ratio: f32,
     }
     #[derive(Default)]
@@ -1631,29 +1611,6 @@ pub(super) mod ffi {
         gain_control: u8,
     }
 
-    struct FfiAudioProcessingState {
-        binding_error: u8,
-        has_module: bool,
-        echo_software: i8,
-        echo_reported_software: i8,
-        echo_reported_effective: u8,
-        echo_platform_available: bool,
-        echo_platform: i8,
-        echo_effective: u8,
-        noise_software: i8,
-        noise_platform_available: bool,
-        noise_platform: i8,
-        noise_effective: u8,
-        gain_software: i8,
-        gain_platform_available: bool,
-        gain_platform: i8,
-        gain_effective: u8,
-        highpass_software: i8,
-        highpass_platform_available: bool,
-        highpass_platform: i8,
-        highpass_effective: u8,
-    }
-
     struct FfiCryptoOptions {
         enable_gcm_crypto_suites: bool,
         prefer_gcm_crypto_suites: bool,
@@ -2088,10 +2045,6 @@ pub(super) mod ffi {
         value: f64,
     }
 
-    struct FfiTrackAudioOptionsResult {
-        code: i32,
-        message: Vec<u8>,
-    }
     struct FfiAudioProcessorStats {
         typing_noise_detected: bool,
         voice_detected: i8,
@@ -2170,7 +2123,6 @@ pub(super) mod ffi {
         vpn_list: Vec<FfiNetworkMask>,
         port_allocator: FfiPortAllocatorOptions,
         pacer_burst_interval: FfiOptionalI64,
-        enable_any_address_ports: bool,
         max_sctp_streams: i32,
         enable_sctp_snap: bool,
         dscp: bool,
@@ -2418,6 +2370,16 @@ pub(super) mod ffi {
         error: UniquePtr<NativeRtcError>,
         detached_owner: bool,
     }
+    struct FfiSframeDecryptError {
+        error_type: i32,
+        has_key_id: bool,
+        key_id: u64,
+        has_frame: bool,
+        payload_type: u8,
+        ssrc: u32,
+        mime_type: String,
+        frame_data: Vec<u8>,
+    }
     struct FfiFrameCryptoOutput {
         status: i32,
         written: usize,
@@ -2644,8 +2606,6 @@ pub(super) mod ffi {
     }
     struct FfiNativeAudioDeviceCreation {
         layer: u8,
-        bypass: bool,
-        helper: bool,
     }
     struct FfiAudioDeviceResult {
         status: i32,
@@ -2669,24 +2629,6 @@ pub(super) mod ffi {
         total_capture_samples_duration_s: f64,
         total_capture_delay_s: f64,
         total_capture_samples_count: u64,
-    }
-    struct FfiAudioDevicePlatformState {
-        topology: i32,
-        echo_cancellation_available: bool,
-        noise_suppression_available: bool,
-        auto_gain_control_available: bool,
-        echo_cancellation_requested: u8,
-        noise_suppression_requested: u8,
-        auto_gain_control_requested: u8,
-        echo_cancellation_active: u8,
-        noise_suppression_active: u8,
-        auto_gain_control_active: u8,
-        voice_processing_enabled_requested: u8,
-        voice_processing_bypassed_requested: u8,
-        voice_processing_agc_enabled_requested: u8,
-        voice_processing_enabled_active: u8,
-        voice_processing_bypassed_active: u8,
-        voice_processing_agc_enabled_active: u8,
     }
     struct FfiApmEchoDetectorMetrics {
         failed: bool,
@@ -2750,7 +2692,6 @@ pub(super) mod ffi {
             pull: bool,
             data: &mut [u8],
         ) -> FfiAudioDeviceCallbackResult;
-        fn audio_device_observed(callbacks: &RustAudioDeviceCallbacks, speech: bool, event: i32);
         type RustInstalledApmEnvironment;
         type RustApmCustomModule;
         type RustEchoEnvironment;
@@ -2818,6 +2759,7 @@ pub(super) mod ffi {
             config: FfiEchoCanceller3Config,
             valid: &mut bool,
         ) -> FfiEchoCanceller3Config;
+        fn apm_neural_is_initialized(module: &RustApmCustomModule, valid: &mut bool) -> bool;
         fn apm_neural_reset(module: &RustApmCustomModule) -> bool;
         fn apm_neural_invalid(module: &RustApmCustomModule);
         fn apm_neural_adjust_invalid(module: &RustApmCustomModule);
@@ -3393,6 +3335,16 @@ pub(super) mod ffi {
         type RustFecControllerFactory;
         type RustFecController;
         type RustFecCompletion;
+        type RustSframeKeyCompletion;
+        type RustSframeDecryptErrorObserver;
+        fn sframe_key_update_complete(
+            source: &RustSframeKeyCompletion,
+            error: UniquePtr<NativeRtcError>,
+        );
+        fn sframe_decrypt_error_observed(
+            source: &RustSframeDecryptErrorObserver,
+            error: FfiSframeDecryptError,
+        );
         fn fec_factory_present(source: &RustFecControllerFactory) -> bool;
         fn fec_controller_create(
             source: &RustFecControllerFactory,
@@ -3774,7 +3726,6 @@ pub(super) mod ffi {
         kind: String,
         enabled: bool,
         state: u8,
-        volume: f64,
         signal_level: FfiOptionalI32,
     }
 
@@ -3950,13 +3901,9 @@ pub(super) mod ffi {
 
     struct FfiAudioSourceOptions {
         echo_cancellation: i8,
-        echo_cancellation_mode: FfiOptionalI32,
         auto_gain_control: i8,
-        auto_gain_control_mode: FfiOptionalI32,
         noise_suppression: i8,
-        noise_suppression_mode: FfiOptionalI32,
         highpass_filter: i8,
-        highpass_filter_mode: FfiOptionalI32,
         stereo_swapping: i8,
         audio_jitter_buffer_max_packets: FfiOptionalI32,
         audio_jitter_buffer_fast_accelerate: i8,
@@ -4225,35 +4172,21 @@ pub(super) mod ffi {
         type NativeApmCustomModule;
         type NativeAudioDevice;
         type NativeAudioTransport;
-        type NativeAudioDeviceObserver;
         fn audio_transport_new(
             callbacks: Box<RustAudioDeviceCallbacks>,
         ) -> UniquePtr<NativeAudioTransport>;
-        fn audio_device_observer_new(
-            callbacks: Box<RustAudioDeviceCallbacks>,
-        ) -> UniquePtr<NativeAudioDeviceObserver>;
         fn audio_device_register_transport(
             device: Pin<&mut NativeAudioDevice>,
             transport: UniquePtr<NativeAudioTransport>,
             error: &mut u8,
         ) -> i32;
-        fn audio_device_register_observer(
-            device: Pin<&mut NativeAudioDevice>,
-            observer: UniquePtr<NativeAudioDeviceObserver>,
-        ) -> i32;
         fn audio_device_from_factory(
             factory: &NativePeerConnectionFactory,
         ) -> UniquePtr<NativeAudioDevice>;
-        fn factory_register_audio_device_observer(
-            factory: &NativePeerConnectionFactory,
-            observer: UniquePtr<NativeAudioDeviceObserver>,
-        ) -> i32;
         fn audio_device_new(
             environment: &NativeEnvironment,
             worker: &NativeThread,
             layer: u8,
-            bypass: bool,
-            helper: bool,
             error: &mut u8,
         ) -> UniquePtr<NativeAudioDevice>;
         fn audio_device_call(
@@ -4268,9 +4201,6 @@ pub(super) mod ffi {
         ) -> FfiAudioDeviceName;
         fn audio_device_statistics(device: Pin<&mut NativeAudioDevice>)
         -> FfiAudioDeviceStatistics;
-        fn audio_device_platform_state(
-            device: Pin<&mut NativeAudioDevice>,
-        ) -> FfiAudioDevicePlatformState;
         type NativeInstalledAudioProcessor;
         fn audio_processor_into_installed(
             processor: UniquePtr<NativeAudioProcessingModule>,
@@ -4539,7 +4469,6 @@ pub(super) mod ffi {
             processor: &NativeAudioProcessingModule,
         ) -> FfiAudioProcessingFormatState;
         fn audio_processor_set_muted(processor: Pin<&mut NativeAudioProcessingModule>, muted: bool);
-        fn audio_processor_muted(processor: Pin<&mut NativeAudioProcessingModule>) -> bool;
         fn audio_processor_set_delay(
             processor: Pin<&mut NativeAudioProcessingModule>,
             delay: i32,
@@ -4871,6 +4800,15 @@ pub(super) mod ffi {
         fn network_controller_native_probe(
             environment: &NativeEnvironment,
             source: Box<RustNetworkControllerFactory>,
+            initial_config: FfiNcConfig,
+            messages: &[FfiNcMessage],
+            kinds: &[u8],
+        ) -> Vec<FfiNcNetworkControlUpdate>;
+        fn network_controller_native_probe_controlled(
+            environment: &NativeEnvironment,
+            clock: &NativeManualClock,
+            source: Box<RustNetworkControllerFactory>,
+            initial_config: FfiNcConfig,
             messages: &[FfiNcMessage],
             kinds: &[u8],
         ) -> Vec<FfiNcNetworkControlUpdate>;
@@ -4881,16 +4819,10 @@ pub(super) mod ffi {
             delta: FfiFecProtectionParams,
             key: FfiFecProtectionParams,
         ) -> FfiFecProtectionResult;
-        fn fec_set_retransmission_mode(source: &NativeFecProtectionCallback, mode: i32) -> u8;
         fn fec_protection_request_async(
             source: SharedPtr<NativeFecProtectionCallback>,
             delta: FfiFecProtectionParams,
             key: FfiFecProtectionParams,
-            completion: Box<RustFecCompletion>,
-        );
-        fn fec_set_retransmission_mode_async(
-            source: SharedPtr<NativeFecProtectionCallback>,
-            mode: i32,
             completion: Box<RustFecCompletion>,
         );
         fn fec_native_probe(
@@ -5823,16 +5755,9 @@ pub(super) mod ffi {
         fn track_source_same_resource(a: &NativeTrackSource, b: &NativeTrackSource) -> bool;
         fn track_source_audio_options(source: &NativeTrackSource) -> FfiAudioSourceOptions;
         fn track_source_video_info(source: &NativeTrackSource) -> FfiVideoSourceInfo;
-        fn media_track_audio_volume(track: &NativeMediaTrack) -> FfiOptionalF64;
         fn media_track_set_volume(track: &NativeMediaTrack, volume: f64);
-        fn media_track_set_should_receive(track: &NativeMediaTrack, receive: bool);
         fn media_track_set_content_hint(track: &NativeMediaTrack, hint: i32);
-        fn media_track_set_audio_options(
-            track: &NativeMediaTrack,
-            options: &FfiAudioSourceOptions,
-        ) -> FfiTrackAudioOptionsResult;
         fn media_track_signal_level(track: &NativeMediaTrack) -> FfiOptionalI32;
-        fn media_track_should_receive(track: &NativeMediaTrack) -> i32;
         fn media_track_content_hint(track: &NativeMediaTrack) -> i32;
         fn media_track_audio_processor(
             track: &NativeMediaTrack,
@@ -6276,9 +6201,6 @@ pub(super) mod ffi {
             value: &NativeTransformableFrame,
             status: &mut i32,
         ) -> UniquePtr<NativeVideoFrameMetadata>;
-        fn transformable_video_header(
-            value: &NativeTransformableFrame,
-        ) -> UniquePtr<NativeRtpVideoHeader>;
         fn transformable_video_set_metadata(
             value: Pin<&mut NativeTransformableFrame>,
             metadata: &NativeVideoFrameMetadata,
@@ -6550,17 +6472,11 @@ pub(super) mod ffi {
         fn rtp_header_id_is_set(value: &NativeRtpHeaderExtensionId) -> bool;
         fn rtp_header_id_string(value: &NativeRtpHeaderExtensionId) -> Vec<u8>;
         fn rtp_header_id_hash(value: &NativeRtpHeaderExtensionId) -> usize;
-        fn rtp_header_id_ref(value: &NativeRtpHeaderExtensionId) -> &i32;
-        fn rtp_header_id_ref_mut(value: Pin<&mut NativeRtpHeaderExtensionId>) -> &mut i32;
-        fn rtp_header_id_deref(value: &NativeRtpHeaderExtensionId) -> &i32;
-        fn rtp_header_id_deref_mut(value: Pin<&mut NativeRtpHeaderExtensionId>) -> &mut i32;
-        fn rtp_header_id_arrow(value: &NativeRtpHeaderExtensionId) -> &i32;
-        fn rtp_header_id_arrow_mut(value: Pin<&mut NativeRtpHeaderExtensionId>) -> &mut i32;
-        fn rtp_header_id_conversion(value: &NativeRtpHeaderExtensionId) -> &i32;
+        fn rtp_header_id_value(value: &NativeRtpHeaderExtensionId) -> i32;
+        fn rtp_header_id_set_value(value: Pin<&mut NativeRtpHeaderExtensionId>, input: i32)
+        -> bool;
         fn rtp_header_id_into_value(value: UniquePtr<NativeRtpHeaderExtensionId>) -> i32;
         fn rtp_header_id_into_const_value(value: UniquePtr<NativeRtpHeaderExtensionId>) -> i32;
-        fn rtp_header_id_into_deref(value: UniquePtr<NativeRtpHeaderExtensionId>) -> i32;
-        fn rtp_header_id_into_const_deref(value: UniquePtr<NativeRtpHeaderExtensionId>) -> i32;
         fn rtp_header_id_equal(
             lhs: &NativeRtpHeaderExtensionId,
             rhs: &NativeRtpHeaderExtensionId,
@@ -7763,6 +7679,8 @@ pub(super) mod ffi {
         fn driver_is_current(driver: &NativeDriverThread) -> bool;
         fn thread_is_owned(thread: &NativeThread) -> bool;
         fn thread_is_current(thread: &NativeThread) -> bool;
+        fn native_threads_same(left: &NativeThread, right: &NativeThread) -> bool;
+        fn thread_alias(thread: &NativeThread) -> UniquePtr<NativeThread>;
         fn thread_requires_retirement(thread: &NativeThread) -> bool;
         fn thread_post_task(thread: &NativeThread, task: Box<RustTask>) -> bool;
         fn thread_post_native_delayed_task(
@@ -7893,63 +7811,6 @@ pub(super) mod ffi {
             format: &FfiSdpAudioFormat,
             options: &NativeAudioEncoderOptions,
         ) -> FfiAudioEncoderCreation;
-        fn audio_encoder_default_allocation_arguments(
-            target: i64,
-            kind: i8,
-            period: i64,
-            valid: &mut bool,
-            bitrate: &mut i32,
-            milliseconds: &mut i64,
-        );
-        fn audio_encoder_adaptor_smoothing_inputs_safe(
-            bitrate: i32,
-            has_period: bool,
-            period: i64,
-        ) -> bool;
-        fn audio_encoder_adaptor_initialization_safe(duration: i32, clock_span_ms: u64) -> bool;
-        fn audio_encoder_adaptor_bitrate_probe(
-            initial_frame: i32,
-            increase: i32,
-            decrease: i32,
-            steps: &[FfiAudioEncoderBitrateStep],
-        ) -> FfiAudioEncoderBitrateProbe;
-        fn audio_encoder_adaptor_smoothing_probe(
-            encoder: &NativeAudioEncoder,
-            first_sample: i32,
-            sample: i32,
-            first_time_us: i64,
-            sample_time_us: i64,
-            average_time_us: i64,
-            has_duration: bool,
-            duration: i32,
-        ) -> FfiAudioEncoderSmoothingProbe;
-        fn audio_encoder_check_network_adaptor_scoring(
-            encoder: &NativeAudioEncoder,
-            bytes: &[u8],
-            has_bandwidth: bool,
-            bandwidth: i32,
-            has_loss: bool,
-            loss: f32,
-        ) -> u8;
-        fn audio_encoder_check_network_adaptor_smoothing(
-            encoder: &NativeAudioEncoder,
-            bytes: &[u8],
-        ) -> u8;
-        fn audio_encoder_check_network_adaptor_arithmetic(
-            encoder: &NativeAudioEncoder,
-            bytes: &[u8],
-            has_overhead: bool,
-            overhead: usize,
-            has_target: bool,
-            target: i32,
-            has_uplink: bool,
-            uplink_min: i32,
-            uplink_max: i32,
-        ) -> u8;
-        fn audio_encoder_check_network_adaptor_config(
-            encoder: &NativeAudioEncoder,
-            bytes: &[u8],
-        ) -> u8;
         type NativeAudioEncoderFailureObserver;
         fn audio_encoder_sdk_failure_observer(
             encoder: &NativeAudioEncoder,
@@ -8002,7 +7863,6 @@ pub(super) mod ffi {
         ) -> FfiAudioEncoderOutput;
         fn audio_encoder_forward_target_sdk(source: &NativeAudioEncoder, bitrate: i32);
         fn audio_encoder_forward_loss_sdk(source: &NativeAudioEncoder, fraction: f32);
-        fn audio_encoder_forward_adaptor_sdk(source: &NativeAudioEncoder, config: &[u8]) -> bool;
         fn audio_encoder_info(encoder: &NativeAudioEncoder) -> FfiAudioEncoderInfo;
         fn audio_encoder_frame_length_range(encoder: &NativeAudioEncoder) -> FfiAudioEncoderRange;
         fn audio_encoder_bitrate_range(encoder: &NativeAudioEncoder) -> FfiAudioEncoderRange;
@@ -8016,21 +7876,9 @@ pub(super) mod ffi {
         fn audio_encoder_set_fec(encoder: &NativeAudioEncoder, enable: bool) -> bool;
         fn audio_encoder_set_dtx(encoder: &NativeAudioEncoder, enable: bool) -> bool;
         fn audio_encoder_set_application(encoder: &NativeAudioEncoder, speech: bool) -> bool;
-        fn audio_encoder_enable_network_adaptor(
-            encoder: &NativeAudioEncoder,
-            config: &[u8],
-            error: &mut u8,
-        ) -> bool;
-        fn audio_encoder_disable_network_adaptor(encoder: &NativeAudioEncoder);
         fn audio_encoder_set_max_playback_rate(encoder: &NativeAudioEncoder, frequency: i32);
         fn audio_encoder_set_target_bitrate(encoder: &NativeAudioEncoder, bitrate: i32) -> bool;
         fn audio_encoder_on_target_bitrate(encoder: &NativeAudioEncoder, bitrate: i32) -> bool;
-        fn audio_encoder_on_bandwidth(
-            encoder: &NativeAudioEncoder,
-            bitrate: i32,
-            has_period: bool,
-            period: i64,
-        ) -> bool;
         fn audio_encoder_on_allocation(
             encoder: &NativeAudioEncoder,
             update: &FfiBitrateAllocationUpdate,
@@ -8286,7 +8134,6 @@ pub(super) mod ffi {
         unsafe fn new_peer_connection_factory(
             environment: &NativeEnvironment,
             network_thread: &NativeThread,
-            worker_thread: &NativeThread,
             signaling_thread: &NativeThread,
             network_manager: *const NativeNetworkManagerProvider,
             network_manager_factory: Box<RustNetworkManagerFactory>,
@@ -8372,9 +8219,6 @@ pub(super) mod ffi {
             delay: i32,
             error: &mut u8,
         ) -> i32;
-        fn factory_audio_processing_state(
-            factory: &NativePeerConnectionFactory,
-        ) -> FfiAudioProcessingState;
         fn factory_audio_devices(
             factory: &NativePeerConnectionFactory,
             recording: bool,
@@ -8682,11 +8526,6 @@ pub(super) mod ffi {
         fn audio_source_view_state(view: &NativeAudioSourceView) -> u8;
         fn audio_source_view_remote(view: &NativeAudioSourceView) -> bool;
         fn audio_source_view_options(view: &NativeAudioSourceView) -> FfiAudioSourceOptions;
-        fn audio_source_view_set_options(
-            view: &NativeAudioSourceView,
-            options: &FfiAudioSourceOptions,
-        ) -> u8;
-        fn audio_source_view_volume(view: &NativeAudioSourceView) -> f64;
         fn audio_source_view_set_volume(view: &NativeAudioSourceView, volume: f64) -> u8;
         fn audio_source_view_observe(
             view: &NativeAudioSourceView,
@@ -8700,12 +8539,7 @@ pub(super) mod ffi {
         fn audio_observer_take(observer: &NativeAudioObserver) -> FfiAudioObserverEvent;
         fn audio_observer_take_dropped(observer: &NativeAudioObserver) -> u64;
         fn audio_observer_close(observer: &NativeAudioObserver);
-        fn audio_source_set_options(
-            source: &NativeAudioSource,
-            options: &FfiAudioSourceOptions,
-        ) -> u8;
         fn audio_source_set_volume(source: &NativeAudioSource, volume: f64) -> u8;
-        fn audio_track_set_volume(track: &NativeAudioTrack, volume: f64) -> u8;
         fn rtp_sender_set_audio_track_volume(
             peer: &NativePeerConnection,
             sender: &NativeRtpSender,
@@ -8714,7 +8548,6 @@ pub(super) mod ffi {
         fn audio_source_options(source: &NativeAudioSource) -> FfiAudioSourceOptions;
         fn audio_source_state(source: &NativeAudioSource) -> u8;
         fn audio_source_remote(source: &NativeAudioSource) -> bool;
-        fn audio_source_volume(source: &NativeAudioSource) -> f64;
         fn audio_track_status(track: &NativeAudioTrack) -> FfiAudioTrackStatus;
         fn rtp_sender_audio_track_status(
             peer: &NativePeerConnection,
@@ -8722,18 +8555,10 @@ pub(super) mod ffi {
         ) -> FfiAudioTrackStatus;
         fn audio_track_state(track: &NativeAudioTrack) -> u8;
         fn audio_track_signal_level(track: &NativeAudioTrack) -> FfiOptionalI32;
-        fn audio_track_volume(track: &NativeAudioTrack) -> f64;
         fn audio_track_kind(track: &NativeAudioTrack) -> String;
         fn audio_track_id(track: &NativeAudioTrack) -> String;
         fn audio_track_enabled(track: &NativeAudioTrack) -> bool;
         fn audio_track_set_enabled(track: &NativeAudioTrack, enabled: bool) -> bool;
-        fn audio_track_set_processing_options(
-            track: &NativeAudioTrack,
-            echo: u8,
-            noise: u8,
-            gain: u8,
-            error: &mut String,
-        ) -> bool;
         fn peer_add_audio_transceiver(
             peer: &NativePeerConnection,
             track: &NativeAudioTrack,
@@ -8966,8 +8791,6 @@ pub(super) mod ffi {
         fn video_track_set_enabled(track: &NativeVideoTrack, enabled: bool) -> bool;
         fn video_track_state(track: &NativeVideoTrack) -> u8;
         fn video_track_kind(track: &NativeVideoTrack) -> String;
-        fn video_track_should_receive(track: &NativeVideoTrack) -> bool;
-        fn video_track_set_should_receive(track: &NativeVideoTrack, receive: bool);
         fn video_track_content_hint(track: &NativeVideoTrack) -> u8;
         fn video_track_set_content_hint(track: &NativeVideoTrack, hint: u8);
         fn video_source_attach_encoded_output(
@@ -9248,6 +9071,7 @@ pub(super) mod ffi {
             receiver: &NativeRtpReceiver,
             peer: &NativePeerConnection,
             suite: i32,
+            observer: Box<RustSframeDecryptErrorObserver>,
         ) -> FfiSframeDecrypterCreation;
         fn sframe_encrypter_clone(
             value: &NativeSframeEncrypter,
@@ -9264,11 +9088,13 @@ pub(super) mod ffi {
             value: &NativeSframeDecrypter,
             id: u64,
             key: &[u8],
-        ) -> UniquePtr<NativeRtcError>;
+            completion: Box<RustSframeKeyCompletion>,
+        );
         fn sframe_remove_decryption_key(
             value: &NativeSframeDecrypter,
             id: u64,
-        ) -> UniquePtr<NativeRtcError>;
+            completion: Box<RustSframeKeyCompletion>,
+        );
         type NativeFrameDecryptionResult;
         fn frame_decryption_result_new(
             status: i32,

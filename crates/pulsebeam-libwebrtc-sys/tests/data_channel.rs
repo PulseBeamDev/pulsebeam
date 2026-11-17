@@ -8,7 +8,7 @@ mod non_trickle;
 
 use pulsebeam_webrtc_sys::{
     ControlledPeerDriver, ControlledSimulatedNetwork, DataChannel, DataChannelConfiguration,
-    DataChannelCounters, DataChannelEvent, DataChannelMessage, DataChannelMessageKind,
+    DataChannelCounters, DataChannelError, DataChannelEvent, DataChannelMessage, DataChannelMessageKind,
     DataChannelSendError, DataChannelSendResult, DataChannelState, Environment, ManualClock,
     OperationId, PeerConfiguration, PeerConnection, PeerConnectionEvent, PeerConnectionFactory,
     PeerErrorKind, RandomnessLease, SessionDescription, TaskQueueFactory,
@@ -1132,7 +1132,7 @@ fn async_native_completion_size_and_counters() {
 }
 
 #[test]
-fn async_admission_and_cancellation_survive_peer_drop() {
+fn async_admission_and_native_completions_survive_peer_handle_drop() {
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let factory = PeerConnectionFactory::builder().build().unwrap();
     let peer = factory.create_peer_connection(Default::default()).unwrap();
@@ -1165,8 +1165,8 @@ fn async_admission_and_cancellation_survive_peer_drop() {
     );
     let settle = |admitted: &mut std::collections::HashSet<_>| {
         // SendAsync always posts to the SDK network queue. This synchronous
-        // getter fences that same queue, including destruction of callbacks
-        // canceled after peer drop, without depending on host polling speed.
+        // getter fences that same queue. The channel retains the peer and native
+        // sends reject its non-open state, independently of host polling speed.
         assert_eq!(channel.buffered_amount(), 0);
         for event in drain_channel(&channel) {
             if let DataChannelEvent::SendComplete(done) = event {
@@ -1174,7 +1174,15 @@ fn async_admission_and_cancellation_survive_peer_drop() {
                     admitted.remove(&done.send_id),
                     "duplicate or unknown result"
                 );
-                assert_eq!(done.result, Err(DataChannelSendError::Canceled));
+                assert_eq!(
+                    done.result,
+                    Err(DataChannelSendError::Native(DataChannelError {
+                        kind: PeerErrorKind::InvalidState,
+                        message: vec![],
+                        detail: None,
+                        sctp_cause_code: None,
+                    }))
+                );
             }
         }
         assert!(admitted.is_empty(), "missing completions: {admitted:?}");

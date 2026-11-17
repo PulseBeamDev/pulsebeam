@@ -1202,9 +1202,9 @@ dependencies = [
 
 [[package]]
 name = "cxx"
-version = "1.0.194"
+version = "1.0.205"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "747d8437319e3a2f43d93b341c137927ca70c0f5dabeea7a005a73665e247c7e"
+checksum = "c8a02bfeba9074b2bbb39492c9b0908ec854f455a3cccdcde7a1de55e2315e40"
 dependencies = [
  "cc",
  "cxx-build",
@@ -1217,9 +1217,9 @@ dependencies = [
 
 [[package]]
 name = "cxx-build"
-version = "1.0.194"
+version = "1.0.205"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0f4697d190a142477b16aef7da8a99bfdc41e7e8b1687583c0d23a79c7afc1e"
+checksum = "bbc2ac76997619d2d888b58ad79488f1c835de41ca4dd3dd7082acf4ecb0a50f"
 dependencies = [
  "cc",
  "codespan-reporting",
@@ -1227,39 +1227,39 @@ dependencies = [
  "proc-macro2",
  "quote",
  "scratch",
- "syn 2.0.117",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "cxxbridge-cmd"
-version = "1.0.194"
+version = "1.0.205"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0956799fa8678d4c50eed028f2de1c0552ae183c76e976cf7ca8c4e36a7c328"
+checksum = "54a486ed16a3f2a053fe7f5b98db4c1a59846a23e8cb9e49f9d1bd48830d51a2"
 dependencies = [
  "clap",
  "codespan-reporting",
  "indexmap",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "cxxbridge-flags"
-version = "1.0.194"
+version = "1.0.205"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23384a836ab4f0ad98ace7e3955ad2de39de42378ab487dc28d3990392cb283a"
+checksum = "c72569be94e2283764d334cd285980b747dbe221e27e315484eb6bcd93fa808a"
 
 [[package]]
 name = "cxxbridge-macro"
-version = "1.0.194"
+version = "1.0.205"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6acc6b5822b9526adfb4fc377b67128fdd60aac757cc4a741a6278603f763cf"
+checksum = "423e795284a7f7b3f843c956a5322c4bc497b60c2dd1a6339da10313cb18d575"
 dependencies = [
  "indexmap",
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -4012,6 +4012,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "pulsebeam-agent-core",
+ "pulsebeam-cc",
  "pulsebeam-rtc",
  "pulsebeam-webrtc-sys",
 ]

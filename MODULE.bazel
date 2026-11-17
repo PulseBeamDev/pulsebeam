@@ -235,6 +235,9 @@ crate.annotation(
     patch_args = ["-p1"],
     build_script_data = ["@swagger_ui_assets//file"],
     build_script_env = {"SWAGGER_UI_DOWNLOAD_URL": "file://$(execpath @swagger_ui_assets//file)"},
+    # RustEmbed includes filesystem timestamps in generated metadata. Metadata-only
+    # and full compilation materialize assets in different action sandboxes.
+    rustc_env = {"SOURCE_DATE_EPOCH": "0"},
     label_injections = {"@swagger_ui_assets//file": "@swagger_ui_assets"},
 )
 use_repo(crate, "crates")

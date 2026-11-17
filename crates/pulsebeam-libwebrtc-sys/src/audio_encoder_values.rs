@@ -1,6 +1,6 @@
 //! Owning values for the pinned AudioEncoder and AudioEncoderFactory contracts.
 //! Representability is separate from operation-specific native preconditions.
-use crate::{AudioCodecPairId, DataRate, TimeDelta};
+use crate::{AudioCodecPairId, DataRate, DataSize, TimeDelta};
 
 /// Exact native codec metric tag, including unknown future values.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -110,15 +110,15 @@ pub struct AudioEncoderFrameLengthRange {
     pub maximum: TimeDelta,
 }
 
-/// Complete pinned bitrate-allocation update. Unused fields still retain
-/// their native state; consumer preconditions are checked only at dispatch.
+/// Complete pinned bitrate-allocation update. Fields retain their native
+/// state; consumer preconditions are checked only at dispatch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BitrateAllocationUpdate {
     pub target_bitrate: DataRate,
     pub packet_loss_ratio: f64,
     pub round_trip_time: TimeDelta,
-    pub bwe_period: TimeDelta,
     pub cwnd_reduce_ratio: f64,
+    pub packet_overhead: DataSize,
 }
 impl Default for BitrateAllocationUpdate {
     fn default() -> Self {
@@ -126,8 +126,8 @@ impl Default for BitrateAllocationUpdate {
             target_bitrate: DataRate::BitsPerSecond(0),
             packet_loss_ratio: 0.0,
             round_trip_time: TimeDelta::plus_infinity(),
-            bwe_period: TimeDelta::plus_infinity(),
             cwnd_reduce_ratio: 0.0,
+            packet_overhead: DataSize::Bytes(0),
         }
     }
 }
@@ -138,12 +138,18 @@ impl BitrateAllocationUpdate {
             DataRate::PositiveInfinity => (0, 1),
             DataRate::NegativeInfinity => (0, -1),
         };
+        let (packet_overhead, packet_overhead_kind) = match self.packet_overhead {
+            DataSize::Bytes(value) => (value, 0),
+            DataSize::PositiveInfinity => (0, 1),
+            DataSize::NegativeInfinity => (0, -1),
+        };
         crate::ffi::FfiBitrateAllocationUpdate {
             target_bitrate,
             target_kind,
             packet_loss_ratio: self.packet_loss_ratio,
             round_trip_time: self.round_trip_time.native_microsecond_bits(),
-            bwe_period: self.bwe_period.native_microsecond_bits(),
+            packet_overhead,
+            packet_overhead_kind,
             cwnd_reduce_ratio: self.cwnd_reduce_ratio,
         }
     }

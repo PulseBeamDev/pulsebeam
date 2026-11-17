@@ -93,8 +93,6 @@ transformable_video_rid(const NativeTransformableFrame &, bool &) noexcept;
 std::unique_ptr<NativeVideoFrameMetadata>
 transformable_video_metadata(const NativeTransformableFrame &,
                              std::int32_t &) noexcept;
-std::unique_ptr<NativeRtpVideoHeader>
-transformable_video_header(const NativeTransformableFrame &) noexcept;
 std::int32_t
 transformable_video_set_metadata(NativeTransformableFrame &,
                                  const NativeVideoFrameMetadata &) noexcept;

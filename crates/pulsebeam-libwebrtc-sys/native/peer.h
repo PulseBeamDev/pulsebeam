@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -11,6 +12,7 @@
 namespace webrtc {
 class AudioDeviceModule;
 class AudioProcessing;
+class EncodedImage;
 class FrameTransformerInterface;
 class PeerConnectionFactoryInterface;
 class PeerConnectionInterface;
@@ -20,6 +22,7 @@ class Thread;
 
 namespace pulsebeam::webrtc_sys {
 
+struct EncodedFrameSelection;
 struct RustMetronome;
 struct RustVideoFactoryEnvironment;
 struct RustCertificateGenerator;
@@ -49,14 +52,12 @@ struct FfiOfferAnswerOptions;
 struct FfiAudioDevice;
 struct FfiNativeAudioDeviceCreation;
 struct FfiAudioProcessingConfig;
-struct FfiAudioProcessingState;
 class NativeAudioEncoderFailureObserver;
 struct FfiDescriptionSnapshot;
 struct FfiPeerIceSnapshot;
 struct FfiPeerEvent;
 struct FfiPeerEventObservation;
 class NativeAudioMixer;
-class NativeAudioDeviceObserver;
 class NativeAudioDevice;
 class NativeAudioDecoderFactory;
 class NativeAudioEncoderFactory;
@@ -167,6 +168,8 @@ public:
   opus_transformer() const noexcept;
   NativeFrameTransformerHosts& frame_transformer_hosts() const noexcept;
   std::shared_ptr<ReadinessSignal> readiness() const noexcept;
+  std::shared_ptr<EncodedFrameSelection> observe_encoded_frames(
+      std::function<void(const webrtc::EncodedImage&, std::uint32_t)>) const;
   bool reserve_encoded_receiver(const std::string &id) const noexcept;
   bool reserve_audio_receiver(const std::string &id) const noexcept;
   void release_audio_receiver(const std::string &id) const noexcept;
@@ -177,7 +180,7 @@ private:
 
 std::unique_ptr<NativePeerConnectionFactory> new_peer_connection_factory(
     const NativeEnvironment &environment, const NativeThread &network_thread,
-    const NativeThread &worker_thread, const NativeThread &signaling_thread,
+    const NativeThread &signaling_thread,
     const NativeNetworkManagerProvider *network_manager,
     rust::Box<RustNetworkManagerFactory> network_manager_factory,
     rust::Box<RustNetworkMonitorFactory> network_monitor_factory,
@@ -238,9 +241,6 @@ FfiApmConfig factory_audio_processor_config(const NativePeerConnectionFactory&, 
 std::uint8_t factory_audio_processor_apply(const NativePeerConnectionFactory&, const FfiApmConfig&) noexcept;
 std::int32_t factory_audio_processor_reverse(const NativePeerConnectionFactory&, std::int32_t, std::size_t, rust::Slice<std::int16_t>, std::uint8_t&) noexcept;
 std::int32_t factory_audio_processor_delay(const NativePeerConnectionFactory&, std::int32_t, std::uint8_t&) noexcept;
-FfiAudioProcessingState factory_audio_processing_state(
-    const NativePeerConnectionFactory &factory) noexcept;
-std::int32_t factory_register_audio_device_observer(const NativePeerConnectionFactory&, std::unique_ptr<NativeAudioDeviceObserver>) noexcept;
 bool factory_audio_devices(const NativePeerConnectionFactory &factory,
                            bool recording, rust::Vec<FfiAudioDevice> &devices,
                            rust::String &error) noexcept;

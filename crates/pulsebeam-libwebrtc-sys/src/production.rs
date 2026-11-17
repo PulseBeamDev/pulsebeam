@@ -2604,15 +2604,6 @@ impl<R: SessionRuntime> Session<R> {
     ) -> Result<crate::VideoTrackStatus, PeerError> {
         Ok(self.video_track_handle(track)?.status())
     }
-    pub fn set_video_track_should_receive(
-        &mut self,
-        track: SessionTrackId,
-        receive: bool,
-    ) -> Result<(), PeerError> {
-        self.check_open()?;
-        self.video_track_handle(track)?.set_should_receive(receive);
-        Ok(())
-    }
     pub fn set_video_track_content_hint(
         &mut self,
         track: SessionTrackId,
@@ -3051,28 +3042,6 @@ impl<R: SessionRuntime> Session<R> {
             .ok_or_else(missing)?
             .options())
     }
-    pub fn set_audio_source_view_options(
-        &mut self,
-        id: SessionAudioSourceViewId,
-        options: &crate::AudioSourceOptions,
-    ) -> Result<(), PeerError> {
-        self.check_open()?;
-        self.audio_source_views
-            .get(&id)
-            .ok_or_else(missing)?
-            .set_options(options)
-            .map_err(|e| error(PeerErrorKind::InvalidParameter, &e.to_string()))
-    }
-    pub fn audio_source_view_volume(
-        &mut self,
-        id: SessionAudioSourceViewId,
-    ) -> Result<f64, PeerError> {
-        Ok(self
-            .audio_source_views
-            .get(&id)
-            .ok_or_else(missing)?
-            .volume())
-    }
     pub fn set_audio_source_view_volume(
         &mut self,
         id: SessionAudioSourceViewId,
@@ -3181,21 +3150,6 @@ impl<R: SessionRuntime> Session<R> {
     pub fn release_audio_source_view(&mut self, id: SessionAudioSourceViewId) {
         self.audio_source_views.remove(&id);
     }
-    /// Invoke native source SetOptions. This reports admission/invocation, not
-    /// an atomic voice-engine reconfiguration or effective processing state.
-    pub fn set_audio_source_options(
-        &mut self,
-        source: SessionSourceId,
-        options: &crate::AudioSourceOptions,
-    ) -> Result<(), PeerError> {
-        self.check_open()?;
-        self.sources
-            .get(&source)
-            .ok_or_else(missing)?
-            .audio_source()?
-            .set_options(options)
-            .map_err(|e| error(PeerErrorKind::InvalidParameter, &e.to_string()))
-    }
     /// Native volume call, including native no-op source implementations.
     pub fn set_audio_source_volume(
         &mut self,
@@ -3257,15 +3211,6 @@ impl<R: SessionRuntime> Session<R> {
             .ok_or_else(missing)?
             .audio_source()?
             .is_remote())
-    }
-    pub fn audio_source_volume(&mut self, source: SessionSourceId) -> Result<f64, PeerError> {
-        self.check_open()?;
-        Ok(self
-            .sources
-            .get(&source)
-            .ok_or_else(missing)?
-            .audio_source()?
-            .volume())
     }
     /// Inspect the actual native sender track, not the retained source map.
     pub fn audio_track_status(
@@ -4208,27 +4153,6 @@ impl<R: SessionRuntime> Session<R> {
         device.enable_built_in_ns(value)
     }
     #[cfg(all(feature = "native", target_os = "linux"))]
-    pub fn audio_device_platform_voice_processing_path_available(
-        &mut self,
-    ) -> Result<bool, crate::AudioDeviceError> {
-        if self.closed {
-            return Err(crate::AudioDeviceError::SessionClosed);
-        }
-        let mut device = self.factory.audio_device_module()?;
-        Ok(device.platform_voice_processing_path_available())
-    }
-    #[cfg(all(feature = "native", target_os = "linux"))]
-    pub fn audio_device_enable_platform_voice_processing_path(
-        &mut self,
-        value: bool,
-    ) -> Result<(), crate::AudioDeviceError> {
-        if self.closed {
-            return Err(crate::AudioDeviceError::SessionClosed);
-        }
-        let mut device = self.factory.audio_device_module()?;
-        device.enable_platform_voice_processing_path(value)
-    }
-    #[cfg(all(feature = "native", target_os = "linux"))]
     pub fn audio_device_set_playout_device(
         &mut self,
         value: u16,
@@ -4275,24 +4199,6 @@ impl<R: SessionRuntime> Session<R> {
         Ok(device.playout_underrun_count())
     }
     #[cfg(all(feature = "native", target_os = "linux"))]
-    pub fn audio_device_current_playout_device(&mut self) -> Result<i32, crate::AudioDeviceError> {
-        if self.closed {
-            return Err(crate::AudioDeviceError::SessionClosed);
-        }
-        let mut device = self.factory.audio_device_module()?;
-        Ok(device.current_playout_device())
-    }
-    #[cfg(all(feature = "native", target_os = "linux"))]
-    pub fn audio_device_current_recording_device(
-        &mut self,
-    ) -> Result<i32, crate::AudioDeviceError> {
-        if self.closed {
-            return Err(crate::AudioDeviceError::SessionClosed);
-        }
-        let mut device = self.factory.audio_device_module()?;
-        Ok(device.current_recording_device())
-    }
-    #[cfg(all(feature = "native", target_os = "linux"))]
     pub fn audio_device_playout_delay_ms(&mut self) -> Result<u16, crate::AudioDeviceError> {
         if self.closed {
             return Err(crate::AudioDeviceError::SessionClosed);
@@ -4319,16 +4225,6 @@ impl<R: SessionRuntime> Session<R> {
         Ok(device.initialized())
     }
     #[cfg(all(feature = "native", target_os = "linux"))]
-    pub fn audio_device_stop_on_mute_mode_enabled(
-        &mut self,
-    ) -> Result<bool, crate::AudioDeviceError> {
-        if self.closed {
-            return Err(crate::AudioDeviceError::SessionClosed);
-        }
-        let mut device = self.factory.audio_device_module()?;
-        Ok(device.stop_on_mute_mode_enabled())
-    }
-    #[cfg(all(feature = "native", target_os = "linux"))]
     pub fn audio_device_statistics(
         &mut self,
     ) -> Result<Option<crate::AudioDeviceStatistics>, crate::AudioDeviceError> {
@@ -4336,18 +4232,6 @@ impl<R: SessionRuntime> Session<R> {
             return Err(crate::AudioDeviceError::SessionClosed);
         }
         Ok(self.factory.audio_device_module()?.statistics())
-    }
-    #[cfg(all(feature = "native", target_os = "linux"))]
-    pub fn audio_device_platform_processing_state(
-        &mut self,
-    ) -> Result<crate::PlatformAudioProcessingState, crate::AudioDeviceError> {
-        if self.closed {
-            return Err(crate::AudioDeviceError::SessionClosed);
-        }
-        Ok(self
-            .factory
-            .audio_device_module()?
-            .platform_processing_state())
     }
     #[cfg(all(feature = "native", target_os = "linux"))]
     pub fn audio_device_name(
@@ -4361,37 +4245,6 @@ impl<R: SessionRuntime> Session<R> {
         self.factory
             .audio_device_module()?
             .device_name(recording, index)
-    }
-    #[cfg(all(feature = "native", target_os = "linux"))]
-    pub fn register_audio_device_observer(
-        &mut self,
-        observer: crate::AudioDeviceObserver,
-    ) -> Result<(), crate::AudioDeviceError> {
-        if self.closed {
-            return Err(crate::AudioDeviceError::SessionClosed);
-        }
-        self.factory
-            .audio_device_module()?
-            .register_observer(observer)
-    }
-    #[cfg(all(feature = "native", target_os = "linux"))]
-    pub fn unregister_audio_device_observer(&mut self) -> Result<(), crate::AudioDeviceError> {
-        if self.closed {
-            return Err(crate::AudioDeviceError::SessionClosed);
-        }
-        self.factory.audio_device_module()?.unregister_observer()
-    }
-    #[cfg(all(feature = "native", target_os = "linux"))]
-    pub fn audio_device_platform_processing_topology(
-        &mut self,
-    ) -> Result<crate::PlatformAudioProcessingTopology, crate::AudioDeviceError> {
-        if self.closed {
-            return Err(crate::AudioDeviceError::SessionClosed);
-        }
-        Ok(self
-            .factory
-            .audio_device_module()?
-            .platform_processing_topology())
     }
     pub fn audio_mixer_failure_observer(
         &mut self,
@@ -4439,12 +4292,6 @@ impl<R: SessionRuntime> Session<R> {
         self.check_open()?;
         self.factory
             .set_audio_processing_delay(milliseconds)
-            .map_err(|e| error(PeerErrorKind::AudioProcessingAdmission, &e.to_string()))
-    }
-    pub fn audio_processing_state(&mut self) -> Result<crate::AudioProcessingState, PeerError> {
-        self.check_open()?;
-        self.factory
-            .try_audio_processing_state()
             .map_err(|e| error(PeerErrorKind::AudioProcessingAdmission, &e.to_string()))
     }
 
@@ -4681,39 +4528,15 @@ impl<R: SessionRuntime> Session<R> {
         let Some(Source::Pcm(source)) = self.sources.get(&source) else {
             return Err(missing());
         };
-        let track = self.factory.create_audio_track(track_id, source)?;
-        if let Some(options) = processing {
-            track.set_audio_processing_options(options)?;
+        if processing.is_some() {
+            return Err(error(
+                PeerErrorKind::UnsupportedOperation,
+                "per-track audio processing controls are unavailable in upstream WebRTC",
+            ));
         }
+        let track = self.factory.create_audio_track(track_id, source)?;
         let value = target.add_audio_transceiver(&track, direction)?;
         self.insert_transceiver(peer, value)
-    }
-
-    /// Change the real retained local track's processing choices. Processing
-    /// is shared by the voice engine, not isolated independently per track.
-    pub fn set_audio_processing_options(
-        &mut self,
-        sender: SessionSenderId,
-        options: crate::AudioProcessingOptions,
-    ) -> Result<(), PeerError> {
-        self.check_open()?;
-        let sender = self.senders.get(&sender).ok_or_else(missing)?;
-        let peer = self.peers.get(&sender.peer).ok_or_else(missing)?;
-        let native_id = sender.value.resource_key();
-        let track = peer
-            .value
-            .inner
-            .audio_sender_tracks
-            .borrow()
-            .get(&native_id)
-            .map(|lease| lease.track.clone())
-            .ok_or_else(|| {
-                error(
-                    PeerErrorKind::UnsupportedOperation,
-                    "sender has no local audio track",
-                )
-            })?;
-        track.set_audio_processing_options(options)
     }
 
     #[cfg(feature = "native")]
@@ -4729,10 +4552,13 @@ impl<R: SessionRuntime> Session<R> {
         if target.inner.closed.get() {
             return Err(error(PeerErrorKind::Closed, "peer is closed"));
         }
-        let track = self.factory.create_microphone_track(track_id)?;
-        if let Some(options) = processing {
-            track.set_audio_processing_options(options)?;
+        if processing.is_some() {
+            return Err(error(
+                PeerErrorKind::UnsupportedOperation,
+                "per-track audio processing controls are unavailable in upstream WebRTC",
+            ));
         }
+        let track = self.factory.create_microphone_track(track_id)?;
         let value = target.add_audio_transceiver(&track, direction)?;
         self.insert_transceiver(peer, value)
     }
@@ -5203,7 +5029,7 @@ impl<R: SessionRuntime> Session<R> {
         value: SessionSframeDecrypterId,
         id: u64,
         key: &[u8],
-    ) -> Result<crate::RtcError, PeerError> {
+    ) -> Result<crate::SframeKeyUpdateOperation, PeerError> {
         self.check_open()?;
         Ok(self
             .sframe_decrypters
@@ -5216,7 +5042,7 @@ impl<R: SessionRuntime> Session<R> {
         &mut self,
         value: SessionSframeDecrypterId,
         id: u64,
-    ) -> Result<crate::RtcError, PeerError> {
+    ) -> Result<crate::SframeKeyUpdateOperation, PeerError> {
         self.check_open()?;
         Ok(self
             .sframe_decrypters
@@ -5224,6 +5050,33 @@ impl<R: SessionRuntime> Session<R> {
             .ok_or_else(missing)?
             .value
             .remove_decryption_key(id))
+    }
+    /// Takes the next decrypt failure observed for this retained SFrame handle.
+    pub fn try_take_sframe_decrypt_error(
+        &self,
+        value: SessionSframeDecrypterId,
+    ) -> Result<Option<crate::SframeDecryptError>, PeerError> {
+        self.check_open()?;
+        Ok(self
+            .sframe_decrypters
+            .get(&value)
+            .ok_or_else(missing)?
+            .value
+            .try_take_decrypt_error())
+    }
+    /// Takes saturating counts of diagnostic SFrame error events/frame bytes
+    /// omitted by bounded retention. Drops do not indicate cryptographic success.
+    pub fn take_sframe_decrypt_error_drops(
+        &self,
+        value: SessionSframeDecrypterId,
+    ) -> Result<crate::SframeDecryptErrorDropCounts, PeerError> {
+        self.check_open()?;
+        Ok(self
+            .sframe_decrypters
+            .get(&value)
+            .ok_or_else(missing)?
+            .value
+            .take_decrypt_error_drops())
     }
     pub fn release_sframe_encrypter(
         &mut self,

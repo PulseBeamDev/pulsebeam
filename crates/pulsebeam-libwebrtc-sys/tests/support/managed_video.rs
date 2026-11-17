@@ -785,3 +785,292 @@ pub fn check_replay(
         std::fs::write(path, serde_json::to_vec(&observation).unwrap()).unwrap();
     }
 }
+
+#[derive(Debug)]
+struct MetadataAuditResult {
+    timestamp: u32,
+    unchanged_write: Result<(), TransformableFrameError>,
+    mismatched_variant: Result<(), TransformableFrameError>,
+    mismatched_codec: Result<(), TransformableFrameError>,
+    unchanged_after_write: bool,
+    unchanged_after_variant: bool,
+    unchanged_after_codec: bool,
+    completion: Result<FrameTransformCompletionOutcome, FrameTransformCompletionError>,
+}
+
+#[derive(Default)]
+struct MetadataAudit {
+    started: AtomicBool,
+    result: Mutex<Option<MetadataAuditResult>>,
+}
+
+impl FrameTransformerProvider for MetadataAudit {
+    fn transform(&self, mut frame: TransformableMediaFrame, completion: FrameTransformCompletion) {
+        if self.started.swap(true, Ordering::AcqRel) {
+            completion.complete(frame).unwrap();
+            return;
+        }
+        let timestamp = frame.rtp_timestamp();
+        let video = match &mut frame {
+            TransformableMediaFrame::Video(video) => video,
+            _ => panic!("expected a video sender frame"),
+        };
+        assert_eq!(video.direction(), TransformableFrameDirection::Sender);
+        let original = video.metadata().unwrap();
+        let values = original.values();
+        let specifics = original.codec_specifics();
+        let mime = video.mime_type().unwrap();
+        assert_eq!(values.codec, VideoCodecType::Vp8);
+        assert!(mime.eq_ignore_ascii_case(b"video/vp8"));
+        assert!(matches!(specifics, RtpVideoHeaderCodecSpecifics::Vp8(_)));
+
+        let unchanged_write = video.set_metadata(&original);
+        let unchanged = |video: &TransformableVideoFrame| {
+            let actual = video.metadata().unwrap();
+            actual.values() == values
+                && actual.codec_specifics() == specifics
+                && video.mime_type().unwrap() == mime
+        };
+        let unchanged_after_write = unchanged(video);
+        let mut proposed = original.clone();
+        proposed
+            .set_codec_specifics(&RtpVideoHeaderCodecSpecifics::H264(Default::default()))
+            .unwrap();
+        let mismatched_variant = video.set_metadata(&proposed);
+        let unchanged_after_variant = unchanged(video);
+        let mut proposed_values = proposed.values();
+        proposed_values.codec = VideoCodecType::H264;
+        proposed.set_values(&proposed_values).unwrap();
+        let mismatched_codec = video.set_metadata(&proposed);
+        let unchanged_after_codec = unchanged(video);
+        // Restore on an old implementation so the finding does not send a
+        // wrongly typed header through the real packetizer.
+        if !unchanged_after_codec || !unchanged_after_variant {
+            video.set_metadata(&original).unwrap();
+        }
+        let completion = completion.complete(frame);
+        *self.result.lock().unwrap() = Some(MetadataAuditResult {
+            timestamp,
+            unchanged_write,
+            mismatched_variant,
+            mismatched_codec,
+            unchanged_after_write,
+            unchanged_after_variant,
+            unchanged_after_codec,
+            completion,
+        });
+    }
+}
+
+#[derive(Debug)]
+struct ReceiverMetadataAuditResult {
+    timestamp: u32,
+    rejection: Result<(), TransformableFrameError>,
+    unchanged: bool,
+    clone_direction: TransformableFrameDirection,
+    clone_timestamp: u32,
+    completion: Result<FrameTransformCompletionOutcome, FrameTransformCompletionError>,
+}
+
+#[derive(Default)]
+struct ReceiverMetadataAudit {
+    started: AtomicBool,
+    result: Mutex<Option<ReceiverMetadataAuditResult>>,
+}
+
+impl FrameTransformerProvider for ReceiverMetadataAudit {
+    fn transform(&self, mut frame: TransformableMediaFrame, completion: FrameTransformCompletion) {
+        if self.started.swap(true, Ordering::AcqRel) {
+            completion.complete(frame).unwrap();
+            return;
+        }
+        let timestamp = frame.rtp_timestamp();
+        let video = match &mut frame {
+            TransformableMediaFrame::Video(video) => video,
+            _ => panic!("expected a video receiver frame"),
+        };
+        assert_eq!(video.direction(), TransformableFrameDirection::Receiver);
+        let original = video.metadata().unwrap();
+        let mut proposed = original.clone();
+        let mut dependencies = original.frame_dependencies();
+        dependencies.push(i64::MAX);
+        proposed.set_frame_dependencies(&dependencies);
+        let rejection = video.set_metadata(&proposed);
+        let actual = video.metadata().unwrap();
+        let unchanged = actual.values() == original.values()
+            && actual.codec_specifics() == original.codec_specifics()
+            && actual.dependencies() == original.dependencies();
+        let clone = frame.sdk_clone().unwrap();
+        let clone_direction = clone.direction();
+        let clone_timestamp = clone.rtp_timestamp();
+        let completion = completion.complete(clone);
+        *self.result.lock().unwrap() = Some(ReceiverMetadataAuditResult {
+            timestamp,
+            rejection,
+            unchanged,
+            clone_direction,
+            clone_timestamp,
+            completion,
+        });
+    }
+}
+
+#[allow(dead_code)]
+pub fn check_sender_metadata_packetizer_codec() {
+    let world = ControlledWorld::acquire(0x7210, Duration::from_secs(7)).unwrap();
+    let network = world.create_network().unwrap();
+    let endpoints = ["192.0.2.1", "192.0.2.2"].map(|ip| {
+        network
+            .register_endpoint(ip.parse::<IpAddr>().unwrap())
+            .unwrap()
+    });
+    let runtimes = endpoints
+        .each_ref()
+        .map(|endpoint| world.runtime().unwrap().with_endpoint(endpoint).unwrap());
+    let mut call = Call::new(runtimes, None);
+    let source = call.sessions[0].create_raw_video_source().unwrap();
+    let transceiver = call.sessions[0]
+        .publish_video(
+            call.peers[0],
+            source,
+            "metadata-vp8",
+            RtpTransceiverDirection::SendOnly,
+            &[],
+        )
+        .unwrap();
+    let codec = call.sessions[0]
+        .get_rtp_sender_capabilities(MediaType::Video)
+        .unwrap()
+        .codecs()
+        .into_iter()
+        .find(|codec| codec.base_codec().name_bytes() == b"VP8")
+        .unwrap();
+    call.sessions[0]
+        .set_rtp_codec_preferences(transceiver, &[codec])
+        .unwrap();
+    let audit = Arc::new(MetadataAudit::default());
+    let transformer = call.sessions[0]
+        .create_frame_transformer(audit.clone(), 1)
+        .unwrap();
+    let sender = call.sessions[0].sender(transceiver).unwrap();
+    call.sessions[0]
+        .set_sender_frame_transformer(sender, Some(transformer))
+        .unwrap();
+    let mut progress = || {
+        assert!(!world.pump(256).blocked);
+        while let Some(packet) = network.next_packet() {
+            network.deliver(packet.id).unwrap();
+        }
+        world.advance(Duration::from_millis(1)).unwrap();
+    };
+    call.negotiate("VP8", &mut progress);
+    let receiver = call.receiver.unwrap();
+    let receiver_audit = Arc::new(ReceiverMetadataAudit::default());
+    let receiver_transformer = call.sessions[1]
+        .create_frame_transformer(receiver_audit.clone(), 1)
+        .unwrap();
+    call.sessions[1]
+        .set_receiver_frame_transformer(receiver, Some(receiver_transformer))
+        .unwrap();
+    call.sessions[1].attach_raw_video(receiver).unwrap();
+    const WIDTH: u32 = 320;
+    const HEIGHT: u32 = 240;
+    let pixels = vec![128; (WIDTH * HEIGHT * 3 / 2) as usize];
+    let mut submitted = 0;
+    let mut next_capture = world.now();
+    let mut received = Vec::new();
+    for _ in 0..10_000 {
+        if submitted < 8 && world.now() >= next_capture {
+            let frame = VideoFrame::i420(
+                WIDTH,
+                HEIGHT,
+                pixels.clone(),
+                world.now().as_micros() as i64,
+                0,
+            )
+            .unwrap();
+            call.sessions[0].push_raw_video(source, &frame).unwrap();
+            submitted += 1;
+            next_capture += Duration::from_millis(33);
+        }
+        progress();
+        call.drain();
+        while let Some(frame) = call.sessions[1].try_raw_video_frame(receiver).unwrap() {
+            received.push(frame.rtp_timestamp);
+        }
+        if let (Some(sender), Some(receiver)) = (
+            audit.result.lock().unwrap().as_ref(),
+            receiver_audit.result.lock().unwrap().as_ref(),
+        ) && received.contains(&sender.timestamp)
+            && received.contains(&receiver.timestamp)
+        {
+            break;
+        }
+    }
+    let result = audit
+        .result
+        .lock()
+        .unwrap()
+        .take()
+        .expect("no SDK sender frame captured");
+    assert_eq!(result.unchanged_write, Ok(()));
+    assert!(
+        result.unchanged_after_write,
+        "unchanged write altered metadata or MIME"
+    );
+    assert_eq!(
+        result.mismatched_variant,
+        Err(TransformableFrameError::CodecVariantAssociation)
+    );
+    assert!(
+        result.unchanged_after_variant,
+        "variant rejection altered metadata or MIME"
+    );
+    assert!(
+        result.mismatched_codec.is_err(),
+        "packetizer codec mismatch accepted: {result:?}"
+    );
+    assert!(
+        result.unchanged_after_codec,
+        "codec rejection altered metadata or MIME"
+    );
+    assert_eq!(
+        result.completion,
+        Ok(FrameTransformCompletionOutcome::DeliveredToNative)
+    );
+    assert!(
+        received.contains(&result.timestamp),
+        "completed sender frame did not reach the receiver"
+    );
+    let receiver_result = receiver_audit
+        .result
+        .lock()
+        .unwrap()
+        .take()
+        .expect("no SDK receiver frame captured");
+    assert_eq!(
+        receiver_result.rejection,
+        Err(TransformableFrameError::UnsupportedInstalledDependencyMutation)
+    );
+    assert!(
+        receiver_result.unchanged,
+        "rejection altered receiver metadata"
+    );
+    assert_eq!(
+        receiver_result.clone_direction,
+        TransformableFrameDirection::Sender
+    );
+    assert_eq!(receiver_result.clone_timestamp, receiver_result.timestamp);
+    assert_eq!(
+        receiver_result.completion,
+        Ok(FrameTransformCompletionOutcome::DeliveredToNative)
+    );
+    assert!(
+        received.contains(&receiver_result.timestamp),
+        "receiver SDK clone did not reach the decoder"
+    );
+    for index in 0..2 {
+        call.sessions[index].close_peer(call.peers[index]).unwrap();
+        call.sessions[index].shutdown().unwrap();
+    }
+}

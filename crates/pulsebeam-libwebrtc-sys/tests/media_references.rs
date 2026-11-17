@@ -57,61 +57,12 @@ fn owning_source_reads_and_explicit_notifiers_follow_real_sdk_changes() {
     assert!(source.same_resource(&source_alias));
     assert!(!source.remote());
     assert_eq!(source.state(), MediaSourceState::Live);
-    assert_eq!(track.audio_volume(), Some(1.0));
     assert_eq!(track.signal_level(), None);
     assert!(track.audio_processor().is_none());
-    assert_eq!(track.should_receive(), None);
     assert_eq!(track.content_hint(), None);
     assert_eq!(source.options().echo_cancellation, None);
-    audio
-        .set_audio_processing_options(AudioProcessingOptions {
-            echo_cancellation: ProcessingChoice::Software,
-            noise_suppression: ProcessingChoice::Disabled,
-            gain_control: ProcessingChoice::Automatic,
-        })
-        .unwrap();
-    let options = source.options();
-    assert_eq!(options.echo_cancellation, Some(true));
-    assert_eq!(
-        options.echo_cancellation_mode,
-        Some(AudioProcessingMode::Software)
-    );
-    assert_eq!(options.noise_suppression, Some(false));
-    assert_eq!(options.auto_gain_control, Some(true));
-    assert_eq!(
-        options.auto_gain_control_mode,
-        Some(AudioProcessingMode::Automatic)
-    );
-    assert_eq!(options.audio_network_adaptor_config, None);
-    assert!(
-        observer.take_event().is_some(),
-        "SDK audio options must notify the common track observer"
-    );
-    assert!(observer.take_event().is_none());
-    let outcome = alias
-        .set_audio_options(&AudioSourceOptions {
-            highpass_filter: Some(true),
-            highpass_filter_mode: Some(AudioProcessingMode::Software),
-            stereo_swapping: Some(true),
-            audio_network_adaptor_config: Some(b"unused-\xff\0".to_vec()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(outcome.code, TrackAudioOptionsCode::Stored);
-    assert!(outcome.ok());
-    assert!(outcome.message.is_empty());
-    assert_eq!(source.options().highpass_filter, Some(true));
-    assert_eq!(
-        source.options().highpass_filter_mode,
-        Some(AudioProcessingMode::Software)
-    );
-    assert_eq!(source.options().echo_cancellation, Some(true)); // Native SetAll merges the consumed subset.
-    assert_eq!(source.options().stereo_swapping, None); // Native AudioTrack deliberately ignores unrelated options.
-    assert_eq!(source.options().audio_network_adaptor_config, None);
-    assert!(observer.take_event().is_some());
-    assert!(observer.take_event().is_none());
+    assert_eq!(source.options(), AudioSourceOptions::default());
     alias.set_audio_volume(2.5).unwrap();
-    assert_eq!(alias.audio_volume(), Some(1.0)); // This SDK local source inherits the no-op volume setter.
     for enabled in [false, true, false] {
         assert!(alias.set_enabled(enabled));
     }
@@ -135,16 +86,11 @@ fn owning_source_reads_and_explicit_notifiers_follow_real_sdk_changes() {
     let MediaTrackSource::Video(video_source) = video.source().unwrap() else {
         panic!()
     };
-    video.set_should_receive(false).unwrap();
-    assert_eq!(video.should_receive(), Some(false));
-    video.set_should_receive(true).unwrap();
     video.set_content_hint(VideoContentHint::Text).unwrap();
     assert_eq!(video.content_hint(), Some(VideoContentHint::Text));
     video.set_content_hint(VideoContentHint::None).unwrap();
     let changes = video.observe(NonZeroUsize::new(2).unwrap());
-    assert_eq!(video.should_receive(), Some(true));
     assert_eq!(video.content_hint(), Some(VideoContentHint::None));
-    assert_eq!(video.audio_volume(), None);
     assert_eq!(video_source.state(), MediaSourceState::Live);
     assert!(!video_source.remote());
     let info = video_source.info();
@@ -196,13 +142,6 @@ fn receiver_streams_preserve_native_bytes_traversal_changes_and_retained_lifetim
     assert!(stream.find_audio_track(b"absent").is_none());
     assert!(stream.find_video_track(&received.id()).is_none());
     received.set_audio_volume(2.75).unwrap();
-    assert_eq!(received.audio_volume(), Some(2.75));
-    let rejected = received
-        .set_audio_options(&AudioSourceOptions::default())
-        .unwrap();
-    assert_eq!(rejected.code, TrackAudioOptionsCode::RejectedRemoteTrack);
-    assert!(!rejected.ok());
-    assert!(!rejected.message.is_empty());
     let source = received.source().unwrap();
     assert!(source.remote());
     assert_eq!(source.state(), MediaSourceState::Live);

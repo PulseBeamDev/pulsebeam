@@ -21,53 +21,26 @@ impl AudioDeviceLayer {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioDeviceCreationMethod {
-    /// Declared but not implemented by this SDK pin. Refused without substituting
-    /// the free factory or inventing a nullable native result.
-    ModuleCreate {
-        bypass_voice_processing: bool,
-    },
-    CreateAudioDeviceModule {
-        bypass_voice_processing: bool,
-    },
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AudioDeviceCreationConfig {
     pub layer: AudioDeviceLayer,
-    pub method: AudioDeviceCreationMethod,
 }
 impl Default for AudioDeviceCreationConfig {
     fn default() -> Self {
         Self {
             layer: AudioDeviceLayer::PlatformDefault,
-            method: AudioDeviceCreationMethod::CreateAudioDeviceModule {
-                bypass_voice_processing: false,
-            },
         }
     }
 }
 impl AudioDeviceCreationConfig {
     pub(crate) fn ffi(self) -> ffi::FfiNativeAudioDeviceCreation {
-        let (helper, bypass) = match self.method {
-            AudioDeviceCreationMethod::CreateAudioDeviceModule {
-                bypass_voice_processing,
-            } => (true, bypass_voice_processing),
-            AudioDeviceCreationMethod::ModuleCreate {
-                bypass_voice_processing,
-            } => (false, bypass_voice_processing),
-        };
         ffi::FfiNativeAudioDeviceCreation {
             layer: self.layer as u8,
-            helper,
-            bypass,
         }
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AudioDeviceError {
     NativeArtifactRequired,
-    /// The SDK declares AudioDeviceModule::Create but contains no definition.
-    UnlinkedStaticCreate,
     NativeModuleUnavailable,
     ControlledExecutionConflict,
     ActiveTransportRegistration,
@@ -98,31 +71,6 @@ pub struct AudioDeviceStatistics {
     pub total_capture_samples_duration_s: f64,
     pub total_capture_delay_s: f64,
     pub total_capture_samples_count: u64,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PlatformAudioProcessingTopology {
-    Independent,
-    EchoCancellationAndNoiseSuppressionCoupled,
-    Unknown(i32),
-}
-#[derive(Clone, Debug, PartialEq)]
-pub struct PlatformAudioProcessingState {
-    pub topology: PlatformAudioProcessingTopology,
-    pub echo_cancellation_available: bool,
-    pub noise_suppression_available: bool,
-    pub auto_gain_control_available: bool,
-    pub echo_cancellation_requested: Option<bool>,
-    pub noise_suppression_requested: Option<bool>,
-    pub auto_gain_control_requested: Option<bool>,
-    pub echo_cancellation_active: Option<bool>,
-    pub noise_suppression_active: Option<bool>,
-    pub auto_gain_control_active: Option<bool>,
-    pub voice_processing_enabled_requested: Option<bool>,
-    pub voice_processing_bypassed_requested: Option<bool>,
-    pub voice_processing_agc_enabled_requested: Option<bool>,
-    pub voice_processing_enabled_active: Option<bool>,
-    pub voice_processing_bypassed_active: Option<bool>,
-    pub voice_processing_agc_enabled_active: Option<bool>,
 }
 /// Owns an explicitly supplied live worker and retains its environment. All ADM
 /// calls and final SDK release marshal to that worker. No thread is started by
@@ -160,15 +108,6 @@ impl InstalledAudioDevice {
     fn status(value: i32) -> Result<(), AudioDeviceError> {
         AudioDeviceModule::status(value)
     }
-    pub fn platform_processing_topology(&mut self) -> PlatformAudioProcessingTopology {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 59, 0);
-        match r.int_value as i32 {
-            0 => PlatformAudioProcessingTopology::Independent,
-            1 => PlatformAudioProcessingTopology::EchoCancellationAndNoiseSuppressionCoupled,
-            n => PlatformAudioProcessingTopology::Unknown(n),
-        }
-    }
-
     pub fn playout_initialized(&mut self) -> bool {
         let r = ffi::audio_device_call(self.native.pin_mut(), 4, 0);
         r.bool_value
@@ -340,18 +279,6 @@ impl InstalledAudioDevice {
         Self::status(r.status)?;
         Ok(())
     }
-    pub fn platform_voice_processing_path_available(&mut self) -> bool {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 47, 0);
-        r.bool_value
-    }
-    pub fn enable_platform_voice_processing_path(
-        &mut self,
-        value: bool,
-    ) -> Result<(), AudioDeviceError> {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 48, value as u32);
-        Self::status(r.status)?;
-        Ok(())
-    }
     pub fn set_playout_device(&mut self, value: u16) -> Result<(), AudioDeviceError> {
         let r = ffi::audio_device_call(self.native.pin_mut(), 50, value as u32);
         Self::status(r.status)?;
@@ -376,14 +303,6 @@ impl InstalledAudioDevice {
         let r = ffi::audio_device_call(self.native.pin_mut(), 54, 0);
         r.int_value as i32
     }
-    pub fn current_playout_device(&mut self) -> i32 {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 55, 0);
-        r.int_value as i32
-    }
-    pub fn current_recording_device(&mut self) -> i32 {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 56, 0);
-        r.int_value as i32
-    }
     pub fn playout_delay_ms(&mut self) -> Result<u16, AudioDeviceError> {
         let r = ffi::audio_device_call(self.native.pin_mut(), 57, 0);
         Self::status(r.status)?;
@@ -396,10 +315,6 @@ impl InstalledAudioDevice {
     }
     pub fn initialized(&mut self) -> bool {
         let r = ffi::audio_device_call(self.native.pin_mut(), 2, 0);
-        r.bool_value
-    }
-    pub fn stop_on_mute_mode_enabled(&mut self) -> bool {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 49, 0);
         r.bool_value
     }
     pub fn device_name(
@@ -432,53 +347,6 @@ impl InstalledAudioDevice {
             total_capture_samples_count: f.total_capture_samples_count,
         })
     }
-    pub fn platform_processing_state(&mut self) -> PlatformAudioProcessingState {
-        let f = ffi::audio_device_platform_state(self.native.pin_mut());
-        let optional = |value| match value {
-            1 => Some(false),
-            2 => Some(true),
-            _ => None,
-        };
-        PlatformAudioProcessingState {
-            topology: match f.topology {
-                0 => PlatformAudioProcessingTopology::Independent,
-                1 => PlatformAudioProcessingTopology::EchoCancellationAndNoiseSuppressionCoupled,
-                n => PlatformAudioProcessingTopology::Unknown(n),
-            },
-            echo_cancellation_available: f.echo_cancellation_available,
-            noise_suppression_available: f.noise_suppression_available,
-            auto_gain_control_available: f.auto_gain_control_available,
-            echo_cancellation_requested: optional(f.echo_cancellation_requested),
-            noise_suppression_requested: optional(f.noise_suppression_requested),
-            auto_gain_control_requested: optional(f.auto_gain_control_requested),
-            echo_cancellation_active: optional(f.echo_cancellation_active),
-            noise_suppression_active: optional(f.noise_suppression_active),
-            auto_gain_control_active: optional(f.auto_gain_control_active),
-            voice_processing_enabled_requested: optional(f.voice_processing_enabled_requested),
-            voice_processing_bypassed_requested: optional(f.voice_processing_bypassed_requested),
-            voice_processing_agc_enabled_requested: optional(
-                f.voice_processing_agc_enabled_requested,
-            ),
-            voice_processing_enabled_active: optional(f.voice_processing_enabled_active),
-            voice_processing_bypassed_active: optional(f.voice_processing_bypassed_active),
-            voice_processing_agc_enabled_active: optional(f.voice_processing_agc_enabled_active),
-        }
-    }
-    pub fn register_observer(
-        &mut self,
-        observer: crate::AudioDeviceObserver,
-    ) -> Result<(), AudioDeviceError> {
-        Self::status(ffi::factory_register_audio_device_observer(
-            self._factory.native(),
-            observer.native,
-        ))
-    }
-    pub fn unregister_observer(&mut self) -> Result<(), AudioDeviceError> {
-        Self::status(ffi::factory_register_audio_device_observer(
-            self._factory.native(),
-            cxx::UniquePtr::null(),
-        ))
-    }
 }
 
 impl AudioDeviceModule {
@@ -491,45 +359,14 @@ impl AudioDeviceModule {
     ) {
         (self.native, self._worker, self._environment)
     }
-    /// The SDK's static Create is declaration-only at this pin. Returns
-    /// UnlinkedStaticCreate, not a fabricated null or a substituted helper.
-    pub fn create(
-        environment: &Environment,
-        worker: WorkerThread,
-        layer: AudioDeviceLayer,
-        bypass_voice_processing: bool,
-    ) -> Result<Option<Self>, AudioDeviceError> {
-        Self::create_impl(environment, worker, layer, bypass_voice_processing, false)
-    }
-    /// Actual CreateAudioDeviceModule helper, not substituted static creation.
+    /// Creates the SDK module through its free CreateAudioDeviceModule factory.
     pub fn create_with_helper(
         environment: &Environment,
         worker: WorkerThread,
         layer: AudioDeviceLayer,
     ) -> Result<Option<Self>, AudioDeviceError> {
-        Self::create_with_helper_options(environment, worker, layer, false)
-    }
-    /// Actual free factory including its bypass_voice_processing argument.
-    pub fn create_with_helper_options(
-        environment: &Environment,
-        worker: WorkerThread,
-        layer: AudioDeviceLayer,
-        bypass_voice_processing: bool,
-    ) -> Result<Option<Self>, AudioDeviceError> {
-        Self::create_impl(environment, worker, layer, bypass_voice_processing, true)
-    }
-    fn create_impl(
-        environment: &Environment,
-        worker: WorkerThread,
-        layer: AudioDeviceLayer,
-        bypass: bool,
-        helper: bool,
-    ) -> Result<Option<Self>, AudioDeviceError> {
         if !cfg!(feature = "native") {
             return Err(AudioDeviceError::NativeArtifactRequired);
-        }
-        if !helper {
-            return Err(AudioDeviceError::UnlinkedStaticCreate);
         }
         let lease = ffi::new_production_lease();
         if lease.is_null() {
@@ -541,16 +378,10 @@ impl AudioDeviceModule {
             environment.native(),
             worker.native(),
             layer as u8,
-            bypass,
-            helper,
             &mut error,
         );
         if error != 0 {
-            return Err(if error == 2 {
-                AudioDeviceError::UnlinkedStaticCreate
-            } else {
-                AudioDeviceError::NativeArtifactRequired
-            });
+            return Err(AudioDeviceError::NativeArtifactRequired);
         }
         if native.is_null() {
             return Ok(None);
@@ -589,29 +420,6 @@ impl AudioDeviceModule {
             return Err(AudioDeviceError::ActiveTransportRegistration);
         }
         Self::status(status)
-    }
-    pub fn register_observer(
-        &mut self,
-        observer: crate::AudioDeviceObserver,
-    ) -> Result<(), AudioDeviceError> {
-        Self::status(ffi::audio_device_register_observer(
-            self.native.pin_mut(),
-            observer.native,
-        ))
-    }
-    pub fn unregister_observer(&mut self) -> Result<(), AudioDeviceError> {
-        Self::status(ffi::audio_device_register_observer(
-            self.native.pin_mut(),
-            cxx::UniquePtr::null(),
-        ))
-    }
-    pub fn platform_processing_topology(&mut self) -> PlatformAudioProcessingTopology {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 59, 0);
-        match r.int_value as i32 {
-            0 => PlatformAudioProcessingTopology::Independent,
-            1 => PlatformAudioProcessingTopology::EchoCancellationAndNoiseSuppressionCoupled,
-            n => PlatformAudioProcessingTopology::Unknown(n),
-        }
     }
     fn status(value: i32) -> Result<(), AudioDeviceError> {
         if value == 0 {
@@ -845,22 +653,6 @@ impl AudioDeviceModule {
         Self::status(r.status)?;
         Ok(())
     }
-    pub fn platform_voice_processing_path_available(&mut self) -> bool {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 47, 0);
-        r.bool_value
-    }
-    pub fn enable_platform_voice_processing_path(
-        &mut self,
-        value: bool,
-    ) -> Result<(), AudioDeviceError> {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 48, value as u32);
-        Self::status(r.status)?;
-        Ok(())
-    }
-    pub fn stop_on_mute_mode_enabled(&mut self) -> bool {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 49, 0);
-        r.bool_value
-    }
     pub fn set_playout_device(&mut self, value: u16) -> Result<(), AudioDeviceError> {
         let r = ffi::audio_device_call(self.native.pin_mut(), 50, value as u32);
         Self::status(r.status)?;
@@ -883,14 +675,6 @@ impl AudioDeviceModule {
     }
     pub fn playout_underrun_count(&mut self) -> i32 {
         let r = ffi::audio_device_call(self.native.pin_mut(), 54, 0);
-        r.int_value as i32
-    }
-    pub fn current_playout_device(&mut self) -> i32 {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 55, 0);
-        r.int_value as i32
-    }
-    pub fn current_recording_device(&mut self) -> i32 {
-        let r = ffi::audio_device_call(self.native.pin_mut(), 56, 0);
         r.int_value as i32
     }
     pub fn playout_delay_ms(&mut self) -> Result<u16, AudioDeviceError> {
@@ -932,37 +716,5 @@ impl AudioDeviceModule {
             total_capture_delay_s: f.total_capture_delay_s,
             total_capture_samples_count: f.total_capture_samples_count,
         })
-    }
-    pub fn platform_processing_state(&mut self) -> PlatformAudioProcessingState {
-        let f = ffi::audio_device_platform_state(self.native.pin_mut());
-        let optional = |value| match value {
-            1 => Some(false),
-            2 => Some(true),
-            _ => None,
-        };
-        PlatformAudioProcessingState {
-            topology: match f.topology {
-                0 => PlatformAudioProcessingTopology::Independent,
-                1 => PlatformAudioProcessingTopology::EchoCancellationAndNoiseSuppressionCoupled,
-                n => PlatformAudioProcessingTopology::Unknown(n),
-            },
-            echo_cancellation_available: f.echo_cancellation_available,
-            noise_suppression_available: f.noise_suppression_available,
-            auto_gain_control_available: f.auto_gain_control_available,
-            echo_cancellation_requested: optional(f.echo_cancellation_requested),
-            noise_suppression_requested: optional(f.noise_suppression_requested),
-            auto_gain_control_requested: optional(f.auto_gain_control_requested),
-            echo_cancellation_active: optional(f.echo_cancellation_active),
-            noise_suppression_active: optional(f.noise_suppression_active),
-            auto_gain_control_active: optional(f.auto_gain_control_active),
-            voice_processing_enabled_requested: optional(f.voice_processing_enabled_requested),
-            voice_processing_bypassed_requested: optional(f.voice_processing_bypassed_requested),
-            voice_processing_agc_enabled_requested: optional(
-                f.voice_processing_agc_enabled_requested,
-            ),
-            voice_processing_enabled_active: optional(f.voice_processing_enabled_active),
-            voice_processing_bypassed_active: optional(f.voice_processing_bypassed_active),
-            voice_processing_agc_enabled_active: optional(f.voice_processing_agc_enabled_active),
-        }
     }
 }

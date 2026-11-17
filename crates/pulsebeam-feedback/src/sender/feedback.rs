@@ -490,26 +490,33 @@ impl Sender {
                     self.add_unknown(report.statuses.len());
                     continue;
                 }
-                let unresolved_reported = (base.max(floor)..=last_reported)
-                    .filter(|&sequence| {
-                        self.lookup_packet(space, sequence)
-                            .and_then(|id| self.entry(id))
-                            .is_none_or(|entry| entry.path_epoch != epoch)
+                // Independent RTP indices may have unsent holes. A claimed receipt
+                // still needs a committed identity; missing holes cannot earn credit.
+                let invalid_reported = normalized
+                    .iter()
+                    .enumerate()
+                    .filter(|(offset, status)| {
+                        let sequence = base.saturating_add(*offset as u64);
+                        sequence >= floor
+                            && self
+                                .lookup_packet(space, sequence)
+                                .and_then(|id| self.entry(id))
+                                .map_or(status.received, |entry| entry.path_epoch != epoch)
                     })
                     .count();
-                let unresolved_advance = if received_edge.is_some_and(|edge| edge >= start) {
+                let invalid_advance = if received_edge.is_some_and(|edge| edge >= start) {
                     (start..base.min(edge.saturating_add(1)))
                         .filter(|&sequence| {
                             self.lookup_packet(space, sequence)
                                 .and_then(|id| self.entry(id))
-                                .is_none_or(|entry| entry.path_epoch != epoch)
+                                .is_some_and(|entry| entry.path_epoch != epoch)
                         })
                         .count()
                 } else {
                     0
                 };
-                if unresolved_reported + unresolved_advance != 0 {
-                    self.add_unknown(unresolved_reported + unresolved_advance);
+                if invalid_reported + invalid_advance != 0 {
+                    self.add_unknown(invalid_reported + invalid_advance);
                     continue;
                 }
                 for (offset, status) in normalized.iter().enumerate() {
@@ -529,7 +536,9 @@ impl Sender {
                 if received_edge.is_some() && edge >= start {
                     self.anchor_missing(None, Some((report.space, edge)), received_at);
                     for sequence in start..=edge {
-                        let sent_id = self.lookup_packet(space, sequence);
+                        let Some(sent_id) = self.lookup_packet(space, sequence) else {
+                            continue;
+                        };
                         let offset = sequence
                             .checked_sub(base)
                             .and_then(|value| usize::try_from(value).ok());
@@ -537,7 +546,14 @@ impl Sender {
                             .and_then(|index| normalized.get(index))
                             .map(|status| (status.received, status.arrival, status.ecn))
                             .unwrap_or((false, None, None));
-                        self.advance_entry(sent_id, epoch, received, arrival, ecn, received_at);
+                        self.advance_entry(
+                            Some(sent_id),
+                            epoch,
+                            received,
+                            arrival,
+                            ecn,
+                            received_at,
+                        );
                     }
                     if let Some(state) = self.spaces.get_mut(&space) {
                         state.highest_acked_sequence = Some(edge);

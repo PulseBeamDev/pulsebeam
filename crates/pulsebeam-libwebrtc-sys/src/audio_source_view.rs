@@ -56,16 +56,6 @@ impl AudioSourceView {
     pub fn options(&self) -> AudioSourceOptions {
         AudioSourceOptions::from_native(ffi::audio_source_view_options(self.native()))
     }
-    /// Native void invocation, not a promise of effective channel processing.
-    pub fn set_options(&self, options: &AudioSourceOptions) -> Result<(), AudioSourceControlError> {
-        AudioSourceControlError::result(ffi::audio_source_view_set_options(
-            self.native(),
-            &options.ffi(),
-        ))
-    }
-    pub fn volume(&self) -> f64 {
-        ffi::audio_source_view_volume(self.native())
-    }
     pub fn set_volume(&self, volume: f64) -> Result<(), AudioSourceControlError> {
         AudioSourceControlError::result(ffi::audio_source_view_set_volume(self.native(), volume))
     }

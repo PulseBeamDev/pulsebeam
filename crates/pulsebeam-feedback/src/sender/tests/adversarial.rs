@@ -782,3 +782,212 @@ fn repeated_profile_activation_preserves_funded_pending_history() {
         Acknowledgment::Missing { .. }
     ));
 }
+
+#[test]
+fn independent_feedback_crosses_unsent_sequence_holes_without_crediting_them() {
+    for reported_holes in [false, true] {
+        let mode = FeedbackMode::Independent;
+        let mut sender = sender(mode);
+        for sequence in [10, 12, 15] {
+            send(&mut sender, context(mode, SPACE, sequence));
+        }
+        feedback(
+            &mut sender,
+            mode,
+            SPACE,
+            10,
+            1,
+            ms(5),
+            &[RECEIVED, RECEIVED, RECEIVED],
+        );
+        assert_eq!(sender.bytes_in_flight, 3 * 123);
+        assert!(sender.inputs.feedback.is_empty());
+        let unknown = sender.counters.unknown_feedback;
+        assert!(unknown > 0, "a receipt for an unsent packet is invalid");
+
+        let mut credited = 0;
+        for (sequence, generation, holes) in [(10, 1, 0), (12, 2, 1), (15, 3, 2)] {
+            sender.clear_observations();
+            let statuses = if reported_holes {
+                let mut statuses = vec![MISSING; holes];
+                statuses.push(RECEIVED);
+                statuses
+            } else {
+                vec![RECEIVED]
+            };
+            let base = sequence - u64::try_from(statuses.len() - 1).unwrap();
+            feedback(
+                &mut sender,
+                mode,
+                SPACE,
+                base,
+                generation,
+                ms(u64::try_from(generation).unwrap() * 10),
+                &statuses,
+            );
+            assert!(sender.inputs.fresh_network_feedback);
+            assert_eq!(sender.inputs.feedback.len(), 1);
+            let observation = sender.inputs.feedback[0];
+            assert!(observation.received && observation.newly_acked);
+            assert!(!observation.lost && !observation.recovered);
+            credited += u64::from(observation.transport_bytes);
+            assert_eq!(sender.bytes_in_flight, 3 * 123 - credited);
+            assert_eq!(sender.counters.unknown_feedback, unknown);
+        }
+        assert_eq!(credited, 3 * 123);
+        assert_eq!(sender.counters.received, 3);
+        assert_eq!(sender.counters.not_received, 0);
+        sender.clear_observations();
+        feedback(
+            &mut sender,
+            mode,
+            SPACE,
+            14,
+            3,
+            ms(40),
+            &[MISSING, RECEIVED],
+        );
+        assert!(!sender.inputs.fresh_network_feedback);
+        assert!(sender.inputs.feedback.is_empty());
+        assert_eq!(sender.bytes_in_flight, 0);
+        sender.assert_storage();
+    }
+}
+
+#[test]
+fn held_overlapping_feedback_requires_receipt_evidence_and_credits_commits_once() {
+    for mode in [FeedbackMode::Continuous, FeedbackMode::Independent] {
+        let settings = SenderConfig {
+            retention: ms(1_000),
+            ..config()
+        };
+        let mut sender = Sender::new(settings, mode, 64 * 1024).unwrap();
+        sender.set_availability(EPOCH, true);
+        let lengths = [180, 1_180, 320, 920];
+        for (packet, wire_len) in lengths.into_iter().enumerate() {
+            send(
+                &mut sender,
+                SendCommit {
+                    at: ms(u64::try_from(packet).unwrap() * 20),
+                    wire_len,
+                    ..context(mode, SPACE, u64::try_from(packet).unwrap())
+                },
+            );
+        }
+        sender.clear_observations();
+        feedback(&mut sender, mode, SPACE, 0, 1, ms(200), &[MISSING; 4]);
+        sender.clear_observations();
+        sender.expire(ms(350), 4);
+        assert_eq!(sender.counters().not_received, 0);
+        assert_eq!(sender.observations().bytes_in_flight, 2_600);
+        assert!(sender.observations().synthetic.is_empty());
+        assert!(sender.next_deadline(ms(350)).unwrap() > ms(350));
+
+        let held = SendStatus {
+            hold: Some(ms(160)),
+            ..RECEIVED
+        };
+        feedback(
+            &mut sender,
+            mode,
+            SPACE,
+            0,
+            2,
+            ms(360),
+            &[MISSING, MISSING, held, MISSING],
+        );
+        let mut credited = sender
+            .observations()
+            .feedback
+            .iter()
+            .filter(|sample| sample.newly_acked)
+            .map(|sample| (sample.sent_id, sample.transport_bytes))
+            .collect::<Vec<_>>();
+        assert_eq!(sender.observations().bytes_in_flight, 920);
+        assert_eq!(
+            sender.observations().timing.unwrap().feedback_hold,
+            Some(ms(160))
+        );
+        let mut losses = Vec::new();
+        for _ in 0..4 {
+            sender.clear_observations();
+            assert!(sender.expire(ms(400), 4) <= 4);
+            losses.extend_from_slice(&sender.observations().synthetic);
+            if sender.next_deadline(ms(400)).unwrap() > ms(400) {
+                break;
+            }
+        }
+        assert!(sender.next_deadline(ms(400)).unwrap() > ms(400));
+        assert_eq!(sender.counters().not_received, 2);
+        assert_eq!(sender.observations().bytes_in_flight, 920);
+        assert_eq!(losses.len(), 2);
+        assert!(losses.iter().all(|sample| {
+            sample.lost && !sample.newly_acked && sample.loss_origin == Some(LossOrigin::Reordering)
+        }));
+
+        sender.clear_observations();
+        feedback(&mut sender, mode, SPACE, 0, 3, ms(420), &[held; 4]);
+        credited.extend(
+            sender
+                .observations()
+                .feedback
+                .iter()
+                .filter(|sample| sample.newly_acked)
+                .map(|sample| (sample.sent_id, sample.transport_bytes)),
+        );
+        assert_eq!(sender.observations().bytes_in_flight, 0);
+        assert_eq!(
+            sender.counters().not_received,
+            2,
+            "late receipt cannot refund terminal loss"
+        );
+        assert!(sender.observations().fresh_network_feedback);
+        assert_eq!(
+            sender
+                .observations()
+                .feedback
+                .iter()
+                .filter(|sample| sample.recovered)
+                .count(),
+            if mode == FeedbackMode::Independent {
+                3
+            } else {
+                0
+            }
+        );
+        credited.sort_unstable();
+        assert_eq!(
+            credited,
+            vec![
+                (SentPacketId(0), 180),
+                (SentPacketId(1), 1_180),
+                (SentPacketId(2), 320),
+                (SentPacketId(3), 920)
+            ]
+        );
+
+        for (generation, at) in [(3, 430), (2, 440)] {
+            sender.clear_observations();
+            feedback(&mut sender, mode, SPACE, 1, generation, ms(at), &[held; 3]);
+            assert!(sender.observations().feedback.is_empty());
+            assert!(!sender.observations().fresh_network_feedback);
+            assert!(sender.observations().timing.is_none());
+        }
+        send(
+            &mut sender,
+            SendCommit {
+                at: ms(450),
+                ..context(mode, SPACE, 4)
+            },
+        );
+        sender.clear_observations();
+        feedback(&mut sender, mode, SPACE, 2, 4, ms(650), &[held; 3]);
+        let observations = sender.observations();
+        assert_eq!(observations.bytes_in_flight, 0);
+        assert_eq!(observations.feedback.len(), 1);
+        assert_eq!(observations.feedback[0].sent_id, SentPacketId(4));
+        assert_eq!(observations.feedback[0].transport_bytes, 123);
+        assert!(observations.feedback[0].newly_acked && observations.feedback[0].received);
+        assert!(observations.fresh_network_feedback);
+    }
+}

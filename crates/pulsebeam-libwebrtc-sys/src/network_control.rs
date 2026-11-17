@@ -340,6 +340,178 @@ pub(crate) fn network_controller_invalid(source: &RustNetworkController, kind: u
 pub(crate) fn network_controller_ecn(source: &RustNetworkController) -> bool {
     source.with(false, |provider| provider.supports_ecn_adaptation())
 }
+/// Explicit initial SDK controller configuration for the bounded native replay seam.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkControllerReplayConfig {
+    pub constraints: TargetRateConstraints,
+    pub stream_based_config: StreamsConfig,
+    pub default_pacing_time_window: TimeDelta,
+}
+/// Real NetworkController callbacks accepted by the internal native replay seam.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum NetworkControllerReplayEvent {
+    NetworkAvailability(NetworkAvailability),
+    NetworkRouteChange(NetworkRouteChange),
+    ProcessInterval(ProcessInterval),
+    RemoteBitrateReport(RemoteBitrateReport),
+    RoundTripTimeUpdate(RoundTripTimeUpdate),
+    SentPacket(SentPacket),
+    ReceivedPacket(ReceivedPacket),
+    StreamsConfig(StreamsConfig),
+    TargetRateConstraints(TargetRateConstraints),
+    TransportLossReport(TransportLossReport),
+    TransportPacketsFeedback(TransportPacketsFeedback),
+    NetworkStateEstimate(NetworkStateEstimate),
+}
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkControllerReplayError {
+    TooManyEvents,
+    InvalidNativeInput,
+}
+/// Replays up to 4096 ordered callbacks through the actual native SDK factory adapter.
+/// A selected manual clock advances to initial constraints and each callback's
+/// local timestamp, which must be monotonic. Embedded receiver arrival times
+/// do not advance it. Internal QA support only; not a production controller API.
+#[doc(hidden)]
+pub fn network_controller_replay_for_test(
+    environment: &crate::Environment,
+    factory: &NetworkControllerFactory,
+    config: NetworkControllerReplayConfig,
+    events: &[NetworkControllerReplayEvent],
+) -> Result<Vec<NetworkControlUpdate>, NetworkControllerReplayError> {
+    if events.len() > 4096 {
+        return Err(NetworkControllerReplayError::TooManyEvents);
+    }
+    let mut messages = Vec::with_capacity(events.len());
+    let mut kinds = Vec::with_capacity(events.len());
+    for event in events {
+        let (kind, message) = match event {
+            NetworkControllerReplayEvent::NetworkAvailability(value) => (
+                0,
+                ffi::FfiNcMessage {
+                    network_availability: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::NetworkRouteChange(value) => (
+                1,
+                ffi::FfiNcMessage {
+                    network_route_change: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::ProcessInterval(value) => (
+                2,
+                ffi::FfiNcMessage {
+                    process_interval: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::RemoteBitrateReport(value) => (
+                3,
+                ffi::FfiNcMessage {
+                    remote_bitrate_report: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::RoundTripTimeUpdate(value) => (
+                4,
+                ffi::FfiNcMessage {
+                    round_trip_time_update: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::SentPacket(value) => (
+                5,
+                ffi::FfiNcMessage {
+                    sent_packet: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::ReceivedPacket(value) => (
+                6,
+                ffi::FfiNcMessage {
+                    received_packet: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::StreamsConfig(value) => (
+                7,
+                ffi::FfiNcMessage {
+                    streams_config: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::TargetRateConstraints(value) => (
+                8,
+                ffi::FfiNcMessage {
+                    target_rate_constraints: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::TransportLossReport(value) => (
+                9,
+                ffi::FfiNcMessage {
+                    transport_loss_report: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::TransportPacketsFeedback(value) => (
+                10,
+                ffi::FfiNcMessage {
+                    transport_packets_feedback: value.native(),
+                    ..Default::default()
+                },
+            ),
+            NetworkControllerReplayEvent::NetworkStateEstimate(value) => (
+                11,
+                ffi::FfiNcMessage {
+                    network_state_estimate: value.native(),
+                    ..Default::default()
+                },
+            ),
+        };
+        kinds.push(kind);
+        messages.push(message);
+    }
+    let initial_config = ffi::FfiNcConfig {
+        constraints: config.constraints.native(),
+        stream_based_config: config.stream_based_config.native(),
+        default_pacing_time_window: config.default_pacing_time_window.native_microsecond_bits(),
+    };
+    let source = Box::new(RustNetworkControllerFactory(
+        Some(factory.clone()),
+        Some(environment.clone()),
+    ));
+    let replies = if let Some(clock) = environment.manual_clock_source() {
+        ffi::network_controller_native_probe_controlled(
+            environment.native(),
+            clock.native(),
+            source,
+            initial_config,
+            &messages,
+            &kinds,
+        )
+    } else {
+        ffi::network_controller_native_probe(
+            environment.native(),
+            source,
+            initial_config,
+            &messages,
+            &kinds,
+        )
+    };
+    if replies.len() != events.len() || replies.iter().any(|reply| reply.failed) {
+        return Err(NetworkControllerReplayError::InvalidNativeInput);
+    }
+    Ok(replies
+        .into_iter()
+        .map(NetworkControlUpdate::from_native)
+        .collect())
+}
 #[cfg(test)]
 #[path = "network_control_tests.rs"]
 mod tests;

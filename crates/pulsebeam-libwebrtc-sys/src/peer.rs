@@ -787,6 +787,8 @@ impl PeerConnectionFactoryBuilder {
         self
     }
 
+    /// Select an explicit SDK worker alias. The pinned SDK routes media work
+    /// on the selected network thread, so a distinct native thread is rejected.
     pub fn worker_thread(mut self, thread: WorkerThread) -> Self {
         self.worker_thread = Some(thread);
         self
@@ -1134,14 +1136,29 @@ impl PeerConnectionFactoryBuilder {
             None::<WorkerThread>,
             None::<Environment>,
         );
-        let worker_thread = match (
-            self.worker_thread.or(device_worker),
-            &self.controlled_driver,
-        ) {
-            (Some(thread), _) => thread,
+        let worker_thread = match (self.worker_thread, &self.controlled_driver) {
+            (Some(thread), Some(_)) => thread,
+            (Some(thread), None) => {
+                if !thread.aliases_network_thread(&network_thread) {
+                    return Err(PeerError {
+                        kind: PeerErrorKind::UnsupportedOperation,
+                        message: "the pinned SDK uses its network thread for media worker dispatch; an explicit worker must alias the selected network thread".into(),
+                    });
+                }
+                thread
+            }
             (None, Some(driver)) => WorkerThread::from_native(driver.borrow_thread()),
-            (None, None) => WorkerThread::start().map_err(native_build_error)?,
+            (None, None) => network_thread.worker_alias(),
         };
+        if device_worker
+            .as_ref()
+            .is_some_and(|worker| !worker.aliases_network_thread(&network_thread))
+        {
+            return Err(PeerError {
+                kind: PeerErrorKind::UnsupportedOperation,
+                message: "the selected audio device worker must alias the selected network thread in the pinned SDK".into(),
+            });
+        }
         let signaling_thread = match (self.signaling_thread, &self.controlled_driver) {
             (Some(thread), _) => thread,
             (None, Some(driver)) => SignalingThread::from_native(driver.borrow_thread()),
@@ -1184,7 +1201,6 @@ impl PeerConnectionFactoryBuilder {
             ffi::new_peer_connection_factory(
                 environment.native(),
                 network_thread.native(),
-                worker_thread.native(),
                 signaling_thread.native(),
                 optional_ptr(self.network_manager.as_ref().map(|value| value.native())),
                 Box::new(crate::RustNetworkManagerFactory(
@@ -1279,8 +1295,8 @@ impl PeerConnectionFactoryBuilder {
             native,
             _environment: environment,
             _audio_device_environment: audio_device_environment,
-            _network_thread: network_thread,
             _worker_thread: worker_thread,
+            _network_thread: network_thread,
             _signaling_thread: signaling_thread,
             _controlled_driver: self.controlled_driver,
             audio_mixer_failure,
@@ -1321,11 +1337,7 @@ impl Default for PeerConnectionFactoryBuilder {
             video_encoder: None,
             video_decoder: None,
             native_audio: false,
-            native_audio_creation: ffi::FfiNativeAudioDeviceCreation {
-                layer: 0,
-                bypass: false,
-                helper: true,
-            },
+            native_audio_creation: ffi::FfiNativeAudioDeviceCreation { layer: 0 },
             #[cfg(all(feature = "native", target_os = "linux"))]
             audio_device_module: None,
             event_logging: false,
@@ -1346,8 +1358,9 @@ pub(crate) struct FactoryInner {
     native: cxx::UniquePtr<ffi::NativePeerConnectionFactory>,
     _environment: Environment,
     _audio_device_environment: Option<Environment>,
-    _network_thread: NetworkThread,
+    // The alias wrapper must be retired before its owning network thread.
     _worker_thread: WorkerThread,
+    _network_thread: NetworkThread,
     _signaling_thread: SignalingThread,
     audio_mixer_failure: Option<crate::AudioMixerFailureObserver>,
     _network_manager: Option<NetworkManagerProvider>,
@@ -1575,21 +1588,6 @@ impl PeerConnectionFactory {
         crate::AudioProcessingModule::admission(error)?;
         Ok(crate::AudioProcessingStatus(status))
     }
-    pub fn try_audio_processing_state(
-        &self,
-    ) -> Result<crate::AudioProcessingState, crate::AudioProcessorError> {
-        let state = self.audio_processing_state();
-        match state.failure {
-            Some(error) => Err(error),
-            None => Ok(state),
-        }
-    }
-    /// Inspect failure before interpreting component values, or use the
-    /// fallible try_audio_processing_state projection.
-    pub fn audio_processing_state(&self) -> crate::AudioProcessingState {
-        ffi::factory_audio_processing_state(self.native()).into()
-    }
-
     /// Create a native owning track container, not SDP routing or media sync.
     pub fn create_media_stream(&self, id: &str) -> Result<crate::LocalMediaStream, PeerError> {
         let native = ffi::create_media_stream(self.native(), id);

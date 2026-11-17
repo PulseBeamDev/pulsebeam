@@ -1,6 +1,6 @@
 // Copyright 2025 The WebRTC Project Authors. All rights reserved.
 // Rust port of scream_v2_parameters.{cc,h} at libwebrtc
-// 326fd06bb4d93900ed6947205b94cefd2413afca. See LICENSE and PATENTS.
+// 7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499. See LICENSE and PATENTS.
 
 use std::time::Duration;
 
@@ -21,6 +21,13 @@ pub(crate) struct Parameters {
     pub virtual_rtt: Duration,
     pub backoff_scale_factor_close_to_ref_window_i: f64,
     pub number_of_rtts_between_reset_ref_window_i_on_congestion: u32,
+    pub reduce_jitter: bool,
+    pub queue_delay_short_avg_g: f64,
+    pub queue_delay_long_avg_g: f64,
+    pub latency_diff_margin_1: Duration,
+    pub latency_diff_margin_2: Duration,
+    pub latency_diff_up_gain: f64,
+    pub latency_diff_down_gain: f64,
     pub ref_window_i_update_max_hold_rtts: u32,
     pub ref_window_overhead_min: f64,
     pub ref_window_overhead_max: f64,
@@ -81,12 +88,19 @@ pub(crate) const DEFAULT: Parameters = Parameters {
     multiplicative_increase_factor: 0.02,
     virtual_rtt: Duration::from_millis(25),
     backoff_scale_factor_close_to_ref_window_i: 2.0,
-    number_of_rtts_between_reset_ref_window_i_on_congestion: 100,
+    number_of_rtts_between_reset_ref_window_i_on_congestion: 100_000_000,
+    reduce_jitter: true,
+    queue_delay_short_avg_g: 1.0 / 5.0,
+    queue_delay_long_avg_g: 1.0 / 50.0,
+    latency_diff_margin_1: Duration::from_millis(1),
+    latency_diff_margin_2: Duration::from_millis(10),
+    latency_diff_up_gain: 20.0,
+    latency_diff_down_gain: 2.0,
     ref_window_i_update_max_hold_rtts: 50,
     ref_window_overhead_min: 1.5,
     ref_window_overhead_max: 3.0,
     min_max_data_in_flight_mss: 4,
-    queue_delay_avg_g: 1.0 / 4.0,
+    queue_delay_avg_g: 1.0 / 2.0,
     delay_min_and_latency_diff_avg_g: 1.0 / 32.0,
     queue_delay_min_threshold: Duration::from_millis(10),
     latency_diff_threshold: Duration::from_millis(10),

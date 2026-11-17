@@ -162,7 +162,7 @@ void Dispatch(const std::shared_ptr<NativeFrameTransformerHost::State>& state,
     request->Finish(); Count(provider->counts.wrong_frame); return;
   }
   webrtc::VideoCodecType codec = webrtc::kVideoCodecGeneric;
-  if (!state->audio) codec = static_cast<const webrtc::TransformableVideoFrameInterface&>(*frame).header().codec;
+  if (!state->audio) codec = static_cast<const webrtc::TransformableVideoFrameInterface&>(*frame).Metadata().GetCodec();
   auto owned = std::make_unique<NativeTransformableFrame>(std::move(frame), state->audio, codec);
   owned->set_provenance(request);
   Count(provider->counts.delivered);

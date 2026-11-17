@@ -1,0 +1,10 @@
+import("//build/toolchain/gcc_toolchain.gni")
+
+clang_toolchain("clang_x64") {
+  extra_cppflags = "-fno-fast-math -ffp-contract=off"
+  extra_asmflags = "-fno-fast-math -ffp-contract=off"
+  toolchain_args = {
+    current_cpu = "x64"
+    current_os = "linux"
+  }
+}

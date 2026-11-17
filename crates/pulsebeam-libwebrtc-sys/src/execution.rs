@@ -1023,7 +1023,19 @@ thread_handle!(NetworkThread, true);
 thread_handle!(WorkerThread, false);
 thread_handle!(SignalingThread, false);
 
+impl WorkerThread {
+    pub fn aliases_network_thread(&self, network: &NetworkThread) -> bool {
+        ffi::native_threads_same(self.native(), network.native())
+    }
+}
+
 impl NetworkThread {
+    /// Construct the SDK worker-role handle for this exact native network thread.
+    /// The alias shares ownership of the native thread.
+    pub fn worker_alias(&self) -> WorkerThread {
+        WorkerThread::from_native(ffi::thread_alias(self.native()))
+    }
+
     pub(crate) fn into_native(mut self) -> cxx::UniquePtr<ffi::NativeThread> {
         std::mem::replace(&mut self.native, cxx::UniquePtr::null())
     }

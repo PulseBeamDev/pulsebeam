@@ -464,8 +464,9 @@ void NativePacketSocketEvents::State::Attach(const std::shared_ptr<NativePacketS
       auto callback = [deliver](webrtc::AsyncPacketSocket*) {
         FfiSocketObservation value{}; value.kind = 2; deliver(std::move(value));
       };
-      if (observer->legacy) socket->SubscribeConnect(std::move(callback));
-      else socket->SubscribeConnect(observer.get(), std::move(callback));
+      // The SDK requires a tag now. Legacy removal remains logical below,
+      // retaining its callback until socket destruction as before.
+      socket->SubscribeConnect(observer.get(), std::move(callback));
       break;
     }
     case 3:

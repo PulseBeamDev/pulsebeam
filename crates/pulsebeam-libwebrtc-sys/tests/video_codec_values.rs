@@ -33,8 +33,8 @@ fn complete_sdp_value_retains_bytes_optional_presence_and_native_value_categorie
         Some(copy.clone())
     );
     let modes_only = format.with_scalability_modes(&[ScalabilityMode::L1T2]);
-    assert_eq!(modes_only.fields().packetization, Some(vec![]));
-    assert_eq!(modes_only.fields().tx_mode, Some(vec![0xff, 0]));
+    assert_eq!(modes_only.fields().packetization, None);
+    assert_eq!(modes_only.fields().tx_mode, None);
     assert_eq!(modes_only.fields().name, fields.name);
     assert!(modes_only.native_string_bytes().unwrap().contains(&0xff));
     assert_ne!(modes_only, format);

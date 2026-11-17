@@ -1,6 +1,6 @@
 //! Owning stock SDK transformable frames. Frame ownership is independent of
 //! callback delivery: retaining a frame does not retain its SDK callback queue.
-use crate::{RtpVideoHeader, TimeDelta, Timestamp, VideoFrameMetadata, ffi};
+use crate::{TimeDelta, Timestamp, VideoFrameMetadata, ffi};
 use std::{
     cell::Cell,
     fmt,
@@ -45,11 +45,12 @@ impl TransformableAudioFrameType {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransformableFrameError {
     UnsupportedSetter,
-    /// These pinned SDK constructors unconditionally abort and cannot be called.
+    /// Video-frame construction is not exposed through this binding.
     UnsupportedVideoConstructor,
     UnsafeMimeCodec,
     UnsafeAudioCaptureTime,
     CodecVariantAssociation,
+    PacketizerCodecMismatch,
     ReceiverMetadataAssertion,
     ReceiverMetadataEqualityConsumption,
     /// The pinned SDK exposes no causal current GFD/DD consumer context.
@@ -60,7 +61,7 @@ impl fmt::Display for TransformableFrameError {
         f.write_str(match self {
             Self::UnsupportedSetter => "the stock frame does not support this setter",
             Self::UnsupportedVideoConstructor => {
-                "the pinned SDK video frame constructor unconditionally aborts"
+                "video-frame construction is unavailable through this binding"
             }
             Self::UnsafeMimeCodec => {
                 "unnamed video codec reaches the native MIME formatting assertion"
@@ -70,6 +71,9 @@ impl fmt::Display for TransformableFrameError {
             }
             Self::CodecVariantAssociation => {
                 "the selected native metadata conversion requires another codec variant"
+            }
+            Self::PacketizerCodecMismatch => {
+                "metadata codec must match the stock sender's immutable packetizer codec"
             }
             Self::ReceiverMetadataAssertion => {
                 "the compiled receiver setter permits only frame ID and dependency changes"
@@ -92,6 +96,7 @@ fn status(value: i32) -> Result<(), TransformableFrameError> {
         5 => Err(TransformableFrameError::ReceiverMetadataAssertion),
         6 => Err(TransformableFrameError::ReceiverMetadataEqualityConsumption),
         7 => Err(TransformableFrameError::UnsupportedInstalledDependencyMutation),
+        8 => Err(TransformableFrameError::PacketizerCodecMismatch),
         _ => unreachable!("closed frame bridge status"),
     }
 }
@@ -344,12 +349,8 @@ impl TransformableVideoFrame {
         status(result)?;
         Ok(VideoFrameMetadata { native })
     }
-    pub fn header(&self) -> RtpVideoHeader {
-        RtpVideoHeader {
-            native: ffi::transformable_video_header(self.native()),
-        }
-    }
     /// Native mutation only. Success does not certify packetization/delivery.
+    /// Sender codec changes are rejected before mutating its private header.
     /// Installed frames retain native-generated dependency fields: this SDK
     /// cannot safely certify arbitrary current GFD/DD dependency rewrites.
     /// Receiver frames update header ID/dependencies but retain their cached

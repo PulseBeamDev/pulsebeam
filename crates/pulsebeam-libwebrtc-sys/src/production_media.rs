@@ -166,18 +166,6 @@ impl<R: SessionRuntime> Session<R> {
             .value
             .set_audio_volume(volume)
     }
-    pub fn set_media_track_should_receive(
-        &mut self,
-        track: SessionMediaTrackId,
-        receive: bool,
-    ) -> Result<(), PeerError> {
-        self.check_open()?;
-        self.media_tracks
-            .get(&track)
-            .ok_or_else(missing)?
-            .value
-            .set_should_receive(receive)
-    }
     pub fn set_media_track_content_hint(
         &mut self,
         track: SessionMediaTrackId,
@@ -190,19 +178,6 @@ impl<R: SessionRuntime> Session<R> {
             .value
             .set_content_hint(hint)
     }
-    pub fn set_media_track_audio_options(
-        &mut self,
-        track: SessionMediaTrackId,
-        options: &crate::AudioSourceOptions,
-    ) -> Result<crate::TrackAudioOptionsResult, PeerError> {
-        self.check_open()?;
-        self.media_tracks
-            .get(&track)
-            .ok_or_else(missing)?
-            .value
-            .set_audio_options(options)
-    }
-
     pub fn set_sender_stream_id_bytes(
         &mut self,
         sender: SessionSenderId,
@@ -460,17 +435,6 @@ impl<R: SessionRuntime> Session<R> {
             .ok_or_else(missing)?;
         Ok(())
     }
-    pub fn media_track_audio_volume(
-        &mut self,
-        track: SessionMediaTrackId,
-    ) -> Result<Option<f64>, PeerError> {
-        Ok(self
-            .media_tracks
-            .get(&track)
-            .ok_or_else(missing)?
-            .value
-            .audio_volume())
-    }
     pub fn media_track_signal_level(
         &mut self,
         track: SessionMediaTrackId,
@@ -481,17 +445,6 @@ impl<R: SessionRuntime> Session<R> {
             .ok_or_else(missing)?
             .value
             .signal_level())
-    }
-    pub fn media_track_should_receive(
-        &mut self,
-        track: SessionMediaTrackId,
-    ) -> Result<Option<bool>, PeerError> {
-        Ok(self
-            .media_tracks
-            .get(&track)
-            .ok_or_else(missing)?
-            .value
-            .should_receive())
     }
     pub fn media_track_content_hint(
         &mut self,

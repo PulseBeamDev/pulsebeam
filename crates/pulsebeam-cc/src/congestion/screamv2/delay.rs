@@ -1,6 +1,6 @@
 // Copyright 2025 The WebRTC Project Authors. All rights reserved.
 // Rust port of delay_based_congestion_control.{cc,h} at libwebrtc
-// 326fd06bb4d93900ed6947205b94cefd2413afca. See LICENSE and PATENTS.
+// 7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499. See LICENSE and PATENTS.
 
 use std::{collections::VecDeque, time::Duration};
 
@@ -13,6 +13,9 @@ pub(super) struct DelayController {
     pub queue_delay: Option<Duration>,
     pub queue_delay_min_avg: Duration,
     pub latency_difference_avg: Duration,
+    qdelay_short_avg: Duration,
+    qdelay_long_avg: Duration,
+    pub(super) queue_delay_trend: f64,
     next_base_delay: Option<i128>,
     base_delay_history: VecDeque<i128>,
     last_base_delay_update: Option<Duration>,
@@ -27,6 +30,9 @@ impl DelayController {
             queue_delay: None,
             queue_delay_min_avg: Duration::ZERO,
             latency_difference_avg: Duration::ZERO,
+            qdelay_short_avg: Duration::ZERO,
+            qdelay_long_avg: Duration::ZERO,
+            queue_delay_trend: 0.0,
             next_base_delay: None,
             base_delay_history: VecDeque::with_capacity(params.base_delay_window_length),
             last_base_delay_update: None,
@@ -77,21 +83,28 @@ impl DelayController {
             _ => sample,
         });
         self.last_queue_delay_sample = Some(min_queue_delay);
-        self.queue_delay_min_avg = ewma_duration(
-            self.queue_delay_min_avg,
-            min_queue_delay.min(params.queue_delay_min_threshold.saturating_mul(2)),
-            params.delay_min_and_latency_diff_avg_g,
-        );
-        self.latency_difference_avg = ewma_duration(
-            self.latency_difference_avg,
-            duration_micros(
-                metrics
-                    .max_one_way_delay
-                    .saturating_sub(metrics.min_one_way_delay),
-            )
-            .min(params.latency_diff_threshold.saturating_mul(2)),
-            params.delay_min_and_latency_diff_avg_g,
-        );
+        if params.reduce_jitter {
+            self.calculate_queue_delay_trend(
+                duration_micros(metrics.max_one_way_delay.saturating_sub(base)),
+                params,
+            );
+        } else {
+            self.queue_delay_min_avg = ewma_duration(
+                self.queue_delay_min_avg,
+                min_queue_delay.min(params.queue_delay_min_threshold.saturating_mul(2)),
+                params.delay_min_and_latency_diff_avg_g,
+            );
+            self.latency_difference_avg = ewma_duration(
+                self.latency_difference_avg,
+                duration_micros(
+                    metrics
+                        .max_one_way_delay
+                        .saturating_sub(metrics.min_one_way_delay),
+                )
+                .min(params.latency_diff_threshold.saturating_mul(2)),
+                params.delay_min_and_latency_diff_avg_g,
+            );
+        }
         if elapsed(now, self.last_base_delay_update) >= params.base_delay_history_update_interval {
             if self.base_delay_history.len() >= params.base_delay_window_length.max(1) {
                 self.base_delay_history.pop_front();
@@ -111,6 +124,37 @@ impl DelayController {
         self.queue_delay = None;
         self.queue_delay_min_avg = Duration::ZERO;
         self.latency_difference_avg = Duration::ZERO;
+        self.qdelay_short_avg = Duration::ZERO;
+        self.qdelay_long_avg = Duration::ZERO;
+        self.queue_delay_trend = 0.0;
+    }
+
+    fn calculate_queue_delay_trend(&mut self, max_queue_delay: Duration, params: Parameters) {
+        self.qdelay_short_avg = ewma_duration(
+            self.qdelay_short_avg,
+            max_queue_delay,
+            params.queue_delay_short_avg_g,
+        );
+        self.qdelay_long_avg = ewma_duration(
+            self.qdelay_long_avg,
+            max_queue_delay,
+            params.queue_delay_long_avg_g,
+        );
+
+        let diff_micros = i128::try_from(self.qdelay_short_avg.as_micros()).unwrap_or(i128::MAX)
+            - i128::try_from(self.qdelay_long_avg.as_micros()).unwrap_or(i128::MAX)
+            - i128::try_from(params.latency_diff_margin_1.as_micros()).unwrap_or(i128::MAX);
+        let margin = i128::try_from(params.latency_diff_margin_1.as_micros()).unwrap_or(i128::MAX);
+        let diff = diff_micros.clamp(-margin, margin) as f64 / 1_000_000.0;
+        if diff > 0.0 {
+            let low_queue_delay_scale = (self.queue_delay.unwrap_or_default().as_secs_f64()
+                / params.latency_diff_margin_2.as_secs_f64())
+            .min(1.0);
+            self.queue_delay_trend += params.latency_diff_up_gain * diff * low_queue_delay_scale;
+        } else {
+            self.queue_delay_trend += params.latency_diff_down_gain * diff;
+        }
+        self.queue_delay_trend = self.queue_delay_trend.clamp(0.0, 1.0);
     }
 
     pub fn is_queue_delay_detected(&self, params: Parameters) -> bool {
@@ -130,8 +174,12 @@ impl DelayController {
     }
 
     pub fn latency_difference_scale(&self, params: Parameters) -> f64 {
-        let norm = params.latency_diff_threshold.as_secs_f64();
-        (0.1 + 1.2 * (norm - self.latency_difference_avg.as_secs_f64()) / norm).clamp(0.1, 1.0)
+        if params.reduce_jitter {
+            1.0 - self.queue_delay_trend
+        } else {
+            let norm = params.latency_diff_threshold.as_secs_f64();
+            (0.1 + 1.2 * (norm - self.latency_difference_avg.as_secs_f64()) / norm).clamp(0.1, 1.0)
+        }
     }
 
     pub fn virtual_alpha(&self, params: Parameters) -> f64 {
@@ -164,9 +212,37 @@ mod tests {
         delay.update(Duration::from_millis(25), metrics(-460_000), false, DEFAULT);
         assert_eq!(delay.queue_delay, Some(Duration::ZERO));
         delay.update(Duration::from_millis(50), metrics(-460_000), false, DEFAULT);
-        assert_eq!(delay.queue_delay, Some(Duration::from_millis(10)));
+        // Native QDelayAvgG is 1/2, so this attack step averages 40 ms with 0.
+        assert_eq!(delay.queue_delay, Some(Duration::from_millis(20)));
         delay.update(Duration::from_millis(75), metrics(-500_000), false, DEFAULT);
         assert_eq!(delay.queue_delay, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn native_reduce_jitter_trend_uses_short_long_deadband_gain_and_clamp() {
+        let mut delay = DelayController::new(DEFAULT);
+        delay.queue_delay = Some(Duration::from_millis(10));
+        delay.calculate_queue_delay_trend(Duration::from_millis(20), DEFAULT);
+        assert_eq!(delay.qdelay_short_avg, Duration::from_millis(4));
+        assert_eq!(delay.qdelay_long_avg, Duration::from_micros(400));
+        assert!((delay.queue_delay_trend - 0.02).abs() < 1e-12);
+
+        delay.queue_delay_trend = 0.999;
+        delay.calculate_queue_delay_trend(Duration::from_millis(20), DEFAULT);
+        assert_eq!(delay.queue_delay_trend, 1.0);
+
+        delay.qdelay_short_avg = Duration::from_millis(20);
+        delay.qdelay_long_avg = Duration::from_millis(20);
+        delay.queue_delay_trend = 0.01;
+        delay.calculate_queue_delay_trend(Duration::ZERO, DEFAULT);
+        assert_eq!(delay.queue_delay_trend, 0.008);
+        assert_eq!(delay.latency_difference_scale(DEFAULT), 0.992);
+
+        delay.reset_queue_delay();
+        assert_eq!(delay.qdelay_short_avg, Duration::ZERO);
+        assert_eq!(delay.qdelay_long_avg, Duration::ZERO);
+        assert_eq!(delay.queue_delay_trend, 0.0);
+        assert_eq!(delay.latency_difference_scale(DEFAULT), 1.0);
     }
 
     #[test]

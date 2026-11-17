@@ -66,26 +66,18 @@ void NativeAudioTransport::PullRenderData(int bits, int rate, std::size_t channe
   auto f = Pcm(frames, channels * static_cast<std::size_t>(bits / 8), channels, rate); f.bits = bits;
   Render(std::move(f), true, output, nullptr, elapsed, ntp);
 }
-NativeAudioDeviceObserver::NativeAudioDeviceObserver(rust::Box<RustAudioDeviceCallbacks> p) noexcept : callbacks_(std::move(p)) {}
-NativeAudioDeviceObserver::~NativeAudioDeviceObserver() { audio_device_callbacks_dispose(*callbacks_); }
-void NativeAudioDeviceObserver::OnDevicesUpdated() { audio_device_observed(*callbacks_, false, 0); }
-void NativeAudioDeviceObserver::OnSpeechActivityEvent(webrtc::AudioDeviceModule::SpeechActivityEvent event) { audio_device_observed(*callbacks_, true, static_cast<std::int32_t>(event)); }
 std::unique_ptr<NativeAudioTransport> audio_transport_new(rust::Box<RustAudioDeviceCallbacks> p) noexcept { return std::make_unique<NativeAudioTransport>(std::move(p)); }
-std::unique_ptr<NativeAudioDeviceObserver> audio_device_observer_new(rust::Box<RustAudioDeviceCallbacks> p) noexcept { return std::make_unique<NativeAudioDeviceObserver>(std::move(p)); }
 
 struct NativeAudioDevice::State {
   webrtc::Thread* worker = nullptr;
   bool owns_module = true;
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> module;
-  // Retire accepted raw-pointer registrations only after final ADM release,
-  // including when a backend cannot synchronously unregister an observer.
   std::vector<std::unique_ptr<NativeAudioTransport>> transports;
-  std::vector<std::unique_ptr<NativeAudioDeviceObserver>> observers;
 };
 NativeAudioDevice::NativeAudioDevice(std::unique_ptr<State> state) noexcept : state_(std::move(state)) {}
 NativeAudioDevice::~NativeAudioDevice() {
   // Rust drops this owner before the explicitly consumed worker/environment.
-  state_->worker->BlockingCall([&] { if (state_->owns_module) { state_->module->StopRecording(); state_->module->StopPlayout(); state_->module->RegisterAudioCallback(nullptr); state_->module->SetObserver(nullptr); state_->module->Terminate(); } state_->module = nullptr; state_->transports.clear(); state_->observers.clear(); });
+  state_->worker->BlockingCall([&] { if (state_->owns_module) { state_->module->StopRecording(); state_->module->StopPlayout(); state_->module->RegisterAudioCallback(nullptr); state_->module->Terminate(); } state_->module = nullptr; state_->transports.clear(); });
 }
 NativeAudioDevice::State& NativeAudioDevice::state() noexcept { return *state_; }
 webrtc::Thread* NativeAudioDevice::worker() const noexcept { return state_->worker; }
@@ -96,16 +88,13 @@ std::unique_ptr<NativeAudioDevice> audio_device_from_factory(const NativePeerCon
   auto state = std::make_unique<NativeAudioDevice::State>(); state->module = std::move(module); state->worker = factory.worker_thread(); state->owns_module = false;
   return std::make_unique<NativeAudioDevice>(std::move(state));
 }
-std::unique_ptr<NativeAudioDevice> audio_device_new(const NativeEnvironment& environment, const NativeThread& worker, std::uint8_t layer, bool bypass, bool helper, std::uint8_t& error) noexcept {
+std::unique_ptr<NativeAudioDevice> audio_device_new(const NativeEnvironment& environment, const NativeThread& worker, std::uint8_t layer, std::uint8_t& error) noexcept {
   error = 0;
 #if defined(PULSEBEAM_WEBRTC_NATIVE_AUDIO)
-  // This pin declares Module::Create but supplies no definition. Do not turn
-  // that missing entry point into a null native result or a helper substitute.
-  if (!helper) { error = 2; return nullptr; }
   auto state = std::make_unique<NativeAudioDevice::State>(); state->worker = worker.thread();
   state->worker->BlockingCall([&] {
     const auto selected = static_cast<webrtc::AudioDeviceModule::AudioLayer>(layer);
-    state->module = webrtc::CreateAudioDeviceModule(environment.environment(), selected, bypass);
+    state->module = webrtc::CreateAudioDeviceModule(environment.environment(), selected);
   });
   if (!state->module) return nullptr;
   return std::make_unique<NativeAudioDevice>(std::move(state));
@@ -123,11 +112,6 @@ std::int32_t audio_device_register_transport(NativeAudioDevice& device, std::uni
     result = module.RegisterAudioCallback(transport.get());
     if (!result && transport) device.state().transports.push_back(std::move(transport));
   });
-  return result;
-}
-std::int32_t audio_device_register_observer(NativeAudioDevice& device, std::unique_ptr<NativeAudioDeviceObserver> observer) noexcept {
-  std::int32_t result = -1;
-  device.state().worker->BlockingCall([&] { result = device.state().module->SetObserver(observer.get()); if (!result && observer) device.state().observers.push_back(std::move(observer)); });
   return result;
 }
 FfiAudioDeviceResult audio_device_call(NativeAudioDevice& device, std::uint8_t operation, std::uint32_t argument) noexcept {
@@ -182,19 +166,13 @@ FfiAudioDeviceResult audio_device_call(NativeAudioDevice& device, std::uint8_t o
       case 44: { r.status = adm.EnableBuiltInAEC(argument != 0); break; }
       case 45: { r.status = adm.EnableBuiltInAGC(argument != 0); break; }
       case 46: { r.status = adm.EnableBuiltInNS(argument != 0); break; }
-      case 47: { r.bool_value = adm.PlatformVoiceProcessingPathIsAvailable(); break; }
-      case 48: { r.status = adm.EnablePlatformVoiceProcessingPath(argument != 0); break; }
-      case 49: { r.bool_value = adm.IsStopOnMuteModeEnabled(); break; }
       case 50: { r.status = adm.SetPlayoutDevice(static_cast<std::uint16_t>(argument)); break; }
       case 51: { r.status = adm.SetRecordingDevice(static_cast<std::uint16_t>(argument)); break; }
       case 52: { const auto count = adm.PlayoutDevices(); r.status = count < 0 ? count : 0; if (count >= 0) r.int_value = count; break; }
       case 53: { const auto count = adm.RecordingDevices(); r.status = count < 0 ? count : 0; if (count >= 0) r.int_value = count; break; }
       case 54: { r.int_value = static_cast<std::uint32_t>(adm.GetPlayoutUnderrunCount()); break; }
-      case 55: { r.int_value = static_cast<std::uint32_t>(adm.GetPlayoutDevice()); break; }
-      case 56: { r.int_value = static_cast<std::uint32_t>(adm.GetRecordingDevice()); break; }
       case 57: { std::uint16_t value = 0; r.status = adm.PlayoutDelay(&value); r.int_value = value; break; }
       case 58: { auto value = webrtc::AudioDeviceModule::kPlatformDefaultAudio; r.status = adm.ActiveAudioLayer(&value); r.int_value = static_cast<std::uint32_t>(value); break; }
-      case 59: { r.int_value = static_cast<std::uint32_t>(adm.GetPlatformAudioProcessingTopology()); break; }
       default: r.status = -1; break;
     }
   }); return r;
@@ -224,29 +202,6 @@ FfiAudioDeviceStatistics audio_device_statistics(NativeAudioDevice& device) noex
     f.total_capture_samples_duration_s = value->total_capture_samples_duration_s;
     f.total_capture_delay_s = value->total_capture_delay_s;
     f.total_capture_samples_count = value->total_capture_samples_count;
-  }); return f;
-}
-FfiAudioDevicePlatformState audio_device_platform_state(NativeAudioDevice& device) noexcept {
-  FfiAudioDevicePlatformState f{};
-  device.state().worker->BlockingCall([&] {
-    const auto value = device.state().module->GetPlatformAudioProcessingState();
-    const auto optional = [](std::optional<bool> v) -> std::uint8_t { return v ? (*v ? 2 : 1) : 0; };
-    f.topology = static_cast<std::int32_t>(value.topology);
-    f.echo_cancellation_available = value.is_echo_cancellation_available;
-    f.noise_suppression_available = value.is_noise_suppression_available;
-    f.auto_gain_control_available = value.is_auto_gain_control_available;
-    f.echo_cancellation_requested = optional(value.is_echo_cancellation_requested);
-    f.noise_suppression_requested = optional(value.is_noise_suppression_requested);
-    f.auto_gain_control_requested = optional(value.is_auto_gain_control_requested);
-    f.echo_cancellation_active = optional(value.is_echo_cancellation_active);
-    f.noise_suppression_active = optional(value.is_noise_suppression_active);
-    f.auto_gain_control_active = optional(value.is_auto_gain_control_active);
-    f.voice_processing_enabled_requested = optional(value.is_voice_processing_enabled_requested);
-    f.voice_processing_bypassed_requested = optional(value.is_voice_processing_bypassed_requested);
-    f.voice_processing_agc_enabled_requested = optional(value.is_voice_processing_agc_enabled_requested);
-    f.voice_processing_enabled_active = optional(value.is_voice_processing_enabled_active);
-    f.voice_processing_bypassed_active = optional(value.is_voice_processing_bypassed_active);
-    f.voice_processing_agc_enabled_active = optional(value.is_voice_processing_agc_enabled_active);
   }); return f;
 }
 }

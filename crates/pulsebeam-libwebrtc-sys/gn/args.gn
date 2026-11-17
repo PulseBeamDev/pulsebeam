@@ -7,6 +7,8 @@ use_lld = true
 rtc_include_tests = false
 rtc_build_examples = false
 rtc_build_tools = false
+# Keep the supported C++ implementation; Rust CXX is owned by the consumer.
+rtc_rust = false
 rtc_include_opus = true
 rtc_build_opus = true
 rtc_build_libvpx = true

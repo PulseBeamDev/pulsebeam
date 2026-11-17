@@ -559,3 +559,29 @@ fn repeated_partial_lifecycles_quiesce_on_drop() {
         drop(peer);
     }
 }
+
+#[test]
+fn explicit_worker_must_be_an_alias_of_the_selected_network_thread() {
+    let network = pulsebeam_webrtc_sys::NetworkThread::start().unwrap();
+    let distinct = pulsebeam_webrtc_sys::WorkerThread::start().unwrap();
+    let error = match PeerConnectionFactory::builder()
+        .network_thread(network)
+        .worker_thread(distinct)
+        .build()
+    {
+        Ok(_) => panic!("distinct explicit worker must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind, PeerErrorKind::UnsupportedOperation);
+    assert!(error.message.contains("must alias the selected network thread"));
+
+    let network = pulsebeam_webrtc_sys::NetworkThread::start().unwrap();
+    let worker_alias = network.worker_alias();
+    assert!(worker_alias.aliases_network_thread(&network));
+    let factory = PeerConnectionFactory::builder()
+        .network_thread(network)
+        .worker_thread(worker_alias)
+        .build()
+        .unwrap();
+    drop(factory);
+}

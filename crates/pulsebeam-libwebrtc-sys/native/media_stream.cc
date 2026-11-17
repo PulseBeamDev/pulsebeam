@@ -67,18 +67,12 @@ FfiVideoSourceInfo track_source_video_info(const NativeTrackSource& s) noexcept 
     out.has_stats = v.GetStats(&stats); if (out.has_stats) { out.input_width = stats.input_width; out.input_height = stats.input_height; }
   }); return out;
 }
-void media_track_set_volume(const NativeMediaTrack& t, double volume) noexcept { Audio(t)->SetVolume(volume); }
-void media_track_set_should_receive(const NativeMediaTrack& t, bool receive) noexcept { Video(t)->set_should_receive(receive); }
-void media_track_set_content_hint(const NativeMediaTrack& t, std::int32_t hint) noexcept { Video(t)->set_content_hint(static_cast<webrtc::VideoTrackInterface::ContentHint>(hint)); }
-FfiTrackAudioOptionsResult media_track_set_audio_options(const NativeMediaTrack& t, const FfiAudioSourceOptions& x) noexcept {
-  if (media_audio_options_check(x)) { FfiTrackAudioOptionsResult out; out.code = -1; out.message = Bytes("binding admission: invalid audio processing mode"); return out; }
-  const auto o = media_audio_options_read(x);
-  const auto result = Audio(t)->SetAudioProcessingOptions(o);
-  FfiTrackAudioOptionsResult out; out.code = static_cast<std::int32_t>(result.code); out.message = Bytes(result.message); return out;
+void media_track_set_volume(const NativeMediaTrack& t, double volume) noexcept {
+  if (auto* audio = Audio(t); audio && audio->GetSource())
+    audio->GetSource()->SetVolume(volume);
 }
-FfiOptionalF64 media_track_audio_volume(const NativeMediaTrack& t) noexcept { if (auto* a = Audio(t)) return {true, a->GetVolume()}; return {false, 0}; }
+void media_track_set_content_hint(const NativeMediaTrack& t, std::int32_t hint) noexcept { Video(t)->set_content_hint(static_cast<webrtc::VideoTrackInterface::ContentHint>(hint)); }
 FfiOptionalI32 media_track_signal_level(const NativeMediaTrack& t) noexcept { int level = 0; auto* a = Audio(t); bool ok = a && a->GetSignalLevel(&level); return {ok, level}; }
-std::int32_t media_track_should_receive(const NativeMediaTrack& t) noexcept { auto* v = Video(t); return v ? static_cast<std::int32_t>(v->should_receive()) : -1; }
 std::int32_t media_track_content_hint(const NativeMediaTrack& t) noexcept { auto* v = Video(t); return v ? static_cast<std::int32_t>(v->content_hint()) : -1; }
 struct NativeAudioProcessor::State {
   webrtc::scoped_refptr<webrtc::AudioProcessorInterface> processor;

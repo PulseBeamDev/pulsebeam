@@ -1,5 +1,7 @@
 use super::*;
 
+mod production_readiness;
+
 fn observation<'a>(feedback: &'a [FeedbackSample]) -> Observation<'a> {
     Observation {
         path_epoch: Some(1),
@@ -55,10 +57,6 @@ fn invalid_batch_is_transactional_and_time_is_not_consumed() {
             ..good
         },
         FeedbackSample {
-            recovered: true,
-            ..good
-        },
-        FeedbackSample {
             received: false,
             ecn: None,
             ..good
@@ -95,6 +93,28 @@ fn invalid_batch_is_transactional_and_time_is_not_consumed() {
         controller.update(Duration::ZERO, observation(&[])),
         Err(UpdateError::InvalidTime)
     );
+}
+
+#[test]
+fn delayed_host_processing_does_not_inflate_network_rtt() {
+    for processing_delay in [Duration::ZERO, Duration::from_millis(300)] {
+        let mut controller = started();
+        controller.commit_send(Duration::ZERO, 1_200, 1_200, false);
+        let feedback = [FeedbackSample {
+            received_at: Duration::from_millis(400),
+            ..sample()
+        }];
+        let envelope = controller
+            .update(
+                Duration::from_millis(400) + processing_delay,
+                Observation {
+                    feedback_hold: Duration::from_millis(100),
+                    ..observation(&feedback)
+                },
+            )
+            .unwrap();
+        assert_eq!(envelope.smoothed_rtt, Duration::from_millis(300));
+    }
 }
 
 #[test]

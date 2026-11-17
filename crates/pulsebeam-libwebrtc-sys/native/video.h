@@ -247,6 +247,8 @@ class NativeRtcError;
 class NativePeerConnection;
 struct FfiSframeEncrypterCreation;
 struct FfiSframeDecrypterCreation;
+struct RustSframeKeyCompletion;
+struct RustSframeDecryptErrorObserver;
 class NativeSframeEncrypter final {
  public:
   struct State;
@@ -269,12 +271,12 @@ struct FfiRtpByteString;
 class NativeRtpSender;
 class NativeRtpReceiver;
 FfiSframeEncrypterCreation rtp_sender_create_sframe(const NativeRtpSender& sender, const NativePeerConnection& peer, const NativeSframeEncrypterInit& init) noexcept;
-FfiSframeDecrypterCreation rtp_receiver_create_sframe(const NativeRtpReceiver& receiver, const NativePeerConnection& peer, std::int32_t suite) noexcept;
+FfiSframeDecrypterCreation rtp_receiver_create_sframe(const NativeRtpReceiver& receiver, const NativePeerConnection& peer, std::int32_t suite, rust::Box<RustSframeDecryptErrorObserver> observer) noexcept;
 std::unique_ptr<NativeSframeEncrypter> sframe_encrypter_clone(const NativeSframeEncrypter& value) noexcept;
 std::unique_ptr<NativeSframeDecrypter> sframe_decrypter_clone(const NativeSframeDecrypter& value) noexcept;
 std::unique_ptr<NativeRtcError> sframe_set_encryption_key(const NativeSframeEncrypter& value, std::uint64_t id, rust::Slice<const std::uint8_t> key) noexcept;
-std::unique_ptr<NativeRtcError> sframe_add_decryption_key(const NativeSframeDecrypter& value, std::uint64_t id, rust::Slice<const std::uint8_t> key) noexcept;
-std::unique_ptr<NativeRtcError> sframe_remove_decryption_key(const NativeSframeDecrypter& value, std::uint64_t id) noexcept;
+void sframe_add_decryption_key(const NativeSframeDecrypter& value, std::uint64_t id, rust::Slice<const std::uint8_t> key, rust::Box<RustSframeKeyCompletion> completion) noexcept;
+void sframe_remove_decryption_key(const NativeSframeDecrypter& value, std::uint64_t id, rust::Box<RustSframeKeyCompletion> completion) noexcept;
 
 class NativeRtpSender final {
  public:
@@ -532,8 +534,6 @@ bool video_track_set_enabled(const NativeVideoTrack& track,
                              bool enabled) noexcept;
 std::uint8_t video_track_state(const NativeVideoTrack& track) noexcept;
 rust::String video_track_kind(const NativeVideoTrack& track) noexcept;
-bool video_track_should_receive(const NativeVideoTrack& track) noexcept;
-void video_track_set_should_receive(const NativeVideoTrack& track, bool receive) noexcept;
 std::uint8_t video_track_content_hint(const NativeVideoTrack& track) noexcept;
 void video_track_set_content_hint(const NativeVideoTrack& track, std::uint8_t hint) noexcept;
 FfiVideoSinkWants video_sink_default_wants() noexcept;

@@ -163,30 +163,6 @@ impl AudioProcessor {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TrackAudioOptionsCode {
-    Applied,
-    Stored,
-    RejectedRemoteTrack,
-    RejectedInvalidCombination,
-    RejectedPlatformUnavailable,
-    ApplyFailed,
-    Other(i32),
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TrackAudioOptionsResult {
-    pub code: TrackAudioOptionsCode,
-    pub message: Vec<u8>,
-}
-impl TrackAudioOptionsResult {
-    pub fn ok(&self) -> bool {
-        matches!(
-            self.code,
-            TrackAudioOptionsCode::Applied | TrackAudioOptionsCode::Stored
-        )
-    }
-}
-
 fn boolean(x: i8) -> Option<bool> {
     match x {
         0 => Some(false),
@@ -205,19 +181,12 @@ impl MediaTrack {
             })
         }
     }
-    /// Forward the native void property update. No source/encoder state is fabricated.
-    pub fn set_should_receive(&self, receive: bool) -> Result<(), crate::PeerError> {
-        self.require_kind(MediaTrackKind::Video)?;
-        ffi::media_track_set_should_receive(self.native(), receive);
-        Ok(())
-    }
     pub fn set_content_hint(&self, hint: VideoContentHint) -> Result<(), crate::PeerError> {
         self.require_kind(MediaTrackKind::Video)?;
         ffi::media_track_set_content_hint(self.native(), hint as i32);
         Ok(())
     }
-    /// SDK volume domain is [0,10]. Some local sources inherit the SDK no-op;
-    /// read back the actual value instead of treating this void call as an echo.
+    /// Set the source's volume using the upstream AudioSourceInterface API.
     pub fn set_audio_volume(&self, volume: f64) -> Result<(), crate::PeerError> {
         self.require_kind(MediaTrackKind::Audio)?;
         if !volume.is_finite() || !(0.0..=10.0).contains(&volume) {
@@ -228,28 +197,6 @@ impl MediaTrack {
         }
         ffi::media_track_set_volume(self.native(), volume);
         Ok(())
-    }
-    /// Preserve every option and the actual SDK result code/message. Native
-    /// AudioTrack stores its supported processing subset, not unrelated jitter
-    /// or network options from this complete value.
-    pub fn set_audio_options(
-        &self,
-        options: &AudioSourceOptions,
-    ) -> Result<TrackAudioOptionsResult, crate::PeerError> {
-        self.require_kind(MediaTrackKind::Audio)?;
-        let x = ffi::media_track_set_audio_options(self.native(), &options.ffi());
-        Ok(TrackAudioOptionsResult {
-            code: match x.code {
-                0 => TrackAudioOptionsCode::Applied,
-                1 => TrackAudioOptionsCode::Stored,
-                2 => TrackAudioOptionsCode::RejectedRemoteTrack,
-                3 => TrackAudioOptionsCode::RejectedInvalidCombination,
-                4 => TrackAudioOptionsCode::RejectedPlatformUnavailable,
-                5 => TrackAudioOptionsCode::ApplyFailed,
-                other => TrackAudioOptionsCode::Other(other),
-            },
-            message: x.message,
-        })
     }
     pub fn source(&self) -> Option<MediaTrackSource> {
         let video = match self.kind() {
@@ -271,10 +218,6 @@ impl MediaTrack {
             MediaTrackSource::Audio(AudioTrackSource(inner))
         })
     }
-    pub fn audio_volume(&self) -> Option<f64> {
-        let x = ffi::media_track_audio_volume(self.native());
-        x.present.then_some(x.value)
-    }
     pub fn signal_level(&self) -> Option<i32> {
         let x = ffi::media_track_signal_level(self.native());
         x.present.then_some(x.value)
@@ -287,9 +230,6 @@ impl MediaTrack {
                 _track: self.clone(),
             }))
         })
-    }
-    pub fn should_receive(&self) -> Option<bool> {
-        boolean(ffi::media_track_should_receive(self.native()) as i8)
     }
     pub fn content_hint(&self) -> Option<VideoContentHint> {
         match ffi::media_track_content_hint(self.native()) {

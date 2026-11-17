@@ -188,7 +188,6 @@ pub struct VideoTrackStatus {
     pub kind: String,
     pub state: VideoTrackState,
     pub enabled: bool,
-    pub should_receive: bool,
     pub content_hint: VideoContentHint,
 }
 
@@ -1331,12 +1330,6 @@ impl VideoTrack {
     pub fn kind(&self) -> String {
         ffi::video_track_kind(self.native())
     }
-    pub fn should_receive(&self) -> bool {
-        ffi::video_track_should_receive(self.native())
-    }
-    pub fn set_should_receive(&self, receive: bool) {
-        ffi::video_track_set_should_receive(self.native(), receive);
-    }
     pub fn content_hint(&self) -> VideoContentHint {
         VideoContentHint::from_native(ffi::video_track_content_hint(self.native()))
     }
@@ -1349,7 +1342,6 @@ impl VideoTrack {
             kind: self.kind(),
             state: self.state(),
             enabled: self.enabled(),
-            should_receive: self.should_receive(),
             content_hint: self.content_hint(),
         }
     }
@@ -2688,9 +2680,16 @@ impl RtpReceiver {
         &self,
         suite: crate::SframeCipherSuite,
     ) -> Result<crate::SframeDecrypter, crate::SframeCreateError> {
+        let (observer, errors) = crate::sframe::sframe_decrypt_error_observer();
         crate::SframeDecrypter::from_creation(
-            ffi::rtp_receiver_create_sframe(self.native(), self.peer.native(), suite.raw()),
+            ffi::rtp_receiver_create_sframe(
+                self.native(),
+                self.peer.native(),
+                suite.raw(),
+                observer,
+            ),
             self.peer.clone(),
+            errors,
         )
     }
     /// Select caller transformation before the receiver's encoded collector.

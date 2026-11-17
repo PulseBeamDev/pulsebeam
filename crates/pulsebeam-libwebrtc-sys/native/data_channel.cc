@@ -5,6 +5,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -398,7 +399,7 @@ std::uint8_t data_channel_send(const NativeDataChannel& channel,
   if (queued >= capacity || data.size() > capacity - queued) {
     return kBackpressure;
   }
-  const webrtc::CopyOnWriteBuffer bytes(data.data(), data.size());
+  const webrtc::CopyOnWriteBuffer bytes(std::span(data.data(), data.size()));
   return native->Send(webrtc::DataBuffer(bytes, binary)) ? kSent : kSendFailed;
 }
 std::uint64_t data_channel_send_async(const NativeDataChannel& channel,
@@ -411,7 +412,7 @@ std::uint64_t data_channel_send_async(const NativeDataChannel& channel,
   completion->events = state.events;
   completion->id = id;
   state.channel->SendAsync(
-      webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(data.data(), data.size()), binary),
+      webrtc::DataBuffer(webrtc::CopyOnWriteBuffer(std::span(data.data(), data.size())), binary),
       [completion = std::move(completion)](webrtc::RTCError error) mutable {
         completion->Finish(error);
       });

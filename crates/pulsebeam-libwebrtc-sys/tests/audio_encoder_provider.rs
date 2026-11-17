@@ -5,7 +5,7 @@ use pulsebeam_webrtc_sys::{
     AudioEncoderOutput, AudioEncoderProductError, AudioEncoderProductFailureKind,
     AudioEncoderProductOperation, AudioEncoderProvider, BitrateAllocationUpdate,
     CallerAudioEncoder, DataRate, Environment, ManualClock, OwnedAudioEncoderOptions,
-    SdpAudioFormat, TimeDelta,
+    SdpAudioFormat,
 };
 use std::{
     sync::{
@@ -18,7 +18,8 @@ use std::{
 struct Pcm {
     encoder: AudioEncoder,
     calls: Arc<AtomicUsize>,
-    bandwidth: Arc<Mutex<Vec<(i32, Option<i64>)>>>,
+    allocations: Arc<Mutex<Vec<BitrateAllocationUpdate>>>,
+    target_bitrates: Arc<Mutex<Vec<i32>>>,
     contexts: Environment,
     corrupt: bool,
     panic_encode: bool,
@@ -80,13 +81,19 @@ impl AudioEncoderProvider for Pcm {
     fn frame_length_range(&mut self) -> Option<AudioEncoderFrameLengthRange> {
         self.encoder.frame_length_range()
     }
-    fn on_received_uplink_bandwidth(
+    fn on_received_target_audio_bitrate(
         &mut self,
         bitrate: i32,
-        period: Option<i64>,
     ) -> Result<(), AudioEncoderError> {
-        self.bandwidth.lock().unwrap().push((bitrate, period));
-        self.encoder.on_received_uplink_bandwidth(bitrate, period)
+        self.target_bitrates.lock().unwrap().push(bitrate);
+        self.encoder.on_received_target_audio_bitrate(bitrate)
+    }
+    fn on_received_uplink_allocation(
+        &mut self,
+        update: BitrateAllocationUpdate,
+    ) -> Result<(), AudioEncoderError> {
+        self.allocations.lock().unwrap().push(update);
+        self.encoder.on_received_uplink_allocation(update)
     }
 }
 fn setup(
@@ -97,7 +104,8 @@ fn setup(
 ) -> (
     CallerAudioEncoder,
     Arc<AtomicUsize>,
-    Arc<Mutex<Vec<(i32, Option<i64>)>>>,
+    Arc<Mutex<Vec<BitrateAllocationUpdate>>>,
+    Arc<Mutex<Vec<i32>>>,
 ) {
     let clock = ManualClock::new(Duration::from_millis(17)).unwrap();
     let environment = Environment::builder().clock(&clock).build().unwrap();
@@ -113,13 +121,15 @@ fn setup(
         .unwrap()
         .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
-    let bandwidth = Arc::new(Mutex::new(Vec::new()));
+    let allocations = Arc::new(Mutex::new(Vec::new()));
+    let target_bitrates = Arc::new(Mutex::new(Vec::new()));
     let product = CallerAudioEncoder::from_provider(
         &environment,
         Pcm {
             encoder,
             calls: calls.clone(),
-            bandwidth: bandwidth.clone(),
+            allocations: allocations.clone(),
+            target_bitrates: target_bitrates.clone(),
             contexts: environment.clone(),
             corrupt,
             panic_encode,
@@ -131,13 +141,13 @@ fn setup(
     drop(options);
     drop(environment);
     drop(clock);
-    (product, calls, bandwidth)
+    (product, calls, allocations, target_bitrates)
 }
 #[test]
 fn owning_caller_product_delegates_real_pcm_and_survives_migrated_use() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<CallerAudioEncoder>();
-    let (product, calls, _) = setup(false, false, false, false);
+    let (product, calls, _, _) = setup(false, false, false, false);
     let alias = product.clone();
     assert_eq!(product.sample_rate_hz(), Ok(8000));
     assert_eq!(product.channels(), Ok(1));
@@ -169,14 +179,13 @@ fn owning_caller_product_delegates_real_pcm_and_survives_migrated_use() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 #[test]
-fn default_controls_keep_native_absence_and_bandwidth_delegation() {
-    let (product, _, bandwidth) = setup(false, false, false, false);
+fn target_and_allocation_callbacks_preserve_supported_sdk_values() {
+    let (product, _, allocations, target_bitrates) = setup(false, false, false, false);
     assert_eq!(product.set_fec(false), Ok(true));
     assert_eq!(product.set_fec(true), Ok(false));
     assert_eq!(product.set_dtx(false), Ok(true));
     assert_eq!(product.set_dtx(true), Ok(false));
     assert_eq!(product.dtx(), Ok(false));
-    assert_eq!(product.enable_audio_network_adaptor(b"\xff\0"), Ok(false));
     assert!(
         product
             .network_adaptation_statistics()
@@ -185,55 +194,15 @@ fn default_controls_keep_native_absence_and_bandwidth_delegation() {
             .is_none()
     );
     product.on_received_target_audio_bitrate(-1).unwrap();
-    product
-        .on_received_uplink_allocation(BitrateAllocationUpdate {
-            target_bitrate: DataRate::BitsPerSecond(i64::MAX - 1),
-            bwe_period: TimeDelta::from_microseconds(-1500).unwrap(),
-            ..BitrateAllocationUpdate::default()
-        })
-        .unwrap();
-    assert_eq!(
-        *bandwidth.lock().unwrap(),
-        vec![
-            (-1, None),
-            (
-                -2,
-                Some(
-                    TimeDelta::from_microseconds(-1500)
-                        .unwrap()
-                        .millis()
-                        .unwrap()
-                )
-            )
-        ]
-    );
-    match product.on_received_uplink_allocation(BitrateAllocationUpdate::default()) {
-        Err(error) => assert_eq!(
-            error,
-            AudioEncoderProductError {
-                operation: AudioEncoderProductOperation::UplinkAllocation,
-                kind: AudioEncoderProductFailureKind::Provider(AudioEncoderError::InvalidControl),
-            }
-        ),
-        Ok(()) => assert_eq!(
-            bandwidth.lock().unwrap().last().copied(),
-            Some((0, Some(9_223_372_036_854_776)))
-        ),
-    }
-    match product.on_received_uplink_allocation(BitrateAllocationUpdate {
-        target_bitrate: DataRate::PositiveInfinity,
-        bwe_period: TimeDelta::minus_infinity(),
+    let update = BitrateAllocationUpdate {
+        target_bitrate: DataRate::BitsPerSecond(32_000),
+        packet_loss_ratio: 0.25,
+        packet_overhead: pulsebeam_webrtc_sys::DataSize::Bytes(17),
         ..BitrateAllocationUpdate::default()
-    }) {
-        Err(error) => assert_eq!(
-            error.kind,
-            AudioEncoderProductFailureKind::Provider(AudioEncoderError::InvalidControl)
-        ),
-        Ok(()) => assert_eq!(
-            bandwidth.lock().unwrap().last().copied(),
-            Some((-1, Some(-9_223_372_036_854_776)))
-        ),
-    }
+    };
+    product.on_received_uplink_allocation(update).unwrap();
+    assert_eq!(*target_bitrates.lock().unwrap(), vec![-1]);
+    assert_eq!(*allocations.lock().unwrap(), vec![update]);
     assert_eq!(
         product
             .on_received_uplink_recoverable_packet_loss_fraction(0.0)
@@ -246,7 +215,7 @@ fn default_controls_keep_native_absence_and_bandwidth_delegation() {
 }
 #[test]
 fn malformed_owned_output_is_rejected_not_repaired_or_replaced_by_buffering() {
-    let (product, calls, _) = setup(true, false, false, false);
+    let (product, calls, _, _) = setup(true, false, false, false);
     assert_eq!(
         product.encode(100, &[0; 80]).err(),
         Some(AudioEncoderProductError {
@@ -264,7 +233,7 @@ fn malformed_owned_output_is_rejected_not_repaired_or_replaced_by_buffering() {
 }
 #[test]
 fn callback_panic_is_typed_and_disables_further_provider_entry() {
-    let (product, calls, _) = setup(false, true, false, false);
+    let (product, calls, _, _) = setup(false, true, false, false);
     let observer = product.failure_observer();
     let error = AudioEncoderProductError {
         operation: AudioEncoderProductOperation::Encode,
@@ -285,7 +254,7 @@ fn callback_panic_is_typed_and_disables_further_provider_entry() {
 }
 #[test]
 fn destructor_failure_observer_outlives_last_owner() {
-    let (product, _, _) = setup(false, false, true, false);
+    let (product, _, _, _) = setup(false, false, true, false);
     let observer = product.failure_observer();
     let alias = product.clone();
     drop(product);
@@ -301,7 +270,7 @@ fn destructor_failure_observer_outlives_last_owner() {
 }
 #[test]
 fn standalone_shape_uses_native_unsigned_wrap_not_a_metadata_whitelist() {
-    let (product, calls, _) = setup(false, false, false, true);
+    let (product, calls, _, _) = setup(false, false, false, true);
     assert_eq!(product.channels(), Ok(1usize << (usize::BITS - 1)));
     // Native size_t channels*100 wraps to zero. This is observation/standalone
     // dispatch, not authorization to feed that metadata to SDK media consumers.
@@ -317,7 +286,7 @@ fn standalone_shape_uses_native_unsigned_wrap_not_a_metadata_whitelist() {
 
 #[test]
 fn mutable_caller_callbacks_serialize_concurrent_real_codec_operations() {
-    let (product, calls, _) = setup(false, false, false, false);
+    let (product, calls, _, _) = setup(false, false, false, false);
     let mut threads = Vec::new();
     for lane in 0..4 {
         let product = product.clone();

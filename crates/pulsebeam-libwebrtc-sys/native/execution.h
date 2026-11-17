@@ -377,6 +377,9 @@ std::int64_t driver_next_deadline_us(const NativeDriverThread& driver) noexcept;
 bool driver_is_current(const NativeDriverThread& driver) noexcept;
 bool thread_is_owned(const NativeThread& thread) noexcept;
 bool thread_is_current(const NativeThread& thread) noexcept;
+bool native_threads_same(const NativeThread& left,
+                         const NativeThread& right) noexcept;
+std::unique_ptr<NativeThread> thread_alias(const NativeThread& thread) noexcept;
 bool thread_requires_retirement(const NativeThread& thread) noexcept;
 bool thread_post_task(const NativeThread& thread,
                       rust::Box<RustTask> task) noexcept;

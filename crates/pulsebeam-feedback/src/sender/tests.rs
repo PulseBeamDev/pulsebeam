@@ -2,6 +2,7 @@ use super::*;
 use crate::allocation::allocations;
 
 mod adversarial;
+mod production_readiness;
 
 const EPOCH: Epoch = Epoch(70);
 const SPACE: SpaceId = SpaceId(1_u64 << 40);

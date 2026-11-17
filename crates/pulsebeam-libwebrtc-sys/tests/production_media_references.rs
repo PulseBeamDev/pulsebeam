@@ -72,31 +72,11 @@ fn migrated_actor_owns_native_stream_source_and_bounded_notifier_references() {
             .is_none()
     );
     assert_eq!(session.media_track_signal_level(track).unwrap(), None);
-    assert_eq!(session.media_track_audio_volume(track).unwrap(), Some(1.0));
     assert!(
         session
             .track_source_audio_options(local_source)
             .unwrap()
             .is_some()
-    );
-    let outcome = session
-        .set_media_track_audio_options(
-            track,
-            &AudioSourceOptions {
-                highpass_filter: Some(true),
-                highpass_filter_mode: Some(AudioProcessingMode::Software),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    assert_eq!(outcome.code, TrackAudioOptionsCode::Stored);
-    assert_eq!(
-        session
-            .track_source_audio_options(local_source)
-            .unwrap()
-            .unwrap()
-            .highpass_filter,
-        Some(true)
     );
     let mut received = None;
     let op = session.create_offer(left, false).unwrap();
@@ -184,17 +164,6 @@ fn migrated_actor_owns_native_stream_source_and_bounded_notifier_references() {
         assert_eq!(session.take_media_track_dropped_events(track).unwrap(), 0);
         assert!(session.track_source_remote(remote_source).unwrap());
         session.set_media_track_volume(remote_track, 3.25).unwrap();
-        assert_eq!(
-            session.media_track_audio_volume(remote_track).unwrap(),
-            Some(3.25)
-        );
-        assert_eq!(
-            session
-                .set_media_track_audio_options(remote_track, &AudioSourceOptions::default())
-                .unwrap()
-                .code,
-            TrackAudioOptionsCode::RejectedRemoteTrack
-        );
         session.shutdown().unwrap();
         assert_eq!(
             session.media_track_state(remote_track).unwrap(),
@@ -227,7 +196,7 @@ fn migrated_actor_owns_native_stream_source_and_bounded_notifier_references() {
 }
 
 #[test]
-fn migrated_actor_forwards_video_track_controls_to_the_actual_sdk() {
+fn migrated_actor_forwards_video_content_hint_to_the_actual_sdk() {
     let mut session = ProductionSession::new(ProductionSessionConfig {
         video_format: Some(VideoCodecFormat::new("VP8")),
     })
@@ -247,17 +216,6 @@ fn migrated_actor_forwards_video_track_controls_to_the_actual_sdk() {
     let track = session.sender_track_reference(sender).unwrap().unwrap();
     let source = session.media_track_source(track).unwrap().unwrap();
     std::thread::spawn(move || {
-        assert_eq!(
-            session.media_track_should_receive(track).unwrap(),
-            Some(true)
-        );
-        session
-            .set_media_track_should_receive(track, false)
-            .unwrap();
-        assert_eq!(
-            session.media_track_should_receive(track).unwrap(),
-            Some(false)
-        );
         session
             .set_media_track_content_hint(track, VideoContentHint::Detailed)
             .unwrap();

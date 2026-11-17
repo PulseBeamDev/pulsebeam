@@ -220,7 +220,7 @@ fn drive_pcm_tones(
 }
 
 #[test]
-fn source_options_reconfigure_active_bidirectional_pcm_without_false_volume_gain() {
+fn caller_fed_audio_survives_upstream_source_volume_calls() {
     let encoder = AudioEncoderFactory::builtin().unwrap();
     let decoder = AudioDecoderFactory::builtin_opus().unwrap();
     let mut session = ProductionSession::builder(ProductionSessionConfig::default())
@@ -264,38 +264,7 @@ fn source_options_reconfigure_active_bidirectional_pcm_without_false_volume_gain
     let (session, later) = thread::spawn(move || {
         let mut session = session;
         let mut call = call;
-        let options = AudioSourceOptions {
-            // Source options reach only the send channel, not NetEq. Preserve
-            // the full value rather than pretending to set receive capacity.
-            audio_jitter_buffer_max_packets: Some(i32::MAX),
-            audio_jitter_buffer_fast_accelerate: Some(false),
-            audio_jitter_buffer_min_delay_ms: Some(0),
-            stereo_swapping: Some(false),
-            audio_network_adaptor: Some(false),
-            audio_network_adaptor_config: Some(vec![0, 0xff, 0]),
-            init_recording_on_send: Some(false),
-            ..AudioSourceOptions::default()
-        };
         for index in 0..2 {
-            session
-                .set_audio_source_options(sources[index], &options)
-                .unwrap();
-            assert_eq!(
-                session.audio_source_options(sources[index]).unwrap(),
-                options
-            );
-            let mut rejected = options.clone();
-            rejected.noise_suppression_mode = Some(AudioProcessingMode::Unknown(99));
-            rejected.stereo_swapping = Some(true);
-            assert!(
-                session
-                    .set_audio_source_options(sources[index], &rejected)
-                    .is_err()
-            );
-            assert_eq!(
-                session.audio_source_options(sources[index]).unwrap(),
-                options
-            );
             assert!(
                 session
                     .set_audio_source_volume(sources[index], f64::NAN)
@@ -305,56 +274,9 @@ fn source_options_reconfigure_active_bidirectional_pcm_without_false_volume_gain
                 .set_audio_source_volume(sources[index], 0.0)
                 .unwrap();
             session.set_audio_track_volume(senders[index], 0.0).unwrap();
-            assert_eq!(session.audio_source_volume(sources[index]).unwrap(), 1.0);
-            assert_eq!(
-                session
-                    .audio_track_status(senders[index])
-                    .unwrap()
-                    .unwrap()
-                    .volume,
-                1.0
-            );
-            // Native source notification alone does not notify an unchanged
-            // live track. Reattach through SetTrack so SetSend genuinely reads
-            // the new options on the actual send channel.
-            if index == 0 {
-                session
-                    .replace_audio_source(senders[index], Some(sources[index]), "retuned-0")
-                    .unwrap();
-            } else {
-                let stream = session.create_media_stream("retuning").unwrap();
-                let original = session
-                    .create_source_track(sources[index], "retuned-1")
-                    .unwrap();
-                assert!(
-                    session
-                        .local_add_media_stream_track(stream, original)
-                        .unwrap()
-                );
-                let alias = session
-                    .find_media_stream_audio_track(stream, "retuned-1")
-                    .unwrap()
-                    .unwrap();
-                session.release_media_stream_track(original);
-                session.local_release_media_stream(stream);
-                session
-                    .replace_sender_track(senders[index], Some(alias))
-                    .unwrap();
-                let installed = session.sender_track(senders[index]).unwrap().unwrap();
-                assert!(session.media_stream_tracks_same(alias, installed).unwrap());
-                session.release_media_stream_track(alias);
-                session.release_media_stream_track(installed);
-            }
         }
         let later = drive_pcm_tones(&mut session, &mut call, peers, sources);
         for source in sources {
-            session
-                .set_audio_source_options(source, &AudioSourceOptions::default())
-                .unwrap();
-            assert_eq!(
-                session.audio_source_options(source).unwrap(),
-                AudioSourceOptions::default()
-            );
             session
                 .push_pcm(
                     source,
@@ -531,7 +453,6 @@ fn remote_audio_views_and_observers_survive_identifier_retirement_and_migration(
         for value in [0.0, 0.25, 0.5] {
             session.set_audio_source_view_volume(alias, value).unwrap();
         }
-        assert_eq!(session.audio_source_view_volume(alias).unwrap(), 0.5);
         assert_eq!(session.take_audio_observer_dropped(volume).unwrap(), 1);
         assert_eq!(session.take_audio_observer_dropped(volume).unwrap(), 0);
         session.close_audio_observer(volume).unwrap();
@@ -553,12 +474,10 @@ fn remote_audio_views_and_observers_survive_identifier_retirement_and_migration(
                 .unwrap()
         );
         session.close_audio_observer(track).unwrap();
-        let mut options = AudioSourceOptions::default();
-        options.stereo_swapping = Some(false);
-        session
-            .set_audio_source_view_options(installed, &options)
-            .unwrap();
-        assert_eq!(session.audio_source_options(sources[0]).unwrap(), options);
+        assert_eq!(
+            session.audio_source_options(sources[0]).unwrap(),
+            AudioSourceOptions::default()
+        );
         let later = drive_pcm_tones(&mut session, &mut call, peers, sources);
         session.close_source(sources[0]).unwrap();
         assert_eq!(
@@ -606,14 +525,12 @@ fn remote_audio_views_and_observers_survive_identifier_retirement_and_migration(
             );
         }
         assert_eq!(session.try_audio_observer_event(track).unwrap(), None);
-        // Both options-change and producer-ended callbacks remain available
-        // after the producer identifier and all outer source-view IDs retire.
-        for _ in 0..2 {
-            assert_eq!(
-                session.try_audio_observer_event(producer).unwrap(),
-                Some(AudioObserverEvent::Changed)
-            );
-        }
+        // The SDK source observer reports the producer's ended transition;
+        // this owned PushAudioSource has no mutable options callback.
+        assert_eq!(
+            session.try_audio_observer_event(producer).unwrap(),
+            Some(AudioObserverEvent::Changed)
+        );
         assert_eq!(session.try_audio_observer_event(producer).unwrap(), None);
         session.close_peer(peers[0]).unwrap();
         session.close_peer(peers[1]).unwrap();
@@ -721,7 +638,6 @@ fn replacing_one_opus_source_preserves_native_sender_and_unrelated_payloads() {
                 AudioSourceState::Live
             );
             assert!(!session.audio_source_is_remote(source).unwrap());
-            assert_eq!(session.audio_source_volume(source).unwrap(), 1.0);
             assert_eq!(
                 session.audio_source_options(source).unwrap(),
                 AudioSourceOptions::default()
@@ -1082,32 +998,13 @@ fn raw_media_crosses_native_call_and_retains_owned_output_after_replacement_and_
             .set_video_track_content_hint(local_track, VideoContentHint::Fluid)
             .unwrap();
         session
-            .set_video_track_content_hint(local_track, VideoContentHint::Fluid)
-            .unwrap();
-        session
-            .set_video_track_should_receive(local_track, false)
-            .unwrap();
-        session
-            .set_video_track_should_receive(local_track, false)
+            .set_video_track_content_hint(local_track, VideoContentHint::Detailed)
             .unwrap();
         let status = session.video_track_status(local_track).unwrap();
         assert_eq!(status.kind, "video");
-        assert!(!status.should_receive);
-        assert_eq!(status.content_hint, VideoContentHint::Fluid);
-        // Exercise the actual receiver stop/restart control before native media.
-        session
-            .set_video_track_should_receive(remote_track, false)
-            .unwrap();
-        session
-            .set_video_track_should_receive(remote_track, true)
-            .unwrap();
-        assert!(
-            session
-                .video_track_status(remote_track)
-                .unwrap()
-                .should_receive
-        );
-        session.close_video_observer(receive_events).unwrap();
+        assert!(status.enabled);
+        assert_eq!(status.content_hint, VideoContentHint::Detailed);
+        // Keep the remote-track observer active after its track ID retires.
         session.release_media_stream_track(local_track);
         session.release_media_stream_track(remote_track);
         (
@@ -1404,6 +1301,7 @@ fn raw_media_crosses_native_call_and_retains_owned_output_after_replacement_and_
             VideoSourceState::Ended
         );
         session.close_video_observer(remote_events).unwrap();
+        session.close_video_observer(receive_events).unwrap();
         session.release_video_source_view(remote);
         for observer in [source_events, remote_events] {
             assert_eq!(
@@ -1413,16 +1311,20 @@ fn raw_media_crosses_native_call_and_retains_owned_output_after_replacement_and_
             assert_eq!(session.try_video_observer_event(observer).unwrap(), None);
             session.release_video_observer(observer);
         }
-        for observer in [track_events, receive_events] {
-            for _ in 0..2 {
-                assert_eq!(
-                    session.try_video_observer_event(observer).unwrap(),
-                    Some(VideoObserverEvent::Changed)
-                );
-            }
-            assert_eq!(session.try_video_observer_event(observer).unwrap(), None);
-            session.release_video_observer(observer);
+        for _ in 0..2 {
+            assert_eq!(
+                session.try_video_observer_event(track_events).unwrap(),
+                Some(VideoObserverEvent::Changed)
+            );
         }
+        assert_eq!(session.try_video_observer_event(track_events).unwrap(), None);
+        session.release_video_observer(track_events);
+        assert_eq!(
+            session.try_video_observer_event(receive_events).unwrap(),
+            Some(VideoObserverEvent::Changed)
+        );
+        assert_eq!(session.try_video_observer_event(receive_events).unwrap(), None);
+        session.release_video_observer(receive_events);
         session.shutdown().unwrap();
         session.shutdown().unwrap();
         drop(session);

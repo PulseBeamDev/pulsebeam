@@ -748,6 +748,7 @@ pub enum Step {
         participant: &'static str,
         publisher: &'static str,
         min_resolution: (u32, u32),
+        temporal_index: Option<u8>,
         timeout: Duration,
     },
     /// Complete fixed-full-rate input interval, followed only by its event deadlines.
@@ -1284,12 +1285,14 @@ struct ParticipantShared {
 impl ParticipantShared {
     fn record_observation(&self, observation: ClientObservation) -> anyhow::Result<()> {
         let mut sources = self.interval_audio_sources.lock().unwrap();
-        for id in observation.snapshot.audio_mapping.values() {
+        for (index, id) in &observation.snapshot.audio_mapping {
+            // Installed receivers can outlive discovery until explicit retirement.
             let publication = observation
                 .snapshot
                 .publications
                 .get(id)
-                .context("public audio assignment has no publication")?;
+                .or_else(|| observation.owned_receiver_publication(*index, id))
+                .context("public audio assignment has no publication or owned receiver")?;
             anyhow::ensure!(
                 publication.kind == pulsebeam_agent_native::agent_core::MediaKind::Audio,
                 "public audio assignment has the wrong kind"
@@ -1953,6 +1956,7 @@ fn current_source_proof(
     participant: &str,
     publisher: &str,
     since: Instant,
+    temporal_index: Option<u8>,
 ) -> anyhow::Result<super::native_origin::NativeOriginProof> {
     let (origin, generation) = source_context(handles, participant, publisher)?;
     let log = handles
@@ -1966,9 +1970,13 @@ fn current_source_proof(
         .get(publisher)
         .and_then(|source| source.shared.solid_picture.as_ref())
         .map(|picture| picture.expected());
-    let proof = log
-        .native_origin
-        .require_current_content(&origin, generation, since, expected)?;
+    let proof = log.native_origin.require_current_content(
+        &origin,
+        generation,
+        since,
+        expected,
+        temporal_index,
+    )?;
     log.native_decoded
         .require_valid_receiver(generation, proof.track.receiver)?;
     Ok(proof)
@@ -3075,6 +3083,7 @@ async fn execute_plan(
                 participant,
                 publisher,
                 min_resolution,
+                temporal_index,
                 timeout,
             } => {
                 let start = Instant::now();
@@ -3092,7 +3101,7 @@ async fn execute_plan(
                 let mut pending = None;
                 tokio::time::timeout(*timeout + buffer, async {
                     loop {
-                        match current_source_proof(handles, participant, publisher, start).and_then(|proof| {
+                        match current_source_proof(handles, participant, publisher, start, *temporal_index).and_then(|proof| {
                             anyhow::ensure!(proof.dimensions.0 >= min_resolution.0 && proof.dimensions.1 >= min_resolution.1, "source representation not visible yet: {:?}, required {min_resolution:?}", proof.dimensions);
                             Ok(proof)
                         }) {
@@ -3143,6 +3152,7 @@ async fn execute_plan(
                     participant,
                     publisher,
                     handle.native_origin_interval,
+                    None,
                 )?;
                 let ledger = handle
                     .shared

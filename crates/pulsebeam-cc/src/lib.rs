@@ -163,7 +163,6 @@ impl Controller {
                     || sample.received_at > now
                     || (sample.received && sample.lost)
                     || (sample.recovered && !sample.received)
-                    || (sample.recovered && sample.newly_acked)
                     || (!sample.received
                         && (sample.receiver_arrival_micros.is_some() || sample.ecn.is_some()))
             })

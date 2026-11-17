@@ -527,9 +527,6 @@ impl AudioProcessingModule {
     pub fn set_output_will_be_muted(&mut self, muted: bool) {
         ffi::audio_processor_set_muted(self.native.pin_mut(), muted);
     }
-    pub fn output_will_be_muted(&mut self) -> bool {
-        ffi::audio_processor_muted(self.native.pin_mut())
-    }
     /// The SDK preserves its actual clamp and warning for delays outside 0..500.
     pub fn set_stream_delay_ms(&mut self, delay: i32) -> AudioProcessingStatus {
         AudioProcessingStatus(ffi::audio_processor_set_delay(self.native.pin_mut(), delay))

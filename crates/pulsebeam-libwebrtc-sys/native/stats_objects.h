@@ -308,7 +308,6 @@ inline FfiRtcStatsData StatsData(const webrtc::RTCStats& value) {
       out.fields.push_back(Pack(s.frames_encoded));
       out.fields.push_back(Pack(s.key_frames_encoded));
       out.fields.push_back(Pack(s.total_encode_time));
-      out.fields.push_back(Pack(s.total_encoded_bytes_target));
       out.fields.push_back(Pack(s.frame_width));
       out.fields.push_back(Pack(s.frame_height));
       out.fields.push_back(Pack(s.frames_per_second));
@@ -416,6 +415,7 @@ inline FfiRtcStatsData StatsData(const webrtc::RTCStats& value) {
       out.fields.push_back(Pack(s.ice_local_username_fragment));
       out.fields.push_back(Pack(s.ice_state));
       out.fields.push_back(Pack(s.ccfb_messages_received));
+      out.fields.push_back(Pack(s.ccfb_messages_sent));
       break;
     }
     case 20: {
@@ -885,7 +885,7 @@ inline bool ApplyStatsData(webrtc::RTCStats& value, const FfiRtcStatsData& data)
       return true;
     }
     case 13: {
-      if (data.fields.size() != 41) return false;
+      if (data.fields.size() != 40) return false;
       if (data.fields[0].kind != TypeCode<uint32_t>()) return false;
       if (data.fields[1].kind != TypeCode<std::string>()) return false;
       if (data.fields[2].kind != TypeCode<std::string>()) return false;
@@ -904,29 +904,28 @@ inline bool ApplyStatsData(webrtc::RTCStats& value, const FfiRtcStatsData& data)
       if (data.fields[15].kind != TypeCode<uint32_t>()) return false;
       if (data.fields[16].kind != TypeCode<uint32_t>()) return false;
       if (data.fields[17].kind != TypeCode<double>()) return false;
-      if (data.fields[18].kind != TypeCode<uint64_t>()) return false;
+      if (data.fields[18].kind != TypeCode<uint32_t>()) return false;
       if (data.fields[19].kind != TypeCode<uint32_t>()) return false;
-      if (data.fields[20].kind != TypeCode<uint32_t>()) return false;
-      if (data.fields[21].kind != TypeCode<double>()) return false;
+      if (data.fields[20].kind != TypeCode<double>()) return false;
+      if (data.fields[21].kind != TypeCode<uint32_t>()) return false;
       if (data.fields[22].kind != TypeCode<uint32_t>()) return false;
-      if (data.fields[23].kind != TypeCode<uint32_t>()) return false;
-      if (data.fields[24].kind != TypeCode<double>()) return false;
-      if (data.fields[25].kind != TypeCode<std::string>()) return false;
-      if (data.fields[26].kind != TypeCode<std::map<std::string,double>>()) return false;
-      if (data.fields[27].kind != TypeCode<uint32_t>()) return false;
+      if (data.fields[23].kind != TypeCode<double>()) return false;
+      if (data.fields[24].kind != TypeCode<std::string>()) return false;
+      if (data.fields[25].kind != TypeCode<std::map<std::string,double>>()) return false;
+      if (data.fields[26].kind != TypeCode<uint32_t>()) return false;
+      if (data.fields[27].kind != TypeCode<std::string>()) return false;
       if (data.fields[28].kind != TypeCode<std::string>()) return false;
-      if (data.fields[29].kind != TypeCode<std::string>()) return false;
+      if (data.fields[29].kind != TypeCode<uint32_t>()) return false;
       if (data.fields[30].kind != TypeCode<uint32_t>()) return false;
       if (data.fields[31].kind != TypeCode<uint32_t>()) return false;
-      if (data.fields[32].kind != TypeCode<uint32_t>()) return false;
-      if (data.fields[33].kind != TypeCode<uint64_t>()) return false;
-      if (data.fields[34].kind != TypeCode<std::map<std::string,double>>()) return false;
-      if (data.fields[35].kind != TypeCode<uint32_t>()) return false;
+      if (data.fields[32].kind != TypeCode<uint64_t>()) return false;
+      if (data.fields[33].kind != TypeCode<std::map<std::string,double>>()) return false;
+      if (data.fields[34].kind != TypeCode<uint32_t>()) return false;
+      if (data.fields[35].kind != TypeCode<bool>()) return false;
       if (data.fields[36].kind != TypeCode<bool>()) return false;
-      if (data.fields[37].kind != TypeCode<bool>()) return false;
-      if (data.fields[38].kind != TypeCode<std::string>()) return false;
-      if (data.fields[39].kind != TypeCode<uint32_t>()) return false;
-      if (data.fields[40].kind != TypeCode<int64_t>()) return false;
+      if (data.fields[37].kind != TypeCode<std::string>()) return false;
+      if (data.fields[38].kind != TypeCode<uint32_t>()) return false;
+      if (data.fields[39].kind != TypeCode<int64_t>()) return false;
       auto& s = static_cast<webrtc::RTCOutboundRtpStreamStats&>(value);
       s.ssrc = Unpack<uint32_t>(data.fields[0]);
       s.kind = Unpack<std::string>(data.fields[1]);
@@ -946,29 +945,28 @@ inline bool ApplyStatsData(webrtc::RTCStats& value, const FfiRtcStatsData& data)
       s.frames_encoded = Unpack<uint32_t>(data.fields[15]);
       s.key_frames_encoded = Unpack<uint32_t>(data.fields[16]);
       s.total_encode_time = Unpack<double>(data.fields[17]);
-      s.total_encoded_bytes_target = Unpack<uint64_t>(data.fields[18]);
-      s.frame_width = Unpack<uint32_t>(data.fields[19]);
-      s.frame_height = Unpack<uint32_t>(data.fields[20]);
-      s.frames_per_second = Unpack<double>(data.fields[21]);
-      s.frames_sent = Unpack<uint32_t>(data.fields[22]);
-      s.huge_frames_sent = Unpack<uint32_t>(data.fields[23]);
-      s.total_packet_send_delay = Unpack<double>(data.fields[24]);
-      s.quality_limitation_reason = Unpack<std::string>(data.fields[25]);
-      s.quality_limitation_durations = Unpack<std::map<std::string,double>>(data.fields[26]);
-      s.quality_limitation_resolution_changes = Unpack<uint32_t>(data.fields[27]);
-      s.content_type = Unpack<std::string>(data.fields[28]);
-      s.encoder_implementation = Unpack<std::string>(data.fields[29]);
-      s.fir_count = Unpack<uint32_t>(data.fields[30]);
-      s.pli_count = Unpack<uint32_t>(data.fields[31]);
-      s.nack_count = Unpack<uint32_t>(data.fields[32]);
-      s.qp_sum = Unpack<uint64_t>(data.fields[33]);
-      s.psnr_sum = Unpack<std::map<std::string,double>>(data.fields[34]);
-      s.psnr_measurements = Unpack<uint32_t>(data.fields[35]);
-      s.active = Unpack<bool>(data.fields[36]);
-      s.power_efficient_encoder = Unpack<bool>(data.fields[37]);
-      s.scalability_mode = Unpack<std::string>(data.fields[38]);
-      s.rtx_ssrc = Unpack<uint32_t>(data.fields[39]);
-      s.packets_sent_with_ect1 = Unpack<int64_t>(data.fields[40]);
+      s.frame_width = Unpack<uint32_t>(data.fields[18]);
+      s.frame_height = Unpack<uint32_t>(data.fields[19]);
+      s.frames_per_second = Unpack<double>(data.fields[20]);
+      s.frames_sent = Unpack<uint32_t>(data.fields[21]);
+      s.huge_frames_sent = Unpack<uint32_t>(data.fields[22]);
+      s.total_packet_send_delay = Unpack<double>(data.fields[23]);
+      s.quality_limitation_reason = Unpack<std::string>(data.fields[24]);
+      s.quality_limitation_durations = Unpack<std::map<std::string,double>>(data.fields[25]);
+      s.quality_limitation_resolution_changes = Unpack<uint32_t>(data.fields[26]);
+      s.content_type = Unpack<std::string>(data.fields[27]);
+      s.encoder_implementation = Unpack<std::string>(data.fields[28]);
+      s.fir_count = Unpack<uint32_t>(data.fields[29]);
+      s.pli_count = Unpack<uint32_t>(data.fields[30]);
+      s.nack_count = Unpack<uint32_t>(data.fields[31]);
+      s.qp_sum = Unpack<uint64_t>(data.fields[32]);
+      s.psnr_sum = Unpack<std::map<std::string,double>>(data.fields[33]);
+      s.psnr_measurements = Unpack<uint32_t>(data.fields[34]);
+      s.active = Unpack<bool>(data.fields[35]);
+      s.power_efficient_encoder = Unpack<bool>(data.fields[36]);
+      s.scalability_mode = Unpack<std::string>(data.fields[37]);
+      s.rtx_ssrc = Unpack<uint32_t>(data.fields[38]);
+      s.packets_sent_with_ect1 = Unpack<int64_t>(data.fields[39]);
       return true;
     }
     case 14: {
@@ -1083,7 +1081,7 @@ inline bool ApplyStatsData(webrtc::RTCStats& value, const FfiRtcStatsData& data)
       return true;
     }
     case 19: {
-      if (data.fields.size() != 18) return false;
+      if (data.fields.size() != 19) return false;
       if (data.fields[0].kind != TypeCode<uint64_t>()) return false;
       if (data.fields[1].kind != TypeCode<uint64_t>()) return false;
       if (data.fields[2].kind != TypeCode<uint64_t>()) return false;
@@ -1102,6 +1100,7 @@ inline bool ApplyStatsData(webrtc::RTCStats& value, const FfiRtcStatsData& data)
       if (data.fields[15].kind != TypeCode<std::string>()) return false;
       if (data.fields[16].kind != TypeCode<std::string>()) return false;
       if (data.fields[17].kind != TypeCode<int>()) return false;
+      if (data.fields[18].kind != TypeCode<int>()) return false;
       auto& s = static_cast<webrtc::RTCTransportStats&>(value);
       s.bytes_sent = Unpack<uint64_t>(data.fields[0]);
       s.packets_sent = Unpack<uint64_t>(data.fields[1]);
@@ -1121,6 +1120,7 @@ inline bool ApplyStatsData(webrtc::RTCStats& value, const FfiRtcStatsData& data)
       s.ice_local_username_fragment = Unpack<std::string>(data.fields[15]);
       s.ice_state = Unpack<std::string>(data.fields[16]);
       s.ccfb_messages_received = Unpack<int>(data.fields[17]);
+      s.ccfb_messages_sent = Unpack<int>(data.fields[18]);
       return true;
     }
     case 20: {

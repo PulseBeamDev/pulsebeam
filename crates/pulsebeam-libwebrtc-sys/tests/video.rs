@@ -1125,7 +1125,14 @@ fn direct_encoded_h264_input_reaches_remote_without_decode() {
             pair.progress();
             sink.try_next_frame()
         })
-        .expect("keyframe did not resume encoded delivery");
+        .unwrap_or_else(|| {
+            panic!(
+                "keyframe did not resume encoded delivery: source_pending={}, source_dropped={}, sink_dropped={}",
+                source.pending_frames(),
+                source.dropped_frames(),
+                sink.dropped_frames()
+            )
+        });
     assert_eq!(next.data, frame.data);
     // Exercise the full owning native operation separately from the older
     // active-video convenience method, and observe the actual encoder callback.
@@ -1421,7 +1428,14 @@ fn direct_h264_l1t3_preserves_input_and_rejects_native_fallback() {
                                     progress();
                                     sink.try_next_frame()
                                 })
-                                .expect("requested keyframe delivered");
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "requested keyframe delivered: source_pending={}, source_dropped={}, sink_dropped={}",
+                                        source.pending_frames(),
+                                        source.dropped_frames(),
+                                        sink.dropped_frames()
+                                    )
+                                });
                             assert_eq!(frame.data, key.data);
                             assert!(frame.key_frame);
                             assert!(frame.dependencies.is_empty());
@@ -2001,7 +2015,6 @@ struct FecObservations {
             pulsebeam_webrtc_sys::FecCallbackOperation<pulsebeam_webrtc_sys::FecProtectionResponse>,
         >,
     >,
-    retransmission: Mutex<Option<pulsebeam_webrtc_sys::FecCallbackOperation<()>>>,
 }
 struct FecFactory(Arc<FecObservations>, std::cell::Cell<usize>);
 impl pulsebeam_webrtc_sys::FecControllerFactoryProvider for FecFactory {
@@ -2035,9 +2048,7 @@ impl pulsebeam_webrtc_sys::FecController for FecProduct {
         self.0.encoding.lock().unwrap().push(data);
     }
     fn update_fec_rates(&self, update: pulsebeam_webrtc_sys::FecRateUpdate) -> u32 {
-        use pulsebeam_webrtc_sys::{
-            FecProtectionCallbackError, FecProtectionParams, FecRetransmissionMode,
-        };
+        use pulsebeam_webrtc_sys::FecProtectionParams;
         let callback = self
             .0
             .callback
@@ -2046,23 +2057,21 @@ impl pulsebeam_webrtc_sys::FecController for FecProduct {
             .clone()
             .expect("native callback installed");
         // This is the SDK's synchronous protection callback path, on worker.
-        callback
-            .request(
-                FecProtectionParams::default(),
-                FecProtectionParams::default(),
-            )
-            .unwrap();
         assert_eq!(
-            callback.set_retransmission_mode(FecRetransmissionMode::ALL_LAYERS),
-            Err(FecProtectionCallbackError::ReentrantNativeLock)
+            callback
+                .request(
+                    FecProtectionParams::default(),
+                    FecProtectionParams::default(),
+                )
+                .unwrap()
+                .native_result,
+            0
         );
         if !self.0.async_started.swap(true, Ordering::SeqCst) {
             *self.0.protection.lock().unwrap() = Some(callback.request_async(
                 FecProtectionParams::default(),
                 FecProtectionParams::default(),
             ));
-            *self.0.retransmission.lock().unwrap() =
-                Some(callback.set_retransmission_mode_async(FecRetransmissionMode::ALL_LAYERS));
         }
         let rate = update.estimated_bitrate_bps;
         self.0.rates.lock().unwrap().push(update);
@@ -2172,7 +2181,6 @@ impl NetworkControlProduct {
                     at_time,
                     bandwidth: DataRate::BitsPerSecond(1_500_000),
                     round_trip_time: TimeDelta::from_native_microsecond_bits(10_000),
-                    bwe_period: TimeDelta::from_native_microsecond_bits(25_000),
                     loss_rate_ratio: 0.0,
                 },
                 cwnd_reduce_ratio: 0.0,
@@ -2413,7 +2421,6 @@ fn factory_fec_product_uses_native_protection_callback_and_existing_worker_dispa
         .push_frame(&VideoFrame::i420(16, 16, synthetic_i420(16, 16), 2_000_000, 90_000).unwrap())
         .unwrap();
     let mut protection = None;
-    let mut retransmission = None;
     let observed = (0..2_000_000).any(|_| {
         pair.progress();
         if protection.is_none() {
@@ -2424,25 +2431,15 @@ fn factory_fec_product_uses_native_protection_callback_and_existing_worker_dispa
                 .as_mut()
                 .and_then(|operation| operation.try_take());
         }
-        if retransmission.is_none() {
-            retransmission = observations
-                .retransmission
-                .lock()
-                .unwrap()
-                .as_mut()
-                .and_then(|operation| operation.try_take());
-        }
         counters.encode.load(Ordering::SeqCst) > 0
             && !observations.encoded.lock().unwrap().is_empty()
             && protection.is_some()
-            && retransmission.is_some()
     });
     assert!(
         observed,
         "native FEC callback or queued operation was not consumed"
     );
     assert_eq!(protection.unwrap().unwrap().native_result, 0);
-    assert_eq!(retransmission, Some(Ok(())));
     assert!(!registration.has_failed());
     assert!(observations.creates.load(Ordering::SeqCst) > 0);
     assert!(!observations.methods.lock().unwrap().is_empty());
@@ -2525,10 +2522,24 @@ fn injected_h264_provider_carries_a_frame_between_peers() {
         transceiver.sender().media_type(),
         pulsebeam_webrtc_sys::MediaType::Video
     );
-    assert_eq!(
-        transceiver.sender().init_send_encodings(),
-        vec![pulsebeam_webrtc_sys::RtpEncodingParameters::default()]
-    );
+    let sender = transceiver.sender();
+    let initial_encodings = sender.get_parameters().encodings();
+    let initial_init_send_encodings = sender.init_send_encodings();
+    let assert_encodings_equal =
+        |actual: &[pulsebeam_webrtc_sys::RtpEncodingParameters],
+         expected: &[pulsebeam_webrtc_sys::RtpEncodingParameters]| {
+            assert_eq!(actual, expected);
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(
+                    actual.scalability_mode_bytes(),
+                    expected.scalability_mode_bytes()
+                );
+                assert_eq!(actual.request_key_frame(), expected.request_key_frame());
+            }
+        };
+    assert_encodings_equal(&initial_init_send_encodings, &initial_encodings);
+    let initial_sender_encodings = sender.parameters().unwrap().encodings;
+    drop(sender);
 
     let sender_codecs = pair.alice.video_sender_capabilities().unwrap();
     let receiver_codecs = pair.bob.video_receiver_capabilities().unwrap();
@@ -2589,6 +2600,13 @@ fn injected_h264_provider_carries_a_frame_between_peers() {
             break;
         }
     }
+    let negotiated_sender = transceiver.sender();
+    assert!(
+        negotiated_sender.init_send_encodings().is_empty(),
+        "applying the local description consumes the pending initial send encodings"
+    );
+    let negotiated_encodings = negotiated_sender.get_parameters().encodings();
+    drop(negotiated_sender);
     let packed = VideoFrame::i420(16, 16, synthetic_i420(16, 16), 2_000_000, 90_000).unwrap();
     let frame = VideoFrame::nv12(16, 16, packed.to_nv12().unwrap(), 2_000_000, 90_000)
         .unwrap()
@@ -2615,6 +2633,17 @@ fn injected_h264_provider_carries_a_frame_between_peers() {
             )
         });
     assert_eq!((received.width, received.height), (16, 16));
+    let retained_sender = transceiver.sender();
+    assert_encodings_equal(
+        &retained_sender.get_parameters().encodings(),
+        &negotiated_encodings,
+    );
+    assert_eq!(
+        retained_sender.parameters().unwrap().encodings,
+        initial_sender_encodings,
+        "sending a frame must preserve the actual initial sender encoding values"
+    );
+    drop(retained_sender);
     assert_ne!(received.rtp_timestamp, 0);
     assert_eq!(
         counters.decoder_rtp_timestamp.load(Ordering::SeqCst),

@@ -1,6 +1,6 @@
 // Copyright 2026 The WebRTC Project Authors. All rights reserved.
 // Rust port of scream_feedback.{cc,h} at libwebrtc
-// 326fd06bb4d93900ed6947205b94cefd2413afca. See LICENSE and PATENTS.
+// 7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499. See LICENSE and PATENTS.
 
 use std::time::Duration;
 
@@ -44,8 +44,8 @@ impl Feedback {
         timed.clear();
         for (index, sample) in input.feedback.iter().enumerate() {
             let ce = input.ecn_mode != EcnMode::Disabled && sample.ecn == Some(EcnMark::Ce);
-            // SentHistory already owns ACK-edge credit, including unreported gaps.
-            // A late recovery must not grant that same transport credit a second time.
+            // The host owns ACK-edge credit, including unreported gaps. Recovery
+            // retracts loss independently; a missing tail may earn its first credit here.
             if sample.newly_acked && !ce {
                 parsed.acked_not_marked = parsed
                     .acked_not_marked
@@ -139,6 +139,23 @@ mod tests {
         assert_eq!(metrics.max_one_way_delay, 30_000);
         assert_eq!(metrics.feedback_hold, Duration::from_millis(120));
         assert_eq!(metrics.rtt_sample, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn recovery_retracts_loss_independently_of_first_ack_credit() {
+        for newly_acked in [false, true] {
+            let recovered = FeedbackSample {
+                newly_acked,
+                recovered: true,
+                ..sample(0, 10_000)
+            };
+            let result = Feedback::parse(Duration::from_millis(100), input(&[recovered]), DEFAULT);
+            assert_eq!(result.acked_not_marked, if newly_acked { 1_000 } else { 0 });
+            assert_eq!(result.received, 1_000);
+            assert_eq!(result.num_received, 1);
+            assert_eq!(result.num_recovered, 1);
+            assert_eq!(result.num_lost, 0);
+        }
     }
 
     #[test]

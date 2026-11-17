@@ -1,0 +1,3 @@
+#!@PULSEBEAM_HOST_TOOLS@/sh
+export PATH=@PULSEBEAM_HOST_TOOLS@
+exec "$@"

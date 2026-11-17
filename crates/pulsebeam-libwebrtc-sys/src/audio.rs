@@ -432,30 +432,11 @@ impl AudioSource {
     pub fn options(&self) -> crate::AudioSourceOptions {
         crate::AudioSourceOptions::from_native(ffi::audio_source_options(self.native()))
     }
-    /// Invoke native SetOptions on signaling. All input is admitted before
-    /// source mutation. Success means the void call returned, not that every
-    /// voice channel accepted it or that processing became effective. Use
-    /// `options()` for stored source state and factory processing diagnostics
-    /// for effective processing. Native channel merge/default behavior remains
-    /// distinct from the caller-fed source's replacement of its option value.
-    pub fn set_options(
-        &self,
-        options: &crate::AudioSourceOptions,
-    ) -> Result<(), crate::AudioSourceControlError> {
-        crate::AudioSourceControlError::result(ffi::audio_source_set_options(
-            self.native(),
-            &options.ffi(),
-        ))
-    }
     /// Invoke the native void volume setter. The caller-fed source's pinned
     /// implementation is a no-op: it still reports volume 1.0 and delivers
     /// unchanged PCM. This does not synthesize sample attenuation.
     pub fn set_volume(&self, volume: f64) -> Result<(), crate::AudioSourceControlError> {
         crate::AudioSourceControlError::result(ffi::audio_source_set_volume(self.native(), volume))
-    }
-    /// Native source volume. The caller-fed source uses the SDK default 1.0.
-    pub fn volume(&self) -> f64 {
-        ffi::audio_source_volume(self.native())
     }
 
     /// Read the native capture timeline without advancing time or pumping work.
@@ -902,36 +883,6 @@ impl AudioTrack {
         self.inner.input_kind == AudioInputKind::OpusFrames
     }
 
-    /// Request upstream AEC, NS and AGC choices for a local PCM track. The
-    /// engine is factory-wide: requests from different tracks can conflict.
-    /// A stored request does not prove an effect is active; inspect the
-    /// factory's `audio_processing_state` after starting capture.
-    pub fn set_audio_processing_options(
-        &self,
-        options: crate::AudioProcessingOptions,
-    ) -> Result<(), crate::PeerError> {
-        if self.is_opus_frames() {
-            return Err(crate::PeerError {
-                kind: crate::PeerErrorKind::InvalidParameter,
-                message: "encoded Opus bypasses PCM audio processing".into(),
-            });
-        }
-        let mut error = String::new();
-        if !ffi::audio_track_set_processing_options(
-            self.native(),
-            options.echo_cancellation as u8,
-            options.noise_suppression as u8,
-            options.gain_control as u8,
-            &mut error,
-        ) {
-            return Err(crate::PeerError {
-                kind: crate::PeerErrorKind::InvalidParameter,
-                message: error,
-            });
-        }
-        Ok(())
-    }
-
     /// Observe actual source samples, rate, channel geometry and optional
     /// capture milliseconds through an owning native sink queue.
     pub fn attach_sink(&self) -> Result<AudioTrackSink, PeerError> {
@@ -973,14 +924,6 @@ impl AudioTrack {
     pub fn signal_level(&self) -> Option<i32> {
         let value = ffi::audio_track_signal_level(self.native());
         value.present.then_some(value.value)
-    }
-    pub fn volume(&self) -> f64 {
-        ffi::audio_track_volume(self.native())
-    }
-    /// Native void setter; successful invocation does not imply that the
-    /// underlying source implements gain or changed its reported volume.
-    pub fn set_volume(&self, volume: f64) -> Result<(), crate::AudioSourceControlError> {
-        crate::AudioSourceControlError::result(ffi::audio_track_set_volume(self.native(), volume))
     }
     pub fn status(&self) -> crate::AudioTrackStatus {
         crate::AudioTrackStatus::from_native(ffi::audio_track_status(self.native()))

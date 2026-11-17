@@ -31,13 +31,14 @@ struct Observations {
 #[derive(Clone, Copy)]
 enum Behavior {
     Good,
+    CallerRetainsFactory,
     PanicFactory,
     PanicInterval,
     NegativeInterval,
     PanicUpdate,
     PanicEcn,
     InvalidUnits,
-    InfiniteBwePeriod,
+    InfiniteRoundTripTime,
     ZeroProbeSize,
     WideProbeTimestampSpan,
     PerProbeOvershoot,
@@ -127,7 +128,6 @@ fn fixed_update() -> NetworkControlUpdate {
                 at_time,
                 bandwidth: DataRate::BitsPerSecond(1_000_000),
                 round_trip_time: TimeDelta::from_native_microsecond_bits(250),
-                bwe_period: TimeDelta::from_native_microsecond_bits(200_000),
                 loss_rate_ratio: 0.25,
             },
             target_rate: DataRate::BitsPerSecond(1_500_000),
@@ -137,7 +137,10 @@ fn fixed_update() -> NetworkControlUpdate {
 }
 impl Controller {
     fn record(&mut self, value: Input) -> NetworkControlUpdate {
-        assert_eq!(self.observations.factory_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            self.observations.factory_drops.load(Ordering::Relaxed),
+            usize::from(!matches!(self.behavior, Behavior::CallerRetainsFactory))
+        );
         self.counter.set(self.counter.get() + 1);
         self.observations.calls.lock().unwrap().push(value);
         if matches!(self.behavior, Behavior::PanicUpdate) {
@@ -147,13 +150,13 @@ impl Controller {
         if matches!(self.behavior, Behavior::InvalidUnits) {
             update.congestion_window = Some(DataSize::Bytes(-1));
         }
-        if matches!(self.behavior, Behavior::InfiniteBwePeriod) {
+        if matches!(self.behavior, Behavior::InfiniteRoundTripTime) {
             update
                 .target_rate
                 .as_mut()
                 .unwrap()
                 .network_estimate
-                .bwe_period = TimeDelta::plus_infinity();
+                .round_trip_time = TimeDelta::plus_infinity();
         }
         match self.behavior {
             Behavior::ZeroProbeSize => {
@@ -247,6 +250,11 @@ fn invoke(
     let replies = ffi::network_controller_native_probe(
         environment.native(),
         Box::new(RustNetworkControllerFactory(Some(factory), None)),
+        ffi::FfiNcConfig {
+            constraints: TargetRateConstraints::default().native(),
+            stream_based_config: StreamsConfig::default().native(),
+            default_pacing_time_window: PacerConfig::DEFAULT_TIME_WINDOW.native_microsecond_bits(),
+        },
         messages,
         kinds,
     );
@@ -436,7 +444,7 @@ fn native_full_graph_ownership_and_presence() {
         Input::TransportPacketsFeedback(sample_transport_packets_feedback()),
         Input::NetworkStateEstimate(sample_network_state_estimate()),
     ];
-    let mut messages: Vec<_> = inputs
+    let messages: Vec<_> = inputs
         .iter()
         .map(|input| match input {
             Input::NetworkAvailability(value) => ffi::FfiNcMessage {
@@ -489,9 +497,7 @@ fn native_full_graph_ownership_and_presence() {
             },
         })
         .collect();
-    let mut kinds: Vec<u8> = (0..12).collect();
-    kinds.push(12);
-    messages.push(Default::default());
+    let kinds: Vec<u8> = (0..12).collect();
     let (replies, failure) = invoke(
         &environment,
         &observations,
@@ -502,13 +508,9 @@ fn native_full_graph_ownership_and_presence() {
     drop(messages);
     assert_eq!(*observations.calls.lock().unwrap(), inputs);
     assert_eq!(failure, None);
-    for reply in &replies[..12] {
+    for reply in &replies {
         assert_eq!(reply, &fixed_update());
     }
-    assert_eq!(
-        replies[12].target_rate.as_ref().unwrap().target_rate,
-        DataRate::BitsPerSecond(1)
-    );
     assert_eq!(observations.intervals.load(Ordering::Relaxed), 1);
     assert_eq!(observations.product_drops.load(Ordering::Relaxed), 1);
     assert_eq!(
@@ -567,7 +569,6 @@ fn native_factory_product_interval_and_drop_panics_are_contained() {
             observations.intervals.load(Ordering::Relaxed),
             usize::from(!matches!(behavior, Behavior::PanicFactory))
         );
-        assert_eq!(observations.ecn_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             observations.product_drops.load(Ordering::Relaxed),
             if matches!(behavior, Behavior::PanicFactory) {
@@ -575,23 +576,6 @@ fn native_factory_product_interval_and_drop_panics_are_contained() {
             } else {
                 1
             }
-        );
-    }
-    let observations = Arc::new(Observations::default());
-    let (replies, failure) = invoke(
-        &environment,
-        &observations,
-        Behavior::PanicEcn,
-        &[Default::default(), Default::default()],
-        &[12, 0],
-    );
-    assert_eq!(failure, Some(NetworkControllerFailure::Panicked));
-    assert_eq!(observations.intervals.load(Ordering::Relaxed), 1);
-    assert_eq!(observations.ecn_calls.load(Ordering::Relaxed), 1);
-    for reply in replies {
-        assert_eq!(
-            reply.target_rate.unwrap().target_rate,
-            DataRate::BitsPerSecond(0)
         );
     }
     let observations = Arc::new(Observations::default());
@@ -634,7 +618,7 @@ fn native_adapter_preserves_wide_probe_timestamps_without_shadow_history() {
 fn native_adapter_forwards_representable_updates_without_arithmetic_budgets() {
     let environment = Environment::builder().build().unwrap();
     for behavior in [
-        Behavior::InfiniteBwePeriod,
+        Behavior::InfiniteRoundTripTime,
         Behavior::ZeroProbeSize,
         Behavior::PerProbeOvershoot,
     ] {
@@ -648,13 +632,13 @@ fn native_adapter_forwards_representable_updates_without_arithmetic_budgets() {
         );
         let mut expected = fixed_update();
         match behavior {
-            Behavior::InfiniteBwePeriod => {
+            Behavior::InfiniteRoundTripTime => {
                 expected
                     .target_rate
                     .as_mut()
                     .unwrap()
                     .network_estimate
-                    .bwe_period = TimeDelta::plus_infinity();
+                    .round_trip_time = TimeDelta::plus_infinity();
             }
             Behavior::ZeroProbeSize => {
                 expected.probe_cluster_configs[0].target_data_rate = DataRate::BitsPerSecond(1);
@@ -695,6 +679,11 @@ fn explicit_factory_trial_gate() {
 }
 #[test]
 fn packet_feedback_helpers_match_native_order_and_marking() {
+    let allocation_limits = BitrateAllocationLimits::default();
+    assert_eq!(
+        BitrateAllocationLimits::from_native(allocation_limits.native()),
+        allocation_limits
+    );
     let sent = SentPacket {
         send_time: Timestamp::zero(),
         ..Default::default()
@@ -748,5 +737,333 @@ fn packet_feedback_helpers_match_native_order_and_marking() {
             ..Default::default()
         }
         .has_updates()
+    );
+}
+
+#[test]
+fn ecn_query_panics_are_contained_without_synthetic_updates() {
+    let environment = Environment::builder().build().unwrap();
+    for behavior in [Behavior::CallerRetainsFactory, Behavior::PanicEcn] {
+        let observations = Arc::new(Observations::default());
+        let factory = registration(&observations, behavior);
+        let source = RustNetworkControllerFactory(Some(factory.clone()), Some(environment.clone()));
+        let product = network_controller_create(
+            &source,
+            ffi::clone_environment(environment.native()),
+            ffi::FfiNcConfig {
+                constraints: TargetRateConstraints::default().native(),
+                stream_based_config: StreamsConfig::default().native(),
+                default_pacing_time_window: PacerConfig::DEFAULT_TIME_WINDOW
+                    .native_microsecond_bits(),
+            },
+        );
+        let panics = matches!(behavior, Behavior::PanicEcn);
+        assert_eq!(network_controller_ecn(&product), !panics);
+        assert_eq!(network_controller_ecn(&product), !panics);
+        assert_eq!(
+            observations.ecn_calls.load(Ordering::Relaxed),
+            if panics { 1 } else { 2 }
+        );
+        let update = network_controller_update(
+            &product,
+            0,
+            ffi::FfiNcMessage {
+                network_availability: sample_network_availability().native(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(update.failed, panics);
+        assert_eq!(
+            observations.calls.lock().unwrap().len(),
+            usize::from(!panics)
+        );
+        assert_eq!(
+            factory.observed_failure(),
+            panics.then_some(NetworkControllerFailure::Panicked)
+        );
+    }
+}
+
+#[test]
+fn test_replay_passes_explicit_initial_config_and_preserves_callback_order() {
+    let observations = Arc::new(Observations::default());
+    let factory = registration(&observations, Behavior::CallerRetainsFactory);
+    let config = NetworkControllerReplayConfig {
+        constraints: TargetRateConstraints {
+            at_time: Timestamp::from_native_microsecond_bits(123),
+            min_data_rate: Some(DataRate::BitsPerSecond(42_000)),
+            max_data_rate: Some(DataRate::BitsPerSecond(2_000_000)),
+            starting_rate: Some(DataRate::BitsPerSecond(900_000)),
+        },
+        stream_based_config: StreamsConfig {
+            at_time: Timestamp::from_native_microsecond_bits(124),
+            pacing_factor: Some(1.25),
+            ..Default::default()
+        },
+        default_pacing_time_window: TimeDelta::from_native_microsecond_bits(17_000),
+    };
+    let events = vec![
+        NetworkControllerReplayEvent::NetworkAvailability(sample_network_availability()),
+        NetworkControllerReplayEvent::SentPacket(sample_sent_packet()),
+        NetworkControllerReplayEvent::TransportPacketsFeedback(sample_transport_packets_feedback()),
+        NetworkControllerReplayEvent::ProcessInterval(sample_process_interval()),
+    ];
+    let replies = network_controller_replay_for_test(
+        &Environment::builder().build().unwrap(),
+        &factory,
+        config.clone(),
+        &events,
+    )
+    .unwrap();
+    assert_eq!(replies, vec![fixed_update(); events.len()]);
+    assert_eq!(
+        *observations.config.lock().unwrap(),
+        Some((
+            config.constraints,
+            config.stream_based_config,
+            config.default_pacing_time_window,
+        ))
+    );
+    assert_eq!(
+        observations.calls.lock().unwrap().as_slice(),
+        &[
+            Input::NetworkAvailability(sample_network_availability()),
+            Input::SentPacket(sample_sent_packet()),
+            Input::TransportPacketsFeedback(sample_transport_packets_feedback()),
+            Input::ProcessInterval(sample_process_interval()),
+        ]
+    );
+}
+
+#[test]
+fn test_replay_rejects_overlong_input_and_uses_builtin_scream_factory() {
+    let environment = Environment::builder()
+        .field_trials(FieldTrials::parse("WebRTC-Bwe-ScreamV2/mode:always/").unwrap())
+        .build()
+        .unwrap();
+    let factory = NetworkControllerFactory::goog_cc(GoogCcFactoryConfig::new(false));
+    let config = NetworkControllerReplayConfig {
+        constraints: TargetRateConstraints {
+            at_time: Timestamp::zero(),
+            min_data_rate: Some(DataRate::BitsPerSecond(30_000)),
+            max_data_rate: Some(DataRate::BitsPerSecond(3_000_000)),
+            starting_rate: Some(DataRate::BitsPerSecond(1_000_000)),
+        },
+        stream_based_config: StreamsConfig::default(),
+        default_pacing_time_window: TimeDelta::from_native_microsecond_bits(5_000),
+    };
+    assert_eq!(
+        network_controller_replay_for_test(
+            &environment,
+            &factory,
+            config.clone(),
+            &vec![NetworkControllerReplayEvent::ProcessInterval(ProcessInterval::default()); 4097],
+        ),
+        Err(NetworkControllerReplayError::TooManyEvents)
+    );
+    assert_eq!(
+        network_controller_replay_for_test(
+            &environment,
+            &factory,
+            config.clone(),
+            &[NetworkControllerReplayEvent::SentPacket(SentPacket {
+                size: DataSize::Bytes(-1),
+                ..Default::default()
+            })],
+        ),
+        Err(NetworkControllerReplayError::InvalidNativeInput)
+    );
+    let events = vec![
+        NetworkControllerReplayEvent::NetworkAvailability(NetworkAvailability {
+            at_time: Timestamp::zero(),
+            network_available: true,
+        }),
+        NetworkControllerReplayEvent::NetworkRouteChange(NetworkRouteChange {
+            at_time: Timestamp::zero(),
+            constraints: config.constraints.clone(),
+            restart_bwe: true,
+        }),
+        NetworkControllerReplayEvent::SentPacket(SentPacket {
+            send_time: Timestamp::from_native_microsecond_bits(10_000),
+            size: DataSize::Bytes(1200),
+            prior_unacked_data: DataSize::Bytes(0),
+            sequence_number: 1,
+            data_in_flight: DataSize::Bytes(1200),
+            ..Default::default()
+        }),
+        NetworkControllerReplayEvent::TransportPacketsFeedback(TransportPacketsFeedback {
+            feedback_time: Timestamp::from_native_microsecond_bits(30_000),
+            data_in_flight: DataSize::Bytes(0),
+            packet_feedbacks: vec![PacketResult {
+                sent_packet: SentPacket {
+                    send_time: Timestamp::from_native_microsecond_bits(10_000),
+                    size: DataSize::Bytes(1200),
+                    sequence_number: 1,
+                    ..Default::default()
+                },
+                receive_time: Timestamp::from_native_microsecond_bits(30_000),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        NetworkControllerReplayEvent::ProcessInterval(ProcessInterval {
+            at_time: Timestamp::from_native_microsecond_bits(40_000),
+            pacer_queue: Some(DataSize::Bytes(0)),
+        }),
+    ];
+    let updates =
+        network_controller_replay_for_test(&environment, &factory, config, &events).unwrap();
+    assert_eq!(updates.len(), events.len());
+    assert!(updates.iter().any(NetworkControlUpdate::has_updates));
+    assert!(
+        updates
+            .iter()
+            .filter_map(|update| update.target_rate.as_ref())
+            .any(|rate| matches!(rate.target_rate, DataRate::BitsPerSecond(value) if value > 0))
+    );
+}
+
+#[test]
+fn controlled_replay_advances_the_selected_manual_clock_at_construction_and_callbacks() {
+    use crate::ManualClock;
+    use std::time::Duration;
+
+    struct ClockFactory(Arc<Mutex<Vec<i64>>>);
+    impl NetworkControllerFactoryProvider for ClockFactory {
+        fn create(&mut self, config: NetworkControllerConfig) -> Box<dyn NetworkController> {
+            let clock = config.environment.environment().clock().unwrap();
+            let now = clock.current_time().microseconds_or(-1);
+            self.0.lock().unwrap().push(now);
+            Box::new(ClockController(self.0.clone(), clock))
+        }
+        fn process_interval(&mut self) -> TimeDelta {
+            TimeDelta::from_native_microsecond_bits(1_000)
+        }
+    }
+    struct ClockController(Arc<Mutex<Vec<i64>>>, crate::Clock);
+    impl ClockController {
+        fn record(&self) -> NetworkControlUpdate {
+            self.0
+                .lock()
+                .unwrap()
+                .push(self.1.current_time().microseconds_or(-1));
+            NetworkControlUpdate::default()
+        }
+    }
+    impl NetworkController for ClockController {
+        fn on_network_availability(&mut self, _: NetworkAvailability) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_network_route_change(&mut self, _: NetworkRouteChange) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_process_interval(&mut self, _: ProcessInterval) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_remote_bitrate_report(&mut self, _: RemoteBitrateReport) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_round_trip_time_update(&mut self, _: RoundTripTimeUpdate) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_sent_packet(&mut self, _: SentPacket) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_received_packet(&mut self, _: ReceivedPacket) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_streams_config(&mut self, _: StreamsConfig) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_target_rate_constraints(&mut self, _: TargetRateConstraints) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_transport_loss_report(&mut self, _: TransportLossReport) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_transport_packets_feedback(
+            &mut self,
+            _: TransportPacketsFeedback,
+        ) -> NetworkControlUpdate {
+            self.record()
+        }
+        fn on_network_state_estimate(&mut self, _: NetworkStateEstimate) -> NetworkControlUpdate {
+            self.record()
+        }
+    }
+
+    let times = Arc::new(Mutex::new(Vec::new()));
+    let manual_clock = ManualClock::new(Duration::ZERO).unwrap();
+    let environment = Environment::builder().clock(&manual_clock).build().unwrap();
+    let factory = NetworkControllerFactory::from_provider(ClockFactory(times.clone()));
+    let config = NetworkControllerReplayConfig {
+        constraints: TargetRateConstraints {
+            at_time: Timestamp::from_native_microsecond_bits(100_000),
+            ..Default::default()
+        },
+        stream_based_config: StreamsConfig::default(),
+        default_pacing_time_window: TimeDelta::from_native_microsecond_bits(5_000),
+    };
+    let events = [
+        NetworkControllerReplayEvent::NetworkAvailability(NetworkAvailability {
+            at_time: Timestamp::from_native_microsecond_bits(200_000),
+            network_available: true,
+        }),
+        NetworkControllerReplayEvent::TransportPacketsFeedback(TransportPacketsFeedback {
+            feedback_time: Timestamp::from_native_microsecond_bits(300_000),
+            packet_feedbacks: vec![PacketResult {
+                receive_time: Timestamp::from_native_microsecond_bits(150_000),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        NetworkControllerReplayEvent::ProcessInterval(ProcessInterval {
+            at_time: Timestamp::from_native_microsecond_bits(350_000),
+            ..Default::default()
+        }),
+    ];
+    assert_eq!(
+        network_controller_replay_for_test(&environment, &factory, config.clone(), &events)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(manual_clock.now(), Duration::from_micros(350_000));
+    assert_eq!(
+        *times.lock().unwrap(),
+        vec![100_000, 200_000, 300_000, 350_000]
+    );
+
+    let backwards = [NetworkControllerReplayEvent::NetworkAvailability(
+        NetworkAvailability {
+            at_time: Timestamp::from_native_microsecond_bits(300_000),
+            network_available: true,
+        },
+    )];
+    assert_eq!(
+        network_controller_replay_for_test(&environment, &factory, config.clone(), &backwards),
+        Err(NetworkControllerReplayError::InvalidNativeInput)
+    );
+    assert_eq!(manual_clock.now(), Duration::from_micros(350_000));
+    assert_eq!(
+        *times.lock().unwrap(),
+        vec![100_000, 200_000, 300_000, 350_000]
+    );
+
+    let config_at_now = NetworkControllerReplayConfig {
+        constraints: TargetRateConstraints {
+            at_time: Timestamp::from_native_microsecond_bits(350_000),
+            ..config.constraints
+        },
+        ..config
+    };
+    assert_eq!(
+        network_controller_replay_for_test(&environment, &factory, config_at_now, &backwards),
+        Err(NetworkControllerReplayError::InvalidNativeInput)
+    );
+    assert_eq!(manual_clock.now(), Duration::from_micros(350_000));
+    assert_eq!(
+        *times.lock().unwrap(),
+        vec![100_000, 200_000, 300_000, 350_000, 350_000]
     );
 }

@@ -52,6 +52,18 @@ bool NamedCodec(webrtc::VideoCodecType codec) {
     return false;
   }
 }
+std::optional<webrtc::VideoCodecType> SenderPacketizerCodec(
+    const NativeTransformableFrame& value) {
+  if (!NamedCodec(value.mime_codec())) return std::nullopt;
+  const auto mime = Video(value).GetMimeType();
+  for (const auto codec : {webrtc::kVideoCodecGeneric, webrtc::kVideoCodecVP8,
+                           webrtc::kVideoCodecVP9, webrtc::kVideoCodecAV1,
+                           webrtc::kVideoCodecH264, webrtc::kVideoCodecH265}) {
+    if (mime == std::string("video/") + webrtc::CodecTypeToPayloadString(codec))
+      return codec;
+  }
+  return std::nullopt;
+}
 // Outgoing audio stores rounded milliseconds in uint64_t. Its CaptureTime
 // getter constructs Timestamp::Millis from that unsigned value. Guard that
 // actual multiplication (and the compiled FromFraction DCHECK), not an
@@ -84,40 +96,29 @@ bool transformable_video_completion_safe(const NativeTransformableFrame& value, 
   auto metadata = transformable_video_metadata(value, status);
   if (!metadata) return false;
   const bool sender_frame = value.frame().GetDirection() == webrtc::TransformableFrameInterface::Direction::kSender;
-  // Sender consumers use a stock sender's private header directly, but convert
-  // receiver Metadata. Receiver consumers convert stock sender Metadata and
-  // otherwise extract the receiver's actual (not cached Metadata) header.
-  auto header = sender_target == sender_frame
-      ? transformable_video_header(value)
-      : rtp_video_header_from_metadata(*metadata, status);
+  auto header = rtp_video_header_from_metadata(*metadata, status);
   if (!header) return false;
-  const auto& actual = header->value();
-  // The generic receiver finder checked_casts spatial_index before its
-  // graceful upper-range/dependency-count drops. Preserve those native drops.
-  if (!sender_target) return !actual.generic || actual.generic->spatial_index >= 0;
+  // This projection is not the private full header. SDK receive assembly
+  // supplies nonnegative spatial indices, and the receiver setter cannot alter
+  // them. Sender metadata retains the codec-specific packetizer fields checked
+  // below; owned writes cannot change the immutable packetizer codec.
+  const auto& projected = header->value();
+  if (!sender_target) return true;
   if (value.frame().GetData().size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) return false;
-  auto codec = actual.codec;
+  auto codec = projected.codec;
   if (sender_frame) {
-    // GetCodecType is private to the stock sender. Its public immutable MIME
-    // identifies the actual packetizer, unlike the mutable metadata codec.
-    if (!NamedCodec(value.mime_codec())) return false;
-    const auto mime = Video(value).GetMimeType();
-    bool found = false;
-    for (const auto candidate : {webrtc::kVideoCodecGeneric, webrtc::kVideoCodecVP8, webrtc::kVideoCodecVP9,
-                                 webrtc::kVideoCodecAV1, webrtc::kVideoCodecH264, webrtc::kVideoCodecH265}) {
-      if (mime == std::string("video/") + webrtc::CodecTypeToPayloadString(candidate)) { codec = candidate; found = true; break; }
-    }
-    if (!found) return false;
+    const auto selected = SenderPacketizerCodec(value);
+    if (!selected) return false;
+    codec = *selected;
   }
-  // The packetizer's codec can differ from the mutable header codec. Validate
-  // each actual std::get selection, rather than pretending a codec setter also
-  // changed the stock sender's immutable selection.
-  if ((codec == webrtc::kVideoCodecVP8 && !std::holds_alternative<webrtc::RTPVideoHeaderVP8>(actual.video_type_header)) ||
-      (codec == webrtc::kVideoCodecVP9 && !std::holds_alternative<webrtc::RTPVideoHeaderVP9>(actual.video_type_header)) ||
-      (codec == webrtc::kVideoCodecH264 && !std::holds_alternative<webrtc::RTPVideoHeaderH264>(actual.video_type_header))) return false;
+  // Validate the variant selected by the immutable packetizer, not merely the
+  // codec field in the metadata projection.
+  if ((codec == webrtc::kVideoCodecVP8 && !std::holds_alternative<webrtc::RTPVideoHeaderVP8>(projected.video_type_header)) ||
+      (codec == webrtc::kVideoCodecVP9 && !std::holds_alternative<webrtc::RTPVideoHeaderVP9>(projected.video_type_header)) ||
+      (codec == webrtc::kVideoCodecH264 && !std::holds_alternative<webrtc::RTPVideoHeaderH264>(projected.video_type_header))) return false;
 #if RTC_DCHECK_IS_ON
   if (codec == webrtc::kVideoCodecVP8 && !value.frame().GetData().empty()) {
-    const auto& vp8 = std::get<webrtc::RTPVideoHeaderVP8>(actual.video_type_header);
+    const auto& vp8 = std::get<webrtc::RTPVideoHeaderVP8>(projected.video_type_header);
     if ((vp8.pictureId != webrtc::kNoPictureId && vp8.pictureId < 0) ||
         (vp8.tl0PicIdx != webrtc::kNoTl0PicIdx && (vp8.tl0PicIdx < 0 || vp8.tl0PicIdx > 255)) ||
         (vp8.temporalIdx != webrtc::kNoTemporalIdx ? vp8.temporalIdx > 3 : vp8.layerSync) ||
@@ -125,7 +126,7 @@ bool transformable_video_completion_safe(const NativeTransformableFrame& value, 
   }
 #endif
   if (codec == webrtc::kVideoCodecVP9) {
-    auto vp9 = std::get<webrtc::RTPVideoHeaderVP9>(actual.video_type_header);
+    auto vp9 = std::get<webrtc::RTPVideoHeaderVP9>(projected.video_type_header);
     if (vp9.num_spatial_layers > webrtc::kMaxVp9NumberOfSpatialLayers) return false;
     // Match RemoveInactiveSpatialLayers' narrow integer assignments, without
     // copying/reading inactive array prefixes. Its loops are bounded above.
@@ -143,8 +144,8 @@ bool transformable_video_completion_safe(const NativeTransformableFrame& value, 
     }
     if (!value.frame().GetData().empty() && !(vp9.spatial_idx < vp9.num_spatial_layers - 1 || vp9.end_of_picture)) return false;
   }
-  if (actual.generic) {
-    const auto& generic = *actual.generic;
+  if (projected.generic) {
+    const auto& generic = *projected.generic;
     if (generic.spatial_index < 0 || generic.spatial_index >= 8 || generic.temporal_index < 0 || generic.temporal_index >= 8) return false;
     for (const auto dependency : generic.dependencies) {
       if (dependency >= generic.frame_id) return false;
@@ -348,23 +349,11 @@ transformable_video_rid(const NativeTransformableFrame &value,
 std::unique_ptr<NativeVideoFrameMetadata>
 transformable_video_metadata(const NativeTransformableFrame &value,
                              std::int32_t &status) noexcept {
-  // Stock sender Metadata consumes GetAsMetadata's codec-selected std::get;
-  // receiver Metadata reads its cached value without re-reading the header.
-  if (value.frame().GetDirection() ==
-      webrtc::TransformableFrameInterface::Direction::kSender) {
-    NativeRtpVideoHeader header(Video(value).header());
-    auto converted = rtp_video_header_as_metadata(header, status);
-    if (!converted) {
-      status = 4;
-      return nullptr;
-    }
-  }
+  // Live video frames originate only in SDK packetization/depacketization;
+  // arbitrary video-frame constructors are not exposed. Owned sender writes
+  // validate codec/variant association before changing the private header.
   status = 0;
   return std::make_unique<NativeVideoFrameMetadata>(Video(value).Metadata());
-}
-std::unique_ptr<NativeRtpVideoHeader>
-transformable_video_header(const NativeTransformableFrame &value) noexcept {
-  return std::make_unique<NativeRtpVideoHeader>(Video(value).header());
 }
 std::int32_t transformable_video_set_metadata(
     NativeTransformableFrame &value,
@@ -404,6 +393,9 @@ std::int32_t transformable_video_set_metadata(
     std::int32_t status = 0;
     if (!rtp_video_header_from_metadata(metadata, status))
       return 4;
+    const auto codec = SenderPacketizerCodec(value);
+    if (!codec) return 2;
+    if (metadata.value().GetCodec() != *codec) return 8;
   }
   Video(value).SetMetadata(metadata.value());
   return 0;

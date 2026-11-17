@@ -553,6 +553,12 @@ class CallerNeuralEstimator final : public webrtc::NeuralResidualEchoEstimator {
     callbacks.Observe(valid);
     return valid ? EchoConfigFromFfi(f).suppressor : config;
   }
+  bool IsInitialized() override {
+    bool valid = false;
+    const bool initialized = apm_neural_is_initialized(*callbacks.provider, valid);
+    callbacks.Observe(valid);
+    return initialized;
+  }
   void Reset() override { callbacks.Observe(apm_neural_reset(*callbacks.provider)); }
 };
 
@@ -1296,7 +1302,6 @@ class RetainedAudioProcessor : public webrtc::AudioProcessing {
   std::size_t num_output_channels() const override { return Core().num_output_channels(); }
   std::size_t num_reverse_channels() const override { return Core().num_reverse_channels(); }
   void set_output_will_be_muted(bool muted) override { Core().set_output_will_be_muted(muted); }
-  bool get_output_will_be_muted() override { return Core().get_output_will_be_muted(); }
   void SetRuntimeSetting(RuntimeSetting setting) override {
     if (installed_audio_processor_reentry(owner_)) return;
     std::lock_guard lock(owner_->operations); InstalledApmScope scope(owner_.get());
@@ -2326,7 +2331,6 @@ FfiAudioProcessingFormatState audio_processor_format(const NativeAudioProcessing
   return {m->proc_sample_rate_hz(), m->proc_split_sample_rate_hz(), m->num_input_channels(), m->num_proc_channels(), m->num_output_channels(), m->num_reverse_channels()};
 }
 void audio_processor_set_muted(NativeAudioProcessingModule& p, bool v) noexcept { p.state().module->set_output_will_be_muted(v); }
-bool audio_processor_muted(NativeAudioProcessingModule& p) noexcept { return p.state().module->get_output_will_be_muted(); }
 std::int32_t audio_processor_set_delay(NativeAudioProcessingModule& p, std::int32_t v) noexcept { return p.state().module->set_stream_delay_ms(v); }
 std::int32_t audio_processor_delay(const NativeAudioProcessingModule& p) noexcept { return p.state().module->stream_delay_ms(); }
 void audio_processor_set_analog_level(NativeAudioProcessingModule& p, std::int32_t v) noexcept { p.state().module->set_stream_analog_level(v); }

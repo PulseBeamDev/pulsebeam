@@ -7,6 +7,7 @@ use std::sync::{
 #[derive(Default)]
 struct Calls {
     adjust: AtomicUsize,
+    initialized: AtomicUsize,
     reset: AtomicUsize,
     estimate: AtomicUsize,
     drops: AtomicUsize,
@@ -21,6 +22,10 @@ impl Drop for Estimator {
     }
 }
 impl NeuralResidualEchoEstimatorProvider for Estimator {
+    fn is_initialized(&mut self) -> Result<bool, String> {
+        self.calls.initialized.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
     fn adjust_config(&mut self, config: Aec3Suppressor) -> Result<Aec3Suppressor, String> {
         self.calls.adjust.fetch_add(1, Ordering::SeqCst);
         if self.reject_adjust {
@@ -94,6 +99,7 @@ fn stock_aec3_drives_the_selected_caller_neural_estimator() {
         );
     }
     assert!(calls.adjust.load(Ordering::SeqCst) > 0);
+    assert!(calls.initialized.load(Ordering::SeqCst) > 0);
     assert!(calls.reset.load(Ordering::SeqCst) > 0);
     assert!(calls.estimate.load(Ordering::SeqCst) > 0);
     assert_eq!(calls.drops.load(Ordering::SeqCst), 0);

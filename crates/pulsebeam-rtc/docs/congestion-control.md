@@ -15,7 +15,7 @@ or a second admission budget.
 ## Pinned implementation
 
 The implementation reference is libwebrtc commit
-[`326fd06bb4d93900ed6947205b94cefd2413afca`](https://webrtc.googlesource.com/src/+/326fd06bb4d93900ed6947205b94cefd2413afca/modules/congestion_controller/scream/).
+[`7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499`](https://webrtc.googlesource.com/src/+/7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499/modules/congestion_controller/scream/).
 The production controller, feedback/delay/loss helpers, network-controller
 adapter and RTP debt pacer are Rust ports. Production does not link the C++
 implementation. Native peers in tests remain independent compatibility fixtures.
@@ -105,7 +105,7 @@ pretending the SFU can re-encode a cheaper stream.
 
 A previously paused slot needs its selected base cost plus the greater of
 10% (truncated to whole bits/s) or 20 kbps, following pinned
-[`MinBitrateWithHysteresis`](https://webrtc.googlesource.com/src/+/326fd06bb4d93900ed6947205b94cefd2413afca/call/bitrate_allocator.cc).
+[`MinBitrateWithHysteresis`](https://webrtc.googlesource.com/src/+/7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499/call/bitrate_allocator.cc).
 There is no timed resume dwell and no guarantee against a later pause when the
 budget falls. These costs come from the SFU's changing encoded-layer statistics,
 not a native encoder's fixed configured minimum. No encoder protection-rate
@@ -228,8 +228,8 @@ nominal target alone cannot prove those properties or physical capacity.
 
 ## References
 
-- [Pinned implementation differences](https://webrtc.googlesource.com/src/+/326fd06bb4d93900ed6947205b94cefd2413afca/modules/congestion_controller/scream/g3doc/implementation_diff.md)
-- [Pinned native pacer](https://webrtc.googlesource.com/src/+/326fd06bb4d93900ed6947205b94cefd2413afca/modules/pacing/pacing_controller.cc)
+- [Pinned implementation differences](https://webrtc.googlesource.com/src/+/7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499/modules/congestion_controller/scream/g3doc/implementation_diff.md)
+- [Pinned native pacer](https://webrtc.googlesource.com/src/+/7cfcf6dc8e6573d09d967d1641fc7bbcf65bd499/modules/pacing/pacing_controller.cc)
 - [SCReAM v2 draft 01, historical standards reference](https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-rfc8298bis-screamv2-01)
 - [RFC 3550: RTP/RTCP](https://www.rfc-editor.org/rfc/rfc3550.html)
 - [RFC 8888: RTP congestion-control feedback](https://www.rfc-editor.org/rfc/rfc8888.html)

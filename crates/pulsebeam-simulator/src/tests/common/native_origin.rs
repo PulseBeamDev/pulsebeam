@@ -730,7 +730,7 @@ impl NativeOriginCorrelation {
         generation: u64,
         since: Instant,
     ) -> Result<NativeOriginProof> {
-        self.require_current_content(origin, generation, since, None)
+        self.require_current_content(origin, generation, since, None, None)
     }
 
     pub fn require_current_content(
@@ -739,6 +739,7 @@ impl NativeOriginCorrelation {
         generation: u64,
         since: Instant,
         expected: Option<PixelSample>,
+        temporal_index: Option<u8>,
     ) -> Result<NativeOriginProof> {
         ensure!(
             self.event_failures == 0,
@@ -758,6 +759,8 @@ impl NativeOriginCorrelation {
             };
             if event.event.source != origin
                 || picture.event_conflict
+                || temporal_index
+                    .is_some_and(|index| event.native_temporal_index != Some(i32::from(index)))
                 || native.at < since
                 || event.captured < since
                 || !matches!(&picture.origin, Origin::Unique(source) if source == origin)
@@ -1538,14 +1541,21 @@ mod tests {
                 1,
                 start,
                 Some(PixelSample::solid(0, 0, 0)),
+                None,
             )
             .unwrap();
+            assert!(
+                log.require_current_content(&event.event.source, 1, start, None, Some(2))
+                    .is_err(),
+                "resolution alone does not establish upper-temporal readiness"
+            );
             assert!(
                 log.require_current_content(
                     &event.event.source,
                     1,
                     start,
-                    Some(PixelSample::solid(176, 96, 96))
+                    Some(PixelSample::solid(176, 96, 96)),
+                    None,
                 )
                 .is_err(),
                 "a fresh old picture cannot settle an explicit content update"

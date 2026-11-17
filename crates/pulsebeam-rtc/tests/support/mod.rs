@@ -396,7 +396,23 @@ impl PeerFixture {
         for _ in 0..2_000 {
             let _ = fixture.step();
             if fixture.peer_connected && fixture.connection_connected {
-                return fixture;
+                // Connected can precede the final DTLS ACK. Commit and deliver
+                // ready setup work before starting post-setup observations.
+                let connected_at = fixture.at();
+                fixture.record_idle_wakeups();
+                for _ in 0..2_000 {
+                    let _ = fixture.step_until(Some(connected_at));
+                    assert_eq!(fixture.at(), connected_at, "setup must not advance time");
+                    if fixture
+                        .take_idle_observations()
+                        .iter()
+                        .any(|(_, next)| next.is_none_or(|deadline| deadline > connected_at))
+                    {
+                        fixture.idle_observations = None;
+                        return fixture;
+                    }
+                }
+                panic!("native feedback setup did not become idle");
             }
         }
         panic!("native feedback peer did not connect");

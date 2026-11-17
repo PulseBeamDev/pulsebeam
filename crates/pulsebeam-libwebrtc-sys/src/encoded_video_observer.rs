@@ -5,8 +5,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-/// Actual native recordable-frame output, or loss of the metadata needed to
-/// identify that output. Polling queue eviction is deliberately not a loss here.
+/// Native decoder inputs selected by the SDK, or loss of metadata needed to
+/// identify those inputs. Frames rejected before decoder invocation are not
+/// observed. Polling queue eviction is deliberately not a loss here.
 #[derive(Clone, Debug)]
 pub enum EncodedVideoFrameObservation {
     Frame(EncodedReceivedVideoFrame),

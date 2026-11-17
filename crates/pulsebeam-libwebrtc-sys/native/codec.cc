@@ -12,11 +12,9 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cfenv>
 #include <cfloat>
 #include <cmath>
 #if defined(__linux__) && defined(__x86_64__)
-#include <xmmintrin.h>
 #endif
 #include <cstring>
 #include <limits>
@@ -79,24 +77,12 @@
 #include "api/video_codecs/video_encoder_factory.h"
 #include "modules/audio_coding/codecs/opus/audio_coder_opus_common.h"
 #include "modules/audio_coding/codecs/opus/audio_encoder_opus.h"
-#include "modules/audio_coding/audio_network_adaptor/bitrate_controller.h"
-#include "modules/audio_coding/audio_network_adaptor/audio_network_adaptor_impl.h"
-#include "api/audio_codecs/opus/audio_encoder_opus.h"
-#if WEBRTC_ENABLE_PROTOBUF
-#include "modules/audio_coding/audio_network_adaptor/util/threshold_curve.h"
-#ifdef WEBRTC_ANDROID_PLATFORM_BUILD
-#include "external/webrtc/webrtc/modules/audio_coding/audio_network_adaptor/config.pb.h"
-#else
-#include "modules/audio_coding/audio_network_adaptor/config.pb.h"
-#endif
-#endif
 #include "modules/video_coding/codecs/vp8/include/vp8.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "media/engine/simulcast_encoder_adapter.h"
 #include "pulsebeam-webrtc-sys/src/lib.rs.h"
 #include "pulsebeam-webrtc-sys/native/opus_carrier.h"
-#include "pulsebeam-webrtc-sys/native/audio_encoder_ana_access.h"
 #include "pulsebeam-webrtc-sys/native/execution.h"
 #include "pulsebeam-webrtc-sys/native/event_log.h"
 
@@ -1689,6 +1675,11 @@ class ScopedBuiltinVp8Encoder final : public webrtc::VideoEncoder {
     NativeBuiltinVp8Scope scope(execution_);
     encoder_->SetRates(parameters);
   }
+  void SetComplexity(std::span<const webrtc::VideoCodecComplexity> complexity,
+      ComplexityControlMode mode) override {
+    NativeBuiltinVp8Scope scope(execution_);
+    encoder_->SetComplexity(complexity, mode);
+  }
   void OnPacketLossRateUpdate(float value) override {
     NativeBuiltinVp8Scope scope(execution_);
     encoder_->OnPacketLossRateUpdate(value);
@@ -2606,612 +2597,33 @@ FfiAudioEncoderQuery audio_encoder_query(const NativeAudioEncoderFactory& factor
 }
 
 namespace {
-// Derived from the actual environment's immutable retaining clock contract.
-// Millisecond smoothers and the packet-loss Timestamp subtraction have distinct
-// domains: a wide finite microsecond range can still have safe millisecond math.
-struct AnaClockEvidence {
-  std::int64_t minimum_ms;
-  std::int64_t maximum_ms;
-  std::uint64_t span_ms;
-  bool packet_loss_deltas_safe;
-
-  bool admits_duration(int duration) const {
-    const auto wide = static_cast<std::int64_t>(duration);
-    if (wide > 0 && maximum_ms > INT64_MAX - wide) return false;
-    if (wide < 0 && minimum_ms < INT64_MIN - wide) return false;
-    const auto magnitude = static_cast<std::uint64_t>(wide < 0 ? -wide : wide);
-    return span_ms <= static_cast<std::uint64_t>(INT64_MAX) - magnitude;
-  }
-};
-
-std::optional<AnaClockEvidence> RetainedAnaClockEvidence(const FfiClockTimeBounds& bounds) {
+bool PacketLossClockSafe(const FfiClockTimeBounds& bounds) {
   if (!bounds.known || (!bounds.monotonic && bounds.minimum_us != bounds.maximum_us) ||
       bounds.minimum_us > bounds.maximum_us ||
-      bounds.minimum_us == INT64_MIN || bounds.maximum_us == INT64_MAX) return std::nullopt;
-  const auto minimum = webrtc::Timestamp::Micros(bounds.minimum_us).ms();
-  const auto maximum = webrtc::Timestamp::Micros(bounds.maximum_us).ms();
-  const auto span_ms = static_cast<std::uint64_t>(maximum) - static_cast<std::uint64_t>(minimum);
-  const auto span_us = static_cast<std::uint64_t>(bounds.maximum_us) - static_cast<std::uint64_t>(bounds.minimum_us);
-  // Timestamp subtraction constructs a finite TimeDelta::Micros. Its native
-  // DCHECK excludes INT64_MAX even though the signed subtraction itself fits.
-  return AnaClockEvidence{minimum, maximum, span_ms, span_us < static_cast<std::uint64_t>(INT64_MAX)};
-}
-
-static_assert(std::numeric_limits<float>::is_iec559 && std::numeric_limits<float>::digits == 24 &&
-    std::numeric_limits<float>::radix == 2 && sizeof(int) == sizeof(std::int32_t));
-
-bool AnaSmoothingContextSafe() {
-#if defined(__FAST_MATH__) || !defined(__linux__) || !defined(__x86_64__)
-  // Other targets require their own floating-environment admission contract.
-  return false;
-#else
-  static_assert(FLT_EVAL_METHOD == 0);
-  unsigned short x87_control;
-  asm volatile("fnstcw %0" : "=m"(x87_control));
-  const unsigned int sse_control = _mm_getcsr();
-  // Every exception, including inexact, must be masked. Native powf and the
-  // recurrence may produce infinities/NaNs before the consuming average check.
-  // Preserve binary32 subnormals and nearest-even rounding in both FP units.
-  return std::fegetround() == FE_TONEAREST &&
-      (x87_control & 0x003fu) == 0x003fu &&
-      (sse_control & 0x1f80u) == 0x1f80u &&
-      (sse_control & 0xe040u) == 0;
-#endif
-}
-
-bool AnaBitrateSampleSafe(std::int32_t bitrate) {
-  // Exact adjacent binary32 boundary, not float(INT32_MAX), which is 2^31.
-  // The native recurrence preserves [-2^31, 2^31-128] under RN-even arithmetic;
-  // see docs/audio-encoder-contracts.md for the endpoint argument and assumptions.
-  constexpr float lower = -0x1p31f;
-  constexpr float upper = 0x1.fffffep30f;
-  const float sample = static_cast<float>(bitrate);
-  return sample >= lower && sample <= upper;
-}
-
-bool AnaBandwidthPeriodSafe(bool has_period, std::int64_t period) {
-  if (!has_period) return true;
-  // Reproduce the SDK's two distinct operations. Large and even negative i64
-  // periods may produce a nonamplifying rounded alpha; do not substitute an
-  // arbitrary i32 period limit or change its pinned ABI conversion semantics.
-  if (period < std::numeric_limits<std::int64_t>::min() / 4 ||
-      period > std::numeric_limits<std::int64_t>::max() / 4) return false;
-  const int native_duration = static_cast<int>(period * 4);
-  const float alpha = native_duration == 0 ? 0.0f : std::exp(-1.0f / native_duration);
-  // Some large negative durations round alpha to exactly one. Preserve that
-  // native frozen-filter behavior instead of rejecting by duration sign alone.
-  return std::isfinite(alpha) && alpha >= 0.0f && alpha <= 1.0f;
-}
-
-bool AnaSmoothingInitializationSafe(int duration, std::uint64_t clock_span_ms) {
-  if (!AnaSmoothingContextSafe()) return false;
-  const float alpha = duration == 0 ? 0.0f : std::exp(-1.0f / duration);
-  if (!std::isfinite(alpha) || alpha < 0.0f) return false;
-  if (duration < 0) {
-    // The initial phase ends before the first sample. A rounded unit alpha or
-    // a durable zero millisecond span makes every post-init multiplier one.
-    return alpha <= 1.0f || clock_span_ms == 0;
-  }
-  if (alpha > 1.0f) return false;
-  if (duration <= 1) return true; // Native has distinct zero/one-duration branches.
-  const float factor = ::powf(duration, -1.0f / duration);
-  const float constant = duration - ::powf(duration, 1.0f - 1.0f / duration);
-  if (!std::isfinite(factor) || factor <= 0.0f || factor > 1.0f ||
-      !std::isfinite(constant) || constant <= 0.0f) return false;
-  // Do not assume powf is monotone just because the exact real power is. Witness
-  // every possible initial-phase exponent under the supplied lifetime span.
-  // This is evaluated once when retaining a proof, not on each native update.
-  const auto window = std::min(clock_span_ms, static_cast<std::uint64_t>(duration));
-  float previous = ::powf(factor, -static_cast<std::int64_t>(duration));
-  if (!std::isfinite(previous) || previous <= 0.0f) return false;
-  for (std::uint64_t elapsed = 1; elapsed <= window; ++elapsed) {
-    const float power = ::powf(factor, static_cast<std::int64_t>(elapsed) - duration);
-    if (!std::isfinite(power) || power <= 0.0f || power > previous) return false;
-    previous = power;
-  }
-  // Both powf values in the native numerator are finite and nonincreasing;
-  // their difference is nonnegative. With a positive constant, exp sees a
-  // nonpositive argument (possibly -infinity), giving a multiplier in [0,1].
-  return true;
-}
-
-enum class AnaSmoothingFailure : std::uint8_t {
-  None = 0, Clock = 1, Context = 2, Initialization = 3,
-  Sample = 4, TimeConstant = 5, Average = 6,
-};
-
-// Shared by delegating runtime guards under the owning encoder's mutex. Failure
-// is sticky within an operation; only its owner may begin a fresh operation.
-struct AnaSmoothingRuntime {
-  explicit AnaSmoothingRuntime(AnaClockEvidence evidence) : clock(evidence) {}
-  const AnaClockEvidence clock;
-  AnaSmoothingFailure failure = AnaSmoothingFailure::None;
-
-  void Reject(AnaSmoothingFailure reason) {
-    if (failure == AnaSmoothingFailure::None) failure = reason;
-  }
-  bool healthy() const { return failure == AnaSmoothingFailure::None; }
-};
-
-// A delegating consuming-operation guard, not a replacement average. Owning
-// Opus creation installs it; native numerical state stays inside SmoothingFilterImpl;
-// only actual returned averages are admitted to downstream integer conversion.
-class BoundedAnaBitrateSmoother final : public webrtc::SmoothingFilter {
- public:
-  static std::unique_ptr<BoundedAnaBitrateSmoother> Create(
-      std::shared_ptr<AnaSmoothingRuntime> runtime) {
-    if (!runtime || !runtime->healthy()) return nullptr;
-    if (!AnaSmoothingContextSafe()) {
-      runtime->Reject(AnaSmoothingFailure::Context);
-      return nullptr;
-    }
-    if (!runtime->clock.admits_duration(kInitializationMs)) {
-      runtime->Reject(AnaSmoothingFailure::Clock);
-      return nullptr;
-    }
-    if (!AnaSmoothingInitializationSafe(kInitializationMs, runtime->clock.span_ms)) {
-      runtime->Reject(AnaSmoothingFailure::Initialization);
-      return nullptr;
-    }
-    return std::unique_ptr<BoundedAnaBitrateSmoother>(
-        new BoundedAnaBitrateSmoother(std::move(runtime)));
-  }
-
-  void AddSample(float sample, webrtc::Timestamp now) override {
-    if (!runtime_->healthy()) return;
-    // Include rounded float(INT32_MAX). It is legal filter state, even though
-    // returning that particular average to the SDK's int cast is not legal.
-    if (!std::isfinite(sample) || sample < -0x1p31f || sample > 0x1p31f) {
-      runtime_->Reject(AnaSmoothingFailure::Sample);
-      return;
-    }
-    const auto time = CheckTime(now);
-    if (!time) return;
-    if (!init_end_ms_) init_end_ms_ = *time + kInitializationMs;
-    filter_.AddSample(sample, now);
-    last_state_ms_ = *time;
-  }
-
-  std::optional<float> GetAverage(webrtc::Timestamp now) override {
-    if (!runtime_->healthy()) return std::nullopt;
-    // Native ignores the timestamp entirely before the first sample.
-    if (!init_end_ms_) return filter_.GetAverage(now);
-    const auto time = CheckTime(now);
-    if (!time) return std::nullopt;
-    const auto average = filter_.GetAverage(now);
-    last_state_ms_ = *time;
-    // Check the actual native result at the narrowing consumption seam. Do not
-    // predict the average or reject an ignored rounded-high sample beforehand.
-    if (average && (!std::isfinite(*average) || *average < -0x1p31f || *average >= 0x1p31f)) {
-      runtime_->Reject(AnaSmoothingFailure::Average);
-      return std::nullopt;
-    }
-    return average;
-  }
-
-  bool SetTimeConstantMs(int duration) override {
-    if (!runtime_->healthy()) return false;
-    // The SDK returns false without evaluating alpha until initialization ends.
-    // Preserve ignored negative/large durations and the native return value.
-    if (!init_end_ms_ || *last_state_ms_ < *init_end_ms_)
-      return filter_.SetTimeConstantMs(duration);
-    if (!AnaSmoothingContextSafe()) {
-      runtime_->Reject(AnaSmoothingFailure::Context);
-      return false;
-    }
-    const float alpha = duration == 0 ? 0.0f : std::exp(-1.0f / duration);
-    if (!std::isfinite(alpha) || alpha < 0.0f) {
-      runtime_->Reject(AnaSmoothingFailure::TimeConstant);
-      return false;
-    }
-    // Amplification is not itself unsafe. The native extrapolation has only FP
-    // operations, no numerical assertions or integer casts. In the admitted
-    // nontrapping context even overflowing powf/recurrence remains defined;
-    // GetAverage checks the actual result before any downstream integer cast.
-    // Do not predict state or restrict a native-valid period by its sign.
-    return filter_.SetTimeConstantMs(duration);
-  }
-
- private:
-  static constexpr int kInitializationMs = 5000;
-  explicit BoundedAnaBitrateSmoother(std::shared_ptr<AnaSmoothingRuntime> runtime)
-      : runtime_(std::move(runtime)), filter_(kInitializationMs) {}
-
-  std::optional<std::int64_t> CheckTime(webrtc::Timestamp now) {
-    if (!now.IsFinite()) {
-      runtime_->Reject(AnaSmoothingFailure::Clock);
-      return std::nullopt;
-    }
-    const auto time = now.ms();
-    if (time < runtime_->clock.minimum_ms || time > runtime_->clock.maximum_ms ||
-        (last_state_ms_ && time < *last_state_ms_)) {
-      runtime_->Reject(AnaSmoothingFailure::Clock);
-      return std::nullopt;
-    }
-    if (!AnaSmoothingContextSafe()) {
-      runtime_->Reject(AnaSmoothingFailure::Context);
-      return std::nullopt;
-    }
-    return time;
-  }
-
-  const std::shared_ptr<AnaSmoothingRuntime> runtime_;
-  webrtc::SmoothingFilterImpl filter_;
-  // Phase/time evidence only. The native filter owns all numerical state.
-  std::optional<std::int64_t> init_end_ms_;
-  std::optional<std::int64_t> last_state_ms_;
-};
-
-// These are retaining obligations, not permission to invoke native ANA yet.
-// Admission reads the actual product and never constructs or replaces controllers.
-struct AudioNetworkAdaptorAdmission {
-  struct Offsets { int increase; int decrease; };
-  std::uint8_t controller_mask = 0;
-  std::vector<int> controller_kinds;
-  std::vector<std::optional<Offsets>> controller_bitrate_offsets;
-  std::vector<int> fec_time_constants_ms;
-  struct ScoringPoint { int bandwidth_bps; float loss; };
-  std::vector<ScoringPoint> scoring_points;
-  std::vector<int> frame_lengths_ms;
-  int initial_frame_length_ms = 0;
-  std::optional<int> fec_time_constant_ms;
-  std::optional<Offsets> legacy_offsets;
-  std::vector<std::pair<int, int>> legacy_transitions;
-  std::optional<Offsets> bitrate_offsets;
-  std::optional<int> minimum_payload_bitrate_bps;
-  bool slow_adaptation = false;
-};
-bool AnaIntDifferenceSafe(int value, int rate) {
-  const auto result = static_cast<std::int64_t>(value) - rate;
-  return result >= INT32_MIN && result <= INT32_MAX;
-}
-
-bool AnaOffsetAssertSafe(std::size_t overhead, int offset) {
-  // RTC_DCHECK_GE/LE use SafeGe/SafeLe, so signed/unsigned comparisons are
-  // mathematical, not the usual C++ unsigned promotion of a negative operand.
-  if (offset == INT32_MIN) return false; // Native negates it as signed int.
-  const auto magnitude = static_cast<std::size_t>(offset < 0 ? -offset : offset);
-  return magnitude <= overhead;
-}
-
-int AnaUnsignedOverheadRate(std::size_t overhead, int offset, int frame) {
-  // Preserve the SDK's defined size_t addition/multiplication wrap and pinned
-  // narrowing. Replacing this with signed or saturating arithmetic changes it.
-  return static_cast<int>((overhead + offset) * 8 * 1000 / frame);
-}
-
-enum class AnaBitrateFailure : std::uint8_t {
-  None = 0, Metrics = 1, Slot = 2, Arithmetic = 3, Construction = 4,
-};
-struct AnaBitrateRuntime {
-  AnaBitrateFailure failure = AnaBitrateFailure::None;
-  bool healthy() const { return failure == AnaBitrateFailure::None; }
-  void Reject(AnaBitrateFailure reason) {
-    if (healthy()) failure = reason;
-  }
-};
-
-// The owning manager must retain the original native controller and supply its
-// exact factory construction arguments. This proxy never predicts bitrate or
-// replaces native decisions. Only sparse metrics and consumed frame history are
-// retained, including the SDK's conditional frame update.
-class GuardedAnaBitrateController final : public webrtc::Controller {
- public:
-  GuardedAnaBitrateController(webrtc::audio_network_adaptor::BitrateController& native,
-      const webrtc::audio_network_adaptor::BitrateController::Config& config,
-      std::shared_ptr<AnaBitrateRuntime> runtime)
-      : native_(native), increase_(config.fl_increase_overhead_offset),
-        decrease_(config.fl_decrease_overhead_offset),
-        frame_ms_(config.initial_frame_length_ms), runtime_(std::move(runtime)) {}
-
-  void UpdateNetworkMetrics(const NetworkMetrics& metrics) override {
-    if (!runtime_->healthy()) return;
-#if RTC_DCHECK_IS_ON
-    if (metrics.overhead_bytes_per_packet && *metrics.overhead_bytes_per_packet == 0) {
-      runtime_->Reject(AnaBitrateFailure::Metrics);
-      return;
-    }
-#endif
-    native_.UpdateNetworkMetrics(metrics);
-    if (metrics.target_audio_bitrate_bps) target_ = metrics.target_audio_bitrate_bps;
-    if (metrics.overhead_bytes_per_packet) overhead_ = metrics.overhead_bytes_per_packet;
-  }
-
-  void MakeDecision(webrtc::AudioEncoderRuntimeConfig* config) override {
-    if (!runtime_->healthy()) return;
-    if (!config || (RTC_DCHECK_IS_ON && config->bitrate_bps)) {
-      runtime_->Reject(AnaBitrateFailure::Slot);
-      return;
-    }
-    const bool consumes = target_.has_value() && overhead_.has_value();
-    const int frame = consumes ? config->frame_length_ms.value_or(frame_ms_) : frame_ms_;
-    if (consumes) {
-      const int offset = config->last_fl_change_increase ? increase_ : decrease_;
-      // Check only the offset and frame the SDK will actually consume. An
-      // inactive INT_MIN offset or an ignored frame slot must not reject it.
-      if (frame <= 0 ||
-#if RTC_DCHECK_IS_ON
-          !AnaOffsetAssertSafe(*overhead_, offset) ||
-#endif
-          !AnaIntDifferenceSafe(*target_, AnaUnsignedOverheadRate(*overhead_, offset, frame))) {
-        runtime_->Reject(AnaBitrateFailure::Arithmetic);
-        return;
-      }
-    }
-    native_.MakeDecision(config);
-    if (consumes) frame_ms_ = frame;
-  }
-
- private:
-  webrtc::audio_network_adaptor::BitrateController& native_;
-  const int increase_;
-  const int decrease_;
-  int frame_ms_;
-  const std::shared_ptr<AnaBitrateRuntime> runtime_;
-  std::optional<int> target_;
-  std::optional<std::size_t> overhead_;
-};
-
-#if WEBRTC_ENABLE_PROTOBUF
-float AnaScoringDistance(const AudioNetworkAdaptorAdmission::ScoringPoint& point,
-    int bandwidth, float loss) {
-  // Match the pinned manager's normalization, subtraction and pow overloads.
-  const auto normalize_bandwidth = [](int value) {
-    return static_cast<float>(std::clamp(value, 0, 120000)) / 120000;
-  };
-  const auto normalize_loss = [](float value) { return std::min(value * 3.3333f, 1.0f); };
-  const float delta_bandwidth = normalize_bandwidth(bandwidth) - normalize_bandwidth(point.bandwidth_bps);
-  const float delta_loss = normalize_loss(loss) - normalize_loss(point.loss);
-  const double distance = std::pow(delta_bandwidth, 2) + std::pow(delta_loss, 2);
-  // Model the pinned RN-even IEEE narrowing without an out-of-range finite
-  // double-to-float cast in the preflight. Native distance overflow yields +inf.
-  const double maximum = std::numeric_limits<float>::max();
-  if (distance > maximum) {
-    const double midpoint = std::ldexp(1.0, 128) - std::ldexp(1.0, 103);
-    return distance >= midpoint ? std::numeric_limits<float>::infinity() : std::numeric_limits<float>::max();
-  }
-  return static_cast<float>(distance);
-}
-
-bool AnaScoringOrderSafe(const AudioNetworkAdaptorAdmission& admission,
-    std::optional<int> bandwidth, std::optional<float> loss) {
-  if (admission.scoring_points.empty() || !bandwidth || !loss) return true;
-  if (!AnaSmoothingContextSafe()) return false;
-  bool nan = false;
-  bool distinct = false;
-  std::optional<float> first_distance;
-  for (const auto& point : admission.scoring_points) {
-    const float distance = AnaScoringDistance(point, *bandwidth, *loss);
-    if (std::isnan(distance)) {
-      nan = true;
-    } else if (!first_distance) {
-      first_distance = distance;
-    } else if (*first_distance != distance) {
-      distinct = true;
-    }
-  }
-  // A NaN compares equivalent to every scored controller. That violates
-  // equivalence transitivity exactly when two non-NaN distance classes exist.
-  // Unscored controllers form a separate, strictly later equivalence class.
-  return !(nan && distinct);
-}
-
-bool AnaControllerArithmeticSafe(const AudioNetworkAdaptorAdmission& admission,
-    std::optional<std::size_t> overhead, std::optional<int> target,
-    std::optional<std::pair<int, int>> uplink_bounds) {
-  if (uplink_bounds && uplink_bounds->first > uplink_bounds->second) return false;
-  if (!overhead) return true;
-  if (admission.bitrate_offsets) {
-    // UpdateNetworkMetrics asserts this before checking whether target is known.
-    if (*overhead == 0) return false;
-    if (target) {
-      auto frames = admission.frame_lengths_ms;
-      frames.push_back(admission.initial_frame_length_ms);
-      const auto offsets = *admission.bitrate_offsets;
-      for (int frame : frames) {
-        if (frame <= 0) return false;
-        for (int offset : {offsets.decrease, offsets.increase}) {
-          // Only legacy frames write last_fl_change_increase. Without them the
-          // native runtime config always selects the decrease offset.
-          if (offset == offsets.increase && offset != offsets.decrease && !admission.legacy_offsets) continue;
-          if (!AnaOffsetAssertSafe(*overhead, offset) ||
-              !AnaIntDifferenceSafe(*target, AnaUnsignedOverheadRate(*overhead, offset, frame))) return false;
-        }
-      }
-    }
-  }
-  if (admission.legacy_offsets) {
-    const auto offsets = *admission.legacy_offsets;
-    const auto& frames = admission.frame_lengths_ms;
-    const auto has_transition = [&](int from, int to) {
-      return std::find(admission.legacy_transitions.begin(), admission.legacy_transitions.end(),
-          std::pair<int, int>{from, to}) != admission.legacy_transitions.end();
-    };
-    for (int from : frames) {
-      // Match the native first configured transition in each search direction.
-      const auto longer = std::find_if(frames.begin(), frames.end(), [&](int to) {
-        return to > from && has_transition(from, to);
-      });
-      if (longer != frames.end()) {
-        if (!AnaOffsetAssertSafe(*overhead, offsets.increase)) return false;
-        if (uplink_bounds && static_cast<std::int64_t>(webrtc::AudioEncoderOpusConfig::kMinBitrateBps) +
-            5000 + AnaUnsignedOverheadRate(*overhead, offsets.increase, from) > INT32_MAX) return false;
-      }
-      const auto shorter = std::find_if(frames.rbegin(), frames.rend(), [&](int to) {
-        return to < from && has_transition(from, to);
-      });
-      // The native decrease branch has no offset bound assertion or negation.
-      if (shorter != frames.rend() && uplink_bounds &&
-          static_cast<std::int64_t>(webrtc::AudioEncoderOpusConfig::kMinBitrateBps) +
-              5000 + AnaUnsignedOverheadRate(*overhead, offsets.decrease, *shorter) > INT32_MAX) return false;
-    }
-  }
-  if (admission.minimum_payload_bitrate_bps && target && uplink_bounds) {
-    // V2 first narrows size_t to int, then performs two signed products. Check
-    // that exact consumed int, not an arbitrary range on the original size_t.
-    const auto product = static_cast<std::int64_t>(static_cast<int>(*overhead)) * 8000;
-    if (product < INT32_MIN || product > INT32_MAX) return false;
-    for (int frame : admission.frame_lengths_ms) {
-      if (frame <= 0) return false;
-      const int rate = static_cast<int>(product) / frame;
-      if (admission.slow_adaptation) {
-        if (!AnaIntDifferenceSafe(uplink_bounds->first, rate) ||
-            !AnaIntDifferenceSafe(uplink_bounds->second, rate)) return false;
-      } else if (!AnaIntDifferenceSafe(*target, rate)) return false;
-    }
-  }
-  return true;
-}
-
-using AnaConfig = webrtc::audio_network_adaptor::config::ControllerManager;
-using AnaController = webrtc::audio_network_adaptor::config::Controller;
-using AnaFecThreshold = webrtc::audio_network_adaptor::config::FecController::Threshold;
-
-bool AnaThresholdConstructible(const AnaFecThreshold& threshold) {
-  if (!threshold.has_low_bandwidth_bps() || !threshold.has_high_bandwidth_bps() ||
-      !threshold.has_low_bandwidth_packet_loss() || !threshold.has_high_bandwidth_packet_loss()) return false;
-#if RTC_DCHECK_IS_ON
-  // Match the native float domain, including its integer-to-float rounding and
-  // merged endpoints. Comparisons also reject the NaNs that violate its DCHECKs.
-  return static_cast<float>(threshold.low_bandwidth_bps()) <= static_cast<float>(threshold.high_bandwidth_bps()) &&
-      threshold.low_bandwidth_packet_loss() >= threshold.high_bandwidth_packet_loss();
-#else
-  return true;  // Native nonasserting curves retain their supplied FP values.
-#endif
-}
-webrtc::ThresholdCurve AnaThreshold(const AnaFecThreshold& threshold) {
-  return {static_cast<float>(threshold.low_bandwidth_bps()), threshold.low_bandwidth_packet_loss(),
-      static_cast<float>(threshold.high_bandwidth_bps()), threshold.high_bandwidth_packet_loss()};
-}
-#endif
-
-[[maybe_unused]] std::optional<AudioNetworkAdaptorAdmission> AdmitAudioNetworkAdaptorConstruction(
-    const webrtc::AudioEncoderOpusImpl& encoder, rust::Slice<const std::uint8_t> bytes) {
-#if WEBRTC_ENABLE_PROTOBUF
-  if (bytes.size() > INT32_MAX) return std::nullopt;
-  AnaConfig config;
-  if (!config.ParseFromArray(bytes.data(), static_cast<int>(bytes.size()))) return std::nullopt;
-  AudioNetworkAdaptorAdmission result;
-  const auto frames = encoder.supported_frame_lengths_ms();
-  result.frame_lengths_ms.assign(frames.begin(), frames.end());
-  std::sort(result.frame_lengths_ms.begin(), result.frame_lengths_ms.end());
-  result.initial_frame_length_ms = encoder.next_frame_length_ms();
-  for (const auto& controller : config.controllers()) {
-    std::uint8_t writes = 0;
-    std::optional<AudioNetworkAdaptorAdmission::Offsets> bitrate_offsets;
-    switch (controller.controller_case()) {
-      case AnaController::kFecController: {
-        writes = 1;
-        const auto& fec = controller.fec_controller();
-        if (!fec.has_fec_enabling_threshold() || !fec.has_fec_disabling_threshold() ||
-            !fec.has_time_constant_ms() || !AnaThresholdConstructible(fec.fec_enabling_threshold()) ||
-            !AnaThresholdConstructible(fec.fec_disabling_threshold())) return std::nullopt;
-#if RTC_DCHECK_IS_ON
-        if (!(AnaThreshold(fec.fec_disabling_threshold()) <= AnaThreshold(fec.fec_enabling_threshold()))) return std::nullopt;
-#endif
-        result.fec_time_constant_ms = fec.time_constant_ms();
-        result.fec_time_constants_ms.push_back(fec.time_constant_ms());
-        break;
-      }
-      case AnaController::kFrameLengthController: {
-        writes = 2;
-        const auto& fl = controller.frame_length_controller();
-        if (!fl.has_fl_increasing_packet_loss_fraction() || !fl.has_fl_decreasing_packet_loss_fraction() ||
-            std::find(frames.begin(), frames.end(), encoder.next_frame_length_ms()) == frames.end()) return std::nullopt;
-        result.legacy_offsets = AudioNetworkAdaptorAdmission::Offsets{
-            fl.fl_increase_overhead_offset(), fl.fl_decrease_overhead_offset()};
-        // Keep every native map entry. Replacement-pair comments in the proto
-        // do not erase the older pairs from the native implementation.
-        if (fl.has_fl_20ms_to_40ms_bandwidth_bps()) result.legacy_transitions.emplace_back(20, 40);
-        if (fl.has_fl_20ms_to_60ms_bandwidth_bps()) result.legacy_transitions.emplace_back(20, 60);
-        if (fl.has_fl_40ms_to_20ms_bandwidth_bps()) result.legacy_transitions.emplace_back(40, 20);
-        if (fl.has_fl_40ms_to_60ms_bandwidth_bps()) result.legacy_transitions.emplace_back(40, 60);
-        if (fl.has_fl_60ms_to_40ms_bandwidth_bps()) result.legacy_transitions.emplace_back(60, 40);
-        if (fl.has_fl_60ms_to_20ms_bandwidth_bps()) result.legacy_transitions.emplace_back(60, 20);
-        if (fl.has_fl_60ms_to_120ms_bandwidth_bps()) result.legacy_transitions.emplace_back(60, 120);
-        if (fl.has_fl_120ms_to_60ms_bandwidth_bps()) result.legacy_transitions.emplace_back(120, 60);
-        break;
-      }
-      case AnaController::kChannelController: {
-        writes = 4;
-        const auto& channels = controller.channel_controller();
-        if (!channels.has_channel_1_to_2_bandwidth_bps() || !channels.has_channel_2_to_1_bandwidth_bps() ||
-            encoder.num_channels_to_encode() == 0 || encoder.num_channels_to_encode() > 2 ||
-            encoder.num_channels_to_encode() > encoder.NumChannels()) return std::nullopt;
-        break;
-      }
-      case AnaController::kDtxController: {
-        writes = 8;
-        const auto& dtx = controller.dtx_controller();
-        if (!dtx.has_dtx_enabling_bandwidth_bps() || !dtx.has_dtx_disabling_bandwidth_bps()) return std::nullopt;
-        break;
-      }
-      case AnaController::kBitrateController: {
-        writes = 16;
-        if (encoder.GetTargetBitrate() <= 0 || encoder.next_frame_length_ms() <= 0) return std::nullopt;
-        const auto& bitrate = controller.bitrate_controller();
-        result.bitrate_offsets = AudioNetworkAdaptorAdmission::Offsets{
-            bitrate.fl_increase_overhead_offset(), bitrate.fl_decrease_overhead_offset()};
-        bitrate_offsets = result.bitrate_offsets;
-        break;
-      }
-      case AnaController::kFrameLengthControllerV2: {
-        writes = 2;
-        if (frames.empty()) return std::nullopt;
-        const auto& fl = controller.frame_length_controller_v2();
-        // Proto2 absence is natively zero/false, not a missing required field.
-        result.minimum_payload_bitrate_bps = fl.min_payload_bitrate_bps();
-        result.slow_adaptation = fl.use_slow_adaptation();
-        break;
-      }
-      default:
-        // Includes unset/unknown oneofs and the removed RPLR controller.
-        return std::nullopt;
-    }
-    // Construction does not consume writer slots. In particular V2 can be
-    // inactive beside another frame writer. Check occupancy only at each
-    // reached native decision, in the actual selected order.
-    result.controller_mask |= writes;
-    result.controller_kinds.push_back(static_cast<int>(controller.controller_case()));
-    result.controller_bitrate_offsets.push_back(bitrate_offsets);
-    if (controller.has_scoring_point()) {
-      const auto& score = controller.scoring_point();
-      if (!score.has_uplink_bandwidth_bps() || !score.has_uplink_packet_loss_fraction()) return std::nullopt;
-      // Construction accepts NaNs. Retain the actual points for a separate
-      // strict-weak-ordering check when native scoring consumes both metrics.
-      result.scoring_points.push_back({score.uplink_bandwidth_bps(), score.uplink_packet_loss_fraction()});
-    }
-  }
-  if (!result.scoring_points.empty() && (!config.has_min_reordering_time_ms() ||
-      !config.has_min_reordering_squared_distance())) return std::nullopt;
-  // An empty controller list is accepted by native code. Unknown fields and
-  // ignored configuration values are neither rewritten nor range-restricted.
-  return result;
-#else
-  return std::nullopt;
-#endif
+      bounds.minimum_us == INT64_MIN || bounds.maximum_us == INT64_MAX) return false;
+  const auto span = static_cast<std::uint64_t>(bounds.maximum_us) -
+      static_cast<std::uint64_t>(bounds.minimum_us);
+  return span < static_cast<std::uint64_t>(INT64_MAX);
 }
 }  // namespace
 
 struct NativeAudioEncoderFailureObserver::State {
   std::atomic<std::uint32_t> first{0};
 };
-namespace { struct OwnedAnaRuntime; }
 struct NativeAudioEncoder::State {
   State(webrtc::Environment env, std::unique_ptr<webrtc::AudioEncoder> value,
       bool is_opus, std::vector<float> multipliers, FfiClockTimeBounds bounds)
       : environment(std::move(env)), encoder(std::move(value)), opus(is_opus),
         bitrate_multipliers(std::move(multipliers)),
-        ana_clock_evidence(RetainedAnaClockEvidence(bounds)) {}
+        packet_loss_clock_safe(PacketLossClockSafe(bounds)) {}
   ~State() { encoder.reset(); }  // Runtime/dependencies remain alive through SDK destruction.
   mutable std::mutex mutex;
   webrtc::Environment environment;
   std::unique_ptr<webrtc::AudioEncoder> encoder;
-  std::shared_ptr<OwnedAnaRuntime> ana;
   const bool opus;
   // The SDK caches the same immutable trial at creation, not at each update.
   const std::vector<float> bitrate_multipliers;
-  const std::optional<AnaClockEvidence> ana_clock_evidence;
+  const bool packet_loss_clock_safe;
   std::optional<std::size_t> overhead_bytes;
   // A forwarding envelope owns this exact origin through its Rust transfer.
   // Never infer a backend type from metadata or cast the envelope as OpusImpl.
@@ -3242,8 +2654,6 @@ std::unique_ptr<NativeAudioEncoderFailureObserver> audio_encoder_sdk_failure_clo
   return std::make_unique<NativeAudioEncoderFailureObserver>(source.state());
 }
 
-#include "pulsebeam-webrtc-sys/native/audio_encoder_ana.inc"
-
 static FfiAudioEncoderCreation CreateAudioEncoderWithOptions(const NativeAudioEncoderFactory& factory,
     const NativeEnvironment& environment, const FfiSdpAudioFormat& format,
     const webrtc::AudioEncoderFactory::Options& options,
@@ -3272,12 +2682,7 @@ static FfiAudioEncoderCreation CreateAudioEncoderWithOptions(const NativeAudioEn
   auto multipliers = opus ? SelectedOpusBitrateMultipliers(env.field_trials()) : std::vector<float>();
   auto state = std::make_unique<NativeAudioEncoder::State>(std::move(env), nullptr, opus,
       std::move(multipliers), clock_bounds.value_or(environment_clock_time_bounds(environment)));
-  if (opus) {
-    // Same SDK leaf/config/options as the known builtin factory. Construct it
-    // once with delegates; never replace an already selected mutable product.
-    auto config = webrtc::AudioEncoderOpus::SdpToConfig(native);
-    if (config && config->IsOk()) state->encoder = CreateOwnedOpus(*state, std::move(*config), options.payload_type);
-  } else state->encoder = factory.factory()->Create(state->environment, native, options);
+  state->encoder = factory.factory()->Create(state->environment, native, options);
   if (state->encoder) result.encoder = std::make_unique<NativeAudioEncoder>(std::move(state));
   return result;
 }
@@ -3295,160 +2700,6 @@ FfiAudioEncoderCreation audio_encoder_create_with_options(const NativeAudioEncod
   // Pass an actual SDK value copy into Create, including exact optional ID.
   // Reuse only admission/product ownership, not a Rust field projection.
   return CreateAudioEncoderWithOptions(factory, environment, format, options.value());
-}
-void audio_encoder_default_allocation_arguments(std::int64_t target, std::int8_t kind,
-    std::int64_t period, bool& valid, std::int32_t& bitrate, std::int64_t& milliseconds) noexcept {
-  valid = false;
-  if (kind < -1 || kind > 1) return;
-#if RTC_DCHECK_IS_ON
-  // DataRate is one-sided and integral getters DCHECK finite values. Do not
-  // convert those assertions into an unconditional release-artifact policy.
-  if (kind != 0 || target < 0 || target == INT64_MAX ||
-      period == INT64_MIN || period == INT64_MAX) return;
-#endif
-  const auto rate = kind == 1 ? webrtc::DataRate::PlusInfinity() :
-      kind == -1 ? webrtc::DataRate::MinusInfinity() : webrtc::DataRate::BitsPerSec(target);
-  const auto delta = period == INT64_MIN ? webrtc::TimeDelta::MinusInfinity() :
-      period == INT64_MAX ? webrtc::TimeDelta::PlusInfinity() : webrtc::TimeDelta::Micros(period);
-  // Same getters and implicit int64->int conversion as the pinned base method.
-  bitrate = rate.bps();
-  milliseconds = delta.ms();
-  valid = true;
-}
-bool audio_encoder_adaptor_smoothing_inputs_safe(std::int32_t bitrate,
-    bool has_period, std::int64_t period) noexcept {
-  // Input preflight only. Native clock, initialization/libm, controller arithmetic
-  // and every consuming operation must be admitted separately before enablement.
-  return AnaSmoothingContextSafe() && AnaBitrateSampleSafe(bitrate) && AnaBandwidthPeriodSafe(has_period, period);
-}
-bool audio_encoder_adaptor_initialization_safe(std::int32_t duration,
-    std::uint64_t clock_span_ms) noexcept {
-  // Caller-supplied span is not evidence of a native clock's lifetime behavior.
-  return AnaSmoothingInitializationSafe(duration, clock_span_ms);
-}
-FfiAudioEncoderBitrateProbe audio_encoder_adaptor_bitrate_probe(std::int32_t initial_frame,
-    std::int32_t increase, std::int32_t decrease,
-    rust::Slice<const FfiAudioEncoderBitrateStep> steps) noexcept {
-  FfiAudioEncoderBitrateProbe result{};
-  if (initial_frame <= 0) {
-    result.status = static_cast<std::uint8_t>(AnaBitrateFailure::Construction);
-    return result;
-  }
-  const webrtc::audio_network_adaptor::BitrateController::Config construction(
-      6000, initial_frame, increase, decrease);
-  webrtc::audio_network_adaptor::BitrateController native(construction);
-  auto runtime = std::make_shared<AnaBitrateRuntime>();
-  GuardedAnaBitrateController controller(native, construction, runtime);
-  for (const auto& step : steps) {
-    webrtc::Controller::NetworkMetrics metrics;
-    if (step.has_target) metrics.target_audio_bitrate_bps = step.target;
-    if (step.has_overhead) metrics.overhead_bytes_per_packet = step.overhead;
-    controller.UpdateNetworkMetrics(metrics);
-    webrtc::AudioEncoderRuntimeConfig config;
-    if (step.has_frame) config.frame_length_ms = step.frame;
-    config.last_fl_change_increase = step.increasing;
-    if (step.occupied) config.bitrate_bps = 0;
-    controller.MakeDecision(&config);
-    if (!runtime->healthy()) break;
-    if (config.bitrate_bps) result.bitrates.push_back(*config.bitrate_bps);
-  }
-  result.status = static_cast<std::uint8_t>(runtime->failure);
-  return result;
-}
-FfiAudioEncoderSmoothingProbe audio_encoder_adaptor_smoothing_probe(
-    const NativeAudioEncoder& encoder, std::int32_t first_sample, std::int32_t sample,
-    std::int64_t first_time_us, std::int64_t sample_time_us, std::int64_t average_time_us,
-    bool has_duration, std::int32_t duration) noexcept {
-  FfiAudioEncoderSmoothingProbe result{};
-  auto& state = encoder.state();
-  std::lock_guard lock(state.mutex);
-  if (!state.ana_clock_evidence) {
-    result.status = static_cast<std::uint8_t>(AnaSmoothingFailure::Clock);
-    return result;
-  }
-  auto runtime = std::make_shared<AnaSmoothingRuntime>(*state.ana_clock_evidence);
-  auto filter = BoundedAnaBitrateSmoother::Create(runtime);
-  if (filter) {
-    filter->AddSample(static_cast<float>(first_sample), webrtc::Timestamp::Micros(first_time_us));
-    filter->GetAverage(webrtc::Timestamp::Micros(sample_time_us));
-    if (has_duration) result.duration_applied = filter->SetTimeConstantMs(duration);
-    filter->AddSample(static_cast<float>(sample), webrtc::Timestamp::Micros(sample_time_us));
-    const auto average = filter->GetAverage(webrtc::Timestamp::Micros(average_time_us));
-    result.has_average = average.has_value();
-    if (average) result.average = *average;
-  }
-  result.status = static_cast<std::uint8_t>(runtime->failure);
-  return result;
-}
-std::uint8_t audio_encoder_check_network_adaptor_scoring(const NativeAudioEncoder& encoder,
-    rust::Slice<const std::uint8_t> bytes, bool has_bandwidth, std::int32_t bandwidth,
-    bool has_loss, float loss) noexcept {
-  auto& state = encoder.state();
-  std::lock_guard lock(state.mutex);
-#if WEBRTC_ENABLE_PROTOBUF
-  if (state.opus) {
-    const auto& opus = static_cast<const webrtc::AudioEncoderOpusImpl&>(*state.encoder);
-    const auto admission = AdmitAudioNetworkAdaptorConstruction(opus, bytes);
-    if (!admission) return 1;
-    return AnaScoringOrderSafe(*admission,
-        has_bandwidth ? std::optional<int>(bandwidth) : std::nullopt,
-        has_loss ? std::optional<float>(loss) : std::nullopt) ? 0 : 2;
-  }
-#endif
-  return 3;
-}
-std::uint8_t audio_encoder_check_network_adaptor_smoothing(const NativeAudioEncoder& encoder,
-    rust::Slice<const std::uint8_t> bytes) noexcept {
-  auto& state = encoder.state();
-  std::lock_guard lock(state.mutex);
-#if WEBRTC_ENABLE_PROTOBUF
-  if (state.opus) {
-    const auto& opus = static_cast<const webrtc::AudioEncoderOpusImpl&>(*state.encoder);
-    const auto admission = AdmitAudioNetworkAdaptorConstruction(opus, bytes);
-    if (!admission) return 1;
-    const auto& clock = state.ana_clock_evidence;
-    if (!clock) return 2;
-    const auto check = [&](int duration) {
-      return clock->admits_duration(duration) && AnaSmoothingInitializationSafe(duration, clock->span_ms);
-    };
-    if (!check(5000) || (admission->fec_time_constant_ms && !check(*admission->fec_time_constant_ms))) return 2;
-    return 0;
-  }
-#endif
-  return 3;
-}
-std::uint8_t audio_encoder_check_network_adaptor_arithmetic(const NativeAudioEncoder& encoder,
-    rust::Slice<const std::uint8_t> bytes, bool has_overhead, std::size_t overhead,
-    bool has_target, std::int32_t target, bool has_uplink, std::int32_t uplink_min,
-    std::int32_t uplink_max) noexcept {
-  auto& state = encoder.state();
-  std::lock_guard lock(state.mutex);
-#if WEBRTC_ENABLE_PROTOBUF
-  if (state.opus) {
-    const auto& opus = static_cast<const webrtc::AudioEncoderOpusImpl&>(*state.encoder);
-    const auto admission = AdmitAudioNetworkAdaptorConstruction(opus, bytes);
-    if (!admission) return 1;
-    return AnaControllerArithmeticSafe(*admission,
-        has_overhead ? std::optional<std::size_t>(overhead) : std::nullopt,
-        has_target ? std::optional<int>(target) : std::nullopt,
-        has_uplink ? std::optional<std::pair<int, int>>(std::pair<int, int>{uplink_min, uplink_max}) : std::nullopt) ? 0 : 2;
-  }
-#endif
-  return 3;
-}
-std::uint8_t audio_encoder_check_network_adaptor_config(const NativeAudioEncoder& encoder,
-    rust::Slice<const std::uint8_t> bytes) noexcept {
-  auto& state = encoder.state();
-  std::lock_guard lock(state.mutex);
-#if WEBRTC_ENABLE_PROTOBUF
-  if (state.opus) {
-    const auto& opus = static_cast<const webrtc::AudioEncoderOpusImpl&>(*state.encoder);
-    return AdmitAudioNetworkAdaptorConstruction(opus, bytes) ? 0 : 1;
-  }
-#endif
-  // Do not probe ControllerManager::Create in a protobuf-disabled artifact:
-  // that path asserts rather than safely reporting its unavailable capability.
-  return 3;
 }
 FfiAudioEncoderInfo audio_encoder_info(const NativeAudioEncoder& encoder) noexcept {
   auto& state = encoder.state();
@@ -3541,10 +2792,8 @@ FfiAudioEncoderOutput audio_encoder_encode(const NativeAudioEncoder& encoder, st
   const auto channels = state.encoder->NumChannels();
   if (sample_rate <= 0 || channels == 0 || channels > std::numeric_limits<std::size_t>::max() /
       static_cast<std::size_t>(sample_rate) || audio.size() != channels * sample_rate / 100) return result;
-  AnaOperation operation(state, 10);
   webrtc::Buffer encoded;
   const auto info = state.encoder->Encode(timestamp, std::span<const std::int16_t>(audio.data(), audio.size()), &encoded);
-  if (const auto error = operation.error()) { result.status = error == 2 ? 4 : 3; return result; }
   result.status = 2;
   if (info.encoded_bytes != encoded.size()) return result;
   if (!info.redundant.empty()) {
@@ -3583,39 +2832,6 @@ bool audio_encoder_set_application(const NativeAudioEncoder& encoder, bool speec
   std::lock_guard lock(state.mutex);
   return state.encoder->SetApplication(speech ? webrtc::AudioEncoder::Application::kSpeech : webrtc::AudioEncoder::Application::kAudio);
 }
-bool audio_encoder_enable_network_adaptor(const NativeAudioEncoder& encoder,
-    rust::Slice<const std::uint8_t> bytes, std::uint8_t& error) noexcept {
-  auto& state = encoder.state(); std::lock_guard lock(state.mutex); error = 0;
-  const absl::string_view config(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-  if (!state.opus) return state.encoder->EnableAudioNetworkAdaptor(config);
-#if WEBRTC_ENABLE_PROTOBUF
-  if (!state.ana_clock_evidence) { error = 2; return false; }
-  if (!state.ana || !state.ana->capable || !AnaSmoothingContextSafe()) { error = 4; return false; }
-  auto admission = AdmitAudioNetworkAdaptorConstruction(
-      static_cast<const webrtc::AudioEncoderOpusImpl&>(*state.encoder), bytes);
-  if (!admission) { error = 1; return false; }
-  for (int duration : admission->fec_time_constants_ms) {
-    // FEC's native smoother performs only nontrapping FP before returning its
-    // actual loss estimate. Protect its integral clock arithmetic here, then
-    // admit the actual estimate before native stats/event-log consumers. Do not
-    // reject an otherwise usable duration by predicting its future average.
-    if (!state.ana_clock_evidence->admits_duration(duration)) { error = 4; return false; }
-  }
-  AnaOperation operation(state, 7);
-  state.ana->pending = std::make_shared<AudioNetworkAdaptorAdmission>(std::move(*admission));
-  const bool enabled = state.encoder->EnableAudioNetworkAdaptor(config);
-  state.ana->pending.reset(); state.ana->active = enabled;
-  error = operation.error(); return enabled;
-#else
-  error = 3; return false;  // The disabled native factory asserts; do not enter it.
-#endif
-}
-void audio_encoder_disable_network_adaptor(const NativeAudioEncoder& encoder) noexcept {
-  auto& state = encoder.state();
-  std::lock_guard lock(state.mutex);
-  state.encoder->DisableAudioNetworkAdaptor();
-  if (state.ana) { state.ana->active = false; state.ana->controllers.reset(); }
-}
 void audio_encoder_set_max_playback_rate(const NativeAudioEncoder& encoder, std::int32_t frequency) noexcept {
   auto& state = encoder.state();
   std::lock_guard lock(state.mutex);
@@ -3636,24 +2852,16 @@ bool audio_encoder_on_target_bitrate(const NativeAudioEncoder& encoder, std::int
   state.encoder->OnReceivedTargetAudioBitrate(bitrate);
   return true;
 }
-bool audio_encoder_on_bandwidth(const NativeAudioEncoder& encoder, std::int32_t bitrate,
-    bool has_period, std::int64_t period) noexcept {
-  auto& state = encoder.state();
-  std::lock_guard lock(state.mutex);
-  const bool active = state.ana && state.ana->active;
-  if (active ? (has_period && (period < INT64_MIN / 4 || period > INT64_MAX / 4)) : !AudioEncoderBandwidthSafe(state, bitrate)) return false;
-  AnaOperation operation(state, 3);
-  state.encoder->OnReceivedUplinkBandwidth(bitrate, has_period ? std::optional<std::int64_t>(period) : std::nullopt);
-  return operation.error() == 0;
-}
 bool audio_encoder_on_allocation(const NativeAudioEncoder& encoder, const FfiBitrateAllocationUpdate& update) noexcept {
   auto& state = encoder.state();
   std::lock_guard lock(state.mutex);
-  // Both pinned native allocation implementations narrow target to int and
-  // query bwe_period as integral milliseconds, even for otherwise no-op codecs.
+  // Opus narrows target_bitrate to int in its allocation callback. Preserve
+  // the exact SDK DataSize domain for packet overhead, including +infinity.
   if (update.target_kind != 0 || update.target_bitrate < 0 || update.target_bitrate > INT32_MAX ||
-      update.bwe_period == INT64_MIN || update.bwe_period == INT64_MAX ||
-      (!(state.ana && state.ana->active) && !AudioEncoderBandwidthSafe(state, static_cast<int>(update.target_bitrate)))) return false;
+      update.packet_overhead_kind < 0 || update.packet_overhead_kind > 1 ||
+      (update.packet_overhead_kind == 0 &&
+       (update.packet_overhead < 0 || update.packet_overhead == INT64_MAX)) ||
+      !AudioEncoderBandwidthSafe(state, static_cast<int>(update.target_bitrate))) return false;
   const auto delta = [](std::int64_t value) {
     if (value == INT64_MIN) return webrtc::TimeDelta::MinusInfinity();
     if (value == INT64_MAX) return webrtc::TimeDelta::PlusInfinity();
@@ -3663,48 +2871,41 @@ bool audio_encoder_on_allocation(const NativeAudioEncoder& encoder, const FfiBit
   native.target_bitrate = webrtc::DataRate::BitsPerSec(update.target_bitrate);
   native.packet_loss_ratio = update.packet_loss_ratio;
   native.round_trip_time = delta(update.round_trip_time);
-  native.bwe_period = delta(update.bwe_period);
+  native.packet_overhead = update.packet_overhead_kind == 1
+      ? webrtc::DataSize::PlusInfinity()
+      : webrtc::DataSize::Bytes(update.packet_overhead);
   native.cwnd_reduce_ratio = update.cwnd_reduce_ratio;
-  AnaOperation operation(state, 4);
   state.encoder->OnReceivedUplinkAllocation(native);
-  return operation.error() == 0;
+  return true;
 }
 bool audio_encoder_on_overhead(const NativeAudioEncoder& encoder, std::size_t overhead) noexcept {
   auto& state = encoder.state();
   std::lock_guard lock(state.mutex);
-  AnaOperation operation(state, 11);
   state.encoder->OnReceivedOverhead(overhead);
-  if (state.opus && !(state.ana && state.ana->active)) state.overhead_bytes = overhead;
-  return operation.error() == 0;
+  if (state.opus) state.overhead_bytes = overhead;
+  return true;
 }
 std::uint8_t audio_encoder_on_packet_loss(const NativeAudioEncoder& encoder, float fraction) noexcept {
   auto& state = encoder.state();
   std::lock_guard lock(state.mutex);
   if (state.opus) {
     if (!std::isfinite(fraction) || fraction < 0 || fraction > 1) return 1;
-    // This smoother subtracts native microsecond timestamps before conversion,
-    // unlike ANA's millisecond smoothers. Require the stronger retained domain.
-    const auto& clock = state.ana_clock_evidence;
-    if (!clock || !clock->packet_loss_deltas_safe) return 2;
+    // The stock packet-loss smoother subtracts finite microsecond timestamps.
+    if (!state.packet_loss_clock_safe) return 2;
   }
-  AnaOperation operation(state, 5);
   state.encoder->OnReceivedUplinkPacketLossFraction(fraction);
-  return operation.error() ? (operation.error() == 2 ? 2 : 3) : 0;
+  return 0;
 }
 bool audio_encoder_on_rtt(const NativeAudioEncoder& encoder, std::int32_t rtt) noexcept {
   auto& state = encoder.state();
   std::lock_guard lock(state.mutex);
-  AnaOperation operation(state, 12);
   state.encoder->OnReceivedRtt(rtt);
-  return operation.error() == 0;
+  return true;
 }
 bool audio_encoder_set_receiver_frame_length_range(const NativeAudioEncoder& encoder,
     std::int32_t minimum, std::int32_t maximum) noexcept {
   auto& state = encoder.state();
   std::lock_guard lock(state.mutex);
-#if RTC_DCHECK_IS_ON
-  if (state.ana && state.ana->active) return false;
-#endif
   state.encoder->SetReceiverFrameLengthRange(minimum, maximum);
   return true;
 }
@@ -3748,9 +2949,6 @@ class RetainedAudioEncoder final : public webrtc::AudioEncoder {
   void OnReceivedTargetAudioBitrate(int bitrate) override {
     if (!audio_encoder_on_target_bitrate(original(), bitrate)) Reject(2, 1);
   }
-  void OnReceivedUplinkBandwidth(int bitrate, std::optional<std::int64_t> period) override {
-    if (!audio_encoder_on_bandwidth(original(), bitrate, period.has_value(), period.value_or(0))) Reject(3, 1);
-  }
   void OnReceivedUplinkAllocation(webrtc::BitrateAllocationUpdate update) override {
     const auto delta = [](webrtc::TimeDelta value) {
       return value.IsMinusInfinity() ? INT64_MIN : value.us_or(INT64_MAX);
@@ -3760,7 +2958,8 @@ class RetainedAudioEncoder final : public webrtc::AudioEncoder {
     value.target_bitrate = update.target_bitrate.bps_or(0);
     value.packet_loss_ratio = update.packet_loss_ratio;
     value.round_trip_time = delta(update.round_trip_time);
-    value.bwe_period = delta(update.bwe_period);
+    value.packet_overhead_kind = update.packet_overhead.IsPlusInfinity() ? 1 : 0;
+    value.packet_overhead = update.packet_overhead.bytes_or(INT64_MAX);
     value.cwnd_reduce_ratio = update.cwnd_reduce_ratio;
     if (!audio_encoder_on_allocation(original(), value)) Reject(4, 1);
   }
@@ -3773,16 +2972,6 @@ class RetainedAudioEncoder final : public webrtc::AudioEncoder {
     // default. Do not invoke it or pretend an unimplemented control succeeded.
     Reject(6, 3);
   }
-  bool EnableAudioNetworkAdaptor(absl::string_view config) override {
-    std::uint8_t error = 0;
-    const auto* bytes = reinterpret_cast<const std::uint8_t*>(config.data());
-    const std::uint8_t empty = 0;
-    const bool enabled = audio_encoder_enable_network_adaptor(original(),
-        rust::Slice<const std::uint8_t>(config.empty() ? &empty : bytes, config.size()), error);
-    if (error) Reject(7, error);
-    return enabled && !error;
-  }
-  void DisableAudioNetworkAdaptor() override { audio_encoder_disable_network_adaptor(original()); }
   void OnReceivedRtt(int rtt) override { if (!audio_encoder_on_rtt(original(), rtt)) Reject(12, 4); }
   void OnReceivedOverhead(std::size_t bytes) override { if (!audio_encoder_on_overhead(original(), bytes)) Reject(11, 4); }
   void SetReceiverFrameLengthRange(int minimum, int maximum) override { if (!audio_encoder_set_receiver_frame_length_range(original(), minimum, maximum)) Reject(13, 1); }
@@ -3802,10 +2991,7 @@ class RetainedAudioEncoder final : public webrtc::AudioEncoder {
     std::lock_guard lock(state.mutex);
     // Preserve the actual caller Buffer append and original EncodedInfo,
     // including redundant leaves. Do not reconstruct it through FFI values.
-    AnaOperation operation(state, 10);
-    auto result = state.encoder->Encode(timestamp, audio, encoded);
-    operation.error();  // Retain ANA-side refusal; actual stock payload/metadata stay genuine.
-    return result;
+    return state.encoder->Encode(timestamp, audio, encoded);
   }
  private:
   void Reject(std::uint8_t operation, std::uint8_t error) const {
@@ -4057,13 +3243,6 @@ void audio_encoder_forward_target_sdk(const NativeAudioEncoder& source, std::int
 void audio_encoder_forward_loss_sdk(const NativeAudioEncoder& source, float fraction) noexcept {
   if (source.forwarding()) source.sdk_encoder().OnReceivedUplinkPacketLossFraction(fraction);
 }
-bool audio_encoder_forward_adaptor_sdk(const NativeAudioEncoder& source,
-    rust::Slice<const std::uint8_t> config) noexcept {
-  if (!source.forwarding()) return false;
-  return source.sdk_encoder().EnableAudioNetworkAdaptor(
-      absl::string_view(reinterpret_cast<const char*>(config.data()), config.size()));
-}
-
 struct NativeAudioDecoder::State {
   State(webrtc::Environment env, std::unique_ptr<webrtc::AudioDecoder> value,
         OwnedAudioDecoderKind selected)
@@ -4675,18 +3854,23 @@ namespace {
 // moving discards ahead of GetAudio's muted-state branch.
 class ObservedNetEqPacketBuffer final : public webrtc::PacketBuffer {
  public:
-  ObservedNetEqPacketBuffer(size_t capacity, const webrtc::TickTimer* timer,
+  ObservedNetEqPacketBuffer(const webrtc::FieldTrialsView& field_trials,
+      size_t capacity, const webrtc::TickTimer* timer,
       webrtc::StatisticsCalculator* stats)
-      : PacketBuffer(capacity, timer, stats) {}
+      : PacketBuffer(field_trials, capacity, timer, stats) {}
 
-  int InsertPacket(webrtc::Packet&& packet) override {
-    if (packet.empty()) return PacketBuffer::InsertPacket(std::move(packet));
+  int InsertPacket(webrtc::Packet&& packet, size_t last_decoded_length,
+      size_t sample_rate, int target_level_ms) override {
+    if (packet.empty())
+      return PacketBuffer::InsertPacket(std::move(packet), last_decoded_length,
+          sample_rate, target_level_ms);
     webrtc::Packet metadata;
     metadata.timestamp = packet.timestamp;
     metadata.sequence_number = packet.sequence_number;
     metadata.payload_type = packet.payload_type;
     metadata.priority = packet.priority;
-    const auto result = PacketBuffer::InsertPacket(std::move(packet));
+    const auto result = PacketBuffer::InsertPacket(std::move(packet),
+        last_decoded_length, sample_rate, target_level_ms);
     // Native InsertPacket may have called our virtual Flush. Reproduce only
     // metadata membership, using the SDK's own wrap-aware packet comparison.
     auto right = std::find_if(snapshot_.rbegin(), snapshot_.rend(),
@@ -4758,7 +3942,7 @@ struct StockNetEqDependencies final : webrtc::NetEqImpl::Dependencies {
       : Dependencies(env, config, std::move(factory),
             webrtc::DefaultNetEqControllerFactory()) {
     packet_buffer = std::make_unique<ObservedNetEqPacketBuffer>(
-        config.max_packets_in_buffer, tick_timer.get(), stats.get());
+        env.field_trials(), config.max_packets_in_buffer, tick_timer.get(), stats.get());
   }
 };
 

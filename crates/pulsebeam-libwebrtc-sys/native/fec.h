@@ -26,14 +26,9 @@ std::unique_ptr<webrtc::FecControllerFactoryInterface> fec_factory_adapter(
 FfiFecProtectionResult fec_protection_request(
     const NativeFecProtectionCallback& source, FfiFecProtectionParams delta,
     FfiFecProtectionParams key) noexcept;
-std::uint8_t fec_set_retransmission_mode(
-    const NativeFecProtectionCallback& source, std::int32_t mode) noexcept;
 void fec_protection_request_async(
     std::shared_ptr<NativeFecProtectionCallback> source,
     FfiFecProtectionParams delta, FfiFecProtectionParams key,
-    rust::Box<RustFecCompletion> completion) noexcept;
-void fec_set_retransmission_mode_async(
-    std::shared_ptr<NativeFecProtectionCallback> source, std::int32_t mode,
     rust::Box<RustFecCompletion> completion) noexcept;
 std::uint32_t fec_native_probe(const NativeEnvironment& environment,
     rust::Box<RustFecControllerFactory> source) noexcept;

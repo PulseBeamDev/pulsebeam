@@ -4,10 +4,13 @@
 #include "rust/cxx.h"
 namespace pulsebeam::webrtc_sys {
 class NativeEnvironment;
+class NativeManualClock;
 struct RustNetworkControllerFactory;
+struct FfiNcConfig;
 struct FfiNcMessage;
 struct FfiNcNetworkControlUpdate;
 std::unique_ptr<webrtc::NetworkControllerFactoryInterface> network_controller_factory_adapter(rust::Box<RustNetworkControllerFactory> source) noexcept;
 bool network_controller_injection_enabled(const NativeEnvironment& environment) noexcept;
-rust::Vec<FfiNcNetworkControlUpdate> network_controller_native_probe(const NativeEnvironment& environment, rust::Box<RustNetworkControllerFactory> source, rust::Slice<const FfiNcMessage> messages, rust::Slice<const std::uint8_t> kinds) noexcept;
+rust::Vec<FfiNcNetworkControlUpdate> network_controller_native_probe(const NativeEnvironment& environment, rust::Box<RustNetworkControllerFactory> source, FfiNcConfig initial_config, rust::Slice<const FfiNcMessage> messages, rust::Slice<const std::uint8_t> kinds) noexcept;
+rust::Vec<FfiNcNetworkControlUpdate> network_controller_native_probe_controlled(const NativeEnvironment& environment, const NativeManualClock& clock, rust::Box<RustNetworkControllerFactory> source, FfiNcConfig initial_config, rust::Slice<const FfiNcMessage> messages, rust::Slice<const std::uint8_t> kinds) noexcept;
 }

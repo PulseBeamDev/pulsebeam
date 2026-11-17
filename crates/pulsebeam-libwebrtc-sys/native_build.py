@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import types
 from urllib.parse import urlparse
 
@@ -52,7 +53,7 @@ def reapi_address(value):
 
 def siso_command(siso, build, executor, endpoint):
     local_jobs = 2 if executor == "reapi" else 8
-    command = [siso, "ninja", "-C", build, f"-local_jobs={local_jobs}", "-remote_jobs=32"]
+    command = [siso, "ninja", "-C", build, f"-local_jobs={local_jobs}", "-remote_jobs=32", "-k=8", "-load=@config//pulsebeam.star"]
     if executor == "local":
         command += ["-offline"]
     else:
@@ -64,7 +65,7 @@ def siso_command(siso, build, executor, endpoint):
     return command + ["pulsebeam:native"]
 
 
-def writable_file(root, relative):
+def stage_file(root, relative, content=None):
     path = root
     for part in Path(relative).parts[:-1]:
         path /= part
@@ -75,9 +76,68 @@ def writable_file(root, relative):
             for child in source.iterdir():
                 (path / child.name).symlink_to(child, target_is_directory=child.is_dir())
     target = root / relative
-    content = target.read_bytes()
-    target.unlink()
+    if content is None:
+        content = target.read_bytes()
+        target.unlink()
+    elif target.exists() or target.is_symlink():
+        raise ValueError(f"Owned build input shadows upstream file: {relative}")
     target.write_bytes(content)
+
+
+def check_cxx_abi(owned_manifest, source_root):
+    with Path(owned_manifest).open("rb") as manifest_file:
+        owned = tomllib.load(manifest_file)
+    dependency = owned.get("dependencies", {}).get("cxx")
+    owned_pin = dependency.get("version") if isinstance(dependency, dict) else dependency
+    if not isinstance(owned_pin, str) or not owned_pin.startswith("="):
+        raise ValueError("owned Cargo manifest must declare cxx with an exact =version pin")
+
+    vendor = Path(source_root) / "third_party/rust/chromium_crates_io/vendor"
+    for crate, role in (("cxx", "runtime"), ("cxxbridge-cmd", "generator")):
+        sdk_manifest = vendor / (crate + "-v1") / "Cargo.toml"
+        with sdk_manifest.open("rb") as manifest_file:
+            sdk_version = tomllib.load(manifest_file).get("package", {}).get("version")
+        if not isinstance(sdk_version, str):
+            raise ValueError(f"SDK CXX {role} manifest has no package.version: {sdk_manifest}")
+        if owned_pin[1:] != sdk_version:
+            raise SystemExit(
+                "WebRTC CXX ABI preflight failed: owned Rust cxx pin "
+                f"{owned_pin[1:]} does not match SDK CXX {role} version {sdk_version}"
+            )
+
+
+def runtime_objects(targets, root="//pulsebeam:runtime"):
+    objects = set()
+    visited = set()
+
+    def visit(label):
+        if label in visited:
+            return
+        visited.add(label)
+        target = targets[label]
+        kind = target["type"]
+        if kind not in ("group", "source_set", "static_library"):
+            if kind in ("shared_library", "loadable_module"):
+                raise ValueError(f"C++ runtime is not statically packageable: {label}")
+            return
+        for outputs in target.get("source_outputs", {}).values():
+            for output in outputs:
+                if output.endswith(".o"):
+                    path = Path(output)
+                    if path.is_absolute() or ".." in path.parts:
+                        raise ValueError(f"Runtime object escapes build directory: {output}")
+                    objects.add(output)
+        for dependency in target.get("deps", []):
+            visit(dependency)
+
+    if targets[root]["type"] == "executable":
+        for dependency in targets[root].get("deps", []):
+            visit(dependency)
+    else:
+        visit(root)
+    if not objects:
+        raise ValueError("GN reported no C++ runtime objects")
+    return sorted(objects)
 
 
 def repository_sources(value):
@@ -128,17 +188,30 @@ def write_notices(gn, root, build, source, env, notices, manifest):
         if any(not label.endswith(host_toolchain) for label in libraries["rust"]):
             raise RuntimeError(f"unmapped GN Rust runtime dependency: {sorted(libraries['rust'])}")
         builder.common_licenses_dict["rust"] = []
-    # The overlay compiles cxx.cc directly, so it has no third-party GN target.
-    cxx_source = "//third_party/rust/chromium_crates_io/vendor/cxx-v1/src/cxx.cc"
     direct_sources = {item for target in describe("//pulsebeam:pulsebeam").values()
                       for item in target.get("sources", []) if item.startswith("//third_party/")}
-    if direct_sources != {cxx_source}:
+    if direct_sources:
         raise RuntimeError(f"unmapped direct third-party GN sources: {sorted(direct_sources)}")
-    libraries["cxx-source"] = direct_sources
-    builder.common_licenses_dict["cxx-source"] = [
-        "third_party/rust/chromium_crates_io/vendor/cxx-v1/LICENSE-APACHE",
-        "third_party/rust/chromium_crates_io/vendor/cxx-v1/LICENSE-MIT",
-    ]
+    # The C++-only SDK target uses the Rust crate\'s dual-license mapping.
+    libraries.setdefault("rust/cxx/v1", set()).add("//build/rust:cxx_cppdeps_lib")
+    builder.common_licenses_dict["rust/cxx/v1"] = sorted(set(
+        builder.common_licenses_dict["rust/cxx/v1"]
+        + ["third_party/rust/chromium_crates_io/vendor/cxx-v1/LICENSE-MIT"]
+    ))
+    # These configured stock codecs are omitted from WebRTC's license table;
+    # use their pinned Chromium license declarations, not a downstream mapping.
+    for name in ("ffmpeg", "openh264"):
+        if name in libraries and name not in builder.common_licenses_dict:
+            package = source / "third_party" / name
+            fields = [line.removeprefix("License File:").strip()
+                      for line in (package / "README.chromium").read_text().splitlines()
+                      if line.startswith("License File:")]
+            if len(fields) != 1 or not fields[0]:
+                raise RuntimeError(f"Missing Chromium license declaration for {name}")
+            paths = [Path(value.strip()) for value in fields[0].split(",")]
+            if any(path.is_absolute() or ".." in path.parts for path in paths):
+                raise RuntimeError(f"Chromium license path escapes package: {name}")
+            builder.common_licenses_dict[name] = [str(Path("third_party") / name / path) for path in paths]
     missing = sorted(set(libraries) - set(builder.common_licenses_dict))
     if missing:
         raise RuntimeError(f"WebRTC GN libraries without upstream license mapping: {[(name, sorted(libraries[name])) for name in missing]}")
@@ -161,7 +234,7 @@ def main():
     sources = parser.add_mutually_exclusive_group(required=True)
     sources.add_argument("--source-root")
     sources.add_argument("--source-manifest", dest="source_root", type=repository_sources)
-    for name in ("bridge", "overlay", "host-bin", "build", "flavor", "pulsebeam", "webrtc", "runtime", "notices", "license-manifest"):
+    for name in ("bridge", "overlay", "host-bin", "build", "flavor", "pulsebeam", "webrtc", "runtime", "notices", "license-manifest", "owned-cargo-manifest"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--asan", action="store_true")
     parser.add_argument("--executor", choices=("local", "cache", "reapi"), default="local")
@@ -176,6 +249,7 @@ def main():
 
 def build(args, lock_fd=None):
     source = Path(args.source_root).absolute()
+    check_cxx_abi(args.owned_cargo_manifest, source)
     overlay = Path(args.overlay).absolute()
     bridge = Path(args.bridge).absolute()
     output_build = Path(args.build).absolute()
@@ -200,22 +274,18 @@ def build(args, lock_fd=None):
                 (root / child.name).symlink_to(child, target_is_directory=child.is_dir())
         package = root / "pulsebeam"
         package.mkdir()
-        for relative in ("BUILD.gn", "bridge.py", "rust"):
-            (package / relative).symlink_to(overlay / relative, target_is_directory=relative == "rust")
+        for relative in ("BUILD.gn", "bridge.py", "rust", "toolchain", "runtime.cc"):
+            (package / relative).symlink_to(overlay / relative, target_is_directory=relative in ("rust", "toolchain"))
         owned = package / "pulsebeam-webrtc-sys"
         (owned / "src").mkdir(parents=True)
         (owned / "src/bridge.rs").symlink_to(bridge)
         (owned / "native").symlink_to(bridge.parent.parent / "native", target_is_directory=True)
         # rustfmt resolves ignore patterns relative to the real config path; a
         # symlink into the upstream checkout puts generated files outside it.
-        for relative in (".gn", ".rustfmt.toml", "BUILD.gn", "buildtools/third_party/libc++/BUILD.gn", "buildtools/third_party/libc++abi/BUILD.gn", "build/toolchain/gcc_toolchain.gni", "build/config/siso/nasm_linux.star", "build/config/siso/rust.star"):
-            writable_file(root, relative)
-        for patch in ("integration.patch", "strict-fp.patch"):
-            run([host / "patch", "--batch", "--fuzz=0", "-p1", "-i", overlay / patch], cwd=root, env=env, lock_fd=lock_fd)
-        if args.executor != "local":
-            backend = "build/config/siso/backend_config/backend.star"
-            writable_file(root, backend)
-            (root / backend).write_text((overlay / "backend.star").read_text().replace("@PULSEBEAM_HOST_TOOLS@", str(host)))
+        stage_file(root, ".rustfmt.toml")
+        stage_file(root, "build/config/siso/pulsebeam.star", (overlay / "siso.star").read_bytes().replace(b"@PULSEBEAM_HOST_TOOLS@", os.fsencode(host)))
+        stage_file(root, "pulsebeam/remote.sh", (overlay / "remote.sh.in").read_bytes().replace(b"@PULSEBEAM_HOST_TOOLS@", os.fsencode(host)))
+        (package / "remote.sh").chmod(0o755)
         native = args.flavor == "native"
         config = (overlay / "args.gn").read_text()
         config += f"\npulsebeam_native = {str(native).lower()}\n"
@@ -227,22 +297,32 @@ def build(args, lock_fd=None):
         if args.asan:
             config += "is_asan = true\ndcheck_always_on = true\n"
         config += f'pkg_config = "{host / "pkg-config"}"\n'
-        config += f'pulsebeam_rm = "{host / "rm"}"\n'
+        config += 'custom_toolchain = "//pulsebeam/toolchain:clang_x64"\n'
         config += f"use_remoteexec = {str(args.executor != 'local').lower()}\n"
         gn = root / "buildtools/linux64/gn"
         siso = root / "third_party/siso/cipd/siso"
-        run([gn, "gen", build, f"--root={root}", "--root-target=//pulsebeam:native", "--args=" + config], cwd=root, env=env, lock_fd=lock_fd)
+        run([gn, "gen", build, f"--root={root}", "--root-target=//pulsebeam:native", "--ide=json", "--args=" + config], cwd=root, env=env, lock_fd=lock_fd)
+        graph = json.loads((build / "project.json").read_text())
+        objects = runtime_objects(graph["targets"])
         write_notices(gn, root, build, source, env, args.notices, args.license_manifest)
-        run(siso_command(siso, build, args.executor, args.reapi), cwd=root, env=env, lock_fd=lock_fd)
+        targets = ["obj/pulsebeam/libpulsebeam.a", "obj/libwebrtc.a", *objects]
+        run(siso_command(siso, build, args.executor, args.reapi) + targets, cwd=root, env=env, lock_fd=lock_fd)
+        runtime = Path(args.runtime).absolute()
+        runtime.parent.mkdir(parents=True, exist_ok=True)
+        runtime.unlink(missing_ok=True)
+        response = build / "runtime.rsp"
+        response.write_text("\n".join(json.dumps(value) for value in objects) + "\n")
+        run([root / "third_party/llvm-build/Release+Asserts/bin/llvm-ar", "rcsD", runtime, "@" + str(response)], cwd=build, env=env, lock_fd=lock_fd)
         for name, relative in {
             "pulsebeam": "obj/pulsebeam/libpulsebeam.a",
             "webrtc": "obj/libwebrtc.a",
-            "runtime": "obj/pulsebeam/libruntime.a",
         }.items():
             output = Path(getattr(args, name))
             output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(build / relative, output)
         output_build.mkdir(exist_ok=True)
+        shutil.copyfile(build / "project.json", output_build / "project.json")
+        shutil.copyfile(build / "args.gn", output_build / "args.gn")
 
 
 if __name__ == "__main__":

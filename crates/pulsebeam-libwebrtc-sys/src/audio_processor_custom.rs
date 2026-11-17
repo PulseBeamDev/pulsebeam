@@ -167,6 +167,7 @@ pub enum AudioProcessingCustomOperation {
     Analyze,
     Metrics,
     Estimate,
+    IsInitialized,
     AdjustConfig,
     Reset,
     ToString,

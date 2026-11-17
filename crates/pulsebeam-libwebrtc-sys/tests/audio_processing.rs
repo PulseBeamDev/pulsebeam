@@ -1,15 +1,10 @@
 use pulsebeam_webrtc_sys::{
-    AudioEncoderFactory, AudioProcessingConfig, AudioProcessingOptions, GainControl,
-    NoiseSuppression, PeerConnectionFactory, ProcessingChoice, ProcessingImplementation,
+    AudioEncoderFactory, AudioProcessingConfig, GainControl, NoiseSuppression,
+    PeerConnectionFactory,
 };
 
 #[test]
-fn software_audio_processing_is_opt_in_and_reports_live_module_status() {
-    let plain = PeerConnectionFactory::builder().build().unwrap();
-    let initial = plain.audio_processing_state();
-    assert!(!initial.has_software_module);
-    assert!(!initial.echo_cancellation.platform_available);
-
+fn software_audio_processing_is_configured_at_factory_creation() {
     let configured = PeerConnectionFactory::builder()
         .audio_processing(AudioProcessingConfig {
             echo_cancellation: true,
@@ -20,26 +15,11 @@ fn software_audio_processing_is_opt_in_and_reports_live_module_status() {
         .unwrap();
     let source = configured.create_audio_source().unwrap();
     let track = configured.create_audio_track("processed", &source).unwrap();
-    track
-        .set_audio_processing_options(AudioProcessingOptions {
-            echo_cancellation: ProcessingChoice::Software,
-            noise_suppression: ProcessingChoice::Automatic,
-            gain_control: ProcessingChoice::Disabled,
-        })
-        .unwrap();
-    let state = configured.audio_processing_state();
-    assert!(state.has_software_module);
-    assert!(!state.echo_cancellation.platform_available);
-    // Before a capture send starts, the effective path can be unknown. Do not
-    // mistake factory configuration for proof of active capture processing.
-    assert_ne!(
-        state.echo_cancellation.effective,
-        ProcessingImplementation::Platform
-    );
+    assert_eq!(track.kind(), "audio");
 }
 
 #[test]
-fn encoded_opus_cannot_claim_pcm_processing() {
+fn encoded_opus_factory_remains_separate_from_pcm_processing() {
     assert!(
         PeerConnectionFactory::builder()
             .audio_encoder_factory(AudioEncoderFactory::with_opus_frames().unwrap())
@@ -55,11 +35,7 @@ fn encoded_opus_cannot_claim_pcm_processing() {
     let track = factory
         .create_encoded_audio_track("encoded", &source)
         .unwrap();
-    assert!(
-        track
-            .set_audio_processing_options(AudioProcessingOptions::default())
-            .is_err()
-    );
+    assert_eq!(track.kind(), "audio");
 }
 
 #[test]
@@ -78,7 +54,7 @@ fn upstream_audio_processing_choices_can_be_constructed_headlessly() {
             GainControl::FixedDigital,
             GainControl::AdaptiveDigitalV2,
         ] {
-            let factory = PeerConnectionFactory::builder()
+            let _factory = PeerConnectionFactory::builder()
                 .audio_processing(AudioProcessingConfig {
                     echo_cancellation: true,
                     noise_suppression: suppression,
@@ -86,7 +62,6 @@ fn upstream_audio_processing_choices_can_be_constructed_headlessly() {
                 })
                 .build()
                 .unwrap();
-            assert!(factory.audio_processing_state().has_software_module);
         }
     }
 }

@@ -49,7 +49,7 @@ test_suite(
     name = "fast",
     tests = ["//%s:unit_tests" % owner for owner in RUST_OWNERS] + [
         "//crates/pulsebeam:cluster_tests", "//crates/pulsebeam:cli_tests",
-        "//crates/pulsebeam-rtc:integration_tests", "//crates/pulsebeam-transport:shared_port_test",
+        "//crates/pulsebeam-rtc:integration_tests", "//crates/pulsebeam-rtc/simulation:scream_differential", "//crates/pulsebeam-transport:shared_port_test",
         "//crates/pulsebeam-runtime:steering_tests",
         "//crates/pulsebeam-udp:simulation_tests",
         "//crates/pulsebeam-cli:production_native", "//agents/pulsebeam-agent-native:package_versions",

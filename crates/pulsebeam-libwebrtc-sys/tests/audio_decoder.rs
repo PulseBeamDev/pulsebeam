@@ -233,9 +233,8 @@ fn opus_empty_and_malformed_frames_and_plc_keep_native_outcomes() {
     let mut prefix = vec![7, 8];
     stereo.generate_plc(usize::MAX, &mut prefix).unwrap();
     assert_eq!(&prefix[..2], &[7, 8]);
-    // SDK AppendData returns the per-channel count, not the full stereo count.
-    // Preserve that native quirk rather than silently repairing its output.
-    assert_eq!(prefix.len(), 2 + 480);
+    // Native PLC appends interleaved samples for both channels.
+    assert_eq!(prefix.len(), 2 + 480 * 2);
 }
 
 #[test]

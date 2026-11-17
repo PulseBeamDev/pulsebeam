@@ -75,7 +75,7 @@ fn header_capability_constructors_optional_ids_raw_direction_bytes_and_assignmen
     assert_eq!(value.direction_raw(), 0);
     let uri = b"u\xff\0ri";
     assert_eq!(HeaderCapability::new(uri).uri_bytes(), uri);
-    let id = RtpHeaderExtensionId::new(i32::MIN);
+    let id = RtpHeaderExtensionId::new(255);
     let mut value = HeaderCapability::with_preferences(uri, &id, true, Direction::Other(i32::MAX));
     assert_eq!(value.uri_bytes(), uri);
     assert_eq!(value.preferred_id().unwrap(), id);
@@ -84,15 +84,15 @@ fn header_capability_constructors_optional_ids_raw_direction_bytes_and_assignmen
     assert_eq!(value.direction(), Direction::Other(i32::MAX));
     assert_eq!(
         HeaderCapability::with_id(uri, &id),
-        HeaderCapability::with_raw_id(uri, i32::MIN)
+        HeaderCapability::with_raw_id(uri, 255)
     );
     assert_eq!(
         HeaderCapability::with_direction(uri, &id, Direction::Stopped),
-        HeaderCapability::with_raw_id_and_direction(uri, i32::MIN, Direction::Stopped)
+        HeaderCapability::with_raw_id_and_direction(uri, 255, Direction::Stopped)
     );
     assert_eq!(
         value,
-        HeaderCapability::with_raw_preferences(uri, i32::MIN, true, Direction::Other(i32::MAX))
+        HeaderCapability::with_raw_preferences(uri, 255, true, Direction::Other(i32::MAX))
     );
     let copy = value.clone();
     let detached = value.preferred_id().unwrap();
@@ -106,7 +106,7 @@ fn header_capability_constructors_optional_ids_raw_direction_bytes_and_assignmen
     value.set_preferred_id(Some(&RtpHeaderExtensionId::not_set()));
     assert_eq!(value.preferred_id().unwrap().value(), 0);
     drop(value);
-    assert_eq!(detached.value(), i32::MIN);
+    assert_eq!(detached.value(), 255);
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn capabilities_children_and_fec_are_independent_ordered_sdk_copies() {
     assert!(value.fec().is_empty());
     let mut codec = RtpCodecCapability::default();
     codec.set_preferred_payload_type(Some(i32::MAX));
-    let header = HeaderCapability::with_raw_preferences(b"e\xff\0", -1, true, Direction::Other(-2));
+    let header = HeaderCapability::with_raw_preferences(b"e\xff\0", 255, true, Direction::Other(-2));
     value.set_codecs(&[codec.clone(), codec.clone()]);
     value.set_header_extensions(&[header.clone()]);
     let fec = [

@@ -1,5 +1,5 @@
-//! Owned transport/observer providers. Callback output storage is initialized
-//! before Rust sees it. Void native callback failures remain observer-visible;
+//! Owned audio transport providers. Callback output storage is initialized
+//! before Rust sees it. Native callback failures remain observable;
 //! initialized fallback output is not a successful custom audio result.
 use crate::ffi;
 use std::{
@@ -65,26 +65,10 @@ pub trait AudioTransportProvider: Send + 'static {
     ) -> Result<AudioDeviceRenderTiming, String>;
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioDeviceSpeechActivity {
-    Started,
-    Ended,
-    Unknown(i32),
-}
-pub trait AudioDeviceObserverProvider: Send + 'static {
-    fn devices_updated(&mut self) -> Result<(), String> {
-        Ok(())
-    }
-    fn speech_activity(&mut self, _event: AudioDeviceSpeechActivity) -> Result<(), String> {
-        Ok(())
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioDeviceCallbackOperation {
     RecordedData,
     NeedPlayData,
     PullRenderData,
-    DevicesUpdated,
-    SpeechActivity,
     Destroy,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,7 +116,6 @@ impl AudioDeviceCallbackFailureObserver {
 }
 enum Provider {
     Transport(Box<dyn AudioTransportProvider>),
-    Observer(Box<dyn AudioDeviceObserverProvider>),
 }
 pub(crate) struct RustAudioDeviceCallbacks {
     provider: Mutex<Option<Provider>>,
@@ -262,7 +245,6 @@ pub(crate) fn audio_device_recorded(
             key_pressed: f.key_pressed,
             estimated_capture_time_ns: f.capture_time_present.then_some(f.capture_time_ns),
         }),
-        _ => Err("transport kind mismatch".into()),
     });
     if let Some(v) = value {
         r.failed = false;
@@ -285,7 +267,6 @@ pub(crate) fn audio_device_render(
     if pull {
         let value = callbacks.call(AudioDeviceCallbackOperation::PullRenderData, |p| match p {
             Provider::Transport(p) => p.pull_render_data(spec(&f), data),
-            _ => Err("transport kind mismatch".into()),
         });
         if let Some(v) = value {
             r.failed = false;
@@ -297,7 +278,6 @@ pub(crate) fn audio_device_render(
     } else {
         let value = callbacks.call(AudioDeviceCallbackOperation::NeedPlayData, |p| match p {
             Provider::Transport(p) => p.need_play_data(spec(&f), data),
-            _ => Err("transport kind mismatch".into()),
         });
         if let Some(v) = value {
             if v.frames > f.frames {
@@ -313,31 +293,6 @@ pub(crate) fn audio_device_render(
     }
     r
 }
-pub(crate) fn audio_device_observed(
-    callbacks: &RustAudioDeviceCallbacks,
-    speech: bool,
-    event: i32,
-) {
-    let operation = if speech {
-        AudioDeviceCallbackOperation::SpeechActivity
-    } else {
-        AudioDeviceCallbackOperation::DevicesUpdated
-    };
-    callbacks.call(operation, |p| match p {
-        Provider::Observer(p) => {
-            if speech {
-                p.speech_activity(match event {
-                    0 => AudioDeviceSpeechActivity::Started,
-                    1 => AudioDeviceSpeechActivity::Ended,
-                    n => AudioDeviceSpeechActivity::Unknown(n),
-                })
-            } else {
-                p.devices_updated()
-            }
-        }
-        _ => Err("observer kind mismatch".into()),
-    });
-}
 pub struct AudioTransport {
     #[cfg_attr(
         not(feature = "native"),
@@ -349,38 +304,13 @@ pub struct AudioTransport {
     pub(crate) native: cxx::UniquePtr<ffi::NativeAudioTransport>,
     failure: AudioDeviceCallbackFailureObserver,
 }
-pub struct AudioDeviceObserver {
-    #[cfg_attr(
-        not(feature = "native"),
-        allow(
-            dead_code,
-            reason = "Core retains the owning adapter without platform registration."
-        )
-    )]
-    pub(crate) native: cxx::UniquePtr<ffi::NativeAudioDeviceObserver>,
-    failure: AudioDeviceCallbackFailureObserver,
-}
 // Opaque callback adapters have no affine SDK resources and serialize Send providers.
 unsafe impl Send for AudioTransport {}
-unsafe impl Send for AudioDeviceObserver {}
 impl AudioTransport {
     pub fn from_provider(provider: impl AudioTransportProvider) -> Self {
         let failure = AudioDeviceCallbackFailureObserver::default();
         let native = ffi::audio_transport_new(Box::new(RustAudioDeviceCallbacks {
             provider: Mutex::new(Some(Provider::Transport(Box::new(provider)))),
-            failure: failure.clone(),
-        }));
-        Self { native, failure }
-    }
-    pub fn failure_observer(&self) -> AudioDeviceCallbackFailureObserver {
-        self.failure.clone()
-    }
-}
-impl AudioDeviceObserver {
-    pub fn from_provider(provider: impl AudioDeviceObserverProvider) -> Self {
-        let failure = AudioDeviceCallbackFailureObserver::default();
-        let native = ffi::audio_device_observer_new(Box::new(RustAudioDeviceCallbacks {
-            provider: Mutex::new(Some(Provider::Observer(Box::new(provider)))),
             failure: failure.clone(),
         }));
         Self { native, failure }
