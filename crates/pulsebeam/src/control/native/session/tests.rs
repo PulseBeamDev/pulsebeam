@@ -45,6 +45,7 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                 wire::SubscriptionSpec {
                     track_id: source.as_str(),
                     kind: wire::TrackKind::Data as i32,
+                    source_room: "room".into(),
                     binding: Some(wire::TrackBinding {
                         transport: Some(wire::track_binding::Transport::Sctp(
                             wire::SctpParameters { stream_id: Some(1) },
@@ -89,7 +90,7 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
             }
         }
         assert_eq!(model.source_waits.len(), count);
-        let wait = model.source_waits[&1];
+        let wait = model.source_waits[&1].clone();
         assert!(wait.deadline >= before + Duration::from_secs(30));
         assert!(wait.deadline <= Instant::now() + Duration::from_secs(30));
         assert_eq!(
@@ -338,6 +339,7 @@ fn subscription(track_id: &str) -> wire::ResourceSpec {
             wire::SubscriptionSpec {
                 track_id: track_id.to_owned(),
                 kind: wire::TrackKind::Data as i32,
+                source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
                         stream_id: Some(1),
@@ -383,7 +385,11 @@ fn input(
     session: &mut NativeSession,
     records: Vec<wire::ClientStateRecord>,
 ) -> Result<Vec<u64>, InputError> {
-    let bytes = codec::encode_client(&wire::ClientStateBatch { records }).unwrap();
+    let bytes = codec::encode_client(&wire::ClientStateBatch {
+        records,
+        ..Default::default()
+    })
+    .unwrap();
     session.apply_input(&bytes).map(|input| input.cutoffs)
 }
 
@@ -569,6 +575,7 @@ fn overlapping_proposals_cannot_replace_queued_or_active_targets() {
                     desired: None,
                     execution: Some(report.clone()),
                 }],
+                ..Default::default()
             })
             .unwrap();
             assert!(session.receive_input(&bytes, 100).unwrap().is_empty());
@@ -598,6 +605,7 @@ fn overlapping_proposals_cannot_replace_queued_or_active_targets() {
     .unwrap();
     let bytes = codec::encode_client(&wire::ClientStateBatch {
         records: vec![absent(1, 3), present(2, 4, publication("second", false))],
+        ..Default::default()
     })
     .unwrap();
     assert!(matches!(
@@ -852,6 +860,34 @@ fn rejected_update_preserves_acceptance_and_publication_reservation() {
             Some(&1)
         );
     }
+    let lookup = wire::ResourceSpec {
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+            wire::SourceLookupSpec {
+                source: Some(wire::LogicalSourceAddress {
+                    room: "room".into(),
+                    participant_external_id: "Owner".into(),
+                    kind: wire::TrackKind::Data as i32,
+                    label: "topic".into(),
+                }),
+            },
+        )),
+    };
+    assert!(
+        input(&mut session, vec![present(16, 16, lookup)])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(owned(&session, 16).rejection.is_none());
+    assert!(matches!(
+        owned(&session, 16).value,
+        Some(wire::confirmed_state::Value::SourceLookup(_))
+    ));
+    assert!(session.take_preparation().unwrap().is_none());
+    assert_eq!(owned(&session, 1).value, accepted);
 }
 
 #[test]
@@ -1562,6 +1598,7 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
                     failure: Some(failure(wire::FailureCode::InternalFailure)),
                 }),
             }],
+            ..Default::default()
         })
         .unwrap();
         assert!(session.receive_input(&report, 100).unwrap().is_empty());
@@ -1672,6 +1709,7 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
             wire::SubscriptionSpec {
                 track_id: track.track_id.clone(),
                 kind: wire::TrackKind::Data as i32,
+                source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
                         stream_id: Some(1),
@@ -2000,4 +2038,463 @@ fn public_revision_and_private_counter_exhaustion_never_wrap() {
     ));
     assert_eq!(session.execution_sequence, u64::MAX);
     assert_eq!(session.retained_bytes, retained);
+}
+
+#[test]
+fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
+    use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind};
+
+    let mut model = session();
+    model
+        .authorization(
+            10_000,
+            2,
+            ResourcePermissions::Grants {
+                room: crate::entity::RoomExternalId::new("room").unwrap(),
+                grants: GrantSet::new(vec![
+                    Grant::new(
+                        vec!["room".into(), "other".into()],
+                        vec![Action::Subscribe],
+                        Some("allowed-publisher".into()),
+                        Some(TrackKind::Data),
+                        Some("label".into()),
+                    )
+                    .unwrap(),
+                ])
+                .unwrap(),
+            },
+        )
+        .unwrap();
+    for (reference, room) in [(81, "room"), (82, "other")] {
+        let spec = wire::ResourceSpec {
+            settings: Some(wire::ResourceSettings {
+                enabled: Some(true),
+                receive: None,
+            }),
+            declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+                wire::SourceLookupSpec {
+                    source: Some(wire::LogicalSourceAddress {
+                        room: room.into(),
+                        participant_external_id: "denied-publisher".into(),
+                        kind: wire::TrackKind::Data as i32,
+                        label: "label".into(),
+                    }),
+                },
+            )),
+        };
+        assert!(
+            input(&mut model, vec![present(reference, reference, spec)])
+                .unwrap()
+                .is_empty()
+        );
+        let value = owned(&model, reference);
+        assert_eq!(value.evaluated_revision, reference);
+        assert_eq!(
+            value.rejection.as_ref().unwrap().code,
+            wire::FailureCode::PermissionDenied as i32
+        );
+        assert!(matches!(
+            value.value,
+            Some(wire::confirmed_state::Value::Absent(_))
+        ));
+        assert!(model.rows[&Key::Owned(reference)].owned.is_none());
+    }
+    model
+        .refresh_source_lookups(32, 100, |_| {
+            panic!("denied lookup reached source resolution")
+        })
+        .unwrap();
+    assert!(!model.lookup_refresh_pending());
+    assert!(model.take_preparation().unwrap().is_none());
+}
+
+#[test]
+fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors() {
+    use crate::entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId, TrackKind};
+    use crate::track::{DataLane, TrackMeta};
+
+    let mut model = session();
+    let grant = pulsebeam_core::auth::grants::Grant::new(
+        vec!["room".into()],
+        vec![pulsebeam_core::auth::grants::Action::Subscribe],
+        Some("publisher".into()),
+        Some(pulsebeam_core::auth::grants::TrackKind::Data),
+        Some("exact-label".into()),
+    )
+    .unwrap();
+    model
+        .authorization(
+            10_000,
+            2,
+            ResourcePermissions::Grants {
+                room: crate::entity::RoomExternalId::new("room").unwrap(),
+                grants: pulsebeam_core::auth::grants::GrantSet::new(vec![grant]).unwrap(),
+            },
+        )
+        .unwrap();
+    let room = RoomId::from_bytes([7; 16]);
+    let connection = ConnectionId::new();
+    let publisher_id = ParticipantId::new();
+    let publisher = ParticipantExternalId::new("publisher").unwrap();
+    let label = "exact-label";
+    let address = wire::LogicalSourceAddress {
+        room: "room".into(),
+        participant_external_id: publisher.as_str().into(),
+        kind: wire::TrackKind::Data as i32,
+        label: label.into(),
+    };
+    let lookup = |enabled| wire::ResourceSpec {
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(enabled),
+            receive: None,
+        }),
+        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+            wire::SourceLookupSpec {
+                source: Some(address.clone()),
+            },
+        )),
+    };
+    let data_track = |connection: ConnectionId| {
+        let id = connection.derive_track_id(TrackKind::Data, label);
+        Track::data_publication(
+            TrackMeta {
+                room_id: room,
+                shard_id: crate::id::ShardId::new(0),
+                id,
+                origin: publisher_id,
+                connection_id: connection,
+                label: Some(label.into()),
+            },
+            DataLane::Ordered,
+        )
+    };
+
+    assert!(
+        input(&mut model, vec![present(51, 51, lookup(true))])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(model.preparations.is_empty());
+    let state = &model.rows[&Key::Owned(51)].value;
+    let Some(wire::confirmed_state::Value::SourceLookup(initial)) = &state.value else {
+        panic!("lookup must be projected immediately")
+    };
+    assert!(initial.participant.is_none() && initial.track.is_none());
+    let initial_revision = state.evaluated_revision;
+
+    let first = data_track(connection);
+    model
+        .observe_participant(wire::Participant {
+            participant_id: publisher_id.as_str(),
+            participant_external_id: publisher.as_str().to_owned(),
+        })
+        .unwrap();
+    model
+        .observe_candidate(super::super::ResolvedSource {
+            track: &first,
+            publisher: &publisher,
+        })
+        .unwrap();
+    assert!(
+        !model
+            .permissions
+            .can_discover_source(&super::super::ResolvedSource {
+                track: &first,
+                publisher: &publisher,
+            })
+    );
+    assert!(!model.rows.keys().any(|key| matches!(key, Key::Track(_))));
+    model
+        .refresh_source_lookups(32, 100, |_| {
+            Some(super::super::ResolvedSource {
+                track: &first,
+                publisher: &publisher,
+            })
+        })
+        .unwrap();
+    let state = &model.rows[&Key::Owned(51)].value;
+    let Some(wire::confirmed_state::Value::SourceLookup(available)) = &state.value else {
+        panic!("lookup state")
+    };
+    assert_eq!(state.evaluated_revision, initial_revision);
+    assert_eq!(
+        available
+            .participant
+            .as_ref()
+            .unwrap()
+            .participant_external_id,
+        "publisher"
+    );
+    assert_eq!(
+        available.track.as_ref().unwrap().track_id,
+        first.id().as_str()
+    );
+
+    let invalid = wire::ResourceSpec {
+        settings: None,
+        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+            wire::SourceLookupSpec {
+                source: Some(address.clone()),
+            },
+        )),
+    };
+    input(&mut model, vec![present(51, 52, invalid)]).unwrap();
+    let rejected = &model.rows[&Key::Owned(51)].value;
+    assert_eq!(
+        rejected.rejection.as_ref().unwrap().code,
+        wire::FailureCode::InvalidConfiguration as i32
+    );
+    assert!(matches!(
+        &rejected.value,
+        Some(wire::confirmed_state::Value::SourceLookup(state))
+            if state.participant.is_some() && state.track.is_some()
+    ));
+
+    input(&mut model, vec![present(51, 53, lookup(false))]).unwrap();
+    let state = &model.rows[&Key::Owned(51)].value;
+    let Some(wire::confirmed_state::Value::SourceLookup(disabled)) = &state.value else {
+        panic!("disabled lookup state")
+    };
+    assert!(disabled.participant.is_none() && disabled.track.is_none());
+
+    input(&mut model, vec![present(51, 54, lookup(true))]).unwrap();
+    let replacement_connection = ConnectionId::new();
+    let replacement = data_track(replacement_connection);
+    model
+        .refresh_source_lookups(32, 100, |_| {
+            Some(super::super::ResolvedSource {
+                track: &replacement,
+                publisher: &publisher,
+            })
+        })
+        .unwrap();
+    let state = &model.rows[&Key::Owned(51)].value;
+    let Some(wire::confirmed_state::Value::SourceLookup(republished)) = &state.value else {
+        panic!("republished lookup state")
+    };
+    assert_eq!(
+        republished.track.as_ref().unwrap().track_id,
+        replacement.id().as_str()
+    );
+
+    model.refresh_source_lookups(32, 100, |_| None).unwrap();
+    let state = &model.rows[&Key::Owned(51)].value;
+    let Some(wire::confirmed_state::Value::SourceLookup(unpublished)) = &state.value else {
+        panic!("unpublished lookup state")
+    };
+    assert!(unpublished.participant.is_none() && unpublished.track.is_none());
+    assert!(input(&mut model, vec![absent(51, 55)]).unwrap().is_empty());
+    assert!(matches!(
+        model.rows[&Key::Owned(51)].value.value,
+        Some(wire::confirmed_state::Value::Absent(_))
+    ));
+}
+
+#[test]
+fn source_lookup_revocation_and_close_finish_locally_without_execution_commands() {
+    let mut model = NativeSession::default();
+    model
+        .authorization(10_000, 1, ResourcePermissions::RoomBound)
+        .unwrap();
+    let spec = wire::ResourceSpec {
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+            wire::SourceLookupSpec {
+                source: Some(wire::LogicalSourceAddress {
+                    room: "room".into(),
+                    participant_external_id: "publisher".into(),
+                    kind: wire::TrackKind::Data as i32,
+                    label: "label".into(),
+                }),
+            },
+        )),
+    };
+    input(&mut model, vec![present(1, 1, spec)]).unwrap();
+    assert!(model.preparations.is_empty());
+    model
+        .authorization(10_000, 2, ResourcePermissions::Denied)
+        .unwrap();
+    let mut commands = Vec::new();
+    let mut turns = 0;
+    while model.revocation_pending() {
+        commands.extend(
+            model
+                .service_revocations(32, |_| panic!("lookup revocation is local"))
+                .unwrap(),
+        );
+        turns += 1;
+        assert!(turns <= 4, "permission sweep failed to settle");
+    }
+    assert!(commands.is_empty());
+    assert!(matches!(
+        &model.rows[&Key::Owned(1)].value.value,
+        Some(wire::confirmed_state::Value::Absent(absent))
+            if absent.reason == wire::AbsenceReason::PermissionRevoked as i32
+    ));
+    assert!(
+        !model.rows[&Key::Owned(1)]
+            .owned
+            .as_ref()
+            .unwrap()
+            .cutoff_pending
+    );
+    assert!(model.preparations.is_empty());
+
+    let mut closing = NativeSession::default();
+    closing
+        .authorization(10_000, 1, ResourcePermissions::RoomBound)
+        .unwrap();
+    input(
+        &mut closing,
+        vec![present(
+            3,
+            3,
+            wire::ResourceSpec {
+                settings: Some(wire::ResourceSettings {
+                    enabled: Some(true),
+                    receive: None,
+                }),
+                declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+                    wire::SourceLookupSpec {
+                        source: Some(wire::LogicalSourceAddress {
+                            room: "room".into(),
+                            participant_external_id: "publisher".into(),
+                            kind: wire::TrackKind::Data as i32,
+                            label: "label".into(),
+                        }),
+                    },
+                )),
+            },
+        )],
+    )
+    .unwrap();
+    closing.close(wire::CloseReason::ProtocolError).unwrap();
+    closing.finish_closed_lookups(32).unwrap();
+    assert!(!closing.closed_lookup_pending);
+    assert!(matches!(
+        &closing.rows[&Key::Owned(3)].value.value,
+        Some(wire::confirmed_state::Value::Absent(absent))
+            if absent.reason == wire::AbsenceReason::Removed as i32
+    ));
+    assert!(closing.preparations.is_empty());
+}
+
+#[test]
+fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
+    use crate::entity::RoomExternalId;
+    use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind as GrantKind};
+
+    let address = || wire::LogicalSourceAddress {
+        room: "room".into(),
+        participant_external_id: "publisher".into(),
+        kind: wire::TrackKind::Data as i32,
+        label: "label".into(),
+    };
+    let spec = || wire::ResourceSpec {
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+            wire::SourceLookupSpec {
+                source: Some(address()),
+            },
+        )),
+    };
+    let mut bounded = NativeSession::default();
+    bounded
+        .authorization(10_000, 1, ResourcePermissions::RoomBound)
+        .unwrap();
+    for start in (1..=40).step_by(16) {
+        let end = (start + 15).min(40);
+        input(
+            &mut bounded,
+            (start..=end)
+                .map(|reference| present(reference, reference, spec()))
+                .collect(),
+        )
+        .unwrap();
+    }
+    assert!(bounded.preparations.is_empty());
+    bounded.refresh_source_lookups(8, 100, |_| None).unwrap();
+    assert!(bounded.lookup_refresh_pending());
+    let mut turns = 1;
+    while bounded.lookup_refresh_pending() {
+        bounded.refresh_source_lookups(8, 100, |_| None).unwrap();
+        turns += 1;
+        assert!(turns <= 8, "lookup cursor failed to make bounded progress");
+    }
+    assert!(turns > 1);
+    assert!(bounded.retained_bytes < STATE_BYTES);
+
+    let other_room_grant = Grant::new(
+        vec!["other".into()],
+        vec![Action::Subscribe],
+        Some("publisher".into()),
+        Some(GrantKind::Data),
+        Some("label".into()),
+    )
+    .unwrap();
+    let mut scoped = NativeSession::default();
+    scoped
+        .authorization(
+            10_000,
+            1,
+            ResourcePermissions::Grants {
+                room: RoomExternalId::new("current").unwrap(),
+                grants: GrantSet::new(vec![other_room_grant]).unwrap(),
+            },
+        )
+        .unwrap();
+    let mut other_room = spec();
+    let Some(wire::resource_spec::Declaration::SourceLookup(lookup)) =
+        other_room.declaration.as_mut()
+    else {
+        panic!("source lookup declaration")
+    };
+    lookup.source.as_mut().unwrap().room = "other".into();
+    input(&mut scoped, vec![present(1, 1, other_room)]).unwrap();
+    assert!(matches!(
+        &scoped.rows[&Key::Owned(1)].value.value,
+        Some(wire::confirmed_state::Value::SourceLookup(lookup))
+            if lookup.spec.as_ref().and_then(|spec| match spec.declaration.as_ref() {
+                Some(wire::resource_spec::Declaration::SourceLookup(value)) => value.source.as_ref(),
+                _ => None,
+            }).is_some_and(|source| source.room == "other")
+    ));
+    assert!(scoped.preparations.is_empty());
+
+    let mut denied = NativeSession::default();
+    denied
+        .authorization(
+            10_000,
+            1,
+            ResourcePermissions::Grants {
+                room: RoomExternalId::new("current").unwrap(),
+                grants: GrantSet::default(),
+            },
+        )
+        .unwrap();
+    for (reference, room) in [(1, "current"), (2, "other")] {
+        let mut request = spec();
+        let Some(wire::resource_spec::Declaration::SourceLookup(lookup)) =
+            request.declaration.as_mut()
+        else {
+            panic!("source lookup declaration")
+        };
+        lookup.source.as_mut().unwrap().room = room.into();
+        input(&mut denied, vec![present(reference, reference, request)]).unwrap();
+        assert!(matches!(
+            &denied.rows[&Key::Owned(reference)].value,
+            wire::ConfirmedState {
+                rejection: Some(failure),
+                value: Some(wire::confirmed_state::Value::Absent(_)),
+                ..
+            } if failure.code == wire::FailureCode::PermissionDenied as i32
+        ));
+    }
+    assert!(denied.preparations.is_empty());
 }

@@ -32,6 +32,7 @@ pub(super) struct NativeReceivers {
 pub(super) struct Receiver {
     transport: ReceiveTransport,
     source: TrackId,
+    source_room: crate::entity::RoomId,
     source_id: String,
     handle: Option<TrackHandle>,
     enabled: bool,
@@ -276,11 +277,15 @@ impl Connection {
         handle: TrackHandle,
         track: &Track,
     ) {
-        if track.meta().room_id != self.room_id || track.meta().origin == self.participant_id {
+        if track.meta().origin == self.participant_id {
             self.disconnect(DisconnectReason::SignalingInput);
             return;
         }
         let id = *track.id().as_bytes();
+        if track.meta().room_id != self.room_id && !self.native_receivers.sources.contains_key(&id)
+        {
+            return;
+        }
         let source = self
             .native_receivers
             .sources
@@ -298,6 +303,7 @@ impl Connection {
         let current = track.meta();
         if source.retired
             || source.track.kind() != track.kind()
+            || prior.room_id != current.room_id
             || prior.origin != current.origin
             || prior.connection_id != current.connection_id
             || prior.label != current.label
@@ -455,6 +461,7 @@ impl Connection {
             }
         };
         let crate::control::native::Receiver {
+            source_room,
             source,
             source_id,
             transport,
@@ -463,7 +470,7 @@ impl Connection {
         let source_track = source;
         let source = source_track.id();
         let metadata = source_track.meta();
-        if metadata.room_id != self.room_id
+        if metadata.room_id != source_room
             || metadata.origin == self.participant_id
             || self
                 .native_receivers
@@ -473,6 +480,7 @@ impl Connection {
                     let previous = current.track.meta();
                     current.retired
                         || current.track.kind() != source_track.kind()
+                        || previous.room_id != metadata.room_id
                         || previous.origin != metadata.origin
                         || previous.connection_id != metadata.connection_id
                         || previous.label != metadata.label
@@ -596,6 +604,7 @@ impl Connection {
             reference,
             Receiver {
                 source,
+                source_room,
                 source_id,
                 handle: None,
                 enabled: false,
@@ -818,7 +827,12 @@ impl Connection {
                 .received
                 .insert((handle.data().as_ffi(), reference));
         }
-        events.set_owned_subscription(reference, receiver.source, enabled && !receiver.failed);
+        events.set_owned_subscription(
+            reference,
+            receiver.source_room,
+            receiver.source,
+            enabled && !receiver.failed,
+        );
         self.record_native_preparation(work, Ok(ResourceExecution::Receiver(execution)), now);
     }
 
@@ -848,13 +862,14 @@ impl Connection {
             return;
         };
         let source = receiver.source;
+        let source_room = receiver.source_room;
         let demand = receiver.enabled && !receiver.failed;
         let ready = self.native_receivers.receiver_ready(receiver);
         if self.apply_native_receiver_gate(reference, ready).is_err() {
             self.disconnect(DisconnectReason::SignalingOutput);
             return;
         }
-        events.set_owned_subscription(reference, source, demand);
+        events.set_owned_subscription(reference, source_room, source, demand);
     }
 
     pub(super) fn quiesce_native_receivers(&mut self) {
@@ -951,13 +966,14 @@ impl Connection {
         receiver.handle = None;
         receiver.deadline = None;
         let preparation = receiver.preparation.take();
+        let source_room = receiver.source_room;
         // Keep retirement bookkeeping funded until the route receipt removes it.
         self.native_receivers.receivers.insert(reference, receiver);
         self.record_native_receiver_binding(reference);
         if let Some((work, _)) = preparation {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Retired.into()));
         }
-        events.unsubscribe_owned(reference);
+        events.unsubscribe_owned(reference, source_room);
     }
 
     pub(super) fn complete_native_receiver_cutoff(&mut self, reference: u64, success: bool) {

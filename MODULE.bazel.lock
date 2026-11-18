@@ -2952,7 +2952,7 @@
           "FILE:@@//crates/pulsebeam-cli/Cargo.toml b8ac0affa5f70081531b93d5de7922e2f6aa77cb9a07243620abf1c098fca41e",
           "FILE:@@//crates/pulsebeam-rtc/simulation/Cargo.toml a354e94e1e8fdabd3a68f3ad9a20d26803cdae0931a1dbae01ae4aa3c736ce0c",
           "FILE:@@//crates/pulsebeam-simulator/Cargo.toml 895e487bf4c09680d7e40cbfa27ad488b3833b76d4f87765d3ce8eba38970dd5",
-          "FILE:@@//agents/pulsebeam-agent-web/Cargo.toml 7dd8bdf225df4fea442d0f06b0c297c8ec8f7c4c0d13de16b74731fec6cae38d",
+          "FILE:@@//agents/pulsebeam-agent-web/Cargo.toml 7dc6097990486686d37ffa570de68f8bf9ad11a21835780b118f2f978116cf71",
           "FILE:@@//tools/rust/wasm_proof/Cargo.toml 6ce0ed9b505f265d47f571d7e6b3ffa9a2e53414241af671d26572772ed6f247",
           "FILE:@@//server/auth/Cargo.toml 2a0aff420d60a542771ce184fc07fa728c584bc823add885e061ede256c9e671",
           "FILE:@@//tools/rust/build_tools/Cargo.lock e8e6f4661ba62f7c474d1c029b8d6a0420822dd26f14770145e2954ea332eadd",

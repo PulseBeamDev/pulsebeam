@@ -1,3 +1,6 @@
+import { OperationError } from "./agent-observation.js";
+import type { ErrorInfo } from "./schema.js";
+
 export class ResourceError extends Error {
   constructor(
     readonly code: string,
@@ -16,8 +19,13 @@ export class ResourceOwnershipError extends ResourceError {
   }
 }
 
-export function resourceFailure(error: unknown): ResourceError {
-  if (error instanceof ResourceError) return error;
+export function resourceFailure(
+  error: unknown,
+): ResourceError | OperationError {
+  if (error instanceof ResourceError || error instanceof OperationError)
+    return error;
+  if (typeof error === "object" && error !== null && "pulsebeamInfo" in error)
+    return new OperationError(error.pulsebeamInfo as ErrorInfo);
   const code =
     typeof error === "object" &&
     error !== null &&
@@ -32,6 +40,7 @@ export function resourceFailure(error: unknown): ResourceError {
 }
 
 export interface ResourceRuntime {
+  resource_now(command: unknown): unknown;
   resource(command: unknown): Promise<unknown>;
 }
 export interface ResourceBinding {
@@ -42,7 +51,7 @@ export interface ResourceBinding {
 export interface ResourceObserver {
   bind(binding: ResourceBinding): void;
   unbind(): void;
-  error?(error: ResourceError): void;
+  error?(error: ResourceError | OperationError): void;
 }
 
 /** Host attachment and Promise lifetimes only. Core grants and releases owners. */
@@ -51,14 +60,21 @@ export class ResourceOwners {
   #closed = false;
   #closing: Promise<void> | undefined;
   readonly #owners = new Set<ResourceOwner>();
-  constructor(readonly report: (error: ResourceError) => void) {}
+  constructor(
+    readonly report: (error: ResourceError | OperationError) => void,
+  ) {}
 
   acquire(command: unknown, observer: ResourceObserver): ResourceOwner {
     if (this.#closed) throw new ResourceError("closed", "agent is closed");
     const owner = new ResourceOwner(this, command, observer);
     this.#owners.add(owner);
-    if (this.#runtime) owner.activate(this.#runtime);
-    return owner;
+    try {
+      if (this.#runtime) owner.activate(this.#runtime);
+      return owner;
+    } catch (error) {
+      void owner.close();
+      throw error;
+    }
   }
   current(runtime: ResourceRuntime): boolean {
     return !this.#closed && runtime === this.#runtime;
@@ -67,7 +83,13 @@ export class ResourceOwners {
     if (this.#closed || this.#runtime === runtime) return;
     this.deactivate();
     this.#runtime = runtime;
-    for (const owner of this.#owners) owner.activate(runtime);
+    for (const owner of this.#owners) {
+      try {
+        owner.activate(runtime);
+      } catch (error) {
+        owner.fail(error);
+      }
+    }
   }
   deactivate(): void {
     this.#runtime = undefined;
@@ -87,13 +109,12 @@ export class ResourceOwners {
 
 export class ResourceOwner {
   #binding: ResourceBinding | undefined;
-  #attachment: object | undefined;
   #closed = false;
   #closing: Promise<void> | undefined;
   readonly #pending = new Set<Promise<void>>();
   readonly ready: Promise<void>;
   #resolve!: () => void;
-  #reject!: (error: ResourceError) => void;
+  #reject!: (error: ResourceError | OperationError) => void;
 
   constructor(
     private registry: ResourceOwners,
@@ -121,15 +142,10 @@ export class ResourceOwner {
   }
   activate(runtime: ResourceRuntime): void {
     if (this.#closed) return;
-    const attachment = {};
-    this.#attachment = attachment;
-    this.#track(this.#acquire(runtime, attachment));
-  }
-  async #acquire(runtime: ResourceRuntime, attachment: object): Promise<void> {
     try {
       const command =
         typeof this.command === "function" ? this.command() : this.command;
-      const result = await runtime.resource(command);
+      const result = runtime.resource_now(command);
       if (
         !result ||
         typeof result !== "object" ||
@@ -144,24 +160,14 @@ export class ResourceOwner {
           ? { slot: result.slot }
           : {}),
       };
-      if (
-        this.#closed ||
-        attachment !== this.#attachment ||
-        !this.registry.current(runtime)
-      ) {
-        await this.#release(binding);
-        return;
-      }
       this.#binding = binding;
       this.observer.bind(binding);
       this.#resolve();
     } catch (error) {
-      if (
-        !this.#closed &&
-        attachment === this.#attachment &&
-        this.registry.current(runtime)
-      )
-        this.fail(error);
+      const failure = resourceFailure(error);
+      this.#reject(failure);
+      this.detach();
+      throw failure;
     }
   }
   fail(error: unknown): void {
@@ -172,11 +178,17 @@ export class ResourceOwner {
     (this.observer.error ?? this.registry.report)(value);
   }
   detach(): void {
-    this.#attachment = undefined;
     const binding = this.#binding;
     this.#binding = undefined;
+    if (binding) {
+      try {
+        binding.runtime.resource_now({ op: "release", owner: binding.owner });
+      } catch {
+        /* A stopped Core has already fenced its owners. */
+      }
+      this.#track(this.#release(binding));
+    }
     this.observer.unbind();
-    if (binding) this.#track(this.#release(binding));
   }
   async #release(binding: ResourceBinding): Promise<void> {
     try {

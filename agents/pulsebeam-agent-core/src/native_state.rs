@@ -19,6 +19,12 @@ pub(crate) enum Resource {
     },
     Reception(MediaSlot),
     DataSubscription(String),
+    SourceLookup {
+        room: String,
+        participant_external_id: String,
+        kind: wire::TrackKind,
+        label: String,
+    },
 }
 
 impl Resource {
@@ -56,6 +62,20 @@ impl Resource {
             ) => {
                 track == &subscription.track_id && subscription.kind == wire::TrackKind::Data as i32
             }
+            (
+                Self::SourceLookup {
+                    room,
+                    participant_external_id,
+                    kind,
+                    label,
+                },
+                Some(wire::resource_spec::Declaration::SourceLookup(lookup)),
+            ) => lookup.source.as_ref().is_some_and(|source| {
+                room == &source.room
+                    && participant_external_id == &source.participant_external_id
+                    && *kind as i32 == source.kind
+                    && label == &source.label
+            }),
             _ => false,
         }
     }
@@ -68,6 +88,19 @@ impl Resource {
             }
             Self::Reception(_) => 0,
             Self::DataSubscription(track) => track.len(),
+            Self::SourceLookup {
+                room,
+                participant_external_id,
+                label,
+                ..
+            } => {
+                // Target, pending work, retirement, cursor and owned keys can retain the address.
+                return size_of::<Self>()
+                    .saturating_add(room.len())
+                    .saturating_add(participant_external_id.len())
+                    .saturating_add(label.len())
+                    .saturating_mul(5);
+            }
         };
         size_of::<Self>().saturating_add(text)
     }
@@ -75,6 +108,7 @@ impl Resource {
 
 struct Target {
     spec: wire::ResourceSpec,
+    terminal_evaluation: Option<wire::ConfirmedState>,
     reference: Option<u64>,
     waiting_for: Option<u64>,
     blocked: bool,
@@ -82,7 +116,13 @@ struct Target {
 
 impl Target {
     fn retained_bytes(&self) -> usize {
-        size_of::<Self>().saturating_add(self.spec.encoded_len())
+        size_of::<Self>()
+            .saturating_add(self.spec.encoded_len())
+            .saturating_add(
+                self.terminal_evaluation
+                    .as_ref()
+                    .map_or(0, Message::encoded_len),
+            )
     }
 }
 
@@ -125,6 +165,7 @@ pub(crate) enum Change {
         retired_binding: Option<Box<wire::TrackBinding>>,
         state: Box<wire::ConfirmedState>,
         new_evaluation: bool,
+        evaluates_current: bool,
     },
     Participant(String),
     Track(String),
@@ -203,6 +244,7 @@ impl NativeState {
             // Reserve representability with the largest revision/ref encodings.
             codec::encode_client(&wire::ClientStateBatch {
                 records: alloc::vec![desired_record(u64::MAX, u64::MAX, Some(spec.clone()))],
+                ..Default::default()
             })
             .map_err(|_| SignalingError::Encode)?;
         }
@@ -225,6 +267,7 @@ impl NativeState {
         };
         let mut next = spec.map(|spec| Target {
             spec,
+            terminal_evaluation: None,
             reference: (!replace).then_some(previous_reference).flatten(),
             waiting_for,
             blocked: false,
@@ -274,12 +317,18 @@ impl NativeState {
         } else {
             self.targets.remove(&resource);
             self.dirty.remove(&resource);
+            if self.cursor.as_ref() == Some(&resource) {
+                self.cursor = None;
+            }
         }
         Ok(())
     }
 
     pub(crate) fn retry(&mut self, resource: &Resource) {
         if let Some(target) = self.targets.get_mut(resource) {
+            if let Some(state) = target.terminal_evaluation.take() {
+                self.retained_bytes = self.retained_bytes.saturating_sub(state.encoded_len());
+            }
             target.blocked = false;
             if target.waiting_for.is_none() {
                 self.dirty.insert(resource.clone());
@@ -533,8 +582,8 @@ impl NativeState {
                                     .participant_references
                                     .get(&id)
                                     .and_then(|references| references.first())
-                                    .and_then(|reference| self.live(*reference))
-                                    .and_then(|live| live.participant.as_ref())
+                                    .and_then(|reference| self.description(*reference))
+                                    .map(|(participant, _)| participant)
                                     .is_some_and(|previous| previous != &participant)
                             {
                                 return Err(SignalingError::Invalid("participant identity"));
@@ -566,8 +615,8 @@ impl NativeState {
                                     .source_references
                                     .get(&id)
                                     .and_then(|references| references.first())
-                                    .and_then(|reference| self.live(*reference))
-                                    .and_then(|live| live.track.as_ref())
+                                    .and_then(|reference| self.description(*reference))
+                                    .map(|(_, track)| track)
                                     .is_some_and(|previous| !tracks_equal(previous, &track))
                             {
                                 return Err(SignalingError::Invalid("track identity"));
@@ -623,11 +672,23 @@ impl NativeState {
         {
             return Err(SignalingError::Invalid("evaluated revision"));
         }
+        if accepted_spec(&state)
+            .is_some_and(|spec| !validation::declarations_equivalent(&owned.sent, spec))
+        {
+            return Err(SignalingError::Invalid("accepted declaration"));
+        }
+        if let Some((participant, track)) = source_description(&state) {
+            self.validate_description(participant, track)?;
+        }
         if let Some(wire::confirmed_state::Value::Owned(live)) = &state.value {
-            self.validate_source(live)?;
-            let spec = live.spec.as_ref().ok_or(SignalingError::MissingPayload)?;
-            if !validation::declarations_equivalent(&owned.sent, spec) {
-                return Err(SignalingError::Invalid("accepted declaration"));
+            if matches!(
+                live.spec
+                    .as_ref()
+                    .and_then(|spec| spec.declaration.as_ref()),
+                Some(wire::resource_spec::Declaration::Publication(_))
+            ) && live.participant.as_ref() != Some(&self.self_participant)
+            {
+                return Err(SignalingError::Invalid("source identity"));
             }
             if let Some(wire::confirmed_state::Value::Owned(previous)) = owned
                 .confirmed
@@ -646,6 +707,13 @@ impl NativeState {
             .confirmed
             .as_ref()
             .is_none_or(|previous| previous.evaluated_revision != state.evaluated_revision);
+        let evaluates_current = !owned.retiring
+            && state.evaluated_revision == owned.sent_revision
+            && self.targets.get(&owned.resource).is_some_and(|target| {
+                target.reference == Some(reference)
+                    && target.waiting_for.is_none()
+                    && specs_equal(&owned.sent, &target.spec)
+            });
         let resource = owned.resource.clone();
         let terminal = matches!(state.value, Some(wire::confirmed_state::Value::Absent(_)));
         let retired_binding = if terminal {
@@ -670,52 +738,47 @@ impl NativeState {
         } else {
             None
         };
-        let old_bytes = owned.retained_bytes();
-        let new_bytes = if terminal {
-            0
+        let previous_terminal_bytes = self
+            .targets
+            .get(&resource)
+            .and_then(|target| target.terminal_evaluation.as_ref())
+            .map_or(0, Message::encoded_len);
+        let owned_bytes = owned.retained_bytes();
+        let old_bytes = owned_bytes.saturating_add(previous_terminal_bytes);
+        let new_bytes = if terminal && evaluates_current {
+            state.encoded_len()
+        } else if terminal {
+            previous_terminal_bytes
         } else {
             old_bytes
                 .saturating_sub(owned.confirmed.as_ref().map_or(0, Message::encoded_len))
                 .saturating_add(state.encoded_len())
         };
+        let identity = |(participant, track): (&wire::Participant, &wire::Track)| {
+            (track.track_id.clone(), participant.participant_id.clone())
+        };
         let previous_source = owned
             .confirmed
             .as_ref()
-            .and_then(|state| match &state.value {
-                Some(wire::confirmed_state::Value::Owned(live)) => Some((
-                    live.track.as_ref()?.track_id.clone(),
-                    live.participant.as_ref()?.participant_id.clone(),
-                )),
-                _ => None,
-            });
-        let next_source = match &state.value {
-            Some(wire::confirmed_state::Value::Owned(live)) if previous_source.is_none() => Some((
-                live.track
-                    .as_ref()
-                    .ok_or(SignalingError::MissingPayload)?
-                    .track_id
-                    .clone(),
-                live.participant
-                    .as_ref()
-                    .ok_or(SignalingError::MissingPayload)?
-                    .participant_id
-                    .clone(),
-            )),
-            _ => None,
-        };
+            .and_then(source_description)
+            .map(identity);
+        let next_source = source_description(&state).map(identity);
         self.account(old_bytes, new_bytes)?;
-        if terminal && let Some((track, participant)) = previous_source {
-            remove_reference(&mut self.source_references, &track, reference);
-            remove_reference(&mut self.participant_references, &participant, reference);
-        } else if let Some((track, participant)) = next_source {
-            self.source_references
-                .entry(track)
-                .or_default()
-                .insert(reference);
-            self.participant_references
-                .entry(participant)
-                .or_default()
-                .insert(reference);
+        if previous_source != next_source {
+            if let Some((track, participant)) = previous_source {
+                remove_reference(&mut self.source_references, &track, reference);
+                remove_reference(&mut self.participant_references, &participant, reference);
+            }
+            if let Some((track, participant)) = next_source {
+                self.source_references
+                    .entry(track)
+                    .or_default()
+                    .insert(reference);
+                self.participant_references
+                    .entry(participant)
+                    .or_default()
+                    .insert(reference);
+            }
         }
         if let Some(target) = self.targets.get_mut(&resource) {
             if terminal && target.waiting_for == Some(reference) {
@@ -723,6 +786,9 @@ impl NativeState {
                 self.dirty.insert(resource.clone());
             } else if target.reference == Some(reference) {
                 if terminal {
+                    if evaluates_current {
+                        target.terminal_evaluation = Some(state.clone());
+                    }
                     target.reference = None;
                     target.blocked = true;
                     self.dirty.remove(&resource);
@@ -764,6 +830,7 @@ impl NativeState {
             retired_binding,
             state: Box::new(state),
             new_evaluation,
+            evaluates_current,
         }))
     }
 
@@ -781,19 +848,17 @@ impl NativeState {
         }
     }
 
-    fn validate_source(&self, live: &wire::LiveResource) -> Result<(), SignalingError> {
-        let participant = live
-            .participant
-            .as_ref()
-            .ok_or(SignalingError::MissingPayload)?;
-        let track = live.track.as_ref().ok_or(SignalingError::MissingPayload)?;
-        let publication = matches!(
-            live.spec
-                .as_ref()
-                .and_then(|spec| spec.declaration.as_ref()),
-            Some(wire::resource_spec::Declaration::Publication(_))
-        );
-        if publication && participant != &self.self_participant
+    fn description(&self, reference: u64) -> Option<(&wire::Participant, &wire::Track)> {
+        source_description(self.owned.get(&reference)?.confirmed.as_ref()?)
+    }
+
+    fn validate_description(
+        &self,
+        participant: &wire::Participant,
+        track: &wire::Track,
+    ) -> Result<(), SignalingError> {
+        if participant.participant_id == self.self_participant.participant_id
+            && participant != &self.self_participant
             || self
                 .participants
                 .get(&participant.participant_id)
@@ -806,15 +871,15 @@ impl NativeState {
                 .participant_references
                 .get(&participant.participant_id)
                 .and_then(|references| references.first())
-                .and_then(|reference| self.live(*reference))
-                .and_then(|live| live.participant.as_ref())
+                .and_then(|reference| self.description(*reference))
+                .map(|(participant, _)| participant)
                 .is_some_and(|known| known != participant)
             || self
                 .source_references
                 .get(&track.track_id)
                 .and_then(|references| references.first())
-                .and_then(|reference| self.live(*reference))
-                .and_then(|live| live.track.as_ref())
+                .and_then(|reference| self.description(*reference))
+                .map(|(_, track)| track)
                 .is_some_and(|known| !tracks_equal(known, track))
         {
             return Err(SignalingError::Invalid("source identity"));
@@ -851,7 +916,7 @@ impl NativeState {
     pub(crate) fn source(&self, id: &str) -> Option<&wire::Track> {
         self.tracks.get(id).or_else(|| {
             let reference = self.source_references.get(id)?.first()?;
-            self.live(*reference)?.track.as_ref()
+            Some(self.description(*reference)?.1)
         })
     }
 
@@ -861,7 +926,7 @@ impl NativeState {
         }
         self.participants.get(id).or_else(|| {
             let reference = self.participant_references.get(id)?.first()?;
-            self.live(*reference)?.participant.as_ref()
+            Some(self.description(*reference)?.0)
         })
     }
 
@@ -890,16 +955,45 @@ impl NativeState {
     }
 
     pub(crate) fn confirmed(&self, resource: &Resource) -> Option<&wire::ConfirmedState> {
-        let reference = self.targets.get(resource)?.reference?;
-        self.owned.get(&reference)?.confirmed.as_ref()
+        let target = self.targets.get(resource)?;
+        match target.reference {
+            Some(reference) => self.owned.get(&reference)?.confirmed.as_ref(),
+            None => target.terminal_evaluation.as_ref(),
+        }
     }
 
     pub(crate) fn evaluation(&self, resource: &Resource) -> Option<&wire::ConfirmedState> {
         let target = self.targets.get(resource)?;
-        let owned = self.owned.get(&target.reference?)?;
+        let Some(reference) = target.reference else {
+            return target.terminal_evaluation.as_ref();
+        };
+        let owned = self.owned.get(&reference)?;
         let state = owned.confirmed.as_ref()?;
         (specs_equal(&target.spec, &owned.sent) && state.evaluated_revision >= owned.sent_revision)
             .then_some(state)
+    }
+
+    pub(crate) fn lookup(&self, resource: &Resource) -> Option<&wire::SourceLookupState> {
+        if self.terminal || !self.initial_complete || self.session.as_ref()?.authorization.is_none()
+        {
+            return None;
+        }
+        let target = self.targets.get(resource)?;
+        if target.spec.settings.as_ref()?.enabled != Some(true) {
+            return None;
+        }
+        let owned = self.owned.get(&target.reference?)?;
+        if owned.retiring || owned.awaiting_evaluation() {
+            return None;
+        }
+        match owned.confirmed.as_ref()?.value.as_ref()? {
+            wire::confirmed_state::Value::SourceLookup(lookup)
+                if lookup.spec.as_ref()?.settings.as_ref()?.enabled == Some(true) =>
+            {
+                Some(lookup)
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn eligible(&self, resource: &Resource) -> Option<&wire::LiveResource> {
@@ -939,7 +1033,7 @@ impl NativeState {
         owned.confirmed.as_ref().is_some_and(|state| {
             state.evaluated_revision >= owned.sent_revision
                 && state.rejection.is_none()
-                && matches!(&state.value, Some(wire::confirmed_state::Value::Owned(live)) if live.spec.as_ref().is_some_and(|spec| specs_equal(spec, &target.spec)))
+                && accepted_spec(state).is_some_and(|spec| specs_equal(spec, &target.spec))
         })
     }
 
@@ -976,6 +1070,26 @@ fn desired_record(
                 None => wire::desired_state::Value::Absent(true),
             }),
         }),
+    }
+}
+
+fn accepted_spec(state: &wire::ConfirmedState) -> Option<&wire::ResourceSpec> {
+    match state.value.as_ref()? {
+        wire::confirmed_state::Value::Owned(live) => live.spec.as_ref(),
+        wire::confirmed_state::Value::SourceLookup(lookup) => lookup.spec.as_ref(),
+        _ => None,
+    }
+}
+
+fn source_description(state: &wire::ConfirmedState) -> Option<(&wire::Participant, &wire::Track)> {
+    match state.value.as_ref()? {
+        wire::confirmed_state::Value::Owned(live) => {
+            Some((live.participant.as_ref()?, live.track.as_ref()?))
+        }
+        wire::confirmed_state::Value::SourceLookup(lookup) => {
+            Some((lookup.participant.as_ref()?, lookup.track.as_ref()?))
+        }
+        _ => None,
     }
 }
 

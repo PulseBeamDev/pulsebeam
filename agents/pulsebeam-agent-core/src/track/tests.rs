@@ -22,6 +22,7 @@ fn message(
     bytes: &[u8],
 ) -> TopicNotification {
     TopicNotification::Message(TopicMessage {
+        room: "room".into(),
         topic: "events".into(),
         mode: delivery,
         data_track_id: track.into(),
@@ -29,6 +30,45 @@ fn message(
         participant_id: participant.into(),
         payload: bytes.into(),
     })
+}
+
+#[test]
+fn per_owner_subscription_views_keep_independent_intent_and_shared_demand() {
+    let selector = TrackSelector {
+        room: "source-room".into(),
+        participant_external_id: "publisher-endpoint".into(),
+        label: "camera".into(),
+    };
+    let mut resources = TrackResources::default();
+    let first = resources.new_owner().unwrap();
+    let second = resources.new_owner().unwrap();
+    resources.claim_video(first, selector.clone()).unwrap();
+    resources.claim_video(second, selector).unwrap();
+    resources
+        .observe_video(
+            second,
+            VideoObservation {
+                visible: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(resources.intent_revision(first), Some(1));
+    assert_eq!(resources.intent_revision(second), Some(2));
+    resources
+        .observe_video(
+            first,
+            VideoObservation {
+                visible: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(resources.intent_revision(first), Some(2));
+    assert_eq!(resources.intent_revision(second), Some(2));
+    assert!(!resources.video_view(first).unwrap().1.visible);
+    assert!(resources.video_view(second).unwrap().1.visible);
+    assert_eq!(resources.video_projection().unwrap().len(), 1);
 }
 
 #[test]
@@ -603,31 +643,15 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     let second = resources.new_owner().unwrap();
     let competing = resources.new_owner().unwrap();
     let selector = TrackSelector {
+        room: "room".into(),
         participant_external_id: "alice".into(),
         label: "camera".into(),
     };
     let other = TrackSelector {
+        room: "room".into(),
         participant_external_id: "bob".into(),
         label: "camera".into(),
     };
-    let mut tracks = BTreeMap::from([
-        (
-            "alice-track".into(),
-            RemoteTrack {
-                id: "alice-track".into(),
-                participant_id: "alice".into(),
-                spec: video("camera"),
-            },
-        ),
-        (
-            "bob-track".into(),
-            RemoteTrack {
-                id: "bob-track".into(),
-                participant_id: "bob".into(),
-                spec: video("camera"),
-            },
-        ),
-    ]);
     resources.claim_video(first, selector.clone()).unwrap();
     resources.claim_video(second, selector.clone()).unwrap();
     let mut observation = VideoObservation {
@@ -653,7 +677,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     resources
         .observe_video(second, observation.clone())
         .unwrap();
-    let projection = resources.video_projection(&tracks).unwrap();
+    let projection = resources.video_projection().unwrap();
     assert_eq!(
         projection,
         vec![VideoSubscription {
@@ -673,7 +697,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     let mut unbounded = observation.clone();
     unbounded.height = 0;
     resources.observe_video(second, unbounded).unwrap();
-    assert_eq!(resources.video_projection(&tracks).unwrap()[0].height, 0);
+    assert_eq!(resources.video_projection().unwrap()[0].height, 0);
     let unbounded_request = resources.begin_media_observation(second).unwrap();
     assert!(
         resources
@@ -684,12 +708,12 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     resources
         .observe_video(second, observation.clone())
         .unwrap();
-    assert_eq!(resources.video_projection(&tracks).unwrap()[0].height, 720);
+    assert_eq!(resources.video_projection().unwrap()[0].height, 720);
     resources.claim_video(competing, other.clone()).unwrap();
     resources
         .observe_video(competing, observation.clone())
         .unwrap();
-    let projection = resources.video_projection(&tracks).unwrap();
+    let projection = resources.video_projection().unwrap();
     assert_eq!(projection[0].selector, Some(selector));
     assert_eq!(projection.len(), 2);
     assert_eq!(projection[1].selector, Some(other.clone()));
@@ -697,18 +721,12 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     for index in 0..256 {
         let participant = format!("extra-{index}");
         let owner = TrackOwner(1000 + index);
-        tracks.insert(
-            participant.clone(),
-            RemoteTrack {
-                id: participant.clone(),
-                participant_id: participant.clone(),
-                spec: video("camera"),
-            },
-        );
+
         resources
             .claim_video(
                 owner,
                 TrackSelector {
+                    room: "room".into(),
                     participant_external_id: participant,
                     label: "camera".into(),
                 },
@@ -717,7 +735,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
         resources.observe_video(owner, observation.clone()).unwrap();
         added.push(owner);
     }
-    let expanded = resources.video_projection(&tracks).unwrap();
+    let expanded = resources.video_projection().unwrap();
     assert_eq!(expanded.len(), 258);
     assert_eq!(expanded.iter().map(|value| value.slot).max(), Some(257));
     for owner in added {
@@ -728,7 +746,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     resources
         .observe_video(second, observation.clone())
         .unwrap();
-    let projection = resources.video_projection(&tracks).unwrap();
+    let projection = resources.video_projection().unwrap();
     assert_eq!(projection[0].selector, Some(other));
 
     resources.release_video(competing);
@@ -736,7 +754,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
         resources.observe_video(competing, observation),
         Err(TrackResourceError::Released)
     );
-    assert!(resources.video_projection(&tracks).unwrap().is_empty());
+    assert!(resources.video_projection().unwrap().is_empty());
 }
 
 #[test]
@@ -744,6 +762,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     let mut resources = TrackResources::default();
     let owner = resources.new_owner().unwrap();
     let selector = TrackSelector {
+        room: "room".into(),
         participant_external_id: "alice".into(),
         label: "camera".into(),
     };
@@ -780,25 +799,16 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
         min_height: 1080,
         ..VideoObservation::default()
     };
-    let mut tracks = BTreeMap::from([(
-        "first".into(),
-        RemoteTrack {
-            id: "first".into(),
-            participant_id: "alice".into(),
-            spec: video("camera"),
-        },
-    )]);
     resources.observe_video(owner, observation.clone()).unwrap();
-    assert!(resources.video_projection(&tracks).unwrap().is_empty());
+    assert!(resources.video_projection().unwrap().is_empty());
     observation.visible = true;
     resources.observe_video(owner, observation).unwrap();
-    assert_eq!(resources.video_projection(&tracks).unwrap().len(), 1);
+    assert_eq!(resources.video_projection().unwrap().len(), 1);
     let first_target = target("first", 11, "receiver-a");
     let first = issue(&mut resources, request, Some(first_target.clone()));
     let unfinished = issue(&mut resources, waiting, Some(first_target));
     assert!(resources.complete_observation_control(&first, true));
     assert!(!resources.complete_observation_control(&first, false));
-    tracks.clear();
     let ended = issue(&mut resources, request, None);
     assert!(ended.closed);
     assert!(!resources.observation_control_current(&first));
@@ -806,20 +816,12 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     let waiting_absent = issue(&mut resources, waiting, None);
     assert!(!waiting_absent.closed);
     assert!(!resources.complete_observation_control(&unfinished, true));
-    let retained = resources.video_projection(&tracks).unwrap();
+    let retained = resources.video_projection().unwrap();
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].selector.as_ref(), Some(&selector));
     assert_eq!(retained[0].slot, 0);
-    tracks.insert(
-        "replacement".into(),
-        RemoteTrack {
-            id: "replacement".into(),
-            participant_id: "alice".into(),
-            spec: video("camera"),
-        },
-    );
     assert_eq!(
-        resources.video_projection(&tracks).unwrap()[0].selector,
+        resources.video_projection().unwrap()[0].selector,
         Some(selector)
     );
     let replacement_target = target("replacement", 19, "receiver-b");
@@ -866,6 +868,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     resources.claim_audio(playback).unwrap();
     let audio = resources.new_owner().unwrap();
     let selector = TrackSelector {
+        room: "room".into(),
         participant_external_id: "alice".into(),
         label: "microphone".into(),
     };
@@ -881,6 +884,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
         .claim_audio_subscription(
             excess,
             TrackSelector {
+                room: "room".into(),
                 participant_external_id: "bob".into(),
                 label: "microphone".into(),
             },
@@ -893,6 +897,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
             .claim_audio_subscription(
                 owner,
                 TrackSelector {
+                    room: "room".into(),
                     participant_external_id: format!("extra-{index}"),
                     label: "microphone".into(),
                 },
@@ -1051,9 +1056,27 @@ fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
     let all = TrackOwner(1);
     let alice = TrackOwner(2);
     let spec = data(TopicMode::Ordered);
-    resources.receive(all, &spec, None).unwrap();
     resources
-        .receive(alice, &spec, Some("alice".into()))
+        .receive(
+            all,
+            &spec,
+            TrackSelector {
+                room: "room".into(),
+                participant_external_id: "alice".into(),
+                label: "events".into(),
+            },
+        )
+        .unwrap();
+    resources
+        .receive(
+            alice,
+            &spec,
+            TrackSelector {
+                room: "room".into(),
+                participant_external_id: "alice".into(),
+                label: "events".into(),
+            },
+        )
         .unwrap();
     resources.retain_producer(&spec).unwrap();
     assert_eq!(resources.registrations().subscribers.len(), 1);
@@ -1085,11 +1108,70 @@ fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
 }
 
 #[test]
+fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct() {
+    let mut resources = TrackResources::default();
+    let first = TrackOwner(1);
+    let second = TrackOwner(2);
+    let other_room = TrackOwner(3);
+    let spec = data(TopicMode::Ordered);
+    let source = TrackSelector {
+        room: "room-a".into(),
+        participant_external_id: "alice".into(),
+        label: "events".into(),
+    };
+    resources.receive(first, &spec, source.clone()).unwrap();
+    resources.receive(second, &spec, source.clone()).unwrap();
+    resources
+        .receive(
+            other_room,
+            &spec,
+            TrackSelector {
+                room: "room-b".into(),
+                ..source
+            },
+        )
+        .unwrap();
+    assert_eq!(resources.registrations().subscribers.len(), 2);
+    assert_eq!(resources.registrations().subscribers[0].room, "room-a");
+    assert_eq!(resources.registrations().subscribers[1].room, "room-b");
+    resources.release_receiver(first);
+    assert_eq!(resources.registrations().subscribers.len(), 2);
+    let mut received = message(TopicMode::Ordered, "alice", "a-track", 0, b"a");
+    let TopicNotification::Message(received) = &mut received else {
+        panic!("message")
+    };
+    received.room = "room-a".into();
+    resources.notify(&TopicNotification::Message(received.clone()));
+    assert_eq!(
+        resources.read(second).unwrap(),
+        Some(DataEvent::Message {
+            participant_id: "alice".into(),
+            track_id: "a-track".into(),
+            sequence: 0,
+            data: b"a".to_vec()
+        })
+    );
+    resources.release_receiver(second);
+    assert_eq!(resources.registrations().subscribers.len(), 1);
+    assert_eq!(resources.registrations().subscribers[0].room, "room-b");
+}
+
+#[test]
 fn latest_coalesces_per_track_and_lossy_drops_oldest() {
     for mode in [TopicMode::Latest, TopicMode::Lossy] {
         let mut resources = TrackResources::default();
         let owner = TrackOwner(1);
-        resources.receive(owner, &data(mode), None).unwrap();
+        resources
+            .receive(
+                owner,
+                &data(mode),
+                TrackSelector {
+                    room: "room".into(),
+                    participant_external_id: "alice".into(),
+                    label: "events".into(),
+                },
+            )
+            .unwrap();
         for sequence in 0..300 {
             resources.notify(&message(mode, "alice", "track", sequence, &[]));
         }
@@ -1110,7 +1192,15 @@ fn ordered_overflow_reports_loss_inline_instead_of_implying_continuity() {
     let mut resources = TrackResources::default();
     let owner = TrackOwner(1);
     resources
-        .receive(owner, &data(TopicMode::Ordered), None)
+        .receive(
+            owner,
+            &data(TopicMode::Ordered),
+            TrackSelector {
+                room: "room".into(),
+                participant_external_id: "alice".into(),
+                label: "events".into(),
+            },
+        )
         .unwrap();
     for sequence in 0..300 {
         resources.notify(&message(
@@ -1145,12 +1235,38 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
         let all = TrackOwner(1);
         let bob = TrackOwner(2);
         let lossy = TrackOwner(3);
-        resources.receive(all, &data(mode), None).unwrap();
         resources
-            .receive(bob, &data(mode), Some("bob".into()))
+            .receive(
+                all,
+                &data(mode),
+                TrackSelector {
+                    room: "room".into(),
+                    participant_external_id: "alice".into(),
+                    label: "events".into(),
+                },
+            )
             .unwrap();
         resources
-            .receive(lossy, &data(TopicMode::Lossy), None)
+            .receive(
+                bob,
+                &data(mode),
+                TrackSelector {
+                    room: "room".into(),
+                    participant_external_id: "bob".into(),
+                    label: "events".into(),
+                },
+            )
+            .unwrap();
+        resources
+            .receive(
+                lossy,
+                &data(TopicMode::Lossy),
+                TrackSelector {
+                    room: "room".into(),
+                    participant_external_id: "alice".into(),
+                    label: "events".into(),
+                },
+            )
             .unwrap();
         for index in 0..=DATA_RECEIVE_CAPACITY {
             resources.notify(&message(mode, "alice", &format!("track-{index}"), 0, &[]));
@@ -1162,6 +1278,8 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
         assert_eq!(resources.read(bob).unwrap(), None);
         resources.notify(&TopicNotification::ChannelFailed {
             channel: TopicChannel::Subscriber(TopicSubscriber {
+                room: "room".into(),
+                participant_external_id: "bob".into(),
                 topic: "events".into(),
                 mode,
             }),
@@ -1175,6 +1293,8 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
         assert_eq!(
             resources.registrations().subscribers,
             vec![TopicSubscriber {
+                room: "room".into(),
+                participant_external_id: "alice".into(),
                 topic: "events".into(),
                 mode: TopicMode::Lossy
             }]
@@ -1201,7 +1321,11 @@ fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
                     label: "x".repeat(257),
                     delivery: TopicMode::Lossy
                 },
-                None
+                TrackSelector {
+                    room: "room".into(),
+                    participant_external_id: "alice".into(),
+                    label: "events".into()
+                }
             )
             .is_err()
     );
@@ -1221,7 +1345,15 @@ fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
     );
     assert_eq!(resources.registrations().publishers.len(), 65);
     resources
-        .receive(TrackOwner(1), &data(TopicMode::Lossy), None)
+        .receive(
+            TrackOwner(1),
+            &data(TopicMode::Lossy),
+            TrackSelector {
+                room: "room".into(),
+                participant_external_id: "alice".into(),
+                label: "events".into(),
+            },
+        )
         .unwrap();
     assert_eq!(resources.registrations().subscribers.len(), 1);
 }

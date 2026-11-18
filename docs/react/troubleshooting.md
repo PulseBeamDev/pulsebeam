@@ -73,13 +73,14 @@ Native Linux host networking avoids this extra VM boundary.
 Check in order:
 
 1. **Joined?** Both participants show `connected`, with distinct external IDs in the same room.
-2. **Published?** Sender capture is active and mounted in `Publish` with the
-   intended logical handle. `enabled={false}` disables sending; `source={null}`
-   withdraws it.
-3. **Discovered?** Inspect `agent.remote.participants` and each participant's
+2. **Published?** Sender capture is active and passed to `usePublish` with the
+   intended logical handle. `{ enabled: false }` disables sending; a null source
+   withdraws the input without closing publication ownership.
+3. **Discovered?** Inspect `agent.participants` and each participant's
    `tracks`. Discovery alone does not prove receive ownership.
-4. **Owned?** A visible, nonzero-sized `Video` owns remote video reception. A
-   mounted `Audio` owns remote audio reception. Confirm topology has capacity.
+4. **Owned?** Create the matching video or audio subscription with `useSubscribe`
+   and pass it to playback through `source`. Inspect its `state()` for admission
+   and execution. Playback alone does not create reception. Confirm topology has capacity.
 5. **Playing?** Handle `Video.onPlaybackError` and `Audio.onPlaybackError`.
    Also check sender silence and browser or OS output.
 
@@ -114,7 +115,7 @@ See [the quickstart](/react/quickstart) to retry a minimal integration.
 
 ## Data failures
 
-Catch `LocalDataTrack.send()` rejection and provide `onError` on mounted `Data`
+Catch `DataPublication.send()` rejection and provide `onError` on mounted `Data`
 owners. Read `agent.connection` and `agent.error` directly in React. Decode and
 validate payloads inside `onEvent`; malformed application payloads should be
 ignored or reported by the application without ending the SDK event stream.

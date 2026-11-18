@@ -1304,131 +1304,250 @@ fn renewal_response_fences_preserve_issued_and_coalesce_unsent_credentials() {
 }
 
 #[test]
-fn selectors_do_not_choose_a_source_from_ambiguous_labels() {
+fn received_resource_state_projects_prejoin_and_owner_local_intent() {
+    let mut agent = Agent::new(crate::AgentConfig {
+        endpoint: "https://sfu.test/".into(),
+        token: "token".into(),
+        retry: Default::default(),
+        log_level: Default::default(),
+    })
+    .unwrap();
+    let selector = crate::TrackSelector {
+        room: "main".into(),
+        participant_external_id: "alice-device".into(),
+        label: "camera".into(),
+    };
+    let mut claim_video = || {
+        let crate::ResourceResult::Owned { owner } = agent
+            .resource(crate::ResourceCommand::ClaimVideo {
+                selector: selector.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected video subscription owner")
+        };
+        owner
+    };
+    let first = claim_video();
+    let second = claim_video();
+    let first_initial = agent.video_subscription_state(first).unwrap();
+    let second_initial = agent.video_subscription_state(second).unwrap();
+    assert_eq!(first_initial.selector.participant_id, "alice-device");
+    assert_eq!(first_initial.intent_revision, 1);
+    assert!(!first_initial.local_enabled);
+    assert_eq!(
+        first_initial.source_status,
+        crate::ffi::SubscriptionSourceStatus::Pending
+    );
+    assert_eq!(
+        first_initial.admission,
+        crate::ffi::PublicationAdmissionStatus::Pending
+    );
+    assert!(first_initial.admission_pending);
+    assert!(!second_initial.local_enabled);
+
+    agent
+        .resource(crate::ResourceCommand::ObserveVideo {
+            owner: first,
+            observation: crate::VideoObservation {
+                visible: true,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let first_changed = agent.video_subscription_state(first).unwrap();
+    let second_unchanged = agent.video_subscription_state(second).unwrap();
+    assert_eq!(first_changed.intent_revision, 2);
+    assert!(first_changed.local_enabled);
+    assert_eq!(second_unchanged.intent_revision, 1);
+    assert!(!second_unchanged.local_enabled);
+
+    let crate::ResourceResult::Owned { owner: publication } = agent
+        .resource(crate::ResourceCommand::DeclareDataPublication {
+            spec: crate::TrackSpec::Data {
+                label: "events".into(),
+                delivery: crate::TopicMode::Ordered,
+            },
+        })
+        .unwrap()
+    else {
+        panic!("expected data publication owner")
+    };
+    let publication = agent.data_publication_state(publication).unwrap();
+    assert_eq!(publication.intent_revision, 1);
+    assert_eq!(
+        publication.admission,
+        crate::ffi::PublicationAdmissionStatus::Pending
+    );
+    assert!(publication.admission_pending);
+    assert_eq!(
+        publication.execution,
+        crate::ffi::PublicationExecution::Unavailable
+    );
+}
+
+#[test]
+fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disabled() {
     let (mut agent, generation, control) = connected(Default::default());
-    let participant = state::Participant {
-        participant_id: "remote".into(),
+    let selector = crate::TrackSelector {
+        room: "room".into(),
         participant_external_id: "external".into(),
+        label: "camera".into(),
+    };
+    let resource = Resource::SourceLookup {
+        room: selector.room.clone(),
+        participant_external_id: selector.participant_external_id.clone(),
+        kind: state::TrackKind::Video,
+        label: selector.label.clone(),
+    };
+    let spec = |enabled| state::ResourceSpec {
+        settings: Some(state::ResourceSettings {
+            enabled: Some(enabled),
+            receive: None,
+        }),
+        declaration: Some(state::resource_spec::Declaration::SourceLookup(
+            state::SourceLookupSpec {
+                source: Some(state::LogicalSourceAddress {
+                    room: selector.room.clone(),
+                    participant_external_id: selector.participant_external_id.clone(),
+                    kind: state::TrackKind::Video as i32,
+                    label: selector.label.clone(),
+                }),
+            },
+        )),
     };
     let track = state::Track {
-        track_id: "source-z".into(),
-        participant_id: participant.participant_id.clone(),
-        label: "camera".into(),
+        track_id: "lookup-only-source".into(),
+        participant_id: "remote".into(),
+        label: selector.label.clone(),
         kind: Some(state::track::Kind::Video(state::VideoTrack {
             format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
                 state::Vp8Parameters {},
             ))),
         })),
     };
-    let mut other = track.clone();
-    other.track_id = "source-a".into();
-    observe(
-        &mut agent,
-        generation,
-        control,
-        vec![
-            confirmed(
-                state::resource_key::Key::Participant(participant.participant_id.clone()),
-                0,
-                state::confirmed_state::Value::Participant(participant),
-            ),
-            confirmed(
-                state::resource_key::Key::Track(track.track_id.clone()),
-                0,
-                state::confirmed_state::Value::Track(track.clone()),
-            ),
-            confirmed(
-                state::resource_key::Key::Track(other.track_id.clone()),
-                0,
-                state::confirmed_state::Value::Track(other.clone()),
-            ),
-        ],
-    );
-    let selector = crate::TrackSelector {
-        participant_external_id: "external".into(),
-        label: "camera".into(),
+    let participant = state::Participant {
+        participant_id: track.participant_id.clone(),
+        participant_external_id: selector.participant_external_id.clone(),
     };
-    let resource = Resource::Reception(MediaSlot::RemoteVideo(0));
+    let stage = |agent: &mut Agent, enabled| {
+        agent
+            .active
+            .as_mut()
+            .unwrap()
+            .state
+            .stage(resource.clone(), Some(spec(enabled)))
+            .unwrap();
+        let batch = state::codec::decode_client(
+            &agent
+                .active
+                .as_mut()
+                .unwrap()
+                .state
+                .next_frame()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        (
+            batch.records[0].owned,
+            batch.records[0].desired.as_ref().unwrap().revision,
+        )
+    };
+    let confirm_lookup = |agent: &mut Agent, reference, revision, enabled| {
+        observe(
+            agent,
+            generation,
+            control,
+            vec![confirmed(
+                state::resource_key::Key::Owned(reference),
+                revision,
+                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
+                    spec: Some(spec(enabled)),
+                    participant: enabled.then(|| participant.clone()),
+                    track: enabled.then(|| track.clone()),
+                })),
+            )],
+        );
+    };
+
+    let (reference, revision) = stage(&mut agent, true);
     assert_eq!(
         selected(
             agent.active.as_ref().unwrap(),
-            &resource,
             &selector,
             state::TrackKind::Video
         ),
         None
     );
-    observe(
-        &mut agent,
-        generation,
-        control,
-        vec![confirmed(
-            state::resource_key::Key::Track(track.track_id),
-            0,
-            state::confirmed_state::Value::Absent(state::AbsentState {
-                reason: state::AbsenceReason::Removed as i32,
-            }),
-        )],
+    confirm_lookup(&mut agent, reference, revision, true);
+    let active = agent.active.as_ref().unwrap();
+    assert!(active.state.tracks().is_empty());
+    assert!(active.state.participants().is_empty());
+    assert_eq!(
+        selected(active, &selector, state::TrackKind::Video),
+        Some(track.track_id.as_str())
+    );
+    let desired = crate::DesiredState {
+        video: vec![crate::VideoSubscription {
+            slot: 0,
+            track_id: track.track_id.clone(),
+            selector: Some(selector.clone()),
+            height: 0,
+            min_height: 0,
+            min_fps: 0,
+            priority: 0,
+            playout_delay: crate::PlayoutDelay::default(),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        source_room_for_track(active, &desired, &track.track_id),
+        Some(selector.room.clone())
+    );
+    assert_eq!(
+        source_room_for_track(active, &crate::DesiredState::default(), &track.track_id),
+        None
     );
     assert_eq!(
         selected(
-            agent.active.as_ref().unwrap(),
-            &resource,
-            &selector,
-            state::TrackKind::Video
+            active,
+            &crate::TrackSelector {
+                room: "other-room".into(),
+                ..selector.clone()
+            },
+            state::TrackKind::Video,
         ),
-        Some(other.track_id.as_str())
-    );
-    let mut renamed = other.clone();
-    renamed.track_id = "source-renamed".into();
-    renamed.label = "screen".into();
-    observe(
-        &mut agent,
-        generation,
-        control,
-        vec![
-            confirmed(
-                state::resource_key::Key::Track(other.track_id.clone()),
-                0,
-                state::confirmed_state::Value::Absent(state::AbsentState {
-                    reason: state::AbsenceReason::Removed as i32,
-                }),
-            ),
-            confirmed(
-                state::resource_key::Key::Track(renamed.track_id.clone()),
-                0,
-                state::confirmed_state::Value::Track(renamed),
-            ),
-        ],
+        None
     );
     assert_eq!(
         selected(
+            active,
+            &crate::TrackSelector {
+                participant_external_id: "other-participant".into(),
+                ..selector.clone()
+            },
+            state::TrackKind::Video,
+        ),
+        None
+    );
+
+    let (disabled_reference, disabled_revision) = stage(&mut agent, false);
+    assert_eq!(
+        selected(
             agent.active.as_ref().unwrap(),
-            &resource,
             &selector,
             state::TrackKind::Video
         ),
         None
     );
-    let mut republished = other;
-    republished.track_id = "source-republished".into();
-    observe(
-        &mut agent,
-        generation,
-        control,
-        vec![confirmed(
-            state::resource_key::Key::Track(republished.track_id.clone()),
-            0,
-            state::confirmed_state::Value::Track(republished.clone()),
-        )],
-    );
+    confirm_lookup(&mut agent, disabled_reference, disabled_revision, false);
     assert_eq!(
         selected(
             agent.active.as_ref().unwrap(),
-            &resource,
             &selector,
             state::TrackKind::Video
         ),
-        Some(republished.track_id.as_str())
+        None
     );
 }

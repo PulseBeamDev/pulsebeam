@@ -16,8 +16,8 @@ assert.equal(agent.state().room, undefined);
 assert.equal(agent.state().desiredRoom, undefined);
 try {
   const updates = agent.snapshots();
-  const exchange = agent.data("foreign-exchange", TopicMode.Ordered);
-  const replies = await agent.participant("publisher").data("foreign-exchange", TopicMode.Ordered).receive();
+  const exchange = agent.data("foreign-exchange", TopicMode.Ordered).publish();
+  const replies = agent.room(room).participant("publisher").data("foreign-exchange", TopicMode.Ordered).subscribe();
   const camera = await agent.createVideoInput({
     encodings: [{ rid: undefined, scaleDownBy: 1, maxBitrateBps: undefined, maxFramerate: undefined, temporalLayers: 1 }],
     dependencyDescriptor: true,
@@ -87,9 +87,10 @@ try {
   }
   console.log("installed Node owned binary data exchanged");
   await replies.close();
-  const interest = await agent.participant("publisher").video("production-camera").subscribe(
+  const interest = agent.room(room).participant("publisher").video("production-camera").subscribe(
     { visible: true, height: 96, minHeight: 0, minFps: 0, priority: 1, playoutDelay: new PlayoutDelay.Adaptive() },
   );
+  if (interest instanceof Promise) throw new Error("video subscribe must be synchronous");
   const receiver = await interest.observe(ReceiveMode.Decoded);
   let pixels;
   while (true) {

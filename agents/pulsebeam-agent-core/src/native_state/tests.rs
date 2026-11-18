@@ -1,6 +1,7 @@
 use super::*;
 
 mod execution;
+mod source_lookup;
 
 fn participant() -> wire::Participant {
     wire::Participant {
@@ -46,6 +47,7 @@ fn frame(records: Vec<wire::ServerStateRecord>, initial_complete: bool) -> Vec<u
     codec::encode_server(&wire::ServerStateBatch {
         records,
         initial_complete,
+        ..Default::default()
     })
     .unwrap()
 }
@@ -274,6 +276,7 @@ fn bounded_batches_emit_current_targets_for_mixed_resources() {
                             wire::SubscriptionSpec {
                                 track_id: id,
                                 kind: wire::TrackKind::Data as i32,
+                                source_room: "room".into(),
                                 binding: Some(binding(stream)),
                             },
                         )),
@@ -372,6 +375,36 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
     assert!(client.eligible(&resource()).is_none());
     assert!(client.tracks().is_empty());
     assert!(client.participants().is_empty());
+    let accepted = client.confirmed(&resource()).unwrap().clone();
+    let retained = client.retained_bytes;
+    let mut lookup = spec(true, 1);
+    lookup.declaration = Some(wire::resource_spec::Declaration::SourceLookup(
+        wire::SourceLookupSpec {
+            source: Some(wire::LogicalSourceAddress {
+                room: "room".into(),
+                participant_external_id: "alice".into(),
+                kind: wire::TrackKind::Data as i32,
+                label: "updates".into(),
+            }),
+        },
+    ));
+    let lookup = wire::ConfirmedState {
+        evaluated_revision: 1,
+        rejection: None,
+        value: Some(wire::confirmed_state::Value::SourceLookup(Box::new(
+            wire::SourceLookupState {
+                spec: Some(lookup),
+                participant: None,
+                track: None,
+            },
+        ))),
+    };
+    assert!(matches!(
+        client.apply(&frame(alloc::vec![record(1, lookup)], false)),
+        Err(SignalingError::Invalid("accepted declaration"))
+    ));
+    assert_eq!(client.confirmed(&resource()), Some(&accepted));
+    assert_eq!(client.retained_bytes, retained);
     client
         .apply(&frame(alloc::vec![session(1, 2_000_000_000, None)], true))
         .unwrap();

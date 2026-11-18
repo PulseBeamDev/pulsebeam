@@ -205,10 +205,61 @@ await flush(() =>
     generation: 1n,
   }),
 );
+await flush(() =>
+  runtime.emit({
+    participants: [{ participantId: "bob" }],
+    catalog: {
+      ...runtime.snapshot.catalog,
+      revision: 1n,
+      tracks: [
+        {
+          id: "remote-chat",
+          participantId: "bob",
+          kind: "data",
+          label: "chat",
+          delivery: "ordered",
+        },
+        {
+          id: "remote-reactions",
+          participantId: "bob",
+          kind: "data",
+          label: "reactions",
+          delivery: "lossy",
+        },
+        {
+          id: "remote-audio",
+          participantId: "bob",
+          kind: "audio",
+          label: "microphone",
+        },
+      ],
+    },
+  }),
+);
 assert.match(document.querySelector("header")!.textContent!, /admitted-alice/);
 assert.match(
   document.querySelector("header")!.textContent!,
   /Room admitted-room/,
+);
+await flush(() => runtime.emit({ roomId: "selected-room" }));
+assert.equal(
+  runtime.dataOwners.size,
+  2,
+  "room-pinned chat and reaction tracks attach for each discovered endpoint",
+);
+assert.deepEqual(
+  [...runtime.audioSelections.values()],
+  [
+    {
+      selected: [
+        {
+          room: "selected-room",
+          participantId: "bob",
+          label: "microphone",
+        },
+      ],
+    },
+  ],
 );
 const abandoned = stream();
 await flush(() => captures[0].resolve(abandoned));

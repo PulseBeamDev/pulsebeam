@@ -1,6 +1,13 @@
 use super::*;
 use std::collections::BTreeMap;
 
+mod resource_state;
+
+pub(super) enum SubscriptionConfiguration {
+    Video(agent_core::VideoObservation),
+    Audio(agent_core::PlayoutDelay),
+}
+
 type PipeObservers = Arc<
     std::sync::Mutex<
         Vec<(
@@ -230,6 +237,7 @@ pub(super) struct Control {
         >,
     >,
     pipe_observers: PipeObservers,
+    resource_observers: Arc<std::sync::Mutex<Vec<resource_state::ResourceObservation>>>,
 }
 
 impl Control {
@@ -244,6 +252,7 @@ impl Control {
             changed: Arc::new(Notify::new()),
             publication_observers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             pipe_observers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            resource_observers: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -280,6 +289,54 @@ impl Control {
 
     pub(super) fn revoke_publication(&self, owner: u64) {
         let _ = self.resource(agent_core::ResourceCommand::Release { owner });
+    }
+
+    pub(super) fn claim_subscription(
+        &self,
+        selector: agent_core::TrackSelector,
+        configuration: SubscriptionConfiguration,
+    ) -> Result<u64, Error> {
+        self.update(|core| {
+            let command: Result<u64, agent_core::AgentError> = match configuration {
+                SubscriptionConfiguration::Video(observation) => {
+                    let agent_core::ResourceResult::Owned { owner } =
+                        core.resource(agent_core::ResourceCommand::ClaimVideo { selector })?
+                    else {
+                        return Err(agent_core::AgentError::InvalidResource(
+                            agent_core::TrackResourceError::WrongKind,
+                        ));
+                    };
+                    if let Err(error) = core
+                        .resource(agent_core::ResourceCommand::ObserveVideo { owner, observation })
+                    {
+                        let _ = core.resource(agent_core::ResourceCommand::Release { owner });
+                        return Err(error);
+                    }
+                    Ok(owner)
+                }
+                SubscriptionConfiguration::Audio(playout_delay) => {
+                    let agent_core::ResourceResult::Owned { owner } =
+                        core.resource(agent_core::ResourceCommand::ClaimAudioSubscription {
+                            selector,
+                        })?
+                    else {
+                        return Err(agent_core::AgentError::InvalidResource(
+                            agent_core::TrackResourceError::WrongKind,
+                        ));
+                    };
+                    if let Err(error) = core.resource(agent_core::ResourceCommand::ConfigureAudio {
+                        owner,
+                        playout_delay,
+                    }) {
+                        let _ = core.resource(agent_core::ResourceCommand::Release { owner });
+                        return Err(error);
+                    }
+                    Ok(owner)
+                }
+            };
+            command
+        })
+        .map_err(Into::into)
     }
 
     pub(super) fn publication_control(&self) -> PublicationControl {
@@ -394,7 +451,11 @@ impl Control {
             })
             .collect::<Vec<_>>();
         drop(pipes);
+        let resource_notifications = self.resource_notifications(&core, false);
         drop(core);
+        for notification in resource_notifications {
+            notification();
+        }
         // Foreign cursor wake callbacks may reenter this actor.
         let _ = self.observer.publish_from(version, state);
         for notification in notifications {
@@ -455,7 +516,11 @@ impl Control {
                 })
                 .collect::<Vec<_>>()
         };
+        let resource_notifications = self.resource_notifications(&core, true);
         drop(core);
+        for notification in resource_notifications {
+            notification();
+        }
         let _ = self.observer.close(state);
         for notification in publications {
             let _ = notification.notify();
@@ -520,11 +585,13 @@ impl Control {
                     let observer = observer.upgrade()?;
                     let state = core.pipe_state(*input)?;
                     (state.status != agent_core::ffi::PipeStatus::Closed)
-                        .then_some((observer, state))
+                        .then_some((*input, observer, state))
                 })
                 .collect::<Vec<_>>()
         };
+        let mut resource_notifications = self.resource_notifications(&core, false);
         let result = core.resource(command);
+        resource_notifications.extend(self.resource_notifications(&core, false));
         let snapshot = core.snapshot();
         let snapshot_state = snapshot.into();
         let snapshot_version = snapshot.version;
@@ -559,12 +626,20 @@ impl Control {
                 .retain(|(input, _)| core.pipe_state(*input).is_some());
             final_pipes
                 .into_iter()
-                .filter_map(|(observer, state)| observer.prepare(state, true).ok())
+                .filter_map(|(input, observer, state)| {
+                    core.pipe_state(input)
+                        .is_none()
+                        .then(|| observer.prepare(state, true).ok())
+                        .flatten()
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
         drop(core);
+        for notification in resource_notifications {
+            notification();
+        }
         let _ = self.observer.publish_from(snapshot_version, snapshot_state);
         if let Some(notification) = released_notification {
             let _ = notification.notify();
@@ -635,6 +710,28 @@ impl Control {
         }
         self.changed.notify_one();
         Ok(result)
+    }
+
+    pub(super) fn send_owned_data(
+        &self,
+        owner: u64,
+        expected_join: u64,
+        data: Vec<u8>,
+    ) -> Result<OperationId, agent_core::AgentError> {
+        self.with(|core| {
+            let state = agent_core::ffi::AgentState::from(core.snapshot());
+            if state.desired_join_revision != expected_join {
+                return Err(agent_core::TrackResourceError::NotConnected.into());
+            }
+            let publication = core.data_publication_state(owner)?;
+            core.send_data(
+                agent_core::TrackSpec::Data {
+                    label: publication.label,
+                    delivery: publication.delivery.into(),
+                },
+                data,
+            )
+        })
     }
 
     pub(super) fn send_data(

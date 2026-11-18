@@ -7,11 +7,12 @@
     });
   const sender = create("__SENDER_TOKEN__");
   const receiver = create("__RECEIVER_TOKEN__");
-  const publisher = sender.data("chat", "lossy");
-  const stream = await receiver
+  const publisher = sender.data("chat", "lossy").publish();
+  const stream = receiver
+    .room("web-adapter-restart")
     .participant("publisher")
     .data("chat", "lossy")
-    .receive();
+    .subscribe();
   const events = [];
   let probe = 0;
   let observedProbe = 0;
@@ -28,7 +29,10 @@
         }
       }
     }
-  })();
+  })().then(
+    () => null,
+    (error) => error,
+  );
   const wait = async (agent, predicate, label) => {
     const snapshots = agent.snapshots();
     let timeout;

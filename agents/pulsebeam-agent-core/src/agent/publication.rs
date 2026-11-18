@@ -121,7 +121,7 @@ impl Agent {
     }
 }
 
-fn publication_failure(failure: &wire::Failure) -> ErrorInfo {
+pub(super) fn publication_failure(failure: &wire::Failure) -> ErrorInfo {
     let (code, message) = match failure.code() {
         wire::FailureCode::InvalidConfiguration => (
             ErrorCode::InvalidArgument,

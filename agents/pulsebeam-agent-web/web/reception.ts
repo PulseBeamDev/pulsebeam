@@ -6,12 +6,34 @@ import {
   type ResourceBinding,
   type ResourceRuntime,
 } from "./resources.js";
+import {
+  ResourceObservation,
+  type NativeResourceObserver,
+} from "./resource-observation.js";
 import type {
+  AudioSubscriptionState,
+  VideoSubscriptionState,
+} from "./schema.js";
+import type {
+  AudioSubscriptionUpdates,
+  VideoSubscriptionUpdates,
   AudioDemand,
   AudioSubscriptionConfig,
   TrackSelector,
   VideoObservation,
 } from "./types.js";
+
+export const defaultVideoObservation = Object.freeze<VideoObservation>({
+  visible: true,
+  height: 0,
+  minHeight: 0,
+  minFps: 0,
+  priority: 0,
+  playoutDelay: Object.freeze({ mode: "adaptive" }),
+});
+export const defaultAudioSubscription = Object.freeze<AudioSubscriptionConfig>({
+  playoutDelay: Object.freeze({ mode: "adaptive" }),
+});
 
 interface NativeObservation {
   track(): MediaStreamTrack | undefined;
@@ -20,7 +42,13 @@ interface NativeObservation {
   free(): void;
 }
 interface ReceptionRuntime extends ResourceRuntime {
-  observe_media(owner: bigint, source?: string): Promise<NativeObservation>;
+  video_subscription(owner: bigint): NativeResourceObserver;
+  audio_subscription(owner: bigint): NativeResourceObserver;
+  observe_media(
+    owner: bigint,
+    source?: string,
+    signal?: AbortSignal,
+  ): Promise<NativeObservation>;
 }
 
 export class MediaObservation {
@@ -53,7 +81,6 @@ class Subscription<C> {
   readonly #pending = new Set<Promise<unknown>>();
   readonly #observations = new Set<MediaObservation>();
   #configuration: C;
-  #applied: Promise<void> = Promise.resolve();
   #closing: Promise<void> | undefined;
 
   constructor(
@@ -61,21 +88,19 @@ class Subscription<C> {
     claim: (configuration: C) => unknown,
     configuration: C,
     private readonly command: Configure<C>,
+    bind: (binding: ResourceBinding) => void = () => {},
   ) {
     this.#configuration = configuration;
     this.#resource = resources.acquire(() => claim(this.#configuration), {
       bind: (binding) => {
-        this.#applied = this.#apply(binding, this.#configuration);
-        void this.#applied.catch((error: unknown) => {
-          if (this.#resource.current(binding)) this.#resource.fail(error);
-        });
+        binding.runtime.resource_now(
+          this.command(binding.owner, this.#configuration),
+        );
+        bind(binding);
       },
       unbind: () => {},
     });
-    const ready = this.#resource.ready.then(async () => {
-      await this.#applied;
-      this.#assertOpen();
-    });
+    const ready = this.#resource.ready.then(() => this.#assertOpen());
     void ready.catch(() => {});
     initialized.set(this, ready);
   }
@@ -124,7 +149,10 @@ class Subscription<C> {
       throw error;
     }
   }
-  protected async observeSource(source?: string): Promise<MediaObservation> {
+  protected async observeSource(
+    source?: string,
+    signal?: AbortSignal,
+  ): Promise<MediaObservation> {
     this.#assertOpen();
     const binding = this.#resource.binding;
     if (!binding || !this.#resource.current(binding))
@@ -136,6 +164,7 @@ class Subscription<C> {
       const native = await (binding.runtime as ReceptionRuntime).observe_media(
         binding.owner,
         source,
+        signal,
       );
       const observation = new MediaObservation(native, () =>
         this.#observations.delete(observation),
@@ -187,21 +216,19 @@ export function claimVideoSubscription(
   return { subscription, ready: initialized.get(subscription)! };
 }
 
-export async function subscribeVideo(
+export function subscribeVideo(
   resources: ResourceOwners,
   selector: TrackSelector,
   configuration: VideoObservation,
-): Promise<VideoSubscription> {
-  return acquire(
-    claimVideoSubscription(resources, selector, configuration).subscription,
-  );
+): VideoSubscription {
+  return new VideoSubscription(resources, selector, configuration);
 }
-export async function subscribeAudio(
+export function subscribeAudio(
   resources: ResourceOwners,
   selector: TrackSelector,
   configuration: AudioSubscriptionConfig,
-): Promise<AudioSubscription> {
-  return acquire(new AudioSubscription(resources, selector, configuration));
+): AudioSubscription {
+  return new AudioSubscription(resources, selector, configuration);
 }
 export async function selectAudio(
   resources: ResourceOwners,
@@ -211,29 +238,49 @@ export async function selectAudio(
 }
 
 export class VideoSubscription extends Subscription<VideoObservation> {
+  readonly #observation: ResourceObservation<VideoSubscriptionState>;
   constructor(
     resources: ResourceOwners,
     selector: TrackSelector,
     configuration: VideoObservation,
   ) {
+    const observation = new ResourceObservation<VideoSubscriptionState>();
     super(
       resources,
       () => ({ op: "claimVideo", selector }),
       configuration,
       (owner, observation) => ({ op: "observeVideo", owner, observation }),
+      (binding) =>
+        observation.bind(
+          (binding.runtime as ReceptionRuntime).video_subscription(
+            binding.owner,
+          ),
+        ),
     );
+    this.#observation = observation;
   }
-  observe(): Promise<MediaObservation> {
-    return this.observeSource();
+  state(): Readonly<VideoSubscriptionState> {
+    return this.#observation.state();
+  }
+  updates(): VideoSubscriptionUpdates {
+    return this.#observation.updates();
+  }
+  override configure(configuration = defaultVideoObservation): Promise<void> {
+    return super.configure(configuration);
+  }
+  observe(signal?: AbortSignal): Promise<MediaObservation> {
+    return this.observeSource(undefined, signal);
   }
 }
 
 export class AudioSubscription extends Subscription<AudioSubscriptionConfig> {
+  readonly #observation: ResourceObservation<AudioSubscriptionState>;
   constructor(
     resources: ResourceOwners,
     selector: TrackSelector,
     configuration: AudioSubscriptionConfig,
   ) {
+    const observation = new ResourceObservation<AudioSubscriptionState>();
     super(
       resources,
       () => ({ op: "claimAudioSubscription", selector }),
@@ -243,10 +290,26 @@ export class AudioSubscription extends Subscription<AudioSubscriptionConfig> {
         owner,
         playoutDelay: value.playoutDelay,
       }),
+      (binding) =>
+        observation.bind(
+          (binding.runtime as ReceptionRuntime).audio_subscription(
+            binding.owner,
+          ),
+        ),
     );
+    this.#observation = observation;
   }
-  observe(): Promise<MediaObservation> {
-    return this.observeSource();
+  state(): Readonly<AudioSubscriptionState> {
+    return this.#observation.state();
+  }
+  updates(): AudioSubscriptionUpdates {
+    return this.#observation.updates();
+  }
+  override configure(configuration = defaultAudioSubscription): Promise<void> {
+    return super.configure(configuration);
+  }
+  observe(signal?: AbortSignal): Promise<MediaObservation> {
+    return this.observeSource(undefined, signal);
   }
 }
 

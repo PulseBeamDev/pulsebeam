@@ -803,14 +803,14 @@ async fn subscribe_remote_videos(
 ) -> Result<()> {
     for selector in video_subscriptions(snapshot, interests) {
         let subscription = agent
+            .room(selector.room.clone())?
             .participant(selector.participant_external_id.clone())?
             .video(selector.label.clone())?
             .subscribe(VideoObservation {
                 visible: true,
                 height: 720,
                 ..Default::default()
-            })
-            .await?;
+            })?;
         interests.insert(selector);
         tasks.spawn(handle_receiving(
             subscription,
@@ -846,7 +846,11 @@ fn video_subscriptions(
         if !participants.insert(participant.external_id.clone()) {
             continue;
         }
+        let Some(room) = snapshot.room_external_id.as_ref() else {
+            continue;
+        };
         subscriptions.push(TrackSelector {
+            room: room.clone(),
             participant_external_id: participant.external_id.clone(),
             label: publication.label.clone(),
         });
@@ -1437,6 +1441,7 @@ mod tests {
     fn video_policy_excludes_self_audio_and_tracks_beyond_capacity() {
         let mut snapshot = Snapshot {
             participant_id: Some("self".into()),
+            room_external_id: Some("application-room".into()),
             ..Default::default()
         };
         for (id, external_id) in [
@@ -1492,7 +1497,8 @@ mod tests {
         let subscriptions = video_subscriptions(&snapshot, &BTreeSet::new());
         assert_eq!(subscriptions.len(), usize::from(REMOTE_VIDEO_SLOTS));
         assert!(subscriptions.iter().all(|subscription| {
-            subscription.label == "camera"
+            subscription.room == "application-room"
+                && subscription.label == "camera"
                 && subscription
                     .participant_external_id
                     .starts_with("external-")
@@ -1503,6 +1509,8 @@ mod tests {
         snapshot.publications.clear();
         assert!(video_subscriptions(&snapshot, &interests).is_empty());
         let first = interests.first().unwrap().clone();
+        snapshot.room_external_id = None;
+        assert_eq!(first.room, "application-room");
         snapshot.publications.insert(
             "republished".into(),
             Publication {

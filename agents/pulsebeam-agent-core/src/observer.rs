@@ -113,6 +113,23 @@ impl RevisionedState for crate::ffi::PipeState {
     }
 }
 
+macro_rules! revisioned_resource_state {
+    ($($state:ty),+ $(,)?) => {$ (
+        impl RevisionedState for $state {
+            fn set_revision(&mut self, revision: u64) {
+                self.observation_revision = revision;
+            }
+        }
+    )+ };
+}
+
+revisioned_resource_state!(
+    crate::ffi::VideoSubscriptionState,
+    crate::ffi::AudioSubscriptionState,
+    crate::ffi::DataSubscriptionState,
+    crate::ffi::DataPublicationState,
+);
+
 trait ResourceState: RevisionedState {
     fn mark_closed(&mut self);
 }
@@ -128,6 +145,23 @@ impl ResourceState for crate::ffi::PipeState {
         self.status = crate::ffi::PipeStatus::Closed;
     }
 }
+
+macro_rules! closable_resource_state {
+    ($($state:ty),+ $(,)?) => {$ (
+        impl ResourceState for $state {
+            fn mark_closed(&mut self) {
+                self.closed = true;
+            }
+        }
+    )+ };
+}
+
+closable_resource_state!(
+    crate::ffi::VideoSubscriptionState,
+    crate::ffi::AudioSubscriptionState,
+    crate::ffi::DataSubscriptionState,
+    crate::ffi::DataPublicationState,
+);
 
 impl<T: RevisionedState> Hub<T> {
     fn set(
@@ -492,6 +526,30 @@ resource_observer!(
     PipeNotification,
     crate::ffi::PipeState
 );
+resource_observer!(
+    VideoSubscriptionStateObserver,
+    VideoSubscriptionUpdates,
+    VideoSubscriptionNotification,
+    crate::ffi::VideoSubscriptionState
+);
+resource_observer!(
+    AudioSubscriptionStateObserver,
+    AudioSubscriptionUpdates,
+    AudioSubscriptionNotification,
+    crate::ffi::AudioSubscriptionState
+);
+resource_observer!(
+    DataSubscriptionStateObserver,
+    DataSubscriptionUpdates,
+    DataSubscriptionNotification,
+    crate::ffi::DataSubscriptionState
+);
+resource_observer!(
+    DataPublicationStateObserver,
+    DataPublicationUpdates,
+    DataPublicationNotification,
+    crate::ffi::DataPublicationState
+);
 
 /// Core-owned bounded latest-state publisher. Main projects actor state into it.
 pub struct AgentStateObserver {
@@ -737,6 +795,89 @@ mod tests {
         for cursor in [&a, &b] {
             let mut ended = Box::pin(cursor.next().unwrap());
             assert_eq!(ended.as_mut().poll(&mut cx), Poll::Ready(None));
+        }
+    }
+
+    #[test]
+    fn data_subscription_observers_keep_independent_cursors_and_terminal_failure_on_close() {
+        use crate::ffi::{
+            DataSubscriptionState, ErrorCode, ErrorInfo, PublicationAdmissionStatus,
+            PublicationExecution, SubscriptionSourceStatus, TopicMode, TrackSelector,
+        };
+
+        let initial = DataSubscriptionState {
+            observation_revision: 0,
+            intent_revision: 3,
+            evaluated_revision: 0,
+            accepted_revision: None,
+            rejected_revision: None,
+            selector: TrackSelector {
+                room: "source-room".into(),
+                participant_id: "publisher-endpoint".into(),
+                label: "events".into(),
+            },
+            delivery: TopicMode::Ordered,
+            local_enabled: true,
+            closed: false,
+            source_status: crate::ffi::SubscriptionSourceStatus::Unavailable,
+            source_track_id: None,
+            admission: PublicationAdmissionStatus::Pending,
+            admission_pending: true,
+            error: None,
+            execution: PublicationExecution::Unavailable,
+            execution_error: None,
+            terminal_error: None,
+        };
+        let observer = DataSubscriptionStateObserver::new(initial);
+        let first = observer.updates().unwrap();
+        let second = observer.updates().unwrap();
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut context = Context::from_waker(&waker);
+        for cursor in [&first, &second] {
+            let mut initial = Box::pin(cursor.next().unwrap());
+            assert_eq!(
+                initial.as_mut().poll(&mut context),
+                Poll::Ready(Some(observer.state()))
+            );
+        }
+        let mut pending = Box::pin(first.next().unwrap());
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+        assert!(first.next().is_err());
+
+        let mut failed_state = observer.state();
+        failed_state.source_status = SubscriptionSourceStatus::Available;
+        failed_state.source_track_id = Some("opaque-track".into());
+        failed_state.admission = PublicationAdmissionStatus::Admitted;
+        failed_state.admission_pending = false;
+        failed_state.execution = PublicationExecution::Installed;
+        failed_state.terminal_error = Some(ErrorInfo::new(
+            ErrorCode::ContinuityLost,
+            "Reliable receive continuity was lost",
+        ));
+        let failed = observer.prepare(failed_state, false).unwrap();
+        let closing = observer.prepare(observer.state(), true).unwrap();
+        failed.notify();
+        closing.notify();
+        let final_state = observer.state();
+        assert_eq!(final_state.observation_revision, 3);
+        assert!(final_state.closed);
+        assert_eq!(
+            final_state.terminal_error.as_ref().map(|error| error.code),
+            Some(ErrorCode::ContinuityLost)
+        );
+        assert_eq!(
+            pending.as_mut().poll(&mut context),
+            Poll::Ready(Some(final_state.clone()))
+        );
+        let mut coalesced = Box::pin(second.next().unwrap());
+        assert_eq!(
+            coalesced.as_mut().poll(&mut context),
+            Poll::Ready(Some(final_state))
+        );
+        for cursor in [&first, &second] {
+            let mut ended = Box::pin(cursor.next().unwrap());
+            assert_eq!(ended.as_mut().poll(&mut context), Poll::Ready(None));
         }
     }
 

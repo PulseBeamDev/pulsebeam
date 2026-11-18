@@ -33,9 +33,31 @@ impl ResourcePermissions {
                 self.can_publish(publication)
             }
             Some(wire::resource_spec::Declaration::Subscription(subscription)) => {
-                self.may_subscribe(subscription.kind)
+                self.may_subscribe_in_room(&subscription.source_room, subscription.kind)
             }
+            Some(wire::resource_spec::Declaration::SourceLookup(lookup)) => lookup
+                .source
+                .as_ref()
+                .is_some_and(|source| self.can_lookup_source(source)),
             None => false,
+        }
+    }
+
+    fn can_lookup_source(&self, source: &wire::LogicalSourceAddress) -> bool {
+        let Some(kind) = track_kind(source.kind) else {
+            return false;
+        };
+        match self {
+            super::ResourcePermissions::Denied => false,
+            #[cfg(test)]
+            super::ResourcePermissions::RoomBound => true,
+            super::ResourcePermissions::Grants { grants, .. } => grants.allows(
+                Action::Subscribe,
+                &source.room,
+                Some(&source.participant_external_id),
+                Some(kind),
+                Some(&source.label),
+            ),
         }
     }
 
@@ -49,20 +71,22 @@ impl ResourcePermissions {
         self.allows(Action::Publish, None, Some(kind), Some(&publication.label))
     }
 
-    pub(super) fn may_subscribe(&self, kind: i32) -> bool {
-        track_kind(kind).is_some_and(|kind| self.may_subscribe_kind(kind))
+    pub(super) fn may_subscribe_in_room(&self, room: &str, kind: i32) -> bool {
+        track_kind(kind).is_some_and(|kind| self.has_subscription_kind_in_room(room, kind))
     }
 
     pub(super) fn can_subscribe(
         &self,
+        source_room: &str,
         participant: &wire::Participant,
         track: &wire::Track,
     ) -> bool {
         let Some(kind) = descriptor_kind(track) else {
             return false;
         };
-        self.allows(
+        self.allows_at_room(
             Action::Subscribe,
+            source_room,
             Some(&participant.participant_external_id),
             Some(kind),
             Some(&track.label),

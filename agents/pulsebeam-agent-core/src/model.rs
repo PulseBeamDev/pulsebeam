@@ -131,6 +131,7 @@ impl AudioSubscription {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TrackSelector {
+    pub room: String,
     pub participant_external_id: String,
     pub label: String,
 }
@@ -487,10 +488,15 @@ impl DesiredState {
 }
 
 impl TrackSelector {
-    fn validate(&self) -> Result<(), ValidationError> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_room_name(&self.room)?;
         validate_participant_id(&self.participant_external_id)?;
         validate_identifier("track label", &self.label, 64, true)
     }
+}
+
+pub fn validate_room_name(room: &str) -> Result<(), ValidationError> {
+    validate_identifier("room external id", room, 256, true)
 }
 
 pub fn validate_participant_id(id: &str) -> Result<(), ValidationError> {

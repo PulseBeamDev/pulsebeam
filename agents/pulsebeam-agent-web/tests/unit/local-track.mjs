@@ -8,6 +8,7 @@ import {
 } from "../../unit-javascript/capture-source.js";
 import { LocalMediaRegistry } from "../../unit-javascript/media.js";
 import { ResourceOwners } from "../../unit-javascript/resources.js";
+import { PipeStatus } from "../../unit-javascript/schema.js";
 import { track } from "../../unit-javascript/track.js";
 
 function nativeTrack(kind = "video") {
@@ -21,13 +22,17 @@ function nativeTrack(kind = "video") {
     },
   });
 }
-function host(replace = async () => {}) {
+function host(install = async () => {}) {
   const commands = [];
   let owner = 0n;
   const runtime = {
-    async resource(command) {
+    async resource(command) {},
+    resource_now(command) {
       commands.push(command);
       if (command.op === "claimPublication") return { owner: ++owner };
+    },
+    configure_publication(owner, enabled) {
+      commands.push({ op: "configure", owner, enabled });
     },
     publication() {
       return {
@@ -35,14 +40,24 @@ function host(replace = async () => {}) {
         updates: () => ({ next: async () => undefined, close() {} }),
       };
     },
-    async replace_owned_track(...args) {
-      commands.push({ op: "replace", args });
-      if (args[1] && args[1].readyState !== "live")
-        throw new Error("capture input has ended");
-      await replace(...args);
-    },
-    async set_owned_muted(...args) {
-      commands.push({ op: "mute", args });
+    create_owned_publication_pipe(owner) {
+      commands.push({ op: "attach", owner });
+      let closed = false;
+      return {
+        state: () => ({
+          observationRevision: closed ? 1n : 0n,
+          status: closed ? PipeStatus.Closed : PipeStatus.Available,
+        }),
+        async install_track(source, configuration) {
+          commands.push({ op: "install", owner, source, configuration });
+          await install(owner, source);
+        },
+        close() {
+          closed = true;
+          commands.push({ op: "detach", owner });
+          return Promise.resolve();
+        },
+      };
     },
   };
   const resources = new ResourceOwners((error) => {
@@ -52,185 +67,186 @@ function host(replace = async () => {}) {
   return { commands, resources, registry: new LocalMediaRegistry(resources) };
 }
 
-test("inert local lookup acquires an explicit publication without owning its source", async () => {
+test("publication declaration and input attachment are separate synchronous borrowed lifetimes", async () => {
   const { commands, resources, registry } = host();
   const native = nativeTrack();
   const source = VideoSource.fromTrack(native);
   const handle = registry.track(track.video("camera"));
   assert.equal(registry.track(track.video("camera")), handle);
   assert.deepEqual(commands, []);
-  assert.equal("setSource" in handle, false);
-  const publication = await handle.publish(source, { enabled: false });
-  assert.equal(commands[0].op, "claimPublication");
-  assert.deepEqual(commands[1].args, [
-    1n,
-    native,
-    { contentHint: "motion" },
-    true,
-    true,
-  ]);
-  await publication.configure({ enabled: true });
-  assert.deepEqual(commands.at(-1), { op: "mute", args: [1n, false] });
+  const publication = handle.publish({ enabled: false });
+  assert.equal("then" in publication, false);
+  assert.equal("setSource" in publication, false);
+  assert.deepEqual(
+    commands.map(({ op }) => op),
+    ["claimPublication", "configure"],
+  );
+  const pipe = source.pipeTo(publication);
+  assert.equal("then" in pipe, false);
+  assert.equal(pipe.state(), pipe.state());
+  assert.equal(commands.at(-1).source, native);
+  publication.configure({ enabled: true });
+  assert.deepEqual(commands.at(-1), {
+    op: "configure",
+    owner: 1n,
+    enabled: true,
+  });
   await publication.configureSender({ contentHint: "detail" });
-  assert.equal(commands.at(-1).args[4], false);
-  await publication.setSource(null);
-  assert.equal(commands.at(-1).args[1], null);
-  await publication.setSource(source);
-  assert.equal(commands.at(-1).args[1], native);
-  await assert.rejects(
-    publication.setSource(AudioSource.fromTrack(nativeTrack("audio"))),
+  assert.equal(commands.at(-1).configuration.contentHint, "detail");
+  assert.throws(
+    () => AudioSource.fromTrack(nativeTrack("audio")).pipeTo(publication),
     TypeError,
   );
-  await publication.close();
-  await publication.close();
-  assert.equal(publication.isClosed(), true);
+  await pipe.close();
+  assert.equal(pipe.isClosed(), true);
+  assert.equal(publication.isClosed(), false);
   assert.equal(source.isClosed(), false);
+  const replacement = source.pipeTo(publication);
+  await publication.close();
+  assert.equal(replacement.isClosed(), true);
+  assert.equal(publication.isClosed(), true);
   assert.equal(native.stops, 0);
-  await assert.rejects(publication.configure({ enabled: false }), /closed/);
-  await assert.rejects(publication.setSource(source), /closed/);
+  assert.throws(() => publication.configure({ enabled: false }), /closed/);
+  assert.throws(() => source.pipeTo(publication), /closed/);
+  await resources.close();
   registry.close();
-  resources.close();
   await source.close();
   await source.close();
   assert.equal(native.stops, 1);
-  assert.equal(source.isClosed(), true);
 });
 
-test("explicit source close withdraws every borrower even though track.stop emits no ended", async () => {
+test("explicit source close withdraws each pipe without closing publications", async () => {
   const { commands, resources, registry } = host();
   const native = nativeTrack();
   const source = VideoSource.fromTrack(native);
-  const a = await registry
-    .track(track.video("a"))
-    .publish(source, { enabled: true });
-  const b = await registry
-    .track(track.video("b"))
-    .publish(source, { enabled: true });
+  const a = registry.track(track.video("a")).publish();
+  const b = registry.track(track.video("b")).publish();
+  const first = source.pipeTo(a);
+  const second = source.pipeTo(b);
   await source.close();
-  assert.equal(source.isClosed(), true);
+  assert.equal(first.isClosed(), true);
+  assert.equal(second.isClosed(), true);
   assert.equal(a.isClosed(), false);
   assert.equal(b.isClosed(), false);
-  const withdrawals = commands.filter(
-    (command) => command.op === "replace" && command.args[1] === null,
-  );
   assert.deepEqual(
-    withdrawals.map((command) => command.args[0]),
+    commands.filter(({ op }) => op === "detach").map(({ owner }) => owner),
     [1n, 2n],
   );
-  await assert.rejects(a.setSource(source), /closed/);
+  assert.throws(() => source.pipeTo(a), /closed/);
   const replacement = VideoSource.fromTrack(nativeTrack());
-  await a.setSource(replacement);
-  assert.equal(commands.at(-1).args[1].readyState, "live");
-  registry.close();
-  resources.close();
-  assert.equal(a.isClosed(), true);
-  assert.equal(b.isClosed(), true);
+  replacement.pipeTo(a);
+  await a.close();
+  await b.close();
+  await resources.close();
   assert.equal(replacement.isClosed(), false);
   await replacement.close();
 });
 
-test("superseded queued and in-flight host input failures do not retire the publication", async () => {
+test("in-flight host input failure after pipe retirement cannot retire the publication", async () => {
   let rejectInput;
   let started;
   const entered = new Promise((resolve) => {
     started = resolve;
   });
-  const lateNative = nativeTrack();
-  const { commands, resources, registry } = host(async (_owner, track) => {
-    if (track === lateNative) {
-      started();
-      await new Promise((_resolve, reject) => {
-        rejectInput = reject;
-      });
-    }
+  const { resources, registry } = host(async () => {
+    started();
+    await new Promise((_resolve, reject) => {
+      rejectInput = reject;
+    });
   });
-  const initial = VideoSource.fromTrack(nativeTrack());
-  const publication = await registry
-    .track(track.video("camera"))
-    .publish(initial, { enabled: true });
-  const queued = VideoSource.fromTrack(nativeTrack());
-  const first = publication.setSource(queued);
-  await queued.close();
-  await first;
-  assert.equal(publication.isClosed(), false);
-  assert.equal(commands.at(-1).args[1], null);
-
-  const late = VideoSource.fromTrack(lateNative);
-  const second = publication.setSource(late);
+  const source = VideoSource.fromTrack(nativeTrack());
+  const publication = registry.track(track.video("camera")).publish();
+  const pipe = source.pipeTo(publication);
   await entered;
-  await late.close();
-  rejectInput(new Error("capture input has ended"));
-  await second;
+  const closing = pipe.close();
+  assert.equal(pipe.isClosed(), true);
   assert.equal(publication.isClosed(), false);
-  assert.equal(commands.at(-1).args[1], null);
-  await publication.setSource(initial);
+  rejectInput(new Error("capture input has ended"));
+  await closing;
+  assert.equal(source.isClosed(), false);
   await publication.close();
-  assert.equal(initial.isClosed(), false);
-  await initial.close();
-  registry.close();
-  resources.close();
+  await resources.close();
+  await source.close();
 });
 
-test("native ended retires a source and terminal Agent retirement cannot revive publication", async () => {
-  const { commands, resources, registry } = host();
+test("native ended retires the borrowed pipe, not its publication", async () => {
+  const { resources, registry } = host();
   const native = nativeTrack("audio");
   const source = AudioSource.fromTrack(native);
-  const handle = registry.track(track.audio("microphone"));
-  const publication = await handle.publish(source, { enabled: true });
+  const publication = registry.track(track.audio("microphone")).publish();
+  const pipe = source.pipeTo(publication);
   native.readyState = "ended";
   native.dispatchEvent(new Event("ended"));
-  await Promise.resolve();
   assert.equal(source.isClosed(), true);
-  assert.equal(commands.at(-1).args[1], null);
+  assert.equal(pipe.isClosed(), true);
+  assert.equal(publication.isClosed(), false);
+  await pipe.close();
+  await publication.close();
   registry.close();
-  resources.close();
-  await assert.rejects(publication.configure({ enabled: true }), /closed/);
+  await resources.close();
+  assert.throws(() => publication.configure({ enabled: true }), /closed/);
   assert.throws(() => registry.track(track.audio("microphone")), /closed/);
-  const before = commands.length;
-  resources.activate({
-    async resource() {
-      throw new Error("must not revive");
-    },
-  });
-  assert.equal(commands.length, before);
 });
 
-test("data receiver close awaits old-runtime claims and their late owner release", async () => {
-  let finishClaim;
+test("data subscription close awaits retired and current runtime cleanup", async () => {
   let finishRelease;
-  let startRelease;
-  const claim = new Promise((resolve) => {
-    finishClaim = resolve;
-  });
   const release = new Promise((resolve) => {
     finishRelease = resolve;
   });
-  const releasing = new Promise((resolve) => {
-    startRelease = resolve;
-  });
   const releases = [];
-  const registry = new DataRegistry({
-    getSnapshot: () => ({ catalog: { tracks: [] } }),
-    subscribe: () => () => {},
-  });
-  registry.activate({
-    async resource(command) {
-      if (command.op === "receiveData") return await claim;
-      assert.equal(command.op, "release");
-      releases.push(["old", command.owner]);
-      startRelease();
-      await release;
+  const resources = new ResourceOwners((error) => assert.fail(error));
+  const registry = new DataRegistry(
+    {
+      getSnapshot: () => ({ roomId: "room", catalog: { tracks: [] } }),
+      subscribe: () => () => {},
     },
-  });
-  const acquiring = registry.local(track.data("messages", "ordered")).receive();
-  registry.activate({
+    resources,
+  );
+  const runtime = (name, owner, cleanup = Promise.resolve()) => ({
+    resource_now(command) {
+      if (command.op === "release") return;
+      assert.equal(command.op, "receiveData");
+      assert.deepEqual(command.source, {
+        room: "room",
+        participantId: "alice",
+        label: "messages",
+      });
+      return { owner };
+    },
+    data_subscription() {
+      return {
+        state: () => ({ observationRevision: 1n }),
+        updates() {
+          let resolve;
+          return {
+            next: () =>
+              new Promise((done) => {
+                resolve = done;
+              }),
+            close: () => resolve?.(undefined),
+          };
+        },
+      };
+    },
     async resource(command) {
-      if (command.op === "receiveData") return { owner: 2n };
       if (command.op === "readData") return null;
-      releases.push(["current", command.owner]);
+      assert.equal(command.op, "release");
+      releases.push([name, command.owner]);
+      await cleanup;
     },
   });
-  const receiver = await acquiring;
+  const activate = (value) => {
+    resources.activate(value);
+  };
+  activate(runtime("old", 1n, release));
+  const receiver = registry
+    .remote(track.data("messages", "ordered"), {
+      room: "room",
+      participantId: "alice",
+    })
+    .subscribe();
+  assert.equal(receiver instanceof Promise, false);
+  activate(runtime("current", 2n));
   const pendingRead = receiver.next();
   let finished = false;
   const closing = receiver.close().then(() => {
@@ -244,17 +260,13 @@ test("data receiver close awaits old-runtime claims and their late owner release
   await setImmediate();
   assert.equal(finished, false);
   assert.equal(registryFinished, false);
-  finishClaim({ owner: 1n });
-  await releasing;
-  assert.equal(finished, false);
   finishRelease();
-  await Promise.all([closing, registryClosing]);
+  await Promise.all([closing, registryClosing, resources.close()]);
   assert.equal(registryFinished, true);
   assert.equal(receiver.isClosed(), true);
   assert.deepEqual(releases, [
-    ["current", 2n],
     ["old", 1n],
+    ["current", 2n],
   ]);
   assert.deepEqual(await receiver.next(), { type: "closed" });
-  registry.close();
 });

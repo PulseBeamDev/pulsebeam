@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct ExpectedParticipant {
     pub id: ParticipantId,
     pub room: &'static str,
+    pub external_id: String,
     pub video: bool,
     pub video_label: String,
     pub audio: bool,
@@ -201,19 +202,28 @@ impl ApplicationStateOracle {
         let expected_video = requested_video
             .iter()
             .map(|id| {
-                let peer = peers
+                let peer = self
+                    .participants
                     .iter()
                     .find(|peer| peer.id.as_str() == *id && peer.video)
                     .ok_or_else(|| anyhow::anyhow!("requested video has no plan publisher"))?;
+                ensure!(
+                    peer.media
+                        .iter()
+                        .any(|publication| publication.kind == MediaKind::Video
+                            && publication.label == peer.video_label),
+                    "requested video has no current publisher descriptor"
+                );
                 Ok(peer.track_id(TrackKind::Video, &peer.video_label).as_str())
             })
             .collect::<Result<BTreeSet<_>>>()?;
+        let allowed_video_origins = requested_video.iter().cloned().collect();
         check_mapping(
             &snapshot.video_mapping,
             &snapshot.publications,
             MediaKind::Video,
             Some(observation.video_capacity),
-            None,
+            Some((observation, &allowed_video_origins)),
         )?;
         ensure!(
             snapshot
@@ -322,10 +332,12 @@ impl ApplicationStateOracle {
             let publishing = peers
                 .iter()
                 .filter(|peer| {
-                    peer.topics.publishers.iter().any(|publisher| {
-                        publisher.topic == subscriber.registration.topic
-                            && publisher.mode == subscriber.registration.mode
-                    })
+                    peer.room == subscriber.registration.room
+                        && peer.external_id == subscriber.registration.participant_external_id
+                        && peer.topics.publishers.iter().any(|publisher| {
+                            publisher.topic == subscriber.registration.topic
+                                && publisher.mode == subscriber.registration.mode
+                        })
                 })
                 .collect::<Vec<_>>();
             let required = publishing.iter().filter(|peer| peer.required).count();

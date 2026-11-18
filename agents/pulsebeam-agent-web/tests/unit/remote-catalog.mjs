@@ -9,14 +9,22 @@ import {
 } from "../../unit-javascript/reception.js";
 
 function fixture() {
+  const listeners = new Set();
   let snapshot = {
     connection: "disconnected",
+    roomId: "room",
     participantId: "self",
     catalog: { participants: [], publications: [], tracks: [] },
     mapping: { video: [], audio: [] },
     tracks: {},
   };
-  const agent = { getSnapshot: () => snapshot, subscribe: () => () => {} };
+  const agent = {
+    getSnapshot: () => snapshot,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
   const catalog = new RemoteCatalog(
     agent,
     new DataRegistry(agent),
@@ -24,13 +32,15 @@ function fixture() {
   );
   return {
     catalog,
-    update(participants, publications, audio = []) {
+    update(participants, publications, audio = [], roomId = "room") {
       snapshot = {
         ...snapshot,
+        roomId,
         catalog: { participants, publications, tracks: publications },
         mapping: { video: [], audio },
       };
       catalog.update(snapshot);
+      for (const listener of listeners) listener();
     },
   };
 }
@@ -48,12 +58,12 @@ const microphone = {
   label: "microphone",
 };
 
-test("catalog preserves external-identity handles across absence and publication replacement", () => {
+test("catalog keeps discovery identity stable across publication replacement", () => {
   const f = fixture();
-  const aliceHandle = f.catalog.participant("alice");
+  const aliceHandle = f.catalog.room("room").participant("alice");
   const video = aliceHandle.video("camera");
   const audio = aliceHandle.audio("microphone");
-  const publicParticipant = f.catalog.facade().participant("alice");
+  const publicParticipant = f.catalog.room("room").participant("alice");
   assert.equal(publicParticipant.id(), "alice");
   assert.equal(
     publicParticipant.video("camera"),
@@ -71,9 +81,13 @@ test("catalog preserves external-identity handles across absence and publication
   const participants = f.catalog.participants;
   const videos = f.catalog.videoTracks;
   const audios = f.catalog.audioTracks;
-  assert.equal(participants[0], aliceHandle);
-  assert.equal(videos[0], video);
-  assert.equal(audios[0], audio);
+  assert.notEqual(participants[0], aliceHandle);
+  assert.notEqual(videos[0], video);
+  assert.notEqual(audios[0], audio);
+  assert.equal(video.id, camera.id);
+  assert.equal(audio.id, microphone.id);
+  assert.equal(aliceHandle.active, true);
+  assert.equal(aliceHandle.tracks.length, 2);
   assert.equal(video.participantId, "alice");
   assert.notEqual(aliceHandle.audio("camera"), video);
   assert.notEqual(aliceHandle.video("microphone"), audio);
@@ -85,21 +99,23 @@ test("catalog preserves external-identity handles across absence and publication
   video.watch(() => notifications++);
   f.update([], []);
   assert.equal(video.active, false);
+  assert.equal(aliceHandle.active, false);
+  assert.deepEqual(aliceHandle.tracks, []);
   assert.equal(notifications, 1);
   f.update([alice], [{ ...camera, id: "new-camera" }]);
-  assert.equal(f.catalog.videoTracks[0], video);
-  assert.equal(f.catalog.participants[0], aliceHandle);
+  assert.equal(f.catalog.videoTracks[0], videos[0]);
+  assert.notEqual(f.catalog.participants[0], aliceHandle);
   assert.equal(video.active, true);
   assert.equal(notifications, 2);
   f.catalog.close();
   assert.equal(video.active, false);
   assert.throws(() => aliceHandle.video("new"), /closed/);
-  assert.throws(() => f.catalog.participant("new"), /closed/);
+  assert.throws(() => f.catalog.room("room").participant("new"), /closed/);
 });
 
-test("audio receiving follows mapping, not catalog or media availability, and close clears analysis", () => {
+test("audio mapping tracks discovery and clears on close", () => {
   const f = fixture();
-  const audio = f.catalog.participant("alice").audio("microphone");
+  const audio = f.catalog.room("room").participant("alice").audio("microphone");
   let notifications = 0;
   audio.watch(() => notifications++);
   f.update([alice], [microphone]);
@@ -139,15 +155,29 @@ test("self is excluded by admitted application participant identity", () => {
       camera,
     ],
   );
-  assert.deepEqual(f.catalog.participants, [f.catalog.participant("alice")]);
-  assert.deepEqual(f.catalog.videoTracks, [
-    f.catalog.participant("alice").video("camera"),
-  ]);
+  assert.equal(f.catalog.participants.length, 1);
+  assert.equal(f.catalog.participants[0].participantId, "alice");
+  assert.equal(f.catalog.videoTracks.length, 1);
+  assert.equal(f.catalog.videoTracks[0].id, camera.id);
   assert.deepEqual(f.catalog.audioTracks, []);
   f.catalog.close();
 });
 
-test("receive option validation is atomic and inert without an attachment", () => {
+test("pinned references hide discovery metadata after a room move", () => {
+  const f = fixture();
+  const participant = f.catalog.room("room").participant("alice");
+  const pinned = participant.video("camera");
+  f.update([alice], [camera]);
+  assert.equal(pinned.id, camera.id);
+  f.update([alice], [{ ...camera, id: "other-room-camera" }], [], "other-room");
+  assert.equal(pinned.id, null);
+  assert.equal(pinned.active, false);
+  assert.deepEqual(participant.tracks, []);
+  assert.equal(f.catalog.videoTracks[0].id, "other-room-camera");
+  f.catalog.close();
+});
+
+test("receive option validation is atomic and inert", () => {
   const f = fixture();
   f.update([alice], [camera]);
   const video = f.catalog.videoTracks[0];
@@ -191,6 +221,13 @@ test("subscription close drains a late physical observation without adopting it"
   });
   resources.activate({
     async resource(command) {
+      if (command.op !== "release") return this.resource_now(command);
+    },
+    video_subscription: () => ({
+      state() {},
+      updates: () => ({ async next() {}, close() {} }),
+    }),
+    resource_now(command) {
       commands.push(command);
       return command.op === "claimVideo" ? { owner: 9n } : undefined;
     },
@@ -200,7 +237,7 @@ test("subscription close drains a late physical observation without adopting it"
       return pending;
     },
   });
-  const selector = { participantId: "alice", label: "camera" };
+  const selector = { room: "room", participantId: "alice", label: "camera" };
   const configuration = {
     visible: true,
     height: 720,
@@ -209,7 +246,8 @@ test("subscription close drains a late physical observation without adopting it"
     priority: 0,
     playoutDelay: { mode: "adaptive" },
   };
-  const subscription = await subscribeVideo(resources, selector, configuration);
+  const subscription = subscribeVideo(resources, selector, configuration);
+  assert.equal("then" in subscription, false);
   assert.deepEqual(commands.slice(0, 2), [
     { op: "claimVideo", selector },
     { op: "observeVideo", owner: 9n, observation: configuration },
@@ -240,12 +278,48 @@ test("subscription close drains a late physical observation without adopting it"
   await resources.close();
 });
 
+test("invalid initial subscription configuration retires its claim in the same turn", async () => {
+  const commands = [];
+  const failure = {
+    pulsebeamInfo: { code: "InvalidArgument", message: "Invalid observation" },
+  };
+  const resources = new ResourceOwners(() => assert.fail("unexpected report"));
+  resources.activate({
+    resource_now(command) {
+      commands.push(command.op);
+      if (command.op === "claimVideo") return { owner: 9n };
+      if (command.op === "observeVideo") throw failure;
+    },
+    async resource(command) {
+      assert.equal(command.op, "release");
+    },
+  });
+  assert.throws(
+    () =>
+      subscribeVideo(
+        resources,
+        { room: "room", participantId: "alice", label: "camera" },
+        {},
+      ),
+    (error) => {
+      assert.deepEqual(error.info, failure.pulsebeamInfo);
+      assert.equal(Object.isFrozen(error.info), true);
+      return true;
+    },
+  );
+  assert.deepEqual(commands, ["claimVideo", "observeVideo", "release"]);
+  await resources.close();
+});
+
 test("audio selection reattachment claims the latest explicit policy", async () => {
   const resources = new ResourceOwners((error) => {
     throw error;
   });
   resources.activate({
     async resource(command) {
+      return this.resource_now(command);
+    },
+    resource_now(command) {
       return command.op === "claimAudioPolicy" ? { owner: 1n } : undefined;
     },
   });
@@ -258,7 +332,7 @@ test("audio selection reattachment claims the latest explicit policy", async () 
   const selection = await selectAudio(resources, initial);
   const next = {
     ...initial,
-    selected: [{ participantId: "alice", label: "microphone" }],
+    selected: [{ room: "room", participantId: "alice", label: "microphone" }],
   };
   await selection.configure(next);
   let configured;
@@ -268,6 +342,9 @@ test("audio selection reattachment claims the latest explicit policy", async () 
   const commands = [];
   resources.activate({
     async resource(command) {
+      if (command.op !== "release") return this.resource_now(command);
+    },
+    resource_now(command) {
       commands.push(command);
       if (command.op === "claimAudioPolicy") return { owner: 2n };
       if (command.op === "configureAudioPolicy") configured();

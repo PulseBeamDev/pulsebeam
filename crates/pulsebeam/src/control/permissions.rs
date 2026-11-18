@@ -9,7 +9,6 @@ pub(crate) enum ResourcePermissions {
     // Unrestricted unit-fixture policy is never an accepted credential profile.
     #[cfg(test)]
     RoomBound,
-    // Source resolution currently remains within the connection's room.
     Grants {
         room: RoomExternalId,
         grants: GrantSet,
@@ -41,6 +40,22 @@ impl ResourcePermissions {
         self.allows(Action::Join, None, None, None)
     }
 
+    pub(super) fn allows_at_room(
+        &self,
+        action: Action,
+        room: &str,
+        participant: Option<&str>,
+        kind: Option<TrackKind>,
+        label: Option<&str>,
+    ) -> bool {
+        match self {
+            Self::Denied => false,
+            #[cfg(test)]
+            Self::RoomBound => true,
+            Self::Grants { grants, .. } => grants.allows(action, room, participant, kind, label),
+        }
+    }
+
     pub(super) fn allows_source(
         &self,
         action: Action,
@@ -53,6 +68,27 @@ impl ResourcePermissions {
             Track::Data(_) => TrackKind::Data,
         };
         self.allows(action, publisher, Some(kind), track.meta().label.as_deref())
+    }
+
+    pub(super) fn allows_source_at_room(
+        &self,
+        action: Action,
+        room: &str,
+        publisher: Option<&str>,
+        track: &Track,
+    ) -> bool {
+        let kind = match track {
+            Track::Audio(_) => TrackKind::Audio,
+            Track::Video(_) => TrackKind::Video,
+            Track::Data(_) => TrackKind::Data,
+        };
+        self.allows_at_room(
+            action,
+            room,
+            publisher,
+            Some(kind),
+            track.meta().label.as_deref(),
+        )
     }
 
     pub(super) fn topic_publications(&self) -> crate::participant::policy::TopicPublications {
@@ -78,12 +114,12 @@ impl ResourcePermissions {
         }
     }
 
-    pub(super) fn may_subscribe_kind(&self, kind: TrackKind) -> bool {
+    pub(super) fn has_subscription_kind_in_room(&self, room: &str, kind: TrackKind) -> bool {
         match self {
             Self::Denied => false,
             #[cfg(test)]
             Self::RoomBound => true,
-            Self::Grants { room, grants } => grants.may_subscribe(room.as_str(), kind),
+            Self::Grants { grants, .. } => grants.may_subscribe(room, kind),
         }
     }
 }

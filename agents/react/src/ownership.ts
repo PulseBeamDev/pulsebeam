@@ -1,155 +1,22 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import type {
+  Agent,
   AudioDemand,
-  AudioPublication,
   AudioSelection,
-  AudioSenderConfig,
-  AudioSource,
   DataEvent,
-  DataReceiver,
   Delivery,
-  PlaybackFailure,
-  VideoPublication,
-  VideoSenderConfig,
-  VideoSource,
+  RemoteDataTrack,
 } from "@pulsebeam/web";
-import {
-  attachRemoteAudio,
-  claimPublication,
-} from "@pulsebeam/web/internal/react";
 import { useCommittedRef } from "./committed-ref.js";
-import {
-  receiveData,
-  localMedia,
-  trackIdentity,
-  managedAgent,
-  type Agent,
-  type LocalDataTrack,
-  type LocalVideoTrack,
-  type LocalAudioTrack,
-  type RemoteDataTrack,
-} from "./agent.js";
-import {
-  publicationTrack,
-  type PublishableAudioSource,
-  type PublishableVideoSource,
+import { useSubscribe } from "./hooks.js";
+import type {
+  PublishableAudioSource,
+  PublishableVideoSource,
 } from "./sources.js";
-
 export type PublicationSource = PublishableVideoSource | PublishableAudioSource;
-export type PublishProps =
-  | {
-      readonly track: LocalVideoTrack;
-      readonly source: PublishableVideoSource | null;
-      readonly enabled?: boolean;
-      readonly content?: VideoSenderConfig["contentHint"];
-    }
-  | {
-      readonly track: LocalAudioTrack;
-      readonly source: PublishableAudioSource | null;
-      readonly enabled?: boolean;
-      readonly content?: AudioSenderConfig["contentHint"];
-    };
-
-type Publication =
-  | { kind: "video"; value: VideoPublication }
-  | { kind: "audio"; value: AudioPublication };
-
-export function Publish(props: PublishProps): null {
-  const committed = useCommittedRef(props);
-  const target = trackIdentity(props.track);
-  const synchronize = useRef<(() => void) | null>(null);
-  const [failure, setFailure] = useState<unknown>(null);
-  const cleanup = useRef<Promise<void>>(Promise.resolve());
-  if (failure) throw failure;
-  useLayoutEffect(() => {
-    setFailure(null);
-    let active = true;
-    let owner: Publication | undefined;
-    const report = (error: unknown) => {
-      if (active) setFailure(error);
-    };
-    const sync = () => {
-      if (!active) return;
-      void cleanup.current.then(() => {
-        if (!active) return;
-        const view = committed.current;
-        try {
-          if (!owner) {
-            if (!view.source) return;
-            const configuration = { enabled: view.enabled ?? true };
-            let ready: Promise<void>;
-            if (view.track.kind === "video") {
-              const claim = claimPublication(
-                localMedia(view.track),
-                publicationTrack(view.source, "video") as VideoSource,
-                configuration,
-              );
-              owner = { kind: "video", value: claim.publication };
-              ready = claim.ready;
-            } else {
-              const claim = claimPublication(
-                localMedia(view.track),
-                publicationTrack(view.source, "audio") as AudioSource,
-                configuration,
-              );
-              owner = { kind: "audio", value: claim.publication };
-              ready = claim.ready;
-            }
-            void ready.then(sync).catch(report);
-            return;
-          }
-          const source = view.source
-            ? publicationTrack(view.source, owner.kind)
-            : null;
-          const configuration = { enabled: view.enabled ?? true };
-          const updates =
-            owner.kind === "video"
-              ? [
-                  owner.value.setSource(source as VideoSource | null),
-                  owner.value.configure(configuration),
-                  owner.value.configureSender({
-                    contentHint: (view.content ??
-                      "motion") as VideoSenderConfig["contentHint"],
-                  }),
-                ]
-              : [
-                  owner.value.setSource(source as AudioSource | null),
-                  owner.value.configure(configuration),
-                  owner.value.configureSender({
-                    contentHint: (view.content ??
-                      "speech") as AudioSenderConfig["contentHint"],
-                  }),
-                ];
-          void Promise.all(updates).catch(report);
-        } catch (error) {
-          report(error);
-        }
-      });
-    };
-    synchronize.current = sync;
-    sync();
-    return () => {
-      active = false;
-      if (synchronize.current === sync) synchronize.current = null;
-      if (owner) {
-        const retired = owner;
-        owner = undefined;
-        cleanup.current = cleanup.current
-          .then(() => retired.value.close())
-          .catch((error: unknown) => {
-            console.error("PulseBeam publication cleanup failed", error);
-          });
-      }
-    };
-  }, [target]);
-  useLayoutEffect(() => {
-    synchronize.current?.();
-  }, [props.source, props.enabled, props.content]);
-  return null;
-}
 
 export interface DataProps<D extends Delivery = Delivery> {
-  readonly track: LocalDataTrack<D> | RemoteDataTrack<D>;
+  readonly track: RemoteDataTrack<D>;
   readonly onEvent: (event: DataEvent<D>) => void | Promise<void>;
   readonly onError?: (error: unknown) => void;
 }
@@ -159,28 +26,19 @@ export function Data<D extends Delivery>({
   onError,
 }: DataProps<D>): null {
   const callbacks = useCommittedRef({ onEvent, onError });
-  const target = trackIdentity(track);
+  const receiver = useSubscribe(track);
   useLayoutEffect(() => {
+    if (!receiver) return;
     let active = true;
-    let receiver: DataReceiver<D> | undefined;
-    const release = () => {
-      active = false;
-      void receiver?.close().catch((error: unknown) => {
-        console.error("PulseBeam data cleanup failed", error);
-      });
-    };
     void (async () => {
       try {
-        receiver = await receiveData(track);
-        if (!active) return;
         while (active) {
           const next = await receiver.next();
-          if (next.type === "closed" || !active) break;
+          if (!active || next.type === "closed") break;
           await callbacks.current.onEvent(next.event);
         }
       } catch (error) {
         if (!active) return;
-        release();
         try {
           if (callbacks.current.onError) callbacks.current.onError(error);
           else console.error("PulseBeam data receive failed", error);
@@ -188,11 +46,15 @@ export function Data<D extends Delivery>({
           console.error("PulseBeam data error handler failed", reportingError);
         }
       } finally {
-        release();
+        void receiver.close().catch((error: unknown) => {
+          console.error("PulseBeam data cleanup failed", error);
+        });
       }
     })();
-    return release;
-  }, [target]);
+    return () => {
+      active = false;
+    };
+  }, [receiver]);
   return null;
 }
 
@@ -200,8 +62,7 @@ export interface SelectAudioProps {
   readonly agent: Agent;
   readonly policy: AudioDemand;
 }
-export function SelectAudio({ agent, policy }: SelectAudioProps): null {
-  const target = managedAgent(agent);
+export function SelectAudio({ agent: target, policy }: SelectAudioProps): null {
   const committed = useCommittedRef(policy);
   const owner = useRef<AudioSelection | null>(null);
   const [failure, setFailure] = useState<unknown>(null);
@@ -239,48 +100,5 @@ export function SelectAudio({ agent, policy }: SelectAudioProps): null {
       if (owner.current === selection) setFailure(error);
     });
   }, [target, policyKey]);
-  return null;
-}
-
-export interface AudioProps {
-  readonly agent: Agent;
-  readonly onPlaybackError?: (failure: PlaybackFailure) => void;
-}
-export function Audio({ agent, onPlaybackError }: AudioProps): null {
-  const callback = useCommittedRef(onPlaybackError);
-  const target = managedAgent(agent);
-  const [failure, setFailure] = useState<unknown>(null);
-  const cleanup = useRef<Promise<void>>(Promise.resolve());
-  if (failure) throw failure;
-  useLayoutEffect(() => {
-    setFailure(null);
-    let active = true;
-    let owner: ReturnType<typeof attachRemoteAudio> | undefined;
-    void cleanup.current
-      .then(() => {
-        if (!active) return;
-        owner = attachRemoteAudio(target, {
-          onPlaybackError: (value) => {
-            if (active) callback.current?.(value);
-          },
-        });
-        return owner.ready;
-      })
-      .catch((error: unknown) => {
-        if (active) setFailure(error);
-      });
-    return () => {
-      active = false;
-      if (owner) {
-        const retired = owner;
-        owner = undefined;
-        cleanup.current = cleanup.current
-          .then(() => retired.close())
-          .catch((error: unknown) => {
-            console.error("PulseBeam audio cleanup failed", error);
-          });
-      }
-    };
-  }, [target]);
   return null;
 }

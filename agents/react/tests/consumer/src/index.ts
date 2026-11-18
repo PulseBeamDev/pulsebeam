@@ -1,7 +1,8 @@
 import {
   Audio,
   Data,
-  Publish,
+  usePublish,
+  useSubscribe,
   SelectAudio,
   Video,
   useAgent,
@@ -20,6 +21,8 @@ const maybeAgent: Agent | null = useAgent(config);
 const agent: Agent = maybeAgent!;
 const capture = useCapture("device", { video: true, audio: false });
 const camera = agent.video("camera");
+// @ts-expect-error No public publication component.
+import { Publish } from "@pulsebeam/react";
 // @ts-expect-error React no longer exports descriptors.
 import { track } from "@pulsebeam/react";
 // @ts-expect-error Descriptor types are not part of the packed React surface.
@@ -31,8 +34,8 @@ camera.setEnabled(false);
 // @ts-expect-error Local media does not expose capture sources.
 camera.source;
 // @ts-expect-error Kind-specific sources must remain safe in packed declarations.
-Publish({ track: camera, source: capture.audio });
-const remote = agent.participant("alice");
+usePublish(camera, capture.audio);
+const remote = agent.room("selected-room").participant("alice");
 const messages = remote.data("messages", "lossy");
 Data({
   track: messages,
@@ -48,7 +51,10 @@ messages.send(new Uint8Array());
 // @ts-expect-error Data delivery is required.
 agent.data("messages");
 Data({
-  track: agent.data("chat", "ordered"),
+  track: agent
+    .room("selected-room")
+    .participant("alice")
+    .data("chat", "ordered"),
   onEvent(event) {
     if (event.type === "gap") {
       const from: bigint = event.from;
@@ -57,13 +63,19 @@ Data({
   },
 });
 const settings: VideoCaptureSettings | undefined = capture.video?.settings;
-Publish({ track: camera, source: capture.video });
+usePublish(camera, capture.video);
 Video({ source: capture.video });
 Video({
-  source: agent.participant("alice").video("camera"),
+  source: useSubscribe(
+    agent.room("selected-room").participant("alice").video("camera"),
+  ),
   onPlaybackError: (failure: PlaybackError) => void failure.retry(),
 });
 SelectAudio({ agent, policy: { automatic: true } });
+Audio({ source: useSubscribe(remote.audio("microphone")) });
+// @ts-expect-error Logical refs cannot implicitly create a receive owner.
+Video({ source: remote.video("camera") });
+// @ts-expect-error No agent-wide implicit audio playback.
 Audio({ agent });
 void settings;
 agent.connect();

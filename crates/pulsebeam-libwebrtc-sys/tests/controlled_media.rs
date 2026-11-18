@@ -1245,9 +1245,10 @@ fn run_media_with_logs(
             Err(CodecError::Released)
         );
         sender.request_keyframe(&[]).unwrap();
-        let replacement_begin = observations.trace.video.len();
+        let mut replacement_begin = observations.trace.video.len();
         let audio_begin = observations.trace.audio.len();
         let mut keyframe_seen = false;
+        let mut delta_rejected = false;
         for tick in 0..50 {
             if tick % 2 == 0 {
                 for who in 0..2 {
@@ -1264,13 +1265,30 @@ fn run_media_with_logs(
                 }
             }
             if tick % 10 == 0 {
-                replacement.push_encoded(vp8_frame(&world, VP8[1])).unwrap();
+                let mut frame = vp8_frame(&world, VP8[1]);
+                if tick == 10 {
+                    sender.request_keyframe(&[]).unwrap();
+                    // Offer a delta-marked access unit only after establishing
+                    // the source. It must be rejected before native decoding.
+                    frame.data[0] |= 1;
+                    frame.key_frame = false;
+                }
+                replacement.push_encoded(frame).unwrap();
                 video_sources[1]
                     .push_encoded(vp8_frame(&world, VP8[1]))
                     .unwrap();
             }
             observations.step(&world, &network, &peers, true);
+            if let Some(error) = replacement.take_encoder_error() {
+                assert_eq!(error, CodecError::InvalidFrame);
+                assert!((10..20).contains(&tick));
+                assert!(!delta_rejected);
+                delta_rejected = true;
+            }
             if replacement.take_keyframe_request() {
+                if !keyframe_seen {
+                    replacement_begin = observations.trace.video.len();
+                }
                 keyframe_seen = true;
                 observations.trace.events.push(format!(
                     "{}:keyframe:stream:{}",
@@ -1284,6 +1302,11 @@ fn run_media_with_logs(
             keyframe_seen,
             "keyframe feedback missing on replacement source"
         );
+        assert!(
+            delta_rejected,
+            "delta-marked replacement input was not rejected"
+        );
+        assert_eq!(replacement.dropped_frames(), 1);
         assert!(
             observations.trace.video[replacement_begin..]
                 .iter()
@@ -1944,16 +1967,9 @@ fn run_h264_profile_with_wire(
             assert_eq!(first.frame_id.is_some(), temporal || simulcast);
         }
         let mut base_id = first.as_ref().and_then(|frame| frame.frame_id);
-        source.take_keyframe_request();
+        assert!(!source.take_keyframe_request());
         if simulcast {
-            assert_eq!(
-                source.take_encoding_keyframe_requests(),
-                if simulcast_mode == 3 {
-                    [false, true, false]
-                } else {
-                    [true; 3]
-                }
-            );
+            assert_eq!(source.take_encoding_keyframe_requests(), [false; 3]);
             let rates = source.latest_rate_control().unwrap();
             if simulcast_mode == 3 {
                 assert!(rates.layer_bitrates_bps[1][0].unwrap_or(0) > 0);

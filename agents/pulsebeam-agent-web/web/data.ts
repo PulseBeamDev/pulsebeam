@@ -1,4 +1,28 @@
-import type { AgentSnapshot } from "./types.js";
+import type {
+  AgentSnapshot,
+  DataPublicationUpdates,
+  DataSubscriptionUpdates,
+} from "./types.js";
+import {
+  ErrorCode,
+  PublicationAdmissionStatus,
+  PublicationExecution,
+  SubscriptionSourceStatus,
+  type DataPublicationState,
+  type DataSubscriptionState,
+  type ErrorInfo,
+} from "./schema.js";
+import { OperationError } from "./agent-observation.js";
+import {
+  ResourceObservation,
+  type NativeResourceObserver,
+} from "./resource-observation.js";
+import {
+  ResourceOwner,
+  ResourceOwners,
+  type ResourceBinding,
+  type ResourceRuntime,
+} from "./resources.js";
 import { track, trackKey, type DataTrackSpec, type Delivery } from "./track.js";
 
 export interface DataMessage {
@@ -8,7 +32,6 @@ export interface DataMessage {
   readonly sequence: bigint;
   readonly data: Uint8Array;
 }
-
 export interface DataGap {
   readonly type: "gap";
   readonly participantId: string;
@@ -16,7 +39,6 @@ export interface DataGap {
   readonly from: bigint;
   readonly to: bigint;
 }
-
 export type DataEvent<D extends Delivery = Delivery> =
   | DataMessage
   | (D extends "ordered" ? DataGap : never);
@@ -24,20 +46,19 @@ export type DataUpdate<D extends Delivery = Delivery> =
   | { readonly type: "event"; readonly event: DataEvent<D> }
   | { readonly type: "closed" };
 
-interface DataReceive<D extends Delivery> {
+interface DataTrack<D extends Delivery> {
   readonly kind: "data";
   readonly label: string;
   readonly delivery: D;
-  receive(): Promise<DataReceiver<D>>;
 }
-
 export interface LocalDataTrack<D extends Delivery = Delivery>
-  extends DataReceive<D> {
-  send(data: Uint8Array): Promise<void>;
+  extends DataTrack<D> {
+  publish(): DataPublication;
 }
-
 export interface RemoteDataTrack<D extends Delivery = Delivery>
-  extends DataReceive<D> {
+  extends DataTrack<D> {
+  subscribe(): DataSubscription<D>;
+  readonly room: string;
   readonly participantId: string;
   readonly id: string | null;
   readonly active: boolean;
@@ -55,8 +76,12 @@ export class DataError extends Error {
   }
 }
 
-function failure(error: unknown): DataError {
-  if (error instanceof DataError) return error;
+function failure(error: unknown): Error {
+  if (error instanceof DataError || error instanceof OperationError)
+    return error;
+  if (typeof error === "object" && error !== null && "pulsebeamInfo" in error) {
+    return new OperationError(error.pulsebeamInfo as ErrorInfo);
+  }
   const code =
     typeof error === "object" &&
     error !== null &&
@@ -71,35 +96,46 @@ function failure(error: unknown): DataError {
   );
 }
 
-export interface DataRuntime {
-  resource(command: unknown): Promise<unknown>;
-  send_data(spec: unknown, payload: Uint8Array): Promise<void>;
+function bytes(data: Uint8Array): void {
+  if (!(data instanceof Uint8Array))
+    throw new OperationError({
+      code: ErrorCode.InvalidArgument,
+      message: "Data send requires Uint8Array",
+    });
 }
 
+export interface DataRuntime extends ResourceRuntime {
+  send_owned_data(owner: bigint, payload: Uint8Array): Promise<void>;
+  data_publication(owner: bigint): NativeResourceObserver;
+  data_subscription(owner: bigint): NativeResourceObserver;
+}
 interface DataHost {
-  getSnapshot(): Pick<AgentSnapshot, "catalog">;
+  getSnapshot(): Pick<AgentSnapshot, "catalog" | "roomId">;
   subscribe(listener: () => void): () => void;
 }
-
-interface Binding {
-  readonly runtime: DataRuntime;
-  readonly owner: bigint;
-}
+type Source = {
+  readonly room: string;
+  readonly participantId: string;
+  readonly label: string;
+};
 type PendingRead<D extends Delivery> = {
   resolve(result: DataUpdate<D>): void;
   reject(error: unknown): void;
 };
 
 export class DataRegistry {
-  #runtime: DataRuntime | undefined;
   #closed = false;
   #closing: Promise<void> | undefined;
   readonly #locals = new Map<string, LocalDataTrack>();
   readonly #remotes = new Map<string, RemoteDataTrack>();
   readonly #streams = new Set<DataStream<Delivery>>();
+  readonly #publications = new Set<DataPublication>();
   readonly #owners = new Map<bigint, DataStream<Delivery>>();
 
-  constructor(readonly host: DataHost) {}
+  constructor(
+    readonly host: DataHost,
+    readonly resources: ResourceOwners,
+  ) {}
 
   local<D extends Delivery>(value: DataTrackSpec<D>): LocalDataTrack<D> {
     this.#requireOpen();
@@ -111,8 +147,14 @@ export class DataRegistry {
         kind: "data" as const,
         label: spec.label,
         delivery: spec.delivery,
-        send: (data: Uint8Array) => this.#send(spec, data),
-        receive: () => this.receive(spec),
+        publish: () => {
+          this.#requireOpen();
+          const publication = new DataPublication(this.resources, spec, () =>
+            this.#publications.delete(publication),
+          );
+          this.#publications.add(publication);
+          return publication;
+        },
       });
       this.#locals.set(key, handle);
     }
@@ -121,19 +163,25 @@ export class DataRegistry {
 
   remote<D extends Delivery>(
     value: DataTrackSpec<D>,
-    participantId: string,
+    source: { readonly room: string; readonly participantId: string },
   ): RemoteDataTrack<D> {
     this.#requireOpen();
     const spec = track.data(value.label, value.delivery);
-    const key = JSON.stringify([participantId, trackKey(spec)]);
+    const { room, participantId } = source;
+    const key = JSON.stringify([room, participantId, trackKey(spec)]);
     let handle = this.#remotes.get(key);
     if (!handle) {
-      const registry = this;
+      const selector = Object.freeze({
+        room,
+        participantId,
+        label: spec.label,
+      });
       const id = () =>
         this.host
           .getSnapshot()
           .catalog.tracks.find(
             (entry) =>
+              this.host.getSnapshot().roomId === room &&
               entry.participantId === participantId &&
               entry.kind === "data" &&
               entry.label === spec.label &&
@@ -143,6 +191,7 @@ export class DataRegistry {
         kind: "data" as const,
         label: spec.label,
         delivery: spec.delivery,
+        room,
         participantId,
         get id() {
           return id();
@@ -150,39 +199,32 @@ export class DataRegistry {
         get active() {
           return id() !== null;
         },
-        receive: () => registry.receive(spec, participantId),
-        watch: (listener: () => void) => registry.host.subscribe(listener),
+        subscribe: () => this.subscribe(spec, selector),
+        watch: (listener: () => void) => this.host.subscribe(listener),
       });
       this.#remotes.set(key, handle);
     }
     return handle as RemoteDataTrack<D>;
   }
 
-  async receive<D extends Delivery>(
+  #stream<D extends Delivery>(
     spec: DataTrackSpec<D>,
-    participantId?: string,
-  ): Promise<DataReceiver<D>> {
+    source: Source,
+  ): DataStream<D> {
     this.#requireOpen();
-    const stream = new DataStream(this, spec, participantId);
+    const stream = new DataStream(this, spec, source);
     this.#streams.add(stream);
-    if (this.#runtime) stream.bind(this.#runtime);
-    await stream.ready();
-    return new DataReceiver(stream);
+    return stream;
   }
-
-  activate(runtime: DataRuntime): void {
-    if (this.#closed || this.#runtime === runtime) return;
-    this.deactivate();
-    this.#runtime = runtime;
-    for (const stream of this.#streams) stream.bind(runtime);
+  subscribe<D extends Delivery>(
+    spec: DataTrackSpec<D>,
+    source: Source,
+  ): DataSubscription<D> {
+    return new DataSubscription(this.#stream(spec, source));
   }
-
   deactivate(): void {
-    this.#runtime = undefined;
     this.#owners.clear();
-    for (const stream of this.#streams) stream.detach();
   }
-
   notify(value: unknown): boolean {
     if (
       typeof value !== "object" ||
@@ -195,101 +237,218 @@ export class DataRegistry {
       for (const owner of value.owners) this.#owners.get(owner)?.wake();
     return true;
   }
-
-  current(runtime: DataRuntime): boolean {
-    return this.#runtime === runtime && !this.#closed;
-  }
-  claimed(stream: DataStream<Delivery>, binding: Binding): void {
+  claimed(stream: DataStream<Delivery>, binding: ResourceBinding): void {
     this.#owners.set(binding.owner, stream);
+  }
+  unclaimed(stream: DataStream<Delivery>, binding: ResourceBinding): void {
+    if (this.#owners.get(binding.owner) === stream)
+      this.#owners.delete(binding.owner);
   }
   forget(stream: DataStream<Delivery>): void {
     this.#streams.delete(stream);
   }
-  release(stream: DataStream<Delivery>, binding: Binding): Promise<void> {
-    if (this.#owners.get(binding.owner) === stream)
-      this.#owners.delete(binding.owner);
-    return release(binding);
-  }
-
   close(): Promise<void> {
     if (this.#closing) return this.#closing;
     this.#closed = true;
     const closing = [...this.#streams].map((stream) => stream.close());
+    closing.push(
+      ...[...this.#publications].map((publication) => publication.close()),
+    );
     this.#locals.clear();
     this.#remotes.clear();
     this.deactivate();
     return (this.#closing = Promise.all(closing).then(() => {}));
   }
-
   #requireOpen(): void {
-    if (this.#closed) throw new DataError("closed", "agent is closed");
-  }
-  #send(spec: DataTrackSpec, data: Uint8Array): Promise<void> {
-    try {
-      this.#requireOpen();
-      if (!(data instanceof Uint8Array))
-        throw new TypeError("data send requires Uint8Array");
-      if (!this.#runtime)
-        throw new DataError("unavailable", "agent runtime is not active");
-      return this.#runtime.send_data(spec, data).catch((error) => {
-        throw failure(error);
+    if (this.#closed)
+      throw new OperationError({
+        code: ErrorCode.Closed,
+        message: "Agent is closed",
       });
+  }
+}
+
+export class DataPublication {
+  readonly #resource: ResourceOwner;
+  readonly #observation = new ResourceObservation<DataPublicationState>();
+  readonly #retired: () => void;
+  readonly #pending = new Set<Promise<void>>();
+  #closing: Promise<void> | undefined;
+
+  constructor(
+    resources: ResourceOwners,
+    spec: DataTrackSpec,
+    retired: () => void,
+  ) {
+    this.#retired = retired;
+    this.#resource = resources.acquire(
+      { op: "declareDataPublication", spec },
+      {
+        bind: (binding) =>
+          this.#observation.bind(
+            (binding.runtime as DataRuntime).data_publication(binding.owner),
+          ),
+        unbind: () => {},
+      },
+    );
+  }
+  state(): Readonly<DataPublicationState> {
+    return this.#observation.state();
+  }
+  updates(): DataPublicationUpdates {
+    return this.#observation.updates();
+  }
+  isClosed(): boolean {
+    return this.#resource.isClosed();
+  }
+  send(data: Uint8Array): Promise<void> {
+    try {
+      bytes(data);
+      if (this.isClosed())
+        throw new OperationError({
+          code: ErrorCode.Closed,
+          message: "Data publication is closed",
+        });
+      const binding = this.#resource.binding;
+      if (!binding || !this.#resource.current(binding))
+        throw new OperationError({
+          code: ErrorCode.NotReady,
+          message: "Data runtime is not active",
+        });
+      const pending = (binding.runtime as DataRuntime)
+        .send_owned_data(binding.owner, data)
+        .catch((error) => {
+          throw failure(error);
+        });
+      this.#pending.add(pending);
+      void pending.then(
+        () => this.#pending.delete(pending),
+        () => this.#pending.delete(pending),
+      );
+      return pending;
     } catch (error) {
       return Promise.reject(failure(error));
     }
   }
-}
-
-async function release(binding: Binding): Promise<void> {
-  try {
-    await binding.runtime.resource({ op: "release", owner: binding.owner });
-  } catch {
-    /* A retired runtime already owns teardown of its resources. */
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    const release = this.#resource.close();
+    return (this.#closing = Promise.allSettled([
+      release,
+      ...this.#pending,
+    ]).then(() => {
+      this.#retired();
+    }));
   }
 }
 
-export class DataReceiver<D extends Delivery = Delivery> {
-  constructor(private readonly stream: DataStream<D>) {}
-
+export interface DataReceiver<D extends Delivery = Delivery> {
+  next(): Promise<DataUpdate<D>>;
+  close(): Promise<void>;
+  isClosed(): boolean;
+}
+export class DataSubscription<D extends Delivery = Delivery>
+  implements DataReceiver<D>
+{
+  readonly #stream: DataStream<D>;
+  constructor(stream: DataStream<D>) {
+    this.#stream = stream;
+  }
+  state(): Readonly<DataSubscriptionState> {
+    return this.#stream.state();
+  }
+  updates(): DataSubscriptionUpdates {
+    return this.#stream.updates();
+  }
   next(): Promise<DataUpdate<D>> {
-    return this.stream.next();
+    return this.#stream.next();
   }
   close(): Promise<void> {
-    return this.stream.close();
+    return this.#stream.close();
   }
   isClosed(): boolean {
-    return this.stream.isClosed();
+    return this.#stream.isClosed();
   }
 }
 
 class DataStream<D extends Delivery> {
   #closed = false;
-  #error: DataError | undefined;
-  #binding: Binding | undefined;
-  #attachment: object | undefined;
-  readonly #lifecycle = new Set<Promise<void>>();
+  #error: Error | undefined;
+  readonly #resource: ResourceOwner;
+  readonly #observation = new ResourceObservation<DataSubscriptionState>();
+  #watcher: DataSubscriptionUpdates | undefined;
   #closing: Promise<void> | undefined;
   #pumping = false;
   #again = false;
   readonly #pending: PendingRead<D>[] = [];
-  #resolveReady!: () => void;
-  #rejectReady!: (error: DataError) => void;
-  readonly #ready = new Promise<void>((resolve, reject) => {
-    this.#resolveReady = resolve;
-    this.#rejectReady = reject;
-  });
 
   constructor(
-    private registry: DataRegistry,
-    private spec: DataTrackSpec<D>,
-    private participantId?: string,
-  ) {}
-
-  ready(): Promise<void> {
-    return this.#ready;
+    private readonly registry: DataRegistry,
+    spec: DataTrackSpec<D>,
+    source: Source,
+  ) {
+    let bound: ResourceBinding | undefined;
+    this.#resource = registry.resources.acquire(
+      { op: "receiveData", spec, source },
+      {
+        bind: (binding) => {
+          bound = binding;
+          this.#observation.bind(
+            (binding.runtime as DataRuntime).data_subscription(binding.owner),
+          );
+          registry.claimed(this, binding);
+          const watcher = this.#observation.updates();
+          this.#watcher = watcher;
+          void this.#watch(watcher).catch((error) => {
+            if (this.#watcher === watcher) this.#fail(failure(error));
+          });
+        },
+        unbind: () => {
+          this.#watcher?.close();
+          this.#watcher = undefined;
+          if (bound) registry.unclaimed(this, bound);
+          bound = undefined;
+        },
+        error: (error) => this.#fail(failure(error)),
+      },
+    );
+    void this.#resource.ready.then(
+      () => this.wake(),
+      (error) => this.#fail(failure(error)),
+    );
+  }
+  state(): Readonly<DataSubscriptionState> {
+    return this.#observation.state();
+  }
+  updates(): DataSubscriptionUpdates {
+    return this.#observation.updates();
   }
   isClosed(): boolean {
     return this.#closed;
+  }
+  #capture(state: Readonly<DataSubscriptionState>): void {
+    const cause =
+      state.terminalError ??
+      (state.execution === PublicationExecution.Failed
+        ? state.executionError
+        : undefined) ??
+      (state.sourceStatus === SubscriptionSourceStatus.Rejected ||
+      state.admission === PublicationAdmissionStatus.Rejected
+        ? state.error
+        : undefined);
+    if (cause && !this.#error) this.#error = new OperationError(cause);
+  }
+  async #watch(watcher: DataSubscriptionUpdates): Promise<void> {
+    while (this.#watcher === watcher) {
+      const state = await watcher.next();
+      if (this.#watcher !== watcher || state === undefined) return;
+      this.#capture(state);
+      if (this.#error) {
+        this.#fail(this.#error);
+        return;
+      }
+      this.wake();
+    }
   }
   next(): Promise<DataUpdate<D>> {
     if (this.#error) return Promise.reject(this.#error);
@@ -300,84 +459,22 @@ class DataStream<D extends Delivery> {
     this.wake();
     return result;
   }
-  bind(runtime: DataRuntime): void {
-    if (this.#closed) return;
-    this.detach();
-    const attachment = {};
-    this.#attachment = attachment;
-    this.#track(this.#acquire(runtime, attachment));
-  }
-  detach(): void {
-    this.#attachment = undefined;
-    const binding = this.#binding;
-    this.#binding = undefined;
-    if (binding) this.#track(this.registry.release(this, binding));
-  }
-  #track(promise: Promise<void>): void {
-    this.#lifecycle.add(promise);
-    void promise.then(
-      () => this.#lifecycle.delete(promise),
-      () => this.#lifecycle.delete(promise),
-    );
-  }
-  async #acquire(runtime: DataRuntime, attachment: object): Promise<void> {
-    try {
-      const value = await runtime.resource({
-        op: "receiveData",
-        spec: this.spec,
-        participantId: this.participantId,
-      });
-      if (
-        typeof value !== "object" ||
-        value === null ||
-        !("owner" in value) ||
-        typeof value.owner !== "bigint"
-      )
-        throw new DataError("runtime", "invalid data receive owner");
-      const binding = { runtime, owner: value.owner };
-      if (
-        this.#closed ||
-        this.#attachment !== attachment ||
-        !this.registry.current(runtime)
-      ) {
-        await release(binding);
-        return;
-      }
-      this.#binding = binding;
-      this.registry.claimed(this, binding);
-      this.#resolveReady();
-      this.wake();
-    } catch (error) {
-      if (
-        !this.#closed &&
-        this.#attachment === attachment &&
-        this.registry.current(runtime)
-      )
-        this.#fail(failure(error));
-    }
-  }
-  close(clearError = true): Promise<void> {
-    if (clearError) this.#error = undefined;
-    if (this.#closed) return this.#closing ?? Promise.resolve();
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    if (this.#watcher) this.#capture(this.state());
     this.#closed = true;
-    this.#resolveReady();
-    this.#attachment = undefined;
-    const binding = this.#binding;
-    this.#binding = undefined;
+    const release = this.#resource.close();
     for (const pending of this.#pending.splice(0)) {
       if (this.#error) pending.reject(this.#error);
       else pending.resolve({ type: "closed" });
     }
-    this.#closing = Promise.all([
-      binding ? this.registry.release(this, binding) : undefined,
-      ...this.#lifecycle,
-    ]).then(() => this.registry.forget(this));
-    return this.#closing;
+    return (this.#closing = release.then(() => {
+      this.registry.forget(this);
+    }));
   }
-  #fail(error: DataError): void {
-    this.#error = error;
-    this.#rejectReady(error);
-    void this.close(false);
+  #fail(error: Error): void {
+    this.#error ??= error;
+    void this.close();
   }
   wake(): void {
     this.#again = true;
@@ -386,8 +483,8 @@ class DataStream<D extends Delivery> {
   async #drain(): Promise<void> {
     this.#pumping = true;
     try {
-      while (!this.#closed && this.#pending.length && this.#binding) {
-        const binding = this.#binding;
+      while (!this.#closed && this.#pending.length && this.#resource.binding) {
+        const binding = this.#resource.binding;
         this.#again = false;
         let value: unknown;
         try {
@@ -396,11 +493,11 @@ class DataStream<D extends Delivery> {
             owner: binding.owner,
           });
         } catch (error) {
-          if (!this.#closed && this.#binding === binding)
+          if (!this.#closed && this.#resource.current(binding))
             this.#fail(failure(error));
           continue;
         }
-        if (this.#closed || this.#binding !== binding) continue;
+        if (this.#closed || !this.#resource.current(binding)) continue;
         if (value === null) {
           if (this.#again) continue;
           break;

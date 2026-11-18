@@ -1,7 +1,7 @@
 use super::*;
 use pulsebeam_agent_native::agent_core::{
     AgentError, DataEvent, ResourceCommand, ResourceResult, TopicPublisher, TopicSubscriber,
-    TrackResourceError, TrackSpec,
+    TrackResourceError, TrackSelector, TrackSpec,
 };
 use pulsebeam_agent_native::{Agent, Error};
 
@@ -14,6 +14,7 @@ pub(super) struct DataLane {
     publisher: Agent,
     receiver: Agent,
     participant_external_id: String,
+    source_room: String,
     owner: u64,
     excluded: u64,
     supplied: BTreeMap<Vec<u8>, u8>,
@@ -64,7 +65,12 @@ impl DataLane {
             .receiver
             .resource(ResourceCommand::ReceiveData {
                 spec: self.spec(),
-                participant_id,
+                source: TrackSelector {
+                    room: self.source_room.clone(),
+                    participant_external_id: participant_id
+                        .unwrap_or_else(|| self.participant_external_id.clone()),
+                    label: self.topic.clone(),
+                },
             })
             .await?
         else {
@@ -82,15 +88,26 @@ impl DataLane {
         handles["anchor"].shared.pending_ops.lock().unwrap().push(
             PendingDriverOp::DeclarePublishTopic(topic.clone(), delivery.mode()),
         );
+        // The excluded-self cursor is a distinct scoped intent from the delivery cursor.
         handles["continuing"]
             .shared
             .pending_ops
             .lock()
             .unwrap()
-            .push(PendingDriverOp::DeclareSubscribeTopic(
-                topic.clone(),
-                delivery.mode(),
-            ));
+            .push(PendingDriverOp::DeclareSubscribeTopic(vec![
+                TopicSubscriber {
+                    room: handles["anchor"].room_name.to_owned(),
+                    participant_external_id: handles["anchor"].endpoint.clone(),
+                    topic: topic.clone(),
+                    mode: delivery.mode(),
+                },
+                TopicSubscriber {
+                    room: handles["continuing"].room_name.to_owned(),
+                    participant_external_id: handles["continuing"].endpoint.clone(),
+                    topic: topic.clone(),
+                    mode: delivery.mode(),
+                },
+            ]));
         let publisher = application_agent(state, handles, "anchor").await?;
         let receiver = application_agent(state, handles, "continuing").await?;
         let participant_external_id = publisher
@@ -107,6 +124,7 @@ impl DataLane {
             publisher,
             receiver,
             participant_external_id,
+            source_room: handles["anchor"].room_name.to_owned(),
             owner: 0,
             excluded: 0,
             supplied: BTreeMap::new(),
@@ -145,6 +163,8 @@ impl DataLane {
                         .any(|status| {
                             status.registration
                                 == TopicSubscriber {
+                                    room: lane.source_room.clone(),
+                                    participant_external_id: lane.participant_external_id.clone(),
                                     topic: lane.topic.clone(),
                                     mode: delivery.mode(),
                                 }

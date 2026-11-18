@@ -19,12 +19,13 @@ fn fixture() -> (ApplicationStateOracle, ClientObservation) {
     let canonical = source_connection.derive_track_id(TrackKind::Video, "opaque-owned-source");
     let model = ApplicationStateOracle {
         participants: [
-            (publisher, true, source_connection),
-            (viewer, false, receiver_connection),
+            (publisher, "publisher", true, source_connection),
+            (viewer, "viewer", false, receiver_connection),
         ]
         .into_iter()
-        .map(|(id, video, connection)| ExpectedParticipant {
+        .map(|(id, external_id, video, connection)| ExpectedParticipant {
             id,
+            external_id: external_id.into(),
             room: "room",
             video,
             video_label: "video".into(),
@@ -78,6 +79,7 @@ fn audio_fixture(capacity: u32) -> (ApplicationStateOracle, ClientObservation) {
     let (mut model, mut client) = fixture();
     for name in ["audio-first", "audio-second", "audio-third"] {
         let mut source = ExpectedParticipant {
+            external_id: name.into(),
             id: ParticipantId::derive(
                 &model.participants[0].room_id().unwrap(),
                 &ParticipantExternalId::new(name).unwrap(),
@@ -237,18 +239,14 @@ fn transition_safety_allows_pending_withdrawal_but_rejects_invalid_assignments()
     })
     .unwrap();
     agent
-        .command(core::AgentCommand::ReplaceDesired(core::DesiredState {
-            revision: 1,
-            connected: true,
-            ..Default::default()
-        }))
+        .command(core::AgentCommand::Join("room".into()))
         .unwrap();
     let core::Effect::Rtc(core::RtcEffect::CreateOffer { generation, .. }) =
         agent.next_effect().unwrap()
     else {
         panic!("expected admission offer");
     };
-    let (_, mut client) = fixture();
+    let (mut cross_room, mut client) = fixture();
     client.snapshot.generation = Some(generation);
     let publication = client.snapshot.publications.pop_first().unwrap().1;
     client
@@ -268,6 +266,23 @@ fn transition_safety_allows_pending_withdrawal_but_rejects_invalid_assignments()
         model
             .check_client(&model.participants[1], &client, &[])
             .is_err()
+    );
+    cross_room.participants[0].room = "other-room";
+    client.snapshot.participants.clear();
+    client.snapshot.remote_tracks.clear();
+    let requested = [cross_room.participants[0].id.as_str()];
+    assert!(client.snapshot.publications.is_empty());
+    cross_room
+        .check_client(&cross_room.participants[1], &client, &requested)
+        .unwrap();
+    let mut unbound = cross_room.participants.clone();
+    unbound[0].media.clear();
+    assert!(
+        ApplicationStateOracle {
+            participants: unbound
+        }
+        .check_client(&cross_room.participants[1], &client, &requested)
+        .is_err()
     );
     let mutations: &[Mutation<ClientObservation>] = &[
         ("retired receiver", |state| state.owned_receivers.clear()),
@@ -293,6 +308,12 @@ fn transition_safety_allows_pending_withdrawal_but_rejects_invalid_assignments()
         assert!(
             ApplicationStateOracle::check_client_safety(&invalid, &allowed).is_err(),
             "accepted {name}"
+        );
+        assert!(
+            cross_room
+                .check_client(&cross_room.participants[1], &invalid, &requested)
+                .is_err(),
+            "accepted explicit remote source with {name}"
         );
     }
 }
@@ -377,6 +398,8 @@ fn subscriber_bindings_follow_declared_room_topic_and_mode() {
             mode: TopicMode::Ordered,
         });
     let registration = TopicSubscriber {
+        room: model.participants[0].room.to_owned(),
+        participant_external_id: model.participants[0].external_id.clone(),
         topic: "updates".into(),
         mode: TopicMode::Ordered,
     };
@@ -415,6 +438,14 @@ fn subscriber_bindings_follow_declared_room_topic_and_mode() {
             .is_err()
     );
     client.snapshot.topics.subscribers[0].publishers = 1;
+    let external = model.participants[0].external_id.clone();
+    model.participants[0].external_id = "other-publisher".into();
+    assert!(
+        model
+            .check_client(&model.participants[1], &client, &requested)
+            .is_err()
+    );
+    model.participants[0].external_id = external;
     model.participants[0].topics.publishers[0].mode = TopicMode::Latest;
     assert!(
         model

@@ -37,10 +37,17 @@ impl NativeSession {
         ) {
             return true;
         }
+        let Some(wire::resource_spec::Declaration::Subscription(subscription)) =
+            owned.declaration.declaration.as_ref()
+        else {
+            return true;
+        };
         if let Some(source) = &owned.receiver_source {
-            return self
-                .permissions
-                .can_subscribe(&source.participant, &source.track);
+            return self.permissions.can_subscribe(
+                &subscription.source_room,
+                &source.participant,
+                &source.track,
+            );
         }
         match &row.value.value {
             Some(wire::confirmed_state::Value::Owned(live)) => live
@@ -48,7 +55,8 @@ impl NativeSession {
                 .as_ref()
                 .zip(live.track.as_ref())
                 .is_some_and(|(participant, track)| {
-                    self.permissions.can_subscribe(participant, track)
+                    self.permissions
+                        .can_subscribe(&subscription.source_room, participant, track)
                 }),
             // An unresolved intent still needs the full source check before preparation.
             _ => true,
@@ -125,7 +133,19 @@ impl NativeSession {
             {
                 if commands.len() < capacity {
                     self.revoke(reference, wire::AbsenceReason::PermissionRevoked)?;
-                    commands.push(self.retirement_command(reference)?);
+                    if self
+                        .rows
+                        .get(&Key::Owned(reference))
+                        .and_then(|row| row.owned.as_ref())
+                        .is_some_and(|owned| is_source_lookup(&owned.declaration))
+                    {
+                        self.finish_source_lookup(
+                            reference,
+                            wire::AbsenceReason::PermissionRevoked,
+                        )?;
+                    } else {
+                        commands.push(self.retirement_command(reference)?);
+                    }
                 } else {
                     sweep.again = true;
                 }

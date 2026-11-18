@@ -24,8 +24,6 @@ mod reconciliation;
 mod room_intent;
 
 const PARTICIPANT_URI: &str = "https://other-origin.test/an%20opaque/path?value=%2Fexact";
-const LOCAL_PUBLISHER: &str = "pa_00000000000000000000000000";
-const REMOTE_PUBLISHER: &str = "pa_11111111111111111111111111";
 const VIDEO_INTENT_LOG_PREFIX: &str = "desired video subscriptions changed";
 
 #[allow(clippy::disallowed_types)] // The process-global test logger serializes capture across tests.
@@ -390,6 +388,8 @@ fn publisher(topic: &str, mode: TopicMode) -> TopicPublisher {
 
 fn subscriber(topic: &str, mode: TopicMode) -> TopicSubscriber {
     TopicSubscriber {
+        room: "room".into(),
+        participant_external_id: "remote-app-user".into(),
         topic: topic.to_string(),
         mode,
     }
@@ -809,6 +809,7 @@ fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
             payload: codec::encode_server(&state::ServerStateBatch {
                 records: vec![record],
                 initial_complete: false,
+                ..Default::default()
             })
             .unwrap(),
         });
@@ -2351,7 +2352,10 @@ fn participant_superseded_notice_is_typed_and_requires_a_new_agent() {
         }))
         .unwrap();
     agent.command(AgentCommand::Reconnect).unwrap();
-    agent.command(AgentCommand::Connect).unwrap();
+    assert_eq!(
+        agent.command(AgentCommand::Connect),
+        Err(AgentError::Replaced)
+    );
     assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(agent.snapshot().terminal_failure.as_ref(), Some(&failure));
     assert_eq!(
@@ -2391,7 +2395,10 @@ fn participant_superseded_notice_is_typed_and_requires_a_new_agent() {
             effect => panic!("unexpected cleanup effect: {effect:?}"),
         }
     }
-    agent.command(AgentCommand::Connect).unwrap();
+    assert_eq!(
+        agent.command(AgentCommand::Connect),
+        Err(AgentError::Replaced)
+    );
     agent.command(AgentCommand::Reconnect).unwrap();
     assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(agent.snapshot().terminal_failure.as_ref(), Some(&failure));
@@ -2474,7 +2481,10 @@ fn superseded_admission_cancels_recovery_and_ignores_late_completions() {
             .unwrap();
     }
     agent.command(AgentCommand::Reconnect).unwrap();
-    agent.command(AgentCommand::Connect).unwrap();
+    assert_eq!(
+        agent.command(AgentCommand::Connect),
+        Err(AgentError::Replaced)
+    );
     assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(
         agent.snapshot().connection,
@@ -2688,6 +2698,7 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
             channel: signal,
             payload: codec::encode_server(&state::ServerStateBatch {
                 initial_complete: true,
+                catalog_records: Vec::new(),
                 records: vec![
                     grant(1),
                     confirmed(
@@ -3029,23 +3040,25 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
         agent.next_effect_after_turn().is_none(),
         "source absence does not release logical receive ownership"
     );
-    let mut waiting = desired(2);
-    waiting.video[0].track_id = "future-video".into();
+    let mut waiting = native_media::scoped_desired(2);
+    waiting.video[0].selector.as_mut().unwrap().label = "future-camera".into();
     agent
         .command(AgentCommand::ReplaceDesired(waiting))
         .unwrap();
     native_media::finish_retirements(&mut agent, generation, &["rv0"], &[]);
+    native_media::confirm_missing_lookups(&mut agent, generation, channel);
     assert!(
         agent.next_effect_after_turn().is_none(),
         "unknown source intent waits without retaining another source's receiver"
     );
-    let mut stopped = desired(3);
+    let mut stopped = native_media::scoped_desired(3);
     stopped.video.clear();
     stopped.audio = AudioSubscription::default();
     agent
         .command(AgentCommand::ReplaceDesired(stopped))
         .unwrap();
     native_media::finish_retirements(&mut agent, generation, &["ra0"], &[]);
+    native_media::confirm_missing_lookups(&mut agent, generation, channel);
     assert!(agent.snapshot().participants.is_empty());
     assert!(agent.snapshot().publications.is_empty());
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
@@ -3089,7 +3102,9 @@ fn partial_native_observations_preserve_other_receivers_and_declared_desire() {
     assert!(agent.snapshot().video_mapping.is_empty());
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     agent
-        .command(AgentCommand::ReplaceDesired(desired(1)))
+        .command(AgentCommand::ReplaceDesired(native_media::scoped_desired(
+            1,
+        )))
         .unwrap();
     assert!(agent.next_effect_after_turn().is_none());
     native_connection::observe(&mut agent, generation, channel, vec![installed]);
@@ -3180,7 +3195,7 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
     assert_eq!(agent.snapshot().video_mapping[&4], "video-track");
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     assert!(agent.next_effect_after_turn().is_none());
-    let mut changed = desired(2);
+    let mut changed = native_media::scoped_desired(2);
     changed.video[0].height = 1080;
     agent
         .command(AgentCommand::ReplaceDesired(changed.clone()))
@@ -3213,19 +3228,21 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     changed.revision = 3;
     changed.video.clear();
-    changed.audio.pinned.clear();
+    changed.audio.selected.clear();
     changed.audio.automatic = false;
     agent
         .command(AgentCommand::ReplaceDesired(changed))
         .unwrap();
     let retired = native_media::next(&mut agent, generation, channel);
-    assert_eq!(retired.len(), 2);
-    for target in &retired {
+    assert_eq!(retired.len(), 4);
+    for previous in &targets {
         assert!(
-            targets
+            retired
                 .iter()
-                .any(|previous| previous.reference == target.reference)
+                .any(|target| target.reference == previous.reference)
         );
+    }
+    for target in &retired {
         assert_eq!(
             target.desired.value,
             Some(state::desired_state::Value::Absent(true))
@@ -3269,12 +3286,14 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         let mut selected = desired(1);
         selected.video[0].track_id.clear();
         selected.video[0].selector = Some(TrackSelector {
+            room: "room".into(),
             participant_external_id: "remote-user".to_string(),
             label: "camera".to_string(),
         });
         selected.audio.pinned.clear();
         selected.audio.automatic = false;
         let audio_selector = TrackSelector {
+            room: "room".into(),
             participant_external_id: "remote-user".to_string(),
             label: "microphone".to_string(),
         };
@@ -3345,45 +3364,27 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         } else {
             None
         };
-        let (mut agent, generation, channel, unresolved) =
+        let (mut agent, generation, channel, resolved, lookups) =
             native_media::connected_with(agent, selected);
-        assert!(unresolved.is_empty());
+        assert_eq!(resolved.len(), 2);
         let participant = state::Participant {
-            participant_id: "remote".into(),
+            participant_id: "pa_11111111111111111111111111".into(),
             participant_external_id: "remote-user".into(),
         };
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            vec![confirmed(
-                state::resource_key::Key::Participant(participant.participant_id.clone()),
-                0,
-                state::confirmed_state::Value::Participant(participant.clone()),
-            )],
-        );
-        assert!(agent.next_effect_after_turn().is_none());
         let tracks = [
-            native_media::track("video-one", "remote", "camera", MediaKind::Video),
-            native_media::track("audio-one", "remote", "microphone", MediaKind::Audio),
+            native_media::track(
+                "video-one",
+                &participant.participant_id,
+                "camera",
+                MediaKind::Video,
+            ),
+            native_media::track(
+                "audio-one",
+                &participant.participant_id,
+                "microphone",
+                MediaKind::Audio,
+            ),
         ];
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            tracks
-                .iter()
-                .map(|track| {
-                    confirmed(
-                        state::resource_key::Key::Track(track.track_id.clone()),
-                        0,
-                        state::confirmed_state::Value::Track(track.clone()),
-                    )
-                })
-                .collect(),
-        );
-        let resolved = native_media::next(&mut agent, generation, channel);
-        assert_eq!(resolved.len(), 2);
         for target in &resolved {
             let Some(state::resource_spec::Declaration::Subscription(subscription)) =
                 &target.spec().declaration
@@ -3571,6 +3572,28 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             assert!(closed.closed && closed.target.is_none());
             assert_eq!(closed.observation, previous.observation);
         }
+        let video_lookup = lookups
+            .iter()
+            .find(|target| matches!(
+                &target.spec().declaration,
+                Some(state::resource_spec::Declaration::SourceLookup(lookup))
+                    if lookup.source.as_ref().is_some_and(|source| source.kind == state::TrackKind::Video as i32)
+            ))
+            .unwrap();
+        observe(
+            &mut agent,
+            generation,
+            channel,
+            vec![confirmed(
+                state::resource_key::Key::Owned(video_lookup.reference),
+                video_lookup.desired.revision,
+                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
+                    spec: Some(video_lookup.spec().clone()),
+                    participant: None,
+                    track: None,
+                })),
+            )],
+        );
         let cutoff = native_media::next(&mut agent, generation, channel);
         assert_eq!(cutoff.len(), 1);
         assert_eq!(cutoff[0].reference, video.reference);
@@ -3591,52 +3614,92 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             &mut agent,
             generation,
             channel,
-            vec![confirmed(
-                state::resource_key::Key::Owned(video.reference),
-                video.desired.revision,
-                state::confirmed_state::Value::Absent(state::AbsentState {
-                    reason: state::AbsenceReason::SourceEnded as i32,
-                }),
-            )],
+            cutoff
+                .iter()
+                .map(|target| {
+                    confirmed(
+                        state::resource_key::Key::Owned(target.reference),
+                        target.desired.revision,
+                        state::confirmed_state::Value::Absent(state::AbsentState {
+                            reason: state::AbsenceReason::SourceEnded as i32,
+                        }),
+                    )
+                })
+                .collect(),
         );
         assert!(agent.snapshot().video_mapping.is_empty());
         native_media::finish_retirements(&mut agent, generation, &["rv0"], &[]);
-        let Effect::Rtc(RtcEffect::AllocateMedia { operation, .. }) = next_effect(&mut agent)
+        assert!(
+            agent.next_effect_after_turn().is_none(),
+            "an unresolved source does not allocate a replacement receiver"
+        );
+        let failed_candidate = native_media::track(
+            "video-failed-candidate",
+            &participant.participant_id,
+            "camera",
+            MediaKind::Video,
+        );
+        observe(
+            &mut agent,
+            generation,
+            channel,
+            vec![confirmed(
+                state::resource_key::Key::Owned(video_lookup.reference),
+                video_lookup.desired.revision,
+                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
+                    spec: Some(video_lookup.spec().clone()),
+                    participant: Some(participant.clone()),
+                    track: Some(failed_candidate),
+                })),
+            )],
+        );
+        let Effect::Rtc(RtcEffect::AllocateMedia {
+            generation: allocated_generation,
+            operation,
+            allocations,
+        }) = next_effect(&mut agent)
         else {
-            panic!("fresh receiver allocation")
+            panic!("resolved replacement receiver allocation")
         };
+        assert_eq!(allocated_generation, generation);
+        assert_eq!(allocations.len(), 1);
         agent
             .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
                 generation,
                 operation,
                 slots: Vec::new(),
-                outcome: client_sdp::ApplyOutcome::NotApplied,
-                preparation: Err(client_sdp::Error::Observation),
+                outcome: crate::client_sdp::ApplyOutcome::NotApplied,
+                preparation: Err(crate::client_sdp::Error::Observation),
             }))
             .unwrap();
         assert!(
-            agent.next_effect_after_turn().is_none(),
-            "failed allocation neither revives the retired receiver nor spins"
+            agent.snapshot().video_mapping.is_empty(),
+            "failed replacement allocation does not revive the retired receiver"
         );
-        let replacement = native_media::track("video-three", "remote", "camera", MediaKind::Video);
+        assert!(
+            agent.next_effect_after_turn().is_none(),
+            "failed replacement allocation does not spin"
+        );
+
+        let replacement = native_media::track(
+            "video-three",
+            &participant.participant_id,
+            "camera",
+            MediaKind::Video,
+        );
         observe(
             &mut agent,
             generation,
             channel,
-            vec![
-                confirmed(
-                    state::resource_key::Key::Track("video-two".into()),
-                    0,
-                    state::confirmed_state::Value::Absent(state::AbsentState {
-                        reason: state::AbsenceReason::Removed as i32,
-                    }),
-                ),
-                confirmed(
-                    state::resource_key::Key::Track(replacement.track_id.clone()),
-                    0,
-                    state::confirmed_state::Value::Track(replacement.clone()),
-                ),
-            ],
+            vec![confirmed(
+                state::resource_key::Key::Owned(video_lookup.reference),
+                video_lookup.desired.revision,
+                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
+                    spec: Some(video_lookup.spec().clone()),
+                    participant: Some(participant.clone()),
+                    track: Some(replacement.clone()),
+                })),
+            )],
         );
         let assigned = SlotBinding {
             slot: MediaSlot::RemoteVideo(0),
@@ -3726,19 +3789,32 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
                 ResourceResult::Superseded
             );
             let withdrawn = native_media::next(&mut agent, generation, channel);
-            assert_eq!(withdrawn.len(), 1);
-            assert_eq!(withdrawn[0].reference, fresh[0].reference);
-            assert_eq!(
-                withdrawn[0].desired.value,
-                Some(state::desired_state::Value::Absent(true))
+            assert_eq!(withdrawn.len(), 2);
+            assert!(
+                withdrawn
+                    .iter()
+                    .any(|target| target.reference == fresh[0].reference)
             );
+            assert!(
+                withdrawn
+                    .iter()
+                    .any(|target| target.reference == video_lookup.reference)
+            );
+            assert!(withdrawn.iter().all(|target| matches!(
+                target.desired.value,
+                Some(state::desired_state::Value::Absent(true))
+            )));
         }
         let audio = resolved
             .iter()
             .find(|target| target.reference != video.reference)
             .unwrap();
-        let replacement =
-            native_media::track("audio-two", "remote", "microphone", MediaKind::Audio);
+        let replacement = native_media::track(
+            "audio-two",
+            &participant.participant_id,
+            "microphone",
+            MediaKind::Audio,
+        );
         observe(
             &mut agent,
             generation,
@@ -3771,6 +3847,28 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         };
         live.execution = state::ExecutionStatus::WaitingForSource as i32;
         observe(&mut agent, generation, channel, vec![waiting]);
+        let audio_lookup = lookups
+            .iter()
+            .find(|target| matches!(
+                &target.spec().declaration,
+                Some(state::resource_spec::Declaration::SourceLookup(lookup))
+                    if lookup.source.as_ref().is_some_and(|source| source.kind == state::TrackKind::Audio as i32)
+            ))
+            .unwrap();
+        observe(
+            &mut agent,
+            generation,
+            channel,
+            vec![confirmed(
+                state::resource_key::Key::Owned(audio_lookup.reference),
+                audio_lookup.desired.revision,
+                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
+                    spec: Some(audio_lookup.spec().clone()),
+                    participant: None,
+                    track: None,
+                })),
+            )],
+        );
         if let Some(old) = &audio_observation {
             assert!(
                 matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == old.observation)
@@ -3796,19 +3894,45 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             &mut agent,
             generation,
             channel,
-            vec![confirmed(
-                state::resource_key::Key::Owned(audio.reference),
-                audio.desired.revision,
-                state::confirmed_state::Value::Absent(state::AbsentState {
-                    reason: state::AbsenceReason::SourceEnded as i32,
-                }),
-            )],
+            cutoff
+                .iter()
+                .map(|target| {
+                    confirmed(
+                        state::resource_key::Key::Owned(target.reference),
+                        target.desired.revision,
+                        state::confirmed_state::Value::Absent(state::AbsentState {
+                            reason: state::AbsenceReason::SourceEnded as i32,
+                        }),
+                    )
+                })
+                .collect(),
         );
         native_media::finish_retirements(
             &mut agent,
             generation,
             &["ra0"],
             core::slice::from_ref(&assigned),
+        );
+        assert!(agent.next_effect_after_turn().is_none());
+        let audio_replacement = native_media::track(
+            "audio-two",
+            &participant.participant_id,
+            "microphone",
+            MediaKind::Audio,
+        );
+        observe(
+            &mut agent,
+            generation,
+            channel,
+            vec![confirmed(
+                state::resource_key::Key::Owned(audio_lookup.reference),
+                audio_lookup.desired.revision,
+                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
+                    spec: Some(audio_lookup.spec().clone()),
+                    participant: Some(participant.clone()),
+                    track: Some(audio_replacement.clone()),
+                })),
+            )],
         );
         native_media::finish_allocation(
             &mut agent,
@@ -3832,7 +3956,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             &mut agent,
             generation,
             channel,
-            vec![fresh_audio[0].installed(participant, replacement)],
+            vec![fresh_audio[0].installed(participant, audio_replacement)],
         );
         assert_eq!(agent.snapshot().audio_mapping[&7], "audio-two");
         if let Some(id) = fresh_audio_request {
@@ -3870,8 +3994,17 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
                 matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == id)
             );
             let withdrawn = native_media::next(&mut agent, generation, channel);
-            assert_eq!(withdrawn.len(), 1);
-            assert_eq!(withdrawn[0].reference, fresh_audio[0].reference);
+            assert_eq!(withdrawn.len(), 2);
+            assert!(
+                withdrawn
+                    .iter()
+                    .any(|target| target.reference == fresh_audio[0].reference)
+            );
+            assert!(
+                withdrawn
+                    .iter()
+                    .any(|target| target.reference == audio_lookup.reference)
+            );
         }
         assert_eq!(agent.snapshot().generation, Some(generation));
         assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
@@ -3947,6 +4080,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
             })
             .collect(),
         initial_complete: false,
+        ..Default::default()
     }
     .encode_to_vec();
     assert!(matches!(
@@ -4192,13 +4326,13 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
             .map(|target| target.receiver_installed(&participant, &tracks))
             .collect(),
     );
-    let mut per_track = desired(2);
+    let mut per_track = native_media::scoped_desired(2);
     per_track.video[0].playout_delay = PlayoutDelay::Fixed {
         min_ms: 20,
         max_ms: 100,
     };
-    per_track.audio.playout_delays.insert(
-        "audio-track".into(),
+    per_track.audio.selector_delays.insert(
+        per_track.audio.selected[0].clone(),
         PlayoutDelay::Fixed {
             min_ms: 0,
             max_ms: 0,
@@ -4242,7 +4376,9 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
         }
     }
     agent
-        .command(AgentCommand::ReplaceDesired(desired(3)))
+        .command(AgentCommand::ReplaceDesired(native_media::scoped_desired(
+            3,
+        )))
         .unwrap();
     assert!(
         agent.next_effect_after_turn().is_none(),
@@ -4283,7 +4419,7 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
             }
         }
     }
-    let mut retracted = desired(4);
+    let mut retracted = native_media::scoped_desired(4);
     retracted.publications.clear();
     retracted.video.clear();
     retracted.audio = AudioSubscription::default();
@@ -4291,7 +4427,7 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
         .command(AgentCommand::ReplaceDesired(retracted))
         .unwrap();
     let withdrawals = native_media::next(&mut agent, generation, channel);
-    assert_eq!(withdrawals.len(), 3);
+    assert_eq!(withdrawals.len(), 5);
     assert!(
         withdrawals
             .iter()
@@ -4541,30 +4677,50 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     let (mut agent, generation, control) =
         native_connection::connected(TopicRegistrations::default());
     let mut registrations = TopicRegistrations::default();
+    let pinned_subscriber = |topic: &str, mode, external_id: &str| TopicSubscriber {
+        room: "room".into(),
+        participant_external_id: external_id.into(),
+        topic: topic.into(),
+        mode,
+    };
     let mut omitted = Vec::new();
-    for (index, (label, mode, local, remote)) in [
-        ("state", TopicMode::Latest, "local-a", "remote-a"),
-        ("telemetry", TopicMode::Lossy, "local-b", "remote-b"),
-        ("chat/Δ", TopicMode::Ordered, "local-c", "remote-c"),
+    let mut omitted_lookup_refs = BTreeSet::new();
+    for (index, (label, mode, local, remote_external, remote_source)) in [
+        (
+            "state",
+            TopicMode::Latest,
+            "local-a",
+            "remote-app-user",
+            "opaque/server/remote-a",
+        ),
+        (
+            "telemetry",
+            TopicMode::Lossy,
+            "local-b",
+            "remote-app-user",
+            "opaque/server/remote-b",
+        ),
+        (
+            "chat/Δ",
+            TopicMode::Ordered,
+            "local-c",
+            "remote-app-user",
+            "opaque/server/remote-c",
+        ),
     ]
     .into_iter()
     .enumerate()
     {
         registrations.publishers.push(publisher(label, mode));
-        registrations.subscribers.push(subscriber(label, mode));
+        let revision = 2 + 2 * u64::try_from(index).unwrap();
         agent
             .command(AgentCommand::ReplaceDesired(DesiredState {
-                revision: 2 + u64::try_from(index).unwrap(),
+                revision,
                 connected: true,
                 topics: registrations.clone(),
                 ..Default::default()
             }))
             .unwrap();
-        if mode == TopicMode::Ordered {
-            assert!(
-                matches!(next_effect(&mut agent), Effect::Timer(TimerEffect::Schedule { after, .. }) if after == Duration::from_secs(2))
-            );
-        }
         let publication = native_connection::prepare_data(&mut agent, generation, control);
         assert!(
             matches!(&publication.spec.declaration, Some(state::resource_spec::Declaration::Publication(spec)) if spec.label == label)
@@ -4576,12 +4732,37 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
             &publication,
             local,
         );
+        let remote_subscriber = pinned_subscriber(label, mode, remote_external);
+        registrations.subscribers.push(remote_subscriber.clone());
+        agent
+            .command(AgentCommand::ReplaceDesired(DesiredState {
+                revision: revision + 1,
+                connected: true,
+                topics: registrations.clone(),
+                ..Default::default()
+            }))
+            .unwrap();
+        if mode == TopicMode::Ordered {
+            assert!(
+                matches!(next_effect(&mut agent), Effect::Timer(TimerEffect::Schedule { after, .. }) if after == Duration::from_secs(2))
+            );
+        }
+        let lookup_references = native_connection::answer_source_lookup_batch(
+            &mut agent,
+            generation,
+            control,
+            &registrations,
+            Some(remote_source),
+        );
+        if index < 2 {
+            omitted_lookup_refs.extend(lookup_references);
+        }
         let receiving = native_connection::prepare_subscription(
             &mut agent,
             generation,
             control,
-            remote,
-            &subscriber(label, mode),
+            remote_source,
+            &remote_subscriber,
         );
         for prepared in [&publication, &receiving] {
             assert!(
@@ -4618,11 +4799,15 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
             .all(|status| status.channel.is_some() && status.data_track_id.is_some())
     );
     let retained = DesiredState {
-        revision: 5,
+        revision: 8,
         connected: true,
         topics: TopicRegistrations {
             publishers: vec![publisher("chat/Δ", TopicMode::Ordered)],
-            subscribers: vec![subscriber("chat/Δ", TopicMode::Ordered)],
+            subscribers: vec![pinned_subscriber(
+                "chat/Δ",
+                TopicMode::Ordered,
+                "remote-app-user",
+            )],
         },
         ..Default::default()
     };
@@ -4640,7 +4825,12 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     };
     assert_eq!(channel, control);
     let batch = codec::decode_client(&payload).unwrap();
-    assert_eq!(batch.records.len(), 4);
+    let expected_refs = omitted
+        .iter()
+        .map(|(reference, _)| *reference)
+        .chain(omitted_lookup_refs.iter().copied())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(batch.records.len(), expected_refs.len());
     let mut refs = BTreeSet::new();
     let confirmed = batch
         .records
@@ -4664,10 +4854,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
             )
         })
         .collect();
-    assert_eq!(
-        refs,
-        omitted.iter().map(|(reference, _)| *reference).collect()
-    );
+    assert_eq!(refs, expected_refs);
     assert_eq!(agent.snapshot().topics.publishers.len(), 1);
     assert_eq!(agent.snapshot().topics.subscribers.len(), 1);
     acknowledge_send(&mut agent, generation, control, operation);
@@ -4770,6 +4957,10 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
             channel,
             vec![native_connection::grant(1)],
         );
+        let Effect::Timer(TimerEffect::Schedule { timer, after }) = next_effect(&mut agent) else {
+            panic!("source recovery timer")
+        };
+        assert_eq!(after, Duration::from_secs(2));
         if discovery_complete {
             agent
                 .handle(HostEvent::DataChannel(DataChannelEvent::Message {
@@ -4778,16 +4969,36 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
                     payload: codec::encode_server(&pulsebeam_proto::state::ServerStateBatch {
                         records: Vec::new(),
                         initial_complete: true,
+                        ..Default::default()
                     })
                     .unwrap(),
                 }))
                 .unwrap();
         }
-        let Effect::Timer(TimerEffect::Schedule { timer, after }) = next_effect(&mut agent) else {
-            panic!("source recovery timer")
-        };
-        assert_eq!(after, Duration::from_secs(2));
-        assert!(agent.next_effect_after_turn().is_none());
+        let _ = native_connection::answer_source_lookup_batch(
+            &mut agent,
+            generation,
+            channel,
+            &TopicRegistrations {
+                subscribers: vec![subscriber.clone()],
+                ..Default::default()
+            },
+            None,
+        );
+        if !discovery_complete {
+            agent
+                .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                    generation,
+                    channel,
+                    payload: codec::encode_server(&pulsebeam_proto::state::ServerStateBatch {
+                        records: Vec::new(),
+                        initial_complete: true,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                }))
+                .unwrap();
+        }
         let receiving = native_connection::prepare_subscription(
             &mut agent,
             generation,
@@ -4838,12 +5049,13 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
         &prepared,
         native_connection::SOURCE,
     );
-    let receiving = native_connection::prepare_subscription(
+    let receiving = native_connection::prepare_subscription_staged(
         &mut agent,
         generation,
         control,
         native_connection::REMOTE_SOURCE,
         &subscriber("state", TopicMode::Latest),
+        Some(&prepared),
     );
     let publish_channel = prepared.channel;
     let subscribe_channel = receiving.channel;
@@ -4932,6 +5144,208 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
         })),
         Err(AgentError::InvalidTopic(TopicError::PayloadTooLarge { .. }))
     ));
+}
+
+#[test]
+fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
+    let mut agent = Agent::new(config()).unwrap();
+    let ResourceResult::Publication { owner, slot, .. } = agent
+        .resource(ResourceCommand::ClaimPublication {
+            spec: TrackSpec::Video {
+                label: "camera".into(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("publication owner");
+    };
+    let ResourceResult::PublicationInput { operation, .. } = agent
+        .resource(ResourceCommand::AttachPublicationInput { owner })
+        .unwrap()
+    else {
+        panic!("input lifetime");
+    };
+    let input = operation.input().unwrap();
+    agent
+        .resource(ResourceCommand::CompletePublicationInput {
+            operation,
+            result: Ok(()),
+        })
+        .unwrap();
+    agent
+        .resource(ResourceCommand::SetPublicationMuted { owner, muted: true })
+        .unwrap();
+    let ResourceResult::Owned { owner: receiver } = agent
+        .resource(ResourceCommand::ClaimVideo {
+            selector: TrackSelector {
+                room: "main".into(),
+                participant_external_id: "remote-device".into(),
+                label: "camera".into(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("pinned receiver owner");
+    };
+    let registered = agent.publication_input_state(input).unwrap();
+    assert_eq!(registered.slot, slot);
+    let pipe = agent.pipe_state(input).unwrap();
+    assert_eq!(pipe.status, crate::ffi::PipeStatus::Available);
+    let pinned = agent.video_subscription_state(receiver).unwrap().selector;
+    while agent.next_effect_after_turn().is_some() {}
+
+    let mut previous = None;
+    for (index, room) in ["main", "breakout", "main"].into_iter().enumerate() {
+        agent.command(AgentCommand::Join(room.into())).unwrap();
+        if let Some((old_generation, _, _, _)) = previous.as_ref() {
+            assert_eq!(agent.snapshot().connection, ConnectionState::Closing);
+            let mut closed = false;
+            let mut delete = None;
+            while let Some(effect) = agent.next_effect_after_turn() {
+                match effect {
+                    Effect::Rtc(RtcEffect::Close { generation }) => {
+                        assert_eq!(generation, *old_generation);
+                        closed = true;
+                    }
+                    Effect::Http(HttpEffect::Request {
+                        operation, request, ..
+                    }) => {
+                        assert_eq!(request.method, HttpMethod::Delete);
+                        delete = Some(operation);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(closed);
+            assert_eq!(
+                agent.publication_input_state(input),
+                Some(registered.clone())
+            );
+            assert_eq!(agent.pipe_state(input), Some(pipe.clone()));
+            agent
+                .handle(HostEvent::Rtc(RtcEvent::Closed {
+                    generation: *old_generation,
+                }))
+                .unwrap();
+            agent
+                .handle(HostEvent::Http(HttpEvent::Response {
+                    operation: delete.expect("retire old admission"),
+                    response: HttpResponse {
+                        status: 204,
+                        headers: vec![],
+                        body: vec![],
+                    },
+                }))
+                .unwrap();
+        }
+        let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = next_effect(&mut agent) else {
+            panic!("fresh room offer");
+        };
+        let control = channel(400 + index as u64);
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+                generation,
+                offer: native_connection::OFFER.into(),
+                resources: OfferResources {
+                    slots: vec![],
+                    signaling_channel: control,
+                    data_channels: vec![],
+                },
+            }))
+            .unwrap();
+        let (operation, request) = native_request(&mut agent, generation);
+        let requested: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(requested["room"], room);
+        let mut response = create_response("participant", "unused", PARTICIPANT_URI);
+        let mut body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        body["room_external_id"] = room.into();
+        body["room_id"] = format!("opaque-{room}").into();
+        response.body = serde_json::to_vec(&body).unwrap();
+        agent
+            .handle(HostEvent::Http(HttpEvent::Response {
+                operation,
+                response: response.clone(),
+            }))
+            .unwrap();
+        assert!(matches!(
+            next_effect(&mut agent),
+            Effect::Rtc(RtcEffect::ApplyAnswer { generation: actual, .. }) if actual == generation
+        ));
+        for event in [
+            HostEvent::Rtc(RtcEvent::Connected { generation }),
+            HostEvent::DataChannel(DataChannelEvent::Opened {
+                generation,
+                channel: control,
+            }),
+            HostEvent::Rtc(RtcEvent::AnswerApplied { generation }),
+            HostEvent::DataChannel(DataChannelEvent::Message {
+                generation,
+                channel: control,
+                payload: pulsebeam_proto::state::codec::encode_server(
+                    &pulsebeam_proto::state::ServerStateBatch {
+                        records: vec![native_connection::grant(1)],
+                        initial_complete: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap(),
+            }),
+        ] {
+            agent.handle(event).unwrap();
+        }
+        assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+        assert_eq!(agent.snapshot().room_external_id.as_deref(), Some(room));
+        assert_eq!(
+            agent.snapshot().accepted_join_revision,
+            Some(index as u64 + 1)
+        );
+        assert_eq!(
+            agent.publication_input_state(input),
+            Some(registered.clone())
+        );
+        assert_eq!(agent.pipe_state(input), Some(pipe.clone()));
+        let publication = agent.publication_state(owner).unwrap();
+        assert!(publication.input_attached && !publication.closed);
+        assert_eq!(publication.label, "camera");
+        assert_eq!(
+            publication.admission.connection_generation,
+            Some(generation.get())
+        );
+        let subscription = agent.video_subscription_state(receiver).unwrap();
+        assert!(!subscription.closed);
+        assert_eq!(subscription.selector, pinned);
+        while agent.next_effect_after_turn().is_some() {}
+        if let Some((old_generation, old_control, old_operation, old_response)) = previous {
+            let before = agent.snapshot().clone();
+            for event in [
+                HostEvent::Rtc(RtcEvent::Connected {
+                    generation: old_generation,
+                }),
+                HostEvent::Rtc(RtcEvent::AnswerApplied {
+                    generation: old_generation,
+                }),
+                HostEvent::Http(HttpEvent::Response {
+                    operation: old_operation,
+                    response: old_response,
+                }),
+            ] {
+                agent.handle(event).unwrap();
+            }
+            native_connection::observe(
+                &mut agent,
+                old_generation,
+                old_control,
+                vec![native_connection::grant(99)],
+            );
+            assert_eq!(agent.snapshot(), &before);
+            assert_eq!(agent.pipe_state(input), Some(pipe.clone()));
+            assert_eq!(
+                agent.video_subscription_state(receiver).unwrap().selector,
+                pinned
+            );
+        }
+        previous = Some((generation, control, operation, response));
+    }
 }
 
 #[test]
@@ -5179,7 +5593,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
     assert_eq!(after_generation, None);
     assert!(agent.is_publishing(&MediaSlot::LocalVideo(slot.clone())));
 
-    let (mut agent, generation, channel, receivers) = native_media::connected_with(
+    let (mut agent, generation, channel, receivers, _lookups) = native_media::connected_with(
         agent,
         DesiredState {
             revision: 1,
@@ -5510,11 +5924,15 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         delivery: TopicMode::Lossy,
     };
     let mut owners = Vec::new();
-    for participant_id in [None, Some("remote-app-user".into()), Some("bob".into())] {
+    for _ in 0..3 {
         let ResourceResult::Owned { owner } = agent
             .resource(ResourceCommand::ReceiveData {
                 spec: spec.clone(),
-                participant_id,
+                source: TrackSelector {
+                    room: "room".into(),
+                    participant_external_id: "remote-app-user".into(),
+                    label: "events".into(),
+                },
             })
             .unwrap()
         else {
@@ -5543,8 +5961,8 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         .unwrap();
     }
     let notifications = drain_notifications(&mut agent);
-    assert_eq!(notifications.iter().filter(|notification| matches!(notification, Notification::DataReady { owners: ready } if ready == &owners[..2])).count(), 1);
-    for owner in &owners[..2] {
+    assert_eq!(notifications.iter().filter(|notification| matches!(notification, Notification::DataReady { owners: ready } if ready == &owners[..])).count(), 1);
+    for owner in &owners {
         assert_eq!(
             agent
                 .resource(ResourceCommand::ReadData { owner: *owner })
@@ -5565,12 +5983,6 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
             ResourceResult::Event { event: None }
         );
     }
-    assert_eq!(
-        agent
-            .resource(ResourceCommand::ReadData { owner: owners[2] })
-            .unwrap(),
-        ResourceResult::Event { event: None }
-    );
     for owner in &owners[..2] {
         agent
             .resource(ResourceCommand::Release { owner: *owner })
@@ -5592,31 +6004,60 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
     };
     assert_eq!(channel, control);
     let batch = codec::decode_client(&payload).unwrap();
-    let [record] = batch.records.as_slice() else {
-        panic!("one source retirement")
-    };
-    assert_eq!(record.owned, receiving.reference);
-    let Some(desired) = &record.desired else {
-        panic!("desired")
-    };
+    assert_eq!(batch.records.len(), 2, "retirements: {:#?}", batch.records);
+    let receiving_retirement = batch
+        .records
+        .iter()
+        .find(|record| record.owned == receiving.reference)
+        .unwrap();
+    let lookup_retirement = batch
+        .records
+        .iter()
+        .find(|record| record.owned != receiving.reference)
+        .unwrap();
     assert!(matches!(
-        desired.value,
+        lookup_retirement
+            .desired
+            .as_ref()
+            .and_then(|desired| desired.value.as_ref()),
         Some(state::desired_state::Value::Absent(true))
     ));
+    for record in &batch.records {
+        assert!(matches!(
+            record
+                .desired
+                .as_ref()
+                .and_then(|desired| desired.value.as_ref()),
+            Some(state::desired_state::Value::Absent(true))
+        ));
+    }
+    assert!(matches!(
+        lookup_retirement
+            .desired
+            .as_ref()
+            .and_then(|desired| desired.value.as_ref()),
+        Some(state::desired_state::Value::Absent(true))
+    ));
+    let confirmations = batch
+        .records
+        .iter()
+        .map(|record| {
+            native_connection::confirmed(
+                state::resource_key::Key::Owned(record.owned),
+                record.desired.as_ref().unwrap().revision,
+                state::confirmed_state::Value::Absent(state::AbsentState {
+                    reason: state::AbsenceReason::Removed as i32,
+                }),
+            )
+        })
+        .collect();
+    assert_eq!(
+        receiving_retirement.owned, receiving.reference,
+        "subscription retirement remains keyed by its owned reference"
+    );
     acknowledge_send(&mut agent, generation, control, operation);
     assert!(agent.next_effect_after_turn().is_none());
-    native_connection::observe(
-        &mut agent,
-        generation,
-        control,
-        vec![native_connection::confirmed(
-            state::resource_key::Key::Owned(receiving.reference),
-            desired.revision,
-            state::confirmed_state::Value::Absent(state::AbsentState {
-                reason: state::AbsenceReason::Removed as i32,
-            }),
-        )],
-    );
+    native_connection::observe(&mut agent, generation, control, confirmations);
     assert_eq!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::CloseDataChannel {
@@ -5651,12 +6092,13 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
         &prepared,
         native_connection::SOURCE,
     );
-    let receiving = native_connection::prepare_subscription(
+    let receiving = native_connection::prepare_subscription_staged(
         &mut agent,
         generation,
         control,
         native_connection::REMOTE_SOURCE,
         &subscriber("chat", TopicMode::Ordered),
+        Some(&prepared),
     );
     let publish_channel = prepared.channel;
     let subscribe_channel = receiving.channel;
@@ -6252,65 +6694,51 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
 #[test]
 fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
     use pulsebeam_proto::state;
+    let pinned = |external_id: &str| TopicSubscriber {
+        room: "room".into(),
+        participant_external_id: external_id.into(),
+        topic: "state".into(),
+        mode: TopicMode::Lossy,
+    };
+    let left_subscriber = pinned("left");
+    let right_subscriber = pinned("right");
     let (mut agent, generation, control) = native_connection::connected(TopicRegistrations {
         publishers: vec![],
-        subscribers: vec![subscriber("state", TopicMode::Lossy)],
+        subscribers: vec![left_subscriber.clone()],
     });
-    let participant = state::Participant {
-        participant_id: "remote".into(),
-        participant_external_id: "remote-app-user".into(),
+    let left = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        "left",
+        &left_subscriber,
+    );
+    let registrations = TopicRegistrations {
+        publishers: vec![],
+        subscribers: vec![left_subscriber.clone(), right_subscriber.clone()],
     };
-    let mut prepared = Vec::new();
-    for source in ["left", "right"] {
-        let track = state::Track {
-            track_id: source.into(),
-            participant_id: participant.participant_id.clone(),
-            label: "state".into(),
-            kind: Some(state::track::Kind::Data(state::DataTrack {
-                delivery: state::DataDelivery::Lossy as i32,
-            })),
-        };
-        native_connection::observe(
-            &mut agent,
-            generation,
-            control,
-            vec![
-                native_connection::confirmed(
-                    state::resource_key::Key::Participant(participant.participant_id.clone()),
-                    0,
-                    state::confirmed_state::Value::Participant(participant.clone()),
-                ),
-                native_connection::confirmed(
-                    state::resource_key::Key::Track(source.into()),
-                    0,
-                    state::confirmed_state::Value::Track(track.clone()),
-                ),
-            ],
-        );
-        let resource = native_connection::prepare_data(&mut agent, generation, control);
-        native_connection::observe(
-            &mut agent,
-            generation,
-            control,
-            vec![native_connection::confirmed(
-                state::resource_key::Key::Owned(resource.reference),
-                resource.revision,
-                state::confirmed_state::Value::Owned(alloc::boxed::Box::new(state::LiveResource {
-                    spec: Some(resource.spec.clone()),
-                    participant: Some(participant.clone()),
-                    track: Some(track),
-                    execution: state::ExecutionStatus::Installed as i32,
-                    execution_failure: None,
-                    activity: None,
-                })),
-            )],
-        );
-        assert!(agent.next_effect_after_turn().is_none());
-        prepared.push(resource);
-    }
-    let [left, right] = prepared.as_slice() else {
-        panic!("two exact sources")
-    };
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            connected: true,
+            topics: registrations.clone(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let _ = native_connection::answer_source_lookup_batch(
+        &mut agent,
+        generation,
+        control,
+        &registrations,
+        None,
+    );
+    let right = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        "right",
+        &right_subscriber,
+    );
     agent
         .command(AgentCommand::RenewAuthorization(
             "surviving-credential".into(),
@@ -6388,7 +6816,24 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().generation, Some(generation));
-    assert_eq!(agent.snapshot().topics.subscribers[0].publishers, 1);
+    let subscribers = &agent.snapshot().topics.subscribers;
+    assert_eq!(subscribers.len(), 2);
+    assert_eq!(
+        subscribers
+            .iter()
+            .find(|status| status.registration.participant_external_id == "left")
+            .unwrap()
+            .publishers,
+        0
+    );
+    assert_eq!(
+        subscribers
+            .iter()
+            .find(|status| status.registration.participant_external_id == "right")
+            .unwrap()
+            .publishers,
+        1
+    );
     assert!(agent.snapshot().terminal_failure.is_none());
     drain_notifications(&mut agent);
     topic_input(
@@ -6438,7 +6883,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
         .unwrap();
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
-            revision: 2,
+            revision: 3,
             ..Default::default()
         }))
         .unwrap();
@@ -6526,12 +6971,13 @@ fn topic_boundaries_reject_malformed_cross_mode_unknown_and_oversized_input() {
         &latest,
         native_connection::SOURCE,
     );
-    let receiving = native_connection::prepare_subscription(
+    let receiving = native_connection::prepare_subscription_staged(
         &mut agent,
         generation,
         control,
         native_connection::REMOTE_SOURCE,
         &subscriber("state", TopicMode::Latest),
+        Some(&latest),
     );
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
@@ -6635,12 +7081,13 @@ fn lossy_keeps_distinct_messages_without_duplicates_coalescing_or_ordering() {
         &prepared,
         native_connection::SOURCE,
     );
-    let receiving = native_connection::prepare_subscription(
+    let receiving = native_connection::prepare_subscription_staged(
         &mut agent,
         generation,
         control,
         native_connection::REMOTE_SOURCE,
         &subscriber("events", TopicMode::Lossy),
+        Some(&prepared),
     );
     drain_notifications(&mut agent);
     for value in 0..3 {
@@ -6708,15 +7155,16 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
         &old_publication,
         native_connection::SOURCE,
     );
-    let old_subscription = native_connection::prepare_subscription(
+    let old_subscription = native_connection::prepare_subscription_staged(
         &mut agent,
         generation,
         control,
         native_connection::REMOTE_SOURCE,
         &subscriber("state", TopicMode::Latest),
+        Some(&old_publication),
     );
-    const NEW_REMOTE: &str = "opaque/remote/replacement";
-    const NEW_LOCAL: &str = "opaque/local/replacement";
+    const NEW_REMOTE: &str = "opaque/server/remote/replacement";
+    const NEW_LOCAL: &str = "opaque/server/local/replacement";
     drain_notifications(&mut agent);
     assert_eq!(
         topic_input(
@@ -6806,6 +7254,41 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
             }))
             .unwrap();
     }
+    let replacement_subscriber = TopicSubscriber {
+        room: "room".into(),
+        participant_external_id: NEW_REMOTE.into(),
+        topic: "state".into(),
+        mode: TopicMode::Latest,
+    };
+    let replacement_topics = TopicRegistrations {
+        publishers: vec![publisher("state", TopicMode::Latest)],
+        subscribers: vec![replacement_subscriber.clone()],
+    };
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 2,
+            connected: true,
+            ..Default::default()
+        }))
+        .unwrap();
+    let _ = native_connection::answer_source_lookup_batch(
+        &mut agent,
+        generation,
+        control,
+        &TopicRegistrations::default(),
+        None,
+    );
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 3,
+            connected: true,
+            topics: TopicRegistrations {
+                publishers: replacement_topics.publishers.clone(),
+                subscribers: Vec::new(),
+            },
+            ..Default::default()
+        }))
+        .unwrap();
     let publication = native_connection::prepare_data(&mut agent, generation, control);
     assert_ne!(publication.channel, old_publication.channel);
     assert!(publication.reference > old_publication.reference);
@@ -6816,12 +7299,27 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
         &publication,
         NEW_LOCAL,
     );
+    agent
+        .command(AgentCommand::ReplaceDesired(DesiredState {
+            revision: 4,
+            connected: true,
+            topics: replacement_topics.clone(),
+            ..Default::default()
+        }))
+        .unwrap();
+    let _ = native_connection::answer_source_lookup_batch(
+        &mut agent,
+        generation,
+        control,
+        &replacement_topics,
+        Some(NEW_REMOTE),
+    );
     let receiving = native_connection::prepare_subscription(
         &mut agent,
         generation,
         control,
         NEW_REMOTE,
-        &subscriber("state", TopicMode::Latest),
+        &replacement_subscriber,
     );
     assert_ne!(receiving.channel, old_subscription.channel);
     assert!(receiving.reference > old_subscription.reference);
@@ -6844,8 +7342,10 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
         wire_message(NEW_REMOTE, 0, b"new"),
     )
     .unwrap();
+    let notifications = drain_notifications(&mut agent);
     assert!(
-        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { participant_id, data_track_id, sequence: 0, payload, .. }))] if participant_id == "remote-app-user" && data_track_id == NEW_REMOTE && payload == b"new")
+        matches!(notifications.as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { participant_id, data_track_id, sequence: 0, payload, .. }))] if participant_id == NEW_REMOTE && data_track_id == NEW_REMOTE && payload == b"new"),
+        "notifications: {notifications:#?}"
     );
     agent
         .command(AgentCommand::SendTopic(TopicSend {
@@ -6872,7 +7372,8 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         publishers: vec![publisher("chat", TopicMode::Ordered)],
         subscribers: vec![subscriber("chat", TopicMode::Ordered)],
     };
-    let (mut agent, old_generation, old_control) = native_connection::connected(registrations);
+    let (mut agent, old_generation, old_control) =
+        native_connection::connected(registrations.clone());
     let old_publication = native_connection::prepare_data(&mut agent, old_generation, old_control);
     native_connection::confirm_publication(
         &mut agent,
@@ -6881,12 +7382,13 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         &old_publication,
         native_connection::SOURCE,
     );
-    let old_subscription = native_connection::prepare_subscription(
+    let old_subscription = native_connection::prepare_subscription_staged(
         &mut agent,
         old_generation,
         old_control,
         native_connection::REMOTE_SOURCE,
         &subscriber("chat", TopicMode::Ordered),
+        Some(&old_publication),
     );
     let publish = publisher("chat", TopicMode::Ordered);
     agent
@@ -6965,6 +7467,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
             payload: codec::encode_server(&state::ServerStateBatch {
                 records: vec![native_connection::grant(1)],
                 initial_complete: true,
+                ..Default::default()
             })
             .unwrap(),
         }))
@@ -6975,8 +7478,13 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
             generation: old_generation
         })
     );
-
-    assert!(agent.next_effect_after_turn().is_none());
+    let _ = native_connection::answer_source_lookup_batch(
+        &mut agent,
+        generation,
+        signal,
+        &registrations,
+        Some("opaque/remote/root-two"),
+    );
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p2"));
     assert_eq!(agent.snapshot().topics.publishers[0].data_track_id, None);
     assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, 0);
@@ -6998,12 +7506,13 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         &publication,
         "opaque/local/root-two",
     );
-    let receiving = native_connection::prepare_subscription(
+    let receiving = native_connection::prepare_subscription_staged(
         &mut agent,
         generation,
         signal,
         "opaque/remote/root-two",
         &subscriber("chat", TopicMode::Ordered),
+        Some(&publication),
     );
     drain_notifications(&mut agent);
     topic_input(

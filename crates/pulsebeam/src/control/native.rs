@@ -22,7 +22,8 @@ pub(crate) use super::permissions::ResourcePermissions;
 #[cfg(test)]
 pub(crate) use session::track_descriptor;
 pub(crate) use session::{
-    ExecutionAction, ExecutionCommand, InputError, NativeSession, OutputError, Preparation, failure,
+    ExecutionAction, ExecutionCommand, InputError, LookupInterestChange, NativeSession,
+    OutputError, Preparation, failure,
 };
 
 pub(crate) struct ResolvedSource<'a> {
@@ -43,6 +44,7 @@ impl ResolvedSource<'_> {
 
 pub(crate) struct ReceiverTarget {
     pub(crate) source: TrackId,
+    pub(crate) source_room: String,
     pub(crate) wait_for_source: bool,
 }
 
@@ -118,6 +120,7 @@ pub(crate) enum ReceiverPreparation {
 }
 
 pub(crate) struct Receiver {
+    pub(crate) source_room: crate::entity::RoomId,
     pub(crate) source: Track,
     pub(crate) source_id: String,
     pub(crate) transport: ReceiveTransport,
@@ -153,6 +156,7 @@ pub(crate) fn receiver_target(
         .map_err(|_| wire::FailureCode::InvalidConfiguration)?;
     Ok(ReceiverTarget {
         source,
+        source_room: subscription.source_room.clone(),
         wait_for_source: !matches!(
             subscription
                 .binding

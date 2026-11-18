@@ -8,5 +8,8 @@
       "@pulsebeam/react": ["./src/index.ts"]
     }
   },
-  "include": ["tests/contracts/strict-consumer.ts"]
+  "include": [
+    "tests/contracts/strict-consumer.ts",
+    "tests/contracts/known-native-receiver.ts"
+  ]
 }

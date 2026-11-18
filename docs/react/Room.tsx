@@ -1,8 +1,8 @@
 import { useState } from "react";
 import {
   Audio,
-  Publish,
-  SelectAudio,
+  usePublish,
+  useSubscribe,
   Video,
   useAgent,
   useCapture,
@@ -10,8 +10,6 @@ import {
   type AgentConfig,
   type CaptureResult,
   type PlaybackError,
-  type PlaybackFailure,
-  type RemoteVideoTrack,
 } from "@pulsebeam/react";
 
 export function Room({
@@ -46,22 +44,25 @@ function ActiveRoom({
   const [videoPlayback, setVideoPlayback] = useState<PlaybackError | null>(
     null,
   );
-  const [audioPlayback, setAudioPlayback] = useState<PlaybackFailure | null>(
+  const [audioPlayback, setAudioPlayback] = useState<PlaybackError | null>(
     null,
   );
   const report = (failure: unknown) => setError(String(failure));
-  const remoteVideos = agent.participants.flatMap((participant) =>
-    participant.tracks.filter(
-      (value): value is RemoteVideoTrack => value.kind === "video",
-    ),
+  const [peer, setPeer] = useState("");
+  const remoteVideo = peer
+    ? agent.room(room).participant(peer).video("camera")
+    : null;
+
+  usePublish(agent.video("camera"), capture.video);
+  usePublish(agent.audio("microphone"), capture.audio);
+  const video = useSubscribe(remoteVideo);
+  const audio = useSubscribe(
+    peer ? agent.room(room).participant(peer).audio("microphone") : null,
   );
 
   return (
     <main>
-      <Publish track={agent.video("camera")} source={capture.video} />
-      <Publish track={agent.audio("microphone")} source={capture.audio} />
-      <SelectAudio agent={agent} policy={{ automatic: true }} />
-      <Audio agent={agent} onPlaybackError={setAudioPlayback} />
+      <Audio source={audio} onPlaybackError={setAudioPlayback} />
       <h1>PulseBeam React room</h1>
       <p role="status">
         Connection: {agent.connection}; participant:{" "}
@@ -90,19 +91,16 @@ function ActiveRoom({
         style={{ width: 320, height: 240 }}
         onPlaybackError={setVideoPlayback}
       />
-      <h2>Remote video ({remoteVideos.length})</h2>
-      {remoteVideos.map((remote) => (
-        <section key={`${remote.participantId}:${remote.label}`}>
-          <p>
-            {remote.participantId}: {remote.label}
-          </p>
-          <Video
-            source={remote}
-            style={{ width: 320, height: 240 }}
-            onPlaybackError={setVideoPlayback}
-          />
-        </section>
-      ))}
+      <h2>Remote video</h2>
+      <label>
+        Other participant ID
+        <input value={peer} onChange={(event) => setPeer(event.target.value)} />
+      </label>
+      <Video
+        source={video}
+        style={{ width: 320, height: 240 }}
+        onPlaybackError={setVideoPlayback}
+      />
       {audioPlayback && (
         <button
           onClick={() =>

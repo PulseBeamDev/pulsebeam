@@ -84,6 +84,9 @@ enum CommandConfig {
     ClaimPublication {
         spec: SpecConfig,
     },
+    DeclareDataPublication {
+        spec: SpecConfig,
+    },
     UpdatePublication {
         owner: u64,
         present: bool,
@@ -101,6 +104,7 @@ enum CommandConfig {
     },
     ConfigureAudio {
         owner: u64,
+        #[serde(default)]
         playout_delay: PlayoutDelayConfig,
     },
     ClaimAudioPolicy {
@@ -115,7 +119,7 @@ enum CommandConfig {
     },
     ReceiveData {
         spec: SpecConfig,
-        participant_id: Option<String>,
+        source: TrackSelectorConfig,
     },
     ReadData {
         owner: u64,
@@ -125,18 +129,15 @@ enum CommandConfig {
     },
 }
 
-pub(super) fn spec(value: JsValue) -> Result<TrackSpec, JsValue> {
-    let config: SpecConfig = serde_wasm_bindgen::from_value(value)
-        .map_err(|error| js_error(format!("invalid track descriptor: {error}")))?;
-    Ok(config.into())
-}
-
 pub(super) fn command(value: JsValue) -> Result<ResourceCommand, JsValue> {
     let config: CommandConfig = serde_wasm_bindgen::from_value(value)
         .map_err(|error| js_error(format!("invalid resource command: {error}")))?;
     Ok(match config {
         CommandConfig::ClaimPublication { spec } => {
             ResourceCommand::ClaimPublication { spec: spec.into() }
+        }
+        CommandConfig::DeclareDataPublication { spec } => {
+            ResourceCommand::DeclareDataPublication { spec: spec.into() }
         }
         CommandConfig::UpdatePublication { owner, present } => {
             ResourceCommand::UpdatePublication { owner, present }
@@ -173,12 +174,9 @@ pub(super) fn command(value: JsValue) -> Result<ResourceCommand, JsValue> {
         CommandConfig::RetainProducer { spec } => {
             ResourceCommand::RetainProducer { spec: spec.into() }
         }
-        CommandConfig::ReceiveData {
-            spec,
-            participant_id,
-        } => ResourceCommand::ReceiveData {
+        CommandConfig::ReceiveData { spec, source } => ResourceCommand::ReceiveData {
             spec: spec.into(),
-            participant_id,
+            source: source.into(),
         },
         CommandConfig::ReadData { owner } => ResourceCommand::ReadData { owner },
         CommandConfig::Release { owner } => ResourceCommand::Release { owner },
@@ -251,6 +249,9 @@ pub(super) fn ready(owners: &[u64]) -> Object {
 }
 
 pub(super) fn error(error: AgentError) -> JsValue {
+    if let AgentError::InvalidResource(TrackResourceError::ReceiveFailed(info)) = &error {
+        return super::operation_error_value(info.clone());
+    }
     let code = match &error {
         AgentError::InvalidConfiguration(agent_core::ValidationError::TopicChannelLimit {
             ..
@@ -272,6 +273,7 @@ pub(super) fn error(error: AgentError) -> JsValue {
             TrackResourceError::Released => "released",
             TrackResourceError::ReceiveOverflow => "receive-overflow",
             TrackResourceError::ReceiveChannelFailed(_) => "receive-channel-failed",
+            TrackResourceError::ReceiveFailed(_) => "receive-failed",
         },
         AgentError::InvalidTopic(agent_core::TopicError::PayloadTooLarge { .. }) => {
             "payload-too-large"
@@ -287,24 +289,13 @@ pub(super) fn error(error: AgentError) -> JsValue {
 
 pub(super) fn send_error(error: crate::engine::DataSendError) -> JsValue {
     use crate::engine::DataSendError;
-    use agent_core::DataSendFailure;
-    let message = error.to_string();
-    let code = match error {
-        DataSendError::Admission(error) => return self::error(error),
-        DataSendError::Closed => "closed",
-        DataSendError::Delivery(failure) => match failure {
-            DataSendFailure::Disconnected => "not-connected",
-            DataSendFailure::TerminalFailure => "terminal-failure",
-            DataSendFailure::TimedOut => "send-timeout",
-            DataSendFailure::TransportReplaced => "stale-binding",
-            DataSendFailure::ChannelFailed => "send-channel-failed",
-            DataSendFailure::Superseded => "superseded",
-            DataSendFailure::HostRejected => "host-rejected",
-            DataSendFailure::QueueFull => "capacity",
-            DataSendFailure::SequenceExhausted => "sequence-exhausted",
-        },
+    use agent_core::ffi::{ErrorCode, ErrorInfo};
+    let info = match error {
+        DataSendError::Admission(error) => ErrorInfo::from(&error),
+        DataSendError::Closed => ErrorInfo::new(ErrorCode::Closed, "Data runtime is closed"),
+        DataSendError::Delivery(failure) => ErrorInfo::from(&failure),
     };
-    coded_error(code, &message)
+    super::operation_error_value(info)
 }
 
 pub(super) fn coded_error(code: &str, message: &str) -> JsValue {

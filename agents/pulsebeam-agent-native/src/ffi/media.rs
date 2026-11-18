@@ -33,6 +33,12 @@ source!(AudioSource);
 
 #[uniffi::export(async_runtime = "tokio")]
 impl VideoSource {
+    pub fn pipe_to(&self, publication: &VideoPublication) -> Result<Arc<Pipe>, NativeError> {
+        Ok(Arc::new(Pipe {
+            runtime: self.runtime.pipe_to(&publication.runtime)?,
+        }))
+    }
+
     pub async fn set_limits(
         &self,
         limits: Vec<EncodingLimits>,
@@ -101,6 +107,66 @@ macro_rules! publication {
 publication!(VideoPublication, VideoSource);
 publication!(AudioPublication, AudioSource);
 
+#[uniffi::export]
+impl AudioSource {
+    pub fn pipe_to(&self, publication: &AudioPublication) -> Result<Arc<Pipe>, NativeError> {
+        Ok(Arc::new(Pipe {
+            runtime: self.runtime.pipe_to(&publication.runtime)?,
+        }))
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct Pipe {
+    runtime: crate::Pipe,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl Pipe {
+    pub fn state(&self) -> core_ffi::PipeState {
+        self.runtime.state()
+    }
+
+    pub fn updates(&self) -> Result<Arc<PipeUpdates>, NativeError> {
+        let updates = self.runtime.updates().map_err(|_| NativeError::Operation {
+            info: core_ffi::ErrorInfo::new(
+                core_ffi::ErrorCode::CapacityExceeded,
+                "Pipe observer capacity exceeded",
+            ),
+        })?;
+        Ok(Arc::new(PipeUpdates { runtime: updates }))
+    }
+
+    pub async fn close(&self) -> Result<(), NativeError> {
+        self.runtime.close().await.map_err(Into::into)
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct PipeUpdates {
+    runtime: agent_core::observer::PipeUpdates,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl PipeUpdates {
+    pub async fn next(&self) -> Result<Option<core_ffi::PipeState>, NativeError> {
+        Ok(self
+            .runtime
+            .next()
+            .map_err(|_| NativeError::Operation {
+                info: core_ffi::ErrorInfo::new(
+                    core_ffi::ErrorCode::Conflict,
+                    "An observation read is already pending",
+                ),
+            })?
+            .await)
+    }
+
+    pub fn close(&self) {
+        self.runtime.close();
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct PublicationUpdates {
     runtime: crate::PublicationUpdates,
@@ -165,15 +231,20 @@ pub struct RemoteVideoTrack {
     runtime: crate::RemoteVideoTrack,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[uniffi::export]
 impl RemoteVideoTrack {
-    pub async fn subscribe(
+    #[uniffi::method(default(configuration = None))]
+    pub fn subscribe(
         &self,
-        configuration: core_ffi::VideoObservation,
+        configuration: Option<core_ffi::VideoObservation>,
     ) -> Result<Arc<VideoSubscription>, NativeError> {
-        Ok(Arc::new(VideoSubscription {
-            runtime: self.runtime.subscribe(configuration.into()).await?,
-        }))
+        let configuration = configuration.unwrap_or_else(|| core_ffi::VideoObservation {
+            visible: true,
+            ..Default::default()
+        });
+        let runtime = self.runtime.subscribe(configuration.into())?;
+        let observer = runtime.video_observer()?;
+        Ok(Arc::new(VideoSubscription { runtime, observer }))
     }
 }
 
@@ -182,27 +253,42 @@ pub struct RemoteAudioTrack {
     runtime: crate::RemoteAudioTrack,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[uniffi::export]
 impl RemoteAudioTrack {
-    pub async fn subscribe(
+    #[uniffi::method(default(configuration = None))]
+    pub fn subscribe(
         &self,
-        configuration: core_ffi::AudioSubscriptionConfig,
+        configuration: Option<core_ffi::AudioSubscriptionConfig>,
     ) -> Result<Arc<AudioSubscription>, NativeError> {
-        Ok(Arc::new(AudioSubscription {
-            runtime: self.runtime.subscribe(configuration).await?,
-        }))
+        let runtime = self.runtime.subscribe(configuration.unwrap_or_default())?;
+        let observer = runtime.audio_observer()?;
+        Ok(Arc::new(AudioSubscription { runtime, observer }))
     }
 }
 
 macro_rules! subscription {
-    ($name:ident) => {
+    ($name:ident, $state:ident, $observer:ident, $updates:ident) => {
         #[derive(uniffi::Object)]
         pub struct $name {
             runtime: RuntimeSubscription,
+            observer: Arc<agent_core::observer::$observer>,
         }
 
         #[uniffi::export(async_runtime = "tokio")]
         impl $name {
+            pub fn state(&self) -> core_ffi::$state {
+                self.runtime.refresh_state();
+                self.observer.state()
+            }
+            pub fn updates(&self) -> Result<Arc<$updates>, NativeError> {
+                self.state();
+                Ok(Arc::new($updates {
+                    runtime: self
+                        .observer
+                        .updates()
+                        .map_err(resource_state::observer_limit)?,
+                }))
+            }
             pub fn is_closed(&self) -> bool {
                 self.runtime.is_closed()
             }
@@ -221,11 +307,28 @@ macro_rules! subscription {
     };
 }
 
-subscription!(VideoSubscription);
-subscription!(AudioSubscription);
+subscription!(
+    VideoSubscription,
+    VideoSubscriptionState,
+    VideoSubscriptionStateObserver,
+    VideoSubscriptionUpdates
+);
+subscription!(
+    AudioSubscription,
+    AudioSubscriptionState,
+    AudioSubscriptionStateObserver,
+    AudioSubscriptionUpdates
+);
 
 #[uniffi::export(async_runtime = "tokio")]
 impl VideoSubscription {
+    pub fn frames(&self) -> Result<Arc<VideoFrames>, NativeError> {
+        Ok(Arc::new(VideoFrames::new(
+            self.runtime.clone(),
+            self.observer.clone(),
+        )?))
+    }
+
     pub async fn configure(
         &self,
         configuration: core_ffi::VideoObservation,
@@ -239,6 +342,13 @@ impl VideoSubscription {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl AudioSubscription {
+    pub fn frames(&self) -> Result<Arc<AudioFrames>, NativeError> {
+        Ok(Arc::new(AudioFrames::new(
+            self.runtime.clone(),
+            self.observer.clone(),
+        )?))
+    }
+
     pub async fn configure(
         &self,
         configuration: core_ffi::AudioSubscriptionConfig,

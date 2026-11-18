@@ -105,13 +105,24 @@ impl NativeControl {
             .as_secs();
         let publishers = &self.publishers;
         self.handler
-            .service(now, |id| {
-                let track = source(id)?;
-                Some(ResolvedSource {
-                    track,
-                    publisher: publishers.get(&track.meta().origin)?,
-                })
-            })
+            .service(
+                now,
+                |id| {
+                    let track = source(id)?;
+                    Some(ResolvedSource {
+                        track,
+                        publisher: publishers.get(&track.meta().origin)?,
+                    })
+                },
+                |_, id| {
+                    let track = source(id)?;
+                    Some(ResolvedSource {
+                        track,
+                        publisher: publishers.get(&track.meta().origin)?,
+                    })
+                },
+                |_| None,
+            )
             .map(|_| ())
     }
 }

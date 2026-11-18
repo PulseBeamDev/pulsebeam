@@ -27,6 +27,7 @@ fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, enabled: bool) -> wire::R
         wire::SubscriptionSpec {
             track_id: track.as_str(),
             kind: wire::TrackKind::Audio as i32,
+            source_room: "room".into(),
             binding: Some(wire::TrackBinding {
                 transport: Some(wire::track_binding::Transport::Rtp(parameters)),
             }),
@@ -290,6 +291,7 @@ pub(super) fn check(source: &Track) {
                     failure: Some(failure(wire::FailureCode::InternalFailure)),
                 }),
             }],
+            ..Default::default()
         })
         .unwrap(),
         &mut sink,
@@ -311,6 +313,7 @@ pub(super) fn check(source: &Track) {
                     failure: Some(failure(wire::FailureCode::Unsupported)),
                 }),
             }],
+            ..Default::default()
         })
         .unwrap(),
         &mut sink,

@@ -22,14 +22,87 @@ package pulsebeam.media.v1;
 
 
 // ============================================================================
+// 0. Exact source addressing and scoped catalog records
+// ============================================================================
+
+// Logical address is stable across publication incarnations. TrackId remains
+// the exact immutable wire identity; resolving this address may create a new
+// binding but never retargets an already-live binding.
+message LogicalSourceAddress {
+  string room = 1; // Nonempty exact room, <=256 UTF-8 bytes.
+  // Exact participant endpoint (sub), <=256 UTF-8 bytes; no control characters.
+  string participant_external_id = 2;
+  TrackKind kind = 3; // AUDIO, VIDEO or DATA; never inferred from a label.
+  string label = 4; // Nonempty exact-case label, <=256 UTF-8 bytes.
+}
+
+// One connection-local, never-reused nonzero watch ID owns an immutable room,
+// page size and cursor scope. Reopening that exact scope may be idempotent; a
+// changed scope needs a new ID. Close is terminal for the ID. Participants are
+// ordered by ascending participant_id UTF-8 bytes. Cursor bytes are opaque
+// continuation state bound by the server to this room/order and expiry.
+message CatalogPageRequest {
+  uint64 watch_id = 1;
+  string room = 2;
+  uint32 participant_limit = 3; // 1..500; omitted means 100.
+  bytes cursor = 4;
+}
+
+message CatalogParticipantEntry {
+  Participant participant = 1;
+  // Complete authorized list, including the empty list for presence-only entries.
+  repeated Track tracks = 2;
+}
+
+// Each record carries a bounded slice of one encoded complete entry. Fragments
+// share revision and count; receivers expose nothing until all pieces validate.
+// Updates are complete full-page revisions, not deltas. Assemble each revision
+// privately with a new CatalogAssembler before replacing the prior snapshot.
+message CatalogParticipantFragment {
+  uint64 watch_id = 1;
+  uint64 revision = 2;
+  uint32 participant_index = 3;
+  uint32 fragment_index = 4;
+  uint32 fragment_count = 5;
+  string participant_id = 6;
+  bytes entry_chunk = 7;
+}
+
+message CatalogPageRecord {
+  uint64 watch_id = 1;
+  string room = 2;
+  uint64 revision = 3;
+  // True only on the final record after every entry for this page revision.
+  bool complete = 4;
+  bool has_more = 5;
+  bytes next_cursor = 6;
+  int64 cursor_expires_at_unix_seconds = 7;
+  repeated CatalogParticipantFragment fragments = 8;
+}
+
+// ============================================================================
 // 1. Bounded directional resource batches
 // ============================================================================
 
 // Complete values applied individually in reliable stream order, not a map-wide
 // transaction. Send promptly; coalesce unsent updates by key. No batch ACK/cursor.
 message ClientStateBatch {
-  // 1..16 desired values or execution observations. The message must fit 4096 bytes.
+  // Resource and catalog records share one 16-record, 4096-byte frame budget.
   repeated ClientStateRecord records = 1;
+  repeated CatalogClientRecord catalog_records = 3;
+}
+
+// Directional catalog control, separate from owned resource proposals.
+message CatalogClientRecord {
+  oneof command {
+    CatalogPageRequest open = 1;
+    CatalogWatchClose close = 2;
+  }
+}
+
+// Terminal for this connection-local watch ID; a replacement scope uses a new ID.
+message CatalogWatchClose {
+  uint64 watch_id = 1;
 }
 
 message ClientStateRecord {
@@ -54,8 +127,7 @@ message ExecutionReport {
 }
 
 message ServerStateBatch {
-  // 1..16 observations, or zero only with initial_complete=true.
-  // The entire raw protobuf message must fit 4096 bytes.
+  // Resource and catalog records share one 16-record, 4096-byte frame budget.
   repeated ServerStateRecord records = 1;
 
   // True exactly once after every initially visible key has been represented
@@ -63,6 +135,20 @@ message ServerStateBatch {
   // continue normally; this is enumeration completeness, not an atomic snapshot,
   // catch-up barrier, acknowledgment or application convergence.
   bool initial_complete = 2;
+  repeated CatalogServerRecord catalog_records = 3;
+}
+
+// Directional catalog response. An error is not a page fragment.
+message CatalogServerRecord {
+  oneof response {
+    CatalogPageRecord page = 1;
+    CatalogWatchError error = 2;
+  }
+}
+
+message CatalogWatchError {
+  uint64 watch_id = 1;
+  Failure failure = 2;
 }
 
 // Keys are connection-scoped typed identities, never generic writable paths.
@@ -142,6 +228,7 @@ message ConfirmedState {
     SessionState session = 5;
     Participant participant = 6;
     Track track = 7;
+    SourceLookupState source_lookup = 8;
   }
 }
 
@@ -266,10 +353,18 @@ message ResourceSpec {
   oneof declaration {
     PublicationSpec publication = 2;
     SubscriptionSpec subscription = 3;
+    SourceLookupSpec source_lookup = 4;
   }
 }
 
-// Publication/data-subscription settings contain no receive variant.
+// Owned, non-forwarding observation of the current exact logical source.
+// Address is immutable for the owned lifetime; it is not a receiver or publisher.
+message SourceLookupSpec {
+  // Required exact logical address. enabled=false permits no descriptor.
+  LogicalSourceAddress source = 1;
+}
+
+// Publication, lookup and data-subscription settings contain no receive variant.
 // Audio/video subscriptions require their matching variant, even when empty.
 message ResourceSettings {
   // Presence REQUIRED, including false. Pause does not retire the resource.
@@ -325,7 +420,10 @@ message SubscriptionSpec {
   // Complete RTP/SCTP configuration after successful local platform preparation.
   // Never copy publisher demux coordinates.
   TrackBinding binding = 3;
-  reserved 4;
+
+  // Literal source-room admission domain for this immutable receiver lifetime.
+  // It is never inferred from track_id or the subscriber's joined room.
+  string source_room = 4;
 }
 
 
@@ -357,6 +455,17 @@ message LiveResource {
   optional MediaActivity activity = 6;
 
   reserved 7;
+}
+
+// Read-only observation attached to an owned lookup declaration. Participant
+// and track are an atomic optional pair and may change as the address resolves.
+// This is not an accepted receiver, transport binding or execution state.
+message SourceLookupState {
+  // Required accepted lookup spec, never a publication/subscription spec.
+  ResourceSpec spec = 1;
+  // Both descriptor fields are absent while unresolved or disabled.
+  Participant participant = 2;
+  Track track = 3;
 }
 
 enum ExecutionStatus {

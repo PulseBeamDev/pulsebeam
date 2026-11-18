@@ -8,6 +8,8 @@ use super::{
     validation::{self, ValidationError},
 };
 
+#[cfg(test)]
+mod catalog_tests;
 mod preflight;
 
 pub const MAX_FRAME_SIZE: usize = 4096;

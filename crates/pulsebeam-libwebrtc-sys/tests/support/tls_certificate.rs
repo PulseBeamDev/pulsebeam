@@ -2,7 +2,10 @@
 use std::{fs, path::Path};
 
 pub fn openssl(args: &[&str]) {
-    let output = crate::tools::command("openssl").args(args).output().unwrap();
+    let output = crate::tools::command("openssl")
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",

@@ -25,13 +25,16 @@ mod control;
 use control::{Control, PublicationControl};
 mod data;
 use data::DataIo;
-pub use data::{DataReceiver, LocalDataTrack, Participant, RemoteDataTrack};
+pub use data::{
+    DataPublication, DataReceiver, LocalDataTrack, Participant, RemoteDataTrack, RoomRef,
+};
 mod producer;
 pub use producer::ProducerInput;
 use producer::ProducerIo;
 mod publication;
 use publication::{InputTarget, PublicationInput, PublicationLease, RegisteredInput};
 pub use publication::{Pipe, Publication, PublicationUpdates};
+pub(crate) mod frames;
 mod subscription;
 pub use subscription::Subscription;
 use subscription::{ObservationIo, SubscriptionLease};
@@ -109,7 +112,7 @@ pub enum AgentEvent {
     RuntimeFailed(String),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
     Core(#[from] agent_core::AgentError),
@@ -131,11 +134,12 @@ pub enum Error {
     InvalidInput(String),
 }
 impl Error {
-    pub(crate) fn error_info(&self) -> agent_core::ffi::ErrorInfo {
+    pub fn error_info(&self) -> agent_core::ffi::ErrorInfo {
         use agent_core::ffi::{ErrorCode, ErrorInfo};
 
         let (code, message) = match self {
             Self::Core(error) => return ErrorInfo::from(error),
+            Self::DataSend(failure) => return ErrorInfo::from(failure),
             Self::Closed => (ErrorCode::Closed, "Agent is closed"),
             Self::NotReady => (ErrorCode::NotReady, "Agent is not ready"),
             Self::Backpressure | Self::CapacityExceeded => {
@@ -144,7 +148,7 @@ impl Error {
             Self::UnknownSlot(_) | Self::InvalidInput(_) => {
                 (ErrorCode::InvalidArgument, "Invalid operation argument")
             }
-            Self::DataSend(_) | Self::Rtc(_) => (ErrorCode::Internal, "Operation failed"),
+            Self::Rtc(_) => (ErrorCode::Internal, "Operation failed"),
         };
         ErrorInfo::new(code, message)
     }
@@ -348,15 +352,20 @@ enum Command {
         identity: SourceIdentity,
         response: oneshot::Sender<Result<i64, Error>>,
     },
+    SendOwnedData {
+        owner: u64,
+        expected_join: u64,
+        data: Vec<u8>,
+        response: oneshot::Sender<Result<(), Error>>,
+    },
+    #[cfg(test)]
     SendData {
         spec: agent_core::TrackSpec,
         data: Vec<u8>,
         response: oneshot::Sender<Result<(), Error>>,
     },
-    ReceiveData {
-        spec: agent_core::TrackSpec,
-        participant_id: Option<String>,
-        response: oneshot::Sender<Result<DataReceiver, Error>>,
+    RegisterDataReceiver {
+        receiver: DataReceiver,
     },
     ReadData {
         owner: u64,
@@ -400,11 +409,16 @@ enum Command {
     RegisterPublication {
         publication: Publication,
     },
+    RegisterSubscription {
+        subscription: Subscription,
+    },
+    #[cfg(test)]
     VideoSubscription {
         selector: agent_core::TrackSelector,
         observation: agent_core::VideoObservation,
         response: oneshot::Sender<Result<Subscription, Error>>,
     },
+    #[cfg(test)]
     AudioSubscription {
         selector: agent_core::TrackSelector,
         playout_delay: agent_core::PlayoutDelay,
@@ -1225,6 +1239,20 @@ where
                 });
                 let _ = response.send(result);
             }
+            Command::SendOwnedData {
+                owner,
+                expected_join,
+                data,
+                response,
+            } => match self.core.send_owned_data(owner, expected_join, data) {
+                Ok(send) => {
+                    self.data_sends.insert(send, response);
+                }
+                Err(error) => {
+                    let _ = response.send(Err(error.into()));
+                }
+            },
+            #[cfg(test)]
             Command::SendData {
                 spec,
                 data,
@@ -1237,14 +1265,7 @@ where
                     let _ = response.send(Err(error.into()));
                 }
             },
-            Command::ReceiveData {
-                spec,
-                participant_id,
-                response,
-            } => {
-                let result = self.receive_data(spec, participant_id);
-                let _ = response.send(result);
-            }
+            Command::RegisterDataReceiver { receiver } => self.register_data_receiver(receiver),
             Command::ReadData { owner, response } => self.read_data(owner, response),
             #[cfg(test)]
             Command::ForeignDesired { desired, response } => {
@@ -1344,6 +1365,19 @@ where
                     self.leases_changed.notify_one();
                 }
             }
+            Command::RegisterSubscription { subscription } => {
+                let owner = subscription.owner();
+                if subscription.is_closed() {
+                    let _ = self
+                        .core
+                        .resource(agent_core::ResourceCommand::Release { owner });
+                } else {
+                    self.subscriptions
+                        .insert(owner, Arc::downgrade(&subscription.inner));
+                    self.leases_changed.notify_one();
+                }
+            }
+            #[cfg(test)]
             Command::VideoSubscription {
                 selector,
                 observation,
@@ -1354,6 +1388,7 @@ where
                     let _ = response.send(result);
                 }
             }
+            #[cfg(test)]
             Command::AudioSubscription {
                 selector,
                 playout_delay,
@@ -2127,7 +2162,11 @@ where
             if let Notification::DataSendFinished { send, error } = &notification
                 && let Some(response) = self.data_sends.remove(send)
             {
-                let _ = response.send(error.map_or(Ok(()), |reason| Err(Error::DataSend(reason))));
+                let _ = response.send(
+                    error
+                        .as_ref()
+                        .map_or(Ok(()), |reason| Err(Error::DataSend(reason.clone()))),
+                );
             }
             let _ = self.events.send(AgentEvent::Core(notification));
             published = published.saturating_add(1);
@@ -2314,8 +2353,8 @@ mod tests {
             ),
             (
                 Error::DataSend(agent_core::DataSendFailure::HostRejected),
-                ErrorCode::Internal,
-                "Operation failed",
+                ErrorCode::ConnectionFailed,
+                "Data send was rejected by the host",
             ),
             (
                 Error::Rtc("private RTC detail".into()),
@@ -2596,10 +2635,20 @@ mod tests {
                     label: "control".into(),
                     delivery: agent_core::TopicMode::Ordered,
                 },
-                None,
+                agent_core::TrackSelector {
+                    room: "room".into(),
+                    participant_external_id: "remote".into(),
+                    label: "control".into(),
+                },
             )
             .unwrap();
         let owner = *actor.data_receivers.keys().next().unwrap();
+        let mut queued = Box::pin(cursor.next());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(queued.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
         actor
             .core
             .resource(agent_core::ResourceCommand::Release { owner })
@@ -2614,6 +2663,7 @@ mod tests {
             )))
         ));
         assert!(cursor.is_closed());
+        let sibling = cursor.clone();
         {
             let changed = actor.leases_changed.notified();
             tokio::pin!(changed);
@@ -2625,6 +2675,26 @@ mod tests {
         }
         actor.retire_data_receivers();
         assert!(actor.data_receivers.is_empty());
+        let command = actor.commands.try_recv().unwrap();
+        assert!(
+            matches!(command, Command::ReadData { owner: queued_owner, .. } if queued_owner == owner)
+        );
+        actor.command(command);
+        assert!(matches!(
+            queued.await,
+            Err(Error::Core(agent_core::AgentError::InvalidResource(
+                agent_core::TrackResourceError::Released
+            )))
+        ));
+        cursor.close().await.unwrap();
+        for reader in [cursor, sibling] {
+            assert!(matches!(
+                reader.next().await,
+                Err(Error::Core(agent_core::AgentError::InvalidResource(
+                    agent_core::TrackResourceError::Released
+                )))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -2639,8 +2709,17 @@ mod tests {
         let _local = agent
             .data("control".into(), agent_core::TopicMode::Ordered)
             .unwrap();
-        let remote = agent.participant("remote".into()).unwrap();
+        let room = agent.room("room".into()).unwrap();
+        assert_eq!(room.name(), "room");
+        let remote = room.participant("remote".into()).unwrap();
         assert_eq!(remote.id(), "remote");
+        let other = agent
+            .room("other".into())
+            .unwrap()
+            .participant("remote".into())
+            .unwrap();
+        assert_eq!(remote.source("control".into()).room, "room");
+        assert_eq!(other.source("control".into()).room, "other");
         let _remote = remote
             .data("control".into(), agent_core::TopicMode::Ordered)
             .unwrap();
@@ -2652,7 +2731,8 @@ mod tests {
                 .data(String::new(), agent_core::TopicMode::Ordered)
                 .is_err()
         );
-        assert!(agent.participant(String::new()).is_err());
+        assert!(agent.room(String::new()).is_err());
+        assert!(room.participant(String::new()).is_err());
 
         let spec = agent_core::TrackSpec::Data {
             label: "control".into(),
@@ -2673,7 +2753,8 @@ mod tests {
         assert!(actor.core.snapshot().topics.publishers.is_empty());
 
         // Policy component only: no physical peer or signaling effect is executed.
-        actor.core.command(AgentCommand::Connect).unwrap();
+        agent.join("other".into()).unwrap();
+        assert_eq!(remote.source("control".into()).room, "room");
         let (response, mut result) = oneshot::channel();
         actor.command(Command::SendData {
             spec,
@@ -2715,6 +2796,7 @@ mod tests {
         let subscription = agent
             .video_subscription(
                 agent_core::TrackSelector {
+                    room: "room".into(),
                     participant_external_id: "remote".into(),
                     label: "camera".into(),
                 },
@@ -2738,6 +2820,7 @@ mod tests {
         assert!(subscription.is_closed());
         let audio = agent
             .audio_subscription(agent_core::TrackSelector {
+                room: "room".into(),
                 participant_external_id: "remote".into(),
                 label: "microphone".into(),
             })
@@ -2778,6 +2861,7 @@ mod tests {
         ));
         let retained = agent
             .audio_subscription(agent_core::TrackSelector {
+                room: "room".into(),
                 participant_external_id: "remote".into(),
                 label: "microphone".into(),
             })
@@ -3368,7 +3452,11 @@ mod tests {
                 let initial = actor.core.snapshot().clone();
                 let _camera = agent.video("camera".into()).unwrap();
                 let microphone = agent.audio("microphone".into()).unwrap();
-                let participant = agent.participant("remote".into()).unwrap();
+                let participant = agent
+                    .room("room".into())
+                    .unwrap()
+                    .participant("remote".into())
+                    .unwrap();
                 let _remote_camera = participant.video("camera".into()).unwrap();
                 let _remote_microphone = participant.audio("microphone".into()).unwrap();
                 assert!(matches!(

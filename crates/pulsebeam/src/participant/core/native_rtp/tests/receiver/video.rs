@@ -20,6 +20,7 @@ fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, fixed: bool) -> wire::Res
         declaration: Some(resource_spec::Declaration::Subscription(wire::SubscriptionSpec {
             track_id: track.as_str(),
             kind: wire::TrackKind::Video as i32,
+            source_room: "room".into(),
             binding: Some(wire::TrackBinding { transport: Some(wire::track_binding::Transport::Rtp(wire::RtpParameters {
                 mid: mid.into(),
                 codec: Some(wire::RtpCodecParameters { payload_type: Some(96), format: Some(format), feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()], ..Default::default() }),

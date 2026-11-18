@@ -9,9 +9,11 @@ must account for every producer and consumer before switching endpoints.
 
 HTTP bootstrap selects `pulsebeam.media.v1` once. Each binary message on
 negotiated channel 0 is one raw protobuf `ClientStateBatch` or `ServerStateBatch`,
-with no encoding prefix or compression. `state::codec` enforces 1..4,096 bytes
-and at most 16 resource records, with structural preflight before generated
-decoding. Use `encode_client`/`decode_client` for owned desired proposals and
+with no encoding prefix or compression. `state::codec` enforces 1..4,096 bytes and at most 16 combined resource and
+catalog records, with structural preflight before generated decoding. Catalog
+open/close commands and page/error responses use directional batch fields but
+remain a private codec foundation: runtime dispatch and live catalog delivery
+are not implemented. Use `encode_client`/`decode_client` for owned desired proposals and
 execution reports, and `encode_server`/`decode_server` for authoritative observations. Their record
 types share resource values, not an envelope that permits either direction.
 `state::validation::validate_spec` checks resource configuration separately:
@@ -55,17 +57,30 @@ whose omission would be unsafe, such as mandatory encryption, needs explicit
 negotiated support before use; adding an optional field is not negotiation.
 Unsupported profiles are rejected during HTTP bootstrap.
 Future compression requires an explicitly supported profile, not per-message
-negotiation. There is no Catalog/Intent/Mapping
-schema, legacy codec export or fallback decoder. The signaling data-channel label
-is unchanged; it does not select a different wire protocol.
+negotiation. The standalone RFC288 catalog schema and bounded codec cover exact
+logical source addresses, scoped page metadata and atomic participant-entry
+fragments; they do not add an envelope variant, runtime dispatch, server delivery
+or SDK observation. Logical selectors use the application's external participant
+endpoint (`sub`), not the room-scoped canonical IDs used by catalog records and
+fragments. There is no legacy codec export or fallback decoder. The signaling
+data-channel label is unchanged; it does not select a different wire protocol.
+
+The private `SourceLookupSpec`/`SourceLookupState` contract describes an owned,
+non-forwarding lookup with an atomic optional participant/track pair, not an
+accepted receiver or transport binding. Lookup-only observation creates no
+receiver, forwarding candidate, placement or dataplane residency. Live scoped
+catalogs remain a separate codec contract.
 
 ## Prepared media reception and failure
 
-`SubscriptionSpec.binding` carries the complete RTP or SCTP configuration after
-successful local platform preparation. RTP bindings contain the independently
-allocated receive identities and negotiated codec/PT, extension and RTCP maps,
-never copied publisher demux coordinates. The source descriptor supplies its
-admitted codec envelope; HTTP capabilities supply server support.
+`SubscriptionSpec` carries the literal `source_room` admission domain together
+with the opaque canonical source `track_id`, expected kind, and complete RTP or
+SCTP binding after successful local platform preparation. The room is immutable
+for that receiver lifetime and is never inferred from the track ID or subscriber
+membership. RTP bindings contain independently allocated receive identities and
+negotiated codec/PT, extension, and RTCP maps, never copied publisher demux
+coordinates. The source descriptor supplies its admitted codec envelope; HTTP
+capabilities supply server support.
 
 The server authorizes the exact source and validates its format, binding,
 identity conflicts and limits before admitting the configuration. It confirms the

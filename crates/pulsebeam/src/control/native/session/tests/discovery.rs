@@ -245,6 +245,7 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
             wire::SubscriptionSpec {
                 track_id: target.as_str(),
                 kind: wire::TrackKind::Data as i32,
+                source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
                         stream_id: Some(1),

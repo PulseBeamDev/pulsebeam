@@ -174,6 +174,7 @@ fn subscriptions_require_resolved_filters_but_no_discovery_projection() {
             wire::SubscriptionSpec {
                 track_id: id.as_str(),
                 kind: wire::TrackKind::Data as i32,
+                source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
                         stream_id: Some(1),

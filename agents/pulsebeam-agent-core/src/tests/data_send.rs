@@ -329,28 +329,56 @@ fn owned_source_end_rejects_in_flight_and_queued_bytes() {
 
 #[test]
 fn terminal_connection_failure_rejects_a_send_waiting_for_its_first_binding() {
-    let mut agent = Agent::new(config()).unwrap();
-    let (_, operation) = begin_connect(&mut agent, desired(1), channel(12));
-    let send = agent.send_data(spec(TopicMode::Lossy), vec![1]).unwrap();
-    deadline(&mut agent);
-    agent
-        .handle(HostEvent::Http(HttpEvent::Response {
-            operation,
-            response: HttpResponse {
-                status: 401,
-                headers: vec![],
-                body: vec![],
-            },
-        }))
-        .unwrap();
-    assert_eq!(
-        finished(&mut agent),
-        vec![(send, Some(DataSendFailure::TerminalFailure))]
-    );
-    assert!(agent.send_data(spec(TopicMode::Lossy), vec![2]).is_err());
-    agent.command(AgentCommand::Connect).unwrap();
-    assert!(
-        finished(&mut agent).is_empty(),
-        "explicit retry cannot retarget the failed send"
-    );
+    for (status, code) in [
+        (401, crate::ffi::ErrorCode::PermissionDenied),
+        (409, crate::ffi::ErrorCode::Replaced),
+    ] {
+        let mut agent = Agent::new(config()).unwrap();
+        let (_, operation) = begin_connect(&mut agent, desired(1), channel(12));
+        let send = agent.send_data(spec(TopicMode::Lossy), vec![1]).unwrap();
+        deadline(&mut agent);
+        agent
+            .handle(HostEvent::Http(HttpEvent::Response {
+                operation,
+                response: HttpResponse {
+                    status,
+                    headers: vec![],
+                    body: vec![],
+                },
+            }))
+            .unwrap();
+        let observed = crate::ffi::AgentState::from(agent.snapshot())
+            .error
+            .unwrap();
+        assert_eq!(observed.code, code);
+        let results = finished(&mut agent);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, send);
+        let failure = results[0].1.as_ref().expect("terminal send failure");
+        assert_eq!(crate::ffi::ErrorInfo::from(failure), observed);
+        let rejected = agent
+            .send_data(spec(TopicMode::Lossy), vec![2])
+            .unwrap_err();
+        assert_eq!(crate::ffi::ErrorInfo::from(&rejected), observed);
+        if code == crate::ffi::ErrorCode::Replaced {
+            assert_eq!(
+                agent.command(AgentCommand::Connect),
+                Err(AgentError::Replaced)
+            );
+        } else {
+            agent.command(AgentCommand::Connect).unwrap();
+            assert!(agent.snapshot().terminal_failure.is_none());
+        }
+        assert_eq!(crate::ffi::ErrorInfo::from(failure), observed);
+        assert!(
+            finished(&mut agent).is_empty(),
+            "explicit retry cannot retarget the failed send"
+        );
+        while let Some(effect) = agent.next_effect_after_turn() {
+            assert!(!matches!(
+                effect,
+                Effect::DataChannel(DataChannelEffect::Send { .. })
+            ));
+        }
+    }
 }

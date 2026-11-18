@@ -27,6 +27,7 @@ pub mod state {
     pub mod validation;
 }
 
+pub mod catalog;
 pub mod topic;
 pub mod rtp_extensions {
     /// RTP header extension IDs that are reserved by PulseBeam.

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Bound::{Excluded, Unbounded};
 
 use pulsebeam_proto::prelude::Message;
 use pulsebeam_proto::state::{self as wire, codec, validation};
@@ -62,6 +63,13 @@ pub(crate) enum OutputError {
 pub(crate) struct NativeInput {
     pub(crate) cutoffs: Vec<u64>,
     pub(crate) executions: Vec<(u64, wire::ExecutionReport)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LookupInterestChange {
+    pub(crate) reference: u64,
+    pub(crate) address: wire::LogicalSourceAddress,
+    pub(crate) active: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -200,6 +208,12 @@ pub(crate) struct NativeSession {
     initial_end: Option<u64>,
     initial_cursor: u64,
     initial_complete: bool,
+    lookup_cursor: u64,
+    lookup_refresh_pending: bool,
+    lookup_refresh_again: bool,
+    lookup_interests: BTreeMap<u64, wire::LogicalSourceAddress>,
+    lookup_changes: VecDeque<LookupInterestChange>,
+    closed_lookup_pending: bool,
     grant_revision: u64,
     permissions: ResourcePermissions,
     permission_sweep: Option<PermissionSweep>,
@@ -237,6 +251,7 @@ impl NativeSession {
         codec::encode_server(&wire::ServerStateBatch {
             records: vec![record],
             initial_complete: false,
+            ..Default::default()
         })
         .map_err(OutputError::Encode)?;
         if self.rows.get(&key).is_some_and(|row| row.value == value) {
@@ -515,6 +530,8 @@ impl NativeSession {
 
     pub(crate) fn close(&mut self, reason: wire::CloseReason) -> Result<(), OutputError> {
         self.closed = true;
+        self.lookup_cursor = 0;
+        self.closed_lookup_pending = true;
         let Some(row) = self.rows.get(&Key::Session) else {
             return Ok(());
         };
@@ -530,7 +547,37 @@ impl NativeSession {
     }
 
     pub(crate) fn terminal_sent(&self) -> bool {
-        self.closed && self.rows.get(&Key::Session).is_some_and(|row| !row.dirty)
+        self.closed
+            && !self.closed_lookup_pending
+            && self.rows.get(&Key::Session).is_some_and(|row| !row.dirty)
+    }
+
+    pub(crate) fn finish_closed_lookups(&mut self, budget: usize) -> Result<(), OutputError> {
+        if !self.closed_lookup_pending {
+            return Ok(());
+        }
+        for _ in 0..budget {
+            let next = self
+                .order
+                .range((Excluded(self.lookup_cursor), Unbounded))
+                .next()
+                .map(|(&ordinal, key)| (ordinal, key.clone()));
+            let Some((ordinal, key)) = next else {
+                self.closed_lookup_pending = false;
+                return Ok(());
+            };
+            self.lookup_cursor = ordinal;
+            if let Key::Owned(reference) = key
+                && self
+                    .rows
+                    .get(&Key::Owned(reference))
+                    .and_then(|row| row.owned.as_ref())
+                    .is_some_and(|owned| !owned.retired && is_source_lookup(&owned.declaration))
+            {
+                self.finish_source_lookup(reference, wire::AbsenceReason::Removed)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn receive_input(
@@ -604,6 +651,36 @@ impl NativeSession {
             let target = record.desired.ok_or(InputError::Revision)?;
             let key = Key::Owned(reference);
             if matches!(target.value, Some(wire::desired_state::Value::Absent(true))) {
+                if self
+                    .rows
+                    .get(&key)
+                    .and_then(|row| row.owned.as_ref())
+                    .is_some_and(|owned| is_source_lookup(&owned.declaration))
+                {
+                    let previous = self
+                        .rows
+                        .get(&key)
+                        .and_then(|row| row.owned.as_ref())
+                        .map_or(0, |owned| owned.target.encoded_len());
+                    self.charge(previous, target.encoded_len())
+                        .map_err(|_| InputError::Capacity)?;
+                    let owned = self
+                        .rows
+                        .get_mut(&key)
+                        .and_then(|row| row.owned.as_mut())
+                        .ok_or(InputError::Capacity)?;
+                    owned.target = target.clone();
+                    owned.retired = true;
+                    owned.cutoff_pending = false;
+                    self.put(
+                        key,
+                        absence(target.revision, wire::AbsenceReason::Removed, None),
+                    )
+                    .map_err(|_| InputError::Capacity)?;
+                    self.sync_lookup_interest(reference)
+                        .map_err(|_| InputError::Capacity)?;
+                    continue;
+                }
                 let previous = self
                     .rows
                     .get(&key)
@@ -654,6 +731,11 @@ impl NativeSession {
                 continue;
             }
             let invalid = validation::validate_spec(spec).is_err()
+                || matches!(
+                    spec.declaration.as_ref(),
+                    Some(wire::resource_spec::Declaration::Subscription(subscription))
+                        if crate::entity::RoomExternalId::new(&subscription.source_room).is_err()
+                )
                 || existing.is_some_and(|owned| {
                     !validation::declarations_equivalent(&owned.declaration, spec)
                 });
@@ -668,6 +750,7 @@ impl NativeSession {
             if !self.permissions.permits_intent(spec) {
                 if existing.is_some() {
                     let previous = existing.map_or(0, |owned| owned.target.encoded_len());
+                    let lookup = existing.is_some_and(|owned| is_source_lookup(&owned.declaration));
                     self.charge(previous, target.encoded_len())
                         .map_err(|_| InputError::Capacity)?;
                     self.rows
@@ -676,8 +759,12 @@ impl NativeSession {
                         .ok_or(InputError::Capacity)?
                         .target = target;
                     let reason = self.permission_denial_reason(reference);
-                    self.revoke(reference, reason)?;
-                    effects.cutoffs.push(reference);
+                    if lookup {
+                        self.finish_source_lookup(reference, reason)?;
+                    } else {
+                        self.revoke(reference, reason)?;
+                        effects.cutoffs.push(reference);
+                    }
                 } else {
                     self.reject(
                         reference,
@@ -687,6 +774,7 @@ impl NativeSession {
                 }
                 continue;
             }
+            let is_new = existing.is_none();
             if let Some(label) = publication_key(spec)
                 && self
                     .publications
@@ -702,7 +790,7 @@ impl NativeSession {
             }
             if !live_fits(spec)
                 || (publication_key(spec).is_some()
-                    && existing.is_none()
+                    && is_new
                     && self.publications.len() >= MAX_PUBLICATIONS)
             {
                 self.reject(
@@ -712,18 +800,24 @@ impl NativeSession {
                 )?;
                 continue;
             }
+            let accepted_revision = target.revision;
+            let source_lookup = is_source_lookup(spec);
             let previous = self
                 .rows
                 .get(&key)
                 .and_then(|row| row.owned.as_ref())
                 .map_or(0, |owned| owned.target.encoded_len());
-            let next = target.encoded_len().saturating_add(if existing.is_none() {
-                spec.encoded_len()
-            } else {
-                0
-            });
+            let next =
+                target
+                    .encoded_len()
+                    .saturating_add(if is_new { spec.encoded_len() } else { 0 });
             self.charge(previous, next)
                 .map_err(|_| InputError::Capacity)?;
+            let (publication, declaration) = if is_new {
+                (publication_key(spec), Some(spec.as_ref().clone()))
+            } else {
+                (None, None)
+            };
             if let Some(row) = self.rows.get_mut(&key)
                 && let Some(owned) = &mut row.owned
             {
@@ -732,10 +826,10 @@ impl NativeSession {
                 // The pending creation exists before preparation and owns its immutable declaration.
                 self.put(key.clone(), absence(0, wire::AbsenceReason::Gone, None))
                     .map_err(|_| InputError::Capacity)?;
-                if let Some(label) = publication_key(spec) {
+                if let Some(label) = publication {
                     self.publications.insert(label, reference);
                 }
-                let declaration = spec.as_ref().clone();
+                let declaration = declaration.ok_or(InputError::Capacity)?;
                 let row = self.rows.get_mut(&key).ok_or(InputError::Capacity)?;
                 row.owned = Some(Owned {
                     receiver_source: None,
@@ -754,9 +848,149 @@ impl NativeSession {
                 // Pending entries have no authoritative absence to send.
                 row.dirty = false;
             }
-            self.queue_preparation(reference);
+            if source_lookup {
+                self.project_source_lookup(reference, accepted_revision)?;
+            } else {
+                self.queue_preparation(reference);
+            }
         }
         Ok(effects)
+    }
+
+    fn finish_source_lookup(
+        &mut self,
+        reference: u64,
+        reason: wire::AbsenceReason,
+    ) -> Result<(), OutputError> {
+        let key = Key::Owned(reference);
+        let (revision, target_bytes) = {
+            let row = self.rows.get(&key).ok_or(OutputError::InvalidObservation)?;
+            let owned = row.owned.as_ref().ok_or(OutputError::InvalidObservation)?;
+            (owned.target.revision, owned.target.encoded_len())
+        };
+        let next_target = wire::DesiredState {
+            revision,
+            value: Some(wire::desired_state::Value::Absent(true)),
+        };
+        self.charge(target_bytes, next_target.encoded_len())?;
+        let owned = self
+            .rows
+            .get_mut(&key)
+            .and_then(|row| row.owned.as_mut())
+            .ok_or(OutputError::InvalidObservation)?;
+        owned.retired = true;
+        owned.cutoff_pending = false;
+        owned.target = next_target;
+        self.put(key, absence(revision, reason, None))?;
+        self.sync_lookup_interest(reference)
+    }
+
+    fn lookup_interest_bytes(address: &wire::LogicalSourceAddress) -> usize {
+        std::mem::size_of::<(u64, wire::LogicalSourceAddress)>()
+            .saturating_add(address.room.len())
+            .saturating_add(address.participant_external_id.len())
+            .saturating_add(address.label.len())
+    }
+
+    fn sync_lookup_interest(&mut self, reference: u64) -> Result<(), OutputError> {
+        let next = self.rows.get(&Key::Owned(reference)).and_then(|row| {
+            let owned = row.owned.as_ref()?;
+            if owned.retired || !is_source_lookup(&owned.declaration) {
+                return None;
+            }
+            let enabled = row.value.value.as_ref().is_some_and(|value| {
+                matches!(value, wire::confirmed_state::Value::SourceLookup(state)
+                    if state.spec.as_ref().and_then(|spec| spec.settings.as_ref())
+                        .is_some_and(|settings| settings.enabled == Some(true)))
+            });
+            if !enabled || !self.permissions.permits_intent(&owned.declaration) {
+                return None;
+            }
+            match owned.declaration.declaration.as_ref()? {
+                wire::resource_spec::Declaration::SourceLookup(lookup) => lookup.source.clone(),
+                _ => None,
+            }
+        });
+        let previous = self.lookup_interests.get(&reference).cloned();
+        if previous == next {
+            return Ok(());
+        }
+        let previous_bytes = previous.as_ref().map_or(0, Self::lookup_interest_bytes);
+        let next_bytes = next.as_ref().map_or(0, Self::lookup_interest_bytes);
+        let queued_bytes = previous_bytes.saturating_add(next_bytes);
+        self.charge(previous_bytes, next_bytes.saturating_add(queued_bytes))?;
+        if let Some(address) = previous {
+            self.lookup_interests.remove(&reference);
+            self.lookup_changes.push_back(LookupInterestChange {
+                reference,
+                address,
+                active: false,
+            });
+        }
+        if let Some(address) = next {
+            self.lookup_interests.insert(reference, address.clone());
+            self.lookup_changes.push_back(LookupInterestChange {
+                reference,
+                address,
+                active: true,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_lookup_changes(&mut self) -> Vec<LookupInterestChange> {
+        let changes = self.lookup_changes.drain(..).collect::<Vec<_>>();
+        let bytes = changes.iter().fold(0usize, |total, change| {
+            total.saturating_add(Self::lookup_interest_bytes(&change.address))
+        });
+        let _ = self.charge(bytes, 0);
+        changes
+    }
+
+    fn project_source_lookup(
+        &mut self,
+        reference: u64,
+        evaluated_revision: u64,
+    ) -> Result<(), InputError> {
+        let key = Key::Owned(reference);
+        let owned = self
+            .rows
+            .get(&key)
+            .and_then(|row| row.owned.as_ref())
+            .ok_or(InputError::Capacity)?;
+        let spec = owned
+            .target
+            .value
+            .as_ref()
+            .and_then(|target| match target {
+                wire::desired_state::Value::Present(spec) => Some(spec.as_ref().clone()),
+                wire::desired_state::Value::Absent(_) => None,
+            })
+            .ok_or(InputError::Capacity)?;
+        let enabled = spec
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.enabled == Some(true));
+        let previous = self.rows.get(&key).and_then(|row| match &row.value.value {
+            Some(wire::confirmed_state::Value::SourceLookup(lookup)) if enabled => {
+                Some((lookup.participant.clone(), lookup.track.clone()))
+            }
+            _ => None,
+        });
+        let value = confirmed(wire::confirmed_state::Value::SourceLookup(Box::new(
+            wire::SourceLookupState {
+                spec: Some(spec),
+                participant: previous
+                    .as_ref()
+                    .and_then(|(participant, _)| participant.clone()),
+                track: previous.and_then(|(_, track)| track),
+            },
+        )));
+        let mut value = value;
+        value.evaluated_revision = evaluated_revision;
+        self.put(key, value).map_err(|_| InputError::Capacity)?;
+        self.sync_lookup_interest(reference)
+            .map_err(|_| InputError::Capacity)
     }
 
     fn reject(
@@ -780,7 +1014,13 @@ impl NativeSession {
         {
             owned.target = target.clone();
             let mut value = row.value.clone();
-            if !matches!(value.value, Some(wire::confirmed_state::Value::Owned(_))) {
+            if !matches!(
+                value.value,
+                Some(
+                    wire::confirmed_state::Value::Owned(_)
+                        | wire::confirmed_state::Value::SourceLookup(_)
+                )
+            ) {
                 owned.retired = true;
                 value.value = Some(wire::confirmed_state::Value::Absent(wire::AbsentState {
                     reason: wire::AbsenceReason::CreateRejected as i32,
@@ -931,6 +1171,126 @@ impl NativeSession {
         Ok(())
     }
 
+    pub(in crate::control) fn refresh_source_lookups<'a>(
+        &mut self,
+        budget: usize,
+        unix_now: u64,
+        mut source: impl FnMut(&wire::LogicalSourceAddress) -> Option<super::ResolvedSource<'a>>,
+    ) -> Result<(), OutputError> {
+        for _ in 0..budget {
+            let next = self
+                .order
+                .range((Excluded(self.lookup_cursor), Unbounded))
+                .next()
+                .map(|(&ordinal, key)| (ordinal, key.clone()));
+            let Some((ordinal, key)) = next else {
+                self.lookup_cursor = 0;
+                self.lookup_refresh_pending = false;
+                return Ok(());
+            };
+            self.lookup_cursor = ordinal;
+            let Key::Owned(reference) = key else {
+                continue;
+            };
+            let Some(row) = self.rows.get(&Key::Owned(reference)) else {
+                continue;
+            };
+            let Some(owned) = row.owned.as_ref() else {
+                continue;
+            };
+            if owned.retired || !is_source_lookup(&owned.declaration) {
+                continue;
+            }
+            let Some(wire::confirmed_state::Value::SourceLookup(current)) = &row.value.value else {
+                continue;
+            };
+            let Some(spec) = current.spec.as_ref() else {
+                return Err(OutputError::InvalidObservation);
+            };
+            let enabled = spec
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings.enabled == Some(true));
+            let resolved = if enabled
+                && self.authorization_current(unix_now)
+                && self.permissions.permits_intent(spec)
+            {
+                let address = spec
+                    .declaration
+                    .as_ref()
+                    .and_then(|declaration| match declaration {
+                        wire::resource_spec::Declaration::SourceLookup(lookup) => {
+                            lookup.source.as_ref()
+                        }
+                        _ => None,
+                    })
+                    .ok_or(OutputError::InvalidObservation)?;
+                source(address).and_then(|source| {
+                    let track = track_descriptor(source.track)?;
+                    let publisher = source.publisher.as_str();
+                    (track.participant_id == source.track.meta().origin.as_str()
+                        && source.publisher.as_str() == address.participant_external_id
+                        && track.label == address.label
+                        && track.kind.as_ref().is_some_and(|kind| match kind {
+                            wire::track::Kind::Audio(_) => {
+                                address.kind == wire::TrackKind::Audio as i32
+                            }
+                            wire::track::Kind::Video(_) => {
+                                address.kind == wire::TrackKind::Video as i32
+                            }
+                            wire::track::Kind::Data(_) => {
+                                address.kind == wire::TrackKind::Data as i32
+                            }
+                        }))
+                    .then(|| {
+                        (
+                            wire::Participant {
+                                participant_id: source.track.meta().origin.as_str(),
+                                participant_external_id: publisher.to_owned(),
+                            },
+                            track,
+                        )
+                    })
+                })
+            } else {
+                None
+            };
+            let mut value = row.value.clone();
+            let Some(wire::confirmed_state::Value::SourceLookup(lookup)) = &mut value.value else {
+                continue;
+            };
+            lookup.participant = resolved
+                .as_ref()
+                .map(|(participant, _)| participant.clone());
+            lookup.track = resolved.map(|(_, track)| track);
+            self.put(Key::Owned(reference), value)?;
+        }
+        self.lookup_refresh_pending = self
+            .order
+            .range((Excluded(self.lookup_cursor), Unbounded))
+            .next()
+            .is_some();
+        if !self.lookup_refresh_pending {
+            self.lookup_cursor = 0;
+            self.lookup_refresh_pending = self.lookup_refresh_again;
+            self.lookup_refresh_again = false;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lookup_refresh_pending(&self) -> bool {
+        self.lookup_refresh_pending
+    }
+
+    pub(crate) fn source_lookup_changed(&mut self) {
+        if self.lookup_refresh_pending {
+            self.lookup_refresh_again = true;
+        } else {
+            self.lookup_cursor = 0;
+            self.lookup_refresh_pending = true;
+        }
+    }
+
     pub(crate) fn preparation_spec(&self, work: &Preparation) -> Option<&wire::ResourceSpec> {
         let owned = self.rows.get(&Key::Owned(work.reference))?.owned.as_ref()?;
         if self.closed
@@ -954,13 +1314,32 @@ impl NativeSession {
         capabilities: Option<&wire::RtpCapabilities>,
         source: impl FnOnce(TrackId) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<Option<ExecutionCommand>, OutputError> {
-        match self.compile_execution(work, capabilities, source) {
+        self.prepare_execution_in_room(work, unix_now, capabilities, |_, track| source(track))
+    }
+
+    pub(crate) fn prepare_execution_in_room<'a>(
+        &mut self,
+        work: &Preparation,
+        unix_now: u64,
+        capabilities: Option<&wire::RtpCapabilities>,
+        source: impl FnOnce(&str, TrackId) -> Option<super::ResolvedSource<'a>>,
+    ) -> Result<Option<ExecutionCommand>, OutputError> {
+        match self.compile_execution_in_room(work, capabilities, source) {
             Ok(ExecutionCommand(ExecutionAction::Prepare {
                 work,
                 resource:
                     super::PreparedResource::Receiver(super::ReceiverPreparation::Waiting(source)),
             })) => {
-                self.retain_source_wait(work, source)?;
+                let source_room = self
+                    .preparation_spec(&work)
+                    .and_then(|spec| match spec.declaration.as_ref() {
+                        Some(wire::resource_spec::Declaration::Subscription(subscription)) => {
+                            Some(subscription.source_room.clone())
+                        }
+                        _ => None,
+                    })
+                    .ok_or(OutputError::InvalidObservation)?;
+                self.retain_source_wait(work, source, source_room)?;
                 Ok(None)
             }
             Ok(command) => Ok(Some(command)),
@@ -982,6 +1361,15 @@ impl NativeSession {
         work: &Preparation,
         capabilities: Option<&wire::RtpCapabilities>,
         source: impl FnOnce(TrackId) -> Option<super::ResolvedSource<'a>>,
+    ) -> Result<ExecutionCommand, wire::Failure> {
+        self.compile_execution_in_room(work, capabilities, |_, track| source(track))
+    }
+
+    fn compile_execution_in_room<'a>(
+        &mut self,
+        work: &Preparation,
+        capabilities: Option<&wire::RtpCapabilities>,
+        source: impl FnOnce(&str, TrackId) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<ExecutionCommand, wire::Failure> {
         use crate::control::native::PreparedResource;
         self.preparation_spec(work)
@@ -1037,7 +1425,7 @@ impl NativeSession {
         &mut self,
         work: &Preparation,
         capabilities: Option<&wire::RtpCapabilities>,
-        source: impl FnOnce(TrackId) -> Option<super::ResolvedSource<'a>>,
+        source: impl FnOnce(&str, TrackId) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<crate::control::native::ReceiverPreparation, wire::Failure> {
         use crate::control::native::{ReceiveTransport, Receiver, ReceiverPreparation};
         let spec = self
@@ -1064,7 +1452,7 @@ impl NativeSession {
             self.project_receiver(work, &preview)?;
             return Ok(ReceiverPreparation::Policy(policy));
         }
-        let source = source(target.source);
+        let source = source(&target.source_room, target.source);
         if source
             .as_ref()
             .is_some_and(|source| source.track.id() != target.source)
@@ -1089,7 +1477,10 @@ impl NativeSession {
         validation::validate_participant(&participant)
             .and_then(|_| validation::validate_track(&track))
             .map_err(|_| failure(wire::FailureCode::Incompatible))?;
-        if !self.permissions.can_subscribe(&participant, &track) {
+        if !self
+            .permissions
+            .can_subscribe(&target.source_room, &participant, &track)
+        {
             return Err(failure(wire::FailureCode::PermissionDenied));
         }
         let (transport, policy) =
@@ -1100,6 +1491,7 @@ impl NativeSession {
                 },
             )?;
         let plan = Receiver {
+            source_room: source.track.meta().room_id,
             source: source.track.clone(),
             source_id: track.track_id.clone(),
             transport,
@@ -1989,6 +2381,7 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
     wire::ServerStateBatch {
         records: vec![record],
         initial_complete: true,
+        ..Default::default()
     }
     .encoded_len()
         <= codec::MAX_FRAME_SIZE
@@ -2012,6 +2405,7 @@ pub(super) fn execution_fits(live: &wire::LiveResource) -> bool {
                 value: Some(wire::confirmed_state::Value::Owned(Box::new(live))),
             }),
         }],
+        ..Default::default()
     }
     .encoded_len()
         <= codec::MAX_FRAME_SIZE
@@ -2073,6 +2467,13 @@ pub(crate) fn failure(code: wire::FailureCode) -> wire::Failure {
         code: code as i32,
         diagnostic: String::new(),
     }
+}
+
+fn is_source_lookup(spec: &wire::ResourceSpec) -> bool {
+    matches!(
+        spec.declaration.as_ref(),
+        Some(wire::resource_spec::Declaration::SourceLookup(_))
+    )
 }
 
 fn publication_key(spec: &wire::ResourceSpec) -> Option<(i32, String)> {

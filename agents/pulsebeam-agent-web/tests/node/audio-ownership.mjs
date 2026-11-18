@@ -4,10 +4,9 @@ import {
   RemoteCatalog,
   attachRemoteAudio,
 } from "../../node_assets/dist/remote-catalog.js";
-import {
-  ResourceOwners,
-  ResourceOwnershipError,
-} from "../../node_assets/dist/resources.js";
+import { ResourceOwners } from "../../node_assets/dist/resources.js";
+import { OperationError } from "../../node_assets/dist/agent-observation.js";
+import { ErrorCode } from "../../node_assets/dist/schema.js";
 import { DataRegistry } from "../../node_assets/dist/data.js";
 
 // Real core admission and host attachment, with controlled decoded media and audio I/O.
@@ -107,13 +106,12 @@ export async function audioOwnershipContract(runtime) {
     );
     assert.equal(contexts.length, 1);
     assert.equal(contexts[0].routes.size, 1);
-    const duplicate = attachRemoteAudio(agent);
-    await assert.rejects(
-      duplicate.ready,
+    assert.throws(
+      () => attachRemoteAudio(agent),
       (error) =>
-        error instanceof ResourceOwnershipError && error.code === "ownership",
+        error instanceof OperationError &&
+        error.info.code === ErrorCode.Conflict,
     );
-    await duplicate.close();
     assert.equal(contexts.length, 1, "declined owner cannot allocate a graph");
     assert.equal(
       contexts[0].routes.size,

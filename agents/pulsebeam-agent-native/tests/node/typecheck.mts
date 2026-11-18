@@ -17,6 +17,11 @@ async function binaryInputs(agent: AgentLike) {
   await camera.submit(new InputFrame.I420({
     frame: { width: 160, height: 96, timestampUs: await camera.captureTimeUs(), data, rotationDegrees: 0 },
   }));
-  await agent.data("foreign-exchange", TopicMode.Ordered).send(data);
+  const address = agent.data("foreign-exchange", TopicMode.Ordered);
+  // @ts-expect-error Sending requires a publication owner.
+  address.send(data);
+  const publication = address.publish();
+  await publication.send(data);
+  publication.close();
 }
 void [agent, nativeAgent, binaryInputs];

@@ -542,21 +542,28 @@ struct PeerBarriers {
 }
 
 struct OwnedData {
-    sender: Arc<pulsebeam_agent_native::ffi::LocalDataTrack>,
-    room: Arc<pulsebeam_agent_native::ffi::DataReceiver>,
-    participant: Arc<pulsebeam_agent_native::ffi::DataReceiver>,
+    sender: Arc<pulsebeam_agent_native::ffi::DataPublication>,
+    room: Arc<pulsebeam_agent_native::ffi::DataSubscription>,
+    participant: Arc<pulsebeam_agent_native::ffi::DataSubscription>,
     remote: String,
 }
 
 impl OwnedData {
     async fn new(agent: &Agent, remote: String) -> anyhow::Result<Self> {
-        let sender = agent.data("owned-bytes".into(), core_ffi::TopicMode::Ordered)?;
-        let room = sender.receive().await?;
-        let participant = agent
-            .participant(remote.clone())?
+        let sender = agent
             .data("owned-bytes".into(), core_ffi::TopicMode::Ordered)?
-            .receive()
-            .await?;
+            .publish()?;
+        let source = agent
+            .room(
+                agent
+                    .snapshot()
+                    .room_id
+                    .ok_or_else(|| anyhow::anyhow!("owned data has no admitted room"))?,
+            )?
+            .participant(remote.clone())?
+            .data("owned-bytes".into(), core_ffi::TopicMode::Ordered)?;
+        let room = source.subscribe()?;
+        let participant = source.subscribe()?;
         Ok(Self {
             sender,
             room,
@@ -567,7 +574,7 @@ impl OwnedData {
 
     async fn message(
         &self,
-        cursor: &pulsebeam_agent_native::ffi::DataReceiver,
+        cursor: &pulsebeam_agent_native::ffi::DataSubscription,
         expected: &[u8],
     ) -> anyhow::Result<pulsebeam_agent_core::DataEvent> {
         loop {
@@ -670,12 +677,12 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
     let alice_reports = reports_tx.clone();
     let alice_barriers = barriers.clone();
     sim.client(alice_ip, async move {
-        let report = run_peer("alice", alice_ip, server_ip, false, alice_barriers).await?;
+        let report = run_peer("alice", "bob", alice_ip, server_ip, false, alice_barriers).await?;
         alice_reports.send(report).await?;
         Ok(())
     });
     sim.client(bob_ip, async move {
-        let report = run_peer("bob", bob_ip, server_ip, true, barriers).await?;
+        let report = run_peer("bob", "alice", bob_ip, server_ip, true, barriers).await?;
         reports_tx.send(report).await?;
         Ok(())
     });
@@ -732,6 +739,7 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
 
 async fn run_peer(
     name: &str,
+    remote: &str,
     ip: IpAddr,
     server_ip: IpAddr,
     reconnect: bool,
@@ -784,14 +792,12 @@ async fn run_peer(
     let agent = Agent::from_runtime(runtime.clone());
     let mut video = agent.create_video_input(Default::default()).await?;
     let mut audio = agent.create_audio_input().await?;
-    let mut video_owner = agent
-        .video("camera".into())?
-        .publish(video.clone(), Default::default())
-        .await?;
+    let mut video_owner = agent.video("camera".into())?.publish(Default::default())?;
+    video_owner.set_source(Some(video.clone())).await?;
     let mut audio_owner = agent
         .audio("microphone".into())?
-        .publish(audio.clone(), Default::default())
-        .await?;
+        .publish(Default::default())?;
+    audio_owner.set_source(Some(audio.clone())).await?;
     video_owner.set_source(None).await?;
     let video_updates = video_owner.updates()?;
     let pending_video = video_updates
@@ -817,10 +823,14 @@ async fn run_peer(
         topic_publishers: vec![latest.clone(), ordered.clone()],
         topic_subscribers: vec![
             core_ffi::TopicSubscriber {
+                room: room.as_str().to_owned(),
+                participant_id: remote.to_owned(),
                 name: latest.name.clone(),
                 mode: latest.mode,
             },
             core_ffi::TopicSubscriber {
+                room: room.as_str().to_owned(),
+                participant_id: remote.to_owned(),
                 name: ordered.name.clone(),
                 mode: ordered.mode,
             },
@@ -888,17 +898,17 @@ async fn run_peer(
         .ok_or_else(|| anyhow::anyhow!("{name} did not discover remote video"))?;
     let remote_video_id = remote_video_publication.id.clone();
     let video_subscription = agent
-        .participant(remote_video_publication.participant_id.clone())?
+        .room(room.as_str().to_owned())?
+        .participant(remote.to_owned())?
         .video(remote_video_publication.label.clone())?
-        .subscribe(core_ffi::VideoObservation {
+        .subscribe(Some(core_ffi::VideoObservation {
             visible: true,
             height: 720,
             min_height: 0,
             min_fps: 0,
             priority: 1,
             playout_delay: core_ffi::PlayoutDelay::Adaptive,
-        })
-        .await?;
+        }))?;
     let remote_audio_publication = initial
         .catalog
         .publications
@@ -910,10 +920,10 @@ async fn run_peer(
         .ok_or_else(|| anyhow::anyhow!("{name} did not discover remote audio"))?;
     let remote_audio_id = remote_audio_publication.id.clone();
     let audio_subscription = agent
-        .participant(remote_audio_publication.participant_id.clone())?
+        .room(room.as_str().to_owned())?
+        .participant(remote.to_owned())?
         .audio(remote_audio_publication.label.clone())?
-        .subscribe(Default::default())
-        .await?;
+        .subscribe(Default::default())?;
 
     wait_media_bindings(&agent, &remote_video_id, &remote_audio_id).await?;
     let mut remote_video = video_subscription.observe(ReceiveMode::Decoded).await?;
@@ -1120,14 +1130,12 @@ async fn run_peer(
     barriers.before_reconnect.wait().await;
     video = agent.create_video_input(Default::default()).await?;
     audio = agent.create_audio_input().await?;
-    video_owner = agent
-        .video("camera".into())?
-        .publish(video.clone(), Default::default())
-        .await?;
+    video_owner = agent.video("camera".into())?.publish(Default::default())?;
+    video_owner.set_source(Some(video.clone())).await?;
     audio_owner = agent
         .audio("microphone".into())?
-        .publish(audio.clone(), Default::default())
-        .await?;
+        .publish(Default::default())?;
+    audio_owner.set_source(Some(audio.clone())).await?;
     video_owner.ready().await?;
     audio_owner.ready().await?;
     barriers.before_reconnect.wait().await;
@@ -1224,8 +1232,7 @@ async fn run_peer(
     )
     .await?;
     drop(events);
-    let owned_data =
-        OwnedData::new(&agent, remote_video_publication.participant_id.clone()).await?;
+    let owned_data = OwnedData::new(&agent, remote.to_owned()).await?;
     owned_data.exchange(&barriers.before_reconnect, 1).await?;
     let same_peer_expected = same_peer.retained.clone();
     anyhow::ensure!(
@@ -1553,8 +1560,8 @@ async fn prove_takeover(config: Config, host: NativeHost, room: &str) -> anyhow:
     let video = old.create_video_input(Default::default()).await?;
     let publication = old
         .video("takeover-camera".into())?
-        .publish(video.clone(), Default::default())
-        .await?;
+        .publish(Default::default())?;
+    publication.set_source(Some(video.clone())).await?;
     predecessor.join(room.to_owned())?;
     let first = wait_connected(&old, None).await?;
     publication.ready().await?;
@@ -1648,8 +1655,8 @@ async fn prove_held_creation_takeover(
     let video = old.create_video_input(Default::default()).await?;
     let publication = old
         .video("held-camera".into())?
-        .publish(video.clone(), Default::default())
-        .await?;
+        .publish(Default::default())?;
+    publication.set_source(Some(video.clone())).await?;
     let snapshots = old.snapshots();
     let connected = Rc::new(Cell::new(false));
     let superseded = Rc::new(Cell::new(false));

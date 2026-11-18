@@ -33,11 +33,14 @@ for Agent-dependent hooks. React owns the runtime lifecycle. Use a React `key` t
 replace logical sessions.
 Capture hooks own the devices: disconnecting an Agent does not stop capture.
 Look up local handles with `agent.video(label)`, `agent.audio(label)`, or
-`agent.data(label, delivery)`. Look up a remote handle with
-`agent.remote.participant(id).video(label)`, `.audio(label)`, or
-`.data(label, delivery)`. Lookup is inert. `Publish`, `Data`, `Video`, and `Audio`
-own their resources only while committed. Use `source`, `enabled`, and `Video.receive`
-rather than synchronization effects. `useCapture` accepts typed exact devices
+`agent.data(label, delivery)`. Look up a room-pinned remote handle with
+`agent.room(room).participant(externalId).video(label)`, `.audio(label)`, or
+`.data(label, delivery)`. The room and external participant identity are fixed
+by that reference and do not follow Agent room changes. Lookup is inert.
+`usePublish` owns publication; `useSubscribe` owns reception. Pass the resulting
+subscription to `Video` or `Audio` through `source`. Playback owns only its
+observation clone, never the independent subscription. Configure receive hints
+through `useSubscribe`, not playback props. `useCapture` accepts typed exact devices
 and portable best-effort settings; `useDevices` inventories cameras and
 microphones. Applications own data codecs and schema validation.
 
@@ -49,13 +52,16 @@ handler or receive failure releases that mount and reports through `onError`
 `onEvent` when reception should continue. Unmount releases ownership without
 waiting for application promises; it cannot undo their side effects.
 
-This API replaces React descriptors and `.track(spec)` without compatibility
-aliases. Local media handles expose only readonly `kind` and `label`; use
-`Publish` props instead of imperative media setters. The caller-owned Web SDK also
-uses typed lookups, with awaited factories and explicit resource lifetimes.
+`useAgent` returns the actual Web SDK Agent, not a React facade. `usePublish(track,
+source?, options?)` and `useSubscribe(remoteTrack, options?)` likewise return the
+SDK's typed owned handles, or null until their effects create them. Read their
+immutable `state()` snapshots directly in render; the hooks observe `updates()`
+through one shared store bridge. Source changes replace only the pipe, and
+unmount closes owned handles without stopping borrowed capture. This replaces
+React descriptors and `.track(spec)` without compatibility aliases.
 
-React exposes only `useAgent` for Agent ownership, with no `createAgent` export
-or advanced escape hatch. Non-React applications use caller-owned `new Agent(config)`
+React creates Agents through `useAgent`, with no `createAgent` export or
+advanced escape hatch. Non-React applications use caller-owned `new Agent(config)`
 from `@pulsebeam/web`. Managed lifecycle functions are internal, not public SDK
 APIs. Keep signing keys on your backend.
 

@@ -1,18 +1,40 @@
 use super::*;
-use agent_core::{
-    MediaObservationControl, ResourceCommand, ResourceResult, TrackSelector, VideoObservation,
-};
+#[cfg(test)]
+use agent_core::TrackSelector;
+use agent_core::{MediaObservationControl, ResourceCommand, ResourceResult, VideoObservation};
 
 pub(super) struct SubscriptionLease {
     owner: u64,
     pub(super) closed: Arc<Signal>,
     commands: mpsc::Sender<Command>,
     changed: Arc<Notify>,
+    core: Control,
+    pub(super) frame_reader: std::sync::Mutex<Weak<super::frames::FrameReaderLease>>,
+}
+
+impl SubscriptionLease {
+    fn release(&self) -> Result<(), Error> {
+        let reader = self
+            .frame_reader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade();
+        if let Some(reader) = reader {
+            reader.close();
+        }
+        self.core
+            .resource(ResourceCommand::Release { owner: self.owner })?;
+        self.changed.notify_one();
+        Ok(())
+    }
 }
 
 impl Drop for SubscriptionLease {
     fn drop(&mut self) {
-        self.closed.close();
+        if !self.closed.is_closed() {
+            self.closed.close();
+            let _ = self.release();
+        }
         self.changed.notify_one();
     }
 }
@@ -20,12 +42,54 @@ impl Drop for SubscriptionLease {
 /// A media selection interest, independent of its physical observations.
 #[derive(Clone)]
 pub struct Subscription {
-    inner: Arc<SubscriptionLease>,
+    pub(super) inner: Arc<SubscriptionLease>,
 }
 
 impl Subscription {
+    pub(super) fn new(
+        owner: u64,
+        commands: &mpsc::Sender<Command>,
+        core: Control,
+        changed: Arc<Notify>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(SubscriptionLease {
+                owner,
+                closed: Arc::new(Signal::default()),
+                commands: commands.clone(),
+                changed,
+                core,
+                frame_reader: std::sync::Mutex::new(Weak::new()),
+            }),
+        }
+    }
+
+    pub(super) fn owner(&self) -> u64 {
+        self.inner.owner
+    }
+
     pub fn is_closed(&self) -> bool {
         self.inner.closed.is_closed()
+    }
+
+    pub(crate) fn refresh_state(&self) {
+        self.inner.core.state();
+    }
+
+    pub(crate) fn video_observer(
+        &self,
+    ) -> Result<Arc<agent_core::observer::VideoSubscriptionStateObserver>, Error> {
+        self.inner
+            .core
+            .video_subscription_observer(self.inner.owner)
+    }
+
+    pub(crate) fn audio_observer(
+        &self,
+    ) -> Result<Arc<agent_core::observer::AudioSubscriptionStateObserver>, Error> {
+        self.inner
+            .core
+            .audio_subscription_observer(self.inner.owner)
     }
 
     pub async fn observe(&self, mode: ReceiveMode) -> Result<RemoteMedia, Error> {
@@ -113,11 +177,7 @@ impl Subscription {
             return Ok(());
         }
         self.inner.closed.close();
-        self.inner.changed.notify_one();
-        self.resource(ResourceCommand::Release {
-            owner: self.inner.owner,
-        })
-        .await
+        self.inner.release()
     }
 
     async fn resource(&self, command: ResourceCommand) -> Result<(), Error> {
@@ -144,6 +204,7 @@ where
     R: rtc::SessionRuntime,
     F: FnMut() -> Result<(R, O), Error>,
 {
+    #[cfg(test)]
     pub(super) fn claim_subscription(
         &mut self,
         selector: TrackSelector,
@@ -165,6 +226,7 @@ where
         Ok(self.subscription_handle(owner))
     }
 
+    #[cfg(test)]
     pub(super) fn claim_audio_subscription(
         &mut self,
         selector: TrackSelector,
@@ -180,6 +242,7 @@ where
         Ok(self.subscription_handle(owner))
     }
 
+    #[cfg(test)]
     pub(super) fn claim_configured_audio_subscription(
         &mut self,
         selector: TrackSelector,
@@ -216,6 +279,8 @@ where
             closed: Arc::new(Signal::default()),
             commands: self.command_tx.clone(),
             changed: self.leases_changed.clone(),
+            core: self.core.clone(),
+            frame_reader: std::sync::Mutex::new(Weak::new()),
         });
         self.subscriptions.insert(owner, Arc::downgrade(&inner));
         Subscription { inner }

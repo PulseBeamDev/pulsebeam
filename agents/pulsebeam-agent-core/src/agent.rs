@@ -39,6 +39,7 @@ mod admission;
 mod credentials;
 mod native;
 mod publication;
+mod subscription;
 
 use admission::CreateRequest;
 
@@ -72,6 +73,8 @@ impl core::fmt::Debug for AgentCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AgentError {
+    #[error("operation failed: {0:?}")]
+    OperationFailed(crate::ffi::ErrorInfo),
     #[error(transparent)]
     InvalidConfiguration(#[from] ValidationError),
     #[error("desired revision {received} is older than accepted revision {accepted}")]
@@ -384,20 +387,16 @@ impl Agent {
         spec: crate::TrackSpec,
         payload: Vec<u8>,
     ) -> Result<OperationId, AgentError> {
+        if let Some(failure) = &self.snapshot.terminal_failure {
+            return Err(AgentError::OperationFailed(failure.into()));
+        }
         if !self.desired.connected {
             return Err(crate::TrackResourceError::NotConnected.into());
         }
-        let subscriber = spec.subscriber()?;
         let send = crate::TopicSend {
-            publisher: crate::TopicPublisher {
-                topic: subscriber.topic,
-                mode: subscriber.mode,
-            },
+            publisher: spec.publisher()?,
             payload,
         };
-        if self.snapshot.terminal_failure.is_some() {
-            return Err(crate::TopicError::PublisherUnavailable(send.publisher.topic).into());
-        }
         self.topics.validate_data_send(&send)?;
         self.resource_command(crate::ResourceCommand::RetainProducer { spec })?;
         let ticket = self
@@ -460,12 +459,8 @@ impl Agent {
             }
             ResourceCommand::DeclareDataPublication { spec } => {
                 self.resources.validate_data_publication_claim(&spec)?;
-                let subscriber = spec.subscriber()?;
                 let mut owned = self.resources.registrations();
-                owned.publishers.push(crate::TopicPublisher {
-                    topic: subscriber.topic.clone(),
-                    mode: subscriber.mode,
-                });
+                owned.publishers.push(spec.publisher()?);
                 self.merged_topics(owned)?;
                 let owner = self.resources.new_owner()?;
                 self.resources.declare_data_publication(owner, &spec)?;
@@ -630,25 +625,18 @@ impl Agent {
                 if !self.desired.connected {
                     return Err(TrackResourceError::NotConnected.into());
                 }
-                let subscriber = spec.subscriber()?;
                 let mut owned = self.resources.registrations();
-                owned.publishers.push(crate::TopicPublisher {
-                    topic: subscriber.topic,
-                    mode: subscriber.mode,
-                });
+                owned.publishers.push(spec.publisher()?);
                 self.merged_topics(owned)?;
                 self.resources.retain_producer(&spec)?;
                 ResourceResult::Updated
             }
-            ResourceCommand::ReceiveData {
-                spec,
-                participant_id,
-            } => {
+            ResourceCommand::ReceiveData { spec, source } => {
                 let mut owned = self.resources.registrations();
-                owned.subscribers.push(spec.subscriber()?);
+                owned.subscribers.push(spec.subscriber(&source)?);
                 self.merged_topics(owned)?;
                 let owner = self.resources.new_owner()?;
-                self.resources.receive(owner, &spec, participant_id)?;
+                self.resources.receive(owner, &spec, source)?;
                 ResourceResult::Owned { owner: owner.id() }
             }
             ResourceCommand::ReadData { owner } => {
@@ -969,9 +957,7 @@ impl Agent {
         desired.topics.publishers.dedup();
         desired.topics.subscribers.dedup();
         if self.resources.has_video() {
-            desired.video = self
-                .resources
-                .video_projection(&self.snapshot.remote_tracks)?;
+            desired.video = self.resources.video_projection()?;
         }
         if self.resources.has_audio_subscriptions() {
             desired.audio = self.resources.audio_projection();
@@ -1050,7 +1036,7 @@ impl Agent {
         if self.participant_superseded() {
             return Err(AgentError::Replaced);
         }
-        crate::model::validate_identifier("room external id", &room, 256, true)?;
+        crate::validate_room_name(&room)?;
         let same = self.desired.connected && self.snapshot.desired_room.as_ref() == Some(&room);
         if same && self.snapshot.terminal_failure.is_none() {
             return Ok(());
@@ -1069,6 +1055,9 @@ impl Agent {
     }
 
     fn connect(&mut self) -> Result<(), AgentError> {
+        if self.participant_superseded() {
+            return Err(AgentError::Replaced);
+        }
         if !self.desired.connected {
             let mut desired = self.declared.clone();
             desired.revision = desired.revision.saturating_add(1);

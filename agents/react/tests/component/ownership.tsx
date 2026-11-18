@@ -10,7 +10,7 @@ import { createRoot } from "react-dom/client";
 import {
   Audio,
   Data,
-  Publish,
+  useSubscribe,
   SelectAudio,
   useAgent,
   type Agent,
@@ -22,8 +22,8 @@ import {
   OperationError,
   ErrorCode,
 } from "@pulsebeam/web";
+import { Publication as Publish } from "./publication.js";
 import { publishableVideoSource } from "../../src/sources.js";
-import { createReactAgent, managedAgent } from "../../src/agent.js";
 import { deferred, flush, Track } from "./platform.js";
 import { runtimes } from "./runtime.js";
 
@@ -132,18 +132,28 @@ export async function stalePublicationClaim() {
   const root = createRoot(document.createElement("div"));
   await flush(() => root.render(<Room />));
   const runtime = runtimes.at(-1)!;
-  const resource = runtime.resource.bind(runtime);
-  runtime.resource = async (command) => {
-    if (command.op === "claimPublication" && command.spec.label === "old")
+  const install = runtime.replace_owned_track.bind(runtime);
+  let retiringOwner: bigint | undefined;
+  runtime.replace_owned_track = async (
+    owner,
+    track,
+    configuration,
+    muted,
+    replaceInput,
+  ) => {
+    await install(owner, track, configuration, muted, replaceInput);
+    if (track && retiringOwner === undefined) {
+      retiringOwner = owner;
       await completion.promise;
-    return resource(command);
+    }
   };
   await flush(activate);
+  assert.notEqual(retiringOwner, undefined);
   await flush(replace);
   assert.equal(
     runtime.publicationOwners.size,
     0,
-    "replacement waits for the pending retired claim to close",
+    "replacement waits for the retired input operation to drain",
   );
   await flush(() => completion.resolve());
   const owner = [...runtime.publicationOwners.keys()][0];
@@ -151,12 +161,10 @@ export async function stalePublicationClaim() {
   assert.deepEqual([...runtime.claimedPublications], ["video:new"]);
   assert.deepEqual([...runtime.publicationOwners.keys()], [owner]);
   assert.equal(runtime.ownedReplacements[0].replaceInput, true);
-  assert.ok(
-    runtime.ownedReplacements.every(
-      (entry) => entry.owner === owner && entry.muted === false,
-    ),
-    "retired claim cannot mutate the replacement publication",
-  );
+  assert.notEqual(owner, retiringOwner);
+  assert.equal(runtime.ownedReplacements.at(-1)?.owner, owner);
+  assert.equal(runtime.ownedReplacements.at(-1)?.track, native);
+  assert.equal(runtime.ownedReplacements.at(-1)?.muted, false);
   assert.equal(
     native.readyState,
     "live",
@@ -178,7 +186,6 @@ export async function ownershipAdapters() {
     }>,
   ) => void;
   let duplicateFailure: Error | undefined;
-  let audioFailure: Error | undefined;
   const events: DataEvent<"ordered">[] = [];
   const native = new Track("video");
   const source = publishableVideoSource(
@@ -202,13 +209,18 @@ export async function ownershipAdapters() {
       selection: false,
     });
     update = (patch) => setState((before) => ({ ...before, ...patch }));
-    // Distinct SDK wrappers still denote the same Web-interned value.
-    const equivalent = createReactAgent(managedAgent(agent));
+    const equivalent = agent;
+    const audio = useSubscribe(
+      agent.room("selected-room").participant("alice").audio("microphone"),
+    );
     const camera = equivalent.video("camera");
-    const messages = equivalent.data("messages", "ordered");
+    const messages = equivalent
+      .room("selected-room")
+      .participant("alice")
+      .data("messages", "ordered");
     return (
       <>
-        <Audio agent={equivalent} />
+        <Audio source={audio} />
         {state.selection && (
           <SelectAudio
             agent={equivalent}
@@ -232,9 +244,7 @@ export async function ownershipAdapters() {
             <Boundary onError={(error) => (duplicateFailure = error)}>
               <Publish track={camera} source={source} />
             </Boundary>
-            <Boundary onError={(error) => (audioFailure = error)}>
-              <Audio agent={equivalent} />
-            </Boundary>
+            <Audio source={audio} />
           </>
         )}
       </>
@@ -253,9 +263,10 @@ export async function ownershipAdapters() {
   const runtime = runtimes.at(-1)!;
   assert.equal(
     runtime.claimedPublications.size,
-    0,
-    "initial null waits for a concrete source",
+    1,
+    "publication intent is independent of its input",
   );
+  assert.equal(runtime.ownedReplacements.length, 0);
   assert.equal(
     runtime.resourceCommands.some(
       (command) => command.op === "claimAudioPolicy",
@@ -267,11 +278,14 @@ export async function ownershipAdapters() {
   assert.equal(runtime.claimedPublications.size, 1);
   const publicationOwner = [...runtime.publicationOwners.keys()][0];
   const dataOwner = [...runtime.dataOwners.keys()][0];
-  const audioOwner = runtime.audioOwner;
+  const audioOwner = [...runtime.audioSubscriptions.keys()][0];
   assert.deepEqual(Object.keys(agent.video("camera")), ["kind", "label"]);
   assert.equal("track" in agent, false);
-  assert.equal("track" in agent.participant("alice"), false);
-  assert.notEqual(runtime.audioOwner, undefined);
+  assert.equal(
+    "track" in agent.room("selected-room").participant("alice"),
+    false,
+  );
+  assert.notEqual(audioOwner, undefined);
   assert.equal(runtime.dataOwners.size, 1);
   runtime.deliverData("messages", {
     type: "message",
@@ -290,7 +304,7 @@ export async function ownershipAdapters() {
   assert.ok([...runtime.ownedMuted.values()].includes(true));
   assert.deepEqual([...runtime.publicationOwners.keys()], [publicationOwner]);
   assert.deepEqual([...runtime.dataOwners.keys()], [dataOwner]);
-  assert.equal(runtime.audioOwner, audioOwner);
+  assert.deepEqual([...runtime.audioSubscriptions.keys()], [audioOwner]);
   await flush(() => update({ source: false }));
   assert.equal(runtime.ownedReplacements.at(-1)?.track, null);
   assert.equal(native.readyState, "live");
@@ -298,8 +312,11 @@ export async function ownershipAdapters() {
   await flush(() => update({ source: true, duplicate: true, selection: true }));
   await flush();
   assert.ok(duplicateFailure instanceof ResourceOwnershipError);
-  assert.ok(audioFailure instanceof ResourceOwnershipError);
-  assert.equal(runtime.audioOwner, audioOwner);
+  assert.deepEqual(
+    [...runtime.audioSubscriptions.keys()],
+    [audioOwner],
+    "independent views share an explicit subscription",
+  );
   assert.equal(runtime.claimedPublications.size, 1);
   assert.equal(runtime.audioSelections.size, 1);
   const selection = [...runtime.audioSelections.keys()][0]!;
@@ -310,9 +327,9 @@ export async function ownershipAdapters() {
   await flush(() => update({ selection: false }));
   assert.equal(runtime.audioSelections.size, 0);
   assert.equal(
-    runtime.audioOwner,
+    [...runtime.audioSubscriptions.keys()][0],
     audioOwner,
-    "selection withdrawal does not close playback",
+    "selection withdrawal does not close explicit reception",
   );
 
   await flush(() => root.unmount());

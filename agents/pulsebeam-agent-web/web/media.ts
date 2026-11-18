@@ -1,17 +1,23 @@
 import {
   AudioSource,
   nativeSourceTrack,
+  pipeSource,
   VideoSource,
   watchSource,
 } from "./capture-source.js";
+import { OperationError, raise } from "./agent-observation.js";
 import { PublicationObservation } from "./publication-observation.js";
 import type { BrowserRuntime } from "./wasm.js";
-import type { PublicationState } from "./schema.js";
+import {
+  ErrorCode,
+  PipeStatus,
+  type PipeState,
+  type PublicationState,
+} from "./schema.js";
 import {
   ResourceError,
   ResourceOwner,
   ResourceOwners,
-  type ResourceBinding,
   type ResourceRuntime,
 } from "./resources.js";
 import {
@@ -24,49 +30,43 @@ import type {
   AudioSenderConfig,
   LocalAudioTrack,
   LocalVideoTrack,
+  PipeUpdates,
   PublicationConfig,
   PublicationUpdates,
   SenderConfig,
   VideoSenderConfig,
 } from "./types.js";
 
+type Runtime = InstanceType<typeof BrowserRuntime>;
+type NativePipe = ReturnType<Runtime["create_owned_publication_pipe"]>;
 export interface MediaRuntime extends ResourceRuntime {
-  replace_owned_track(
-    owner: bigint,
-    source: MediaStreamTrack | null,
-    config: SenderConfig,
-    muted: boolean,
-    replaceInput: boolean,
-  ): Promise<void>;
-  set_owned_muted(owner: bigint, muted: boolean): Promise<void>;
+  create_owned_publication_pipe(owner: bigint): NativePipe;
+  configure_publication(owner: bigint, enabled: boolean): void;
 }
-
 type Source = VideoSource | AudioSource;
 type ConfigFor<S extends Source> = S extends VideoSource
   ? VideoSenderConfig
   : AudioSenderConfig;
 type LocalHandle = LocalVideoHandle | LocalAudioHandle;
 const owners = new WeakMap<LocalHandle, LocalMediaRegistry>();
-const publications = new WeakMap<object, ResourceOwner>();
+const configurePipe = Symbol("sender configuration");
 
 class LocalVideoHandle implements LocalVideoTrack {
   readonly kind = "video";
   constructor(readonly label: string) {}
-  async publish(
-    source: VideoSource,
-    configuration: PublicationConfig,
-  ): Promise<VideoPublication> {
-    return registryFor(this).publish(this, source, configuration);
+  publish(
+    configuration: PublicationConfig = { enabled: true },
+  ): VideoPublication {
+    return registryFor(this).claim(this, configuration) as VideoPublication;
   }
 }
 class LocalAudioHandle implements LocalAudioTrack {
   readonly kind = "audio";
   constructor(readonly label: string) {}
-  async publish(
-    source: AudioSource,
-    configuration: PublicationConfig,
-  ): Promise<AudioPublication> {
-    return registryFor(this).publish(this, source, configuration);
+  publish(
+    configuration: PublicationConfig = { enabled: true },
+  ): AudioPublication {
+    return registryFor(this).claim(this, configuration) as AudioPublication;
   }
 }
 function registryFor(handle: LocalHandle): LocalMediaRegistry {
@@ -74,37 +74,120 @@ function registryFor(handle: LocalHandle): LocalMediaRegistry {
   if (!registry) throw new ResourceError("closed", "agent is closed");
   return registry;
 }
-function validateSource(source: Source, kind: "video" | "audio"): void {
-  nativeSourceTrack(source, kind);
-  if (source.isClosed())
-    throw new ResourceError("closed", "media source is closed");
-}
 function validateConfiguration(configuration: PublicationConfig): void {
   if (typeof configuration.enabled !== "boolean")
-    throw new TypeError("enabled must be a boolean");
+    throw new OperationError({
+      code: ErrorCode.InvalidArgument,
+      message: "enabled must be a boolean",
+    });
+}
+
+export class Pipe {
+  #value: Readonly<PipeState> | undefined;
+  #unwatch: (() => void) | undefined;
+  #closing: Promise<void> | undefined;
+  readonly #pending = new Set<Promise<void>>();
+  constructor(
+    private readonly native: NativePipe,
+    private readonly source: Source,
+    private readonly retired: (closing: Promise<void>) => void,
+    configuration: SenderConfig,
+  ) {
+    this.#unwatch = watchSource(
+      source,
+      () => void this.close().catch(() => {}),
+    );
+    void this[configurePipe](configuration).catch(() => {});
+  }
+  isClosed(): boolean {
+    return this.state().status === PipeStatus.Closed;
+  }
+  #accept(value: PipeState): Readonly<PipeState> {
+    if (this.#value?.observationRevision === value.observationRevision)
+      return this.#value;
+    const next = Object.freeze({
+      ...value,
+      error: value.error ? Object.freeze({ ...value.error }) : undefined,
+    });
+    if (
+      !this.#value ||
+      value.observationRevision > this.#value.observationRevision
+    )
+      this.#value = next;
+    return next;
+  }
+  state(): Readonly<PipeState> {
+    return this.#accept(this.native.state() as PipeState);
+  }
+  updates(): PipeUpdates {
+    this.state();
+    try {
+      const cursor = this.native.updates();
+      return {
+        next: async () => {
+          try {
+            const value = (await cursor.next()) as PipeState | undefined;
+            return value === undefined ? undefined : this.#accept(value);
+          } catch (error) {
+            return raise(error);
+          }
+        },
+        close: () => cursor.close(),
+      };
+    } catch (error) {
+      return raise(error);
+    }
+  }
+  [configurePipe](configuration: SenderConfig): Promise<void> {
+    const pending = this.native
+      .install_track(
+        nativeSourceTrack(this.source, this.source.kind),
+        configuration,
+      )
+      .catch((error: unknown) => raise(error));
+    this.#pending.add(pending);
+    void pending.then(
+      () => this.#pending.delete(pending),
+      () => this.#pending.delete(pending),
+    );
+    return pending;
+  }
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    this.#unwatch?.();
+    this.#unwatch = undefined;
+    try {
+      const closing = this.native.close();
+      this.#closing = Promise.all([
+        closing,
+        Promise.allSettled([...this.#pending]),
+      ]).then(
+        () => {},
+        (error: unknown) => raise(error),
+      );
+      this.retired(this.#closing);
+      return this.#closing;
+    } catch (error) {
+      return raise(error);
+    }
+  }
 }
 
 class Publication<S extends Source> {
   readonly #resource: ResourceOwner;
-  #source: S | null;
-  #sourceRevision = {};
   readonly #observation = new PublicationObservation();
-  #enabled: boolean;
+  #pipe: Pipe | undefined;
   #config: SenderConfig;
-  #unwatch: (() => void) | undefined;
+  #configuration: PublicationConfig;
   readonly #pending = new Set<Promise<void>>();
   #closing: Promise<void> | undefined;
-
   constructor(
     resources: ResourceOwners,
     readonly handle: LocalHandle,
-    source: S,
     configuration: PublicationConfig,
   ) {
-    validateSource(source, handle.kind);
     validateConfiguration(configuration);
-    this.#source = source;
-    this.#enabled = configuration.enabled;
+    this.#configuration = { ...configuration };
     this.#config =
       handle.kind === "video"
         ? { contentHint: "motion" }
@@ -116,23 +199,18 @@ class Publication<S extends Source> {
       },
       {
         bind: (binding) => {
-          this.#observation.bind(
-            binding.runtime as InstanceType<typeof BrowserRuntime>,
+          const runtime = binding.runtime as MediaRuntime;
+          runtime.configure_publication(
             binding.owner,
+            this.#configuration.enabled,
           );
-          void this.#replace(true).catch(() => {});
+          this.#observation.bind(runtime as Runtime, binding.owner);
         },
         unbind: () => {
-          if (this.#resource?.isClosed()) {
-            this.#unwatch?.();
-            this.#unwatch = undefined;
-            this.#source = null;
-          }
+          void this.#pipe?.close().catch(() => {});
         },
       },
     );
-    publications.set(this, this.#resource);
-    if (!this.#resource.isClosed()) this.#watchSource();
   }
   isClosed(): boolean {
     return this.#resource.isClosed();
@@ -143,133 +221,83 @@ class Publication<S extends Source> {
   updates(): PublicationUpdates {
     return this.#observation.updates();
   }
-  #assertOpen(): void {
+  #binding() {
     if (this.isClosed())
       throw new ResourceError("closed", "publication is closed");
-  }
-  async setSource(source: S | null): Promise<void> {
-    this.#assertOpen();
-    if (source) validateSource(source, this.handle.kind);
-    if (source === this.#source) return;
-    this.#unwatch?.();
-    this.#unwatch = undefined;
-    this.#source = source;
-    this.#sourceRevision = {};
-    this.#watchSource();
-    await this.#replace(true);
-  }
-  async configure(configuration: PublicationConfig): Promise<void> {
-    this.#assertOpen();
-    validateConfiguration(configuration);
-    this.#enabled = configuration.enabled;
     const binding = this.#resource.binding;
-    if (binding && this.#resource.current(binding)) {
-      await this.#operation(binding, () =>
-        (binding.runtime as MediaRuntime).set_owned_muted(
-          binding.owner,
-          !configuration.enabled,
-        ),
+    if (!binding || !this.#resource.current(binding))
+      throw new ResourceError("unavailable", "publication runtime is inactive");
+    return binding;
+  }
+  [pipeSource](source: S): Pipe {
+    const native = nativeSourceTrack(source, this.handle.kind);
+    if (source.isClosed() || native.readyState !== "live")
+      throw new ResourceError("closed", "media source is closed");
+    const binding = this.#binding();
+    try {
+      const input = (
+        binding.runtime as MediaRuntime
+      ).create_owned_publication_pipe(binding.owner);
+      const pipe = new Pipe(
+        input,
+        source,
+        (closing) => {
+          if (this.#pipe === pipe) this.#pipe = undefined;
+          this.#pending.add(closing);
+          void closing.then(
+            () => this.#pending.delete(closing),
+            () => this.#pending.delete(closing),
+          );
+        },
+        this.#config,
       );
+      const previous = this.#pipe;
+      this.#pipe = pipe;
+      void previous?.close().catch(() => {});
+      return pipe;
+    } catch (error) {
+      return raise(error);
+    }
+  }
+  configure(configuration: PublicationConfig): void {
+    validateConfiguration(configuration);
+    const binding = this.#binding();
+    try {
+      (binding.runtime as MediaRuntime).configure_publication(
+        binding.owner,
+        configuration.enabled,
+      );
+      this.#configuration = { ...configuration };
+    } catch (error) {
+      return raise(error);
     }
   }
   async configureSender(configuration: ConfigFor<S>): Promise<void> {
-    this.#assertOpen();
-    this.#config = configuration;
-    await this.#replace(false);
-  }
-  #replace(replaceInput: boolean): Promise<void> {
-    const binding = this.#resource.binding;
-    if (!binding || !this.#resource.current(binding)) return Promise.resolve();
-    const source = this.#source;
-    const track =
-      source && !source.isClosed()
-        ? nativeSourceTrack(source, this.handle.kind)
-        : null;
-    const configuration = this.#config;
-    const muted = !this.#enabled;
-    return this.#operation(binding, () =>
-      (binding.runtime as MediaRuntime).replace_owned_track(
-        binding.owner,
-        track,
-        configuration,
-        muted,
-        replaceInput,
-      ),
-    );
-  }
-  #operation(
-    binding: ResourceBinding,
-    operation: () => Promise<void>,
-  ): Promise<void> {
-    // Host validation can reject ended input before Core observes supersession.
-    const sourceRevision = this.#sourceRevision;
-    const current = () =>
-      sourceRevision === this.#sourceRevision &&
-      this.#resource.current(binding);
-    const pending = Promise.resolve()
-      .then(() => {
-        if (current()) return operation();
-      })
-      .catch((error: unknown) => {
-        if (!current()) return;
-        this.#resource.fail(error);
-        throw error;
-      });
-    this.#pending.add(pending);
-    void pending.then(
-      () => this.#pending.delete(pending),
-      () => this.#pending.delete(pending),
-    );
-    return pending;
-  }
-  #watchSource(): void {
-    const source = this.#source;
-    if (!source) return;
-    this.#unwatch = watchSource(source, () => {
-      if (source === this.#source) void this.setSource(null).catch(() => {});
-    });
+    this.#binding();
+    this.#config = { ...configuration };
+    await this.#pipe?.[configurePipe](this.#config);
   }
   close(): Promise<void> {
     if (this.#closing) return this.#closing;
-    this.#unwatch?.();
-    this.#unwatch = undefined;
-    this.#source = null;
+    let pipe: Promise<void> | undefined;
+    try {
+      pipe = this.#pipe?.close();
+    } catch (error) {
+      pipe = Promise.reject(error);
+    }
     const release = this.#resource.close();
-    return (this.#closing = Promise.allSettled([
-      release,
-      ...this.#pending,
-    ]).then(() => {}));
+    return (this.#closing = Promise.all([pipe, release, ...this.#pending]).then(
+      () => {},
+    ));
   }
 }
-
 export class VideoPublication extends Publication<VideoSource> {}
 export class AudioPublication extends Publication<AudioSource> {}
-
-// React must retain the owner before readiness to retire a pending claim on unmount.
-export function claimPublication(
-  handle: LocalVideoTrack,
-  source: VideoSource,
-  configuration: PublicationConfig,
-): { publication: VideoPublication; ready: Promise<void> };
-export function claimPublication(
-  handle: LocalAudioTrack,
-  source: AudioSource,
-  configuration: PublicationConfig,
-): { publication: AudioPublication; ready: Promise<void> };
-export function claimPublication(
-  handle: LocalHandle,
-  source: Source,
-  configuration: PublicationConfig,
-): { publication: VideoPublication | AudioPublication; ready: Promise<void> } {
-  const publication = registryFor(handle).claim(handle, source, configuration);
-  return { publication, ready: publications.get(publication)!.ready };
-}
 
 export class LocalMediaRegistry {
   readonly #handles = new Map<string, LocalHandle>();
   #closed = false;
   constructor(readonly resources: ResourceOwners) {}
-
   track(spec: VideoTrackSpec): LocalVideoTrack;
   track(spec: AudioTrackSpec): LocalAudioTrack;
   track(
@@ -290,55 +318,17 @@ export class LocalMediaRegistry {
     }
     return handle;
   }
-  publish(
-    handle: LocalVideoHandle,
-    source: VideoSource,
-    configuration: PublicationConfig,
-  ): Promise<VideoPublication>;
-  publish(
-    handle: LocalAudioHandle,
-    source: AudioSource,
-    configuration: PublicationConfig,
-  ): Promise<AudioPublication>;
-  async publish(
-    handle: LocalHandle,
-    source: Source,
-    configuration: PublicationConfig,
-  ): Promise<VideoPublication | AudioPublication> {
-    const publication = this.claim(handle, source, configuration);
-    try {
-      await publications.get(publication)!.ready;
-      return publication;
-    } catch (error) {
-      await publication.close();
-      throw error;
-    }
-  }
   claim(
     handle: LocalHandle,
-    source: Source,
     configuration: PublicationConfig,
   ): VideoPublication | AudioPublication {
     if (this.#closed || owners.get(handle) !== this)
       throw new ResourceError("closed", "agent is closed");
     return handle.kind === "video"
-      ? new VideoPublication(
-          this.resources,
-          handle,
-          source as VideoSource,
-          configuration,
-        )
-      : new AudioPublication(
-          this.resources,
-          handle,
-          source as AudioSource,
-          configuration,
-        );
+      ? new VideoPublication(this.resources, handle, configuration)
+      : new AudioPublication(this.resources, handle, configuration);
   }
   close(): void {
-    if (this.#closed) return;
     this.#closed = true;
-    for (const handle of this.#handles.values()) owners.delete(handle);
-    this.#handles.clear();
   }
 }

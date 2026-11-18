@@ -39,6 +39,7 @@ fn receiver_failure_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
             wire::SubscriptionSpec {
                 track_id: "source".into(),
                 kind: wire::TrackKind::Audio as i32,
+                source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Rtp(parameters.clone())),
                 }),

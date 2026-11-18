@@ -141,6 +141,15 @@ js_run_binary(
     out_dirs = ["quickstart"],
 )
 
+js_run_binary(
+    name = "known_native_receiver",
+    tool = ":quickstart_builder",
+    srcs = [":quickstart_source", ":package", ":node_modules", "//agents/pulsebeam-agent-web:package", "tests/contracts/known-native-receiver.ts"],
+    args = ["known_native_receiver", "tests/contracts/known-native-receiver.ts"],
+    chdir = package_name(),
+    out_dirs = ["known_native_receiver"],
+)
+
 py_binary(
     name = "quickstart_dev",
     srcs = ["//tools:static-server.py"],

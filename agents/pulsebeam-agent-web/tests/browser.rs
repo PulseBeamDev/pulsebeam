@@ -106,6 +106,72 @@ async fn native_platform_smoke() -> TestResult<()> {
             .await?;
             assert_eq!(rejections, 0, "{name}: unhandled completion");
         }
+        let source_room = RoomExternalId::new("react-native-source")?;
+        let publisher_token = mint_development_token(
+            &source_room,
+            &ParticipantExternalId::new("native-publisher")?,
+            expires_at,
+        )?;
+        let receiver_token = pulsebeam_server::sign_participant_token(
+            &pulsebeam_server::insecure_dev_api_key()?,
+            &serde_json::from_value(serde_json::json!([
+                {"rooms":["react-native-receiver"],"allow":["join"]},
+                {"rooms":[source_room.as_str()],"allow":["subscribe"]}
+            ]))?,
+            "react-receiver",
+            expires_at,
+        )?;
+        let react = StaticServer::start(
+            std::env::var_os("PULSEBEAM_REACT_FIXTURE_ROOT")
+                .ok_or("missing React fixture assets")?,
+        )
+        .await?;
+        let mut producer = tokio::process::Command::new(
+            std::env::var_os("PULSEBEAM_FOREIGN_SMOKE").ok_or("missing Python producer fixture")?,
+        )
+        .arg("--publish")
+        .arg(destination.endpoint())
+        .arg(publisher_token)
+        .arg(source_room.as_str())
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+        let config = serde_json::json!({
+            "endpoint": destination.endpoint(),
+            "token": receiver_token,
+            "room": "react-native-receiver",
+            "sourceRoom": source_room.as_str(),
+        });
+        let received = async {
+            navigate(&bidi, &context, react.url("index.html")).await?;
+            let result: serde_json::Value = evaluate_json(
+                &bidi,
+                &context,
+                &format!("import('./main.js').then(module => module.receiveNative({config}))"),
+            )
+            .await?;
+            for field in ["video", "data", "wasm"] {
+                assert_eq!(result[field], true, "installed Python to React: {field}");
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        }
+        .await;
+        use tokio::io::AsyncWriteExt as _;
+        producer
+            .stdin
+            .take()
+            .ok_or("missing producer shutdown pipe")?
+            .write_all(b"stop\n")
+            .await?;
+        let stopped =
+            tokio::time::timeout(std::time::Duration::from_secs(5), producer.wait()).await??;
+        received?;
+        assert!(
+            stopped.success(),
+            "installed Python producer failed: {stopped}"
+        );
         navigate(&bidi, &context, fixture.url("tests/uniffi-fixture.html")).await?;
         let ffi: serde_json::Value = evaluate_json(
             &bidi,

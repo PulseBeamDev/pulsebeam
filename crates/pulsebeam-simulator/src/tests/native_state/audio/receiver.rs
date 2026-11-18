@@ -15,7 +15,14 @@ impl NativeAudioReceiver {
         server: IpAddr,
         source: &wire::Track,
     ) -> anyhow::Result<Self> {
-        let (mut peer, _) = WirePeer::connect_on(host, server, "native-rtp-listener", true).await?;
+        let (mut peer, _) = WirePeer::connect_on_room(
+            host,
+            server,
+            "native-rtp-listener",
+            true,
+            "native-state-receiver",
+        )
+        .await?;
         let input = peer._factory.create_encoded_audio_source(1)?;
         let track = peer
             ._factory
@@ -100,6 +107,7 @@ impl NativeAudioReceiver {
                 wire::SubscriptionSpec {
                     track_id: source.track_id.clone(),
                     kind: wire::TrackKind::Audio as i32,
+                    source_room: "native-state-wire".into(),
                     binding: Some(wire::TrackBinding {
                         transport: Some(wire::track_binding::Transport::Rtp(parameters)),
                     }),

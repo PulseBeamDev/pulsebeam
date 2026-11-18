@@ -4,6 +4,92 @@ use crate::participant::ParticipantEffect;
 const NATIVE_BUDGET: usize = 32;
 const MAX_TERMINAL_HANDOFFS: usize = 256;
 const TERMINAL_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
+const LOOKUP_WAKE_BUDGET: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SourceLookupKey {
+    room: RoomId,
+    participant: String,
+    label: String,
+}
+
+#[derive(Default)]
+pub(super) struct SourceLookupIndex {
+    by_source: std::collections::BTreeMap<
+        SourceLookupKey,
+        std::collections::BTreeSet<(ConnectionId, u64)>,
+    >,
+    by_owner: std::collections::BTreeMap<(ConnectionId, u64), SourceLookupKey>,
+    wake_queue: std::collections::VecDeque<SourceLookupKey>,
+    wake_queued: std::collections::BTreeSet<SourceLookupKey>,
+    wake_cursor: std::collections::BTreeMap<SourceLookupKey, (ConnectionId, u64)>,
+    wake_again: std::collections::BTreeSet<SourceLookupKey>,
+}
+
+impl SourceLookupIndex {
+    pub(super) fn change(
+        &mut self,
+        connection: ConnectionId,
+        source_room: RoomId,
+        change: crate::control::native::LookupInterestChange,
+    ) {
+        let owner = (connection, change.reference);
+        let key = SourceLookupKey {
+            room: source_room,
+            participant: change.address.participant_external_id,
+            label: change.address.label,
+        };
+        if let Some(previous) = self.by_owner.remove(&owner) {
+            if let Some(owners) = self.by_source.get_mut(&previous) {
+                owners.remove(&owner);
+                if owners.is_empty() {
+                    self.by_source.remove(&previous);
+                }
+            }
+        }
+        if change.active {
+            self.by_source.entry(key.clone()).or_default().insert(owner);
+            self.by_owner.insert(owner, key);
+        }
+    }
+
+    pub(super) fn remove_connection(&mut self, connection: ConnectionId) {
+        let owners = self
+            .by_owner
+            .range((connection, 0)..=(connection, u64::MAX))
+            .map(|(owner, _)| *owner)
+            .collect::<Vec<_>>();
+        for owner in owners {
+            if let Some(key) = self.by_owner.remove(&owner)
+                && let Some(indexed) = self.by_source.get_mut(&key)
+            {
+                indexed.remove(&owner);
+                if indexed.is_empty() {
+                    self.by_source.remove(&key);
+                }
+            }
+        }
+    }
+
+    pub(super) fn source_changed(&mut self, room: RoomId, participant: String, label: String) {
+        self.changed(SourceLookupKey {
+            room,
+            participant,
+            label,
+        });
+    }
+
+    fn changed(&mut self, key: SourceLookupKey) {
+        if !self.by_source.contains_key(&key) {
+            return;
+        }
+        if self.wake_queued.insert(key.clone()) {
+            self.wake_queue.push_back(key);
+        } else {
+            self.wake_again.insert(key);
+        }
+    }
+}
 
 pub(super) struct RetiringNative {
     handler: StateProtocolHandler,
@@ -12,6 +98,31 @@ pub(super) struct RetiringNative {
 }
 
 impl ControllerActor {
+    fn source_room_id(
+        &self,
+        subscriber: ParticipantId,
+        room: &str,
+    ) -> Option<crate::entity::RoomId> {
+        let external = crate::entity::RoomExternalId::new(room).ok()?;
+        #[cfg(test)]
+        {
+            let _ = subscriber;
+            Some(crate::entity::RoomId::from_external(&external))
+        }
+        #[cfg(not(test))]
+        {
+            let project = self
+                .core
+                .registry
+                .get_participant(&subscriber)?
+                .authorization
+                .as_ref()?
+                .authority
+                .project_id;
+            Some(crate::entity::RoomId::derive(&project, &external))
+        }
+    }
+
     pub(super) fn native_resource_lease(
         &self,
         connection: ConnectionId,
@@ -58,6 +169,7 @@ impl ControllerActor {
     }
 
     pub(super) fn service_native_connections(&mut self) {
+        self.service_lookup_wakes();
         for _ in 0..NATIVE_BUDGET {
             let Some(&(deadline, connection)) = self.native_deadlines.first() else {
                 break;
@@ -73,6 +185,74 @@ impl ControllerActor {
                 break;
             };
             self.service_native_connection(connection);
+        }
+    }
+
+    fn service_lookup_wakes(&mut self) {
+        for _ in 0..LOOKUP_WAKE_BUDGET {
+            let Some(key) = self.source_lookup_index.wake_queue.pop_front() else {
+                break;
+            };
+            if !self.source_lookup_index.wake_queued.contains(&key) {
+                continue;
+            }
+            let cursor = self.source_lookup_index.wake_cursor.get(&key).copied();
+            let next = self
+                .source_lookup_index
+                .by_source
+                .get(&key)
+                .and_then(|owners| {
+                    owners
+                        .range((
+                            cursor.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .copied()
+                });
+            let Some(owner) = next else {
+                if self.source_lookup_index.wake_again.remove(&key) {
+                    self.source_lookup_index.wake_cursor.remove(&key);
+                    self.source_lookup_index.wake_queue.push_back(key);
+                    continue;
+                }
+                self.source_lookup_index.wake_queued.remove(&key);
+                self.source_lookup_index.wake_cursor.remove(&key);
+                continue;
+            };
+            let (connection, _) = owner;
+            let Some(service) = self.native_connections.get_mut(&connection) else {
+                self.source_lookup_index.remove_connection(connection);
+                self.source_lookup_index.wake_queue.push_back(key);
+                continue;
+            };
+            service.handler.model.source_lookup_changed();
+            if !service.handler.handoff.schedule() {
+                self.source_lookup_index.wake_queue.push_back(key);
+                continue;
+            }
+            self.source_lookup_index
+                .wake_cursor
+                .insert(key.clone(), owner);
+            let more = self
+                .source_lookup_index
+                .by_source
+                .get(&key)
+                .is_some_and(|owners| {
+                    owners
+                        .range((std::ops::Bound::Excluded(owner), std::ops::Bound::Unbounded))
+                        .next()
+                        .is_some()
+                });
+            if more {
+                self.source_lookup_index.wake_queue.push_back(key);
+            } else if self.source_lookup_index.wake_again.remove(&key) {
+                self.source_lookup_index.wake_cursor.remove(&key);
+                self.source_lookup_index.wake_queue.push_back(key);
+            } else {
+                self.source_lookup_index.wake_queued.remove(&key);
+                self.source_lookup_index.wake_cursor.remove(&key);
+            }
         }
     }
 
@@ -93,6 +273,7 @@ impl ControllerActor {
         }
         let participant = native.participant;
         if !self.current_incarnation(participant, connection) {
+            self.source_lookup_index.remove_connection(connection);
             return;
         }
         let room = native.room;
@@ -100,17 +281,54 @@ impl ControllerActor {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        match native.service(unix_now, |track| {
-            let track = self
-                .lifecycle
-                .source(room, participant, track, &self.core.registry)?;
-            let publisher = self.core.registry.get_participant(&track.meta().origin)?;
-            Some(crate::control::native::ResolvedSource {
-                track,
-                publisher: publisher.participant_external_id.as_ref()?,
-            })
-        }) {
+        match native.service(
+            unix_now,
+            |track| {
+                let track =
+                    self.lifecycle
+                        .source(room, room, participant, track, &self.core.registry)?;
+                let publisher = self.core.registry.get_participant(&track.meta().origin)?;
+                Some(crate::control::native::ResolvedSource {
+                    track,
+                    publisher: publisher.participant_external_id.as_ref()?,
+                })
+            },
+            |source_room, track| {
+                let source_room = self.source_room_id(participant, source_room)?;
+                let track = self.lifecycle.source(
+                    room,
+                    source_room,
+                    participant,
+                    track,
+                    &self.core.registry,
+                )?;
+                let publisher = self.core.registry.get_participant(&track.meta().origin)?;
+                Some(crate::control::native::ResolvedSource {
+                    track,
+                    publisher: publisher.participant_external_id.as_ref()?,
+                })
+            },
+            |address| {
+                let source_room = self.source_room_id(participant, &address.room)?;
+                let (track, publisher) = self.lifecycle.source_by_address(
+                    room,
+                    source_room,
+                    participant,
+                    address,
+                    &self.core.registry,
+                )?;
+                Some(crate::control::native::ResolvedSource { track, publisher })
+            },
+        ) {
             Ok(wake) => {
+                for change in native.model.take_lookup_changes() {
+                    if let Some(source_room) =
+                        self.source_room_id(participant, &change.address.room)
+                    {
+                        self.source_lookup_index
+                            .change(connection, source_room, change);
+                    }
+                }
                 let deadline = native.model.deadline();
                 if let Some(deadline) = deadline {
                     self.native_deadlines.insert((deadline, connection));
@@ -137,6 +355,7 @@ impl ControllerActor {
                         .increment(1);
                 }
                 tracing::warn!(?error, participant_id = %participant, %connection, "native controller connection failed");
+                self.source_lookup_index.remove_connection(connection);
                 self.remove_incarnation(participant, connection);
             }
         }
@@ -161,6 +380,7 @@ impl ControllerActor {
         connection: ConnectionId,
     ) -> Option<NativeService> {
         let native = self.native_connections.remove(&connection)?;
+        self.source_lookup_index.remove_connection(connection);
         if let Some(deadline) = native.deadline {
             self.native_deadlines.remove(&(deadline, connection));
         }
@@ -313,6 +533,7 @@ impl ControllerActor {
                 .lifecycle
                 .source(
                     native.room,
+                    native.room,
                     native.participant,
                     track.id(),
                     &self.core.registry,
@@ -344,6 +565,17 @@ impl ControllerActor {
         meta: &crate::track::TrackMeta,
         track: Option<&crate::track::Track>,
     ) {
+        if let Some(label) = meta.label.as_ref()
+            && let Some(publisher) = self.core.registry.get_participant(&meta.origin)
+            && publisher.connection_id == meta.connection_id
+            && let Some(external) = publisher.participant_external_id.as_ref()
+        {
+            self.source_lookup_index.source_changed(
+                meta.room_id,
+                external.as_str().to_owned(),
+                label.clone(),
+            );
+        }
         for participant in self
             .core
             .registry
@@ -355,7 +587,13 @@ impl ControllerActor {
             if track.is_some()
                 && self
                     .lifecycle
-                    .source(meta.room_id, participant, meta.id, &self.core.registry)
+                    .source(
+                        meta.room_id,
+                        meta.room_id,
+                        participant,
+                        meta.id,
+                        &self.core.registry,
+                    )
                     .is_none()
             {
                 continue;
@@ -424,5 +662,61 @@ impl ControllerActor {
         if changed {
             self.seed_native_sources(connection);
         }
+    }
+}
+
+#[cfg(test)]
+mod source_lookup_index_tests {
+    use super::*;
+
+    #[test]
+    fn lookup_interest_wakes_coalesce_and_cleanup_with_owner_lifetimes() {
+        let mut index = SourceLookupIndex::default();
+        let first = ConnectionId::new();
+        let second = ConnectionId::new();
+        let address = pulsebeam_proto::state::LogicalSourceAddress {
+            room: String::from("source-room"),
+            participant_external_id: String::from("publisher"),
+            kind: pulsebeam_proto::state::TrackKind::Data as i32,
+            label: String::from("topic"),
+        };
+        let change = |reference, active| crate::control::native::LookupInterestChange {
+            reference,
+            address: address.clone(),
+            active,
+        };
+
+        let room = RoomId::derive(
+            &crate::entity::ProjectId::new(),
+            &crate::entity::RoomExternalId::new(&address.room).unwrap(),
+        );
+        let other_project_room = RoomId::derive(
+            &crate::entity::ProjectId::new(),
+            &crate::entity::RoomExternalId::new(&address.room).unwrap(),
+        );
+        index.change(first, room, change(1, true));
+        index.change(second, room, change(2, true));
+        index.source_changed(
+            other_project_room,
+            address.participant_external_id.clone(),
+            address.label.clone(),
+        );
+        assert!(index.wake_queue.is_empty());
+        for _ in 0..2 {
+            index.source_changed(
+                room,
+                address.participant_external_id.clone(),
+                address.label.clone(),
+            );
+        }
+        assert_eq!(index.wake_queue.len(), 1);
+        assert!(index.wake_again.contains(index.wake_queue.front().unwrap()));
+        assert_eq!(index.by_source.values().next().unwrap().len(), 2);
+
+        index.change(first, room, change(1, false));
+        assert_eq!(index.by_source.values().next().unwrap().len(), 1);
+        index.remove_connection(second);
+        assert!(index.by_source.is_empty());
+        assert!(index.by_owner.is_empty());
     }
 }

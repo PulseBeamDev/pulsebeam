@@ -1,8 +1,12 @@
-import type { AudioSource, VideoSource } from "./capture-source.js";
 import type { EventStream, SnapshotStream } from "./observation.js";
 import type {
   AgentState as ObservedAgentState,
   PublicationState as ObservedPublicationState,
+  PipeState as ObservedPipeState,
+  VideoSubscriptionState as ObservedVideoSubscriptionState,
+  AudioSubscriptionState as ObservedAudioSubscriptionState,
+  DataPublicationState as ObservedDataPublicationState,
+  DataSubscriptionState as ObservedDataSubscriptionState,
 } from "./schema.js";
 import type { AudioPublication, VideoPublication } from "./media.js";
 import type {
@@ -20,27 +24,43 @@ export interface PublicationConfig {
   readonly enabled: boolean;
 }
 
+export interface PipeUpdates {
+  next(): Promise<Readonly<ObservedPipeState> | undefined>;
+  close(): void;
+}
+
 export interface PublicationUpdates {
   next(): Promise<Readonly<ObservedPublicationState> | undefined>;
+  close(): void;
+}
+
+export interface VideoSubscriptionUpdates {
+  next(): Promise<Readonly<ObservedVideoSubscriptionState> | undefined>;
+  close(): void;
+}
+export interface AudioSubscriptionUpdates {
+  next(): Promise<Readonly<ObservedAudioSubscriptionState> | undefined>;
+  close(): void;
+}
+export interface DataPublicationUpdates {
+  next(): Promise<Readonly<ObservedDataPublicationState> | undefined>;
+  close(): void;
+}
+export interface DataSubscriptionUpdates {
+  next(): Promise<Readonly<ObservedDataSubscriptionState> | undefined>;
   close(): void;
 }
 
 export interface LocalVideoTrack {
   readonly kind: "video";
   readonly label: string;
-  publish(
-    source: VideoSource,
-    configuration: PublicationConfig,
-  ): Promise<VideoPublication>;
+  publish(configuration?: PublicationConfig): VideoPublication;
 }
 
 export interface LocalAudioTrack {
   readonly kind: "audio";
   readonly label: string;
-  publish(
-    source: AudioSource,
-    configuration: PublicationConfig,
-  ): Promise<AudioPublication>;
+  publish(configuration?: PublicationConfig): AudioPublication;
 }
 export type TopicMode = "latest" | "lossy" | "ordered";
 export type LogLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
@@ -66,6 +86,7 @@ export interface PublicationIntent {
 }
 
 export interface TrackSelector {
+  readonly room: string;
   readonly participantId: string;
   readonly label: string;
 }
@@ -213,7 +234,7 @@ export interface RemoteVideoTrack {
   readonly label: string;
   readonly active: boolean;
   watch(listener: () => void): () => void;
-  subscribe(configuration: VideoObservation): Promise<VideoSubscription>;
+  subscribe(configuration?: VideoObservation): VideoSubscription;
 }
 
 export interface RemoteAudioTrack {
@@ -223,7 +244,7 @@ export interface RemoteAudioTrack {
   readonly participantId: string;
   readonly label: string;
   watch(listener: () => void): () => void;
-  subscribe(configuration: AudioSubscriptionConfig): Promise<AudioSubscription>;
+  subscribe(configuration?: AudioSubscriptionConfig): AudioSubscription;
 }
 
 export type RemotePublishedTrack =
@@ -232,6 +253,7 @@ export type RemotePublishedTrack =
   | RemoteDataTrack;
 
 export interface RemoteParticipant {
+  readonly room: string;
   readonly participantId: string;
   readonly active: boolean;
   readonly tracks: readonly RemotePublishedTrack[];
@@ -241,9 +263,13 @@ export interface RemoteParticipant {
   data<D extends Delivery>(label: string, delivery: D): RemoteDataTrack<D>;
 }
 
+export interface RoomRef {
+  readonly name: string;
+  participant(participantId: string): RemoteParticipant;
+}
+
 export interface RemoteMedia {
   readonly participants: readonly RemoteParticipant[];
-  participant(participantId: string): RemoteParticipant;
 }
 
 export type TopicEvent<T> =
@@ -476,7 +502,7 @@ export interface Agent {
   video(label: string): LocalVideoTrack;
   audio(label: string): LocalAudioTrack;
   data<D extends Delivery>(label: string, delivery: D): LocalDataTrack<D>;
-  participant(id: string): RemoteParticipant;
+  room(name: string): RoomRef;
   selectAudio(policy: AudioDemand): Promise<AudioSelection>;
   /** Synchronously replace the desired room; Core owns admission and recovery. */
   join(room: string): void;

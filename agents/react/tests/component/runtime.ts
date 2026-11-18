@@ -1,12 +1,14 @@
 // Only the external WASM transport boundary is modeled. Facade, data,
 // resource, capture and component policy are the production implementations.
+import { PipeStatus } from "@pulsebeam/web";
+
 export const runtimes: BrowserRuntime[] = [];
 export const initializeSynchronously = () => {};
 
 export class BrowserRuntime {
   closed = false;
   config: any;
-  desired: any;
+  desired: any = { video: [] };
   snapshotListener?: (snapshot: any) => void;
   eventListener?: (event: any) => void;
   errorListener?: (error: any) => void;
@@ -30,6 +32,8 @@ export class BrowserRuntime {
   ownedMuted = new Map<bigint, boolean>();
   audioOwner?: bigint;
   audioSelections = new Map<bigint, any>();
+  audioSubscriptions = new Map<bigint, any>();
+  dataPublications = new Map<bigint, any>();
   observationWaiters = new Map<bigint, Set<(error: unknown) => void>>();
   dataOwners = new Map<
     bigint,
@@ -61,14 +65,85 @@ export class BrowserRuntime {
     this.config = config;
     runtimes.push(this);
   }
-  observer() {
-    const unsupported = (): never => {
-      throw new Error("Core observation belongs to the emitted-WASM contract");
+  readonly observations = new Map<
+    object | bigint | "agent",
+    { state: any; changed: Set<() => void> }
+  >();
+  observer(owner: object | bigint | "agent" = "agent") {
+    let entry = this.observations.get(owner);
+    if (!entry) {
+      entry = {
+        state: Object.freeze({ observationRevision: 1n }),
+        changed: new Set(),
+      };
+      this.observations.set(owner, entry);
+    }
+    const current = entry;
+    return {
+      state: () => current.state,
+      updates() {
+        let previous: unknown;
+        let resolve: ((value: any) => void) | undefined;
+        let closed = false;
+        const changed = () => {
+          if (resolve) {
+            const done = resolve;
+            resolve = undefined;
+            previous = current.state;
+            done(previous);
+          }
+        };
+        current.changed.add(changed);
+        return {
+          next: () => {
+            if (closed) return Promise.resolve(undefined);
+            if (previous !== current.state) {
+              previous = current.state;
+              return Promise.resolve(previous);
+            }
+            return new Promise((done) => {
+              resolve = done;
+            });
+          },
+          close: () => {
+            closed = true;
+            current.changed.delete(changed);
+            resolve?.(undefined);
+            resolve = undefined;
+          },
+        };
+      },
     };
-    return { state: unsupported, updates: unsupported };
   }
-  publication(_owner: bigint) {
-    return this.observer();
+  setObservation(owner: object | bigint | "agent", state: object) {
+    this.observer(owner);
+    const entry = this.observations.get(owner)!;
+    entry.state = Object.freeze(state);
+    for (const changed of entry.changed) changed();
+  }
+  state() {
+    return this.observer().state();
+  }
+  publication(owner: bigint) {
+    if (!this.observations.has(owner))
+      this.setObservation(owner, {
+        observationRevision: 1n,
+        configuration: Object.freeze({}),
+        admission: Object.freeze({}),
+      });
+    return this.observer(owner);
+  }
+  video_subscription(owner: bigint) {
+    return this.observer(owner);
+  }
+  audio_subscription(owner: bigint) {
+    return this.observer(owner);
+  }
+  data_subscription(owner: bigint) {
+    return this.observer(owner);
+  }
+  data_publication(owner: bigint) {
+    return this.observer(owner);
   }
   set_snapshot_listener(listener?: (snapshot: any) => void) {
     this.snapshotListener = listener;
@@ -85,6 +160,19 @@ export class BrowserRuntime {
     this.recomputeVideo();
   }
   async resource(command: any) {
+    if (
+      command.op !== "release" ||
+      this.publicationOwners.has(command.owner) ||
+      this.videoOwners.has(command.owner) ||
+      this.dataOwners.has(command.owner) ||
+      this.audioSelections.has(command.owner) ||
+      this.audioSubscriptions.has(command.owner) ||
+      this.dataPublications.has(command.owner) ||
+      this.audioOwner === command.owner
+    )
+      return this.resource_now(command);
+  }
+  resource_now(command: any) {
     this.resourceCommands.push(command);
     if (command.op === "claimVideo") {
       const owner = this.nextOwner++;
@@ -113,6 +201,17 @@ export class BrowserRuntime {
       this.publicationOwners.set(owner, { key, slot });
       return { owner, slot };
     }
+    if (command.op === "declareDataPublication") {
+      const owner = this.nextOwner++;
+      this.dataPublications.set(owner, command.spec);
+      return { owner };
+    }
+    if (command.op === "claimAudioSubscription") {
+      const owner = this.nextOwner++;
+      this.audioSubscriptions.set(owner, command.selector);
+      return { owner };
+    }
+    if (command.op === "configureAudio") return { type: "updated" };
     if (command.op === "receiveData") {
       const owner = this.nextOwner++;
       this.dataOwners.set(owner, { spec: command.spec, events: [] });
@@ -144,6 +243,8 @@ export class BrowserRuntime {
       return { owner };
     }
     if (command.op === "release") {
+      this.audioSubscriptions.delete(command.owner);
+      this.dataPublications.delete(command.owner);
       this.videoOwners.delete(command.owner);
       this.retireObservations(command.owner);
       const publication = this.publicationOwners.get(command.owner);
@@ -159,15 +260,36 @@ export class BrowserRuntime {
     throw new Error(`unsupported resource command ${command.op}`);
   }
   // This component boundary has no physical receiver or decoded DOM media.
-  async observe_media(owner: bigint): Promise<any> {
-    if (this.closed || !this.videoOwners.has(owner))
+  async observe_media(
+    owner: bigint,
+    _source?: string,
+    signal?: AbortSignal,
+  ): Promise<any> {
+    if (
+      signal?.aborted ||
+      this.closed ||
+      (!this.videoOwners.has(owner) && !this.audioSubscriptions.has(owner))
+    )
       throw Object.assign(new Error("observation owner closed"), {
         pulsebeamCode: "closed",
       });
     return new Promise((_resolve, reject) => {
       const waiters = this.observationWaiters.get(owner) ?? new Set();
-      waiters.add(reject);
+      const cancel = () =>
+        finish(
+          Object.assign(new Error("observation cancelled"), {
+            pulsebeamCode: "closed",
+          }),
+        );
+      const finish = (error: unknown) => {
+        signal?.removeEventListener("abort", cancel);
+        waiters.delete(finish);
+        if (waiters.size === 0) this.observationWaiters.delete(owner);
+        reject(error);
+      };
+      waiters.add(finish);
       this.observationWaiters.set(owner, waiters);
+      signal?.addEventListener("abort", cancel, { once: true });
     });
   }
   retireObservations(owner?: bigint) {
@@ -239,6 +361,35 @@ export class BrowserRuntime {
     this.config = { ...this.config, token };
   }
   set_log_level() {}
+  configure_publication(owner: bigint, enabled: boolean) {
+    this.ownedMuted.set(owner, !enabled);
+  }
+  create_owned_publication_pipe(owner: bigint) {
+    const key = {};
+    const observation = this.observer(key);
+    this.setObservation(key, {
+      observationRevision: 1n,
+      status: PipeStatus.Available,
+    });
+    return {
+      ...observation,
+      install_track: (track: MediaStreamTrack, configuration: any) =>
+        this.replace_owned_track(
+          owner,
+          track,
+          configuration,
+          this.ownedMuted.get(owner) ?? false,
+          true,
+        ),
+      close: () => {
+        this.setObservation(key, {
+          observationRevision: observation.state().observationRevision + 1n,
+          status: PipeStatus.Closed,
+        });
+        return this.replace_owned_track(owner, null, {}, true, true);
+      },
+    };
+  }
   async replace_owned_track(
     owner: bigint,
     track: MediaStreamTrack | null,
@@ -279,6 +430,9 @@ export class BrowserRuntime {
     };
     this.recomputeVideo();
     this.snapshotListener?.(this.snapshot);
+    this.setObservation("agent", {
+      observationRevision: this.observer().state().observationRevision + 1n,
+    });
   }
   event(event: unknown) {
     this.eventListener?.(event);

@@ -2,10 +2,11 @@ use super::*;
 use pulsebeam_runtime::time::Instant;
 use std::ops::Bound::{Excluded, Unbounded};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct SourceWait {
     pub(super) work: Preparation,
     pub(super) source: TrackId,
+    pub(super) source_room: String,
     pub(super) deadline: Instant,
 }
 
@@ -26,6 +27,7 @@ impl NativeSession {
         &mut self,
         work: Preparation,
         source: TrackId,
+        source_room: String,
     ) -> Result<(), OutputError> {
         if self.source_waits.contains_key(&work.reference) {
             return Err(OutputError::InvalidObservation);
@@ -41,6 +43,7 @@ impl NativeSession {
             SourceWait {
                 work,
                 source,
+                source_room,
                 deadline,
             },
         );
@@ -58,6 +61,15 @@ impl NativeSession {
         unix_now: u64,
         now: Instant,
         available: impl Fn(TrackId) -> bool,
+    ) -> Result<(), OutputError> {
+        self.service_source_waits_in_room(unix_now, now, |_, track| available(track))
+    }
+
+    pub(in crate::control) fn service_source_waits_in_room(
+        &mut self,
+        unix_now: u64,
+        now: Instant,
+        available: impl Fn(&str, TrackId) -> bool,
     ) -> Result<(), OutputError> {
         for _ in 0..16 {
             let Some(&(deadline, reference)) = self.source_deadlines.first() else {
@@ -84,7 +96,7 @@ impl NativeSession {
                 .source_waits
                 .range((self.source_cursor.map_or(Unbounded, Excluded), Unbounded))
                 .next()
-                .map(|(&reference, &wait)| (reference, wait));
+                .map(|(&reference, wait)| (reference, wait.clone()));
             let Some((reference, wait)) = next else {
                 self.source_scan = self.source_rescan;
                 self.source_rescan = false;
@@ -93,7 +105,7 @@ impl NativeSession {
             };
             self.source_cursor = Some(reference);
             let stale = self.preparation_spec(&wait.work).is_none();
-            if stale || available(wait.source) {
+            if stale || available(&wait.source_room, wait.source) {
                 self.remove_source_wait(reference);
                 self.observe_deferral(super::super::ExecutionDeferral {
                     work: wait.work,

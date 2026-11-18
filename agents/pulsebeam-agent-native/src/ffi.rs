@@ -6,6 +6,10 @@ use tokio::sync::Mutex;
 
 mod media;
 pub use media::*;
+mod frames;
+pub use frames::*;
+mod resource_state;
+pub use resource_state::*;
 
 use crate::{
     Agent as RuntimeAgent, AgentEvent as RuntimeEvent, Config, EncodingLimits, EncodingState,
@@ -233,9 +237,9 @@ impl Agent {
             runtime: self.runtime.data(label, delivery.into())?,
         }))
     }
-    pub fn participant(&self, id: String) -> Result<Arc<Participant>, NativeError> {
-        Ok(Arc::new(Participant {
-            runtime: self.runtime.participant(id)?,
+    pub fn room(&self, name: String) -> Result<Arc<RoomRef>, NativeError> {
+        Ok(Arc::new(RoomRef {
+            runtime: self.runtime.room(name)?,
         }))
     }
     pub fn snapshot(&self) -> core_ffi::Snapshot {
@@ -316,14 +320,55 @@ pub struct LocalDataTrack {
     runtime: crate::LocalDataTrack,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[uniffi::export]
 impl LocalDataTrack {
-    pub async fn send(&self, data: Vec<u8>) -> Result<(), NativeError> {
-        self.runtime.send(data).await.map_err(Into::into)
+    pub fn publish(&self) -> Result<Arc<DataPublication>, NativeError> {
+        Ok(Arc::new(DataPublication {
+            runtime: self.runtime.publish()?,
+        }))
     }
-    pub async fn receive(&self) -> Result<Arc<DataReceiver>, NativeError> {
-        Ok(Arc::new(DataReceiver {
-            runtime: self.runtime.receive().await?,
+}
+
+#[derive(uniffi::Object)]
+pub struct DataPublication {
+    runtime: crate::DataPublication,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl DataPublication {
+    pub fn state(&self) -> core_ffi::DataPublicationState {
+        self.runtime.state()
+    }
+    pub fn updates(&self) -> Result<Arc<DataPublicationUpdates>, NativeError> {
+        Ok(Arc::new(DataPublicationUpdates {
+            runtime: self
+                .runtime
+                .updates()
+                .map_err(resource_state::observer_limit)?,
+        }))
+    }
+    pub async fn send(&self, data: Vec<u8>) -> Result<(), NativeError> {
+        self.runtime.send(data).await.map_err(operation_error)
+    }
+    pub fn close(&self) -> Result<(), NativeError> {
+        self.runtime.close().map_err(operation_error)
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct RoomRef {
+    runtime: crate::RoomRef,
+}
+
+#[uniffi::export]
+impl RoomRef {
+    pub fn name(&self) -> String {
+        self.runtime.name().into()
+    }
+
+    pub fn participant(&self, id: String) -> Result<Arc<Participant>, NativeError> {
+        Ok(Arc::new(Participant {
+            runtime: self.runtime.participant(id)?,
         }))
     }
 }
@@ -354,22 +399,33 @@ pub struct RemoteDataTrack {
     runtime: crate::RemoteDataTrack,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[uniffi::export]
 impl RemoteDataTrack {
-    pub async fn receive(&self) -> Result<Arc<DataReceiver>, NativeError> {
-        Ok(Arc::new(DataReceiver {
-            runtime: self.runtime.receive().await?,
+    pub fn subscribe(&self) -> Result<Arc<DataSubscription>, NativeError> {
+        Ok(Arc::new(DataSubscription {
+            runtime: self.runtime.subscribe()?,
         }))
     }
 }
 
 #[derive(uniffi::Object)]
-pub struct DataReceiver {
+pub struct DataSubscription {
     runtime: crate::DataReceiver,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
-impl DataReceiver {
+impl DataSubscription {
+    pub fn state(&self) -> core_ffi::DataSubscriptionState {
+        self.runtime.state()
+    }
+    pub fn updates(&self) -> Result<Arc<DataSubscriptionUpdates>, NativeError> {
+        Ok(Arc::new(DataSubscriptionUpdates {
+            runtime: self
+                .runtime
+                .updates()
+                .map_err(resource_state::observer_limit)?,
+        }))
+    }
     pub fn is_closed(&self) -> bool {
         self.runtime.is_closed()
     }

@@ -747,7 +747,9 @@ class EncodedFrameCollector
   const std::shared_ptr<ReadinessSignal> readiness_;
   std::shared_ptr<rust::Box<RustEncodedVideoObserver>> observer_;
   const bool ordered_;
-  static constexpr std::size_t kMaxFrames = 4;
+  // Native reference recovery can synchronously release a two-second 30 fps
+  // history before the host can drain it. The byte cap still bounds retention.
+  static constexpr std::size_t kMaxFrames = 64;
   static constexpr std::size_t kMaxPendingFrames = 512;
   static constexpr std::size_t kMaxBytes = 4 * 1024 * 1024;
   std::mutex mutex_;

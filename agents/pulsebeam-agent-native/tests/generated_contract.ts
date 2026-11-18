@@ -17,7 +17,10 @@ import {
   TopicMode,
   VideoObservation,
   Agent,
+  RoomRef,
   AudioSource,
+  AudioFrames,
+  VideoFrames,
   Encoding,
   EventStream,
   FeedbackStream,
@@ -92,7 +95,11 @@ if (renewed !== undefined || agent.snapshot().credentialRevision !== 1n || agent
   throw new Error("renew did not synchronously commit inert credential intent");
 }
 const localData = agent.data("control", TopicMode.Ordered);
-const participant = agent.participant("remote");
+const room = agent.room("room");
+if (!RoomRef.instanceOf(room) || room.name() !== "room" || "participant" in agent || "receive" in localData) {
+  throw new Error("reference factory retained a room-wide receive surface");
+}
+const participant = room.participant("remote");
 const remoteData = participant.data("control", TopicMode.Ordered);
 const localVideo = agent.video("camera");
 const sameVideo = agent.video("camera");
@@ -212,36 +219,137 @@ try {
 } catch (error) {
   if (!NativeError.NotReady.instanceOf(error)) throw error;
 }
-const videoSubscription = await remoteVideo.subscribe(VideoObservation.create({
+const explicitVideo = remoteVideo.subscribe(VideoObservation.create({
   visible: false, height: 0, minHeight: 0, minFps: 0, priority: 1,
   playoutDelay: PlayoutDelay.Adaptive.new(),
 }));
-const audioSubscription = await remoteAudio.subscribe(AudioSubscriptionConfig.create({
+await explicitVideo.close();
+explicitVideo.uniffiDestroy();
+const explicitAudio = remoteAudio.subscribe(AudioSubscriptionConfig.create({
   playoutDelay: PlayoutDelay.Adaptive.new(),
 }));
+await explicitAudio.close();
+explicitAudio.uniffiDestroy();
+const videoSubscription = remoteVideo.subscribe();
+if (videoSubscription instanceof Promise) throw new Error("video subscribe must be synchronous");
+const audioSubscription = remoteAudio.subscribe();
+if (audioSubscription instanceof Promise) throw new Error("audio subscribe must be synchronous");
+const videoState = videoSubscription.state();
+const audioState = audioSubscription.state();
+const videoUpdates = videoSubscription.updates();
+const audioUpdates = audioSubscription.updates();
+if (!videoState.configuration.visible || videoState.configuration.height !== 0 ||
+    videoState.configuration.minHeight !== 0 || videoState.configuration.minFps !== 0 ||
+    videoState.configuration.priority !== 0 ||
+    !PlayoutDelay.Adaptive.instanceOf(videoState.configuration.playoutDelay) ||
+    !PlayoutDelay.Adaptive.instanceOf(audioState.playoutDelay) ||
+    (await videoUpdates.next())?.observationRevision !== videoState.observationRevision ||
+    (await audioUpdates.next())?.observationRevision !== audioState.observationRevision) {
+  throw new Error("subscription defaults or current-first state were lost");
+}
 const audioSelection = await agent.selectAudio(AudioDemand.create({
   pinned: [], selected: [], automatic: false, playoutDelays: [], selectorDelays: [],
 }));
 await audioSelection.close();
 if (audioSubscription.isClosed()) throw new Error("selection close retired named audio demand");
+const frameReaders: (VideoFrames | AudioFrames)[] = [];
+const pendingFrames: Promise<unknown>[] = [];
+for (const [subscription, Reader] of [
+  [videoSubscription, VideoFrames], [audioSubscription, AudioFrames],
+] as const) {
+  const reader = subscription.frames();
+  if (reader instanceof Promise || !Reader.instanceOf(reader)) throw new Error("frames must return a concrete reader synchronously");
+  try {
+    subscription.frames();
+    throw new Error("second active frame reader was admitted");
+  } catch (error) {
+    if (!NativeError.Operation.instanceOf(error) || error.inner.info.code !== ErrorCode.Conflict) throw error;
+  }
+  const reads = [reader.next(), reader.next()];
+  const first = await Promise.race(reads.map((read, index) => read.then(
+    () => ({ index, error: undefined }),
+    (error: unknown) => ({ index, error }),
+  )));
+  if (!NativeError.Operation.instanceOf(first.error) || first.error.inner.info.code !== ErrorCode.Conflict) {
+    throw new Error("concurrent frame read did not fail with Conflict", { cause: first.error });
+  }
+  if (reader.close() !== undefined || await reads[1 - first.index] !== undefined) {
+    throw new Error("reader close did not end pending read");
+  }
+  if (subscription.isClosed()) throw new Error("reader close retired subscription");
+  reader.uniffiDestroy();
+  const replacement = subscription.frames();
+  if (replacement instanceof Promise || !Reader.instanceOf(replacement)) throw new Error("reader was not replaced synchronously");
+  frameReaders.push(replacement);
+  pendingFrames.push(replacement.next());
+}
 const pendingMedia = videoSubscription.observe(ReceiveMode.Decoded).then(
   () => { throw new Error("absent source produced a media observation"); },
   (error: unknown) => error,
 );
+if ("send" in localData || "receive" in remoteData) {
+  throw new Error("inert data addresses exposed payload operations");
+}
+if (false) {
+  // @ts-expect-error Sending requires an owned publication.
+  localData.send(new Uint8Array());
+  // @ts-expect-error Reception requires an owned subscription.
+  remoteData.receive();
+}
+const dataPublication = localData.publish();
+const dataState = dataPublication.state();
+const dataUpdates = dataPublication.updates();
+const siblingDataUpdates = dataPublication.updates();
+if (dataPublication instanceof Promise || dataState.label !== "control" ||
+    dataState.delivery !== TopicMode.Ordered ||
+    (await dataUpdates.next())?.observationRevision !== dataState.observationRevision ||
+    (await siblingDataUpdates.next())?.observationRevision !== dataState.observationRevision) {
+  throw new Error("data publication did not expose independent current-first cursors");
+}
+dataUpdates.close();
 try {
-  await localData.send(new Uint8Array([0, 255]));
+  agent.data("control", TopicMode.Ordered).publish();
+  throw new Error("duplicate data publication was admitted");
+} catch (error) {
+  if (!NativeError.Resource.instanceOf(error) ||
+      !ResourceFailure.AlreadyOwned.instanceOf(error.inner.reason)) throw error;
+}
+try {
+  await dataPublication.send(new Uint8Array([0, 255]));
   throw new Error("disconnected data send was admitted");
 } catch (error) {
   if (
-    !NativeError.Resource.instanceOf(error) ||
-    !ResourceFailure.NotConnected.instanceOf(error.inner.reason)
+    !NativeError.Operation.instanceOf(error) ||
+    error.inner.info.code !== ErrorCode.NotReady
   ) {
     throw error;
   }
 }
-const closedCursor = await localData.receive();
-const roomCursor = await localData.receive();
-const participantCursor = await remoteData.receive();
+await dataPublication.close();
+if (!dataPublication.state().closed || !(await siblingDataUpdates.next())?.closed ||
+    await siblingDataUpdates.next() !== undefined) {
+  throw new Error("data publication did not retain its final state");
+}
+siblingDataUpdates.close();
+try {
+  await dataPublication.send(new Uint8Array([0, 255]));
+  throw new Error("closed data publication accepted a send");
+} catch (error) {
+  if (!NativeError.Operation.instanceOf(error) || error.inner.info.code !== ErrorCode.Closed) throw error;
+}
+const replacementData = localData.publish();
+await replacementData.close();
+const closedCursor = remoteData.subscribe();
+const independentCursor = remoteData.subscribe();
+const participantCursor = remoteData.subscribe();
+if (closedCursor instanceof Promise || independentCursor instanceof Promise || participantCursor instanceof Promise) {
+  throw new Error("data subscribe was asynchronous");
+}
+const receiverState = closedCursor.state();
+const receiverUpdates = closedCursor.updates();
+if ((await receiverUpdates.next())?.observationRevision !== receiverState.observationRevision) {
+  throw new Error("data receiver did not expose current-first state");
+}
 const pendingClose = closedCursor.next();
 await closedCursor.close();
 await closedCursor.close();
@@ -251,10 +359,15 @@ if (
 ) {
   throw new Error("cursor close did not complete its read");
 }
-if (roomCursor.isClosed() || participantCursor.isClosed()) {
+if (!closedCursor.state().closed || !(await receiverUpdates.next())?.closed ||
+    await receiverUpdates.next() !== undefined) {
+  throw new Error("data receiver did not expose its final state");
+}
+receiverUpdates.close();
+if (independentCursor.isClosed() || participantCursor.isClosed()) {
   throw new Error("cursor close retired an independent receiver");
 }
-const pendingRoom = roomCursor.next();
+const pendingIndependent = independentCursor.next();
 const pendingParticipant = participantCursor.next();
 const snapshots = agent.snapshots();
 const events = agent.events();
@@ -287,12 +400,18 @@ retiredEvents.uniffiDestroy();
 const pendingSnapshot = snapshots.next();
 const pendingEvent = events.next();
 await agent.disconnect();
-if (agent.isClosed() || roomCursor.isClosed() || participantCursor.isClosed()) {
+if (agent.isClosed() || independentCursor.isClosed() || participantCursor.isClosed()) {
   throw new Error("disconnect was terminal");
 }
 await agent.close();
 await agent.close();
 if (!agent.isClosed()) throw new Error("close did not retire the Agent");
+for (const [index, reader] of frameReaders.entries()) {
+  if (await pendingFrames[index] !== undefined || await reader.next() !== undefined || reader.close() !== undefined) {
+    throw new Error("subscription close did not finish frame reader");
+  }
+  reader.uniffiDestroy();
+}
 if (!audioSource.isClosed() || !audioPublication.isClosed() ||
     !audioSubscription.isClosed() || !videoSubscription.isClosed() ||
     !NativeError.Closed.instanceOf(await pendingMedia)) {
@@ -305,7 +424,7 @@ if (!EventUpdate.Closed.instanceOf(await pendingEvent)) {
   throw new Error("terminal close did not finish a pending event read");
 }
 if (
-  !DataUpdate.Closed.instanceOf(await pendingRoom) ||
+  !DataUpdate.Closed.instanceOf(await pendingIndependent) ||
   !DataUpdate.Closed.instanceOf(await pendingParticipant)
 ) {
   throw new Error("Agent close did not complete owned data reads");
@@ -317,6 +436,20 @@ try {
 } catch (error) {
   if (!NativeError.Operation.instanceOf(error) || error.inner.info.code !== ErrorCode.Closed) throw error;
 }
+if (!videoSubscription.state().closed || !(await videoUpdates.next())?.closed ||
+    await videoUpdates.next() !== undefined || !audioSubscription.state().closed ||
+    !(await audioUpdates.next())?.closed || await audioUpdates.next() !== undefined) {
+  throw new Error("terminal Agent close did not finish subscription state cursors");
+}
+videoUpdates.close();
+audioUpdates.close();
+videoUpdates.uniffiDestroy();
+audioUpdates.uniffiDestroy();
+receiverUpdates.uniffiDestroy();
+dataUpdates.uniffiDestroy();
+siblingDataUpdates.uniffiDestroy();
+dataPublication.uniffiDestroy();
+replacementData.uniffiDestroy();
 const finalAudioPublication = await pendingAudioPublication;
 if (!finalAudioPublication?.closed || await audioPublicationUpdates.next() !== undefined ||
     !audioPublication.state().closed) {
@@ -348,7 +481,7 @@ localAudio.uniffiDestroy();
 sameVideo.uniffiDestroy();
 localVideo.uniffiDestroy();
 closedCursor.uniffiDestroy();
-roomCursor.uniffiDestroy();
+independentCursor.uniffiDestroy();
 participantCursor.uniffiDestroy();
 remoteData.uniffiDestroy();
 participant.uniffiDestroy();

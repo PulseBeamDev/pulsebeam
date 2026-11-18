@@ -224,6 +224,9 @@ impl<R: rtc::SessionRuntime> NativePeer<R> {
             })?;
             session.create_peer_with_configuration(crate::qualification_network::configuration())?
         };
+        // Fund a normal three-rung video start without imposing a bitrate
+        // floor. Subsequent native congestion feedback remains authoritative.
+        session.set_peer_bitrate(peer, None, Some(1_500_000), None)?;
         let mut channels = BTreeMap::new();
         let mut channel_bindings = Vec::new();
         let mut signaling_channel = None;

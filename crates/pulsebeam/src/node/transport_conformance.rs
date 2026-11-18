@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CONNECT: Duration = Duration::from_secs(30);
 const DELIVERY: Duration = Duration::from_secs(30);
 const CLEANUP: Duration = Duration::from_secs(10);
+const ROOM: &str = "dual-stack-transport";
 const TOPIC: &str = "dual-stack-probe";
 const A_TO_B: &[u8] = b"application-owned IPv4 to IPv6 probe";
 const B_TO_A: &[u8] = b"application-owned IPv6 to IPv4 probe";
@@ -269,13 +270,15 @@ fn publisher() -> TopicPublisher {
     }
 }
 
-fn desired() -> DesiredState {
+fn desired(remote_participant: &str) -> DesiredState {
     DesiredState {
         revision: 1,
         connected: true,
         topics: TopicRegistrations {
             publishers: vec![publisher()],
             subscribers: vec![TopicSubscriber {
+                room: ROOM.into(),
+                participant_external_id: remote_participant.into(),
                 topic: TOPIC.into(),
                 mode: TopicMode::Latest,
             }],
@@ -435,9 +438,9 @@ async fn witness(
     let events_a = a.events();
     let events_b = b.events();
     let (pair_a, pair_b) = pulsebeam_runtime::time::timeout(CONNECT, async {
-        pulsebeam_runtime::try_join!(a.replace_desired(desired()), b.replace_desired(desired()))?;
-        a.join("dual-stack-transport".to_owned())?;
-        b.join("dual-stack-transport".to_owned())?;
+        pulsebeam_runtime::try_join!(a.replace_desired(desired("v6")), b.replace_desired(desired("v4")))?;
+        a.join(ROOM.to_owned())?;
+        b.join(ROOM.to_owned())?;
         pulsebeam_runtime::try_join!(ready(a, Family::V4.address(port), None, protocol), ready(b, Family::V6.address(port), None, protocol))
     }).await.context("FAILED: 30s dual-stack connection/topic/selected-pair evidence deadline; require IPv4/IPv6 loopback and compatible native candidates")??;
     tracing::info!(
@@ -757,6 +760,7 @@ fn qualification_rejects_missing_payload_sequential_peers_and_unretired_graphs()
         "connection without payload qualified"
     );
     let mut message = TopicMessage {
+        room: ROOM.into(),
         topic: TOPIC.into(),
         mode: TopicMode::Latest,
         data_track_id: "publication".into(),

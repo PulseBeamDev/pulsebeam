@@ -313,8 +313,11 @@ impl SourceTrace {
                             .captured
                             .checked_add(deadline)
                             .context("event deadline overflow")?,
-                "source event {} missed its deadline {deadline:?}",
-                event.event.capture
+                "source event {} missed its deadline {deadline:?}: elapsed={:?}, temporal_index={:?}, rtp_timestamp={}",
+                event.event.capture,
+                native.at.checked_duration_since(supplied.captured),
+                supplied.temporal_index,
+                key.2
             );
             ensure!(
                 native.dimensions

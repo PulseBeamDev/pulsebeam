@@ -78,6 +78,7 @@ impl StateProtocolHandler {
             return Err(OutputError::InvalidObservation.into());
         }
         self.commands.clear();
+        self.model.finish_closed_lookups(FACT_BUDGET)?;
         if let Some(progress) = self.handoff.progress() {
             self.model.commit_sent(progress)?;
         }
@@ -117,6 +118,10 @@ impl StateProtocolHandler {
         &mut self,
         unix_now: u64,
         source: impl Fn(TrackId) -> Option<ResolvedSource<'a>>,
+        source_in_room: impl Fn(&str, TrackId) -> Option<ResolvedSource<'a>>,
+        lookup_source: impl Fn(
+            &pulsebeam_proto::state::LogicalSourceAddress,
+        ) -> Option<ResolvedSource<'a>>,
     ) -> Result<bool, InputError> {
         if self.handoff.failed() {
             return Err(OutputError::InvalidObservation.into());
@@ -163,11 +168,13 @@ impl StateProtocolHandler {
                 self.retain(command)?;
             }
         }
-        self.model.service_source_waits(
+        self.model
+            .refresh_source_lookups(FACT_BUDGET, unix_now, &lookup_source)?;
+        self.model.service_source_waits_in_room(
             unix_now,
             pulsebeam_runtime::time::Instant::now(),
-            |track| {
-                source(track)
+            |room, track| {
+                source_in_room(room, track)
                     .is_some_and(|source| source.track.id() == track && source.is_available())
             },
         )?;
@@ -180,11 +187,11 @@ impl StateProtocolHandler {
             let Some(work) = self.model.take_preparation()? else {
                 break;
             };
-            if let Some(command) = self.model.prepare_execution(
+            if let Some(command) = self.model.prepare_execution_in_room(
                 &work,
                 unix_now,
                 self.capabilities.as_ref(),
-                &source,
+                &source_in_room,
             )? {
                 self.retain(command)?;
             }
@@ -204,7 +211,9 @@ impl StateProtocolHandler {
             return Err(OutputError::Capacity.into());
         }
         if self.commands.len() < PREPARATION_BUDGET
-            && (self.model.revocation_pending() || self.model.preparation_pending(unix_now))
+            && (self.model.revocation_pending()
+                || self.model.preparation_pending(unix_now)
+                || self.model.lookup_refresh_pending())
             && !self.handoff.schedule()
         {
             return Err(OutputError::Capacity.into());

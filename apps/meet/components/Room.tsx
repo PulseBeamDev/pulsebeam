@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Audio,
   Data,
@@ -8,6 +8,8 @@ import {
   useAgent,
   useCapture,
   type Agent,
+  type AudioDemand,
+  type RemoteDataTrack,
   type RemoteVideoTrack,
 } from "@pulsebeam/react";
 import {
@@ -99,7 +101,6 @@ function ActiveRoom({
   const playbackRetry = useRef<(() => Promise<void>) | null>(null);
   const joinedRoom = useRef<string | null>(null);
   const {
-    Chat,
     messages,
     error: chatError,
     clearError: clearChatError,
@@ -108,17 +109,66 @@ function ActiveRoom({
     send: sendChat,
   } = useChat(agent);
   const {
-    Reactions,
     reactions,
     onEvent: receiveReaction,
     dismiss: dismissReaction,
     send: sendReaction,
   } = useReaction(agent);
-  const remoteVideoTracks = agent.participants.flatMap((participant) =>
-    participant.tracks.filter(
-      (value): value is RemoteVideoTrack => value.kind === "video",
-    ),
-  );
+  const {
+    remoteVideoTracks,
+    remoteAudioSelectors,
+    remoteChatTracks,
+    remoteReactionTracks,
+  } = useMemo(() => {
+    const videos: RemoteVideoTrack[] = [];
+    const audioSelectors: Array<NonNullable<AudioDemand["selected"]>[number]> =
+      [];
+    const chats: RemoteDataTrack<"ordered">[] = [];
+    const reactions: RemoteDataTrack<"lossy">[] = [];
+    if (agent.roomId !== room)
+      return {
+        remoteVideoTracks: videos,
+        remoteAudioSelectors: audioSelectors,
+        remoteChatTracks: chats,
+        remoteReactionTracks: reactions,
+      };
+    const pinnedRoom = agent.room(room);
+    for (const participant of agent.participants) {
+      for (const track of participant.tracks) {
+        if (track.kind === "video")
+          videos.push(
+            pinnedRoom
+              .participant(participant.participantId)
+              .video(track.label),
+          );
+        if (track.kind === "audio")
+          audioSelectors.push({
+            room,
+            participantId: participant.participantId,
+            label: track.label,
+          });
+        if (track.kind !== "data") continue;
+        if (track.label === "chat" && track.delivery === "ordered")
+          chats.push(
+            pinnedRoom
+              .participant(participant.participantId)
+              .data("chat", "ordered"),
+          );
+        if (track.label === "reactions" && track.delivery === "lossy")
+          reactions.push(
+            pinnedRoom
+              .participant(participant.participantId)
+              .data("reactions", "lossy"),
+          );
+      }
+    }
+    return {
+      remoteVideoTracks: videos,
+      remoteAudioSelectors: audioSelectors,
+      remoteChatTracks: chats,
+      remoteReactionTracks: reactions,
+    };
+  }, [agent, room, agent.roomId, agent.participants]);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(remoteVideoTracks);
   const connect = useCallback(() => {
     try {
@@ -228,7 +278,7 @@ function ActiveRoom({
       <Publish track={Camera} source={capture.video} enabled={cameraOn} />
       <Publish track={Microphone} source={capture.audio} enabled={micOn} />
       <Publish track={Screen} source={screen} content="detail" />
-      <SelectAudio agent={agent} policy={{ automatic: true }} />
+      <SelectAudio agent={agent} policy={{ selected: remoteAudioSelectors }} />
       <Audio
         agent={agent}
         onPlaybackError={(failure) =>
@@ -238,8 +288,21 @@ function ActiveRoom({
           })
         }
       />
-      <Data track={Chat} onEvent={receiveChat} onError={onChatError} />
-      <Data track={Reactions} onEvent={receiveReaction} />
+      {remoteChatTracks.map((track) => (
+        <Data
+          key={`${track.room}:${track.participantId}:${track.label}`}
+          track={track}
+          onEvent={receiveChat}
+          onError={onChatError}
+        />
+      ))}
+      {remoteReactionTracks.map((track) => (
+        <Data
+          key={`${track.room}:${track.participantId}:${track.label}`}
+          track={track}
+          onEvent={receiveReaction}
+        />
+      ))}
       <Paper
         component="header"
         square

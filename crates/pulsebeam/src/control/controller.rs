@@ -147,6 +147,10 @@ impl AuthorizationLease {
         &self.permissions
     }
 
+    pub(super) fn room_external_id(&self) -> &crate::entity::RoomExternalId {
+        &self.authority.room_external_id
+    }
+
     fn allows_current_room(&self) -> bool {
         self.permissions
             .allows_join(&self.authority.room_external_id)
@@ -436,6 +440,7 @@ struct NativeDeletionCompletion {
 #[derive(Debug)]
 struct OwnershipCutoff {
     ticket: ownership::Ticket,
+    incarnation: ownership::Incarnation,
     success: bool,
 }
 
@@ -615,6 +620,7 @@ pub struct ControllerActor {
     materializations: VecDeque<MaterializationWork>,
     native_connections: std::collections::HashMap<ConnectionId, NativeService>,
     retiring_native: std::collections::HashMap<ConnectionId, native_service::RetiringNative>,
+    source_lookup_index: native_service::SourceLookupIndex,
     native_ready_tx: mailbox::Sender<ConnectionId>,
     native_ready_rx: mailbox::Receiver<ConnectionId>,
     native_deadlines: BTreeSet<(pulsebeam_runtime::time::Instant, ConnectionId)>,
@@ -687,6 +693,7 @@ impl ControllerActor {
             materializations: VecDeque::new(),
             native_connections: std::collections::HashMap::new(),
             retiring_native: std::collections::HashMap::new(),
+            source_lookup_index: native_service::SourceLookupIndex::default(),
             native_ready_tx,
             native_ready_rx,
             native_deadlines: BTreeSet::new(),
@@ -1594,6 +1601,9 @@ impl ControllerActor {
             Err(if superseded {
                 ControllerError::Superseded
             } else {
+                if let Some(owned) = &owned {
+                    self.ownership.retry_failed_materialization(&owned.ticket);
+                }
                 ControllerError::ServiceUnavailable
             })
         };
@@ -1777,7 +1787,7 @@ impl ControllerActor {
                         .get_participant(&request.subscriber)
                         .is_some_and(|meta| {
                             meta.connection_id == connection_id
-                                && meta.room_id == request.room_id
+                                && meta.room_id == request.subscriber_room
                                 && self.native_connections.contains_key(&connection_id)
                         })
                 {
@@ -1794,11 +1804,19 @@ impl ControllerActor {
             }
             ShardEvent::OwnedSubscriptionRemoved {
                 room_id,
+                source_room,
                 subscriber,
                 connection_id,
                 reference,
             } => {
-                self.begin_owned_cutoff(subscriber, connection_id, reference, room_id, None);
+                self.begin_owned_cutoff(
+                    subscriber,
+                    connection_id,
+                    reference,
+                    room_id,
+                    source_room,
+                    None,
+                );
             }
             ShardEvent::TrackSubscribed {
                 subscriber,
@@ -1960,7 +1978,11 @@ impl ControllerActor {
                     .send(NativeDeletionCompletion {
                         bytes,
                         publication: None,
-                        ownership: Some(OwnershipCutoff { ticket, success }),
+                        ownership: Some(OwnershipCutoff {
+                            ticket,
+                            incarnation,
+                            success,
+                        }),
                     })
                     .await;
             });
@@ -1975,6 +1997,7 @@ impl ControllerActor {
         if let Some(result) = completed.ownership {
             self.ownership.finish_retirement(
                 &result.ticket,
+                result.incarnation,
                 result.success,
                 pulsebeam_runtime::time::Instant::now(),
             );
@@ -2002,6 +2025,7 @@ impl ControllerActor {
             meta.connection_id,
             reference,
             meta.room_id,
+            meta.room_id,
             Some(meta),
         );
     }
@@ -2012,6 +2036,7 @@ impl ControllerActor {
         connection_id: ConnectionId,
         reference: u64,
         room_id: RoomId,
+        source_room: RoomId,
         publication: Option<crate::track::TrackMeta>,
     ) {
         let Some(shard) = self
@@ -2064,7 +2089,7 @@ impl ControllerActor {
             outcome.into_iter().collect()
         } else {
             self.lifecycle.unsubscribe_owned(
-                room_id,
+                source_room,
                 participant,
                 reference,
                 &self.core.registry,
@@ -3504,6 +3529,7 @@ mod replacement_tests {
                 materializations: VecDeque::new(),
                 native_connections: std::collections::HashMap::new(),
                 retiring_native: std::collections::HashMap::new(),
+                source_lookup_index: native_service::SourceLookupIndex::default(),
                 native_ready_tx,
                 native_ready_rx,
                 native_deadlines: BTreeSet::new(),
@@ -3513,7 +3539,7 @@ mod replacement_tests {
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
-    async fn native_source_and_discovery_scopes_use_authoritative_facts() {
+    async fn native_exact_reception_and_discovery_scopes_use_authoritative_source_facts() {
         use crate::control::native::{
             ExecutionAction, ExecutionCompletion, PreparedResource, ReceiverPreparation,
             ResourceExecution, handoff,
@@ -3523,29 +3549,44 @@ mod replacement_tests {
         use crate::participant::signaling::SignalingProgress;
         use pulsebeam_proto::state::{self as wire, codec};
 
-        for publisher_known in [true, false] {
+        for (publisher_known, same_room) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
             let (mut actor, _receivers) = actor_with_receivers(2);
-            let room = RoomId::from_external(&RoomExternalId::new("source-authority").unwrap());
+            let room = RoomId::from_external(
+                &RoomExternalId::new(if same_room {
+                    "source-authority"
+                } else {
+                    "subscriber-room"
+                })
+                .unwrap(),
+            );
+            let source_room =
+                RoomId::from_external(&RoomExternalId::new("source-authority").unwrap());
             let publisher = ParticipantId::new();
             let subscriber = ParticipantId::new();
             let publisher_external = ParticipantExternalId::new("server-publisher").unwrap();
             let subscriber_external = ParticipantExternalId::new("subscriber").unwrap();
-            for (participant, connection, shard, external) in [
+            for (participant, connection, shard, partition, external, participant_room) in [
                 (
                     publisher,
                     connection_id(1),
+                    0,
                     0,
                     if publisher_known {
                         Some(publisher_external.clone())
                     } else {
                         None
                     },
+                    source_room,
                 ),
                 (
                     subscriber,
                     connection_id(3),
                     1,
+                    if same_room { 1 } else { 0 },
                     Some(subscriber_external.clone()),
+                    room,
                 ),
             ] {
                 let address = actor.core.reserve_transport(
@@ -3557,9 +3598,9 @@ mod replacement_tests {
                     .registry
                     .commit_candidate(
                         participant,
-                        room,
+                        participant_room,
                         ShardId::new(shard),
-                        shard,
+                        partition,
                         address,
                         connection,
                         SignalingProtocol::State,
@@ -3570,7 +3611,7 @@ mod replacement_tests {
             }
             let track = crate::track::Track::data_publication(
                 crate::track::TrackMeta {
-                    room_id: room,
+                    room_id: source_room,
                     shard_id: ShardId::new(0),
                     id: connection_id(1).derive_publication_track_id(
                         TrackKind::Data,
@@ -3583,6 +3624,18 @@ mod replacement_tests {
                 },
                 crate::track::DataLane::Ordered,
             );
+            let publisher_lease = authorization_lease(
+                u64::MAX,
+                UNIX_EPOCH,
+                pulsebeam_runtime::time::Instant::now(),
+                "source-authority",
+                source_room,
+                publisher,
+            );
+            actor
+                .core
+                .registry
+                .update_authorization(&publisher, connection_id(1), publisher_lease);
             actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(track.clone())));
             let (controller, mut endpoint) =
                 handoff::pair(connection_id(3), actor.native_ready_tx.clone());
@@ -3624,6 +3677,7 @@ mod replacement_tests {
                                     wire::SubscriptionSpec {
                                         track_id: track.id().as_str(),
                                         kind: wire::TrackKind::Data as i32,
+                                        source_room: "source-authority".into(),
                                         binding: Some(wire::TrackBinding {
                                             transport: Some(wire::track_binding::Transport::Sctp(
                                                 wire::SctpParameters { stream_id: Some(1) },
@@ -3635,6 +3689,7 @@ mod replacement_tests {
                         ))),
                     }),
                 }],
+                ..Default::default()
             };
             assert!(endpoint.input(codec::encode_client(&request).unwrap()));
             actor.service_native_connections();
@@ -3735,91 +3790,93 @@ mod replacement_tests {
                 let batch = codec::decode_server(&revoked.bytes).unwrap();
                 assert!(batch.records.iter().any(|record| record.confirmed.as_ref().is_some_and(|value| matches!(&value.value, Some(wire::confirmed_state::Value::Absent(absent)) if absent.reason == wire::AbsenceReason::PermissionRevoked as i32))));
                 records.extend(batch.records);
-                let discovery_scope = |discover| {
-                    use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind};
-                    let mut grants = vec![
-                        Grant::new(
-                            vec!["source-authority".into()],
-                            vec![Action::Join],
-                            None,
-                            None,
-                            None,
-                        )
-                        .unwrap(),
-                    ];
-                    if discover {
-                        grants.push(
-                            Grant::new(
-                                vec!["source-authority".into()],
-                                vec![Action::Discover],
-                                None,
-                                Some(TrackKind::Data),
-                                Some("private-topic".into()),
-                            )
-                            .unwrap(),
-                        );
-                    }
-                    crate::control::native::ResourcePermissions::Grants {
-                        room: RoomExternalId::new("source-authority").unwrap(),
-                        grants: GrantSet::new(grants).unwrap(),
-                    }
-                };
                 assert!(endpoint.progress(SignalingProgress {
                     sequence: revoked.sequence,
                     cid: revoked.cid,
                     at: pulsebeam_runtime::time::Instant::now()
                 }));
-                assert!(
-                    actor
-                        .native_connections
-                        .get_mut(&connection_id(3))
-                        .unwrap()
-                        .handler
-                        .model
-                        .authorization(i64::MAX, 3, discovery_scope(true))
-                        .unwrap()
-                );
-                actor.seed_native_sources(connection_id(3));
-                actor.service_native_connections();
-                let catalog = endpoint.output().unwrap();
-                let visible = codec::decode_server(&catalog.bytes).unwrap();
-                assert!(visible.records.iter().any(|record| matches!(record.key.as_ref().and_then(|key| key.key.as_ref()), Some(wire::resource_key::Key::Track(id)) if *id == track.id().as_str())));
-                assert!(visible.records.iter().any(|record| record.confirmed.as_ref().is_some_and(|value| matches!(&value.value, Some(wire::confirmed_state::Value::Participant(peer)) if peer.participant_external_id == publisher_external.as_str()))));
-                assert!(endpoint.command().is_none());
-                assert!(endpoint.progress(SignalingProgress {
-                    sequence: catalog.sequence,
-                    cid: catalog.cid,
-                    at: pulsebeam_runtime::time::Instant::now()
-                }));
-                assert!(
-                    actor
-                        .native_connections
-                        .get_mut(&connection_id(3))
-                        .unwrap()
-                        .handler
-                        .model
-                        .authorization(i64::MAX, 4, discovery_scope(false))
-                        .unwrap()
-                );
-                actor.seed_native_sources(connection_id(3));
-                actor.service_native_connections();
-                let withdrawn = endpoint.output().unwrap();
-                let withdrawn = codec::decode_server(&withdrawn.bytes).unwrap();
-                for key in [
-                    wire::resource_key::Key::Track(track.id().as_str()),
-                    wire::resource_key::Key::Participant(publisher.as_str()),
-                ] {
-                    assert!(withdrawn.records.iter().any(|record| {
-                        record.key.as_ref().and_then(|key| key.key.as_ref()) == Some(&key)
-                            && record.confirmed.as_ref().is_some_and(|value| {
-                                matches!(
-                                    &value.value,
-                                    Some(wire::confirmed_state::Value::Absent(_))
+                if same_room {
+                    let discovery_scope = |discover| {
+                        use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind};
+                        let mut grants = vec![
+                            Grant::new(
+                                vec!["source-authority".into()],
+                                vec![Action::Join],
+                                None,
+                                None,
+                                None,
+                            )
+                            .unwrap(),
+                        ];
+                        if discover {
+                            grants.push(
+                                Grant::new(
+                                    vec!["source-authority".into()],
+                                    vec![Action::Discover],
+                                    None,
+                                    Some(TrackKind::Data),
+                                    Some("private-topic".into()),
                                 )
-                            })
+                                .unwrap(),
+                            );
+                        }
+                        crate::control::native::ResourcePermissions::Grants {
+                            room: RoomExternalId::new("source-authority").unwrap(),
+                            grants: GrantSet::new(grants).unwrap(),
+                        }
+                    };
+                    assert!(
+                        actor
+                            .native_connections
+                            .get_mut(&connection_id(3))
+                            .unwrap()
+                            .handler
+                            .model
+                            .authorization(i64::MAX, 3, discovery_scope(true))
+                            .unwrap()
+                    );
+                    actor.seed_native_sources(connection_id(3));
+                    actor.service_native_connections();
+                    let catalog = endpoint.output().unwrap();
+                    let visible = codec::decode_server(&catalog.bytes).unwrap();
+                    assert!(visible.records.iter().any(|record| matches!(record.key.as_ref().and_then(|key| key.key.as_ref()), Some(wire::resource_key::Key::Track(id)) if *id == track.id().as_str())));
+                    assert!(visible.records.iter().any(|record| record.confirmed.as_ref().is_some_and(|value| matches!(&value.value, Some(wire::confirmed_state::Value::Participant(peer)) if peer.participant_external_id == publisher_external.as_str()))));
+                    assert!(endpoint.command().is_none());
+                    assert!(endpoint.progress(SignalingProgress {
+                        sequence: catalog.sequence,
+                        cid: catalog.cid,
+                        at: pulsebeam_runtime::time::Instant::now()
                     }));
+                    assert!(
+                        actor
+                            .native_connections
+                            .get_mut(&connection_id(3))
+                            .unwrap()
+                            .handler
+                            .model
+                            .authorization(i64::MAX, 4, discovery_scope(false))
+                            .unwrap()
+                    );
+                    actor.seed_native_sources(connection_id(3));
+                    actor.service_native_connections();
+                    let withdrawn = endpoint.output().unwrap();
+                    let withdrawn = codec::decode_server(&withdrawn.bytes).unwrap();
+                    for key in [
+                        wire::resource_key::Key::Track(track.id().as_str()),
+                        wire::resource_key::Key::Participant(publisher.as_str()),
+                    ] {
+                        assert!(withdrawn.records.iter().any(|record| {
+                            record.key.as_ref().and_then(|key| key.key.as_ref()) == Some(&key)
+                                && record.confirmed.as_ref().is_some_and(|value| {
+                                    matches!(
+                                        &value.value,
+                                        Some(wire::confirmed_state::Value::Absent(_))
+                                    )
+                                })
+                        }));
+                    }
+                    assert!(endpoint.command().is_none());
                 }
-                assert!(endpoint.command().is_none());
             } else {
                 assert!(endpoint.command().is_none());
             }
@@ -3834,6 +3891,77 @@ mod replacement_tests {
                 }
             }));
         }
+    }
+
+    #[test]
+    fn native_handler_rearms_bounded_source_lookup_refresh_until_drained() {
+        use crate::control::native::handoff;
+        use pulsebeam_proto::state::{self as wire, codec};
+
+        let connection = connection_id(37);
+        let (ready_tx, mut ready_rx) = mailbox::bounded(std::num::NonZeroUsize::new(4).unwrap());
+        let (handoff, mut endpoint) = handoff::pair(connection, ready_tx);
+        let participant = ParticipantId::new();
+        let room = RoomId::from_external(&RoomExternalId::new("handler-room").unwrap());
+        let external = crate::entity::ParticipantExternalId::new("subscriber").unwrap();
+        let mut handler =
+            StateProtocolHandler::new(participant, room, external, None, handoff).unwrap();
+        handler
+            .model
+            .authorization(
+                10_000,
+                1,
+                crate::control::native::ResourcePermissions::RoomBound,
+            )
+            .unwrap();
+
+        for start in (1_u64..=48).step_by(16) {
+            let records = (start..start + 16)
+                .map(|reference| wire::ClientStateRecord {
+                    owned: reference,
+                    execution: None,
+                    desired: Some(wire::DesiredState {
+                        revision: reference,
+                        value: Some(wire::desired_state::Value::Present(Box::new(
+                            wire::ResourceSpec {
+                                settings: Some(wire::ResourceSettings {
+                                    enabled: Some(true),
+                                    receive: None,
+                                }),
+                                declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+                                    wire::SourceLookupSpec {
+                                        source: Some(wire::LogicalSourceAddress {
+                                            room: "handler-room".into(),
+                                            participant_external_id: "publisher".into(),
+                                            kind: wire::TrackKind::Data as i32,
+                                            label: "label".into(),
+                                        }),
+                                    },
+                                )),
+                            },
+                        ))),
+                    }),
+                })
+                .collect();
+            let bytes = codec::encode_client(&wire::ClientStateBatch {
+                records,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(bytes.len() <= codec::MAX_FRAME_SIZE);
+            assert!(handler.model.receive_input(&bytes, 1).unwrap().is_empty());
+        }
+
+        assert!(handler.handoff.schedule());
+        assert_eq!(ready_rx.try_recv().unwrap(), connection);
+        handler.service(1, |_| None, |_, _| None, |_| None).unwrap();
+        assert!(handler.model.lookup_refresh_pending());
+        assert_eq!(ready_rx.try_recv().unwrap(), connection);
+        handler.service(1, |_| None, |_, _| None, |_| None).unwrap();
+        assert!(!handler.model.lookup_refresh_pending());
+        assert!(!handler.model.preparation_pending(1));
+        assert!(endpoint.command().is_none());
+        assert!(ready_rx.try_recv().is_err());
     }
 
     #[test]
@@ -3948,7 +4076,7 @@ mod replacement_tests {
                 crate::media::ChannelId::from_value(0),
                 pulsebeam_runtime::time::Instant::now(),
             );
-            native.service(0, |_| None).unwrap();
+            native.service(0, |_| None, |_, _| None, |_| None).unwrap();
             let initial = endpoint.output().expect("initial session output in flight");
             endpoint.acknowledge_wakeup();
             actor.native_connections.insert(
@@ -5070,8 +5198,12 @@ mod replacement_tests {
         );
 
         actor.ownership.start_retirement(&old_ticket);
-        actor.ownership.finish_retirement(&old_ticket, false, now);
-        actor.ownership.finish_retirement(&old_ticket, true, now);
+        actor
+            .ownership
+            .finish_retirement(&old_ticket, incarnation, false, now);
+        actor
+            .ownership
+            .finish_retirement(&old_ticket, incarnation, true, now);
         actor.ownership.retire(&old_ticket, now);
         assert!(actor.ownership.has_incarnation(incarnation));
         actor.ownership.queue_retirement(incarnation);
@@ -5106,7 +5238,9 @@ mod replacement_tests {
         actor.release_deletion(completed);
         assert!(!actor.ownership.has_incarnation(incarnation));
         assert_eq!(actor.deletion_bytes, 0);
-        actor.ownership.finish_retirement(&old_ticket, true, now);
+        actor
+            .ownership
+            .finish_retirement(&old_ticket, incarnation, true, now);
         actor.advance_materializations();
         let (destination, next_command) = actor.command_backlog.pop_front().unwrap();
         assert_eq!(destination, ShardId::new(1));
@@ -5729,7 +5863,8 @@ mod replacement_tests {
             ShardEvent::OwnedSubscriptionSet {
                 connection_id: connection_id(3),
                 request: super::super::topology::OwnedSubscription {
-                    room_id,
+                    subscriber_room: room_id,
+                    source_room: room_id,
                     subscriber,
                     reference: 2,
                     track: received.id(),
@@ -5744,6 +5879,7 @@ mod replacement_tests {
             ShardId::new(1),
             ShardEvent::OwnedSubscriptionRemoved {
                 room_id,
+                source_room: room_id,
                 subscriber,
                 connection_id: connection_id(3),
                 reference: 2,

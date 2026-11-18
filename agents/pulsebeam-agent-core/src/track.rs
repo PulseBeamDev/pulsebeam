@@ -73,15 +73,35 @@ impl TrackSpec {
         }
     }
 
-    pub(crate) fn subscriber(&self) -> Result<TopicSubscriber, TrackResourceError> {
+    pub(crate) fn publisher(&self) -> Result<TopicPublisher, TrackResourceError> {
         self.validate()?;
         match self {
-            Self::Data { label, delivery } => Ok(TopicSubscriber {
+            Self::Data { label, delivery } => Ok(TopicPublisher {
                 topic: label.clone(),
                 mode: *delivery,
             }),
             _ => Err(TrackResourceError::WrongKind),
         }
+    }
+
+    pub(crate) fn subscriber(
+        &self,
+        source: &TrackSelector,
+    ) -> Result<TopicSubscriber, TrackResourceError> {
+        source.validate()?;
+        let publisher = self.publisher()?;
+        if publisher.topic != source.label {
+            return Err(ValidationError::Identifier {
+                field: "data source label",
+            }
+            .into());
+        }
+        Ok(TopicSubscriber {
+            room: source.room.clone(),
+            participant_external_id: source.participant_external_id.clone(),
+            topic: publisher.topic,
+            mode: publisher.mode,
+        })
     }
 }
 
@@ -132,6 +152,8 @@ pub enum TrackResourceError {
     ReceiveOverflow,
     #[error("data receive channel failed: {0}")]
     ReceiveChannelFailed(String),
+    #[error("data reception failed: {0:?}")]
+    ReceiveFailed(crate::ffi::ErrorInfo),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -365,19 +387,13 @@ impl PublicationOwner {
 
 struct DataReceiver {
     subscriber: TopicSubscriber,
-    participant_id: Option<String>,
     queue: VecDeque<DataEvent>,
     failure: Option<TrackResourceError>,
 }
 
 impl DataReceiver {
     fn push(&mut self, event: DataEvent) {
-        if self.failure.is_some()
-            || self
-                .participant_id
-                .as_deref()
-                .is_some_and(|id| id != event.identity().0)
-        {
+        if self.failure.is_some() || self.subscriber.participant_external_id != event.identity().0 {
             return;
         }
         match self.subscriber.mode {
@@ -521,7 +537,7 @@ pub enum ResourceCommand {
     },
     ReceiveData {
         spec: TrackSpec,
-        participant_id: Option<String>,
+        source: TrackSelector,
     },
     ReadData {
         owner: u64,
@@ -568,9 +584,60 @@ pub struct TrackResources {
     observations: BTreeMap<MediaObservationId, observation::MediaObservation>,
     producers: BTreeSet<TopicPublisher>,
     receivers: BTreeMap<TrackOwner, DataReceiver>,
+    intent_revisions: BTreeMap<TrackOwner, u64>,
 }
 
 impl TrackResources {
+    fn begin_intent(&mut self, owner: TrackOwner) -> Result<u64, TrackResourceError> {
+        let revision = self
+            .intent_revisions
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(TrackResourceError::PublicationConfigurationSpaceExhausted)?;
+        self.intent_revisions.insert(owner, revision);
+        Ok(revision)
+    }
+
+    pub(crate) fn intent_revision(&self, owner: TrackOwner) -> Option<u64> {
+        self.intent_revisions.get(&owner).copied()
+    }
+
+    pub(crate) fn video_view(
+        &self,
+        owner: TrackOwner,
+    ) -> Option<(&TrackSelector, &VideoObservation)> {
+        let view = self.video.get(&owner)?;
+        Some((&view.selector, &view.observation))
+    }
+
+    pub(crate) fn audio_view(&self, owner: TrackOwner) -> Option<(&TrackSelector, PlayoutDelay)> {
+        match self.audio_views.get(&owner)? {
+            AudioView::Named {
+                selector,
+                playout_delay,
+            } => Some((selector, *playout_delay)),
+            AudioView::Policy(_) => None,
+        }
+    }
+
+    pub(crate) fn data_publication(&self, owner: TrackOwner) -> Option<(&str, TopicMode)> {
+        self.data_publications
+            .iter()
+            .find_map(|(label, (current, mode))| {
+                (*current == owner).then_some((label.as_str(), *mode))
+            })
+    }
+
+    pub(crate) fn data_receiver(
+        &self,
+        owner: TrackOwner,
+    ) -> Option<(&TopicSubscriber, Option<&TrackResourceError>)> {
+        let receiver = self.receivers.get(&owner)?;
+        Some((&receiver.subscriber, receiver.failure.as_ref()))
+    }
+
     pub fn new_owner(&mut self) -> Result<TrackOwner, TrackResourceError> {
         self.next_owner = self
             .next_owner
@@ -686,6 +753,7 @@ impl TrackResources {
         {
             return Err(TrackResourceError::OwnerInUse);
         }
+        self.begin_intent(owner)?;
         self.data_publications
             .insert(label.clone(), (owner, *delivery));
         Ok(())
@@ -1114,6 +1182,7 @@ impl TrackResources {
 
     pub(crate) fn release(&mut self, owner: TrackOwner) {
         self.publications.retain(|_, entry| entry.owner != owner);
+        self.intent_revisions.remove(&owner);
         self.data_publications
             .retain(|_, (current, _)| *current != owner);
         self.release_audio(owner);
@@ -1180,6 +1249,7 @@ impl TrackResources {
         }) {
             return Err(TrackResourceError::AlreadyOwned);
         }
+        self.begin_intent(owner)?;
         self.audio_views.insert(
             owner,
             AudioView::Named {
@@ -1222,6 +1292,7 @@ impl TrackResources {
         }) {
             return Err(TrackResourceError::AlreadyOwned);
         }
+        self.begin_intent(owner)?;
         if let Some(AudioView::Named {
             playout_delay: delay,
             ..
@@ -1241,6 +1312,7 @@ impl TrackResources {
             return Err(TrackResourceError::OwnerInUse);
         }
         self.validate_audio_policy(owner, &policy)?;
+        self.begin_intent(owner)?;
         self.audio_views.insert(owner, AudioView::Policy(policy));
         Ok(())
     }
@@ -1256,6 +1328,7 @@ impl TrackResources {
             None => return Err(TrackResourceError::Released),
         }
         self.validate_audio_policy(owner, &policy)?;
+        self.begin_intent(owner)?;
         self.audio_views.insert(owner, AudioView::Policy(policy));
         Ok(())
     }
@@ -1365,6 +1438,7 @@ impl TrackResources {
         if self.video.contains_key(&owner) {
             return Err(TrackResourceError::OwnerInUse);
         }
+        self.begin_intent(owner)?;
         self.video.insert(
             owner,
             VideoView {
@@ -1387,6 +1461,10 @@ impl TrackResources {
         {
             return Err(TrackResourceError::InvalidPlayoutDelay);
         }
+        if !self.video.contains_key(&owner) {
+            return Err(TrackResourceError::Released);
+        }
+        self.begin_intent(owner)?;
         let view = self
             .video
             .get_mut(&owner)
@@ -1399,10 +1477,7 @@ impl TrackResources {
         self.video.remove(&owner).is_some()
     }
 
-    pub fn video_projection(
-        &mut self,
-        tracks: &BTreeMap<String, RemoteTrack>,
-    ) -> Result<Vec<VideoSubscription>, TrackResourceError> {
+    pub fn video_projection(&mut self) -> Result<Vec<VideoSubscription>, TrackResourceError> {
         let mut grouped: BTreeMap<TrackSelector, VideoObservation> = BTreeMap::new();
         for view in self.video.values().filter(|view| view.observation.visible) {
             let observation = &view.observation;
@@ -1431,16 +1506,6 @@ impl TrackResources {
                 (PlayoutDelay::Adaptive, delay) | (delay, PlayoutDelay::Adaptive) => delay,
             };
         }
-        grouped.retain(|selector, _| {
-            self.video_slots.contains_key(selector)
-                || tracks.values().any(|track| {
-                    track.participant_id == selector.participant_external_id
-                        && track.spec
-                            == (TrackSpec::Video {
-                                label: selector.label.clone(),
-                            })
-                })
-        });
         self.video_slots
             .retain(|selector, _| self.video.values().any(|view| view.selector == *selector));
         let mut occupied: BTreeSet<_> = self.video_slots.values().copied().collect();
@@ -1472,11 +1537,7 @@ impl TrackResources {
     }
 
     pub fn retain_producer(&mut self, spec: &TrackSpec) -> Result<(), TrackResourceError> {
-        let subscriber = spec.subscriber()?;
-        let publisher = TopicPublisher {
-            topic: subscriber.topic,
-            mode: subscriber.mode,
-        };
+        let publisher = spec.publisher()?;
         if let Some((_, mode)) = self.data_publications.get(spec.label()) {
             if *mode != publisher.mode {
                 return Err(TrackResourceError::AlreadyOwned);
@@ -1503,25 +1564,22 @@ impl TrackResources {
         &mut self,
         owner: TrackOwner,
         spec: &TrackSpec,
-        participant_id: Option<String>,
+        source: TrackSelector,
     ) -> Result<(), TrackResourceError> {
-        let subscriber = spec.subscriber()?;
+        let subscriber = spec.subscriber(&source)?;
         if self.receivers.contains_key(&owner) {
             return Err(TrackResourceError::OwnerInUse);
-        }
-        if let Some(id) = &participant_id {
-            crate::validate_participant_id(id)?;
         }
         let mut registrations = self.registrations();
         registrations.subscribers.push(subscriber.clone());
         registrations.normalize();
         registrations.subscribers.dedup();
         registrations.validate()?;
+        self.begin_intent(owner)?;
         self.receivers.insert(
             owner,
             DataReceiver {
                 subscriber,
-                participant_id,
                 queue: VecDeque::new(),
                 failure: None,
             },
@@ -1571,6 +1629,30 @@ impl TrackResources {
         Ok(receiver.queue.pop_front())
     }
 
+    pub(crate) fn fail_receivers_for_source(
+        &mut self,
+        source: &TrackSelector,
+        mode: Option<TopicMode>,
+        error: &crate::ffi::ErrorInfo,
+    ) -> ReceiveUpdate {
+        let mut update = ReceiveUpdate::default();
+        for (owner, receiver) in &mut self.receivers {
+            let subscriber = &receiver.subscriber;
+            if receiver.failure.is_some()
+                || subscriber.room != source.room
+                || subscriber.participant_external_id != source.participant_external_id
+                || subscriber.topic != source.label
+                || mode.is_some_and(|mode| subscriber.mode != mode)
+            {
+                continue;
+            }
+            receiver.fail(TrackResourceError::ReceiveFailed(error.clone()));
+            update.ready.push(*owner);
+            update.registrations_changed = true;
+        }
+        update
+    }
+
     /// Feed only notifications already validated and deduplicated by the topic transport.
     pub fn notify(&mut self, notification: &TopicNotification) -> ReceiveUpdate {
         let mut update = ReceiveUpdate::default();
@@ -1580,7 +1662,8 @@ impl TrackResources {
             }
             match notification {
                 TopicNotification::Message(message)
-                    if receiver.subscriber.topic == message.topic
+                    if receiver.subscriber.room == message.room
+                        && receiver.subscriber.topic == message.topic
                         && receiver.subscriber.mode == message.mode =>
                 {
                     receiver.push(DataEvent::Message {

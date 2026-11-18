@@ -17,12 +17,19 @@ pub enum ValidationError {
     Format,
     Failure,
     Capability,
+    Catalog,
 }
 
 type Result<T = ()> = core::result::Result<T, ValidationError>;
 
 pub fn validate_client_batch(batch: &ClientStateBatch) -> Result {
-    if batch.records.is_empty() || batch.records.len() > codec::MAX_RECORDS {
+    if batch
+        .records
+        .len()
+        .saturating_add(batch.catalog_records.len())
+        > codec::MAX_RECORDS
+        || batch.records.is_empty() && batch.catalog_records.is_empty()
+    {
         return Err(ValidationError::Batch);
     }
     let mut previous = 0;
@@ -53,12 +60,31 @@ pub fn validate_client_batch(batch: &ClientStateBatch) -> Result {
         // Invalid configuration gets a scoped evaluation rejection, not a
         // malformed-envelope failure.
     }
+    for record in &batch.catalog_records {
+        match record.command.as_ref() {
+            Some(catalog_client_record::Command::Open(request)) => {
+                crate::catalog::validate_request(
+                    request.watch_id,
+                    &request.room,
+                    request.participant_limit,
+                    &request.cursor,
+                )
+                .map_err(|_| ValidationError::Catalog)?;
+            }
+            Some(catalog_client_record::Command::Close(close)) if close.watch_id != 0 => {}
+            _ => return Err(ValidationError::Catalog),
+        }
+    }
     Ok(())
 }
 
 pub fn validate_server_batch(batch: &ServerStateBatch) -> Result {
-    if batch.records.len() > codec::MAX_RECORDS
-        || batch.records.is_empty() && !batch.initial_complete
+    if batch
+        .records
+        .len()
+        .saturating_add(batch.catalog_records.len())
+        > codec::MAX_RECORDS
+        || batch.records.is_empty() && batch.catalog_records.is_empty() && !batch.initial_complete
     {
         return Err(ValidationError::Batch);
     }
@@ -74,6 +100,19 @@ pub fn validate_server_batch(batch: &ServerStateBatch) -> Result {
             .as_ref()
             .ok_or(ValidationError::Confirmed)?;
         validate_confirmed(key, confirmed)?;
+    }
+    for record in &batch.catalog_records {
+        match record.response.as_ref() {
+            Some(catalog_server_record::Response::Page(page)) => {
+                crate::catalog::validate_page_record(page).map_err(|_| ValidationError::Catalog)?;
+            }
+            Some(catalog_server_record::Response::Error(error))
+                if error.watch_id != 0 && error.failure.is_some() =>
+            {
+                validate_failure(error.failure.as_ref().ok_or(ValidationError::Catalog)?)?;
+            }
+            _ => return Err(ValidationError::Catalog),
+        }
     }
     Ok(())
 }
@@ -105,6 +144,12 @@ fn validate_confirmed(key: &resource_key::Key, confirmed: &ConfirmedState) -> Re
                 return Err(ValidationError::Confirmed);
             }
             validate_live(live)
+        }
+        (Key::Owned(reference), Some(Value::SourceLookup(lookup))) => {
+            if confirmed.evaluated_revision < *reference {
+                return Err(ValidationError::Confirmed);
+            }
+            validate_source_lookup(lookup)
         }
         (Key::Owned(_), Some(Value::Absent(absent))) => {
             if !known::<AbsenceReason>(absent.reason)
@@ -172,8 +217,15 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
                 }
             }
         }
+        resource_spec::Declaration::SourceLookup(lookup) => {
+            if settings.receive.is_some() {
+                return Err(ValidationError::Settings);
+            }
+            let source = lookup.source.as_ref().ok_or(ValidationError::Identity)?;
+            crate::catalog::validate_address(source).map_err(|_| ValidationError::Identity)
+        }
         resource_spec::Declaration::Subscription(subscription) => {
-            if !text(&subscription.track_id, 128) {
+            if !text(&subscription.track_id, 128) || !text(&subscription.source_room, 256) {
                 return Err(ValidationError::Identity);
             }
             let kind =
@@ -224,6 +276,12 @@ fn validate_discovery_format(format: Option<&CodecFormat>, audio: bool) -> Resul
 pub fn validate_live(live: &LiveResource) -> Result {
     let spec = live.spec.as_ref().ok_or(ValidationError::Confirmed)?;
     validate_spec(spec)?;
+    if matches!(
+        spec.declaration,
+        Some(resource_spec::Declaration::SourceLookup(_))
+    ) {
+        return Err(ValidationError::Confirmed);
+    }
     let participant = live.participant.as_ref().ok_or(ValidationError::Identity)?;
     let track = live.track.as_ref().ok_or(ValidationError::Identity)?;
     validate_participant(participant)?;
@@ -257,6 +315,7 @@ pub fn validate_live(live: &LiveResource) -> Result {
                 _ => return Err(ValidationError::Identity),
             }
         }
+        resource_spec::Declaration::SourceLookup(_) => return Err(ValidationError::Confirmed),
         resource_spec::Declaration::Subscription(subscription) => {
             let kind = match &track.kind {
                 Some(track::Kind::Audio(_)) => TrackKind::Audio,
@@ -301,6 +360,44 @@ pub fn validate_live(live: &LiveResource) -> Result {
                 .ok_or(ValidationError::Failure)?,
         ),
         _ => Err(ValidationError::Confirmed),
+    }
+}
+
+pub fn validate_source_lookup(lookup: &SourceLookupState) -> Result {
+    let spec = lookup.spec.as_ref().ok_or(ValidationError::Confirmed)?;
+    validate_spec(spec)?;
+    let source = match spec.declaration.as_ref() {
+        Some(resource_spec::Declaration::SourceLookup(lookup)) => {
+            lookup.source.as_ref().ok_or(ValidationError::Identity)?
+        }
+        _ => return Err(ValidationError::Confirmed),
+    };
+    match (&lookup.participant, &lookup.track) {
+        (None, None) => Ok(()),
+        (Some(participant), Some(track)) => {
+            if spec.settings.as_ref().and_then(|settings| settings.enabled) != Some(true) {
+                return Err(ValidationError::Confirmed);
+            }
+            validate_participant(participant)?;
+            validate_track(track)?;
+            if participant.participant_id != track.participant_id
+                || participant.participant_external_id != source.participant_external_id
+                || track.label != source.label
+                || track.kind.as_ref().map(track_kind) != Some(source.kind)
+            {
+                return Err(ValidationError::Identity);
+            }
+            Ok(())
+        }
+        _ => Err(ValidationError::Confirmed),
+    }
+}
+
+fn track_kind(kind: &track::Kind) -> i32 {
+    match kind {
+        track::Kind::Audio(_) => TrackKind::Audio as i32,
+        track::Kind::Video(_) => TrackKind::Video as i32,
+        track::Kind::Data(_) => TrackKind::Data as i32,
     }
 }
 
@@ -470,7 +567,11 @@ pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> boo
         (Some(Declaration::Subscription(left)), Some(Declaration::Subscription(right))) => {
             left.track_id == right.track_id
                 && left.kind == right.kind
+                && left.source_room == right.source_room
                 && bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())
+        }
+        (Some(Declaration::SourceLookup(left)), Some(Declaration::SourceLookup(right))) => {
+            left.source == right.source
         }
         _ => false,
     }

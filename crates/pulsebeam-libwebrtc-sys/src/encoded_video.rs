@@ -162,13 +162,23 @@ impl Pending {
             .filter(|(index, _)| selected[*index])
         {
             if frame_types.get(index) == Some(&VideoFrameType::Key) {
-                // Preserve every native request before rejecting the capture
-                // batch. Returning early strands later rungs on delta input.
-                self.feedback.request_encoding_keyframe(index);
                 missing_keyframe |= !unit.key_frame;
             }
         }
         if missing_keyframe {
+            // Rejection discards the whole capture, so every selected native
+            // request still needs input. Supplied keys in an accepted capture
+            // already satisfy those requests and must not request repeats.
+            for (index, _) in self
+                .frames
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| selected[*index])
+            {
+                if frame_types.get(index) == Some(&VideoFrameType::Key) {
+                    self.feedback.request_encoding_keyframe(index);
+                }
+            }
             // This is a rejected producer image, not a fatal encoder failure.
             // Keep the SDK encoder alive so a subsequent supplied keyframe can
             // be consumed on its own real capture callback.
@@ -1499,50 +1509,57 @@ mod tests {
     }
 
     #[test]
-    fn all_selected_native_keyframe_requests_survive_first_delta_rejection() {
+    fn all_selected_native_keyframe_requests_survive_capture_rejection() {
         // Metadata-only preflight test; these broker values never enter RTC.
-        let mut frames = broker_batch(1);
-        for frame in &mut frames {
-            frame.key_frame = false;
+        for keyframes in [[false; 3], [true, false, true]] {
+            let mut frames = broker_batch(1);
+            for (frame, keyframe) in frames.iter_mut().zip(keyframes) {
+                frame.key_frame = keyframe;
+            }
+            let pending = Pending {
+                source_id: 1,
+                sequence: 0,
+                dropped: Arc::new(AtomicU64::new(0)),
+                feedback: Arc::new(SourceFeedback::default()),
+                frames,
+            };
+            assert!(pending.reject_missing_keyframes(&[VideoFrameType::Key; 3], &[true; 3]));
+            assert_eq!(
+                pending.feedback.encoding_keyframes.load(Ordering::Acquire),
+                0b111
+            );
+            assert!(pending.feedback.keyframe_requested.load(Ordering::Acquire));
+            assert_eq!(pending.dropped.load(Ordering::Relaxed), 3);
+            assert_eq!(
+                *pending.feedback.encoder_error.lock().unwrap(),
+                Some(CodecError::InvalidFrame)
+            );
         }
-        let pending = Pending {
-            source_id: 1,
-            sequence: 0,
-            dropped: Arc::new(AtomicU64::new(0)),
-            feedback: Arc::new(SourceFeedback::default()),
-            frames,
-        };
-        assert!(pending.reject_missing_keyframes(&[VideoFrameType::Key; 3], &[true; 3]));
-        assert_eq!(
-            pending.feedback.encoding_keyframes.load(Ordering::Acquire),
-            0b111
-        );
-        assert!(pending.feedback.keyframe_requested.load(Ordering::Acquire));
-        assert_eq!(pending.dropped.load(Ordering::Relaxed), 3);
-        assert_eq!(
-            *pending.feedback.encoder_error.lock().unwrap(),
-            Some(CodecError::InvalidFrame)
-        );
     }
 
     #[test]
-    fn unfunded_units_do_not_publish_selected_keyframe_feedback() {
-        let pending = Pending {
-            source_id: 1,
-            sequence: 0,
-            dropped: Arc::new(AtomicU64::new(0)),
-            feedback: Arc::new(SourceFeedback::default()),
-            frames: broker_batch(1),
-        };
-        assert!(
-            !pending.reject_missing_keyframes(&[VideoFrameType::Key; 3], &[true, true, false],)
-        );
-        assert_eq!(
-            pending.feedback.encoding_keyframes.load(Ordering::Acquire),
-            0b011
-        );
-        assert_eq!(pending.dropped.load(Ordering::Relaxed), 0);
-        assert!(pending.feedback.encoder_error.lock().unwrap().is_none());
+    fn supplied_keyframes_do_not_request_repeats_or_unfunded_keys() {
+        for selected in [[true; 3], [true, true, false]] {
+            let mut frames = broker_batch(1);
+            if !selected[2] {
+                frames[2].key_frame = false;
+            }
+            let pending = Pending {
+                source_id: 1,
+                sequence: 0,
+                dropped: Arc::new(AtomicU64::new(0)),
+                feedback: Arc::new(SourceFeedback::default()),
+                frames,
+            };
+            assert!(!pending.reject_missing_keyframes(&[VideoFrameType::Key; 3], &selected));
+            assert_eq!(
+                pending.feedback.encoding_keyframes.load(Ordering::Acquire),
+                0
+            );
+            assert!(!pending.feedback.keyframe_requested.load(Ordering::Acquire));
+            assert_eq!(pending.dropped.load(Ordering::Relaxed), 0);
+            assert!(pending.feedback.encoder_error.lock().unwrap().is_none());
+        }
     }
 
     #[test]

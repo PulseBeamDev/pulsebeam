@@ -332,25 +332,29 @@
   let handoffVideo;
   let videoPublication;
   let audioPublication;
+  let videoPipe;
+  let audioPipe;
   let replacementVideoTrack;
   let steadyIterator;
   let cyclingIterator;
-  let audioSelection;
+  let audioSubscription;
   let audioPlayback;
   let retiringPublication;
   const pendingReplacements = [];
   try {
     MediaStreamTrack.prototype.clone = observeClone;
     await source.resume();
-    audioSelection = await receiver.selectAudio({ automatic: true });
+    audioSubscription = await receiver
+      .room("public-web-contract")
+      .participant("web-sender")
+      .audio("voice")
+      .subscribe({ playoutDelay: { mode: "adaptive" } });
     audioPlayback = pulsebeam.attachRemoteAudio(receiver);
     await audioPlayback.ready;
-    videoPublication = await sender
-      .video("camera")
-      .publish(VideoSource.fromTrack(videoTrack), { enabled: true });
-    audioPublication = await sender
-      .audio("voice")
-      .publish(AudioSource.fromTrack(audioTrack), { enabled: true });
+    videoPublication = sender.video("camera").publish({ enabled: true });
+    videoPipe = VideoSource.fromTrack(videoTrack).pipeTo(videoPublication);
+    audioPublication = sender.audio("voice").publish({ enabled: true });
+    audioPipe = AudioSource.fromTrack(audioTrack).pipeTo(audioPublication);
     sender.join("public-web-contract");
     receiver.join("public-web-contract");
     await sender.connect();
@@ -457,12 +461,12 @@
       await delivery;
       await dataReady(name);
     };
-    const steadyPublisher = sender.data("reuse-steady", "ordered");
-    const cyclingPublisher = sender.data("reuse-cycle", "ordered");
-    steadyIterator = await receiver
+    const steadyPublisher = sender.data("reuse-steady", "ordered").publish();
+    steadyIterator = receiver
+      .room(receiver.roomId)
       .participant("web-sender")
       .data("reuse-steady", "ordered")
-      .receive();
+      .subscribe();
     await warmOrdered(steadyPublisher, steadyIterator, 0, "reuse-steady");
     await steadyPublisher.send(Uint8Array.of(1));
     await receiveValue(steadyIterator, 1);
@@ -473,13 +477,15 @@
       steadyChannels.length === 2,
       "one continuing data route on the two peers",
     );
+    const cyclingPublisher = sender.data("reuse-cycle", "ordered").publish();
     let retiredPayload;
     for (let lifetime = 0; lifetime < 3; lifetime++) {
-      cyclingIterator = await receiver
+      cyclingIterator = receiver
+        .room(receiver.roomId)
         .participant("web-sender")
         .data("reuse-cycle", "ordered")
-        .receive();
-      // Earlier retained values on a fresh subscription are legitimate replay.
+        .subscribe();
+      // Witness each fresh subscription's live frontier before the assertion send.
       await warmOrdered(
         cyclingPublisher,
         cyclingIterator,
@@ -553,7 +559,10 @@
     const publication = receiver
       .snapshot()
       .catalog.publications.find((p) => p.kind === "video");
-    const remoteVideo = receiver.participant("web-sender").video("camera");
+    const pinnedPublisher = receiver
+      .room(receiver.roomId)
+      .participant("web-sender");
+    const remoteVideo = pinnedPublisher.video("camera");
     attachment = attachRemoteVideo(remoteVideo, video, undefined, {
       preferences: {
         minHeight: 1,
@@ -612,7 +621,8 @@
           receiver.snapshot().generation === receiverGeneration &&
           fixedPeer.connectionState === "connected" &&
           peers.size === 2 &&
-          receiver.participant("web-sender").video("camera") === remoteVideo,
+          pinnedPublisher.room === "public-web-contract" &&
+          pinnedPublisher.video("camera") === remoteVideo,
         `${label}: same agents, connection and remote handle`,
       );
     };
@@ -729,8 +739,13 @@
       "installed receiver MID",
     );
     replacementVideoTrack = canvas.captureStream(10).getVideoTracks()[0];
-    await videoPublication.setSource(
-      VideoSource.fromTrack(replacementVideoTrack),
+    await videoPipe.close();
+    videoPipe = VideoSource.fromTrack(replacementVideoTrack).pipeTo(
+      videoPublication,
+    );
+    await until(
+      () => videoPipe.state().status === pulsebeam.PipeStatus.Available,
+      "replacement pipe is available",
     );
     videoTrack.stop();
     await attachment.close();
@@ -801,7 +816,7 @@
       return clone;
     };
     RTCRtpSender.prototype.replaceTrack = function (next) {
-      if (this !== allocatedSender || pendingTrack)
+      if (this !== allocatedSender || !next || pendingTrack)
         return originalReplaceTrack.call(this, next);
       pendingTrack = next;
       return new Promise((resolve, reject) => {
@@ -809,8 +824,9 @@
           originalReplaceTrack.call(this, next).then(resolve, reject);
       });
     };
-    pendingReplacements.push(
-      videoPublication.setSource(VideoSource.fromTrack(replacementVideoTrack)),
+    pendingReplacements.push(videoPipe.close());
+    videoPipe = VideoSource.fromTrack(replacementVideoTrack).pipeTo(
+      videoPublication,
     );
     await until(() => pendingTrack, "native sender replacement is in flight");
     assert(
@@ -827,8 +843,9 @@
       replacementVideoTrack.enabled,
       "mute does not change caller capture",
     );
-    pendingReplacements.push(
-      videoPublication.setSource(VideoSource.fromTrack(replacementVideoTrack)),
+    pendingReplacements.push(videoPipe.close());
+    videoPipe = VideoSource.fromTrack(replacementVideoTrack).pipeTo(
+      videoPublication,
     );
     await Promise.resolve();
     retiringPublication = videoPublication.close();
@@ -842,9 +859,10 @@
         handoffClones.length === 1,
       "release immediately stops only owned capture and fences queued cloning",
     );
-    videoPublication = await sender
-      .video("camera")
-      .publish(VideoSource.fromTrack(replacementVideoTrack), { enabled: true });
+    videoPublication = sender.video("camera").publish({ enabled: true });
+    videoPipe = VideoSource.fromTrack(replacementVideoTrack).pipeTo(
+      videoPublication,
+    );
     assert(
       handoffClones.length === 1,
       "reused slot waits for the old operation",
@@ -890,9 +908,8 @@
         outputRoutes.size === 0,
       "retired audio source ends its receiver and owned playback route",
     );
-    audioPublication = await sender
-      .audio("voice")
-      .publish(AudioSource.fromTrack(audioTrack), { enabled: true });
+    audioPublication = sender.audio("voice").publish({ enabled: true });
+    audioPipe = AudioSource.fromTrack(audioTrack).pipeTo(audioPublication);
     await until(() => {
       const snapshot = receiver.snapshot();
       const fresh = (kind, oldId) => {
@@ -1015,7 +1032,7 @@
       videoPublication?.close(),
       audioPublication?.close(),
       audioPlayback?.close(),
-      audioSelection?.close(),
+      audioSubscription?.close(),
       retiringPublication,
       ...pendingReplacements,
       sender.close(),

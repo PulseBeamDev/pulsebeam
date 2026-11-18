@@ -117,7 +117,7 @@ test("desired revisions copy nested policy and omission withdraws complete inten
     video: [
       {
         slot: 0,
-        selector: { participantId: "alice", label: "camera" },
+        selector: { room: "room", participantId: "alice", label: "camera" },
         height: 180,
         playoutDelay: { mode: "fixed", minMs: 10, maxMs: 20 },
       },
@@ -125,7 +125,7 @@ test("desired revisions copy nested policy and omission withdraws complete inten
     audio: {
       automatic: false,
       pinned: ["voice"],
-      selected: [{ participantId: "alice", label: "voice" }],
+      selected: [{ room: "room", participantId: "alice", label: "voice" }],
     },
     topics: [{ name: "chat", mode: "ordered", publish: true }],
   };

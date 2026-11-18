@@ -1,19 +1,49 @@
 use std::{
     cell::Cell,
     collections::BTreeMap,
+    future::{Future, poll_fn},
+    pin::Pin,
     rc::{Rc, Weak},
+    task::Poll,
 };
 
 use agent_core::{MediaObservationControl, MediaObservationId, ResourceCommand, ResourceResult};
 use futures_channel::oneshot;
 use js_sys::Promise;
-use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{future_to_promise, spawn_local};
-use web_sys::{MediaStreamTrack, RtcPeerConnectionState};
+use web_sys::{AbortSignal, MediaStreamTrack, RtcPeerConnectionState};
 
 use super::{LocalOperationError, RuntimeInner, input_is_live, same_js_object};
 
 type Reply = oneshot::Sender<Result<BrowserMediaObservation, JsValue>>;
+
+struct AbortListener {
+    signal: AbortSignal,
+    callback: Closure<dyn FnMut()>,
+}
+
+impl AbortListener {
+    fn new(signal: AbortSignal) -> Result<(Self, oneshot::Receiver<()>), JsValue> {
+        let (sender, receiver) = oneshot::channel();
+        let mut sender = Some(sender);
+        let callback = Closure::wrap(Box::new(move || {
+            if let Some(sender) = sender.take() {
+                let _ = sender.send(());
+            }
+        }) as Box<dyn FnMut()>);
+        signal.add_event_listener_with_callback("abort", callback.as_ref().unchecked_ref())?;
+        Ok((Self { signal, callback }, receiver))
+    }
+}
+
+impl Drop for AbortListener {
+    fn drop(&mut self) {
+        let _ = self
+            .signal
+            .remove_event_listener_with_callback("abort", self.callback.as_ref().unchecked_ref());
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Observations {
@@ -104,7 +134,11 @@ impl RuntimeInner {
         self: &Rc<Self>,
         owner: u64,
         source: Option<String>,
+        signal: Option<AbortSignal>,
     ) -> Promise {
+        if signal.as_ref().is_some_and(AbortSignal::aborted) {
+            return Promise::reject(&closed_error());
+        }
         self.observations.borrow_mut().beginning += 1;
         let weak = Rc::downgrade(self);
         future_to_promise(async move {
@@ -114,7 +148,7 @@ impl RuntimeInner {
                 None => ResourceCommand::BeginMediaObservation { owner },
             };
             let result = inner.input_resource(command).await;
-            let (sender, receiver) = oneshot::channel();
+            let (sender, mut receiver) = oneshot::channel();
             let mut observations = inner.observations.borrow_mut();
             observations.beginning -= 1;
             let result = match result {
@@ -142,7 +176,7 @@ impl RuntimeInner {
                                 attempting: false,
                             },
                         );
-                        Ok(control)
+                        Ok((id, control))
                     }
                 }
                 Ok(_) => Err(LocalOperationError::runtime(
@@ -156,12 +190,55 @@ impl RuntimeInner {
                 observations.early.clear();
             }
             drop(observations);
-            let control = result?;
+            let (id, control) = result?;
             if let Some(control) = control {
                 inner.observation_control(control);
             }
-            let result = receiver.await.map_err(|_| closed_error())??;
-            Ok(JsValue::from(result))
+            let result = if let Some(signal) = signal {
+                if signal.aborted() {
+                    inner.cancel_observation(id).await;
+                    return Err(closed_error());
+                }
+                let (listener, mut aborted) = match AbortListener::new(signal.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        inner.cancel_observation(id).await;
+                        return Err(error);
+                    }
+                };
+                if signal.aborted() {
+                    drop(listener);
+                    inner.cancel_observation(id).await;
+                    return Err(closed_error());
+                }
+                let result = match poll_fn(|cx| {
+                    if let Poll::Ready(result) = Pin::new(&mut receiver).poll(cx) {
+                        return Poll::Ready(Some(result));
+                    }
+                    if Pin::new(&mut aborted).poll(cx).is_ready() {
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending
+                })
+                .await
+                {
+                    Some(result) => result,
+                    None => {
+                        drop(listener);
+                        inner.cancel_observation(id).await;
+                        return Err(closed_error());
+                    }
+                };
+                drop(listener);
+                if signal.aborted() {
+                    inner.cancel_observation(id).await;
+                    return Err(closed_error());
+                }
+                result
+            } else {
+                receiver.await
+            };
+            Ok(JsValue::from(result.map_err(|_| closed_error())??))
         })
     }
 
@@ -409,6 +486,24 @@ impl RuntimeInner {
         } else {
             lease.retire();
         }
+    }
+
+    async fn cancel_observation(&self, id: MediaObservationId) {
+        let entry = self.observations.borrow_mut().entries.remove(&id);
+        if let Some(entry) = entry {
+            if let Some(lease) = entry.lease.upgrade() {
+                lease.stop();
+            }
+            if let Some(control) = entry.control {
+                self.release_observation(control).await;
+                return;
+            }
+        }
+        let _ = self
+            .input_resource(ResourceCommand::Release {
+                owner: id.request(),
+            })
+            .await;
     }
 
     async fn fail_observation(&self, control: MediaObservationControl, error: JsValue) {

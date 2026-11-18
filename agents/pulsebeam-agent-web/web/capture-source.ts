@@ -1,4 +1,7 @@
 import { ResourceError } from "./resources.js";
+import type { AudioPublication, Pipe, VideoPublication } from "./media.js";
+
+export const pipeSource = Symbol("publication input");
 
 type Source = VideoSource | AudioSource;
 interface SourceState {
@@ -56,6 +59,9 @@ export class VideoSource {
   static fromTrack(track: MediaStreamTrack): VideoSource {
     return new VideoSource(track);
   }
+  pipeTo(publication: VideoPublication): Pipe {
+    return publication[pipeSource](this);
+  }
   isClosed(): boolean {
     return closed(this);
   }
@@ -71,6 +77,9 @@ export class AudioSource {
   }
   static fromTrack(track: MediaStreamTrack): AudioSource {
     return new AudioSource(track);
+  }
+  pipeTo(publication: AudioPublication): Pipe {
+    return publication[pipeSource](this);
   }
   isClosed(): boolean {
     return closed(this);

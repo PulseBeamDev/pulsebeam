@@ -33,7 +33,8 @@ for (const name of [
   "useAgent",
   "useDevices",
   "useCapture",
-  "Publish",
+  "usePublish",
+  "useSubscribe",
   "SelectAudio",
   "Data",
   "Video",
@@ -41,6 +42,7 @@ for (const name of [
 ]) {
   assert.equal(typeof sdk[name], "function", name);
 }
+assert.equal("Publish" in sdk, false, "publication ownership belongs to hooks");
 assert.equal("track" in sdk, false, "React descriptor export was removed");
 assert.equal(
   "createAgent" in sdk,

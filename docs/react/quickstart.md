@@ -87,14 +87,13 @@ your application's backend.
 import { useState } from "react";
 import {
   Audio,
-  Publish,
-  SelectAudio,
+  usePublish,
+  useSubscribe,
   Video,
   useAgent,
   useCapture,
   type Agent,
   type CaptureResult,
-  type RemoteVideoTrack,
 } from "@pulsebeam/react";
 
 export function Call({
@@ -126,18 +125,16 @@ function Room({ token, media }: { token: string; media: CaptureResult }) {
 
 function ActiveRoom({ agent, media }: { agent: Agent; media: CaptureResult }) {
   const [error, setError] = useState("");
-  const remoteVideos = agent.participants.flatMap((participant) =>
-    participant.tracks.filter(
-      (value): value is RemoteVideoTrack => value.kind === "video",
-    ),
-  );
+  const [peer, setPeer] = useState("");
+  const participant = peer ? agent.room("demo").participant(peer) : null;
+  usePublish(agent.video("camera"), media.video);
+  usePublish(agent.audio("microphone"), media.audio);
+  const video = useSubscribe(participant?.video("camera") ?? null);
+  const audio = useSubscribe(participant?.audio("microphone") ?? null);
 
   return (
     <>
-      <Publish track={agent.video("camera")} source={media.video} />
-      <Publish track={agent.audio("microphone")} source={media.audio} />
-      <SelectAudio agent={agent} policy={{ automatic: true }} />
-      <Audio agent={agent} />
+      <Audio source={audio} />
       <button
         onClick={() => {
           try {
@@ -152,13 +149,11 @@ function ActiveRoom({ agent, media }: { agent: Agent; media: CaptureResult }) {
       {error && <p role="alert">{error}</p>}
       <p>Connection: {agent.connection}</p>
       {agent.error && <p role="alert">{agent.error.message}</p>}
-      {remoteVideos.map((remote) => (
-        <Video
-          key={`${remote.participantId}:${remote.label}`}
-          source={remote}
-          style={{ width: 320, height: 240 }}
-        />
-      ))}
+      <label>
+        Other participant ID
+        <input value={peer} onChange={(event) => setPeer(event.target.value)} />
+      </label>
+      <Video source={video} style={{ width: 320, height: 240 }} />
     </>
   );
 }
@@ -177,8 +172,9 @@ sends media directly to PulseBeam, not through your application backend.
 ## 4. Try it
 
 Open your app in two tabs with different participant tokens for the same
-`demo` room. Enable devices and join in both tabs. Each should display the
-other's video and play remote audio. Use headphones to avoid feedback.
+`demo` room. Enable devices and join in both tabs. Enter the other tab's
+application participant ID, the value your backend used when issuing its token.
+Each should display the other's video and play remote audio. Use headphones to avoid feedback.
 
 ## Complete example
 

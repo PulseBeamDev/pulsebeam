@@ -225,6 +225,7 @@ fn application<R: SessionRuntime>(
         );
     let encoded_overflow = mode == ObservationMode::EncodedCallbackOverflow;
     let overflow = encoded_overflow || mode == ObservationMode::CallbackOverflow;
+    let frame_limit = if encoded_overflow { 68 } else { 8 };
     let callbacks = Arc::new(Mutex::new(Vec::<FrameObservation>::new()));
     let encoded_callbacks = Arc::new(Mutex::new(Vec::new()));
     let observer_dropped = Arc::new(AtomicBool::new(false));
@@ -291,8 +292,8 @@ fn application<R: SessionRuntime>(
                     let frame = observation.frame.expect("actual native I420 snapshot");
                     let mut snapshots = snapshots.lock().unwrap();
                     assert!(
-                        snapshots.len() < 8,
-                        "fixture only submits eight actual source frames"
+                        snapshots.len() < frame_limit,
+                        "callbacks cannot exceed submitted source frames"
                     );
                     snapshots.push(FrameObservation {
                         width: frame.width,
@@ -320,7 +321,7 @@ fn application<R: SessionRuntime>(
                                 assert!(frame.mime_type.eq_ignore_ascii_case("video/h264"));
                                 assert!(!frame.data.is_empty());
                                 let mut snapshots = snapshots.lock().unwrap();
-                                assert!(snapshots.len() < 8);
+                                assert!(snapshots.len() < frame_limit);
                                 if snapshots.is_empty() {
                                     assert!(frame.key_frame);
                                 }
@@ -354,15 +355,19 @@ fn application<R: SessionRuntime>(
         call.sessions[1].attach_raw_video(receiver).unwrap();
     }
 
-    // Above VGA: host-derived cores can select native VPx worker pthreads.
-    // Do not let a tiny source make an uncontrolled host default look safe.
-    const WIDTH: u32 = 1280;
-    const HEIGHT: u32 = 720;
-    let y = (WIDTH * HEIGHT) as usize;
+    // Keep the codec-worker proofs above VGA. The encoded-overflow proof needs
+    // more frames, not more pixels: its smaller source reduces total codec work.
+    let (width, height) = if encoded_overflow {
+        (320, 180)
+    } else {
+        (1280, 720)
+    };
+    let release_after = if encoded_overflow { 66 } else { 6 };
+    let y = (width * height) as usize;
     let mut pixels = vec![128; y * 3 / 2];
-    for row in 0..HEIGHT as usize {
-        for col in 0..WIDTH as usize {
-            pixels[row * WIDTH as usize + col] = if (row / 90 + col / 160) % 2 == 0 {
+    for row in 0..height as usize {
+        for col in 0..width as usize {
+            pixels[row * width as usize + col] = if (row / 90 + col / 160) % 2 == 0 {
                 40
             } else {
                 180
@@ -379,9 +384,9 @@ fn application<R: SessionRuntime>(
     let mut held_raw = None;
     for _ in 0..10_000 {
         let current = now();
-        if submitted < 8 && current >= next_capture {
+        if submitted < frame_limit && current >= next_capture {
             let frame =
-                VideoFrame::i420(WIDTH, HEIGHT, pixels.clone(), current.as_micros() as i64, 0)
+                VideoFrame::i420(width, height, pixels.clone(), current.as_micros() as i64, 0)
                     .unwrap();
             call.sessions[0].push_raw_video(source, &frame).unwrap();
             submitted += 1;
@@ -389,7 +394,9 @@ fn application<R: SessionRuntime>(
         }
         progress();
         call.drain();
-        if dual_observation && (!encoded_overflow || encoded_callbacks.lock().unwrap().len() >= 6) {
+        if dual_observation
+            && (!encoded_overflow || encoded_callbacks.lock().unwrap().len() >= release_after)
+        {
             while let Some(frame) = call.sessions[1].try_video_frame(receiver).unwrap() {
                 assert!(frame.mime_type.eq_ignore_ascii_case("video/h264"));
                 assert!(!frame.data.is_empty());
@@ -403,11 +410,11 @@ fn application<R: SessionRuntime>(
                 }
             }
         }
-        if (!overflow || callbacks.lock().unwrap().len() >= 6)
+        if (!overflow || callbacks.lock().unwrap().len() >= release_after)
             && let Some(frame) = call.sessions[1].try_raw_video_frame(receiver).unwrap()
             && received.len() < 2
         {
-            assert_eq!((frame.width, frame.height), (WIDTH, HEIGHT));
+            assert_eq!((frame.width, frame.height), (width, height));
             let visible_i420 = frame.buffer.as_bytes().to_vec();
             assert_eq!(visible_i420.len(), y * 3 / 2);
             assert!(visible_i420[..y].iter().any(|&sample| sample < 80));
@@ -472,7 +479,7 @@ fn application<R: SessionRuntime>(
                 encoded_drops > 0,
                 "native encoded callbacks must survive actual polling retention loss"
             );
-            assert!(encoded_callbacks.lock().unwrap().len() >= 6);
+            assert!(encoded_callbacks.lock().unwrap().len() >= release_after);
         } else {
             assert_eq!(encoded_drops, 0);
         }

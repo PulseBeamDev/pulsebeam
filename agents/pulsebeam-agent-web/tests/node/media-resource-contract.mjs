@@ -27,7 +27,11 @@ export async function mediaResourceContract(pulsebeam) {
       "inert lookup cannot claim a sender",
     );
 
-    const first = await local.publish(source, { enabled: false });
+    const first = local.publish({ enabled: false });
+    assert.equal(first instanceof Promise, false);
+    const input = source.pipeTo(first);
+    assert.equal(input instanceof Promise, false);
+    assert.equal(input.state(), input.state());
     const initial = first.state();
     assert.equal(initial.kind, pulsebeam.PublicationMediaKind.Video);
     assert.equal(initial.label, "camera");
@@ -71,13 +75,17 @@ export async function mediaResourceContract(pulsebeam) {
         error.info.code === pulsebeam.ErrorCode.CapacityExceeded,
     );
     boundedCursors.forEach((cursor) => cursor.close());
-    await assert.rejects(
-      local.publish(source, { enabled: true }),
-      pulsebeam.ResourceOwnershipError,
+    assert.throws(
+      () => local.publish({ enabled: true }),
+      (error) =>
+        error instanceof pulsebeam.OperationError &&
+        error.info.code === pulsebeam.ErrorCode.Conflict,
     );
     assert.equal(borrowed.readyState, "live");
     await first.configure({ enabled: true });
-    await first.setSource(null);
+    await input.close();
+    assert.equal(input.state().status, pulsebeam.PipeStatus.Closed);
+    assert.equal(first.isClosed(), false);
     assert.equal(
       borrowed.readyState,
       "live",
@@ -88,11 +96,12 @@ export async function mediaResourceContract(pulsebeam) {
     assert.equal(first.state().closed, true);
     assert.equal((await retiredCursor.next()).closed, true);
     retiredCursor.close();
-    const replacement = await local.publish(source, { enabled: true });
+    const replacement = local.publish({ enabled: true });
+    source.pipeTo(replacement);
     await replacement.close();
     assert.equal(borrowed.readyState, "live");
 
-    const participant = agent.participant("absent");
+    const participant = agent.room("room").participant("absent");
     const video = await participant.video("camera").subscribe({
       visible: true,
       height: 360,
@@ -113,15 +122,12 @@ export async function mediaResourceContract(pulsebeam) {
     );
     const pendingVideo = assert.rejects(video.observe(), { code: "closed" });
     const pendingAudio = assert.rejects(audio.observe(), { code: "closed" });
-    const pendingPublication = agent
-      .video("late")
-      .publish(source, { enabled: true });
-    const retiredPublication = pendingPublication.then(
-      (publication) => assert.equal(publication.isClosed(), true),
-      (error) => assert.equal(error.code, "closed"),
-    );
+    const pendingPublication = agent.video("late").publish({ enabled: true });
+    const pendingPipe = source.pipeTo(pendingPublication);
     await agent.close();
-    await Promise.all([pendingVideo, pendingAudio, retiredPublication]);
+    await Promise.all([pendingVideo, pendingAudio]);
+    assert.equal(pendingPublication.isClosed(), true);
+    assert.equal(pendingPipe.state().status, pulsebeam.PipeStatus.Closed);
     assert.equal(video.isClosed(), true);
     assert.equal(audio.isClosed(), true);
     assert.equal(
@@ -366,12 +372,12 @@ async function publicationRebindContract(source) {
   agent.activate();
   try {
     await agent.initialized();
-    const publication = await agent.video("rebound").publish(source, {
-      enabled: false,
-    });
+    const publication = agent.video("rebound").publish({ enabled: false });
+    const oldPipe = source.pipeTo(publication);
     const oldCursor = publication.updates();
     await oldCursor.next();
     agent.deactivate();
+    assert.equal(oldPipe.isClosed(), true);
     assert.equal(publication.state().closed, true);
     agent.activate();
     await agent.initialized();

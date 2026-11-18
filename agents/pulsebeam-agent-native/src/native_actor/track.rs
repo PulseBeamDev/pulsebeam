@@ -4,8 +4,9 @@ use agent_core::{TrackSelector, TrackSpec, VideoObservation};
 #[derive(Clone)]
 struct MediaAddress {
     spec: TrackSpec,
-    participant_id: Option<String>,
+    source: Option<TrackSelector>,
     commands: mpsc::Sender<Command>,
+    core: Control,
     closed: Arc<Signal>,
     finished: Arc<Signal>,
 }
@@ -13,8 +14,9 @@ struct MediaAddress {
 impl MediaAddress {
     fn new(
         spec: TrackSpec,
-        participant_id: Option<String>,
+        source: Option<TrackSelector>,
         commands: &mpsc::Sender<Command>,
+        core: &Control,
         closed: &Arc<Signal>,
         finished: &Arc<Signal>,
     ) -> Result<Self, Error> {
@@ -23,37 +25,61 @@ impl MediaAddress {
         }
         spec.validate()
             .map_err(|error| Error::Core(agent_core::AgentError::InvalidResource(error.into())))?;
+        if let Some(source) = &source {
+            source.validate().map_err(|error| {
+                Error::Core(agent_core::AgentError::InvalidResource(error.into()))
+            })?;
+        }
         Ok(Self {
             spec,
-            participant_id,
+            source,
             commands: commands.clone(),
+            core: core.clone(),
             closed: closed.clone(),
             finished: finished.clone(),
         })
     }
 
-    async fn request<T>(
+    fn selector(&self) -> Result<TrackSelector, Error> {
+        self.source.clone().ok_or_else(|| {
+            Error::InvalidInput("local media does not identify a remote source".into())
+        })
+    }
+
+    fn claim(
         &self,
-        command: impl FnOnce(oneshot::Sender<Result<T, Error>>) -> Command,
-    ) -> Result<T, Error> {
+        selector: TrackSelector,
+        configuration: control::SubscriptionConfiguration,
+    ) -> Result<Subscription, Error> {
         if self.closed.is_closed() || self.finished.is_closed() {
             return Err(Error::Closed);
         }
-        let (response, result) = oneshot::channel();
-        self.commands
-            .send(command(response))
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-
-    fn selector(&self) -> Result<TrackSelector, Error> {
-        Ok(TrackSelector {
-            participant_external_id: self.participant_id.clone().ok_or_else(|| {
-                Error::InvalidInput("local media does not identify a remote participant".into())
-            })?,
-            label: self.spec.label().into(),
-        })
+        let owner = self.core.claim_subscription(selector, configuration)?;
+        let subscription = Subscription::new(
+            owner,
+            &self.commands,
+            self.core.clone(),
+            self.core.changed.clone(),
+        );
+        if self.closed.is_closed() || self.finished.is_closed() {
+            drop(subscription);
+            return Err(Error::Closed);
+        }
+        match self.commands.try_send(Command::RegisterSubscription {
+            subscription: subscription.clone(),
+        }) {
+            Ok(()) => {
+                self.core.changed.notify_one();
+                Ok(subscription)
+            }
+            Err(error) => {
+                drop(subscription);
+                match error {
+                    mpsc::error::TrySendError::Full(_) => Err(Error::Backpressure),
+                    mpsc::error::TrySendError::Closed(_) => Err(Error::Closed),
+                }
+            }
+        }
     }
 }
 
@@ -126,6 +152,7 @@ macro_rules! local_track {
                         TrackSpec::$kind { label },
                         None,
                         &self.commands,
+                        &self.core,
                         &self.lease.close,
                         &self.lease.finished,
                     )?,
@@ -145,15 +172,12 @@ pub struct RemoteVideoTrack {
 }
 
 impl RemoteVideoTrack {
-    pub async fn subscribe(&self, observation: VideoObservation) -> Result<Subscription, Error> {
+    pub fn subscribe(&self, observation: VideoObservation) -> Result<Subscription, Error> {
         let selector = self.address.selector()?;
-        self.address
-            .request(|response| Command::VideoSubscription {
-                selector,
-                observation,
-                response,
-            })
-            .await
+        self.address.claim(
+            selector,
+            control::SubscriptionConfiguration::Video(observation),
+        )
     }
 }
 
@@ -163,28 +187,27 @@ pub struct RemoteAudioTrack {
 }
 
 impl RemoteAudioTrack {
-    pub async fn subscribe(
+    pub fn subscribe(
         &self,
         configuration: agent_core::ffi::AudioSubscriptionConfig,
     ) -> Result<Subscription, Error> {
         let selector = self.address.selector()?;
-        self.address
-            .request(|response| Command::AudioSubscription {
-                selector,
-                playout_delay: configuration.playout_delay.into(),
-                response,
-            })
-            .await
+        self.address.claim(
+            selector,
+            control::SubscriptionConfiguration::Audio(configuration.playout_delay.into()),
+        )
     }
 }
 
 impl Participant {
     pub fn video(&self, label: String) -> Result<RemoteVideoTrack, Error> {
+        let source = self.source(label.clone());
         Ok(RemoteVideoTrack {
             address: MediaAddress::new(
                 TrackSpec::Video { label },
-                Some(self.id().into()),
+                Some(source),
                 &self.commands,
+                &self.core,
                 &self.closed,
                 &self.finished,
             )?,
@@ -192,14 +215,81 @@ impl Participant {
     }
 
     pub fn audio(&self, label: String) -> Result<RemoteAudioTrack, Error> {
+        let source = self.source(label.clone());
         Ok(RemoteAudioTrack {
             address: MediaAddress::new(
                 TrackSpec::Audio { label },
-                Some(self.id().into()),
+                Some(source),
                 &self.commands,
+                &self.core,
                 &self.closed,
                 &self.finished,
             )?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn subscription_claim_is_local_and_close_fences_queued_actor_registration() {
+        let core = Control::new(
+            agent_core::Agent::new(agent_core::AgentConfig {
+                endpoint: "http://pulsebeam.test".into(),
+                token: "token".into(),
+                retry: Default::default(),
+                log_level: agent_core::LogLevel::Off,
+            })
+            .unwrap(),
+        );
+        let (commands, mut queued) = mpsc::channel(4);
+        let closed = Arc::new(Signal::default());
+        let finished = Arc::new(Signal::default());
+        let selector = TrackSelector {
+            room: "pinned-room".into(),
+            participant_external_id: "remote-endpoint".into(),
+            label: "camera".into(),
+        };
+        let address = MediaAddress::new(
+            TrackSpec::Video {
+                label: selector.label.clone(),
+            },
+            Some(selector.clone()),
+            &commands,
+            &core,
+            &closed,
+            &finished,
+        )
+        .unwrap();
+
+        assert_eq!(core.snapshot().desired_room, None);
+        let first = address
+            .claim(
+                selector.clone(),
+                control::SubscriptionConfiguration::Video(Default::default()),
+            )
+            .unwrap();
+        assert!(!first.is_closed());
+        first.close().await.unwrap();
+        assert!(first.is_closed());
+        let Command::RegisterSubscription { subscription } = queued.try_recv().unwrap() else {
+            panic!("synchronous subscription did not queue actor registration")
+        };
+        assert!(
+            subscription.is_closed(),
+            "stale actor continuation saw live demand"
+        );
+        drop(subscription);
+
+        let replacement = address
+            .claim(
+                selector,
+                control::SubscriptionConfiguration::Video(Default::default()),
+            )
+            .unwrap();
+        assert!(!replacement.is_closed());
+        replacement.close().await.unwrap();
     }
 }

@@ -11,12 +11,13 @@ lifetimes through React. Non-React browser applications use `@pulsebeam/web`.
 ## `useAgent`
 
 ```ts
-useAgent(config: AgentConfig): Agent
+useAgent(config: AgentConfig): Agent | null
 ```
 
-The hook returns a stable facade immediately. React activates it while mounted,
-renews authorization when `token` changes, and closes the managed runtime after
-unmount. Key the owning component when endpoint, identity, or topology changes.
+The hook returns null until a committed effect creates the actual Web SDK Agent.
+It never joins implicitly. React observes that handle, renews authorization when
+`token` changes, and closes it on unmount. Key the owning component when endpoint,
+identity, or topology changes.
 
 ```ts
 interface AgentConfig {
@@ -32,11 +33,42 @@ interface AgentConfig {
 }
 ```
 
-`Agent` exposes readonly `connection`, `error`, `participantId`, `roomId`,
-`authorizationExpiresAt`, and `remote`; plus `connect()`, `disconnect()`, and
-`video(label)`, `audio(label)`, and `data(label, delivery)` lookup. React does not expose runtime lifecycle,
-logging mutation, snapshot, subscription, or token-renewal methods on this
-facade.
+The returned type is `Agent` from `@pulsebeam/web`, including `join(room)`,
+`state()`, `updates()`, and typed local and room-pinned remote lookups. Rendering
+reads the same cached-by-revision `state()` object as the internal observation
+bridge. Hook-owned Agents close on unmount; token prop changes call `renew()`.
+Do not add a competing imperative token-renewal owner.
+
+## `usePublish` and `useSubscribe`
+
+```ts
+const publication = usePublish(agent.video("camera"), capture.video);
+const subscription = useSubscribe(
+  agent.room("robots").participant("robot-42").video("front"),
+);
+```
+
+Call dependent hooks in a mounted child after the Agent exists. Both hooks also
+accept null references and return null until effect-owned creation. Their results
+are the SDK's actual typed publication/subscription handles, not wrapper objects.
+They observe `state()` internally; no separate snapshot hook is needed. Ongoing
+admission and execution failures remain state values. Creation or observation
+failures reach the nearest Error Boundary after cleanup.
+
+`usePublish(track, source?, options?)` accepts local video, audio, or data refs.
+Media sources may be matching SDK or capture sources; null or omitted source
+retains a publication without input. Media options are `{ enabled: boolean }`,
+with active defaults when omitted. Source changes replace only the pipe; option
+changes configure the existing publication. Borrowed sources survive cleanup.
+Data publication takes no source and returns `DataPublication`.
+
+`useSubscribe(remoteTrack, options?)` accepts room-pinned video, audio, or data
+refs. Media options are the SDK's complete `VideoObservation` or
+`AudioSubscriptionConfig`, not partial playback hints. Omit options to use SDK
+defaults. Changes configure the existing subscription; omitting options restores its SDK
+defaults. Data returns `DataSubscription<D>` with its typed `next()` event API.
+Changed target scope closes the old handle and returns null until its replacement
+exists. Unmount and Strict Mode replay close owned resources and cursors.
 
 ## Logical track lookup
 
@@ -48,8 +80,8 @@ const Chat = agent.data("chat", "ordered");
 
 Labels are application-defined identities. Lookup returns a stable logical
 handle but does not reserve capacity, publish, subscribe, or play media. Local
-media handles expose only readonly `kind` and `label`; local data handles add
-`delivery` and binary `send`. Remote data handles are receive-only.
+media refs expose `kind`, `label`, and `publish()`. Local data refs also expose
+`delivery`; their publications send bytes. Remote refs expose `subscribe()`.
 
 Equivalent SDK-issued handles within an Agent identify the same logical target.
 Agent scope, local versus participant selection, participant ID, kind, label,
@@ -60,7 +92,7 @@ new one after commit. Fabricated handles are unsupported.
 This is a source-breaking replacement of the React `track` export,
 `TrackSpec`/`VideoTrackSpec`/`AudioTrackSpec`/`DataTrackSpec` exports, `.track(spec)`
 methods, and local media setters. There are no deprecated aliases. The
-caller-owned Web SDK also uses typed lookups, awaited factories, and explicit
+caller-owned Web SDK also uses typed lookups, synchronous factories, and explicit
 resource lifetimes.
 
 Core validates portable label rules when an owner acquires the resource. Media
@@ -117,65 +149,45 @@ The result has readonly `cameras`, `microphones`, `state`, and `error`. Devices
 are typed `{ kind, id, label }` objects suitable for `useCapture`. Device labels
 may be empty before permission is granted.
 
-## `Publish`
+## `Video` and `Audio`
 
 ```tsx
-<Publish
-  track={agent.video("camera")}
-  source={capture.video}
-  enabled={true}
-  content="motion"
-/>
+const video = useSubscribe(remoteVideo, {
+  visible: true, height: 360, minHeight: 180, minFps: 15, priority: 100,
+  playoutDelay: { mode: "adaptive" },
+});
+const audio = useSubscribe(remoteAudio);
+
+<Video source={video} mirror={false} onPlaybackError={({ error, retry }) => {}} />
+<Audio source={audio} onPlaybackError={(failure) => setFailure(failure)} />
 ```
 
-`track` must be a local audio or video handle. `source` is the matching captured
-source or null. `enabled` defaults to true. Video content defaults to `motion`;
-audio content defaults to `speech`. Mount owns publication, prop changes update
-it, and unmount releases it. A null source retains the declaration without a
-source, while `enabled={false}` retains ownership with media disabled. Neither
-stops borrowed capture. Independent mounts own independent resources; duplicate
-exclusive publication or audio playback claims conflict. Allocation or runtime
-failures reach the nearest React error boundary.
+`source` accepts matching captured media, a Web SDK media source, an already-owned
+video or audio subscription, a `MediaObservation`, or null. A logical remote track
+is not a playback source: call `useSubscribe` first. Null renders nothing.
 
-## `Video`
+Playback never creates or closes reception. Each view of a subscription acquires
+its own observation clone and releases only that clone and its update cursor on
+unmount or source replacement. Pending acquisition is cancelled; late output
+cannot attach to a retired view. An explicitly supplied `MediaObservation` or
+capture source is borrowed, not closed. Independent views do not create extra
+subscription owners.
 
-```tsx
-<Video
-  source={remoteVideo}
-  receive={{ priority: 100, minFps: 15 }}
-  mirror={false}
-  onPlaybackError={({ error, retry }) => {}}
-/>
-```
+Both components forward normal media element props except `src` and `children`.
+`autoPlay` defaults to true; Video also defaults `muted` and `playsInline` to true.
+`mirror` composes with Video's provided style. Presentation changes do not recreate
+the subscription. Configure reception through `useSubscribe`, not renderer props.
 
-`source` accepts a captured video source, remote video track, or null. The
-component forwards normal video element props except `src` and `children`.
-`muted`, `autoPlay`, and `playsInline` default to true. `mirror` composes with the
-provided style. Presentation and `receive` changes update the existing owner.
-Captured video is preview-only and creates no remote receive demand or audible
-playback.
-
-For a remote source, mounted visibility and nonzero size own receive demand.
-`receive` supports `priority`, `minFps`, `minHeight`,
-and `playoutDelay: { minMs, maxMs }`. `onPlaybackError` provides the original
-error and a gesture-safe retry function.
-
-## `Audio`
-
-```tsx
-<Audio agent={agent} onPlaybackError={(failure) => setFailure(failure)} />
-```
-
-Mount one owner to follow and play the Agent's remote audio tracks. A
-`PlaybackFailure` contains `message`, optional `cause`, and `retry()`. Call retry
-from a user gesture when browser autoplay policy blocks playback. Unmount stops
-and releases playback ownership.
+`onPlaybackError` receives a `PlaybackError` containing the original browser
+`error` and `retry()`. Call retry from a user gesture when autoplay is blocked.
+A retired view's retry does nothing; callback changes use the latest committed
+callback. Resource setup failures reach the nearest React error boundary.
 
 ## Remote participants and tracks
 
 ```ts
-agent.remote.participants: readonly RemoteParticipant[]
-agent.remote.participant(participantId): RemoteParticipant
+agent.participants: readonly RemoteParticipant[]
+agent.room(room).participant(participantId): RemoteParticipant
 participant.video(label): RemoteVideoTrack
 participant.audio(label): RemoteAudioTrack
 participant.data(label, delivery): RemoteDataTrack
@@ -190,17 +202,28 @@ immutable current snapshots.
 ## `Data`
 
 ```tsx
-<Data track={agent.data("chat", "ordered")} onEvent={handleEvent} onError={report} />
+<Data
+  track={agent.room("meeting").participant("alice").data("chat", "ordered")}
+  onEvent={handleEvent}
+  onError={report}
+/>
 ```
 
-Each committed mount owns one event subscription. A local data handle receives
-from all matching publishers in the room; a participant data handle receives
-only from that participant. A local handle also sends bytes:
+Each committed mount owns one event subscription to its pinned participant.
+Receiving does not require watching the room catalog. To send, retain an owned
+publication created with `usePublish`:
 
-```ts
-const payload = Uint8Array.of(0, 255);
-await agent.data("chat", "ordered").send(payload);
+```tsx
+const publication = usePublish(agent.data("chat", "ordered"));
+
+async function send(payload: Uint8Array) {
+  if (!publication) return;
+  await publication.send(payload);
+}
 ```
+
+The hook returns null until its effect creates the publication, then closes it
+on unmount. Handle send failures at the application action.
 
 Events are discriminated by `type`:
 

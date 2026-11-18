@@ -1,5 +1,6 @@
 use super::*;
 
+mod source_failure;
 #[cfg(test)]
 mod tests;
 use crate::native_state::{Change, Resource};
@@ -100,64 +101,55 @@ pub(super) fn kind(track: &state::Track) -> state::TrackKind {
     }
 }
 
+fn lookup_key(room: &str, participant: &str, kind: state::TrackKind, label: &str) -> Resource {
+    Resource::SourceLookup {
+        room: room.into(),
+        participant_external_id: participant.into(),
+        kind,
+        label: label.into(),
+    }
+}
+
 fn selected<'a>(
     session: &'a Session,
-    resource: &Resource,
     selector: &crate::TrackSelector,
     expected: state::TrackKind,
 ) -> Option<&'a str> {
-    let matches = |track: &state::Track| {
-        kind(track) == expected
-            && track.label == selector.label
-            && session
-                .state
-                .source_participant(&track.participant_id)
-                .is_some_and(|owner| {
-                    owner.participant_external_id == selector.participant_external_id
-                })
-    };
-    if let Some(live) =
-        session
-            .state
-            .confirmed(resource)
-            .and_then(|confirmed| match confirmed.value.as_ref()? {
-                state::confirmed_state::Value::Owned(live) => Some(live),
-                _ => None,
-            })
-        && live.execution != state::ExecutionStatus::WaitingForSource as i32
-        && let Some(track) = live.track.as_ref().filter(|track| matches(track))
-    {
-        return Some(&track.track_id);
-    }
-    if expected == state::TrackKind::Audio {
-        let retained = session
-            .state
-            .owned()
-            .filter(|(resource, live)| {
-                matches!(resource, Resource::Reception(MediaSlot::RemoteAudio(_)))
-                    && live.execution != state::ExecutionStatus::WaitingForSource as i32
-            })
-            .filter_map(|(_, live)| live.track.as_ref())
-            .filter(|track| matches(track))
-            .map(|track| track.track_id.as_str())
-            .collect::<BTreeSet<_>>();
-        if retained.len() == 1 {
-            return retained.first().copied();
-        }
-        if !retained.is_empty() {
-            return None;
-        }
-    }
-    let mut candidates = session
+    let resource = lookup_key(
+        &selector.room,
+        &selector.participant_external_id,
+        expected,
+        &selector.label,
+    );
+    session
         .state
-        .tracks()
-        .values()
-        .filter(|track| matches(track));
-    let candidate = candidates.next()?;
-    candidates
-        .next()
-        .is_none()
-        .then_some(candidate.track_id.as_str())
+        .lookup(&resource)?
+        .track
+        .as_ref()
+        .map(|track| track.track_id.as_str())
+}
+
+fn want_lookup(
+    wanted: &mut BTreeMap<Resource, state::ResourceSpec>,
+    room: &str,
+    participant: &str,
+    kind: state::TrackKind,
+    label: &str,
+) {
+    let key = lookup_key(room, participant, kind, label);
+    wanted.entry(key).or_insert_with(|| state::ResourceSpec {
+        settings: Some(settings(true)),
+        declaration: Some(state::resource_spec::Declaration::SourceLookup(
+            state::SourceLookupSpec {
+                source: Some(state::LogicalSourceAddress {
+                    room: room.into(),
+                    participant_external_id: participant.into(),
+                    kind: kind as i32,
+                    label: label.into(),
+                }),
+            },
+        )),
+    });
 }
 
 fn rtp(
@@ -296,6 +288,7 @@ fn publication(
 
 fn subscription(
     track: String,
+    source_room: String,
     kind: state::TrackKind,
     binding: state::TrackBinding,
     receive: Option<state::resource_settings::Receive>,
@@ -310,9 +303,38 @@ fn subscription(
                 track_id: track,
                 kind: kind as i32,
                 binding: Some(binding),
+                source_room,
             },
         )),
     }
+}
+
+fn source_room_for_track(session: &Session, desired: &DesiredState, track: &str) -> Option<String> {
+    for selector in &desired.audio.selected {
+        if selected(session, selector, state::TrackKind::Audio) == Some(track) {
+            return Some(selector.room.clone());
+        }
+    }
+    for selector in desired
+        .video
+        .iter()
+        .filter_map(|video| video.selector.as_ref())
+    {
+        if selected(session, selector, state::TrackKind::Video) == Some(track) {
+            return Some(selector.room.clone());
+        }
+    }
+    for subscriber in &desired.topics.subscribers {
+        let selector = crate::TrackSelector {
+            room: subscriber.room.clone(),
+            participant_external_id: subscriber.participant_external_id.clone(),
+            label: subscriber.topic.clone(),
+        };
+        if selected(session, &selector, state::TrackKind::Data) == Some(track) {
+            return Some(subscriber.room.clone());
+        }
+    }
+    None
 }
 
 fn payload(
@@ -440,6 +462,37 @@ pub(super) fn reconcile(
     effects: &mut VecDeque<Effect>,
 ) -> Result<(), SignalingError> {
     let mut wanted = BTreeMap::new();
+    for selector in desired
+        .video
+        .iter()
+        .filter_map(|video| video.selector.as_ref())
+    {
+        want_lookup(
+            &mut wanted,
+            &selector.room,
+            &selector.participant_external_id,
+            state::TrackKind::Video,
+            &selector.label,
+        );
+    }
+    for selector in &desired.audio.selected {
+        want_lookup(
+            &mut wanted,
+            &selector.room,
+            &selector.participant_external_id,
+            state::TrackKind::Audio,
+            &selector.label,
+        );
+    }
+    for subscriber in &desired.topics.subscribers {
+        want_lookup(
+            &mut wanted,
+            &subscriber.room,
+            &subscriber.participant_external_id,
+            state::TrackKind::Data,
+            &subscriber.topic,
+        );
+    }
     let mut media = BTreeMap::new();
     for value in &desired.publications {
         let kind = value.kind;
@@ -474,7 +527,7 @@ pub(super) fn reconcile(
         let resource = Resource::Reception(slot.clone());
         let track = match &video.selector {
             Some(selector) => {
-                selected(session, &resource, selector, state::TrackKind::Video).map(str::to_owned)
+                selected(session, selector, state::TrackKind::Video).map(str::to_owned)
             }
             None => Some(video.track_id.clone()),
         };
@@ -486,8 +539,12 @@ pub(super) fn reconcile(
         if let Some(track) = track
             && let Some(binding) = receive_rtp(session, logs, &resource, &slot, &track)
         {
+            let Some(source_room) = source_room_for_track(session, desired, &track) else {
+                continue;
+            };
             let spec = subscription(
                 track,
+                source_room,
                 state::TrackKind::Video,
                 binding,
                 Some(state::resource_settings::Receive::Video(
@@ -521,8 +578,7 @@ pub(super) fn reconcile(
         })
         .collect::<BTreeMap<_, _>>();
     for selector in &desired.audio.selected {
-        let resource = Resource::Reception(MediaSlot::RemoteAudio(0));
-        if let Some(id) = selected(session, &resource, selector, state::TrackKind::Audio) {
+        if let Some(id) = selected(session, selector, state::TrackKind::Audio) {
             audio.insert(
                 id.into(),
                 desired
@@ -589,8 +645,12 @@ pub(super) fn reconcile(
             media.insert(slot.clone(), want);
         }
         if let Some(binding) = receive_rtp(session, logs, &resource, &slot, &id) {
+            let Some(source_room) = source_room_for_track(session, desired, &id) else {
+                continue;
+            };
             let spec = subscription(
                 id,
+                source_room,
                 state::TrackKind::Audio,
                 binding,
                 Some(state::resource_settings::Receive::Audio(
@@ -628,33 +688,29 @@ pub(super) fn reconcile(
             );
         }
     }
-    for track in session
-        .state
-        .tracks()
-        .values()
-        .chain(session.state.owned().filter_map(|(resource, live)| {
-            matches!(resource, Resource::DataSubscription(_))
-                .then_some(live.track.as_ref())
-                .flatten()
-        }))
-    {
+    for registration in &subscribers {
+        let key = lookup_key(
+            &registration.room,
+            &registration.participant_external_id,
+            state::TrackKind::Data,
+            &registration.topic,
+        );
+        let Some(track) = session
+            .state
+            .lookup(&key)
+            .and_then(|lookup| lookup.track.as_ref())
+        else {
+            continue;
+        };
         let Some(state::track::Kind::Data(format)) = track.kind.as_ref() else {
             continue;
         };
-        if track.participant_id == session.participant_id {
-            continue;
-        }
-        let Some(mode) = crate::TopicMode::from_delivery(format.delivery) else {
-            continue;
-        };
-        let registration = crate::TopicSubscriber {
-            topic: track.label.clone(),
-            mode,
-        };
-        if subscribers.contains(&registration) {
+        if track.participant_id != session.participant_id
+            && crate::TopicMode::from_delivery(format.delivery) == Some(registration.mode)
+        {
             data.insert(
                 Resource::DataSubscription(track.track_id.clone()),
-                crate::TopicChannel::Subscriber(registration),
+                crate::TopicChannel::Subscriber(registration.clone()),
             );
         }
     }
@@ -748,7 +804,16 @@ pub(super) fn reconcile(
                     let Resource::DataSubscription(id) = &resource else {
                         continue;
                     };
-                    subscription(id.clone(), state::TrackKind::Data, binding, None)
+                    let Some(source_room) = source_room_for_track(session, desired, id) else {
+                        continue;
+                    };
+                    subscription(
+                        id.clone(),
+                        source_room,
+                        state::TrackKind::Data,
+                        binding,
+                        None,
+                    )
                 }
             };
             wanted.insert(resource, spec);
@@ -851,17 +916,14 @@ fn media_needed(
             value.slot == *index
                 && want.source.as_deref()
                     == match &value.selector {
-                        Some(selector) => {
-                            selected(session, &want.resource, selector, state::TrackKind::Video)
-                        }
+                        Some(selector) => selected(session, selector, state::TrackKind::Video),
                         None => Some(value.track_id.as_str()),
                     }
         }),
         MediaSlot::RemoteAudio(_) => want.source.as_ref().is_some_and(|source| {
             desired.audio.pinned.contains(source)
                 || desired.audio.selected.iter().any(|selector| {
-                    selected(session, &want.resource, selector, state::TrackKind::Audio)
-                        == Some(source.as_str())
+                    selected(session, selector, state::TrackKind::Audio) == Some(source.as_str())
                 })
                 || desired.audio.automatic
                     && session
@@ -1022,12 +1084,7 @@ impl Agent {
         selector: &crate::TrackSelector,
     ) -> Option<crate::MediaObservationTarget> {
         let active = self.active.as_ref()?;
-        let source = selected(
-            active,
-            &Resource::Reception(MediaSlot::RemoteAudio(0)),
-            selector,
-            state::TrackKind::Audio,
-        )?;
+        let source = selected(active, selector, state::TrackKind::Audio)?;
         self.audio_source_observation_target(source)
     }
 
@@ -1048,30 +1105,20 @@ impl Agent {
 
     pub(super) fn audio_source_authorized(&self, owner: u64, source: &str) -> bool {
         let active = self.active.as_ref();
-        let track = active.and_then(|active| {
-            active.state.tracks().get(source).or_else(|| {
-                active
-                    .state
-                    .owned()
-                    .filter_map(|(_, live)| live.track.as_ref())
-                    .find(|track| track.track_id == source)
-            })
-        });
+        let track = active.and_then(|active| active.state.source(source));
         if track.is_some_and(|track| {
             kind(track) != state::TrackKind::Audio
                 || active.is_some_and(|active| track.participant_id == active.participant_id)
         }) {
             return false;
         }
-        let selector = track.and_then(|track| {
-            let participant = active?.state.source_participant(&track.participant_id)?;
-            Some(crate::TrackSelector {
-                participant_external_id: participant.participant_external_id.clone(),
-                label: track.label.clone(),
+        let selector = active.and_then(|active| {
+            self.desired.audio.selected.iter().find(|selector| {
+                selected(active, selector, state::TrackKind::Audio) == Some(source)
             })
         });
         self.resources
-            .audio_source_authorized(crate::TrackOwner(owner), source, selector.as_ref())
+            .audio_source_authorized(crate::TrackOwner(owner), source, selector)
     }
 
     pub fn source_preparation(&self, slot: &MediaSlot) -> SourcePreparation<'_> {
@@ -1568,22 +1615,48 @@ impl Agent {
                     retired_binding,
                     state: confirmed,
                     new_evaluation,
+                    evaluates_current,
                     ..
                 } => {
+                    if matches!(resource, Resource::SourceLookup { .. }) {
+                        if evaluates_current {
+                            self.apply_lookup_read_failure(&resource, &confirmed)?;
+                        }
+                        self.intent_dirty = true;
+                        let resolved = matches!(&confirmed.value,
+                            Some(state::confirmed_state::Value::SourceLookup(lookup)) if lookup.track.is_some());
+                        let usable = self
+                            .active
+                            .as_ref()
+                            .is_some_and(|active| active.state.lookup(&resource).is_some());
+                        agent_log!(
+                            self,
+                            Debug,
+                            "Native source lookup changed: {resource:?} evaluated={} resolved={resolved} usable={usable}",
+                            confirmed.evaluated_revision
+                        );
+                    }
                     if let Some(rejection) = &confirmed.rejection {
                         if new_evaluation {
+                            let message = if rejection.diagnostic.is_empty()
+                                || matches!(
+                                    resource,
+                                    Resource::SourceLookup {
+                                        kind: state::TrackKind::Data,
+                                        ..
+                                    }
+                                ) {
+                                alloc::format!("resource rejected: {:?}", rejection.code())
+                            } else {
+                                rejection.diagnostic.clone()
+                            };
                             agent_log!(
                                 self,
                                 Warn,
                                 "Native resource {resource:?} rejected: {:?}: {}",
                                 rejection.code(),
-                                rejection.diagnostic
+                                message
                             );
-                            let message = if rejection.diagnostic.is_empty() {
-                                alloc::format!("resource rejected: {:?}", rejection.code())
-                            } else {
-                                rejection.diagnostic.clone()
-                            };
                             self.notifications
                                 .push_back(Notification::ServerError(message));
                         }

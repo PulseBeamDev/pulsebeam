@@ -5,6 +5,8 @@ import {
 } from "./remote-media.js";
 import {
   claimVideoSubscription,
+  defaultVideoObservation,
+  defaultAudioSubscription,
   subscribeAudio,
   subscribeVideo,
 } from "./reception.js";
@@ -30,6 +32,7 @@ import type {
   RemoteMediaAttachmentOptions,
   RemoteVideoTrack,
   RemoteMedia,
+  RoomRef,
 } from "./types.js";
 
 type PlaybackCallback = (
@@ -110,26 +113,38 @@ class VideoHandle implements RemoteVideoTrack {
   options: ReceiveOptions = validateReceiveOptions({});
   constructor(
     readonly catalog: RemoteCatalog,
+    readonly room: string,
     readonly participantId: string,
     readonly label: string,
   ) {
     videoOwners.set(this, this);
   }
   get id(): string | null {
-    return this.publicationId ?? null;
+    return this.catalog.resolve(
+      this.room,
+      this.participantId,
+      "video",
+      this.label,
+    );
   }
   get active(): boolean {
-    return this.publicationId !== undefined;
+    return this.id !== null;
   }
   watch(listener: () => void): () => void {
     if (this.catalog.closed) return () => {};
-    this.#listeners.add(listener);
-    return () => this.#listeners.delete(listener);
+    let id = this.id;
+    return this.catalog.agent.subscribe(() => {
+      const next = this.id;
+      if (next === id) return;
+      id = next;
+      listener();
+    });
   }
-  subscribe(configuration: VideoObservation) {
+  subscribe(configuration: VideoObservation = defaultVideoObservation) {
     return subscribeVideo(
       this.catalog.owners,
       {
+        room: this.room,
         participantId: this.participantId,
         label: this.label,
       },
@@ -164,17 +179,29 @@ class AudioHandle implements RemoteAudioTrack {
   readonly #listeners = new Set<() => void>();
   constructor(
     readonly catalog: RemoteCatalog,
+    readonly room: string,
     readonly participantId: string,
     readonly label: string,
   ) {}
   get id(): string | null {
-    return this.publicationId ?? null;
+    return this.catalog.resolve(
+      this.room,
+      this.participantId,
+      "audio",
+      this.label,
+    );
   }
   get active(): boolean {
-    return this.publicationId !== undefined;
+    return this.id !== null;
   }
   get receiving(): boolean {
-    return this.#binding !== undefined;
+    const id = this.id;
+    return (
+      id !== null &&
+      this.catalog.agent
+        .getSnapshot()
+        .mapping.audio.some((entry) => entry.publicationId === id)
+    );
   }
   bind(id: string | undefined, receiver: number | undefined): void {
     const changed = id !== this.publicationId || receiver !== this.#binding;
@@ -184,13 +211,19 @@ class AudioHandle implements RemoteAudioTrack {
   }
   watch(listener: () => void): () => void {
     if (this.catalog.closed) return () => {};
-    this.#listeners.add(listener);
-    return () => this.#listeners.delete(listener);
+    let state = `${this.id}:${this.receiving}`;
+    return this.catalog.agent.subscribe(() => {
+      const next = `${this.id}:${this.receiving}`;
+      if (next === state) return;
+      state = next;
+      listener();
+    });
   }
-  subscribe(configuration: AudioSubscriptionConfig) {
+  subscribe(configuration: AudioSubscriptionConfig = defaultAudioSubscription) {
     return subscribeAudio(
       this.catalog.owners,
       {
+        room: this.room,
         participantId: this.participantId,
         label: this.label,
       },
@@ -198,10 +231,10 @@ class AudioHandle implements RemoteAudioTrack {
     );
   }
   readWaveform(buffer: Float32Array): void {
-    this.catalog.read(this.publicationId, buffer, false);
+    this.catalog.read(this.id ?? undefined, buffer, false);
   }
   readSpectrum(buffer: Float32Array): void {
-    this.catalog.read(this.publicationId, buffer, true);
+    this.catalog.read(this.id ?? undefined, buffer, true);
   }
   close(): void {
     this.bind(undefined, undefined);
@@ -214,28 +247,62 @@ class ParticipantHandle implements RemoteParticipant {
   readonly audios = new Map<string, AudioHandle>();
   videoTracks: readonly RemoteVideoTrack[] = Object.freeze([]);
   audioTracks: readonly RemoteAudioTrack[] = Object.freeze([]);
-  tracks: readonly RemotePublishedTrack[] = Object.freeze([]);
+  #tracks: readonly RemotePublishedTrack[] = Object.freeze([]);
+  get tracks(): readonly RemotePublishedTrack[] {
+    if (this.catalog.closed || !this.catalog.isCurrentRoom(this.room))
+      return Object.freeze([]);
+    const entries = this.catalog.agent
+      .getSnapshot()
+      .catalog.tracks.filter(
+        (entry) => entry.participantId === this.participantId,
+      );
+    this.#tracks = collection(
+      this.#tracks,
+      entries.map((entry) =>
+        entry.kind === "data"
+          ? this.data(entry.label, entry.delivery)
+          : entry.kind === "video"
+            ? this.video(entry.label)
+            : this.audio(entry.label),
+      ),
+    );
+    return this.#tracks;
+  }
   get active(): boolean {
-    return this.catalog.participants.includes(this);
+    return (
+      !this.catalog.closed &&
+      this.catalog.isCurrentRoom(this.room) &&
+      this.catalog.agent
+        .getSnapshot()
+        .catalog.participants.some(
+          (participant) => participant.participantId === this.participantId,
+        )
+    );
   }
   id(): string {
     return this.participantId;
   }
   data<D extends Delivery>(label: string, delivery: D): RemoteDataTrack<D> {
-    return this.catalog.data.remote(
-      track.data(label, delivery),
-      this.participantId,
-    );
+    return this.catalog.data.remote(track.data(label, delivery), {
+      room: this.room,
+      participantId: this.participantId,
+    });
   }
   constructor(
     readonly catalog: RemoteCatalog,
+    readonly room: string,
     readonly participantId: string,
   ) {}
   video(label: string): VideoHandle {
     this.catalog.requireOpen();
     let handle = this.videos.get(label);
     if (!handle) {
-      handle = new VideoHandle(this.catalog, this.participantId, label);
+      handle = new VideoHandle(
+        this.catalog,
+        this.room,
+        this.participantId,
+        label,
+      );
       this.videos.set(label, handle);
     }
     return handle;
@@ -244,7 +311,12 @@ class ParticipantHandle implements RemoteParticipant {
     this.catalog.requireOpen();
     let handle = this.audios.get(label);
     if (!handle) {
-      handle = new AudioHandle(this.catalog, this.participantId, label);
+      handle = new AudioHandle(
+        this.catalog,
+        this.room,
+        this.participantId,
+        label,
+      );
       this.audios.set(label, handle);
     }
     return handle;
@@ -270,6 +342,7 @@ export class RemoteCatalog implements RemoteMedia {
   #facade: RemoteMedia | undefined;
   #playback: RemoteAudioPlayback | undefined;
   #closed = false;
+  #catalogRoom: string | null = null;
   participants: readonly RemoteParticipant[] = Object.freeze([]);
   videoTracks: readonly RemoteVideoTrack[] = Object.freeze([]);
   audioTracks: readonly RemoteAudioTrack[] = Object.freeze([]);
@@ -297,7 +370,7 @@ export class RemoteCatalog implements RemoteMedia {
             return handle.active;
           },
           watch: (listener: () => void) => handle.watch(listener),
-          subscribe: (configuration: VideoObservation) =>
+          subscribe: (configuration?: VideoObservation) =>
             handle.subscribe(configuration),
         });
         this.#publicVideos.set(handle, value);
@@ -319,7 +392,7 @@ export class RemoteCatalog implements RemoteMedia {
             return handle.active;
           },
           watch: (listener: () => void) => handle.watch(listener),
-          subscribe: (configuration: AudioSubscriptionConfig) =>
+          subscribe: (configuration?: AudioSubscriptionConfig) =>
             handle.subscribe(configuration),
         });
         this.#publicAudios.set(handle, value);
@@ -336,6 +409,7 @@ export class RemoteCatalog implements RemoteMedia {
             ? wrapAudio(entry as AudioHandle)
             : entry;
       value = Object.freeze({
+        room: handle.room,
         participantId: handle.participantId,
         id: () => handle.id(),
         get active() {
@@ -377,8 +451,6 @@ export class RemoteCatalog implements RemoteMedia {
         }
         return collection;
       },
-      participant: (participantId: string) =>
-        wrapParticipant(this.participant(participantId)),
     });
     return this.#facade;
   }
@@ -428,10 +500,15 @@ export class RemoteCatalog implements RemoteMedia {
     const owner = this.owners.acquire(
       { op: "claimAudio" },
       {
-        bind: () => {
-          playback = new RemoteAudioPlayback(this.logLevel, report);
-          this.#playback = playback;
-          playback.start(this.agent.getSnapshot());
+        bind: (binding) => {
+          void Promise.resolve()
+            .then(() => {
+              if (!owner.current(binding)) return;
+              playback = new RemoteAudioPlayback(this.logLevel, report);
+              this.#playback = playback;
+              playback.start(this.agent.getSnapshot());
+            })
+            .catch((error: unknown) => owner.fail(error));
         },
         unbind: () => {
           playback?.close();
@@ -450,12 +527,43 @@ export class RemoteCatalog implements RemoteMedia {
   requireOpen(): void {
     if (this.#closed) throw new Error("agent is closed");
   }
-  participant(participantId: string): ParticipantHandle {
+  isCurrentRoom(room: string): boolean {
+    return this.agent.getSnapshot().roomId === room;
+  }
+  resolve(
+    room: string,
+    participantId: string,
+    kind: "audio" | "video",
+    label: string,
+  ): string | null {
+    if (this.#closed || !this.isCurrentRoom(room)) return null;
+    return (
+      this.agent
+        .getSnapshot()
+        .catalog.publications.find(
+          (publication) =>
+            publication.participantId === participantId &&
+            publication.kind === kind &&
+            publication.label === label,
+        )?.id ?? null
+    );
+  }
+  room(name: string): RoomRef {
     this.requireOpen();
-    let handle = this.#handles.get(participantId);
+    return Object.freeze({
+      name,
+      participant: (id: string) => {
+        this.requireOpen();
+        return this.#discovered(name, id);
+      },
+    });
+  }
+  #discovered(room: string, participantId: string): ParticipantHandle {
+    const key = JSON.stringify([room, participantId]);
+    let handle = this.#handles.get(key);
     if (!handle) {
-      handle = new ParticipantHandle(this, participantId);
-      this.#handles.set(participantId, handle);
+      handle = new ParticipantHandle(this, room, participantId);
+      this.#handles.set(key, handle);
     }
     return handle;
   }
@@ -479,12 +587,18 @@ export class RemoteCatalog implements RemoteMedia {
   }
   update(snapshot: AgentSnapshot): void {
     if (this.#closed) return;
+    if (this.#catalogRoom !== snapshot.roomId) {
+      this.#handles.clear();
+      this.#catalogRoom = snapshot.roomId;
+    }
     this.#playback?.update(snapshot);
     const byId = new Map<string, ParticipantHandle>();
     const participants: ParticipantHandle[] = [];
     for (const participant of snapshot.catalog.participants) {
       if (participant.participantId === snapshot.participantId) continue;
-      const handle = this.participant(participant.participantId);
+      const room = snapshot.roomId;
+      if (room === null) continue;
+      const handle = this.#discovered(room, participant.participantId);
       byId.set(participant.participantId, handle);
       participants.push(handle);
     }
@@ -518,18 +632,6 @@ export class RemoteCatalog implements RemoteMedia {
         const id = audioIds.get(handle);
         handle.bind(id, id === undefined ? undefined : receivers.get(id));
       }
-      participant.tracks = collection(
-        participant.tracks,
-        snapshot.catalog.tracks
-          .filter((entry) => entry.participantId === participant.participantId)
-          .map((entry) =>
-            entry.kind === "data"
-              ? participant.data(entry.label, entry.delivery)
-              : entry.kind === "video"
-                ? participant.video(entry.label)
-                : participant.audio(entry.label),
-          ),
-      );
       participant.videoTracks = collection(
         participant.videoTracks,
         videos.filter(
@@ -559,7 +661,6 @@ export class RemoteCatalog implements RemoteMedia {
       for (const handle of participant.audios.values()) handle.close();
       participant.videoTracks = Object.freeze([]);
       participant.audioTracks = Object.freeze([]);
-      participant.tracks = Object.freeze([]);
     }
     this.participants = Object.freeze([]);
     this.videoTracks = Object.freeze([]);
@@ -616,6 +717,7 @@ function attachVideoHandle(
   const claim = claimVideoSubscription(
     handle.catalog.owners,
     {
+      room: handle.room,
       participantId: handle.participantId,
       label: handle.label,
     },

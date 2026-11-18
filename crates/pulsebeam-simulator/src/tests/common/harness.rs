@@ -642,6 +642,16 @@ pub enum Step {
         participant: &'static str,
         subscriptions: Vec<VideoSubscription>,
     },
+    MoveRoom {
+        description: &'static str,
+        participant: &'static str,
+        room: &'static str,
+        timeout: Duration,
+    },
+    ReleaseRetainedVideoResources {
+        description: &'static str,
+        participant: &'static str,
+    },
     RelabelOwnedVideo {
         description: &'static str,
         participant: &'static str,
@@ -1129,12 +1139,14 @@ enum ParticipantCmd {
 #[derive(Clone)]
 enum PendingDriverOp {
     SetSubscriptions(Vec<VideoSubscription>),
+    MoveRoom(&'static str, String, Arc<AtomicBool>),
+    ReleaseRetainedVideoResources(Arc<AtomicBool>),
     RelabelOwnedVideo(String),
     ReplaceVideoSource(Arc<AtomicBool>),
     ReleaseReplacedVideoSource(Arc<AtomicBool>),
     ApplicationAgent(Arc<Mutex<Option<pulsebeam_agent_native::Agent>>>),
     DeclarePublishTopic(String, TopicMode),
-    DeclareSubscribeTopic(String, TopicMode),
+    DeclareSubscribeTopic(Vec<TopicSubscriber>),
     PublishData(String, TopicMode, Vec<u8>),
     /// (pinned participant ids, auto)
     SetAudioIntent(Vec<String>, bool),
@@ -1201,16 +1213,16 @@ impl OperationQueue {
                     self.intent.topics.publishers.push(registration);
                 }
             }
-            PendingDriverOp::DeclareSubscribeTopic(topic, mode) => {
-                let registration = TopicSubscriber {
-                    topic: topic.clone(),
-                    mode: *mode,
-                };
-                if !self.intent.topics.subscribers.contains(&registration) {
-                    self.intent.topics.subscribers.push(registration);
+            PendingDriverOp::DeclareSubscribeTopic(registrations) => {
+                for registration in registrations {
+                    if !self.intent.topics.subscribers.contains(registration) {
+                        self.intent.topics.subscribers.push(registration.clone());
+                    }
                 }
             }
             PendingDriverOp::RelabelOwnedVideo(_)
+            | PendingDriverOp::MoveRoom(..)
+            | PendingDriverOp::ReleaseRetainedVideoResources(_)
             | PendingDriverOp::ReplaceVideoSource(_)
             | PendingDriverOp::ReleaseReplacedVideoSource(_)
             | PendingDriverOp::ApplicationAgent(_)
@@ -1284,6 +1296,16 @@ struct ParticipantShared {
 
 impl ParticipantShared {
     fn record_observation(&self, observation: ClientObservation) -> anyhow::Result<()> {
+        if observation.snapshot.connection
+            == pulsebeam_agent_native::agent_core::ConnectionState::Connected
+            && let Some(id) = observation.snapshot.participant_id.as_ref()
+        {
+            let mut current = self.participant_id.lock().unwrap();
+            if current.as_ref() != Some(id) {
+                *current = Some(id.clone());
+                self.incarnations.lock().unwrap().push(id.clone());
+            }
+        }
         let mut sources = self.interval_audio_sources.lock().unwrap();
         for (index, id) in &observation.snapshot.audio_mapping {
             // Installed receivers can outlive discovery until explicit retirement.
@@ -1350,6 +1372,9 @@ struct ParticipantHandle {
     shared: Arc<ParticipantShared>,
     cmd_tx: mpsc::Sender<ParticipantCmd>,
     room_name: &'static str,
+    authorized_rooms: BTreeSet<&'static str>,
+    endpoint: String,
+    data_subscriptions: Vec<TopicSubscriber>,
     /// When this participant last asked for a stream. Time-to-first-frame is measured from here,
     /// not from the start of the plan: the settle steps before a subscription are not time the
     /// viewer spent waiting.
@@ -1672,6 +1697,19 @@ async fn run_participant(
                                 .ctx
                                 .set_video_subscriptions(subscriptions, sequence)
                                 .await?,
+                            PendingDriverOp::MoveRoom(room, token, receipt) => {
+                                client.ctx.retain_video_subscriptions();
+                                client.ctx.retain_video_owners().await?;
+                                client.ctx.agent.renew(token)?;
+                                client.ctx.agent.join(room.to_owned())?;
+                                receipt.store(true, Ordering::Release);
+                                true
+                            }
+                            PendingDriverOp::ReleaseRetainedVideoResources(receipt) => {
+                                client.release_retained_video_resources().await?;
+                                receipt.store(true, Ordering::Release);
+                                true
+                            }
                             PendingDriverOp::RelabelOwnedVideo(label) => {
                                 let complete = client.relabel_owned_video(label.clone()).await?;
                                 if complete { *shared.video_label.lock().unwrap() = label; }
@@ -1694,8 +1732,12 @@ async fn run_participant(
                             PendingDriverOp::DeclarePublishTopic(topic, mode) => {
                                 client.ctx.register_publisher(topic, mode).await?
                             }
-                            PendingDriverOp::DeclareSubscribeTopic(topic, mode) => {
-                                client.ctx.register_subscriber(topic, mode).await?
+                            PendingDriverOp::DeclareSubscribeTopic(registrations) => {
+                                let mut complete = true;
+                                for registration in registrations {
+                                    complete &= client.ctx.register_subscriber(registration).await?;
+                                }
+                                complete
                             }
                             PendingDriverOp::PublishData(topic, mode, data) => {
                                 client.ctx.send_topic(&topic, mode, data).await?
@@ -1816,6 +1858,8 @@ fn step_name(step: &Step) -> &'static str {
         Step::SubscribeTo { .. } => "SubscribeTo",
         Step::SubscribeToQos { .. } => "SubscribeToQos",
         Step::SubscribeToConfigured { .. } => "SubscribeToConfigured",
+        Step::MoveRoom { .. } => "MoveRoom",
+        Step::ReleaseRetainedVideoResources { .. } => "ReleaseRetainedVideoResources",
         Step::WaitForSourceVideo { .. } => "WaitForSourceVideo",
         Step::UpdateSolidVideo { .. } => "UpdateSolidVideo",
         Step::QuietSolidVideo { .. } => "QuietSolidVideo",
@@ -2752,6 +2796,60 @@ async fn execute_plan(
                     .push(PendingDriverOp::SetSubscriptions(subscriptions.clone()));
             }
 
+            Step::MoveRoom {
+                description,
+                participant,
+                room,
+                timeout,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                handle.authorized_rooms.insert(room);
+                let token = super::client::token_for_rooms(
+                    &handle.endpoint,
+                    &handle.authorized_rooms.iter().copied().collect::<Vec<_>>(),
+                )?;
+                let receipt = Arc::new(AtomicBool::new(false));
+                handle
+                    .shared
+                    .pending_ops
+                    .lock()
+                    .unwrap()
+                    .push(PendingDriverOp::MoveRoom(room, token, receipt.clone()));
+                tokio::time::timeout(*timeout, async {
+                    loop {
+                        let accepted = handle.shared.observation.lock().unwrap().as_ref().is_some_and(|observation| {
+                            let snapshot = &observation.snapshot;
+                            snapshot.connection == pulsebeam_agent_native::agent_core::ConnectionState::Connected
+                                && snapshot.room_external_id.as_deref() == Some(*room)
+                                && snapshot.participant_external_id.as_deref() == Some(handle.endpoint.as_str())
+                                && snapshot.accepted_join_revision == Some(snapshot.join_revision)
+                                && snapshot.accepted_credential_revision == Some(snapshot.credential_revision)
+                        });
+                        if receipt.load(Ordering::Acquire) && accepted { break; }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }).await.with_context(|| format!("{description}: same-Agent room move did not settle"))?;
+                handle.room_name = room;
+            }
+            Step::ReleaseRetainedVideoResources {
+                description,
+                participant,
+            } => {
+                let handle = get_handle(handles, participant, description)?;
+                let receipt = Arc::new(AtomicBool::new(false));
+                handle.shared.pending_ops.lock().unwrap().push(
+                    PendingDriverOp::ReleaseRetainedVideoResources(receipt.clone()),
+                );
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !receipt.load(Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .with_context(|| {
+                    format!("{description}: original video resource release failed")
+                })?;
+            }
             Step::RelabelOwnedVideo {
                 description,
                 participant,
@@ -2964,7 +3062,16 @@ async fn execute_plan(
             } => {
                 let handle = get_handle(handles, participant, description)?;
                 handle.shared.pending_ops.lock().unwrap().push(
-                    PendingDriverOp::DeclareSubscribeTopic(topic.to_string(), *mode),
+                    PendingDriverOp::DeclareSubscribeTopic(
+                        handle
+                            .data_subscriptions
+                            .iter()
+                            .filter(|registration| {
+                                registration.topic == *topic && registration.mode == *mode
+                            })
+                            .cloned()
+                            .collect(),
+                    ),
                 );
             }
             Step::PublishData {
@@ -4872,7 +4979,16 @@ fn observed_media(
         let Some(observation) = observation.as_ref() else {
             continue;
         };
-        for descriptor in observation.snapshot.publications.values() {
+        let generation = observation
+            .snapshot
+            .generation
+            .map(|generation| generation.get());
+        let owned = observation
+            .owned_receivers
+            .iter()
+            .filter(|evidence| Some(evidence.track.generation) == generation)
+            .map(|evidence| &evidence.publication);
+        for descriptor in observation.snapshot.publications.values().chain(owned) {
             if let Some(previous) = catalog.insert(descriptor.id.clone(), descriptor.clone()) {
                 anyhow::ensure!(
                     previous == *descriptor,
@@ -4907,6 +5023,7 @@ fn expected_state(handles: &PlanHandles) -> anyhow::Result<super::oracle::Applic
         let mut participant = super::oracle::ExpectedParticipant {
             id: id.parse()?,
             room: handle.room_name,
+            external_id: handle.endpoint.clone(),
             video: handle.publishes_video,
             video_label: handle.shared.video_label.lock().unwrap().clone(),
             audio: handle.publishes_audio,
@@ -4944,7 +5061,7 @@ fn planned_video(
     let eligible = participants
         .iter()
         .filter(|peer| {
-            peer.room == participant.room
+            handle.authorized_rooms.contains(peer.room)
                 && peer.id != participant.id
                 && peer.video
                 && (peer.required
@@ -4978,6 +5095,11 @@ fn planned_video(
         let automatic = eligible
             .iter()
             .filter(|id| !explicitly_requested.contains(id.as_str()))
+            .filter(|id| {
+                participants
+                    .iter()
+                    .any(|peer| peer.id.as_str() == **id && peer.room == participant.room)
+            })
             .cloned()
             .collect::<Vec<_>>();
         requested.extend(automatic);
@@ -5843,55 +5965,60 @@ fn topic_payload(event: &TopicNotification) -> Option<&[u8]> {
     }
 }
 
-fn initial_topic_registrations(plan: &[Step]) -> BTreeMap<&'static str, TopicRegistrations> {
-    // Data-channel labels are transport topology; scenario steps still control when each API
-    // declaration becomes observable, but fixed labels belong in the initial offer.
+fn initial_topic_registrations(
+    plan: &[Step],
+    endpoints: &BTreeMap<&'static str, (String, String)>,
+) -> anyhow::Result<BTreeMap<&'static str, TopicRegistrations>> {
     let mut by_participant = BTreeMap::<_, TopicRegistrations>::new();
     for step in plan {
-        let (participant, publisher, subscriber) = match step {
+        match step {
             Step::DeclarePublishTopic {
                 participant,
                 topic,
                 mode,
                 ..
-            } => (
-                *participant,
-                Some(TopicPublisher {
-                    topic: (*topic).to_string(),
+            } => {
+                let registration = TopicPublisher {
+                    topic: (*topic).into(),
                     mode: *mode,
-                }),
-                None,
-            ),
+                };
+                let registrations = by_participant.entry(*participant).or_default();
+                if !registrations.publishers.contains(&registration) {
+                    registrations.publishers.push(registration);
+                }
+            }
             Step::DeclareSubscribeTopic {
                 participant,
                 topic,
                 mode,
                 ..
-            } => (
-                *participant,
-                None,
-                Some(TopicSubscriber {
-                    topic: (*topic).to_string(),
-                    mode: *mode,
-                }),
-            ),
-            _ => continue,
-        };
-        let registrations = by_participant.entry(participant).or_default();
-        if let Some(publisher) = publisher
-            && !registrations.publishers.contains(&publisher)
-        {
-            registrations.publishers.push(publisher);
-        }
-        if let Some(subscriber) = subscriber
-            && !registrations.subscribers.contains(&subscriber)
-        {
-            registrations.subscribers.push(subscriber);
+            } => {
+                let (room, own_endpoint) = endpoints
+                    .get(participant)
+                    .with_context(|| format!("unknown topic subscriber {participant}"))?;
+                let registrations = by_participant.entry(*participant).or_default();
+                // The scenario's all-peer policy expands application-known addresses,
+                // never a wildcard receive or SDK-owned discovery policy.
+                for (source_room, endpoint) in endpoints.values() {
+                    if source_room != room || endpoint == own_endpoint {
+                        continue;
+                    }
+                    let registration = TopicSubscriber {
+                        room: source_room.clone(),
+                        participant_external_id: endpoint.clone(),
+                        topic: (*topic).into(),
+                        mode: *mode,
+                    };
+                    if !registrations.subscribers.contains(&registration) {
+                        registrations.subscribers.push(registration);
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    by_participant
+    Ok(by_participant)
 }
-
 impl FeedbackProfile {
     /// Feedback degraded about as much as the forward path on the same wireless link.
     pub fn wifi() -> Self {
@@ -6140,7 +6267,8 @@ impl LocalNodeSim {
                 Step::BeginHeldReconnect { timeout, .. }
                 | Step::WaitForPublication { timeout, .. }
                 | Step::WaitForVideo { timeout, .. }
-                | Step::WaitForVideoAtResolution { timeout, .. } => Some(*timeout),
+                | Step::WaitForVideoAtResolution { timeout, .. }
+                | Step::MoveRoom { timeout, .. } => Some(*timeout),
                 _ => None,
             })
             .sum::<Duration>()
@@ -6174,8 +6302,32 @@ impl LocalNodeSim {
         let tcp_only = self.tcp_only;
         let udp_only = self.udp_only;
         let num_shards = self.num_shards;
+        let mut name_to_ip = PlanIps::new();
+        name_to_ip.insert("server", server_ip);
+        let mut endpoints = BTreeMap::new();
+        let mut ip_counter = 2u8;
+        for room in &self.rooms {
+            for participant in &room.participants {
+                let ip = if self.ip_version == turmoil::IpVersion::V6 {
+                    subnet_ip_v6(subnet, ip_counter)
+                } else {
+                    subnet_ip(subnet, ip_counter)
+                };
+                ip_counter += 1;
+                name_to_ip.insert(participant.name, ip);
+                endpoints.insert(
+                    participant.name,
+                    (
+                        room.name.to_owned(),
+                        super::client::planned_external_id(ip, participant.external_id),
+                    ),
+                );
+            }
+        }
+        let planned_topics = initial_topic_registrations(&plan, &endpoints)
+            .expect("topic declarations name configured participants");
         let initial_topics = if self.predeclare_topics {
-            initial_topic_registrations(&plan)
+            planned_topics.clone()
         } else {
             BTreeMap::new()
         };
@@ -6203,8 +6355,6 @@ impl LocalNodeSim {
         let quality_references: Arc<Mutex<BTreeMap<String, &'static QualityVideoReference>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let h264_publishers: Arc<Mutex<FixturePublishers>> = Arc::new(Mutex::new(BTreeMap::new()));
-        let mut name_to_ip = PlanIps::new();
-        name_to_ip.insert("server", server_ip);
         pulsebeam_runtime::net::shaper::set_gro_window(server_ip, self.link.gro_window);
 
         // Impairment is keyed by destination, so configuring the SFU's address is what degrades
@@ -6217,17 +6367,9 @@ impl LocalNodeSim {
             pulsebeam_runtime::net::shaper::set_reorder(server_ip, feedback.reorder);
         }
 
-        let mut ip_counter = 2u8;
         for room in &self.rooms {
             for participant in &room.participants {
-                let ip = if self.ip_version == turmoil::IpVersion::V6 {
-                    subnet_ip_v6(subnet, ip_counter)
-                } else {
-                    subnet_ip(subnet, ip_counter)
-                };
-                ip_counter += 1;
-
-                name_to_ip.insert(participant.name, ip);
+                let ip = name_to_ip[participant.name];
                 pulsebeam_runtime::net::shaper::set_gro_window(ip, self.link.gro_window);
                 // The runtime shaper sits on the SFU's egress socket, so this models loss and
                 // bandwidth on the path to the participant. Client UDP sockets bypass it; do not
@@ -6268,6 +6410,12 @@ impl LocalNodeSim {
                         shared: shared.clone(),
                         cmd_tx,
                         room_name: room.name,
+                        authorized_rooms: BTreeSet::from([room.name]),
+                        endpoint: endpoints[participant.name].1.clone(),
+                        data_subscriptions: planned_topics
+                            .get(participant.name)
+                            .map(|topics| topics.subscribers.clone())
+                            .unwrap_or_default(),
                         subscribed_at: None,
                         interval_video_baseline: VideoReceiveStats::default(),
                         interval_decoded_video_baseline: BTreeMap::new(),

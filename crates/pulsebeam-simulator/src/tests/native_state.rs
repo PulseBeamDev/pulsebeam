@@ -33,6 +33,8 @@ struct WirePeer {
     _host: NativeHost,
 }
 
+const DATA_ROOM: &str = "native-state-wire";
+
 impl WirePeer {
     async fn connect(
         ip: IpAddr,
@@ -48,6 +50,16 @@ impl WirePeer {
         server: IpAddr,
         subject: &str,
         audio: bool,
+    ) -> anyhow::Result<(Self, String)> {
+        Self::connect_on_room(host, server, subject, audio, DATA_ROOM).await
+    }
+
+    async fn connect_on_room(
+        host: NativeHost,
+        server: IpAddr,
+        subject: &str,
+        audio: bool,
+        room: &str,
     ) -> anyhow::Result<(Self, String)> {
         let (_runtime, lease) = host.runtime()?;
         let factory = host.raw_peer_factory()?;
@@ -104,13 +116,20 @@ impl WirePeer {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs()
             + 60;
+        let rooms = if room == DATA_ROOM {
+            vec![DATA_ROOM]
+        } else {
+            vec![DATA_ROOM, room]
+        };
         let token = pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key()?,
-            &serde_json::from_value(serde_json::json!([{"rooms":["native-state-wire"],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
+            &serde_json::from_value(
+                serde_json::json!([{"rooms":rooms,"allow":["join","publish","subscribe"]}]),
+            )
+            .unwrap(),
             subject,
             expiry,
         )?;
-        let room = "native-state-wire";
         let admission = http::Request::builder()
             .method("POST")
             .uri(format!("http://{server}:7070/api/v1/native/admissions"))
@@ -337,6 +356,7 @@ impl WirePeer {
                     }),
                 }),
             }],
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
@@ -433,6 +453,7 @@ fn subscription(source: &wire::Track, channel: u32, enabled: bool) -> wire::Reso
             wire::SubscriptionSpec {
                 track_id: source.track_id.clone(),
                 kind: wire::TrackKind::Data as i32,
+                source_room: DATA_ROOM.into(),
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
                         stream_id: Some(channel),

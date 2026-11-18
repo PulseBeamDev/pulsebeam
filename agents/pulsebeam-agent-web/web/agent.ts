@@ -28,6 +28,7 @@ import type {
   Publication,
   RemoteTrack,
   RemoteParticipant,
+  RoomRef,
   Topic,
   TopicMode,
   TopicRegistration,
@@ -119,7 +120,6 @@ class AgentFacade implements AgentApi {
   #runtime: Runtime | undefined;
   #observation: AgentObservation | undefined;
   #runtimeGeneration: bigint | null = null;
-  readonly #data = new DataRegistry(this);
   readonly #resources = new ResourceOwners((error) => {
     if (
       this.#runtimeConfig.logLevel !== "off" &&
@@ -127,6 +127,7 @@ class AgentFacade implements AgentApi {
     )
       console.warn("PulseBeam resource ownership failed", error);
   });
+  readonly #data = new DataRegistry(this, this.#resources);
   readonly #media = new LocalMediaRegistry(this.#resources);
   readonly #remote: RemoteCatalog;
   readonly #topics: TopicRegistry;
@@ -211,7 +212,6 @@ class AgentFacade implements AgentApi {
       const current = runtime;
       this.#runtime = current;
       this.#observation = new AgentObservation(current);
-      this.#data.activate(current);
       this.#resources.activate(current);
       current.set_event_listener((event: unknown) => {
         if (active()) this.#runtimeEvent(event);
@@ -316,8 +316,8 @@ class AgentFacade implements AgentApi {
   get participants(): readonly RemoteParticipant[] {
     return this.#remote.facade().participants;
   }
-  participant(id: string): RemoteParticipant {
-    return this.#remote.facade().participant(id);
+  room(name: string): RoomRef {
+    return this.#remote.room(name);
   }
   selectAudio(policy: AudioDemand) {
     return selectAudio(this.#resources, policy);
@@ -870,8 +870,7 @@ export class Agent implements AgentApi {
   readonly audio: AgentApi["audio"] = (label) => this.#raw.audio(label);
   readonly data: AgentApi["data"] = (label, delivery) =>
     this.#raw.data(label, delivery);
-  readonly participant: AgentApi["participant"] = (id) =>
-    this.#raw.participant(id);
+  readonly room: AgentApi["room"] = (name) => this.#raw.room(name);
   readonly selectAudio: AgentApi["selectAudio"] = (policy) =>
     this.#raw.selectAudio(policy);
   readonly isClosed = () => this.#raw.isClosed();

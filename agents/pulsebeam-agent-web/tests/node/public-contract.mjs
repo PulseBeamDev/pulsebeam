@@ -149,6 +149,214 @@ export async function publicContract(pulsebeam) {
     assert.equal(await replacement.next(), initialState);
     replacement.close();
     assert.equal(agent.state(), initialState, "observation is inert");
+    const participant = agent.room("observation-room").participant("alice");
+    const equivalent = agent.room("observation-room").participant("alice");
+    assert.equal(participant, equivalent);
+    assert.equal(participant.video("camera"), equivalent.video("camera"));
+    assert.equal(participant.audio("voice"), equivalent.audio("voice"));
+    assert.notEqual(
+      participant.video("camera"),
+      agent.room("other-room").participant("alice").video("camera"),
+    );
+    assert.notEqual(
+      participant.video("camera"),
+      agent.room("observation-room").participant("bob").video("camera"),
+    );
+    const defaultVideo = participant.video("default-camera").subscribe();
+    const defaultAudio = participant.audio("default-microphone").subscribe();
+    assert.equal(defaultVideo.state().localEnabled, true);
+    assert.equal(defaultVideo.state().configuration.visible, true);
+    assert.deepEqual(defaultAudio.state().playoutDelay, { tag: "Adaptive" });
+    await defaultVideo.configure({
+      visible: false,
+      height: 10,
+      minHeight: 0,
+      minFps: 0,
+      priority: 1,
+      playoutDelay: { mode: "fixed", minMs: 20, maxMs: 20 },
+    });
+    await defaultAudio.configure({
+      playoutDelay: { mode: "fixed", minMs: 20, maxMs: 20 },
+    });
+    await defaultVideo.configure();
+    await defaultAudio.configure();
+    assert.equal(defaultVideo.state().configuration.visible, true);
+    assert.deepEqual(defaultVideo.state().configuration.playoutDelay, {
+      tag: "Adaptive",
+    });
+    assert.deepEqual(defaultAudio.state().playoutDelay, { tag: "Adaptive" });
+    await defaultVideo.close();
+    await defaultAudio.close();
+    const videoConfig = {
+      visible: true,
+      height: 720,
+      minHeight: 360,
+      minFps: 15,
+      priority: 100,
+      playoutDelay: { mode: "fixed", minMs: 10, maxMs: 40 },
+    };
+    const audioConfig = {
+      playoutDelay: { mode: "fixed", minMs: 20, maxMs: 50 },
+    };
+    const subscriptions = [
+      {
+        handle: participant.video("camera").subscribe(videoConfig),
+        selector: {
+          room: "observation-room",
+          participantId: "alice",
+          label: "camera",
+        },
+        initial: {
+          ...videoConfig,
+          playoutDelay: { tag: "Fixed", inner: { minMs: 10, maxMs: 40 } },
+        },
+        changed: { ...videoConfig, height: 480 },
+        expected: {
+          ...videoConfig,
+          height: 480,
+          playoutDelay: { tag: "Fixed", inner: { minMs: 10, maxMs: 40 } },
+        },
+        field: "configuration",
+      },
+      {
+        handle: participant.audio("microphone").subscribe(audioConfig),
+        selector: {
+          room: "observation-room",
+          participantId: "alice",
+          label: "microphone",
+        },
+        initial: { tag: "Fixed", inner: { minMs: 20, maxMs: 50 } },
+        changed: { playoutDelay: { mode: "adaptive" } },
+        expected: { tag: "Adaptive" },
+        field: "playoutDelay",
+      },
+    ];
+    for (const {
+      handle,
+      selector,
+      initial,
+      changed,
+      expected,
+      field,
+    } of subscriptions) {
+      const first = handle.state();
+      assert.equal(first.closed, false);
+      assert.deepEqual(first.selector, selector);
+      assert.deepEqual(first[field], initial);
+      assert.equal(
+        first.sourceStatus,
+        pulsebeam.SubscriptionSourceStatus.Pending,
+      );
+      assert.equal(first.sourceTrackId, undefined);
+      assert.equal(handle.state(), first);
+      assert.equal(Object.isFrozen(first), true);
+      assert.equal(Object.isFrozen(first.selector), true);
+      assert.equal(Object.isFrozen(first[field]), true);
+      const delay =
+        field === "configuration"
+          ? first.configuration.playoutDelay
+          : first.playoutDelay;
+      assert.equal(Object.isFrozen(delay), true);
+      assert.equal(Object.isFrozen(delay.inner), true);
+      assert.throws(() => {
+        first.selector.label = "other";
+      }, TypeError);
+      const cursor = handle.updates();
+      const siblingCursor = handle.updates();
+      assert.equal(await cursor.next(), first);
+      assert.equal(await siblingCursor.next(), first);
+      cursor.close();
+      assert.equal(handle.isClosed(), false);
+      await handle.configure(changed);
+      const configured = handle.state();
+      assert.deepEqual(configured[field], expected);
+      assert.ok(configured.observationRevision > first.observationRevision);
+      assert.equal(handle.state(), configured);
+      assert.equal(await siblingCursor.next(), configured);
+      for (let index = 0; index < 16; ++index) {
+        const abort = new AbortController();
+        const cancelled = assert.rejects(
+          handle.observe(abort.signal),
+          (error) => error.code === "closed",
+        );
+        await setImmediate();
+        abort.abort();
+        await cancelled;
+        assert.equal(
+          handle.isClosed(),
+          false,
+          "cancelling output acquisition preserves reception",
+        );
+      }
+      const alreadyAborted = new AbortController();
+      alreadyAborted.abort();
+      await assert.rejects(
+        handle.observe(alreadyAborted.signal),
+        (error) => error.code === "closed",
+      );
+      await handle.close();
+      const final = handle.state();
+      assert.equal(final.closed, true);
+      assert.equal(handle.state(), final);
+      assert.equal(await siblingCursor.next(), final);
+      assert.equal(await siblingCursor.next(), undefined);
+      siblingCursor.close();
+    }
+    const localData = agent.data("owned-events", "ordered");
+    const publication = localData.publish();
+    const dataSubscription = participant
+      .data("owned-events", "ordered")
+      .subscribe();
+    const unrelatedData = participant.data("other-events", "lossy").subscribe();
+    assert.equal(publication instanceof Promise, false);
+    assert.equal(dataSubscription instanceof Promise, false);
+    const publicationState = publication.state();
+    const subscriptionState = dataSubscription.state();
+    assert.equal(publicationState.label, "owned-events");
+    assert.equal(publicationState.delivery, 2); // Core TopicMode.Ordered
+    assert.deepEqual(subscriptionState.selector, {
+      room: "observation-room",
+      participantId: "alice",
+      label: "owned-events",
+    });
+    assert.equal(subscriptionState.delivery, publicationState.delivery);
+    assert.equal(unrelatedData.state().delivery, 1); // Core TopicMode.Lossy
+    assert.throws(
+      () => localData.publish(),
+      (error) => {
+        assert.ok(error instanceof OperationError);
+        assert.equal(error.info.code, ErrorCode.Conflict);
+        return true;
+      },
+    );
+    await assert.rejects(publication.send(Uint8Array.of(0, 255)), (error) => {
+      assert.ok(error instanceof OperationError);
+      assert.equal(error.info.code, ErrorCode.NotReady);
+      assert.equal(Object.isFrozen(error.info), true);
+      return true;
+    });
+    const publicationUpdates = publication.updates();
+    const subscriptionUpdates = dataSubscription.updates();
+    assert.equal(await publicationUpdates.next(), publicationState);
+    assert.equal(await subscriptionUpdates.next(), subscriptionState);
+    const pendingData = dataSubscription.next();
+    await dataSubscription.close();
+    assert.deepEqual(await pendingData, { type: "closed" });
+    const closedSubscription = dataSubscription.state();
+    assert.equal(closedSubscription.closed, true);
+    assert.equal(await subscriptionUpdates.next(), closedSubscription);
+    assert.equal(await subscriptionUpdates.next(), undefined);
+    assert.equal(unrelatedData.state().closed, false);
+    assert.equal(publication.state().closed, false);
+    await publication.close();
+    const closedPublication = publication.state();
+    assert.equal(closedPublication.closed, true);
+    assert.equal(await publicationUpdates.next(), closedPublication);
+    assert.equal(await publicationUpdates.next(), undefined);
+    assert.equal(unrelatedData.state().closed, false);
+    publicationUpdates.close();
+    subscriptionUpdates.close();
+    await unrelatedData.close();
     const revision = agent.snapshot().desiredRevision;
     assert.equal(agent.snapshot().joinRevision, 0n);
     assert.equal(agent.snapshot().credentialRevision, 0n);
@@ -228,6 +436,17 @@ export async function publicContract(pulsebeam) {
     await agent.connect();
     await agent.disconnect();
     assert.equal(agent.isClosed(), false, "disconnect is not terminal");
+    const beforeRoomLookup = agent.snapshot();
+    const room = agent.room("conference-42");
+    const pinnedParticipant = room.participant("alice");
+    assert.equal(room.name, "conference-42");
+    assert.equal(pinnedParticipant.room, "conference-42");
+    assert.equal(pinnedParticipant.participantId, "alice");
+    assert.deepEqual(
+      agent.snapshot(),
+      beforeRoomLookup,
+      "room lookup is inert",
+    );
     const camera = agent.video("camera");
     assert.equal(agent.video("camera"), camera);
     for (const removed of [
@@ -237,14 +456,30 @@ export async function publicContract(pulsebeam) {
       "reconnect",
       "track",
       "remote",
+      "participant",
       "getSnapshot",
       "subscribe",
     ])
       assert.equal(removed in agent, false, `removed public ${removed}`);
-    const owner = await camera.publish(source, { enabled: true });
+    const owner = camera.publish({ enabled: true });
+    assert.equal(owner instanceof Promise, false);
+    const input = source.pipeTo(owner);
+    assert.equal(input instanceof Promise, false);
+    await input.close();
     await owner.close();
     assert.equal(borrowed.readyState, "live", "publication borrows capture");
-    const data = await agent.data("chat", "ordered").receive();
+    assert.equal("receive" in agent.data("chat", "ordered"), false);
+    assert.equal("send" in agent.data("chat", "ordered"), false);
+    assert.equal(
+      "receive" in
+        agent.room("room").participant("alice").data("chat", "ordered"),
+      false,
+    );
+    const data = await agent
+      .room("room")
+      .participant("alice")
+      .data("chat", "ordered")
+      .subscribe();
     const pending = data.next();
     const pendingSiblingSnapshot = sibling.next();
     const pendingSiblingEvent = siblingEvents.next();

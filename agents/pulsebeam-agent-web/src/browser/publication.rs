@@ -80,7 +80,7 @@ impl BrowserPipe {
                 config.clone(),
                 super::PublicationInputRequest {
                     owner: self.owner,
-                    muted: false,
+                    muted: None,
                     intent: agent_core::PublicationInputIntent::Retain(self.input),
                 },
             )
@@ -339,13 +339,13 @@ fn publication_state_value(state: &ffi::PublicationState) -> JsValue {
     value.into()
 }
 
-fn optional(value: Option<u64>) -> JsValue {
+pub(super) fn optional(value: Option<u64>) -> JsValue {
     value
         .map(|value| BigInt::from(value).into())
         .unwrap_or(JsValue::UNDEFINED)
 }
 
-fn error_value(info: &ffi::ErrorInfo) -> JsValue {
+pub(super) fn error_value(info: &ffi::ErrorInfo) -> JsValue {
     let value = Object::new();
     set(&value, "code", info.code as u32);
     set(&value, "message", info.message.clone());

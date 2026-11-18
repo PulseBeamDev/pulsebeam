@@ -1,13 +1,10 @@
 import type {
   AudioSource as WebAudioSource,
   VideoSource as WebVideoSource,
-  ReceiveOptions,
 } from "@pulsebeam/web";
-import { nativeSourceTrack } from "@pulsebeam/web/internal/react";
 
 const sourceBrand = Symbol("PulseBeam source");
 const publishableBrand = Symbol("PulseBeam publishable source");
-
 export interface VideoSource {
   readonly kind: "video";
   readonly [sourceBrand]: true;
@@ -22,128 +19,48 @@ export interface PublishableVideoSource extends VideoSource {
 export interface PublishableAudioSource extends AudioSource {
   readonly [publishableBrand]: true;
 }
-
-export interface VideoAttachment {
-  setAutoPlay(autoPlay: boolean): void;
-  setPreferences(preferences: ReceiveOptions): void;
-  close(): void;
-}
-type PlaybackError = (error: unknown, retry: () => Promise<void>) => void;
-export type VideoBinding = (
-  element: HTMLVideoElement,
-  onError: PlaybackError,
-  options: { autoPlay: boolean; preferences: ReceiveOptions },
-) => VideoAttachment;
-
-const videos = new WeakMap<VideoSource, VideoBinding>();
 const tracks = new WeakMap<object, WebVideoSource | WebAudioSource>();
 
-export function videoSource<T extends { readonly kind: "video" }>(
+function source<T extends { readonly kind: "video" | "audio" }>(
   value: T,
-  binding: VideoBinding,
-): T & VideoSource {
-  const source = Object.defineProperty(value, sourceBrand, {
-    value: true,
-  }) as T & VideoSource;
-  videos.set(source, binding);
-  return source;
+  track: WebVideoSource | WebAudioSource,
+) {
+  tracks.set(value, track);
+  Object.defineProperty(value, sourceBrand, { value: true });
+  return Object.defineProperty(value, publishableBrand, { value: true });
 }
-export function audioSource<T extends { readonly kind: "audio" }>(
-  value: T,
-): T & AudioSource {
-  return Object.defineProperty(value, sourceBrand, { value: true }) as T &
-    AudioSource;
-}
-export function attachVideoSource(
-  source: VideoSource,
-  ...args: Parameters<VideoBinding>
-): VideoAttachment {
-  const bind = videos.get(source);
-  if (!bind) throw new TypeError("invalid video source");
-  return bind(...args);
-}
-
 export function publishableVideoSource<T extends { readonly kind: "video" }>(
   value: T,
   track: WebVideoSource,
 ): T & PublishableVideoSource {
-  const source = videoSource(
-    value,
-    localVideoBinding(() => track),
-  );
-  tracks.set(source, track);
-  return Object.defineProperty(source, publishableBrand, { value: true }) as T &
-    PublishableVideoSource;
+  return source(value, track) as T & PublishableVideoSource;
 }
 export function publishableAudioSource<T extends { readonly kind: "audio" }>(
   value: T,
   track: WebAudioSource,
 ): T & PublishableAudioSource {
-  const source = audioSource(value);
-  tracks.set(source, track);
-  return Object.defineProperty(source, publishableBrand, { value: true }) as T &
-    PublishableAudioSource;
+  return source(value, track) as T & PublishableAudioSource;
 }
 export function publicationTrack(
-  source: PublishableVideoSource | PublishableAudioSource,
+  value: PublishableVideoSource | PublishableAudioSource,
   kind: "video" | "audio",
 ) {
-  const track = tracks.get(source);
-  if (!track || source.kind !== kind)
+  const track = tracks.get(value);
+  if (!track || value.kind !== kind)
     throw new TypeError(`invalid publishable ${kind} source`);
   return track;
 }
-
-export function releasePublicationSource(
-  source: PublishableVideoSource | PublishableAudioSource | null,
-): void {
-  if (source) void tracks.get(source)?.close();
+export function playbackTrack(
+  value: VideoSource | AudioSource | WebVideoSource | WebAudioSource,
+  kind: "video" | "audio",
+) {
+  const track = tracks.get(value) ?? ("pipeTo" in value ? value : undefined);
+  if (!track || track.kind !== kind)
+    throw new TypeError(`invalid ${kind} source`);
+  return track;
 }
-
-export function localVideoBinding(
-  read: () => WebVideoSource | null,
-  subscribe: (listener: () => void) => () => void = () => () => {},
-): VideoBinding {
-  return (element, onError, options) => {
-    let autoPlay = options.autoPlay;
-    let live = true;
-    let current: WebVideoSource | null | undefined;
-    let stream: MediaStream | null = null;
-    const play = () => {
-      const attached = stream;
-      const retry = async () => {
-        if (live && attached && stream === attached) await element.play();
-      };
-      void retry().catch((error: unknown) => {
-        if (live && stream === attached && autoPlay) onError(error, retry);
-      });
-    };
-    const sync = () => {
-      const next = read();
-      if (next === current) return;
-      current = next;
-      if (stream && element.srcObject === stream) element.srcObject = null;
-      const track = next ? nativeSourceTrack(next, "video") : null;
-      stream = track?.readyState === "live" ? new MediaStream([track]) : null;
-      if (!stream) return;
-      element.srcObject = stream;
-      if (autoPlay) play();
-    };
-    const unsubscribe = subscribe(sync);
-    sync();
-    return {
-      setAutoPlay(value) {
-        if (!live || value === autoPlay) return;
-        autoPlay = value;
-        if (autoPlay && stream) play();
-      },
-      setPreferences() {},
-      close() {
-        live = false;
-        unsubscribe();
-        if (stream && element.srcObject === stream) element.srcObject = null;
-        stream = null;
-      },
-    };
-  };
+export function releasePublicationSource(
+  value: PublishableVideoSource | PublishableAudioSource | null,
+): void {
+  if (value) void tracks.get(value)?.close();
 }

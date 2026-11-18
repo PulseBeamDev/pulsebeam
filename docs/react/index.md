@@ -36,17 +36,18 @@ Signing credentials never enter the browser.
 These concepts explain the quickstart after you have tried it:
 
 1. **Agent:** one room session handle for one participant. `useAgent` returns
-   a handle immediately and owns its runtime while the component is mounted.
+   null until its committed effect creates the actual Web SDK Agent, then owns
+   that handle and observation while mounted.
 2. **Capture:** `useCapture("device", options)` and
    `useCapture("display", options)` own local capture tracks. Start capture
    from a user gesture. Connect alone does not open devices.
 3. **Publication:** look up a local handle with `agent.video(label)` or
-   `agent.audio(label)` and mount `<Publish>` to own publication. Lookup alone
+   `agent.audio(label)` and pass it to `usePublish` to own publication. Lookup alone
    does not publish or reserve a slot.
-4. **Remote media:** `agent.remote.participants` exposes immutable participant
-   snapshots and their tracks. `Video` presents one video track and controls
-   reception while visible and nonzero-sized. Mount `<Audio agent={agent}>` to
-   own remote audio playback; a user gesture may be needed to retry it.
+4. **Remote media:** look up a known source with
+   `agent.room(room).participant(id).video(label)` or `.audio(label)`. Lookup is
+   inert and room-pinned. `useSubscribe` owns exact reception independently of
+   discovery and returns the SDK subscription; its `state()` reports execution.
 
 A room groups participants authorized to join it. The admitted external IDs are
 your application's room and participant identities, not opaque transport IDs.
@@ -54,10 +55,11 @@ The `camera` and `microphone` strings are labels chosen by your application,
 not protocol constants. Logical track handles use participant identity and label
 to follow media across temporary absence or replacement. Keep labels stable.
 
-For live application messages, use `agent.data(label, delivery)` and mount
-`<Data>` to own its event stream. To receive from one participant, use
-`agent.remote.participant(id).data(label, delivery)`. Data payloads are bytes; your application
-owns encoding, decoding, validation, and malformed-payload policy. It is not
+For live application messages, pass `agent.data(label, delivery)` to `usePublish`.
+To receive from one participant, pass
+`agent.room(room).participant(id).data(label, delivery)` to `useSubscribe` and read
+its typed events. Data payloads are bytes; your application owns encoding,
+decoding, validation, and malformed-payload policy. It is not
 durable message storage. See [data tracks](/react/guides#data-tracks) for
 publication, subscription cleanup, and recovery limits.
 
@@ -76,5 +78,5 @@ publication, subscription cleanup, and recovery limits.
 
 Use the [guides](/react/guides) when adding controls, and the
 [reference](/react/reference) for exact contracts. React owns Agents through
-`useAgent` only. Non-React applications use caller-owned `createAgent` from
+`useAgent` only. Non-React applications use caller-owned `new Agent(config)` from
 `@pulsebeam/web`; internal managed lifecycle functions are not public APIs.

@@ -71,7 +71,10 @@ async def witness():
         assert agent.snapshot().credential_revision == 1
         assert agent.snapshot().desired_room is None
         local = agent.data("control", core.TopicMode.ORDERED)
-        participant = agent.participant("remote")
+        room = agent.room("room")
+        assert isinstance(room, native.RoomRef) and room.name() == "room"
+        assert not hasattr(agent, "participant") and not hasattr(local, "receive")
+        participant = room.participant("remote")
         remote = participant.data("control", core.TopicMode.ORDERED)
         local_video = agent.video("camera")
         same_video = agent.video("camera")
@@ -94,7 +97,14 @@ async def witness():
         video_publication = local_video.publish()
         assert not inspect.isawaitable(video_publication)
         assert video_publication.state().configuration.enabled is True
-        await video_publication.set_source(video_source)
+        pipe = video_source.pipe_to(video_publication)
+        assert not inspect.isawaitable(pipe)
+        assert isinstance(pipe, native.Pipe)
+        pipe_updates = pipe.updates()
+        initial_pipe = pipe.state()
+        assert isinstance(pipe_updates, native.PipeUpdates)
+        assert isinstance(initial_pipe.status, core.PipeStatus)
+        assert (await pipe_updates.next()).observation_revision == initial_pipe.observation_revision
         publication_updates = video_publication.updates()
         initial_publication = video_publication.state()
         assert isinstance(publication_updates, native.PublicationUpdates)
@@ -123,8 +133,18 @@ async def witness():
         assert video_publication.state().configuration.enabled is True
         await video_publication.configure(core.PublicationConfig(enabled=False))
         assert video_publication.state().configuration.enabled is False
-        await video_publication.set_source(None)
-        await video_publication.set_source(video_source)
+        unrelated_data = local.publish()
+        unrelated_data.close()
+        assert unrelated_data.state().closed
+        assert pipe.state().status != core.PipeStatus.CLOSED
+        assert not video_publication.state().closed and video_publication.state().input_attached
+        assert not video_source.is_closed(), "unrelated resource close stopped borrowed producer"
+        await pipe.close()
+        assert pipe.state().status == core.PipeStatus.CLOSED
+        assert (await pipe_updates.next()).status == core.PipeStatus.CLOSED
+        assert await pipe_updates.next() is None
+        pipe_updates.close()
+        assert not video_source.is_closed(), "pipe close stopped borrowed producer"
         pending_bound = asyncio.create_task(video_publication.ready())
         await video_publication.close()
         assert video_publication.state().closed
@@ -167,36 +187,132 @@ async def witness():
             pass
         else:
             raise AssertionError("unallocated input accepted a frame")
-        video_subscription = await remote_video.subscribe(core.VideoObservation(
+        closed_before_admission = remote_video.subscribe(core.VideoObservation(
             visible=False, height=0, min_height=0, min_fps=0, priority=1,
             playout_delay=core.PlayoutDelay.ADAPTIVE(),
         ))
-        audio_subscription = await remote_audio.subscribe(core.AudioSubscriptionConfig(
+        assert not inspect.isawaitable(closed_before_admission)
+        await closed_before_admission.close()
+        assert closed_before_admission.is_closed()
+        explicit_audio = remote_audio.subscribe(core.AudioSubscriptionConfig(
             playout_delay=core.PlayoutDelay.ADAPTIVE(),
         ))
+        await explicit_audio.close()
+        video_subscription = remote_video.subscribe()
+        assert not inspect.isawaitable(video_subscription)
+        audio_subscription = remote_audio.subscribe()
+        assert not inspect.isawaitable(audio_subscription)
+        video_state = video_subscription.state()
+        audio_state = audio_subscription.state()
+        assert isinstance(video_state, core.VideoSubscriptionState)
+        assert isinstance(audio_state, core.AudioSubscriptionState)
+        assert video_state.configuration == core.VideoObservation(
+            visible=True, height=0, min_height=0, min_fps=0, priority=0,
+            playout_delay=core.PlayoutDelay.ADAPTIVE(),
+        )
+        assert audio_state.playout_delay.is_ADAPTIVE()
+        video_updates = video_subscription.updates()
+        audio_updates = audio_subscription.updates()
+        assert isinstance(video_updates, native.VideoSubscriptionUpdates)
+        assert isinstance(audio_updates, native.AudioSubscriptionUpdates)
+        assert (await video_updates.next()).observation_revision == video_state.observation_revision
+        assert (await audio_updates.next()).observation_revision == audio_state.observation_revision
         audio_selection = await agent.select_audio(core.AudioDemand(
             pinned=[], selected=[], automatic=False, playout_delays=[], selector_delays=[],
         ))
         await audio_selection.close()
         assert not audio_subscription.is_closed(), "selection close retired named audio demand"
+        frame_readers = []
+        pending_frames = []
+        for subscription, reader_type in (
+            (video_subscription, native.VideoFrames),
+            (audio_subscription, native.AudioFrames),
+        ):
+            reader = subscription.frames()
+            assert isinstance(reader, reader_type) and not inspect.isawaitable(reader)
+            try:
+                subscription.frames()
+            except native.NativeError.Operation as error:
+                assert error.info.code == core.ErrorCode.CONFLICT
+            else:
+                raise AssertionError("second active frame reader was admitted")
+            reads = {asyncio.create_task(reader.next()), asyncio.create_task(reader.next())}
+            done, pending = await asyncio.wait(reads, return_when=asyncio.FIRST_COMPLETED)
+            assert len(done) == 1 and len(pending) == 1, "inert frame reads did not leave one pending"
+            try:
+                await done.pop()
+            except native.NativeError.Operation as error:
+                assert error.info.code == core.ErrorCode.CONFLICT
+            else:
+                raise AssertionError("concurrent frame read was admitted")
+            assert reader.close() is None
+            assert await pending.pop() is None
+            assert not subscription.is_closed(), "reader close retired subscription"
+            replacement = subscription.frames()
+            assert isinstance(replacement, reader_type) and not inspect.isawaitable(replacement)
+            frame_readers.append(replacement)
+            pending_frames.append(asyncio.create_task(replacement.next()))
         pending_media = asyncio.create_task(video_subscription.observe(native.ReceiveMode.DECODED))
+        assert not hasattr(local, "send"), "inert data address exposed send"
+        assert not hasattr(remote, "receive"), "inert data address exposed receive"
+        data_publication = local.publish()
+        assert not inspect.isawaitable(data_publication)
+        data_state = data_publication.state()
+        assert isinstance(data_state, core.DataPublicationState)
+        assert data_state.label == "control" and data_state.delivery == core.TopicMode.ORDERED
+        data_updates = data_publication.updates()
+        sibling_data_updates = data_publication.updates()
+        assert isinstance(data_updates, native.DataPublicationUpdates)
+        assert (await data_updates.next()).observation_revision == data_state.observation_revision
+        assert (await sibling_data_updates.next()).observation_revision == data_state.observation_revision
+        data_updates.close()
         try:
-            await local.send(bytes([0, 255]))
+            agent.data("control", core.TopicMode.ORDERED).publish()
         except native.NativeError.Resource as error:
-            assert error.reason.is_NOT_CONNECTED()
+            assert error.reason.is_ALREADY_OWNED()
+        else:
+            raise AssertionError("duplicate data publication was admitted")
+        try:
+            await data_publication.send(bytes([0, 255]))
+        except native.NativeError.Operation as error:
+            assert error.info.code == core.ErrorCode.NOT_READY
         else:
             raise AssertionError("disconnected data send was admitted")
-        closed_cursor = await local.receive()
-        room_cursor = await local.receive()
-        participant_cursor = await remote.receive()
+        data_publication.close()
+        assert data_publication.state().closed
+        assert (await sibling_data_updates.next()).closed
+        assert await sibling_data_updates.next() is None
+        sibling_data_updates.close()
+        try:
+            await data_publication.send(bytes([0, 255]))
+        except native.NativeError.Operation as error:
+            assert error.info.code == core.ErrorCode.CLOSED
+        else:
+            raise AssertionError("closed data publication accepted a send")
+        replacement_data = local.publish()
+        replacement_data.close()
+        closed_cursor = remote.subscribe()
+        independent_cursor = remote.subscribe()
+        participant_cursor = remote.subscribe()
+        assert not any(inspect.isawaitable(cursor) for cursor in (
+            closed_cursor, independent_cursor, participant_cursor,
+        ))
+        receiver_state = closed_cursor.state()
+        receiver_updates = closed_cursor.updates()
+        assert isinstance(receiver_state, core.DataSubscriptionState)
+        assert isinstance(receiver_updates, native.DataSubscriptionUpdates)
+        assert (await receiver_updates.next()).observation_revision == receiver_state.observation_revision
         pending_close = asyncio.create_task(closed_cursor.next())
         await closed_cursor.close()
         await closed_cursor.close()
         assert (await pending_close).is_CLOSED()
         assert closed_cursor.is_closed()
-        assert not room_cursor.is_closed()
+        assert closed_cursor.state().closed and (await receiver_updates.next()).closed
+        assert await receiver_updates.next() is None
+        receiver_updates.close()
+        assert not independent_cursor.is_closed()
         assert not participant_cursor.is_closed()
-        pending_room = asyncio.create_task(room_cursor.next())
+        pending_independent = asyncio.create_task(independent_cursor.next())
         pending_participant = asyncio.create_task(participant_cursor.next())
         snapshots = agent.snapshots()
         events = agent.events()
@@ -217,13 +333,17 @@ async def witness():
         pending_event = asyncio.create_task(events.next())
         await agent.disconnect()
         assert not agent.is_closed(), "disconnect was terminal"
-        assert not room_cursor.is_closed()
+        assert not independent_cursor.is_closed()
         assert not participant_cursor.is_closed()
         await agent.close()
         await agent.close()
         assert agent.is_closed()
         assert audio_source.is_closed() and audio_publication.is_closed()
         assert audio_subscription.is_closed() and video_subscription.is_closed()
+        for reader, pending in zip(frame_readers, pending_frames):
+            assert await pending is None
+            assert await reader.next() is None
+            assert reader.close() is None
         try:
             await pending_media
         except native.NativeError.Closed:
@@ -232,7 +352,7 @@ async def witness():
             raise AssertionError("terminal close did not end pending media acquisition")
         assert (await pending_snapshot).is_CLOSED()
         assert (await pending_event).is_CLOSED()
-        assert (await pending_room).is_CLOSED()
+        assert (await pending_independent).is_CLOSED()
         assert (await pending_participant).is_CLOSED()
         try:
             agent.join("room")
@@ -240,6 +360,11 @@ async def witness():
             assert error.info.code == core.ErrorCode.CLOSED
         else:
             raise AssertionError("closed Agent revived")
+        assert video_subscription.state().closed and (await video_updates.next()).closed
+        assert audio_subscription.state().closed and (await audio_updates.next()).closed
+        assert await video_updates.next() is None and await audio_updates.next() is None
+        video_updates.close()
+        audio_updates.close()
         final_audio_publication = await pending_audio_publication
         assert final_audio_publication.closed and audio_publication.state().closed
         assert await audio_publication_updates.next() is None

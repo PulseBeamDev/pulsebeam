@@ -109,6 +109,7 @@ impl Transition {
             let mut expected = ExpectedParticipant {
                 id: id.parse()?,
                 room: handle.room_name,
+                external_id: handle.endpoint.clone(),
                 video: handle.publishes_video,
                 video_label: handle.shared.video_label.lock().unwrap().clone(),
                 audio: handle.publishes_audio,

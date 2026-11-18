@@ -40,10 +40,17 @@ test("production attachment reports controlled geometry and visibility to core",
   const pending = new Map();
   const owners = new ResourceOwners(() => {});
   owners.activate({
+    video_subscription: () => ({
+      state() {},
+      updates: () => ({ async next() {}, close() {} }),
+    }),
     async observe_media(owner) {
       return new Promise((_resolve, reject) => pending.set(owner, reject));
     },
     async resource(command) {
+      return this.resource_now(command);
+    },
+    resource_now(command) {
       if (command.op === "claimVideo") return { owner: nextOwner++ };
       if (command.op === "observeVideo") {
         observations.set(command.owner, command.observation);
@@ -65,7 +72,7 @@ test("production attachment reports controlled geometry and visibility to core",
   snapshot.catalog.tracks = snapshot.catalog.publications;
   const catalog = new RemoteCatalog(agent, new DataRegistry(agent), owners);
   catalog.update(snapshot);
-  const handle = catalog.participant("alice").video("camera");
+  const handle = catalog.room("room").participant("alice").video("camera");
   const parent = new Video();
   const small = new Video();
   small.parentElement = parent;

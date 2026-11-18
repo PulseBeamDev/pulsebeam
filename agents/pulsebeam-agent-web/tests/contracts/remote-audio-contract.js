@@ -98,6 +98,7 @@
       participantId: "alice",
     });
     let snapshot = {
+      roomId: "room",
       connection: "connected",
       participantId: "self",
       catalog: {
@@ -175,7 +176,7 @@
         decoderStream.getAudioTracks()[0] === received[0],
       "one private detached hidden muted receiver decoder",
     );
-    const voice = catalog.participant("alice").audio("first");
+    const voice = catalog.room("room").participant("alice").audio("first");
     const spectrum = new Float32Array(1024);
     voice.readSpectrum(spectrum);
     assert(

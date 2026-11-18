@@ -315,6 +315,7 @@ pub(in crate::participant::core) fn frame_for(
                 value: Some(value),
             }),
         }],
+        ..Default::default()
     })
     .unwrap()
 }

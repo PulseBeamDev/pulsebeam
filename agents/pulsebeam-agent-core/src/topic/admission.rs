@@ -13,12 +13,12 @@ use crate::{
 
 const SEND_ADMISSION_WINDOW: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, uniffi::Enum)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, uniffi::Enum)]
 pub enum DataSendFailure {
     #[error("data send was disconnected")]
     Disconnected,
     #[error("data send failed with the connection")]
-    TerminalFailure,
+    TerminalFailure { error: crate::ffi::ErrorInfo },
     #[error("data send admission timed out")]
     TimedOut,
     #[error("data send generation or authoritative binding was replaced")]
@@ -134,8 +134,10 @@ impl Topics {
                 .and_then(|state| state.data_track_id.clone());
             let failure = if !connected_intent {
                 Some(DataSendFailure::Disconnected)
-            } else if snapshot.terminal_failure.is_some() {
-                Some(DataSendFailure::TerminalFailure)
+            } else if let Some(failure) = &snapshot.terminal_failure {
+                Some(DataSendFailure::TerminalFailure {
+                    error: failure.into(),
+                })
             } else if admission.generation.is_some() && admission.generation != generation
                 || admission.binding.is_some() && admission.binding != binding
             {
@@ -280,7 +282,7 @@ impl Topics {
             })
             .collect::<Vec<_>>();
         for ticket in tickets {
-            self.finish_data_send(ticket, Some(error), effects, notifications);
+            self.finish_data_send(ticket, Some(error.clone()), effects, notifications);
         }
     }
 

@@ -2,11 +2,6 @@ import assert from "node:assert/strict";
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Data, useAgent, type Agent, type DataEvent } from "../../src/index.js";
-import {
-  createReactAgent,
-  managedAgent,
-  trackIdentity,
-} from "../../src/agent.js";
 import { deferred, flush } from "./platform.js";
 import { runtimes } from "./runtime.js";
 
@@ -47,13 +42,16 @@ export async function dataLifetimes() {
       generation: 0,
     });
     update = (patch) => setState((before) => ({ ...before, ...patch }));
-    const equivalent = createReactAgent(managedAgent(agent));
+    const equivalent = agent;
     return (
       <>
         {state.mounted && (
           <Data
             key={state.generation}
-            track={equivalent.data(state.label, "ordered")}
+            track={equivalent
+              .room("selected-room")
+              .participant("alice")
+              .data(state.label, "ordered")}
             onEvent={async (event) => {
               assert.equal(event.type, "message");
               if (event.type !== "message") return;
@@ -69,7 +67,10 @@ export async function dataLifetimes() {
           />
         )}
         <Data
-          track={agent.data("chat", "ordered")}
+          track={agent
+            .room("selected-room")
+            .participant("alice")
+            .data("chat", "ordered")}
           onEvent={(event) => {
             assert.equal(event.type, "message");
             if (event.type !== "message") return;
@@ -94,23 +95,19 @@ export async function dataLifetimes() {
       ),
     );
     const runtime = runtimes.at(-1)!;
-    const room = trackIdentity(agent.data("chat", "ordered"));
-    assert.equal(
-      room,
-      trackIdentity(
-        createReactAgent(managedAgent(agent)).data("chat", "ordered"),
-      ),
-    );
-    assert.notEqual(room, trackIdentity(agent.data("chat", "lossy")));
-    assert.notEqual(room, trackIdentity(agent.video("chat")));
-    assert.notEqual(room, trackIdentity(agent.data("other", "ordered")));
-    const participant = trackIdentity(
-      agent.participant("alice").data("chat", "ordered"),
-    );
+    const room = agent.data("chat", "ordered");
+    assert.equal(room, agent.data("chat", "ordered"));
+    assert.notEqual(room, agent.data("chat", "lossy"));
+    assert.notEqual(room, agent.video("chat"));
+    assert.notEqual(room, agent.data("other", "ordered"));
+    const participant = agent
+      .room("selected-room")
+      .participant("alice")
+      .data("chat", "ordered");
     assert.notEqual(room, participant);
     assert.notEqual(
       participant,
-      trackIdentity(agent.participant("bob").data("chat", "ordered")),
+      agent.room("selected-room").participant("bob").data("chat", "ordered"),
     );
     const owners = [...runtime.dataOwners.keys()];
     assert.equal(owners.length, 2);
@@ -217,7 +214,10 @@ export async function staleDataClaims() {
     mount = setMounted;
     return mounted ? (
       <Data
-        track={agent.data("late", "ordered")}
+        track={agent
+          .room("selected-room")
+          .participant("alice")
+          .data("late", "ordered")}
         onEvent={(event) => {
           calls.push(event);
         }}

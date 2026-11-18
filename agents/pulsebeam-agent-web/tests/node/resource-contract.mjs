@@ -53,7 +53,8 @@ export async function resourceContract(BrowserRuntime) {
       present: true,
     });
     const spec = { kind: "data", label: "events", delivery: "ordered" };
-    const receiver = await resource({ op: "receiveData", spec });
+    const source = { room: "room", participantId: "alice", label: "events" };
+    const receiver = await resource({ op: "receiveData", spec, source });
     assert.equal(
       await resource({ op: "readData", owner: receiver.owner }),
       null,
@@ -73,7 +74,9 @@ export async function resourceContract(BrowserRuntime) {
     });
     await resource({ op: "release", owner: replacementAudio.owner });
     const concurrent = await Promise.all(
-      Array.from({ length: 40 }, () => resource({ op: "receiveData", spec })),
+      Array.from({ length: 40 }, () =>
+        resource({ op: "receiveData", spec, source }),
+      ),
     );
     assert.equal(runtime.snapshot().topics.subscribers.length, 1);
     await Promise.all(
@@ -94,7 +97,7 @@ export async function resourceContract(BrowserRuntime) {
         publish: true,
       })),
     });
-    const additional = await resource({ op: "receiveData", spec });
+    const additional = await resource({ op: "receiveData", spec, source });
     const declared = runtime.snapshot().topics.publishers;
     assert.equal(declared.length, 64);
     assert.equal(runtime.snapshot().topics.subscribers.length, 1);

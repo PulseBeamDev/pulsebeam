@@ -8,8 +8,10 @@ use crate as model;
 
 mod pipe;
 mod publication;
+mod subscription;
 pub use pipe::*;
 pub use publication::*;
+pub use subscription::*;
 
 uniffi::setup_scaffolding!();
 
@@ -124,6 +126,7 @@ pub struct AudioTrackDelay {
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct TrackSelector {
+    pub room: String,
     pub participant_id: String,
     pub label: String,
 }
@@ -159,6 +162,8 @@ pub struct TopicPublisher {
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct TopicSubscriber {
+    pub room: String,
+    pub participant_id: String,
     pub name: String,
     pub mode: TopicMode,
 }
@@ -363,9 +368,38 @@ impl From<&model::Snapshot> for AgentState {
     }
 }
 
+impl From<&crate::DataSendFailure> for ErrorInfo {
+    fn from(failure: &crate::DataSendFailure) -> Self {
+        use crate::DataSendFailure;
+        let (code, message) = match failure {
+            DataSendFailure::Disconnected => (ErrorCode::NotReady, "Data send is disconnected"),
+            DataSendFailure::TimedOut => (ErrorCode::NotReady, "Data send admission timed out"),
+            DataSendFailure::TransportReplaced => {
+                (ErrorCode::NotReady, "Data send target was replaced")
+            }
+            DataSendFailure::Superseded => (ErrorCode::NotReady, "Data send was superseded"),
+            DataSendFailure::TerminalFailure { error } => return error.clone(),
+            DataSendFailure::ChannelFailed => {
+                (ErrorCode::ConnectionFailed, "Data send channel failed")
+            }
+            DataSendFailure::HostRejected => (
+                ErrorCode::ConnectionFailed,
+                "Data send was rejected by the host",
+            ),
+            DataSendFailure::QueueFull => (ErrorCode::CapacityExceeded, "Data send queue is full"),
+            DataSendFailure::SequenceExhausted => (
+                ErrorCode::CapacityExceeded,
+                "Data send sequence space is exhausted",
+            ),
+        };
+        Self::new(code, message)
+    }
+}
+
 impl From<&model::AgentError> for ErrorInfo {
     fn from(error: &model::AgentError) -> Self {
         let (code, message) = match error {
+            model::AgentError::OperationFailed(info) => return info.clone(),
             model::AgentError::Replaced => (ErrorCode::Replaced, "Agent was replaced"),
             model::AgentError::CredentialRevisionExhausted => {
                 (ErrorCode::CapacityExceeded, "Revision space exhausted")
@@ -384,6 +418,9 @@ impl From<&model::AgentError> for ErrorInfo {
             model::AgentError::InvalidResource(model::TrackResourceError::Released) => {
                 (ErrorCode::Closed, "Resource is closed")
             }
+            model::AgentError::InvalidResource(model::TrackResourceError::ReceiveFailed(info)) => {
+                return info.clone();
+            }
             model::AgentError::InvalidResource(model::TrackResourceError::NotConnected) => {
                 (ErrorCode::NotReady, "Connection is not ready")
             }
@@ -394,6 +431,12 @@ impl From<&model::AgentError> for ErrorInfo {
                 | model::TrackResourceError::PublicationCapacityExceeded
                 | model::TrackResourceError::SlotSpaceExhausted { .. },
             ) => (ErrorCode::CapacityExceeded, "Resource capacity exceeded"),
+            model::AgentError::InvalidTopic(
+                model::TopicError::SendQueueFull(_) | model::TopicError::SequenceExhausted(_),
+            ) => (ErrorCode::CapacityExceeded, "Data send capacity exceeded"),
+            model::AgentError::InvalidTopic(model::TopicError::PublisherUnavailable(_)) => {
+                (ErrorCode::NotReady, "Data publisher is not ready")
+            }
             model::AgentError::InvalidConfiguration(_)
             | model::AgentError::InvalidAuthorizationToken
             | model::AgentError::InvalidOffer(_)
@@ -424,6 +467,12 @@ pub enum FailureClass {
 pub struct Failure {
     pub class: FailureClass,
     pub message: String,
+}
+
+impl From<&model::Failure> for ErrorInfo {
+    fn from(failure: &model::Failure) -> Self {
+        Self::from(&Failure::from(failure.clone()))
+    }
 }
 
 impl From<&Failure> for ErrorInfo {
@@ -546,6 +595,7 @@ pub enum TopicDropReason {
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct TopicMessage {
+    pub room: String,
     pub name: String,
     pub mode: TopicMode,
     pub data_track_id: String,
@@ -596,7 +646,7 @@ pub enum Notification {
     },
     DataSendFinished {
         send: u64,
-        error: Option<String>,
+        error: Option<ErrorInfo>,
     },
     Topic {
         notification: TopicNotification,
@@ -665,6 +715,7 @@ pub enum ResourceFailure {
     InvalidPlayoutDelay,
     ReceiveOverflow,
     ReceiveChannelFailed { message: String },
+    ReceiveFailed { error: ErrorInfo },
 }
 
 impl From<model::TrackResourceError> for ResourceFailure {
@@ -696,6 +747,7 @@ impl From<model::TrackResourceError> for ResourceFailure {
             model::TrackResourceError::ReceiveChannelFailed(message) => {
                 Self::ReceiveChannelFailed { message }
             }
+            model::TrackResourceError::ReceiveFailed(error) => Self::ReceiveFailed { error },
         }
     }
 }
@@ -985,6 +1037,7 @@ impl From<model::AudioSubscription> for AudioDemand {
 impl From<TrackSelector> for model::TrackSelector {
     fn from(value: TrackSelector) -> Self {
         Self {
+            room: value.room,
             participant_external_id: value.participant_id,
             label: value.label,
         }
@@ -994,6 +1047,7 @@ impl From<TrackSelector> for model::TrackSelector {
 impl From<model::TrackSelector> for TrackSelector {
     fn from(value: model::TrackSelector) -> Self {
         Self {
+            room: value.room,
             participant_id: value.participant_external_id,
             label: value.label,
         }
@@ -1059,6 +1113,8 @@ impl From<model::TopicPublisher> for TopicPublisher {
 impl From<TopicSubscriber> for model::TopicSubscriber {
     fn from(value: TopicSubscriber) -> Self {
         Self {
+            room: value.room,
+            participant_external_id: value.participant_id,
             topic: value.name,
             mode: value.mode.into(),
         }
@@ -1068,6 +1124,8 @@ impl From<TopicSubscriber> for model::TopicSubscriber {
 impl From<model::TopicSubscriber> for TopicSubscriber {
     fn from(value: model::TopicSubscriber) -> Self {
         Self {
+            room: value.room,
+            participant_id: value.participant_external_id,
             name: value.topic,
             mode: value.mode.into(),
         }
@@ -1270,6 +1328,7 @@ impl From<model::TopicDropReason> for TopicDropReason {
 impl From<model::TopicMessage> for TopicMessage {
     fn from(value: model::TopicMessage) -> Self {
         Self {
+            room: value.room,
             name: value.topic,
             mode: value.mode.into(),
             data_track_id: value.data_track_id,
@@ -1343,7 +1402,7 @@ impl From<model::Notification> for Notification {
             model::Notification::DataReady { owners } => Self::DataReady { owners },
             model::Notification::DataSendFinished { send, error } => Self::DataSendFinished {
                 send: send.get(),
-                error: error.map(|error| error.to_string()),
+                error: error.map(|error| ErrorInfo::from(&error)),
             },
             model::Notification::Topic(notification) => Self::Topic {
                 notification: notification.into(),
@@ -1369,6 +1428,7 @@ impl From<model::AgentError> for AgentError {
             model::AgentError::RenewalBusy => AgentOperationErrorCode::RenewalBusy,
             model::AgentError::InvalidTopic(_) => AgentOperationErrorCode::InvalidTopic,
             model::AgentError::RenewalNotReady
+            | model::AgentError::OperationFailed(_)
             | model::AgentError::Replaced
             | model::AgentError::CredentialRevisionExhausted
             | model::AgentError::InvalidOffer(_)
@@ -1596,6 +1656,7 @@ mod tests {
     fn notification_conversion_keeps_topic_payload_and_identity() {
         let notification =
             model::Notification::Topic(model::TopicNotification::Message(model::TopicMessage {
+                room: "room".into(),
                 topic: "chat".to_string(),
                 mode: model::TopicMode::Ordered,
                 participant_id: "participant".to_string(),
@@ -1608,6 +1669,7 @@ mod tests {
             Notification::Topic {
                 notification: TopicNotification::Message {
                     message: TopicMessage {
+                        room: "room".into(),
                         name: "chat".to_string(),
                         mode: TopicMode::Ordered,
                         participant_id: "participant".to_string(),
@@ -1627,6 +1689,8 @@ mod tests {
             mode: TopicMode::Ordered,
         };
         let subscriber = TopicSubscriber {
+            room: "room".into(),
+            participant_id: "remote".into(),
             name: "chat".to_string(),
             mode: TopicMode::Ordered,
         };
@@ -1718,6 +1782,7 @@ mod tests {
             crate::VideoObservation::default()
         );
         let selector = TrackSelector {
+            room: "room".into(),
             participant_id: "web-sender".to_string(),
             label: "camera".to_string(),
         };
@@ -1990,6 +2055,82 @@ mod tests {
             assert_eq!(info.code, code);
             assert_ffi_round_trip(info);
         }
+        for (failure, code) in [
+            (crate::DataSendFailure::Disconnected, ErrorCode::NotReady),
+            (crate::DataSendFailure::TimedOut, ErrorCode::NotReady),
+            (
+                crate::DataSendFailure::TransportReplaced,
+                ErrorCode::NotReady,
+            ),
+            (crate::DataSendFailure::Superseded, ErrorCode::NotReady),
+            (
+                crate::DataSendFailure::TerminalFailure {
+                    error: ErrorInfo::new(ErrorCode::ConnectionFailed, "Connection interrupted"),
+                },
+                ErrorCode::ConnectionFailed,
+            ),
+            (
+                crate::DataSendFailure::TerminalFailure {
+                    error: ErrorInfo::new(ErrorCode::PermissionDenied, "Authorization failed"),
+                },
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                crate::DataSendFailure::TerminalFailure {
+                    error: ErrorInfo::new(ErrorCode::Replaced, "Agent was replaced"),
+                },
+                ErrorCode::Replaced,
+            ),
+            (
+                crate::DataSendFailure::ChannelFailed,
+                ErrorCode::ConnectionFailed,
+            ),
+            (
+                crate::DataSendFailure::HostRejected,
+                ErrorCode::ConnectionFailed,
+            ),
+            (
+                crate::DataSendFailure::QueueFull,
+                ErrorCode::CapacityExceeded,
+            ),
+            (
+                crate::DataSendFailure::SequenceExhausted,
+                ErrorCode::CapacityExceeded,
+            ),
+        ] {
+            let info = ErrorInfo::from(&failure);
+            assert_eq!(info.code, code);
+            assert!(info.message.len() <= 256);
+            assert_eq!(
+                ErrorInfo::from(&model::AgentError::OperationFailed(info.clone())),
+                info,
+            );
+            assert_ffi_round_trip(Notification::DataSendFinished {
+                send: 1,
+                error: Some(info.clone()),
+            });
+            assert_ffi_round_trip(info);
+            assert_ffi_round_trip(failure);
+        }
+        for (error, code) in [
+            (
+                model::TopicError::SendQueueFull("private-topic".into()),
+                ErrorCode::CapacityExceeded,
+            ),
+            (
+                model::TopicError::SequenceExhausted("private-topic".into()),
+                ErrorCode::CapacityExceeded,
+            ),
+            (
+                model::TopicError::PublisherUnavailable("private-topic".into()),
+                ErrorCode::NotReady,
+            ),
+        ] {
+            let info = ErrorInfo::from(&model::AgentError::InvalidTopic(error));
+            assert_eq!(info.code, code);
+            assert!(!info.message.contains("private-topic"));
+            assert_ffi_round_trip(info);
+        }
         let expired = ErrorInfo::from(&Failure {
             class: FailureClass::ResourceExpired,
             message: "untrusted credential or proof details".into(),
@@ -2007,6 +2148,7 @@ mod tests {
         }
         for mode in [TopicMode::Latest, TopicMode::Lossy, TopicMode::Ordered] {
             assert_ffi_round_trip(TopicMessage {
+                room: "room".into(),
                 name: "chat".to_string(),
                 mode,
                 participant_id: "participant".to_string(),
@@ -2020,6 +2162,8 @@ mod tests {
             mode: TopicMode::Ordered,
         };
         let subscriber = TopicSubscriber {
+            room: "room".into(),
+            participant_id: "remote".into(),
             name: "chat".to_string(),
             mode: TopicMode::Ordered,
         };
@@ -2036,6 +2180,7 @@ mod tests {
             },
             TopicNotification::Message {
                 message: TopicMessage {
+                    room: "room".into(),
                     name: "chat".to_string(),
                     mode: TopicMode::Latest,
                     data_track_id: "data-track".to_string(),

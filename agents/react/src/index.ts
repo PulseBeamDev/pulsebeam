@@ -1,14 +1,14 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Agent, type AgentConfig } from "@pulsebeam/web";
 import { sessionKey } from "./session-key.js";
-import { createReactAgent, type Agent } from "./agent.js";
-import type { AgentConfig } from "@pulsebeam/web";
-import {
-  createManagedAgent,
-  type ManagedAgent,
-} from "@pulsebeam/web/internal/react";
+import { useObservation } from "./observation.js";
 
+export { usePublish, useSubscribe } from "./hooks.js";
 export type {
+  Agent,
   AgentConfig,
+  AgentState,
+  AgentUpdates,
   AudioDemand,
   AgentError,
   AgentLogging,
@@ -16,33 +16,50 @@ export type {
   DataEvent,
   DataGap,
   DataMessage,
+  DataUpdate,
   Delivery,
   FailureClass,
   LogLevel,
   PlaybackFailure,
   ReceiveOptions,
-} from "@pulsebeam/web";
-export type {
-  Agent,
+  ErrorInfo,
   LocalAudioTrack,
   LocalVideoTrack,
   LocalDataTrack,
   RemoteAudioTrack,
   RemoteDataTrack,
   RemoteParticipant,
-  RemoteTrack,
+  RoomRef,
+  RemotePublishedTrack,
   RemoteVideoTrack,
-} from "./agent.js";
-export { Publish, Data, Audio, SelectAudio } from "./ownership.js";
+  AudioPublication,
+  VideoPublication,
+  DataPublication,
+  AudioSubscription,
+  VideoSubscription,
+  DataSubscription,
+  PublicationConfig,
+  VideoObservation,
+  AudioSubscriptionConfig,
+  PublicationState,
+  VideoSubscriptionState,
+  AudioSubscriptionState,
+  DataPublicationState,
+  DataSubscriptionState,
+  PublicationUpdates,
+  VideoSubscriptionUpdates,
+  AudioSubscriptionUpdates,
+  DataPublicationUpdates,
+  DataSubscriptionUpdates,
+} from "@pulsebeam/web";
+export { Data, SelectAudio } from "./ownership.js";
 export type {
-  AudioProps,
   SelectAudioProps,
   DataProps,
   PublicationSource,
-  PublishProps,
 } from "./ownership.js";
-export { Video } from "./playback.js";
-export type { VideoProps, PlaybackError } from "./playback.js";
+export { Video, Audio } from "./playback.js";
+export type { VideoProps, AudioProps, PlaybackError } from "./playback.js";
 export { useDevices, useCapture, MediaCaptureError } from "./capture.js";
 export type {
   AudioCaptureSettings,
@@ -63,8 +80,8 @@ export function useAgent(config: AgentConfig): Agent | null {
   const key = sessionKey(config);
   const [owned, setOwned] = useState<{
     key: string;
-    managed: ManagedAgent;
-    facade: Agent;
+    lifetime: number;
+    agent: Agent;
   } | null>(null);
   const [failure, setFailure] = useState<{
     key: string;
@@ -73,12 +90,13 @@ export function useAgent(config: AgentConfig): Agent | null {
   } | null>(null);
   const generation = useRef(0);
   const cleanup = useRef<Promise<void>>(Promise.resolve());
-  const current = owned?.key === key ? owned : null;
+  const current =
+    owned?.key === key && owned.lifetime === generation.current ? owned : null;
 
   useEffect(() => {
     const lifetime = ++generation.current;
     let active = true;
-    let managed: ManagedAgent | undefined;
+    let agent: Agent | undefined;
     const reportCleanup = (error: unknown) => {
       console.error("PulseBeam Agent cleanup failed", error);
     };
@@ -86,24 +104,9 @@ export function useAgent(config: AgentConfig): Agent | null {
       await cleanup.current;
       if (!active || generation.current !== lifetime) return;
       try {
-        managed = createManagedAgent(config);
-        managed.activate();
-        await managed.initialized();
-        if (!active || generation.current !== lifetime) {
-          const retired = managed;
-          managed = undefined;
-          await retired.close();
-          return;
-        }
-        setOwned({ key, managed, facade: createReactAgent(managed) });
+        agent = new Agent(config);
+        setOwned({ key, lifetime, agent });
       } catch (error) {
-        if (managed) {
-          try {
-            await managed.close();
-          } catch (closeError) {
-            reportCleanup(closeError);
-          }
-        }
         if (active && generation.current === lifetime)
           setFailure({ key, lifetime, error });
       }
@@ -111,14 +114,12 @@ export function useAgent(config: AgentConfig): Agent | null {
     return () => {
       active = false;
       if (generation.current === lifetime) ++generation.current;
-      if (managed) {
-        const retired = managed;
-        managed = undefined;
-        cleanup.current = cleanup.current
-          .then(() => retired.close())
-          .catch((error: unknown) => {
-            reportCleanup(error);
-          });
+      if (agent) {
+        const closing = agent.close();
+        agent = undefined;
+        cleanup.current = Promise.all([cleanup.current, closing])
+          .then(() => {})
+          .catch(reportCleanup);
       }
     };
   }, [key]);
@@ -126,22 +127,17 @@ export function useAgent(config: AgentConfig): Agent | null {
   useEffect(() => {
     if (!current) return;
     try {
-      current.managed.renew(config.token);
+      current.agent.renew(config.token);
     } catch (error) {
       setFailure({ key, lifetime: generation.current, error });
     }
-  }, [current?.managed, config.token, key]);
+  }, [current?.agent, config.token, key]);
   useEffect(() => {
-    current?.managed.setLogging(config.logging?.level ?? "warn");
-  }, [current?.managed, config.logging?.level]);
+    current?.agent.setLogging(config.logging?.level ?? "warn");
+  }, [current?.agent, config.logging?.level]);
 
-  const subscribe = current?.managed.subscribe ?? noSubscribe;
-  const getSnapshot = current?.managed.getSnapshot ?? noSnapshot;
-  useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  useObservation(current?.agent ?? null);
   if (failure?.key === key && failure.lifetime === generation.current)
     throw failure.error;
-  return current?.facade ?? null;
+  return current?.agent ?? null;
 }
-
-const noSubscribe = (_listener: () => void) => () => {};
-const noSnapshot = () => null;

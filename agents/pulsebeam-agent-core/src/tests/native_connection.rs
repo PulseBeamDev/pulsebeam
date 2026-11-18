@@ -14,6 +14,7 @@ pub(crate) fn observe(
             payload: codec::encode_server(&state::ServerStateBatch {
                 records,
                 initial_complete: false,
+                ..Default::default()
             })
             .unwrap(),
         }))
@@ -33,6 +34,142 @@ pub(crate) fn confirmed(
             value: Some(value),
         }),
     }
+}
+
+fn lookup_record(
+    reference: u64,
+    revision: u64,
+    spec: state::ResourceSpec,
+    track_id: &str,
+    mode: Option<TopicMode>,
+) -> state::ServerStateRecord {
+    let Some(state::resource_spec::Declaration::SourceLookup(lookup)) = &spec.declaration else {
+        panic!("source lookup")
+    };
+    let Some(address) = &lookup.source else {
+        panic!("logical source")
+    };
+    let label = address.label.clone();
+    let participant_id = match address.participant_external_id.as_str() {
+        "left" => "pa_22222222222222222222222222",
+        "right" => "pa_33333333333333333333333333",
+        "opaque/server/remote-a" => "pa_44444444444444444444444444",
+        "opaque/server/remote-b" => "pa_55555555555555555555555555",
+        "opaque/server/remote-c" => "pa_66666666666666666666666666",
+        "opaque/server/remote/replacement" => "pa_77777777777777777777777777",
+        _ => "pa_11111111111111111111111111",
+    };
+    let participant = state::Participant {
+        participant_id: participant_id.into(),
+        participant_external_id: address.participant_external_id.clone(),
+    };
+    let track_kind = match state::TrackKind::try_from(address.kind).unwrap() {
+        state::TrackKind::Video => state::track::Kind::Video(state::VideoTrack {
+            format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
+                state::Vp8Parameters {},
+            ))),
+        }),
+        state::TrackKind::Audio => state::track::Kind::Audio(state::AudioTrack {
+            format: Some(state::CodecFormat::from(state::codec_format::Codec::Opus(
+                state::OpusParameters::default(),
+            ))),
+        }),
+        state::TrackKind::Data => state::track::Kind::Data(state::DataTrack {
+            delivery: mode.unwrap_or(TopicMode::Ordered).delivery() as i32,
+        }),
+        _ => panic!("unsupported lookup kind"),
+    };
+    confirmed(
+        state::resource_key::Key::Owned(reference),
+        revision,
+        state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
+            spec: Some(spec),
+            participant: Some(participant.clone()),
+            track: Some(state::Track {
+                track_id: track_id.into(),
+                participant_id: participant.participant_id,
+                label,
+                kind: Some(track_kind),
+            }),
+        })),
+    )
+}
+
+pub(crate) fn answer_source_lookup_batch(
+    agent: &mut Agent,
+    generation: Generation,
+    control: ChannelId,
+    topics: &crate::TopicRegistrations,
+    remote_source_override: Option<&str>,
+) -> Vec<u64> {
+    let effect = next_effect(agent);
+    let Effect::DataChannel(DataChannelEffect::Send {
+        operation,
+        generation: actual_generation,
+        channel: actual_channel,
+        payload,
+        ..
+    }) = effect
+    else {
+        panic!("SourceLookup StateBatch, got {effect:?}")
+    };
+    assert_eq!((actual_generation, actual_channel), (generation, control));
+    let batch = codec::decode_client(&payload).unwrap();
+    let registrations = &topics.subscribers;
+    let mut lookup_references = Vec::new();
+    let records = batch
+        .records
+        .into_iter()
+        .filter_map(|record| {
+            let desired = record.desired?;
+            let revision = desired.revision;
+            match desired.value? {
+                state::desired_state::Value::Absent(_) => Some(confirmed(
+                    state::resource_key::Key::Owned(record.owned),
+                    revision,
+                    state::confirmed_state::Value::Absent(state::AbsentState {
+                        reason: state::AbsenceReason::Removed as i32,
+                    }),
+                )),
+                state::desired_state::Value::Present(spec) => {
+                    let Some(state::resource_spec::Declaration::SourceLookup(lookup)) =
+                        &spec.declaration
+                    else {
+                        return None;
+                    };
+                    let address = lookup.source.as_ref()?;
+                    lookup_references.push(record.owned);
+                    let mode = registrations
+                        .iter()
+                        .find(|subscriber| {
+                            subscriber.room == address.room
+                                && subscriber.participant_external_id
+                                    == address.participant_external_id
+                                && subscriber.topic == address.label
+                        })
+                        .map(|subscriber| subscriber.mode);
+                    let track_id = remote_source_override.unwrap_or_else(|| {
+                        if address.participant_external_id == "remote-app-user" {
+                            REMOTE_SOURCE
+                        } else {
+                            &address.participant_external_id
+                        }
+                    });
+                    Some(lookup_record(
+                        record.owned,
+                        revision,
+                        spec.as_ref().clone(),
+                        track_id,
+                        mode,
+                    ))
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(!records.is_empty(), "SourceLookup request in StateBatch");
+    acknowledge_send(agent, generation, control, operation);
+    observe(agent, generation, control, records);
+    lookup_references
 }
 
 pub(crate) fn grant(revision: u64) -> state::ServerStateRecord {
@@ -111,6 +248,8 @@ pub(crate) fn connected(topics: crate::TopicRegistrations) -> (Agent, Generation
         .subscribers
         .iter()
         .any(|subscriber| subscriber.mode == TopicMode::Ordered);
+    let has_subscribers = !topics.subscribers.is_empty();
+    let fixture_topics = topics.clone();
     let (mut agent, generation, channel) = joining(topics);
     agent
         .handle(HostEvent::Rtc(RtcEvent::Connected { generation }))
@@ -132,6 +271,7 @@ pub(crate) fn connected(topics: crate::TopicRegistrations) -> (Agent, Generation
             payload: codec::encode_server(&state::ServerStateBatch {
                 records: Vec::new(),
                 initial_complete: true,
+                ..Default::default()
             })
             .unwrap(),
         }))
@@ -141,19 +281,25 @@ pub(crate) fn connected(topics: crate::TopicRegistrations) -> (Agent, Generation
             matches!(agent.next_effect_after_turn(), Some(Effect::Timer(TimerEffect::Schedule { after, .. })) if after == Duration::from_secs(2))
         );
     }
-    assert!(agent.next_effect_after_turn().is_none());
+    if has_subscribers {
+        let _ = answer_source_lookup_batch(&mut agent, generation, channel, &fixture_topics, None);
+    } else {
+        assert!(agent.next_effect_after_turn().is_none());
+    }
     (agent, generation, channel)
 }
 
 pub(crate) const SOURCE: &str = "opaque/server/data/source";
 pub(crate) const REMOTE_SOURCE: &str = "opaque/server/remote/source";
 
+#[derive(Clone)]
 pub(crate) struct PreparedData {
     pub channel: ChannelId,
     pub requested_channel: DataChannelSpec,
     pub reference: u64,
     pub revision: u64,
     pub spec: state::ResourceSpec,
+    pub additional: Vec<PreparedData>,
 }
 
 pub(crate) fn prepare_channel(
@@ -174,7 +320,9 @@ pub(crate) fn prepare_channel(
             }),
         }))
         .unwrap();
-    let effect = next_effect(agent);
+    let effect = agent
+        .next_effect_after_turn()
+        .unwrap_or_else(|| panic!("accepted SourceLookup produced no selected payload receiver"));
     let Effect::Rtc(RtcEffect::CreateDataChannel {
         generation: actual,
         channel,
@@ -208,34 +356,84 @@ pub(crate) fn prepare_data_pending(
     control: ChannelId,
 ) -> (PreparedData, OperationId, Vec<u8>) {
     let (channel, channel_spec) = prepare_channel(agent, generation, control);
-    let Effect::DataChannel(DataChannelEffect::Send {
-        operation,
-        channel: output,
-        payload,
-        ..
-    }) = next_effect(agent)
-    else {
-        panic!("StateBatch")
+    let mut channels = vec![(channel, channel_spec)];
+    let mut effect = next_effect(agent);
+    let (operation, output, payload) = loop {
+        match effect {
+            Effect::Rtc(RtcEffect::CreateDataChannel {
+                generation: actual_generation,
+                channel: pending_channel,
+                specification,
+            }) => {
+                assert_eq!(actual_generation, generation);
+                channels.push((pending_channel, specification.clone()));
+                let stream_id = specification.negotiated_id.unwrap();
+                assert_ne!(stream_id, 0);
+                agent
+                    .handle(HostEvent::DataChannel(DataChannelEvent::Prepared {
+                        generation,
+                        channel: pending_channel,
+                        preparation: Ok(PreparedDataChannel {
+                            stream_id,
+                            negotiated: true,
+                            ordered: specification.ordered,
+                            reliability: specification.reliability,
+                            association_max_channels: Some(8),
+                        }),
+                    }))
+                    .unwrap();
+                effect = next_effect(agent);
+            }
+            Effect::DataChannel(DataChannelEffect::Send {
+                operation,
+                channel,
+                payload,
+                ..
+            }) => break (operation, channel, payload),
+            other => panic!("StateBatch after physical payload preparation, got {other:?}"),
+        }
     };
     assert_eq!(output, control);
     let batch = codec::decode_client(&payload).unwrap();
-    assert_eq!(batch.records.len(), 1);
-    let record = &batch.records[0];
-    let reference = &record.owned;
-    let Some(desired) = &record.desired else {
-        panic!("desired")
-    };
-    let Some(state::desired_state::Value::Present(spec)) = &desired.value else {
-        panic!("present")
-    };
-    let publication = PreparedData {
-        channel,
-        requested_channel: channel_spec,
-        reference: *reference,
-        revision: desired.revision,
-        spec: spec.as_ref().clone(),
-    };
-    (publication, operation, payload)
+    assert_eq!(
+        batch.records.len(),
+        channels.len(),
+        "records: {:#?}",
+        batch.records
+    );
+    let mut prepared = batch
+        .records
+        .iter()
+        .zip(channels)
+        .map(|(record, (channel, requested_channel))| {
+            let Some(desired) = &record.desired else {
+                panic!("present resource")
+            };
+            let Some(state::desired_state::Value::Present(spec)) = &desired.value else {
+                panic!("present resource")
+            };
+            PreparedData {
+                channel,
+                requested_channel,
+                reference: record.owned,
+                revision: desired.revision,
+                spec: spec.as_ref().clone(),
+                additional: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let primary = prepared
+        .iter()
+        .position(|resource| {
+            matches!(
+                resource.spec.declaration,
+                Some(state::resource_spec::Declaration::Publication(_))
+            )
+        })
+        .unwrap_or(0);
+    let mut primary = prepared.remove(primary);
+    primary.additional = prepared;
+    (primary, operation, payload)
 }
 
 pub(crate) fn prepare_data(
@@ -300,9 +498,29 @@ pub(crate) fn prepare_subscription(
     source: &str,
     subscriber: &TopicSubscriber,
 ) -> PreparedData {
+    prepare_subscription_staged(agent, generation, control, source, subscriber, None)
+}
+
+pub(crate) fn prepare_subscription_staged(
+    agent: &mut Agent,
+    generation: Generation,
+    control: ChannelId,
+    source: &str,
+    subscriber: &TopicSubscriber,
+    staged: Option<&PreparedData>,
+) -> PreparedData {
+    let participant_id = match subscriber.participant_external_id.as_str() {
+        "left" => "pa_22222222222222222222222222",
+        "right" => "pa_33333333333333333333333333",
+        "opaque/server/remote-a" => "pa_44444444444444444444444444",
+        "opaque/server/remote-b" => "pa_55555555555555555555555555",
+        "opaque/server/remote-c" => "pa_66666666666666666666666666",
+        "opaque/server/remote/replacement" => "pa_77777777777777777777777777",
+        _ => "pa_11111111111111111111111111",
+    };
     let participant = state::Participant {
-        participant_id: REMOTE_PUBLISHER.into(),
-        participant_external_id: "remote-app-user".into(),
+        participant_id: participant_id.into(),
+        participant_external_id: subscriber.participant_external_id.clone(),
     };
     let track = state::Track {
         track_id: source.into(),
@@ -312,23 +530,53 @@ pub(crate) fn prepare_subscription(
             delivery: subscriber.mode.delivery() as i32,
         })),
     };
-    observe(
-        agent,
-        generation,
-        control,
-        vec![
-            confirmed(
-                state::resource_key::Key::Participant(participant.participant_id.clone()),
-                0,
-                state::confirmed_state::Value::Participant(participant.clone()),
-            ),
-            confirmed(
-                state::resource_key::Key::Track(source.into()),
-                0,
-                state::confirmed_state::Value::Track(track.clone()),
-            ),
-        ],
-    );
+    if let Some(staged) = staged {
+        let prepared = staged
+            .additional
+            .iter()
+            .find(|resource| {
+                matches!(
+                    &resource.spec.declaration,
+                    Some(state::resource_spec::Declaration::Subscription(subscription))
+                        if subscription.track_id == source
+                            && subscription.kind == state::TrackKind::Data as i32
+                )
+            })
+            .unwrap_or_else(|| panic!("staged source subscription for {source}"))
+            .clone();
+        observe(
+            agent,
+            generation,
+            control,
+            vec![confirmed(
+                state::resource_key::Key::Owned(prepared.reference),
+                prepared.revision,
+                state::confirmed_state::Value::Owned(alloc::boxed::Box::new(state::LiveResource {
+                    spec: Some(prepared.spec.clone()),
+                    participant: Some(participant),
+                    track: Some(track),
+                    execution: state::ExecutionStatus::Installed as i32,
+                    execution_failure: None,
+                    activity: None,
+                })),
+            )],
+        );
+        if subscriber.mode == TopicMode::Ordered {
+            let (operation, channel, body) = next_topic_send(agent);
+            assert_eq!(channel, prepared.channel);
+            assert_eq!(
+                body,
+                TopicBody::Probe(TopicProbe {
+                    data_track_id: source.into(),
+                    from_sequence: 0,
+                    live: true
+                })
+            );
+            acknowledge_send(agent, generation, channel, operation);
+        }
+        assert!(agent.next_effect_after_turn().is_none());
+        return prepared;
+    }
     let prepared = prepare_data(agent, generation, control);
     assert!(
         matches!(&prepared.spec.declaration, Some(state::resource_spec::Declaration::Subscription(subscription)) if subscription.track_id == source && subscription.kind == state::TrackKind::Data as i32)

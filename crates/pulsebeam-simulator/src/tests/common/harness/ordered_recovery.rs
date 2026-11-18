@@ -486,6 +486,7 @@ mod tests {
 
     fn message(sequence: u64) -> TopicNotification {
         TopicNotification::Message(TopicMessage {
+            room: "room".into(),
             topic: "state".into(),
             mode: TopicMode::Ordered,
             participant_id: "publisher".into(),
@@ -498,6 +499,8 @@ mod tests {
     fn gap(expected_sequence: u64, available_sequence: u64) -> TopicNotification {
         TopicNotification::RecoveryGap {
             subscriber: TopicSubscriber {
+                room: "room".into(),
+                participant_external_id: "publisher".into(),
                 topic: "state".into(),
                 mode: TopicMode::Ordered,
             },

@@ -1,214 +1,299 @@
 import assert from "node:assert/strict";
-import { useState } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  useAgent,
-  Video,
-  type Agent,
-  type ReceiveOptions,
-} from "../../src/index.js";
-import { flush } from "./platform.js";
+import { AudioSource, VideoSource } from "@pulsebeam/web";
+import { Audio, Video, useAgent, type Agent } from "../../src/index.js";
+import { deferred, flush, Track } from "./platform.js";
 import { runtimes } from "./runtime.js";
-import { createReactAgent, managedAgent } from "../../src/agent.js";
 
+// This entry point is shared by the component lifecycle runner.
 export async function videoPreferences() {
   let agent!: Agent;
-  let change!: (
-    patch: Partial<{
-      first: ReceiveOptions;
-      second: ReceiveOptions;
-      hide: boolean;
-      remove: boolean;
-      reverse: boolean;
-      autoPlay: boolean;
-    }>,
-  ) => void;
-  const original = HTMLVideoElement.prototype.getBoundingClientRect;
-  HTMLVideoElement.prototype.getBoundingClientRect = function () {
-    const height = this.dataset.size === "large" ? 240 : 120;
+  function Room() {
+    const current = useAgent({
+      endpoint: "http://localhost",
+      token: "playback",
+    });
+    if (current) agent = current;
+    return null;
+  }
+  const ownerRoot = createRoot(document.createElement("div"));
+  await flush(() => ownerRoot.render(<Room />));
+  const runtime = runtimes.at(-1)!;
+  const remote = agent.room("room").participant("alice");
+  const video = remote.video("camera").subscribe();
+  const audio = remote.audio("microphone").subscribe();
+  await flush();
+
+  // Control only the physical observation boundary, not Core admission policy.
+  const requests: {
+    owner: bigint;
+    signal?: AbortSignal;
+    result: ReturnType<typeof deferred<any>>;
+  }[] = [];
+  const boundary = runtime as typeof runtime & {
+    observe_media: (
+      owner: bigint,
+      source?: string,
+      signal?: AbortSignal,
+    ) => Promise<any>;
+  };
+  const previous = boundary.observe_media;
+  boundary.observe_media = (owner, _source, signal) => {
+    const result = deferred<any>();
+    requests.push({ owner, signal, result });
+    return result.promise;
+  };
+  function complete(
+    request: (typeof requests)[number],
+    kind: "video" | "audio",
+  ) {
+    const track = new Track(kind);
+    let closed = false;
+    let closes = 0;
+    request.result.resolve({
+      track: () => track,
+      is_closed: () => closed,
+      close: async () => {
+        closed = true;
+        closes++;
+      },
+      free: () => {},
+    });
     return {
-      top: 0,
-      left: 0,
-      right: 320,
-      bottom: height,
-      width: 320,
-      height,
-      x: 0,
-      y: 0,
-      toJSON() {
-        return {};
+      track,
+      get closes() {
+        return closes;
       },
     };
-  };
-  function Room() {
-    const current = useAgent({ endpoint: "http://localhost", token: "token" });
-    return current ? <VideoRoom agent={current} /> : null;
-  }
-  function VideoRoom({ agent: current }: { agent: Agent }) {
-    agent = current;
-    const [state, setState] = useState({
-      first: {
-        minHeight: 360,
-        minFps: 15,
-        priority: 1,
-        playoutDelay: { minMs: 100, maxMs: 200 },
-      } as ReceiveOptions,
-      second: {
-        minHeight: 720,
-        minFps: 30,
-        priority: 5,
-        playoutDelay: { minMs: 0, maxMs: 50 },
-      } as ReceiveOptions,
-      hide: false,
-      remove: false,
-      reverse: false,
-      autoPlay: true,
-    });
-    change = (patch) => setState((before) => ({ ...before, ...patch }));
-    const remote = createReactAgent(managedAgent(agent))
-      .participant("alice")
-      .video("camera");
-    const views = [
-      <Video
-        key="one"
-        source={remote}
-        autoPlay={state.autoPlay}
-        mirror={!state.autoPlay}
-        receive={state.first}
-        data-size="small"
-      />,
-      !state.remove && (
-        <Video
-          key="two"
-          source={remote}
-          receive={state.second}
-          hidden={state.hide}
-          data-size="large"
-        />
-      ),
-    ];
-    return <>{state.reverse ? views.reverse() : views}</>;
   }
   const host = document.createElement("div");
-  document.body.append(host);
   const root = createRoot(host);
+  const play = HTMLMediaElement.prototype.play;
   try {
-    await flush(() => root.render(<Room />));
-    const runtime = runtimes.at(-1)!;
-    const remote = agent.participant("alice").video("camera");
-    assert.equal(
-      "agent" in agent.participant("alice"),
-      false,
-      "remote facade cannot expose the managed Agent",
+    for (const kind of ["video", "audio"] as const) {
+      const subscription = kind === "video" ? video : audio;
+      const render = (count: number) =>
+        kind === "video" ? (
+          <>
+            {count > 0 && (
+              <Video
+                source={video}
+                data-testid="one"
+                muted
+                autoPlay
+                playsInline
+              />
+            )}
+            {count > 1 && <Video source={video} data-testid="two" />}
+          </>
+        ) : (
+          <>
+            {count > 0 && (
+              <Audio source={audio} data-testid="one" muted autoPlay />
+            )}
+            {count > 1 && <Audio source={audio} data-testid="two" />}
+          </>
+        );
+      const start = requests.length;
+      const commands = runtime.resourceCommands.length;
+      await flush(() => root.render(render(2)));
+      assert.equal(
+        requests.length - start,
+        2,
+        `${kind}: each view borrows an observation`,
+      );
+      const first = complete(requests[start]!, kind);
+      const second = complete(requests[start + 1]!, kind);
+      await flush();
+      const one = host.querySelector<HTMLMediaElement>('[data-testid="one"]')!;
+      const two = host.querySelector<HTMLMediaElement>('[data-testid="two"]')!;
+      assert.ok(
+        (one.srcObject as MediaStream)
+          .getTracks()
+          .includes(first.track as unknown as MediaStreamTrack),
+      );
+      assert.ok(
+        (two.srcObject as MediaStream)
+          .getTracks()
+          .includes(second.track as unknown as MediaStreamTrack),
+      );
+      assert.equal(one.muted, true);
+      assert.equal(one.hasAttribute("autoplay"), true);
+      if (kind === "video") assert.equal(one.hasAttribute("playsinline"), true);
+      await flush(() => root.render(render(1)));
+      assert.equal(first.closes, 0, `${kind}: surviving view keeps its clone`);
+      assert.equal(second.closes, 1, `${kind}: removed view closes its clone`);
+      await flush(() => root.render(null));
+      assert.equal(first.closes, 1);
+      assert.equal(
+        subscription.isClosed(),
+        false,
+        `${kind}: caller retains subscription`,
+      );
+      assert.equal(
+        runtime.resourceCommands
+          .slice(commands)
+          .some(
+            (c: any) =>
+              c.op === "claimVideo" ||
+              c.op === "claimAudioSubscription" ||
+              c.op === "release",
+          ),
+        false,
+        `${kind}: playback neither claims nor releases a receive owner`,
+      );
+
+      const pending = requests.length;
+      await flush(() => root.render(render(1)));
+      assert.equal(requests.length, pending + 1);
+      await flush(() => root.render(null));
+      assert.equal(
+        requests[pending]!.signal?.aborted,
+        true,
+        `${kind}: unmount aborts pending acquisition`,
+      );
+      const late = complete(requests[pending]!, kind);
+      await flush();
+      assert.equal(late.closes, 1, `${kind}: late clone is closed`);
+      assert.equal(subscription.isClosed(), false);
+
+      const replacement =
+        kind === "video"
+          ? remote.video("other-camera").subscribe()
+          : remote.audio("other-microphone").subscribe();
+      await flush();
+      const renderSource = (next: boolean) =>
+        kind === "video" ? (
+          <Video source={next ? (replacement as typeof video) : video} />
+        ) : (
+          <Audio source={next ? (replacement as typeof audio) : audio} />
+        );
+      const replaced = requests.length;
+      await flush(() => root.render(renderSource(false)));
+      const element = host.querySelector<HTMLMediaElement>(kind)!;
+      await flush(() => root.render(renderSource(true)));
+      assert.equal(requests.length, replaced + 2);
+      assert.equal(
+        requests[replaced]!.signal?.aborted,
+        true,
+        `${kind}: replacement aborts the old acquisition`,
+      );
+      const current = complete(requests[replaced + 1]!, kind);
+      await flush();
+      const stale = complete(requests[replaced]!, kind);
+      await flush();
+      assert.equal(
+        stale.closes,
+        1,
+        `${kind}: stale completion closes its clone`,
+      );
+      assert.ok(
+        (element.srcObject as MediaStream)
+          .getTracks()
+          .includes(current.track as unknown as MediaStreamTrack),
+      );
+      assert.ok(
+        !(element.srcObject as MediaStream)
+          .getTracks()
+          .includes(stale.track as unknown as MediaStreamTrack),
+        `${kind}: stale completion cannot reattach`,
+      );
+      await flush(() => root.render(null));
+      assert.equal(current.closes, 1);
+      assert.equal(replacement.isClosed(), false);
+      await replacement.close();
+    }
+
+    const capturedVideo = new Track("video");
+    const capturedAudio = new Track("audio");
+    const videoSource = VideoSource.fromTrack(
+      capturedVideo as unknown as MediaStreamTrack,
     );
-    assert.equal("advanced" in agent, false);
-    assert.equal("getSnapshot" in agent, false);
-    assert.equal("close" in agent, false);
-    assert.deepEqual(
-      runtime.desired.video,
-      [],
-      "absent remote source creates no demand",
+    const audioSource = AudioSource.fromTrack(
+      capturedAudio as unknown as MediaStreamTrack,
+    );
+    const blocked = deferred<void>();
+    const error = new Error("autoplay blocked");
+    let calls = 0;
+    let oldCallback = 0;
+    let failure: { error: unknown; retry(): Promise<void> } | undefined;
+    HTMLMediaElement.prototype.play = () => {
+      calls++;
+      return blocked.promise;
+    };
+    await flush(() =>
+      root.render(
+        <Video source={videoSource} onPlaybackError={() => oldCallback++} />,
+      ),
     );
     await flush(() =>
-      runtime.emit({
-        participants: [{ participantId: "alice" }],
-        publications: [
-          {
-            id: "camera-id",
-            participantId: "alice",
-            kind: "video",
-            label: "camera",
-          },
-        ],
-      }),
+      root.render(
+        <Video
+          source={videoSource}
+          onPlaybackError={(value) => {
+            failure = value;
+          }}
+        />,
+      ),
     );
-    const desired = () => runtime.desired.video[0];
-    assert.deepEqual(desired(), {
-      slot: 0,
-      trackId: "camera-id",
-      height: 240,
-      minHeight: 720,
-      minFps: 30,
-      priority: 5,
-      playoutDelay: { mode: "fixed", minMs: 0, maxMs: 200 },
-    });
-    const aggregate = { ...desired() };
-    const owners = [...runtime.videoOwners.keys()];
-    await flush(() => change({ autoPlay: false, first: { priority: 2 } }));
-    assert.deepEqual(
-      [...runtime.videoOwners.keys()],
-      owners,
-      "equivalent wrappers and presentation update existing views",
+    await flush(() => blocked.reject(error));
+    assert.equal(
+      oldCallback,
+      0,
+      "the latest committed playback callback is used",
+    );
+    assert.equal(failure?.error, error);
+    const retry = failure!.retry;
+    await flush(() =>
+      root.render(<Audio source={audioSource} autoPlay={false} />),
+    );
+    const audioElement = host.querySelector("audio")!;
+    assert.ok(
+      (audioElement.srcObject as MediaStream)
+        .getTracks()
+        .includes(capturedAudio as unknown as MediaStreamTrack),
+    );
+    const beforeRetry = calls;
+    await flush(() => retry());
+    assert.equal(calls, beforeRetry, "retry from a retired source is inert");
+    const stalePlay = deferred<void>();
+    let staleCallbacks = 0;
+    HTMLMediaElement.prototype.play = () => stalePlay.promise;
+    await flush(() =>
+      root.render(
+        <Video source={videoSource} onPlaybackError={() => staleCallbacks++} />,
+      ),
     );
     await flush(() =>
-      change({
-        autoPlay: true,
-        first: {
-          minHeight: 360,
-          minFps: 15,
-          priority: 1,
-          playoutDelay: { minMs: 100, maxMs: 200 },
-        },
-      }),
+      root.render(<Audio source={audioSource} autoPlay={false} />),
     );
-    await flush(() => change({ reverse: true }));
-    assert.deepEqual(desired(), aggregate, "aggregation is order independent");
-    await flush(() => change({ hide: true }));
-    await flush(() => window.dispatchEvent(new Event("resize")));
-    assert.deepEqual(desired(), {
-      slot: 0,
-      trackId: "camera-id",
-      height: 120,
-      minHeight: 360,
-      minFps: 15,
-      priority: 1,
-      playoutDelay: { mode: "fixed", minMs: 100, maxMs: 200 },
-    });
-    await flush(() =>
-      change({ first: { playoutDelay: { minMs: 0, maxMs: 0 } } }),
-    );
-    assert.deepEqual(desired().playoutDelay, {
-      mode: "fixed",
-      minMs: 0,
-      maxMs: 0,
-    });
-    await flush(() => change({ first: {} }));
+    await flush(() => stalePlay.reject(new Error("late playback failure")));
     assert.equal(
-      "playoutDelay" in desired(),
-      false,
-      "withdrawn latency requests defaults, not zero bounds",
+      staleCallbacks,
+      0,
+      "retired playback cannot report a late failure",
     );
-    await flush(() => change({ hide: false, remove: true }));
-    assert.equal(desired().height, 120);
-    assert.equal("playoutDelay" in desired(), false);
-    const [continuingOwner] = runtime.videoOwners.keys();
-    assert.equal(runtime.videoOwners.size, 1);
-    assert.ok(owners.includes(continuingOwner));
-    await flush(() => change({ remove: false }));
-    const remountedOwners = [...runtime.videoOwners.keys()];
-    assert.equal(remountedOwners.length, 2);
-    assert.ok(remountedOwners.includes(continuingOwner));
-    assert.equal(
-      remountedOwners.filter((owner) => !owners.includes(owner)).length,
-      1,
-    );
-    assert.equal(desired().trackId, "camera-id");
-    assert.equal(desired().height, 240);
-    assert.equal(runtimes.at(-1), runtime, "handoff keeps the session runtime");
-    assert.equal(agent.participant("alice").video("camera"), remote);
-    await flush(() => change({ remove: true }));
-    assert.deepEqual([...runtime.videoOwners.keys()], [continuingOwner]);
-    host.remove();
-    await flush(() => window.dispatchEvent(new Event("resize")));
-    assert.deepEqual(
-      runtime.desired.video,
-      [],
-      "detached presentation contributes no demand",
-    );
-    assert.equal(agent.participant("alice").video("camera"), remote);
+    await flush(() => root.render(null));
+    assert.equal(capturedVideo.stopped, 0);
+    assert.equal(capturedAudio.stopped, 0);
+    assert.equal(videoSource.isClosed(), false);
+    assert.equal(audioSource.isClosed(), false);
+    await videoSource.close();
+    await audioSource.close();
   } finally {
+    HTMLMediaElement.prototype.play = play;
     await flush(() => root.unmount());
-    HTMLVideoElement.prototype.getBoundingClientRect = original;
-    host.remove();
+    for (const request of requests)
+      request.result.resolve({
+        track: () => undefined,
+        is_closed: () => false,
+        close: async () => {},
+        free: () => {},
+      });
+    await flush();
+    boundary.observe_media = previous;
+    await video.close();
+    await audio.close();
+    await flush(() => ownerRoot.unmount());
   }
 }

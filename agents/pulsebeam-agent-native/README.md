@@ -113,14 +113,18 @@ rungs. Temporal indices may differ between rungs of an L1T3 batch.
 ### Remote observations
 
 Retain a named subscription instead of selecting a receiver slot. With a spawned `agent`, subscribe to the publisher's external participant
-ID and immutable publication label:
+ID and immutable publication label. Create the reference with the explicit room
+name supplied to `join`; the examples use `"room"`. References remain pinned
+when the Agent joins another room. Creating a room or participant reference
+performs no network operation. Cross-room source lookup is currently unsupported,
+even with an authorizing grant:
 
 ```rust
 use pulsebeam_agent_native::{
     agent_core::VideoObservation, ReceiveMode,
 };
 
-let subscription = agent.participant("publisher".into())?.video("camera".into())?
+let subscription = agent.room("room".into())?.participant("publisher".into())?.video("camera".into())?
     .subscribe(VideoObservation { visible: true, height: 720, ..Default::default() }).await?;
 let observation = subscription.observe(ReceiveMode::Decoded).await?;
 // Consume owned updates with observation.next().await.
@@ -131,7 +135,7 @@ subscription.close().await?;
 For audio, use the same imports and spawned agent:
 
 ```rust
-let subscription = agent.participant("publisher".into())?.audio("microphone".into())?
+let subscription = agent.room("room".into())?.participant("publisher".into())?.audio("microphone".into())?
     .subscribe(Default::default()).await?;
 let observation = subscription.observe(ReceiveMode::Decoded).await?;
 // Consume owned PCM updates from this exact native receiver track.
@@ -172,8 +176,8 @@ the old handle. Removing a source from the policy ends that owner's observations
 without disturbing another owner's demand. Use `observe(mode)` only with a
 named parent; a collection policy does not identify one implicit source.
 
-Generated callers use `participant(id).video(label).subscribe(core.VideoObservation)`
-or `participant(id).audio(label).subscribe(core.AudioSubscriptionConfig)` and the
+Generated callers use `room(name).participant(id).video(label).subscribe(core.VideoObservation)`
+or `room(name).participant(id).audio(label).subscribe(core.AudioSubscriptionConfig)` and the
 returned typed subscription's `observe(mode)`. Video preferences contain only
 display demand, not a receiver slot or publication ID. Explicitly visible video
 with height zero has no height ceiling; set `visible: false` to withdraw display
@@ -208,11 +212,11 @@ injection does not turn its bookkeeping into an application observation.
 
 ## Binary data
 
-`Agent::data(label, delivery)` and `Agent::participant(id)?.data(label, delivery)` return inert logical handles. Participant IDs are application external IDs, not native receiver coordinates. Lookup validates the key without acquiring transport demand. Equivalent handles do not need to be the same object.
+`Agent::data(label, delivery)` and `Agent::room(name)?.participant(id)?.data(label, delivery)` return inert logical handles. Participant IDs are application external IDs, not native receiver coordinates. Lookup validates the key without acquiring transport demand. Equivalent handles do not need to be the same object.
 
-A local handle's async `send(bytes)` uses Core's lazy Agent-lifetime producer admission. It requires connected intent and resolves on transport admission, not remote delivery or durable acknowledgment. Core settlement failures remain typed as `NativeError::DataSend`; resource refusals, including disconnected intent, use `NativeError::Resource` with a core-owned reason. Topic admission errors, including oversized payloads and full send queues, use `NativeError::Topic` with their structured core-owned reason.
+Call `publish()` on a local handle to synchronously reserve an owned `DataPublication`. Send bytes through that publication's async `send(bytes)` and close it when publishing ends. Sending requires connected intent and resolves on transport admission, not remote delivery or durable acknowledgment. Generated operation failures expose the shared `ErrorInfo` classification.
 
-Call `receive` on a local handle for room-wide incoming data or on a participant's handle for participant-bound data. Each call owns an independent bounded `DataReceiver`. Its async `next` returns `DataUpdate::Event` containing a core `DataEvent::Message` or `Gap`, or terminal `DataUpdate::Closed`. Message bytes are owned. No Agent-global event filtering or manual topic registration is required. Ordered reception starts at a live frontier, not historical replay; local send admission does not prove that a remote cursor is ready.
+Call `subscribe()` on a participant's data handle for that exact room, participant and label. It synchronously returns an owned subscription, even before joining or publication. Local data handles do not receive; there is no room-wide data receive factory. Each call owns an independent bounded subscription (`DataReceiver` in Rust, `DataSubscription` in generated bindings). Its async `next` returns `DataUpdate::Event` containing a core `DataEvent::Message` or `Gap`, or terminal `DataUpdate::Closed`. Message bytes are owned. No Agent-global event filtering or manual topic registration is required. Ordered reception starts at a live frontier, not historical replay; local send admission does not prove that a remote cursor is ready.
 
 Core owns buffering and delivery policy: latest coalesces by publisher track, lossy evicts at capacity, and ordered delivery represents loss inline as gaps or terminates with a typed receive-overflow error when it cannot preserve that representation. Channel failures also terminate the affected cursor. After a terminal read error, subsequent reads return `Closed`.
 

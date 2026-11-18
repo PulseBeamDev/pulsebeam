@@ -5,6 +5,7 @@
   const { DataRegistry } = await import("/dist/data.js");
   const { ResourceOwners } = await import("/dist/resources.js");
   const snapshot = {
+    roomId: "room",
     connection: "disconnected",
     catalog: {
       participants: [{ participantId: "alice" }],
@@ -33,10 +34,17 @@
   const owners = new ResourceOwners(() => {});
   const pending = new Map();
   owners.activate({
+    video_subscription: () => ({
+      state() {},
+      updates: () => ({ async next() {}, close() {} }),
+    }),
     async observe_media(token) {
       return new Promise((_resolve, reject) => pending.set(token, reject));
     },
     async resource(command) {
+      return this.resource_now(command);
+    },
+    resource_now(command) {
       if (command.op === "claimVideo") return { owner: ++owner };
       if (command.op === "observeVideo") {
         wire = command.observation.visible ? [command.observation] : [];
@@ -56,7 +64,7 @@
   snapshot.catalog.tracks = snapshot.catalog.publications;
   const catalog = new RemoteCatalog(agent, new DataRegistry(agent), owners);
   catalog.update(snapshot);
-  const handle = catalog.participant("alice").video("camera");
+  const handle = catalog.room("room").participant("alice").video("camera");
   const host = document.createElement("div");
   document.body.append(host);
   const attachments = [];

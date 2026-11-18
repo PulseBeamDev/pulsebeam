@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Publish, Video, useAgent } from "../../src/index.js";
+import { Video, useAgent } from "../../src/index.js";
+import { Publication as Publish } from "./publication.js";
 import { dataLifetimes, staleDataClaims } from "./data.js";
 import { useCapture, useDevices } from "../../src/index.js";
 import { captures, deferred, flush, stream } from "./platform.js";
@@ -232,6 +233,16 @@ assert.equal(capturedPreview.srcObject, null);
 assert.equal(host.childElementCount, 0);
 assert.ok(runtimes.every((runtime) => runtime.closed));
 host.remove();
+const {
+  actualHandleHooks,
+  audioAndDataHookOwners,
+  abandonedHookOwners,
+  hookSetupFailure,
+} = await import("./hooks.js");
+await actualHandleHooks();
+await audioAndDataHookOwners();
+await abandonedHookOwners();
+await hookSetupFailure();
 console.log(
   "React component lifecycle, capture cancellation, ownership and playback retry passed",
 );

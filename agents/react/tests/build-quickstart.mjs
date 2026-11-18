@@ -9,7 +9,7 @@ await cp(
   `${output}/pulsebeam_agent_web_bg.wasm`,
 );
 await build({
-  entryPoints: ["quickstart_source/main.tsx"],
+  entryPoints: [process.argv[3] ?? "quickstart_source/main.tsx"],
   bundle: true,
   format: "esm",
   outfile: `${output}/main.js`,

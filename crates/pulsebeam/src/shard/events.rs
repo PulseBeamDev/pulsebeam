@@ -213,6 +213,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     fn set_owned_subscription(
         &mut self,
         reference: u64,
+        source_room: crate::entity::RoomId,
         track: crate::entity::TrackId,
         enabled: bool,
     ) {
@@ -222,7 +223,8 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                 ShardEvent::OwnedSubscriptionSet {
                     connection_id: self.connection_id,
                     request: crate::control::topology::OwnedSubscription {
-                        room_id: self.room_id,
+                        subscriber_room: self.room_id,
+                        source_room,
                         subscriber: self.id,
                         reference,
                         track,
@@ -232,12 +234,13 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             ));
     }
 
-    fn unsubscribe_owned(&mut self, reference: u64) {
+    fn unsubscribe_owned(&mut self, reference: u64, source_room: crate::entity::RoomId) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
                 ShardEvent::OwnedSubscriptionRemoved {
                     room_id: self.room_id,
+                    source_room,
                     subscriber: self.id,
                     connection_id: self.connection_id,
                     reference,

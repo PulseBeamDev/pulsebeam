@@ -44,18 +44,16 @@ Device labels may be empty until the user grants permission. Treat
 
 ## Enablement, withdrawal, and release
 
-Look up a local handle, then mount `Publish` to own publication.
+Look up a local handle, then call `usePublish` to own publication.
 
 ```tsx
-<Publish
-  track={agent.video("camera")}
-  source={capture.video}
-  enabled={cameraOn}
-/>
+const publication = usePublish(agent.video("camera"), capture.video, {
+  enabled: cameraOn,
+});
 ```
 
-`enabled={false}` disables media while retaining ownership. A null source keeps
-the declaration without a source; unmounting `Publish` releases it. The capture
+`enabled: false` disables media while retaining ownership. A null source keeps
+the declaration without a source; unmounting the hook owner releases it. The capture
 remains owned by `useCapture` until `stop()` or unmount. Lookup alone has no
 publication side effect.
 
@@ -69,12 +67,9 @@ const display = useCapture("display", {
   audio: false,
 });
 
-<button onClick={() => void display.request()}>Share screen</button>
-<Publish
-  track={agent.video("screen")}
-  source={display.video}
-  content="detail"
-/>
+usePublish(agent.video("screen"), display.video);
+
+<button onClick={() => void display.request().catch(report)}>Share screen</button>
 ```
 
 Call `display.stop()` to end sharing. Browser-native cancellation is exposed
@@ -86,24 +81,28 @@ Participants and their immutable track arrays are the discovery surface. Narrow
 by `kind` when collecting video tracks.
 
 ```tsx
-const videos = agent.remote.participants.flatMap((participant) =>
+const videos = agent.participants.flatMap((participant) =>
   participant.tracks.filter(
     (value): value is RemoteVideoTrack => value.kind === "video",
   ),
 );
 ```
 
-A mounted, visible, nonzero-sized `Video` owns reception of a remote video.
-Use `receive` for policy hints.
+Create reception explicitly with `useSubscribe`. Rendering and receive demand
+have independent lifetimes; unmounting a view does not close its subscription.
 
 ```tsx
+const subscription = useSubscribe(remote, {
+  visible: true,
+  height: 360,
+  minHeight: 180,
+  priority: pinned ? 200 : 10,
+  minFps: 15,
+  playoutDelay: { mode: "fixed", minMs: 100, maxMs: 200 },
+});
+
 <Video
-  source={remote}
-  receive={{
-    priority: pinned ? 200 : 10,
-    minFps: 15,
-    playoutDelay: { minMs: 100, maxMs: 200 },
-  }}
+  source={subscription}
   onPlaybackError={(failure) => setVideoFailure(failure)}
 />
 ```
@@ -113,14 +112,14 @@ replacement. Use participant ID plus label for React keys.
 
 ## Remote audio and autoplay
 
-Mount one `Audio` owner for the Agent. It follows discovered remote audio tracks.
-When autoplay is blocked, retain the failure and invoke `retry()` from a click or
-keyboard gesture.
+Pass an already-owned audio subscription to `Audio`. When autoplay is blocked,
+retain the failure and invoke `retry()` from a click or keyboard gesture.
 
 ```tsx
-const [audioFailure, setAudioFailure] = useState<PlaybackFailure | null>(null);
+const [audioFailure, setAudioFailure] = useState<PlaybackError | null>(null);
+const audio = useSubscribe(agent.room(room).participant(peer).audio("microphone"));
 
-<Audio agent={agent} onPlaybackError={setAudioFailure} />
+<Audio source={audio} onPlaybackError={setAudioFailure} />
 {audioFailure && (
   <button onClick={() => void audioFailure.retry()}>Enable remote audio</button>
 )}
@@ -153,17 +152,19 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 function Chat({ agent }: { agent: Agent }) {
-  const ChatTrack = agent.data("chat", "ordered");
+  const publication = usePublish(agent.data("chat", "ordered"));
+  const incoming = agent.room("meeting").participant("alice").data("chat", "ordered");
 
   async function send(message: string) {
-    await ChatTrack.send(encoder.encode(JSON.stringify(message)));
+    if (!publication) return;
+    await publication.send(encoder.encode(JSON.stringify(message)));
   }
 
   return (
     <>
       <button onClick={() => void send("hello").catch(report)}>Send hello</button>
       <Data
-      track={ChatTrack}
+      track={incoming}
       onEvent={(event) => {
         if (event.type === "gap") {
           showGap(event.from, event.to);

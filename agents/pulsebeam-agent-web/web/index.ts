@@ -3,12 +3,23 @@ export { OperationError } from "./agent-observation.js";
 export {
   AgentStatus,
   ErrorCode,
+  PipeStatus,
   PublicationMediaKind,
   PublicationAdmissionStatus,
   PublicationDemand,
   PublicationExecution,
+  SubscriptionSourceStatus,
 } from "./schema.js";
-export type { AgentState, ErrorInfo, PublicationState } from "./schema.js";
+export type {
+  AgentState,
+  ErrorInfo,
+  PipeState,
+  PublicationState,
+  VideoSubscriptionState,
+  AudioSubscriptionState,
+  DataPublicationState,
+  DataSubscriptionState,
+} from "./schema.js";
 export type {
   SnapshotStream,
   SnapshotUpdate,
@@ -21,12 +32,14 @@ export type {
   LocalDataTrack,
   RemoteDataTrack,
   DataReceiver,
+  DataPublication,
+  DataSubscription,
   DataUpdate,
   DataEvent,
   DataMessage,
   DataGap,
 } from "./data.js";
-export type { AudioPublication, VideoPublication } from "./media.js";
+export type { AudioPublication, Pipe, VideoPublication } from "./media.js";
 export { AudioSource, VideoSource } from "./capture-source.js";
 export { attachRemoteVideo, attachRemoteAudio } from "./remote-catalog.js";
 export type {
@@ -65,10 +78,17 @@ export type {
   PlayoutDelay,
   PublicationConfig,
   PublicationUpdates,
+  VideoSubscriptionUpdates,
+  AudioSubscriptionUpdates,
+  DataPublicationUpdates,
+  DataSubscriptionUpdates,
+  PipeUpdates,
   ReceiveOptions,
   RemoteAudioTrack,
   RemoteParticipant,
+  RoomRef,
   RemotePublishedTrack,
+  TrackSelector,
   RemoteVideoTrack,
   SenderConfig,
   SenderEncoding,

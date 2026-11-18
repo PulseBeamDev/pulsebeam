@@ -1,7 +1,6 @@
 import {
   Audio,
   Data,
-  Publish,
   SelectAudio,
   Video,
   useAgent,
@@ -14,13 +13,26 @@ import {
   type VideoCaptureSettings,
   type AudioCaptureSettings,
 } from "@pulsebeam/react";
-import { Agent as WebAgent } from "@pulsebeam/web";
+import {
+  Agent as WebAgent,
+  type VideoPublication,
+  type AudioPublication,
+  type DataPublication,
+  type VideoSubscription,
+  type AudioSubscription,
+  type DataSubscription,
+  type VideoSource,
+  type AudioSource,
+} from "@pulsebeam/web";
+import { usePublish, useSubscribe } from "@pulsebeam/react";
 import { createElement } from "react";
 
 // @ts-expect-error React owns Agents only through useAgent.
 import { createAgent as createReactAgent } from "@pulsebeam/react";
 // @ts-expect-error Managed lifecycle is not public Web API.
 import { createManagedAgent } from "@pulsebeam/web";
+// @ts-expect-error The publication component was replaced by actual-handle hooks.
+import { Publish } from "@pulsebeam/react";
 // @ts-expect-error No provider hierarchy.
 import { AgentProvider } from "@pulsebeam/react";
 // @ts-expect-error Replaced capture hooks are absent.
@@ -37,6 +49,62 @@ const config: AgentConfig = {
 };
 const nullableAgent: Agent | null = useAgent(config);
 const agent: Agent = nullableAgent!;
+// Check identity in both directions, not just assignability to a narrowed facade.
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+    ? true
+    : false;
+type Expect<T extends true> = T;
+type AgentIdentity = Expect<
+  Equal<ReturnType<typeof useAgent>, WebAgent | null>
+>;
+const actualAgent: WebAgent = nullableAgent!;
+const videoSource = null as VideoSource | null;
+const audioSource = null as AudioSource | null;
+const videoPublication = usePublish(actualAgent.video("video"), videoSource);
+const audioPublication = usePublish(actualAgent.audio("audio"), audioSource, {
+  enabled: true,
+});
+const dataPublication = usePublish(actualAgent.data("data", "ordered"));
+const remote = actualAgent.room("room").participant("alice");
+const videoSubscription = useSubscribe(remote.video("video"));
+const audioSubscription = useSubscribe(remote.audio("audio"));
+const dataSubscription = useSubscribe(remote.data("data", "ordered"));
+type VideoPublicationIdentity = Expect<
+  Equal<typeof videoPublication, VideoPublication | null>
+>;
+type AudioPublicationIdentity = Expect<
+  Equal<typeof audioPublication, AudioPublication | null>
+>;
+type DataPublicationIdentity = Expect<
+  Equal<typeof dataPublication, DataPublication | null>
+>;
+type VideoSubscriptionIdentity = Expect<
+  Equal<typeof videoSubscription, VideoSubscription | null>
+>;
+type AudioSubscriptionIdentity = Expect<
+  Equal<typeof audioSubscription, AudioSubscription | null>
+>;
+type DataSubscriptionIdentity = Expect<
+  Equal<typeof dataSubscription, DataSubscription<"ordered"> | null>
+>;
+usePublish(actualAgent.video("video"), null);
+usePublish(null, null);
+useSubscribe(null);
+// @ts-expect-error Audio sources cannot feed video publications.
+usePublish(actualAgent.video("video"), audioSource);
+// @ts-expect-error A remote track cannot be published.
+usePublish(remote.video("video"), videoSource);
+// @ts-expect-error A local track cannot be subscribed to.
+useSubscribe(actualAgent.video("video"));
+void [
+  videoPublication,
+  audioPublication,
+  dataPublication,
+  videoSubscription,
+  audioSubscription,
+  dataSubscription,
+];
 const direct = new WebAgent(config);
 await direct.connect();
 await direct.close();
@@ -82,21 +150,16 @@ import type { DataTrackSpec } from "@pulsebeam/react";
 const localVideo = agent.video("camera");
 const localAudio = agent.audio("microphone");
 const chat = agent.data("chat", "ordered");
-createElement(Publish, {
-  track: localVideo,
-  source: capture.video,
-  enabled: false,
-  content: "detail",
+usePublish(localVideo, capture.video, { enabled: false })?.configureSender({
+  contentHint: "detail",
 });
-createElement(Publish, {
-  track: localAudio,
-  source: capture.audio,
-  content: "music",
+usePublish(localAudio, capture.audio)?.configureSender({
+  contentHint: "music",
 });
 // @ts-expect-error Audio source cannot bind a video publication.
-Publish({ track: localVideo, source: capture.audio });
+usePublish(localVideo, capture.audio);
 // @ts-expect-error Publication content is kind-specific.
-Publish({ track: localVideo, source: capture.video, content: "speech" });
+videoPublication?.configureSender({ contentHint: "speech" });
 // @ts-expect-error No normal imperative publication setter.
 localVideo.setSource(capture.video);
 // @ts-expect-error Publication enabled state belongs to Publish.
@@ -108,7 +171,7 @@ agent.track({ kind: "video", label: "camera" });
 // @ts-expect-error Delivery is required.
 agent.data("chat");
 
-const participant = agent.participant("alice");
+const participant = agent.room("selected-room").participant("alice");
 const participantId: string = participant.id();
 void participantId;
 const remoteVideo = participant.video("camera");
@@ -128,25 +191,34 @@ Data({
   },
 });
 Data({
-  track: agent.data("state", "latest"),
+  track: participant.data("state", "latest"),
   onEvent(event) {
     const message: "message" = event.type;
     void message;
   },
 });
 createElement(Video, {
-  source: remoteVideo,
-  receive: {
+  source: useSubscribe(remoteVideo, {
+    visible: true,
+    height: 360,
     minHeight: 360,
     minFps: 15,
     priority: 1,
-    playoutDelay: { minMs: 0, maxMs: 100 },
-  },
+    playoutDelay: { mode: "fixed", minMs: 0, maxMs: 100 },
+  }),
 });
+// @ts-expect-error Playback cannot create an implicit reception owner.
+Video({ source: remoteVideo });
+// @ts-expect-error Reception configuration belongs to the independent subscription.
+Video({ source: videoSubscription, receive: {} });
+// @ts-expect-error Audio subscriptions cannot feed video playback.
+Video({ source: audioSubscription });
+// @ts-expect-error Playback does not select or own agent-wide audio reception.
+Audio({ agent });
 createElement(Video, { source: capture.video });
 createElement(SelectAudio, { agent, policy: { automatic: true } });
 createElement(Audio, {
-  agent,
+  source: useSubscribe(remoteAudio),
   onPlaybackError: (failure) => void failure.retry(),
 });
 createElement(Data, {
@@ -166,8 +238,12 @@ createElement(Data, {
     void [participantId, trackId];
   },
 });
+// @ts-expect-error Local publications cannot be received by the same endpoint.
 createElement(Data, { track: chat, onEvent: () => {} });
+// @ts-expect-error Sending requires an owned publication.
 void chat.send(new Uint8Array([0, 255]));
+const chatPublication = usePublish(chat);
+if (chatPublication) void chatPublication.send(new Uint8Array([0, 255]));
 // @ts-expect-error React data handles own receive only through Data.
 chat.events();
 // @ts-expect-error React remote data handles own receive only through Data.
@@ -188,7 +264,7 @@ agent.local;
 agent.topic("chat", { mode: "ordered" });
 // @ts-expect-error Retry is connect(), not a second session operation.
 agent.reconnect();
-// @ts-expect-error React owns release.
+// The returned handle is the SDK Agent, including its terminal close operation.
 agent.close();
 // @ts-expect-error No low-level normal observation.
 agent.getSnapshot();

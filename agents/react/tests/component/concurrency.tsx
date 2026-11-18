@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { startTransition, Suspense, useLayoutEffect } from "react";
 import { createRoot } from "react-dom/client";
-import { Audio, Data, Publish, Video, useAgent } from "../../src/index.js";
+import { Audio, Data, Video, useAgent, useSubscribe } from "../../src/index.js";
+import { Publication as Publish } from "./publication.js";
 import { runtimes } from "./runtime.js";
 import { useCapture, type CaptureResult } from "../../src/index.js";
 import { VideoSource } from "@pulsebeam/web";
@@ -46,8 +47,20 @@ export async function concurrentRender() {
     speculative: boolean;
   }) {
     const camera = agent.video("camera");
-    const messages = agent.data("messages", "ordered");
-    const remote = agent.participant("alice").video("camera");
+    const messages = agent
+      .room("selected-room")
+      .participant("alice")
+      .data("messages", "ordered");
+    const remote = agent
+      .room("selected-room")
+      .participant("alice")
+      .video("camera");
+    const video = useSubscribe(speculative ? remote : null);
+    const audio = useSubscribe(
+      speculative
+        ? agent.room("selected-room").participant("alice").audio("microphone")
+        : null,
+    );
     const capture = useCapture("device", {
       video: { width: speculative ? 1280 : 640 },
       audio: false,
@@ -67,14 +80,14 @@ export async function concurrentRender() {
         {speculative && (
           <>
             <Publish track={camera} source={source} />
-            <Audio agent={agent} />
+            <Audio source={audio} />
             <Data
               track={messages}
               onEvent={() => {
                 abandonedFailures++;
               }}
             />
-            <Video source={remote} />
+            <Video source={video} />
             <Suspend />
           </>
         )}

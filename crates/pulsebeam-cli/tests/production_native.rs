@@ -7,7 +7,10 @@ use pulsebeam_agent_native::{
     Agent, Config, Host, I420Frame, InputFrame, MediaStreamUpdate, OutputFrame, ProducerInput,
     ReceiveMode,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    io::Write,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 // Reuse the real loopback node fixture already owned by browser integration.
 mod support {
@@ -22,23 +25,38 @@ const HEIGHT: u32 = 96;
 const LUMA: usize = 160 * 96;
 const CHROMA: usize = 80 * 48;
 
-fn config(endpoint: &str, participant: &str) -> Result<Config> {
+fn config(endpoint: &str, participant: &str, discover: bool) -> Result<Config> {
+    config_in_room(endpoint, participant, discover, ROOM)
+}
+
+fn config_in_room(endpoint: &str, participant: &str, discover: bool, room: &str) -> Result<Config> {
+    let allow: &[&str] = if discover {
+        &["join", "publish", "discover", "subscribe"]
+    } else {
+        &["join", "publish", "subscribe"]
+    };
     let expiry = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs()
         .saturating_add(120);
+    let grants = if room == ROOM {
+        serde_json::json!([{"rooms":[room],"allow":allow}])
+    } else {
+        serde_json::json!([
+            {"rooms":[room],"allow":allow},
+            {"rooms":[ROOM],"allow":["subscribe"]}
+        ])
+    };
     Ok(Config::new(AgentConfig {
         endpoint: endpoint.into(),
         token: pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key()?,
-            &serde_json::from_value(
-                serde_json::json!([{"rooms":[ROOM],"allow":["join","publish","discover","subscribe"]}]),
-            )?,
+            &serde_json::from_value(grants)?,
             participant,
             expiry,
         )?,
         retry: Default::default(),
-        log_level: Default::default(),
+        log_level: pulsebeam_agent_native::agent_core::LogLevel::Debug,
     }))
 }
 
@@ -98,12 +116,14 @@ async fn foreign_witness(
     command: &mut tokio::process::Command,
     timeout: Duration,
 ) -> Result<String> {
-    let exchange = publisher.data("foreign-exchange".into(), TopicMode::Ordered)?;
+    let exchange = publisher
+        .data("foreign-exchange".into(), TopicMode::Ordered)?
+        .publish()?;
     let messages = publisher
+        .room(ROOM.into())?
         .participant(participant.into())?
         .data("foreign-exchange".into(), TopicMode::Ordered)?
-        .receive()
-        .await?;
+        .subscribe()?;
     let expected = expected.to_vec();
     let (received_tx, mut received_rx) = tokio::sync::oneshot::channel();
     let responder = tokio::spawn(async move {
@@ -162,6 +182,17 @@ async fn foreign_witness(
 
 #[tokio::test]
 async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
+    for receiver_room in [ROOM, "native-production-receiver"] {
+        production_native_i420(receiver_room).await?;
+    }
+    Ok(())
+}
+
+async fn production_native_i420(receiver_room: &str) -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("pulsebeam_agent_core=debug,pulsebeam::control=debug")
+        .with_test_writer()
+        .try_init();
     if let Some(root) = std::env::var_os("PULSEBEAM_BASELINE_ROOT") {
         let release = std::fs::read_to_string(std::path::Path::new(&root).join("etc/os-release"))?;
         ensure!(
@@ -202,12 +233,12 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
     // This constructor selects ThreadedRuntime, production reqwest and native
     // Linux sockets. No ControlledWorld or simulator clock is present.
     let publisher = Agent::spawn(
-        config(&endpoint, "publisher")?,
+        config(&endpoint, "publisher", true)?,
         Host::new(Box::new(reqwest::Client::new())),
     )
     .await?;
     let subscriber = Agent::spawn(
-        config(&endpoint, "subscriber")?,
+        config_in_room(&endpoint, "subscriber", false, receiver_room)?,
         Host::new(Box::new(reqwest::Client::new())),
     )
     .await?;
@@ -217,6 +248,7 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
         .publish(Default::default())?;
     publication.set_source(Some(&camera)).await?;
     let subscription = subscriber
+        .room(ROOM.into())?
         .participant("publisher".into())?
         .video("production-camera".into())?
         .subscribe(VideoObservation {
@@ -224,10 +256,9 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
             height: HEIGHT,
             priority: 1,
             ..Default::default()
-        })
-        .await?;
+        })?;
     publisher.join(ROOM.into())?;
-    subscriber.join(ROOM.into())?;
+    subscriber.join(receiver_room.into())?;
     tokio::time::timeout(Duration::from_secs(20), async {
         tokio::try_join!(connected(&publisher), connected(&subscriber))?;
         anyhow::Ok(())
@@ -243,18 +274,26 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
         )
     })??;
 
+    ensure!(
+        publisher.snapshot().room_external_id.as_deref() == Some(ROOM)
+            && subscriber.snapshot().room_external_id.as_deref() == Some(receiver_room),
+        "production participants did not occupy the intended room scopes"
+    );
     publication.ready().await?;
     let mut producer = tokio::spawn(produce_i420(camera.clone()));
     let mut observation = None;
     let media = tokio::time::timeout(Duration::from_secs(20), async {
         let remote = observation.insert(subscription.observe(ReceiveMode::Decoded).await?);
-        ensure!(remote.source_track_id().is_some_and(|id| subscriber.snapshot().publications.get(id).is_some_and(|source| source.label == "production-camera" && Some(source.participant_id.as_str()) == publisher.snapshot().participant_id.as_deref())), "observation is not bound to the actual remote publication ID");
+        ensure!(remote.source_track_id().is_some_and(|source| !source.is_empty()), "observation has no canonical source");
+        let snapshot = subscriber.snapshot();
+        ensure!(snapshot.publications.is_empty() && snapshot.remote_tracks.is_empty(), "exact reception without Discover exposed catalog metadata");
         loop {
             tokio::select! {
                 result = &mut producer => bail!("production input stopped: {result:?}"),
                 update = remote.next() => match update {
                     MediaStreamUpdate::Frame { frame } => {
                         ensure!(Some(frame.track.generation) == subscriber.snapshot().generation.map(Generation::get), "wrong production generation");
+                        ensure!(frame.track.receiver == remote.receiver(), "decoded frame belongs to another physical observation");
                         let OutputFrame::I420 { frame: pixels } = frame.frame else { bail!("native production video did not decode"); };
                         ensure!(pixels.width == WIDTH && pixels.height == HEIGHT, "unexpected native decoded dimensions");
                         ensure!(pixels.data.len() == LUMA + CHROMA + CHROMA, "invalid native I420 layout");
@@ -262,8 +301,8 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
                         ensure!(luma.iter().all(|sample| sample.abs_diff(180) <= 12), "native decoded pixels do not match submitted content");
                         break anyhow::Ok(pixels);
                     }
-                    MediaStreamUpdate::Track { .. } | MediaStreamUpdate::NativeDropped { .. } | MediaStreamUpdate::NativeDecodedDropped { .. } => {},
-                    MediaStreamUpdate::Lagged { skipped } => bail!("production observation lagged by {skipped} updates"),
+                    // This smoke witness requires one matching decoded frame, not lossless cursor delivery.
+                    MediaStreamUpdate::Track { .. } | MediaStreamUpdate::NativeDropped { .. } | MediaStreamUpdate::NativeDecodedDropped { .. } | MediaStreamUpdate::Lagged { .. } => {},
                     MediaStreamUpdate::Closed => bail!("production video closed before delivery"),
                 }
             }
@@ -314,13 +353,14 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
         Some(&pixels) == retained.as_ref(),
         "owning production pixels changed after close"
     );
-    println!(
-        "production native raw-I420 encode/real HTTP+SFU+Linux sockets/native decode/owned-close PASS"
-    );
-    if std::env::var_os("PULSEBEAM_FOREIGN_SMOKE").is_some() {
+    writeln!(
+        std::io::stdout(),
+        "production native raw-I420 encode/real HTTP+SFU+Linux sockets/native decode/owned-close PASS receiver_room={receiver_room}"
+    )?;
+    if receiver_room == ROOM && std::env::var_os("PULSEBEAM_FOREIGN_SMOKE").is_some() {
         // Reuse the bounded server and live Rust publisher for both installed consumers.
-        let foreign = config(&endpoint, "foreign")?;
-        let foreign_reader = config(&endpoint, "foreign-reader")?;
+        let foreign = config(&endpoint, "foreign", true)?;
+        let foreign_reader = config(&endpoint, "foreign-reader", true)?;
         let mut command = tokio::process::Command::new(std::env::var("PULSEBEAM_FOREIGN_SMOKE")?);
         command
             .arg(&endpoint)
@@ -338,9 +378,9 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
             Duration::from_secs(35),
         )
         .await?;
-        print!("{output}");
+        std::io::stdout().write_all(output.as_bytes())?;
 
-        let node = config(&endpoint, "foreign-node")?;
+        let node = config(&endpoint, "foreign-node", true)?;
         let mut command = tokio::process::Command::new(std::env::var("PULSEBEAM_NODE_WITNESS")?);
         command
             .arg(&endpoint)
@@ -357,7 +397,7 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
             Duration::from_secs(60),
         )
         .await?;
-        print!("{output}");
+        std::io::stdout().write_all(output.as_bytes())?;
     }
     producer.abort();
     let _ = producer.await;

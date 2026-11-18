@@ -36,9 +36,11 @@ use crate::sender_config::{
 mod media_observation;
 mod preparation;
 mod publication;
+mod resource_state;
 pub use publication::{
     BrowserPipe, BrowserPipeUpdates, BrowserPublicationObserver, BrowserPublicationUpdates,
 };
+use resource_state::ResourceObserver;
 mod resources;
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
@@ -76,6 +78,7 @@ struct TopicRegistrationConfig {
     publish: bool,
     #[serde(default)]
     subscribe: bool,
+    source: Option<TrackSelectorConfig>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -143,6 +146,7 @@ struct AudioDemandConfig {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TrackSelectorConfig {
+    room: String,
     participant_id: String,
     label: String,
 }
@@ -150,6 +154,7 @@ struct TrackSelectorConfig {
 impl From<TrackSelectorConfig> for TrackSelector {
     fn from(value: TrackSelectorConfig) -> Self {
         Self {
+            room: value.room,
             participant_external_id: value.participant_id,
             label: value.label,
         }
@@ -236,7 +241,7 @@ impl LocalOperationError {
 #[derive(Clone, Copy)]
 struct PublicationInputRequest {
     owner: u64,
-    muted: bool,
+    muted: Option<bool>,
     intent: agent_core::PublicationInputIntent,
 }
 
@@ -279,8 +284,8 @@ impl Drop for LocalSlotOperations {
 }
 
 impl DesiredConfig {
-    fn into_core(self) -> DesiredState {
-        DesiredState {
+    fn into_core(self) -> Result<DesiredState, JsValue> {
+        Ok(DesiredState {
             revision: 0,
             connected: self.connected,
             publications: self.publications,
@@ -299,8 +304,8 @@ impl DesiredConfig {
                 })
                 .collect(),
             audio: self.audio.into(),
-            topics: topic_registrations(&self.topics),
-        }
+            topics: topic_registrations(&self.topics)?,
+        })
     }
 }
 
@@ -517,11 +522,18 @@ impl Host for BrowserHost {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        inner.close_pipe_observers_for(owner);
-        let binding = inner.publication_slots.borrow_mut().remove(&owner);
-        if let Some(binding) = binding {
-            inner.invalidate_local_slot(binding);
-        }
+        inner.release_resource(owner);
+    }
+
+    fn prepare_resource_state(
+        &self,
+        owner: u64,
+        state: &crate::engine::ResourceState,
+        closing: bool,
+    ) -> Option<crate::engine::ResourceNotification> {
+        self.inner
+            .upgrade()?
+            .prepare_resource_state(owner, state, closing)
     }
 
     fn publication_input_state(&self, state: &agent_core::PublicationInputState) {
@@ -559,6 +571,7 @@ struct RuntimeInner {
     agent_state: Rc<agent_core::observer::AgentStateObserver>,
     publication_observers:
         RefCell<BTreeMap<u64, Rc<agent_core::observer::PublicationStateObserver>>>,
+    resource_observers: RefCell<BTreeMap<u64, ResourceObserver>>,
     pipe_observers: RefCell<
         Vec<(
             u64,
@@ -610,6 +623,7 @@ impl BrowserRuntime {
                 (&agent_core::Snapshot::default()).into(),
             )),
             publication_observers: RefCell::new(BTreeMap::new()),
+            resource_observers: RefCell::new(BTreeMap::new()),
             pipe_observers: RefCell::new(Vec::new()),
             pending_pipe_notifications: RefCell::new(Vec::new()),
             logger: BrowserLogger::new(config.log_level),
@@ -671,23 +685,53 @@ impl BrowserRuntime {
             LocalOperationError::validation(format!("invalid desired state: {error}")).into_js()
         })?;
         self.inner
-            .replace_desired(desired.into_core())
+            .replace_desired(desired.into_core()?)
             .map_err(js_error)?;
         Ok(())
     }
 
     pub fn claim_owned_publication(&self, spec: JsValue) -> Result<JsValue, JsValue> {
-        self.inner.ensure_open().map_err(|_| {
+        self.claim_publication_spec(resources::publication_spec(spec)?)
+    }
+
+    pub fn configure_publication(&self, owner: u64, enabled: bool) -> Result<(), JsValue> {
+        let actor = self.inner.actor.borrow().clone().ok_or_else(|| {
             operation_error_value(agent_core::ffi::ErrorInfo::new(
                 agent_core::ffi::ErrorCode::Closed,
                 "Browser runtime is closed",
             ))
         })?;
-        let spec = resources::publication_spec(spec)?;
-        let kind = spec.media_kind().ok_or_else(|| {
+        let result = actor
+            .resource_now(agent_core::ResourceCommand::SetPublicationMuted {
+                owner,
+                muted: !enabled,
+            })
+            .map_err(operation_error_value)?;
+        let host = BrowserHost::new(&self.inner);
+        if let agent_core::ResourceResult::PublicationInputState(state) = result {
+            host.publication_input_state(&state);
+        }
+        if let Some(notification) = self.inner.prepare_current_publication(owner) {
+            notification.notify();
+        }
+        host.notify_prepared_pipe_states();
+        Ok(())
+    }
+
+    pub fn resource_now(&self, command: JsValue) -> Result<JsValue, JsValue> {
+        let command = resources::command(command).map_err(|_| {
             operation_error_value(agent_core::ffi::ErrorInfo::new(
                 agent_core::ffi::ErrorCode::InvalidArgument,
-                "Expected a media publication declaration",
+                "Invalid resource command",
+            ))
+        })?;
+        if let agent_core::ResourceCommand::ClaimPublication { spec } = command {
+            return self.claim_publication_spec(spec);
+        }
+        self.inner.ensure_open().map_err(|_| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Closed,
+                "Browser runtime is closed",
             ))
         })?;
         let actor = self.inner.actor.borrow().clone().ok_or_else(|| {
@@ -696,26 +740,47 @@ impl BrowserRuntime {
                 "Browser runtime is closed",
             ))
         })?;
-        let result = actor
-            .resource_now(agent_core::ResourceCommand::ClaimPublication { spec })
-            .map_err(operation_error_value)?;
-        let agent_core::ResourceResult::Publication {
-            owner,
-            slot,
-            after_generation,
-        } = &result
-        else {
-            return Err(operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::Internal,
-                "Unexpected publication declaration result",
-            )));
+        let release = match &command {
+            agent_core::ResourceCommand::Release { owner } => Some(*owner),
+            _ => None,
         };
-        self.inner
-            .register_publication(*owner, slot, kind, *after_generation);
-        if let Some(notification) = self.inner.prepare_current_publication(*owner) {
+        let final_state = release.and_then(|owner| actor.publication_state(owner));
+        let final_resource = release.and_then(|owner| actor.observed_resource_state(owner));
+        let result = actor.resource_now(command);
+        let mut publications = Vec::new();
+        let mut resources = Vec::new();
+        if let Some(owner) = release {
+            self.inner.release_resource(owner);
+            if let Some(mut state) = final_state {
+                state.closed = true;
+                publications.extend(self.inner.prepare_publication(owner, &state, true));
+            }
+            if let Some(mut state) = final_resource {
+                state.mark_closed();
+                resources.extend(self.inner.prepare_resource_state(owner, &state, true));
+            }
+        }
+        let owners = self
+            .inner
+            .publication_observers
+            .borrow()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        publications.extend(
+            owners
+                .into_iter()
+                .filter_map(|owner| self.inner.prepare_current_publication(owner)),
+        );
+        resources.extend(self.inner.prepare_current_resources());
+        for notification in publications {
             notification.notify();
         }
-        Ok(resources::result(result))
+        for notification in resources {
+            notification();
+        }
+        self.inner.notify_prepared_pipe_states();
+        result.map(resources::result).map_err(operation_error_value)
     }
 
     #[wasm_bindgen(unchecked_return_type = "Promise<any>")]
@@ -747,9 +812,10 @@ impl BrowserRuntime {
         &self,
         owner: u64,
         source: Option<String>,
+        signal: Option<web_sys::AbortSignal>,
     ) -> Result<js_sys::Promise, JsValue> {
         self.inner.ensure_open()?;
-        Ok(self.inner.begin_observation(owner, source))
+        Ok(self.inner.begin_observation(owner, source, signal))
     }
 
     pub fn renew(&self, token: String) -> Result<(), JsValue> {
@@ -796,7 +862,7 @@ impl BrowserRuntime {
                     config,
                     PublicationInputRequest {
                         owner,
-                        muted,
+                        muted: Some(muted),
                         intent: if replace_input {
                             agent_core::PublicationInputIntent::Replace
                         } else {
@@ -881,24 +947,25 @@ impl BrowserRuntime {
     }
 
     #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
-    pub fn send_data(&self, spec: JsValue, payload: &[u8]) -> Result<js_sys::Promise, JsValue> {
-        self.inner.ensure_open()?;
-        let spec = resources::spec(spec)?;
+    pub fn send_owned_data(&self, owner: u64, payload: &[u8]) -> Result<js_sys::Promise, JsValue> {
+        use agent_core::ffi::{ErrorCode, ErrorInfo};
+        self.inner.ensure_open().map_err(|_| {
+            operation_error_value(ErrorInfo::new(ErrorCode::Closed, "Data runtime is closed"))
+        })?;
         let completion = self
             .inner
             .actor
             .borrow()
             .as_ref()
-            .ok_or_else(|| js_error("runtime actor not initialized"))?
-            .send_data(spec, payload.to_vec())
-            .map_err(js_error)?;
-        Ok(future_to_promise(async move {
-            completion
-                .await
-                .map_err(|_| js_error("data send was canceled"))?
-                .map_err(resources::send_error)?;
-            Ok(JsValue::UNDEFINED)
-        }))
+            .ok_or_else(|| {
+                operation_error_value(ErrorInfo::new(
+                    ErrorCode::NotReady,
+                    "Data runtime is not ready",
+                ))
+            })?
+            .send_owned_data(owner, payload.to_vec())
+            .map_err(operation_error_value)?;
+        Ok(data_send_promise(completion))
     }
 
     #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
@@ -1035,6 +1102,49 @@ impl BrowserRuntime {
         set(&value, "closed", self.inner.is_closed());
         set(&value, "lastError", self.inner.last_error.borrow().clone());
         value.into()
+    }
+}
+
+impl BrowserRuntime {
+    fn claim_publication_spec(&self, spec: agent_core::TrackSpec) -> Result<JsValue, JsValue> {
+        self.inner.ensure_open().map_err(|_| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Closed,
+                "Browser runtime is closed",
+            ))
+        })?;
+        let kind = spec.media_kind().ok_or_else(|| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::InvalidArgument,
+                "Expected a media publication declaration",
+            ))
+        })?;
+        let actor = self.inner.actor.borrow().clone().ok_or_else(|| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Closed,
+                "Browser runtime is closed",
+            ))
+        })?;
+        let result = actor
+            .resource_now(agent_core::ResourceCommand::ClaimPublication { spec })
+            .map_err(operation_error_value)?;
+        let agent_core::ResourceResult::Publication {
+            owner,
+            slot,
+            after_generation,
+        } = &result
+        else {
+            return Err(operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Internal,
+                "Unexpected publication declaration result",
+            )));
+        };
+        self.inner
+            .register_publication(*owner, slot, kind, *after_generation);
+        if let Some(notification) = self.inner.prepare_current_publication(*owner) {
+            notification.notify();
+        }
+        Ok(resources::result(result))
     }
 }
 
@@ -1238,6 +1348,9 @@ impl RuntimeInner {
 
     fn close_publication_observers(&self) {
         self.prepare_pipe_shutdown();
+        let resources = self.prepare_resource_shutdown();
+        let mut agent_state: agent_core::ffi::AgentState = (&self.snapshot()).into();
+        agent_state.room = None;
         let publications = std::mem::take(&mut *self.publication_observers.borrow_mut());
         let current = {
             let actor = self.actor.borrow();
@@ -1263,8 +1376,12 @@ impl RuntimeInner {
                 observer.prepare(state, true).ok()
             })
             .collect::<Vec<_>>();
+        let _ = self.agent_state.close(agent_state);
         for notification in notifications {
             notification.notify();
+        }
+        for notification in resources {
+            notification();
         }
         self.notify_prepared_pipe_states();
     }
@@ -1547,7 +1664,7 @@ impl RuntimeInner {
                 owner: publication.owner,
                 input: publication.intent,
                 present: track.is_some(),
-                muted: Some(publication.muted),
+                muted: publication.muted,
             })
             .await?
         else {
@@ -1756,6 +1873,14 @@ impl RuntimeInner {
         Ok(value.into())
     }
 
+    fn release_resource(self: &Rc<Self>, owner: u64) {
+        self.close_pipe_observers_for(owner);
+        let binding = self.publication_slots.borrow_mut().remove(&owner);
+        if let Some(binding) = binding {
+            self.invalidate_local_slot(binding);
+        }
+    }
+
     fn prepare_current_publication(
         &self,
         owner: u64,
@@ -1774,6 +1899,9 @@ impl RuntimeInner {
         state: &agent_core::ffi::PublicationState,
         closing: bool,
     ) -> Option<agent_core::observer::PublicationNotification> {
+        if self.is_closed() && !closing {
+            return None;
+        }
         let observer = {
             let mut observers = self.publication_observers.borrow_mut();
             observers
@@ -2692,7 +2820,7 @@ impl RuntimeInner {
     }
 }
 
-fn topic_registrations(topics: &[TopicRegistrationConfig]) -> TopicRegistrations {
+fn topic_registrations(topics: &[TopicRegistrationConfig]) -> Result<TopicRegistrations, JsValue> {
     let mut registrations = TopicRegistrations::default();
     for topic in topics {
         let mode = topic.mode.into();
@@ -2703,13 +2831,40 @@ fn topic_registrations(topics: &[TopicRegistrationConfig]) -> TopicRegistrations
             });
         }
         if topic.subscribe {
+            let source = topic
+                .source
+                .as_ref()
+                .filter(|source| source.label == topic.name)
+                .ok_or_else(|| {
+                    LocalOperationError::validation("data reception requires an exact source")
+                        .into_js()
+                })?;
             registrations.subscribers.push(TopicSubscriber {
+                room: source.room.clone(),
+                participant_external_id: source.participant_id.clone(),
                 topic: topic.name.clone(),
                 mode,
             });
         }
     }
-    registrations
+    Ok(registrations)
+}
+
+fn data_send_promise(
+    completion: futures_channel::oneshot::Receiver<Result<(), crate::engine::DataSendError>>,
+) -> js_sys::Promise {
+    future_to_promise(async move {
+        completion
+            .await
+            .map_err(|_| {
+                operation_error_value(agent_core::ffi::ErrorInfo::new(
+                    agent_core::ffi::ErrorCode::Closed,
+                    "Data send was closed",
+                ))
+            })?
+            .map_err(resources::send_error)?;
+        Ok(JsValue::UNDEFINED)
+    })
 }
 
 fn parse_topic_mode(mode: &str) -> Result<TopicMode, JsValue> {

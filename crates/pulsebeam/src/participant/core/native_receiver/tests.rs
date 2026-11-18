@@ -14,6 +14,7 @@ fn subscription(source: TrackId, channel: u32, enabled: bool) -> wire::ResourceS
             wire::SubscriptionSpec {
                 track_id: source.as_str(),
                 kind: wire::TrackKind::Data as i32,
+                source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
                         stream_id: Some(channel),
@@ -114,11 +115,13 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     };
     assert!(issued == work);
     let crate::control::native::Receiver {
+        source_room,
         source,
         source_id,
         transport,
         policy,
     } = *plan;
+    assert_eq!(source_room, participant.room_id);
     assert_eq!(source.id(), id);
     assert_eq!(source_id, id.as_str());
     assert!(policy.enabled && policy.video.is_none());
@@ -144,6 +147,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
                 lane: DataLane::Ordered,
             },
             source: id,
+            source_room,
             source_id,
             handle: None,
             enabled: false,
@@ -208,6 +212,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
                     failure: Some(failure(wire::FailureCode::Unsupported)),
                 }),
             }],
+            ..Default::default()
         })
         .unwrap(),
         &mut sink,

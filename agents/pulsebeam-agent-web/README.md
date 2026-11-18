@@ -37,15 +37,18 @@ session. `await agent.close()` is terminal and releases its resources.
 const camera = agent.video("camera");
 const microphone = agent.audio("microphone");
 const chat = agent.data("chat", "ordered");
-const participant = agent.participant("alice");
+const room = agent.room("conference-42");
+const participant = room.participant("alice");
 const remoteCamera = participant.video("camera");
 const remoteChat = participant.data("chat", "ordered");
 ```
 
-Lookup is inert and returns stable logical handles. A remote handle can exist
-before its participant or publication appears and survives temporary absence or
-replacement. Resource factories, not lookup, acquire ownership. This API replaces
-descriptors, `.track(spec)`, and `.remote.participant(id)` without aliases.
+Lookup is inert and returns logical handles pinned to the supplied application
+room name. A remote handle can exist before its participant or publication
+appears and survives temporary absence or replacement, but it never follows the
+Agent into another room. Resource factories, not lookup, acquire ownership. Room
+references replace unpinned `Agent.participant(id)` lookup. The descriptor and
+`.track(spec)` APIs remain absent.
 
 ## Publish caller-owned capture
 
@@ -136,7 +139,7 @@ await playback.ready;
 receive policy; playback owns the decoded output route and autoplay recovery.
 Attaching playback does not implicitly select remote audio. Configure explicit
 selection with `await selection.configure({ automatic: false, selected:
-[{ participantId: "alice", label: "microphone" }] })`.
+[{ room: "conference-42", participantId: "alice", label: "microphone" }] })`.
 
 Close `playback` and `selection` independently when their owners end. A custom
 audio consumer can instead use `participant.audio(label).subscribe(...)` and
@@ -145,11 +148,12 @@ source-scoped observations.
 ## Send and receive bytes
 
 Applications own codecs, schema validation, versioning, and malformed-payload
-policy. Local data handles can send and receive. Participant-scoped data handles
-are receive-only.
+policy. Local data handles create owned publications; room-pinned participant
+data handles create independent subscriptions.
 
 ```ts
-const messages = await remoteChat.receive();
+const publication = chat.publish();
+const messages = remoteChat.subscribe();
 const reading = (async () => {
   while (true) {
     const update = await messages.next();
@@ -162,11 +166,12 @@ const reading = (async () => {
     }
   }
 })();
-await chat.send(new TextEncoder().encode("hello"));
+await publication.send(new TextEncoder().encode("hello"));
 ```
 
 `showGap` and `handleBytes` are application handlers. Handle processing failures
-on `reading`. To stop reception, call `await messages.close()`, then await the
+on `reading`. Close the publication with `await publication.close()` when sending
+ends. To stop reception, call `await messages.close()`, then await the
 reading task. Closing one receiver does not close other receivers or their Agent.
 There is no implicit JSON codec, automatic iterator, or callback subscription.
 

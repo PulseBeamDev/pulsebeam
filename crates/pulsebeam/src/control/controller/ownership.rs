@@ -199,6 +199,7 @@ struct Family {
     sequence: NonZeroU64,
     binding: RequestBinding,
     pending: bool,
+    retryable_materialization: bool,
     result: Option<CachedResult>,
     idle: Option<Instant>,
     expired: bool,
@@ -346,17 +347,23 @@ impl Authority {
                         return Err(Error::ChangedAttempt);
                     }
                     if family.pending {
+                        if family.retryable_materialization {
+                            return Err(Error::QuiescencePending);
+                        }
                         let work = self.work.get(&ticket).ok_or(Error::ReplayUnavailable)?;
                         if work.waiters >= MAX_WAITERS {
                             return Err(Error::Capacity);
                         }
                         return Ok(Admission::Pending(ticket));
                     }
-                    return if family.result.is_some() {
-                        Ok(Admission::Replay(ticket))
-                    } else {
-                        Err(Error::ReplayUnavailable)
-                    };
+                    if family.result.is_some() {
+                        return Ok(Admission::Replay(ticket));
+                    }
+                    if !family.retryable_materialization {
+                        return Err(Error::ReplayUnavailable);
+                    }
+                    // Only an uncommitted materialization failure can repeat this request.
+                    // Physical retirement must clear pending before allocation is retried.
                 }
                 Ordering::Greater => {}
             }
@@ -445,6 +452,7 @@ impl Authority {
             sequence,
             binding,
             pending: true,
+            retryable_materialization: false,
             result: None,
             idle: None,
             expired: false,
@@ -463,6 +471,22 @@ impl Authority {
         self.result_bytes = bytes;
         self.put_record(principal.clone(), record);
         Ok(Admission::Start(ticket))
+    }
+
+    pub(crate) fn retry_failed_materialization(&mut self, ticket: &Ticket) {
+        if !self.work.get(ticket).is_some_and(|work| work.pending) {
+            return;
+        }
+        if let Some(family) = self
+            .records
+            .get_mut(&ticket.principal)
+            .and_then(|record| record.family.as_mut())
+            && family.proof == ticket.proof
+            && family.sequence == ticket.sequence
+            && family.pending
+        {
+            family.retryable_materialization = true;
+        }
     }
 
     pub(crate) fn detach_waiter(&mut self, ticket: &Ticket) {
@@ -680,7 +704,13 @@ impl Authority {
         physical.retirement = Retirement::InFlight;
     }
 
-    pub(crate) fn finish_retirement(&mut self, ticket: &Ticket, success: bool, now: Instant) {
+    pub(crate) fn finish_retirement(
+        &mut self,
+        ticket: &Ticket,
+        incarnation: Incarnation,
+        success: bool,
+        now: Instant,
+    ) {
         let Some(physical) = self
             .work
             .get_mut(ticket)
@@ -688,7 +718,7 @@ impl Authority {
         else {
             return;
         };
-        if physical.retirement != Retirement::InFlight {
+        if physical.incarnation != incarnation || physical.retirement != Retirement::InFlight {
             return;
         }
         physical.retirement = if success {
@@ -1029,6 +1059,81 @@ mod tests {
         assert!(
             authority.is_current(&new),
             "stale cleanup cannot retire the new owner"
+        );
+        check(&authority);
+    }
+
+    #[test]
+    fn failed_materialization_retries_exact_request_only_after_retirement() {
+        let mut authority = Authority::default();
+        let mut entropy = StdRng::seed_from_u64(17);
+        let principal = principal("alice");
+        let now = Instant::now();
+        let proof = authority
+            .issue(principal.clone(), now, &mut entropy)
+            .unwrap();
+        let ticket = start(&mut authority, &principal, proof, 1, now);
+        let old = Incarnation {
+            participant: ParticipantId::new(),
+            connection: ConnectionId::new(),
+            transport: NodeTransportAddress::new(
+                crate::route::TransportRoute::new(crate::id::ShardId::new(0), 1),
+                1,
+            ),
+        };
+        let attach = |authority: &mut Authority, incarnation| {
+            let work = authority.work.get_mut(&ticket).unwrap();
+            assert!(work.physical.is_none());
+            work.physical = Some(Physical {
+                incarnation,
+                submitted: true,
+                retirement: Retirement::Live,
+            });
+            assert!(
+                authority
+                    .incarnations
+                    .insert(incarnation, ticket.clone())
+                    .is_none()
+            );
+        };
+        attach(&mut authority, old);
+        authority.retry_failed_materialization(&ticket);
+        authority.queue_retirement(old);
+        authority.retire(&ticket, now);
+        assert_eq!(
+            authority.preview(&principal, proof, sequence(1), RequestBinding([1; 32]), now),
+            Err(Error::QuiescencePending)
+        );
+        authority.start_retirement(&ticket);
+        authority.finish_retirement(&ticket, old, true, now);
+        assert_eq!(
+            authority.begin(&principal, proof, sequence(1), RequestBinding([2; 32]), now),
+            Err(Error::ChangedAttempt)
+        );
+        assert_eq!(start(&mut authority, &principal, proof, 1, now), ticket);
+        let current = Incarnation {
+            connection: ConnectionId::new(),
+            ..old
+        };
+        attach(&mut authority, current);
+        check(&authority);
+        authority.commit(&ticket, b"answer".to_vec(), now).unwrap();
+        assert_eq!(
+            authority.begin(&principal, proof, sequence(1), RequestBinding([1; 32]), now),
+            Ok(Admission::Replay(ticket.clone()))
+        );
+        authority.retry_failed_materialization(&ticket);
+        authority.queue_retirement(current);
+        authority.start_retirement(&ticket);
+        authority.finish_retirement(&ticket, old, true, now);
+        assert!(
+            authority.has_incarnation(current),
+            "old cutoff cannot retire the retried incarnation"
+        );
+        authority.finish_retirement(&ticket, current, true, now);
+        assert_eq!(
+            authority.begin(&principal, proof, sequence(1), RequestBinding([1; 32]), now),
+            Err(Error::ReplayUnavailable)
         );
         check(&authority);
     }

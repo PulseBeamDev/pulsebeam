@@ -740,30 +740,85 @@ fn marker_only_publisher_streams_to_a_dd_subscriber_test() {
 /// neither its frame assertions nor its currently failing result are replaced.
 #[test]
 fn same_receiver_encoded_and_native_decoded_video_test() {
-    LocalNodeSim::new()
-        .with_room(
-            Room::new("room1")
-                .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::subscriber("bob").with_encoded_and_native_decoded_video()),
-        )
-        .run(vec![
+    let mut plan = vec![
+        Step::WaitForPublication {
+            description: "Resolve the stationary source before retaining its explicit room interest",
+            publisher: "alice",
+            timeout: Duration::from_secs(5),
+        },
+        Step::SubscribeToConfigured {
+            description: "Keep the original named main-room subscription throughout the roundtrip",
+            participant: "bob",
+            targets: vec![super::common::harness::VideoSubscription {
+                participant_id: "alice".into(),
+                height: 720,
+                ..Default::default()
+            }],
+        },
+    ];
+    for (phase, room, seconds) in [(0, "room1", 3), (1, "breakout", 4), (2, "room1", 4)] {
+        if phase > 0 {
+            plan.push(Step::MoveRoom {
+                description: "Move the same Agent while retaining logical reception and outbound owners",
+                participant: "bob", room, timeout: Duration::from_secs(5),
+            });
+        }
+        plan.extend([
             Step::Run {
-                description: "Deliver both actual observer boundaries from the same native receiver",
-                duration: Duration::from_secs(10),
+                description: "Deliver both actual observer boundaries in the current room phase",
+                duration: Duration::from_secs(seconds),
             },
             Step::CheckVideoDecodedFromInterval {
                 description: "Authenticated encoded AUs remain independently decodable",
-                participant: "bob", publisher: "alice", min_frames: 150, min_resolution: (1280, 720),
+                participant: "bob", publisher: "alice", min_frames: 50, min_resolution: (1280, 720),
             },
             Step::CheckNativeDecodedVideo {
                 description: "Actual native decoder delivers changing fresh 720p I420 with advancing stats",
-                participant: "bob", dimensions: (1280, 720), min_fresh_frames: 150,
+                participant: "bob", dimensions: (1280, 720), min_fresh_frames: 50,
             },
             Step::CheckNativeVideoDecodedFromInterval {
-                description: "Native pixels correlate to Alice's actual current HTTP admission",
-                participant: "bob", publisher: "alice", min_frames: 150, min_resolution: (1280, 720),
+                description: "Native pixels correlate to Alice's actual current HTTP admission in every room phase",
+                participant: "bob", publisher: "alice", min_frames: 50, min_resolution: (1280, 720),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "The original outbound source and pipe deliver independently decoded video in the admitted room",
+                participant: if room == "breakout" { "charlie" } else { "alice" },
+                publisher: "bob", min_frames: 50, min_resolution: (320, 180),
+            },
+            Step::CheckNativeDecodedVideo {
+                description: "The admitted-room viewer decodes changing native pictures from the moving publisher",
+                participant: if room == "breakout" { "charlie" } else { "alice" },
+                dimensions: (320, 180), min_fresh_frames: 50,
+            },
+            Step::CheckNativeVideoDecodedFromInterval {
+                description: "Outbound native pixels correlate to Bob's current admission after every room move",
+                participant: if room == "breakout" { "charlie" } else { "alice" },
+                publisher: "bob", min_frames: 50, min_resolution: (320, 180),
             },
         ]);
+    }
+    plan.push(Step::ReleaseRetainedVideoResources {
+        description: "Original reception, source, publication and pipe owners and cursors survive the roundtrip",
+        participant: "bob",
+    });
+    let mut bob = Participant::publisher("bob", &["q"])
+        .and_subscribes()
+        .with_encoded_and_native_decoded_video();
+    bob.auto_subscribe = false;
+    LocalNodeSim::new()
+        .with_room(
+            Room::new("room1")
+                .with_participant(
+                    Participant::publisher("alice", &["q", "h", "f"])
+                        .and_subscribes()
+                        .with_encoded_and_native_decoded_video(),
+                )
+                .with_participant(bob),
+        )
+        .with_room(Room::new("breakout").with_participant(
+            Participant::subscriber("charlie").with_encoded_and_native_decoded_video(),
+        ))
+        .run(plan);
 }
 
 #[test]

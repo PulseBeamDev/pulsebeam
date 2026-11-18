@@ -28,6 +28,19 @@ pub(crate) enum DataSendError {
     Closed,
 }
 
+mod resource_state;
+pub(crate) use resource_state::{ResourceKind, ResourceNotification, ResourceState};
+
+#[derive(Debug)]
+pub(crate) enum DataSendTarget {
+    #[cfg(test)]
+    Track(agent_core::TrackSpec),
+    Publication {
+        owner: u64,
+        expected_join: u64,
+    },
+}
+
 type DataSendCompletion = oneshot::Sender<Result<(), DataSendError>>;
 
 #[derive(Default)]
@@ -36,6 +49,7 @@ pub(crate) struct Turn {
     pub(crate) notifications: Vec<Notification>,
     pub(crate) snapshot: Option<Snapshot>,
     pub(crate) publications: Vec<(u64, agent_core::ffi::PublicationState, bool)>,
+    pub(crate) resources: Vec<(u64, ResourceState, bool)>,
     pub(crate) error: Option<TurnError>,
     logs: Vec<agent_core::DeferredLog>,
 }
@@ -61,12 +75,35 @@ struct Control {
     agent: RefCell<Agent>,
     accepting: Cell<bool>,
     wake_pending: Cell<bool>,
+    publication_owners: RefCell<BTreeMap<u64, ()>>,
+    resource_observers: RefCell<BTreeMap<u64, ResourceKind>>,
+}
+
+impl Control {
+    fn resource(
+        &self,
+        command: agent_core::ResourceCommand,
+    ) -> Result<agent_core::ResourceResult, AgentError> {
+        let release = match &command {
+            agent_core::ResourceCommand::Release { owner } => Some(*owner),
+            _ => None,
+        };
+        let result = self.agent.borrow_mut().resource(command);
+        let mut owners = self.publication_owners.borrow_mut();
+        if let Ok(agent_core::ResourceResult::Publication { owner, .. }) = &result {
+            owners.insert(*owner, ());
+        }
+        if let Some(owner) = release {
+            owners.remove(&owner);
+            self.resource_observers.borrow_mut().remove(&owner);
+        }
+        result
+    }
 }
 
 pub(crate) struct Driver {
     control: Rc<Control>,
     published_version: Option<u64>,
-    publication_owners: BTreeMap<u64, ()>,
 }
 
 impl Driver {
@@ -78,9 +115,10 @@ impl Driver {
                 agent: RefCell::new(agent),
                 accepting: Cell::new(true),
                 wake_pending: Cell::new(false),
+                publication_owners: RefCell::new(BTreeMap::new()),
+                resource_observers: RefCell::new(BTreeMap::new()),
             }),
             published_version: None,
-            publication_owners: BTreeMap::new(),
         })
     }
 
@@ -121,12 +159,34 @@ impl Driver {
         self.finish_turn(error)
     }
 
-    pub(crate) fn send_data(
+    fn send_data(
         &mut self,
-        spec: agent_core::TrackSpec,
+        target: DataSendTarget,
         payload: Vec<u8>,
     ) -> (Result<agent_core::OperationId, AgentError>, Turn) {
-        let result = self.control.agent.borrow_mut().send_data(spec, payload);
+        let result = (|| {
+            let mut agent = self.control.agent.borrow_mut();
+            let spec = match target {
+                #[cfg(test)]
+                DataSendTarget::Track(spec) => spec,
+                DataSendTarget::Publication {
+                    owner,
+                    expected_join,
+                } => {
+                    if agent_core::ffi::AgentState::from(agent.snapshot()).desired_join_revision
+                        != expected_join
+                    {
+                        return Err(agent_core::TrackResourceError::NotConnected.into());
+                    }
+                    let publication = agent.data_publication_state(owner)?;
+                    agent_core::TrackSpec::Data {
+                        label: publication.label,
+                        delivery: publication.delivery.into(),
+                    }
+                }
+            };
+            agent.send_data(spec, payload)
+        })();
         let turn = self.finish_turn(None);
         (result, turn)
     }
@@ -141,14 +201,19 @@ impl Driver {
         };
         let final_state =
             releasing.and_then(|owner| self.control.agent.borrow().publication_state(owner).ok());
-        let result = self.control.agent.borrow_mut().resource(command);
-        if let Ok(agent_core::ResourceResult::Publication { owner, .. }) = &result {
-            self.publication_owners.insert(*owner, ());
-        }
-        if let Some(owner) = releasing {
-            self.publication_owners.remove(&owner);
-        }
+        let final_resource = releasing.and_then(|owner| {
+            self.control
+                .resource_observers
+                .borrow()
+                .get(&owner)
+                .and_then(|kind| kind.state(&self.control.agent.borrow(), owner))
+        });
+        let result = self.control.resource(command);
         let mut turn = self.finish_turn(None);
+        if let (Some(owner), Some(mut state)) = (releasing, final_resource) {
+            state.mark_closed();
+            turn.resources.push((owner, state, true));
+        }
         if let (Some(owner), Some(mut state)) = (releasing, final_state) {
             state.closed = true;
             turn.publications.push((owner, state, true));
@@ -169,7 +234,9 @@ impl Driver {
         }
 
         let publications = self
+            .control
             .publication_owners
+            .borrow()
             .keys()
             .filter_map(|owner| {
                 agent
@@ -179,6 +246,16 @@ impl Driver {
             })
             .collect();
 
+        let resources = self
+            .control
+            .resource_observers
+            .borrow()
+            .iter()
+            .filter_map(|(owner, kind)| {
+                kind.state(&agent, *owner)
+                    .map(|state| (*owner, state, false))
+            })
+            .collect();
         let version = agent.snapshot().version;
         let snapshot = if self.published_version == Some(version) {
             None
@@ -192,6 +269,7 @@ impl Driver {
             notifications,
             snapshot,
             publications,
+            resources,
             error,
             logs: agent.drain_logs(),
         }
@@ -218,6 +296,14 @@ pub(crate) trait Host {
         _state: &agent_core::ffi::PublicationState,
         _closing: bool,
     ) -> Option<agent_core::observer::PublicationNotification> {
+        None
+    }
+    fn prepare_resource_state(
+        &self,
+        _owner: u64,
+        _state: &ResourceState,
+        _closing: bool,
+    ) -> Option<ResourceNotification> {
         None
     }
     fn publication_input_state(&self, _state: &agent_core::PublicationInputState) {}
@@ -267,7 +353,7 @@ pub(crate) enum Message {
         completion: oneshot::Sender<Result<(), String>>,
     },
     DataSend {
-        spec: agent_core::TrackSpec,
+        target: DataSendTarget,
         payload: Vec<u8>,
         completion: DataSendCompletion,
     },
@@ -345,6 +431,30 @@ impl ActorHandle {
         self.control.agent.borrow().publication_state(owner).ok()
     }
 
+    pub(crate) fn observe_resource(&self, owner: u64, kind: ResourceKind) -> Option<ResourceState> {
+        let state = kind.state(&self.control.agent.borrow(), owner)?;
+        self.control
+            .resource_observers
+            .borrow_mut()
+            .insert(owner, kind);
+        Some(state)
+    }
+
+    pub(crate) fn observed_resource_state(&self, owner: u64) -> Option<ResourceState> {
+        let kind = *self.control.resource_observers.borrow().get(&owner)?;
+        kind.state(&self.control.agent.borrow(), owner)
+    }
+
+    pub(crate) fn resource_states(&self) -> Vec<(u64, ResourceState)> {
+        let agent = self.control.agent.borrow();
+        self.control
+            .resource_observers
+            .borrow()
+            .iter()
+            .filter_map(|(owner, kind)| kind.state(&agent, *owner).map(|state| (*owner, state)))
+            .collect()
+    }
+
     /// Synchronously reserve a local resource while preserving actor acceptance.
     /// CoreChanged is coalesced, and every actor turn projects the current Core.
     pub(crate) fn resource_now(
@@ -359,8 +469,6 @@ impl ActorHandle {
         }
         let result = self
             .control
-            .agent
-            .borrow_mut()
             .resource(command)
             .map_err(|error| agent_core::ffi::ErrorInfo::from(&error))?;
         if !self.control.wake_pending.replace(true) {
@@ -406,17 +514,61 @@ impl ActorHandle {
         Ok(receiver)
     }
 
+    #[cfg(test)]
     pub(crate) fn send_data(
         &self,
         spec: agent_core::TrackSpec,
         payload: Vec<u8>,
-    ) -> Result<oneshot::Receiver<Result<(), DataSendError>>, String> {
-        let (completion, receiver) = oneshot::channel();
-        self.send(Message::DataSend {
-            spec,
+    ) -> Result<oneshot::Receiver<Result<(), DataSendError>>, agent_core::ffi::ErrorInfo> {
+        self.queue_data(DataSendTarget::Track(spec), payload)
+    }
+
+    pub(crate) fn send_owned_data(
+        &self,
+        owner: u64,
+        payload: Vec<u8>,
+    ) -> Result<oneshot::Receiver<Result<(), DataSendError>>, agent_core::ffi::ErrorInfo> {
+        let expected_join = {
+            let agent = self.control.agent.borrow();
+            agent
+                .data_publication_state(owner)
+                .map_err(|error| agent_core::ffi::ErrorInfo::from(&error))?;
+            agent_core::ffi::AgentState::from(agent.snapshot()).desired_join_revision
+        };
+        self.queue_data(
+            DataSendTarget::Publication {
+                owner,
+                expected_join,
+            },
             payload,
-            completion,
-        })?;
+        )
+    }
+
+    fn queue_data(
+        &self,
+        target: DataSendTarget,
+        payload: Vec<u8>,
+    ) -> Result<oneshot::Receiver<Result<(), DataSendError>>, agent_core::ffi::ErrorInfo> {
+        use agent_core::ffi::{ErrorCode, ErrorInfo};
+        if self.closed.get() || !self.control.accepting.get() || self.sender.is_closed() {
+            return Err(ErrorInfo::new(ErrorCode::Closed, "Data runtime is closed"));
+        }
+        let (completion, receiver) = oneshot::channel();
+        self.sender
+            .try_send(Message::DataSend {
+                target,
+                payload,
+                completion,
+            })
+            .map_err(|error| match error {
+                MpscTrySendError::Full(_) => ErrorInfo::new(
+                    ErrorCode::CapacityExceeded,
+                    "Data operation mailbox is full",
+                ),
+                MpscTrySendError::Closed(_) => {
+                    ErrorInfo::new(ErrorCode::Closed, "Data runtime is closed")
+                }
+            })?;
         Ok(receiver)
     }
 
@@ -583,8 +735,18 @@ impl<H: Host> Actor<H> {
                 self.host.prepare_publication_state(*owner, state, *closing)
             })
             .collect::<Vec<_>>();
+        let resources = turn
+            .resources
+            .iter()
+            .filter_map(|(owner, state, closing)| {
+                self.host.prepare_resource_state(*owner, state, *closing)
+            })
+            .collect::<Vec<_>>();
         for publication in publications {
             publication.notify();
+        }
+        for notification in resources {
+            notification();
         }
         self.host.notify_prepared_pipe_states();
         let snapshot = if let Some(snapshot) = turn.snapshot.clone() {
@@ -610,8 +772,11 @@ impl<H: Host> Actor<H> {
             if let Notification::DataSendFinished { send, error } = notification
                 && let Some(completion) = self.data_sends.remove(send)
             {
-                let _ = completion
-                    .send(error.map_or(Ok(()), |error| Err(DataSendError::Delivery(error))));
+                let _ = completion.send(
+                    error
+                        .as_ref()
+                        .map_or(Ok(()), |error| Err(DataSendError::Delivery(error.clone()))),
+                );
             }
         }
 
@@ -716,11 +881,11 @@ impl<H: Host> Actor<H> {
                 ));
             }
             Message::DataSend {
-                spec,
+                target,
                 payload,
                 completion,
             } => {
-                let (result, turn) = self.driver.send_data(spec, payload);
+                let (result, turn) = self.driver.send_data(target, payload);
                 match result {
                     Ok(ticket) => {
                         self.data_sends.insert(ticket, completion);
@@ -874,8 +1039,8 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        Actor, Driver, Host, Input, LifecycleCommand, Message, PublicCommand, SerialQueue,
-        TurnErrorSource,
+        Actor, DataSendTarget, Driver, Host, Input, LifecycleCommand, Message, PublicCommand,
+        SerialQueue, TurnErrorSource,
     };
     use agent_core::{
         AgentCommand, ChannelId, ConnectionState, DesiredState, Effect, Failure, FailureClass,
@@ -960,6 +1125,11 @@ mod tests {
 
     #[test]
     fn intent_commits_without_actor_progress_and_wakes_through_a_full_mailbox() {
+        use agent_core::{TopicMode, TrackSpec, ffi::ErrorCode};
+        let data = TrackSpec::Data {
+            label: "events".into(),
+            delivery: TopicMode::Ordered,
+        };
         let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
         let (sender, receiver) = super::channel::mpsc::channel(1);
         let handle = actor.handle(sender);
@@ -1010,6 +1180,10 @@ mod tests {
         handle
             .send_public(PublicCommand::SetLogLevel(agent_core::LogLevel::Off))
             .unwrap();
+        assert_eq!(
+            handle.send_data(data.clone(), vec![1]).unwrap_err().code,
+            ErrorCode::CapacityExceeded
+        );
         handle.join("mailbox-full".into()).unwrap();
         let committed = handle.snapshot();
         assert_eq!(committed.desired_room.as_deref(), Some("mailbox-full"));
@@ -1040,6 +1214,10 @@ mod tests {
         );
         actor.shutdown();
         assert!(handle.join("after-shutdown".into()).is_err());
+        assert_eq!(
+            handle.send_data(data.clone(), vec![1]).unwrap_err().code,
+            ErrorCode::Closed
+        );
 
         let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
         let (sender, receiver) = super::channel::mpsc::channel(1);
@@ -1048,6 +1226,10 @@ mod tests {
         let before = handle.snapshot();
         assert!(handle.join("no-runtime".into()).is_err());
         assert_eq!(handle.snapshot(), before);
+        assert_eq!(
+            handle.send_data(data, vec![1]).unwrap_err().code,
+            ErrorCode::Closed
+        );
     }
 
     #[test]
@@ -1387,10 +1569,10 @@ mod tests {
         actor.turn(Input::Command(AgentCommand::Join("room".into())));
         let (completion, mut pending) = oneshot::channel();
         actor.process(Message::DataSend {
-            spec: agent_core::TrackSpec::Data {
+            target: DataSendTarget::Track(agent_core::TrackSpec::Data {
                 label: "pending".into(),
                 delivery: agent_core::TopicMode::Lossy,
-            },
+            }),
             payload: vec![0, 255],
             completion,
         });
@@ -1402,8 +1584,8 @@ mod tests {
         assert!(matches!(
             pending.try_recv().unwrap(),
             Some(Err(super::DataSendError::Delivery(
-                agent_core::DataSendFailure::TerminalFailure
-            )))
+                agent_core::DataSendFailure::TerminalFailure { error }
+            ))) if error == agent_core::ffi::AgentState::from(&actor.driver.snapshot()).error.unwrap()
         ));
         assert_eq!(
             actor.driver.snapshot().connection,

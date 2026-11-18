@@ -2,6 +2,7 @@ use super::*;
 use crate::{client_sdp, rtc_preparation};
 use pulsebeam_proto::state::{self, codec};
 
+#[derive(Clone)]
 pub(super) struct Target {
     pub reference: u64,
     pub desired: state::DesiredState,
@@ -111,30 +112,41 @@ pub(super) fn discover_receivers(
 
 #[track_caller]
 pub(super) fn next(agent: &mut Agent, generation: Generation, channel: ChannelId) -> Vec<Target> {
+    next_if_ready(agent, generation, channel).expect("native resource frame")
+}
+
+fn next_if_ready(
+    agent: &mut Agent,
+    generation: Generation,
+    channel: ChannelId,
+) -> Option<Vec<Target>> {
+    let effect = agent.next_effect_after_turn()?;
     let Effect::DataChannel(DataChannelEffect::Send {
         operation,
         generation: actual_generation,
         channel: actual_channel,
         payload,
         ..
-    }) = next_effect(agent)
+    }) = effect
     else {
-        panic!("native resource frame")
+        panic!("native resource frame, got {effect:?}")
     };
     assert_eq!((actual_generation, actual_channel), (generation, channel));
     let batch = codec::decode_client(&payload).unwrap();
     acknowledge_send(agent, generation, channel, operation);
-    batch
-        .records
-        .into_iter()
-        .map(|record| {
-            let reference = record.owned;
-            let Some(desired) = record.desired else {
-                panic!("desired resource")
-            };
-            Target { reference, desired }
-        })
-        .collect()
+    Some(
+        batch
+            .records
+            .into_iter()
+            .map(|record| {
+                let reference = record.owned;
+                let Some(desired) = record.desired else {
+                    panic!("desired resource")
+                };
+                Target { reference, desired }
+            })
+            .collect(),
+    )
 }
 
 fn current_bindings(updated: &[SlotBinding]) -> client_sdp::Bindings {
@@ -144,6 +156,47 @@ fn current_bindings(updated: &[SlotBinding]) -> client_sdp::Bindings {
         .retain(|binding| !updated.iter().any(|current| current.slot == binding.slot));
     resources.slots.extend_from_slice(updated);
     prepared_media(&resources).0
+}
+
+pub(super) fn confirm_missing_lookups(
+    agent: &mut Agent,
+    generation: Generation,
+    channel: ChannelId,
+) {
+    let targets = next(agent, generation, channel);
+    let records = targets
+        .iter()
+        .map(|target| {
+            let value = match &target.desired.value {
+                Some(state::desired_state::Value::Absent(true)) => {
+                    state::confirmed_state::Value::Absent(state::AbsentState {
+                        reason: state::AbsenceReason::Removed as i32,
+                    })
+                }
+                Some(state::desired_state::Value::Present(spec))
+                    if matches!(
+                        spec.declaration,
+                        Some(state::resource_spec::Declaration::SourceLookup(_))
+                    ) =>
+                {
+                    state::confirmed_state::Value::SourceLookup(Box::new(
+                        state::SourceLookupState {
+                            spec: Some(spec.as_ref().clone()),
+                            participant: None,
+                            track: None,
+                        },
+                    ))
+                }
+                value => panic!("unexpected unresolved source work: {value:?}"),
+            };
+            native_connection::confirmed(
+                state::resource_key::Key::Owned(target.reference),
+                target.desired.revision,
+                value,
+            )
+        })
+        .collect();
+    native_connection::observe(agent, generation, channel, records);
 }
 
 pub(super) fn finish_retirements(
@@ -273,10 +326,33 @@ pub(super) fn prepared_media(
     (bindings, capabilities)
 }
 
+pub(super) fn scoped_desired(revision: u64) -> DesiredState {
+    let mut state = desired(revision);
+    state.video[0].track_id.clear();
+    state.video[0].selector = Some(TrackSelector {
+        room: "room".into(),
+        participant_external_id: "publisher-external".into(),
+        label: "camera".into(),
+    });
+    state.audio.pinned.clear();
+    state.audio.selected = vec![TrackSelector {
+        room: "room".into(),
+        participant_external_id: "publisher-external".into(),
+        label: "microphone".into(),
+    }];
+    state
+}
+
 pub(super) fn connected() -> (Agent, Generation, ChannelId, Vec<Target>) {
-    let connected = connected_with(Agent::new(config()).unwrap(), desired(1));
+    let connected = connected_with_tracks(
+        Agent::new(config()).unwrap(),
+        scoped_desired(1),
+        "publisher",
+        "video-track",
+        "audio-track",
+    );
     assert_eq!(connected.3.len(), 2);
-    connected
+    (connected.0, connected.1, connected.2, connected.3)
 }
 
 pub(super) fn begin(
@@ -353,9 +429,114 @@ pub(super) fn begin(
 pub(super) fn connected_with(
     agent: Agent,
     initial: DesiredState,
-) -> (Agent, Generation, ChannelId, Vec<Target>) {
+) -> (Agent, Generation, ChannelId, Vec<Target>, Vec<Target>) {
+    connected_with_tracks(
+        agent,
+        initial,
+        "pa_11111111111111111111111111",
+        "video-one",
+        "audio-one",
+    )
+}
+
+fn connected_with_tracks(
+    agent: Agent,
+    initial: DesiredState,
+    participant_id: &str,
+    video_track: &str,
+    audio_track: &str,
+) -> (Agent, Generation, ChannelId, Vec<Target>, Vec<Target>) {
     let (mut agent, generation, channel) = begin(agent, initial, |_| {});
-    let mut targets = next(&mut agent, generation, channel);
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: codec::encode_server(&state::ServerStateBatch {
+                records: Vec::new(),
+                initial_complete: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        }))
+        .unwrap();
+    let pending = next(&mut agent, generation, channel);
+    let lookups = pending
+        .iter()
+        .filter(|target| {
+            matches!(
+                target.spec().declaration,
+                Some(state::resource_spec::Declaration::SourceLookup(_))
+            )
+        })
+        .map(|target| {
+            let Some(state::resource_spec::Declaration::SourceLookup(lookup)) =
+                &target.spec().declaration
+            else {
+                panic!("source lookup")
+            };
+            let address = lookup.source.as_ref().unwrap();
+            let participant = state::Participant {
+                participant_id: participant_id.into(),
+                participant_external_id: address.participant_external_id.clone(),
+            };
+            let (track_id, kind) = match state::TrackKind::try_from(address.kind).unwrap() {
+                state::TrackKind::Video => (
+                    video_track,
+                    state::track::Kind::Video(state::VideoTrack {
+                        format: Some(format(MediaKind::Video)),
+                    }),
+                ),
+                state::TrackKind::Audio => (
+                    audio_track,
+                    state::track::Kind::Audio(state::AudioTrack {
+                        format: Some(format(MediaKind::Audio)),
+                    }),
+                ),
+                _ => panic!("media source lookup"),
+            };
+            native_connection::confirmed(
+                state::resource_key::Key::Owned(target.reference),
+                target.desired.revision,
+                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
+                    spec: Some(target.spec().clone()),
+                    participant: Some(participant.clone()),
+                    track: Some(state::Track {
+                        track_id: track_id.into(),
+                        participant_id: participant.participant_id,
+                        label: address.label.clone(),
+                        kind: Some(kind),
+                    }),
+                })),
+            )
+        })
+        .collect::<Vec<_>>();
+    let lookup_targets = pending
+        .iter()
+        .filter(|target| {
+            matches!(
+                target.spec().declaration,
+                Some(state::resource_spec::Declaration::SourceLookup(_))
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut targets = pending
+        .into_iter()
+        .filter(|target| {
+            !matches!(
+                target.spec().declaration,
+                Some(state::resource_spec::Declaration::SourceLookup(_))
+            )
+        })
+        .collect::<Vec<_>>();
+    if !lookups.is_empty() {
+        native_connection::observe(&mut agent, generation, channel, lookups);
+        if let Some(mut resolved) = next_if_ready(&mut agent, generation, channel) {
+            targets.append(&mut resolved);
+        } else {
+            targets.extend(lookup_targets.clone());
+        }
+    }
     let publication = targets.remove(
         targets
             .iter()
@@ -387,5 +568,5 @@ pub(super) fn connected_with(
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert!(agent.next_effect_after_turn().is_none());
-    (agent, generation, channel, targets)
+    (agent, generation, channel, targets, lookup_targets)
 }

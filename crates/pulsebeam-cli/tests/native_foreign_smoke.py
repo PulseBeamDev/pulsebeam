@@ -37,11 +37,13 @@ async def witness(endpoint, token, reader_token, room, package):
     try:
         updates = agent.snapshots()
         reader_updates = reader.snapshots()
-        data = agent.data("foreign-bytes", core.TopicMode.ORDERED)
-        room_cursor = await reader.data("foreign-bytes", core.TopicMode.ORDERED).receive()
-        participant_cursor = await reader.participant("foreign").data(
+        data = agent.data("foreign-bytes", core.TopicMode.ORDERED).publish()
+        room_cursor = reader.room(room).participant("foreign").data(
             "foreign-bytes", core.TopicMode.ORDERED,
-        ).receive()
+        ).subscribe()
+        participant_cursor = reader.room(room).participant("foreign").data(
+            "foreign-bytes", core.TopicMode.ORDERED,
+        ).subscribe()
         reader.join(room)
         camera = await agent.create_video_input(native.VideoSourceConfig(
             encodings=[native.Encoding(
@@ -109,10 +111,10 @@ async def witness(endpoint, token, reader_token, room, package):
         assert (await message(participant_cursor, payload[::-1])).data == payload[::-1]
         await participant_cursor.close()
         await publication.ready()
-        exchange = agent.data("foreign-exchange", core.TopicMode.ORDERED)
-        replies = await agent.participant("publisher").data(
+        exchange = agent.data("foreign-exchange", core.TopicMode.ORDERED).publish()
+        replies = agent.room(room).participant("publisher").data(
             "foreign-exchange", core.TopicMode.ORDERED,
-        ).receive()
+        ).subscribe()
 
         async def send_until_reply():
             while True:
@@ -125,34 +127,35 @@ async def witness(endpoint, token, reader_token, room, package):
             assert isinstance(reply.sequence, int)
             sender.cancel()
         await replies.close()
-        received_interest = await agent.participant("publisher").video("production-camera").subscribe(
+        received_interest = agent.room(room).participant("publisher").video("production-camera").subscribe(
             core.VideoObservation(
                 visible=True, height=96, min_height=0, min_fps=0, priority=1,
                 playout_delay=core.PlayoutDelay.ADAPTIVE(),
             ),
         )
-        received = await received_interest.observe(native.ReceiveMode.DECODED)
-        while True:
-            update = await received.next()
-            assert not update.is_CLOSED() and not update.is_LAGGED(), update
-            if update.is_FRAME() and update.frame.frame.is_I420():
-                pixels = update.frame.frame.frame
-                assert pixels.width == 160 and pixels.height == 96
-                assert len(pixels.data) == 160 * 96 + 2 * 80 * 48
-                assert isinstance(pixels.timestamp_us, int)
-                retained = bytes(pixels.data)
-                break
-        await received.close()
+        received = received_interest.frames()
+        frame = await received.next()
+        assert isinstance(frame, native.VideoFrame), frame
+        assert isinstance(frame.track, native.NativeReceiverInfo)
+        assert frame.track.track_id and frame.track.mid
+        assert isinstance(frame.metadata, native.FrameMetadata)
+        pixels = frame.frame
+        assert isinstance(pixels, native.I420Frame)
+        assert pixels.width == 160 and pixels.height == 96
+        assert len(pixels.data) == 160 * 96 + 2 * 80 * 48
+        assert isinstance(pixels.timestamp_us, int)
+        retained = bytes(pixels.data)
+        received.close()
         await received_interest.close()
-        assert bytes(pixels.data) == retained, "owned pixels changed after observation close"
-        interest = await agent.participant("absent-publisher").audio("microphone").subscribe(
+        assert bytes(frame.frame.data) == retained, "owned pixels changed after reader and subscription close"
+        interest = agent.room(room).participant("absent-publisher").audio("microphone").subscribe(
             core.AudioSubscriptionConfig(playout_delay=core.PlayoutDelay.ADAPTIVE()),
         )
         video_preferences = core.VideoObservation(
             visible=True, height=720, min_height=0, min_fps=0, priority=1,
             playout_delay=core.PlayoutDelay.ADAPTIVE(),
         )
-        video_interest = await agent.participant("absent-publisher").video("camera").subscribe(
+        video_interest = agent.room(room).participant("absent-publisher").video("camera").subscribe(
             video_preferences,
         )
         assert not video_interest.is_closed(), "new foreign video interest is closed"
@@ -219,6 +222,54 @@ async def witness(endpoint, token, reader_token, room, package):
         await asyncio.wait_for(asyncio.gather(agent.close(), reader.close()), timeout=3)
 
 
+async def publish_live(endpoint, token, room, package):
+    core = importlib.import_module(f"{package}.pulsebeam_agent_core")
+    native = importlib.import_module(f"{package}.pulsebeam_agent_native")
+    agent = native.Agent(core.AgentConfig(
+        endpoint=endpoint, token=token, log_level=core.LogLevel.WARN,
+        retry=core.RetryPolicy(
+            initial_delay_ms=100, maximum_delay_ms=1000, maximum_attempts=2,
+        ),
+    ))
+    camera = await agent.create_video_input(native.VideoSourceConfig(
+        encodings=[native.Encoding(
+            rid=None, scale_down_by=1, max_bitrate_bps=None,
+            max_framerate=None, temporal_layers=1,
+        )], dependency_descriptor=True,
+    ))
+    publication = agent.video("camera").publish()
+    await publication.set_source(camera)
+    data = agent.data("frame-events", core.TopicMode.ORDERED).publish()
+    agent.join(room)
+    await publication.ready()
+
+    async def frames():
+        sequence = 0
+        while True:
+            await camera.submit(native.InputFrame.I420(frame=native.I420Frame(
+                width=160, height=96, timestamp_us=await camera.capture_time_us(),
+                data=bytes([180]) * (160 * 96) + bytes([90]) * (80 * 48)
+                + bytes([180]) * (80 * 48), rotation_degrees=0,
+            )))
+            await data.send(bytes([0, 255, 128]) + sequence.to_bytes(8, "little"))
+            sequence += 1
+            # Live source cadence, not a retry of an accepted frame or payload.
+            await asyncio.sleep(1 / 30)
+
+    pump = asyncio.create_task(frames())
+    stop = asyncio.create_task(asyncio.to_thread(sys.stdin.readline))
+    try:
+        done, _ = await asyncio.wait([pump, stop], return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    finally:
+        pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+        await publication.close()
+        await camera.close()
+        await agent.close()
+
+
 def main():
     if len(sys.argv) == 6 and sys.argv[1] == "--witness":
         package = importlib.import_module("pulsebeam_agent")
@@ -259,7 +310,10 @@ def main():
             sys.path.insert(0, str(site))
             package = importlib.import_module("pulsebeam_agent")
             assert Path(package.__file__).is_relative_to(site)
-            asyncio.run(asyncio.wait_for(witness(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], package.__name__), timeout=25))
+            if len(sys.argv) == 5 and sys.argv[1] == "--publish":
+                asyncio.run(asyncio.wait_for(publish_live(sys.argv[2], sys.argv[3], sys.argv[4], package.__name__), timeout=30))
+            else:
+                asyncio.run(asyncio.wait_for(witness(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], package.__name__), timeout=25))
 
 
 if __name__ == "__main__":

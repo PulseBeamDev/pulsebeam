@@ -74,6 +74,8 @@ pub struct TopicPublisher {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TopicSubscriber {
+    pub room: String,
+    pub participant_external_id: String,
     pub topic: String,
     pub mode: TopicMode,
 }
@@ -92,6 +94,7 @@ pub struct TopicSend {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopicMessage {
+    pub room: String,
     pub topic: String,
     pub mode: TopicMode,
     pub data_track_id: String,
@@ -247,6 +250,7 @@ struct SubscriberState {
 
 #[derive(Clone)]
 struct CatalogBinding {
+    room: Option<String>,
     topic: String,
     mode: TopicMode,
     participant_id: String,
@@ -255,7 +259,11 @@ struct CatalogBinding {
 
 impl CatalogBinding {
     fn matches(&self, subscriber: &TopicSubscriber) -> bool {
-        !self.local && self.topic == subscriber.topic && self.mode == subscriber.mode
+        !self.local
+            && self.room.as_deref() == Some(subscriber.room.as_str())
+            && self.participant_id == subscriber.participant_external_id
+            && self.topic == subscriber.topic
+            && self.mode == subscriber.mode
     }
 }
 
@@ -299,6 +307,8 @@ impl TopicRegistrations {
         }
         let mut subscribers = BTreeSet::new();
         for subscriber in &self.subscribers {
+            crate::validate_room_name(&subscriber.room)?;
+            crate::validate_participant_id(&subscriber.participant_external_id)?;
             validate_topic(&subscriber.topic)?;
             if !subscribers.insert(subscriber) {
                 return Err(ValidationError::Duplicate {
@@ -394,6 +404,10 @@ impl Topics {
         self.catalog.insert(
             source.track.track_id.clone(),
             CatalogBinding {
+                room: match &source.registration {
+                    TopicChannel::Publisher(_) => None,
+                    TopicChannel::Subscriber(subscriber) => Some(subscriber.room.clone()),
+                },
                 topic: source.track.label.clone(),
                 mode,
                 participant_id: source.participant.participant_external_id.clone(),
@@ -1173,6 +1187,7 @@ impl Topics {
             self.delivered_messages = self.delivered_messages.saturating_add(1);
             notifications.push_back(Notification::Topic(TopicNotification::Message(
                 TopicMessage {
+                    room: subscriber.room.clone(),
                     topic: subscriber.topic.clone(),
                     mode: subscriber.mode,
                     data_track_id: message.data_track_id,
@@ -1536,8 +1551,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn catalog_bindings_match_room_participant_topic_and_mode_together() {
+        let subscriber = TopicSubscriber {
+            room: "room-a".into(),
+            participant_external_id: "alice".into(),
+            topic: "events".into(),
+            mode: TopicMode::Ordered,
+        };
+        let binding = CatalogBinding {
+            room: Some(subscriber.room.clone()),
+            topic: subscriber.topic.clone(),
+            mode: subscriber.mode,
+            participant_id: subscriber.participant_external_id.clone(),
+            local: false,
+        };
+        assert!(binding.matches(&subscriber));
+        for other in [
+            TopicSubscriber {
+                room: "room-b".into(),
+                ..subscriber.clone()
+            },
+            TopicSubscriber {
+                participant_external_id: "bob".into(),
+                ..subscriber.clone()
+            },
+            TopicSubscriber {
+                topic: "other-topic".into(),
+                ..subscriber.clone()
+            },
+            TopicSubscriber {
+                mode: TopicMode::Lossy,
+                ..subscriber.clone()
+            },
+        ] {
+            assert!(!binding.matches(&other));
+        }
+        assert!(
+            !CatalogBinding {
+                local: true,
+                ..binding
+            }
+            .matches(&subscriber)
+        );
+    }
+
     fn ordered_topics(ids: &mut IdGenerator) -> (Topics, TopicSubscriber, Generation) {
         let subscriber = TopicSubscriber {
+            room: "room".into(),
+            participant_external_id: "remote-app".into(),
             topic: "state".into(),
             mode: TopicMode::Ordered,
         };
@@ -1559,6 +1621,7 @@ mod tests {
         topics.catalog.insert(
             "authoritative".into(),
             CatalogBinding {
+                room: Some(subscriber.room.clone()),
                 topic: subscriber.topic.clone(),
                 mode: subscriber.mode,
                 participant_id: "remote".into(),
@@ -1847,6 +1910,8 @@ mod tests {
         for mode in [TopicMode::Latest, TopicMode::Lossy, TopicMode::Ordered] {
             assert_eq!(TopicMode::from_delivery(mode.delivery() as i32), Some(mode));
             registrations.subscribers.push(TopicSubscriber {
+                room: "room".into(),
+                participant_external_id: "remote-app-user".into(),
                 topic: "literal/Δ label".into(),
                 mode,
             });

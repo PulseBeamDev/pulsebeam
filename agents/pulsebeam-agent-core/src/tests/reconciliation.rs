@@ -34,11 +34,11 @@ fn whole_state_churn_reduces_once_without_physical_work_or_wire_revisions() {
         .map(|target| target.desired.revision)
         .max()
         .unwrap();
-    let mut changed = desired(2);
+    let mut changed = native_media::scoped_desired(2);
     changed.video[0].height = 1080;
     changed.video[0].priority = 4;
-    changed.audio.playout_delays.insert(
-        "audio-track".into(),
+    changed.audio.selector_delays.insert(
+        changed.audio.selected[0].clone(),
         PlayoutDelay::Fixed {
             min_ms: 10,
             max_ms: 40,
@@ -62,7 +62,9 @@ fn whole_state_churn_reduces_once_without_physical_work_or_wire_revisions() {
         .command(AgentCommand::ReplaceDesired(changed))
         .unwrap();
     agent
-        .command(AgentCommand::ReplaceDesired(desired(4)))
+        .command(AgentCommand::ReplaceDesired(native_media::scoped_desired(
+            4,
+        )))
         .unwrap();
     assert_eq!(agent.snapshot().desired_revision, 4);
     assert!(
@@ -90,7 +92,7 @@ fn whole_state_churn_reduces_once_without_physical_work_or_wire_revisions() {
             "stale wakes and duplicate facts are quiescent"
         );
     }
-    let mut latest = desired(5);
+    let mut latest = native_media::scoped_desired(5);
     latest.video[0].height = 540;
     agent.command(AgentCommand::ReplaceDesired(latest)).unwrap();
     let timer = wake(&mut agent);

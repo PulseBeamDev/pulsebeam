@@ -31,14 +31,21 @@ macro_rules! shapes {
 }
 
 shapes! {
-    ClientStateBatch { 1 => ClientStateRecord },
+    ClientStateBatch { 1 => ClientStateRecord, 3 => CatalogClientRecord },
+    CatalogClientRecord { 1 => CatalogPageRequest, 2 => CatalogWatchClose },
+    CatalogPageRequest {},
+    CatalogWatchClose {},
     ClientStateRecord { 2 => DesiredState, 3 => ExecutionReport },
     ExecutionReport { 3 => Failure },
-    ServerStateBatch { 1 => ServerStateRecord },
+    ServerStateBatch { 1 => ServerStateRecord, 3 => CatalogServerRecord },
+    CatalogServerRecord { 1 => CatalogPageRecord, 2 => CatalogWatchError },
+    CatalogWatchError { 2 => Failure },
+    CatalogPageRecord { 8 => CatalogParticipantFragment },
+    CatalogParticipantFragment {},
     ServerStateRecord { 1 => ResourceKey, 2 => ConfirmedState },
     ResourceKey {},
     DesiredState { 2 => ResourceSpec },
-    ConfirmedState { 2 => Failure, 3 => LiveResource, 4 => AbsentState, 5 => SessionState, 6 => Participant, 7 => Track },
+    ConfirmedState { 2 => Failure, 3 => LiveResource, 4 => AbsentState, 5 => SessionState, 6 => Participant, 7 => Track, 8 => SourceLookupState },
     AbsentState {},
     SessionState { 1 => Authorization },
     Authorization {},
@@ -47,7 +54,10 @@ shapes! {
     AudioTrack { 1 => CodecFormat },
     VideoTrack { 1 => CodecFormat },
     DataTrack {},
-    ResourceSpec { 1 => ResourceSettings, 2 => PublicationSpec, 3 => SubscriptionSpec },
+    ResourceSpec { 1 => ResourceSettings, 2 => PublicationSpec, 3 => SubscriptionSpec, 4 => SourceLookupSpec },
+    SourceLookupSpec { 1 => LogicalSourceAddress },
+    LogicalSourceAddress {},
+    SourceLookupState { 1 => ResourceSpec, 2 => Participant, 3 => Track },
     ResourceSettings { 2 => AudioReceiveOptions, 3 => VideoReceiveOptions },
     PublicationSpec { 2 => AudioPublication, 3 => VideoPublication, 4 => DataPublication },
     AudioPublication { 1 => TrackBinding },
@@ -94,7 +104,9 @@ fn message(
         if matches!(
             shape,
             Some(Shape::ClientStateBatch | Shape::ServerStateBatch)
-        ) && field == 1
+        ) && (field == 1
+            || matches!(shape, Some(Shape::ClientStateBatch) if field == 3)
+            || matches!(shape, Some(Shape::ServerStateBatch) if field == 3))
         {
             records = records.saturating_add(1);
             if records > super::MAX_RECORDS {

@@ -40,7 +40,8 @@ struct HttpWitness {
 }
 impl AsyncHttpClient for HttpWitness {
     fn execute(&self, request: HttpRequest) -> HttpResult<'_> {
-        let admission = request.method() == http::Method::POST;
+        let admission =
+            request.method() == http::Method::POST && request.uri().path() == "/api/v1/native";
         let uri = request.uri().to_string();
         Box::pin(async move {
             let response = self.inner.execute(request).await?;
@@ -106,6 +107,8 @@ async fn peer(ip: IpAddr, server: IpAddr, name: &str, publishes: bool) -> anyhow
                     vec![]
                 } else {
                     vec![api::TopicSubscriber {
+                        room: "calibration".into(),
+                        participant_id: "source".into(),
                         name: TOPIC.into(),
                         mode: api::TopicMode::Lossy,
                     }]
