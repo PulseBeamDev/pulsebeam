@@ -59,6 +59,7 @@ export function Publish(props: PublishProps): null {
   const target = trackIdentity(props.track);
   const synchronize = useRef<(() => void) | null>(null);
   const [failure, setFailure] = useState<unknown>(null);
+  const cleanup = useRef<Promise<void>>(Promise.resolve());
   if (failure) throw failure;
   useLayoutEffect(() => {
     setFailure(null);
@@ -69,65 +70,76 @@ export function Publish(props: PublishProps): null {
     };
     const sync = () => {
       if (!active) return;
-      const view = committed.current;
-      try {
-        if (!owner) {
-          if (!view.source) return;
-          const configuration = { enabled: view.enabled ?? true };
-          let ready: Promise<void>;
-          if (view.track.kind === "video") {
-            const claim = claimPublication(
-              localMedia(view.track),
-              publicationTrack(view.source, "video") as VideoSource,
-              configuration,
-            );
-            owner = { kind: "video", value: claim.publication };
-            ready = claim.ready;
-          } else {
-            const claim = claimPublication(
-              localMedia(view.track),
-              publicationTrack(view.source, "audio") as AudioSource,
-              configuration,
-            );
-            owner = { kind: "audio", value: claim.publication };
-            ready = claim.ready;
+      void cleanup.current.then(() => {
+        if (!active) return;
+        const view = committed.current;
+        try {
+          if (!owner) {
+            if (!view.source) return;
+            const configuration = { enabled: view.enabled ?? true };
+            let ready: Promise<void>;
+            if (view.track.kind === "video") {
+              const claim = claimPublication(
+                localMedia(view.track),
+                publicationTrack(view.source, "video") as VideoSource,
+                configuration,
+              );
+              owner = { kind: "video", value: claim.publication };
+              ready = claim.ready;
+            } else {
+              const claim = claimPublication(
+                localMedia(view.track),
+                publicationTrack(view.source, "audio") as AudioSource,
+                configuration,
+              );
+              owner = { kind: "audio", value: claim.publication };
+              ready = claim.ready;
+            }
+            void ready.then(sync).catch(report);
+            return;
           }
-          void ready.then(sync).catch(report);
-          return;
+          const source = view.source
+            ? publicationTrack(view.source, owner.kind)
+            : null;
+          const configuration = { enabled: view.enabled ?? true };
+          const updates =
+            owner.kind === "video"
+              ? [
+                  owner.value.setSource(source as VideoSource | null),
+                  owner.value.configure(configuration),
+                  owner.value.configureSender({
+                    contentHint: (view.content ??
+                      "motion") as VideoSenderConfig["contentHint"],
+                  }),
+                ]
+              : [
+                  owner.value.setSource(source as AudioSource | null),
+                  owner.value.configure(configuration),
+                  owner.value.configureSender({
+                    contentHint: (view.content ??
+                      "speech") as AudioSenderConfig["contentHint"],
+                  }),
+                ];
+          void Promise.all(updates).catch(report);
+        } catch (error) {
+          report(error);
         }
-        const source = view.source
-          ? publicationTrack(view.source, owner.kind)
-          : null;
-        const configuration = { enabled: view.enabled ?? true };
-        const updates =
-          owner.kind === "video"
-            ? [
-                owner.value.setSource(source as VideoSource | null),
-                owner.value.configure(configuration),
-                owner.value.configureSender({
-                  contentHint: (view.content ??
-                    "motion") as VideoSenderConfig["contentHint"],
-                }),
-              ]
-            : [
-                owner.value.setSource(source as AudioSource | null),
-                owner.value.configure(configuration),
-                owner.value.configureSender({
-                  contentHint: (view.content ??
-                    "speech") as AudioSenderConfig["contentHint"],
-                }),
-              ];
-        void Promise.all(updates).catch(report);
-      } catch (error) {
-        report(error);
-      }
+      });
     };
     synchronize.current = sync;
     sync();
     return () => {
       active = false;
       if (synchronize.current === sync) synchronize.current = null;
-      void owner?.value.close();
+      if (owner) {
+        const retired = owner;
+        owner = undefined;
+        cleanup.current = cleanup.current
+          .then(() => retired.value.close())
+          .catch((error: unknown) => {
+            console.error("PulseBeam publication cleanup failed", error);
+          });
+      }
     };
   }, [target]);
   useLayoutEffect(() => {
@@ -153,7 +165,9 @@ export function Data<D extends Delivery>({
     let receiver: DataReceiver<D> | undefined;
     const release = () => {
       active = false;
-      void receiver?.close();
+      void receiver?.close().catch((error: unknown) => {
+        console.error("PulseBeam data cleanup failed", error);
+      });
     };
     void (async () => {
       try {
@@ -213,7 +227,9 @@ export function SelectAudio({ agent, policy }: SelectAudioProps): null {
       active = false;
       const selection = owner.current;
       owner.current = null;
-      void selection?.close();
+      void selection?.close().catch((error: unknown) => {
+        console.error("PulseBeam audio selection cleanup failed", error);
+      });
     };
   }, [target]);
   useLayoutEffect(() => {
@@ -234,21 +250,36 @@ export function Audio({ agent, onPlaybackError }: AudioProps): null {
   const callback = useCommittedRef(onPlaybackError);
   const target = managedAgent(agent);
   const [failure, setFailure] = useState<unknown>(null);
+  const cleanup = useRef<Promise<void>>(Promise.resolve());
   if (failure) throw failure;
   useLayoutEffect(() => {
     setFailure(null);
     let active = true;
-    const owner = attachRemoteAudio(target, {
-      onPlaybackError: (value) => {
-        if (active) callback.current?.(value);
-      },
-    });
-    void owner.ready.catch((error) => {
-      if (active) setFailure(error);
-    });
+    let owner: ReturnType<typeof attachRemoteAudio> | undefined;
+    void cleanup.current
+      .then(() => {
+        if (!active) return;
+        owner = attachRemoteAudio(target, {
+          onPlaybackError: (value) => {
+            if (active) callback.current?.(value);
+          },
+        });
+        return owner.ready;
+      })
+      .catch((error: unknown) => {
+        if (active) setFailure(error);
+      });
     return () => {
       active = false;
-      void owner.close();
+      if (owner) {
+        const retired = owner;
+        owner = undefined;
+        cleanup.current = cleanup.current
+          .then(() => retired.close())
+          .catch((error: unknown) => {
+            console.error("PulseBeam audio cleanup failed", error);
+          });
+      }
     };
   }, [target]);
   return null;

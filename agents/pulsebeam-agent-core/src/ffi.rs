@@ -264,6 +264,129 @@ pub enum ConnectionState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ErrorCode {
+    InvalidArgument,
+    Conflict,
+    NotReady,
+    PermissionDenied,
+    CapacityExceeded,
+    Replaced,
+    ContinuityLost,
+    Unsupported,
+    Closed,
+    ConnectionFailed,
+    Internal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ErrorInfo {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl ErrorInfo {
+    /// Construct from trusted contextual text. Untrusted failure details must use `From<&Failure>`.
+    pub fn new(code: ErrorCode, message: &str) -> Self {
+        let mut bounded = String::new();
+        for character in message.chars() {
+            if bounded.len().saturating_add(character.len_utf8()) > 256 {
+                break;
+            }
+            bounded.push(character);
+        }
+        Self {
+            code,
+            message: bounded,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AgentStatus {
+    Idle,
+    Joining,
+    Joined,
+    Recovering,
+    Failed,
+    Closed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct AgentState {
+    pub observation_revision: u64,
+    pub desired_join_revision: u64,
+    pub evaluated_join_revision: u64,
+    pub desired_credential_revision: u64,
+    pub evaluated_credential_revision: u64,
+    pub room: Option<String>,
+    pub desired_room: Option<String>,
+    pub status: AgentStatus,
+    pub error: Option<ErrorInfo>,
+}
+
+impl From<&model::Snapshot> for AgentState {
+    fn from(value: &model::Snapshot) -> Self {
+        let status = match value.connection {
+            model::ConnectionState::Disconnected => AgentStatus::Idle,
+            model::ConnectionState::Connected => AgentStatus::Joined,
+            model::ConnectionState::TerminalFailure => AgentStatus::Failed,
+            model::ConnectionState::Reconnecting | model::ConnectionState::RetryWaiting { .. } => {
+                AgentStatus::Recovering
+            }
+            _ => AgentStatus::Joining,
+        };
+        let failure = value.terminal_failure.as_ref().or_else(|| {
+            value
+                .credential_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.error.as_ref())
+        });
+        Self {
+            observation_revision: 0,
+            desired_join_revision: value.join_revision,
+            evaluated_join_revision: value.evaluated_join_revision,
+            desired_credential_revision: value.credential_revision,
+            evaluated_credential_revision: value
+                .credential_outcome
+                .as_ref()
+                .map_or(0, |outcome| outcome.revision),
+            room: value.room_external_id.clone(),
+            desired_room: value.desired_room.clone(),
+            status,
+            error: failure.map(|failure| ErrorInfo::from(&Failure::from(failure.clone()))),
+        }
+    }
+}
+
+impl From<&model::AgentError> for ErrorInfo {
+    fn from(error: &model::AgentError) -> Self {
+        let (code, message) = match error {
+            model::AgentError::Replaced => (ErrorCode::Replaced, "Agent was replaced"),
+            model::AgentError::CredentialRevisionExhausted => {
+                (ErrorCode::CapacityExceeded, "Revision space exhausted")
+            }
+            model::AgentError::RenewalBusy => {
+                (ErrorCode::Conflict, "Credential evaluation is in progress")
+            }
+            model::AgentError::RenewalNotReady => (ErrorCode::NotReady, "Connection is not ready"),
+            model::AgentError::StaleDesiredRevision { .. }
+            | model::AgentError::ConflictingDesiredRevision(_) => {
+                (ErrorCode::Conflict, "Intent revision conflicts")
+            }
+            model::AgentError::InvalidConfiguration(_)
+            | model::AgentError::InvalidAuthorizationToken
+            | model::AgentError::InvalidOffer(_)
+            | model::AgentError::InvalidSignaling(_)
+            | model::AgentError::InvalidTopic(_)
+            | model::AgentError::InvalidResource(_) => {
+                (ErrorCode::InvalidArgument, "Invalid operation argument")
+            }
+        };
+        Self::new(code, message)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FailureClass {
     InvalidConfiguration,
     Authorization,
@@ -280,6 +403,34 @@ pub enum FailureClass {
 pub struct Failure {
     pub class: FailureClass,
     pub message: String,
+}
+
+impl From<&Failure> for ErrorInfo {
+    fn from(failure: &Failure) -> Self {
+        let code = match failure.class {
+            FailureClass::InvalidConfiguration => ErrorCode::InvalidArgument,
+            FailureClass::Authorization => ErrorCode::PermissionDenied,
+            FailureClass::ParticipantSuperseded => ErrorCode::Replaced,
+            FailureClass::Protocol => ErrorCode::Internal,
+            FailureClass::Transient
+            | FailureClass::RetryExhausted
+            | FailureClass::Browser
+            | FailureClass::Native
+            | FailureClass::ResourceExpired => ErrorCode::ConnectionFailed,
+        };
+        let message = match failure.class {
+            FailureClass::InvalidConfiguration => "Invalid configuration",
+            FailureClass::Authorization => "Authorization failed",
+            FailureClass::ParticipantSuperseded => "Agent was replaced",
+            FailureClass::Protocol => "Protocol operation failed",
+            FailureClass::Transient => "Connection interrupted",
+            FailureClass::ResourceExpired => "Resource is no longer available",
+            FailureClass::RetryExhausted => "Connection retry limit reached",
+            FailureClass::Browser => "Browser operation failed",
+            FailureClass::Native => "Native operation failed",
+        };
+        Self::new(code, message)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -468,7 +619,7 @@ pub struct TransportStatistics {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
-pub enum ErrorCode {
+pub enum AgentOperationErrorCode {
     InvalidConfiguration,
     InvalidDesiredState,
     InvalidTopic,
@@ -556,7 +707,7 @@ impl From<model::TopicError> for TopicFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AgentError {
-    pub code: ErrorCode,
+    pub code: AgentOperationErrorCode,
     pub message: String,
 }
 
@@ -569,7 +720,7 @@ impl AgentConfig {
             log_level: self.log_level.into(),
         };
         config.validate().map_err(|error| AgentError {
-            code: ErrorCode::InvalidConfiguration,
+            code: AgentOperationErrorCode::InvalidConfiguration,
             message: error.to_string(),
         })?;
         Ok(config)
@@ -591,7 +742,7 @@ impl DesiredState {
         };
         desired.normalize();
         desired.validate().map_err(|error| AgentError {
-            code: ErrorCode::InvalidDesiredState,
+            code: AgentOperationErrorCode::InvalidDesiredState,
             message: error.to_string(),
         })?;
         Ok(desired)
@@ -1179,18 +1330,20 @@ impl From<model::Notification> for Notification {
 impl From<model::AgentError> for AgentError {
     fn from(value: model::AgentError) -> Self {
         let code = match &value {
-            model::AgentError::InvalidConfiguration(_) => ErrorCode::InvalidConfiguration,
+            model::AgentError::InvalidConfiguration(_) => {
+                AgentOperationErrorCode::InvalidConfiguration
+            }
             model::AgentError::StaleDesiredRevision { .. }
             | model::AgentError::ConflictingDesiredRevision(_)
             | model::AgentError::InvalidAuthorizationToken
-            | model::AgentError::InvalidResource(_) => ErrorCode::InvalidDesiredState,
-            model::AgentError::RenewalBusy => ErrorCode::RenewalBusy,
-            model::AgentError::InvalidTopic(_) => ErrorCode::InvalidTopic,
+            | model::AgentError::InvalidResource(_) => AgentOperationErrorCode::InvalidDesiredState,
+            model::AgentError::RenewalBusy => AgentOperationErrorCode::RenewalBusy,
+            model::AgentError::InvalidTopic(_) => AgentOperationErrorCode::InvalidTopic,
             model::AgentError::RenewalNotReady
             | model::AgentError::Replaced
             | model::AgentError::CredentialRevisionExhausted
             | model::AgentError::InvalidOffer(_)
-            | model::AgentError::InvalidSignaling(_) => ErrorCode::Runtime,
+            | model::AgentError::InvalidSignaling(_) => AgentOperationErrorCode::Runtime,
         };
         Self {
             code,
@@ -1243,7 +1396,7 @@ mod tests {
         let error = invalid
             .into_core()
             .expect_err("relative endpoint must fail");
-        assert_eq!(error.code, ErrorCode::InvalidConfiguration);
+        assert_eq!(error.code, AgentOperationErrorCode::InvalidConfiguration);
 
         let desired = DesiredState {
             video: vec![VideoDemand {
@@ -1261,7 +1414,7 @@ mod tests {
         let error = desired
             .into_core(1)
             .expect_err("empty source identity must fail");
-        assert_eq!(error.code, ErrorCode::InvalidDesiredState);
+        assert_eq!(error.code, AgentOperationErrorCode::InvalidDesiredState);
     }
 
     #[test]
@@ -1656,7 +1809,7 @@ mod tests {
             unroutable_media_dropped: 1,
         });
         assert_ffi_round_trip(AgentError {
-            code: ErrorCode::Runtime,
+            code: AgentOperationErrorCode::Runtime,
             message: "runtime unavailable".to_string(),
         });
     }
@@ -1750,12 +1903,44 @@ mod tests {
         ] {
             assert_ffi_round_trip(value);
         }
-        for value in [
-            ErrorCode::InvalidConfiguration,
-            ErrorCode::InvalidDesiredState,
-            ErrorCode::InvalidTopic,
+        for code in [
+            ErrorCode::InvalidArgument,
+            ErrorCode::Conflict,
+            ErrorCode::NotReady,
+            ErrorCode::PermissionDenied,
+            ErrorCode::CapacityExceeded,
+            ErrorCode::Replaced,
+            ErrorCode::ContinuityLost,
+            ErrorCode::Unsupported,
             ErrorCode::Closed,
-            ErrorCode::Runtime,
+            ErrorCode::ConnectionFailed,
+            ErrorCode::Internal,
+        ] {
+            assert_ffi_round_trip(code);
+            assert_ffi_round_trip(ErrorInfo::new(code, "Context"));
+        }
+        for status in [
+            AgentStatus::Idle,
+            AgentStatus::Joining,
+            AgentStatus::Joined,
+            AgentStatus::Recovering,
+            AgentStatus::Failed,
+            AgentStatus::Closed,
+        ] {
+            assert_ffi_round_trip(status);
+        }
+        let expired = ErrorInfo::from(&Failure {
+            class: FailureClass::ResourceExpired,
+            message: "untrusted credential or proof details".into(),
+        });
+        assert_eq!(expired.code, ErrorCode::ConnectionFailed);
+        assert_eq!(expired.message, "Resource is no longer available");
+        for value in [
+            AgentOperationErrorCode::InvalidConfiguration,
+            AgentOperationErrorCode::InvalidDesiredState,
+            AgentOperationErrorCode::InvalidTopic,
+            AgentOperationErrorCode::Closed,
+            AgentOperationErrorCode::Runtime,
         ] {
             assert_ffi_round_trip(value);
         }

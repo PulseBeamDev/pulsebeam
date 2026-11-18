@@ -7,6 +7,7 @@ import {
   Video,
   useAgent,
   useCapture,
+  type Agent,
   type RemoteVideoTrack,
 } from "@pulsebeam/react";
 import {
@@ -40,32 +41,49 @@ const latencyModes: Record<
   Zero: { minMs: 0, maxMs: 0 },
 };
 
-export function Room({
-  token,
-  endpoint,
-  room,
-  onLeave,
-}: {
+export function Room(props: {
   token: string;
   endpoint: string;
   room: string;
   onLeave(): void;
 }) {
   const agent = useAgent({
-    endpoint,
-    token,
+    endpoint: props.endpoint,
+    token: props.token,
     logging: { level: "debug" },
   });
+  const displayCapture = useCapture("display", {
+    video: { width: 1920, height: 1080, frameRate: 30 },
+    audio: false,
+  });
+  if (!agent) return <Typography role="status">Preparing session…</Typography>;
+  return (
+    <ActiveRoom {...props} agent={agent} displayCapture={displayCapture} />
+  );
+}
+
+function ActiveRoom({
+  token,
+  endpoint,
+  room,
+  onLeave,
+  agent,
+  displayCapture,
+}: {
+  token: string;
+  endpoint: string;
+  room: string;
+  onLeave(): void;
+  agent: Agent;
+  displayCapture: ReturnType<typeof useCapture>;
+}) {
   const { capture, devices, cameraOn, micOn, setCameraOn, setMicOn } =
     useMeetMedia();
   const {
     video: screen,
     stop: stopShare,
     request: requestShare,
-  } = useCapture("display", {
-    video: { width: 1920, height: 1080, frameRate: 30 },
-    audio: false,
-  });
+  } = displayCapture;
   const Camera = agent.video("camera");
   const Microphone = agent.audio("microphone");
   const Screen = agent.video("screen");
@@ -79,6 +97,7 @@ export function Room({
   const [chatOpen, setChatOpen] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const playbackRetry = useRef<(() => Promise<void>) | null>(null);
+  const joinedRoom = useRef<string | null>(null);
   const {
     Chat,
     messages,
@@ -111,7 +130,9 @@ export function Room({
     }
   }, [agent, room]);
   useEffect(() => {
+    if (joinedRoom.current === room) return;
     agent.join(room);
+    joinedRoom.current = room;
   }, [agent, room]);
   const startShare = async () => {
     try {

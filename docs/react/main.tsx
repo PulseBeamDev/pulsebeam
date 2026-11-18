@@ -5,9 +5,10 @@ import { Room } from "./Room.js";
 
 function App() {
   const [config, setConfig] = useState<AgentConfig | null>(null);
+  const [room, setRoom] = useState("demo");
   return config ? (
     <>
-      <Room config={config} />
+      <Room config={config} room={room} onLeave={() => setConfig(null)} />
       <button onClick={() => setConfig(null)}>Unmount room</button>
     </>
   ) : (
@@ -15,6 +16,7 @@ function App() {
       onSubmit={(event) => {
         event.preventDefault();
         const fields = new FormData(event.currentTarget);
+        setRoom(String(fields.get("room")));
         setConfig({
           endpoint: String(fields.get("endpoint")),
           token: String(fields.get("token")),
@@ -25,6 +27,9 @@ function App() {
       <label>
         Server endpoint{" "}
         <input name="endpoint" defaultValue="http://localhost:7070" required />
+      </label>
+      <label>
+        Room <input name="room" defaultValue="demo" required />
       </label>
       <label>
         Participant token{" "}

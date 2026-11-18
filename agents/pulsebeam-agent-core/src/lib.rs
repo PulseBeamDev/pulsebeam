@@ -26,6 +26,7 @@ mod track;
 
 pub mod client_sdp;
 pub mod ffi;
+pub mod observer;
 
 pub use ffi::UniFfiTag;
 

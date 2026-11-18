@@ -1,4 +1,10 @@
 import type {
+  AgentState,
+  AgentStatus,
+  ErrorCode,
+  ErrorInfo,
+} from "../web/schema.js";
+import type {
   AgentConfig,
   AgentError,
   DesiredState,
@@ -39,6 +45,17 @@ type Equal<A, B> =
 
 // Any in a boundary or nested data field must fail even when assignments compile.
 export type StrictBoundaries = [
+  Assert<NoAny<AgentState>>,
+  Assert<NoAny<AgentStatus>>,
+  Assert<NoAny<ErrorInfo>>,
+  Assert<NoAny<ErrorCode>>,
+  Assert<Equal<AgentState["observationRevision"], bigint>>,
+  Assert<Equal<AgentState["desiredJoinRevision"], bigint>>,
+  Assert<Equal<AgentState["room"], string | undefined>>,
+  Assert<Equal<AgentState["desiredRoom"], string | undefined>>,
+  Assert<Equal<AgentState["error"], ErrorInfo | undefined>>,
+  Assert<Equal<ErrorInfo["code"], ErrorCode>>,
+  Assert<Equal<ErrorInfo["message"], string>>,
   Assert<NoAny<AgentConfig>>,
   Assert<NoAny<DesiredState>>,
   Assert<NoAny<Snapshot>>,

@@ -521,6 +521,7 @@ impl Host for BrowserHost {
 
 struct RuntimeInner {
     actor: RefCell<Option<ActorHandle>>,
+    agent_state: Rc<agent_core::observer::AgentStateObserver>,
     logger: BrowserLogger,
     local_operation_gates: RefCell<BTreeMap<String, Weak<LocalSlotOperations>>>,
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
@@ -556,6 +557,9 @@ impl BrowserRuntime {
         };
         let inner = Rc::new(RuntimeInner {
             actor: RefCell::new(None),
+            agent_state: Rc::new(agent_core::observer::AgentStateObserver::new(
+                (&agent_core::Snapshot::default()).into(),
+            )),
             logger: BrowserLogger::new(config.log_level),
             local_operation_gates: RefCell::new(BTreeMap::new()),
             local_tracks: RefCell::new(BTreeMap::new()),
@@ -662,7 +666,9 @@ impl BrowserRuntime {
             .borrow()
             .clone()
             .ok_or_else(|| js_error("runtime actor not initialized"))?;
-        actor.renew(token).map_err(js_error)
+        actor.renew(token).map_err(js_error)?;
+        self.inner.agent_state();
+        Ok(())
     }
 
     pub fn renew_authorization(&self, token: String) -> Result<(), JsValue> {
@@ -756,7 +762,9 @@ impl BrowserRuntime {
             .borrow()
             .clone()
             .ok_or_else(|| js_error("runtime actor not initialized"))?;
-        actor.join(room).map_err(js_error)
+        actor.join(room).map_err(js_error)?;
+        self.inner.agent_state();
+        Ok(())
     }
 
     pub fn connect(&self) -> Result<(), JsValue> {
@@ -844,6 +852,22 @@ impl BrowserRuntime {
         self.inner.request_abort();
     }
 
+    pub fn state(&self) -> JsValue {
+        agent_state_value(&self.inner.agent_state())
+    }
+
+    pub fn updates(&self) -> Result<BrowserAgentUpdates, JsValue> {
+        self.inner.agent_state();
+        agent_updates(&self.inner.agent_state)
+    }
+
+    pub fn observer(&self) -> BrowserAgentObserver {
+        self.inner.agent_state();
+        BrowserAgentObserver {
+            observer: self.inner.agent_state.clone(),
+        }
+    }
+
     pub fn snapshot(&self) -> JsValue {
         snapshot_value(&self.inner.snapshot())
     }
@@ -856,6 +880,61 @@ impl BrowserRuntime {
         set(&value, "closed", self.inner.is_closed());
         set(&value, "lastError", self.inner.last_error.borrow().clone());
         value.into()
+    }
+}
+
+#[wasm_bindgen]
+pub struct BrowserAgentObserver {
+    observer: Rc<agent_core::observer::AgentStateObserver>,
+}
+
+#[wasm_bindgen]
+impl BrowserAgentObserver {
+    pub fn state(&self) -> JsValue {
+        agent_state_value(&self.observer.state())
+    }
+
+    pub fn updates(&self) -> Result<BrowserAgentUpdates, JsValue> {
+        agent_updates(&self.observer)
+    }
+}
+
+fn agent_updates(
+    observer: &agent_core::observer::AgentStateObserver,
+) -> Result<BrowserAgentUpdates, JsValue> {
+    observer
+        .updates()
+        .map(|updates| BrowserAgentUpdates { updates })
+        .map_err(|_| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::CapacityExceeded,
+                "Observer capacity exceeded",
+            ))
+        })
+}
+
+#[wasm_bindgen]
+pub struct BrowserAgentUpdates {
+    updates: agent_core::observer::AgentUpdates,
+}
+
+#[wasm_bindgen]
+impl BrowserAgentUpdates {
+    pub async fn next(&self) -> Result<JsValue, JsValue> {
+        let next = self.updates.next().map_err(|_| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Conflict,
+                "An observation read is already pending",
+            ))
+        })?;
+        Ok(next
+            .await
+            .as_ref()
+            .map_or(JsValue::UNDEFINED, agent_state_value))
+    }
+
+    pub fn close(&self) {
+        self.updates.close();
     }
 }
 
@@ -938,6 +1017,7 @@ impl RuntimeInner {
 
     fn request_close(&self) {
         self.closing.set(true);
+        self.close_agent_state();
         self.close_observations();
         self.stop_local_sources();
         let actor = self.actor.borrow();
@@ -951,6 +1031,7 @@ impl RuntimeInner {
 
     fn request_abort(&self) {
         self.closing.set(true);
+        self.close_agent_state();
         self.close_observations();
         self.stop_local_sources();
         let actor = self.actor.borrow();
@@ -969,6 +1050,20 @@ impl RuntimeInner {
         actor
             .as_ref()
             .map_or_else(agent_core::Snapshot::default, |actor| actor.snapshot())
+    }
+
+    fn agent_state(&self) -> agent_core::ffi::AgentState {
+        let snapshot = self.snapshot();
+        let _ = self
+            .agent_state
+            .publish_from(snapshot.version, (&snapshot).into());
+        self.agent_state.state()
+    }
+
+    fn close_agent_state(&self) {
+        let mut state = self.agent_state();
+        state.room = None;
+        let _ = self.agent_state.close(state);
     }
 
     async fn input_resource(
@@ -1310,6 +1405,9 @@ impl RuntimeInner {
     }
 
     fn publish_turn(&self, turn: &Turn) {
+        if turn.snapshot.is_some() {
+            self.agent_state();
+        }
         if let Some(error) = &turn.error {
             let class = match error.source {
                 TurnErrorSource::Command => "validation",
@@ -1339,6 +1437,7 @@ impl RuntimeInner {
     }
 
     fn publish_current_snapshot(&self) {
+        self.agent_state();
         let listener = self.snapshot_listener.borrow().clone();
         if let Some(listener) = listener {
             let snapshot = snapshot_value(&self.snapshot());
@@ -2180,6 +2279,7 @@ impl RuntimeInner {
         if self.closed.replace(true) {
             return;
         }
+        self.close_agent_state();
         self.close_observations();
         self.stop_local_sources();
         for (_, peer) in std::mem::take(&mut *self.peers.borrow_mut()) {
@@ -2442,6 +2542,52 @@ async fn fetch(request: Request) -> Result<HttpResponse, String> {
         headers,
         body: Uint8Array::new(&body).to_vec(),
     })
+}
+
+fn agent_state_value(state: &agent_core::ffi::AgentState) -> JsValue {
+    let value = Object::new();
+    set(&value, "observationRevision", state.observation_revision);
+    set(&value, "desiredJoinRevision", state.desired_join_revision);
+    set(
+        &value,
+        "evaluatedJoinRevision",
+        state.evaluated_join_revision,
+    );
+    set(
+        &value,
+        "desiredCredentialRevision",
+        state.desired_credential_revision,
+    );
+    set(
+        &value,
+        "evaluatedCredentialRevision",
+        state.evaluated_credential_revision,
+    );
+    set(&value, "room", state.room.clone());
+    set(&value, "desiredRoom", state.desired_room.clone());
+    // UBRN simple enums use their zero-based declaration order.
+    set(&value, "status", state.status as u32);
+    if let Some(error) = &state.error {
+        set(&value, "error", error_info_value(error));
+    }
+    value.into()
+}
+
+fn error_info_value(info: &agent_core::ffi::ErrorInfo) -> JsValue {
+    let value = Object::new();
+    set(&value, "code", info.code as u32);
+    set(&value, "message", info.message.clone());
+    value.into()
+}
+
+fn operation_error_value(info: agent_core::ffi::ErrorInfo) -> JsValue {
+    let error = js_sys::Error::new(&info.message);
+    let _ = Reflect::set(
+        error.as_ref(),
+        &JsValue::from_str("pulsebeamInfo"),
+        &error_info_value(&info),
+    );
+    error.into()
 }
 
 fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {

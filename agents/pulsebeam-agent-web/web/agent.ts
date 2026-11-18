@@ -2,13 +2,16 @@ import { DataRegistry, type LocalDataTrack } from "./data.js";
 import { track, type Delivery } from "./track.js";
 import { selectAudio } from "./reception.js";
 import { observeSnapshots, observeEvents } from "./observation.js";
+import { AgentObservation } from "./agent-observation.js";
+import type { AgentState } from "./schema.js";
 import type {
   Agent,
   AgentConfig,
   AgentEvent,
   AgentError,
   AgentSnapshot,
-  AgentState,
+  AgentState as DesiredState,
+  AgentUpdates,
   AudioDemand,
   CatalogSnapshot,
   ConnectionState,
@@ -108,8 +111,9 @@ class AgentFacade implements Agent {
   #eventListeners = new Set<(event: AgentEvent) => void>();
   readonly #snapshots = new Set<ReturnType<typeof observeSnapshots>>();
   readonly #events = new Set<ReturnType<typeof observeEvents>>();
-  #state: AgentState = copyState({ connected: false });
+  #state: DesiredState = copyState({ connected: false });
   #runtime: Runtime | undefined;
+  #observation: AgentObservation | undefined;
   #runtimeGeneration: bigint | null = null;
   readonly #data = new DataRegistry(this);
   readonly #resources = new ResourceOwners((error) => {
@@ -182,6 +186,7 @@ class AgentFacade implements Agent {
           throw error;
         }
         this.#runtime = runtime;
+        this.#observation = new AgentObservation(runtime);
         this.#data.activate(runtime);
         this.#resources.activate(runtime);
         runtime.set_event_listener((event: unknown) => {
@@ -201,6 +206,7 @@ class AgentFacade implements Agent {
           this.#data.deactivate();
           this.#resources.deactivate();
           runtime.abort();
+          this.#observation.retire();
           this.#runtime = undefined;
           this.#runtimeGeneration = null;
           throw error;
@@ -230,6 +236,7 @@ class AgentFacade implements Agent {
       runtime.set_error_listener();
       runtime.close();
       runtime.abort();
+      this.#observation?.retire();
     }
     this.#remote.resetPlayback();
     this.#publish(emptySnapshot("disconnected"));
@@ -296,6 +303,18 @@ class AgentFacade implements Agent {
     callbacks: TopicCallbacks<T>,
   ): () => void {
     return this.#topics.listen(name, options, callbacks);
+  }
+
+  state(): Readonly<AgentState> {
+    if (!this.#observation)
+      throw new ResourceError("not-ready", "agent is still initializing");
+    return this.#observation.state();
+  }
+
+  updates(): AgentUpdates {
+    if (!this.#observation)
+      throw new ResourceError("not-ready", "agent is still initializing");
+    return this.#observation.updates();
   }
 
   snapshot(): AgentSnapshot {
@@ -381,13 +400,13 @@ class AgentFacade implements Agent {
     await this.#ready;
   }
 
-  setState(state: AgentState): void {
+  setState(state: DesiredState): void {
     if (this.#closed) return;
     validatePlayoutDelay(state);
     this.#applyState(copyState(state));
   }
 
-  #effectiveState(state: AgentState): AgentState {
+  #effectiveState(state: DesiredState): DesiredState {
     const topics = new Map<string, TopicRegistration>();
     for (const topic of state.topics ?? [])
       topics.set(`${topic.mode}:${topic.name}`, topic);
@@ -409,7 +428,7 @@ class AgentFacade implements Agent {
     };
   }
 
-  #applyState(state: AgentState): void {
+  #applyState(state: DesiredState): void {
     if (this.#closed) return;
     const next = copyState(state);
     if (this.#runtime)
@@ -782,6 +801,7 @@ export interface ManagedAgent extends Agent {
   readonly subscribe: (listener: () => void) => () => void;
   activate(): void;
   deactivate(): void;
+  initialized(): Promise<void>;
 }
 
 export function createManagedAgent(config: AgentConfig): ManagedAgent {
@@ -825,6 +845,8 @@ export async function createAgent(config: AgentConfig): Promise<Agent> {
     disconnect: () => raw.disconnect(),
     renewAuthorization: (token: string) => raw.renewAuthorization(token),
     setLogging: (level: LogLevel) => raw.setLogging(level),
+    state: () => raw.state(),
+    updates: () => raw.updates(),
     snapshot: () => raw.snapshot(),
     snapshots: () => raw.snapshots(),
     events: () => raw.events(),

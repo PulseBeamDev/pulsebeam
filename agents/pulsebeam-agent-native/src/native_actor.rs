@@ -562,7 +562,7 @@ impl Agent {
         desired: agent_core::ffi::DesiredState,
     ) -> Result<(), agent_core::ffi::AgentError> {
         let closed = || agent_core::ffi::AgentError {
-            code: agent_core::ffi::ErrorCode::Closed,
+            code: agent_core::ffi::AgentOperationErrorCode::Closed,
             message: "agent is closed".into(),
         };
         let (response, result) = oneshot::channel();
@@ -677,6 +677,14 @@ impl Agent {
             || self.lease.abort.is_closed()
             || self.lease.finished.is_closed()
     }
+    pub fn state(&self) -> agent_core::ffi::AgentState {
+        self.core.state()
+    }
+    pub fn updates(
+        &self,
+    ) -> Result<agent_core::observer::AgentUpdates, agent_core::observer::ObserverLimit> {
+        self.core.updates()
+    }
     pub fn snapshot(&self) -> Snapshot {
         self.core.snapshot()
     }
@@ -709,11 +717,13 @@ impl Agent {
     }
     pub async fn close(&self) -> Result<(), Error> {
         self.lease.close.close();
+        self.core.close_observation();
         self.lease.finished.wait().await;
         Ok(())
     }
     pub async fn abort(&self) -> Result<(), Error> {
         self.lease.abort.close();
+        self.core.close_observation();
         self.lease.finished.wait().await;
         Ok(())
     }
@@ -1188,7 +1198,7 @@ where
                         .desired_revision
                         .checked_add(1)
                         .ok_or_else(|| agent_core::ffi::AgentError {
-                            code: agent_core::ffi::ErrorCode::InvalidDesiredState,
+                            code: agent_core::ffi::AgentOperationErrorCode::InvalidDesiredState,
                             message: "desired revision space exhausted".into(),
                         })
                         .and_then(|revision| desired.into_core(revision))
@@ -2169,6 +2179,7 @@ where
         for waiter in self.close_waiters.drain(..) {
             let _ = waiter.send(Err(Error::Closed));
         }
+        self.core.close_observation();
         self.finished.close();
     }
 }

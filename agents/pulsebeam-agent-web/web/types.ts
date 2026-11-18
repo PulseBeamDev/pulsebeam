@@ -1,5 +1,6 @@
 import type { AudioSource, VideoSource } from "./capture-source.js";
 import type { EventStream, SnapshotStream } from "./observation.js";
+import type { AgentState as ObservedAgentState } from "./schema.js";
 import type { AudioPublication, VideoPublication } from "./media.js";
 import type {
   AudioSelection,
@@ -451,6 +452,11 @@ export type AgentEvent =
   | ({ readonly type: "failure" } & AgentError)
   | { readonly type: "state-change" };
 
+export interface AgentUpdates {
+  next(): Promise<Readonly<ObservedAgentState> | undefined>;
+  close(): void;
+}
+
 export interface Agent {
   /** Current observed connection state. Reactive when returned by React useAgent(). */
   readonly connection: ConnectionState;
@@ -472,6 +478,8 @@ export interface Agent {
   renewAuthorization(token: string): Promise<void>;
   isClosed(): boolean;
   setLogging(level: LogLevel): void;
+  state(): Readonly<ObservedAgentState>;
+  updates(): AgentUpdates;
   snapshot(): AgentSnapshot;
   snapshots(): SnapshotStream;
   events(): EventStream;

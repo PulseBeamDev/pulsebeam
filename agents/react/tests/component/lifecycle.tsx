@@ -9,30 +9,63 @@ import { runtimes } from "./runtime.js";
 import { concurrentRender } from "./concurrency.js";
 
 import { captureLifecycle } from "./capture.js";
-import { ownershipAdapters, stalePublicationClaim } from "./ownership.js";
+import {
+  agentCreationFailure,
+  ownershipAdapters,
+  repeatedSessionFailure,
+  stalePublicationClaim,
+} from "./ownership.js";
 import { videoPreferences } from "./video.js";
 
 await concurrentRender();
 await captureLifecycle();
+await agentCreationFailure();
+await repeatedSessionFailure();
 await ownershipAdapters();
 await stalePublicationClaim();
 await dataLifetimes();
 await staleDataClaims();
 await videoPreferences();
 
-let agent: ReturnType<typeof useAgent>;
+let agent: NonNullable<ReturnType<typeof useAgent>>;
 let capture: ReturnType<typeof useCapture>;
 let updateToken: () => void;
 let replaceSession: () => void;
 let playback: { retry(): Promise<void> } | undefined;
 let devicesReady = false;
+let firstRenderWasNull = false;
 let setEnabled!: (enabled: boolean) => void;
 function Room() {
   const [token, setToken] = useState("first");
   const [endpoint, setEndpoint] = useState("http://localhost");
-  agent = useAgent({ endpoint, token });
+  const current = useAgent({ endpoint, token });
   capture = useCapture("device", { video: true, audio: true });
   devicesReady = useDevices().state === "ready";
+  if (!current) {
+    firstRenderWasNull = true;
+    return null;
+  }
+  return (
+    <ActiveRoom
+      agent={current}
+      capture={capture}
+      setToken={setToken}
+      setEndpoint={setEndpoint}
+    />
+  );
+}
+function ActiveRoom({
+  agent: current,
+  capture,
+  setToken,
+  setEndpoint,
+}: {
+  agent: NonNullable<ReturnType<typeof useAgent>>;
+  capture: ReturnType<typeof useCapture>;
+  setToken: (token: string) => void;
+  setEndpoint: (endpoint: string) => void;
+}) {
+  agent = current;
   updateToken = () => setToken("renewed");
   replaceSession = () => setEndpoint("http://localhost/replacement");
   const camera = agent.video("camera");
@@ -63,6 +96,7 @@ await flush(() =>
     </StrictMode>,
   ),
 );
+assert.equal(firstRenderWasNull, true, "Agent is null before effect creation");
 assert.equal(devicesReady, true);
 assert.equal(
   runtimes.filter((runtime) => !runtime.closed).length,

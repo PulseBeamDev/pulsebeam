@@ -19,6 +19,13 @@ async def witness():
         log_level=core.LogLevel.WARN,
     ))
     try:
+        initial_state = agent.state()
+        state_updates = agent.updates()
+        assert isinstance(state_updates, native.AgentUpdates)
+        assert initial_state.status == core.AgentStatus.IDLE
+        assert initial_state.room is None and initial_state.desired_room is None
+        assert isinstance(initial_state.observation_revision, int)
+        assert (await state_updates.next()).observation_revision == initial_state.observation_revision
         revision = agent.snapshot().desired_revision
         assert agent.snapshot().join_revision == 0
         assert isinstance(agent.snapshot().join_revision, int)
@@ -160,10 +167,18 @@ async def witness():
         assert (await pending_participant).is_CLOSED()
         try:
             agent.join("room")
-        except native.NativeError.Closed:
-            pass
+        except native.NativeError.Operation as error:
+            assert error.info.code == core.ErrorCode.CLOSED
         else:
             raise AssertionError("closed Agent revived")
+        final_state = await state_updates.next()
+        assert final_state.status == core.AgentStatus.CLOSED
+        assert final_state.desired_credential_revision == agent.snapshot().credential_revision
+        assert initial_state.status == core.AgentStatus.IDLE
+        assert (await state_updates.next()) is None
+        assert agent.state().observation_revision == final_state.observation_revision
+        state_updates.close()
+        state_updates.close()
     finally:
         await agent.close()
     print("generated Python lifecycle contract PASS")

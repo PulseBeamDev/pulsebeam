@@ -27,8 +27,10 @@ start PulseBeam, issue tokens, and join or publish media in React.
 - [API reference](../../docs/react/reference.md)
 - [Fix a failing step](../../docs/react/troubleshooting.md)
 
-Import from `@pulsebeam/react`. `useAgent` returns an Agent immediately; React
-owns its runtime lifecycle. Use a React `key` to replace logical sessions.
+Import from `@pulsebeam/react`. `useAgent` returns `null` until its committed
+effect has created and initialized the Agent; render a mounted child component
+for Agent-dependent hooks. React owns the runtime lifecycle. Use a React `key` to
+replace logical sessions.
 Capture hooks own the devices: disconnecting an Agent does not stop capture.
 Look up local handles with `agent.video(label)`, `agent.audio(label)`, or
 `agent.data(label, delivery)`. Look up a remote handle with

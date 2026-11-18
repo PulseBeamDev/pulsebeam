@@ -61,6 +61,12 @@ export class BrowserRuntime {
     this.config = config;
     runtimes.push(this);
   }
+  observer() {
+    const unsupported = (): never => {
+      throw new Error("Core observation belongs to the emitted-WASM contract");
+    };
+    return { state: unsupported, updates: unsupported };
+  }
   set_snapshot_listener(listener?: (snapshot: any) => void) {
     this.snapshotListener = listener;
     listener?.(this.snapshot);
@@ -226,7 +232,7 @@ export class BrowserRuntime {
   join(room: string) {
     this.joins.push(room);
   }
-  renew_authorization(token: string) {
+  renew(token: string) {
     this.config = { ...this.config, token };
   }
   set_log_level() {}

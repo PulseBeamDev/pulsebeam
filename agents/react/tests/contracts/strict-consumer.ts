@@ -35,7 +35,8 @@ const config: AgentConfig = {
   token: "opaque-token",
   logging: { level: "info" },
 };
-const agent: Agent = useAgent(config);
+const nullableAgent: Agent | null = useAgent(config);
+const agent: Agent = nullableAgent!;
 const direct = await createAgent(config);
 await direct.connect();
 await direct.close();

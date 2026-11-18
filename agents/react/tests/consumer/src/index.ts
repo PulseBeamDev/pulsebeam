@@ -16,7 +16,8 @@ const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   token: "opaque-token",
 };
-const agent: Agent = useAgent(config);
+const maybeAgent: Agent | null = useAgent(config);
+const agent: Agent = maybeAgent!;
 const capture = useCapture("device", { video: true, audio: false });
 const camera = agent.video("camera");
 // @ts-expect-error React no longer exports descriptors.

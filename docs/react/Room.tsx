@@ -6,15 +6,42 @@ import {
   Video,
   useAgent,
   useCapture,
+  type Agent,
   type AgentConfig,
+  type CaptureResult,
   type PlaybackError,
   type PlaybackFailure,
   type RemoteVideoTrack,
 } from "@pulsebeam/react";
 
-export function Room({ config }: { config: AgentConfig }) {
+export function Room({
+  config,
+  room,
+  onLeave,
+}: {
+  config: AgentConfig;
+  room: string;
+  onLeave(): void;
+}) {
   const agent = useAgent(config);
   const capture = useCapture("device", { video: true, audio: true });
+  if (!agent) return <p role="status">Preparing session…</p>;
+  return (
+    <ActiveRoom agent={agent} capture={capture} room={room} onLeave={onLeave} />
+  );
+}
+
+function ActiveRoom({
+  agent,
+  capture,
+  room,
+  onLeave,
+}: {
+  agent: Agent;
+  capture: CaptureResult;
+  room: string;
+  onLeave(): void;
+}) {
   const [error, setError] = useState("");
   const [videoPlayback, setVideoPlayback] = useState<PlaybackError | null>(
     null,
@@ -41,18 +68,21 @@ export function Room({ config }: { config: AgentConfig }) {
         {agent.participantId ?? "not admitted"}
       </p>
       <p>Capture: {capture.state}</p>
-      <button onClick={() => void agent.connect().catch(report)}>Join</button>
+      <button
+        onClick={() => {
+          try {
+            agent.join(room);
+          } catch (error) {
+            report(error);
+          }
+        }}
+      >
+        Join
+      </button>
       <button onClick={() => void capture.request().catch(report)}>
         Enable camera and microphone
       </button>
-      <button
-        onClick={() => {
-          capture.stop();
-          void agent.disconnect().catch(report);
-        }}
-      >
-        Leave and stop capture
-      </button>
+      <button onClick={onLeave}>Leave and stop capture</button>
       <h2>Local preview</h2>
       <Video
         source={capture.video}

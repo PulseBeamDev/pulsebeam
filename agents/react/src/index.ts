@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { sessionKey } from "./session-key.js";
 import { createReactAgent, type Agent } from "./agent.js";
 import type { AgentConfig } from "@pulsebeam/web";
@@ -59,44 +59,89 @@ export type {
 } from "./capture.js";
 
 /** React owns activation and release. Key the component for a different logical participant. */
-export function useAgent(config: AgentConfig): Agent {
+export function useAgent(config: AgentConfig): Agent | null {
   const key = sessionKey(config);
-  const create = () => {
-    const managed = createManagedAgent(config);
-    return { key, managed, facade: createReactAgent(managed) };
-  };
-  const [owned, setOwned] = useState(create);
-  let current = owned;
-  if (owned.key !== key) {
-    current = create();
-    setOwned(current);
-  }
-  const { managed, facade } = current;
-  const [failure, setFailure] = useState<{
+  const [owned, setOwned] = useState<{
+    key: string;
     managed: ManagedAgent;
+    facade: Agent;
+  } | null>(null);
+  const [failure, setFailure] = useState<{
+    key: string;
+    lifetime: number;
     error: unknown;
   } | null>(null);
+  const generation = useRef(0);
+  const cleanup = useRef<Promise<void>>(Promise.resolve());
+  const current = owned?.key === key ? owned : null;
+
   useEffect(() => {
-    managed.activate();
-    return () => managed.deactivate();
-  }, [managed]);
-  useEffect(() => {
+    const lifetime = ++generation.current;
     let active = true;
-    void managed.renewAuthorization(config.token).catch((error: unknown) => {
-      if (active) setFailure({ managed, error });
-    });
+    let managed: ManagedAgent | undefined;
+    const reportCleanup = (error: unknown) => {
+      console.error("PulseBeam Agent cleanup failed", error);
+    };
+    void (async () => {
+      await cleanup.current;
+      if (!active || generation.current !== lifetime) return;
+      try {
+        managed = createManagedAgent(config);
+        managed.activate();
+        await managed.initialized();
+        if (!active || generation.current !== lifetime) {
+          const retired = managed;
+          managed = undefined;
+          await retired.close();
+          return;
+        }
+        setOwned({ key, managed, facade: createReactAgent(managed) });
+      } catch (error) {
+        if (managed) {
+          try {
+            await managed.close();
+          } catch (closeError) {
+            reportCleanup(closeError);
+          }
+        }
+        if (active && generation.current === lifetime)
+          setFailure({ key, lifetime, error });
+      }
+    })();
     return () => {
       active = false;
+      if (generation.current === lifetime) ++generation.current;
+      if (managed) {
+        const retired = managed;
+        managed = undefined;
+        cleanup.current = cleanup.current
+          .then(() => retired.close())
+          .catch((error: unknown) => {
+            reportCleanup(error);
+          });
+      }
     };
-  }, [managed, config.token]);
+  }, [key]);
+
   useEffect(() => {
-    managed.setLogging(config.logging?.level ?? "warn");
-  }, [managed, config.logging?.level]);
-  useSyncExternalStore(
-    managed.subscribe,
-    managed.getSnapshot,
-    managed.getSnapshot,
-  );
-  if (failure?.managed === managed) throw failure.error;
-  return facade;
+    if (!current) return;
+    try {
+      current.managed.renew(config.token);
+    } catch (error) {
+      setFailure({ key, lifetime: generation.current, error });
+    }
+  }, [current?.managed, config.token, key]);
+  useEffect(() => {
+    current?.managed.setLogging(config.logging?.level ?? "warn");
+  }, [current?.managed, config.logging?.level]);
+
+  const subscribe = current?.managed.subscribe ?? noSubscribe;
+  const getSnapshot = current?.managed.getSnapshot ?? noSnapshot;
+  useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  if (failure?.key === key && failure.lifetime === generation.current)
+    throw failure.error;
+  return current?.facade ?? null;
 }
+
+const noSubscribe = (_listener: () => void) => () => {};
+const noSnapshot = () => null;

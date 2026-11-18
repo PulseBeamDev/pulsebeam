@@ -34,6 +34,17 @@ export async function concurrentRender() {
       endpoint: "http://localhost",
       token: "abandoned",
     });
+    return agent ? (
+      <CommittedProbe agent={agent} speculative={speculative} />
+    ) : null;
+  }
+  function CommittedProbe({
+    agent,
+    speculative,
+  }: {
+    agent: NonNullable<ReturnType<typeof useAgent>>;
+    speculative: boolean;
+  }) {
     const camera = agent.video("camera");
     const messages = agent.data("messages", "ordered");
     const remote = agent.participant("alice").video("camera");
@@ -123,6 +134,7 @@ export async function concurrentRender() {
     );
   } finally {
     await flush(() => root.unmount());
+    await flush();
     preview.getTracks().forEach((track) => track.stop());
     assert.ok(
       acquired.getTracks().every((track) => track.readyState === "ended"),

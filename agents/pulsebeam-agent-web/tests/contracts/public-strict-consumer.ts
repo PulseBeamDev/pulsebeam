@@ -5,6 +5,12 @@ import {
   attachRemoteVideo,
   attachRemoteAudio,
   ResourceOwnershipError,
+  AgentStatus,
+  ErrorCode,
+  OperationError,
+  type AgentState,
+  type AgentUpdates,
+  type ErrorInfo,
   type AgentError,
   type AgentSnapshot,
   type DataEvent,
@@ -22,7 +28,7 @@ import { createWebAgent } from "../../web/index.js";
 // @ts-expect-error Descriptors are not a parallel public lookup path.
 import { track } from "../../web/index.js";
 // @ts-expect-error Desired-state mutation is not a normal public API.
-import type { AgentState } from "../../web/index.js";
+import type { DesiredState } from "../../web/index.js";
 // @ts-expect-error JSON topic registration is not required for binary data.
 import type { Topic } from "../../web/index.js";
 
@@ -31,6 +37,32 @@ const agent = await createAgent({
   token: "opaque",
 });
 agent.join("explicit-room");
+const currentState: AgentState = agent.state();
+const stateCursor: AgentUpdates = agent.updates();
+const nextState: Promise<AgentState | undefined> = stateCursor.next();
+const stateRevision: bigint = currentState.observationRevision;
+const desiredJoinRevision: bigint = currentState.desiredJoinRevision;
+const observedRoom: string | undefined = currentState.room;
+const status: AgentStatus = currentState.status;
+const operation = new OperationError({
+  code: ErrorCode.Conflict,
+  message: "Pending observation read",
+});
+const info: ErrorInfo = operation.info;
+type NoAny<T> = 0 extends 1 & T ? false : true;
+const stateTyped: NoAny<ReturnType<typeof agent.state>> = true;
+const updateTyped: NoAny<Awaited<ReturnType<AgentUpdates["next"]>>> = true;
+// @ts-expect-error State views are immutable generated values.
+currentState.desiredRoom = "overwrite";
+if (currentState.error) {
+  // @ts-expect-error Nested error information is immutable too.
+  currentState.error.message = "overwrite";
+}
+// @ts-expect-error Concrete cursors do not expose the foreign backend.
+stateCursor.cursor;
+stateCursor.close();
+void [nextState, stateRevision, desiredJoinRevision, observedRoom, status, info,
+  stateTyped, updateTyped];
 const renewed: void = agent.renew("opaque-renewed");
 void renewed;
 const connected: Promise<void> = agent.connect();

@@ -1,4 +1,7 @@
 export { createAgent } from "./agent.js";
+export { OperationError } from "./agent-observation.js";
+export { AgentStatus, ErrorCode } from "./schema.js";
+export type { AgentState, ErrorInfo } from "./schema.js";
 export type {
   SnapshotStream,
   SnapshotUpdate,
@@ -38,6 +41,7 @@ export type {
   AgentEvent,
   AgentLogging,
   AgentSnapshot,
+  AgentUpdates,
   AudioDemand,
   AudioSenderConfig,
   AudioSubscriptionConfig,

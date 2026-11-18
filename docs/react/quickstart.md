@@ -84,18 +84,26 @@ microphone; the keyed room owns the PulseBeam session. Pass in a token from
 your application's backend.
 
 ```tsx
+import { useState } from "react";
 import {
   Audio,
   Publish,
+  SelectAudio,
   Video,
   useAgent,
   useCapture,
+  type Agent,
   type CaptureResult,
   type RemoteVideoTrack,
 } from "@pulsebeam/react";
 
-
-export function Call({ sessionId, token }: { sessionId: string; token: string }) {
+export function Call({
+  sessionId,
+  token,
+}: {
+  sessionId: string;
+  token: string;
+}) {
   const media = useCapture("device", { video: true, audio: true });
 
   return (
@@ -112,7 +120,13 @@ export function Call({ sessionId, token }: { sessionId: string; token: string })
 
 function Room({ token, media }: { token: string; media: CaptureResult }) {
   const agent = useAgent({ endpoint: "http://localhost:7070", token });
-  const remoteVideos = agent.remote.participants.flatMap((participant) =>
+  if (!agent) return <p role="status">Preparing session…</p>;
+  return <ActiveRoom agent={agent} media={media} />;
+}
+
+function ActiveRoom({ agent, media }: { agent: Agent; media: CaptureResult }) {
+  const [error, setError] = useState("");
+  const remoteVideos = agent.participants.flatMap((participant) =>
     participant.tracks.filter(
       (value): value is RemoteVideoTrack => value.kind === "video",
     ),
@@ -122,9 +136,20 @@ function Room({ token, media }: { token: string; media: CaptureResult }) {
     <>
       <Publish track={agent.video("camera")} source={media.video} />
       <Publish track={agent.audio("microphone")} source={media.audio} />
+      <SelectAudio agent={agent} policy={{ automatic: true }} />
       <Audio agent={agent} />
-      <button onClick={() => agent.connect()}>Join room</button>
-      <button onClick={() => agent.disconnect()}>Leave room</button>
+      <button
+        onClick={() => {
+          try {
+            agent.join("demo");
+          } catch (failure) {
+            setError(String(failure));
+          }
+        }}
+      >
+        Join room
+      </button>
+      {error && <p role="alert">{error}</p>}
       <p>Connection: {agent.connection}</p>
       {agent.error && <p role="alert">{agent.error.message}</p>}
       {remoteVideos.map((remote) => (
@@ -139,12 +164,15 @@ function Room({ token, media }: { token: string; media: CaptureResult }) {
 }
 ```
 
+`useAgent()` returns `null` until its committed effect has initialized the Agent.
+The mounted child uses the ready Agent without creating resources during render.
 Committed JSX owns publications, including source changes and withdrawal on
-unmount. No synchronization effect is needed. `connect()` records connection
-intent; the Agent handles transient retries. Terminal failures require an
-explicit retry after correcting the cause. The browser sends media directly to PulseBeam, not through your
-application backend. To switch rooms or participants, change `sessionId`
-(the React key); refreshing a token for the same session preserves its Agent.
+unmount. `join("demo")` records explicit room intent; admission and transient
+recovery remain asynchronous. Unmount `Room` to end the session. Calling
+`agent.join(nextRoom)` changes rooms without replacing the Agent or stopping the
+parent's capture. Change `sessionId` (the React key) for a different logical
+session; refreshing a token for the same session preserves its Agent. The browser
+sends media directly to PulseBeam, not through your application backend.
 
 ## 4. Try it
 

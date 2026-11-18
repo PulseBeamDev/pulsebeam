@@ -22,6 +22,8 @@ pub struct NativeAgentConfig {
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum NativeError {
+    #[error("SDK operation failed: {info:?}")]
+    Operation { info: core_ffi::ErrorInfo },
     #[error("core operation failed: {error:?}")]
     Core { error: core_ffi::AgentError },
     #[error("resource operation failed: {reason:?}")]
@@ -155,7 +157,21 @@ impl Agent {
     }
 
     pub fn renew(&self, token: String) -> Result<(), NativeError> {
-        self.runtime.renew(token).map_err(Into::into)
+        self.runtime.renew(token).map_err(operation_error)
+    }
+    pub fn state(&self) -> core_ffi::AgentState {
+        self.runtime.state()
+    }
+    pub fn updates(&self) -> Result<Arc<AgentUpdates>, NativeError> {
+        self.runtime
+            .updates()
+            .map(|updates| Arc::new(AgentUpdates { updates }))
+            .map_err(|_| NativeError::Operation {
+                info: core_ffi::ErrorInfo::new(
+                    core_ffi::ErrorCode::CapacityExceeded,
+                    "Observer capacity exceeded",
+                ),
+            })
     }
     pub async fn renew_authorization(&self, token: String) -> Result<(), NativeError> {
         self.runtime
@@ -199,7 +215,7 @@ impl Agent {
         self.runtime.is_closed()
     }
     pub fn join(&self, room: String) -> Result<(), NativeError> {
-        self.runtime.join(room).map_err(Into::into)
+        self.runtime.join(room).map_err(operation_error)
     }
 
     pub async fn connect(&self) -> Result<(), NativeError> {
@@ -219,6 +235,46 @@ impl Agent {
 impl Agent {
     pub fn from_runtime(runtime: RuntimeAgent) -> Arc<Self> {
         Arc::new(Self { runtime })
+    }
+}
+
+fn operation_error(error: RuntimeError) -> NativeError {
+    let info = match error {
+        RuntimeError::Core(error) => core_ffi::ErrorInfo::from(&error),
+        RuntimeError::Closed => {
+            core_ffi::ErrorInfo::new(core_ffi::ErrorCode::Closed, "Agent is closed")
+        }
+        RuntimeError::Backpressure => core_ffi::ErrorInfo::new(
+            core_ffi::ErrorCode::CapacityExceeded,
+            "Operation capacity exceeded",
+        ),
+        RuntimeError::NotReady => {
+            core_ffi::ErrorInfo::new(core_ffi::ErrorCode::NotReady, "Agent is not ready")
+        }
+        _ => core_ffi::ErrorInfo::new(core_ffi::ErrorCode::Internal, "Operation failed"),
+    };
+    NativeError::Operation { info }
+}
+
+#[derive(uniffi::Object)]
+pub struct AgentUpdates {
+    updates: agent_core::observer::AgentUpdates,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl AgentUpdates {
+    pub async fn next(&self) -> Result<Option<core_ffi::AgentState>, NativeError> {
+        let next = self.updates.next().map_err(|_| NativeError::Operation {
+            info: core_ffi::ErrorInfo::new(
+                core_ffi::ErrorCode::Conflict,
+                "An observation read is already pending",
+            ),
+        })?;
+        Ok(next.await)
+    }
+
+    pub fn close(&self) {
+        self.updates.close();
     }
 }
 

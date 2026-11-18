@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { Component, StrictMode, useState, type ReactNode } from "react";
+import {
+  Component,
+  StrictMode,
+  useEffect,
+  useState,
+  type ReactNode,
+} from "react";
 import { createRoot } from "react-dom/client";
 import {
   Audio,
@@ -32,6 +38,65 @@ class Boundary extends Component<
   }
 }
 
+export async function agentCreationFailure() {
+  let failure: Error | undefined;
+  function InvalidAgent() {
+    const agent = useAgent({ endpoint: "http://localhost", token: " " });
+    return agent ? <output>unexpected Agent</output> : null;
+  }
+  const root = createRoot(document.createElement("div"));
+  await flush(() =>
+    root.render(
+      <Boundary onError={(error) => (failure = error)}>
+        <InvalidAgent />
+      </Boundary>,
+    ),
+  );
+  assert.match(failure?.message ?? "", /authorization token is invalid/);
+  await flush(() => root.unmount());
+}
+
+export async function repeatedSessionFailure() {
+  const failures: Error[] = [];
+  let rejectAndReplace!: () => void;
+  let returnToFirst!: () => void;
+  function Room() {
+    const [endpoint, setEndpoint] = useState("http://localhost/first");
+    const [token, setToken] = useState("valid");
+    const agent = useAgent({ endpoint, token });
+    useEffect(() => {
+      if (token === " ") {
+        setEndpoint("http://localhost/second");
+        setToken("valid");
+      }
+    }, [token]);
+    rejectAndReplace = () => setToken(" ");
+    returnToFirst = () => setEndpoint("http://localhost/first");
+    return agent ? <output>{endpoint}</output> : null;
+  }
+  const host = document.createElement("div");
+  const root = createRoot(host);
+  await flush(() =>
+    root.render(
+      <Boundary onError={(error) => failures.push(error)}>
+        <Room />
+      </Boundary>,
+    ),
+  );
+  const first = runtimes.at(-1)!;
+  await flush(rejectAndReplace);
+  assert.equal(host.textContent, "http://localhost/second");
+  assert.equal(first.closed, true);
+  await flush(returnToFirst);
+  assert.equal(host.textContent, "http://localhost/first");
+  assert.deepEqual(
+    failures,
+    [],
+    "a retired lifetime's rejection cannot fail a reused session key",
+  );
+  await flush(() => root.unmount());
+}
+
 export async function stalePublicationClaim() {
   let replace!: () => void;
   const completion = deferred<void>();
@@ -46,6 +111,9 @@ export async function stalePublicationClaim() {
       endpoint: "http://localhost",
       token: "stale-publication",
     });
+    return agent ? <StalePublicationRoom agent={agent} /> : null;
+  }
+  function StalePublicationRoom({ agent }: { agent: Agent }) {
     const [label, setLabel] = useState("old");
     const [mounted, setMounted] = useState(false);
     activate = () => setMounted(true);
@@ -65,9 +133,14 @@ export async function stalePublicationClaim() {
   };
   await flush(activate);
   await flush(replace);
+  assert.equal(
+    runtime.publicationOwners.size,
+    0,
+    "replacement waits for the pending retired claim to close",
+  );
+  await flush(() => completion.resolve());
   const owner = [...runtime.publicationOwners.keys()][0];
   assert.notEqual(owner, undefined);
-  await flush(() => completion.resolve());
   assert.deepEqual([...runtime.claimedPublications], ["video:new"]);
   assert.deepEqual([...runtime.publicationOwners.keys()], [owner]);
   assert.equal(runtime.ownedReplacements[0].replaceInput, true);
@@ -76,6 +149,11 @@ export async function stalePublicationClaim() {
       (entry) => entry.owner === owner && entry.muted === false,
     ),
     "retired claim cannot mutate the replacement publication",
+  );
+  assert.equal(
+    native.readyState,
+    "live",
+    "publication keeps borrowed capture alive",
   );
   await flush(() => root.unmount());
   assert.equal(runtime.publicationOwners.size, 0);
@@ -102,7 +180,14 @@ export async function ownershipAdapters() {
   );
 
   function Room() {
-    agent = useAgent({ endpoint: "http://localhost", token: "ownership" });
+    const current = useAgent({
+      endpoint: "http://localhost",
+      token: "ownership",
+    });
+    return current ? <OwnershipRoom agent={current} /> : null;
+  }
+  function OwnershipRoom({ agent: current }: { agent: Agent }) {
+    agent = current;
     const [state, setState] = useState({
       source: false,
       enabled: true,

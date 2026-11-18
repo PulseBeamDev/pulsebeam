@@ -1,5 +1,8 @@
 import {
   AgentConfig,
+  AgentStatus,
+  AgentUpdates,
+  ErrorCode,
   AudioDemand,
   AudioSubscriptionConfig,
   DataUpdate,
@@ -41,6 +44,15 @@ const agent = await Agent.create(
     logLevel: LogLevel.Warn,
   }),
 );
+const initialState = agent.state();
+const stateUpdates = agent.updates();
+if (!AgentUpdates.instanceOf(stateUpdates) ||
+    initialState.status !== AgentStatus.Idle ||
+    initialState.room !== undefined || initialState.desiredRoom !== undefined ||
+    typeof initialState.observationRevision !== "bigint" ||
+    (await stateUpdates.next())?.observationRevision !== initialState.observationRevision) {
+  throw new Error("missing initial concrete Agent state");
+}
 const revision = agent.snapshot().desiredRevision;
 const joinRevision: bigint = agent.snapshot().joinRevision;
 const credentialRevision: bigint = agent.snapshot().credentialRevision;
@@ -238,8 +250,19 @@ try {
   void joined;
   throw new Error("closed Agent revived");
 } catch (error) {
-  if (!NativeError.Closed.instanceOf(error)) throw error;
+  if (!NativeError.Operation.instanceOf(error) || error.inner.info.code !== ErrorCode.Closed) throw error;
 }
+const finalState = await stateUpdates.next();
+if (finalState?.status !== AgentStatus.Closed ||
+    finalState.desiredCredentialRevision !== agent.snapshot().credentialRevision ||
+    initialState.status !== AgentStatus.Idle ||
+    (await stateUpdates.next()) !== undefined ||
+    agent.state().observationRevision !== finalState.observationRevision) {
+  throw new Error("Agent state did not retain one immutable final close");
+}
+stateUpdates.close();
+stateUpdates.close();
+stateUpdates.uniffiDestroy();
 audioSelection.uniffiDestroy();
 audioSubscription.uniffiDestroy();
 videoSubscription.uniffiDestroy();

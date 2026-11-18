@@ -41,7 +41,11 @@ export async function videoPreferences() {
     };
   };
   function Room() {
-    agent = useAgent({ endpoint: "http://localhost", token: "token" });
+    const current = useAgent({ endpoint: "http://localhost", token: "token" });
+    return current ? <VideoRoom agent={current} /> : null;
+  }
+  function VideoRoom({ agent: current }: { agent: Agent }) {
+    agent = current;
     const [state, setState] = useState({
       first: {
         minHeight: 360,

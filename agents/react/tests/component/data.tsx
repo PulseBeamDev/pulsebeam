@@ -35,7 +35,11 @@ export async function dataLifetimes() {
   const errors: string[] = [];
   let fail = false;
   function Room() {
-    agent = useAgent({ endpoint: "http://localhost", token: "data" });
+    const current = useAgent({ endpoint: "http://localhost", token: "data" });
+    return current ? <DataRoom agent={current} /> : null;
+  }
+  function DataRoom({ agent: current }: { agent: Agent }) {
+    agent = current;
     const [state, setState] = useState({
       version: 1,
       label: "chat",
@@ -202,7 +206,13 @@ export async function staleDataClaims() {
   const completion = deferred<void>();
   const calls: unknown[] = [];
   function Room() {
-    agent = useAgent({ endpoint: "http://localhost", token: "stale-data" });
+    const current = useAgent({
+      endpoint: "http://localhost",
+      token: "stale-data",
+    });
+    return current ? <StaleDataRoom agent={current} /> : null;
+  }
+  function StaleDataRoom({ agent }: { agent: Agent }) {
     const [mounted, setMounted] = useState(false);
     mount = setMounted;
     return mounted ? (
