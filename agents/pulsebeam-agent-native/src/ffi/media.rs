@@ -124,30 +124,41 @@ impl PublicationUpdates {
     }
 }
 
-macro_rules! local_track {
-    ($name:ident, $source:ident, $publication:ident) => {
-        #[derive(uniffi::Object)]
-        pub struct $name {
-            runtime: crate::$name,
-        }
-
-        #[uniffi::export(async_runtime = "tokio")]
-        impl $name {
-            pub async fn publish(
-                &self,
-                source: Arc<$source>,
-                configuration: core_ffi::PublicationConfig,
-            ) -> Result<Arc<$publication>, NativeError> {
-                Ok(Arc::new($publication {
-                    runtime: self.runtime.publish(&source.runtime, configuration).await?,
-                }))
-            }
-        }
-    };
+#[derive(uniffi::Object)]
+pub struct LocalVideoTrack {
+    runtime: crate::LocalVideoTrack,
 }
 
-local_track!(LocalVideoTrack, VideoSource, VideoPublication);
-local_track!(LocalAudioTrack, AudioSource, AudioPublication);
+#[derive(uniffi::Object)]
+pub struct LocalAudioTrack {
+    runtime: crate::LocalAudioTrack,
+}
+
+#[uniffi::export]
+impl LocalVideoTrack {
+    #[uniffi::method(default(options = None))]
+    pub fn publish(
+        &self,
+        options: Option<core_ffi::PublicationConfig>,
+    ) -> Result<Arc<VideoPublication>, NativeError> {
+        Ok(Arc::new(VideoPublication {
+            runtime: self.runtime.publish(options.unwrap_or_default())?,
+        }))
+    }
+}
+
+#[uniffi::export]
+impl LocalAudioTrack {
+    #[uniffi::method(default(options = None))]
+    pub fn publish(
+        &self,
+        options: Option<core_ffi::PublicationConfig>,
+    ) -> Result<Arc<AudioPublication>, NativeError> {
+        Ok(Arc::new(AudioPublication {
+            runtime: self.runtime.publish(options.unwrap_or_default())?,
+        }))
+    }
+}
 
 #[derive(uniffi::Object)]
 pub struct RemoteVideoTrack {

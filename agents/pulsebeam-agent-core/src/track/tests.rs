@@ -67,6 +67,53 @@ fn descriptors_preserve_wire_identity_and_delivery() {
 }
 
 #[test]
+fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
+    let mut resources = TrackResources::default();
+    let owner = resources.new_owner().unwrap();
+    let spec = data(TopicMode::Ordered);
+    resources.declare_data_publication(owner, &spec).unwrap();
+    let media_owner = resources.new_owner().unwrap();
+    resources
+        .claim_publication(media_owner, video("events"), &BTreeSet::new())
+        .unwrap();
+    resources.retain_producer(&spec).unwrap();
+    assert!(resources.producers.is_empty());
+    assert_eq!(
+        resources.retain_producer(&data(TopicMode::Latest)),
+        Err(TrackResourceError::AlreadyOwned)
+    );
+    resources.declare_data_publication(owner, &spec).unwrap();
+    assert_eq!(
+        resources.declare_data_publication(owner, &data(TopicMode::Latest)),
+        Err(TrackResourceError::AlreadyOwned)
+    );
+    assert_eq!(
+        resources.registrations().publishers,
+        vec![TopicPublisher {
+            topic: "events".into(),
+            mode: TopicMode::Ordered
+        }]
+    );
+    let other = resources.new_owner().unwrap();
+    assert_eq!(
+        resources.declare_data_publication(other, &data(TopicMode::Latest)),
+        Err(TrackResourceError::AlreadyOwned)
+    );
+    resources.release(owner);
+    resources.release(owner);
+    resources
+        .declare_data_publication(other, &data(TopicMode::Latest))
+        .unwrap();
+    assert_eq!(
+        resources.registrations().publishers,
+        vec![TopicPublisher {
+            topic: "events".into(),
+            mode: TopicMode::Latest
+        }]
+    );
+}
+
+#[test]
 fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
     for kind in [MediaKind::Video, MediaKind::Audio] {
         let mut resources = TrackResources::default();
@@ -93,7 +140,7 @@ fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
             resources.claim_publication(second, camera.clone(), &BTreeSet::new()),
             Err(TrackResourceError::AlreadyOwned)
         );
-        for index in 1..=256 {
+        for index in 1..=63 {
             let owner = resources.new_owner().unwrap();
             let input = spec(&format!("input-{index}"));
             assert_eq!(
@@ -104,7 +151,12 @@ fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
             );
             resources.update_publication(owner, &input, true).unwrap();
         }
-        assert_eq!(resources.publications().len(), 257);
+        assert_eq!(resources.publications().len(), 64);
+        let over_capacity = resources.new_owner().unwrap();
+        assert_eq!(
+            resources.claim_publication(over_capacity, spec("over-capacity"), &BTreeSet::new()),
+            Err(TrackResourceError::PublicationCapacityExceeded)
+        );
         assert!(
             resources
                 .publications()
@@ -126,7 +178,7 @@ fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
                 .unwrap(),
             format!("{prefix}0")
         );
-        assert_eq!(resources.publications().len(), 257);
+        assert_eq!(resources.publications().len(), 64);
     }
 }
 

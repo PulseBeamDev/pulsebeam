@@ -4,8 +4,10 @@ import { Agent, InputFrame, type AgentLike, type NativeAgentConfig } from "@puls
 declare const config: AgentConfig;
 declare const nativeConfig: NativeAgentConfig;
 config.logLevel = LogLevel.Warn;
-const agent: Promise<AgentLike> = Agent.create(config);
-const nativeAgent: Promise<AgentLike> = Agent.createWithMedia(nativeConfig);
+const agent: AgentLike = new Agent(config);
+const nativeAgent: AgentLike = Agent.createWithMedia(nativeConfig);
+// @ts-expect-error The legacy asynchronous constructor is not public.
+void Agent.create;
 async function binaryInputs(agent: AgentLike) {
   const camera = await agent.createVideoInput({
     encodings: [{ rid: undefined, scaleDownBy: 1, maxBitrateBps: undefined, maxFramerate: undefined, temporalLayers: 1 }],

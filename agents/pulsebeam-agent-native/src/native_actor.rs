@@ -397,11 +397,8 @@ enum Command {
         spec: agent_core::TrackSpec,
         response: oneshot::Sender<Result<Publication, Error>>,
     },
-    PublishTrack {
-        spec: agent_core::TrackSpec,
-        source: ProducerInput,
-        configuration: agent_core::ffi::PublicationConfig,
-        response: oneshot::Sender<Result<Publication, Error>>,
+    RegisterPublication {
+        publication: Publication,
     },
     VideoSubscription {
         selector: agent_core::TrackSelector,
@@ -466,6 +463,16 @@ impl Agent {
     pub async fn spawn(config: Config, host: Host) -> Result<Self, Error> {
         let (agent, actor) = Self::parts(config, host, || Ok((rtc::ThreadedRuntime, ())))?;
         tokio::spawn(actor.run());
+        Ok(agent)
+    }
+
+    pub(crate) fn spawn_on_handle(
+        config: Config,
+        host: Host,
+        handle: &tokio::runtime::Handle,
+    ) -> Result<Self, Error> {
+        let (agent, actor) = Self::parts(config, host, || Ok((rtc::ThreadedRuntime, ())))?;
+        handle.spawn(actor.run());
         Ok(agent)
     }
 
@@ -1326,15 +1333,15 @@ where
                     let _ = response.send(result);
                 }
             }
-            Command::PublishTrack {
-                spec,
-                source,
-                configuration,
-                response,
-            } => {
-                if !response.is_closed() {
-                    let result = self.publish_track(spec, source, configuration);
-                    let _ = response.send(result);
+            Command::RegisterPublication { publication } => {
+                let owner = publication.inner.owner;
+                if self.close.is_closed() || publication.is_closed() {
+                    publication.inner.closed.close();
+                    self.core.revoke_publication(owner);
+                } else {
+                    self.publications
+                        .insert(owner, Arc::downgrade(&publication.inner));
+                    self.leases_changed.notify_one();
                 }
             }
             Command::VideoSubscription {
@@ -2196,6 +2203,12 @@ where
         }
     }
     fn shutdown(&mut self) {
+        while let Ok(command) = self.commands.try_recv() {
+            if let Command::RegisterPublication { publication } = command {
+                publication.inner.closed.close();
+                self.core.revoke_publication(publication.inner.owner);
+            }
+        }
         self.data_receivers.clear();
         for (_, response) in std::mem::take(&mut self.data_sends) {
             let _ = response.send(Err(Error::Closed));
@@ -2207,8 +2220,11 @@ where
             }
         }
         self.producers.clear();
-        for lease in self.publications.values().filter_map(Weak::upgrade) {
-            lease.closed.close();
+        for (&owner, weak) in &self.publications {
+            if let Some(lease) = weak.upgrade() {
+                lease.closed.close();
+                self.core.revoke_publication(owner);
+            }
         }
         for input in self.inputs.values() {
             if let Some(lease) = input.lease.upgrade() {
@@ -2908,6 +2924,194 @@ mod tests {
     }
 
     #[test]
+    fn synchronous_declaration_is_inert_and_pipe_attaches_before_actor_progress() {
+        let _guard = crate::native_media::NATIVE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (agent, mut actor) = Agent::parts(
+                    config(),
+                    Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+                    || Ok((rtc::ThreadedRuntime, ())),
+                )
+                .unwrap();
+                let cancelled = agent
+                    .audio("cancel-before-register".into())
+                    .unwrap()
+                    .declare(Default::default())
+                    .unwrap();
+                let mut closing = Box::pin(cancelled.close());
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(closing.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                let registration = actor.commands.try_recv().unwrap();
+                actor.command(registration);
+                let release = actor.commands.try_recv().unwrap();
+                actor.command(release);
+                closing.await.unwrap();
+                assert!(actor.publications.is_empty());
+
+                let track = agent.audio("cold".into()).unwrap();
+                let publication = track
+                    .declare(agent_core::ffi::PublicationConfig { enabled: true })
+                    .unwrap();
+                assert_eq!(
+                    publication.state().admission.status,
+                    agent_core::ffi::PublicationAdmissionStatus::Pending
+                );
+                assert!(matches!(
+                    agent
+                        .audio("cold".into())
+                        .unwrap()
+                        .declare(Default::default()),
+                    Err(Error::Core(agent_core::AgentError::InvalidResource(
+                        agent_core::TrackResourceError::AlreadyOwned
+                    )))
+                ));
+                assert!(actor.publications.is_empty());
+
+                let source = actor.create_producer(None).unwrap();
+                let pipe = source.pipe_to(&publication).unwrap();
+                let reserved = pipe.handle.input_id;
+                let registration = actor.commands.try_recv().unwrap();
+                actor.command(registration);
+                let install = actor.commands.try_recv().unwrap();
+                actor.command(install);
+                assert_eq!(pipe.handle.operation.input(), Some(reserved));
+                assert_eq!(pipe.state().status, agent_core::ffi::PipeStatus::Available);
+                let mut closing_pipe = Box::pin(pipe.close());
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(closing_pipe.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                let cleanup = actor.commands.try_recv().unwrap();
+                actor.command(cleanup);
+                closing_pipe.await.unwrap();
+                assert_eq!(pipe.state().status, agent_core::ffi::PipeStatus::Closed);
+                assert!(!source.is_closed());
+
+                let late = agent
+                    .audio("agent-close-before-register".into())
+                    .unwrap()
+                    .declare(Default::default())
+                    .unwrap();
+                let drained = agent
+                    .audio("agent-close-during-drain".into())
+                    .unwrap()
+                    .declare(Default::default())
+                    .unwrap();
+                let updates = drained.updates().unwrap();
+                assert!(!updates.next().await.unwrap().unwrap().closed);
+                let mut final_read = Box::pin(updates.next());
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(final_read.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                let mut closing_agent = Box::pin(agent.close());
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(closing_agent.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                let registration = actor.commands.try_recv().unwrap();
+                actor.command(registration);
+                assert!(late.is_closed());
+                assert!(
+                    agent
+                        .core
+                        .external(|core| core.publication_state(late.inner.owner).is_err())
+                );
+                actor.shutdown();
+                closing_agent.await.unwrap();
+                assert!(drained.is_closed());
+                assert!(
+                    agent
+                        .core
+                        .external(|core| core.publication_state(drained.inner.owner).is_err())
+                );
+                assert!(actor.publications.is_empty());
+                assert!(final_read.await.unwrap().unwrap().closed);
+                assert!(updates.next().await.unwrap().is_none());
+                updates.close();
+                drop(agent);
+            });
+    }
+
+    #[test]
+    fn declaration_rolls_back_when_registration_queue_is_full_or_closed() {
+        let _guard = crate::native_media::NATIVE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+            || Ok((rtc::ThreadedRuntime, ())),
+        )
+        .unwrap();
+        for _ in 0..COMMANDS {
+            actor
+                .command_tx
+                .try_send(Command::Core {
+                    command: AgentCommand::Join("queue-fill".into()),
+                    response: oneshot::channel().0,
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            agent
+                .audio("rollback".into())
+                .unwrap()
+                .declare(Default::default()),
+            Err(Error::Backpressure)
+        ));
+        let (owner, _) = agent
+            .core
+            .declare_publication(
+                agent_core::TrackSpec::Audio {
+                    label: "rollback".into(),
+                },
+                true,
+            )
+            .unwrap();
+        agent.core.revoke_publication(owner);
+        actor.commands.close();
+        assert!(matches!(
+            agent
+                .audio("closed-queue".into())
+                .unwrap()
+                .declare(Default::default()),
+            Err(Error::Closed)
+        ));
+        let (owner, _) = agent
+            .core
+            .declare_publication(
+                agent_core::TrackSpec::Audio {
+                    label: "closed-queue".into(),
+                },
+                true,
+            )
+            .unwrap();
+        agent.core.revoke_publication(owner);
+        agent.core.close_observation();
+    }
+
+    #[test]
     fn pipe_reserves_core_lifetime_and_closes_without_closing_borrowed_source() {
         let _guard = crate::native_media::NATIVE_TEST_SERIAL
             .lock()
@@ -3163,7 +3367,7 @@ mod tests {
                 .unwrap();
                 let initial = actor.core.snapshot().clone();
                 let _camera = agent.video("camera".into()).unwrap();
-                let _microphone = agent.audio("microphone".into()).unwrap();
+                let microphone = agent.audio("microphone".into()).unwrap();
                 let participant = agent.participant("remote".into()).unwrap();
                 let _remote_camera = participant.video("camera".into()).unwrap();
                 let _remote_microphone = participant.audio("microphone".into()).unwrap();
@@ -3179,9 +3383,20 @@ mod tests {
                 let spec = agent_core::TrackSpec::Audio {
                     label: "microphone".into(),
                 };
-                let publication = actor
-                    .publish_track(spec.clone(), source.clone(), Default::default())
-                    .unwrap();
+                let publication = microphone.publish(Default::default()).unwrap();
+                let mut binding = Box::pin(publication.set_source(Some(&source)));
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(binding.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                let registration = actor.commands.recv().await.unwrap();
+                actor.command(registration);
+                let attachment = actor.commands.recv().await.unwrap();
+                actor.command(attachment);
+                binding.await.unwrap();
                 actor
                     .core
                     .command(AgentCommand::Join("producer-room".into()))

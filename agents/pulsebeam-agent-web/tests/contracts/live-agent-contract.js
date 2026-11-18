@@ -212,13 +212,12 @@
     [...peers].find((peer) =>
       peer.getReceivers().some((receiver) => receiver.track === track),
     );
-  const { attachRemoteVideo, createAgent, VideoSource, AudioSource } =
-    pulsebeam;
-  const sender = await createAgent({
+  const { attachRemoteVideo, Agent, VideoSource, AudioSource } = pulsebeam;
+  const sender = new Agent({
     endpoint,
     token: "__SENDER_TOKEN__",
   });
-  const receiver = await createAgent({
+  const receiver = new Agent({
     endpoint,
     token: "__RECEIVER_TOKEN__",
   });

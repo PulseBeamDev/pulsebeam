@@ -2,10 +2,14 @@ import { DataRegistry, type LocalDataTrack } from "./data.js";
 import { track, type Delivery } from "./track.js";
 import { selectAudio } from "./reception.js";
 import { observeSnapshots, observeEvents } from "./observation.js";
-import { AgentObservation } from "./agent-observation.js";
-import type { AgentState } from "./schema.js";
+import {
+  AgentObservation,
+  OperationError,
+  raise,
+} from "./agent-observation.js";
+import { ErrorCode, type AgentState } from "./schema.js";
 import type {
-  Agent,
+  Agent as AgentApi,
   AgentConfig,
   AgentEvent,
   AgentError,
@@ -35,7 +39,7 @@ import { RemoteCatalog } from "./remote-catalog.js";
 import { TopicRegistry } from "./topic.js";
 import { ResourceError, ResourceOwners } from "./resources.js";
 import { LocalMediaRegistry } from "./media.js";
-import { BrowserRuntime, whenInitialized } from "./wasm.js";
+import { BrowserRuntime, initializeSynchronously } from "./wasm.js";
 import {
   copyConfig,
   copyState,
@@ -105,7 +109,7 @@ function localFailureClass(error: unknown): AgentError["class"] {
   return "runtime";
 }
 
-class AgentFacade implements Agent {
+class AgentFacade implements AgentApi {
   #snapshot: AgentSnapshot = emptySnapshot("disconnected");
   #listeners = new Set<() => void>();
   #eventListeners = new Set<(event: AgentEvent) => void>();
@@ -136,7 +140,15 @@ class AgentFacade implements Agent {
   #runtimeConfig: RuntimeConfig;
 
   constructor(config: AgentConfig, managed = false) {
-    const runtimeConfig = copyConfig(config);
+    let runtimeConfig: RuntimeConfig;
+    try {
+      runtimeConfig = copyConfig(config);
+    } catch {
+      throw new OperationError({
+        code: ErrorCode.InvalidArgument,
+        message: "Invalid Agent configuration",
+      });
+    }
     this.#runtimeConfig = runtimeConfig;
     this.#remote = new RemoteCatalog(
       this,
@@ -158,66 +170,87 @@ class AgentFacade implements Agent {
         }
       },
     );
-    if (!managed) this.activate();
+    if (!managed) this.#activate(false);
   }
 
   // React can create an inert handle during render. Activation only happens
   // after React commits, and can be repeated after Strict Mode effect cleanup.
   activate(): void {
-    if (this.#closed) throw new Error("agent is closed");
+    this.#activate(true);
+  }
+
+  #activate(managed: boolean): void {
+    if (this.#closed) throw new ResourceError("closed", "agent is closed");
     if (this.#active) return;
     this.#active = true;
     const activation = ++this.#activation;
     const active = () =>
       !this.#closed && this.#active && activation === this.#activation;
-    this.#ready = whenInitialized()
-      .catch((error: unknown) => {
-        if (active()) this.#terminalFailure("initialization", message(error));
+    let runtime: Runtime | undefined;
+    try {
+      try {
+        initializeSynchronously();
+      } catch {
+        const error = new OperationError({
+          code:
+            typeof WebAssembly === "undefined"
+              ? ErrorCode.Unsupported
+              : ErrorCode.Internal,
+          message: "Browser runtime initialization failed",
+        });
+        if (active()) this.#terminalFailure("initialization", error.message);
         throw error;
-      })
-      .then(() => {
-        if (!active()) throw new Error("agent is inactive");
-        let runtime: Runtime;
-        try {
-          runtime = new BrowserRuntime(this.#runtimeConfig);
-        } catch (error) {
-          if (active())
-            this.#terminalFailure("invalid-configuration", message(error));
-          throw error;
-        }
-        this.#runtime = runtime;
-        this.#observation = new AgentObservation(runtime);
-        this.#data.activate(runtime);
-        this.#resources.activate(runtime);
-        runtime.set_event_listener((event: unknown) => {
-          if (active()) this.#runtimeEvent(event);
-        });
-        runtime.set_error_listener((error: unknown) => {
-          if (active())
-            this.#emitFailure(localFailureClass(error), message(error));
-        });
-        try {
-          runtime.replace_desired(
-            desiredValue(this.#effectiveState(this.#state)),
-          );
-        } catch (error) {
-          if (active())
-            this.#terminalFailure("invalid-configuration", message(error));
-          this.#data.deactivate();
-          this.#resources.deactivate();
-          runtime.abort();
-          this.#observation.retire();
+      }
+      try {
+        runtime = new BrowserRuntime(this.#runtimeConfig);
+      } catch (error) {
+        if (active())
+          this.#terminalFailure("invalid-configuration", message(error));
+        raise(error);
+      }
+      const current = runtime;
+      this.#runtime = current;
+      this.#observation = new AgentObservation(current);
+      this.#data.activate(current);
+      this.#resources.activate(current);
+      current.set_event_listener((event: unknown) => {
+        if (active()) this.#runtimeEvent(event);
+      });
+      current.set_error_listener((error: unknown) => {
+        if (active())
+          this.#emitFailure(localFailureClass(error), message(error));
+      });
+      // Core owns constructor defaults. Queued replay could overtake an immediate join.
+      if (managed)
+        current.replace_desired(
+          desiredValue(this.#effectiveState(this.#state)),
+        );
+      this.#ready = Promise.resolve(current);
+      current.set_snapshot_listener((snapshot: RuntimeSnapshot) => {
+        if (active()) this.#runtimeSnapshot(current, snapshot);
+      });
+      if (active() && this.#desiredRoom !== undefined)
+        current.join(this.#desiredRoom);
+    } catch (error) {
+      try {
+        if (active() && this.#snapshot.connection !== "terminal-failure")
+          this.#terminalFailure("invalid-configuration", message(error));
+      } finally {
+        if (active()) {
+          const observation = this.#observation;
+          ++this.#activation;
           this.#runtime = undefined;
           this.#runtimeGeneration = null;
-          throw error;
+          this.#ready = Promise.reject(error);
+          void this.#ready.catch(() => {});
+          this.#data.deactivate();
+          this.#resources.deactivate();
+          runtime?.abort();
+          observation?.retire();
         }
-        runtime.set_snapshot_listener((snapshot: RuntimeSnapshot) => {
-          if (active()) this.#runtimeSnapshot(runtime, snapshot);
-        });
-        if (this.#desiredRoom !== undefined) runtime.join(this.#desiredRoom);
-        return runtime;
-      });
-    void this.#ready.catch(() => {});
+      }
+      if (!managed) throw error;
+    }
   }
 
   deactivate(): void {
@@ -267,7 +300,7 @@ class AgentFacade implements Agent {
     if (this.#closed) throw new ResourceError("closed", "agent is closed");
   }
 
-  bindPublicAgent(agent: Agent): void {
+  bindPublicAgent(agent: AgentApi): void {
     this.#remote.bindAgent(agent);
   }
 
@@ -795,7 +828,7 @@ class AgentFacade implements Agent {
   }
 }
 
-export interface ManagedAgent extends Agent {
+export interface ManagedAgent extends AgentApi {
   readonly participants: readonly RemoteParticipant[];
   readonly getSnapshot: () => AgentSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
@@ -808,50 +841,51 @@ export function createManagedAgent(config: AgentConfig): ManagedAgent {
   return new AgentFacade(config, true);
 }
 
-export async function createAgent(config: AgentConfig): Promise<Agent> {
-  const raw = new AgentFacade(config);
-  try {
-    await raw.initialized();
-  } catch (error) {
-    await raw.close();
-    throw error;
+export class Agent implements AgentApi {
+  readonly #raw: AgentFacade;
+
+  constructor(config: AgentConfig) {
+    this.#raw = new AgentFacade(config);
+    this.#raw.bindPublicAgent(this);
+    Object.freeze(this);
   }
-  const agent: Agent = Object.freeze({
-    get connection() {
-      return raw.connection;
-    },
-    get error() {
-      return raw.error;
-    },
-    get participantId() {
-      return raw.participantId;
-    },
-    get roomId() {
-      return raw.roomId;
-    },
-    get authorizationExpiresAt() {
-      return raw.authorizationExpiresAt;
-    },
-    video: (label: string) => raw.video(label),
-    audio: (label: string) => raw.audio(label),
-    data: <D extends Delivery>(label: string, delivery: D) =>
-      raw.data(label, delivery),
-    participant: (id: string) => raw.participant(id),
-    selectAudio: (policy: AudioDemand) => raw.selectAudio(policy),
-    isClosed: () => raw.isClosed(),
-    join: (room: string) => raw.join(room),
-    renew: (token: string) => raw.renew(token),
-    connect: () => raw.connect(),
-    disconnect: () => raw.disconnect(),
-    renewAuthorization: (token: string) => raw.renewAuthorization(token),
-    setLogging: (level: LogLevel) => raw.setLogging(level),
-    state: () => raw.state(),
-    updates: () => raw.updates(),
-    snapshot: () => raw.snapshot(),
-    snapshots: () => raw.snapshots(),
-    events: () => raw.events(),
-    close: () => raw.close(),
-  });
-  raw.bindPublicAgent(agent);
-  return agent;
+
+  get connection() {
+    return this.#raw.connection;
+  }
+  get error() {
+    return this.#raw.error;
+  }
+  get participantId() {
+    return this.#raw.participantId;
+  }
+  get roomId() {
+    return this.#raw.roomId;
+  }
+  get authorizationExpiresAt() {
+    return this.#raw.authorizationExpiresAt;
+  }
+
+  readonly video: AgentApi["video"] = (label) => this.#raw.video(label);
+  readonly audio: AgentApi["audio"] = (label) => this.#raw.audio(label);
+  readonly data: AgentApi["data"] = (label, delivery) =>
+    this.#raw.data(label, delivery);
+  readonly participant: AgentApi["participant"] = (id) =>
+    this.#raw.participant(id);
+  readonly selectAudio: AgentApi["selectAudio"] = (policy) =>
+    this.#raw.selectAudio(policy);
+  readonly isClosed = () => this.#raw.isClosed();
+  readonly join = (room: string) => this.#raw.join(room);
+  readonly renew = (token: string) => this.#raw.renew(token);
+  readonly connect = () => this.#raw.connect();
+  readonly disconnect = () => this.#raw.disconnect();
+  readonly renewAuthorization = (token: string) =>
+    this.#raw.renewAuthorization(token);
+  readonly setLogging = (level: LogLevel) => this.#raw.setLogging(level);
+  readonly state = () => this.#raw.state();
+  readonly updates = () => this.#raw.updates();
+  readonly snapshot = () => this.#raw.snapshot();
+  readonly snapshots = () => this.#raw.snapshots();
+  readonly events = () => this.#raw.events();
+  readonly close = () => this.#raw.close();
 }

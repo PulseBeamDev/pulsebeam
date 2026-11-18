@@ -1,26 +1,115 @@
 import assert from "node:assert/strict";
+import { setImmediate } from "node:timers/promises";
 import { Track } from "./platform.mjs";
 
 export async function publicContract(pulsebeam) {
-  const { createAgent, VideoSource, AgentStatus, ErrorCode, OperationError } =
+  const { Agent, VideoSource, AgentStatus, ErrorCode, OperationError } =
     pulsebeam;
   const { createManagedAgent } = await import(
     "../../node_assets/dist/internal/react.js"
   );
-  const closedDuringInitialization = createManagedAgent({
+  assert.equal("createAgent" in pulsebeam, false);
+  const immediate = new Agent({
     endpoint: "http://localhost",
-    token: "close-before-initialization",
+    token: "join-immediately-after-construction",
+    logging: { level: "off" },
   });
-  closedDuringInitialization.activate();
-  await closedDuringInitialization.close();
-  assert.equal(closedDuringInitialization.isClosed(), true);
-  assert.equal(closedDuringInitialization.connection, "disconnected");
+  immediate.join("constructor-room");
+  assert.equal(immediate.state().desiredJoinRevision, 1n);
+  await setImmediate();
+  assert.notEqual(
+    immediate.state().status,
+    AgentStatus.Idle,
+    "constructor defaults must not overtake an immediately submitted join",
+  );
+  await immediate.close();
+  for (const invalid of [
+    { endpoint: "private-configuration-value", token: "public-smoke" },
+    { endpoint: "http://localhost", token: "" },
+    {
+      endpoint: "http://localhost",
+      token: "public-smoke",
+      logging: { level: "private-configuration-value" },
+    },
+  ]) {
+    assert.throws(
+      () => new Agent(invalid),
+      (error) => {
+        assert.equal(error instanceof OperationError, true);
+        assert.equal(error.info.code, ErrorCode.InvalidArgument);
+        assert.equal(
+          error.message.includes("private-configuration-value"),
+          false,
+        );
+        assert.equal(Object.isFrozen(error.info), true);
+        return true;
+      },
+    );
+  }
+  const closedDuringActivation = createManagedAgent({
+    endpoint: "http://localhost",
+    token: "close-during-activation",
+  });
+  closedDuringActivation.subscribe(() => {
+    if (!closedDuringActivation.isClosed()) void closedDuringActivation.close();
+  });
+  closedDuringActivation.activate();
+  assert.equal(closedDuringActivation.isClosed(), true);
+  await closedDuringActivation.close();
+  assert.equal(closedDuringActivation.connection, "disconnected");
 
-  const agent = await createAgent({
+  const reactivated = createManagedAgent({
+    endpoint: "http://localhost",
+    token: "reactivate-during-activation",
+  });
+  let replaced = false;
+  reactivated.subscribe(() => {
+    if (replaced) return;
+    replaced = true;
+    reactivated.deactivate();
+    reactivated.activate();
+  });
+  reactivated.activate();
+  assert.equal(replaced, true);
+  await reactivated.initialized();
+  assert.equal(reactivated.state().status, AgentStatus.Idle);
+  await reactivated.close();
+
+  const recoveredActivation = createManagedAgent({
+    endpoint: "http://localhost",
+    token: "recover-during-activation-failure",
+  });
+  recoveredActivation.setState({
+    connected: false,
+    topics: [{ name: "chat", mode: "invalid", publish: true }],
+  });
+  let recovered = false;
+  recoveredActivation.subscribe(() => {
+    if (recovered || recoveredActivation.connection !== "terminal-failure")
+      return;
+    recovered = true;
+    recoveredActivation.deactivate();
+    recoveredActivation.setState({ connected: false });
+    recoveredActivation.activate();
+  });
+  recoveredActivation.activate();
+  assert.equal(recovered, true);
+  assert.doesNotThrow(
+    () => recoveredActivation.renew("reopened-credential"),
+    "retired activation cleanup must not detach the replacement Core",
+  );
+  await recoveredActivation.initialized();
+  assert.equal(recoveredActivation.state().status, AgentStatus.Idle);
+  assert.equal(recoveredActivation.error, null);
+  await recoveredActivation.close();
+
+  const agent = new Agent({
     endpoint: "http://localhost",
     token: "public-smoke",
     logging: { level: "off" },
   });
+  assert.equal(agent instanceof Agent, true);
+  assert.equal(agent instanceof Promise, false);
   const borrowed = new Track("video");
   const source = VideoSource.fromTrack(borrowed);
   try {
@@ -185,7 +274,7 @@ export async function publicContract(pulsebeam) {
     await agent.close();
     assert.equal(agent.snapshot(), terminal);
     await assert.rejects(agent.connect(), { code: "closed" });
-    const unobserved = await createAgent({
+    const unobserved = new Agent({
       endpoint: "http://localhost",
       token: "close-before-observation",
       logging: { level: "off" },
@@ -202,6 +291,6 @@ export async function publicContract(pulsebeam) {
   } finally {
     await agent.close();
     await source.close();
-    await closedDuringInitialization.close();
+    await closedDuringActivation.close();
   }
 }

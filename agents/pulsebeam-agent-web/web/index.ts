@@ -1,4 +1,4 @@
-export { createAgent } from "./agent.js";
+export { Agent } from "./agent.js";
 export { OperationError } from "./agent-observation.js";
 export {
   AgentStatus,
@@ -42,7 +42,6 @@ export type {
 } from "./reception.js";
 export { ResourceError, ResourceOwnershipError } from "./resources.js";
 export type {
-  Agent,
   AgentConfig,
   AgentError,
   AgentEvent,

@@ -7,7 +7,7 @@ export async function dataResourceContract(pulsebeam) {
     token: "owned-binary",
     logging: { level: "off" },
   };
-  const agent = await pulsebeam.createAgent(config);
+  const agent = new pulsebeam.Agent(config);
   const until = async (condition, label) => {
     for (let step = 0; step < 1000; step++) {
       if (condition()) return;
@@ -20,7 +20,7 @@ export async function dataResourceContract(pulsebeam) {
     assert.equal(Object.isFrozen(local), true);
     assert.equal(local, agent.data("events", "ordered"));
     assert.notEqual(local, agent.data("events", "latest"));
-    const other = await pulsebeam.createAgent(config);
+    const other = new pulsebeam.Agent(config);
     try {
       const otherLocal = other.data("events", "ordered");
       assert.notEqual(local, otherLocal);

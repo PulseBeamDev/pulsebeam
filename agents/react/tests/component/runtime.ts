@@ -1,7 +1,7 @@
 // Only the external WASM transport boundary is modeled. Facade, data,
 // resource, capture and component policy are the production implementations.
 export const runtimes: BrowserRuntime[] = [];
-export const whenInitialized = async () => {};
+export const initializeSynchronously = () => {};
 
 export class BrowserRuntime {
   closed = false;

@@ -16,7 +16,12 @@ import {
   type Agent,
   type DataEvent,
 } from "../../src/index.js";
-import { VideoSource, ResourceOwnershipError } from "@pulsebeam/web";
+import {
+  VideoSource,
+  ResourceOwnershipError,
+  OperationError,
+  ErrorCode,
+} from "@pulsebeam/web";
 import { publishableVideoSource } from "../../src/sources.js";
 import { createReactAgent, managedAgent } from "../../src/agent.js";
 import { deferred, flush, Track } from "./platform.js";
@@ -52,7 +57,9 @@ export async function agentCreationFailure() {
       </Boundary>,
     ),
   );
-  assert.match(failure?.message ?? "", /authorization token is invalid/);
+  assert.ok(failure instanceof OperationError);
+  assert.equal(failure.info.code, ErrorCode.InvalidArgument);
+  assert.equal(Object.isFrozen(failure.info), true);
   await flush(() => root.unmount());
 }
 

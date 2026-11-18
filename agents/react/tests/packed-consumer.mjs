@@ -50,7 +50,8 @@ assert.equal(
 const web = await import(
   pathToFileURL(join(directory, "node_modules/@pulsebeam/web/dist/index.js"))
 );
-assert.equal(typeof web.createAgent, "function");
+assert.equal(typeof web.Agent, "function");
+assert.equal("createAgent" in web, false);
 assert.equal("track" in web, false, "Web descriptor export was removed");
 assert.equal(typeof web.VideoSource.fromTrack, "function");
 assert.equal(typeof web.AudioSource.fromTrack, "function");

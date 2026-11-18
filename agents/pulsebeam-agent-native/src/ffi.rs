@@ -1,5 +1,5 @@
 //! Generated-language boundary for the shared native actor and owned media.
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use agent_core::ffi as core_ffi;
 use tokio::sync::Mutex;
@@ -126,40 +126,78 @@ pub struct Agent {
     runtime: RuntimeAgent,
 }
 
+fn startup_error() -> NativeError {
+    NativeError::Operation {
+        info: core_ffi::ErrorInfo::new(
+            core_ffi::ErrorCode::Internal,
+            "Native Agent startup failed",
+        ),
+    }
+}
+
+fn invalid_agent_config_error() -> NativeError {
+    NativeError::Operation {
+        info: core_ffi::ErrorInfo::new(
+            core_ffi::ErrorCode::InvalidArgument,
+            "Invalid Agent configuration",
+        ),
+    }
+}
+
+fn native_host_runtime() -> Result<Arc<tokio::runtime::Runtime>, ()> {
+    static RUNTIME: OnceLock<StdMutex<Option<Arc<tokio::runtime::Runtime>>>> = OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| StdMutex::new(None));
+    let mut runtime = runtime.lock().map_err(|_| ())?;
+    if let Some(runtime) = runtime.as_ref() {
+        return Ok(Arc::clone(runtime));
+    }
+    let created = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|_| ())?;
+    let created = Arc::new(created);
+    *runtime = Some(Arc::clone(&created));
+    Ok(created)
+}
+
+fn construct_agent(config: NativeAgentConfig) -> Result<Arc<Agent>, NativeError> {
+    let session = config
+        .session
+        .into_core()
+        .map_err(|_| invalid_agent_config_error())?;
+    let native_runtime = native_host_runtime().map_err(|()| startup_error())?;
+    let _entered = native_runtime.handle().enter();
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|_| startup_error())?;
+    let runtime = RuntimeAgent::spawn_on_handle(
+        Config {
+            session,
+            media: config.media,
+            decoded_video_observer: None,
+            encoded_video_observer: None,
+        },
+        Host::new(Box::new(client)),
+        native_runtime.handle(),
+    )
+    .map_err(operation_error)?;
+    Ok(Arc::new(Agent { runtime }))
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl Agent {
-    // UniFFI 0.31 Python supports named async constructors, not async primary ones.
     #[uniffi::constructor]
-    pub async fn create(config: core_ffi::AgentConfig) -> Result<Arc<Self>, NativeError> {
-        Self::create_with_media(NativeAgentConfig {
+    pub fn new(config: core_ffi::AgentConfig) -> Result<Arc<Self>, NativeError> {
+        construct_agent(NativeAgentConfig {
             session: config,
             media: MediaConfig::default(),
         })
-        .await
     }
 
     #[uniffi::constructor]
-    pub async fn create_with_media(config: NativeAgentConfig) -> Result<Arc<Self>, NativeError> {
-        let session = config
-            .session
-            .into_core()
-            .map_err(|error| NativeError::Core { error })?;
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|error| NativeError::Native {
-                message: format!("failed to initialize HTTP client: {error}"),
-            })?;
-        let runtime = RuntimeAgent::spawn(
-            Config {
-                session,
-                media: config.media,
-                decoded_video_observer: None,
-                encoded_video_observer: None,
-            },
-            Host::new(Box::new(client)),
-        )
-        .await?;
-        Ok(Self::from_runtime(runtime))
+    pub fn create_with_media(config: NativeAgentConfig) -> Result<Arc<Self>, NativeError> {
+        construct_agent(config)
     }
 
     pub fn renew(&self, token: String) -> Result<(), NativeError> {
@@ -168,6 +206,7 @@ impl Agent {
     pub fn state(&self) -> core_ffi::AgentState {
         self.runtime.state()
     }
+
     pub fn updates(&self) -> Result<Arc<AgentUpdates>, NativeError> {
         self.runtime
             .updates()
@@ -488,7 +527,7 @@ mod tests {
             log_level: agent_core::LogLevel::default(),
         };
         // No connect intent: this is a boundary/policy test, not native media proof.
-        let agent = Agent::create(session.into()).await.unwrap();
+        let agent = Agent::new(session.into()).unwrap();
         let mut desired = core_ffi::DesiredState::from(agent_core::DesiredState::default());
         desired.publications.push(core_ffi::PublicationIntent {
             slot: "publication".into(),

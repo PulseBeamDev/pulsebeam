@@ -5350,6 +5350,147 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
 }
 
 #[test]
+fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
+    let mut agent = Agent::new(config()).unwrap();
+    assert_eq!(
+        agent.resource(ResourceCommand::DeclareDataPublication {
+            spec: TrackSpec::Video {
+                label: "not-data".into(),
+            },
+        }),
+        Err(AgentError::InvalidResource(TrackResourceError::WrongKind))
+    );
+    let first = TrackSpec::Data {
+        label: "same-label".into(),
+        delivery: TopicMode::Ordered,
+    };
+    let ResourceResult::Owned { owner } = agent
+        .resource(ResourceCommand::DeclareDataPublication { spec: first })
+        .unwrap()
+    else {
+        panic!("data publication")
+    };
+    assert_eq!(owner, 1);
+    assert_eq!(
+        agent.resource(ResourceCommand::DeclareDataPublication {
+            spec: TrackSpec::Data {
+                label: "same-label".into(),
+                delivery: TopicMode::Latest,
+            }
+        }),
+        Err(AgentError::InvalidResource(
+            TrackResourceError::AlreadyOwned
+        ))
+    );
+    let ResourceResult::Owned { owner: next } = agent
+        .resource(ResourceCommand::DeclareDataPublication {
+            spec: TrackSpec::Data {
+                label: "another-label".into(),
+                delivery: TopicMode::Latest,
+            },
+        })
+        .unwrap()
+    else {
+        panic!("data publication")
+    };
+    assert_eq!(next, owner + 1);
+}
+
+#[test]
+fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
+    let mut agent = Agent::new(config()).unwrap();
+    let mut media_owners = Vec::new();
+    for index in 0..32 {
+        let spec = if index % 2 == 0 {
+            TrackSpec::Video {
+                label: format!("media-{index}"),
+            }
+        } else {
+            TrackSpec::Audio {
+                label: format!("media-{index}"),
+            }
+        };
+        let ResourceResult::Publication { owner, .. } = agent
+            .resource(ResourceCommand::ClaimPublication { spec })
+            .unwrap()
+        else {
+            panic!("media publication")
+        };
+        media_owners.push(owner);
+    }
+    let mut data_owners = Vec::new();
+    for index in 0..32 {
+        let spec = TrackSpec::Data {
+            label: format!("data-{index}"),
+            delivery: TopicMode::Ordered,
+        };
+        let ResourceResult::Owned { owner } = agent
+            .resource(ResourceCommand::DeclareDataPublication { spec })
+            .unwrap()
+        else {
+            panic!("data publication")
+        };
+        data_owners.push(owner);
+    }
+    assert_eq!(
+        agent.resource(ResourceCommand::ClaimPublication {
+            spec: TrackSpec::Video {
+                label: "over-capacity-media".into(),
+            },
+        }),
+        Err(AgentError::InvalidResource(
+            TrackResourceError::PublicationCapacityExceeded
+        ))
+    );
+    let rejected = TrackSpec::Data {
+        label: "over-capacity".into(),
+        delivery: TopicMode::Latest,
+    };
+    assert_eq!(
+        agent.resource(ResourceCommand::DeclareDataPublication {
+            spec: rejected.clone()
+        }),
+        Err(AgentError::InvalidResource(
+            TrackResourceError::PublicationCapacityExceeded
+        ))
+    );
+    agent
+        .resource(ResourceCommand::Release {
+            owner: media_owners[0],
+        })
+        .unwrap();
+    let ResourceResult::Owned { owner: replacement } = agent
+        .resource(ResourceCommand::DeclareDataPublication { spec: rejected })
+        .unwrap()
+    else {
+        panic!("replacement data publication")
+    };
+    assert_eq!(replacement, data_owners[31] + 1);
+    agent
+        .resource(ResourceCommand::Release {
+            owner: media_owners[1],
+        })
+        .unwrap();
+    agent
+        .resource(ResourceCommand::Release {
+            owner: media_owners[0],
+        })
+        .unwrap();
+    let ResourceResult::Owned { owner: next } = agent
+        .resource(ResourceCommand::DeclareDataPublication {
+            spec: TrackSpec::Data {
+                label: "after-stale-release".into(),
+                delivery: TopicMode::Lossy,
+            },
+        })
+        .unwrap()
+    else {
+        panic!("next declaration")
+    };
+    assert_eq!(next, replacement + 1);
+}
+
+#[test]
 fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifetime() {
     use pulsebeam_proto::state::{self, codec};
     let registrations = TopicRegistrations {

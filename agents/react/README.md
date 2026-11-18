@@ -55,7 +55,7 @@ aliases. Local media handles expose only readonly `kind` and `label`; use
 uses typed lookups, with awaited factories and explicit resource lifetimes.
 
 React exposes only `useAgent` for Agent ownership, with no `createAgent` export
-or advanced escape hatch. Non-React applications use caller-owned `createAgent`
+or advanced escape hatch. Non-React applications use caller-owned `new Agent(config)`
 from `@pulsebeam/web`. Managed lifecycle functions are internal, not public SDK
 APIs. Keep signing keys on your backend.
 

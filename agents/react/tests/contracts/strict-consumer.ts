@@ -14,7 +14,7 @@ import {
   type VideoCaptureSettings,
   type AudioCaptureSettings,
 } from "@pulsebeam/react";
-import { createAgent } from "@pulsebeam/web";
+import { Agent as WebAgent } from "@pulsebeam/web";
 import { createElement } from "react";
 
 // @ts-expect-error React owns Agents only through useAgent.
@@ -37,7 +37,7 @@ const config: AgentConfig = {
 };
 const nullableAgent: Agent | null = useAgent(config);
 const agent: Agent = nullableAgent!;
-const direct = await createAgent(config);
+const direct = new WebAgent(config);
 await direct.connect();
 await direct.close();
 // @ts-expect-error Required ownership configuration.

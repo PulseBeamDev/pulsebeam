@@ -391,6 +391,7 @@ impl From<&model::AgentError> for ErrorInfo {
                 model::TrackResourceError::PublicationConfigurationSpaceExhausted
                 | model::TrackResourceError::InputOperationSpaceExhausted
                 | model::TrackResourceError::OwnerSpaceExhausted
+                | model::TrackResourceError::PublicationCapacityExceeded
                 | model::TrackResourceError::SlotSpaceExhausted { .. },
             ) => (ErrorCode::CapacityExceeded, "Resource capacity exceeded"),
             model::AgentError::InvalidConfiguration(_)
@@ -655,6 +656,7 @@ pub enum ResourceFailure {
     NotConnected,
     AlreadyOwned,
     OwnerInUse,
+    PublicationCapacityExceeded,
     OwnerSpaceExhausted,
     InputOperationSpaceExhausted,
     PublicationConfigurationSpaceExhausted,
@@ -675,6 +677,9 @@ impl From<model::TrackResourceError> for ResourceFailure {
             model::TrackResourceError::NotConnected => Self::NotConnected,
             model::TrackResourceError::AlreadyOwned => Self::AlreadyOwned,
             model::TrackResourceError::OwnerInUse => Self::OwnerInUse,
+            model::TrackResourceError::PublicationCapacityExceeded => {
+                Self::PublicationCapacityExceeded
+            }
             model::TrackResourceError::OwnerSpaceExhausted => Self::OwnerSpaceExhausted,
             model::TrackResourceError::InputOperationSpaceExhausted => {
                 Self::InputOperationSpaceExhausted
@@ -1964,6 +1969,10 @@ mod tests {
             ),
             (
                 model::TrackResourceError::OwnerSpaceExhausted,
+                ErrorCode::CapacityExceeded,
+            ),
+            (
+                model::TrackResourceError::PublicationCapacityExceeded,
                 ErrorCode::CapacityExceeded,
             ),
             (

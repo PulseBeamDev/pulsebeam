@@ -13,7 +13,7 @@ import tempfile
 async def witness(endpoint, token, reader_token, room, package):
     core = importlib.import_module(f"{package}.pulsebeam_agent_core")
     native = importlib.import_module(f"{package}.pulsebeam_agent_native")
-    agent = await native.Agent.create(
+    agent = native.Agent(
         core.AgentConfig(
             endpoint=endpoint,
             token=token,
@@ -23,13 +23,17 @@ async def witness(endpoint, token, reader_token, room, package):
             log_level=core.LogLevel.WARN,
         )
     )
-    reader = await native.Agent.create(core.AgentConfig(
+    reader = native.Agent(core.AgentConfig(
         endpoint=endpoint, token=reader_token,
         retry=core.RetryPolicy(
             initial_delay_ms=100, maximum_delay_ms=1000, maximum_attempts=2,
         ),
         log_level=core.LogLevel.WARN,
     ))
+    assert agent.state().status == core.AgentStatus.IDLE
+    assert agent.state().room is None and agent.state().desired_room is None
+    assert reader.state().status == core.AgentStatus.IDLE
+    assert reader.state().room is None and reader.state().desired_room is None
     try:
         updates = agent.snapshots()
         reader_updates = reader.snapshots()
@@ -45,9 +49,8 @@ async def witness(endpoint, token, reader_token, room, package):
                 max_framerate=None, temporal_layers=1,
             )], dependency_descriptor=True,
         ))
-        publication = await agent.video("foreign-camera").publish(
-            camera, core.PublicationConfig(enabled=True),
-        )
+        publication = agent.video("foreign-camera").publish()
+        await publication.set_source(camera)
         agent.join(room)
         while True:
             update = await updates.next()
@@ -211,7 +214,7 @@ async def witness(endpoint, token, reader_token, room, package):
         assert publication.is_closed() and not camera.is_closed(), "publication close stopped producer"
         await camera.close()
         assert camera.is_closed(), "producer close did not retire input"
-        print("installed Python Agent.create/dynamic RTC/real SFU/owned binary data/independent source/named media close PASS")
+        print("installed Python synchronous Agent/dynamic RTC/real SFU/owned binary data/independent source/named media close PASS")
     finally:
         await asyncio.wait_for(asyncio.gather(agent.close(), reader.close()), timeout=3)
 

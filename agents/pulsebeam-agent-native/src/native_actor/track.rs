@@ -1,5 +1,5 @@
 use super::*;
-use agent_core::{ResourceCommand, TrackSelector, TrackSpec, VideoObservation};
+use agent_core::{TrackSelector, TrackSpec, VideoObservation};
 
 #[derive(Clone)]
 struct MediaAddress {
@@ -47,20 +47,6 @@ impl MediaAddress {
         result.await.map_err(|_| Error::Closed)?
     }
 
-    async fn publish(
-        &self,
-        source: &ProducerInput,
-        configuration: agent_core::ffi::PublicationConfig,
-    ) -> Result<Publication, Error> {
-        self.request(|response| Command::PublishTrack {
-            spec: self.spec.clone(),
-            source: source.clone(),
-            configuration,
-            response,
-        })
-        .await
-    }
-
     fn selector(&self) -> Result<TrackSelector, Error> {
         Ok(TrackSelector {
             participant_external_id: self.participant_id.clone().ok_or_else(|| {
@@ -76,15 +62,60 @@ macro_rules! local_track {
         #[derive(Clone)]
         pub struct $name {
             address: MediaAddress,
+            core: Control,
         }
 
         impl $name {
-            pub async fn publish(
+            pub(crate) fn declare(
                 &self,
-                source: &ProducerInput,
                 configuration: agent_core::ffi::PublicationConfig,
             ) -> Result<Publication, Error> {
-                self.address.publish(source, configuration).await
+                if self.address.closed.is_closed() || self.address.finished.is_closed() {
+                    return Err(Error::Closed);
+                }
+                let (owner, observer) = self
+                    .core
+                    .declare_publication(self.address.spec.clone(), configuration.enabled)?;
+                let inner = PublicationLease::new(
+                    owner,
+                    self.address.spec.clone(),
+                    self.address.commands.clone(),
+                    self.core.changed.clone(),
+                    self.core.publication_control(),
+                    observer,
+                );
+                let publication = Publication { inner };
+                if self.address.closed.is_closed() || self.address.finished.is_closed() {
+                    publication.inner.closed.close();
+                    self.core.revoke_publication(owner);
+                    return Err(Error::Closed);
+                }
+                match self
+                    .address
+                    .commands
+                    .try_send(Command::RegisterPublication {
+                        publication: publication.clone(),
+                    }) {
+                    Ok(()) => {
+                        self.core.changed.notify_one();
+                        Ok(publication)
+                    }
+                    Err(error) => {
+                        publication.inner.closed.close();
+                        self.core.revoke_publication(owner);
+                        match error {
+                            mpsc::error::TrySendError::Full(_) => Err(Error::Backpressure),
+                            mpsc::error::TrySendError::Closed(_) => Err(Error::Closed),
+                        }
+                    }
+                }
+            }
+
+            pub fn publish(
+                &self,
+                configuration: agent_core::ffi::PublicationConfig,
+            ) -> Result<Publication, Error> {
+                self.declare(configuration)
             }
         }
 
@@ -98,6 +129,7 @@ macro_rules! local_track {
                         &self.lease.close,
                         &self.lease.finished,
                     )?,
+                    core: self.core.clone(),
                 })
             }
         }
@@ -169,36 +201,5 @@ impl Participant {
                 &self.finished,
             )?,
         })
-    }
-}
-
-impl<R, F, O> Actor<R, F, O>
-where
-    R: rtc::SessionRuntime,
-    F: FnMut() -> Result<(R, O), Error>,
-{
-    pub(super) fn publish_track(
-        &mut self,
-        spec: TrackSpec,
-        source: ProducerInput,
-        configuration: agent_core::ffi::PublicationConfig,
-    ) -> Result<Publication, Error> {
-        let publication = self.claim_publication(spec)?;
-        let owner = publication.inner.owner;
-        let result = self
-            .core
-            .resource(ResourceCommand::SetPublicationMuted {
-                owner,
-                muted: !configuration.enabled,
-            })
-            .map_err(Error::from)
-            .and_then(|_| self.bind_producer(owner, Some(source)));
-        if let Err(error) = result {
-            publication.inner.closed.close();
-            self.retire_publications();
-            self.retire_producers();
-            return Err(error);
-        }
-        Ok(publication)
     }
 }

@@ -609,14 +609,12 @@ async fn spawn_agent(
         .create_video_input(benchmark_video_profile(simulcast))
         .await?;
     let microphone = agent.create_audio_input().await?;
-    let camera_owner = agent
-        .video("camera".into())?
-        .publish(&camera, Default::default())
-        .await?;
-    let _microphone_owner = agent
+    let camera_owner = agent.video("camera".into())?.publish(Default::default())?;
+    camera_owner.set_source(Some(&camera)).await?;
+    let microphone_owner = agent
         .audio("microphone".into())?
-        .publish(&microphone, Default::default())
-        .await?;
+        .publish(Default::default())?;
+    microphone_owner.set_source(Some(&microphone)).await?;
     let mut snapshots = agent.snapshots();
     agent.connect().await?;
     wait_until_connected(&mut snapshots).await?;

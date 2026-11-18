@@ -112,6 +112,8 @@ pub enum TrackResourceError {
     NotConnected,
     #[error("resource already has an exclusive owner")]
     AlreadyOwned,
+    #[error("owned publication capacity exceeded")]
+    PublicationCapacityExceeded,
     #[error("owner already owns another resource")]
     OwnerInUse,
     #[error("resource owner identity space exhausted")]
@@ -441,6 +443,9 @@ pub enum ResourceCommand {
     ClaimPublication {
         spec: TrackSpec,
     },
+    DeclareDataPublication {
+        spec: TrackSpec,
+    },
     UpdatePublication {
         owner: u64,
         present: bool,
@@ -555,6 +560,7 @@ pub enum ResourceResult {
 pub struct TrackResources {
     next_owner: u64,
     publications: BTreeMap<TrackSpec, PublicationOwner>,
+    data_publications: BTreeMap<String, (TrackOwner, TopicMode)>,
     audio: Option<TrackOwner>,
     audio_views: BTreeMap<TrackOwner, AudioView>,
     video: BTreeMap<TrackOwner, VideoView>,
@@ -591,6 +597,9 @@ impl TrackResources {
         if self.publications.values().any(|entry| entry.owner == owner) {
             return Err(TrackResourceError::OwnerInUse);
         }
+        if self.owned_publication_capacity_exceeded() {
+            return Err(TrackResourceError::PublicationCapacityExceeded);
+        }
         let prefix = match kind {
             MediaKind::Video => 'v',
             MediaKind::Audio => 'a',
@@ -626,6 +635,60 @@ impl TrackResources {
             },
         );
         Ok(slot)
+    }
+
+    pub(crate) fn owned_publication_capacity_exceeded(&self) -> bool {
+        self.publications
+            .len()
+            .checked_add(self.data_publications.len())
+            .is_none_or(|count| count >= 64)
+    }
+
+    pub(crate) fn validate_data_publication_claim(
+        &self,
+        spec: &TrackSpec,
+    ) -> Result<(), TrackResourceError> {
+        spec.validate()?;
+        let TrackSpec::Data { label, .. } = spec else {
+            return Err(TrackResourceError::WrongKind);
+        };
+        if self.data_publications.contains_key(label) {
+            return Err(TrackResourceError::AlreadyOwned);
+        }
+        if self.owned_publication_capacity_exceeded() {
+            return Err(TrackResourceError::PublicationCapacityExceeded);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn declare_data_publication(
+        &mut self,
+        owner: TrackOwner,
+        spec: &TrackSpec,
+    ) -> Result<(), TrackResourceError> {
+        spec.validate()?;
+        let TrackSpec::Data { label, delivery } = spec else {
+            return Err(TrackResourceError::WrongKind);
+        };
+        if let Some((current, mode)) = self.data_publications.get(label) {
+            return if *current == owner && *mode == *delivery {
+                Ok(())
+            } else {
+                Err(TrackResourceError::AlreadyOwned)
+            };
+        }
+        self.validate_data_publication_claim(spec)?;
+        if self.publications.values().any(|entry| entry.owner == owner)
+            || self
+                .data_publications
+                .values()
+                .any(|(current, _)| *current == owner)
+        {
+            return Err(TrackResourceError::OwnerInUse);
+        }
+        self.data_publications
+            .insert(label.clone(), (owner, *delivery));
+        Ok(())
     }
 
     pub fn update_publication(
@@ -1051,6 +1114,8 @@ impl TrackResources {
 
     pub(crate) fn release(&mut self, owner: TrackOwner) {
         self.publications.retain(|_, entry| entry.owner != owner);
+        self.data_publications
+            .retain(|_, (current, _)| *current != owner);
         self.release_audio(owner);
         self.audio_views.remove(&owner);
         self.release_video(owner);
@@ -1412,6 +1477,19 @@ impl TrackResources {
             topic: subscriber.topic,
             mode: subscriber.mode,
         };
+        if let Some((_, mode)) = self.data_publications.get(spec.label()) {
+            if *mode != publisher.mode {
+                return Err(TrackResourceError::AlreadyOwned);
+            }
+            return Ok(());
+        }
+        if self
+            .producers
+            .iter()
+            .any(|current| current.topic == publisher.topic && current.mode != publisher.mode)
+        {
+            return Err(TrackResourceError::AlreadyOwned);
+        }
         let mut registrations = self.registrations();
         registrations.publishers.push(publisher.clone());
         registrations.normalize();
@@ -1457,7 +1535,19 @@ impl TrackResources {
 
     pub fn registrations(&self) -> TopicRegistrations {
         let mut registrations = TopicRegistrations {
-            publishers: self.producers.iter().cloned().collect(),
+            publishers: self
+                .producers
+                .iter()
+                .cloned()
+                .chain(
+                    self.data_publications
+                        .iter()
+                        .map(|(topic, (_, mode))| TopicPublisher {
+                            topic: topic.clone(),
+                            mode: *mode,
+                        }),
+                )
+                .collect(),
             subscribers: self
                 .receivers
                 .values()

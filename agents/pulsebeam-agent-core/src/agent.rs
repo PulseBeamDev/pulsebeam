@@ -426,12 +426,18 @@ impl Agent {
             ResourceCommand::ClaimPublication { spec } => {
                 spec.validate()?;
                 let kind = spec.media_kind().ok_or(TrackResourceError::WrongKind)?;
+                if self.resources.has_publication(&spec) {
+                    return Err(TrackResourceError::AlreadyOwned.into());
+                }
                 if self
                     .local_bindings
                     .iter()
                     .any(|(slot, label)| slot.kind() == kind && label == spec.label())
                 {
                     return Err(TrackResourceError::AlreadyOwned.into());
+                }
+                if self.resources.owned_publication_capacity_exceeded() {
+                    return Err(TrackResourceError::PublicationCapacityExceeded.into());
                 }
                 let occupied = self
                     .local_bindings
@@ -451,6 +457,19 @@ impl Agent {
                     slot,
                     after_generation,
                 }
+            }
+            ResourceCommand::DeclareDataPublication { spec } => {
+                self.resources.validate_data_publication_claim(&spec)?;
+                let subscriber = spec.subscriber()?;
+                let mut owned = self.resources.registrations();
+                owned.publishers.push(crate::TopicPublisher {
+                    topic: subscriber.topic.clone(),
+                    mode: subscriber.mode,
+                });
+                self.merged_topics(owned)?;
+                let owner = self.resources.new_owner()?;
+                self.resources.declare_data_publication(owner, &spec)?;
+                ResourceResult::Owned { owner: owner.id() }
             }
             ResourceCommand::UpdatePublication { owner, present } => {
                 let owner = TrackOwner(owner);

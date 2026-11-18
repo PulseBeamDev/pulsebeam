@@ -510,16 +510,7 @@ impl Host for BrowserHost {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        let operations = inner.local_operations(slot);
-        inner.publication_slots.borrow_mut().insert(
-            owner,
-            PublicationSlot {
-                slot: slot.into(),
-                kind,
-                operations,
-                after_generation,
-            },
-        );
+        inner.register_publication(owner, slot, kind, after_generation);
     }
 
     fn resource_released(&self, owner: u64) {
@@ -601,8 +592,12 @@ pub struct BrowserRuntime {
 impl BrowserRuntime {
     #[wasm_bindgen(constructor)]
     pub fn new(config: JsValue) -> Result<BrowserRuntime, JsValue> {
-        let config: RuntimeConfig = serde_wasm_bindgen::from_value(config)
-            .map_err(|error| js_error(format!("invalid browser runtime config: {error}")))?;
+        let config: RuntimeConfig = serde_wasm_bindgen::from_value(config).map_err(|_| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::InvalidArgument,
+                "Invalid Agent configuration",
+            ))
+        })?;
         let core_config = AgentConfig {
             endpoint: config.endpoint,
             token: config.token,
@@ -633,7 +628,7 @@ impl BrowserRuntime {
             closed: Cell::new(false),
         });
         let actor = spawn_actor(core_config, BrowserHost::new(&inner))
-            .map_err(|error| js_error(error.to_string()))?;
+            .map_err(|error| operation_error_value((&error).into()))?;
         *inner.actor.borrow_mut() = Some(actor);
         Ok(Self { inner })
     }
@@ -679,6 +674,48 @@ impl BrowserRuntime {
             .replace_desired(desired.into_core())
             .map_err(js_error)?;
         Ok(())
+    }
+
+    pub fn claim_owned_publication(&self, spec: JsValue) -> Result<JsValue, JsValue> {
+        self.inner.ensure_open().map_err(|_| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Closed,
+                "Browser runtime is closed",
+            ))
+        })?;
+        let spec = resources::publication_spec(spec)?;
+        let kind = spec.media_kind().ok_or_else(|| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::InvalidArgument,
+                "Expected a media publication declaration",
+            ))
+        })?;
+        let actor = self.inner.actor.borrow().clone().ok_or_else(|| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Closed,
+                "Browser runtime is closed",
+            ))
+        })?;
+        let result = actor
+            .resource_now(agent_core::ResourceCommand::ClaimPublication { spec })
+            .map_err(operation_error_value)?;
+        let agent_core::ResourceResult::Publication {
+            owner,
+            slot,
+            after_generation,
+        } = &result
+        else {
+            return Err(operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Internal,
+                "Unexpected publication declaration result",
+            )));
+        };
+        self.inner
+            .register_publication(*owner, slot, kind, *after_generation);
+        if let Some(notification) = self.inner.prepare_current_publication(*owner) {
+            notification.notify();
+        }
+        Ok(resources::result(result))
     }
 
     #[wasm_bindgen(unchecked_return_type = "Promise<any>")]
@@ -970,7 +1007,7 @@ impl BrowserRuntime {
             .pipe_observers
             .borrow_mut()
             .push((owner, input, Rc::downgrade(&observer)));
-        Ok(BrowserPipe {
+        let pipe = BrowserPipe {
             actor,
             input,
             observer,
@@ -979,7 +1016,11 @@ impl BrowserRuntime {
             slot: operation.slot().into(),
             inner: Rc::downgrade(&self.inner),
             closing: RefCell::new(None),
-        })
+        };
+        if let Some(notification) = self.inner.prepare_current_publication(owner) {
+            notification.notify();
+        }
+        Ok(pipe)
     }
 
     pub fn snapshot(&self) -> JsValue {
@@ -1127,6 +1168,25 @@ impl RuntimeInner {
             return Err("runtime actor not initialized".to_owned());
         };
         actor.send_public(PublicCommand::SetConnected(connected))
+    }
+
+    fn register_publication(
+        self: &Rc<Self>,
+        owner: u64,
+        slot: &str,
+        kind: MediaKind,
+        after_generation: Option<Generation>,
+    ) {
+        let operations = self.local_operations(slot);
+        self.publication_slots.borrow_mut().insert(
+            owner,
+            PublicationSlot {
+                slot: slot.into(),
+                kind,
+                operations,
+                after_generation,
+            },
+        );
     }
 
     fn request_close(&self) {
@@ -1694,6 +1754,18 @@ impl RuntimeInner {
         }
         set(&value, "senders", sender_values);
         Ok(value.into())
+    }
+
+    fn prepare_current_publication(
+        &self,
+        owner: u64,
+    ) -> Option<agent_core::observer::PublicationNotification> {
+        let state = self
+            .actor
+            .borrow()
+            .as_ref()
+            .and_then(|actor| actor.publication_state(owner))?;
+        self.prepare_publication(owner, &state, false)
     }
 
     fn prepare_publication(

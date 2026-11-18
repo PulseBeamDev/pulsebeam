@@ -1,12 +1,12 @@
 (async () => {
   const endpoint = "__DESTINATION_ENDPOINT__";
   const create = (token) =>
-    window.pulsebeam.createAgent({
+    new window.pulsebeam.Agent({
       endpoint,
       token,
     });
-  const sender = await create("__SENDER_TOKEN__");
-  const receiver = await create("__RECEIVER_TOKEN__");
+  const sender = create("__SENDER_TOKEN__");
+  const receiver = create("__RECEIVER_TOKEN__");
   const publisher = sender.data("chat", "lossy");
   const stream = await receiver
     .participant("publisher")

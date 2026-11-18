@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import inspect
 from pathlib import Path
 import shutil
 import sys
@@ -11,13 +12,45 @@ import tempfile
 async def witness():
     core = importlib.import_module("contract.pulsebeam_agent_core")
     native = importlib.import_module("contract.pulsebeam_agent_native")
-    agent = await native.Agent.create(core.AgentConfig(
+    for endpoint, token, maximum_attempts in (
+        ("relative", "secret-token", 2),
+        ("http://pulsebeam.test", "", 2),
+        ("http://pulsebeam.test", "secret-token", 0),
+    ):
+        try:
+            native.Agent(core.AgentConfig(
+                endpoint=endpoint, token=token,
+                retry=core.RetryPolicy(
+                    initial_delay_ms=100, maximum_delay_ms=1000,
+                    maximum_attempts=maximum_attempts,
+                ),
+                log_level=core.LogLevel.WARN,
+            ))
+        except native.NativeError.Operation as error:
+            assert error.info.code == core.ErrorCode.INVALID_ARGUMENT
+            assert error.info.message == "Invalid Agent configuration"
+            assert "secret-token" not in error.info.message
+        else:
+            raise AssertionError("invalid Agent configuration was not rejected synchronously")
+    session = core.AgentConfig(
         endpoint="http://pulsebeam.test", token="token",
         retry=core.RetryPolicy(
             initial_delay_ms=100, maximum_delay_ms=1000, maximum_attempts=2,
         ),
         log_level=core.LogLevel.WARN,
+    )
+    agent = native.Agent(session)
+    media_agent = native.Agent.create_with_media(native.NativeAgentConfig(
+        session=session, media=native.MediaConfig(
+            audio_input=native.AudioInput.PCM(),
+            video_input=native.VideoInput.I420,
+            video_publications=[],
+        ),
     ))
+    assert not inspect.isawaitable(media_agent)
+    assert media_agent.state().status == core.AgentStatus.IDLE
+    assert media_agent.state().room is None
+    assert not inspect.isawaitable(agent)
     try:
         initial_state = agent.state()
         state_updates = agent.updates()
@@ -58,7 +91,10 @@ async def witness():
         assert isinstance(audio_source, native.AudioSource)
         assert agent.snapshot().desired_revision == revision, "source creation published"
         configuration = core.PublicationConfig(enabled=True)
-        video_publication = await local_video.publish(video_source, configuration)
+        video_publication = local_video.publish()
+        assert not inspect.isawaitable(video_publication)
+        assert video_publication.state().configuration.enabled is True
+        await video_publication.set_source(video_source)
         publication_updates = video_publication.updates()
         initial_publication = video_publication.state()
         assert isinstance(publication_updates, native.PublicationUpdates)
@@ -68,7 +104,7 @@ async def witness():
         assert isinstance(initial_publication.configuration.desired_revision, int)
         assert (await publication_updates.next()).observation_revision == initial_publication.observation_revision
         try:
-            await same_video.publish(video_source, configuration)
+            same_video.publish()
         except native.NativeError.Resource as error:
             assert error.reason.is_ALREADY_OWNED()
         else:
@@ -102,7 +138,8 @@ async def witness():
         else:
             raise AssertionError("publication without a native binding became ready")
         assert not video_source.is_closed(), "publication close stopped producer"
-        video_replacement = await same_video.publish(video_source, configuration)
+        video_replacement = same_video.publish(configuration)
+        await video_replacement.set_source(video_source)
         feedback = video_source.feedback()
         sibling_feedback = video_source.feedback()
         pending_feedback = asyncio.create_task(feedback.next())
@@ -114,7 +151,10 @@ async def witness():
         await video_source.close()
         assert not video_replacement.is_closed(), "source stop closed publication ownership"
         await video_replacement.close()
-        audio_publication = await local_audio.publish(audio_source, configuration)
+        audio_publication = local_audio.publish()
+        assert not inspect.isawaitable(audio_publication)
+        assert audio_publication.state().configuration.enabled is True
+        await audio_publication.set_source(audio_source)
         audio_publication_updates = audio_publication.updates()
         initial_audio_publication = await audio_publication_updates.next()
         assert initial_audio_publication.admission.status == core.PublicationAdmissionStatus.PENDING
@@ -213,7 +253,7 @@ async def witness():
         state_updates.close()
         state_updates.close()
     finally:
-        await agent.close()
+        await asyncio.gather(agent.close(), media_agent.close())
     print("generated Python lifecycle contract PASS")
 
 

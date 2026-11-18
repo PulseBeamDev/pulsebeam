@@ -14,7 +14,7 @@ With Node 22, install the npm archive in your application. npm resolves its pinn
 
 ```sh
 npm install --ignore-scripts /path/to/node_package.tgz
-node --input-type=module -e 'import { Agent } from "@pulsebeam/agent/native"; console.log(typeof Agent.create)'
+node --input-type=module -e 'import { Agent } from "@pulsebeam/agent/native"; console.log(typeof Agent)'
 ```
 
 With Python 3.12, install the wheel in your virtual environment:
@@ -24,13 +24,13 @@ python -m pip install /path/to/pulsebeam_agent-0.3.2-py3-none-manylinux_2_39_x86
 python -c 'from pulsebeam_agent import pulsebeam_agent_native as native; print(native.Agent)'
 ```
 
-The commands print the generated constructor or class, confirming that the package and native library load. They do not establish a session. Use an application-issued session endpoint and participant token to connect; applications must keep signing secrets on their backend. The Node namespaces are `@pulsebeam/agent/core` and `@pulsebeam/agent/native`; Python uses `pulsebeam_agent.pulsebeam_agent_core` and `pulsebeam_agent.pulsebeam_agent_native`.
+The commands print the generated Agent class, confirming that the package and native library load. They do not establish a session. Use an application-issued session endpoint and participant token to connect; applications must keep signing secrets on their backend. The Node namespaces are `@pulsebeam/agent/core` and `@pulsebeam/agent/native`; Python uses `pulsebeam_agent.pulsebeam_agent_core` and `pulsebeam_agent.pulsebeam_agent_native`.
 
 ## Configure and connect
 
 Rust callers supply a core `AgentConfig`, optional native `MediaConfig`, and an HTTP `Host`, then call `Agent::spawn`. This selects `ThreadedRuntime` with normal native sockets. Construction validates configuration without connecting. Call `connect` to establish connection intent; use owned publications and subscriptions for media. Core remains the owner of topology, authorization, topics and recovery policy.
 
-Generated APIs use the named async constructor `ffi::Agent::create(AgentConfig)` (Python: `await Agent.create(config)`). It creates the same actor with default PCM/I420 input and a production HTTP client. Native-only encoder/input choices use `create_with_media(NativeAgentConfig)` instead. Native configuration contains `session` and `media`, not application-owned UDP/TCP sockets. The generated interface exposes owned logical resources, not raw desired-state replacement or publication-bound submission ports. Controlled Rust hosts can still execute explicit low-level transport fixtures.
+Generated APIs construct synchronously with `new Agent(AgentConfig)` in Node and `Agent(config)` in Python. The returned Agent already exposes its real Core state, starts idle with no room intent, and performs no join, request, device acquisition or RTC setup before an explicit operation. Native-only encoder/input choices use the distinct synchronous `Agent.createWithMedia(NativeAgentConfig)` constructor in Node and `Agent.create_with_media(config)` in Python. Native configuration contains `session` and `media`, not application-owned UDP/TCP sockets. The generated interface exposes owned logical resources, not raw desired-state replacement or publication-bound submission ports. Controlled Rust hosts can still execute explicit low-level transport fixtures.
 
 Factory input choices are independent for audio and video:
 
@@ -60,7 +60,8 @@ use pulsebeam_agent_native::agent_core::ffi::PublicationConfig;
 
 let camera = agent.create_video_input(Default::default()).await?;
 let publication = agent.video("camera".into())?
-    .publish(&camera, PublicationConfig { enabled: true }).await?;
+    .publish(PublicationConfig { enabled: true })?;
+publication.set_source(Some(&camera)).await?;
 agent.connect().await?;
 publication.ready().await?;
 // Capture owned I420 frames and submit them through camera.submit(frame).await.
@@ -70,10 +71,12 @@ publication.close().await?;
 camera.close().await?;
 ```
 
-Generated callers use concrete `VideoSource`/`AudioSource` arguments and
-`VideoPublication`/`AudioPublication` owners. Python uses
-`await agent.video(label).publish(source, core.PublicationConfig(enabled=True))`.
-Audio inputs use `create_audio_input`; native video inputs take
+Generated `publish(options?)` returns a `VideoPublication` or `AudioPublication`
+synchronously without requiring input or waiting for admission. Omitting options
+enables the publication by default. Python uses
+`publication = agent.video(label).publish()`, followed by
+`await publication.set_source(source)` to attach an existing concrete
+`VideoSource` or `AudioSource`. Audio inputs use `create_audio_input`; native video inputs take
 `VideoSourceConfig`. No source objects are nested in configuration records.
 
 Keep the source alive independently of the publication. `set_source(None)`

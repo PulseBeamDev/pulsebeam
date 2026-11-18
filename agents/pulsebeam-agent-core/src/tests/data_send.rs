@@ -101,6 +101,23 @@ fn owned_sends_wait_for_host_acceptance_and_latest_supersession_is_explicit() {
 }
 
 #[test]
+fn legacy_send_uses_owned_data_declaration_without_retaining_an_alias() {
+    let (mut agent, _, _) = native_connection::connected(TopicRegistrations::default());
+    let declaration = spec(TopicMode::Lossy);
+    let ResourceResult::Owned { owner } = agent
+        .resource(ResourceCommand::DeclareDataPublication {
+            spec: declaration.clone(),
+        })
+        .unwrap()
+    else {
+        panic!("data publication")
+    };
+    assert!(agent.send_data(spec(TopicMode::Ordered), vec![1]).is_err());
+    agent.send_data(declaration, vec![1]).unwrap();
+    agent.resource(ResourceCommand::Release { owner }).unwrap();
+}
+
+#[test]
 fn owned_send_waits_for_its_first_authoritative_owned_binding() {
     let (mut agent, generation, signal) = native_connection::connected(TopicRegistrations {
         publishers: vec![publisher("state", TopicMode::Lossy)],

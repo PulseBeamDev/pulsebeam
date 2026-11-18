@@ -11,16 +11,19 @@ Issue a short-lived participant token on your application backend. Keep signing
 keys and API keys out of browser code.
 
 ```ts
-import { createAgent } from "@pulsebeam/web";
+import { Agent } from "@pulsebeam/web";
 
-const agent = await createAgent({
+const agent = new Agent({
   endpoint: "https://media.example.com",
   token: "SHORT_LIVED_PARTICIPANT_TOKEN",
 });
 await agent.connect();
 ```
 
-Creation initializes the browser runtime but does not connect or acquire media.
+Construction synchronously initializes the browser runtime and validates local
+configuration. It does not connect, select a room, or acquire media. Current Core
+state is available immediately through `agent.state()`, without an initialization
+Promise.
 `connect()` records connection intent; it is not a delivery or media-readiness
 acknowledgment. `disconnect()` clears that intent without closing the Agent or
 its resources. The Agent retries transient failures while connection is desired.

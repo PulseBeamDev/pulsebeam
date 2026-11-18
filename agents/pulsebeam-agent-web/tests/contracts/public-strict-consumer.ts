@@ -1,7 +1,7 @@
 import {
   AudioSource,
   VideoSource,
-  createAgent,
+  Agent,
   attachRemoteVideo,
   attachRemoteAudio,
   ResourceOwnershipError,
@@ -32,7 +32,7 @@ import type { DesiredState } from "../../web/index.js";
 // @ts-expect-error JSON topic registration is not required for binary data.
 import type { Topic } from "../../web/index.js";
 
-const agent = await createAgent({
+const agent = new Agent({
   endpoint: "https://pulsebeam.example",
   token: "opaque",
 });

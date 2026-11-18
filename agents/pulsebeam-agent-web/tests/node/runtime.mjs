@@ -14,15 +14,25 @@ const config = {
 };
 if (process.argv[2] === "initialization-failure") {
   let attempts = 0;
-  globalThis.fetch = async () => {
-    attempts++;
-    throw new Error("controlled artifact fetch failure");
+  const NativeModule = WebAssembly.Module;
+  WebAssembly.Module = class extends NativeModule {
+    constructor(source) {
+      attempts++;
+      throw new WebAssembly.CompileError(
+        "controlled artifact compilation failure",
+      );
+    }
   };
-  const { createAgent } = await import("../../node_assets/dist/index.js");
-  await assert.rejects(
-    createAgent(config),
-    /controlled artifact fetch failure/,
+  const { Agent, ErrorCode, OperationError } = await import(
+    "../../node_assets/dist/index.js"
   );
+  const initializationFailure = (error) => {
+    assert.equal(error instanceof OperationError, true);
+    assert.equal(error.info.code, ErrorCode.Internal);
+    assert.equal(error.message, "Browser runtime initialization failed");
+    return true;
+  };
+  assert.throws(() => new Agent(config), initializationFailure);
   const { createManagedAgent } = await import(
     "../../node_assets/dist/internal/react.js"
   );
@@ -35,18 +45,18 @@ if (process.argv[2] === "initialization-failure") {
   );
   agent.activate();
   agent.join("initialization-retry-room");
-  await assert.rejects(agent.connect(), /controlled artifact fetch failure/);
-  const observed = await failure;
-  assert.equal(observed.class, "initialization");
-  await assert.rejects(agent.disconnect(), /controlled artifact fetch failure/);
+  await assert.rejects(agent.connect(), initializationFailure);
+  assert.equal((await failure).class, "initialization");
+  const observed = agent.getSnapshot().failure;
+  await assert.rejects(agent.disconnect(), initializationFailure);
   assert.equal(agent.getSnapshot().failure, observed);
   assert.equal(agent.connection, "terminal-failure");
   await import("./platform.mjs");
-  globalThis.fetch = async () => {
-    attempts++;
-    return new Response(bytes, {
-      headers: { "Content-Type": "application/wasm" },
-    });
+  WebAssembly.Module = class extends NativeModule {
+    constructor(source) {
+      attempts++;
+      super(source);
+    }
   };
   const recovered = new Promise((resolve) => {
     const unsubscribe = agent.subscribe(() => {
@@ -62,34 +72,13 @@ if (process.argv[2] === "initialization-failure") {
   assert.equal(agent.snapshot().desiredRoom, "initialization-retry-room");
   assert.equal(
     attempts,
-    3,
-    "public creation rejects and managed explicit connect retries initialization",
+    4,
+    "constructor and managed activation fail synchronously; explicit connects retry initialization",
   );
   assert.equal(agent.error, null);
   await agent.close();
   console.log(
-    "artifact fetch failure persists through state updates and explicit connect retries initialization",
-  );
-} else if (process.argv[2] === "raw-loader-race") {
-  const { default: initialize, BrowserRuntime } = await import(
-    "../../node_assets/dist/wasm/pulsebeam_agent_web.js"
-  );
-  let release;
-  const slow = initialize({
-    module_or_path: new Promise((resolve) => {
-      release = resolve;
-    }),
-  });
-  await initialize({ module_or_path: bytes });
-  const runtime = new BrowserRuntime(config);
-  assert.equal(runtime.diagnostics().peers, 0);
-  release(bytes);
-  await slow;
-  // This is the original fixture fault: an overlapping generated initialization
-  // replaces the instance behind a receiver allocated by the other instance.
-  assert.throws(() => runtime.diagnostics(), WebAssembly.RuntimeError);
-  console.log(
-    "overlapping raw initialization reproduces the invalid receiver trap",
+    "artifact compilation failure persists through state updates and explicit connect retries initialization",
   );
 } else {
   const failedInitialization = spawnSync(
@@ -103,17 +92,6 @@ if (process.argv[2] === "initialization-failure") {
     failedInitialization.stderr + failedInitialization.stdout,
   );
   console.log(failedInitialization.stdout.trim());
-  const counterexample = spawnSync(
-    process.execPath,
-    [import.meta.filename, "raw-loader-race"],
-    { encoding: "utf8" },
-  );
-  assert.equal(
-    counterexample.status,
-    0,
-    counterexample.stderr + counterexample.stdout,
-  );
-  console.log(counterexample.stdout.trim());
   let requests = 0;
   globalThis.fetch = async () => {
     requests++;
@@ -121,17 +99,90 @@ if (process.argv[2] === "initialization-failure") {
       headers: { "Content-Type": "application/wasm" },
     });
   };
+  const NativeModule = WebAssembly.Module;
+  const NativeInstance = WebAssembly.Instance;
+  const nativeInstantiate = WebAssembly.instantiate;
+  let compilations = 0;
+  let instances = 0;
+  let asynchronousInstantiations = 0;
+  WebAssembly.Instance = class extends NativeInstance {
+    constructor(module, imports) {
+      instances++;
+      super(module, imports);
+    }
+  };
+  WebAssembly.instantiate = (...args) => {
+    asynchronousInstantiations++;
+    return Reflect.apply(nativeInstantiate, WebAssembly, args);
+  };
+  WebAssembly.Module = class extends NativeModule {
+    constructor(source) {
+      compilations++;
+      super(source);
+    }
+  };
+  const { Agent, AgentStatus, ErrorCode } = await import(
+    "../../node_assets/dist/index.js"
+  );
   const { BrowserRuntime, whenInitialized } = await import(
     "../../node_assets/dist/wasm.js"
   );
-  await Promise.all([whenInitialized(), whenInitialized(), whenInitialized()]);
-  assert.equal(
-    requests,
-    1,
-    "production loader shares one in-flight initialization",
+  assert.deepEqual(
+    [compilations, instances, asynchronousInstantiations],
+    [0, 0, 0],
+    "root import does not compile or instantiate WASM",
   );
+  const agent = new Agent(config);
+  assert.equal(agent instanceof Agent, true);
+  assert.equal(agent instanceof Promise, false);
+  assert.equal(agent.state().status, AgentStatus.Idle);
+  assert.equal(agent.snapshot().desiredRoom, null);
+  assert.equal(agent.snapshot().connection, "disconnected");
+  assert.equal(requests, 0, "constructor does not fetch or connect");
+  const initialization = whenInitialized();
+  const inert = new BrowserRuntime(config);
+  assert.equal(
+    inert.diagnostics().peers,
+    0,
+    "Core exists before awaiting initialization",
+  );
+  inert.close();
+  await agent.close();
+  await Promise.all([initialization, whenInitialized(), whenInitialized()]);
+  assert.deepEqual(
+    [compilations, instances, asynchronousInstantiations],
+    [1, 1, 0],
+    "private bootstrap creates one synchronous Core instance",
+  );
+  assert.equal(requests, 0, "local bootstrap does not fetch");
+  WebAssembly.Module = NativeModule;
+  WebAssembly.Instance = NativeInstance;
+  WebAssembly.instantiate = nativeInstantiate;
+  const invalidConfiguration = (error) => {
+    assert.equal(error instanceof Error, true);
+    assert.equal(error.pulsebeamInfo.code, ErrorCode.InvalidArgument);
+    assert.equal(error.message.includes("private-configuration-value"), false);
+    return true;
+  };
   assert.throws(
     () => new BrowserRuntime({ ...config, token: "t".repeat(8193) }),
+    invalidConfiguration,
+  );
+  assert.throws(
+    () =>
+      new BrowserRuntime({
+        ...config,
+        endpoint: "private-configuration-value",
+      }),
+    invalidConfiguration,
+  );
+  assert.throws(
+    () =>
+      new BrowserRuntime({
+        ...config,
+        token: { private: "private-configuration-value" },
+      }),
+    invalidConfiguration,
   );
   const runtime = new BrowserRuntime({ ...config, token: "t".repeat(8192) });
   assert.deepEqual(runtime.diagnostics(), {

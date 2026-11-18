@@ -48,6 +48,31 @@ pub struct Publication {
     pub(super) inner: Arc<PublicationLease>,
 }
 
+impl PublicationLease {
+    pub(super) fn new(
+        owner: u64,
+        spec: TrackSpec,
+        commands: mpsc::Sender<Command>,
+        changed: Arc<Notify>,
+        control: PublicationControl,
+        observer: Arc<agent_core::observer::PublicationStateObserver>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            owner,
+            spec,
+            closed: Arc::new(Signal::default()),
+            closing: std::sync::atomic::AtomicBool::new(false),
+            readiness: watch::channel(None).0,
+            commands,
+            changed,
+            control,
+            observer,
+            pipe: Arc::new(std::sync::Mutex::new(None)),
+            pipe_serial: std::sync::Mutex::new(()),
+        })
+    }
+}
+
 impl Publication {
     pub fn is_closed(&self) -> bool {
         self.inner.closing.load(Ordering::Acquire) || self.inner.closed.is_closed()
@@ -605,19 +630,14 @@ where
             return Err(Error::Rtc("Core did not claim a publication".into()));
         };
         let observer = self.core.publication_observer(owner).map_err(Error::from)?;
-        let inner = Arc::new(PublicationLease {
+        let inner = PublicationLease::new(
             owner,
             spec,
-            closed: Arc::new(Signal::default()),
-            closing: std::sync::atomic::AtomicBool::new(false),
-            readiness: watch::channel(None).0,
-            commands: self.command_tx.clone(),
-            changed: self.leases_changed.clone(),
-            control: self.core.publication_control(),
+            self.command_tx.clone(),
+            self.leases_changed.clone(),
+            self.core.publication_control(),
             observer,
-            pipe: Arc::new(std::sync::Mutex::new(None)),
-            pipe_serial: std::sync::Mutex::new(()),
-        });
+        );
         self.publications.insert(owner, Arc::downgrade(&inner));
         Ok(Publication { inner })
     }

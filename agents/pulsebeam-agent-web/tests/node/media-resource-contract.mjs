@@ -3,7 +3,7 @@ import { setImmediate } from "node:timers/promises";
 import { Track } from "./platform.mjs";
 
 export async function mediaResourceContract(pulsebeam) {
-  const agent = await pulsebeam.createAgent({
+  const agent = new pulsebeam.Agent({
     endpoint: "http://localhost",
     token: "media-resource-contract",
     logging: { level: "off" },
@@ -14,7 +14,7 @@ export async function mediaResourceContract(pulsebeam) {
     const beforeLookup = agent.snapshot().desiredRevision;
     const local = agent.video("camera");
     assert.equal(agent.video("camera"), local);
-    const other = await pulsebeam.createAgent({
+    const other = new pulsebeam.Agent({
       endpoint: "http://localhost",
       token: "other-media-resource-contract",
       logging: { level: "off" },
@@ -144,11 +144,29 @@ async function ownedPipeContract() {
     token: "owned-pipe-contract",
   });
   try {
-    const publication = await runtime.resource({
-      op: "claimPublication",
-      spec: { kind: "video", label: "pipe-contract" },
-    });
+    const declaration = { kind: "video", label: "pipe-contract" };
+    const publication = runtime.claim_owned_publication(declaration);
+    assert.equal(publication.then, undefined, "declaration is synchronous");
+    const observation = runtime.publication(publication.owner);
+    const pending = observation.state();
+    assert.equal(
+      pending.admission.status,
+      0,
+      "declaration is pending without admission",
+    );
+    assert.equal(pending.inputAttached, false, "declaration needs no source");
+    assert.throws(
+      () => runtime.claim_owned_publication(declaration),
+      (error) => error.pulsebeamInfo?.code === 1,
+      "duplicate publication conflicts before actor progress",
+    );
+    assert.deepEqual(
+      observation.state(),
+      pending,
+      "rejected declaration preserves incumbent",
+    );
     const pipe = runtime.create_owned_publication_pipe(publication.owner);
+    assert.equal(observation.state().inputAttached, true);
     assert.throws(
       () => runtime.create_owned_publication_pipe(publication.owner),
       (error) => error.pulsebeamInfo?.code === 1,

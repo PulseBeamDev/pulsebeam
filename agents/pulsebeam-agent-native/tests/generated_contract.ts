@@ -35,7 +35,23 @@ import {
 
 // No connection intent: this witnesses generated objects and async disposal,
 // not network admission or media delivery. Production-native covers that boundary.
-const agent = await Agent.create(
+for (const config of [
+  AgentConfig.create({ endpoint: "relative", token: "secret-token", retry: RetryPolicy.create({ initialDelayMs: 100n, maximumDelayMs: 1000n, maximumAttempts: 2 }), logLevel: LogLevel.Warn }),
+  AgentConfig.create({ endpoint: "http://pulsebeam.test", token: "", retry: RetryPolicy.create({ initialDelayMs: 100n, maximumDelayMs: 1000n, maximumAttempts: 2 }), logLevel: LogLevel.Warn }),
+  AgentConfig.create({ endpoint: "http://pulsebeam.test", token: "secret-token", retry: RetryPolicy.create({ initialDelayMs: 100n, maximumDelayMs: 1000n, maximumAttempts: 0 }), logLevel: LogLevel.Warn }),
+]) {
+  try {
+    new Agent(config);
+    throw new Error("invalid Agent config was accepted");
+  } catch (error) {
+    if (!NativeError.Operation.instanceOf(error) ||
+        error.inner.info.code !== ErrorCode.InvalidArgument ||
+        error.inner.info.message !== "Invalid Agent configuration" ||
+        error.inner.info.message.includes("secret-token")) throw error;
+  }
+}
+
+const agent = new Agent(
   AgentConfig.create({
     endpoint: "http://pulsebeam.test",
     token: "token",
@@ -47,6 +63,7 @@ const agent = await Agent.create(
     logLevel: LogLevel.Warn,
   }),
 );
+if (agent instanceof Promise) throw new Error("Agent construction was asynchronous");
 const initialState = agent.state();
 const stateUpdates = agent.updates();
 if (!AgentUpdates.instanceOf(stateUpdates) ||
@@ -101,11 +118,15 @@ if (!VideoSource.instanceOf(videoSource) || !AudioSource.instanceOf(audioSource)
   throw new Error("source construction acquired publication intent");
 }
 const publicationConfig = PublicationConfig.create({ enabled: true });
+const videoPublication = localVideo.publish();
+if (videoPublication instanceof Promise || !videoPublication.state().configuration.enabled) {
+  throw new Error("zero-argument publish was not synchronous with RFC enabled default");
+}
 if (false) {
   // @ts-expect-error An audio source is not a video publication source.
-  await localVideo.publish(audioSource, publicationConfig);
+  await videoPublication.setSource(audioSource);
 }
-const videoPublication = await localVideo.publish(videoSource, publicationConfig);
+await videoPublication.setSource(videoSource);
 const publicationUpdates = videoPublication.updates();
 const initialPublication = videoPublication.state();
 if (!PublicationUpdates.instanceOf(publicationUpdates) ||
@@ -117,7 +138,7 @@ if (!PublicationUpdates.instanceOf(publicationUpdates) ||
   throw new Error("publication did not expose pending Core state and local configuration");
 }
 try {
-  await sameVideo.publish(videoSource, publicationConfig);
+  sameVideo.publish();
   throw new Error("equivalent lookup bypassed publication exclusivity");
 } catch (error) {
   if (!NativeError.Resource.instanceOf(error) ||
@@ -154,7 +175,8 @@ if (!NativeError.Closed.instanceOf(await pendingBound) || videoSource.isClosed()
   throw new Error("publication close transferred producer ownership");
 }
 publicationUpdates.close();
-const videoReplacement = await sameVideo.publish(videoSource, publicationConfig);
+const videoReplacement = sameVideo.publish(publicationConfig);
+await videoReplacement.setSource(videoSource);
 const feedback = videoSource.feedback();
 const siblingFeedback = videoSource.feedback();
 if (!FeedbackStream.instanceOf(feedback)) throw new Error("feedback is not a generated object");
@@ -171,7 +193,11 @@ siblingFeedback.uniffiDestroy();
 await videoSource.close();
 if (videoReplacement.isClosed()) throw new Error("source stop closed publication ownership");
 await videoReplacement.close();
-const audioPublication = await localAudio.publish(audioSource, publicationConfig);
+const audioPublication = localAudio.publish();
+if (audioPublication instanceof Promise || !audioPublication.state().configuration.enabled) {
+  throw new Error("zero-argument audio publish was not synchronous with RFC enabled default");
+}
+await audioPublication.setSource(audioSource);
 const audioPublicationUpdates = audioPublication.updates();
 const initialAudioPublication = await audioPublicationUpdates.next();
 if (!initialAudioPublication || initialAudioPublication.admission.status !== PublicationAdmissionStatus.Pending) {

@@ -214,8 +214,8 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
     let camera = publisher.create_video_input(Default::default()).await?;
     let publication = publisher
         .video("production-camera".into())?
-        .publish(&camera, Default::default())
-        .await?;
+        .publish(Default::default())?;
+    publication.set_source(Some(&camera)).await?;
     let subscription = subscriber
         .participant("publisher".into())?
         .video("production-camera".into())?

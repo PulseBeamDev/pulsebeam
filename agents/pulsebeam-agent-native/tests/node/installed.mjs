@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
 import { Agent, InputFrame, NativeError, PublicationUpdates, ReceiveMode } from "@pulsebeam/agent/native";
-import { ErrorCode, LogLevel, PlayoutDelay, PublicationAdmissionStatus, PublicationDemand, TopicMode } from "@pulsebeam/agent/core";
+import { AgentStatus, ErrorCode, LogLevel, PlayoutDelay, PublicationAdmissionStatus, PublicationDemand, TopicMode } from "@pulsebeam/agent/core";
 
 const room = process.argv[4];
 assert.ok(room, "an explicit room is required");
-const agent = await Agent.create({
+const agent = new Agent({
   endpoint: process.argv[2],
   token: process.argv[3],
   retry: { initialDelayMs: 100n, maximumDelayMs: 1000n, maximumAttempts: 2 },
   logLevel: LogLevel.Warn,
 });
+assert(!(agent instanceof Promise), "Agent constructor returned a Promise");
+assert.equal(agent.state().status, AgentStatus.Idle);
+assert.equal(agent.state().room, undefined);
+assert.equal(agent.state().desiredRoom, undefined);
 try {
   const updates = agent.snapshots();
   const exchange = agent.data("foreign-exchange", TopicMode.Ordered);
@@ -18,7 +22,8 @@ try {
     encodings: [{ rid: undefined, scaleDownBy: 1, maxBitrateBps: undefined, maxFramerate: undefined, temporalLayers: 1 }],
     dependencyDescriptor: true,
   });
-  const publication = await agent.video("node-camera").publish(camera, { enabled: true });
+  const publication = agent.video("node-camera").publish();
+  await publication.setSource(camera);
   const publicationUpdates = publication.updates();
   assert(PublicationUpdates.instanceOf(publicationUpdates));
   const pendingPublication = publication.state();
