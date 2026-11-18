@@ -30,12 +30,19 @@ const agent = await createAgent({
   endpoint: "https://pulsebeam.example",
   token: "opaque",
 });
+agent.join("explicit-room");
+const renewed: void = agent.renew("opaque-renewed");
+void renewed;
 const connected: Promise<void> = agent.connect();
 await connected;
 await agent.disconnect();
 await agent.renewAuthorization("renewed");
 agent.setLogging("info");
 const snapshot: AgentSnapshot = agent.snapshot();
+const joinRevision: bigint = snapshot.joinRevision;
+const desiredRoom: string | null = snapshot.desiredRoom;
+void joinRevision;
+void desiredRoom;
 const error: AgentError | null = agent.error;
 const snapshots = agent.snapshots();
 const events = agent.events();

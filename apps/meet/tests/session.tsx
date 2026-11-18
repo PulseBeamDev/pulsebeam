@@ -136,9 +136,9 @@ const password = document.querySelector<HTMLInputElement>(
 assert.ok(password);
 assert.equal(password.autocomplete, "off");
 await input(password, token);
-const endpoint = [...document.querySelectorAll("form input")].find(
-  (element) => element !== password,
-) as HTMLInputElement;
+const endpoint = document.querySelector<HTMLInputElement>(
+  'input[name="endpoint"]',
+)!;
 await input(endpoint, "http://localhost:7070");
 assert.equal(
   button("Join room").disabled,
@@ -171,6 +171,15 @@ assert.equal(
   "invalid endpoint cannot join with capture",
 );
 await input(endpoint, "http://localhost:7070");
+assert.equal(
+  button("Join room").disabled,
+  true,
+  "a token never selects a room",
+);
+await input(
+  document.querySelector<HTMLInputElement>('input[name="room"]')!,
+  "selected-room",
+);
 assert.equal(button("Join room").disabled, false);
 await click("Mute microphone");
 await click("Turn camera off");
@@ -187,7 +196,7 @@ await click("Join room");
 assert.equal(runtimes.filter((runtime) => !runtime.closed).length, 1);
 const runtime = runtimes.at(-1)!;
 const deliver = (event: unknown) => runtime.deliverData("chat", event);
-assert.equal(runtime.desired.connected, true);
+assert.deepEqual(runtime.joins, ["selected-room"]);
 await flush(() =>
   runtime.emit({
     connection: "connected",
@@ -440,6 +449,10 @@ assert.ok(button("Turn camera off"), "Leave resets lobby camera intent");
 await input(
   document.querySelector<HTMLInputElement>('input[type="password"]')!,
   token,
+);
+await input(
+  document.querySelector<HTMLInputElement>('input[name="room"]')!,
+  "selected-room",
 );
 await click("Join room");
 await click("Leave");

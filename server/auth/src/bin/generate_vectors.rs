@@ -20,8 +20,8 @@ struct Claims<'a> {
     iss: ProjectId,
     aud: &'static str,
     sub: &'a str,
-    room: &'a str,
     exp: u64,
+    grants: &'a pulsebeam_core::auth::grants::GrantSet,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -48,8 +48,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             iss: project,
             aud: "pb",
             sub: &input.participant,
-            room: &input.room,
             exp: input.expiration.parse()?,
+            grants: &input.grants,
         })?;
         let signing_input = format!(
             "{}.{}",

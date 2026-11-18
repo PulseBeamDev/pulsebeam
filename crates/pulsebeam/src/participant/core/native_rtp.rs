@@ -439,6 +439,37 @@ impl Connection {
         }
     }
 
+    pub(super) fn quiesce_native_rtp(&mut self) {
+        let mut remove_encodings = BTreeSet::new();
+        self.pending_keyframe_requests.clear();
+        self.last_keyframe_request.clear();
+        for source in std::mem::take(&mut self.native_rtp)
+            .publications
+            .into_values()
+        {
+            if let Some(handle) = source.fanout {
+                self.upstream.unbind_track_handle(source.track.id(), handle);
+            }
+            if !source.retiring {
+                for encoding in &source.binding.description().encodings {
+                    self.transport.retire_encoding(encoding.primary);
+                    remove_encodings.insert(encoding.primary);
+                }
+            }
+        }
+        if !remove_encodings.is_empty()
+            && self
+                .transport
+                .update_compiled_rtp(CompiledRtpConfigurationPatch {
+                    remove_encodings,
+                    ..Default::default()
+                })
+                .is_err()
+        {
+            self.disconnect(DisconnectReason::SignalingOutput);
+        }
+    }
+
     pub(super) fn apply_native_retirement(
         &mut self,
         scope: crate::participant::policy::ExecutionScope,

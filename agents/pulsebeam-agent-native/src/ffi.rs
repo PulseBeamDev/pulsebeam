@@ -154,6 +154,9 @@ impl Agent {
         Ok(Self::from_runtime(runtime))
     }
 
+    pub fn renew(&self, token: String) -> Result<(), NativeError> {
+        self.runtime.renew(token).map_err(Into::into)
+    }
     pub async fn renew_authorization(&self, token: String) -> Result<(), NativeError> {
         self.runtime
             .renew_authorization(token)
@@ -195,6 +198,10 @@ impl Agent {
     pub fn is_closed(&self) -> bool {
         self.runtime.is_closed()
     }
+    pub fn join(&self, room: String) -> Result<(), NativeError> {
+        self.runtime.join(room).map_err(Into::into)
+    }
+
     pub async fn connect(&self) -> Result<(), NativeError> {
         self.runtime.connect().await.map_err(Into::into)
     }

@@ -46,10 +46,18 @@ async fn native_platform_smoke() -> TestResult<()> {
         &ParticipantExternalId::new("web-receiver")?,
         expires_at,
     )?;
+    let renewed_sender = mint_development_token(
+        &room,
+        &ParticipantExternalId::new("web-sender")?,
+        expires_at
+            .checked_add(60)
+            .ok_or("renewal expiry overflow")?,
+    )?;
     let live = include_str!("contracts/live-agent-contract.js")
         .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
         .replace("__SENDER_TOKEN__", &sender)
-        .replace("__RECEIVER_TOKEN__", &receiver);
+        .replace("__RECEIVER_TOKEN__", &receiver)
+        .replace("__RENEWED_SENDER_TOKEN__", &renewed_sender);
     let mut browser = capabilities()?;
     browser.add_arg("--autoplay-policy=no-user-gesture-required")?;
     browser.add_arg("--force-device-scale-factor=2")?;
@@ -189,7 +197,7 @@ async fn gesture_required_audio_smoke() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn web_adapter_restart_smoke() -> TestResult<()> {
+async fn server_restart_fences_old_agents() -> TestResult<()> {
     let destination = DestinationServer::start().await?;
     let address = destination.address();
     let server = StaticServer::start(root()).await?;
@@ -202,7 +210,7 @@ async fn web_adapter_restart_smoke() -> TestResult<()> {
         &ParticipantExternalId::new("subscriber")?,
         expires_at,
     )?;
-    let start = include_str!("contracts/adapter-restart-start.js")
+    let start = include_str!("contracts/server-restart-start.js")
         .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver);
@@ -215,13 +223,21 @@ async fn web_adapter_restart_smoke() -> TestResult<()> {
         assert_eq!(before["initial"], serde_json::json!([1]));
         drop(destination);
         let _restarted = DestinationServer::bind(address).await?;
-        let recovered: bool = evaluate_json(
+        let fenced: bool = evaluate_json(
             &bidi,
             &context,
-            include_str!("contracts/adapter-restart-finish.js"),
+            include_str!("contracts/server-restart-finish.js"),
         )
         .await?;
-        assert!(recovered);
+        assert!(fenced);
+        let fresh: serde_json::Value = evaluate_json(&bidi, &context, &start).await?;
+        assert_eq!(fresh["initial"], serde_json::json!([1]));
+        let closed: bool = evaluate_json(
+            &bidi,
+            &context,
+            "(async () => { const { sender, receiver, stream, pumping } = globalThis.__serverRestart; await stream.close(); await pumping; await Promise.all([sender.close(), receiver.close()]); delete globalThis.__serverRestart; return true; })()",
+        ).await?;
+        assert!(closed);
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     })
     .await?;

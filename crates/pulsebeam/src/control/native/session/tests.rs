@@ -1,5 +1,8 @@
 use super::*;
 
+mod discovery;
+mod permissions;
+
 #[test]
 fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_the_source() {
     use crate::control::native::{PreparedResource, ReceiverPreparation};
@@ -13,16 +16,20 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
         Expire,
         Cancel,
         SourceArrives,
+        SourceArrivesWithoutDiscovery,
         SourceArrivesAfterRenewal,
     }
     for outcome in [
         Outcome::Expire,
         Outcome::Cancel,
         Outcome::SourceArrives,
+        Outcome::SourceArrivesWithoutDiscovery,
         Outcome::SourceArrivesAfterRenewal,
     ] {
         let mut model = NativeSession::default();
-        model.authorization(99, 1).unwrap();
+        model
+            .authorization(99, 1, ResourcePermissions::RoomBound)
+            .unwrap();
         let connection = ConnectionId::new();
         let source = connection.derive_publication_track_id(
             TrackKind::Data,
@@ -64,7 +71,9 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
         }
         assert!(!model.preparation_pending(100));
         assert!(model.source_waits.is_empty());
-        model.authorization(10_000, 2).unwrap();
+        model
+            .authorization(10_000, 2, ResourcePermissions::RoomBound)
+            .unwrap();
         let before = Instant::now();
         while model.preparation_pending(100) {
             for _ in 0..SELECT_WORK {
@@ -149,14 +158,18 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                     matches!(&model.rows[&Key::Owned(1)].value.value, Some(wire::confirmed_state::Value::Absent(value)) if value.reason == wire::AbsenceReason::Removed as i32)
                 );
             }
-            Outcome::SourceArrives | Outcome::SourceArrivesAfterRenewal => {
+            Outcome::SourceArrives
+            | Outcome::SourceArrivesWithoutDiscovery
+            | Outcome::SourceArrivesAfterRenewal => {
                 let revision = if matches!(outcome, Outcome::SourceArrivesAfterRenewal) {
                     3
                 } else {
                     2
                 };
                 if revision == 3 {
-                    model.authorization(10_000, revision).unwrap();
+                    model
+                        .authorization(10_000, revision, ResourcePermissions::RoomBound)
+                        .unwrap();
                 }
                 let owner = ParticipantId::new();
                 let track = Track::data_publication(
@@ -170,16 +183,35 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                     },
                     DataLane::Ordered,
                 );
-                model
-                    .observe_participant(wire::Participant {
-                        participant_id: owner.as_str(),
-                        participant_external_id: ParticipantExternalId::new("source")
-                            .unwrap()
-                            .as_str()
-                            .to_owned(),
-                    })
-                    .unwrap();
-                model.observe_candidate(&track).unwrap();
+                let publisher = ParticipantExternalId::new("source").unwrap();
+                if matches!(outcome, Outcome::SourceArrivesWithoutDiscovery) {
+                    let mut incomplete = track.clone();
+                    incomplete.meta_mut().label = None;
+                    let unresolved = super::super::ResolvedSource {
+                        track: &incomplete,
+                        publisher: &publisher,
+                    };
+                    assert!(!unresolved.is_available());
+                    model.source_wait_changed();
+                    model
+                        .service_source_waits(100, Instant::now(), |_| unresolved.is_available())
+                        .unwrap();
+                    assert_eq!(model.source_waits[&1].deadline, wait.deadline);
+                    model.source_wait_changed();
+                } else {
+                    model
+                        .observe_participant(wire::Participant {
+                            participant_id: owner.as_str(),
+                            participant_external_id: publisher.as_str().to_owned(),
+                        })
+                        .unwrap();
+                    model
+                        .observe_candidate(super::super::ResolvedSource {
+                            track: &track,
+                            publisher: &publisher,
+                        })
+                        .unwrap();
+                }
                 model
                     .service_source_waits(100, Instant::now(), |id| id == source)
                     .unwrap();
@@ -187,8 +219,36 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                 let work = model.take_preparation().unwrap().unwrap();
                 assert!(work.scope().sequence > wait.work.scope().sequence);
                 assert_eq!(work.grant_revision, revision);
+                if matches!(outcome, Outcome::SourceArrivesWithoutDiscovery) {
+                    let mut replacement = track.clone();
+                    let replacement_connection = ConnectionId::new();
+                    replacement.meta_mut().connection_id = replacement_connection;
+                    replacement.meta_mut().id = replacement_connection.derive_publication_track_id(
+                        TrackKind::Data,
+                        "not-yet-observed",
+                        NonZeroU64::new(1).unwrap(),
+                    );
+                    let before_rejection = model.retained_bytes;
+                    assert!(
+                        matches!(model.compile_execution(&work, None, |_| Some(super::super::ResolvedSource { track: &replacement, publisher: &publisher })), Err(error) if error.code == wire::FailureCode::Incompatible as i32)
+                    );
+                    assert_eq!(model.retained_bytes, before_rejection);
+                    assert!(
+                        model.rows[&Key::Owned(1)]
+                            .owned
+                            .as_ref()
+                            .unwrap()
+                            .receiver_source
+                            .is_none()
+                    );
+                }
                 let command = model
-                    .prepare_execution(&work, 100, None, |_| Some(&track))
+                    .prepare_execution(&work, 100, None, |_| {
+                        Some(super::super::ResolvedSource {
+                            track: &track,
+                            publisher: &publisher,
+                        })
+                    })
                     .unwrap()
                     .unwrap();
                 assert!(matches!(
@@ -202,6 +262,26 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                     model.rows[&Key::Owned(1)].value.value,
                     Some(wire::confirmed_state::Value::Owned(_))
                 ));
+                if matches!(outcome, Outcome::SourceArrivesWithoutDiscovery) {
+                    assert!(
+                        model
+                            .rows
+                            .keys()
+                            .all(|key| !matches!(key, Key::Participant(_) | Key::Track(_)))
+                    );
+                    let retained = model.rows[&Key::Owned(1)]
+                        .owned
+                        .as_ref()
+                        .unwrap()
+                        .receiver_source
+                        .as_ref()
+                        .unwrap();
+                    assert_eq!(
+                        retained.participant.participant_external_id,
+                        publisher.as_str()
+                    );
+                    assert_eq!(retained.track, track_descriptor(&track).unwrap());
+                }
             }
         }
         assert!(model.source_waits.is_empty());
@@ -216,7 +296,9 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
 
 fn session() -> NativeSession {
     let mut session = NativeSession::default();
-    session.authorization(10_000, 1).unwrap();
+    session
+        .authorization(10_000, 1, ResourcePermissions::RoomBound)
+        .unwrap();
     session.set_cid(
         ChannelId::from_value(0),
         pulsebeam_runtime::time::Instant::now(),
@@ -728,8 +810,12 @@ fn execution_attempts_and_grants_fence_stale_work_and_expired_commits() {
     assert!(session.preparation_current(&old, 100).unwrap());
     assert_eq!(session.retained_bytes, prepaid);
     let old_value = live(&session, &old);
-    session.authorization(9000, 2).unwrap();
-    session.authorization(20000, 1).unwrap();
+    session
+        .authorization(9000, 2, ResourcePermissions::RoomBound)
+        .unwrap();
+    session
+        .authorization(20000, 1, ResourcePermissions::RoomBound)
+        .unwrap();
     assert_eq!(session.grant_revision, 2);
     assert!(session.preparation_spec(&old).is_none());
     assert!(!session.complete(old, Ok(old_value), 100).unwrap());
@@ -738,7 +824,9 @@ fn execution_attempts_and_grants_fence_stale_work_and_expired_commits() {
     assert!(!session.complete(next, Ok(next_value), 9000).unwrap());
     assert_eq!(owned(&session, 1).evaluated_revision, 0);
     assert!(owned(&session, 1).rejection.is_none());
-    session.authorization(20000, 3).unwrap();
+    session
+        .authorization(20000, 3, ResourcePermissions::RoomBound)
+        .unwrap();
     let current = session.take_preparation().unwrap().unwrap();
     assert!(!session.complete(stale, Ok(stale_value), 9000).unwrap());
     assert!(session.preparation_current(&current, 9000).unwrap());
@@ -913,7 +1001,9 @@ fn terminal_lifetimes_release_rows_queues_and_byte_funding_without_history() {
 #[test]
 fn initial_enumeration_is_finite_fair_and_not_a_live_catchup_barrier() {
     let mut session = NativeSession::default();
-    session.authorization(10000, 1).unwrap();
+    session
+        .authorization(10000, 1, ResourcePermissions::RoomBound)
+        .unwrap();
     for index in 0..512 {
         session
             .observe_participant(wire::Participant {
@@ -1027,7 +1117,9 @@ fn selected_output_is_frozen_and_commit_does_not_clear_newer_state() {
     let pending = endpoint.output().unwrap();
     assert_eq!(pending.bytes.as_ptr(), pointer);
     assert_eq!(pending.deadline, deadline);
-    session.authorization(9000, 2).unwrap();
+    session
+        .authorization(9000, 2, ResourcePermissions::RoomBound)
+        .unwrap();
     assert!(session.poll().unwrap().is_none());
     assert!(!session.needs_poll());
     assert_eq!(session.enumeration_progress(), 0);
@@ -1075,11 +1167,19 @@ fn discovery_requires_real_immutable_descriptors_and_does_not_delay_initial_gran
         session.poll(),
         Err(OutputError::InvalidObservation)
     ));
-    session.observe_track(source(1, "literal topic")).unwrap();
+    session
+        .observe_track(
+            source(1, "literal topic"),
+            &crate::entity::ParticipantExternalId::new("Owner").unwrap(),
+        )
+        .unwrap();
     assert_eq!(session.unavailable, 0);
     drain(&mut session);
     assert!(matches!(
-        session.observe_track(source(1, "relabel")),
+        session.observe_track(
+            source(1, "relabel"),
+            &crate::entity::ParticipantExternalId::new("Owner").unwrap()
+        ),
         Err(OutputError::InvalidObservation)
     ));
     session
@@ -1103,7 +1203,9 @@ async fn unrelated_grant_churn_cannot_hide_a_stalled_selected_frame() {
     let bytes = session.poll().unwrap().unwrap().bytes.clone();
     for revision in 2..=30 {
         pulsebeam_runtime::time::advance(std::time::Duration::from_secs(1)).await;
-        session.authorization(10000, revision).unwrap();
+        session
+            .authorization(10000, revision, ResourcePermissions::RoomBound)
+            .unwrap();
         assert_eq!(session.poll().unwrap().unwrap().bytes, bytes);
     }
     pulsebeam_runtime::time::advance(std::time::Duration::from_secs(1)).await;
@@ -1118,7 +1220,9 @@ async fn delayed_admission_receipt_uses_original_open_and_admission_times() {
     for before_deadline in [true, false] {
         let opened = Instant::now();
         let mut session = NativeSession::default();
-        session.authorization(10_000, 1).unwrap();
+        session
+            .authorization(10_000, 1, ResourcePermissions::RoomBound)
+            .unwrap();
         for index in 0..64 {
             session
                 .observe_participant(wire::Participant {
@@ -1243,7 +1347,12 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
             lane,
             None,
         );
-        session.observe_candidate(&source).unwrap();
+        session
+            .observe_candidate(super::super::ResolvedSource {
+                track: &source,
+                publisher: &external_id,
+            })
+            .unwrap();
         let Some(wire::confirmed_state::Value::Track(observed)) = &session
             .rows
             .get(&Key::Track(id.as_str()))
@@ -1397,7 +1506,9 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
     let mut session = session();
     drain(&mut session);
     let base = session.retained_bytes;
-    session.authorization(99, 2).unwrap();
+    session
+        .authorization(99, 2, ResourcePermissions::RoomBound)
+        .unwrap();
     let binding = |available| crate::participant::policy::ResourceObservation::ReceiverBinding {
         binding: 1,
         state: Some(crate::participant::policy::ReceiverBinding {
@@ -1420,7 +1531,13 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
         participant_external_id: "Owner".into(),
     };
     session.observe_participant(owner.clone()).unwrap();
-    session.observe_track(track.clone()).unwrap();
+    session
+        .observe_track(
+            track.clone(),
+            &crate::entity::ParticipantExternalId::new(&owner.participant_external_id).unwrap(),
+        )
+        .unwrap();
+    drain(&mut session);
     let spec = wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
             enabled: Some(true),
@@ -1472,7 +1589,12 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
     session
         .remove_participant(owner.participant_id.clone())
         .unwrap();
-    assert!(session.source(&track.track_id).is_none());
+    assert!(matches!(
+        session.rows[&Key::Track(track.track_id.clone())]
+            .value
+            .value,
+        Some(wire::confirmed_state::Value::Absent(_))
+    ));
     let before_failure = session.retained_bytes;
     session.observe_receiver_failure(1, None).unwrap();
     let failure_bytes = receiver_failure_bytes(&failure(wire::FailureCode::InvalidConfiguration));
@@ -1517,7 +1639,9 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
         session.rows[&Key::Owned(1)].value.value,
         Some(wire::confirmed_state::Value::Owned(_))
     ));
-    session.authorization(10_000, 3).unwrap();
+    session
+        .authorization(10_000, 3, ResourcePermissions::RoomBound)
+        .unwrap();
     let work = session.take_preparation().unwrap().unwrap();
     assert!(matches!(
         session
@@ -1735,7 +1859,7 @@ fn public_revision_and_private_counter_exhaustion_never_wrap() {
     ));
     session.version = u64::MAX;
     assert!(matches!(
-        session.authorization(10000, 2),
+        session.authorization(10000, 2, ResourcePermissions::RoomBound),
         Err(OutputError::Capacity)
     ));
     assert_eq!(session.version, u64::MAX);

@@ -16,6 +16,7 @@ mod support {
 #[path = "../../../agents/pulsebeam-agent-web/tests/support/destination.rs"]
 mod destination;
 
+const ROOM: &str = "native-production-boundary";
 const WIDTH: u32 = 160;
 const HEIGHT: u32 = 96;
 const LUMA: usize = 160 * 96;
@@ -30,7 +31,9 @@ fn config(endpoint: &str, participant: &str) -> Result<Config> {
         endpoint: endpoint.into(),
         token: pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key()?,
-            "native-production-boundary",
+            &serde_json::from_value(
+                serde_json::json!([{"rooms":[ROOM],"allow":["join","publish","discover","subscribe"]}]),
+            )?,
             participant,
             expiry,
         )?,
@@ -223,8 +226,8 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    publisher.connect().await?;
-    subscriber.connect().await?;
+    publisher.join(ROOM.into())?;
+    subscriber.join(ROOM.into())?;
     tokio::time::timeout(Duration::from_secs(20), async {
         tokio::try_join!(connected(&publisher), connected(&subscriber))?;
         anyhow::Ok(())
@@ -323,6 +326,7 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
             .arg(&endpoint)
             .arg(&foreign.session.token)
             .arg(&foreign_reader.session.token)
+            .arg(ROOM)
             .env_remove("LD_LIBRARY_PATH")
             .env_remove("LD_PRELOAD")
             .kill_on_drop(true);
@@ -341,6 +345,7 @@ async fn production_native_i420_crosses_real_sfu_and_closes() -> Result<()> {
         command
             .arg(&endpoint)
             .arg(&node.session.token)
+            .arg(ROOM)
             .env_remove("LD_LIBRARY_PATH")
             .env_remove("LD_PRELOAD")
             .kill_on_drop(true);

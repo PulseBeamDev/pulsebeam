@@ -29,6 +29,11 @@ export async function publicContract(pulsebeam) {
       "creation is not connection intent",
     );
     const revision = agent.snapshot().desiredRevision;
+    assert.equal(agent.snapshot().joinRevision, 0n);
+    assert.equal(agent.snapshot().credentialRevision, 0n);
+    assert.equal(agent.snapshot().acceptedCredentialRevision, null);
+    assert.equal(agent.snapshot().credentialOutcome, null);
+    assert.equal(agent.snapshot().desiredRoom, null);
     const snapshots = agent.snapshots();
     const sibling = agent.snapshots();
     const events = agent.events();
@@ -50,6 +55,49 @@ export async function publicContract(pulsebeam) {
     assert.equal((await pendingEvent).type, "closed");
     assert.equal(sibling.isClosed(), false);
     assert.equal(siblingEvents.isClosed(), false);
+    const joinUpdates = agent.snapshots();
+    agent.join("public-contract-room");
+    while (true) {
+      const update = await joinUpdates.next();
+      assert.notEqual(update.type, "closed");
+      const current =
+        update.type === "snapshot" ? update.snapshot : agent.snapshot();
+      if (
+        current?.desiredRoom === "public-contract-room" &&
+        current.joinRevision === 1n
+      )
+        break;
+    }
+    await joinUpdates.close();
+    assert.equal(agent.snapshot().desiredRoom, "public-contract-room");
+    assert.equal(agent.snapshot().joinRevision, 1n);
+    const joinedRevision = agent.snapshot().desiredRevision;
+    const disconnectUpdates = agent.snapshots();
+    await agent.disconnect();
+    // Renewal is queued after disconnect and provides an observable actor barrier.
+    await agent.renewAuthorization("public-smoke-renewed");
+    while (true) {
+      const update = await disconnectUpdates.next();
+      assert.notEqual(update.type, "closed");
+      const current =
+        update.type === "snapshot" ? update.snapshot : agent.snapshot();
+      if (current?.credentialRevision === 1n) break;
+    }
+    await disconnectUpdates.close();
+    const disconnectedRevision = agent.snapshot().desiredRevision;
+    assert.ok(
+      disconnectedRevision > joinedRevision,
+      `disconnect after join must advance Core intent: ${joinedRevision} -> ${disconnectedRevision}`,
+    );
+    const renewedUpdates = agent.snapshots();
+    assert.equal(agent.renew("synchronous-renewed"), undefined);
+    while (true) {
+      const update = await renewedUpdates.next();
+      assert.notEqual(update.type, "closed");
+      const current = update.type === "snapshot" ? update.snapshot : agent.snapshot();
+      if (current?.credentialRevision === 2n) break;
+    }
+    await renewedUpdates.close();
     await agent.connect();
     await agent.disconnect();
     assert.equal(agent.isClosed(), false, "disconnect is not terminal");

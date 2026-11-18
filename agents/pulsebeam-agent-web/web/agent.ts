@@ -12,6 +12,7 @@ import type {
   AudioDemand,
   CatalogSnapshot,
   ConnectionState,
+  CredentialOutcome,
   LogLevel,
   LocalAudioTrack,
   LocalVideoTrack,
@@ -39,6 +40,7 @@ import {
   emptySnapshot,
   freezeTopicSnapshot,
   validatePlayoutDelay,
+  validateToken,
   type RuntimeConfig,
 } from "./agent-state.js";
 
@@ -53,6 +55,13 @@ type RuntimeTopicCounter =
 interface RuntimeSnapshot {
   readonly version: bigint;
   readonly desiredRevision: bigint;
+  readonly joinRevision: bigint;
+  readonly credentialRevision: bigint;
+  readonly acceptedCredentialRevision?: bigint;
+  readonly credentialOutcome?: Omit<CredentialOutcome, "error"> & {
+    readonly error?: AgentError;
+  };
+  readonly desiredRoom?: string;
   readonly connection: ConnectionState;
   readonly generation?: bigint;
   readonly participantId?: string;
@@ -118,6 +127,7 @@ class AgentFacade implements Agent {
   #closing: Promise<void> | undefined;
   #active = false;
   #activation = 0;
+  #desiredRoom: string | undefined;
   #ready: Promise<Runtime> | undefined;
   #runtimeConfig: RuntimeConfig;
 
@@ -198,6 +208,7 @@ class AgentFacade implements Agent {
         runtime.set_snapshot_listener((snapshot: RuntimeSnapshot) => {
           if (active()) this.#runtimeSnapshot(runtime, snapshot);
         });
+        if (this.#desiredRoom !== undefined) runtime.join(this.#desiredRoom);
         return runtime;
       });
     void this.#ready.catch(() => {});
@@ -331,6 +342,26 @@ class AgentFacade implements Agent {
     };
   };
 
+  join(room: string): void {
+    if (this.#closed) throw new ResourceError("closed", "agent is closed");
+    if (typeof room !== "string") throw new TypeError("room must be a string");
+    const previousState = this.#state;
+    const previousRoom = this.#desiredRoom;
+    const nextState = copyState({ ...previousState, connected: true });
+    // Core callbacks can synchronously submit a newer room intent.
+    this.#state = nextState;
+    this.#desiredRoom = room;
+    try {
+      this.#runtime?.join(room);
+    } catch (error) {
+      if (this.#state === nextState) {
+        this.#state = previousState;
+        this.#desiredRoom = previousRoom;
+      }
+      throw error;
+    }
+  }
+
   async connect(): Promise<void> {
     if (this.#closed) throw new ResourceError("closed", "agent is closed");
     if (this.#snapshot.connection === "terminal-failure" && !this.#runtime) {
@@ -405,12 +436,23 @@ class AgentFacade implements Agent {
     this.#requireRuntime().force_reconnect();
   }
 
+  renew(token: string): void {
+    if (this.#closed) throw new ResourceError("closed", "agent is closed");
+    validateToken(token);
+    const previous = this.#runtimeConfig;
+    const next = { ...previous, token };
+    this.#runtimeConfig = next;
+    try {
+      this.#requireRuntime().renew(token);
+    } catch (error) {
+      if (this.#runtimeConfig === next) this.#runtimeConfig = previous;
+      throw error;
+    }
+  }
+
   async renewAuthorization(token: string): Promise<void> {
     if (this.#closed) throw new ResourceError("closed", "agent is closed");
-    if (!token || token.length > 16_384 || !/^[!-~]+$/.test(token)) {
-      throw new Error("authorization token is invalid");
-    }
-    if (token === this.#runtimeConfig.token) return;
+    validateToken(token);
     this.#runtime?.renew_authorization(token);
     this.#runtimeConfig = { ...this.#runtimeConfig, token };
   }
@@ -644,6 +686,18 @@ class AgentFacade implements Agent {
     const next: AgentSnapshot = Object.freeze({
       version: Number(raw.version),
       desiredRevision: Number(raw.desiredRevision),
+      joinRevision: raw.joinRevision,
+      credentialRevision: raw.credentialRevision,
+      acceptedCredentialRevision: raw.acceptedCredentialRevision ?? null,
+      credentialOutcome: raw.credentialOutcome
+        ? Object.freeze({
+            ...raw.credentialOutcome,
+            error: raw.credentialOutcome.error
+              ? Object.freeze({ ...raw.credentialOutcome.error })
+              : null,
+          })
+        : null,
+      desiredRoom: raw.desiredRoom ?? null,
       connection: raw.connection,
       generation:
         this.#runtimeGeneration === null
@@ -765,6 +819,8 @@ export async function createAgent(config: AgentConfig): Promise<Agent> {
     participant: (id: string) => raw.participant(id),
     selectAudio: (policy: AudioDemand) => raw.selectAudio(policy),
     isClosed: () => raw.isClosed(),
+    join: (room: string) => raw.join(room),
+    renew: (token: string) => raw.renew(token),
     connect: () => raw.connect(),
     disconnect: () => raw.disconnect(),
     renewAuthorization: (token: string) => raw.renewAuthorization(token),

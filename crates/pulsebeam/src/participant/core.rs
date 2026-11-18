@@ -6,6 +6,8 @@ use crate::control::native::handoff::{EndpointHandoff, Fact, Opened};
 mod native_data;
 mod native_receiver;
 mod native_rtp;
+#[cfg(test)]
+mod topic_tests;
 use crate::media::{Direction, KeyframeRequestKind, MediaKind, Mid, Pt, Ssrc};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use pulsebeam_proto::topic::TopicFrame;
@@ -104,6 +106,7 @@ pub struct ConnectionConfig {
     pub connection_id: entity::ConnectionId,
     pub profile: SignalingProtocol,
     pub allow_topic_channels: bool,
+    pub(crate) topic_publications: super::policy::TopicPublications,
     pub authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
     pub rtc: pulsebeam_rtc::AcceptedConnection,
     pub resources: NegotiatedResources,
@@ -161,6 +164,7 @@ pub struct Connection {
     upstream: UpstreamAllocator,
     negotiated: NegotiatedResources,
     allow_topic_channels: bool,
+    topic_publications: super::policy::TopicPublications,
     pub(crate) participant_id: entity::ParticipantId,
     pub(crate) connection_id: entity::ConnectionId,
     last_keyframe_request: HashMap<(Mid, SourceEncoding), Instant>,
@@ -193,6 +197,7 @@ pub struct Connection {
     // Cold: touched rarely
     disconnect_reason: Option<DisconnectReason>,
     native_handoff: Option<EndpointHandoff>,
+    native_terminal: bool,
     native_channel: Option<crate::media::ChannelId>,
     renewal_pending: bool,
     playout_reconnect_sent: bool,
@@ -230,11 +235,13 @@ impl Connection {
             participant_id: cfg.participant_id,
             connection_id: cfg.connection_id,
             allow_topic_channels: cfg.allow_topic_channels,
+            topic_publications: cfg.topic_publications,
             upstream: UpstreamAllocator::new(ctx, cfg.connection_id),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
             disconnect_reason: None,
             native_handoff,
+            native_terminal: false,
             native_channel: None,
             renewal_pending: false,
             playout_reconnect_sent: false,
@@ -371,6 +378,9 @@ impl Connection {
             } => self.on_ingress(batch, source_shard),
             ParticipantInput::Timeout(now) => self.on_timeout(now),
             ParticipantInput::Authorization { revision, expiry } => {
+                if self.native_terminal {
+                    return;
+                }
                 if revision > self.authorization_revision
                     && let Some(expiry) = expiry
                 {
@@ -1000,6 +1010,14 @@ impl Connection {
             }
             Event::SenderReport(report) => self.handle_sender_report(report),
             Event::EncodingDiscovered(info) => {
+                if self.native_terminal
+                    || self
+                        .native_handoff
+                        .as_ref()
+                        .is_some_and(EndpointHandoff::execution_stopped)
+                {
+                    return;
+                }
                 let Ok(mid) = Mid::new(&info.mid) else {
                     return;
                 };
@@ -1082,12 +1100,22 @@ impl Connection {
                 match intent {
                     DataTrackIntent::InternalSignaling => {}
                     DataTrackIntent::UserTopic(channel) => {
+                        let label = (channel.direction == DataTrackDirection::Publish)
+                            .then(|| crate::track::publication_label(channel.lane, &channel.topic));
+                        if self
+                            .authorization_expiry
+                            .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
+                            || label
+                                .as_deref()
+                                .is_some_and(|label| !self.topic_publications.allows(label))
+                        {
+                            self.transport.close_native_data(cid);
+                            return;
+                        }
                         if let Some(previous) = self.data.close(cid) {
                             self.release_data_channel(previous, events);
                         }
-                        let publication = if channel.direction == DataTrackDirection::Publish {
-                            let label =
-                                crate::track::publication_label(channel.lane, &channel.topic);
+                        let publication = if let Some(label) = label {
                             let Some(id) =
                                 self.data.allocate_publication(self.connection_id, &label)
                             else {
@@ -1231,6 +1259,10 @@ impl Connection {
     }
 
     fn evaluate_native_preparations(&mut self, events: &mut impl ParticipantSink) {
+        self.observe_native_terminal();
+        if self.native_terminal {
+            return;
+        }
         if self.native_handoff.is_some() {
             while self.native_preparation_budget > 0 {
                 let Some(command) = self
@@ -1545,6 +1577,7 @@ impl Connection {
     }
 
     fn poll_native_signaling(&mut self) -> Result<SignalingWrite, OutputError> {
+        self.observe_native_terminal();
         if let Some(handoff) = &mut self.native_handoff {
             if handoff.failed() {
                 return Err(OutputError::InvalidObservation);
@@ -1569,6 +1602,7 @@ impl Connection {
     }
 
     pub(crate) fn native_ready(&mut self) {
+        self.observe_native_terminal();
         if let Some(handoff) = &self.native_handoff {
             handoff.acknowledge_wakeup();
         }
@@ -1589,7 +1623,10 @@ impl Connection {
     }
 }
 
-fn whip_media_label(profile: SignalingProtocol, kind: MediaKind) -> Option<&'static str> {
+pub(crate) fn whip_media_label(
+    profile: SignalingProtocol,
+    kind: MediaKind,
+) -> Option<&'static str> {
     match (profile, kind) {
         (SignalingProtocol::Whip, MediaKind::Audio) => Some("audio"),
         (SignalingProtocol::Whip, MediaKind::Video) => Some("video"),
@@ -1774,6 +1811,7 @@ mod rtc_clock_tests {
                         connection_id,
                         profile: SignalingProtocol::State,
                         allow_topic_channels: false,
+                        topic_publications: Default::default(),
                         authorization_expiry: None,
                         rtc,
                         resources,
@@ -1837,6 +1875,7 @@ mod rtc_clock_tests {
                 connection_id,
                 profile: SignalingProtocol::State,
                 allow_topic_channels: false,
+                topic_publications: Default::default(),
                 authorization_expiry: None,
                 rtc,
                 resources,
@@ -1874,6 +1913,7 @@ mod rtc_clock_tests {
                 connection_id,
                 profile: SignalingProtocol::State,
                 allow_topic_channels: false,
+                topic_publications: Default::default(),
                 authorization_expiry: Some(
                     pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(200),
                 ),
@@ -2075,6 +2115,7 @@ mod upstream_route_table_tests {
                 connection_id,
                 profile: SignalingProtocol::Whip,
                 allow_topic_channels: true,
+                topic_publications: Default::default(),
                 authorization_expiry: None,
                 rtc: crate::control::application_only_test_connection(),
                 resources: NegotiatedResources::empty_for_test(),

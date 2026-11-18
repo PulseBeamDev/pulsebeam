@@ -18,9 +18,10 @@ import { Radio, RefreshCw } from "lucide-react";
 export function Lobby({
   onJoin,
 }: {
-  onJoin(token: string, endpoint: string): void;
+  onJoin(token: string, endpoint: string, room: string): void;
 }) {
   const [token, setToken] = useState("");
+  const [room, setRoom] = useState("");
   const [serverURL, setServerURL] = useState(defaultServerUrl);
   const { capture, devices } = useMeetMedia();
   const { video, audio, error, request } = capture;
@@ -81,7 +82,8 @@ export function Lobby({
             spacing={2}
             onSubmit={(event) => {
               event.preventDefault();
-              if (video && audio && endpoint) onJoin(token, endpoint);
+              if (video && audio && endpoint && room)
+                onJoin(token, endpoint, room);
             }}
           >
             <TextField
@@ -95,6 +97,7 @@ export function Lobby({
             />
             <TextField
               label="Server URL"
+              name="endpoint"
               fullWidth
               value={serverURL}
               slotProps={{ htmlInput: { inputMode: "url" } }}
@@ -105,12 +108,21 @@ export function Lobby({
                 "Enter an absolute HTTP(S) URL without query or fragment."
               }
             />
+            <TextField
+              label="Room"
+              name="room"
+              fullWidth
+              required
+              value={room}
+              onChange={(event) => setRoom(event.target.value)}
+              autoComplete="off"
+            />
             <Button
               type="submit"
               size="large"
               variant="contained"
               fullWidth
-              disabled={!video || !audio || !endpoint}
+              disabled={!video || !audio || !endpoint || !room}
             >
               Join room
             </Button>

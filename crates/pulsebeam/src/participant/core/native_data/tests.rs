@@ -173,6 +173,7 @@ pub(in crate::participant::core) fn participant_with_capabilities(
         connection_id: entity::ConnectionId::new(),
         profile: SignalingProtocol::State,
         allow_topic_channels: false,
+        topic_publications: Default::default(),
         authorization_expiry: Some(
             pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(expiry),
         ),
@@ -225,6 +226,72 @@ fn declaration() -> wire::ResourceSpec {
             },
         )),
     }
+}
+
+fn retain_publication(
+    participant: &mut NativeParticipant,
+    work: Preparation,
+    deadline: Option<Instant>,
+) -> (TrackId, ChannelId, pulsebeam_rtc::DataChannelInstallation) {
+    let id = participant.connection_id.derive_publication_track_id(
+        TrackKind::Data,
+        "camera/updates",
+        NonZeroU64::new(work.reference).unwrap(),
+    );
+    let channel = crate::media::ChannelId::from_value(1);
+    let track = Track::data_publication(
+        track::TrackMeta {
+            room_id: participant.room_id,
+            shard_id: participant.shard_id,
+            id,
+            origin: participant.participant_id,
+            connection_id: participant.connection_id,
+            label: Some("camera/updates".into()),
+        },
+        DataLane::Ordered,
+    );
+    assert_eq!(track.publication_label().as_deref(), Some("camera/updates"));
+    assert!(track.requires_reverse_route());
+    // Exercise the retained runtime receipt directly, not SCTP admission or an Installed claim.
+    participant
+        .native_data
+        .channels
+        .insert(channel, work.reference);
+    participant
+        .native_data
+        .tracks
+        .insert(*id.as_bytes(), work.reference);
+    let installation = participant
+        .transport
+        .install_data_channel(crate::participant::transport::native_data_config(
+            channel,
+            DataLane::Ordered,
+        ))
+        .unwrap();
+    participant.native_data.publications.insert(
+        work.reference,
+        DataPublication {
+            channel,
+            track,
+            source_id: id.as_str(),
+            fanout: None,
+            enabled: false,
+            opened: false,
+            installation,
+            published: false,
+            retiring: false,
+            preparation: Some(work),
+            storage_sequence: work.scope().sequence,
+            deadline,
+        },
+    );
+    if let Some(deadline) = deadline {
+        participant
+            .native_data
+            .deadlines
+            .insert((deadline, work.reference));
+    }
+    (id, channel, installation)
 }
 
 pub(in crate::participant::core) fn frame(
@@ -387,6 +454,147 @@ fn declaration_without_a_usable_binding_is_not_invented_execution() {
 }
 
 #[test]
+fn terminal_handoff_fences_prefetched_and_in_flight_work_without_blocking_output() {
+    for in_flight in [false, true] {
+        let mut participant = participant();
+        let initial = participant
+            .native_handoff
+            .as_mut()
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            participant
+                .native_handoff
+                .as_ref()
+                .unwrap()
+                .progress(SignalingProgress {
+                    sequence: initial.sequence,
+                    cid: initial.cid,
+                    at: Instant::now(),
+                })
+        );
+        participant
+            .signaling
+            .apply_input(&frame(
+                1,
+                wire::desired_state::Value::Present(Box::new(declaration())),
+            ))
+            .unwrap();
+        let work = participant.signaling.take_preparation().unwrap().unwrap();
+        let queued = participant
+            .signaling
+            .prepare_execution(&work, unix_now(), None, |_| panic!("publication context"))
+            .unwrap()
+            .unwrap();
+        let delayed = participant
+            .signaling
+            .prepare_execution(&work, unix_now(), None, |_| panic!("publication context"))
+            .unwrap()
+            .unwrap();
+        participant.signaling.command(queued);
+        assert!(
+            participant
+                .native_handoff
+                .as_mut()
+                .unwrap()
+                .commands_pending()
+        );
+        let remaining = participant
+            .signaling
+            .prepare_execution(&work, unix_now(), None, |_| panic!("publication context"))
+            .unwrap()
+            .unwrap();
+        participant.signaling.command(remaining);
+        let mut sink = MockParticipantSink::new();
+        assert!(participant.native_scope_authorized(work.scope(), unix_now()));
+        let retained = if in_flight {
+            assert!(participant.admit_native_preparation(work));
+            let (_, _, installation) = retain_publication(
+                &mut participant,
+                work,
+                Some(Instant::now() + Duration::from_secs(1)),
+            );
+            assert!(
+                participant
+                    .transport
+                    .data_channel_installation(installation)
+                    .is_some()
+            );
+            assert_eq!(participant.native_data.publications.len(), 1);
+            assert!(participant.native_data.deadline().is_some());
+            Some(installation)
+        } else {
+            None
+        };
+        participant
+            .signaling
+            .begin_terminal(wire::CloseReason::AuthorizationRevoked)
+            .unwrap();
+        assert!(!participant.native_handoff.as_ref().unwrap().failed());
+        assert!(
+            !participant
+                .native_handoff
+                .as_mut()
+                .unwrap()
+                .commands_pending()
+        );
+        assert!(
+            participant
+                .native_handoff
+                .as_mut()
+                .unwrap()
+                .command()
+                .is_none()
+        );
+        assert!(!participant.native_execution_current(work.scope(), unix_now()));
+        assert!(participant.native_callback_fenced(work.scope().binding));
+        participant
+            .endpoint
+            .execute_native_command(delayed, &mut sink);
+        participant.native_ready();
+        if let Some(installation) = retained {
+            assert!(
+                participant
+                    .transport
+                    .data_channel_installation(installation)
+                    .is_none()
+            );
+        }
+        participant.input(ParticipantInput::Authorization {
+            revision: 100,
+            expiry: Some(i64::MAX),
+        });
+        assert!(participant.native_terminal);
+        assert_eq!(participant.authorization_expiry.unwrap().unix_seconds(), 0);
+        assert!(!participant.native_scope_authorized(work.scope(), unix_now()));
+        assert!(participant.native_data.publications.is_empty());
+        assert!(participant.native_data.channels.is_empty());
+        assert!(participant.native_data.deadline().is_none());
+        assert!(participant.native_receivers.deadline().is_none());
+        assert!(sink.publish_track_calls.is_empty());
+        assert!(participant.disconnect_reason.is_none());
+        let terminal = participant
+            .native_handoff
+            .as_mut()
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            codec::decode_server(&terminal.bytes)
+                .unwrap()
+                .records
+                .iter()
+                .any(|record| matches!(
+                    record.confirmed.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(wire::confirmed_state::Value::Session(session))
+                        if session.closed == Some(wire::CloseReason::AuthorizationRevoked as i32)
+                ))
+        );
+    }
+}
+
+#[test]
 fn contradictory_execution_fact_terminates_its_connection() {
     let mut participant = participant();
     participant
@@ -461,52 +669,7 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
         .prepare_execution(&work, unix_now(), None, |_| panic!("publication context"))
         .unwrap()
         .unwrap();
-    let id = participant.connection_id.derive_publication_track_id(
-        TrackKind::Data,
-        "camera/updates",
-        NonZeroU64::new(1).unwrap(),
-    );
-    let channel = crate::media::ChannelId::from_value(1);
-    let track = Track::data_publication(
-        track::TrackMeta {
-            room_id: participant.room_id,
-            shard_id: participant.shard_id,
-            id,
-            origin: participant.participant_id,
-            connection_id: participant.connection_id,
-            label: Some("camera/updates".into()),
-        },
-        DataLane::Ordered,
-    );
-    assert_eq!(track.publication_label().as_deref(), Some("camera/updates"));
-    assert!(track.requires_reverse_route());
-    // Exercise the retained runtime receipt directly, not SCTP admission or an Installed claim.
-    participant.native_data.channels.insert(channel, 1);
-    participant.native_data.tracks.insert(*id.as_bytes(), 1);
-    let installation = participant
-        .transport
-        .install_data_channel(crate::participant::transport::native_data_config(
-            channel,
-            DataLane::Ordered,
-        ))
-        .unwrap();
-    participant.native_data.publications.insert(
-        1,
-        DataPublication {
-            channel,
-            track,
-            source_id: id.as_str(),
-            fanout: None,
-            enabled: false,
-            opened: false,
-            installation,
-            published: false,
-            retiring: false,
-            preparation: Some(work),
-            storage_sequence: work.scope().sequence,
-            deadline: None,
-        },
-    );
+    let (id, channel, installation) = retain_publication(&mut participant, work, None);
     let mut sink = MockParticipantSink::new();
     participant.execute_native_command(in_flight_duplicate, &mut sink);
     assert!(participant.native_execution.contains(work.scope()));

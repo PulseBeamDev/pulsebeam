@@ -1356,14 +1356,8 @@ mod tests {
             log_level: agent_core::LogLevel::default(),
         })
         .unwrap();
-        core.command(agent_core::AgentCommand::ReplaceDesired(
-            agent_core::DesiredState {
-                revision: 1,
-                connected: true,
-                ..agent_core::DesiredState::default()
-            },
-        ))
-        .unwrap();
+        core.command(agent_core::AgentCommand::Join("peer-room".into()))
+            .unwrap();
         let (generation, specs) = loop {
             match core.next_effect().expect("core requested an offer") {
                 agent_core::Effect::Rtc(agent_core::RtcEffect::CreateOffer {

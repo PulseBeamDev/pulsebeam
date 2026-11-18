@@ -435,13 +435,15 @@ impl WirePeer {
             + 60;
         let token = pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key()?,
-            "native-state-wire",
+            &serde_json::from_value(serde_json::json!([{"rooms":["native-state-wire"],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
             "rtp-listener",
             expiry,
         )?;
         let request = http::Request::builder()
             .method("POST")
-            .uri(format!("http://{server}:7070/api/v1/whep"))
+            .uri(format!(
+                "http://{server}:7070/api/v1/whep?room=native-state-wire"
+            ))
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/sdp")
             .body(offer.sdp.into_bytes())?;

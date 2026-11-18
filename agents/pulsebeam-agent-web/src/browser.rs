@@ -654,6 +654,17 @@ impl BrowserRuntime {
         Ok(self.inner.begin_observation(owner, source))
     }
 
+    pub fn renew(&self, token: String) -> Result<(), JsValue> {
+        self.inner.ensure_open()?;
+        let actor = self
+            .inner
+            .actor
+            .borrow()
+            .clone()
+            .ok_or_else(|| js_error("runtime actor not initialized"))?;
+        actor.renew(token).map_err(js_error)
+    }
+
     pub fn renew_authorization(&self, token: String) -> Result<(), JsValue> {
         self.inner.ensure_open()?;
         self.inner.renew_authorization(token).map_err(js_error)
@@ -735,6 +746,17 @@ impl BrowserRuntime {
     pub async fn statistics(&self) -> Result<JsValue, JsValue> {
         self.inner.ensure_open()?;
         self.inner.statistics().await.map_err(js_error)
+    }
+
+    pub fn join(&self, room: String) -> Result<(), JsValue> {
+        self.inner.ensure_open()?;
+        let actor = self
+            .inner
+            .actor
+            .borrow()
+            .clone()
+            .ok_or_else(|| js_error("runtime actor not initialized"))?;
+        actor.join(room).map_err(js_error)
     }
 
     pub fn connect(&self) -> Result<(), JsValue> {
@@ -898,6 +920,7 @@ impl RuntimeInner {
     }
 
     fn renew_authorization(&self, token: String) -> Result<(), String> {
+        agent_core::validate_authorization_token(&token).map_err(|error| error.to_string())?;
         let actor = self.actor.borrow();
         let Some(actor) = actor.as_ref() else {
             return Err("runtime actor not initialized".to_owned());
@@ -1298,10 +1321,11 @@ impl RuntimeInner {
             });
         }
         let snapshot_listener = self.snapshot_listener.borrow().clone();
-        if let Some(snapshot) = &turn.snapshot
+        if turn.snapshot.is_some()
             && let Some(listener) = snapshot_listener
         {
-            call_listener(&listener, &snapshot_value(snapshot), "snapshot");
+            // Effects and error callbacks may already have replaced room intent.
+            call_listener(&listener, &snapshot_value(&self.snapshot()), "snapshot");
         }
         let event_listener = self.event_listener.borrow().clone();
         if let Some(listener) = event_listener {
@@ -2402,7 +2426,7 @@ async fn fetch(request: Request) -> Result<HttpResponse, String> {
         .dyn_into()
         .map_err(|value| format!("fetch returned a non-Response value: {}", js_message(value)))?;
     let mut headers = Vec::new();
-    for name in ["location", "content-type"] {
+    for name in ["location", "content-type", "etag"] {
         if let Some(value) = response.headers().get(name).map_err(js_message)? {
             headers.push(HttpHeader {
                 name: name.to_owned(),
@@ -2424,6 +2448,31 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
     let value = Object::new();
     set(&value, "version", snapshot.version);
     set(&value, "desiredRevision", snapshot.desired_revision);
+    set(&value, "joinRevision", snapshot.join_revision);
+    set(&value, "credentialRevision", snapshot.credential_revision);
+    set(
+        &value,
+        "acceptedCredentialRevision",
+        snapshot.accepted_credential_revision,
+    );
+    if let Some(outcome) = &snapshot.credential_outcome {
+        let item = Object::new();
+        set(&item, "revision", outcome.revision);
+        set(
+            &item,
+            "status",
+            match outcome.status {
+                agent_core::CredentialStatus::Accepted => "accepted",
+                agent_core::CredentialStatus::Rejected => "rejected",
+                agent_core::CredentialStatus::Uncertain => "uncertain",
+            },
+        );
+        if let Some(error) = &outcome.error {
+            set(&item, "error", failure_value(error));
+        }
+        set(&value, "credentialOutcome", item);
+    }
+    set(&value, "desiredRoom", snapshot.desired_room.clone());
     set(&value, "connection", connection_name(&snapshot.connection));
     set(
         &value,

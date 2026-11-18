@@ -77,6 +77,7 @@ export interface Agent
     | "participantId"
     | "roomId"
     | "authorizationExpiresAt"
+    | "join"
     | "connect"
     | "disconnect"
   > {
@@ -286,6 +287,7 @@ export function createReactAgent(raw: ManagedAgent): Agent {
       return collection(raw.participants, wrapParticipant);
     },
     participant: (id: string) => wrapParticipant(raw.participant(id)),
+    join: (room: string) => raw.join(room),
     connect: () => raw.connect(),
     disconnect: () => raw.disconnect(),
     video: (label: string) => wrapLocal(raw.video(label)),

@@ -69,6 +69,7 @@ pub(crate) fn joining(topics: crate::TopicRegistrations) -> (Agent, Generation, 
             ..Default::default()
         }))
         .unwrap();
+    agent.command(AgentCommand::Join("room".into())).unwrap();
     let Some(Effect::Rtc(RtcEffect::CreateOffer {
         generation,
         data_channels,
@@ -91,10 +92,7 @@ pub(crate) fn joining(topics: crate::TopicRegistrations) -> (Agent, Generation, 
             },
         }))
         .unwrap();
-    let Some(Effect::Http(HttpEffect::Request { operation, .. })) = agent.next_effect_after_turn()
-    else {
-        panic!("POST")
-    };
+    let (operation, _) = native_request(&mut agent, generation);
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,

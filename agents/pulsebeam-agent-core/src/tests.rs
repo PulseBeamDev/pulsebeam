@@ -21,6 +21,7 @@ mod data_send;
 pub(crate) mod native_connection;
 mod native_media;
 mod reconciliation;
+mod room_intent;
 
 const PARTICIPANT_URI: &str = "https://other-origin.test/an%20opaque/path?value=%2Fexact";
 const LOCAL_PUBLISHER: &str = "pa_00000000000000000000000000";
@@ -98,11 +99,46 @@ fn log_level_applies_per_agent_verbosity() {
 }
 
 #[test]
-fn configuration_debug_redacts_the_bearer_token() {
+fn configuration_and_http_debug_keep_credentials_and_proofs_private() {
     let debug = format!("{:?}", config());
 
     assert!(debug.contains("[REDACTED]"));
     assert!(!debug.contains("private-token"));
+    let headers = vec![
+        HttpHeader {
+            name: "Authorization".into(),
+            value: "Bearer private-token".into(),
+        },
+        HttpHeader {
+            name: "pUlSeBeAm-OwNeR".into(),
+            value: "opaque-owner-secret".into(),
+        },
+        HttpHeader {
+            name: "PulseBeam-Attempt".into(),
+            value: "7".into(),
+        },
+    ];
+    let body = br#"{"owner":"opaque-owner-secret","poison":"private-token"}"#.to_vec();
+    let request = HttpRequest {
+        method: HttpMethod::Post,
+        uri: "https://example.test/api/v1/native".into(),
+        headers: headers.clone(),
+        body: body.clone(),
+    };
+    let response = HttpResponse {
+        status: 200,
+        headers,
+        body: body.clone(),
+    };
+    for debug in [format!("{request:?}"), format!("{response:?}")] {
+        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("PulseBeam-Attempt"));
+        assert!(!debug.contains("private-token"));
+        assert!(!debug.contains("opaque-owner-secret"));
+        assert!(!debug.contains(&format!("{body:?}")));
+    }
+    assert_eq!(request.body, body);
+    assert_eq!(response.body, body);
 }
 
 #[test]
@@ -452,12 +488,80 @@ fn next_effect(agent: &mut Agent) -> Effect {
     agent.next_effect_after_turn().expect("expected effect")
 }
 
+fn native_request(agent: &mut Agent, generation: Generation) -> (OperationId, HttpRequest) {
+    let mut effect = next_effect(agent);
+    if let Effect::Http(HttpEffect::Request {
+        operation,
+        generation: actual,
+        request,
+    }) = &effect
+        && request.uri == "https://sfu.test/api/v1/native/admissions"
+    {
+        assert_eq!(*actual, Some(generation));
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.body, b"{}");
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|header| header.name == "Accept-Encoding" && header.value == "identity")
+        );
+        agent
+            .handle(HostEvent::Http(HttpEvent::Response {
+                operation: *operation,
+                response: HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: br#"{"owner":"opaque-test-proof"}"#.to_vec(),
+                },
+            }))
+            .unwrap();
+        effect = next_effect(agent);
+    }
+    let Effect::Http(HttpEffect::Request {
+        operation,
+        generation: actual,
+        request,
+    }) = effect
+    else {
+        panic!("expected native request, got {effect:?}");
+    };
+    assert_eq!(actual, Some(generation));
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|header| header.name == "PulseBeam-Owner" && header.value == "opaque-test-proof")
+    );
+    assert_eq!(
+        request
+            .headers
+            .iter()
+            .filter(|header| header.name == "PulseBeam-Attempt")
+            .count(),
+        1
+    );
+    (operation, request)
+}
+
 fn begin_connect(
     agent: &mut Agent,
     state: DesiredState,
     cid: ChannelId,
 ) -> (Generation, OperationId) {
+    let (generation, operation, _) = begin_admission(agent, state, cid);
+    (generation, operation)
+}
+
+fn begin_admission(
+    agent: &mut Agent,
+    state: DesiredState,
+    cid: ChannelId,
+) -> (Generation, OperationId, HttpRequest) {
     agent.command(AgentCommand::ReplaceDesired(state)).unwrap();
+    if agent.snapshot().desired_room.is_none() {
+        agent.command(AgentCommand::Join("room".into())).unwrap();
+    }
     let generation = match next_effect(agent) {
         Effect::Rtc(RtcEffect::CreateOffer {
             generation,
@@ -482,27 +586,17 @@ fn begin_connect(
             resources: resources(cid),
         }))
         .unwrap();
-    let operation = match next_effect(agent) {
-        Effect::Http(HttpEffect::Request {
-            operation,
-            generation: Some(actual_generation),
-            request,
-        }) => {
-            assert_eq!(actual_generation, generation);
-            assert_eq!(request.method, HttpMethod::Post);
-            assert_eq!(request.uri, "https://sfu.test/api/v1/native");
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
-                serde_json::json!({"profile": "pulsebeam.media.v1", "offer": offer()}),
-            );
-            assert!(request.headers.iter().any(|header| {
-                header.name == "Authorization" && header.value == "Bearer private-token"
-            }));
-            operation
-        }
-        effect => panic!("expected create request, got {effect:?}"),
-    };
-    (generation, operation)
+    let (operation, request) = native_request(agent, generation);
+    assert_eq!(request.method, HttpMethod::Post);
+    assert_eq!(request.uri, "https://sfu.test/api/v1/native");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+        serde_json::json!({"profile": "pulsebeam.media.v1", "offer": offer(), "room": agent.snapshot().desired_room}),
+    );
+    assert!(request.headers.iter().any(|header| {
+        header.name == "Authorization" && header.value == "Bearer private-token"
+    }));
+    (generation, operation, request)
 }
 
 fn activate_connection(
@@ -511,6 +605,11 @@ fn activate_connection(
     operation: OperationId,
     cid: ChannelId,
 ) {
+    let applying = if agent.snapshot().connection == ConnectionState::Reconnecting {
+        ConnectionState::Reconnecting
+    } else {
+        ConnectionState::ApplyingAnswer
+    };
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,
@@ -541,7 +640,7 @@ fn activate_connection(
             channel: cid,
         }))
         .unwrap();
-    assert_eq!(agent.snapshot().connection, ConnectionState::ApplyingAnswer);
+    assert_eq!(agent.snapshot().connection, applying);
     agent
         .handle(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }))
         .unwrap();
@@ -606,18 +705,20 @@ fn drain_notifications(agent: &mut Agent) -> Vec<Notification> {
 #[test]
 fn disconnected_credential_update_is_used_for_next_http_admission() {
     let mut agent = Agent::new(config()).unwrap();
-    assert_eq!(
-        agent.command(AgentCommand::RenewAuthorization("bad\nheader".to_string())),
-        Err(AgentError::InvalidAuthorizationToken)
-    );
+    let replacement = "r".repeat(8192);
     agent
-        .command(AgentCommand::RenewAuthorization(
-            "replacement-token".to_string(),
-        ))
+        .command(AgentCommand::RenewAuthorization(replacement.clone()))
         .unwrap();
+    for invalid in ["bad\nheader".to_string(), "r".repeat(8193)] {
+        assert_eq!(
+            agent.command(AgentCommand::RenewAuthorization(invalid)),
+            Err(AgentError::InvalidAuthorizationToken)
+        );
+    }
     agent
         .command(AgentCommand::ReplaceDesired(desired(1)))
         .unwrap();
+    agent.command(AgentCommand::Join("room".into())).unwrap();
     let generation = match next_effect(&mut agent) {
         Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
         effect => panic!("expected offer, got {effect:?}"),
@@ -629,14 +730,39 @@ fn disconnected_credential_update_is_used_for_next_http_admission() {
             resources: resources(channel(9)),
         }))
         .unwrap();
-    let request = match next_effect(&mut agent) {
-        Effect::Http(HttpEffect::Request { request, .. }) => request,
-        effect => panic!("expected HTTP admission, got {effect:?}"),
+    let Effect::Http(HttpEffect::Request {
+        operation, request, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("capability request");
     };
+    assert_eq!(request.uri, "https://sfu.test/api/v1/native/admissions");
     assert!(request.headers.iter().any(|header| {
-        header.name == "Authorization" && header.value == "Bearer replacement-token"
+        header.name == "Authorization" && header.value == format!("Bearer {replacement}")
     }));
-    assert!(!format!("{request:?}").contains("replacement-token"));
+    agent
+        .command(AgentCommand::RenewAuthorization(
+            "changed-during-capability".into(),
+        ))
+        .unwrap();
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: br#"{"owner":"opaque-test-proof"}"#.to_vec(),
+            },
+        }))
+        .unwrap();
+    let (operation, request) = native_request(&mut agent, generation);
+    assert!(request.headers.iter().any(|header| {
+        header.name == "Authorization" && header.value == format!("Bearer {replacement}")
+    }));
+    assert!(!format!("{request:?}").contains(&replacement));
+    activate_connection(&mut agent, generation, operation, channel(9));
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(1));
+    assert_eq!(agent.snapshot().credential_revision, 2);
 }
 
 #[test]
@@ -740,11 +866,15 @@ fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
 
 #[test]
 fn rejected_renewal_preserves_the_committed_credential_and_expiry() {
-    let (mut agent, _, _) = native_connection::connected(Default::default());
+    let (mut agent, generation, _) = native_connection::connected(Default::default());
     assert_eq!(agent.snapshot().authorization_expires_at, Some(10_001));
+    assert_eq!(agent.snapshot().credential_revision, 0);
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
     let command = AgentCommand::RenewAuthorization("new-secret".to_string());
     assert!(!format!("{command:?}").contains("new-secret"));
     agent.command(command).unwrap();
+    assert_eq!(agent.snapshot().credential_revision, 1);
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
     let operation = match next_effect(&mut agent) {
         Effect::Http(HttpEffect::Request {
             operation, request, ..
@@ -765,10 +895,11 @@ fn rejected_renewal_preserves_the_committed_credential_and_expiry() {
         }
         effect => panic!("expected renewal PATCH, got {effect:?}"),
     };
-    assert_eq!(
-        agent.command(AgentCommand::RenewAuthorization("second".to_string())),
-        Err(AgentError::RenewalBusy)
-    );
+    agent
+        .command(AgentCommand::RenewAuthorization("second".to_string()))
+        .unwrap();
+    assert_eq!(agent.snapshot().credential_revision, 2);
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,
@@ -783,6 +914,15 @@ fn rejected_renewal_preserves_the_committed_credential_and_expiry() {
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert!(agent.snapshot().terminal_failure.is_none());
     agent
+        .host_failed(Failure {
+            class: FailureClass::Protocol,
+            message: "host stopped".into(),
+        })
+        .unwrap();
+    agent
+        .command(AgentCommand::RenewAuthorization("future-admission".into()))
+        .unwrap();
+    agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 2,
             ..DesiredState::default()
@@ -793,7 +933,9 @@ fn rejected_renewal_preserves_the_committed_credential_and_expiry() {
         Effect::Rtc(RtcEffect::Close { .. })
     ));
     let Effect::Http(HttpEffect::Request {
-        request: delete, ..
+        operation: delete_operation,
+        request: delete,
+        ..
     }) = next_effect(&mut agent)
     else {
         panic!("delete request")
@@ -807,11 +949,42 @@ fn rejected_renewal_preserves_the_committed_credential_and_expiry() {
             .any(|header| header.name == "Authorization" && header.value == "Bearer private-token")
     );
     assert!(!format!("{delete:?}").contains("private-token"));
+    assert_eq!(agent.snapshot().credential_revision, 3);
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
+    assert_eq!(
+        agent
+            .snapshot()
+            .credential_outcome
+            .as_ref()
+            .unwrap()
+            .revision,
+        1
+    );
+    assert_eq!(
+        agent.snapshot().credential_outcome.as_ref().unwrap().status,
+        CredentialStatus::Rejected
+    );
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: delete_operation,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Closed { generation }))
+        .unwrap();
+    assert_eq!(agent.snapshot().credential_revision, 3);
+    assert_eq!(agent.snapshot().accepted_credential_revision, None);
 }
 
 #[test]
 fn accepted_renewal_commits_the_new_credential_only_on_authorization() {
     let (mut agent, generation, control) = native_connection::connected(Default::default());
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
     agent
         .command(AgentCommand::RenewAuthorization("new-secret".to_string()))
         .unwrap();
@@ -837,6 +1010,11 @@ fn accepted_renewal_commits_the_new_credential_only_on_authorization() {
         }))
         .unwrap();
     assert_eq!(agent.snapshot().authorization_expires_at, Some(10_001));
+    assert_eq!(agent.snapshot().credential_revision, 1);
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
+    agent
+        .command(AgentCommand::RenewAuthorization("queued-newest".into()))
+        .unwrap();
     native_connection::observe(
         &mut agent,
         generation,
@@ -844,6 +1022,30 @@ fn accepted_renewal_commits_the_new_credential_only_on_authorization() {
         vec![native_connection::grant(2)],
     );
     assert_eq!(agent.snapshot().authorization_expires_at, Some(10_002));
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(1));
+    assert_eq!(agent.snapshot().credential_revision, 2);
+    assert_eq!(
+        agent
+            .snapshot()
+            .credential_outcome
+            .as_ref()
+            .unwrap()
+            .revision,
+        1
+    );
+    assert_eq!(
+        agent.snapshot().credential_outcome.as_ref().unwrap().status,
+        CredentialStatus::Accepted
+    );
+    agent
+        .host_failed(Failure {
+            class: FailureClass::Protocol,
+            message: "host stopped".into(),
+        })
+        .unwrap();
+    agent
+        .command(AgentCommand::RenewAuthorization("future-admission".into()))
+        .unwrap();
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 2,
@@ -980,12 +1182,22 @@ fn construction_and_desired_state_validate_complete_external_input() {
         Err(AgentError::InvalidConfiguration(ValidationError::Token))
     ));
 
+    let mut bounded = config();
+    bounded.token = "t".repeat(8192);
+    assert!(Agent::new(bounded.clone()).is_ok());
+    bounded.token.push('t');
+    assert!(matches!(
+        Agent::new(bounded),
+        Err(AgentError::InvalidConfiguration(ValidationError::Token))
+    ));
+
     let mut injected_header = config();
     injected_header.token = "redacted".to_string();
     let mut agent = Agent::new(injected_header).unwrap();
     agent
         .command(AgentCommand::ReplaceDesired(desired(1)))
         .unwrap();
+    agent.command(AgentCommand::Join("room".into())).unwrap();
     let generation = match next_effect(&mut agent) {
         Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
         effect => panic!("expected offer, got {effect:?}"),
@@ -1040,6 +1252,7 @@ fn rtc_host_failure_closes_the_generation_and_uses_core_retry_policy() {
     agent
         .command(AgentCommand::ReplaceDesired(desired(1)))
         .unwrap();
+    agent.command(AgentCommand::Join("room".into())).unwrap();
     let generation = match next_effect(&mut agent) {
         Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
         effect => panic!("expected offer, got {effect:?}"),
@@ -1074,15 +1287,16 @@ fn rtc_host_failure_closes_the_generation_and_uses_core_retry_policy() {
 }
 
 #[test]
-fn transient_retries_continue_past_the_old_budget_with_a_ten_second_ceiling() {
+fn transient_retries_exhaust_configured_budget_with_a_ten_second_ceiling() {
     let mut config = config();
-    config.retry.maximum_attempts = 1;
+    config.retry.maximum_attempts = 24;
     config.retry.maximum_delay = Duration::from_secs(30);
     let mut agent = Agent::new(config).unwrap();
     agent
         .command(AgentCommand::ReplaceDesired(desired(1)))
         .unwrap();
-    for _ in 0..24 {
+    agent.command(AgentCommand::Join("room".into())).unwrap();
+    for index in 0..24 {
         let generation = match next_effect(&mut agent) {
             Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
             effect => panic!("expected offer, got {effect:?}"),
@@ -1097,6 +1311,14 @@ fn transient_retries_continue_past_the_old_budget_with_a_ten_second_ceiling() {
             next_effect(&mut agent),
             Effect::Rtc(RtcEffect::Close { generation })
         );
+        if index == 23 {
+            assert_eq!(
+                agent.snapshot().terminal_failure.as_ref().unwrap().class,
+                FailureClass::RetryExhausted
+            );
+            assert!(agent.next_effect().is_none());
+            break;
+        }
         let (timer, delay) = match next_effect(&mut agent) {
             Effect::Timer(TimerEffect::Schedule { timer, after }) => (timer, after),
             effect => panic!("expected retry timer, got {effect:?}"),
@@ -1150,6 +1372,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
     agent
         .command(AgentCommand::ReplaceDesired(desired(1)))
         .unwrap();
+    agent.command(AgentCommand::Join("room".into())).unwrap();
     let generation = match next_effect(&mut agent) {
         Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
         effect => panic!("expected offer, got {effect:?}"),
@@ -1207,9 +1430,7 @@ fn malformed_offer_resources_are_rejected_without_consuming_the_attempt() {
             },
         }))
         .unwrap();
-    let Effect::Http(HttpEffect::Request { operation, .. }) = next_effect(&mut agent) else {
-        panic!("data-only session request")
-    };
+    let (operation, _) = native_request(&mut agent, generation);
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,
@@ -1271,6 +1492,7 @@ fn malformed_negotiated_coordinates_are_rejected_transactionally() {
         agent
             .command(AgentCommand::ReplaceDesired(desired(1)))
             .unwrap();
+        agent.command(AgentCommand::Join("room".into())).unwrap();
         let generation = match next_effect(&mut agent) {
             Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) => generation,
             effect => panic!("expected offer, got {effect:?}"),
@@ -1477,17 +1699,41 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
 #[test]
 fn transient_failure_schedules_a_bounded_retry_that_disconnect_cancels() {
     let mut agent = Agent::new(config()).unwrap();
-    let (_generation, operation) = begin_connect(&mut agent, desired(1), channel(2));
+    let (generation, operation) = begin_connect(&mut agent, desired(1), channel(2));
+    agent
+        .command(AgentCommand::RenewAuthorization("newest-secret".into()))
+        .unwrap();
     agent
         .handle(HostEvent::Http(HttpEvent::Failed {
             operation,
-            message: "network down".to_string(),
+            message: "network down: Bearer private-token; newest-secret".to_string(),
         }))
         .unwrap();
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::Close { .. })
-    ));
+    let outcome = agent.snapshot().credential_outcome.as_ref().unwrap();
+    assert_eq!(outcome.revision, 0);
+    assert_eq!(outcome.status, CredentialStatus::Uncertain);
+    assert_eq!(
+        outcome.error.as_ref().unwrap().class,
+        FailureClass::Transient
+    );
+    assert_eq!(
+        outcome.error.as_ref().unwrap().message,
+        "native admission outcome is uncertain"
+    );
+    assert_eq!(agent.snapshot().credential_revision, 1);
+    assert_eq!(agent.snapshot().accepted_credential_revision, None);
+    let notifications = drain_notifications(&mut agent);
+    let observed = format!("{:?} {:?}", agent.snapshot(), notifications);
+    assert!(!observed.contains("private-token"));
+    assert!(!observed.contains("newest-secret"));
+    let before = agent.snapshot().clone();
+    agent
+        .handle(HostEvent::Http(HttpEvent::Failed {
+            operation,
+            message: "late duplicate".into(),
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot(), &before);
     let timer = match next_effect(&mut agent) {
         Effect::Timer(TimerEffect::Schedule { timer, after }) => {
             assert!((Duration::from_millis(250)..=Duration::from_millis(500)).contains(&after));
@@ -1511,11 +1757,164 @@ fn transient_failure_schedules_a_bounded_retry_that_disconnect_cancels() {
         next_effect(&mut agent),
         Effect::Timer(TimerEffect::Cancel { timer })
     );
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation })
+    );
+    assert_eq!(agent.snapshot().connection, ConnectionState::Closing);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Closed { generation }))
+        .unwrap();
     assert_eq!(agent.snapshot().connection, ConnectionState::Disconnected);
     agent
         .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
         .unwrap();
     assert!(agent.next_effect_after_turn().is_none());
+
+    let mut agent = Agent::new(config()).unwrap();
+    let (generation, original, captured) = begin_admission(&mut agent, desired(1), channel(2));
+    agent
+        .command(AgentCommand::RenewAuthorization("newest-secret".into()))
+        .unwrap();
+    agent
+        .handle(HostEvent::Http(HttpEvent::Failed {
+            operation: original,
+            message: "lost response".into(),
+        }))
+        .unwrap();
+    let Effect::Timer(TimerEffect::Schedule { timer, .. }) = next_effect(&mut agent) else {
+        panic!("retry timer");
+    };
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    let (retried, replay) = native_request(&mut agent, generation);
+    assert_ne!(original, retried);
+    assert_eq!(captured, replay);
+    assert!(agent.next_effect_after_turn().is_none());
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: original,
+            response: create_response("p1", "unused", PARTICIPANT_URI),
+        }))
+        .unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Http(HttpEffect::Cancel { operation: retried })
+    );
+    assert!(
+        matches!(next_effect(&mut agent), Effect::Rtc(RtcEffect::ApplyAnswer { generation: actual, .. }) if actual == generation)
+    );
+    let accepted = agent.snapshot().clone();
+    for operation in [retried, original] {
+        agent
+            .handle(HostEvent::Http(HttpEvent::Response {
+                operation,
+                response: create_response("p1", "unused", PARTICIPANT_URI),
+            }))
+            .unwrap();
+        assert_eq!(agent.snapshot(), &accepted);
+        assert!(
+            agent.next_effect_after_turn().is_none(),
+            "cached aliases must not delete the winning incarnation"
+        );
+    }
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: retried,
+            response: HttpResponse {
+                status: 409,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    assert_eq!(
+        agent.snapshot().terminal_failure.as_ref().unwrap().class,
+        FailureClass::ParticipantSuperseded
+    );
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation })
+    );
+    assert!(
+        matches!(next_effect(&mut agent), Effect::Http(HttpEffect::Request { request, .. }) if request.method == HttpMethod::Delete && request.uri == PARTICIPANT_URI)
+    );
+    assert!(agent.next_effect_after_turn().is_none());
+
+    let mut agent = Agent::new(config()).unwrap();
+    let (first, original) = begin_connect(
+        &mut agent,
+        DesiredState {
+            revision: 1,
+            connected: true,
+            ..Default::default()
+        },
+        channel(2),
+    );
+    activate_connection(&mut agent, first, original, channel(2));
+    while let Some(effect) = agent.next_effect_after_turn() {
+        assert!(!matches!(effect, Effect::Http(_)));
+    }
+    agent.command(AgentCommand::Reconnect).unwrap();
+    let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = next_effect(&mut agent) else {
+        panic!("replacement peer");
+    };
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation,
+            offer: offer(),
+            resources: resources(channel(3)),
+        }))
+        .unwrap();
+    let (replacement, request) = native_request(&mut agent, generation);
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|header| header.name == "PulseBeam-Attempt" && header.value == "2")
+    );
+    let before = agent.snapshot().clone();
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: original,
+            response: HttpResponse {
+                status: 409,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    assert_eq!(
+        agent.snapshot(),
+        &before,
+        "an older attempt can be superseded by this Agent's newer claim"
+    );
+    assert!(agent.next_effect_after_turn().is_none());
+    activate_connection(&mut agent, generation, replacement, channel(3));
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation: first })
+    );
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    while let Some(effect) = agent.next_effect_after_turn() {
+        assert!(!matches!(effect, Effect::Http(_)));
+    }
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: replacement,
+            response: HttpResponse {
+                status: 409,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    assert_eq!(
+        agent.snapshot().terminal_failure.as_ref().unwrap().class,
+        FailureClass::ParticipantSuperseded
+    );
+    assert!(core::iter::from_fn(|| agent.next_effect_after_turn()).any(|effect| matches!(effect, Effect::Rtc(RtcEffect::Close { generation: actual }) if actual == generation)));
 }
 
 #[test]
@@ -1610,12 +2009,11 @@ fn transport_loss_fences_incumbent_signaling_during_replacement() {
         };
         assert_eq!(request.method, HttpMethod::Post);
         assert!(
-            request
-                .headers
-                .iter()
-                .any(|header| header.name == "Authorization"
-                    && header.value == "Bearer private-token")
+            request.headers.iter().any(
+                |header| header.name == "Authorization" && header.value == "Bearer uncommitted"
+            )
         );
+        assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
         assert!(agent.next_effect_after_turn().is_none());
     }
 }
@@ -1795,6 +2193,12 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
             generation: replacement_generation
         })
     );
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close {
+            generation: old_generation
+        })
+    );
     assert_eq!(agent.snapshot().generation, Some(old_generation));
     assert_eq!(
         agent.snapshot().connection,
@@ -1806,7 +2210,7 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
             .any(|notification| matches!(
                 notification,
                 Notification::Failure(Failure {
-                    class: FailureClass::InvalidConfiguration,
+                    class: FailureClass::ResourceExpired,
                     ..
                 })
             ))
@@ -1996,7 +2400,7 @@ fn participant_superseded_notice_is_typed_and_requires_a_new_agent() {
         ConnectionState::TerminalFailure
     );
     let mut fresh = Agent::new(config()).unwrap();
-    fresh.command(AgentCommand::Connect).unwrap();
+    fresh.command(AgentCommand::Join("room".into())).unwrap();
     assert!(matches!(
         next_effect(&mut fresh),
         Effect::Rtc(RtcEffect::CreateOffer { .. })
@@ -2013,43 +2417,16 @@ fn superseded_admission_cancels_recovery_and_ignores_late_completions() {
             message: "transient network failure".into(),
         }))
         .unwrap();
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::Close { .. })
-    ));
     let Effect::Timer(TimerEffect::Schedule { timer, .. }) = next_effect(&mut agent) else {
         panic!("retry timer")
     };
     agent
         .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
         .unwrap();
-    let Effect::Rtc(RtcEffect::CreateOffer {
-        generation: retry, ..
-    }) = next_effect(&mut agent)
-    else {
-        panic!("retry offer")
-    };
-    agent
-        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
-            generation: retry,
-            offer: native_connection::OFFER.into(),
-            resources: OfferResources {
-                slots: vec![],
-                signaling_channel: channel(13),
-                data_channels: vec![],
-            },
-        }))
-        .unwrap();
-    let Effect::Http(HttpEffect::Request {
-        operation: retry_operation,
-        ..
-    }) = next_effect(&mut agent)
-    else {
-        panic!("retry request")
-    };
+    let (retry_operation, _) = native_request(&mut agent, generation);
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
-            operation: retry_operation,
+            operation,
             response: HttpResponse {
                 status: 409,
                 headers: vec![],
@@ -2059,18 +2436,31 @@ fn superseded_admission_cancels_recovery_and_ignores_late_completions() {
         .unwrap();
     assert_eq!(
         next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::Close { generation: retry })
+        Effect::Rtc(RtcEffect::Close { generation })
     );
-    for generation in [generation, retry] {
-        agent
-            .handle(HostEvent::Rtc(RtcEvent::Disconnected { generation }))
-            .unwrap();
-        agent
-            .handle(HostEvent::Rtc(RtcEvent::Failed {
-                generation,
-                message: "late".into(),
-            }))
-            .unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Http(HttpEffect::Cancel {
+            operation: retry_operation
+        })
+    );
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: retry_operation,
+            response: create_response("p1", "unused", PARTICIPANT_URI),
+        }))
+        .unwrap();
+    assert!(
+        matches!(next_effect(&mut agent), Effect::Http(HttpEffect::Request { request, .. }) if request.method == HttpMethod::Delete && request.uri == PARTICIPANT_URI)
+    );
+    for event in [
+        RtcEvent::Disconnected { generation },
+        RtcEvent::Failed {
+            generation,
+            message: "late".into(),
+        },
+    ] {
+        agent.handle(HostEvent::Rtc(event)).unwrap();
     }
     agent
         .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
@@ -2132,9 +2522,11 @@ fn explicit_connect_retries_terminal_intent_but_not_an_in_flight_attempt() {
 }
 
 #[test]
-fn explicit_connect_establishes_connected_intent_from_idle() {
+fn explicit_connect_waits_for_a_concrete_join_before_preparing_a_peer() {
     let mut agent = Agent::new(config()).unwrap();
     agent.command(AgentCommand::Connect).unwrap();
+    assert!(agent.next_effect_after_turn().is_none());
+    agent.command(AgentCommand::Join("room".into())).unwrap();
     assert!(matches!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::CreateOffer { .. })
@@ -2175,7 +2567,7 @@ fn explicit_disconnect_preserves_resource_owners_and_declared_intent() {
             ..Default::default()
         }))
         .unwrap();
-    agent.command(AgentCommand::Connect).unwrap();
+    agent.command(AgentCommand::Join("room".into())).unwrap();
     let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = next_effect(&mut agent) else {
         panic!("connection attempt")
     };
@@ -2210,7 +2602,7 @@ fn explicit_disconnect_preserves_resource_owners_and_declared_intent() {
 }
 
 #[test]
-fn authorization_is_latched_across_incidental_updates_until_explicit_reconnect() {
+fn admission_denial_is_latched_across_incidental_updates() {
     let mut agent = Agent::new(config()).unwrap();
     let (failed_generation, operation) = begin_connect(&mut agent, desired(1), channel(12));
     agent
@@ -2246,9 +2638,6 @@ fn authorization_is_latched_across_incidental_updates_until_explicit_reconnect()
     let mut retry = desired(2);
     retry.video[0].height = 360;
     agent.command(AgentCommand::ReplaceDesired(retry)).unwrap();
-    agent
-        .command(AgentCommand::RenewAuthorization("new-token".to_owned()))
-        .unwrap();
     agent.set_log_level(LogLevel::Debug);
     agent
         .handle(HostEvent::Rtc(RtcEvent::Connected {
@@ -3542,6 +3931,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
     let before = agent.snapshot().clone();
     assert_eq!(before.participants.len(), 1);
     assert_eq!(before.publications.len(), 1);
+    assert_eq!(before.accepted_credential_revision, Some(0));
     let malformed = state::ServerStateBatch {
         records: ["first", "second"]
             .into_iter()
@@ -3650,8 +4040,18 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
         request
             .headers
             .iter()
-            .any(|header| header.name == "Authorization" && header.value == "Bearer private-token"),
-        "late renewal cannot replace committed credentials"
+            .any(|header| header.name == "Authorization" && header.value == "Bearer new-secret"),
+        "future admission retains newest desire independently of a cancelled renewal"
+    );
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
+    assert_eq!(agent.snapshot().credential_revision, 1);
+    assert!(
+        agent
+            .snapshot()
+            .credential_outcome
+            .as_ref()
+            .is_none_or(|outcome| outcome.revision == 0),
+        "late renewal cannot confirm the cancelled credential"
     );
 }
 

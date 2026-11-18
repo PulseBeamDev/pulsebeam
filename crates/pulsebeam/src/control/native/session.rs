@@ -8,7 +8,7 @@ use crate::media::ChannelId;
 use crate::participant::signaling::{SignalingOutput, SignalingProgress};
 use crate::track::Track;
 
-use super::{ExecutionDisposition, ResourceExecution};
+use super::{ExecutionDisposition, ResourceExecution, ResourcePermissions};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Key {
@@ -152,9 +152,14 @@ struct Row {
     ticket: Option<u64>,
     unavailable: bool,
     represented: bool,
+    discovered_tracks: usize,
+    self_context: bool,
 }
 
+mod discovery;
+mod revocation;
 mod source_wait;
+use revocation::PermissionSweep;
 use source_wait::SourceWait;
 
 struct Pending {
@@ -195,6 +200,9 @@ pub(crate) struct NativeSession {
     initial_cursor: u64,
     initial_complete: bool,
     grant_revision: u64,
+    permissions: ResourcePermissions,
+    permission_sweep: Option<PermissionSweep>,
+    discovery_reconciling: bool,
     closed: bool,
     retained_bytes: usize,
     unavailable: usize,
@@ -271,6 +279,8 @@ impl NativeSession {
                 ticket: Some(version),
                 unavailable: false,
                 represented: false,
+                discovered_tracks: 0,
+                self_context: false,
             },
         );
         self.dirty.insert(version, key);
@@ -282,94 +292,6 @@ impl NativeSession {
         self.initial_end.get_or_insert(self.ordinal);
         self.initial_deadline
             .get_or_insert_with(|| progress_deadline(at));
-    }
-
-    pub(crate) fn apply_participants(
-        &mut self,
-        added: impl IntoIterator<Item = crate::participant::effect::RoomPeer>,
-        removed: impl IntoIterator<Item = crate::entity::ParticipantId>,
-    ) -> Result<(), OutputError> {
-        for peer in added {
-            match peer.external_id {
-                Some(external) => self.observe_participant(wire::Participant {
-                    participant_id: peer.id.as_str(),
-                    participant_external_id: external.as_str().to_owned(),
-                })?,
-                None => self.unavailable(Key::Participant(peer.id.as_str()))?,
-            }
-        }
-        for id in removed {
-            self.remove_participant(id.as_str())?;
-        }
-        Ok(())
-    }
-
-    fn unavailable(&mut self, key: Key) -> Result<(), OutputError> {
-        self.put(key.clone(), absence(0, wire::AbsenceReason::Gone, None))?;
-        if let Some(row) = self.rows.get_mut(&key)
-            && !row.unavailable
-        {
-            row.unavailable = true;
-            self.unavailable = self.unavailable.saturating_add(1);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn observe_candidate(
-        &mut self,
-        track: &crate::track::Track,
-    ) -> Result<(), OutputError> {
-        match track_descriptor(track) {
-            Some(descriptor) => self.observe_track(descriptor),
-            None => self.unavailable(Key::Track(track.id().as_str())),
-        }
-    }
-
-    pub(crate) fn observe_participant(
-        &mut self,
-        participant: wire::Participant,
-    ) -> Result<(), OutputError> {
-        validation::validate_participant(&participant)
-            .map_err(|_| OutputError::InvalidObservation)?;
-        let key = Key::Participant(participant.participant_id.clone());
-        if self.rows.get(&key).is_some_and(|row| matches!(&row.value.value, Some(wire::confirmed_state::Value::Participant(current)) if current != &participant)) {
-            return Err(OutputError::InvalidObservation);
-        }
-        self.put(
-            key,
-            confirmed(wire::confirmed_state::Value::Participant(participant)),
-        )
-    }
-
-    pub(crate) fn remove_participant(&mut self, id: String) -> Result<(), OutputError> {
-        self.put(
-            Key::Participant(id),
-            absence(0, wire::AbsenceReason::Removed, None),
-        )
-    }
-
-    pub(crate) fn observe_track(&mut self, track: wire::Track) -> Result<(), OutputError> {
-        validation::validate_track(&track).map_err(|_| OutputError::InvalidObservation)?;
-        let key = Key::Track(track.track_id.clone());
-        if self.rows.get(&key).is_some_and(|row| matches!(&row.value.value, Some(wire::confirmed_state::Value::Track(current)) if current != &track)) {
-            return Err(OutputError::InvalidObservation);
-        }
-        self.put(key, confirmed(wire::confirmed_state::Value::Track(track)))
-    }
-
-    pub(crate) fn source(&self, id: &str) -> Option<(wire::Participant, wire::Track)> {
-        let row = self.rows.get(&Key::Track(id.to_owned()))?;
-        let Some(wire::confirmed_state::Value::Track(track)) = &row.value.value else {
-            return None;
-        };
-        let owner = self
-            .rows
-            .get(&Key::Participant(track.participant_id.clone()))?;
-        let Some(wire::confirmed_state::Value::Participant(participant)) = &owner.value.value
-        else {
-            return None;
-        };
-        Some((participant.clone(), track.clone()))
     }
 
     pub(crate) fn observe_execution(
@@ -556,16 +478,24 @@ impl NativeSession {
         self.put(key, value)
     }
 
-    pub(crate) fn remove_track(&mut self, id: String) -> Result<(), OutputError> {
-        self.put(
-            Key::Track(id),
-            absence(0, wire::AbsenceReason::Removed, None),
-        )
-    }
-
-    pub(crate) fn authorization(&mut self, expires: i64, revision: u64) -> Result<(), OutputError> {
+    pub(crate) fn authorization(
+        &mut self,
+        expires: i64,
+        revision: u64,
+        permissions: ResourcePermissions,
+    ) -> Result<bool, OutputError> {
         if self.closed || revision <= self.grant_revision {
-            return Ok(());
+            return Ok(false);
+        }
+        let changed = self.permissions != permissions;
+        if changed {
+            self.discovery_reconciling = self.grant_revision != 0
+                || matches!(
+                    permissions,
+                    ResourcePermissions::Grants { .. } | ResourcePermissions::Denied
+                );
+            self.permissions = permissions;
+            self.permissions_changed();
         }
         self.grant_revision = revision;
         self.put(
@@ -578,7 +508,8 @@ impl NativeSession {
                 closed: None,
                 diagnostic: String::new(),
             })),
-        )
+        )?;
+        Ok(changed)
     }
 
     pub(crate) fn close(&mut self, reason: wire::CloseReason) -> Result<(), OutputError> {
@@ -731,6 +662,28 @@ impl NativeSession {
                     target,
                     failure(wire::FailureCode::InvalidConfiguration),
                 )?;
+                continue;
+            }
+            if !self.permissions.permits_intent(spec) {
+                if existing.is_some() {
+                    let previous = existing.map_or(0, |owned| owned.target.encoded_len());
+                    self.charge(previous, target.encoded_len())
+                        .map_err(|_| InputError::Capacity)?;
+                    self.rows
+                        .get_mut(&key)
+                        .and_then(|row| row.owned.as_mut())
+                        .ok_or(InputError::Capacity)?
+                        .target = target;
+                    let reason = self.permission_denial_reason(reference);
+                    self.revoke(reference, reason)?;
+                    effects.cutoffs.push(reference);
+                } else {
+                    self.reject(
+                        reference,
+                        target,
+                        failure(wire::FailureCode::PermissionDenied),
+                    )?;
+                }
                 continue;
             }
             if let Some(label) = publication_key(spec)
@@ -994,7 +947,7 @@ impl NativeSession {
         work: &Preparation,
         unix_now: u64,
         capabilities: Option<&wire::RtpCapabilities>,
-        source: impl FnOnce(TrackId) -> Option<&'a Track>,
+        source: impl FnOnce(TrackId) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<Option<ExecutionCommand>, OutputError> {
         match self.compile_execution(work, capabilities, source) {
             Ok(ExecutionCommand(ExecutionAction::Prepare {
@@ -1007,6 +960,12 @@ impl NativeSession {
             }
             Ok(command) => Ok(Some(command)),
             Err(error) => {
+                if error.code == wire::FailureCode::PermissionDenied as i32 {
+                    let reason = self.permission_denial_reason(work.reference);
+                    self.revoke(work.reference, reason)?;
+                    self.defer_preparation(*work)?;
+                    return self.retirement_command(work.reference).map(Some);
+                }
                 self.complete_projected(*work, Err(error), unix_now)?;
                 Ok(None)
             }
@@ -1017,9 +976,14 @@ impl NativeSession {
         &mut self,
         work: &Preparation,
         capabilities: Option<&wire::RtpCapabilities>,
-        source: impl FnOnce(TrackId) -> Option<&'a Track>,
+        source: impl FnOnce(TrackId) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<ExecutionCommand, wire::Failure> {
         use crate::control::native::PreparedResource;
+        self.preparation_spec(work)
+            .ok_or_else(|| failure(wire::FailureCode::ResourceGone))?;
+        if !self.owned_may_continue(work.reference) {
+            return Err(failure(wire::FailureCode::PermissionDenied));
+        }
         let resource = if let Some(publication) = self.prepare_publication(work, capabilities)? {
             PreparedResource::Publication(publication)
         } else {
@@ -1068,7 +1032,7 @@ impl NativeSession {
         &mut self,
         work: &Preparation,
         capabilities: Option<&wire::RtpCapabilities>,
-        source: impl FnOnce(TrackId) -> Option<&'a Track>,
+        source: impl FnOnce(TrackId) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<crate::control::native::ReceiverPreparation, wire::Failure> {
         use crate::control::native::{ReceiveTransport, Receiver, ReceiverPreparation};
         let spec = self
@@ -1095,7 +1059,14 @@ impl NativeSession {
             self.project_receiver(work, &preview)?;
             return Ok(ReceiverPreparation::Policy(policy));
         }
-        let Some((participant, track)) = self.source(target.key) else {
+        let source = source(target.source);
+        if source
+            .as_ref()
+            .is_some_and(|source| source.track.id() != target.source)
+        {
+            return Err(failure(wire::FailureCode::Incompatible));
+        }
+        let Some(source) = source.filter(super::ResolvedSource::is_available) else {
             if !target.wait_for_source {
                 return Err(failure(wire::FailureCode::ResourceGone));
             }
@@ -1104,18 +1075,27 @@ impl NativeSession {
                 .map_err(|_| failure(wire::FailureCode::CapacityExceeded))?;
             return Ok(ReceiverPreparation::Waiting(source));
         };
-        let (source, (transport, policy)) = source(target.source)
-            .ok_or(wire::FailureCode::Incompatible)
-            .and_then(|source| {
-                crate::control::native::receiver(spec, source, &track, capabilities)
-                    .map(|prepared| (source, prepared))
-            })
-            .map_err(|code| wire::Failure {
-                diagnostic: "native receiver transport preparation failed".to_owned(),
-                ..failure(code)
-            })?;
+        let track = track_descriptor(source.track)
+            .ok_or_else(|| failure(wire::FailureCode::Incompatible))?;
+        let participant = wire::Participant {
+            participant_id: source.track.meta().origin.as_str(),
+            participant_external_id: source.publisher.as_str().to_owned(),
+        };
+        validation::validate_participant(&participant)
+            .and_then(|_| validation::validate_track(&track))
+            .map_err(|_| failure(wire::FailureCode::Incompatible))?;
+        if !self.permissions.can_subscribe(&participant, &track) {
+            return Err(failure(wire::FailureCode::PermissionDenied));
+        }
+        let (transport, policy) =
+            crate::control::native::receiver(spec, source.track, &track, capabilities).map_err(
+                |code| wire::Failure {
+                    diagnostic: "native receiver transport preparation failed".to_owned(),
+                    ..failure(code)
+                },
+            )?;
         let plan = Receiver {
-            source: source.clone(),
+            source: source.track.clone(),
             source_id: track.track_id.clone(),
             transport,
             policy,
@@ -1563,7 +1543,16 @@ impl NativeSession {
             return Err(OutputError::InvalidObservation);
         }
         owned.cutoff_pending = false;
-        let value = if owned.cutoff_reason != wire::AbsenceReason::Removed {
+        let value = if matches!(
+            owned.cutoff_reason,
+            wire::AbsenceReason::PermissionRevoked | wire::AbsenceReason::CreateRejected
+        ) {
+            absence(
+                row.value.evaluated_revision.max(owned.target.revision),
+                owned.cutoff_reason,
+                Some(failure(wire::FailureCode::PermissionDenied)),
+            )
+        } else if owned.cutoff_reason != wire::AbsenceReason::Removed {
             absence(
                 row.value.evaluated_revision,
                 owned.cutoff_reason,
@@ -1647,7 +1636,7 @@ impl NativeSession {
             return Ok(None);
         }
         let session_dirty = self.rows.get(&Key::Session).is_some_and(|row| row.dirty);
-        if self.unavailable != 0 && !session_dirty {
+        if self.unavailable != 0 && !session_dirty && !self.discovery_reconciling {
             return Err(OutputError::InvalidObservation);
         }
         let mut keys = Vec::new();
@@ -1705,9 +1694,11 @@ impl NativeSession {
             let Some(row) = self.rows.get(&key) else {
                 continue;
             };
-            if row.owned.as_ref().is_some_and(|owned| {
-                owned.cutoff_pending || !owned.retired && row.value.evaluated_revision == 0
-            }) {
+            if self.discovery_reconciling && matches!(key, Key::Participant(_) | Key::Track(_))
+                || row.owned.as_ref().is_some_and(|owned| {
+                    owned.cutoff_pending || !owned.retired && row.value.evaluated_revision == 0
+                })
+            {
                 self.requeue(&key);
                 continue;
             }
@@ -1757,8 +1748,10 @@ impl NativeSession {
         {
             selected_cursor = end;
         }
-        batch.initial_complete =
-            self.unavailable == 0 && !self.initial_complete && selected_cursor == end;
+        batch.initial_complete = self.unavailable == 0
+            && !self.discovery_reconciling
+            && !self.initial_complete
+            && selected_cursor == end;
         if batch.encoded_len() > codec::MAX_FRAME_SIZE {
             batch.initial_complete = false;
         }
@@ -1877,6 +1870,7 @@ impl NativeSession {
     fn collect(&mut self, key: &Key) {
         let remove = self.rows.get(key).is_some_and(|row| {
             !row.dirty
+                && row.discovered_tracks == 0
                 && matches!(
                     row.value.value,
                     Some(wire::confirmed_state::Value::Absent(_))

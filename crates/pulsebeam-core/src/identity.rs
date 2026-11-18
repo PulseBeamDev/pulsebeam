@@ -638,14 +638,64 @@ mod tests {
     }
 
     #[test]
-    fn external_ids_enforce_ascii_contract_boundaries() {
-        let max = "x".repeat(36);
-        for valid in ["a", "Z", "0", "_", "-", "aB_9-z", &max] {
-            assert!(RoomExternalId::new(valid).is_ok());
-            assert!(ParticipantExternalId::new(valid).is_ok());
+    fn external_ids_preserve_literal_utf8_with_bounded_bytes() {
+        let ascii_max = "x".repeat(256);
+        let utf8_max = "é".repeat(128);
+        let astral_max = "🦀".repeat(64);
+        for valid in [
+            "a",
+            "Z",
+            "0",
+            "_",
+            "-",
+            "aB_9-z",
+            "meeting/123/main",
+            " café/device-1 ",
+            "cafe\u{301}",
+            &ascii_max,
+            &utf8_max,
+            &astral_max,
+        ] {
+            let room = RoomExternalId::new(valid).unwrap();
+            let participant = ParticipantExternalId::new(valid).unwrap();
+            assert_eq!(room.as_str(), valid);
+            assert_eq!(participant.as_str(), valid);
+            assert_eq!(
+                serde_json::from_str::<RoomExternalId>(&serde_json::to_string(&room).unwrap())
+                    .unwrap(),
+                room
+            );
+            assert_eq!(
+                serde_json::from_str::<ParticipantExternalId>(
+                    &serde_json::to_string(&participant).unwrap()
+                )
+                .unwrap(),
+                participant
+            );
         }
-        let too_long = "x".repeat(37);
-        for invalid in ["", "has space", "slash/", "unicodé", &too_long] {
+        assert_ne!(
+            RoomExternalId::new("café"),
+            RoomExternalId::new("cafe\u{301}")
+        );
+        assert_ne!(
+            ParticipantExternalId::new("alice"),
+            ParticipantExternalId::new("Alice")
+        );
+        for invalid in [
+            format!("{ascii_max}x"),
+            format!("{utf8_max}x"),
+            format!("{astral_max}x"),
+        ] {
+            assert_eq!(
+                RoomExternalId::new(&invalid),
+                Err(IdValidationError::TooLong(256))
+            );
+            assert_eq!(
+                ParticipantExternalId::new(&invalid),
+                Err(IdValidationError::TooLong(256))
+            );
+        }
+        for invalid in ["", "abc\n", "abc\r", "abc\t", "\0", "\u{7f}", "\u{85}"] {
             assert!(RoomExternalId::new(invalid).is_err());
             assert!(ParticipantExternalId::new(invalid).is_err());
         }

@@ -1,9 +1,8 @@
 use std::collections::VecDeque;
 
 use super::handoff::{ControllerHandoff, Fact};
-use super::{ExecutionCommand, InputError, NativeSession, OutputError};
+use super::{ExecutionCommand, InputError, NativeSession, OutputError, ResolvedSource};
 use crate::entity::{ParticipantExternalId, ParticipantId, RoomId, TrackId};
-use crate::track::Track;
 
 const FACT_BUDGET: usize = 32;
 const PREPARATION_BUDGET: usize = 32;
@@ -28,7 +27,7 @@ impl StateProtocolHandler {
         handoff: ControllerHandoff,
     ) -> Result<Self, OutputError> {
         let mut model = NativeSession::default();
-        model.observe_participant(pulsebeam_proto::state::Participant {
+        model.observe_self(pulsebeam_proto::state::Participant {
             participant_id: participant.as_str(),
             participant_external_id: external.as_str().to_owned(),
         })?;
@@ -64,6 +63,14 @@ impl StateProtocolHandler {
             transferred = true;
         }
         transferred
+    }
+
+    pub(in crate::control) fn close(
+        &mut self,
+        reason: pulsebeam_proto::state::CloseReason,
+    ) -> Result<(), OutputError> {
+        self.handoff.stop_execution();
+        self.model.close(reason)
     }
 
     pub(in crate::control) fn service_terminal(&mut self) -> Result<bool, InputError> {
@@ -109,7 +116,7 @@ impl StateProtocolHandler {
     pub(in crate::control) fn service<'a>(
         &mut self,
         unix_now: u64,
-        source: impl Fn(TrackId) -> Option<&'a Track>,
+        source: impl Fn(TrackId) -> Option<ResolvedSource<'a>>,
     ) -> Result<bool, InputError> {
         if self.handoff.failed() {
             return Err(OutputError::InvalidObservation.into());
@@ -142,6 +149,12 @@ impl StateProtocolHandler {
                 }
             }
         }
+        for command in self.model.service_revocations(
+            PREPARATION_BUDGET.saturating_sub(self.commands.len()),
+            &source,
+        )? {
+            self.retain(command)?;
+        }
         // One bounded wire batch per quantum, without making essential facts wait for input space.
         if self.commands.len() < PREPARATION_BUDGET
             && let Some(bytes) = self.handoff.input()
@@ -153,7 +166,10 @@ impl StateProtocolHandler {
         self.model.service_source_waits(
             unix_now,
             pulsebeam_runtime::time::Instant::now(),
-            |track| source(track).is_some(),
+            |track| {
+                source(track)
+                    .is_some_and(|source| source.track.id() == track && source.is_available())
+            },
         )?;
         for _ in 0..PREPARATION_BUDGET {
             if self.commands.len() >= PREPARATION_BUDGET
@@ -188,7 +204,7 @@ impl StateProtocolHandler {
             return Err(OutputError::Capacity.into());
         }
         if self.commands.len() < PREPARATION_BUDGET
-            && self.model.preparation_pending(unix_now)
+            && (self.model.revocation_pending() || self.model.preparation_pending(unix_now))
             && !self.handoff.schedule()
         {
             return Err(OutputError::Capacity.into());

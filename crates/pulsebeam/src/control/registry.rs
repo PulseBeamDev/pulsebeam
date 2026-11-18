@@ -32,6 +32,7 @@ pub struct ParticipantMeta {
 pub struct RoomRegistry {
     room_shards: HashMap<RoomId, RoomShard>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
+    connections: HashMap<ConnectionId, ParticipantId>,
 }
 
 impl RoomRegistry {
@@ -39,6 +40,7 @@ impl RoomRegistry {
         Self {
             room_shards: HashMap::new(),
             participants: HashMap::new(),
+            connections: HashMap::new(),
         }
     }
 
@@ -98,6 +100,7 @@ impl RoomRegistry {
         shard_id: ShardId,
         transport: Option<NodeTransportAddress>,
     ) {
+        let connection_id = ConnectionId::new();
         if let Some(previous) = self.participants.insert(
             participant_id,
             ParticipantMeta {
@@ -105,14 +108,16 @@ impl RoomRegistry {
                 room_id,
                 participant_external_id: None,
                 transport,
-                connection_id: ConnectionId::new(),
+                connection_id,
                 profile: SignalingProtocol::State,
                 authorization: None,
                 materialized: false,
             },
         ) {
+            self.connections.remove(&previous.connection_id);
             self.remove_from_room_shard(&previous.room_id, &participant_id, previous.shard_id);
         }
+        self.connections.insert(connection_id, participant_id);
         let room = self
             .room_shards
             .entry(room_id)
@@ -130,6 +135,15 @@ impl RoomRegistry {
 
     pub fn get_participant(&self, participant_id: &ParticipantId) -> Option<&ParticipantMeta> {
         self.participants.get(participant_id)
+    }
+
+    pub(super) fn get_connection(
+        &self,
+        connection: ConnectionId,
+    ) -> Option<(ParticipantId, &ParticipantMeta)> {
+        let participant = *self.connections.get(&connection)?;
+        let meta = self.participants.get(&participant)?;
+        (meta.connection_id == connection).then_some((participant, meta))
     }
 
     pub fn local_participant_ids_in_room(&self, room_id: &RoomId) -> Vec<ParticipantId> {
@@ -159,8 +173,14 @@ impl RoomRegistry {
         profile: SignalingProtocol,
         participant_external_id: Option<ParticipantExternalId>,
     ) -> Result<Option<ParticipantMeta>, CommitCandidateError> {
-        if let Some(current) = self.participants.get(&participant_id)
-            && current.connection_id >= connection_id
+        if self
+            .connections
+            .get(&connection_id)
+            .is_some_and(|owner| *owner != participant_id)
+            || self
+                .participants
+                .get(&participant_id)
+                .is_some_and(|current| current.connection_id >= connection_id)
         {
             return Err(CommitCandidateError::Superseded);
         }
@@ -178,7 +198,9 @@ impl RoomRegistry {
                 materialized: true,
             },
         );
+        self.connections.insert(connection_id, participant_id);
         if let Some(previous) = &previous {
+            self.connections.remove(&previous.connection_id);
             if previous.room_id == room_id {
                 // Keep the partition table alive across a same-room replacement,
                 // even when this was its only participant.
@@ -208,6 +230,7 @@ impl RoomRegistry {
     #[cfg(test)]
     pub fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ShardId> {
         let meta = self.participants.remove(participant_id)?;
+        self.connections.remove(&meta.connection_id);
         self.remove_from_room_shard(&meta.room_id, participant_id, meta.shard_id);
         Some(meta.shard_id)
     }
@@ -226,6 +249,7 @@ impl RoomRegistry {
             return None;
         }
         let meta = self.participants.remove(participant_id)?;
+        self.connections.remove(&meta.connection_id);
         self.remove_from_room_shard(&meta.room_id, participant_id, meta.shard_id);
         Some(meta)
     }
@@ -436,6 +460,11 @@ mod tests {
             reg.get_participant(&participant).unwrap().connection_id,
             current
         );
+        assert_eq!(
+            reg.get_connection(current).map(|(owner, _)| owner),
+            Some(participant)
+        );
+        assert!(reg.get_connection(connection_id(2)).is_none());
     }
 
     #[test]
@@ -443,7 +472,7 @@ mod tests {
         let mut reg = RoomRegistry::new();
         let room = room_id("failed-prepare");
         let participant = participant_id();
-        let current = connection_id(1);
+        let current = connection_id(2);
         reg.commit_candidate(
             participant,
             room,
@@ -456,12 +485,30 @@ mod tests {
         )
         .unwrap();
 
-        let _failed_candidate = (connection_id(2), transport(0, 2));
+        let failed = connection_id(1);
+        assert_eq!(
+            reg.commit_candidate(
+                participant,
+                room,
+                ShardId::new(0),
+                0,
+                transport(0, 2),
+                failed,
+                SignalingProtocol::State,
+                None,
+            ),
+            Err(CommitCandidateError::Superseded)
+        );
 
         assert_eq!(
             reg.get_participant(&participant).unwrap().connection_id,
             current
         );
+        assert_eq!(
+            reg.get_connection(current).map(|(owner, _)| owner),
+            Some(participant)
+        );
+        assert!(reg.get_connection(failed).is_none());
     }
 
     #[test]
@@ -501,6 +548,11 @@ mod tests {
             reg.get_participant(&participant).unwrap().connection_id,
             newer
         );
+        assert_eq!(
+            reg.get_connection(newer).map(|(owner, _)| owner),
+            Some(participant)
+        );
+        assert!(reg.get_connection(older).is_none());
     }
 
     #[test]
@@ -542,7 +594,13 @@ mod tests {
             reg.get_participant(&participant).unwrap().connection_id,
             current
         );
+        assert!(reg.get_connection(old).is_none());
+        assert_eq!(
+            reg.get_connection(current).map(|(owner, _)| owner),
+            Some(participant)
+        );
         assert!(reg.remove_incarnation(&participant, current).is_some());
+        assert!(reg.get_connection(current).is_none());
     }
 
     #[test]

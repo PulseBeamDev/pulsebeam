@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use pulsebeam_agent_core::ffi as core_ffi;
 use pulsebeam_agent_native::ffi::{Agent, EventUpdate, NativeEvent, SnapshotUpdate};
 use pulsebeam_agent_native::{
-    Agent as RuntimeAgent, AudioInput, Config, H264Frame, Host, InputFrame, MediaStreamUpdate,
-    OpusFrame, OutputFrame, ReceiveMode, VideoInput,
+    Agent as RuntimeAgent, AsyncHttpClient, AudioInput, Config, H264Frame, Host, InputFrame,
+    MediaStreamUpdate, OpusFrame, OutputFrame, ReceiveMode, VideoInput,
 };
 use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
 
@@ -22,6 +22,111 @@ use super::common::{
 };
 
 const NATIVE_RUNTIME_SEED: u64 = 1;
+
+#[derive(Default)]
+struct CreationEvidence {
+    requests: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    posts: Vec<pulsebeam_core::net::HttpRequest>,
+    locations: Vec<Vec<u8>>,
+    statuses: Vec<http::StatusCode>,
+    dropped: bool,
+}
+
+struct LostCreationResponse {
+    inner: Box<dyn AsyncHttpClient>,
+    evidence: Arc<Mutex<CreationEvidence>>,
+}
+
+impl AsyncHttpClient for LostCreationResponse {
+    fn execute(
+        &self,
+        request: pulsebeam_core::net::HttpRequest,
+    ) -> pulsebeam_core::net::HttpResult<'_> {
+        Box::pin(async move {
+            let creation = request.headers().get("PulseBeam-Owner").map(|owner| {
+                (
+                    request.body().clone(),
+                    owner.as_bytes().to_vec(),
+                    request
+                        .headers()
+                        .get("PulseBeam-Attempt")
+                        .expect("creation sequence")
+                        .as_bytes()
+                        .to_vec(),
+                )
+            });
+            if let Some(captured) = creation {
+                let mut copy = http::Request::builder()
+                    .method(request.method())
+                    .uri(request.uri())
+                    .body(request.body().clone())
+                    .expect("copy native admission");
+                *copy.headers_mut() = request.headers().clone();
+                {
+                    let mut evidence = self.evidence.lock().unwrap();
+                    evidence.requests.push(captured);
+                    evidence.posts.push(copy);
+                }
+                let response = self.inner.execute(request).await?;
+                self.evidence
+                    .lock()
+                    .unwrap()
+                    .statuses
+                    .push(response.status());
+                if response.status() == http::StatusCode::CREATED {
+                    let mut evidence = self.evidence.lock().unwrap();
+                    evidence.locations.push(
+                        response
+                            .headers()
+                            .get(http::header::LOCATION)
+                            .expect("created connection location")
+                            .as_bytes()
+                            .to_vec(),
+                    );
+                    if !evidence.dropped {
+                        evidence.dropped = true;
+                        return Err(
+                            std::io::Error::other("simulated lost creation response").into()
+                        );
+                    }
+                }
+                Ok(response)
+            } else {
+                self.inner.execute(request).await
+            }
+        })
+    }
+}
+
+struct HeldCreationResponse {
+    inner: Box<dyn AsyncHttpClient>,
+    admitted: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl AsyncHttpClient for HeldCreationResponse {
+    fn execute(
+        &self,
+        request: pulsebeam_core::net::HttpRequest,
+    ) -> pulsebeam_core::net::HttpResult<'_> {
+        Box::pin(async move {
+            let creation = request.headers().contains_key("PulseBeam-Owner");
+            let response = self.inner.execute(request).await?;
+            if creation && response.status() == http::StatusCode::CREATED {
+                let release = self.release.lock().unwrap().take();
+                if let Some(release) = release {
+                    if let Some(admitted) = self.admitted.lock().unwrap().take() {
+                        let _ = admitted.send(());
+                    }
+                    release
+                        .await
+                        .map_err(|_| std::io::Error::other("creation gate closed"))?;
+                }
+            }
+            Ok(response)
+        })
+    }
+}
 
 struct RuntimeRetirement(Rc<Cell<usize>>);
 
@@ -639,7 +744,7 @@ async fn run_peer(
         endpoint,
         token: pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
-            (room).as_str(),
+            &serde_json::from_value(serde_json::json!([{"rooms":[(room).as_str()],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
             (participant).as_str(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -655,16 +760,26 @@ async fn run_peer(
     let host = NativeHost::bind(ip)?;
     let created = Rc::new(Cell::new(0_usize));
     let retired = Rc::new(Cell::new(0_usize));
-    let (runtime, actor) =
-        RuntimeAgent::managed_with_services(config, Host::new(create_http_client()), {
-            let created = created.clone();
-            let retired = retired.clone();
-            move || {
-                let (runtime, owner) = host.runtime()?;
-                created.set(created.get().saturating_add(1));
-                Ok((runtime, (owner, RuntimeRetirement(retired.clone()))))
-            }
-        })?;
+    let creation_evidence = Arc::new(Mutex::new(CreationEvidence::default()));
+    let http: Box<dyn AsyncHttpClient> = if reconnect {
+        Box::new(LostCreationResponse {
+            inner: create_http_client(),
+            evidence: creation_evidence.clone(),
+        })
+    } else {
+        create_http_client()
+    };
+    let successor_config = config.clone();
+    let (runtime, actor) = RuntimeAgent::managed_with_services(config, Host::new(http), {
+        let created = created.clone();
+        let retired = retired.clone();
+        let host = host.clone();
+        move || {
+            let (runtime, owner) = host.runtime()?;
+            created.set(created.get().saturating_add(1));
+            Ok((runtime, (owner, RuntimeRetirement(retired.clone()))))
+        }
+    })?;
     tokio::task::spawn_local(actor);
     let agent = Agent::from_runtime(runtime.clone());
     let mut video = agent.create_video_input(Default::default()).await?;
@@ -701,8 +816,24 @@ async fn run_peer(
         ..Default::default()
     };
     replace_transport_desired(&runtime, desired.clone()).await?;
+    runtime.join(room.as_str().to_owned())?;
 
     let connected = wait_connected(&agent, None).await?;
+    if reconnect {
+        let evidence = creation_evidence.lock().unwrap();
+        anyhow::ensure!(
+            evidence.dropped && evidence.requests.len() == 2,
+            "lost successful creation did not produce exactly one retry"
+        );
+        anyhow::ensure!(
+            evidence.requests[0] == evidence.requests[1],
+            "creation retry changed the captured body, proof or sequence"
+        );
+        anyhow::ensure!(
+            evidence.locations.len() == 2 && evidence.locations[0] == evidence.locations[1],
+            "creation retry did not recover the same admitted connection"
+        );
+    }
     let generation = connected
         .generation
         .ok_or_else(|| anyhow::anyhow!("connected without generation"))?;
@@ -1141,6 +1272,18 @@ async fn run_peer(
         (first_generation, None)
     };
     barriers.after_reconnect.wait().await;
+    if reconnect {
+        let evidence = creation_evidence.lock().unwrap();
+        anyhow::ensure!(
+            evidence.requests.len() == 3,
+            "reconnect did not submit exactly one new creation"
+        );
+        anyhow::ensure!(
+            evidence.requests[2].1 == evidence.requests[0].1
+                && evidence.requests[2].2 != evidence.requests[0].2,
+            "reconnect did not retain its owner proof with a new sequence"
+        );
+    }
     anyhow::ensure!(
         created.get() == usize::from(reconnect).saturating_add(1)
             && retired.get() == usize::from(reconnect),
@@ -1328,6 +1471,10 @@ async fn run_peer(
         "terminal Agent close did not finish a pending data read"
     );
 
+    if reconnect {
+        prove_takeover(successor_config, host, room.as_str()).await?;
+    }
+
     Ok(PeerReport {
         participant,
         reconnected: reconnect,
@@ -1350,6 +1497,231 @@ async fn run_peer(
             .saturating_add(same_peer.ordered_messages)
             .saturating_add(second.ordered_messages),
     })
+}
+
+async fn prove_takeover(config: Config, host: NativeHost, room: &str) -> anyhow::Result<()> {
+    let evidence = Arc::new(Mutex::new(CreationEvidence {
+        dropped: true,
+        ..Default::default()
+    }));
+    let predecessor_host = host.clone();
+    let (predecessor, actor) = RuntimeAgent::managed_with_services(
+        config.clone(),
+        Host::new(Box::new(LostCreationResponse {
+            inner: create_http_client(),
+            evidence: evidence.clone(),
+        })),
+        move || predecessor_host.runtime(),
+    )?;
+    tokio::task::spawn_local(actor);
+    let old = Agent::from_runtime(predecessor.clone());
+    let video = old.create_video_input(Default::default()).await?;
+    let publication = old
+        .video("takeover-camera".into())?
+        .publish(video.clone(), Default::default())
+        .await?;
+    predecessor.join(room.to_owned())?;
+    let first = wait_connected(&old, None).await?;
+    publication.ready().await?;
+    old.reconnect().await?;
+    wait_connected(&old, first.generation).await?;
+    publication.ready().await?;
+
+    let (successor, actor) =
+        RuntimeAgent::managed_with_services(config.clone(), Host::new(create_http_client()), {
+            let host = host.clone();
+            move || host.runtime()
+        })?;
+    tokio::task::spawn_local(actor);
+    let new = Agent::from_runtime(successor.clone());
+    successor.join(room.to_owned())?;
+    wait_connected(&new, None).await?;
+
+    // Actual captured initial and continuation POSTs are replayed directly to
+    // the server, independent of delivery of the replacement notification.
+    let posts = std::mem::take(&mut evidence.lock().unwrap().posts);
+    anyhow::ensure!(posts.len() == 2, "missing captured predecessor admissions");
+    let client = create_http_client();
+    for post in posts {
+        let response = client
+            .execute(post)
+            .await
+            .map_err(|error| anyhow::anyhow!("stale admission replay: {error}"))?;
+        anyhow::ensure!(
+            response.status() == http::StatusCode::CONFLICT,
+            "superseded admission was not fenced: {}",
+            response.status()
+        );
+    }
+    anyhow::ensure!(
+        new.snapshot().connection == core_ffi::ConnectionState::Connected,
+        "stale replay displaced successor"
+    );
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let snapshots = old.snapshots();
+        loop {
+            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
+                anyhow::bail!("predecessor snapshot stream closed");
+            };
+            if snapshot.failure.as_ref().is_some_and(|failure| {
+                failure.class == core_ffi::FailureClass::ParticipantSuperseded
+            }) {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await??;
+    anyhow::ensure!(
+        video.submit(video_frame(0)).await.is_err(),
+        "replaced predecessor retained media target"
+    );
+    publication.close().await?;
+    video.close().await?;
+    predecessor.abort().await?;
+    new.close().await?;
+    prove_held_creation_takeover(config, host, room).await?;
+    Ok(())
+}
+
+async fn prove_held_creation_takeover(
+    config: Config,
+    host: NativeHost,
+    room: &str,
+) -> anyhow::Result<()> {
+    let evidence = Arc::new(Mutex::new(CreationEvidence {
+        dropped: true,
+        ..Default::default()
+    }));
+    let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let http = HeldCreationResponse {
+        inner: Box::new(LostCreationResponse {
+            inner: create_http_client(),
+            evidence: evidence.clone(),
+        }),
+        admitted: Mutex::new(Some(admitted_tx)),
+        release: Mutex::new(Some(release_rx)),
+    };
+    let old_host = host.clone();
+    let (predecessor, actor) = RuntimeAgent::managed_with_services(
+        config.clone(),
+        Host::new(Box::new(http)),
+        move || old_host.runtime(),
+    )?;
+    tokio::task::spawn_local(actor);
+    let old = Agent::from_runtime(predecessor.clone());
+    let video = old.create_video_input(Default::default()).await?;
+    let publication = old
+        .video("held-camera".into())?
+        .publish(video.clone(), Default::default())
+        .await?;
+    let snapshots = old.snapshots();
+    let connected = Rc::new(Cell::new(false));
+    let superseded = Rc::new(Cell::new(false));
+    let admitted = Rc::new(Cell::new(false));
+    let observed_connected = connected.clone();
+    let observed_superseded = superseded.clone();
+    let observed_admitted = admitted.clone();
+    let observer = tokio::task::spawn_local(async move {
+        while let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await {
+            if snapshot.connection == core_ffi::ConnectionState::Connected {
+                observed_connected.set(true);
+            }
+            if snapshot.participant_id.is_some()
+                || !snapshot.catalog.participants.is_empty()
+                || !snapshot.catalog.publications.is_empty()
+                || !snapshot.mapping.video.is_empty()
+                || !snapshot.mapping.audio.is_empty()
+            {
+                observed_admitted.set(true);
+            }
+            if snapshot.failure.as_ref().is_some_and(|failure| {
+                failure.class == core_ffi::FailureClass::ParticipantSuperseded
+            }) {
+                observed_superseded.set(true);
+            }
+        }
+    });
+    predecessor.join(room.to_owned())?;
+    tokio::time::timeout(Duration::from_secs(20), admitted_rx).await??;
+    anyhow::ensure!(
+        !connected.get(),
+        "predecessor connected before held SDP answer"
+    );
+    let (successor, actor) =
+        RuntimeAgent::managed_with_services(config, Host::new(create_http_client()), move || {
+            host.runtime()
+        })?;
+    tokio::task::spawn_local(actor);
+    let new = Agent::from_runtime(successor.clone());
+    successor.join(room.to_owned())?;
+    let successor_connected = wait_connected(&new, None).await?;
+    anyhow::ensure!(
+        !connected.get(),
+        "predecessor connected before answer release"
+    );
+    release_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("held answer receiver closed"))?;
+    // Observe the whole bounded window, including transient connected snapshots.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    if !superseded.get() {
+        predecessor.disconnect().await?;
+        predecessor.join(room.to_owned())?;
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let snapshots = old.snapshots();
+        loop {
+            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
+                anyhow::bail!("held predecessor snapshot stream closed");
+            };
+            if snapshot.failure.as_ref().is_some_and(|failure| {
+                failure.class == core_ffi::FailureClass::ParticipantSuperseded
+            }) {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await??;
+    anyhow::ensure!(
+        evidence
+            .lock()
+            .unwrap()
+            .statuses
+            .contains(&http::StatusCode::CONFLICT),
+        "predecessor continuation did not receive authoritative ownership rejection"
+    );
+    let requests = evidence.lock().unwrap().requests.clone();
+    anyhow::ensure!(!requests.is_empty(), "missing held admission evidence");
+    anyhow::ensure!(
+        requests.iter().all(|request| request.1 == requests[0].1),
+        "predecessor fell back to a fresh ownership family"
+    );
+    anyhow::ensure!(
+        !connected.get(),
+        "obsolete held admission reached Connected (superseded observed: {})",
+        superseded.get()
+    );
+    anyhow::ensure!(
+        !admitted.get(),
+        "obsolete predecessor restored participant, presence, or media state"
+    );
+    anyhow::ensure!(
+        new.snapshot().connection == core_ffi::ConnectionState::Connected
+            && new.snapshot().generation == successor_connected.generation,
+        "held predecessor displaced successor"
+    );
+    println!(
+        "[held-creation] attempts={} superseded_observed={} bounded_seconds=20",
+        requests.len(),
+        superseded.get()
+    );
+    publication.close().await?;
+    video.close().await?;
+    predecessor.abort().await?;
+    new.close().await?;
+    observer.abort();
+    Ok(())
 }
 
 async fn native_payload_channels(

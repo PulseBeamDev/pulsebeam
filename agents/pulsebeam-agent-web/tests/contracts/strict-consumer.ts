@@ -53,6 +53,8 @@ export type StrictBoundaries = [
   Assert<Equal<AgentConfig["token"], string>>,
   Assert<Equal<DesiredState["connected"], boolean>>,
   Assert<Equal<Snapshot["desiredRevision"], bigint>>,
+  Assert<Equal<Snapshot["joinRevision"], bigint>>,
+  Assert<Equal<Snapshot["desiredRoom"], string | undefined>>,
   Assert<Equal<AgentError["message"], string>>,
   Assert<Equal<TransportStatistics["bytesSent"], bigint>>,
   Assert<Equal<TopicMessage["sequence"], bigint>>,

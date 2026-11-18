@@ -1,10 +1,16 @@
 {
-  "version": 1,
+  "version": 2,
   "base": {
     "project_id": "p_0067MYZ1001R010000000000064",
     "key_id": "kid_0067MYZ1005R030010000000068",
     "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-    "room": "Room_9-Z",
+    "requested_room": "Room_9-Z",
+    "grants": [
+      {
+        "rooms": ["Room_9-Z"],
+        "allow": ["join", "publish", "discover", "subscribe"]
+      }
+    ],
     "participant": "Alice_-9",
     "expiration": "2000"
   },
@@ -15,7 +21,13 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "room": "Room_9-Z",
+        "requested_room": "Room_9-Z",
+        "grants": [
+          {
+            "rooms": ["Room_9-Z"],
+            "allow": ["join", "publish", "discover", "subscribe"]
+          }
+        ],
         "participant": "Alice_-9",
         "expiration": "2000"
       },
@@ -27,7 +39,13 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "room": "-",
+        "requested_room": "-",
+        "grants": [
+          {
+            "rooms": ["-"],
+            "allow": ["join", "publish", "discover", "subscribe"]
+          }
+        ],
         "participant": "_",
         "expiration": "0"
       },
@@ -39,7 +57,13 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "room": "Room_9-Z",
+        "requested_room": "Room_9-Z",
+        "grants": [
+          {
+            "rooms": ["Room_9-Z"],
+            "allow": ["join", "publish", "discover", "subscribe"]
+          }
+        ],
         "participant": "Alice_-9",
         "expiration": "9007199254740991"
       },
@@ -51,7 +75,13 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "room": "Room_9-Z",
+        "requested_room": "Room_9-Z",
+        "grants": [
+          {
+            "rooms": ["Room_9-Z"],
+            "allow": ["join", "publish", "discover", "subscribe"]
+          }
+        ],
         "participant": "Alice_-9",
         "expiration": "9007199254740993"
       },
@@ -63,9 +93,53 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "room": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        "requested_room": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        "grants": [
+          {
+            "rooms": ["XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"],
+            "allow": ["join", "publish", "discover", "subscribe"]
+          }
+        ],
         "participant": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
         "expiration": "18446744073709551615"
+      },
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+    },
+    {
+      "name": "literal-utf8-scope",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
+        "requested_room": " meeting/会議/main ",
+        "grants": [
+          {
+            "rooms": [" meeting/会議/main "],
+            "allow": ["join", "publish", "discover", "subscribe"]
+          }
+        ],
+        "participant": " café/device-1 ",
+        "expiration": "2000"
+      },
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+    },
+    {
+      "name": "utf8-byte-boundary",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
+        "requested_room": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+        "grants": [
+          {
+            "rooms": [
+              "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+            ],
+            "allow": ["join", "publish", "discover", "subscribe"]
+          }
+        ],
+        "participant": "🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀",
+        "expiration": "2000"
       },
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
@@ -75,8 +149,101 @@
         "project_id": "p_oo67myzloolrolooooooooooo64",
         "key_id": "kid_OO67MYZIOO5RO3OOIOOOOOOOO68",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "room": "Room_9-Z",
+        "requested_room": "Room_9-Z",
+        "grants": [
+          {
+            "rooms": ["Room_9-Z"],
+            "allow": ["join", "publish", "discover", "subscribe"]
+          }
+        ],
         "participant": "Alice_-9",
+        "expiration": "2000"
+      },
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+    },
+    {
+      "name": "filtered-grants",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
+        "requested_room": "workspace/main",
+        "grants": [
+          {
+            "rooms": ["workspace/*"],
+            "allow": ["join"]
+          },
+          {
+            "rooms": ["workspace/*"],
+            "allow": ["publish"],
+            "kind": "data",
+            "label": "chat/会議"
+          },
+          {
+            "rooms": ["*"],
+            "allow": ["discover", "subscribe"],
+            "participant": "café/device",
+            "kind": "video",
+            "label": "camera/main"
+          }
+        ],
+        "participant": "Alice_-9",
+        "expiration": "2000"
+      },
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+    },
+    {
+      "name": "deny-all",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
+        "requested_room": "Room_9-Z",
+        "grants": [],
+        "participant": "Alice_-9",
+        "expiration": "2000"
+      },
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+    },
+    {
+      "name": "encoded-token-limit",
+      "input": {
+        "project_id": "p_0067MYZ1001R010000000000064",
+        "key_id": "kid_0067MYZ1005R030010000000068",
+        "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
+        "requested_room": "general",
+        "grants": [
+          {
+            "rooms": [
+              "general",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+            ],
+            "allow": ["join"]
+          }
+        ],
+        "participant": "p",
         "expiration": "2000"
       },
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
@@ -144,26 +311,6 @@
       "value": 42
     },
     {
-      "name": "room-missing",
-      "field": "room",
-      "value": null
-    },
-    {
-      "name": "room-boolean",
-      "field": "room",
-      "value": true
-    },
-    {
-      "name": "room-empty",
-      "field": "room",
-      "value": ""
-    },
-    {
-      "name": "room-number",
-      "field": "room",
-      "value": 42
-    },
-    {
       "name": "participant-missing",
       "field": "participant",
       "value": null
@@ -194,64 +341,14 @@
       "value": true
     },
     {
-      "name": "room-long",
-      "field": "room",
-      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    },
-    {
-      "name": "room-space",
-      "field": "room",
-      "value": "has space"
-    },
-    {
-      "name": "room-slash",
-      "field": "room",
-      "value": "a/b"
-    },
-    {
-      "name": "room-unicode",
-      "field": "room",
-      "value": "café"
-    },
-    {
-      "name": "room-newline",
-      "field": "room",
-      "value": "abc\n"
-    },
-    {
-      "name": "room-leading",
-      "field": "room",
-      "value": " abc"
-    },
-    {
       "name": "participant-long",
       "field": "participant",
-      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    },
-    {
-      "name": "participant-space",
-      "field": "participant",
-      "value": "has space"
-    },
-    {
-      "name": "participant-slash",
-      "field": "participant",
-      "value": "a/b"
-    },
-    {
-      "name": "participant-unicode",
-      "field": "participant",
-      "value": "café"
+      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     },
     {
       "name": "participant-newline",
       "field": "participant",
       "value": "abc\n"
-    },
-    {
-      "name": "participant-leading",
-      "field": "participant",
-      "value": " abc"
     },
     {
       "name": "project_id-prefix",
@@ -469,6 +566,418 @@
       "field": "expiration",
       "value": "Infinity",
       "representation": "number"
+    },
+    {
+      "name": "grants-missing",
+      "field": "grants",
+      "value": null
+    },
+    {
+      "name": "grants-boolean",
+      "field": "grants",
+      "value": true
+    },
+    {
+      "name": "grants-string",
+      "field": "grants",
+      "value": ""
+    },
+    {
+      "name": "grants-number",
+      "field": "grants",
+      "value": 42
+    },
+    {
+      "name": "rooms-empty",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": [],
+          "allow": ["join"]
+        }
+      ]
+    },
+    {
+      "name": "room-pattern-long",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": [
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          ],
+          "allow": ["join"]
+        }
+      ]
+    },
+    {
+      "name": "room-pattern-utf8-long",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": [
+            "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+          ],
+          "allow": ["join"]
+        }
+      ]
+    },
+    {
+      "name": "room-pattern-control",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["abc\n"],
+          "allow": ["join"]
+        }
+      ]
+    },
+    {
+      "name": "room-pattern-middle-wildcard",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["a/*/b"],
+          "allow": ["join"]
+        }
+      ]
+    },
+    {
+      "name": "room-pattern-unslashed-wildcard",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["prefix*"],
+          "allow": ["join"]
+        }
+      ]
+    },
+    {
+      "name": "received-grant-count",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        }
+      ]
+    },
+    {
+      "name": "received-pattern-count",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": [
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same",
+            "same"
+          ],
+          "allow": ["join"]
+        },
+        {
+          "rooms": ["same"],
+          "allow": ["join"]
+        }
+      ]
+    },
+    {
+      "name": "duplicate-action",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["*"],
+          "allow": ["join", "join"]
+        }
+      ]
+    },
+    {
+      "name": "unknown-action",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["*"],
+          "allow": ["read"]
+        }
+      ]
+    },
+    {
+      "name": "join-kind-filter",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["*"],
+          "allow": ["join"],
+          "kind": "audio"
+        }
+      ]
+    },
+    {
+      "name": "publish-participant-filter",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["*"],
+          "allow": ["publish"],
+          "participant": "other"
+        }
+      ]
+    },
+    {
+      "name": "unknown-kind",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["*"],
+          "allow": ["subscribe"],
+          "kind": "screen"
+        }
+      ]
+    },
+    {
+      "name": "empty-label",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["*"],
+          "allow": ["subscribe"],
+          "label": ""
+        }
+      ]
+    },
+    {
+      "name": "label-long",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": ["*"],
+          "allow": ["publish"],
+          "label": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      ]
+    },
+    {
+      "name": "encoded-token-over-limit",
+      "field": "grants",
+      "value": [
+        {
+          "rooms": [
+            "general",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+            "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+          ],
+          "allow": ["join"]
+        }
+      ]
     }
   ]
 }

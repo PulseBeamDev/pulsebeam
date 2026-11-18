@@ -15,8 +15,10 @@ use pulsebeam_proto::{
 
 use crate::{
     ChannelId, DataChannelEffect, DataChannelReliability, DataChannelSpec, Effect, Generation,
-    LogLevel, Notification, OperationId, Snapshot, ValidationError, id::IdGenerator,
+    Notification, OperationId, Snapshot, ValidationError, id::IdGenerator,
 };
+
+pub(crate) const LOG_TARGET: &str = module_path!();
 
 mod admission;
 pub use admission::DataSendFailure;
@@ -265,7 +267,6 @@ struct AuxiliarySend {
 
 #[derive(Default)]
 pub(crate) struct Topics {
-    log_level: LogLevel,
     publishers: BTreeMap<TopicPublisher, PublisherState>,
     subscribers: BTreeMap<TopicSubscriber, SubscriberState>,
     registrations: TopicRegistrations,
@@ -311,17 +312,6 @@ impl TopicRegistrations {
 }
 
 impl Topics {
-    pub(crate) fn new(log_level: LogLevel) -> Self {
-        Self {
-            log_level,
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn set_log_level(&mut self, level: LogLevel) {
-        self.log_level = level;
-    }
-
     pub(crate) fn end_session(
         &mut self,
         snapshot: &mut Snapshot,
@@ -1344,13 +1334,6 @@ impl Topics {
         notifications: &mut VecDeque<Notification>,
     ) {
         self.dropped_sends = self.dropped_sends.saturating_add(1);
-        if self.log_level.allows(log::Level::Warn) {
-            log::warn!(
-                "topic send dropped topic={} mode={:?} reason={reason:?}",
-                publisher.topic,
-                publisher.mode
-            );
-        }
         notifications.push_back(Notification::Topic(TopicNotification::SendDropped {
             publisher: publisher.clone(),
             reason,
@@ -1373,9 +1356,6 @@ impl Topics {
             );
         }
         self.channel_failures = self.channel_failures.saturating_add(1);
-        if self.log_level.allows(log::Level::Warn) {
-            log::warn!("topic channel failed channel={channel:?}: {message}");
-        }
         notifications.push_back(Notification::Topic(TopicNotification::ChannelFailed {
             channel,
             message,

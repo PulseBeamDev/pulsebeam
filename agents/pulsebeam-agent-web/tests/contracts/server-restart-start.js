@@ -75,6 +75,8 @@
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   };
+  sender.join("web-adapter-restart");
+  receiver.join("web-adapter-restart");
   await sender.connect();
   await receiver.connect();
   const before = await wait(
@@ -96,7 +98,7 @@
       resolve();
     }, 50);
   });
-  globalThis.__adapterRestart = {
+  globalThis.__serverRestart = {
     sender,
     receiver,
     publisher,
@@ -105,7 +107,6 @@
     events,
     wait,
     synchronize,
-    previousGeneration: before.generation,
   };
   return { initial: events[0].payload, generation: Number(before.generation) };
 })();

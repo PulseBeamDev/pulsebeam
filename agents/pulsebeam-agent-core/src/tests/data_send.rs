@@ -161,7 +161,7 @@ fn owned_send_binding_wait_is_bounded_and_timeout_releases_only_its_admission() 
         ))
     ));
     assert!(agent.snapshot().topics.publishers.is_empty());
-    agent.command(AgentCommand::Connect).unwrap();
+    agent.command(AgentCommand::Join("room".into())).unwrap();
     assert!(matches!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::CreateOffer { .. })

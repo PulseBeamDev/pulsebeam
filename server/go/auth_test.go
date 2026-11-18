@@ -23,9 +23,9 @@ import (
 const fixtureAPIKey = "p_0067MYZ1001R010000000000064.kid_0067MYZ1005R030010000000068.MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7"
 
 type input struct {
-	Room        string `json:"room"`
-	Participant string `json:"participant"`
-	Expiration  string `json:"expiration"`
+	Grants      []pulsebeam.Grant `json:"grants"`
+	Participant string            `json:"participant"`
+	Expiration  string            `json:"expiration"`
 }
 
 type vector struct {
@@ -76,9 +76,12 @@ func TestConformance(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := pulsebeam.SignParticipantToken(fixtureAPIKey, v.Input.Room, v.Input.Participant, exp)
+			got, err := pulsebeam.SignParticipantToken(fixtureAPIKey, v.Input.Grants, v.Input.Participant, exp)
 			if err != nil || got != v.Token {
 				t.Fatalf("token mismatch: %v", err)
+			}
+			if v.Name == "encoded-token-limit" && len(got) != 8192 {
+				t.Fatal("encoded token boundary changed")
 			}
 			parts := strings.Split(got, ".")
 			for i, expected := range []string{v.Header, v.Claims} {
@@ -103,22 +106,48 @@ func TestConformance(t *testing.T) {
 	}
 }
 
-// Check the compiler contract using the actual public function signature.
-func rejectsTypedCall(t *testing.T, r rejection) {
-	t.Helper()
+// Reflect the linked public signature and require a valid baseline before negatives.
+func typedCallError(args []string) error {
 	functionType := reflect.TypeOf(pulsebeam.SignParticipantToken)
+	pkg := types.NewPackage("consumer", "consumer")
+	grantName := types.NewTypeName(token.NoPos, pkg, "Grant", nil)
+	grant := types.NewNamed(grantName, types.NewStruct(nil, nil), nil)
+	pkg.Scope().Insert(grantName)
 	params := make([]*types.Var, functionType.NumIn())
 	for i := range params {
-		kind := types.String
-		if functionType.In(i).Kind() == reflect.Uint64 {
-			kind = types.Uint64
+		var parameter types.Type
+		switch functionType.In(i).Kind() {
+		case reflect.String:
+			parameter = types.Typ[types.String]
+		case reflect.Uint64:
+			parameter = types.Typ[types.Uint64]
+		case reflect.Slice:
+			if functionType.In(i) != reflect.TypeOf([]pulsebeam.Grant{}) {
+				return fmt.Errorf("unexpected public slice type")
+			}
+			parameter = types.NewSlice(grant)
+		default:
+			return fmt.Errorf("unexpected public parameter type")
 		}
-		params[i] = types.NewVar(token.NoPos, nil, "", types.Typ[kind])
+		params[i] = types.NewVar(token.NoPos, nil, "", parameter)
 	}
-	pkg := types.NewPackage("consumer", "consumer")
 	pkg.Scope().Insert(types.NewFunc(token.NoPos, pkg, "Sign", types.NewSignatureType(nil, nil, nil, types.NewTuple(params...), types.NewTuple(), false)))
-	args := []string{`"key"`, `"room"`, `"participant"`, "uint64(2000)"}
-	index := map[string]int{"room": 1, "participant": 2, "expiration": 3}[r.Field]
+	set := token.NewFileSet()
+	file, err := parser.ParseFile(set, "consumer.go", "package consumer; func call(){ Sign("+strings.Join(args, ",")+") }", 0)
+	if err != nil {
+		return err
+	}
+	config := &types.Config{}
+	return types.NewChecker(config, set, pkg, nil).Files([]*ast.File{file})
+}
+
+func rejectsTypedCall(t *testing.T, r rejection) {
+	t.Helper()
+	args := []string{`"key"`, `[]Grant{}`, `"participant"`, "uint64(2000)"}
+	if err := typedCallError(args); err != nil {
+		t.Fatalf("valid signature baseline: %v", err)
+	}
+	index := map[string]int{"grants": 1, "participant": 2, "expiration": 3}[r.Field]
 	if r.Value == nil {
 		args = append(args[:index], args[index+1:]...)
 	} else if r.Representation == "string" {
@@ -132,50 +161,91 @@ func rejectsTypedCall(t *testing.T, r rejection) {
 		if r.Name == "expiration-negative" || r.Name == "expiration-overflow" || r.Name == "expiration-fractional" {
 			args[index] = value
 		}
+	} else if value, ok := r.Value.(string); ok {
+		args[index] = strconv.Quote(value)
 	} else {
 		args[index] = fmt.Sprint(r.Value)
 	}
-	set := token.NewFileSet()
-	file, err := parser.ParseFile(set, "consumer.go", "package consumer; func call(){ Sign("+strings.Join(args, ",")+") }", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	config := &types.Config{}
-	checker := types.NewChecker(config, set, pkg, nil)
-	if checker.Files([]*ast.File{file}) == nil {
+	if typedCallError(args) == nil {
 		t.Fatal("invalid input type was accepted")
 	}
 }
 
 func TestInvalidInputsAndDiagnostics(t *testing.T) {
-	_, _, invalid := fixture(t)
+	base, _, invalid := fixture(t)
 	for _, r := range invalid {
-		// Expiration is the only public signing input checked by Go's type system.
-		if r.Field != "expiration" {
+		if r.Field != "expiration" && r.Field != "participant" && r.Field != "grants" {
 			continue
 		}
-		t.Run(r.Name, func(t *testing.T) { rejectsTypedCall(t, r) })
+		t.Run(r.Name, func(t *testing.T) {
+			if r.Field == "expiration" {
+				rejectsTypedCall(t, r)
+				return
+			}
+			grants, participant := base.Grants, base.Participant
+			if r.Field == "grants" {
+				if _, ok := r.Value.([]any); !ok {
+					rejectsTypedCall(t, r)
+					return
+				}
+				encoded, err := json.Marshal(r.Value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(encoded, &grants); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				value, ok := r.Value.(string)
+				if !ok {
+					rejectsTypedCall(t, r)
+					return
+				}
+				participant = value
+			}
+			token, err := pulsebeam.SignParticipantToken(fixtureAPIKey, grants, participant, 2000)
+			if err == nil || token != "" {
+				t.Fatal("invalid input was accepted")
+			}
+			if strings.Contains(err.Error(), fixtureAPIKey) {
+				t.Fatal("diagnostic leaked the API key")
+			}
+		})
 	}
+}
+
+func grants(pattern string) []pulsebeam.Grant {
+	return []pulsebeam.Grant{{Rooms: []string{pattern}, Allow: []pulsebeam.Action{pulsebeam.Join}}}
 }
 
 func TestOpaqueIdentityStrings(t *testing.T) {
 	parts := strings.Split(pulsebeam.InsecureDevAPIKey(), ".")
 	parts[0], parts[1] = "unknown-issuer", "unknown-key"
-	token, err := pulsebeam.SignParticipantToken(strings.Join(parts, "."), "room with spaces", "participant/with/slashes", 2000)
+	token, err := pulsebeam.SignParticipantToken(strings.Join(parts, "."), grants("room with spaces"), "participant/with/slashes", 2000)
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded := strings.Split(token, ".")
 	header, err := base64.RawURLEncoding.DecodeString(encoded[0])
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	claims, err := base64.RawURLEncoding.DecodeString(encoded[1])
-	if err != nil { t.Fatal(err) }
-	var h struct { Kid string `json:"kid"` }
-	var c struct { Iss string `json:"iss"`; Room string `json:"room"`; Sub string `json:"sub"` }
+	if err != nil {
+		t.Fatal(err)
+	}
+	var h struct {
+		Kid string `json:"kid"`
+	}
+	var c struct {
+		Iss    string            `json:"iss"`
+		Grants []pulsebeam.Grant `json:"grants"`
+		Sub    string            `json:"sub"`
+	}
 	if json.Unmarshal(header, &h) != nil || json.Unmarshal(claims, &c) != nil {
 		t.Fatal("invalid signed JWT")
 	}
-	if h.Kid != parts[1] || c.Iss != parts[0] || c.Room != "room with spaces" || c.Sub != "participant/with/slashes" {
+	if h.Kid != parts[1] || c.Iss != parts[0] || len(c.Grants) != 1 || c.Grants[0].Rooms[0] != "room with spaces" || c.Sub != "participant/with/slashes" {
 		t.Fatal("signer modified opaque identities")
 	}
 }
@@ -190,7 +260,7 @@ func TestEmbeddedDevelopmentAPIKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	var expected struct {
-		APIKey string `json:"apiKey"`
+		APIKey    string `json:"apiKey"`
 		PublicKey string `json:"publicKey"`
 	}
 	if err := json.Unmarshal(data, &expected); err != nil {
@@ -200,7 +270,7 @@ func TestEmbeddedDevelopmentAPIKey(t *testing.T) {
 	if actual != expected.APIKey {
 		t.Fatal("embedded API key differs from canonical JSON")
 	}
-	jwt, err := pulsebeam.SignParticipantToken(actual, "demo", "alice", 2000000000)
+	jwt, err := pulsebeam.SignParticipantToken(actual, grants("demo"), "alice", 2000000000)
 	if err != nil || jwt == "" {
 		t.Fatalf("development token: %v", err)
 	}
@@ -227,7 +297,7 @@ func TestEmbeddedDevelopmentAPIKey(t *testing.T) {
 		actual + ".extra",
 		strings.Replace(actual, ".", "..", 1),
 	} {
-		_, err := pulsebeam.SignParticipantToken(bad, "demo", "alice", 2000000000)
+		_, err := pulsebeam.SignParticipantToken(bad, grants("demo"), "alice", 2000000000)
 		if err == nil {
 			t.Fatal("invalid API key accepted")
 		}

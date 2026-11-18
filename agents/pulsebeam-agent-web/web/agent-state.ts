@@ -34,6 +34,11 @@ export function emptySnapshot(connection: ConnectionState): AgentSnapshot {
   return Object.freeze({
     version: 0,
     desiredRevision: 0,
+    joinRevision: 0n,
+    credentialRevision: 0n,
+    acceptedCredentialRevision: null,
+    credentialOutcome: null,
+    desiredRoom: null,
     connection,
     generation: null,
     participantId: null,
@@ -56,7 +61,19 @@ export function emptySnapshot(connection: ConnectionState): AgentSnapshot {
   });
 }
 
+// Bound credentials even before a managed Agent has initialized its core runtime.
+export function validateToken(token: string): void {
+  if (
+    typeof token !== "string" ||
+    !token ||
+    token.length > 8192 ||
+    !/^[!-~]+$/.test(token)
+  )
+    throw new Error("authorization token is invalid");
+}
+
 export function copyConfig(config: AgentConfig): RuntimeConfig {
+  validateToken(config.token);
   return Object.freeze({
     endpoint: config.endpoint,
     token: config.token,

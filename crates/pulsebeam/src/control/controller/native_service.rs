@@ -12,6 +12,51 @@ pub(super) struct RetiringNative {
 }
 
 impl ControllerActor {
+    pub(super) fn native_resource_lease(
+        &self,
+        connection: ConnectionId,
+    ) -> Option<&AuthorizationLease> {
+        if let Some(native) = self.native_connections.get(&connection)
+            && let Some(meta) = self
+                .core
+                .registry
+                .get_participant(&native.handler.participant)
+            && meta.connection_id == connection
+            && meta.profile == SignalingProtocol::State
+            && let Some(lease) = &meta.authorization
+            && let Some(external) = &meta.participant_external_id
+            && lease.matches_participant(meta.room_id, native.handler.participant, external)
+        {
+            return Some(lease);
+        }
+        // Terminal metadata can authorize exact cleanup, never prove quiescence.
+        if let Some(retiring) = self.retiring_native.get(&connection)
+            && retiring.meta.connection_id == connection
+            && retiring.meta.profile == SignalingProtocol::State
+            && let Some(lease) = &retiring.meta.authorization
+            && let Some(external) = &retiring.meta.participant_external_id
+            && lease.matches_participant(
+                retiring.meta.room_id,
+                retiring.handler.participant,
+                external,
+            )
+        {
+            return Some(lease);
+        }
+        self.materializations.iter().find_map(|work| {
+            let pending = &work.pending;
+            let lease = pending.authorization.as_ref()?;
+            (pending.connection_id == connection
+                && pending.profile == SignalingProtocol::State
+                && lease.matches_participant(
+                    pending.room_id,
+                    pending.participant,
+                    &pending.participant_external_id,
+                ))
+            .then_some(lease)
+        })
+    }
+
     pub(super) fn service_native_connections(&mut self) {
         for _ in 0..NATIVE_BUDGET {
             let Some(&(deadline, connection)) = self.native_deadlines.first() else {
@@ -56,8 +101,14 @@ impl ControllerActor {
             .unwrap_or_default()
             .as_secs();
         match native.service(unix_now, |track| {
-            self.lifecycle
-                .source(room, participant, track, &self.core.registry)
+            let track = self
+                .lifecycle
+                .source(room, participant, track, &self.core.registry)?;
+            let publisher = self.core.registry.get_participant(&track.meta().origin)?;
+            Some(crate::control::native::ResolvedSource {
+                track,
+                publisher: publisher.participant_external_id.as_ref()?,
+            })
         }) {
             Ok(wake) => {
                 let deadline = native.model.deadline();
@@ -121,13 +172,11 @@ impl ControllerActor {
         participant: ParticipantId,
         meta: crate::control::registry::ParticipantMeta,
         mut handler: StateProtocolHandler,
+        reason: CloseReason,
     ) -> bool {
         if self.retiring_native.len() >= MAX_TERMINAL_HANDOFFS
             || meta.transport.is_none()
-            || handler
-                .model
-                .close(pulsebeam_proto::state::CloseReason::ParticipantReplaced)
-                .is_err()
+            || handler.close(reason).is_err()
         {
             return false;
         }
@@ -166,8 +215,7 @@ impl ControllerActor {
             return;
         }
         if matches!(result, Ok(true)) {
-            // The registry now names the replacement. Wake the displaced
-            // endpoint by its retained shard and exact connection incarnation.
+            // Wake terminal output by the retained location, even after registry removal.
             self.command_backlog.push_back((
                 retiring.meta.shard_id,
                 ShardCommand::NativeReady {
@@ -242,8 +290,25 @@ impl ControllerActor {
         else {
             return;
         };
-        let mut result = Ok(());
+        let peers = self
+            .core
+            .registry
+            .local_participant_ids_in_room(&native.room)
+            .into_iter()
+            .filter(|id| *id != native.participant)
+            .filter_map(|id| {
+                let peer = self.core.registry.get_participant(&id)?;
+                peer.materialized
+                    .then(|| crate::participant::effect::RoomPeer {
+                        id,
+                        external_id: peer.participant_external_id.clone(),
+                    })
+            });
+        let mut result = native.model.apply_participants(peers, std::iter::empty());
         for track in self.lifecycle.sources_in_room(native.room) {
+            if result.is_err() {
+                break;
+            }
             if self
                 .lifecycle
                 .source(
@@ -256,7 +321,17 @@ impl ControllerActor {
             {
                 continue;
             }
-            result = native.model.observe_candidate(track);
+            let Some(publisher) = self
+                .core
+                .registry
+                .get_participant(&track.meta().origin)
+                .and_then(|peer| peer.participant_external_id.as_ref())
+            else {
+                continue;
+            };
+            result = native
+                .model
+                .observe_candidate(crate::control::native::ResolvedSource { track, publisher });
             if result.is_err() {
                 break;
             }
@@ -299,10 +374,24 @@ impl ControllerActor {
             else {
                 continue;
             };
-            let result = match track {
-                Some(track) => native.model.observe_candidate(track),
-                None => native.model.remove_track(meta.id.as_str()),
-            };
+            native.model.source_wait_changed();
+            let result =
+                match track {
+                    Some(track) => {
+                        match self
+                            .core
+                            .registry
+                            .get_participant(&track.meta().origin)
+                            .and_then(|peer| peer.participant_external_id.as_ref())
+                        {
+                            Some(publisher) => native.model.observe_candidate(
+                                crate::control::native::ResolvedSource { track, publisher },
+                            ),
+                            None => native.model.remove_track(meta.id.as_str()),
+                        }
+                    }
+                    None => native.model.remove_track(meta.id.as_str()),
+                };
             self.finish_native_observation(connection, result);
         }
     }
@@ -310,7 +399,7 @@ impl ControllerActor {
     pub(super) fn observe_native_authorization(
         &mut self,
         participant: ParticipantId,
-        lease: AuthorizationLease,
+        lease: &AuthorizationLease,
     ) {
         let Some(meta) = self.core.registry.get_participant(&participant) else {
             return;
@@ -323,9 +412,17 @@ impl ControllerActor {
             return;
         };
         let result = match lease.native_expiry() {
-            Ok(expiry) => native.model.authorization(expiry, lease.revision),
+            Ok(expiry) => {
+                native
+                    .model
+                    .authorization(expiry, lease.revision, lease.permissions().clone())
+            }
             Err(_) => Err(crate::control::native::OutputError::InvalidObservation),
         };
-        self.finish_native_observation(connection, result);
+        let changed = matches!(result, Ok(true));
+        self.finish_native_observation(connection, result.map(|_| ()));
+        if changed {
+            self.seed_native_sources(connection);
+        }
     }
 }

@@ -30,16 +30,20 @@ repository paths. A future registry release must publish the shared dependency
 before the SDK; no registry publication is performed by this build.
 
 ```rust
-use pulsebeam_server::sign_participant_token;
+use pulsebeam_server::{Action, Grant, GrantSet, sign_participant_token};
 
 fn token(api_key: &str) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(sign_participant_token(
-        api_key, "general", "Alice", 2_000_000_000,
-    )?)
+    let grants = GrantSet::new(vec![Grant::new(
+        vec!["general".into()],
+        vec![Action::Join, Action::Publish, Action::Discover, Action::Subscribe],
+        None, None, None,
+    )?])?;
+    Ok(sign_participant_token(api_key, &grants, "Alice", 2_000_000_000)?)
 }
 ```
 
-The opaque API key plus room, participant and expiration are mandatory.
+The opaque API key, grants, participant and expiration are mandatory. Grants
+are validated on construction or deserialization; an empty `GrantSet` grants no access.
 The SDK splits the API key and imports only the standard PKCS#8 Ed25519 private key;
 the SFU validates identities. The SDK never reads the environment. Expiration
 is a `u64` absolute Unix timestamp in `0..18446744073709551615`, not a TTL.
@@ -48,9 +52,11 @@ and overflowing constants before signing. Validate externally supplied values
 instead of casting them to `u64`. No clock is consulted. Zero and past expiration
 may be signed, but authorize nothing at or after expiry.
 
-Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. The SDK copies these and the project/key identifiers into
-the JWT without validating their format; the SFU enforces their validity.
+Participant IDs, room patterns and labels are nonempty UTF-8 strings of at most
+256 bytes, without control characters. Case and exact text are preserved.
+The SDK validates these bounds and grant structure. Project/key identifiers
+remain opaque; the SFU validates their format, registry membership and authority.
+See the [grant schema and limits](../auth/README.md#grants).
 The SDK rejects unusable signing keys, and errors do not disclose secrets.
 
 Keep signing secrets on your server, never in clients or logs. Offline signing

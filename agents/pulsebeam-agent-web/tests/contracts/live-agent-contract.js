@@ -352,6 +352,8 @@
     audioPublication = await sender
       .audio("voice")
       .publish(AudioSource.fromTrack(audioTrack), { enabled: true });
+    sender.join("public-web-contract");
+    receiver.join("public-web-contract");
     await sender.connect();
     await receiver.connect();
     await until(
@@ -368,6 +370,21 @@
     assert(receiver.roomId === "public-web-contract", "room identity");
     const senderGeneration = sender.snapshot().generation;
     const receiverGeneration = receiver.snapshot().generation;
+    const credentialRevision = sender.snapshot().credentialRevision + 1n;
+    await sender.renewAuthorization("__RENEWED_SENDER_TOKEN__");
+    await until(() => {
+      const snapshot = sender.snapshot();
+      return (
+        snapshot.credentialRevision === credentialRevision &&
+        snapshot.acceptedCredentialRevision === credentialRevision &&
+        snapshot.credentialOutcome?.revision === credentialRevision &&
+        snapshot.credentialOutcome.status === "accepted"
+      );
+    }, "browser fetch renewal acknowledgement and ordered grant");
+    assert(
+      sender.snapshot().generation === senderGeneration,
+      "renewal preserves the admitted connection",
+    );
     const receiveValue = async (iterator, expected) => {
       let received;
       let failure;

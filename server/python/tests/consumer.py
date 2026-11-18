@@ -36,10 +36,10 @@ with tempfile.TemporaryDirectory() as directory:
 
     fixture_key = "p_0067MYZ1001R010000000000064.kid_0067MYZ1005R030010000000068.MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7"
     def adapt(i):
-        return {"room": i["room"], "participant": i["participant"], "expiration": int(i["expiration"])}
+        return {"grants": i["grants"], "participant": i["participant"], "expiration": int(i["expiration"])}
 
     development_token = sign(
-        sdk.INSECURE_DEV_API_KEY, room="demo", participant="alice", expiration=2000000000
+        sdk.INSECURE_DEV_API_KEY, grants=[{"rooms": ["demo"], "allow": ["join"]}], participant="alice", expiration=2000000000
     )
     assert json.loads(base64.urlsafe_b64decode(
         development_token.split(".")[1] + "=" * (-len(development_token.split(".")[1]) % 4)
@@ -57,6 +57,8 @@ with tempfile.TemporaryDirectory() as directory:
     for v in vectors["valid"]:
         token = sign(fixture_key, **adapt(v["input"]))
         assert token == v["token"], v["name"]
+        if v["name"] == "encoded-token-limit":
+            assert len(token.encode("ascii")) == 8192
         header, claims, signature = token.split(".")
         decode = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
         assert decode(header).decode() == v["header"]
@@ -68,8 +70,7 @@ with tempfile.TemporaryDirectory() as directory:
         Ed25519PublicKey.from_public_bytes(bytes.fromhex(v["public_key_hex"])).verify(decode(signature), v["signing_input"].encode())
 
     for v in vectors["invalid"]:
-        # Only expiration needs local checking; the SFU validates identities.
-        if v["field"] != "expiration":
+        if v["field"] not in ("expiration", "participant", "grants"):
             continue
         args = adapt(vectors["base"])
         representation = v.get("representation")
@@ -104,7 +105,7 @@ with tempfile.TemporaryDirectory() as directory:
     opaque = sdk.INSECURE_DEV_API_KEY.split(".")
     opaque[0], opaque[1] = "unknown-issuer", "unknown-key"
     signed = sign(
-        ".".join(opaque), room="room with spaces",
+        ".".join(opaque), grants=[{"rooms": ["room with spaces"], "allow": ["join"]}],
         participant="participant/with/slashes", expiration=2000
     )
     head, claims = (
@@ -113,7 +114,8 @@ with tempfile.TemporaryDirectory() as directory:
     )
     assert head["kid"] == opaque[1]
     assert claims["iss"] == opaque[0]
-    assert claims["room"] == "room with spaces"
+    assert claims["grants"][0]["rooms"][0] == "room with spaces"
+    assert "room" not in claims
     assert claims["sub"] == "participant/with/slashes"
 
     for invalid in (
@@ -123,7 +125,7 @@ with tempfile.TemporaryDirectory() as directory:
         sdk.INSECURE_DEV_API_KEY.replace(".", "..", 1),
     ):
         try:
-            sign(invalid, room="demo", participant="alice", expiration=2000000000)
+            sign(invalid, grants=[{"rooms": ["demo"], "allow": ["join"]}], participant="alice", expiration=2000000000)
         except ValueError:
             pass
         else:

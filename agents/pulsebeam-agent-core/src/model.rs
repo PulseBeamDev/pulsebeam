@@ -9,6 +9,20 @@ use crate::{Generation, TopicNotification, TopicRegistrations, TopicSnapshot};
 
 pub const MAX_MID_BYTES: usize = 16;
 
+const MAX_AUTHORIZATION_TOKEN_BYTES: usize = 8_192;
+
+/// Preflight credential input before a host retains or queues it.
+/// Agent commands revalidate when they apply the credential intent.
+pub fn validate_authorization_token(token: &str) -> Result<(), ValidationError> {
+    if token.is_empty()
+        || token.len() > MAX_AUTHORIZATION_TOKEN_BYTES
+        || token.bytes().any(|byte| !(b'!'..=b'~').contains(&byte))
+    {
+        return Err(ValidationError::Token);
+    }
+    Ok(())
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     pub endpoint: String,
@@ -206,10 +220,31 @@ pub enum ConnectionState {
     TerminalFailure,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialStatus {
+    Accepted,
+    Rejected,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialOutcome {
+    pub revision: u64,
+    pub status: CredentialStatus,
+    pub error: Option<Failure>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub version: u64,
     pub desired_revision: u64,
+    pub join_revision: u64,
+    pub evaluated_join_revision: u64,
+    pub accepted_join_revision: Option<u64>,
+    pub credential_revision: u64,
+    pub accepted_credential_revision: Option<u64>,
+    pub credential_outcome: Option<CredentialOutcome>,
+    pub desired_room: Option<String>,
     pub connection: ConnectionState,
     pub generation: Option<Generation>,
     pub participant_id: Option<String>,
@@ -232,6 +267,13 @@ impl Default for Snapshot {
         Self {
             version: 0,
             desired_revision: 0,
+            join_revision: 0,
+            evaluated_join_revision: 0,
+            accepted_join_revision: None,
+            credential_revision: 0,
+            accepted_credential_revision: None,
+            credential_outcome: None,
+            desired_room: None,
             connection: ConnectionState::Disconnected,
             generation: None,
             participant_id: None,
@@ -292,7 +334,7 @@ pub enum Notification {
 pub enum ValidationError {
     #[error("endpoint must be an absolute HTTP(S) URL")]
     Endpoint,
-    #[error("token must be a non-empty HTTP bearer value")]
+    #[error("token must be an HTTP bearer value of at most 8192 bytes")]
     Token,
     #[error("{field} is invalid")]
     Identifier { field: &'static str },
@@ -329,14 +371,7 @@ impl AgentConfig {
         {
             return Err(ValidationError::Endpoint);
         }
-        if self.token.is_empty()
-            || self
-                .token
-                .bytes()
-                .any(|byte| !(b'!'..=b'~').contains(&byte))
-        {
-            return Err(ValidationError::Token);
-        }
+        validate_authorization_token(&self.token)?;
         if self.retry.maximum_attempts == 0
             || self.retry.initial_delay > self.retry.maximum_delay
             || self.retry.maximum_delay == Duration::ZERO

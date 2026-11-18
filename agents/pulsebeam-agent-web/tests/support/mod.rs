@@ -41,7 +41,7 @@ pub fn mint_development_token(
 ) -> TestResult<String> {
     Ok(pulsebeam_server::sign_participant_token(
         &pulsebeam_server::insecure_dev_api_key().unwrap(),
-        room.as_str(),
+            &serde_json::from_value(serde_json::json!([{"rooms":[room.as_str()],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
         participant.as_str(),
         expires_at,
     )?)

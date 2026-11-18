@@ -70,11 +70,12 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         },
         DataLane::Ordered,
     );
+    let publisher = entity::ParticipantExternalId::new("source").unwrap();
     participant
         .signaling
         .observe_participant(wire::Participant {
             participant_id: owner.as_str(),
-            participant_external_id: "source".into(),
+            participant_external_id: publisher.as_str().to_owned(),
         })
         .unwrap();
     participant.signaling.observe_candidate(&track).unwrap();
@@ -100,7 +101,10 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         .signaling
         .prepare_execution(&work, unix_now(), None, |source| {
             assert_eq!(source, id);
-            Some(&track)
+            Some(crate::control::native::ResolvedSource {
+                track: &track,
+                publisher: &publisher,
+            })
         })
         .unwrap()
         .unwrap()

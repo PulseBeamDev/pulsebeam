@@ -8,7 +8,7 @@ call, Rust signer, WASM, or language bridge. Public key-registry publication is 
 
 `from pulsebeam_server import INSECURE_DEV_API_KEY` provides one publicly known
 API key for local `--dev` servers. Pass it to
-`sign_participant_token(api_key, room=..., participant=..., expiration=...)`.
+`sign_participant_token(api_key, grants=..., participant=..., expiration=...)`.
 **Never use these credentials in production or expose a development server.**
 
 ## Local installation
@@ -28,24 +28,25 @@ from pulsebeam_server import sign_participant_token
 def issue_token(api_key: str) -> str:
     return sign_participant_token(
         api_key,
-        room="general",
+        grants=[{"rooms": ["general"], "allow": ["join", "publish", "discover", "subscribe"]}],
         participant="Alice",
         expiration=2000000000,
     )
 ```
 
-The API takes one opaque API key plus room, participant and expiration.
+The API takes one opaque API key plus grants, participant and expiration.
 The SDK never reads the environment. Expiration must be an exact int in `0..18446744073709551615`,
 representing absolute Unix seconds, not a TTL. Booleans, floats and strings are
 not accepted. Invalid values raise without returning a token. No clock is
 consulted: zero and past timestamps can be signed, but the server rejects tokens
 at and after their expiration.
 
-Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. The SDK copies these and the credential's IDs into the JWT
-without interpreting them, imports the PKCS#8 private key, and signs;
-the SFU validates identity formats. Treat the API key
-as one opaque server-side secret.
+Participant IDs, room patterns and labels are nonempty UTF-8 strings of at most
+256 bytes, without control characters. The SDK validates these bounds and the
+[grant schema](../auth/README.md#grants), preserving exact text and case.
+The exported `Grant` TypedDict describes the input. Omit unrestricted filters;
+explicit None is invalid. Empty grants grant no access. The SFU validates issuer
+and key formats and registry membership. Treat the API key as one opaque secret.
 
 Keep secrets on servers only, never in clients or logs. Offline signing cannot
 check registration or whether a secret belongs to the supplied project/key.

@@ -44,6 +44,7 @@ export type {
   CatalogSnapshot,
   CatalogTrack,
   ConnectionState,
+  CredentialOutcome,
   FailureClass,
   FixedPlayoutDelay,
   LogLevel,

@@ -42,6 +42,23 @@ const agent = await Agent.create(
   }),
 );
 const revision = agent.snapshot().desiredRevision;
+const joinRevision: bigint = agent.snapshot().joinRevision;
+const credentialRevision: bigint = agent.snapshot().credentialRevision;
+const acceptedCredentialRevision: bigint | undefined = agent.snapshot().acceptedCredentialRevision;
+if (agent.snapshot().credentialOutcome !== undefined) {
+  throw new Error("inert agent evaluated credentials");
+}
+if (credentialRevision !== 0n || acceptedCredentialRevision !== undefined) {
+  throw new Error("inert agent acquired accepted credentials");
+}
+const desiredRoom: string | undefined = agent.snapshot().desiredRoom;
+if (joinRevision !== 0n || desiredRoom !== undefined) {
+  throw new Error("inert agent acquired room intent");
+}
+const renewed: void = agent.renew("renewed-token");
+if (renewed !== undefined || agent.snapshot().credentialRevision !== 1n || agent.snapshot().desiredRoom !== undefined) {
+  throw new Error("renew did not synchronously commit inert credential intent");
+}
 const localData = agent.data("control", TopicMode.Ordered);
 const participant = agent.participant("remote");
 const remoteData = participant.data("control", TopicMode.Ordered);
@@ -217,7 +234,8 @@ if (
   throw new Error("Agent close did not complete owned data reads");
 }
 try {
-  await agent.connect();
+  const joined: void = agent.join("room");
+  void joined;
   throw new Error("closed Agent revived");
 } catch (error) {
   if (!NativeError.Closed.instanceOf(error)) throw error;

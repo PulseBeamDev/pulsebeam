@@ -24,7 +24,12 @@ import pulsebeam "github.com/PulseBeamDev/pulsebeam/server/go"
 
 func issueToken(apiKey string) (string, error) {
     return pulsebeam.SignParticipantToken(
-        apiKey, "general", "Alice", uint64(2000000000),
+        apiKey,
+        []pulsebeam.Grant{{
+            Rooms: []string{"general"},
+            Allow: []pulsebeam.Action{pulsebeam.Join, pulsebeam.Publish, pulsebeam.Discover, pulsebeam.Subscribe},
+        }},
+        "Alice", uint64(2000000000),
     )
 }
 ```
@@ -38,9 +43,11 @@ string, or out-of-range arguments. Do not cast an inexact caller value to uint64
 validate external data before passing it to the typed API. No clock is consulted.
 Zero and past expiration can be signed, but the server rejects at and after expiry.
 
-Room and participant are case-sensitive external IDs of 1–36 ASCII characters
-in `[A-Za-z0-9_-]`. The SDK copies IDs unchanged into the JWT; the SFU
-validates them. The API key remains opaque to applications.
+Participant IDs, room patterns and labels are nonempty UTF-8 strings of at most
+256 bytes, without control characters. The SDK validates these bounds and the
+[grant schema](../auth/README.md#grants), preserving exact text and case.
+Optional grant filters use pointers: nil omits a filter. A nil or empty grant
+slice grants no access. The API key remains opaque to applications.
 
 Keep secrets on servers only, never in clients or logs. Offline signing cannot
 check registration or whether a secret belongs to the supplied project/key.

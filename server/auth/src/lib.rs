@@ -1,3 +1,4 @@
+use pulsebeam_core::auth::grants::GrantSet;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5,7 +6,8 @@ pub struct Input {
     pub project_id: String,
     pub key_id: String,
     pub secret: String,
-    pub room: String,
+    pub requested_room: String,
+    pub grants: GrantSet,
     pub participant: String,
     pub expiration: String,
 }
@@ -82,7 +84,7 @@ mod tests {
     use pulsebeam_core::{
         auth::{
             ApiSigningKey, DEVELOPMENT_PROJECT_ID, KeyRegistry, KeyRegistryEntry, TokenError,
-            verify_participant_token,
+            authenticate_participant_token as verify_participant_token,
         },
         identity::{
             ApiKeyId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId, RoomId,
@@ -93,7 +95,7 @@ mod tests {
     fn shared_contract_and_server_authorization() {
         let vectors: Vectors = serde_json::from_str(include_str!("../vectors.json")).unwrap();
         let cases: Cases = serde_json::from_str(include_str!("../cases.json")).unwrap();
-        assert_eq!(vectors.version, 1);
+        assert_eq!(vectors.version, 2);
         assert_eq!(cases.version, vectors.version);
         assert!(cases.base == vectors.base);
         assert!(cases.invalid == vectors.invalid);
@@ -153,7 +155,7 @@ mod tests {
             assert_eq!(
                 pulsebeam_server::sign_participant_token(
                     &api_key,
-                    &input.room,
+                    &input.grants,
                     &input.participant,
                     exp
                 )
@@ -181,26 +183,39 @@ mod tests {
                 );
                 continue;
             }
-            let authorization =
-                verify_participant_token(&registry, &golden.token, exp - 1).unwrap();
-            assert_eq!(authorization.project_id, project);
-            assert_eq!(authorization.room_external_id.as_str(), input.room);
+            let principal = verify_participant_token(&registry, &golden.token, exp - 1).unwrap();
+            assert_eq!(principal.project_id(), project);
             assert_eq!(
-                authorization.participant_external_id.as_str(),
+                principal.participant_external_id().as_str(),
                 input.participant
             );
-            assert_eq!(authorization.expiry.unix_seconds(), exp);
-            assert_eq!(
-                authorization.room_id,
-                RoomId::derive(&project, &authorization.room_external_id)
-            );
-            assert_eq!(
-                authorization.participant_id,
-                ParticipantId::derive(
-                    &authorization.room_id,
-                    &authorization.participant_external_id
-                )
-            );
+            assert_eq!(principal.expiry().unix_seconds(), exp);
+            let selected =
+                principal.authorize_room(RoomExternalId::new(&input.requested_room).unwrap());
+            assert_eq!(selected.is_ok(), golden.name != "deny-all");
+            if let Ok(authorization) = selected {
+                assert_eq!(authorization.grants, input.grants);
+                assert_eq!(
+                    authorization.room_external_id.as_str(),
+                    input.requested_room
+                );
+                assert_eq!(
+                    authorization.participant_external_id.as_str(),
+                    input.participant
+                );
+                assert_eq!(authorization.expiry.unix_seconds(), exp);
+                assert_eq!(
+                    authorization.room_id,
+                    RoomId::derive(&project, &authorization.room_external_id)
+                );
+                assert_eq!(
+                    authorization.participant_id,
+                    ParticipantId::derive(
+                        &authorization.room_id,
+                        &authorization.participant_external_id
+                    )
+                );
+            }
             assert_eq!(
                 verify_participant_token(&registry, &golden.token, exp),
                 Err(TokenError::Expired)
@@ -247,15 +262,24 @@ mod tests {
                 verify_participant_token(&wrong_key, &golden.token, exp - 1),
                 Err(TokenError::Invalid)
             );
-            let tampered_claims = golden
-                .claims
-                .replace(&input.participant, "OtherParticipant");
+            let tampered_claims = golden.claims.replacen(
+                &format!(
+                    "\"sub\":{}",
+                    serde_json::to_string(&input.participant).unwrap()
+                ),
+                &format!(
+                    "\"sub\":{}",
+                    serde_json::to_string(&"x".repeat(input.participant.len())).unwrap()
+                ),
+                1,
+            );
             let tampered = format!(
                 "{}.{}.{}",
                 BASE64URL_NOPAD.encode(golden.header.as_bytes()),
                 BASE64URL_NOPAD.encode(tampered_claims.as_bytes()),
                 golden.signature
             );
+            assert_eq!(tampered.len(), golden.token.len());
             assert_eq!(
                 verify_participant_token(&registry, &tampered, exp - 1),
                 Err(TokenError::Invalid)
@@ -271,6 +295,28 @@ mod tests {
         // Verify internal ID and signing-secret codec fixtures here. Packaged
         // SDK consumers exercise only the public opaque-key signing contract.
         for rejection in vectors.invalid {
+            if rejection.field == "grants" {
+                let grants = serde_json::from_value::<GrantSet>(rejection.value);
+                if rejection.name == "encoded-token-over-limit" {
+                    let error = pulsebeam_server::sign_participant_token(
+                        &format!(
+                            "{}.{}.{}",
+                            vectors.base.project_id, vectors.base.key_id, vectors.base.secret
+                        ),
+                        &grants.unwrap(),
+                        &vectors.base.participant,
+                        vectors.base.expiration.parse().unwrap(),
+                    )
+                    .unwrap_err();
+                    assert!(matches!(
+                        error,
+                        pulsebeam_server::SigningError::TokenTooLarge
+                    ));
+                } else {
+                    assert!(grants.is_err(), "{}", rejection.name);
+                }
+                continue;
+            }
             let Some(value) = rejection.value.as_str() else {
                 continue;
             };
@@ -278,7 +324,6 @@ mod tests {
                 "project_id" => value.parse::<ProjectId>().is_err(),
                 "key_id" => value.parse::<ApiKeyId>().is_err(),
                 "secret" => value.parse::<ApiSigningKey>().is_err(),
-                "room" => RoomExternalId::new(value).is_err(),
                 "participant" => ParticipantExternalId::new(value).is_err(),
                 "expiration" => continue,
                 _ => panic!("unknown conformance field"),

@@ -545,7 +545,7 @@ impl TrackLifecycle {
             .collect()
     }
 
-    fn reconcile(
+    pub(super) fn reconcile(
         &mut self,
         identity: TrackAncestry,
         registry: &RoomRegistry,
@@ -638,6 +638,10 @@ impl TrackLifecycle {
             ParticipantLocation::bound_in_room(registry, &identity.publisher, identity.room_id)
                 .expect("a published track must have a bound live publisher in its room");
 
+        let publisher = registry
+            .get_participant(&identity.publisher)
+            .and_then(|meta| meta.participant_external_id.as_ref())
+            .map(crate::entity::ParticipantExternalId::as_str);
         let mut locations = HashMap::new();
         let candidates = self
             .topology
@@ -646,6 +650,20 @@ impl TrackLifecycle {
             .filter_map(|participant| {
                 let location =
                     ParticipantLocation::bound_in_room(registry, &participant, identity.room_id)?;
+                let meta = registry.get_participant(&participant)?;
+                let allowed = meta.authorization.as_ref().map_or(
+                    meta.profile == super::controller::SignalingProtocol::State,
+                    |lease| {
+                        lease.permissions().allows_source(
+                            pulsebeam_core::auth::grants::Action::Subscribe,
+                            publisher,
+                            &track,
+                        )
+                    },
+                );
+                if !allowed {
+                    return None;
+                }
                 locations.insert(participant, location);
                 Some(participant)
             })

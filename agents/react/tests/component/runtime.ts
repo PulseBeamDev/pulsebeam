@@ -11,6 +11,7 @@ export class BrowserRuntime {
   eventListener?: (event: any) => void;
   errorListener?: (error: any) => void;
   sent: { name: string; mode: string; payload: Uint8Array }[] = [];
+  joins: string[] = [];
   sendCompletion: Promise<void> = Promise.resolve();
   tracks = new Map<number, MediaStreamTrack>();
   nextOwner = 1n;
@@ -37,6 +38,11 @@ export class BrowserRuntime {
   snapshot = {
     version: 1n,
     desiredRevision: 0n,
+    joinRevision: 0n,
+    credentialRevision: 0n,
+    acceptedCredentialRevision: undefined,
+    credentialOutcome: undefined,
+    desiredRoom: undefined as string | undefined,
     connection: "disconnected",
     catalog: { revision: 0n, tracks: [] },
     mapping: { acceptedIntentRevision: 0n, video: [], audio: [] },
@@ -216,6 +222,9 @@ export class BrowserRuntime {
       });
     }
     this.desired = { ...this.desired, video };
+  }
+  join(room: string) {
+    this.joins.push(room);
   }
   renew_authorization(token: string) {
     this.config = { ...this.config, token };

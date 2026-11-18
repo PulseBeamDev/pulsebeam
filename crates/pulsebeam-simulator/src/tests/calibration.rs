@@ -76,7 +76,7 @@ async fn peer(ip: IpAddr, server: IpAddr, name: &str, publishes: bool) -> anyhow
         endpoint: format!("http://{server}:7070"),
         token: pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
-            "calibration",
+            &serde_json::from_value(serde_json::json!([{"rooms":["calibration"],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
             name,
             u64::try_from(i64::MAX)?,
         )?,
@@ -116,6 +116,7 @@ async fn peer(ip: IpAddr, server: IpAddr, name: &str, publishes: bool) -> anyhow
             .map_err(|error| anyhow::anyhow!("{error:?}"))?,
         )
         .await?;
+    agent.join("calibration".into())?;
     Ok(Peer {
         agent,
         transport: runtime,

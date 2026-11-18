@@ -81,10 +81,14 @@ fn media_want(
 }
 
 pub(super) struct Renewal {
-    pub token: String,
+    pub credential: super::Credential,
     pub operation: Option<OperationId>,
     pub expected_revision: u64,
     pub accepted: bool,
+    pub retry: Option<TimerId>,
+    pub attempts: u8,
+    pub uncertain: bool,
+    pub issued: bool,
 }
 
 pub(super) fn kind(track: &state::Track) -> state::TrackKind {
@@ -158,6 +162,7 @@ fn selected<'a>(
 
 fn rtp(
     session: &mut Session,
+    logs: &mut crate::logging::LogBuffer,
     resource: &Resource,
     slot: &MediaSlot,
     source: Option<&str>,
@@ -188,9 +193,9 @@ fn rtp(
                 .media_leases
                 .entry(slot.clone())
                 .or_insert_with(|| {
-                    log::debug!(
+                    logs.write(log::Level::Debug, module_path!(), format_args!(
                         "Native bootstrap media lease awaits preparation: slot={slot:?} resource={resource:?} error={preparation_error:?} pending={pending}"
-                    );
+                    ));
                     MediaLease {
                         resource: resource.clone(),
                         mid: coordinate.mid.clone(),
@@ -233,6 +238,7 @@ fn rtp(
 
 fn receive_rtp(
     session: &mut Session,
+    logs: &mut crate::logging::LogBuffer,
     resource: &Resource,
     slot: &MediaSlot,
     source: &str,
@@ -240,7 +246,7 @@ fn receive_rtp(
     if session.state.target_spec(resource).and_then(|spec| spec.declaration.as_ref()).is_some_and(|declaration| matches!(declaration, state::resource_spec::Declaration::Subscription(value) if value.track_id != source)) {
         return None;
     }
-    rtp(session, resource, slot, Some(source))
+    rtp(session, logs, resource, slot, Some(source))
 }
 
 fn receiver_spec_available(
@@ -427,6 +433,7 @@ pub(super) fn project_retired_receivers(session: &Session, snapshot: &mut Snapsh
 
 pub(super) fn reconcile(
     session: &mut Session,
+    logs: &mut crate::logging::LogBuffer,
     desired: &DesiredState,
     topics: &crate::topic::Topics,
     ids: &mut IdGenerator,
@@ -449,7 +456,7 @@ pub(super) fn reconcile(
         if let Some(want) = media_want(session, resource.clone(), &slot, None) {
             media.insert(slot.clone(), want);
         }
-        if let Some(binding) = rtp(session, &resource, &slot, None) {
+        if let Some(binding) = rtp(session, logs, &resource, &slot, None) {
             let kind = if kind == crate::MediaKind::Audio {
                 state::publication_spec::Kind::Audio(state::AudioPublication {
                     binding: Some(binding),
@@ -477,7 +484,7 @@ pub(super) fn reconcile(
             media.insert(slot.clone(), want);
         }
         if let Some(track) = track
-            && let Some(binding) = receive_rtp(session, &resource, &slot, &track)
+            && let Some(binding) = receive_rtp(session, logs, &resource, &slot, &track)
         {
             let spec = subscription(
                 track,
@@ -581,7 +588,7 @@ pub(super) fn reconcile(
         if let Some(want) = media_want(session, resource.clone(), &slot, Some(&id)) {
             media.insert(slot.clone(), want);
         }
-        if let Some(binding) = receive_rtp(session, &resource, &slot, &id) {
+        if let Some(binding) = receive_rtp(session, logs, &resource, &slot, &id) {
             let spec = subscription(
                 id,
                 state::TrackKind::Audio,
@@ -763,9 +770,13 @@ pub(super) fn reconcile(
         .collect::<Vec<_>>();
     for resource in removed {
         if session.state.target_spec(&resource).is_some() {
-            log::debug!(
-                "Native resource no longer wanted: generation={:?} resource={resource:?}",
-                session.generation
+            logs.write(
+                log::Level::Debug,
+                module_path!(),
+                format_args!(
+                    "Native resource no longer wanted: generation={:?} resource={resource:?}",
+                    session.generation
+                ),
             );
         }
         session.state.stage(resource.clone(), None)?;
@@ -793,10 +804,13 @@ pub(super) fn reconcile(
             }
         ) && session.state.target_spec(&resource) != Some(&spec)
         {
-            log::debug!(
-                "Native media publication wanted: generation={:?} resource={resource:?} declaration={:?}",
-                session.generation,
-                spec.declaration
+            logs.write(
+                log::Level::Debug,
+                module_path!(),
+                format_args!(
+                    "Native media publication wanted: generation={:?} resource={resource:?} declaration={:?}",
+                    session.generation, spec.declaration
+                ),
             );
         }
         if let Err(error) = session.state.stage(resource, Some(spec)) {
@@ -1466,6 +1480,8 @@ impl Agent {
                         continue;
                     };
                     if let Some(grant) = &session.authorization {
+                        active.authorization_revision =
+                            active.authorization_revision.max(grant.revision);
                         active.authorization_expires_at = Some(grant.expires_at_unix_seconds);
                         self.snapshot.authorization_expires_at = active.authorization_expires_at;
                     }
@@ -1498,6 +1514,7 @@ impl Agent {
                         return Ok(());
                     }
                     self.commit_renewal();
+                    self.request_reconciliation();
                 }
                 Change::Participant(id) => {
                     discovery_changed = true;
@@ -1532,10 +1549,14 @@ impl Agent {
                 Change::Track(id) => {
                     discovery_changed = true;
                     self.project_native_track(&id);
-                    log::debug!(
-                        "Native track discovery changed: generation={:?} track={id} publication={:?}",
-                        self.snapshot.generation,
-                        self.snapshot.publications.get(&id)
+                    self.logs.write(
+                        log::Level::Debug,
+                        module_path!(),
+                        format_args!(
+                            "Native track discovery changed: generation={:?} track={id} publication={:?}",
+                            self.snapshot.generation,
+                            self.snapshot.publications.get(&id)
+                        ),
                     );
                     self.intent_dirty = true;
                 }
@@ -1781,7 +1802,13 @@ impl Agent {
                 .is_some_and(|grant| grant.revision >= renewal.expected_revision)
         {
             if let Some(renewal) = active.pending_renewal.take() {
-                self.config.token = renewal.token;
+                let revision = renewal.credential.revision;
+                self.snapshot.accepted_credential_revision = Some(revision);
+                active.credential = renewal.credential;
+                self.bump_snapshot();
+                self.notifications.push_back(Notification::SnapshotChanged);
+                self.credential_accepted(revision);
+                self.request_reconciliation();
             }
         }
     }

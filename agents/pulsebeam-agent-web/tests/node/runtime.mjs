@@ -34,6 +34,7 @@ if (process.argv[2] === "initialization-failure") {
     }),
   );
   agent.activate();
+  agent.join("initialization-retry-room");
   await assert.rejects(agent.connect(), /controlled artifact fetch failure/);
   const observed = await failure;
   assert.equal(observed.class, "initialization");
@@ -55,8 +56,10 @@ if (process.argv[2] === "initialization-failure") {
       }
     });
   });
+  agent.join("initialization-retry-room");
   await agent.connect();
   await recovered;
+  assert.equal(agent.snapshot().desiredRoom, "initialization-retry-room");
   assert.equal(
     attempts,
     3,
@@ -127,7 +130,10 @@ if (process.argv[2] === "initialization-failure") {
     1,
     "production loader shares one in-flight initialization",
   );
-  const runtime = new BrowserRuntime(config);
+  assert.throws(
+    () => new BrowserRuntime({ ...config, token: "t".repeat(8193) }),
+  );
+  const runtime = new BrowserRuntime({ ...config, token: "t".repeat(8192) });
   assert.deepEqual(runtime.diagnostics(), {
     peers: 0,
     requests: 0,
@@ -135,11 +141,46 @@ if (process.argv[2] === "initialization-failure") {
     closed: false,
     lastError: undefined,
   });
+  runtime.renew_authorization("r".repeat(8192));
+  assert.throws(() => runtime.renew_authorization("r".repeat(8193)));
+  assert.equal(runtime.diagnostics().lastError, undefined);
   runtime.renew_authorization("renewed");
   assert.equal(runtime.snapshot().connection, "disconnected");
+  assert.equal(runtime.snapshot().joinRevision, 0n);
+  assert.equal(runtime.snapshot().credentialRevision, 0n);
+  assert.equal(runtime.snapshot().acceptedCredentialRevision, undefined);
+  assert.equal(runtime.snapshot().credentialOutcome, undefined);
+  assert.equal(runtime.snapshot().desiredRoom, undefined);
+  const beforeJoin = runtime.snapshot();
+  assert.throws(() => runtime.join("bad\0room"));
+  assert.deepEqual(runtime.snapshot(), beforeJoin);
+  const snapshots = [];
+  runtime.set_snapshot_listener((snapshot) => snapshots.push(snapshot));
+  assert.equal(runtime.join("room-a"), undefined);
+  const roomA = runtime.snapshot();
+  assert.equal(roomA.desiredRoom, "room-a");
+  assert.equal(roomA.joinRevision, 1n);
+  runtime.join("room-b");
+  assert.equal(runtime.snapshot().desiredRoom, "room-b");
+  assert.equal(runtime.snapshot().joinRevision, 2n);
+  assert.equal(roomA.desiredRoom, "room-a", "snapshots retain owned values");
+  assert.equal(snapshots.length, 1, "join does not invoke callbacks inline");
+  let reentrantSnapshot;
+  runtime.set_snapshot_listener((snapshot) => {
+    reentrantSnapshot = snapshot;
+    runtime.join("from-listener");
+  });
+  assert.equal(reentrantSnapshot.desiredRoom, "room-b");
+  assert.equal(runtime.snapshot().desiredRoom, "from-listener");
+  assert.equal(runtime.snapshot().joinRevision, 3n);
+  assert.equal(runtime.diagnostics().peers, 0);
+  assert.equal(runtime.diagnostics().requests, 0);
+  assert.equal(runtime.diagnostics().timers, 0);
+  runtime.set_snapshot_listener(undefined);
   runtime.close();
   assert.equal(runtime.diagnostics().closed, true);
   assert.throws(() => runtime.connect(), /closed/);
+  assert.throws(() => runtime.join("after-close"), /closed/);
   assert.throws(() => runtime.set_owned_muted(1n, true), /closed/);
   assert.throws(
     () => runtime.replace_owned_track(1n, null, {}, false, true),
@@ -172,6 +213,6 @@ if (process.argv[2] === "initialization-failure") {
     "emitted Rust runtime source ownership, mute persistence, slot reuse and close fencing passed",
   );
   console.log(
-    "emitted WASM initialization, diagnostics, authorization, close fencing and free passed",
+    "emitted WASM initialization, synchronous room intent, owned snapshots, callback reentry, authorization and close fencing passed",
   );
 }

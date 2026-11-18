@@ -58,7 +58,7 @@ import { signParticipantToken } from "@pulsebeam/server";
 function issueToken(apiKey: string) {
   return signParticipantToken({
     apiKey,
-    room: "general",
+    grants: [{ rooms: ["general"], allow: ["join", "publish", "discover", "subscribe"] }],
     participant: "alice",
     expiration: Math.floor(Date.now() / 1000) + 3600,
   });
@@ -67,17 +67,20 @@ function issueToken(apiKey: string) {
 
 The SDK signs locally without reading the environment itself or performing a
 network request. Only the short-lived participant JWT goes to the browser.
-A renewal must use the **same** room and participant identity.
+A renewal must use the same project and participant identity. Grants may change;
+the server checks them against the accepted connection's selected room.
 
 Only the opaque `apiKey` input is supported. The SDK splits its components,
 copies issuer and key IDs unchanged, and imports the PKCS#8 Ed25519 private key.
 Applications never supply separate credential fields.
 
 The expiration must be an absolute safe-integer number or bigint within the
-unsigned 64-bit range; it is not a TTL. Room/participant IDs are case-sensitive
-1–36 ASCII characters in `[A-Za-z0-9_-]`. The SDK does not validate identity
-formats; the SFU enforces them. Offline signing cannot check public-key
-registration or user permissions. Errors must not print sensitive values.
+unsigned 64-bit range; it is not a TTL. Participant IDs, room patterns and labels
+are nonempty UTF-8 strings of at most 256 bytes, without control characters.
+The SDK validates these bounds and the [grant schema](../auth/README.md#grants).
+Case and exact text are preserved. Exported `Grant`, `Action` and `TrackKind`
+types describe the input. Empty grants grant no access. Offline signing cannot
+check public-key registration or a user's authority. Errors do not print secrets.
 
 ## Contributor checks
 

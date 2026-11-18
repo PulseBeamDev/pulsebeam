@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 
-async def witness(endpoint, token, reader_token, package):
+async def witness(endpoint, token, reader_token, room, package):
     core = importlib.import_module(f"{package}.pulsebeam_agent_core")
     native = importlib.import_module(f"{package}.pulsebeam_agent_native")
     agent = await native.Agent.create(
@@ -38,7 +38,7 @@ async def witness(endpoint, token, reader_token, package):
         participant_cursor = await reader.participant("foreign").data(
             "foreign-bytes", core.TopicMode.ORDERED,
         ).receive()
-        await reader.connect()
+        reader.join(room)
         camera = await agent.create_video_input(native.VideoSourceConfig(
             encodings=[native.Encoding(
                 rid=None, scale_down_by=1, max_bitrate_bps=None,
@@ -48,7 +48,7 @@ async def witness(endpoint, token, reader_token, package):
         publication = await agent.video("foreign-camera").publish(
             camera, core.PublicationConfig(enabled=True),
         )
-        await agent.connect()
+        agent.join(room)
         while True:
             update = await updates.next()
             assert update.is_SNAPSHOT(), f"lost foreign snapshot observation: {update}"
@@ -217,10 +217,10 @@ async def witness(endpoint, token, reader_token, package):
 
 
 def main():
-    if len(sys.argv) == 5 and sys.argv[1] == "--witness":
+    if len(sys.argv) == 6 and sys.argv[1] == "--witness":
         package = importlib.import_module("pulsebeam_agent")
         assert Path(package.__file__).is_relative_to("/opt/lib/python3.12/site-packages")
-        asyncio.run(asyncio.wait_for(witness(sys.argv[2], sys.argv[3], sys.argv[4], package.__name__), timeout=25))
+        asyncio.run(asyncio.wait_for(witness(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], package.__name__), timeout=25))
         return
 
     from installer import install
@@ -256,7 +256,7 @@ def main():
             sys.path.insert(0, str(site))
             package = importlib.import_module("pulsebeam_agent")
             assert Path(package.__file__).is_relative_to(site)
-            asyncio.run(asyncio.wait_for(witness(sys.argv[1], sys.argv[2], sys.argv[3], package.__name__), timeout=25))
+            asyncio.run(asyncio.wait_for(witness(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], package.__name__), timeout=25))
 
 
 if __name__ == "__main__":

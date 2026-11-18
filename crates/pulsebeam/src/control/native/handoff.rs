@@ -16,6 +16,7 @@ const COMMANDS: usize = 32;
 const READY: u8 = 1;
 const FAILED: u8 = 2;
 const ENDPOINT_READY: u8 = 4;
+const EXECUTION_STOPPED: u8 = 8;
 
 pub(crate) fn describe_metrics() {
     metrics::describe_counter!(
@@ -54,7 +55,7 @@ pub(crate) struct Opened {
     pub at: Instant,
 }
 
-// One control-rate wake/failure word per connection, never touched by media or topic forwarding.
+// One control-rate wake/failure/cutoff word, never touched by media or topic forwarding.
 #[expect(
     clippy::disallowed_types,
     reason = "Independent per-connection native control readiness state, not packet state or a multi-atomic snapshot"
@@ -182,6 +183,12 @@ pub(crate) fn pair(
 }
 
 impl ControllerHandoff {
+    pub(crate) fn stop_execution(&self) {
+        self.signal
+            .state
+            .fetch_or(EXECUTION_STOPPED, Ordering::AcqRel);
+    }
+
     pub(crate) fn stop(&self) {
         self.signal.fail();
     }
@@ -218,7 +225,7 @@ impl ControllerHandoff {
     }
 
     pub(crate) fn command(&self, command: ExecutionCommand) -> Result<(), ExecutionCommand> {
-        if self.failed() {
+        if self.signal.state.load(Ordering::Acquire) & (FAILED | EXECUTION_STOPPED) != 0 {
             return Err(command);
         }
         self.commands
@@ -287,7 +294,15 @@ impl EndpointHandoff {
             .fetch_and(!ENDPOINT_READY, Ordering::AcqRel);
     }
 
+    pub(crate) fn execution_stopped(&self) -> bool {
+        self.signal.state.load(Ordering::Acquire) & (FAILED | EXECUTION_STOPPED) != 0
+    }
+
     pub(crate) fn commands_pending(&mut self) -> bool {
+        if self.execution_stopped() {
+            self.next_command = None;
+            return false;
+        }
         if self.next_command.is_none() {
             self.next_command = self.receive_command();
         }
@@ -346,7 +361,8 @@ impl EndpointHandoff {
     }
 
     pub(crate) fn command(&mut self) -> Option<ExecutionCommand> {
-        if self.failed() {
+        if self.execution_stopped() {
+            self.next_command = None;
             return None;
         }
         self.next_command.take().or_else(|| self.receive_command())

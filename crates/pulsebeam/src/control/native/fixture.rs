@@ -1,8 +1,9 @@
 use super::handler::StateProtocolHandler;
 use super::handoff::{self, EndpointHandoff};
-use super::{InputError, NativeSession};
+use super::{InputError, NativeSession, OutputError, ResolvedSource};
 use crate::entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId, TrackId};
 use crate::track::Track;
+use std::collections::BTreeMap;
 
 pub(crate) fn execution_handoff(
     resources: &mut crate::control::NegotiatedResources,
@@ -20,6 +21,7 @@ pub(crate) fn execution_handoff(
 pub(crate) struct NativeControl {
     handler: StateProtocolHandler,
     ready: pulsebeam_queue::Receiver<ConnectionId>,
+    publishers: BTreeMap<ParticipantId, ParticipantExternalId>,
 }
 
 impl NativeControl {
@@ -33,18 +35,63 @@ impl NativeControl {
     ) -> (Self, EndpointHandoff) {
         let (sender, ready) = pulsebeam_queue::bounded(std::num::NonZeroUsize::MIN);
         let (controller, endpoint) = handoff::pair(connection, sender);
+        let publishers = BTreeMap::from([(participant, external.clone())]);
         let mut handler =
             StateProtocolHandler::new(participant, room, external, capabilities, controller)
                 .unwrap();
         handler
             .model
-            .authorization(i64::try_from(expiry).unwrap(), 1)
+            .authorization(
+                i64::try_from(expiry).unwrap(),
+                1,
+                super::ResourcePermissions::RoomBound,
+            )
             .unwrap();
-        (Self { handler, ready }, endpoint)
+        (
+            Self {
+                handler,
+                ready,
+                publishers,
+            },
+            endpoint,
+        )
+    }
+
+    pub(crate) fn observe_participant(
+        &mut self,
+        participant: pulsebeam_proto::state::Participant,
+    ) -> Result<(), OutputError> {
+        let id = participant
+            .participant_id
+            .parse()
+            .map_err(|_| OutputError::InvalidObservation)?;
+        let external = ParticipantExternalId::new(&participant.participant_external_id)
+            .map_err(|_| OutputError::InvalidObservation)?;
+        self.handler.model.observe_participant(participant)?;
+        self.publishers.insert(id, external);
+        Ok(())
+    }
+
+    pub(crate) fn observe_candidate(&mut self, track: &Track) -> Result<(), OutputError> {
+        let publisher = self
+            .publishers
+            .get(&track.meta().origin)
+            .ok_or(OutputError::InvalidObservation)?;
+        self.handler
+            .model
+            .observe_candidate(ResolvedSource { track, publisher })
     }
 
     pub(crate) fn command(&self, command: super::ExecutionCommand) {
         assert!(self.handler.handoff.command(command).is_ok());
+    }
+
+    pub(crate) fn begin_terminal(
+        &mut self,
+        reason: pulsebeam_proto::state::CloseReason,
+    ) -> Result<(), InputError> {
+        self.handler.close(reason)?;
+        self.handler.service_terminal().map(|_| ())
     }
 
     pub(crate) fn service<'a>(
@@ -56,7 +103,16 @@ impl NativeControl {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        self.handler.service(now, source).map(|_| ())
+        let publishers = &self.publishers;
+        self.handler
+            .service(now, |id| {
+                let track = source(id)?;
+                Some(ResolvedSource {
+                    track,
+                    publisher: publishers.get(&track.meta().origin)?,
+                })
+            })
+            .map(|_| ())
     }
 }
 

@@ -106,17 +106,39 @@ impl WirePeer {
             + 60;
         let token = pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key()?,
-            "native-state-wire",
+            &serde_json::from_value(serde_json::json!([{"rooms":["native-state-wire"],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
             subject,
             expiry,
         )?;
+        let room = "native-state-wire";
+        let admission = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://{server}:7070/api/v1/native/admissions"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(b"{}".to_vec())?;
+        let admission = create_http_client()
+            .execute(admission)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            admission.status() == http::StatusCode::OK,
+            "native ownership admission: {}",
+            admission.status()
+        );
+        let admission: serde_json::Value = serde_json::from_slice(admission.body())?;
+        let owner = admission["owner"]
+            .as_str()
+            .context("opaque native ownership capability")?;
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("http://{server}:7070/api/v1/native"))
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
+            .header("pulsebeam-owner", owner)
+            .header("pulsebeam-attempt", "1")
             .body(serde_json::to_vec(
-                &serde_json::json!({"profile":wire::PROFILE,"offer":offer}),
+                &serde_json::json!({"profile":wire::PROFILE,"offer":offer,"room":room}),
             )?)?;
         let response = create_http_client()
             .execute(request)

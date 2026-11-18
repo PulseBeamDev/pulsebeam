@@ -86,7 +86,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                 .coordinates
                 .insert(slot.clone(), Some(assigned.clone()));
             active.media_preparation = preparation;
-            assert!(rtp(active, &resource, &slot, None).is_none());
+            assert!(rtp(active, &mut agent.logs, &resource, &slot, None).is_none());
             assert!(active.media_leases[&slot].retired);
             assert_eq!(active.media_leases[&slot].mid, assigned.mid);
             retire_media(active, &mut agent.ids, &mut agent.effects);
@@ -110,7 +110,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
             assert!(active.coordinates.contains_key(&slot));
             assert!(active.coordinates[&slot].is_none());
             assert!(!active.media_leases.contains_key(&slot));
-            assert!(rtp(active, &resource, &slot, None).is_none());
+            assert!(rtp(active, &mut agent.logs, &resource, &slot, None).is_none());
             assert!(!active.media_leases.contains_key(&slot));
             assert!(agent.next_effect_after_turn().is_none());
         }
@@ -831,74 +831,103 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
 
 #[test]
 fn renewal_retries_original_precondition_and_commits_credentials_only_after_ordered_grant() {
-    let (mut agent, generation, control) = connected(Default::default());
+    use crate::CredentialStatus;
+
+    let patch = |agent: &mut Agent| {
+        let Some(Effect::Http(HttpEffect::Request {
+            operation, request, ..
+        })) = agent.next_effect_after_turn()
+        else {
+            panic!("conditional PATCH")
+        };
+        assert_eq!(request.method, HttpMethod::Patch);
+        (operation, request)
+    };
+    let retry = |agent: &mut Agent| {
+        let Some(Effect::Timer(TimerEffect::Schedule { timer, after })) =
+            agent.next_effect_after_turn()
+        else {
+            panic!("bounded authorization retry")
+        };
+        assert!(!after.is_zero());
+        agent
+            .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+            .unwrap();
+        patch(agent)
+    };
+    let (mut agent, generation, control) = connected(crate::TopicRegistrations::default());
     agent
         .command(AgentCommand::RenewAuthorization("replacement".into()))
         .unwrap();
-    let Some(Effect::Http(HttpEffect::Request {
-        operation, request, ..
-    })) = agent.next_effect_after_turn()
-    else {
-        panic!("PATCH")
-    };
-    assert_eq!(request.method, HttpMethod::Patch);
-    assert!(request.body.is_empty());
+    let (operation, original) = patch(&mut agent);
     assert!(
-        request
+        original
             .headers
             .iter()
             .any(|header| header.name == "If-Match" && header.value == "\"auth-1\"")
     );
-    assert!(!format!("{request:?}").contains("replacement"));
+    for token in ["superseded", "newest"] {
+        agent
+            .command(AgentCommand::RenewAuthorization(token.into()))
+            .unwrap();
+    }
+    assert_eq!(agent.snapshot().credential_revision, 3);
+    assert!(
+        agent.next_effect_after_turn().is_none(),
+        "new desire cannot overlap the issued PATCH"
+    );
     agent
         .handle(HostEvent::Http(HttpEvent::Failed {
             operation,
-            message: "ambiguous".into(),
+            message: "private failure must not enter state".into(),
         }))
         .unwrap();
     observe(&mut agent, generation, control, vec![grant(2)]);
-    assert_eq!(agent.config.token, "private-token");
-    agent
-        .command(AgentCommand::RenewAuthorization("replacement".into()))
-        .unwrap();
-    let Some(Effect::Http(HttpEffect::Request {
-        operation, request, ..
-    })) = agent.next_effect_after_turn()
-    else {
-        panic!("retry PATCH")
-    };
-    assert!(
-        request
-            .headers
-            .iter()
-            .any(|header| header.name == "If-Match" && header.value == "\"auth-1\"")
+    assert_eq!(agent.config.token, "newest");
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
+    assert_eq!(
+        agent
+            .snapshot()
+            .credential_outcome
+            .as_ref()
+            .unwrap()
+            .revision,
+        1
+    );
+    assert_eq!(
+        agent.snapshot().credential_outcome.as_ref().unwrap().status,
+        CredentialStatus::Uncertain
+    );
+    assert!(!format!("{:?}", agent.snapshot()).contains("private failure"));
+    let (retry_operation, retried) = retry(&mut agent);
+    assert_eq!(
+        retried, original,
+        "transport ambiguity retains the original credential and precondition"
     );
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
-            operation,
+            operation: retry_operation,
             response: HttpResponse {
                 status: 412,
-                headers: Vec::new(),
-                body: Vec::new(),
+                headers: vec![HttpHeader {
+                    name: "ETag".into(),
+                    value: "\"auth-4\"".into(),
+                }],
+                body: vec![],
             },
         }))
         .unwrap();
-    assert_eq!(agent.config.token, "private-token");
-    agent
-        .command(AgentCommand::RenewAuthorization("replacement".into()))
-        .unwrap();
-    let Some(Effect::Http(HttpEffect::Request {
-        operation, request, ..
-    })) = agent.next_effect_after_turn()
-    else {
-        panic!("fresh PATCH")
-    };
-    assert!(
-        request
-            .headers
-            .iter()
-            .any(|header| header.name == "If-Match" && header.value == "\"auth-2\"")
+    assert_eq!(
+        agent
+            .snapshot()
+            .credential_outcome
+            .as_ref()
+            .unwrap()
+            .revision,
+        1,
+        "old uncertainty is not attributed to unissued newest desire"
     );
+    let before = agent.snapshot().clone();
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,
@@ -906,15 +935,372 @@ fn renewal_retries_original_precondition_and_commits_credentials_only_after_orde
                 status: 204,
                 headers: vec![HttpHeader {
                     name: "ETag".into(),
-                    value: "\"auth-3\"".into(),
+                    value: "\"auth-2\"".into(),
                 }],
-                body: Vec::new(),
+                body: vec![],
             },
         }))
         .unwrap();
-    assert_eq!(agent.config.token, "private-token");
-    observe(&mut agent, generation, control, vec![grant(3)]);
-    assert_eq!(agent.config.token, "replacement");
+    assert_eq!(
+        agent.snapshot(),
+        &before,
+        "a superseded HTTP completion is fenced"
+    );
+    let (fresh_operation, fresh) = retry(&mut agent);
+    assert!(
+        fresh
+            .headers
+            .iter()
+            .any(|header| header.name == "If-Match" && header.value == "\"auth-4\"")
+    );
+    assert!(
+        fresh
+            .headers
+            .iter()
+            .any(|header| header.name == "Authorization" && header.value == "Bearer newest")
+    );
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: fresh_operation,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![HttpHeader {
+                    name: "ETag".into(),
+                    value: "\"auth-5\"".into(),
+                }],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
+    agent
+        .command(AgentCommand::RenewAuthorization("newer".into()))
+        .unwrap();
+    assert!(
+        agent.next_effect_after_turn().is_none(),
+        "HTTP acceptance still waits for its ordered grant"
+    );
+    observe(&mut agent, generation, control, vec![grant(5)]);
+    assert_eq!(agent.config.token, "newer");
+    assert_eq!(agent.snapshot().credential_revision, 4);
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(3));
+    assert_eq!(
+        agent
+            .snapshot()
+            .credential_outcome
+            .as_ref()
+            .unwrap()
+            .revision,
+        3
+    );
+    assert_eq!(
+        agent.snapshot().credential_outcome.as_ref().unwrap().status,
+        CredentialStatus::Accepted
+    );
+    let (denied, newer) = patch(&mut agent);
+    assert!(
+        newer
+            .headers
+            .iter()
+            .any(|header| header.name == "If-Match" && header.value == "\"auth-5\"")
+    );
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: denied,
+            response: HttpResponse {
+                status: 403,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    assert_eq!(
+        agent
+            .snapshot()
+            .credential_outcome
+            .as_ref()
+            .unwrap()
+            .revision,
+        4
+    );
+    assert_eq!(
+        agent.snapshot().credential_outcome.as_ref().unwrap().status,
+        CredentialStatus::Rejected
+    );
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(3));
+    assert!(
+        agent.next_effect_after_turn().is_none(),
+        "denied unchanged desire is not a retry loop"
+    );
+
+    agent.config.retry.maximum_attempts = 2;
+    agent
+        .command(AgentCommand::RenewAuthorization("newer".into()))
+        .unwrap();
+    assert_eq!(
+        agent.snapshot().credential_revision,
+        5,
+        "explicit settled retry has a fresh revision"
+    );
+    let (uncertain, _) = patch(&mut agent);
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: uncertain,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    let (uncertain_retry, _) = retry(&mut agent);
+    agent
+        .handle(HostEvent::Http(HttpEvent::Failed {
+            operation: uncertain_retry,
+            message: "lost".into(),
+        }))
+        .unwrap();
+    let outcome = agent.snapshot().credential_outcome.as_ref().unwrap();
+    assert_eq!(outcome.revision, 5);
+    assert_eq!(outcome.status, CredentialStatus::Uncertain);
+    assert_eq!(
+        outcome.error.as_ref().unwrap().class,
+        FailureClass::RetryExhausted
+    );
+    assert!(agent.next_effect_after_turn().is_none());
+    agent
+        .command(AgentCommand::RenewAuthorization("recover".into()))
+        .unwrap();
+    let (recovery, recovery_request) = patch(&mut agent);
+    assert!(
+        recovery_request
+            .headers
+            .iter()
+            .any(|header| header.name == "Authorization" && header.value == "Bearer newer")
+    );
+    assert!(
+        recovery_request
+            .headers
+            .iter()
+            .any(|header| header.name == "If-Match" && header.value == "\"auth-5\"")
+    );
+    agent
+        .handle(HostEvent::Http(HttpEvent::Failed {
+            operation: recovery,
+            message: "lost".into(),
+        }))
+        .unwrap();
+    let Some(Effect::Timer(TimerEffect::Schedule { timer, after })) =
+        agent.next_effect_after_turn()
+    else {
+        panic!("retry timer");
+    };
+    assert!(!after.is_zero());
+
+    let mut disconnected = Agent::new(agent.config.clone()).unwrap();
+    for agent in [&mut agent, &mut disconnected] {
+        agent.snapshot.credential_revision = u64::MAX;
+        let before = agent.snapshot().clone();
+        let effects = agent.effects.clone();
+        assert_eq!(
+            agent.command(AgentCommand::RenewAuthorization("exhausted".into())),
+            Err(AgentError::CredentialRevisionExhausted)
+        );
+        assert_eq!(agent.snapshot(), &before);
+        assert_eq!(agent.effects, effects);
+    }
+    agent.command(AgentCommand::Disconnect).unwrap();
+    let mut cancelled = false;
+    let mut deleted = false;
+    while let Some(effect) = agent.next_effect_after_turn() {
+        match effect {
+            Effect::Timer(TimerEffect::Cancel {
+                timer: cancelled_timer,
+            }) => {
+                assert_eq!(cancelled_timer, timer);
+                cancelled = true;
+            }
+            Effect::Rtc(RtcEffect::Close { generation: closed }) => assert_eq!(closed, generation),
+            Effect::Http(HttpEffect::Request { request, .. }) => {
+                assert_eq!(request.method, HttpMethod::Delete);
+                assert!(request.headers.iter().any(
+                    |header| header.name == "Authorization" && header.value == "Bearer newest"
+                ));
+                deleted = true;
+            }
+            effect => panic!("unexpected closing effect: {effect:?}"),
+        }
+    }
+    assert!(cancelled && deleted);
+    let before = agent.snapshot().clone();
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: recovery,
+            response: HttpResponse {
+                status: 204,
+                headers: vec![HttpHeader {
+                    name: "ETag".into(),
+                    value: "\"auth-6\"".into(),
+                }],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    observe(&mut agent, generation, control, vec![grant(6)]);
+    assert_eq!(agent.snapshot(), &before);
+    assert!(agent.next_effect_after_turn().is_none());
+}
+
+#[test]
+fn renewal_response_fences_preserve_issued_and_coalesce_unsent_credentials() {
+    use crate::CredentialStatus;
+
+    for (status, etags, body) in [
+        (204, vec![], vec![]),
+        (204, vec!["\"auth-2\""], vec![1]),
+        (204, vec!["\"auth-2\"", "\"auth-3\""], vec![]),
+        (204, vec!["\"auth-3\""], vec![]),
+        (412, vec![], vec![]),
+        (412, vec!["\"auth-+2\""], vec![]),
+        (412, vec!["\"auth-1\""], vec![]),
+        (412, vec!["\"auth-2\"", "\"auth-3\""], vec![]),
+        (408, vec![], vec![]),
+        (429, vec![], vec![]),
+        (500, vec![], vec![]),
+    ] {
+        let (mut agent, generation, control) = connected(crate::TopicRegistrations::default());
+        agent
+            .command(AgentCommand::RenewAuthorization(
+                "credential-not-in-state".into(),
+            ))
+            .unwrap();
+        let Some(Effect::Http(HttpEffect::Request {
+            operation,
+            request: original,
+            ..
+        })) = agent.next_effect_after_turn()
+        else {
+            panic!("initial PATCH");
+        };
+        agent
+            .command(AgentCommand::RenewAuthorization(
+                "latest-not-in-state".into(),
+            ))
+            .unwrap();
+        agent
+            .handle(HostEvent::Http(HttpEvent::Response {
+                operation,
+                response: HttpResponse {
+                    status,
+                    headers: etags
+                        .into_iter()
+                        .map(|value| HttpHeader {
+                            name: "ETag".into(),
+                            value: value.into(),
+                        })
+                        .collect(),
+                    body,
+                },
+            }))
+            .unwrap();
+        observe(&mut agent, generation, control, vec![grant(2)]);
+        assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
+        let outcome = agent.snapshot().credential_outcome.as_ref().unwrap();
+        assert_eq!(outcome.revision, 1);
+        assert_eq!(outcome.status, CredentialStatus::Uncertain);
+        assert!(!format!("{:?}", agent.snapshot()).contains("not-in-state"));
+        let Some(Effect::Timer(TimerEffect::Schedule { timer, after })) =
+            agent.next_effect_after_turn()
+        else {
+            panic!("bounded retry");
+        };
+        assert!(!after.is_zero());
+        agent
+            .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+            .unwrap();
+        let Some(Effect::Http(HttpEffect::Request { request, .. })) =
+            agent.next_effect_after_turn()
+        else {
+            panic!("retry PATCH");
+        };
+        assert_eq!(
+            request, original,
+            "status {status} cannot resolve the original request's uncertainty"
+        );
+    }
+
+    let (mut agent, generation, control) = connected(crate::TopicRegistrations::default());
+    agent
+        .command(AgentCommand::RenewAuthorization("first".into()))
+        .unwrap();
+    let Some(Effect::Http(HttpEffect::Request { operation, .. })) = agent.next_effect_after_turn()
+    else {
+        panic!("first PATCH");
+    };
+    agent
+        .command(AgentCommand::RenewAuthorization("second".into()))
+        .unwrap();
+    observe(&mut agent, generation, control, vec![grant(5)]);
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation,
+            response: HttpResponse {
+                status: 412,
+                headers: vec![HttpHeader {
+                    name: "ETag".into(),
+                    value: "\"auth-4\"".into(),
+                }],
+                body: vec![],
+            },
+        }))
+        .unwrap();
+    agent
+        .command(AgentCommand::RenewAuthorization("third".into()))
+        .unwrap();
+    let before = agent.snapshot().clone();
+    agent
+        .command(AgentCommand::RenewAuthorization("third".into()))
+        .unwrap();
+    assert_eq!(agent.snapshot(), &before);
+    let Some(Effect::Timer(TimerEffect::Schedule { timer, after })) =
+        agent.next_effect_after_turn()
+    else {
+        panic!("fenced retry");
+    };
+    assert!(!after.is_zero());
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    let Some(Effect::Http(HttpEffect::Request { request, .. })) = agent.next_effect_after_turn()
+    else {
+        panic!("coalesced PATCH");
+    };
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|header| header.name == "Authorization" && header.value == "Bearer third")
+    );
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|header| header.name == "If-Match" && header.value == "\"auth-5\"")
+    );
+    assert_eq!(agent.snapshot().credential_revision, 3);
+    assert_eq!(agent.snapshot().accepted_credential_revision, Some(0));
+    assert_eq!(
+        agent
+            .snapshot()
+            .credential_outcome
+            .as_ref()
+            .unwrap()
+            .revision,
+        1
+    );
 }
 
 #[test]

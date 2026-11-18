@@ -363,6 +363,22 @@ fn mint_development_token(
     participant: &ParticipantExternalId,
     expiration: u64,
 ) -> Result<String> {
+    if room.as_str().contains('*') {
+        anyhow::bail!("development tokens require a concrete room");
+    }
+    use pulsebeam_server::{Action, Grant, GrantSet};
+    let grants = GrantSet::new(vec![Grant::new(
+        vec![room.as_str().to_owned()],
+        vec![
+            Action::Join,
+            Action::Publish,
+            Action::Discover,
+            Action::Subscribe,
+        ],
+        None,
+        None,
+        None,
+    )?])?;
     let key = ApiKey::from_signing_key(
         *DEVELOPMENT_PROJECT_ID.as_bytes(),
         *DEVELOPMENT_API_KEY_ID.as_bytes(),
@@ -370,7 +386,7 @@ fn mint_development_token(
     )?;
     Ok(pulsebeam_server::sign_participant_token(
         &key.to_secret_string(),
-        room.as_str(),
+        &grants,
         participant.as_str(),
         expiration,
     )?)
@@ -1189,10 +1205,20 @@ mod tests {
 
         assert_eq!(alice.endpoint, "http://127.0.0.1:7070");
         assert_ne!(alice.token, bob.token);
-        let alice_auth =
-            verify_participant_token(&development_registry(), &alice.token, 1_000).unwrap();
-        let bob_auth =
-            verify_participant_token(&development_registry(), &bob.token, 1_000).unwrap();
+        let alice_auth = verify_participant_token(
+            &development_registry(),
+            &alice.token,
+            RoomExternalId::new("bench-room-7").unwrap(),
+            1_000,
+        )
+        .unwrap();
+        let bob_auth = verify_participant_token(
+            &development_registry(),
+            &bob.token,
+            RoomExternalId::new("bench-room-7").unwrap(),
+            1_000,
+        )
+        .unwrap();
         assert_eq!(alice_auth.room_external_id.as_str(), "bench-room-7");
         assert_eq!(bob_auth.room_external_id.as_str(), "bench-room-7");
         assert_eq!(alice_auth.participant_external_id.as_str(), "bench-7000");
@@ -1219,12 +1245,22 @@ mod tests {
             panic!("token command must parse as token");
         };
         let token = development_token_at(config, 1_000).unwrap();
-        assert_eq!(
-            token,
-            "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDAwMDAwMDAwMVIwMTAwMDAwMDAwMDAwMDgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwMDAwMDAwMDAxUjAxMDAwMDAwMDAwMDAwNCIsImF1ZCI6InBiIiwic3ViIjoiYWxpY2UiLCJyb29tIjoiZ2VuZXJhbCIsImV4cCI6MjAwMH0.Bp8UJVINeP0cqUiG_0qSk4wjqDg5MGZqRcBel3Qy176HoTy0OQvTpTp5Uuav5k2Wlsgdd58rPt6DLiWVt0U1AQ"
-        );
         let registry = development_registry();
-        assert!(verify_participant_token(&registry, &token, 1_999).is_ok());
+        let verified = verify_participant_token(
+            &registry,
+            &token,
+            RoomExternalId::new("general").unwrap(),
+            1_999,
+        )
+        .unwrap();
+        assert_eq!(verified.participant_external_id.as_str(), "alice");
+        assert_eq!(verified.expiry.unix_seconds(), 2_000);
+        assert_eq!(
+            serde_json::to_value(verified.grants).unwrap(),
+            serde_json::json!([
+                {"rooms":["general"],"allow":["join","publish","discover","subscribe"]}
+            ])
+        );
 
         let default_cli = Cli::try_parse_from([
             "pulsebeam-cli",

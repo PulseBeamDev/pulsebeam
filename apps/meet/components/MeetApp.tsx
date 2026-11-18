@@ -34,6 +34,7 @@ function MeetSession() {
   const [session, setSession] = useState<{
     token: string;
     endpoint: string;
+    room: string;
   } | null>(null);
   const {
     capture: { stop },
@@ -49,6 +50,8 @@ function MeetSession() {
   return session ? (
     <Room {...session} onLeave={leave} />
   ) : (
-    <Lobby onJoin={(token, endpoint) => setSession({ token, endpoint })} />
+    <Lobby
+      onJoin={(token, endpoint, room) => setSession({ token, endpoint, room })}
+    />
   );
 }

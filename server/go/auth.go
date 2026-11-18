@@ -8,7 +8,102 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
+
+const maxCompactTokenLen = 8192
+
+type Action string
+
+const (
+	Join      Action = "join"
+	Publish   Action = "publish"
+	Discover  Action = "discover"
+	Subscribe Action = "subscribe"
+)
+
+type TrackKind string
+
+const (
+	Audio TrackKind = "audio"
+	Video TrackKind = "video"
+	Data  TrackKind = "data"
+)
+
+type Grant struct {
+	Rooms       []string   `json:"rooms"`
+	Allow       []Action   `json:"allow"`
+	Participant *string    `json:"participant,omitempty"`
+	Kind        *TrackKind `json:"kind,omitempty"`
+	Label       *string    `json:"label,omitempty"`
+}
+
+func validScope(value string) bool {
+	if len(value) == 0 || len(value) > 256 || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func validateGrants(grants []Grant) error {
+	if len(grants) > 32 {
+		return errors.New("invalid grant count")
+	}
+	patterns := 0
+	for _, grant := range grants {
+		patterns += len(grant.Rooms)
+		if len(grant.Rooms) == 0 || patterns > 64 {
+			return errors.New("invalid room pattern count")
+		}
+		for _, room := range grant.Rooms {
+			if !validScope(room) || (strings.Contains(room, "*") && room != "*" && !(strings.HasSuffix(room, "/*") && strings.Count(room, "*") == 1)) {
+				return errors.New("invalid room pattern")
+			}
+		}
+		if len(grant.Allow) == 0 || len(grant.Allow) > 4 {
+			return errors.New("invalid actions")
+		}
+		var seen uint8
+		for _, action := range grant.Allow {
+			var bit uint8
+			switch action {
+			case Join:
+				bit = 1
+			case Publish:
+				bit = 2
+			case Discover:
+				bit = 4
+			case Subscribe:
+				bit = 8
+			default:
+				return errors.New("invalid action")
+			}
+			if seen&bit != 0 {
+				return errors.New("duplicate action")
+			}
+			seen |= bit
+		}
+		if (grant.Participant != nil && !validScope(*grant.Participant)) || (grant.Label != nil && !validScope(*grant.Label)) {
+			return errors.New("invalid grant filter")
+		}
+		if grant.Kind != nil && *grant.Kind != Audio && *grant.Kind != Video && *grant.Kind != Data {
+			return errors.New("invalid track kind")
+		}
+		if seen&1 != 0 && (grant.Participant != nil || grant.Kind != nil || grant.Label != nil) {
+			return errors.New("invalid join filters")
+		}
+		if seen&2 != 0 && grant.Participant != nil {
+			return errors.New("invalid publish participant filter")
+		}
+	}
+	return nil
+}
 
 // The public issuer and key IDs are copied into JWT fields as opaque strings.
 // Standard x509 handles all private-key encoding and algorithm validation.
@@ -34,12 +129,20 @@ func parseAPIKey(apiKey string) (string, string, ed25519.PrivateKey, error) {
 
 // SignParticipantToken signs a participant JWT using an opaque server-only API key.
 // expiration is absolute Unix seconds, not a TTL. No clock or network is consulted.
-func SignParticipantToken(apiKey, room, participant string, expiration uint64) (string, error) {
+func SignParticipantToken(apiKey string, grants []Grant, participant string, expiration uint64) (string, error) {
+	if !validScope(participant) {
+		return "", errors.New("invalid participant identifier")
+	}
+	if err := validateGrants(grants); err != nil {
+		return "", err
+	}
+	if grants == nil {
+		grants = []Grant{}
+	}
 	project, key, privateKey, err := parseAPIKey(apiKey)
 	if err != nil {
 		return "", err
 	}
-	// JSON serialization escapes untrusted text without interpreting ID formats.
 	header, err := json.Marshal(struct {
 		Alg string `json:"alg"`
 		Kid string `json:"kid"`
@@ -49,17 +152,20 @@ func SignParticipantToken(apiKey, room, participant string, expiration uint64) (
 		return "", errors.New("invalid JWT header")
 	}
 	claims, err := json.Marshal(struct {
-		Iss  string `json:"iss"`
-		Aud  string `json:"aud"`
-		Sub  string `json:"sub"`
-		Room string `json:"room"`
-		Exp  uint64 `json:"exp"`
-	}{project, "pb", participant, room, expiration})
+		Iss    string  `json:"iss"`
+		Aud    string  `json:"aud"`
+		Sub    string  `json:"sub"`
+		Exp    uint64  `json:"exp"`
+		Grants []Grant `json:"grants"`
+	}{project, "pb", participant, expiration, grants})
 	if err != nil {
 		return "", errors.New("invalid JWT claims")
 	}
 	encoding := base64.RawURLEncoding
 	input := encoding.EncodeToString(header) + "." + encoding.EncodeToString(claims)
+	if len(input)+1+encoding.EncodedLen(ed25519.SignatureSize) > maxCompactTokenLen {
+		return "", errors.New("participant token exceeds the 8192-byte limit")
+	}
 	signature := ed25519.Sign(privateKey, []byte(input))
 	return input + "." + encoding.EncodeToString(signature), nil
 }

@@ -1,4 +1,5 @@
-mod native_json;
+mod admission;
+pub(crate) mod creation;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,7 +17,8 @@ use hyper::header::{
     ALLOW, AUTHORIZATION, CONTENT_TYPE, ETAG, IF_MATCH, LOCATION, RETRY_AFTER, WWW_AUTHENTICATE,
 };
 use pulsebeam_core::auth::{
-    KeyRegistry, TokenError, VerifiedAuthorization, verify_participant_token,
+    KeyRegistry, TokenError, VerifiedAuthorization, VerifiedPrincipal,
+    authenticate_participant_token,
 };
 use pulsebeam_queue::TrySendError;
 use pulsebeam_runtime::time::Instant;
@@ -69,6 +71,12 @@ pub enum ApiError {
     BadUrl,
     #[error("resource not found")]
     NotFound,
+    #[error("identity response encoding is required")]
+    NotAcceptable,
+    #[error("ownership recovery is unavailable")]
+    RecoveryUnavailable,
+    #[error("ownership attempt was superseded")]
+    OwnershipSuperseded,
     #[error("authorization precondition required")]
     PreconditionRequired,
     #[error("bad request: {0}")]
@@ -77,7 +85,7 @@ pub enum ApiError {
     Unknown(String),
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 struct Problem {
     r#type: &'static str,
     title: &'static str,
@@ -85,8 +93,36 @@ struct Problem {
     detail: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ProblemResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    problem: Option<Problem>,
+}
+
+impl ProblemResponse {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+}
+
+impl IntoResponse for ProblemResponse {
+    fn into_response(self) -> Response {
+        match self.problem {
+            Some(problem) => (self.status, self.headers, Json(problem)).into_response(),
+            None => self.status.into_response(),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        self.into_problem().into_response()
+    }
+}
+
+impl ApiError {
+    pub(crate) fn into_problem(self) -> ProblemResponse {
         let (status, title) = match &self {
             Self::AuthorizationRequired
             | Self::Authorization(_)
@@ -104,19 +140,21 @@ impl IntoResponse for ApiError {
             | Self::JoinError(controller::ControllerError::OfferRejected(_))
             | Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "Bad Request"),
             Self::NotFound => (StatusCode::NOT_FOUND, "Not Found"),
+            Self::NotAcceptable => (StatusCode::NOT_ACCEPTABLE, "Not Acceptable"),
             Self::PreconditionRequired => {
                 (StatusCode::PRECONDITION_REQUIRED, "Precondition Required")
             }
-            Self::JoinError(controller::ControllerError::GrantGone) => (StatusCode::GONE, "Gone"),
+            Self::JoinError(controller::ControllerError::GrantGone) | Self::RecoveryUnavailable => {
+                (StatusCode::GONE, "Gone")
+            }
             Self::JoinError(controller::ControllerError::AuthorizationRejected) => {
                 (StatusCode::FORBIDDEN, "Forbidden")
             }
             Self::JoinError(controller::ControllerError::AuthorizationPrecondition { .. }) => {
                 (StatusCode::PRECONDITION_FAILED, "Precondition Failed")
             }
-            Self::JoinError(controller::ControllerError::Superseded) => {
-                (StatusCode::CONFLICT, "Conflict")
-            }
+            Self::JoinError(controller::ControllerError::Superseded)
+            | Self::OwnershipSuperseded => (StatusCode::CONFLICT, "Conflict"),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"),
             Self::JoinError(controller::ControllerError::ServiceUnavailable)
@@ -127,7 +165,13 @@ impl IntoResponse for ApiError {
                 revision,
             }) => match grant_etag(*revision) {
                 Ok(etag) => Some(etag),
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(_) => {
+                    return ProblemResponse {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        headers: HeaderMap::new(),
+                        problem: None,
+                    };
+                }
             },
             _ => None,
         };
@@ -143,40 +187,93 @@ impl IntoResponse for ApiError {
         } else {
             self.to_string()
         };
-        let mut response = (
-            status,
-            [(CONTENT_TYPE, "application/problem+json")],
-            Json(Problem {
-                r#type: "about:blank",
-                title,
-                status: status.as_u16(),
-                detail,
-            }),
-        )
-            .into_response();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json"),
+        );
         if let Some(challenge) = challenge {
-            response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
+            headers.insert(WWW_AUTHENTICATE, challenge);
         }
         if let Some(etag) = etag {
-            response.headers_mut().insert(ETAG, etag);
+            headers.insert(ETAG, etag);
         }
         if matches!(
             status,
             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
         ) {
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
         }
-        response
+        ProblemResponse {
+            status,
+            headers,
+            problem: Some(Problem {
+                r#type: "about:blank",
+                title,
+                status: status.as_u16(),
+                detail,
+            }),
+        }
     }
 }
 
-pub(crate) fn verify_bearer(
+impl From<controller::OwnedAdmissionError> for ProblemResponse {
+    fn from(error: controller::OwnedAdmissionError) -> Self {
+        use controller::{OwnedAdmissionError, ownership::Error};
+        match error {
+            OwnedAdmissionError::Request(error) => ApiError::JoinError(error),
+            OwnedAdmissionError::Authority(Error::UnknownProof | Error::ReplayUnavailable) => {
+                ApiError::RecoveryUnavailable
+            }
+            OwnedAdmissionError::Authority(Error::Replaced | Error::StaleAttempt) => {
+                ApiError::OwnershipSuperseded
+            }
+            OwnedAdmissionError::Authority(Error::InvalidProof | Error::ChangedAttempt) => {
+                ApiError::BadRequest("invalid ownership attempt".to_owned())
+            }
+            OwnedAdmissionError::Authority(Error::Capacity | Error::QuiescencePending) => {
+                ApiError::ServiceUnavailable
+            }
+            OwnedAdmissionError::Authority(Error::ResultTooLarge)
+            | OwnedAdmissionError::Image(creation::Error::TooLarge) => ApiError::PayloadTooLarge,
+            OwnedAdmissionError::Authority(Error::InvalidTransition)
+            | OwnedAdmissionError::Image(
+                creation::Error::Serialization | creation::Error::InvalidImage,
+            ) => ApiError::Unknown("owned admission failed".to_owned()),
+        }
+        .into_problem()
+    }
+}
+
+impl From<creation::PreflightError> for ApiError {
+    fn from(error: creation::PreflightError) -> Self {
+        match error {
+            creation::PreflightError::IdentityRequired => Self::NotAcceptable,
+            error => Self::BadRequest(error.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+fn verify_bearer(
     headers: &HeaderMap,
     registry: &KeyRegistry,
     now: u64,
 ) -> Result<VerifiedAuthorization, ApiError> {
+    authenticate_bearer(headers, registry, now)?
+        .authorize_room(pulsebeam_core::identity::RoomExternalId::new("general")?)
+        .map_err(|_| controller::ControllerError::AuthorizationRejected.into())
+}
+
+fn authenticate_bearer(
+    headers: &HeaderMap,
+    registry: &KeyRegistry,
+    now: u64,
+) -> Result<VerifiedPrincipal, ApiError> {
+    authenticate_participant_token(registry, bearer_token(headers)?, now).map_err(Into::into)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
     let mut values = headers.get_all(AUTHORIZATION).iter();
     let value = values.next().ok_or(ApiError::AuthorizationRequired)?;
     if values.next().is_some() {
@@ -190,7 +287,7 @@ pub(crate) fn verify_bearer(
     {
         return Err(TokenError::Malformed.into());
     }
-    verify_participant_token(registry, token, now).map_err(Into::into)
+    Ok(token)
 }
 
 fn build_location(headers: &HeaderMap, cfg: &ApiConfig, path: &str) -> Result<String, ApiError> {
@@ -214,12 +311,17 @@ struct NativeRequest {
     #[schema(example = "pulsebeam.media.v1")]
     profile: String,
     offer: String,
+    room: String,
 }
 
 fn parse_native_request(body: &[u8]) -> Result<NativeRequest, ApiError> {
     let invalid = || ApiError::BadRequest("invalid native JSON request".to_owned());
-    native_json::unique_keys(body).map_err(|_| invalid())?;
+    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(invalid());
+    }
     let request: NativeRequest = serde_json::from_slice(body).map_err(|_| invalid())?;
+    pulsebeam_core::identity::RoomExternalId::new(&request.room)
+        .map_err(|_| ApiError::BadRequest("invalid room external id".to_owned()))?;
     if request.profile != pulsebeam_proto::state::PROFILE {
         return Err(ApiError::BadRequest(
             "unsupported native profile".to_owned(),
@@ -229,21 +331,46 @@ fn parse_native_request(body: &[u8]) -> Result<NativeRequest, ApiError> {
 }
 
 #[derive(Serialize, ToSchema)]
-struct NativeResponse {
+struct NativeResponse<'a> {
     profile: &'static str,
     #[schema(value_type = Object)]
-    rtp_capabilities: pulsebeam_proto::state::RtpCapabilities,
+    rtp_capabilities: &'a pulsebeam_proto::state::RtpCapabilities,
     #[schema(value_type = Vec<String>)]
-    data_delivery: Vec<pulsebeam_proto::state::DataDelivery>,
-    room_external_id: String,
+    data_delivery: [pulsebeam_proto::state::DataDelivery; 3],
+    room_external_id: &'a str,
     #[schema(value_type = String)]
     room_id: RoomId,
-    participant_external_id: String,
+    participant_external_id: &'a str,
     #[schema(value_type = String)]
     participant_id: ParticipantId,
     #[schema(value_type = String)]
     connection_id: ConnectionId,
-    answer: String,
+    answer: &'a str,
+}
+
+impl<'a> NativeResponse<'a> {
+    fn new(
+        authorization: &'a VerifiedAuthorization,
+        connection_id: ConnectionId,
+        rtp_capabilities: &'a pulsebeam_proto::state::RtpCapabilities,
+        answer: &'a str,
+    ) -> Self {
+        Self {
+            profile: pulsebeam_proto::state::PROFILE,
+            rtp_capabilities,
+            data_delivery: [
+                pulsebeam_proto::state::DataDelivery::Latest,
+                pulsebeam_proto::state::DataDelivery::Lossy,
+                pulsebeam_proto::state::DataDelivery::Ordered,
+            ],
+            room_external_id: authorization.room_external_id.as_str(),
+            room_id: authorization.room_id,
+            participant_external_id: authorization.participant_external_id.as_str(),
+            participant_id: authorization.participant_id,
+            connection_id,
+            answer,
+        }
+    }
 }
 
 fn ensure_json_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -385,92 +512,85 @@ fn validate_single_media_per_kind(offer: &str) -> Result<(), ApiError> {
     security(("bearer_auth" = [])),
     tag = "native"
 )]
-async fn create_native(
-    State(state): State<AppState>,
+async fn create_native(state: State<AppState>, request: Request) -> Result<Response, ApiError> {
+    admission::create(state, request).await
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeAdmissionRequest {}
+
+#[derive(Serialize, ToSchema)]
+struct NativeAdmissionResponse {
+    owner: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/native/admissions",
+    request_body(content = NativeAdmissionRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Fresh principal ownership capability", body = NativeAdmissionResponse),
+        (status = 400, description = "Invalid request", body = Problem),
+        (status = 401, description = "Invalid bearer authorization", body = Problem),
+        (status = 503, description = "Ownership authority unavailable", body = Problem)
+    ),
+    security(("bearer_auth" = [])),
+    tag = "native"
+)]
+async fn issue_native_admission(
+    state: State<AppState>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let headers = request.headers().clone();
-    let wall_now = SystemTime::now();
-    let unix_now = wall_now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let authorization = verify_bearer(&headers, &state.key_registry, unix_now)?;
-    ensure_json_content_type(&headers)?;
-    let body = to_bytes(request.into_body(), MAX_NATIVE_BODY_BYTES)
-        .await
-        .map_err(|_| ApiError::PayloadTooLarge)?;
-    let request = parse_native_request(&body)?;
-    if request.offer.len() > MAX_NATIVE_SDP_BYTES {
+    admission::issue(state, request).await
+}
+
+fn native_message(
+    authorization: &VerifiedAuthorization,
+    offer: String,
+    wall_now: SystemTime,
+) -> Result<
+    (
+        controller::CreateParticipant,
+        pulsebeam_proto::state::RtpCapabilities,
+    ),
+    ApiError,
+> {
+    if offer.len() > MAX_NATIVE_SDP_BYTES {
         return Err(ApiError::PayloadTooLarge);
     }
-    validate_native_directions(&request.offer)?;
-    let offer = request.offer;
-    let lease = controller::AuthorizationLease::from_expiry(
-        authorization.expiry,
+    validate_native_directions(&offer)?;
+    let lease = controller::AuthorizationLease::from_verified(
+        authorization.clone(),
         wall_now,
-        pulsebeam_runtime::time::Instant::now(),
+        Instant::now(),
     )?;
     lease.native_expiry()?;
-    let connection_id = ConnectionId::new();
     let rtp_capabilities = crate::control::rtp::capabilities();
-    let participant_state = ParticipantState {
-        manual_sub: true,
-        room_id: authorization.room_id,
-        participant_id: authorization.participant_id,
-        participant_external_id: authorization.participant_external_id.clone(),
-        connection_id,
-        old_connection_id: None,
-        authorization: Some(lease),
-        profile: SignalingProtocol::State,
-        rtp_capabilities: Some(rtp_capabilities.clone()),
-    };
-    let (reply_tx, reply_rx) = pulsebeam_runtime::sync::oneshot::channel();
-    state
-        .controller
-        .try_send(
-            (
-                controller::CreateParticipant {
-                    state: participant_state,
-                    offer,
-                },
-                reply_tx,
-            )
-                .into(),
-        )
-        .map_err(|error| match error {
-            TrySendError::Full(_) => ApiError::RateLimited,
-            TrySendError::Closed(_) => ApiError::ServiceUnavailable,
-        })?;
-    let reply: CreateParticipantReply = reply_rx
-        .await
-        .map_err(|_| controller::ControllerError::ServiceUnavailable)??;
-    let location = build_location(
-        &headers,
-        &state.api_config,
-        &format!("/native/{connection_id}"),
-    )?;
-    let location = HeaderValue::from_str(&location).map_err(|_| ApiError::BadUrl)?;
-    Ok((
-        StatusCode::CREATED,
-        [(LOCATION, location)],
-        Json(NativeResponse {
-            profile: pulsebeam_proto::state::PROFILE,
-            rtp_capabilities,
-            data_delivery: vec![
-                pulsebeam_proto::state::DataDelivery::Latest,
-                pulsebeam_proto::state::DataDelivery::Lossy,
-                pulsebeam_proto::state::DataDelivery::Ordered,
-            ],
-            room_external_id: authorization.room_external_id.as_str().to_owned(),
+    let message = controller::CreateParticipant {
+        state: ParticipantState {
+            manual_sub: true,
             room_id: authorization.room_id,
-            participant_external_id: authorization.participant_external_id.as_str().to_owned(),
             participant_id: authorization.participant_id,
-            connection_id,
-            answer: reply.answer,
-        }),
-    )
-        .into_response())
+            participant_external_id: authorization.participant_external_id.clone(),
+            connection_id: ConnectionId::new(),
+            old_connection_id: None,
+            authorization: Some(lease),
+            profile: SignalingProtocol::State,
+            rtp_capabilities: Some(rtp_capabilities.clone()),
+        },
+        offer,
+    };
+    Ok((message, rtp_capabilities))
+}
+
+#[cfg(test)]
+pub(super) fn owned_native_router(
+    controller: ControllerSender,
+    cfg: ApiConfig,
+    registry: KeyRegistry,
+) -> Router {
+    router(controller, cfg, registry)
 }
 
 fn grant_etag(revision: u64) -> Result<HeaderValue, ApiError> {
@@ -534,7 +654,7 @@ async fn patch_native(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let authorization = verify_bearer(headers, &state.key_registry, now)?;
+    let principal = authenticate_bearer(headers, &state.key_registry, now)?;
     let expected_revision = grant_precondition(headers)?;
     let connection_id = connection_id.parse().map_err(|_| ApiError::NotFound)?;
     to_bytes(request.into_body(), 0).await.map_err(|_| {
@@ -545,11 +665,11 @@ async fn patch_native(
         .controller
         .try_send(
             (
-                controller::ReplaceAuthorization {
-                    authorization,
+                controller::NativeResourceRequest {
+                    principal,
                     connection_id,
-                    expected_revision,
                 },
+                expected_revision,
                 send,
             )
                 .into(),
@@ -567,9 +687,11 @@ async fn patch_native(
     path = "/native/{connection_id}",
     params(("connection_id" = String, Path, description = "Canonical connection ID")),
     responses(
-        (status = 204, description = "Native connection cutoff acknowledged, or already absent"),
+        (status = 204, description = "Native connection cutoff acknowledged"),
         (status = 401, description = "Invalid bearer authorization", body = Problem, content_type = "application/problem+json"),
+        (status = 403, description = "Credential cannot authorize this resource", body = Problem, content_type = "application/problem+json"),
         (status = 404, description = "Malformed connection ID", body = Problem, content_type = "application/problem+json"),
+        (status = 410, description = "Resource authorization context is unavailable, not proof of physical absence", body = Problem, content_type = "application/problem+json"),
         (status = 429, description = "Controller is busy", body = Problem, content_type = "application/problem+json"),
         (status = 503, description = "Service unavailable", body = Problem, content_type = "application/problem+json")
     ),
@@ -585,15 +707,15 @@ async fn delete_native(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let authorization = verify_bearer(&headers, &state.key_registry, now)?;
+    let principal = authenticate_bearer(&headers, &state.key_registry, now)?;
     let connection_id = connection_id.parse().map_err(|_| ApiError::NotFound)?;
     let (send, receive) = pulsebeam_runtime::sync::oneshot::channel();
     state
         .controller
         .try_send(
             (
-                controller::DeleteNative {
-                    authorization,
+                controller::NativeResourceRequest {
+                    principal,
                     connection_id,
                 },
                 send,
@@ -606,6 +728,44 @@ async fn delete_native(
         })?;
     receive.await.map_err(|_| ApiError::ServiceUnavailable)??;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn requested_sdp_room(uri: &Uri) -> Result<pulsebeam_core::identity::RoomExternalId, ApiError> {
+    let invalid = || ApiError::BadRequest("one valid room query parameter is required".to_owned());
+    let mut pairs = uri.query().ok_or_else(invalid)?.split('&');
+    let (name, encoded) = pairs
+        .next()
+        .and_then(|pair| pair.split_once('='))
+        .ok_or_else(invalid)?;
+    if name != "room"
+        || pairs.next().is_some()
+        || encoded.len() > pulsebeam_core::auth::grants::MAX_SCOPE_BYTES.saturating_mul(3)
+    {
+        return Err(invalid());
+    }
+    let mut decoded = Vec::with_capacity(pulsebeam_core::auth::grants::MAX_SCOPE_BYTES);
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        if decoded.len() == pulsebeam_core::auth::grants::MAX_SCOPE_BYTES {
+            return Err(invalid());
+        }
+        decoded.push(match byte {
+            b'+' => b' ',
+            b'%' => {
+                let hex = |byte| {
+                    char::from(byte)
+                        .to_digit(16)
+                        .and_then(|value| u8::try_from(value).ok())
+                };
+                let high = bytes.next().and_then(hex).ok_or_else(invalid)?;
+                let low = bytes.next().and_then(hex).ok_or_else(invalid)?;
+                (high << 4) | low
+            }
+            byte => byte,
+        });
+    }
+    let room = std::str::from_utf8(&decoded).map_err(|_| invalid())?;
+    pulsebeam_core::identity::RoomExternalId::new(room).map_err(|_| invalid())
 }
 
 async fn create_sdp_profile(
@@ -621,7 +781,10 @@ async fn create_sdp_profile(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let authorization = verify_bearer(&headers, &state.key_registry, unix_now)?;
+    let principal = authenticate_bearer(&headers, &state.key_registry, unix_now)?;
+    let authorization = principal
+        .authorize_room(requested_sdp_room(request.uri())?)
+        .map_err(|_| controller::ControllerError::AuthorizationRejected)?;
     ensure_sdp_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SIGNALING_BODY_BYTES)
         .await
@@ -631,8 +794,8 @@ async fn create_sdp_profile(
     validate_strict_directions(raw_offer, required_direction)?;
     validate_single_media_per_kind(raw_offer)?;
     let offer = raw_offer.to_owned();
-    let lease = controller::AuthorizationLease::from_expiry(
-        authorization.expiry,
+    let lease = controller::AuthorizationLease::from_verified(
+        authorization.clone(),
         wall_now,
         pulsebeam_runtime::time::Instant::now(),
     )?;
@@ -684,6 +847,7 @@ async fn create_sdp_profile(
 #[utoipa::path(
     post,
     path = "/whip",
+    params(("room" = String, Query, description = "Explicit concrete room external ID")),
     request_body(content = String, description = "Send-only WebRTC SDP offer", content_type = "application/sdp"),
     responses(
         (status = 201, description = "WHIP connection created", body = String, content_type = "application/sdp",
@@ -709,6 +873,7 @@ async fn create_whip(
 #[utoipa::path(
     post,
     path = "/whep",
+    params(("room" = String, Query, description = "Explicit concrete room external ID")),
     request_body(content = String, description = "Receive-only WebRTC SDP offer", content_type = "application/sdp"),
     responses(
         (status = 201, description = "WHEP connection created", body = String, content_type = "application/sdp",
@@ -736,7 +901,7 @@ fn verify_discovery(state: &AppState, headers: &HeaderMap) -> Result<StatusCode,
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let _authorization = verify_bearer(headers, &state.key_registry, now)?;
+    let _principal = authenticate_bearer(headers, &state.key_registry, now)?;
     Ok(StatusCode::OK)
 }
 
@@ -852,14 +1017,13 @@ async fn delete_sdp_profile(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let authorization = verify_bearer(&headers, &state.key_registry, now)?;
+    let principal = authenticate_bearer(&headers, &state.key_registry, now)?;
     let connection_id = connection_id.parse().map_err(|_| ApiError::NotFound)?;
     state
         .controller
         .try_send(
-            controller::DeleteParticipant {
-                room_id: authorization.room_id,
-                participant_id: authorization.participant_id,
+            controller::DeleteSdpResource {
+                principal,
                 connection_id,
                 profile,
             }
@@ -954,6 +1118,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        issue_native_admission,
         create_native,
         patch_native,
         delete_native,
@@ -972,7 +1137,7 @@ fn build_openapi(base_path: &str) -> utoipa::openapi::OpenApi {
         options_whep_session,
         delete_whep
     ),
-    components(schemas(NativeRequest, NativeResponse, Problem)),
+    components(schemas(NativeRequest, NativeResponse, NativeAdmissionRequest, NativeAdmissionResponse, Problem)),
     tags(
         (name = "native", description = "Native signaling resource"),
         (name = "whip", description = "Strict WHIP signaling resource"),
@@ -998,6 +1163,8 @@ pub(crate) fn cors() -> tower_http::cors::CorsLayer {
             CONTENT_TYPE,
             hyper::header::CONTENT_ENCODING,
             hyper::header::ACCEPT,
+            hyper::header::HeaderName::from_static("pulsebeam-owner"),
+            hyper::header::HeaderName::from_static("pulsebeam-attempt"),
         ])
         .expose_headers([LOCATION, ETAG, RETRY_AFTER, ALLOW, ACCEPT_POST])
         .max_age(std::time::Duration::from_secs(86400))
@@ -1007,6 +1174,7 @@ pub fn router(controller: ControllerSender, cfg: ApiConfig, key_registry: KeyReg
     let openapi = build_openapi(&cfg.base_path);
     let api = Router::new()
         .route("/native", post(create_native))
+        .route("/native/admissions", post(issue_native_admission))
         .route(
             "/native/{connection_id}",
             axum::routing::delete(delete_native).patch(patch_native),
@@ -1122,6 +1290,10 @@ mod tests {
         change.apply().unwrap().0.to_sdp_string()
     }
 
+    fn full_grants(room_pattern: &str) -> pulsebeam_core::auth::grants::GrantSet {
+        serde_json::from_value(serde_json::json!([{"rooms":[room_pattern],"allow":["join","publish","discover","subscribe"]}])).unwrap()
+    }
+
     fn live_token() -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1129,11 +1301,122 @@ mod tests {
             .as_secs();
         pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
-            (RoomExternalId::new("general").unwrap()).as_str(),
+            &full_grants((RoomExternalId::new("general").unwrap()).as_str()),
             (ParticipantExternalId::new("alice").unwrap()).as_str(),
             now + 60,
         )
         .unwrap()
+    }
+
+    fn cache_creation(
+        response: creation::CreationResponse<'_>,
+        authorization: &VerifiedAuthorization,
+        profile: SignalingProtocol,
+        offer: &str,
+        credential: &str,
+    ) -> [controller::ownership::ResultBytes; 2] {
+        use controller::ownership::{Admission, Authority, PrincipalKey, RequestBinding};
+        use rand::SeedableRng;
+
+        let prepared = response.validate().unwrap();
+        let mut authority = Authority::default();
+        let authenticated =
+            pulsebeam_core::auth::authenticate_participant_token(&auth_registry(), credential, 0)
+                .unwrap();
+        let principal = PrincipalKey::from_principal(&authenticated);
+        assert_eq!(principal, PrincipalKey::from_verified(authorization));
+        let now = Instant::now();
+        let mut entropy = rand::rngs::StdRng::seed_from_u64(23);
+        let proof = authority
+            .issue(principal.clone(), now, &mut entropy)
+            .unwrap();
+        let binding = RequestBinding::for_request(
+            profile,
+            &authorization.room_external_id,
+            offer,
+            credential,
+        )
+        .unwrap();
+        let Admission::Start(ticket) = authority
+            .begin(
+                &principal,
+                proof,
+                std::num::NonZeroU64::new(1).unwrap(),
+                binding,
+                now,
+            )
+            .unwrap()
+        else {
+            panic!("expected creation response reservation");
+        };
+        authority.commit(&ticket, prepared.encode(), now).unwrap();
+        [
+            authority.result(&ticket, now).unwrap(),
+            authority.result(&ticket, now).unwrap(),
+        ]
+    }
+
+    async fn assert_creation_replay(
+        image: controller::ownership::ResultBytes,
+        location: &str,
+        content_type: &str,
+        expected: &[u8],
+    ) {
+        let budget = creation::DeliveryBudget::new();
+        let mut held: Vec<_> = (0..creation::MAX_DELIVERIES)
+            .map(|_| creation::Delivery::new(image.clone(), budget.reserve().unwrap()))
+            .collect();
+        assert!(budget.reserve().is_none());
+        let mut cached = Some(creation::into_response(held.pop().unwrap()).unwrap());
+        let service = tower::service_fn(move |_: Request| {
+            let response = cached.take().unwrap();
+            async move { Ok::<_, std::convert::Infallible>(response) }
+        });
+        let response =
+            tower::Layer::layer(&tower_http::compression::CompressionLayer::new(), service)
+                .oneshot(
+                    Request::builder()
+                        .header(hyper::header::ACCEPT_ENCODING, "zstd")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()[LOCATION], location);
+        assert_eq!(response.headers()[CONTENT_TYPE], content_type);
+        assert_eq!(
+            response.headers()[hyper::header::CONTENT_ENCODING],
+            "identity"
+        );
+        let (parts, body) = response.into_parts();
+        let payload = to_bytes(Body::new(body), MAX_SIGNALING_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(payload.as_ref(), expected);
+        assert!(budget.reserve().is_none());
+        drop(parts);
+        let alias = payload.clone();
+        drop(payload);
+        assert!(
+            budget.reserve().is_none(),
+            "the final body alias retains its slot"
+        );
+        drop(alias);
+        assert!(budget.reserve().is_some());
+
+        let response =
+            creation::into_response(creation::Delivery::new(image, budget.reserve().unwrap()))
+                .unwrap();
+        let location = response.headers()[LOCATION].clone();
+        drop(response);
+        assert!(
+            budget.reserve().is_none(),
+            "a retained header also owns the slot"
+        );
+        drop(location);
+        assert!(budget.reserve().is_some());
+        drop(held);
     }
 
     fn native_post(token: &str, body: Vec<u8>) -> Request {
@@ -1144,6 +1427,8 @@ mod tests {
             .header(CONTENT_TYPE, "application/json")
             .header("x-forwarded-proto", "https")
             .header("x-forwarded-host", "media.example")
+            .header("pulsebeam-owner", "0".repeat(52))
+            .header("pulsebeam-attempt", "1")
             .body(Body::from(body))
             .unwrap()
     }
@@ -1151,7 +1436,7 @@ mod tests {
     fn sdp_post(token: &str, profile: &str, body: Vec<u8>) -> Request {
         Request::builder()
             .method("POST")
-            .uri(format!("/api/v1/{profile}"))
+            .uri(format!("/api/v1/{profile}?room=general"))
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(CONTENT_TYPE, "application/sdp")
             .header("x-forwarded-proto", "https")
@@ -1161,83 +1446,71 @@ mod tests {
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
-    async fn native_post_returns_claim_identity_answer_and_absolute_location() {
+    async fn native_post_requires_authenticated_ownership_admission() {
         let (controller, mut commands) =
-            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(4).unwrap() });
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let app = router(controller, cfg(), auth_registry());
         let token = live_token();
-        let offer = valid_offer();
-        let expected_offer = offer.clone();
         let body = serde_json::to_vec(&serde_json::json!({
             "profile": "pulsebeam.media.v1",
-            "offer": offer.clone()
+            "offer": valid_offer(),
+            "room": "general"
         }))
         .unwrap();
-        let unrepresentable = pulsebeam_server::sign_participant_token(
-            &pulsebeam_server::insecure_dev_api_key().unwrap(),
-            RoomExternalId::new("general").unwrap().as_str(),
-            ParticipantExternalId::new("alice").unwrap().as_str(),
-            u64::MAX,
+
+        let mut missing_proof = native_post(&token, body.clone());
+        missing_proof.headers_mut().remove("pulsebeam-owner");
+        let response = app.clone().oneshot(missing_proof).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            commands.try_recv().is_err(),
+            "missing ownership proof reached controller"
+        );
+
+        let authorization = verify_bearer(
+            &authorization_headers(&token),
+            &auth_registry(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         )
         .unwrap();
-        let rejected = pulsebeam_runtime::select! {
-            response = app.clone().oneshot(native_post(&unrepresentable, body.clone())) => {
-                response.unwrap()
-            }
-            _ = commands.recv() => panic!("unrepresentable Native expiry reached the controller"),
-        };
-        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
-        assert!(commands.try_recv().is_err());
+        let offer = valid_offer();
+        let (message, capabilities) =
+            native_message(&authorization, offer.clone(), SystemTime::now()).unwrap();
+        assert!(message.state.manual_sub);
+        assert_eq!(message.state.profile, SignalingProtocol::State);
+        assert!(message.state.authorization.is_some());
+        assert_eq!(message.state.rtp_capabilities, Some(capabilities.clone()));
+        assert_eq!(message.offer, offer);
+        let long_location = HeaderValue::from_bytes(&vec![b'a'; 300_000]).unwrap();
+        let escaped = "\0".repeat(MAX_NATIVE_SDP_BYTES);
+        assert!(matches!(
+            creation::CreationResponse::native(
+                &long_location,
+                &authorization,
+                message.state.connection_id,
+                &capabilities,
+                &escaped,
+            )
+            .validate(),
+            Err(creation::Error::TooLarge)
+        ));
+        assert!(
+            creation::CreationResponse::sdp(&long_location, &escaped)
+                .validate()
+                .is_ok()
+        );
 
-        let responder = pulsebeam_runtime::task::spawn(async move {
-            let controller::ControllerCommand::CreateParticipant(message, reply) =
-                commands.recv().await.unwrap()
-            else {
-                panic!("expected create command")
-            };
-            assert!(message.state.manual_sub);
-            assert_eq!(message.state.profile, SignalingProtocol::State);
-            assert!(message.state.authorization.is_some());
-            assert_eq!(
-                message.state.rtp_capabilities,
-                Some(crate::control::rtp::capabilities())
-            );
-            assert_eq!(message.offer, expected_offer);
-            let answer = message.offer;
-            reply.send(Ok(CreateParticipantReply { answer })).unwrap();
-        });
-        let response = app.oneshot(native_post(&token, body)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let location = response.headers()[LOCATION].to_str().unwrap().to_owned();
-        assert!(location.starts_with("https://media.example/api/v1/native/c_0"));
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
-        let body = to_bytes(response.into_body(), MAX_SIGNALING_BODY_BYTES)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["profile"], pulsebeam_proto::state::PROFILE);
-        assert_eq!(
-            body["data_delivery"],
-            serde_json::json!(["LATEST", "LOSSY", "ORDERED"])
+        let mut invalid = token;
+        invalid.push('x');
+        let response = app.oneshot(native_post(&invalid, body)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            commands.try_recv().is_err(),
+            "invalid bearer reached controller"
         );
-        assert_eq!(
-            body["rtp_capabilities"],
-            serde_json::to_value(crate::control::rtp::capabilities()).unwrap()
-        );
-        assert_eq!(body["room_external_id"], "general");
-        assert_eq!(body["participant_external_id"], "alice");
-        let room_id = RoomId::derive(
-            &DEVELOPMENT_PROJECT_ID,
-            &RoomExternalId::new("general").unwrap(),
-        );
-        let participant_id =
-            ParticipantId::derive(&room_id, &ParticipantExternalId::new("alice").unwrap());
-        assert_eq!(body["room_id"], room_id.as_str());
-        assert_eq!(body["participant_id"], participant_id.as_str());
-        assert!(body["connection_id"].as_str().unwrap().starts_with("c_0"));
-        assert_eq!(body["answer"].as_str().unwrap(), offer);
-        assert!(location.ends_with(body["connection_id"].as_str().unwrap()));
-        responder.await.unwrap();
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
@@ -1246,10 +1519,7 @@ mod tests {
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let app = router(controller, cfg(), auth_registry());
         let offer = "not SDP\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
-        let body = serde_json::to_vec(
-            &serde_json::json!({"profile": "pulsebeam.media.v1", "offer": offer}),
-        )
-        .unwrap();
+        let body = offer.as_bytes().to_vec();
         let responder = pulsebeam_runtime::task::spawn(async move {
             let controller::ControllerCommand::CreateParticipant(message, reply) =
                 commands.recv().await.unwrap()
@@ -1272,12 +1542,16 @@ mod tests {
             };
             reply.send(Err(error.into())).unwrap();
         });
-        let response = app.oneshot(native_post(&live_token(), body)).await.unwrap();
+        let response = app
+            .oneshot(sdp_post(&live_token(), "whip", body))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(problem["status"], 400);
+        assert_eq!(problem["title"], "Bad Request");
         assert!(
             problem["detail"]
                 .as_str()
@@ -1291,14 +1565,17 @@ mod tests {
     async fn native_post_rejects_malformed_contract_before_controller_allocation() {
         let token = live_token();
         let cases = [
-            serde_json::to_vec(&serde_json::json!({"profile": "unsupported", "offer": valid_offer()})).unwrap(),
-            serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": valid_offer(), "unknown": true}))
+            serde_json::to_vec(&serde_json::json!({"profile": "unsupported", "offer": valid_offer(), "room":"general"})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": valid_offer(), "room":"general", "unknown": true}))
                 .unwrap(),
             b"{".to_vec(),
             vec![b' '; MAX_NATIVE_BODY_BYTES + 1],
-            serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": " ".repeat(MAX_NATIVE_SDP_BYTES + 1)})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": " ".repeat(MAX_NATIVE_SDP_BYTES + 1), "room":"general"})).unwrap(),
             br#"{"offer":"v=0","offer":"v=1"}"#.to_vec(),
-            serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": valid_offer(), ("diagnostic-secret-".repeat(32)): true})).unwrap(),
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","room":""}"#.to_vec(),
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","room":"a","room":"b"}"#.to_vec(),
+            serde_json::to_vec(&serde_json::json!({"profile":"pulsebeam.media.v1","offer":"v=0","room":"é".repeat(129)})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({"profile": "pulsebeam.media.v1", "offer": valid_offer(), "room":"general", ("diagnostic-secret-".repeat(32)): true})).unwrap(),
         ];
         for body in cases {
             let (controller, mut commands) =
@@ -1338,6 +1615,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+    async fn native_selected_room_rejects_before_controller_allocation() {
+        let (controller, mut commands) =
+            pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
+        let body = serde_json::to_vec(&serde_json::json!({"profile":"pulsebeam.media.v1","offer":valid_offer(),"room":"other"})).unwrap();
+        let response = router(controller.clone(), cfg(), auth_registry())
+            .oneshot(native_post(&live_token(), body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(commands.try_recv().is_err());
+
+        let app = owned_native_router(controller, cfg(), auth_registry());
+        let token = live_token();
+        let offer = valid_offer();
+        let create = |room: Option<&str>| {
+            let mut request = native_post(
+                &token,
+                serde_json::to_vec(&serde_json::json!({
+                    "profile": pulsebeam_proto::state::PROFILE, "offer": offer, "room": room,
+                }))
+                .unwrap(),
+            );
+            request.headers_mut().insert(
+                "pulsebeam-owner",
+                HeaderValue::from_str(&"0".repeat(52)).unwrap(),
+            );
+            request
+                .headers_mut()
+                .insert("pulsebeam-attempt", HeaderValue::from_static("1"));
+            request
+        };
+        let mut missing_proof = create(Some("general"));
+        missing_proof.headers_mut().remove("pulsebeam-owner");
+        let mut no_identity = create(Some("general"));
+        no_identity.headers_mut().insert(
+            hyper::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity;q=0, zstd"),
+        );
+        let mut bad_location = create(Some("general"));
+        bad_location.headers_mut().insert(
+            "x-forwarded-proto",
+            HeaderValue::from_static("not a scheme"),
+        );
+        let unrepresentable_token = pulsebeam_server::sign_participant_token(
+            &pulsebeam_server::insecure_dev_api_key().unwrap(),
+            &full_grants("general"),
+            "alice",
+            u64::MAX,
+        )
+        .unwrap();
+        let mut unrepresentable = create(Some("general"));
+        unrepresentable.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {unrepresentable_token}")).unwrap(),
+        );
+        let mut rejected = vec![
+            (unrepresentable, StatusCode::UNAUTHORIZED),
+            (create(None), StatusCode::BAD_REQUEST),
+            (create(Some("other")), StatusCode::FORBIDDEN),
+            (missing_proof, StatusCode::BAD_REQUEST),
+            (no_identity, StatusCode::NOT_ACCEPTABLE),
+            (bad_location, StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+        for body in [
+            b"[]".to_vec(),
+            br#"{"room":"general"}"#.to_vec(),
+            vec![b' '; 1_025],
+        ] {
+            let status = if body.len() > 1_024 {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            rejected.push((
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/native/admissions")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+                status,
+            ));
+        }
+        for (request, status) in rejected {
+            let response = pulsebeam_runtime::select! {
+                response = app.clone().oneshot(request) => response.unwrap(),
+                _ = commands.recv() => panic!("rejected ownership preflight reached the controller"),
+            };
+            assert_eq!(response.status(), status);
+            assert!(commands.try_recv().is_err());
+        }
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
@@ -1394,7 +1766,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
         assert!(commands.try_recv().is_err());
-        let observed = verify_bearer(
+        let observed = authenticate_bearer(
             &authorization_headers(&token),
             &auth_registry(),
             SystemTime::now()
@@ -1409,18 +1781,23 @@ mod tests {
                 Err(controller::ControllerError::AuthorizationPrecondition { revision: 2 }),
                 Err(controller::ControllerError::GrantGone),
             ] {
-                let controller::ControllerCommand::ReplaceAuthorization(message, reply) =
-                    commands.recv().await.unwrap()
+                let controller::ControllerCommand::ReplaceAuthorization(
+                    message,
+                    expected_revision,
+                    reply,
+                ) = commands.recv().await.unwrap()
                 else {
                     panic!("expected grant replacement")
                 };
                 assert_eq!(message.connection_id, connection);
-                assert_eq!(message.expected_revision, 1);
+                assert_eq!(expected_revision, 1);
+                assert_eq!(message.principal.project_id(), observed.project_id());
                 assert_eq!(
-                    message.authorization.participant_id,
-                    observed.participant_id
+                    message.principal.participant_external_id(),
+                    observed.participant_external_id()
                 );
-                assert_eq!(message.authorization.room_id, observed.room_id);
+                assert_eq!(message.principal.expiry(), observed.expiry());
+                assert_eq!(format!("{message:?}"), "NativeResourceRequest([redacted])");
                 reply.send(result).unwrap();
             }
         });
@@ -1487,6 +1864,12 @@ mod tests {
             panic!("expected native delete command")
         };
         assert_eq!(message.connection_id, connection_id);
+        assert_eq!(message.principal.project_id(), *DEVELOPMENT_PROJECT_ID);
+        assert_eq!(
+            message.principal.participant_external_id().as_str(),
+            "alice"
+        );
+        assert_eq!(format!("{message:?}"), "NativeResourceRequest([redacted])");
         assert!(
             futures_lite::future::poll_once(&mut response)
                 .await
@@ -1523,6 +1906,7 @@ mod tests {
             let token = live_token();
             let offer = directional_offer(direction);
             let answer = offer.clone();
+            let captured_token = token.clone();
             let responder = pulsebeam_runtime::task::spawn(async move {
                 let controller::ControllerCommand::CreateParticipant(message, reply) =
                     commands.recv().await.unwrap()
@@ -1531,8 +1915,35 @@ mod tests {
                 };
                 assert_eq!(message.state.profile, profile);
                 assert!(!message.state.manual_sub);
-                assert!(message.state.authorization.is_some());
+                let verified = verify_bearer(
+                    &authorization_headers(&captured_token),
+                    &auth_registry(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                )
+                .unwrap();
+                let authorization = &verified;
+                let location = HeaderValue::from_str(&format!(
+                    "https://media.example/api/v1/{resource}/{}",
+                    message.state.connection_id
+                ))
+                .unwrap();
+                let oversized = "a".repeat(controller::ownership::MAX_RESULT_BYTES);
+                assert!(matches!(
+                    creation::CreationResponse::sdp(&location, &oversized).validate(),
+                    Err(creation::Error::TooLarge)
+                ));
+                let images = cache_creation(
+                    creation::CreationResponse::sdp(&location, &answer),
+                    authorization,
+                    profile,
+                    &message.offer,
+                    &captured_token,
+                );
                 reply.send(Ok(CreateParticipantReply { answer })).unwrap();
+                images
             });
             let response = app
                 .oneshot(sdp_post(&token, resource, offer.into_bytes()))
@@ -1542,13 +1953,15 @@ mod tests {
             assert_eq!(response.headers()[CONTENT_TYPE], "application/sdp");
             assert!(!response.headers().contains_key("etag"));
             assert!(!response.headers().contains_key("pb-participant-id"));
-            let location = response.headers()[LOCATION].to_str().unwrap();
+            let location = response.headers()[LOCATION].to_str().unwrap().to_owned();
             assert!(location.starts_with(&format!("https://media.example/api/v1/{resource}/c_0")));
             let body = to_bytes(response.into_body(), MAX_SIGNALING_BODY_BYTES)
                 .await
                 .unwrap();
             assert!(body.starts_with(b"v=0"));
-            responder.await.unwrap();
+            for image in responder.await.unwrap() {
+                assert_creation_replay(image, &location, "application/sdp", &body).await;
+            }
         }
     }
 
@@ -1593,7 +2006,7 @@ mod tests {
             let connection_id = ConnectionId::new();
             let request = Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/v1/{resource}/{connection_id}"))
+                .uri(format!("/api/v1/{resource}/{connection_id}?room=general"))
                 .header(AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap();
@@ -1602,13 +2015,15 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
-            let controller::ControllerCommand::DeleteParticipant(message) =
+            let controller::ControllerCommand::DeleteSdpResource(message) =
                 commands.recv().await.unwrap()
             else {
-                panic!("expected delete command")
+                panic!("expected SDP resource delete command")
             };
             assert_eq!(message.connection_id, connection_id);
             assert_eq!(message.profile, profile);
+            let expected = authenticate_participant_token(&auth_registry(), &token, 0).unwrap();
+            assert_eq!(message.principal, expected);
         }
 
         let token = live_token();
@@ -1617,7 +2032,7 @@ mod tests {
                 pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
             let malformed = Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/v1/{resource}/not-a-connection"))
+                .uri(format!("/api/v1/{resource}/not-a-connection?room=general"))
                 .header(AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap();
@@ -1633,33 +2048,27 @@ mod tests {
     }
 
     #[test]
-    fn strict_request_checks_profile_and_whole_document_keys() {
-        let native =
-            parse_native_request(br#"{"profile":"pulsebeam.media.v1","offer":"v=0"}"#).unwrap();
-        assert_eq!(native.profile, pulsebeam_proto::state::PROFILE);
+    fn strict_request_requires_explicit_room_and_unique_known_fields() {
+        let selected = parse_native_request(
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","room":"other"}"#,
+        )
+        .unwrap();
+        assert_eq!(selected.profile, pulsebeam_proto::state::PROFILE);
+        assert_eq!(selected.room, "other");
         for body in [
             br#"{"offer":"v=0"}"#.as_slice(),
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0"}"#,
+            br#"["pulsebeam.media.v1","v=0","other"]"#,
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","offer":"v=1","room":"other"}"#,
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","room":"other","r\u006fom":"another"}"#,
             br#"{"profile":"old","offer":"v=0"}"#,
             br#"{"profile":null,"offer":"v=0"}"#,
-            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","room":"other"}"#,
+            br#"{"profile":"pulsebeam.media.v1","offer":"v=0","room":[]}"#,
             br#"{"profile":"pulsebeam.media.v1","offer":"v=0","manual":true}"#,
             br#"{"profile":"pulsebeam.media.v1","offer":"v=0","rtp_capabilities":{}}"#,
         ] {
             assert!(parse_native_request(body).is_err());
         }
-        for body in [
-            br#"{"offer":"v=0","offer":"v=1"}"#.as_slice(),
-            br#"{"rtp_capabilities":{"future":{"key":false,"key":true}}}"#,
-            br#"{"future":[{"key":0,"\u006bey":1}]}"#,
-        ] {
-            assert!(native_json::unique_keys(body).is_err());
-        }
-        assert!(
-            native_json::unique_keys(
-                br#"{"values":[null,true,false,-1,1.5,"x"],"nested":[{"key":0},{"key":1}]}"#
-            )
-            .is_ok()
-        );
     }
 
     #[test]
@@ -1764,7 +2173,7 @@ mod tests {
     async fn authorization_failures_are_secret_safe_rfc_9457_responses() {
         let token = pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
-            (RoomExternalId::new("general").unwrap()).as_str(),
+            &full_grants((RoomExternalId::new("general").unwrap()).as_str()),
             (ParticipantExternalId::new("alice").unwrap()).as_str(),
             2_000,
         )
@@ -1886,6 +2295,7 @@ mod tests {
             paths,
             [
                 "/native",
+                "/native/admissions",
                 "/native/{connection_id}",
                 "/whep",
                 "/whep/{connection_id}",
@@ -2043,12 +2453,50 @@ mod tests {
     }
 
     #[test]
-    fn superseded_candidates_are_conflicts() {
+    fn admission_failures_have_stable_statuses() {
+        use controller::{OwnedAdmissionError, ownership::Error};
         assert_eq!(
             ApiError::JoinError(controller::ControllerError::Superseded)
                 .into_response()
                 .status(),
             StatusCode::CONFLICT
         );
+        for (error, status) in [
+            (Error::InvalidProof, StatusCode::BAD_REQUEST),
+            (Error::UnknownProof, StatusCode::GONE),
+            (Error::Replaced, StatusCode::CONFLICT),
+            (Error::StaleAttempt, StatusCode::CONFLICT),
+            (Error::ChangedAttempt, StatusCode::BAD_REQUEST),
+            (Error::Capacity, StatusCode::SERVICE_UNAVAILABLE),
+            (Error::ReplayUnavailable, StatusCode::GONE),
+            (Error::QuiescencePending, StatusCode::SERVICE_UNAVAILABLE),
+            (Error::ResultTooLarge, StatusCode::PAYLOAD_TOO_LARGE),
+            (Error::InvalidTransition, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let response =
+                ProblemResponse::from(OwnedAdmissionError::Authority(error)).into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().contains_key(RETRY_AFTER),
+                status == StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(!response.headers().contains_key(WWW_AUTHENTICATE));
+        }
+        for (error, status) in [
+            (creation::Error::TooLarge, StatusCode::PAYLOAD_TOO_LARGE),
+            (
+                creation::Error::Serialization,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                creation::Error::InvalidImage,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            assert_eq!(
+                ProblemResponse::from(OwnedAdmissionError::Image(error)).status(),
+                status
+            );
+        }
     }
 }

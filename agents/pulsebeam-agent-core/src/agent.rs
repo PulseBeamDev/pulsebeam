@@ -25,21 +25,27 @@ const CONTENT_TYPE: &str = "Content-Type";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const SIGNAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_EARLY_SIGNALING_MESSAGES: usize = 64;
+pub(crate) const MAX_ORPHANED_CREATES: usize = 32;
 
 macro_rules! agent_log {
     ($agent:expr, $level:ident, $($message:tt)*) => {
         if $agent.config.log_level.allows(log::Level::$level) {
-            log::log!(log::Level::$level, $($message)*);
+            $agent.logs.write(log::Level::$level, module_path!(), format_args!($($message)*));
         }
     };
 }
 
+mod admission;
+mod credentials;
 mod native;
+
+use admission::CreateRequest;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum AgentCommand {
     ReplaceDesired(DesiredState),
     RenewAuthorization(String),
+    Join(String),
     Connect,
     Disconnect,
     Reconnect,
@@ -54,6 +60,7 @@ impl core::fmt::Debug for AgentCommand {
                 .field(desired)
                 .finish(),
             Self::RenewAuthorization(_) => formatter.write_str("RenewAuthorization([REDACTED])"),
+            Self::Join(room) => formatter.debug_tuple("Join").field(room).finish(),
             Self::Connect => formatter.write_str("Connect"),
             Self::Disconnect => formatter.write_str("Disconnect"),
             Self::Reconnect => formatter.write_str("Reconnect"),
@@ -72,6 +79,10 @@ pub enum AgentError {
     ConflictingDesiredRevision(u64),
     #[error("authorization token is invalid")]
     InvalidAuthorizationToken,
+    #[error("participant ownership was replaced")]
+    Replaced,
+    #[error("credential revision space is exhausted")]
+    CredentialRevisionExhausted,
     #[error("authorization renewal is already in flight")]
     RenewalBusy,
     #[error("signaling is not ready for authorization renewal")]
@@ -100,7 +111,15 @@ pub struct SourcePreparation<'a> {
     pub readiness: SourceReadiness,
 }
 
+#[derive(Clone)]
+struct Credential {
+    token: String,
+    revision: u64,
+}
+
 struct Session {
+    credential: Credential,
+    admission: admission::AcceptedReceipts,
     generation: Generation,
     resource_uri: String,
     participant_id: String,
@@ -122,6 +141,7 @@ struct Session {
 
     authorization_expires_at: Option<i64>,
     pending_renewal: Option<native::Renewal>,
+    authorization_revision: u64,
     signaling_terminal: bool,
     signaling_channel: ChannelId,
     data_preparations: BTreeMap<ChannelId, Result<crate::PreparedDataChannel, String>>,
@@ -139,11 +159,13 @@ enum AttemptMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AttemptStage {
     Offering,
+    Acquiring,
     Requesting,
     ApplyingAnswer,
 }
 
 struct Candidate {
+    credential: Credential,
     capabilities: crate::BootstrapCapabilities,
     resource_uri: String,
     room_external_id: String,
@@ -157,6 +179,7 @@ struct Candidate {
 struct NativeRequest<'a> {
     profile: &'static str,
     offer: &'a str,
+    room: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -171,12 +194,22 @@ struct NativeResponse {
     answer: String,
 }
 
+struct CapabilityRequest {
+    operation: Option<OperationId>,
+    credential: Credential,
+    request: HttpRequest,
+    attempts: u8,
+}
+
 struct Attempt {
     generation: Generation,
+    join_revision: u64,
+    room: Option<String>,
     mode: AttemptMode,
     stage: AttemptStage,
     resources: Option<OfferResources>,
-    request: Option<OperationId>,
+    capability: Option<CapabilityRequest>,
+    request: Option<CreateRequest>,
     candidate: Option<Candidate>,
     answer_applied: bool,
     transport_connected: bool,
@@ -189,9 +222,16 @@ struct Attempt {
     data_preparations: BTreeMap<ChannelId, Result<crate::PreparedDataChannel, String>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RetryTarget {
+    Connection(AttemptMode),
+    Capability,
+    Creation,
+}
+
 struct Retry {
     timer: TimerId,
-    mode: AttemptMode,
+    target: RetryTarget,
 }
 
 struct PendingSignal {
@@ -210,6 +250,9 @@ struct Closing {
 
 pub struct Agent {
     config: AgentConfig,
+    config_credential_revision: u64,
+    admission_denial: Option<credentials::AdmissionDenial>,
+    logs: crate::logging::LogBuffer,
     desired: DesiredState,
     declared: DesiredState,
     resources: crate::TrackResources,
@@ -220,6 +263,7 @@ pub struct Agent {
     notifications: VecDeque<Notification>,
     published_notifications: VecDeque<Notification>,
     active: Option<Session>,
+    ownership: admission::Ownership,
     attempt: Option<Attempt>,
     retry: Option<Retry>,
     retry_attempts: u8,
@@ -229,16 +273,18 @@ pub struct Agent {
     reconciliation_wake: Option<TimerId>,
     intent_dirty: bool,
     closing: Option<Closing>,
-    orphaned_creates: BTreeSet<OperationId>,
+    orphaned_creates: BTreeMap<OperationId, Credential>,
     topics: Topics,
 }
 
 impl Agent {
     pub fn new(mut config: AgentConfig) -> Result<Self, AgentError> {
         config.validate()?;
-        let log_level = config.log_level;
         Ok(Self {
             config,
+            config_credential_revision: 0,
+            admission_denial: None,
+            logs: Default::default(),
             desired: DesiredState::default(),
             declared: DesiredState::default(),
             resources: crate::TrackResources::default(),
@@ -249,6 +295,7 @@ impl Agent {
             notifications: VecDeque::new(),
             published_notifications: VecDeque::new(),
             active: None,
+            ownership: admission::Ownership::default(),
             attempt: None,
             retry: None,
             retry_attempts: 0,
@@ -258,9 +305,17 @@ impl Agent {
             reconciliation_wake: None,
             intent_dirty: false,
             closing: None,
-            orphaned_creates: BTreeSet::new(),
-            topics: Topics::new(log_level),
+            orphaned_creates: BTreeMap::new(),
+            topics: Topics::default(),
         })
+    }
+
+    pub fn defer_logs(&mut self) {
+        self.logs.defer();
+    }
+
+    pub fn drain_logs(&mut self) -> Vec<crate::DeferredLog> {
+        self.logs.drain()
     }
 
     pub fn set_log_level(&mut self, level: crate::LogLevel) {
@@ -268,13 +323,13 @@ impl Agent {
             return;
         }
         self.config.log_level = level;
-        self.topics.set_log_level(level);
     }
 
     pub fn command(&mut self, command: AgentCommand) -> Result<(), AgentError> {
         let result = match command {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
             AgentCommand::RenewAuthorization(token) => self.renew_authorization(token),
+            AgentCommand::Join(room) => self.join(room),
             AgentCommand::Connect => self.connect(),
             AgentCommand::Disconnect => self.disconnect(),
             AgentCommand::Reconnect => {
@@ -696,11 +751,40 @@ impl Agent {
         let mut ready = BTreeSet::new();
         while let Some(notification) = self.notifications.pop_front() {
             if let Notification::Topic(topic) = &notification {
+                if self.config.log_level.allows(log::Level::Warn) {
+                    match topic {
+                        crate::TopicNotification::SendDropped { publisher, reason } => {
+                            self.logs.write(
+                                log::Level::Warn,
+                                crate::topic::LOG_TARGET,
+                                format_args!(
+                                    "topic send dropped topic={} mode={:?} reason={reason:?}",
+                                    publisher.topic, publisher.mode
+                                ),
+                            );
+                        }
+                        crate::TopicNotification::ChannelFailed { channel, message } => {
+                            self.logs.write(
+                                log::Level::Warn,
+                                crate::topic::LOG_TARGET,
+                                format_args!("topic channel failed channel={channel:?}: {message}"),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 let update = self.resources.notify(topic);
                 ready.extend(update.ready.into_iter().map(crate::TrackOwner::id));
                 if update.registrations_changed {
                     self.refresh_resources()?;
                 }
+            }
+            if matches!(notification, Notification::SnapshotChanged)
+                && self
+                    .published_notifications
+                    .contains(&Notification::SnapshotChanged)
+            {
+                continue;
             }
             self.published_notifications.push_back(notification);
         }
@@ -761,65 +845,16 @@ impl Agent {
         }
     }
 
-    fn renew_authorization(&mut self, token: String) -> Result<(), AgentError> {
-        if token.is_empty()
-            || token.len() > 16_384
-            || token.bytes().any(|byte| !(b'!'..=b'~').contains(&byte))
-        {
-            return Err(AgentError::InvalidAuthorizationToken);
-        }
-        if !self.desired.connected || self.snapshot.terminal_failure.is_some() {
-            self.config.token = token;
-            return Ok(());
-        }
-        let active = self
-            .active
-            .as_mut()
-            .filter(|active| !active.signaling_terminal)
-            .ok_or(AgentError::RenewalNotReady)?;
-        let expected_revision = if let Some(pending) = &active.pending_renewal {
-            if pending.token != token || pending.operation.is_some() || pending.accepted {
-                return Err(AgentError::RenewalBusy);
-            }
-            pending.expected_revision
-        } else {
-            active
-                .state
-                .session()
-                .and_then(|session| session.authorization.as_ref())
-                .and_then(|grant| grant.revision.checked_add(1))
-                .ok_or(AgentError::RenewalNotReady)?
-        };
-        let operation = self.ids.operation();
-        let precondition = expected_revision
-            .checked_sub(1)
-            .ok_or(AgentError::RenewalNotReady)?;
-        self.effects.push_back(Effect::Http(HttpEffect::Request {
-            operation,
-            generation: Some(active.generation),
-            request: HttpRequest {
-                method: HttpMethod::Patch,
-                uri: active.resource_uri.clone(),
-                headers: vec![
-                    HttpHeader {
-                        name: "Authorization".into(),
-                        value: format!("Bearer {token}"),
-                    },
-                    HttpHeader {
-                        name: "If-Match".into(),
-                        value: format!("\"auth-{precondition}\""),
-                    },
-                ],
-                body: Vec::new(),
-            },
-        }));
-        active.pending_renewal = Some(native::Renewal {
-            token,
-            operation: Some(operation),
-            expected_revision,
-            accepted: false,
-        });
-        Ok(())
+    fn advance_credential_revision(&mut self) -> Result<u64, AgentError> {
+        let revision = self
+            .snapshot
+            .credential_revision
+            .checked_add(1)
+            .ok_or(AgentError::CredentialRevisionExhausted)?;
+        self.snapshot.credential_revision = revision;
+        self.bump_snapshot();
+        self.notifications.push_back(Notification::SnapshotChanged);
+        Ok(revision)
     }
 
     fn replace_desired(&mut self, mut desired: DesiredState) -> Result<(), AgentError> {
@@ -971,6 +1006,28 @@ impl Agent {
         Ok(())
     }
 
+    fn join(&mut self, room: String) -> Result<(), AgentError> {
+        if self.participant_superseded() {
+            return Err(AgentError::Replaced);
+        }
+        crate::model::validate_identifier("room external id", &room, 256, true)?;
+        let same = self.desired.connected && self.snapshot.desired_room.as_ref() == Some(&room);
+        if same && self.snapshot.terminal_failure.is_none() {
+            return Ok(());
+        }
+        self.snapshot.desired_room = Some(room);
+        self.snapshot.join_revision = self.snapshot.join_revision.saturating_add(1);
+        self.bump_snapshot();
+        self.notifications.push_back(Notification::SnapshotChanged);
+        if !self.desired.connected {
+            self.connect()?;
+        } else {
+            self.snapshot.terminal_failure = None;
+            self.begin_close();
+        }
+        Ok(())
+    }
+
     fn connect(&mut self) -> Result<(), AgentError> {
         if !self.desired.connected {
             let mut desired = self.declared.clone();
@@ -1024,7 +1081,16 @@ impl Agent {
     }
 
     fn start_attempt(&mut self, mode: AttemptMode) {
-        if self.snapshot.terminal_failure.is_some() {
+        self.admission_denial = None;
+        if self.snapshot.desired_room.is_none() || self.snapshot.terminal_failure.is_some() {
+            return;
+        }
+        // Retain late-response cleanup fences rather than evicting unknown admissions.
+        if self.orphaned_creates.len() >= MAX_ORPHANED_CREATES {
+            self.fail_terminal(Failure {
+                class: FailureClass::InvalidConfiguration,
+                message: "pending admission cleanup capacity exhausted".into(),
+            });
             return;
         }
         debug_assert!(self.attempt.is_none());
@@ -1038,9 +1104,12 @@ impl Agent {
         );
         self.attempt = Some(Attempt {
             generation,
+            join_revision: self.snapshot.join_revision,
+            room: self.snapshot.desired_room.clone(),
             mode,
             stage: AttemptStage::Offering,
             resources: None,
+            capability: None,
             request: None,
             candidate: None,
             answer_applied: false,
@@ -1229,10 +1298,8 @@ impl Agent {
             .as_mut()
             .filter(|active| active.generation == generation)
             .and_then(|active| active.pending_renewal.take())
-            && let Some(operation) = renewal.operation
         {
-            self.effects
-                .push_back(Effect::Http(HttpEffect::Cancel { operation }));
+            self.cancel_credential_work(renewal);
         }
     }
 
@@ -1293,30 +1360,207 @@ impl Agent {
             return Ok(());
         }
         validate_offer(&offer, &resources, &attempt.topic_registrations)?;
-        let mode = attempt.mode;
-        let operation = self.ids.operation();
-        let request = self.create_request(&offer)?;
+        let prepared = CapabilityRequest {
+            operation: None,
+            credential: Credential {
+                token: self.config.token.clone(),
+                revision: self.config_credential_revision,
+            },
+            request: self.create_request(&offer)?,
+            attempts: 0,
+        };
         if let Some(attempt) = self.attempt.as_mut() {
-            attempt.stage = AttemptStage::Requesting;
+            attempt.stage = AttemptStage::Acquiring;
             attempt.resources = Some(resources);
-            attempt.request = Some(operation);
         }
-        agent_log!(
-            self,
-            Debug,
-            "requesting native session mode={mode:?} generation={} operation={}",
-            generation.get(),
-            operation.get(),
-        );
+        if self.ownership.available() {
+            self.claim_prepared(prepared);
+        } else {
+            if let Some(attempt) = self.attempt.as_mut() {
+                attempt.capability = Some(prepared);
+            }
+            self.acquire_capability();
+        }
+        self.update_attempt_state();
+        Ok(())
+    }
+
+    fn acquire_capability(&mut self) {
+        let Some(attempt) = self.attempt.as_mut() else {
+            return;
+        };
+        let Some(prepared) = attempt.capability.as_mut() else {
+            return;
+        };
+        if prepared.operation.is_some() {
+            return;
+        }
+        let operation = self.ids.operation();
+        prepared.operation = Some(operation);
+        prepared.attempts = prepared.attempts.saturating_add(1);
         self.effects.push_back(Effect::Http(HttpEffect::Request {
             operation,
-            generation: Some(generation),
-            request,
+            generation: Some(attempt.generation),
+            request: HttpRequest {
+                method: HttpMethod::Post,
+                uri: format!("{}/api/v1/native/admissions", self.config.endpoint),
+                headers: admission_headers(&prepared.credential.token),
+                body: b"{}".to_vec(),
+            },
         }));
-        if mode == AttemptMode::Fresh && self.active.is_none() {
-            self.set_connection_state(ConnectionState::Joining);
+    }
+
+    fn capability_failed(&mut self, operation: OperationId, failure: Failure) -> bool {
+        let Some(prepared) = self
+            .attempt
+            .as_mut()
+            .and_then(|attempt| attempt.capability.as_mut())
+            .filter(|prepared| prepared.operation == Some(operation))
+        else {
+            return false;
+        };
+        prepared.operation = None;
+        let revision = prepared.credential.revision;
+        let attempts = prepared.attempts;
+        if failure.class == FailureClass::Transient && attempts < self.config.retry.maximum_attempts
+        {
+            self.notify_failure(failure);
+            self.schedule_retry_target(RetryTarget::Capability);
+        } else {
+            let mode = self
+                .attempt
+                .as_ref()
+                .map_or(AttemptMode::Fresh, |attempt| attempt.mode);
+            if failure.class == FailureClass::Authorization {
+                self.reject_admission_credential(revision, mode, failure);
+            } else {
+                self.fail_uncertain_admission(
+                    revision,
+                    Failure {
+                        class: if failure.class == FailureClass::Transient {
+                            FailureClass::RetryExhausted
+                        } else {
+                            failure.class
+                        },
+                        message: failure.message,
+                    },
+                );
+            }
         }
-        Ok(())
+        true
+    }
+
+    fn capability_response(&mut self, operation: OperationId, response: &HttpResponse) -> bool {
+        if !self
+            .attempt
+            .as_ref()
+            .and_then(|attempt| attempt.capability.as_ref())
+            .is_some_and(|prepared| prepared.operation == Some(operation))
+        {
+            return false;
+        }
+        if response.status != 200 {
+            return self.capability_failed(
+                operation,
+                classify_http_failure(response.status)
+                    .unwrap_or_else(|| Failure::protocol("invalid admission capability response")),
+            );
+        }
+        let Some(prepared) = self
+            .attempt
+            .as_mut()
+            .and_then(|attempt| attempt.capability.take())
+        else {
+            return true;
+        };
+        if response.status != 200 || self.ownership.install(&response.body).is_err() {
+            self.fail_uncertain_admission(
+                prepared.credential.revision,
+                Failure::protocol("invalid admission capability response"),
+            );
+            return true;
+        }
+        self.claim_prepared(prepared);
+        true
+    }
+
+    fn claim_prepared(&mut self, prepared: CapabilityRequest) {
+        let Some(attempt) = self.attempt.as_ref() else {
+            return;
+        };
+        let generation = attempt.generation;
+        let operation = self.ids.operation();
+        let maximum_attempts = self.config.retry.maximum_attempts.min(
+            u8::try_from(MAX_ORPHANED_CREATES.saturating_sub(self.orphaned_creates.len()))
+                .unwrap_or(u8::MAX),
+        );
+        let result = self.ownership.create(
+            operation,
+            prepared.credential,
+            generation,
+            prepared.request,
+            maximum_attempts,
+        );
+        match result {
+            Ok((request, effect)) => {
+                if let Some(attempt) = self.attempt.as_mut() {
+                    attempt.stage = AttemptStage::Requesting;
+                    attempt.request = Some(request);
+                }
+                self.effects.push_back(Effect::Http(effect));
+            }
+            Err(error) => self.fail_attempt(Failure {
+                class: FailureClass::RetryExhausted,
+                message: match error {
+                    admission::Error::SequenceExhausted => "ownership sequence space exhausted",
+                    _ => "native admission request cannot be claimed",
+                }
+                .into(),
+            }),
+        }
+    }
+
+    fn retry_creation(&mut self) {
+        let operation = self.ids.operation();
+        let result = self
+            .attempt
+            .as_mut()
+            .filter(|attempt| attempt.stage == AttemptStage::Requesting)
+            .and_then(|attempt| attempt.request.as_mut())
+            .map(|request| request.retry(operation));
+        match result {
+            Some(Ok(effect)) => {
+                self.effects.push_back(Effect::Http(effect));
+                self.update_attempt_state();
+            }
+            Some(Err(_)) => self.fail_attempt(Failure {
+                class: FailureClass::RetryExhausted,
+                message: "native admission retry budget exhausted".into(),
+            }),
+            None => {}
+        }
+    }
+
+    fn retry_uncertain_creation(&mut self, revision: u64, failure: Failure) {
+        self.credential_outcome(
+            revision,
+            crate::CredentialStatus::Uncertain,
+            Some(failure.clone()),
+        );
+        self.notify_failure(failure);
+        if self
+            .attempt
+            .as_ref()
+            .and_then(|attempt| attempt.request.as_ref())
+            .is_some_and(CreateRequest::can_retry)
+        {
+            self.schedule_retry_target(RetryTarget::Creation);
+        } else {
+            self.fail_attempt(Failure {
+                class: FailureClass::RetryExhausted,
+                message: "native admission retry budget exhausted".into(),
+            });
+        }
     }
 
     fn handle_http(&mut self, event: HttpEvent) -> Result<(), AgentError> {
@@ -1325,29 +1569,34 @@ impl Agent {
                 operation,
                 response,
             } => self.http_response(operation, response),
-            HttpEvent::Failed { operation, message } => {
-                if let Some(renewal) = self
-                    .active
-                    .as_mut()
-                    .and_then(|active| active.pending_renewal.as_mut())
-                    .filter(|renewal| renewal.operation == Some(operation))
-                {
-                    renewal.operation = None;
-                    self.notify_failure(Failure::transient(message));
+            HttpEvent::Failed { operation, .. } => {
+                if self.credential_http_failed(operation) {
                     return Ok(());
                 }
                 if self.remove_delete(operation) {
                     return Ok(());
                 }
-                if self
+                if self.capability_failed(
+                    operation,
+                    Failure::transient("admission capability request failed"),
+                ) {
+                    return Ok(());
+                }
+                if let Some(revision) = self
                     .attempt
-                    .as_ref()
-                    .is_some_and(|attempt| attempt.request == Some(operation))
+                    .as_mut()
+                    .filter(|attempt| attempt.stage == AttemptStage::Requesting)
+                    .and_then(|attempt| attempt.request.as_mut())
+                    .and_then(|request| {
+                        request
+                            .failed(operation)
+                            .then_some(request.credential.revision)
+                    })
                 {
-                    if let Some(attempt) = self.attempt.as_mut() {
-                        attempt.request = None;
-                    }
-                    self.fail_attempt(Failure::transient(message));
+                    self.retry_uncertain_creation(
+                        revision,
+                        Failure::transient("native admission outcome is uncertain"),
+                    );
                 }
                 Ok(())
             }
@@ -1359,56 +1608,80 @@ impl Agent {
         operation: OperationId,
         response: HttpResponse,
     ) -> Result<(), AgentError> {
-        if let Some(active) = self.active.as_mut()
-            && let Some(renewal) = active
-                .pending_renewal
-                .as_mut()
-                .filter(|renewal| renewal.operation == Some(operation))
-        {
-            renewal.operation = None;
-            let expected = format!("\"auth-{}\"", renewal.expected_revision);
-            if response.status == 204
-                && response.headers.iter().any(|header| {
-                    header.name.eq_ignore_ascii_case("etag") && header.value == expected
-                })
-            {
-                renewal.accepted = true;
-                self.commit_renewal();
-            } else if (400..500).contains(&response.status) && response.status != 408 {
-                active.pending_renewal = None;
-                self.notifications.push_back(Notification::ServerError(
-                    "authorization replacement rejected".into(),
-                ));
-            } else {
-                self.notifications.push_back(Notification::ServerError(
-                    "authorization replacement outcome is ambiguous".into(),
-                ));
-            }
+        if self.credential_http_response(operation, &response) {
             return Ok(());
         }
         if self.remove_delete(operation) {
             return Ok(());
         }
-        if self.orphaned_creates.remove(&operation) {
-            if response.status / 100 == 2
-                && let Ok((candidate, _)) = parse_create_response(&response)
-            {
-                self.emit_untracked_delete(candidate.resource_uri);
+        if self.capability_response(operation, &response) {
+            return Ok(());
+        }
+        if matches!(response.status, 409 | 410)
+            && (self
+                .attempt
+                .as_ref()
+                .and_then(|attempt| attempt.request.as_ref())
+                .is_some_and(|request| request.is_latest_receipt(operation, &self.ownership))
+                || self.active.as_ref().is_some_and(|active| {
+                    active
+                        .admission
+                        .is_latest_receipt(operation, &self.ownership)
+                }))
+        {
+            if let Some(failure) = classify_http_failure(response.status) {
+                if let Some(request) = self
+                    .attempt
+                    .as_mut()
+                    .and_then(|attempt| attempt.request.as_mut())
+                {
+                    let _ = request.responded(operation, true);
+                }
+                let revision = self
+                    .attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.request.as_ref())
+                    .map(|request| request.credential.revision);
+                if let Some(revision) = revision {
+                    self.fail_uncertain_admission(revision, failure);
+                } else {
+                    self.fail_terminal(failure);
+                }
             }
             return Ok(());
         }
-        let (mode, generation) = match self.attempt.as_ref() {
-            Some(attempt)
-                if attempt.request == Some(operation)
-                    && attempt.stage == AttemptStage::Requesting =>
+        if let Some(credential) = self.orphaned_creates.remove(&operation) {
+            if response.status / 100 == 2
+                && let Ok((candidate, _)) = parse_create_response(&response, credential)
             {
-                (attempt.mode, attempt.generation)
+                self.emit_untracked_delete(candidate.resource_uri, candidate.credential.token);
+            }
+            return Ok(());
+        }
+        let failure = classify_http_failure(response.status);
+        let (mode, generation, credential, uncertain, current) = match self.attempt.as_mut() {
+            Some(attempt) if attempt.stage == AttemptStage::Requesting => {
+                let Some(request) = attempt.request.as_mut() else {
+                    return Ok(());
+                };
+                let Some(uncertain) = request.responded(
+                    operation,
+                    failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.class != FailureClass::Authorization),
+                ) else {
+                    return Ok(());
+                };
+                (
+                    attempt.mode,
+                    attempt.generation,
+                    request.credential.clone(),
+                    uncertain,
+                    request.operation == operation,
+                )
             }
             Some(_) | None => return Ok(()),
         };
-        if let Some(attempt) = self.attempt.as_mut() {
-            attempt.request = None;
-        }
         agent_log!(
             self,
             Debug,
@@ -1417,22 +1690,58 @@ impl Agent {
             operation.get(),
             response.status,
         );
-        let failure = classify_http_failure(response.status);
+        let credential_revision = credential.revision;
         if let Some(failure) = failure {
-            self.fail_attempt(failure);
+            if !current
+                && !matches!(
+                    failure.class,
+                    FailureClass::ParticipantSuperseded | FailureClass::ResourceExpired
+                )
+            {
+                return Ok(());
+            }
+            if failure.class == FailureClass::Authorization && !uncertain {
+                self.reject_admission_credential(credential_revision, mode, failure);
+            } else if failure.class == FailureClass::Transient {
+                self.retry_uncertain_creation(credential_revision, failure);
+            } else {
+                self.fail_uncertain_admission(credential_revision, failure);
+            }
             return Ok(());
         }
-        let (candidate, answer) = match parse_create_response(&response) {
+        let (candidate, answer) = match parse_create_response(&response, credential) {
             Ok(parsed) => parsed,
             Err(message) => {
-                self.fail_attempt(Failure::protocol(message));
+                self.fail_uncertain_admission(credential_revision, Failure::protocol(message));
                 return Ok(());
             }
         };
+        if self
+            .attempt
+            .as_ref()
+            .and_then(|attempt| attempt.room.as_deref())
+            .is_some_and(|room| room != candidate.room_external_id)
+        {
+            self.emit_untracked_delete(candidate.resource_uri, candidate.credential.token);
+            self.fail_uncertain_admission(
+                credential_revision,
+                Failure::protocol("native response room does not match requested room"),
+            );
+            return Ok(());
+        }
         let capabilities = candidate.capabilities.clone();
+        if let Some(retry) = self.retry.take() {
+            self.effects
+                .push_back(Effect::Timer(TimerEffect::Cancel { timer: retry.timer }));
+        }
         if let Some(attempt) = self.attempt.as_mut() {
+            if let Some(request) = attempt.request.as_mut() {
+                for operation in request.accept() {
+                    self.effects
+                        .push_back(Effect::Http(HttpEffect::Cancel { operation }));
+                }
+            }
             attempt.stage = AttemptStage::ApplyingAnswer;
-            attempt.request = None;
             attempt.candidate = Some(candidate);
         }
         self.effects.push_back(Effect::Rtc(RtcEffect::ApplyAnswer {
@@ -1447,6 +1756,9 @@ impl Agent {
     fn handle_timer(&mut self, event: TimerEvent) -> Result<(), AgentError> {
         match event {
             TimerEvent::Fired { timer } => {
+                if self.credential_timer(timer) {
+                    return Ok(());
+                }
                 if self
                     .retry
                     .as_ref()
@@ -1455,7 +1767,11 @@ impl Agent {
                     if let Some(retry) = self.retry.take()
                         && self.desired.connected
                     {
-                        self.start_attempt(retry.mode);
+                        match retry.target {
+                            RetryTarget::Connection(mode) => self.start_attempt(mode),
+                            RetryTarget::Capability => self.acquire_capability(),
+                            RetryTarget::Creation => self.retry_creation(),
+                        }
                     }
                 } else if self.reconciliation_wake == Some(timer) {
                     self.reconciliation_wake = None;
@@ -1855,6 +2171,10 @@ impl Agent {
             debug_assert!(false, "ready attempt must have offer resources");
             return Ok(());
         };
+        let Some(admission) = attempt.request.take() else {
+            debug_assert!(false, "ready attempt must have admission receipts");
+            return Ok(());
+        };
         let coordinates = resources
             .slots
             .into_iter()
@@ -1867,8 +2187,13 @@ impl Agent {
                 participant_external_id: candidate.participant_external_id.clone(),
             },
         )?;
+        self.retry_attempts = 0;
+        self.snapshot.evaluated_join_revision = attempt.join_revision;
+        self.snapshot.accepted_join_revision = Some(attempt.join_revision);
         let previous_generation = self.active.as_ref().map(|session| session.generation);
         if let Some(previous) = self.active.replace(Session {
+            credential: candidate.credential,
+            admission: admission.into_accepted_receipts(),
             generation: attempt.generation,
             resource_uri: candidate.resource_uri,
             participant_id: candidate.participant_id,
@@ -1890,6 +2215,7 @@ impl Agent {
 
             authorization_expires_at: None,
             pending_renewal: None,
+            authorization_revision: 0,
             signaling_terminal: false,
             signaling_channel: resources.signaling_channel,
             data_preparations: attempt.data_preparations,
@@ -1897,13 +2223,8 @@ impl Agent {
             media_preparation: attempt.media_preparation,
         }) && previous.generation != attempt.generation
         {
-            if let Some(operation) = previous
-                .pending_renewal
-                .as_ref()
-                .and_then(|renewal| renewal.operation)
-            {
-                self.effects
-                    .push_back(Effect::Http(HttpEffect::Cancel { operation }));
+            if let Some(renewal) = previous.pending_renewal {
+                self.cancel_credential_work(renewal);
             }
             self.effects.push_back(Effect::Rtc(RtcEffect::Close {
                 generation: previous.generation,
@@ -1926,6 +2247,7 @@ impl Agent {
             self.snapshot.participant_external_id = Some(active.participant_external_id.clone());
             self.snapshot.room_external_id = Some(active.room_external_id.clone());
             self.snapshot.authorization_expires_at = None;
+            self.snapshot.accepted_credential_revision = Some(active.credential.revision);
             self.topics.bind_native(
                 active.generation,
                 active.participant_id.clone(),
@@ -1934,6 +2256,9 @@ impl Agent {
             );
             self.topics
                 .probe_remote_publishers(&mut self.ids, &mut self.effects);
+        }
+        if let Some(revision) = self.snapshot.accepted_credential_revision {
+            self.credential_accepted(revision);
         }
         self.set_connection_state(ConnectionState::Connected);
         for payload in attempt.early_signaling {
@@ -1959,7 +2284,7 @@ impl Agent {
         };
         let state = match attempt.stage {
             AttemptStage::Offering => ConnectionState::CreatingOffer,
-            AttemptStage::Requesting => ConnectionState::Joining,
+            AttemptStage::Acquiring | AttemptStage::Requesting => ConnectionState::Joining,
             AttemptStage::ApplyingAnswer if !attempt.answer_applied => {
                 ConnectionState::ApplyingAnswer
             }
@@ -1975,6 +2300,11 @@ impl Agent {
         let Some(mut attempt) = self.attempt.take() else {
             return;
         };
+        self.snapshot.evaluated_join_revision = attempt.join_revision;
+        if let Some(retry) = self.retry.take() {
+            self.effects
+                .push_back(Effect::Timer(TimerEffect::Cancel { timer: retry.timer }));
+        }
         agent_log!(
             self,
             Warn,
@@ -1986,16 +2316,23 @@ impl Agent {
         self.effects.push_back(Effect::Rtc(RtcEffect::Close {
             generation: attempt.generation,
         }));
-        if let Some(operation) = attempt.request.take() {
+        if let Some(capability) = attempt.capability.take()
+            && let Some(operation) = capability.operation
+        {
             self.effects
                 .push_back(Effect::Http(HttpEffect::Cancel { operation }));
-            let _ = self.orphaned_creates.insert(operation);
+        }
+        if let Some(request) = attempt.request.take() {
+            self.retire_creation(request);
         }
         if let Some(candidate) = attempt.candidate.take() {
-            self.emit_untracked_delete(candidate.resource_uri);
+            self.emit_untracked_delete(candidate.resource_uri, candidate.credential.token);
         }
         self.pending_signal = None;
         self.intent_dirty = true;
+        if failure.class == FailureClass::Authorization && self.retry_denied_admission() {
+            return;
+        }
         match failure.class {
             FailureClass::Transient => {
                 self.notify_failure(failure);
@@ -2011,6 +2348,9 @@ impl Agent {
     }
 
     fn fail_terminal(&mut self, failure: Failure) {
+        if failure.class != FailureClass::Authorization {
+            self.admission_denial = None;
+        }
         if self.snapshot.terminal_failure.is_some() {
             return;
         }
@@ -2031,7 +2371,10 @@ impl Agent {
         if let Some(active) = self.active.as_ref() {
             self.fence_signaling(active.generation);
         }
-        if failure.class == FailureClass::ParticipantSuperseded {
+        if matches!(
+            failure.class,
+            FailureClass::ParticipantSuperseded | FailureClass::ResourceExpired
+        ) {
             if let Some(active) = self.active.as_ref() {
                 self.effects.push_back(Effect::Rtc(RtcEffect::Close {
                     generation: active.generation,
@@ -2045,7 +2388,21 @@ impl Agent {
     }
 
     fn schedule_retry(&mut self, mode: AttemptMode) {
+        self.schedule_retry_target(RetryTarget::Connection(mode));
+    }
+
+    fn schedule_retry_target(&mut self, target: RetryTarget) {
+        if self.retry.is_some() {
+            return;
+        }
         self.retry_attempts = self.retry_attempts.saturating_add(1);
+        if self.retry_attempts >= self.config.retry.maximum_attempts {
+            self.fail_terminal(Failure {
+                class: FailureClass::RetryExhausted,
+                message: "connection retry budget exhausted".into(),
+            });
+            return;
+        }
         let shift = u32::from(self.retry_attempts.saturating_sub(1).min(10));
         let multiplier = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
         let ceiling = self.config.retry.maximum_delay.min(Duration::from_secs(10));
@@ -2075,12 +2432,12 @@ impl Agent {
         agent_log!(
             self,
             Info,
-            "scheduled connection retry mode={mode:?} attempt={} timer={} delay_ms={}",
+            "scheduled connection retry target={target:?} attempt={} timer={} delay_ms={}",
             self.retry_attempts,
             timer.get(),
             delay.as_millis(),
         );
-        self.retry = Some(Retry { timer, mode });
+        self.retry = Some(Retry { timer, target });
         self.effects.push_back(Effect::Timer(TimerEffect::Schedule {
             timer,
             after: delay,
@@ -2128,6 +2485,7 @@ impl Agent {
         if self.snapshot.terminal_failure.is_some() || self.closing.is_some() {
             return;
         }
+        self.reconcile_credentials();
         self.topics.reconcile(
             &self.desired.topics,
             &mut self.snapshot,
@@ -2145,6 +2503,7 @@ impl Agent {
             self.intent_dirty = false;
             if let Err(error) = native::reconcile(
                 active,
+                &mut self.logs,
                 &self.desired,
                 &self.topics,
                 &mut self.ids,
@@ -2247,6 +2606,7 @@ impl Agent {
     }
 
     fn begin_close(&mut self) {
+        self.admission_denial = None;
         if self.closing.is_some() {
             return;
         }
@@ -2287,30 +2647,33 @@ impl Agent {
             self.effects.push_back(Effect::Rtc(RtcEffect::Close {
                 generation: attempt.generation,
             }));
-            if let Some(operation) = attempt.request.take() {
-                self.effects
-                    .push_back(Effect::Http(HttpEffect::Cancel { operation }));
-                let _ = self.orphaned_creates.insert(operation);
-            }
-            if let Some(candidate) = attempt.candidate.take() {
-                self.track_delete(candidate.resource_uri, &mut closing);
-            }
-        }
-        if let Some(active) = self.active.take() {
-            if let Some(operation) = active
-                .pending_renewal
-                .as_ref()
-                .and_then(|renewal| renewal.operation)
+            if let Some(capability) = attempt.capability.take()
+                && let Some(operation) = capability.operation
             {
                 self.effects
                     .push_back(Effect::Http(HttpEffect::Cancel { operation }));
+            }
+            if let Some(request) = attempt.request.take() {
+                self.retire_creation(request);
+            }
+            if let Some(candidate) = attempt.candidate.take() {
+                self.track_delete(
+                    candidate.resource_uri,
+                    candidate.credential.token,
+                    &mut closing,
+                );
+            }
+        }
+        if let Some(active) = self.active.take() {
+            if let Some(renewal) = active.pending_renewal {
+                self.cancel_credential_work(renewal);
             }
             if closing.generations.insert(active.generation) {
                 self.effects.push_back(Effect::Rtc(RtcEffect::Close {
                     generation: active.generation,
                 }));
             }
-            self.track_delete(active.resource_uri, &mut closing);
+            self.track_delete(active.resource_uri, active.credential.token, &mut closing);
         }
         self.retry_attempts = 0;
         if closing.generations.is_empty() && closing.deletes.is_empty() {
@@ -2323,22 +2686,34 @@ impl Agent {
         }
     }
 
-    fn track_delete(&mut self, resource_uri: String, closing: &mut Closing) {
+    fn retire_creation(&mut self, request: CreateRequest) {
+        for (operation, pending) in request.unsettled() {
+            if pending {
+                self.effects
+                    .push_back(Effect::Http(HttpEffect::Cancel { operation }));
+            }
+            let _ = self
+                .orphaned_creates
+                .insert(operation, request.credential.clone());
+        }
+    }
+
+    fn track_delete(&mut self, resource_uri: String, token: String, closing: &mut Closing) {
         let operation = self.ids.operation();
         let _ = closing.deletes.insert(operation);
         self.effects.push_back(Effect::Http(HttpEffect::Request {
             operation,
             generation: None,
-            request: delete_request(resource_uri, &self.config.token),
+            request: delete_request(resource_uri, &token),
         }));
     }
 
-    fn emit_untracked_delete(&mut self, resource_uri: String) {
+    fn emit_untracked_delete(&mut self, resource_uri: String, token: String) {
         let operation = self.ids.operation();
         self.effects.push_back(Effect::Http(HttpEffect::Request {
             operation,
             generation: None,
-            request: delete_request(resource_uri, &self.config.token),
+            request: delete_request(resource_uri, &token),
         }));
     }
 
@@ -2374,7 +2749,9 @@ impl Agent {
         self.snapshot.participant_id = None;
         self.snapshot.participant_external_id = None;
         self.snapshot.room_external_id = None;
+        self.snapshot.accepted_join_revision = None;
         self.snapshot.authorization_expires_at = None;
+        self.snapshot.accepted_credential_revision = None;
         self.clear_observed_state();
         if self.participant_superseded() {
             self.set_connection_state(ConnectionState::TerminalFailure);
@@ -2403,15 +2780,22 @@ impl Agent {
         let body = serde_json::to_vec(&NativeRequest {
             profile: pulsebeam_proto::state::PROFILE,
             offer,
+            room: self
+                .attempt
+                .as_ref()
+                .and_then(|attempt| attempt.room.as_deref())
+                .ok_or(AgentError::InvalidOffer(
+                    "native admission requires a selected room",
+                ))?,
         })
         .map_err(|_| AgentError::InvalidOffer("SDP offer could not be encoded"))?;
-        if body.len() > 262_144 {
+        if body.len() > admission::MAX_CREATE_BODY_BYTES {
             return Err(AgentError::InvalidOffer("native JSON request is too large"));
         }
         Ok(HttpRequest {
             method: HttpMethod::Post,
             uri: format!("{}/api/v1/native", self.config.endpoint),
-            headers: request_headers(&self.config.token, true),
+            headers: admission_headers(&self.config.token),
             body,
         })
     }
@@ -2537,6 +2921,15 @@ fn delete_request(resource_uri: String, token: &str) -> HttpRequest {
     }
 }
 
+fn admission_headers(token: &str) -> Vec<HttpHeader> {
+    let mut headers = request_headers(token, true);
+    headers.push(HttpHeader {
+        name: "Accept-Encoding".into(),
+        value: "identity".into(),
+    });
+    headers
+}
+
 fn request_headers(token: &str, json: bool) -> Vec<HttpHeader> {
     let mut headers = vec![HttpHeader {
         name: "Authorization".to_string(),
@@ -2562,7 +2955,11 @@ fn classify_http_failure(status: u16) -> Option<Failure> {
             "participant session was superseded",
         ),
         408 | 425 | 429 | 500..=599 => (FailureClass::Transient, "transient HTTP failure"),
-        400 | 404 | 410 | 412 | 422 => (
+        410 => (
+            FailureClass::ResourceExpired,
+            "admission recovery is unavailable",
+        ),
+        400 | 404 | 412 | 422 => (
             FailureClass::InvalidConfiguration,
             "server rejected session configuration",
         ),
@@ -2574,7 +2971,10 @@ fn classify_http_failure(status: u16) -> Option<Failure> {
     })
 }
 
-fn parse_create_response(response: &HttpResponse) -> Result<(Candidate, String), String> {
+fn parse_create_response(
+    response: &HttpResponse,
+    credential: Credential,
+) -> Result<(Candidate, String), String> {
     let resource_uri = unique_header(response, "Location")?
         .ok_or_else(|| "create response is missing Location".to_string())?;
     validate_resource_uri(resource_uri)?;
@@ -2593,6 +2993,7 @@ fn parse_create_response(response: &HttpResponse) -> Result<(Candidate, String),
     validate_answer(&body.answer)?;
     Ok((
         Candidate {
+            credential,
             capabilities: crate::BootstrapCapabilities {
                 rtp: body.rtp_capabilities,
                 data_delivery,
@@ -2839,8 +3240,20 @@ mod response_tests {
             "data_delivery": ["LATEST", "LOSSY", "ORDERED"],
             "answer": "v=0\r\n",
             "future": {"ignored": true},
+            "token": "not-a-request-credential",
         });
-        let (candidate, answer) = parse_create_response(&response(complete.clone())).unwrap();
+        let parse = |response: &HttpResponse| {
+            parse_create_response(
+                response,
+                Credential {
+                    token: "request-token".into(),
+                    revision: 17,
+                },
+            )
+        };
+        let (candidate, answer) = parse(&response(complete.clone())).unwrap();
+        assert_eq!(candidate.credential.token, "request-token");
+        assert_eq!(candidate.credential.revision, 17);
         assert_eq!(
             candidate.resource_uri,
             "https://elsewhere.test/exact%2Fopaque?x=a%2Fb"
@@ -2865,7 +3278,7 @@ mod response_tests {
         ] {
             let mut missing = complete.as_object().unwrap().clone();
             let _ = missing.remove(field);
-            assert!(parse_create_response(&response(missing.into())).is_err());
+            assert!(parse(&response(missing.into())).is_err());
         }
 
         for (field, value) in [
@@ -2886,10 +3299,7 @@ mod response_tests {
         ] {
             let mut invalid = complete.as_object().unwrap().clone();
             invalid.insert(field.to_string(), value);
-            assert!(
-                parse_create_response(&response(invalid.into())).is_err(),
-                "{field}"
-            );
+            assert!(parse(&response(invalid.into())).is_err(), "{field}");
         }
 
         for (modes, supported) in [
@@ -2901,15 +3311,15 @@ mod response_tests {
         ] {
             let mut future = complete.as_object().unwrap().clone();
             future.insert("data_delivery".to_string(), modes);
-            let (candidate, _) = parse_create_response(&response(future.into())).unwrap();
+            let (candidate, _) = parse(&response(future.into())).unwrap();
             assert_eq!(candidate.capabilities.data_delivery, supported);
         }
         let mut missing_location = response(complete.clone());
         missing_location.headers.clear();
-        assert!(parse_create_response(&missing_location).is_err());
+        assert!(parse(&missing_location).is_err());
 
         let mut relative_location = response(complete);
         relative_location.headers[0].value = "/api/v1/native/relative".to_string();
-        assert!(parse_create_response(&relative_location).is_err());
+        assert!(parse(&relative_location).is_err());
     }
 }

@@ -3,21 +3,99 @@
 import base64
 import binascii
 import json
+import unicodedata
+from typing import Literal, TypedDict
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import load_der_private_key
+
+_MAX_COMPACT_TOKEN_BYTES = 8192
+Action = Literal["join", "publish", "discover", "subscribe"]
+TrackKind = Literal["audio", "video", "data"]
+
+
+class _RequiredGrant(TypedDict):
+    rooms: list[str]
+    allow: list[Action]
+
+
+class Grant(_RequiredGrant, total=False):
+    participant: str
+    kind: TrackKind
+    label: str
+
+
+def _scope(value: object) -> bool:
+    if type(value) is not str or not value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 256 and not any(
+            unicodedata.category(character) == "Cc" for character in value
+        )
+    except UnicodeEncodeError:
+        return False
+
+
+def _checked_grants(grants: list[Grant]) -> list[Grant]:
+    if type(grants) is not list or len(grants) > 32:
+        raise ValueError("Invalid grants")
+    patterns = 0
+    checked = []
+    for grant in grants:
+        if type(grant) is not dict or set(grant) - {
+            "rooms", "allow", "participant", "kind", "label"
+        }:
+            raise ValueError("Invalid grant")
+        rooms = grant.get("rooms")
+        allow = grant.get("allow")
+        if type(rooms) is not list or not rooms:
+            raise ValueError("Invalid rooms")
+        patterns += len(rooms)
+        if patterns > 64:
+            raise ValueError("Invalid room pattern count")
+        for room in rooms:
+            if not _scope(room) or (
+                "*" in room and room != "*"
+                and not (room.endswith("/*") and room.count("*") == 1)
+            ):
+                raise ValueError("Invalid room pattern")
+        if type(allow) is not list or not 1 <= len(allow) <= 4 or any(
+            type(action) is not str or action not in ("join", "publish", "discover", "subscribe")
+            for action in allow
+        ) or len(set(allow)) != len(allow):
+            raise ValueError("Invalid actions")
+        filters = set(grant) & {"participant", "kind", "label"}
+        for name in ("participant", "label"):
+            if name in filters and not _scope(grant[name]):
+                raise ValueError("Invalid grant filter")
+        if "kind" in filters and grant["kind"] not in ("audio", "video", "data"):
+            raise ValueError("Invalid track kind")
+        if "join" in allow and filters:
+            raise ValueError("Invalid join filters")
+        if "publish" in allow and "participant" in filters:
+            raise ValueError("Invalid publish participant filter")
+        normalized = {"rooms": list(rooms), "allow": list(allow)}
+        for name in ("participant", "kind", "label"):
+            if name in filters:
+                normalized[name] = grant[name]
+        checked.append(normalized)
+    return checked
+
 
 def _base64(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
 def sign_participant_token(
-    api_key: str, *, room: str, participant: str, expiration: int
+    api_key: str, *, grants: list[Grant], participant: str, expiration: int
 ) -> str:
     """Sign a JWT offline with one opaque API key and absolute Unix expiration.
 
     No clock, environment lookup, or network request is performed.
     """
+    if not _scope(participant):
+        raise ValueError("Invalid participant identifier")
+    checked = _checked_grants(grants)
     if type(api_key) is not str:
         raise ValueError("Invalid API key")
     parts = api_key.split(".")
@@ -36,9 +114,13 @@ def sign_participant_token(
         raise ValueError("Invalid expiration")
     header = json.dumps({"alg": "EdDSA", "kid": key, "typ": "pb+jwt"}, separators=(",", ":"))
     claims = json.dumps(
-        {"iss": project, "aud": "pb", "sub": participant, "room": room, "exp": expiration},
+        {"iss": project, "aud": "pb", "sub": participant, "exp": expiration, "grants": checked},
         separators=(",", ":"),
+        ensure_ascii=False,
     )
     signing_input = _base64(header.encode()) + "." + _base64(claims.encode())
+    # Ed25519's 64-byte signature occupies 86 unpadded base64url characters.
+    if len(signing_input) + 1 + 86 > _MAX_COMPACT_TOKEN_BYTES:
+        raise ValueError("Participant token exceeds the 8192-byte limit")
     signature = private_key.sign(signing_input.encode("ascii"))
     return signing_input + "." + _base64(signature)

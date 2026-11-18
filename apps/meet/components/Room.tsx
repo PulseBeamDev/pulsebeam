@@ -43,10 +43,12 @@ const latencyModes: Record<
 export function Room({
   token,
   endpoint,
+  room,
   onLeave,
 }: {
   token: string;
   endpoint: string;
+  room: string;
   onLeave(): void;
 }) {
   const agent = useAgent({
@@ -100,13 +102,17 @@ export function Room({
   );
   const { remoteTracks, spotlight, setPin } = useVideoLayout(remoteVideoTracks);
   const connect = useCallback(() => {
-    void agent.connect().catch((reason: unknown) => {
+    try {
+      agent.join(room);
+    } catch (reason) {
       setFailure(
         `Connection: ${reason instanceof Error ? reason.message : String(reason)}`,
       );
-    });
-  }, [agent]);
-  useEffect(connect, [connect]);
+    }
+  }, [agent, room]);
+  useEffect(() => {
+    agent.join(room);
+  }, [agent, room]);
   const startShare = async () => {
     try {
       await requestShare();

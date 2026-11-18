@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { Agent, InputFrame, NativeError, ReceiveMode } from "@pulsebeam/agent/native";
 import { LogLevel, PlayoutDelay, TopicMode } from "@pulsebeam/agent/core";
 
+const room = process.argv[4];
+assert.ok(room, "an explicit room is required");
 const agent = await Agent.create({
   endpoint: process.argv[2],
   token: process.argv[3],
@@ -17,7 +19,7 @@ try {
     dependencyDescriptor: true,
   });
   const publication = await agent.video("node-camera").publish(camera, { enabled: true });
-  await agent.connect();
+  agent.join(room);
   while (true) {
     const update = await updates.next();
     assert.equal(update.tag, "Snapshot");
@@ -101,7 +103,7 @@ try {
   assert(camera.isClosed());
   await agent.close();
   assert(agent.isClosed());
-  await assert.rejects(agent.connect(), (error) => NativeError.Closed.instanceOf(error));
+  assert.throws(() => agent.join(room), (error) => NativeError.Closed.instanceOf(error));
   console.log("installed Node owned data/media/real SFU/independent source/terminal close PASS");
 } finally {
   await agent.close();

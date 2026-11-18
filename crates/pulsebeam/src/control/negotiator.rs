@@ -94,6 +94,34 @@ impl NegotiatedResources {
     pub(crate) fn media_sections(&self) -> &[NegotiatedMedia] {
         &self.media
     }
+
+    pub(super) fn publications_allowed(
+        &self,
+        profile: super::controller::SignalingProtocol,
+        permissions: &super::permissions::ResourcePermissions,
+    ) -> bool {
+        use super::controller::SignalingProtocol;
+        use pulsebeam_core::auth::grants::{Action, TrackKind};
+        match profile {
+            SignalingProtocol::State => true,
+            SignalingProtocol::Whep => self
+                .media
+                .iter()
+                .all(|media| media.direction == Direction::SendOnly),
+            SignalingProtocol::Whip => self.media.iter().all(|media| {
+                if media.direction != Direction::RecvOnly {
+                    return false;
+                }
+                let kind = match media.kind {
+                    MediaKind::Audio => TrackKind::Audio,
+                    MediaKind::Video => TrackKind::Video,
+                };
+                crate::participant::whip_media_label(profile, media.kind).is_some_and(|label| {
+                    permissions.allows(Action::Publish, None, Some(kind), Some(label))
+                })
+            }),
+        }
+    }
     pub(crate) fn without_bootstrap_media(mut self) -> Self {
         self.media.clear();
         self
@@ -279,9 +307,15 @@ pub(crate) fn application_only_test_connection() -> AcceptedConnection {
 }
 
 #[cfg(test)]
+pub(crate) fn application_only_test_connection_and_offer() -> (AcceptedConnection, String) {
+    let (connection, _, _, offer) = application_only_test_pair();
+    (connection, offer)
+}
+
+#[cfg(test)]
 pub(crate) fn application_only_test_connection_and_binding()
 -> (AcceptedConnection, NegotiatedResources, Vec<u8>) {
-    let (accepted, resources, mut peer) = application_only_test_pair();
+    let (accepted, resources, mut peer, _) = application_only_test_pair();
     let binding = (0..64)
         .find_map(|_| match peer.poll_output().unwrap() {
             str0m::Output::Transmit(tx) => {
@@ -300,7 +334,7 @@ pub(crate) fn application_only_test_connection_and_binding()
 }
 
 #[cfg(test)]
-fn application_only_test_pair() -> (AcceptedConnection, NegotiatedResources, str0m::Rtc) {
+fn application_only_test_pair() -> (AcceptedConnection, NegotiatedResources, str0m::Rtc, String) {
     let mut peer = str0m::RtcConfig::new().build(std::time::Instant::now());
     peer.add_local_candidate(
         str0m::Candidate::builder()
@@ -312,13 +346,14 @@ fn application_only_test_pair() -> (AcceptedConnection, NegotiatedResources, str
     let mut changes = peer.sdp_api();
     changes.add_channel("test".to_owned());
     let (offer, pending) = changes.apply().unwrap();
+    let offer = offer.to_sdp_string();
     let local = "127.0.0.1:6000".parse().unwrap();
     let (accepted, answer, resources) = Negotiator::new(vec![
         LocalCandidate::Udp(local),
         LocalCandidate::TcpPassive(local),
     ])
     .create_answer(
-        offer.to_sdp_string(),
+        offer.clone(),
         crate::control::ufrag::test_credentials(),
         ReceiveTime::now(),
         None,
@@ -330,7 +365,7 @@ fn application_only_test_pair() -> (AcceptedConnection, NegotiatedResources, str
             str0m::change::SdpAnswer::from_sdp_string(&answer).unwrap(),
         )
         .unwrap();
-    (accepted, resources, peer)
+    (accepted, resources, peer, offer)
 }
 
 #[cfg(test)]
@@ -400,7 +435,7 @@ mod tests {
             (Direction::RecvOnly, "a=sendonly"),
         ] {
             let mut negotiator = negotiator();
-            let (_, answer, _) = negotiator
+            let (_, answer, resources) = negotiator
                 .create_answer(
                     chrome_like_offer(offer_direction),
                     test_credentials(),
@@ -409,6 +444,24 @@ mod tests {
                 )
                 .unwrap();
             assert!(answer.contains(answer_direction));
+            for profile in [
+                super::super::controller::SignalingProtocol::Whip,
+                super::super::controller::SignalingProtocol::Whep,
+            ] {
+                let expected = match profile {
+                    super::super::controller::SignalingProtocol::Whip => {
+                        offer_direction == Direction::SendOnly
+                    }
+                    _ => offer_direction == Direction::RecvOnly,
+                };
+                assert_eq!(
+                    resources.publications_allowed(
+                        profile,
+                        &super::super::permissions::ResourcePermissions::RoomBound
+                    ),
+                    expected
+                );
+            }
         }
     }
 

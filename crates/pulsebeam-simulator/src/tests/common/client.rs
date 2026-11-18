@@ -446,7 +446,7 @@ impl SimClientBuilder {
             endpoint: self.endpoint,
             token: pulsebeam_server::sign_participant_token(
                 &pulsebeam_server::insecure_dev_api_key().unwrap(),
-                (room).as_str(),
+            &serde_json::from_value(serde_json::json!([{"rooms":[(room).as_str()],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
                 (participant).as_str(),
                 expires_at,
             )?,
@@ -754,6 +754,7 @@ impl SimClientBuilder {
         let mut declared = desired.clone();
         declared.audio = AudioSubscription::default();
         agent.replace_desired(declared).await?;
+        agent.join(room.as_str().to_owned())?;
 
         let mut snapshots = agent.snapshots();
         while snapshots.borrow().participant_id.is_none()

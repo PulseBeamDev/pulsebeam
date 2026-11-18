@@ -6,15 +6,16 @@ use crate::identity::{
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 pub use pulsebeam_auth::api_key::{ApiKey, ApiKeyError};
+pub use pulsebeam_auth::grants;
 pub use pulsebeam_auth::keys::{ApiPublicKey, ApiSigningKey, KeyValidationError};
-use serde::{Deserialize, Serialize, de};
-use std::{collections::HashMap, fmt, sync::LazyLock};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::LazyLock};
 
 #[cfg(test)]
 const KEY_BYTES: usize = 32;
 #[cfg(test)]
 const REDACTED: &str = "[REDACTED]";
-pub const MAX_COMPACT_TOKEN_LEN: usize = 16_384;
+pub use pulsebeam_auth::MAX_COMPACT_TOKEN_LEN;
 
 // The --dev server and all server SDKs use the same public test key.
 #[derive(Deserialize)]
@@ -45,6 +46,80 @@ pub static DEVELOPMENT_API_PUBLIC_KEY: LazyLock<ApiPublicKey> =
     LazyLock::new(|| DEV_CREDENTIALS.public_key);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedPrincipal {
+    project_id: ProjectId,
+    participant_external_id: ParticipantExternalId,
+    expiry: AuthorizationExpiry,
+    grants: grants::GrantSet,
+}
+
+impl VerifiedPrincipal {
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
+    }
+
+    pub fn participant_external_id(&self) -> &ParticipantExternalId {
+        &self.participant_external_id
+    }
+
+    pub fn expiry(&self) -> AuthorizationExpiry {
+        self.expiry
+    }
+
+    pub fn authorize_room(
+        self,
+        room: RoomExternalId,
+    ) -> Result<VerifiedAuthorization, RoomAuthorizationError> {
+        if !self
+            .grants
+            .allows(grants::Action::Join, room.as_str(), None, None, None)
+        {
+            return Err(RoomAuthorizationError::Denied);
+        }
+        Ok(self.bind_room(room))
+    }
+
+    pub fn authorize_existing(
+        self,
+        accepted: &VerifiedAuthorization,
+    ) -> Result<VerifiedAuthorization, RoomAuthorizationError> {
+        if self.project_id != accepted.project_id
+            || self.participant_external_id != accepted.participant_external_id
+        {
+            return Err(RoomAuthorizationError::Denied);
+        }
+        let authorization = self.bind_room(accepted.room_external_id.clone());
+        if authorization.room_id != accepted.room_id
+            || authorization.participant_id != accepted.participant_id
+        {
+            return Err(RoomAuthorizationError::Denied);
+        }
+        Ok(authorization)
+    }
+
+    fn bind_room(self, room: RoomExternalId) -> VerifiedAuthorization {
+        let room_id = RoomId::derive(&self.project_id, &room);
+        let participant_id = ParticipantId::derive(&room_id, &self.participant_external_id);
+        VerifiedAuthorization {
+            project_id: self.project_id,
+            room_external_id: room,
+            room_id,
+            participant_external_id: self.participant_external_id,
+            participant_id,
+            expiry: self.expiry,
+            grants: self.grants,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RoomAuthorizationError {
+    #[error("authorization does not permit the selected room")]
+    Denied,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedAuthorization {
     pub project_id: ProjectId,
     pub room_external_id: RoomExternalId,
@@ -52,6 +127,7 @@ pub struct VerifiedAuthorization {
     pub participant_external_id: ParticipantExternalId,
     pub participant_id: ParticipantId,
     pub expiry: AuthorizationExpiry,
+    pub grants: grants::GrantSet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,121 +158,60 @@ pub enum TokenError {
     Expired,
 }
 
-enum UniqueJson {
-    Null,
-    Bool,
-    Number(serde_json::Number),
-    String(String),
-    Array(Vec<Self>),
-    Object(HashMap<String, Self>),
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenHeader {
+    alg: String,
+    kid: ApiKeyId,
+    typ: String,
+    #[serde(default)]
+    crit: Vec<String>,
 }
 
-impl<'de> Deserialize<'de> for UniqueJson {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-
-        impl<'de> de::Visitor<'de> for Visitor {
-            type Value = UniqueJson;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a JSON value without duplicate object members")
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(UniqueJson::Null)
-            }
-
-            fn visit_none<E>(self) -> Result<Self::Value, E> {
-                Ok(UniqueJson::Null)
-            }
-
-            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-                let _ = value;
-                Ok(UniqueJson::Bool)
-            }
-
-            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(UniqueJson::Number(value.into()))
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(UniqueJson::Number(value.into()))
-            }
-
-            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                serde_json::Number::from_f64(value)
-                    .map(UniqueJson::Number)
-                    .ok_or_else(|| E::custom("invalid JSON number"))
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(UniqueJson::String(value.to_owned()))
-            }
-
-            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-                Ok(UniqueJson::String(value))
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: de::SeqAccess<'de>,
-            {
-                let mut values = Vec::new();
-                while let Some(value) = sequence.next_element()? {
-                    values.push(value);
-                }
-                Ok(UniqueJson::Array(values))
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: de::MapAccess<'de>,
-            {
-                let mut values = HashMap::new();
-                while let Some((key, value)) = map.next_entry()? {
-                    if values.insert(key, value).is_some() {
-                        return Err(de::Error::custom("duplicate JSON member"));
-                    }
-                }
-                Ok(UniqueJson::Object(values))
-            }
-        }
-
-        deserializer.deserialize_any(Visitor)
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParticipantClaims {
+    iss: ProjectId,
+    aud: String,
+    sub: ParticipantExternalId,
+    exp: u64,
+    grants: grants::GrantSet,
 }
 
-fn parse_object(segment: &str) -> Result<HashMap<String, UniqueJson>, TokenError> {
+fn decode_json<T: serde::de::DeserializeOwned>(segment: &str) -> Result<T, TokenError> {
     let bytes = BASE64URL_NOPAD
         .decode(segment.as_bytes())
         .map_err(|_| TokenError::Malformed)?;
-    match serde_json::from_slice(&bytes).map_err(|_| TokenError::Malformed)? {
-        UniqueJson::Object(object) => Ok(object),
-        _ => Err(TokenError::Malformed),
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(TokenError::Malformed);
     }
-}
-
-fn take_string(object: &mut HashMap<String, UniqueJson>, name: &str) -> Result<String, TokenError> {
-    match object.remove(name) {
-        Some(UniqueJson::String(value)) => Ok(value),
-        _ => Err(TokenError::Invalid),
-    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        if error.is_data() {
+            TokenError::Invalid
+        } else {
+            TokenError::Malformed
+        }
+    })
 }
 
 pub fn verify_participant_token(
     registry: &KeyRegistry,
     token: &str,
+    room: RoomExternalId,
     now: u64,
 ) -> Result<VerifiedAuthorization, TokenError> {
+    let principal = authenticate_participant_token(registry, token, now)?;
+    principal
+        .authorize_room(room)
+        .map_err(|_| TokenError::Invalid)
+}
+
+/// Verify the current credential profile without materializing a room incarnation.
+pub fn authenticate_participant_token(
+    registry: &KeyRegistry,
+    token: &str,
+    now: u64,
+) -> Result<VerifiedPrincipal, TokenError> {
     if token.len() > MAX_COMPACT_TOKEN_LEN {
         return Err(TokenError::Malformed);
     }
@@ -213,44 +228,25 @@ pub fn verify_participant_token(
         return Err(TokenError::Malformed);
     }
 
-    let mut header = parse_object(encoded_header)?;
-    if take_string(&mut header, "alg")? != "EdDSA" || take_string(&mut header, "typ")? != "pb+jwt" {
+    let header: TokenHeader = decode_json(encoded_header)?;
+    if header.alg != "EdDSA" || header.typ != "pb+jwt" || !header.crit.is_empty() {
         return Err(TokenError::Invalid);
     }
-    let key_id = take_string(&mut header, "kid")?
-        .parse::<ApiKeyId>()
-        .map_err(|_| TokenError::Invalid)?;
-    if let Some(crit) = header.remove("crit") {
-        match crit {
-            UniqueJson::Array(values) if values.is_empty() => {}
-            _ => return Err(TokenError::Invalid),
-        }
-    }
-
-    let mut claims = parse_object(encoded_claims)?;
-    if claims.contains_key("iat") || take_string(&mut claims, "aud")? != "pb" {
+    let claims: ParticipantClaims = decode_json(encoded_claims)?;
+    if claims.aud != "pb" {
         return Err(TokenError::Invalid);
     }
-    let project_id = take_string(&mut claims, "iss")?
-        .parse::<ProjectId>()
-        .map_err(|_| TokenError::Invalid)?;
-    let participant_external_id = ParticipantExternalId::new(&take_string(&mut claims, "sub")?)
-        .map_err(|_| TokenError::Invalid)?;
-    let room_external_id =
-        RoomExternalId::new(&take_string(&mut claims, "room")?).map_err(|_| TokenError::Invalid)?;
-    let exp = match claims.remove("exp") {
-        Some(UniqueJson::Number(value)) => value.as_u64().ok_or(TokenError::Invalid)?,
-        _ => return Err(TokenError::Invalid),
-    };
-    let expiry = AuthorizationExpiry::from_unix_seconds(exp);
+    let expiry = AuthorizationExpiry::from_unix_seconds(claims.exp);
     if expiry.is_expired_at(now) {
         return Err(TokenError::Expired);
     }
 
-    if project_id != registry.project_id() {
+    if claims.iss != registry.project_id() {
         return Err(TokenError::Invalid);
     }
-    let public_key = registry.public_key(&key_id).ok_or(TokenError::Invalid)?;
+    let public_key = registry
+        .public_key(&header.kid)
+        .ok_or(TokenError::Invalid)?;
     let signature = BASE64URL_NOPAD
         .decode(encoded_signature.as_bytes())
         .ok()
@@ -262,15 +258,11 @@ pub fn verify_participant_token(
         .verify_strict(signing_input.as_bytes(), &signature)
         .map_err(|_| TokenError::Invalid)?;
 
-    let room_id = RoomId::derive(&project_id, &room_external_id);
-    let participant_id = ParticipantId::derive(&room_id, &participant_external_id);
-    Ok(VerifiedAuthorization {
-        project_id,
-        room_external_id,
-        room_id,
-        participant_external_id,
-        participant_id,
+    Ok(VerifiedPrincipal {
+        project_id: claims.iss,
+        participant_external_id: claims.sub,
         expiry,
+        grants: claims.grants,
     })
 }
 
@@ -358,6 +350,9 @@ impl KeyRegistry {
 }
 
 #[cfg(test)]
+mod grants_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(
         clippy::arithmetic_side_effects,
@@ -367,6 +362,19 @@ mod tests {
     )]
 
     use super::*;
+
+    fn verify_participant_token(
+        registry: &KeyRegistry,
+        token: &str,
+        now: u64,
+    ) -> Result<VerifiedAuthorization, TokenError> {
+        super::verify_participant_token(
+            registry,
+            token,
+            RoomExternalId::new("general").unwrap(),
+            now,
+        )
+    }
 
     fn development_registry() -> KeyRegistry {
         KeyRegistry::new(
@@ -418,7 +426,7 @@ mod tests {
         signed_token(
             &format!("{{\"alg\":\"{alg}\",\"kid\":\"{kid}\",\"typ\":\"{typ}\"{header_extra}}}"),
             &format!(
-                "{{\"iss\":\"{iss}\",\"aud\":\"{aud}\",\"sub\":\"{sub}\",\"room\":\"{room}\",\"exp\":{exp}{claims_extra}}}"
+                "{{\"iss\":\"{iss}\",\"aud\":\"{aud}\",\"sub\":\"{sub}\",\"exp\":{exp},\"grants\":[{{\"rooms\":[\"{room}\"],\"allow\":[\"join\",\"publish\",\"discover\",\"subscribe\"]}}]{claims_extra}}}"
             ),
             &DEVELOPMENT_API_SIGNING_KEY,
         )
@@ -521,11 +529,17 @@ mod tests {
     }
 
     #[test]
-    fn development_jwt_golden_vector_verifies_and_derives_canonical_identity() {
+    fn development_jwt_requires_grants_and_derives_canonical_identity() {
         let room = RoomExternalId::new("general").unwrap();
         let participant = ParticipantExternalId::new("alice").unwrap();
         let token = "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDAwMDAwMDAwMVIwMTAwMDAwMDAwMDAwMDgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwMDAwMDAwMDAxUjAxMDAwMDAwMDAwMDAwNCIsImF1ZCI6InBiIiwic3ViIjoiYWxpY2UiLCJyb29tIjoiZ2VuZXJhbCIsImV4cCI6MjAwMH0.Bp8UJVINeP0cqUiG_0qSk4wjqDg5MGZqRcBel3Qy176HoTy0OQvTpTp5Uuav5k2Wlsgdd58rPt6DLiWVt0U1AQ";
 
+        assert_eq!(
+            authenticate_participant_token(&development_registry(), token, 1_999),
+            Err(TokenError::Invalid)
+        );
+        let token = profile_token("", "");
+        let token = token.as_str();
         let authorization =
             verify_participant_token(&development_registry(), token, 1_999).unwrap();
         assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
@@ -544,6 +558,53 @@ mod tests {
         );
         assert_eq!(authorization.expiry.unix_seconds(), 2_000);
         assert!(!format!("{authorization:?}").contains(token));
+
+        let principal =
+            authenticate_participant_token(&development_registry(), token, 1_999).unwrap();
+        assert_eq!(principal.project_id(), authorization.project_id);
+        assert_eq!(principal.participant_external_id(), &participant);
+        assert_eq!(principal.expiry(), authorization.expiry);
+        assert!(!format!("{principal:?}").contains(token));
+        assert_eq!(
+            principal.clone().authorize_room(room).unwrap(),
+            authorization
+        );
+        assert_eq!(
+            principal.authorize_room(RoomExternalId::new("other").unwrap()),
+            Err(RoomAuthorizationError::Denied)
+        );
+        assert_eq!(
+            authenticate_participant_token(&development_registry(), token, 2_000),
+            Err(TokenError::Expired)
+        );
+    }
+
+    #[test]
+    fn complete_encoded_token_budget_includes_header_separators_and_signature() {
+        let header = format!(
+            "{{\"alg\":\"EdDSA\",\"kid\":\"{}\",\"typ\":\"pb+jwt\"}}",
+            DEVELOPMENT_API_KEY_ID.as_str()
+        );
+        let claims = format!(
+            "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"p\",\"exp\":2000,\"grants\":[{{\"rooms\":[\"general\"],\"allow\":[\"join\"]}}]}}",
+            DEVELOPMENT_PROJECT_ID.as_str()
+        );
+        let fixed = BASE64URL_NOPAD.encode(claims.as_bytes()).len() + 2 + 86;
+        let header_bytes = (8192 - fixed) * 3 / 4;
+        let padded_header = format!("{}{header}", " ".repeat(header_bytes - header.len()));
+        let at_limit = signed_token(&padded_header, &claims, &DEVELOPMENT_API_SIGNING_KEY);
+        assert_eq!(at_limit.len(), 8192);
+        assert!(verify_participant_token(&development_registry(), &at_limit, 1_000).is_ok());
+        let oversized = signed_token(
+            &format!(" {padded_header}"),
+            &claims,
+            &DEVELOPMENT_API_SIGNING_KEY,
+        );
+        assert!(oversized.len() > 8192);
+        assert_eq!(
+            verify_participant_token(&development_registry(), &oversized, 1_000),
+            Err(TokenError::Malformed)
+        );
     }
 
     #[test]
@@ -607,7 +668,7 @@ mod tests {
                 "pb+jwt",
                 &DEVELOPMENT_PROJECT_ID.as_str(),
                 "pb",
-                "not valid",
+                r"not\nvalid",
                 "general",
                 "2000",
                 "",
@@ -620,7 +681,7 @@ mod tests {
                 &DEVELOPMENT_PROJECT_ID.as_str(),
                 "pb",
                 "alice",
-                "not/valid",
+                r"not\u0085valid",
                 "2000",
                 "",
                 "",
@@ -707,21 +768,120 @@ mod tests {
     }
 
     #[test]
-    fn jwt_accepts_aliases_and_unknown_noncritical_members() {
+    fn jwt_accepts_aliases_and_empty_critical_header() {
         let project_alias = DEVELOPMENT_PROJECT_ID.as_str().replace('0', "O");
         let key_alias = DEVELOPMENT_API_KEY_ID.as_str().to_ascii_lowercase();
         let token = signed_token(
             &format!(
-                "{{\"alg\":\"EdDSA\",\"kid\":\"{key_alias}\",\"typ\":\"pb+jwt\",\"crit\":[],\"future\":{{\"enabled\":true}}}}"
+                "{{\"alg\":\"EdDSA\",\"kid\":\"{key_alias}\",\"typ\":\"pb+jwt\",\"crit\":[]}}"
             ),
             &format!(
-                "{{\"iss\":\"{project_alias}\",\"aud\":\"pb\",\"sub\":\"alice\",\"room\":\"general\",\"exp\":2000,\"future\":[1,2,3]}}"
+                "{{\"iss\":\"{project_alias}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"grants\":[{{\"rooms\":[\"general\"],\"allow\":[\"join\"]}}]}}"
             ),
             &DEVELOPMENT_API_SIGNING_KEY,
         );
         let authorization =
             verify_participant_token(&development_registry(), &token, 1_000).unwrap();
         assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
+    }
+
+    #[test]
+    fn selected_room_and_existing_resource_have_distinct_grant_checks() {
+        let header = format!(
+            "{{\"alg\":\"EdDSA\",\"kid\":\"{}\",\"typ\":\"pb+jwt\"}}",
+            DEVELOPMENT_API_KEY_ID.as_str()
+        );
+        let token = |grants: &str, expiration| {
+            signed_token(
+                &header,
+                &format!(
+                    "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":{expiration},\"grants\":{grants}}}",
+                    DEVELOPMENT_PROJECT_ID.as_str()
+                ),
+                &DEVELOPMENT_API_SIGNING_KEY,
+            )
+        };
+        let registry = development_registry();
+        let credential = token(r#"[{"rooms":["team/*"],"allow":["join"]}]"#, 2000);
+        let principal = authenticate_participant_token(&registry, &credential, 1000).unwrap();
+        let room = RoomExternalId::new("team/é").unwrap();
+        let accepted = principal.clone().authorize_room(room.clone()).unwrap();
+        for denied in ["team", "team-other/é", "elsewhere"] {
+            assert_eq!(
+                principal
+                    .clone()
+                    .authorize_room(RoomExternalId::new(denied).unwrap()),
+                Err(RoomAuthorizationError::Denied)
+            );
+        }
+        let credential = token("[]", 3000);
+        let revoked = authenticate_participant_token(&registry, &credential, 1000).unwrap();
+        assert_eq!(
+            revoked.clone().authorize_room(room),
+            Err(RoomAuthorizationError::Denied)
+        );
+        let replacement = revoked.clone().authorize_existing(&accepted).unwrap();
+        assert_eq!(replacement.room_id, accepted.room_id);
+        assert_eq!(replacement.participant_id, accepted.participant_id);
+        assert_eq!(replacement.grants, grants::GrantSet::default());
+        assert_eq!(replacement.expiry.unix_seconds(), 3000);
+        let mut other = accepted.clone();
+        other.participant_external_id = ParticipantExternalId::new("other").unwrap();
+        assert_eq!(
+            revoked.clone().authorize_existing(&other),
+            Err(RoomAuthorizationError::Denied)
+        );
+        other = accepted;
+        other.room_id = RoomId::derive(
+            &other.project_id,
+            &RoomExternalId::new("different").unwrap(),
+        );
+        assert_eq!(
+            revoked.authorize_existing(&other),
+            Err(RoomAuthorizationError::Denied)
+        );
+    }
+
+    #[test]
+    fn jwt_schema_rejects_extensions_duplicate_grants_and_malformed_filters() {
+        let registry = development_registry();
+        for token in [
+            profile_token(",\"future\":{\"enabled\":true}", ""),
+            profile_token("", ",\"room\":\"general\""),
+            profile_token("", ",\"future\":[[[[1]]]]"),
+            profile_token("", ",\"grants\":[]"),
+            profile_token("", ",\"grants\":null"),
+        ] {
+            assert!(authenticate_participant_token(&registry, &token, 1000).is_err());
+        }
+        let header = format!(
+            "{{\"alg\":\"EdDSA\",\"kid\":\"{}\",\"typ\":\"pb+jwt\"}}",
+            DEVELOPMENT_API_KEY_ID.as_str()
+        );
+        let header_array =
+            serde_json::json!(["EdDSA", DEVELOPMENT_API_KEY_ID.as_str(), "pb+jwt", []]).to_string();
+        let claims = format!(
+            "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"grants\":[{{\"rooms\":[\"*\"],\"allow\":[\"join\"]}}]}}",
+            DEVELOPMENT_PROJECT_ID.as_str()
+        );
+        let array_token = signed_token(&header_array, &claims, &DEVELOPMENT_API_SIGNING_KEY);
+        assert!(authenticate_participant_token(&registry, &array_token, 1000).is_err());
+        let claims_array = serde_json::json!([DEVELOPMENT_PROJECT_ID.as_str(), "pb", "alice", 2000, [{"rooms":["*"],"allow":["join"]}]]).to_string();
+        let array_token = signed_token(&header, &claims_array, &DEVELOPMENT_API_SIGNING_KEY);
+        assert!(authenticate_participant_token(&registry, &array_token, 1000).is_err());
+        for grants in [
+            r#"[{"rooms":["*"],"allow":["join"],"label":null}]"#,
+            r#"[{"rooms":["*"],"rooms":["general"],"allow":["join"]}]"#,
+            r#"[{"rooms":["*"],"allow":["unknown"]}]"#,
+            r#"[{"rooms":["*"],"allow":["subscribe"],"kind":{"nested":"audio"}}]"#,
+        ] {
+            let claims = format!(
+                "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"grants\":{grants}}}",
+                DEVELOPMENT_PROJECT_ID.as_str()
+            );
+            let token = signed_token(&header, &claims, &DEVELOPMENT_API_SIGNING_KEY);
+            assert!(authenticate_participant_token(&registry, &token, 1000).is_err());
+        }
     }
 
     #[test]

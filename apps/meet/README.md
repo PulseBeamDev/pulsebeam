@@ -37,7 +37,8 @@ packages automatically. Initial downloads require network access.
 4. Allow camera and microphone access. The lobby requires both capture tracks
    before **Join room** becomes enabled, even if you only intend to view media.
    Confirm the camera preview appears, paste the token into **Bearer token**,
-   set **Server URL** to `http://localhost:7070`, and select **Join room**.
+   set **Server URL** to `http://localhost:7070`, enter `demo` in **Room**, and
+   select **Join room**. The token grants access; it does not select the room.
 
 The room should show `alice`, `Room demo`, and a `connected` status. To see remote
 video, mint another token with `--participant bob` in the same room and join from

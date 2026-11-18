@@ -181,7 +181,44 @@ impl Connection {
         execution_bytes(label)
     }
 
+    pub(super) fn observe_native_terminal(&mut self) {
+        if !self.native_terminal
+            && self
+                .native_handoff
+                .as_ref()
+                .is_some_and(EndpointHandoff::execution_stopped)
+        {
+            self.native_terminal = true;
+            // Reuse local packet/RTC admission gates while leaving the opaque signaling writer alive.
+            self.authorization_expiry =
+                Some(pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(0));
+            self.stream_writer.discard();
+            self.transport.discard_mutations();
+            self.quiesce_native_data();
+            self.quiesce_native_receivers();
+            self.quiesce_native_rtp();
+        }
+    }
+
+    fn quiesce_native_data(&mut self) {
+        for publication in std::mem::take(&mut self.native_data)
+            .publications
+            .into_values()
+        {
+            self.transport
+                .cancel_data_channel_installation(publication.installation);
+        }
+    }
+
     pub(super) fn admit_native_preparation(&mut self, work: Preparation) -> bool {
+        if self.native_terminal
+            || self
+                .native_handoff
+                .as_ref()
+                .is_some_and(EndpointHandoff::execution_stopped)
+        {
+            return false;
+        }
         if !self.native_execution.begin(work.scope()) {
             if !self.native_execution.contains(work.scope()) {
                 self.defer_native_preparation(work);
@@ -200,7 +237,12 @@ impl Connection {
     }
 
     pub(super) fn native_scope_authorized(&self, scope: ExecutionScope, now: u64) -> bool {
-        scope.authorization == self.authorization_revision
+        !self.native_terminal
+            && !self
+                .native_handoff
+                .as_ref()
+                .is_some_and(EndpointHandoff::execution_stopped)
+            && scope.authorization == self.authorization_revision
             && self
                 .authorization_expiry
                 .is_none_or(|expiry| !expiry.is_expired_at(now))
@@ -208,7 +250,13 @@ impl Connection {
     }
 
     pub(super) fn native_callback_fenced(&self, binding: u64) -> bool {
-        self.disconnect_reason.is_some() || self.native_execution.is_fenced(binding)
+        self.native_terminal
+            || self
+                .native_handoff
+                .as_ref()
+                .is_some_and(EndpointHandoff::execution_stopped)
+            || self.disconnect_reason.is_some()
+            || self.native_execution.is_fenced(binding)
     }
 
     fn native_preparation_storage(&self, work: Preparation) -> Option<u64> {

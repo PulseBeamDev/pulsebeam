@@ -7,7 +7,7 @@ use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::net::UdpMode;
 use pulsebeam_runtime::net::tcp::TcpListener;
 use pulsebeam_runtime::rand;
-use pulsebeam_runtime::rand::{RngCore, SeedableRng};
+use pulsebeam_runtime::rand::SeedableRng;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
@@ -281,7 +281,8 @@ impl NodeBuilder {
         self
     }
 
-    /// Inject a specific RNG (useful for deterministic simulation).
+    /// Supply OS-seeded randomness in production, including for ownership capabilities.
+    /// Deterministic seeds are only suitable for tests and simulation.
     pub fn rng(mut self, rng: rand::Rng) -> Self {
         self.rng = Some(rng);
         self
@@ -394,15 +395,30 @@ impl NodeBuilder {
     /// Consumes the builder and runs the node until `shutdown` is cancelled.
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
         let Some(options) = self.cluster.take() else {
-            return self.run_media(shutdown).await;
+            return self
+                .run_media(
+                    shutdown,
+                    crate::control::controller::OwnershipMode::Standalone,
+                )
+                .await;
         };
         let membership = crate::cluster::Service::start(options).await?;
         membership
-            .supervise(self.run_media(shutdown.clone()), shutdown)
+            .supervise(
+                self.run_media(
+                    shutdown.clone(),
+                    crate::control::controller::OwnershipMode::Unavailable,
+                ),
+                shutdown,
+            )
             .await
     }
 
-    async fn run_media(self, shutdown: CancellationToken) -> Result<()> {
+    async fn run_media(
+        self,
+        shutdown: CancellationToken,
+        ownership_mode: crate::control::controller::OwnershipMode,
+    ) -> Result<()> {
         // Default to an IPv6-any listener and disable v6-only mode so one socket can serve
         // both IPv6 and IPv4 peers.
         let local_addr = self
@@ -416,7 +432,7 @@ impl NodeBuilder {
             self.udp_mode,
         )
         .await?;
-        self.run_bound(udp_sockets, advertised_addrs, shutdown)
+        self.run_bound(udp_sockets, advertised_addrs, shutdown, ownership_mode)
             .await
     }
 
@@ -468,6 +484,7 @@ impl NodeBuilder {
         udp_sockets: Vec<pulsebeam_udp::BoundUdpSocket>,
         advertised_addrs: Vec<SocketAddr>,
         shutdown: CancellationToken,
+        ownership_mode: crate::control::controller::OwnershipMode,
     ) -> Result<()> {
         let data_threads = self.data_threads;
         let shard_runtime = self.shard_runtime;
@@ -610,7 +627,8 @@ impl NodeBuilder {
             )
         })?;
 
-        let controller_rng = rand::Rng::seed_from_u64(rng.next_u64());
+        // Ownership proofs must retain the full seed entropy, not a u64 child seed.
+        let controller_rng = rand::Rng::from_rng(&mut rng);
 
         // One NTP<->Instant anchor for the whole node: read the wall clock once,
         // here, so every shard shares a timeline and nothing reads it again.
@@ -716,6 +734,7 @@ impl NodeBuilder {
             self.room_placement,
             view_writers,
         );
+        controller.set_ownership_mode(ownership_mode);
         controller.set_links(links, frame_ports, clock_origin);
         if let Some(address) = self.link_listen {
             let (host, installs) = crate::link::host::Host::bind(address, clock_origin).await.context("binding Link UDP")?;

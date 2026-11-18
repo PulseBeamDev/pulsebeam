@@ -6,6 +6,7 @@ pub(crate) mod lifecycle;
 mod link;
 pub(crate) mod native;
 mod negotiator;
+mod permissions;
 pub(crate) mod placement;
 mod registry;
 mod room;

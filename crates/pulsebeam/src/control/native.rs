@@ -1,4 +1,4 @@
-use crate::entity::{TrackId, TrackKind};
+use crate::entity::{ParticipantExternalId, TrackId, TrackKind};
 use crate::media::ChannelId;
 use crate::participant::Connection;
 use crate::participant::policy::{
@@ -14,7 +14,10 @@ use super::rtp::policy;
 pub(crate) mod fixture;
 pub(super) mod handler;
 pub(crate) mod handoff;
+mod permissions;
 mod session;
+
+pub(crate) use super::permissions::ResourcePermissions;
 
 #[cfg(test)]
 pub(crate) use session::track_descriptor;
@@ -22,9 +25,24 @@ pub(crate) use session::{
     ExecutionAction, ExecutionCommand, InputError, NativeSession, OutputError, Preparation, failure,
 };
 
-pub(crate) struct ReceiverTarget<'a> {
+pub(crate) struct ResolvedSource<'a> {
+    pub(crate) track: &'a Track,
+    pub(crate) publisher: &'a ParticipantExternalId,
+}
+
+impl ResolvedSource<'_> {
+    fn is_available(&self) -> bool {
+        self.track.meta().label.is_some()
+            && match self.track {
+                Track::Audio(track) => track.format.is_some(),
+                Track::Video(track) => track.format.is_some(),
+                Track::Data(_) => true,
+            }
+    }
+}
+
+pub(crate) struct ReceiverTarget {
     pub(crate) source: TrackId,
-    pub(crate) key: &'a str,
     pub(crate) wait_for_source: bool,
 }
 
@@ -118,7 +136,7 @@ pub(crate) struct ReceiverPolicy {
 
 pub(crate) fn receiver_target(
     spec: &wire::ResourceSpec,
-) -> Result<ReceiverTarget<'_>, wire::FailureCode> {
+) -> Result<ReceiverTarget, wire::FailureCode> {
     let Some(wire::resource_spec::Declaration::Subscription(subscription)) = &spec.declaration
     else {
         return Err(wire::FailureCode::Unsupported);
@@ -135,7 +153,6 @@ pub(crate) fn receiver_target(
         .map_err(|_| wire::FailureCode::InvalidConfiguration)?;
     Ok(ReceiverTarget {
         source,
-        key: &subscription.track_id,
         wait_for_source: !matches!(
             subscription
                 .binding

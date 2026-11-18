@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{
     Arc, Weak,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -21,6 +21,8 @@ use tokio::time::Instant;
 use crate::native_media::*;
 use crate::native_peer::{NativePeer, Observation};
 
+mod control;
+use control::Control;
 mod data;
 use data::DataIo;
 pub use data::{DataReceiver, LocalDataTrack, Participant, RemoteDataTrack};
@@ -173,6 +175,11 @@ pub struct ObservationStream<T: Clone> {
     receiver: Mutex<Option<broadcast::Receiver<T>>>,
     closed: Arc<Signal>,
     retired: Signal,
+    version: Option<VersionFloor<T>>,
+}
+struct VersionFloor<T> {
+    get: fn(&T) -> u64,
+    last: AtomicU64,
 }
 impl<T: Clone> ObservationStream<T> {
     fn new(receiver: broadcast::Receiver<T>, closed: Arc<Signal>) -> Self {
@@ -180,7 +187,21 @@ impl<T: Clone> ObservationStream<T> {
             receiver: Mutex::new(Some(receiver)),
             closed,
             retired: Signal::default(),
+            version: None,
         }
+    }
+    fn after(mut self, get: fn(&T) -> u64, version: u64) -> Self {
+        self.version = Some(VersionFloor {
+            get,
+            last: AtomicU64::new(version),
+        });
+        self
+    }
+    fn fresh(&self, value: &T) -> bool {
+        self.version.as_ref().is_none_or(|floor| {
+            let version = (floor.get)(value);
+            version > floor.last.fetch_max(version, Ordering::Relaxed)
+        })
     }
     pub fn is_closed(&self) -> bool {
         self.closed.is_closed() || self.retired.is_closed()
@@ -202,16 +223,19 @@ impl<T: Clone> ObservationStream<T> {
         let Some(active) = receiver.as_mut() else {
             return Some(StreamUpdate::Closed);
         };
-        let result = match active.try_recv() {
-            Ok(value) => Some(StreamUpdate::Value(value)),
-            Err(broadcast::error::TryRecvError::Empty) => None,
-            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                Some(StreamUpdate::Lagged { skipped })
-            }
-            Err(broadcast::error::TryRecvError::Closed) => {
-                self.retired.close();
-                Some(StreamUpdate::Closed)
-            }
+        let result = loop {
+            break match active.try_recv() {
+                Ok(value) if !self.fresh(&value) => continue,
+                Ok(value) => Some(StreamUpdate::Value(value)),
+                Err(broadcast::error::TryRecvError::Empty) => None,
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    Some(StreamUpdate::Lagged { skipped })
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    self.retired.close();
+                    Some(StreamUpdate::Closed)
+                }
+            };
         };
         if self.is_closed() {
             receiver.take();
@@ -235,25 +259,28 @@ impl<T: Clone> ObservationStream<T> {
         let Some(active) = receiver.as_mut() else {
             return StreamUpdate::Closed;
         };
-        let result = tokio::select! {
-            biased;
-            _ = self.closed.wait() => None,
-            _ = self.retired.wait() => None,
-            result = active.recv() => Some(result),
-        };
-        if self.is_closed() {
-            receiver.take();
-            return StreamUpdate::Closed;
-        }
-        match result {
-            Some(Ok(value)) => StreamUpdate::Value(value),
-            Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
-                StreamUpdate::Lagged { skipped }
-            }
-            Some(Err(broadcast::error::RecvError::Closed)) | None => {
-                self.retired.close();
+        loop {
+            let result = tokio::select! {
+                biased;
+                _ = self.closed.wait() => None,
+                _ = self.retired.wait() => None,
+                result = active.recv() => Some(result),
+            };
+            if self.is_closed() {
                 receiver.take();
-                StreamUpdate::Closed
+                return StreamUpdate::Closed;
+            }
+            match result {
+                Some(Ok(value)) if !self.fresh(&value) => continue,
+                Some(Ok(value)) => return StreamUpdate::Value(value),
+                Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                    return StreamUpdate::Lagged { skipped };
+                }
+                Some(Err(broadcast::error::RecvError::Closed)) | None => {
+                    self.retired.close();
+                    receiver.take();
+                    return StreamUpdate::Closed;
+                }
             }
         }
     }
@@ -394,6 +421,7 @@ struct Submission {
 
 #[derive(Clone)]
 pub struct Agent {
+    core: Control,
     commands: mpsc::Sender<Command>,
     snapshot: watch::Receiver<Snapshot>,
     snapshot_events: broadcast::Sender<Snapshot>,
@@ -459,7 +487,9 @@ impl Agent {
         let abort = Arc::new(Signal::default());
         let finished = Arc::new(Signal::default());
         let (http_tx, http_rx) = mpsc::channel(COMMANDS);
+        let core = Control::new(core);
         let agent = Self {
+            core: core.clone(),
             commands: commands.clone(),
             snapshot,
             snapshot_events: snapshot_events.clone(),
@@ -525,7 +555,7 @@ impl Agent {
         result.await.map_err(|_| Error::Closed)?
     }
     // Foreign callers submit complete states without revisions. Assign them in
-    // the actor's control order, including close and Rust-originated commands.
+    // the shared core's control order, including close and Rust-originated commands.
     #[cfg(test)]
     pub(crate) async fn replace_foreign_desired(
         &self,
@@ -622,6 +652,20 @@ impl Agent {
     pub async fn send_topic(&self, send: TopicSend) -> Result<(), Error> {
         self.command(AgentCommand::SendTopic(send)).await
     }
+    pub fn join(&self, room: String) -> Result<(), Error> {
+        self.intent(AgentCommand::Join(room))
+    }
+    pub fn renew(&self, token: String) -> Result<(), Error> {
+        self.intent(AgentCommand::RenewAuthorization(token))
+    }
+    fn intent(&self, command: AgentCommand) -> Result<(), Error> {
+        self.core.external(|core| {
+            if self.is_closed() {
+                return Err(Error::Closed);
+            }
+            core.command(command).map_err(Error::Core)
+        })
+    }
     pub async fn connect(&self) -> Result<(), Error> {
         self.command(AgentCommand::Connect).await
     }
@@ -634,17 +678,17 @@ impl Agent {
             || self.lease.finished.is_closed()
     }
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot.borrow().clone()
+        self.core.snapshot()
     }
     pub fn snapshots(&self) -> watch::Receiver<Snapshot> {
         self.snapshot.clone()
     }
     pub fn snapshot_events(&self) -> (Snapshot, ObservationStream<Snapshot>) {
         let receiver = self.snapshot_events.subscribe();
-        (
-            self.snapshot(),
-            ObservationStream::new(receiver, self.lease.finished.clone()),
-        )
+        let initial = self.snapshot();
+        let updates = ObservationStream::new(receiver, self.lease.finished.clone())
+            .after(|snapshot| snapshot.version, initial.version);
+        (initial, updates)
     }
     pub fn events(&self) -> ObservationStream<AgentEvent> {
         ObservationStream::new(self.events.subscribe(), self.lease.finished.clone())
@@ -889,7 +933,7 @@ where
     F: FnMut() -> Result<(R, O), Error>,
 {
     config: Config,
-    core: agent_core::Agent,
+    core: Control,
     // A generation is destroyed before the factory closure (which may own the
     // controlled world's affine services). There is no closed-peer history.
     peer: Option<NativePeer<R>>,
@@ -978,6 +1022,7 @@ where
                 _ = self.abort.wait() => break,
                 _ = self.close.wait(), if !self.terminal_requested => {},
                 _ = self.leases_changed.notified() => {},
+                _ = self.core.changed.notified() => {},
                 _ = std::future::poll_fn(|cx| match self.peer.as_mut() { Some(peer) => peer.poll_ready(cx), None => std::task::Poll::Pending }) => {},
                 command = self.commands.recv(), if !self.terminal_requested => match command { Some(command) => self.command(command), None => break },
                 submission = self.media.recv(), if !self.terminal_requested => if let Some(submission) = submission {
@@ -1138,21 +1183,20 @@ where
             Command::ReadData { owner, response } => self.read_data(owner, response),
             #[cfg(test)]
             Command::ForeignDesired { desired, response } => {
-                let result = self
-                    .core
-                    .snapshot()
-                    .desired_revision
-                    .checked_add(1)
-                    .ok_or_else(|| agent_core::ffi::AgentError {
-                        code: agent_core::ffi::ErrorCode::InvalidDesiredState,
-                        message: "desired revision space exhausted".into(),
-                    })
-                    .and_then(|revision| desired.into_core(revision))
-                    .and_then(|desired| {
-                        self.core
-                            .command(AgentCommand::ReplaceDesired(desired))
-                            .map_err(Into::into)
-                    });
+                let result = self.core.external(|core| {
+                    core.snapshot()
+                        .desired_revision
+                        .checked_add(1)
+                        .ok_or_else(|| agent_core::ffi::AgentError {
+                            code: agent_core::ffi::ErrorCode::InvalidDesiredState,
+                            message: "desired revision space exhausted".into(),
+                        })
+                        .and_then(|revision| desired.into_core(revision))
+                        .and_then(|desired| {
+                            core.command(AgentCommand::ReplaceDesired(desired))
+                                .map_err(Into::into)
+                        })
+                });
                 let _ = response.send(result);
             }
             Command::Core { command, response } => {
@@ -1382,7 +1426,7 @@ where
             .is_none_or(|peer| !peer.receivers.contains_key(&slot))
         {
             return Err(
-                if self.core.source_preparation(&slot).readiness == SourceReadiness::Failed {
+                if self.core.source_readiness(&slot) == SourceReadiness::Failed {
                     Error::Rtc("receiver preparation failed".into())
                 } else {
                     Error::NotReady
@@ -1690,6 +1734,13 @@ where
                             self.retire_peer();
                         }
                         self.accept(HostEvent::Rtc(RtcEvent::Closed { generation }));
+                        // Settle old disconnects at retirement, before a newer join's offer.
+                        if self.peer.is_none()
+                            && self.core.snapshot().connection
+                                != agent_core::ConnectionState::Closing
+                        {
+                            self.finish_disconnects();
+                        }
                     }
                 },
                 Effect::DataChannel(effect) => {
@@ -1995,7 +2046,7 @@ where
         self.next_stats = None;
     }
     async fn publish(&mut self) {
-        let snapshot = self.core.snapshot().clone();
+        let snapshot = self.core.snapshot();
         if *self.snapshot.borrow() != snapshot {
             #[cfg(feature = "sim")]
             tracing::debug!(target: "pulsebeam_sim_recovery",
@@ -2021,9 +2072,13 @@ where
             }
         }
         if snapshot.connection == agent_core::ConnectionState::Disconnected && self.peer.is_none() {
-            for response in self.close_waiters.drain(..) {
-                let _ = response.send(Ok(()));
-            }
+            self.finish_disconnects();
+        }
+        self.core.flush_logs();
+    }
+    fn finish_disconnects(&mut self) {
+        for response in self.close_waiters.drain(..) {
+            let _ = response.send(Ok(()));
         }
     }
     fn http_effect(&mut self, effect: HttpEffect) {
@@ -2185,6 +2240,30 @@ mod tests {
         assert_eq!(sibling.next().await, StreamUpdate::Closed);
         sibling.close().await;
         assert_eq!(sender.receiver_count(), 0);
+
+        let (sender, receiver) = broadcast::channel::<Snapshot>(4);
+        let updates = ObservationStream::new(receiver, Arc::new(Signal::default()))
+            .after(|snapshot| snapshot.version, 7);
+        for version in [6, 7] {
+            sender
+                .send(Snapshot {
+                    version,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert_eq!(updates.try_next(), None);
+        for version in [7, 8] {
+            sender
+                .send(Snapshot {
+                    version,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert!(
+            matches!(updates.next().await, StreamUpdate::Value(snapshot) if snapshot.version == 8)
+        );
     }
 
     struct PendingHttp(Arc<AtomicBool>);
@@ -2231,6 +2310,87 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn intent_commits_without_actor_progress_and_survives_an_old_disconnect() {
+        let attempted = Arc::new(AtomicBool::new(false));
+        let attempted_runtime = attempted.clone();
+        let (agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+            move || {
+                attempted_runtime.store(true, Ordering::SeqCst);
+                Err::<(rtc::ThreadedRuntime, ()), _>(Error::NotReady)
+            },
+        )
+        .unwrap();
+        let initial = agent.snapshot();
+        assert!(matches!(agent.join(String::new()), Err(Error::Core(_))));
+        assert_eq!(agent.snapshot(), initial);
+        assert!(actor.core.next_effect().is_none());
+        assert!(matches!(agent.renew(String::new()), Err(Error::Core(_))));
+        assert_eq!(agent.snapshot(), initial);
+        agent.renew("new-token".into()).unwrap();
+        let renewed = agent.snapshot();
+        assert_eq!(renewed.credential_revision, 1);
+        assert_eq!(renewed.desired_room, None);
+        agent.renew("new-token".into()).unwrap();
+        assert_eq!(agent.snapshot(), renewed);
+        agent.join("first".into()).unwrap();
+        let first = agent.snapshot();
+        assert_eq!(first.desired_room.as_deref(), Some("first"));
+        assert_eq!(first.join_revision, 1);
+        let (initial, updates) = agent.snapshot_events();
+        assert_eq!(initial, first);
+        actor.publish().await;
+        assert_eq!(updates.try_next(), None);
+        for revision in 0..1000 {
+            agent.join(format!("room/{revision}")).unwrap();
+        }
+        let newest = agent.snapshot();
+        assert_eq!(newest.desired_room.as_deref(), Some("room/999"));
+        assert_eq!(newest.join_revision, 1001);
+        agent.join("room/999".into()).unwrap();
+        assert_eq!(agent.snapshot(), newest);
+        assert!(!attempted.load(Ordering::SeqCst));
+        assert!(actor.peer.is_none() && actor.http_tasks.is_empty());
+        assert!(matches!(
+            actor.commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let notifications: Vec<_> = std::iter::from_fn(|| actor.core.next_notification()).collect();
+        assert_eq!(
+            notifications
+                .iter()
+                .filter(|value| matches!(value, Notification::SnapshotChanged))
+                .count(),
+            1
+        );
+        assert!(notifications.len() < 8);
+        actor.publish().await;
+        assert_eq!(updates.next().await, StreamUpdate::Value(newest));
+
+        let (response, mut result) = oneshot::channel();
+        actor.command(Command::Disconnect { response });
+        agent.join("destination".into()).unwrap();
+        actor.drain_effects();
+        assert!(result.try_recv().unwrap().is_ok());
+        assert!(attempted.load(Ordering::SeqCst));
+        assert_eq!(
+            agent.snapshot().desired_room.as_deref(),
+            Some("destination")
+        );
+        agent.lease.close.close();
+        let closing = agent.snapshot();
+        assert!(matches!(agent.join("forbidden".into()), Err(Error::Closed)));
+        assert!(matches!(
+            agent.renew("forbidden".into()),
+            Err(Error::Closed)
+        ));
+        assert_eq!(agent.snapshot(), closing);
+        actor.shutdown();
+        assert!(matches!(agent.join("forbidden".into()), Err(Error::Closed)));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn zero_timer_is_actor_owned_cancelled_and_fired_once() {
         let mut core = agent_core::Agent::new(config().session).unwrap();
@@ -2240,6 +2400,8 @@ mod tests {
             ..Default::default()
         }))
         .unwrap();
+        core.command(AgentCommand::Join("timer-room".into()))
+            .unwrap();
         let effect = core.next_effect().unwrap();
         let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = effect else {
             panic!("expected offer, got {effect:?}");
@@ -2356,7 +2518,7 @@ mod tests {
         let _remote = remote
             .data("control".into(), agent_core::TopicMode::Ordered)
             .unwrap();
-        assert_eq!(*actor.core.snapshot(), initial);
+        assert_eq!(actor.core.snapshot(), initial);
         assert!(actor.data_receivers.is_empty());
         assert!(actor.core.next_effect().is_none());
         assert!(
@@ -2587,7 +2749,11 @@ mod tests {
             let feedback = input.feedback();
             assert!(matches!(input.submit(pcm()).await, Err(Error::NotReady)));
             for round in 1..=2 {
-                agent.connect().await.unwrap();
+                if round == 1 {
+                    agent.join("runtime-services".into()).unwrap();
+                } else {
+                    agent.connect().await.unwrap();
+                }
                 if round == 1 {
                     publication.configure(agent_core::ffi::PublicationConfig { enabled: true }).await.unwrap();
                 }
@@ -2657,10 +2823,10 @@ mod tests {
                     actor.commands.try_recv(),
                     Err(mpsc::error::TryRecvError::Empty)
                 ));
-                assert_eq!(actor.core.snapshot(), &initial);
+                assert_eq!(actor.core.snapshot(), initial);
                 let source = actor.create_producer(None).unwrap();
                 let feedback = source.feedback();
-                assert_eq!(actor.core.snapshot(), &initial);
+                assert_eq!(actor.core.snapshot(), initial);
                 assert!(matches!(source.submit(pcm()).await, Err(Error::NotReady)));
                 let spec = agent_core::TrackSpec::Audio {
                     label: "microphone".into(),
@@ -2668,7 +2834,10 @@ mod tests {
                 let publication = actor
                     .publish_track(spec.clone(), source.clone(), Default::default())
                     .unwrap();
-                actor.core.command(AgentCommand::Connect).unwrap();
+                actor
+                    .core
+                    .command(AgentCommand::Join("producer-room".into()))
+                    .unwrap();
                 actor.drain_effects();
                 actor.prepare_producers();
                 source.ready().await.unwrap();
@@ -2919,7 +3088,7 @@ mod tests {
         let owner = *actor.publications.keys().next().unwrap();
         let input = actor.register_input(owner).unwrap();
         let feedback = input.feedback();
-        let latest_control = |core: &mut agent_core::Agent| {
+        let latest_control = |core: &Control| {
             Arc::new(
                 std::iter::from_fn(|| core.next_effect())
                     .filter_map(|effect| match effect {
@@ -2930,7 +3099,7 @@ mod tests {
                     .unwrap(),
             )
         };
-        let original = latest_control(&mut actor.core);
+        let original = latest_control(&actor.core);
         assert!(actor.input_submission_current(&original));
         for muted in [true, false] {
             actor
@@ -2938,7 +3107,7 @@ mod tests {
                 .resource(agent_core::ResourceCommand::SetPublicationMuted { owner, muted })
                 .unwrap();
         }
-        let resumed = latest_control(&mut actor.core);
+        let resumed = latest_control(&actor.core);
         assert_ne!(original, resumed);
         assert!(actor.input_submission_current(&resumed));
         let (response, _) = oneshot::channel();
@@ -2954,7 +3123,7 @@ mod tests {
         assert!(actor.input_submission_current(&forged.control));
 
         let _replacement = actor.register_input(owner).unwrap();
-        let replacement_control = latest_control(&mut actor.core);
+        let replacement_control = latest_control(&actor.core);
         assert!(input.is_closed());
         assert!(matches!(feedback.try_next(), Some(StreamUpdate::Closed)));
         assert_ne!(
@@ -2973,7 +3142,7 @@ mod tests {
         assert!(!actor.input_submission_current(&forged.control));
 
         let current = actor.register_input(owner).unwrap();
-        forged.control = latest_control(&mut actor.core);
+        forged.control = latest_control(&actor.core);
         assert!(actor.input_submission_current(&forged.control));
         actor.publications[&owner].upgrade().unwrap().closed.close();
         assert!(
@@ -3004,7 +3173,7 @@ mod tests {
             .unwrap();
         let owner = *actor.publications.keys().next_back().unwrap();
         actor.bind_producer(owner, Some(producer.clone())).unwrap();
-        let original = latest_control(&mut actor.core);
+        let original = latest_control(&actor.core);
         let physical = PhysicalSource {
             inner: Arc::new(SourceLease {
                 slot: MediaSlot::LocalVideo("v0".into()),
@@ -3050,7 +3219,7 @@ mod tests {
                 .resource(agent_core::ResourceCommand::SetPublicationMuted { owner, muted })
                 .unwrap();
         }
-        let resumed = latest_control(&mut actor.core);
+        let resumed = latest_control(&actor.core);
         actor.producers[&producer_owner].bind_target(publication::InputTarget {
             source: physical,
             control: resumed.clone(),

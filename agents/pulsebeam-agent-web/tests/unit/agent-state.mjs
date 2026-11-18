@@ -6,6 +6,7 @@ import {
   emptySnapshot,
   freezeTopicSnapshot,
   validatePlayoutDelay,
+  validateToken,
 } from "../../unit-javascript/agent-state.js";
 
 import {
@@ -78,6 +79,35 @@ test("configuration owns immutable connection and logging inputs", () => {
   );
 });
 
+test("credentials are bounded before runtime creation and renewal", () => {
+  const token = "t".repeat(8192);
+  assert.equal(
+    copyConfig({ endpoint: "https://example.test", token }).token,
+    token,
+  );
+  assert.doesNotThrow(() => validateToken(token));
+  for (const invalid of [
+    "t".repeat(8193),
+    "",
+    "bad\nheader",
+    "é",
+    null,
+    5,
+    {},
+    undefined,
+    true,
+  ]) {
+    assert.throws(
+      () => validateToken(invalid),
+      /authorization token is invalid/,
+    );
+    assert.throws(
+      () => copyConfig({ endpoint: "https://example.test", token: invalid }),
+      /authorization token is invalid/,
+    );
+  }
+});
+
 test("desired revisions copy nested policy and omission withdraws complete intent", () => {
   const input = {
     connected: true,
@@ -134,6 +164,11 @@ test("empty and runtime topic snapshots cannot be mutated through retained input
   const initial = emptySnapshot("disconnected");
   assert.equal(initial.connection, "disconnected");
   assert.equal(initial.failure, null);
+  assert.equal(initial.joinRevision, 0n);
+  assert.equal(initial.credentialRevision, 0n);
+  assert.equal(initial.acceptedCredentialRevision, null);
+  assert.equal(initial.credentialOutcome, null);
+  assert.equal(initial.desiredRoom, null);
   assert.deepEqual(initial.tracks, {});
   assert.ok(
     Object.isFrozen(initial) && Object.isFrozen(initial.catalog.participants),

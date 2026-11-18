@@ -412,7 +412,9 @@ fn config(endpoint: &str, participant: &str) -> Result<Config> {
         endpoint: endpoint.into(),
         token: pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key()?,
-            "dual-stack-transport",
+            &serde_json::from_value(
+                serde_json::json!([{"rooms":["dual-stack-transport"],"allow":["join","publish","discover","subscribe"]}]),
+            )?,
             participant,
             expiry,
         )?,
@@ -434,6 +436,8 @@ async fn witness(
     let events_b = b.events();
     let (pair_a, pair_b) = pulsebeam_runtime::time::timeout(CONNECT, async {
         pulsebeam_runtime::try_join!(a.replace_desired(desired()), b.replace_desired(desired()))?;
+        a.join("dual-stack-transport".to_owned())?;
+        b.join("dual-stack-transport".to_owned())?;
         pulsebeam_runtime::try_join!(ready(a, Family::V4.address(port), None, protocol), ready(b, Family::V6.address(port), None, protocol))
     }).await.context("FAILED: 30s dual-stack connection/topic/selected-pair evidence deadline; require IPv4/IPv6 loopback and compatible native candidates")??;
     tracing::info!(
@@ -610,6 +614,7 @@ async fn run(protocol: Protocol) -> Result<()> {
         sockets,
         advertised,
         shutdown.clone(),
+        crate::control::controller::OwnershipMode::Standalone,
     ));
     let mut node_observed = false;
     let mut agents = Vec::new();

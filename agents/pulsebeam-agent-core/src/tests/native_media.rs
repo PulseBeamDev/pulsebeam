@@ -294,6 +294,7 @@ pub(super) fn begin(
     agent
         .command(AgentCommand::ReplaceDesired(initial))
         .unwrap();
+    agent.command(AgentCommand::Join("room".into())).unwrap();
     let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = next_effect(&mut agent) else {
         panic!("offer")
     };
@@ -304,9 +305,7 @@ pub(super) fn begin(
             resources,
         }))
         .unwrap();
-    let Effect::Http(HttpEffect::Request { operation, .. }) = next_effect(&mut agent) else {
-        panic!("POST")
-    };
+    let (operation, _) = native_request(&mut agent, generation);
     let mut response = create_response("p1", "unused", PARTICIPANT_URI);
     let mut body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     body["rtp_capabilities"] = serde_json::to_value(&capabilities).unwrap();

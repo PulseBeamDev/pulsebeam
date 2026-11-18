@@ -1,9 +1,9 @@
+use crate::MAX_SCOPE_BYTES;
 use data_encoding::Encoding;
 use data_encoding_macro::new_encoding;
 use uuid::{Uuid, Variant, Version};
 
 pub const UUID_TEXT_LEN: usize = 26;
-const EXTERNAL_ID_MAX_LEN: usize = 36;
 const VERSION: u8 = b'0';
 pub(crate) const CROCKFORD: Encoding = new_encoding! {
     symbols: "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
@@ -94,13 +94,10 @@ pub fn validate_external(value: &str) -> Result<(), IdValidationError> {
     if value.is_empty() {
         return Err(IdValidationError::Empty);
     }
-    if value.len() > EXTERNAL_ID_MAX_LEN {
-        return Err(IdValidationError::TooLong(EXTERNAL_ID_MAX_LEN));
+    if value.len() > MAX_SCOPE_BYTES {
+        return Err(IdValidationError::TooLong(MAX_SCOPE_BYTES));
     }
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
+    if value.chars().any(char::is_control) {
         return Err(IdValidationError::InvalidCharacters);
     }
     Ok(())

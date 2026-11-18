@@ -8,7 +8,9 @@ use std::{
 };
 
 mod native_service;
+pub(crate) mod ownership;
 
+use super::api::creation;
 use super::native::handler::StateProtocolHandler;
 use super::{MAX_NATIVE_SDP_BYTES, egress::CommandBacklog, placement};
 use crate::control::steering::Steering;
@@ -29,8 +31,9 @@ use crate::{
 };
 use pulsebeam_core::auth::{
     AuthorizationExpiry, KeyRegistry, MAX_COMPACT_TOKEN_LEN, TokenError, VerifiedAuthorization,
-    verify_participant_token,
+    VerifiedPrincipal, authenticate_participant_token,
 };
+use pulsebeam_proto::state::CloseReason;
 use pulsebeam_queue as mailbox;
 use pulsebeam_rtc::LocalCandidate;
 use pulsebeam_runtime::rt::{Migration, MigrationHandle};
@@ -58,21 +61,42 @@ pub enum SignalingProtocol {
     Whep,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum OwnershipMode {
+    Unavailable,
+    Standalone,
+}
+
 const AUTHORIZATION_TIMER_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizationLease {
-    expiry: AuthorizationExpiry,
+    authority: Box<VerifiedAuthorization>,
+    permissions: super::permissions::ResourcePermissions,
     deadline: pulsebeam_runtime::time::Instant,
     revision: u64,
 }
 
 impl AuthorizationLease {
-    pub fn from_expiry(
-        expiry: AuthorizationExpiry,
+    pub fn from_verified(
+        authorization: VerifiedAuthorization,
         wall_now: SystemTime,
         runtime_now: pulsebeam_runtime::time::Instant,
     ) -> Result<Self, TokenError> {
+        let permissions = super::permissions::ResourcePermissions::Grants {
+            room: authorization.room_external_id.clone(),
+            grants: authorization.grants.clone(),
+        };
+        Self::from_authority(Box::new(authorization), permissions, wall_now, runtime_now)
+    }
+
+    fn from_authority(
+        authority: Box<VerifiedAuthorization>,
+        permissions: super::permissions::ResourcePermissions,
+        wall_now: SystemTime,
+        runtime_now: pulsebeam_runtime::time::Instant,
+    ) -> Result<Self, TokenError> {
+        let expiry = authority.expiry;
         let unix_now = wall_now
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
@@ -84,42 +108,60 @@ impl AuthorizationLease {
                 .saturating_sub(Duration::from_nanos(u64::from(unix_now.subsec_nanos())));
         let delay = remaining.min(AUTHORIZATION_TIMER_HORIZON);
         Ok(Self {
-            expiry,
+            authority,
+            permissions,
             deadline: runtime_now.checked_add(delay).unwrap_or(runtime_now),
             revision: 1,
         })
     }
 
-    fn is_expired_at(self, wall_now: SystemTime) -> bool {
+    fn is_expired_at(&self, wall_now: SystemTime) -> bool {
         let unix_now = wall_now
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO);
-        self.expiry.is_expired_at(unix_now.as_secs())
+        self.expiry().is_expired_at(unix_now.as_secs())
     }
 
     fn refresh_at(
-        self,
+        &self,
         wall_now: SystemTime,
         runtime_now: pulsebeam_runtime::time::Instant,
     ) -> Result<Self, TokenError> {
-        let refreshed = Self::from_expiry(self.expiry, wall_now, runtime_now)?;
+        let refreshed = Self::from_authority(
+            self.authority.clone(),
+            self.permissions.clone(),
+            wall_now,
+            runtime_now,
+        )?;
         Ok(Self {
             revision: self.revision,
             ..refreshed
         })
     }
 
-    pub(crate) fn revision(self) -> u64 {
+    pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
 
+    pub(super) fn permissions(&self) -> &super::permissions::ResourcePermissions {
+        &self.permissions
+    }
+
+    fn allows_current_room(&self) -> bool {
+        self.permissions
+            .allows_join(&self.authority.room_external_id)
+    }
+
     fn replacing(
-        self,
-        expiry: AuthorizationExpiry,
+        &self,
+        authorization: VerifiedAuthorization,
         wall_now: SystemTime,
         runtime_now: pulsebeam_runtime::time::Instant,
     ) -> Result<Self, ControllerError> {
-        let mut next = Self::from_expiry(expiry, wall_now, runtime_now)
+        if !self.matches_identity(&authorization) {
+            return Err(ControllerError::AuthorizationRejected);
+        }
+        let mut next = Self::from_verified(authorization, wall_now, runtime_now)
             .map_err(|_| ControllerError::AuthorizationExpired)?;
         next.revision = self
             .revision
@@ -128,16 +170,35 @@ impl AuthorizationLease {
         Ok(next)
     }
 
-    pub(crate) fn deadline(self) -> pulsebeam_runtime::time::Instant {
+    pub(crate) fn deadline(&self) -> pulsebeam_runtime::time::Instant {
         self.deadline
     }
 
-    pub(crate) fn native_expiry(self) -> Result<i64, TokenError> {
-        i64::try_from(self.expiry.unix_seconds()).map_err(|_| TokenError::Invalid)
+    pub(crate) fn native_expiry(&self) -> Result<i64, TokenError> {
+        i64::try_from(self.expiry().unix_seconds()).map_err(|_| TokenError::Invalid)
     }
 
-    pub(crate) fn expiry(self) -> AuthorizationExpiry {
-        self.expiry
+    pub(crate) fn expiry(&self) -> AuthorizationExpiry {
+        self.authority.expiry
+    }
+
+    fn matches_participant(
+        &self,
+        room: RoomId,
+        participant: ParticipantId,
+        external: &crate::entity::ParticipantExternalId,
+    ) -> bool {
+        self.authority.room_id == room
+            && self.authority.participant_id == participant
+            && &self.authority.participant_external_id == external
+    }
+
+    fn matches_identity(&self, authorization: &VerifiedAuthorization) -> bool {
+        self.authority.project_id == authorization.project_id
+            && self.authority.room_external_id == authorization.room_external_id
+            && self.authority.room_id == authorization.room_id
+            && self.authority.participant_external_id == authorization.participant_external_id
+            && self.authority.participant_id == authorization.participant_id
     }
 }
 
@@ -159,20 +220,95 @@ pub enum ControllerCommand {
     BindLinkReverse(crate::link::BindReverse),
     UnbindLinkSend(crate::link::UnbindSend),
     UnbindLinkReceive(pulsebeam_link::BindingId),
+    Admission(AdmissionCommand),
     CreateParticipant(
         CreateParticipant,
         oneshot::Sender<Result<CreateParticipantReply, ControllerError>>,
     ),
     DeleteParticipant(DeleteParticipant),
-    DeleteNative(DeleteNative, oneshot::Sender<Result<(), ControllerError>>),
+    DeleteSdpResource(DeleteSdpResource),
+    DeleteNative(
+        NativeResourceRequest,
+        oneshot::Sender<Result<(), ControllerError>>,
+    ),
     ReplaceAuthorization(
-        ReplaceAuthorization,
+        NativeResourceRequest,
+        u64,
         oneshot::Sender<Result<u64, ControllerError>>,
     ),
     PatchParticipant(
         PatchParticipant,
         oneshot::Sender<Result<PatchParticipantReply, ControllerError>>,
     ),
+}
+
+pub struct AdmissionCommand(AdmissionAction);
+
+enum AdmissionAction {
+    Issue(Box<IssueOwnershipCommand>),
+    Create(Box<OwnedCreateCommand>),
+}
+
+struct IssueOwnershipCommand {
+    principal: VerifiedPrincipal,
+    reply: oneshot::Sender<Result<ownership::Proof, ControllerError>>,
+}
+
+struct OwnedCreateCommand {
+    message: CreateParticipant,
+    attempt: OwnershipAttempt,
+    reply: OwnedReply,
+}
+
+impl std::fmt::Debug for AdmissionCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AdmissionCommand([redacted])")
+    }
+}
+
+impl AdmissionCommand {
+    pub(crate) fn issue(
+        principal: VerifiedPrincipal,
+        reply: oneshot::Sender<Result<ownership::Proof, ControllerError>>,
+    ) -> Self {
+        Self(AdmissionAction::Issue(Box::new(IssueOwnershipCommand {
+            principal,
+            reply,
+        })))
+    }
+
+    pub(crate) fn create(
+        message: CreateParticipant,
+        proof: ownership::Proof,
+        sequence: std::num::NonZeroU64,
+        location: axum::http::HeaderValue,
+        credential: &str,
+        reply: OwnedReply,
+    ) -> Result<Self, OwnedAdmissionError> {
+        let lease = message
+            .state
+            .authorization
+            .as_ref()
+            .ok_or(ControllerError::AuthorizationRejected)?;
+        let binding = ownership::RequestBinding::for_request(
+            message.state.profile,
+            &lease.authority.room_external_id,
+            &message.offer,
+            credential,
+        )?;
+        Ok(Self(AdmissionAction::Create(Box::new(
+            OwnedCreateCommand {
+                message,
+                attempt: OwnershipAttempt {
+                    proof,
+                    sequence,
+                    binding,
+                    location,
+                },
+                reply,
+            },
+        ))))
+    }
 }
 
 #[derive(Debug)]
@@ -192,6 +328,29 @@ pub struct DeleteParticipant {
     pub participant_id: ParticipantId,
     pub connection_id: ConnectionId,
     pub profile: SignalingProtocol,
+}
+
+pub struct DeleteSdpResource {
+    pub principal: VerifiedPrincipal,
+    pub connection_id: ConnectionId,
+    pub profile: SignalingProtocol,
+}
+
+impl std::fmt::Debug for DeleteSdpResource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DeleteSdpResource([redacted])")
+    }
+}
+
+pub struct NativeResourceRequest {
+    pub principal: VerifiedPrincipal,
+    pub connection_id: ConnectionId,
+}
+
+impl std::fmt::Debug for NativeResourceRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NativeResourceRequest([redacted])")
+    }
 }
 
 #[derive(Debug)]
@@ -248,6 +407,7 @@ const SHARD_COMMAND_EGRESS_BUDGET: usize = 64;
 const SHARD_UPDATE_EGRESS_BUDGET: usize = 64;
 const PENDING_NATIVE_DELETE_BYTES: usize = 64 * 1024;
 const NATIVE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+type MaterializationCutoffs = arrayvec::ArrayVec<oneshot::Sender<()>, 4>;
 
 enum NativeDeleteReply {
     Http(oneshot::Sender<Result<(), ControllerError>>),
@@ -270,6 +430,13 @@ struct PublicationCutoff {
 struct NativeDeletionCompletion {
     bytes: usize,
     publication: Option<PublicationCutoff>,
+    ownership: Option<OwnershipCutoff>,
+}
+
+#[derive(Debug)]
+struct OwnershipCutoff {
+    ticket: ownership::Ticket,
+    success: bool,
 }
 
 struct PendingMaterialization {
@@ -286,6 +453,59 @@ struct PendingMaterialization {
     transport: crate::route::NodeTransportAddress,
     room_id: RoomId,
     answer: String,
+    owned: Option<OwnedMaterialization>,
+}
+
+struct OwnedMaterialization {
+    ticket: ownership::Ticket,
+    image: Vec<u8>,
+}
+
+enum MaterializationSuccess {
+    Answer(String),
+    Owned(ownership::ResultBytes),
+}
+
+impl PendingMaterialization {
+    fn incarnation(&self) -> ownership::Incarnation {
+        ownership::Incarnation {
+            participant: self.participant,
+            connection: self.connection_id,
+            transport: self.transport,
+        }
+    }
+}
+
+struct OwnershipAttempt {
+    proof: ownership::Proof,
+    sequence: std::num::NonZeroU64,
+    binding: ownership::RequestBinding,
+    location: axum::http::HeaderValue,
+}
+
+enum OwnedPreparation {
+    Start(ownership::Ticket, Box<PendingMaterialization>),
+    Pending(ownership::Ticket),
+    Replay(ownership::Ticket),
+}
+
+#[derive(Debug)]
+pub(crate) enum OwnedAdmissionError {
+    Request(ControllerError),
+    Authority(ownership::Error),
+    Image(creation::Error),
+}
+
+impl From<ControllerError> for OwnedAdmissionError {
+    fn from(error: ControllerError) -> Self {
+        Self::Request(error)
+    }
+}
+
+impl From<ownership::Error> for OwnedAdmissionError {
+    fn from(error: ownership::Error) -> Self {
+        Self::Authority(error)
+    }
 }
 
 enum RequiredAction {
@@ -301,7 +521,27 @@ struct MaterializationWork {
     ack: oneshot::Receiver<bool>,
     ready: Option<bool>,
     superseded: bool,
+    cutoffs: MaterializationCutoffs,
     started: pulsebeam_runtime::time::Instant,
+}
+
+impl MaterializationWork {
+    fn matches_native(
+        &self,
+        authorization: &VerifiedAuthorization,
+        connection: ConnectionId,
+    ) -> bool {
+        let pending = &self.pending;
+        pending.participant == authorization.participant_id
+            && pending.connection_id == connection
+            && pending.room_id == authorization.room_id
+            && pending.profile == SignalingProtocol::State
+            && pending.participant_external_id == authorization.participant_external_id
+            && pending
+                .authorization
+                .as_ref()
+                .is_some_and(|lease| lease.matches_identity(authorization))
+    }
 }
 
 const MAX_PENDING_RENEWALS: usize = 32;
@@ -313,9 +553,27 @@ struct RenewalResult {
     verified: Option<VerifiedAuthorization>,
 }
 
+type OwnedReply = oneshot::Sender<Result<creation::Delivery, super::api::ProblemResponse>>;
+
+struct OwnedWaiter {
+    reply: OwnedReply,
+    permit: pulsebeam_runtime::sync::OwnedSemaphorePermit,
+}
+
+type OwnedReplies = arrayvec::ArrayVec<OwnedWaiter, { ownership::MAX_WAITERS }>;
+
 enum MaterializationReply {
     Create(oneshot::Sender<Result<CreateParticipantReply, ControllerError>>),
     Patch(oneshot::Sender<Result<PatchParticipantReply, ControllerError>>),
+    Owned(Box<OwnedReplies>),
+}
+
+impl MaterializationReply {
+    fn owned(reply: OwnedWaiter) -> Self {
+        let mut replies = OwnedReplies::new();
+        replies.push(reply);
+        Self::Owned(Box::new(replies))
+    }
 }
 
 struct NativeService {
@@ -349,6 +607,10 @@ pub struct ControllerActor {
     deletion_tx: pulsebeam_runtime::sync::mpsc::Sender<NativeDeletionCompletion>,
     deletion_rx: pulsebeam_runtime::sync::mpsc::Receiver<NativeDeletionCompletion>,
     deletion_bytes: usize,
+    ownership: ownership::Authority,
+    ownership_entropy: pulsebeam_runtime::rand::Rng,
+    ownership_mode: OwnershipMode,
+    delivery_budget: creation::DeliveryBudget,
     steering: Option<Box<dyn Steering>>,
     materializations: VecDeque<MaterializationWork>,
     native_connections: std::collections::HashMap<ConnectionId, NativeService>,
@@ -378,7 +640,7 @@ impl ControllerActor {
     }
 
     pub(crate) fn with_placement(
-        _rng: pulsebeam_runtime::rand::Rng,
+        ownership_entropy: pulsebeam_runtime::rand::Rng,
         shard_contexts: Vec<ShardContext>,
         candidates: Vec<LocalCandidate>,
         room_partition_size: usize,
@@ -417,6 +679,10 @@ impl ControllerActor {
             deletion_tx,
             deletion_rx,
             deletion_bytes: 0,
+            ownership: ownership::Authority::default(),
+            ownership_entropy,
+            ownership_mode: OwnershipMode::Unavailable,
+            delivery_budget: creation::DeliveryBudget::new(),
             steering: None,
             materializations: VecDeque::new(),
             native_connections: std::collections::HashMap::new(),
@@ -425,6 +691,10 @@ impl ControllerActor {
             native_ready_rx,
             native_deadlines: BTreeSet::new(),
         }
+    }
+
+    pub(crate) fn set_ownership_mode(&mut self, mode: OwnershipMode) {
+        self.ownership_mode = mode;
     }
 
     pub(crate) fn set_execution(&mut self, execution: Option<MigrationHandle>) {
@@ -569,6 +839,7 @@ impl ControllerActor {
         self.record_budget_hit("shard_events", shard_events, SHARD_EVENT_BUDGET);
 
         if maintenance_due {
+            self.ownership.expire(started, API_COMMAND_BUDGET);
             self.router.poll_loads();
             self.maintain_placement(pulsebeam_runtime::time::Instant::now());
         }
@@ -586,6 +857,7 @@ impl ControllerActor {
         self.record_budget_hit("api_commands", commands, API_COMMAND_BUDGET);
 
         self.service_native_connections();
+        self.advance_incarnation_cutoffs();
         let commands_ready = self.flush_command_backlog();
         let updates_ready = self.flush_update_backlogs();
         self.egress_ready = commands_ready || updates_ready;
@@ -719,6 +991,10 @@ impl ControllerActor {
                 }
                 None
             }
+            ControllerCommand::Admission(command) => {
+                self.process_admission(command, SystemTime::now());
+                None
+            }
             ControllerCommand::CreateParticipant(message, reply) => {
                 if self.materializations.len() >= MAX_PENDING_MATERIALIZATIONS {
                     let _ = reply.send(Err(ControllerError::ServiceUnavailable));
@@ -748,8 +1024,55 @@ impl ControllerActor {
                 }
                 None
             }
+            ControllerCommand::DeleteSdpResource(message) => {
+                let wall_now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if message.profile != SignalingProtocol::State
+                    && !message.principal.expiry().is_expired_at(wall_now)
+                {
+                    let authorization = self
+                        .sdp_resource_lease(message.connection_id, message.profile)
+                        .and_then(|accepted| {
+                            message
+                                .principal
+                                .authorize_existing(&accepted.authority)
+                                .ok()
+                        });
+                    if let Some(authorization) = authorization {
+                        for work in &mut self.materializations {
+                            if work.pending.connection_id == message.connection_id
+                                && work.pending.participant == authorization.participant_id
+                                && work.pending.room_id == authorization.room_id
+                                && work.pending.profile == message.profile
+                            {
+                                work.superseded = true;
+                            }
+                        }
+                        self.remove_incarnation(
+                            authorization.participant_id,
+                            message.connection_id,
+                        );
+                    }
+                }
+                None
+            }
             ControllerCommand::DeleteNative(message, reply) => {
-                match self.begin_native_delete(message, SystemTime::now()) {
+                let wall_now = SystemTime::now();
+                let connection_id = message.connection_id;
+                let result =
+                    self.authorize_native_resource(message, wall_now)
+                        .and_then(|authorization| {
+                            self.begin_native_delete(
+                                DeleteNative {
+                                    authorization,
+                                    connection_id,
+                                },
+                                wall_now,
+                            )
+                        });
+                match result {
                     Ok((bytes, acks)) => {
                         let completed = self.deletion_tx.clone();
                         pulsebeam_runtime::task::spawn(async move {
@@ -768,12 +1091,22 @@ impl ControllerActor {
                 }
                 None
             }
-            ControllerCommand::ReplaceAuthorization(message, reply) => {
-                let result = self.replace_authorization(
-                    message,
-                    SystemTime::now(),
-                    pulsebeam_runtime::time::Instant::now(),
-                );
+            ControllerCommand::ReplaceAuthorization(message, expected_revision, reply) => {
+                let wall_now = SystemTime::now();
+                let connection_id = message.connection_id;
+                let result =
+                    self.authorize_native_resource(message, wall_now)
+                        .and_then(|authorization| {
+                            self.replace_authorization(
+                                ReplaceAuthorization {
+                                    authorization,
+                                    connection_id,
+                                    expected_revision,
+                                },
+                                wall_now,
+                                pulsebeam_runtime::time::Instant::now(),
+                            )
+                        });
                 let _ = reply.send(result);
                 None
             }
@@ -796,32 +1129,377 @@ impl ControllerActor {
         }
     }
 
-    fn start_materialization(&mut self, action: RequiredAction) {
-        let RequiredAction::Materialize { mut pending, reply } = action;
-        if !self.candidate_is_newer(pending.participant, pending.connection_id) {
-            self.core.registry.release_partition(
-                pending.room_id,
-                pending.participant,
-                pending.connection_id,
-            );
-            self.core
-                .release_transport(pending.transport, pulsebeam_runtime::time::Instant::now());
-            Self::reply_materialization(reply, Err(ControllerError::Superseded));
-            return;
+    fn process_admission(&mut self, command: AdmissionCommand, wall_now: SystemTime) {
+        match command.0 {
+            AdmissionAction::Issue(command) => {
+                let IssueOwnershipCommand { principal, reply } = *command;
+                if !reply.is_closed() {
+                    let result = self.issue_ownership(&principal, wall_now);
+                    let _ = reply.send(result);
+                }
+            }
+            AdmissionAction::Create(command) => {
+                let OwnedCreateCommand {
+                    message,
+                    attempt,
+                    reply,
+                } = *command;
+                if !reply.is_closed()
+                    && let Err((reply, error)) =
+                        self.submit_owned_create(message, attempt, reply, wall_now)
+                {
+                    let _ = reply.send(Err(error.into()));
+                }
+            }
         }
-        let Some(ack) = pending.ack.take() else {
-            pulsebeam_runtime::fatal!("materialization must retain its acknowledgement receiver");
+    }
+
+    fn issue_ownership(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        wall_now: SystemTime,
+    ) -> Result<ownership::Proof, ControllerError> {
+        if !matches!(self.ownership_mode, OwnershipMode::Standalone) {
+            return Err(ControllerError::ServiceUnavailable);
+        }
+        let unix_now = wall_now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO);
+        if principal.expiry().is_expired_at(unix_now.as_secs()) {
+            return Err(ControllerError::AuthorizationExpired);
+        }
+        self.ownership
+            .issue(
+                ownership::PrincipalKey::from_principal(principal),
+                pulsebeam_runtime::time::Instant::now(),
+                &mut self.ownership_entropy,
+            )
+            .map_err(|_| ControllerError::ServiceUnavailable)
+    }
+
+    fn submit_owned_create(
+        &mut self,
+        message: CreateParticipant,
+        attempt: OwnershipAttempt,
+        reply: OwnedReply,
+        wall_now: SystemTime,
+    ) -> Result<ownership::Ticket, (OwnedReply, OwnedAdmissionError)> {
+        self.prune_owned_waiters();
+        let Some(permit) = self.delivery_budget.reserve() else {
+            return Err((reply, ControllerError::ServiceUnavailable.into()));
         };
+        let waiter = OwnedWaiter { reply, permit };
+        let prepared = match self.begin_owned_create(message, attempt, wall_now) {
+            Ok(prepared) => prepared,
+            Err(error) => return Err((waiter.reply, error)),
+        };
+        match prepared {
+            OwnedPreparation::Start(ticket, pending) => {
+                self.start_materialization(RequiredAction::Materialize {
+                    pending: *pending,
+                    reply: MaterializationReply::owned(waiter),
+                });
+                Ok(ticket)
+            }
+            OwnedPreparation::Pending(ticket) => {
+                self.attach_owned_waiter(&ticket, waiter)
+                    .map_err(|(waiter, error)| (waiter.reply, error.into()))?;
+                Ok(ticket)
+            }
+            OwnedPreparation::Replay(ticket) => {
+                let bytes = match self
+                    .ownership
+                    .result(&ticket, pulsebeam_runtime::time::Instant::now())
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => return Err((waiter.reply, error.into())),
+                };
+                let _ = waiter
+                    .reply
+                    .send(Ok(creation::Delivery::new(bytes, waiter.permit)));
+                Ok(ticket)
+            }
+        }
+    }
+
+    fn begin_owned_create(
+        &mut self,
+        message: CreateParticipant,
+        attempt: OwnershipAttempt,
+        wall_now: SystemTime,
+    ) -> Result<OwnedPreparation, OwnedAdmissionError> {
+        if !matches!(self.ownership_mode, OwnershipMode::Standalone) {
+            return Err(ControllerError::ServiceUnavailable.into());
+        }
+        let state = &message.state;
+        let lease = state
+            .authorization
+            .as_ref()
+            .ok_or(ControllerError::AuthorizationRejected)?;
+        if !lease.matches_participant(
+            state.room_id,
+            state.participant_id,
+            &state.participant_external_id,
+        ) || !lease.allows_current_room()
+        {
+            return Err(ControllerError::AuthorizationRejected.into());
+        }
+        if lease.is_expired_at(wall_now) {
+            return Err(ControllerError::AuthorizationExpired.into());
+        }
+        let principal = ownership::PrincipalKey::from_verified(&lease.authority);
+        let now = pulsebeam_runtime::time::Instant::now();
+        let OwnershipAttempt {
+            proof,
+            sequence,
+            binding,
+            location,
+        } = attempt;
+        let preview = self
+            .ownership
+            .preview(&principal, proof, sequence, binding, now)?;
+        if !matches!(preview, ownership::Admission::Start(_)) {
+            return match self
+                .ownership
+                .begin(&principal, proof, sequence, binding, now)?
+            {
+                ownership::Admission::Pending(ticket) => Ok(OwnedPreparation::Pending(ticket)),
+                ownership::Admission::Replay(ticket) => Ok(OwnedPreparation::Replay(ticket)),
+                ownership::Admission::Start(_) => {
+                    pulsebeam_runtime::fatal!("ownership preview changed without a transition")
+                }
+            };
+        }
+        if self.materializations.len() >= MAX_PENDING_MATERIALIZATIONS
+            || self.materializations.try_reserve(1).is_err()
+        {
+            return Err(ControllerError::ServiceUnavailable.into());
+        }
+        self.ownership.reserve_binding()?;
+        let capabilities = message.state.rtp_capabilities.clone();
+        let mut pending = self.begin_create_participant(message.state, message.offer)?;
+        let response = if pending.profile == SignalingProtocol::State {
+            let Some(capabilities) = capabilities.as_ref() else {
+                pulsebeam_runtime::fatal!("prepared native creation lost protocol capabilities");
+            };
+            let Some(lease) = pending.authorization.as_ref() else {
+                pulsebeam_runtime::fatal!("owned creation lost verified authorization");
+            };
+            creation::CreationResponse::native(
+                &location,
+                &lease.authority,
+                pending.connection_id,
+                capabilities,
+                &pending.answer,
+            )
+        } else {
+            creation::CreationResponse::sdp(&location, &pending.answer)
+        };
+        let prepared = match response.validate() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.discard_materialization(pending, MaterializationCutoffs::new());
+                return Err(OwnedAdmissionError::Image(error));
+            }
+        };
+        let claim_now = pulsebeam_runtime::time::Instant::now();
+        let claim_wall = wall_now.checked_add(claim_now.saturating_duration_since(now));
+        if claim_wall.is_none_or(|wall| {
+            pending
+                .authorization
+                .as_ref()
+                .is_none_or(|lease| lease.is_expired_at(wall))
+        }) {
+            self.discard_materialization(pending, MaterializationCutoffs::new());
+            return Err(ControllerError::AuthorizationExpired.into());
+        }
+        let ticket = match self
+            .ownership
+            .begin(&principal, proof, sequence, binding, claim_now)
+        {
+            Ok(ownership::Admission::Start(ticket)) => ticket,
+            Err(error) => {
+                self.discard_materialization(pending, MaterializationCutoffs::new());
+                return Err(error.into());
+            }
+            Ok(_) => {
+                pulsebeam_runtime::fatal!("prepared ownership claim changed without a transition")
+            }
+        };
+        let image = prepared.encode();
+        self.fence_predecessors(&ticket);
+        let Some(lease) = pending.authorization.as_ref() else {
+            pulsebeam_runtime::fatal!("owned admission lost verified authorization");
+        };
+        if let Err(error) = self
+            .ownership
+            .bind(&ticket, &lease.authority, pending.incarnation())
+        {
+            drop(image);
+            self.discard_materialization(pending, MaterializationCutoffs::new());
+            self.ownership.retire(&ticket, claim_now);
+            return Err(error.into());
+        }
+        pending.owned = Some(OwnedMaterialization {
+            ticket: ticket.clone(),
+            image,
+        });
+        Ok(OwnedPreparation::Start(ticket, Box::new(pending)))
+    }
+
+    fn prune_owned_waiters(&mut self) {
+        for work in &mut self.materializations {
+            let Some(owned) = work.pending.owned.as_ref() else {
+                continue;
+            };
+            let MaterializationReply::Owned(replies) = &mut work.reply else {
+                pulsebeam_runtime::fatal!("owned materialization must retain charged reply sinks");
+            };
+            replies.retain(|waiter| {
+                if waiter.reply.is_closed() {
+                    self.ownership.detach_waiter(&owned.ticket);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    fn attach_owned_waiter(
+        &mut self,
+        ticket: &ownership::Ticket,
+        reply: OwnedWaiter,
+    ) -> Result<(), (OwnedWaiter, ownership::Error)> {
+        let work = self.materializations.iter_mut().find(|work| {
+            work.pending
+                .owned
+                .as_ref()
+                .is_some_and(|owned| &owned.ticket == ticket)
+        });
+        let Some(work) = work else {
+            self.ownership.detach_waiter(ticket);
+            return Err((reply, ownership::Error::ReplayUnavailable));
+        };
+        let MaterializationReply::Owned(replies) = &mut work.reply else {
+            pulsebeam_runtime::fatal!("owned materialization must retain charged reply sinks");
+        };
+        if replies.is_full() {
+            self.ownership.detach_waiter(ticket);
+            return Err((reply, ownership::Error::Capacity));
+        }
+        replies.push(reply);
+        Ok(())
+    }
+
+    fn fence_predecessors(&mut self, ticket: &ownership::Ticket) {
+        for incarnation in self.ownership.predecessors(ticket) {
+            for work in &mut self.materializations {
+                if work.pending.incarnation() == incarnation {
+                    work.superseded = true;
+                }
+            }
+            let previous = self
+                .core
+                .registry
+                .get_participant(&incarnation.participant)
+                .filter(|meta| {
+                    meta.connection_id == incarnation.connection
+                        && meta.transport == Some(incarnation.transport)
+                })
+                .cloned();
+            if let Some(meta) = previous {
+                self.terminate_incarnation(
+                    incarnation.participant,
+                    meta,
+                    true,
+                    Some(CloseReason::ParticipantReplaced),
+                );
+            }
+            self.ownership.retry_retirement(incarnation);
+        }
+        self.advance_materializations();
+    }
+
+    fn submit_materialization(
+        &mut self,
+        pending: &PendingMaterialization,
+    ) -> Result<bool, ControllerError> {
+        if self.ownership.has_incarnation(pending.incarnation())
+            && pending
+                .authorization
+                .as_ref()
+                .is_none_or(|lease| lease.is_expired_at(SystemTime::now()))
+        {
+            return Err(ControllerError::AuthorizationExpired);
+        }
+        if !self.candidate_is_newer(pending.participant, pending.connection_id) {
+            return Err(ControllerError::Superseded);
+        }
+        match self.ownership.submit(pending.incarnation()) {
+            Ok(()) => Ok(true),
+            Err(ownership::Error::QuiescencePending) => Ok(false),
+            Err(ownership::Error::Replaced) => Err(ControllerError::Superseded),
+            Err(_) => Err(ControllerError::ServiceUnavailable),
+        }
+    }
+
+    fn discard_materialization(
+        &mut self,
+        mut pending: PendingMaterialization,
+        cutoffs: MaterializationCutoffs,
+    ) {
+        let Some(command) = pending.command.take() else {
+            pulsebeam_runtime::fatal!("cannot locally discard an issued materialization");
+        };
+        drop(command);
+        drop(pending.owned.take());
+        self.ownership.cancel_unsubmitted(
+            pending.incarnation(),
+            pulsebeam_runtime::time::Instant::now(),
+        );
+        self.core.registry.release_partition(
+            pending.room_id,
+            pending.participant,
+            pending.connection_id,
+        );
+        self.core
+            .release_transport(pending.transport, pulsebeam_runtime::time::Instant::now());
+        for cutoff in cutoffs {
+            let _ = cutoff.send(());
+        }
+    }
+
+    fn issue_materialization(&mut self, pending: &mut PendingMaterialization) {
         let Some(command) = pending.command.take() else {
             pulsebeam_runtime::fatal!("materialization must retain its shard command");
         };
         self.command_backlog.push_back((pending.shard, command));
+    }
+
+    fn start_materialization(&mut self, action: RequiredAction) {
+        let RequiredAction::Materialize { mut pending, reply } = action;
+        let submitted = match self.submit_materialization(&pending) {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                self.discard_materialization(pending, MaterializationCutoffs::new());
+                Self::reply_materialization(reply, Err(error));
+                return;
+            }
+        };
+        let Some(ack) = pending.ack.take() else {
+            pulsebeam_runtime::fatal!("materialization must retain its acknowledgement receiver");
+        };
+        if submitted {
+            self.issue_materialization(&mut pending);
+        }
         self.materializations.push_back(MaterializationWork {
             pending,
             reply,
             ack,
             ready: None,
             superseded: false,
+            cutoffs: MaterializationCutoffs::new(),
             started: pulsebeam_runtime::time::Instant::now(),
         });
     }
@@ -847,6 +1525,25 @@ impl ControllerActor {
             let Some(mut work) = self.materializations.pop_front() else {
                 break;
             };
+            if work.pending.command.is_some() {
+                let submitted = if work.superseded {
+                    Err(ControllerError::Superseded)
+                } else {
+                    self.submit_materialization(&work.pending)
+                };
+                match submitted {
+                    Ok(false) => {
+                        self.materializations.push_back(work);
+                        continue;
+                    }
+                    Err(error) => {
+                        self.discard_materialization(work.pending, work.cutoffs);
+                        Self::reply_materialization(work.reply, Err(error));
+                        continue;
+                    }
+                    Ok(true) => self.issue_materialization(&mut work.pending),
+                }
+            }
             let ready = work.ready.or_else(|| match work.ack.try_recv() {
                 Ok(result) => Some(result),
                 Err(oneshot::error::TryRecvError::Closed) => Some(false),
@@ -862,21 +1559,23 @@ impl ControllerActor {
 
     fn finish_materialization(&mut self, work: MaterializationWork, materialized: bool) {
         let MaterializationWork {
-            pending,
+            mut pending,
             reply,
             started,
             superseded,
+            cutoffs,
             ..
         } = work;
-        let superseded =
-            superseded || !self.candidate_is_newer(pending.participant, pending.connection_id);
+        let incarnation = pending.incarnation();
+        let (shard, transport) = (pending.shard, pending.transport);
+        let owned = pending.owned.take();
+        let superseded = superseded
+            || !cutoffs.is_empty()
+            || !self.candidate_is_newer(pending.participant, pending.connection_id);
         metrics::histogram!("control_materialization_wait_us")
             .record(started.elapsed().as_micros() as f64);
         let result = if materialized {
-            let transport = pending.transport;
-            let participant = pending.participant;
-            let shard = pending.shard;
-            let result = if superseded {
+            if superseded {
                 self.core.registry.release_partition(
                     pending.room_id,
                     pending.participant,
@@ -885,48 +1584,144 @@ impl ControllerActor {
                 Err(ControllerError::Superseded)
             } else {
                 self.complete_materialization(pending, SystemTime::now())
-            };
-            if result.is_err() {
-                let generation = self.lifecycle.next_generation();
-                if let Some(update) = self.updates.get_mut(shard.index()) {
-                    update.stage(
-                        generation,
-                        crate::shard_update::ShardUpdateOp::RemoveParticipant {
-                            participant,
-                            address: transport,
-                        },
-                    );
-                    self.mark_update_touched(shard);
-                    self.publish_staged();
-                }
-                self.core
-                    .release_transport(transport, pulsebeam_runtime::time::Instant::now());
             }
-            result
         } else {
             self.core.registry.release_partition(
                 pending.room_id,
                 pending.participant,
                 pending.connection_id,
             );
-            self.core
-                .release_transport(pending.transport, pulsebeam_runtime::time::Instant::now());
             Err(if superseded {
                 ControllerError::Superseded
             } else {
                 ControllerError::ServiceUnavailable
             })
         };
+        let committed = result.is_ok();
+        let result = result.and_then(|answer| {
+            let Some(OwnedMaterialization { ticket, image }) = owned else {
+                return Ok(MaterializationSuccess::Answer(answer));
+            };
+            let now = pulsebeam_runtime::time::Instant::now();
+            self.ownership
+                .commit(&ticket, image, now)
+                .map_err(|_| ControllerError::ServiceUnavailable)?;
+            let bytes = self.ownership.result(&ticket, now).unwrap_or_else(|_| {
+                pulsebeam_runtime::fatal!("committed ownership image must remain available");
+            });
+            Ok(MaterializationSuccess::Owned(bytes))
+        });
+        if result.is_err() {
+            if committed {
+                let meta = self
+                    .core
+                    .registry
+                    .get_participant(&incarnation.participant)
+                    .filter(|meta| meta.connection_id == incarnation.connection)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        pulsebeam_runtime::fatal!("committed materialization lost its incarnation");
+                    });
+                self.terminate_incarnation(incarnation.participant, meta, true, None);
+            } else if materialized
+                || !cutoffs.is_empty()
+                || self.ownership.has_incarnation(incarnation)
+            {
+                self.cleanup_materialization(incarnation, shard, cutoffs);
+            } else {
+                self.core
+                    .release_transport(transport, pulsebeam_runtime::time::Instant::now());
+            }
+        }
         Self::reply_materialization(reply, result);
     }
 
-    fn reply_materialization(reply: MaterializationReply, result: Result<String, ControllerError>) {
+    fn cleanup_materialization(
+        &mut self,
+        incarnation: ownership::Incarnation,
+        shard: ShardId,
+        cutoffs: MaterializationCutoffs,
+    ) {
+        let ownership::Incarnation {
+            participant,
+            transport,
+            ..
+        } = incarnation;
+        self.publish_staged();
+        let generation = self.lifecycle.next_generation();
+        let Some(update) = self.updates.get_mut(shard.index()) else {
+            pulsebeam_runtime::fatal!("materialization cleanup has no owning shard");
+        };
+        update.stage(
+            generation,
+            crate::shard_update::ShardUpdateOp::RemoveParticipant {
+                participant,
+                address: transport,
+            },
+        );
+        self.mark_update_touched(shard);
+        self.publish_staged();
+        self.core
+            .release_transport(transport, pulsebeam_runtime::time::Instant::now());
+        self.ownership.queue_retirement(incarnation);
+        if cutoffs.is_empty() {
+            return;
+        }
+        // The command is finished. Fence its final cleanup, not an earlier empty shard.
+        let generation = self.lifecycle.next_generation();
+        let Some(update) = self.updates.get_mut(shard.index()) else {
+            pulsebeam_runtime::fatal!("materialization cutoff has no owning shard");
+        };
+        let ack = update.stage_cutoff(generation);
+        self.mark_update_touched(shard);
+        self.publish_staged();
+        pulsebeam_runtime::task::spawn(async move {
+            if ack.await.is_ok() {
+                for cutoff in cutoffs {
+                    let _ = cutoff.send(());
+                }
+            }
+        });
+    }
+
+    fn reply_materialization(
+        reply: MaterializationReply,
+        result: Result<MaterializationSuccess, ControllerError>,
+    ) {
         match reply {
             MaterializationReply::Create(reply) => {
-                let _ = reply.send(result.map(|answer| CreateParticipantReply { answer }));
+                let _ = reply.send(result.map(|success| {
+                    let MaterializationSuccess::Answer(answer) = success else {
+                        pulsebeam_runtime::fatal!(
+                            "owned creation cannot return an uncharged answer"
+                        );
+                    };
+                    CreateParticipantReply { answer }
+                }));
             }
             MaterializationReply::Patch(reply) => {
-                let _ = reply.send(result.map(|answer| PatchParticipantReply { answer }));
+                let _ = reply.send(result.map(|success| {
+                    let MaterializationSuccess::Answer(answer) = success else {
+                        pulsebeam_runtime::fatal!("owned creation cannot return a patch answer");
+                    };
+                    PatchParticipantReply { answer }
+                }));
+            }
+            MaterializationReply::Owned(replies) => {
+                let result = result
+                    .map(|success| {
+                        let MaterializationSuccess::Owned(bytes) = success else {
+                            pulsebeam_runtime::fatal!("owned creation must return charged bytes");
+                        };
+                        bytes
+                    })
+                    .map_err(|error| super::api::ApiError::JoinError(error).into_problem());
+                for waiter in *replies {
+                    let result = result
+                        .clone()
+                        .map(|image| creation::Delivery::new(image, waiter.permit));
+                    let _ = waiter.reply.send(result);
+                }
             }
         }
     }
@@ -1118,11 +1913,72 @@ impl ControllerActor {
         }
     }
 
+    fn advance_incarnation_cutoffs(&mut self) {
+        for _ in 0..API_COMMAND_BUDGET {
+            let Some((ticket, incarnation)) = self.ownership.next_retirement() else {
+                break;
+            };
+            let bytes = self
+                .updates
+                .len()
+                .saturating_mul(
+                    std::mem::size_of::<crate::shard_update::ShardUpdate>()
+                        .saturating_add(std::mem::size_of::<oneshot::Receiver<()>>()),
+                )
+                .saturating_add(std::mem::size_of::<NativeDeletionCompletion>().saturating_mul(2))
+                .saturating_add(ticket.retained_bytes());
+            let mut acks = Vec::new();
+            if self.deletion_bytes.saturating_add(bytes) > PENDING_NATIVE_DELETE_BYTES
+                || self
+                    .updates
+                    .get(incarnation.transport.shard().index())
+                    .is_none()
+                || self
+                    .updates
+                    .iter()
+                    .any(crate::shard_update::ShardUpdateWriter::is_closed)
+                || acks.try_reserve_exact(self.updates.len()).is_err()
+            {
+                break;
+            }
+            self.ownership.start_retirement(&ticket);
+            self.deletion_bytes = self.deletion_bytes.saturating_add(bytes);
+            self.publish_staged();
+            let generation = self.lifecycle.next_generation();
+            for (index, writer) in self.updates.iter_mut().enumerate() {
+                acks.push(writer.stage_cutoff(generation));
+                let Some(touched) = self.update_touched.get_mut(index) else {
+                    pulsebeam_runtime::fatal!("ownership cutoff targeted an unconfigured shard");
+                };
+                *touched = true;
+            }
+            self.publish_staged();
+            let completed = self.deletion_tx.clone();
+            pulsebeam_runtime::task::spawn(async move {
+                let success = drain_cutoffs(&mut acks).await;
+                let _ = completed
+                    .send(NativeDeletionCompletion {
+                        bytes,
+                        publication: None,
+                        ownership: Some(OwnershipCutoff { ticket, success }),
+                    })
+                    .await;
+            });
+        }
+    }
+
     fn release_deletion(&mut self, completed: NativeDeletionCompletion) {
         self.deletion_bytes = self
             .deletion_bytes
             .checked_sub(completed.bytes)
             .unwrap_or_else(|| pulsebeam_runtime::fatal!("native deletion credit released twice"));
+        if let Some(result) = completed.ownership {
+            self.ownership.finish_retirement(
+                &result.ticket,
+                result.success,
+                pulsebeam_runtime::time::Instant::now(),
+            );
+        }
         if let Some(result) = completed.publication
             && let Some(meta) = self.core.registry.get_participant(&result.participant)
             && meta.connection_id == result.connection_id
@@ -1239,6 +2095,7 @@ impl ControllerActor {
             self.publish_staged();
             self.release_deletion(NativeDeletionCompletion {
                 bytes: 0,
+                ownership: None,
                 publication: Some(PublicationCutoff {
                     participant,
                     connection_id,
@@ -1273,6 +2130,65 @@ impl ControllerActor {
         ));
     }
 
+    fn sdp_resource_lease(
+        &self,
+        connection: ConnectionId,
+        profile: SignalingProtocol,
+    ) -> Option<&AuthorizationLease> {
+        if let Some((participant, meta)) = self.core.registry.get_connection(connection)
+            && meta.profile == profile
+            && let Some(lease) = &meta.authorization
+            && let Some(external) = &meta.participant_external_id
+            && lease.matches_participant(meta.room_id, participant, external)
+        {
+            return Some(lease);
+        }
+        self.materializations.iter().find_map(|work| {
+            let pending = &work.pending;
+            let lease = pending.authorization.as_ref()?;
+            (pending.connection_id == connection
+                && pending.profile == profile
+                && lease.matches_participant(
+                    pending.room_id,
+                    pending.participant,
+                    &pending.participant_external_id,
+                ))
+            .then_some(lease)
+        })
+    }
+
+    fn authorize_native_resource(
+        &self,
+        request: NativeResourceRequest,
+        wall_now: SystemTime,
+    ) -> Result<VerifiedAuthorization, ControllerError> {
+        if request.principal.expiry().is_expired_at(
+            wall_now
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        ) {
+            return Err(ControllerError::AuthorizationExpired);
+        }
+        let accepted = self
+            .native_resource_lease(request.connection_id)
+            .ok_or(ControllerError::GrantGone)?;
+        if request.principal.project_id() != accepted.authority.project_id
+            || request.principal.participant_external_id()
+                != &accepted.authority.participant_external_id
+        {
+            return Err(ControllerError::AuthorizationRejected);
+        }
+        let authorization = request
+            .principal
+            .authorize_existing(&accepted.authority)
+            .map_err(|_| ControllerError::AuthorizationRejected)?;
+        if !accepted.matches_identity(&authorization) {
+            return Err(ControllerError::AuthorizationRejected);
+        }
+        Ok(authorization)
+    }
+
     fn begin_native_delete(
         &mut self,
         request: DeleteNative,
@@ -1287,6 +2203,11 @@ impl ControllerActor {
         ) {
             return Err(ControllerError::AuthorizationExpired);
         }
+        let pending = self
+            .materializations
+            .iter()
+            .filter(|work| work.matches_native(&verified, request.connection_id))
+            .count();
         let bytes = self
             .updates
             .len()
@@ -1294,8 +2215,20 @@ impl ControllerActor {
                 std::mem::size_of::<crate::shard_update::ShardUpdate>()
                     .saturating_add(std::mem::size_of::<oneshot::Receiver<()>>()),
             )
-            .saturating_add(std::mem::size_of::<ControllerCommand>());
+            .saturating_add(std::mem::size_of::<ControllerCommand>())
+            .saturating_add(
+                pending.saturating_mul(
+                    std::mem::size_of::<crate::shard_update::ShardUpdate>()
+                        .saturating_add(
+                            std::mem::size_of::<oneshot::Receiver<()>>().saturating_mul(2),
+                        )
+                        .saturating_add(std::mem::size_of::<MaterializationCutoffs>()),
+                ),
+            );
         if self.deletion_bytes.saturating_add(bytes) > PENDING_NATIVE_DELETE_BYTES
+            || self.materializations.iter().any(|work| {
+                work.matches_native(&verified, request.connection_id) && work.cutoffs.is_full()
+            })
             || self
                 .updates
                 .iter()
@@ -1304,14 +2237,26 @@ impl ControllerActor {
             return Err(ControllerError::ServiceUnavailable);
         }
         let mut acks = Vec::new();
-        acks.try_reserve_exact(self.updates.len())
+        acks.try_reserve_exact(self.updates.len().saturating_add(pending))
             .map_err(|_| ControllerError::ServiceUnavailable)?;
+        for work in &mut self.materializations {
+            if work.matches_native(&verified, request.connection_id) {
+                let (done, receipt) = oneshot::channel();
+                work.cutoffs.push(done);
+                work.superseded = true;
+                acks.push(receipt);
+            }
+        }
         if self
             .core
             .registry
             .get_participant(&verified.participant_id)
             .is_some_and(|meta| {
                 meta.room_id == verified.room_id
+                    && meta
+                        .authorization
+                        .as_ref()
+                        .is_some_and(|lease| lease.matches_identity(&verified))
                     && meta.profile == SignalingProtocol::State
                     && meta.participant_external_id.as_ref()
                         == Some(&verified.participant_external_id)
@@ -1320,6 +2265,7 @@ impl ControllerActor {
             self.remove_incarnation(verified.participant_id, request.connection_id);
         }
         // Fence every writer: an old Location may already have teardown queued on a former shard.
+        self.publish_staged();
         let generation = self.lifecycle.next_generation();
         for (index, writer) in self.updates.iter_mut().enumerate() {
             acks.push(writer.stage_cutoff(generation));
@@ -1352,7 +2298,13 @@ impl ControllerActor {
         {
             return Err(ControllerError::AuthorizationRejected);
         }
-        let previous = meta.authorization.ok_or(ControllerError::GrantGone)?;
+        let previous = meta
+            .authorization
+            .clone()
+            .ok_or(ControllerError::GrantGone)?;
+        if !previous.matches_identity(&verified) {
+            return Err(ControllerError::AuthorizationRejected);
+        }
         if previous.is_expired_at(wall_now) {
             self.remove_incarnation(verified.participant_id, request.connection_id);
             return Err(ControllerError::GrantGone);
@@ -1376,30 +2328,47 @@ impl ControllerActor {
             return Err(ControllerError::ServiceUnavailable);
         }
         let shard = meta.shard_id;
-        let lease = previous.replacing(verified.expiry, wall_now, runtime_now)?;
-        self.install_authorization(
-            verified.participant_id,
-            request.connection_id,
-            previous,
-            lease,
-        );
+        let participant = verified.participant_id;
+        let lease = previous.replacing(verified, wall_now, runtime_now)?;
+        let revision = lease.revision();
+        self.install_authorization(participant, request.connection_id, &previous, lease)?;
         self.send_renewal_result(
             shard,
-            verified.participant_id,
+            participant,
             request.connection_id,
-            lease.revision(),
+            revision,
             Some(expiry),
         );
-        Ok(lease.revision())
+        Ok(revision)
     }
 
     fn install_authorization(
         &mut self,
         participant: ParticipantId,
         connection_id: ConnectionId,
-        previous: AuthorizationLease,
+        previous: &AuthorizationLease,
         lease: AuthorizationLease,
-    ) {
+    ) -> Result<(), ControllerError> {
+        let meta = self
+            .core
+            .registry
+            .get_participant(&participant)
+            .filter(|meta| {
+                meta.connection_id == connection_id && meta.authorization.as_ref() == Some(previous)
+            })
+            .ok_or(ControllerError::GrantGone)?;
+        if !previous.matches_identity(&lease.authority) {
+            return Err(ControllerError::AuthorizationRejected);
+        }
+        if !lease.allows_current_room() {
+            self.terminate_incarnation(
+                participant,
+                meta.clone(),
+                true,
+                Some(CloseReason::AuthorizationRevoked),
+            );
+            return Err(ControllerError::AuthorizationRejected);
+        }
         self.authorization_expiries
             .remove(&AuthorizationExpiryWork {
                 deadline: previous.deadline(),
@@ -1408,13 +2377,14 @@ impl ControllerActor {
             });
         self.core
             .registry
-            .update_authorization(&participant, connection_id, lease);
+            .update_authorization(&participant, connection_id, lease.clone());
         self.authorization_expiries.insert(AuthorizationExpiryWork {
             deadline: lease.deadline(),
             participant_id: participant,
             connection_id,
         });
-        self.observe_native_authorization(participant, lease);
+        self.observe_native_authorization(participant, &lease);
+        Ok(())
     }
 
     fn begin_renewal(
@@ -1433,7 +2403,11 @@ impl ControllerActor {
         {
             return;
         }
-        let expected_revision = meta.authorization.map_or(0, AuthorizationLease::revision);
+        let Some(accepted) = meta.authorization.as_ref() else {
+            return;
+        };
+        let expected_revision = accepted.revision();
+        let accepted = accepted.authority.clone();
         let Some(registry) = self.key_registry.clone() else {
             self.send_renewal_result(shard, participant, connection_id, expected_revision, None);
             return;
@@ -1449,7 +2423,9 @@ impl ControllerActor {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
                 .as_secs();
-            let verified = verify_participant_token(&registry, &token, now).ok();
+            let verified = authenticate_participant_token(&registry, &token, now)
+                .ok()
+                .and_then(|principal| principal.authorize_existing(&accepted).ok());
             let _ = tx.blocking_send(RenewalResult {
                 participant,
                 connection_id,
@@ -1468,38 +2444,46 @@ impl ControllerActor {
             return;
         }
         let shard = meta.shard_id;
-        let previous = meta.authorization;
+        let previous = meta.authorization.clone();
         let wall_now = SystemTime::now();
         let expiry = result.verified.and_then(|verified| {
             if verified.participant_id != result.participant
                 || verified.room_id != meta.room_id
-                || Some(verified.participant_external_id) != meta.participant_external_id
-                || previous.is_none_or(|lease| {
-                    lease.revision() != result.expected_revision
+                || Some(&verified.participant_external_id) != meta.participant_external_id.as_ref()
+                || previous.as_ref().is_none_or(|lease| {
+                    !lease.matches_identity(&verified)
+                        || lease.revision() != result.expected_revision
                         || lease.is_expired_at(wall_now)
-                        || verified.expiry.unix_seconds() <= lease.expiry.unix_seconds()
+                        || verified.expiry.unix_seconds() <= lease.expiry().unix_seconds()
                 })
             {
                 return None;
             }
             i64::try_from(verified.expiry.unix_seconds()).ok()?;
-            previous?
-                .replacing(
-                    verified.expiry,
-                    wall_now,
-                    pulsebeam_runtime::time::Instant::now(),
-                )
+            previous
+                .as_ref()?
+                .replacing(verified, wall_now, pulsebeam_runtime::time::Instant::now())
                 .ok()
         });
-        if let (Some(lease), Some(previous)) = (expiry, previous) {
-            self.install_authorization(result.participant, result.connection_id, previous, lease);
+        let revision = expiry
+            .as_ref()
+            .map_or(result.expected_revision, AuthorizationLease::revision);
+        let mut unix_expiry = expiry
+            .as_ref()
+            .and_then(|lease| i64::try_from(lease.expiry().unix_seconds()).ok());
+        if let (Some(lease), Some(previous)) = (expiry, previous)
+            && self
+                .install_authorization(result.participant, result.connection_id, &previous, lease)
+                .is_err()
+        {
+            unix_expiry = None;
         }
         self.send_renewal_result(
             shard,
             result.participant,
             result.connection_id,
-            expiry.map_or(result.expected_revision, AuthorizationLease::revision),
-            expiry.and_then(|lease| i64::try_from(lease.expiry.unix_seconds()).ok()),
+            revision,
+            unix_expiry,
         );
     }
 
@@ -1795,11 +2779,20 @@ impl ControllerActor {
         mut state: ParticipantState,
         offer: String,
     ) -> Result<PendingMaterialization, ControllerError> {
+        if state.authorization.as_ref().is_some_and(|lease| {
+            !lease.matches_participant(
+                state.room_id,
+                state.participant_id,
+                &state.participant_external_id,
+            ) || !lease.allows_current_room()
+        }) {
+            return Err(ControllerError::AuthorizationRejected);
+        }
         let control_capabilities = if state.profile == SignalingProtocol::State {
             if offer.len() > MAX_NATIVE_SDP_BYTES {
                 return Err(NegotiatorError::InvalidResources.into());
             }
-            if let Some(lease) = state.authorization {
+            if let Some(lease) = state.authorization.as_ref() {
                 lease
                     .native_expiry()
                     .map_err(|_| ControllerError::AuthorizationRejected)?;
@@ -1853,6 +2846,16 @@ impl ControllerActor {
                     return Err(error.into());
                 }
             };
+        if !resources.publications_allowed(
+            state.profile,
+            state.authorization.as_ref().map_or(
+                &super::permissions::ResourcePermissions::Denied,
+                AuthorizationLease::permissions,
+            ),
+        ) {
+            self.core.release_transport(address, now);
+            return Err(ControllerError::AuthorizationRejected);
+        }
         if control_capabilities.is_some() && answer.len() > MAX_NATIVE_SDP_BYTES {
             self.core.release_transport(address, now);
             return Err(NegotiatorError::InvalidResources.into());
@@ -1891,7 +2894,7 @@ impl ControllerActor {
         }
         let connection_id = state.connection_id;
         let participant_external_id = state.participant_external_id.clone();
-        let authorization = state.authorization;
+        let authorization = state.authorization.clone();
         let profile = state.profile;
         let native = if let Some(capabilities) = resources.native_rtp_capabilities.take() {
             let (control, endpoint) =
@@ -1907,11 +2910,13 @@ impl ControllerActor {
                 self.core.release_transport(address, now);
                 return Err(ControllerError::ServiceUnavailable);
             };
-            if let Some(lease) = authorization {
-                let initialized = lease
-                    .native_expiry()
-                    .ok()
-                    .and_then(|expiry| native.model.authorization(expiry, lease.revision).ok());
+            if let Some(lease) = authorization.as_ref() {
+                let initialized = lease.native_expiry().ok().and_then(|expiry| {
+                    native
+                        .model
+                        .authorization(expiry, lease.revision, lease.permissions().clone())
+                        .ok()
+                });
                 if initialized.is_none() {
                     self.core.release_transport(address, now);
                     return Err(ControllerError::AuthorizationRejected);
@@ -1945,6 +2950,7 @@ impl ControllerActor {
             transport: address,
             room_id,
             answer,
+            owned: None,
         })
     }
 
@@ -1982,7 +2988,12 @@ impl ControllerActor {
             wall_now,
         )?;
         if let Some(previous) = previous {
-            self.terminate_incarnation(participant_id, previous, false);
+            self.terminate_incarnation(
+                participant_id,
+                previous,
+                false,
+                Some(CloseReason::ParticipantReplaced),
+            );
         }
         if let Some(mut native) = pending.native.take() {
             let _ = native.handoff.rearm();
@@ -2055,11 +3066,20 @@ impl ControllerActor {
         participant_external_id: crate::entity::ParticipantExternalId,
         wall_now: SystemTime,
     ) -> Result<Option<crate::control::registry::ParticipantMeta>, ControllerError> {
-        if authorization.is_some_and(|lease| lease.is_expired_at(wall_now)) {
+        if authorization.as_ref().is_some_and(|lease| {
+            !lease.matches_participant(room_id, participant_id, &participant_external_id)
+                || !lease.allows_current_room()
+        }) {
+            return Err(ControllerError::AuthorizationRejected);
+        }
+        if authorization
+            .as_ref()
+            .is_some_and(|lease| lease.is_expired_at(wall_now))
+        {
             return Err(ControllerError::AuthorizationExpired);
         }
         if profile == SignalingProtocol::State
-            && let Some(lease) = authorization
+            && let Some(lease) = authorization.as_ref()
         {
             lease
                 .native_expiry()
@@ -2094,11 +3114,12 @@ impl ControllerActor {
             )
             .map_err(|_| ControllerError::Superseded)?;
         if let Some(lease) = authorization {
+            let deadline = lease.deadline();
             self.core
                 .registry
                 .update_authorization(&participant_id, connection_id, lease);
             self.authorization_expiries.insert(AuthorizationExpiryWork {
-                deadline: lease.deadline(),
+                deadline,
                 participant_id,
                 connection_id,
             });
@@ -2149,7 +3170,7 @@ impl ControllerActor {
         else {
             return;
         };
-        self.terminate_incarnation(participant, meta, true);
+        self.terminate_incarnation(participant, meta, true, None);
     }
 
     fn terminate_incarnation(
@@ -2157,9 +3178,10 @@ impl ControllerActor {
         participant: ParticipantId,
         meta: crate::control::registry::ParticipantMeta,
         remove_current: bool,
+        close_reason: Option<CloseReason>,
     ) {
         let native = self.retire_native_connection(meta.connection_id);
-        if let Some(lease) = meta.authorization {
+        if let Some(lease) = meta.authorization.as_ref() {
             self.authorization_expiries
                 .remove(&AuthorizationExpiryWork {
                     deadline: lease.deadline(),
@@ -2204,9 +3226,8 @@ impl ControllerActor {
         for outcome in outcomes {
             self.publish_track_lifecycle(outcome);
         }
-        if !remove_current
-            && let Some(native) = native
-            && self.begin_native_retirement(participant, meta.clone(), native.handler)
+        if let (Some(native), Some(reason)) = (native, close_reason)
+            && self.begin_native_retirement(participant, meta.clone(), native.handler, reason)
         {
             return;
         }
@@ -2239,6 +3260,11 @@ impl ControllerActor {
         }
         self.core
             .release_transport(address, pulsebeam_runtime::time::Instant::now());
+        self.ownership.queue_retirement(ownership::Incarnation {
+            participant,
+            connection: meta.connection_id,
+            transport: address,
+        });
     }
 
     fn expire_authorizations(
@@ -2269,15 +3295,14 @@ impl ControllerActor {
             if lease.is_expired_at(wall_now) {
                 self.remove_incarnation(work.participant_id, work.connection_id);
             } else if let Ok(lease) = lease.refresh_at(wall_now, runtime_now) {
+                let deadline = lease.deadline();
                 self.core.registry.update_authorization(
                     &work.participant_id,
                     work.connection_id,
                     lease,
                 );
-                self.authorization_expiries.insert(AuthorizationExpiryWork {
-                    deadline: lease.deadline(),
-                    ..work
-                });
+                self.authorization_expiries
+                    .insert(AuthorizationExpiryWork { deadline, ..work });
             }
         }
     }
@@ -2333,6 +3358,7 @@ async fn complete_native_delete(
             let _ = completed
                 .send(NativeDeletionCompletion {
                     bytes: 0,
+                    ownership: None,
                     publication: Some(PublicationCutoff {
                         participant,
                         connection_id,
@@ -2349,6 +3375,7 @@ async fn complete_native_delete(
         .send(NativeDeletionCompletion {
             bytes,
             publication: None,
+            ownership: None,
         })
         .await;
 }
@@ -2362,6 +3389,8 @@ mod replacement_tests {
         control::registry::CommitCandidateError, entity::RoomExternalId,
         shard::metrics::ShardMetrics, shard_update::new_shard_update,
     };
+
+    mod permissions;
 
     impl ControllerActor {
         #[allow(
@@ -2467,6 +3496,10 @@ mod replacement_tests {
                 deletion_tx,
                 deletion_rx,
                 deletion_bytes: 0,
+                ownership: ownership::Authority::default(),
+                ownership_entropy: pulsebeam_runtime::rand::seeded_rng(19),
+                ownership_mode: OwnershipMode::Unavailable,
+                delivery_budget: creation::DeliveryBudget::new(),
                 steering: None,
                 materializations: VecDeque::new(),
                 native_connections: std::collections::HashMap::new(),
@@ -2477,6 +3510,330 @@ mod replacement_tests {
             },
             receivers,
         )
+    }
+
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
+    async fn native_source_and_discovery_scopes_use_authoritative_facts() {
+        use crate::control::native::{
+            ExecutionAction, ExecutionCompletion, PreparedResource, ReceiverPreparation,
+            ResourceExecution, handoff,
+        };
+        use crate::entity::{ParticipantExternalId, TrackKind};
+        use crate::participant::policy::ReceiverExecution;
+        use crate::participant::signaling::SignalingProgress;
+        use pulsebeam_proto::state::{self as wire, codec};
+
+        for publisher_known in [true, false] {
+            let (mut actor, _receivers) = actor_with_receivers(2);
+            let room = RoomId::from_external(&RoomExternalId::new("source-authority").unwrap());
+            let publisher = ParticipantId::new();
+            let subscriber = ParticipantId::new();
+            let publisher_external = ParticipantExternalId::new("server-publisher").unwrap();
+            let subscriber_external = ParticipantExternalId::new("subscriber").unwrap();
+            for (participant, connection, shard, external) in [
+                (
+                    publisher,
+                    connection_id(1),
+                    0,
+                    if publisher_known {
+                        Some(publisher_external.clone())
+                    } else {
+                        None
+                    },
+                ),
+                (
+                    subscriber,
+                    connection_id(3),
+                    1,
+                    Some(subscriber_external.clone()),
+                ),
+            ] {
+                let address = actor.core.reserve_transport(
+                    ShardId::new(shard),
+                    pulsebeam_runtime::time::Instant::now(),
+                );
+                actor
+                    .core
+                    .registry
+                    .commit_candidate(
+                        participant,
+                        room,
+                        ShardId::new(shard),
+                        shard,
+                        address,
+                        connection,
+                        SignalingProtocol::State,
+                        external,
+                    )
+                    .unwrap();
+                actor.core.registry.mark_materialized(&participant);
+            }
+            let track = crate::track::Track::data_publication(
+                crate::track::TrackMeta {
+                    room_id: room,
+                    shard_id: ShardId::new(0),
+                    id: connection_id(1).derive_publication_track_id(
+                        TrackKind::Data,
+                        "private-topic",
+                        std::num::NonZeroU64::new(1).unwrap(),
+                    ),
+                    origin: publisher,
+                    connection_id: connection_id(1),
+                    label: Some("private-topic".into()),
+                },
+                crate::track::DataLane::Ordered,
+            );
+            actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(track.clone())));
+            let (controller, mut endpoint) =
+                handoff::pair(connection_id(3), actor.native_ready_tx.clone());
+            let mut native =
+                StateProtocolHandler::new(subscriber, room, subscriber_external, None, controller)
+                    .unwrap();
+            native
+                .model
+                .authorization(
+                    i64::MAX,
+                    1,
+                    crate::control::native::ResourcePermissions::RoomBound,
+                )
+                .unwrap();
+            actor.native_connections.insert(
+                connection_id(3),
+                NativeService {
+                    handler: native,
+                    deadline: None,
+                },
+            );
+            assert!(endpoint.opened(handoff::Opened {
+                channel: crate::media::ChannelId::from_value(0),
+                at: pulsebeam_runtime::time::Instant::now()
+            }));
+            let request = wire::ClientStateBatch {
+                records: vec![wire::ClientStateRecord {
+                    owned: 1,
+                    execution: None,
+                    desired: Some(wire::DesiredState {
+                        revision: 1,
+                        value: Some(wire::desired_state::Value::Present(Box::new(
+                            wire::ResourceSpec {
+                                settings: Some(wire::ResourceSettings {
+                                    enabled: Some(true),
+                                    receive: None,
+                                }),
+                                declaration: Some(wire::resource_spec::Declaration::Subscription(
+                                    wire::SubscriptionSpec {
+                                        track_id: track.id().as_str(),
+                                        kind: wire::TrackKind::Data as i32,
+                                        binding: Some(wire::TrackBinding {
+                                            transport: Some(wire::track_binding::Transport::Sctp(
+                                                wire::SctpParameters { stream_id: Some(1) },
+                                            )),
+                                        }),
+                                    },
+                                )),
+                            },
+                        ))),
+                    }),
+                }],
+            };
+            assert!(endpoint.input(codec::encode_client(&request).unwrap()));
+            actor.service_native_connections();
+            let output = endpoint.output().unwrap();
+            let mut records = codec::decode_server(&output.bytes).unwrap().records;
+            if publisher_known {
+                let ExecutionAction::Prepare {
+                    work,
+                    resource: PreparedResource::Receiver(ReceiverPreparation::Ready(plan)),
+                } = endpoint.command().unwrap().into_action()
+                else {
+                    panic!("authoritative receiver preparation")
+                };
+                assert_eq!(plan.source.id(), track.id());
+                assert_eq!(plan.source.meta().origin, publisher);
+                assert_eq!(plan.source.meta().label, track.meta().label);
+                assert!(endpoint.progress(SignalingProgress {
+                    sequence: output.sequence,
+                    cid: output.cid,
+                    at: pulsebeam_runtime::time::Instant::now()
+                }));
+                assert!(
+                    endpoint.fact(handoff::Fact::Completion(ExecutionCompletion {
+                        work,
+                        result: Ok(ResourceExecution::Receiver(ReceiverExecution {
+                            source: track.id(),
+                            enabled: true,
+                            ready: false,
+                            failed: false
+                        })),
+                        released: false,
+                        unix_now: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    }))
+                );
+                actor.service_native_connections();
+                let confirmed = endpoint.output().unwrap();
+                let batch = codec::decode_server(&confirmed.bytes).unwrap();
+                let live = batch
+                    .records
+                    .iter()
+                    .find_map(|record| match record.confirmed.as_ref()?.value.as_ref()? {
+                        wire::confirmed_state::Value::Owned(live) => Some(live),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    live.participant.as_ref().unwrap().participant_external_id,
+                    publisher_external.as_str()
+                );
+                assert_eq!(live.track, crate::control::native::track_descriptor(&track));
+                records.extend(batch.records);
+                assert!(endpoint.progress(SignalingProgress {
+                    sequence: confirmed.sequence,
+                    cid: confirmed.cid,
+                    at: pulsebeam_runtime::time::Instant::now(),
+                }));
+                let native = &mut actor
+                    .native_connections
+                    .get_mut(&connection_id(3))
+                    .unwrap()
+                    .handler;
+                native
+                    .model
+                    .authorization(
+                        i64::MAX,
+                        2,
+                        crate::control::native::ResourcePermissions::Denied,
+                    )
+                    .unwrap();
+                assert!(native.handoff.schedule());
+                actor.service_native_connections();
+                let ExecutionAction::Retire(scope) = endpoint.command().unwrap().into_action()
+                else {
+                    panic!("permission reduction must dispatch retirement")
+                };
+                assert_eq!(scope.binding, 1);
+                assert_eq!(scope.authorization, 2);
+                let authorization = endpoint.output().unwrap();
+                let batch = codec::decode_server(&authorization.bytes).unwrap();
+                assert!(batch.records.iter().all(|record| !matches!(
+                    record.key.as_ref().and_then(|key| key.key.as_ref()),
+                    Some(wire::resource_key::Key::Owned(1))
+                )));
+                records.extend(batch.records);
+                assert!(endpoint.progress(SignalingProgress {
+                    sequence: authorization.sequence,
+                    cid: authorization.cid,
+                    at: pulsebeam_runtime::time::Instant::now()
+                }));
+                assert!(endpoint.fact(handoff::Fact::Resource(
+                    crate::participant::policy::ResourceObservation::Released { binding: 1 }
+                )));
+                actor.service_native_connections();
+                let revoked = endpoint.output().unwrap();
+                let batch = codec::decode_server(&revoked.bytes).unwrap();
+                assert!(batch.records.iter().any(|record| record.confirmed.as_ref().is_some_and(|value| matches!(&value.value, Some(wire::confirmed_state::Value::Absent(absent)) if absent.reason == wire::AbsenceReason::PermissionRevoked as i32))));
+                records.extend(batch.records);
+                let discovery_scope = |discover| {
+                    use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind};
+                    let mut grants = vec![
+                        Grant::new(
+                            vec!["source-authority".into()],
+                            vec![Action::Join],
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    ];
+                    if discover {
+                        grants.push(
+                            Grant::new(
+                                vec!["source-authority".into()],
+                                vec![Action::Discover],
+                                None,
+                                Some(TrackKind::Data),
+                                Some("private-topic".into()),
+                            )
+                            .unwrap(),
+                        );
+                    }
+                    crate::control::native::ResourcePermissions::Grants {
+                        room: RoomExternalId::new("source-authority").unwrap(),
+                        grants: GrantSet::new(grants).unwrap(),
+                    }
+                };
+                assert!(endpoint.progress(SignalingProgress {
+                    sequence: revoked.sequence,
+                    cid: revoked.cid,
+                    at: pulsebeam_runtime::time::Instant::now()
+                }));
+                assert!(
+                    actor
+                        .native_connections
+                        .get_mut(&connection_id(3))
+                        .unwrap()
+                        .handler
+                        .model
+                        .authorization(i64::MAX, 3, discovery_scope(true))
+                        .unwrap()
+                );
+                actor.seed_native_sources(connection_id(3));
+                actor.service_native_connections();
+                let catalog = endpoint.output().unwrap();
+                let visible = codec::decode_server(&catalog.bytes).unwrap();
+                assert!(visible.records.iter().any(|record| matches!(record.key.as_ref().and_then(|key| key.key.as_ref()), Some(wire::resource_key::Key::Track(id)) if *id == track.id().as_str())));
+                assert!(visible.records.iter().any(|record| record.confirmed.as_ref().is_some_and(|value| matches!(&value.value, Some(wire::confirmed_state::Value::Participant(peer)) if peer.participant_external_id == publisher_external.as_str()))));
+                assert!(endpoint.command().is_none());
+                assert!(endpoint.progress(SignalingProgress {
+                    sequence: catalog.sequence,
+                    cid: catalog.cid,
+                    at: pulsebeam_runtime::time::Instant::now()
+                }));
+                assert!(
+                    actor
+                        .native_connections
+                        .get_mut(&connection_id(3))
+                        .unwrap()
+                        .handler
+                        .model
+                        .authorization(i64::MAX, 4, discovery_scope(false))
+                        .unwrap()
+                );
+                actor.seed_native_sources(connection_id(3));
+                actor.service_native_connections();
+                let withdrawn = endpoint.output().unwrap();
+                let withdrawn = codec::decode_server(&withdrawn.bytes).unwrap();
+                for key in [
+                    wire::resource_key::Key::Track(track.id().as_str()),
+                    wire::resource_key::Key::Participant(publisher.as_str()),
+                ] {
+                    assert!(withdrawn.records.iter().any(|record| {
+                        record.key.as_ref().and_then(|key| key.key.as_ref()) == Some(&key)
+                            && record.confirmed.as_ref().is_some_and(|value| {
+                                matches!(
+                                    &value.value,
+                                    Some(wire::confirmed_state::Value::Absent(_))
+                                )
+                            })
+                    }));
+                }
+                assert!(endpoint.command().is_none());
+            } else {
+                assert!(endpoint.command().is_none());
+            }
+            assert!(records.iter().all(|record| !matches!(
+                record.key.as_ref().and_then(|key| key.key.as_ref()),
+                Some(wire::resource_key::Key::Track(_))
+            )));
+            assert!(records.iter().all(|record| {
+                match record.key.as_ref().and_then(|key| key.key.as_ref()) {
+                    Some(wire::resource_key::Key::Participant(id)) => id != &publisher.as_str(),
+                    _ => true,
+                }
+            }));
+        }
     }
 
     #[test]
@@ -2533,14 +3890,26 @@ mod replacement_tests {
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
-    async fn replacement_terminal_handoff_preserves_output_until_bounded_teardown() {
+    async fn replacement_and_join_loss_preserve_terminal_output_until_bounded_teardown() {
         use crate::participant::signaling::SignalingProgress;
         use pulsebeam_proto::state::{self, codec};
 
-        for acknowledge in [true, false] {
+        for (acknowledge, revoke_join) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
             let mut actor = actor();
             let participant = ParticipantId::new();
             let room = RoomId::from_external(&RoomExternalId::new("terminal-replacement").unwrap());
+            let wall = SystemTime::now();
+            let now = pulsebeam_runtime::time::Instant::now();
+            let lease = authorization_lease(
+                i64::MAX as u64,
+                wall,
+                now,
+                "terminal-replacement",
+                room,
+                participant,
+            );
             let external = crate::entity::ParticipantExternalId::new("alice").unwrap();
             let shard = ShardId::new(0);
             let old = connection_id(1);
@@ -2556,10 +3925,10 @@ mod replacement_tests {
                     0,
                     transport,
                     old,
-                    None,
+                    Some(lease.clone()),
                     SignalingProtocol::State,
                     external.clone(),
-                    SystemTime::now(),
+                    wall,
                 )
                 .unwrap();
             let (handoff, mut endpoint) =
@@ -2567,7 +3936,14 @@ mod replacement_tests {
             let mut native =
                 StateProtocolHandler::new(participant, room, external.clone(), None, handoff)
                     .unwrap();
-            native.model.authorization(10_000, 1).unwrap();
+            native
+                .model
+                .authorization(
+                    lease.native_expiry().unwrap(),
+                    lease.revision(),
+                    lease.permissions().clone(),
+                )
+                .unwrap();
             native.model.set_cid(
                 crate::media::ChannelId::from_value(0),
                 pulsebeam_runtime::time::Instant::now(),
@@ -2583,27 +3959,118 @@ mod replacement_tests {
                 },
             );
 
-            let replacement = actor
-                .core
-                .reserve_transport(shard, pulsebeam_runtime::time::Instant::now());
-            let previous = actor
-                .commit_reserved_candidate(
-                    participant,
-                    room,
-                    shard,
-                    0,
-                    replacement,
-                    winner,
-                    None,
-                    SignalingProtocol::State,
-                    external,
-                    SystemTime::now(),
-                )
-                .unwrap()
+            let source = permissions::source(
+                room,
+                participant,
+                old,
+                crate::entity::TrackKind::Data,
+                "cleanup",
+            );
+            let outcome = actor
+                .lifecycle
+                .publish(source, &actor.core.registry, now)
                 .unwrap();
-            actor.terminate_incarnation(participant, previous, false);
+            actor.publish_track_lifecycle(outcome);
+            assert_eq!(actor.lifecycle.sources_in_room(room).count(), 1);
+            let reason = if revoke_join {
+                use pulsebeam_core::auth::grants::{Action, Grant, GrantSet};
+                let mut joined = lease
+                    .replacing((*lease.authority).clone(), wall, now)
+                    .unwrap();
+                joined.permissions = crate::control::permissions::ResourcePermissions::Grants {
+                    room: RoomExternalId::new("terminal-replacement").unwrap(),
+                    grants: GrantSet::new(vec![
+                        Grant::new(
+                            vec!["terminal-replacement".into()],
+                            vec![
+                                Action::Join,
+                                Action::Publish,
+                                Action::Discover,
+                                Action::Subscribe,
+                            ],
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                };
+                actor
+                    .install_authorization(participant, old, &lease, joined.clone())
+                    .unwrap();
+                assert_eq!(
+                    actor
+                        .core
+                        .registry
+                        .get_participant(&participant)
+                        .unwrap()
+                        .authorization
+                        .as_ref(),
+                    Some(&joined)
+                );
+                assert!(matches!(
+                    actor.install_authorization(participant, old, &lease, lease.clone()),
+                    Err(ControllerError::GrantGone)
+                ));
+                assert!(actor.native_connections.contains_key(&old));
+                assert_eq!(actor.authorization_expiries.len(), 1);
+                let mut next = joined
+                    .replacing((*lease.authority).clone(), wall, now)
+                    .unwrap();
+                next.permissions = crate::control::permissions::ResourcePermissions::Grants {
+                    room: RoomExternalId::new("terminal-replacement").unwrap(),
+                    grants: pulsebeam_core::auth::grants::GrantSet::default(),
+                };
+                assert!(matches!(
+                    actor.install_authorization(participant, old, &joined, next),
+                    Err(ControllerError::AuthorizationRejected)
+                ));
+                assert!(actor.core.registry.get_participant(&participant).is_none());
+                actor.finish_renewal(RenewalResult {
+                    participant,
+                    connection_id: old,
+                    expected_revision: lease.revision(),
+                    verified: Some((*lease.authority).clone()),
+                });
+                assert!(actor.core.registry.get_participant(&participant).is_none());
+                assert!(!actor.command_backlog.iter().any(|(_, command)| matches!(
+                    command,
+                    ShardCommand::AuthorizationResult { .. }
+                )));
+                CloseReason::AuthorizationRevoked
+            } else {
+                let replacement = actor.core.reserve_transport(shard, now);
+                let previous = actor
+                    .commit_reserved_candidate(
+                        participant,
+                        room,
+                        shard,
+                        0,
+                        replacement,
+                        winner,
+                        None,
+                        SignalingProtocol::State,
+                        external,
+                        wall,
+                    )
+                    .unwrap()
+                    .unwrap();
+                actor.terminate_incarnation(
+                    participant,
+                    previous,
+                    false,
+                    Some(CloseReason::ParticipantReplaced),
+                );
+                CloseReason::ParticipantReplaced
+            };
+            assert!(actor.authorization_expiries.is_empty());
+            assert_eq!(actor.lifecycle.sources_in_room(room).count(), 0);
             assert!(!actor.native_connections.contains_key(&old));
             assert!(actor.retiring_native.contains_key(&old));
+            let cleanup_context = actor.native_resource_lease(old).unwrap();
+            assert_eq!(cleanup_context.authority.room_id, room);
+            assert_eq!(cleanup_context.authority.participant_id, participant);
             assert!(
                 !endpoint.failed(),
                 "keep the old endpoint alive while handing off terminal output"
@@ -2624,7 +4091,7 @@ mod replacement_tests {
             assert!(batch.records.iter().any(|record| matches!(
                 record.confirmed.as_ref().and_then(|value| value.value.as_ref()),
                 Some(state::confirmed_state::Value::Session(session))
-                    if session.closed == Some(state::CloseReason::ParticipantReplaced as i32)
+                    if session.closed == Some(reason as i32)
             )));
             if acknowledge {
                 assert!(endpoint.progress(SignalingProgress {
@@ -2642,27 +4109,37 @@ mod replacement_tests {
             pulsebeam_runtime::time::advance(Duration::from_millis(100)).await;
             actor.service_native_connections();
             assert!(actor.retiring_native.is_empty());
+            assert!(actor.native_resource_lease(old).is_none());
             assert!(actor.native_deadlines.is_empty());
             assert!(endpoint.failed());
-            assert_eq!(
-                actor
-                    .core
-                    .registry
-                    .get_participant(&participant)
-                    .unwrap()
-                    .connection_id,
-                winner
-            );
-            actor.remove_incarnation(participant, old);
-            assert_eq!(
-                actor
-                    .core
-                    .registry
-                    .get_participant(&participant)
-                    .unwrap()
-                    .connection_id,
-                winner
-            );
+            if revoke_join {
+                assert!(actor.core.registry.get_participant(&participant).is_none());
+            } else {
+                assert_eq!(
+                    actor
+                        .core
+                        .registry
+                        .get_participant(&participant)
+                        .unwrap()
+                        .connection_id,
+                    winner
+                );
+                assert!(matches!(
+                    actor.install_authorization(participant, old, &lease, lease.clone()),
+                    Err(ControllerError::GrantGone)
+                ));
+                actor.remove_incarnation(participant, old);
+                assert_eq!(
+                    actor
+                        .core
+                        .registry
+                        .get_participant(&participant)
+                        .unwrap()
+                        .connection_id,
+                    winner
+                );
+            }
+            assert!(actor.authorization_expiries.is_empty());
         }
     }
 
@@ -2751,11 +4228,13 @@ mod replacement_tests {
                     transport,
                     room_id,
                     answer: "answer".to_owned(),
+                    owned: None,
                 },
                 reply: MaterializationReply::Create(reply),
                 ack: receiver,
                 ready: None,
                 superseded: false,
+                cutoffs: MaterializationCutoffs::new(),
                 started: pulsebeam_runtime::time::Instant::now(),
             });
         }
@@ -2879,13 +4358,29 @@ mod replacement_tests {
         ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, sequence])
     }
 
+    fn full_grants(room_pattern: &str) -> pulsebeam_core::auth::grants::GrantSet {
+        serde_json::from_value(serde_json::json!([{"rooms":[room_pattern],"allow":["join","publish","discover","subscribe"]}])).unwrap()
+    }
+
     fn authorization_lease(
         expiry: u64,
         wall_now: SystemTime,
         runtime_now: pulsebeam_runtime::time::Instant,
+        room: &str,
+        room_id: RoomId,
+        participant_id: ParticipantId,
     ) -> AuthorizationLease {
-        AuthorizationLease::from_expiry(
-            AuthorizationExpiry::from_unix_seconds(expiry),
+        AuthorizationLease::from_verified(
+            VerifiedAuthorization {
+                grants: full_grants("*"),
+                project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+                room_external_id: RoomExternalId::new(room).unwrap(),
+                room_id,
+                participant_external_id: crate::entity::ParticipantExternalId::new("alice")
+                    .unwrap(),
+                participant_id,
+                expiry: AuthorizationExpiry::from_unix_seconds(expiry),
+            },
             wall_now,
             runtime_now,
         )
@@ -2919,6 +4414,9 @@ mod replacement_tests {
                     100,
                     UNIX_EPOCH,
                     pulsebeam_runtime::time::Instant::now(),
+                    "delete",
+                    room_id,
+                    participant_id,
                 )),
                 SignalingProtocol::State,
                 participant_external_id.clone(),
@@ -2926,6 +4424,7 @@ mod replacement_tests {
             )
             .unwrap();
         let authorization = VerifiedAuthorization {
+            grants: full_grants("*"),
             project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
             room_external_id,
             room_id,
@@ -3025,6 +4524,1029 @@ mod replacement_tests {
                 .is_none()
         );
         assert_eq!(acks.len(), 2);
+    }
+
+    #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
+    async fn native_delete_waits_for_late_materialization_and_applied_cleanup() {
+        struct NoFrames;
+        impl crate::shard::core::IngressTransport for NoFrames {
+            fn send_frame(&self, _: ShardId, _: crate::shard::worker::ShardFrame) {
+                panic!("admission and cleanup must not forward application frames");
+            }
+        }
+
+        let now = pulsebeam_runtime::time::Instant::now();
+        let (mut actor, _commands) = actor_with_receivers(2);
+        actor.core = ControllerCore::with_shards(2, 4, RoomPartitionPlacement::Balanced);
+        actor.negotiator = Negotiator::new(vec![pulsebeam_rtc::LocalCandidate::Udp(
+            "127.0.0.1:6000".parse().unwrap(),
+        )]);
+        actor.updates.clear();
+        let mut shards = Vec::new();
+        for index in 0..2 {
+            let shard = ShardId::new(index);
+            let (writer, updates) = new_shard_update(shard);
+            actor.updates.push(writer);
+            shards.push(crate::shard::core::ShardCore::new(
+                shard,
+                4,
+                2,
+                crate::clock::WallAnchor::new(UNIX_EPOCH, now),
+                updates,
+            ));
+        }
+        let config = |participant_id, connection_id, room_id, external: &str| {
+            let mut resources = crate::control::NegotiatedResources::empty_for_test();
+            let handoff =
+                crate::control::native::fixture::execution_handoff(&mut resources, connection_id);
+            let (rtc, offer) =
+                crate::control::negotiator::application_only_test_connection_and_offer();
+            (
+                Box::new(crate::participant::ConnectionConfig {
+                    manual_sub: true,
+                    room_id,
+                    participant_id,
+                    participant_external_id: crate::entity::ParticipantExternalId::new(external)
+                        .unwrap(),
+                    connection_id,
+                    profile: SignalingProtocol::State,
+                    allow_topic_channels: false,
+                    topic_publications: Default::default(),
+                    authorization_expiry: None,
+                    rtc,
+                    resources,
+                }),
+                handoff,
+                offer,
+            )
+        };
+        let participant = ParticipantId::new();
+        let room = RoomId::from_external(&RoomExternalId::new("late-cutoff").unwrap());
+        let connection = connection_id(1);
+        let expiry = u64::try_from(i64::MAX).unwrap();
+        let lease = authorization_lease(expiry, UNIX_EPOCH, now, "late-cutoff", room, participant);
+        let authorization = lease.authority.as_ref().clone();
+        let credential = pulsebeam_server::sign_participant_token(
+            &pulsebeam_server::insecure_dev_api_key().unwrap(),
+            &full_grants("capability-only"),
+            "alice",
+            2_000,
+        )
+        .unwrap();
+        let registry = KeyRegistry::new(
+            *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+            vec![pulsebeam_core::auth::KeyRegistryEntry {
+                key_id: *pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
+                public_key: *pulsebeam_core::auth::DEVELOPMENT_API_PUBLIC_KEY,
+            }],
+        )
+        .unwrap();
+        let authenticated =
+            pulsebeam_core::auth::authenticate_participant_token(&registry, &credential, 1_000)
+                .unwrap();
+        let wall_now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let issue = |actor: &mut ControllerActor, wall_now| {
+            let (reply, mut received) = oneshot::channel();
+            let command = AdmissionCommand::issue(authenticated.clone(), reply);
+            assert_eq!(format!("{command:?}"), "AdmissionCommand([redacted])");
+            actor.process_admission(command, wall_now);
+            received.try_recv().unwrap()
+        };
+        assert!(matches!(
+            issue(&mut actor, wall_now),
+            Err(ControllerError::ServiceUnavailable)
+        ));
+        actor.set_ownership_mode(OwnershipMode::Standalone);
+        let (reply, canceled) = oneshot::channel();
+        drop(canceled);
+        actor.process_admission(
+            AdmissionCommand::issue(authenticated.clone(), reply),
+            wall_now,
+        );
+        assert!(matches!(
+            issue(&mut actor, UNIX_EPOCH + Duration::from_secs(2_000)),
+            Err(ControllerError::AuthorizationExpired)
+        ));
+        let proofs: [ownership::Proof; 4] =
+            std::array::from_fn(|_| issue(&mut actor, wall_now).unwrap());
+        assert!(matches!(
+            issue(&mut actor, wall_now),
+            Err(ControllerError::ServiceUnavailable)
+        ));
+        assert!(actor.core.registry.get_participant(&participant).is_none());
+        assert!(actor.materializations.is_empty());
+        assert!(actor.command_backlog.is_empty());
+        let principal = ownership::PrincipalKey::from_principal(&authenticated);
+        assert_eq!(
+            principal,
+            ownership::PrincipalKey::from_verified(&authorization)
+        );
+        let original = proofs[0];
+        let transport = actor.core.reserve_transport(ShardId::new(0), now);
+        actor
+            .core
+            .registry
+            .reserve_partition(room, participant, connection, ShardId::new(0), 0);
+        let binding = ownership::RequestBinding::for_request(
+            SignalingProtocol::State,
+            &authorization.room_external_id,
+            "original offer",
+            "original credential",
+        )
+        .unwrap();
+        let one = std::num::NonZeroU64::new(1).unwrap();
+        let ownership::Admission::Start(old_ticket) = actor
+            .ownership
+            .begin(&principal, original, one, binding, now)
+            .unwrap()
+        else {
+            panic!("expected original attempt");
+        };
+        let incarnation = ownership::Incarnation {
+            participant,
+            connection,
+            transport,
+        };
+        let mut wrong_scope = authorization.clone();
+        wrong_scope.project_id = crate::entity::ProjectId::new();
+        assert_eq!(
+            actor.ownership.bind(&old_ticket, &wrong_scope, incarnation),
+            Err(ownership::Error::InvalidTransition)
+        );
+        actor
+            .ownership
+            .bind(&old_ticket, &authorization, incarnation)
+            .unwrap();
+        assert_eq!(
+            actor
+                .ownership
+                .bind(&old_ticket, &authorization, incarnation),
+            Err(ownership::Error::InvalidTransition)
+        );
+        assert_eq!(
+            actor.ownership.commit(&old_ticket, Vec::new(), now),
+            Err(ownership::Error::InvalidTransition)
+        );
+        let (old_config, _old_handoff, offer) = config(participant, connection, room, "alice");
+        let (ack, received) = oneshot::channel();
+        let (reply, mut old_response) = oneshot::channel();
+        actor.start_materialization(RequiredAction::Materialize {
+            pending: PendingMaterialization {
+                native: None,
+                shard: ShardId::new(0),
+                partition_index: 0,
+                command: Some(ShardCommand::MaterializeParticipant {
+                    transport,
+                    config: old_config,
+                    ack,
+                }),
+                ack: Some(received),
+                participant,
+                participant_external_id: authorization.participant_external_id.clone(),
+                connection_id: connection,
+                authorization: Some(lease),
+                profile: SignalingProtocol::State,
+                transport,
+                room_id: room,
+                answer: "late answer".to_owned(),
+                owned: None,
+            },
+            reply: MaterializationReply::Create(reply),
+        });
+        let (owner, old_command) = actor.command_backlog.pop_front().unwrap();
+        assert_eq!(owner, ShardId::new(0));
+
+        let other = ParticipantId::new();
+        let other_room = RoomId::from_external(&RoomExternalId::new("unblocked").unwrap());
+        let other_transport = actor.core.reserve_transport(ShardId::new(1), now);
+        let (other_config, _other_handoff, _) = config(other, connection_id(10), other_room, "bob");
+        let (ack, other_ready) = oneshot::channel();
+        shards[1].on_command(
+            ShardCommand::MaterializeParticipant {
+                transport: other_transport,
+                config: other_config,
+                ack,
+            },
+            &NoFrames,
+        );
+        assert!(other_ready.await.unwrap());
+        actor.core.registry.add_participant(
+            other,
+            other_room,
+            ShardId::new(1),
+            Some(other_transport),
+        );
+        assert_eq!(shards[1].participant_count(), 1);
+
+        let next_participant = ParticipantId::new();
+        let next_lease = authorization_lease(
+            expiry,
+            UNIX_EPOCH,
+            now,
+            "unblocked",
+            other_room,
+            next_participant,
+        );
+        assert_eq!(
+            ownership::PrincipalKey::from_verified(&next_lease.authority),
+            principal
+        );
+        let message = |connection_id, offer: &str| CreateParticipant {
+            state: ParticipantState {
+                manual_sub: true,
+                room_id: other_room,
+                participant_id: next_participant,
+                participant_external_id: next_lease.authority.participant_external_id.clone(),
+                connection_id,
+                old_connection_id: None,
+                authorization: Some(next_lease.clone()),
+                profile: SignalingProtocol::Whip,
+                rtp_capabilities: None,
+            },
+            offer: offer.to_owned(),
+        };
+        let proof = issue(&mut actor, wall_now).unwrap();
+        assert_eq!(
+            actor
+                .ownership
+                .preview(&principal, original, one, binding, now),
+            Ok(ownership::Admission::Pending(old_ticket.clone()))
+        );
+        let attempt = |proof, sequence, offer: &str| OwnershipAttempt {
+            proof,
+            sequence,
+            location: axum::http::HeaderValue::from_static("https://edge.test/whip/first"),
+            binding: ownership::RequestBinding::for_request(
+                SignalingProtocol::Whip,
+                &next_lease.authority.room_external_id,
+                offer,
+                "next credential",
+            )
+            .unwrap(),
+        };
+        let create = |message, sequence, reply| {
+            AdmissionCommand::create(
+                message,
+                proof,
+                sequence,
+                axum::http::HeaderValue::from_static("https://edge.test/whip/first"),
+                "next credential",
+                reply,
+            )
+            .unwrap()
+        };
+        actor.set_ownership_mode(OwnershipMode::Unavailable);
+        assert!(matches!(
+            actor.begin_owned_create(
+                message(connection_id(3), &offer),
+                attempt(proof, one, &offer),
+                UNIX_EPOCH
+            ),
+            Err(OwnedAdmissionError::Request(
+                ControllerError::ServiceUnavailable
+            ))
+        ));
+        actor.set_ownership_mode(OwnershipMode::Standalone);
+        let unknown = ownership::Proof::parse(&"0".repeat(52)).unwrap();
+        assert!(matches!(
+            actor.begin_owned_create(
+                message(connection_id(3), &offer),
+                attempt(unknown, one, &offer),
+                UNIX_EPOCH
+            ),
+            Err(OwnedAdmissionError::Authority(_))
+        ));
+        assert!(matches!(
+            actor.begin_owned_create(
+                message(connection_id(3), "invalid SDP"),
+                attempt(proof, one, "invalid SDP"),
+                UNIX_EPOCH
+            ),
+            Err(OwnedAdmissionError::Request(_))
+        ));
+        assert!(matches!(
+            actor.begin_owned_create(
+                message(connection_id(3), &offer),
+                OwnershipAttempt {
+                    location: axum::http::HeaderValue::from_bytes(&vec![
+                        b'x';
+                        ownership::MAX_RESULT_BYTES
+                    ],)
+                    .unwrap(),
+                    ..attempt(proof, one, &offer)
+                },
+                UNIX_EPOCH,
+            ),
+            Err(OwnedAdmissionError::Image(creation::Error::TooLarge))
+        ));
+        assert!(!actor.materializations.front().unwrap().superseded);
+        assert_eq!(
+            actor
+                .ownership
+                .preview(&principal, original, one, binding, now),
+            Ok(ownership::Admission::Pending(old_ticket.clone()))
+        );
+        assert!(!actor.core.registry.partition_reserved(
+            other_room,
+            next_participant,
+            connection_id(3),
+            ShardId::new(1),
+            0
+        ));
+
+        let (reply, canceled) = oneshot::channel();
+        drop(canceled);
+        actor.process_admission(
+            create(message(connection_id(3), &offer), one, reply),
+            UNIX_EPOCH,
+        );
+        assert!(!actor.materializations.front().unwrap().superseded);
+        assert_eq!(
+            actor
+                .ownership
+                .preview(&principal, original, one, binding, now),
+            Ok(ownership::Admission::Pending(old_ticket.clone()))
+        );
+
+        let saturated: Vec<_> = (0..creation::MAX_DELIVERIES)
+            .map(|_| actor.delivery_budget.reserve().unwrap())
+            .collect();
+        let (reply, mut busy) = oneshot::channel();
+        let command = create(message(connection_id(3), &offer), one, reply);
+        assert_eq!(format!("{command:?}"), "AdmissionCommand([redacted])");
+        actor.process_admission(command, UNIX_EPOCH);
+        assert_eq!(
+            busy.try_recv().unwrap().err().unwrap().status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!actor.materializations.front().unwrap().superseded);
+        assert_eq!(
+            actor
+                .ownership
+                .preview(&principal, original, one, binding, now),
+            Ok(ownership::Admission::Pending(old_ticket.clone()))
+        );
+        drop(saturated);
+        let (reply, mut unsent_response) = oneshot::channel();
+        actor.process_admission(
+            create(message(connection_id(3), &offer), one, reply),
+            UNIX_EPOCH,
+        );
+        let first_next = actor
+            .materializations
+            .back()
+            .unwrap()
+            .pending
+            .owned
+            .as_ref()
+            .unwrap()
+            .ticket
+            .clone();
+        assert_eq!(
+            actor.materializations.back().unwrap().pending.shard,
+            ShardId::new(1)
+        );
+        assert!(
+            actor.command_backlog.is_empty(),
+            "old physical work blocks new shard commands"
+        );
+        assert!(
+            actor.materializations.front().unwrap().superseded,
+            "claim fences pending work before a client close"
+        );
+        let (reply, mut duplicate_response) = oneshot::channel();
+        let duplicate = actor
+            .submit_owned_create(
+                message(connection_id(99), &offer),
+                attempt(proof, one, &offer),
+                reply,
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        assert_eq!(duplicate, first_next);
+        let two = std::num::NonZeroU64::new(2).unwrap();
+        let (reply, mut next_response) = oneshot::channel();
+        let next_ticket = actor
+            .submit_owned_create(
+                message(connection_id(2), &offer),
+                attempt(proof, two, &offer),
+                reply,
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        assert_eq!(
+            unsent_response.try_recv().unwrap().unwrap_err().status(),
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            duplicate_response.try_recv().unwrap().unwrap_err().status(),
+            axum::http::StatusCode::CONFLICT
+        );
+        let expected_image = actor
+            .materializations
+            .back()
+            .unwrap()
+            .pending
+            .owned
+            .as_ref()
+            .unwrap()
+            .image
+            .clone();
+        let mut duplicates = Vec::new();
+        for _ in 1..ownership::MAX_WAITERS {
+            let (reply, response) = oneshot::channel();
+            let ticket = actor
+                .submit_owned_create(
+                    message(connection_id(99), &offer),
+                    attempt(proof, two, &offer),
+                    reply,
+                    UNIX_EPOCH,
+                )
+                .unwrap();
+            assert_eq!(ticket, next_ticket);
+            duplicates.push(response);
+        }
+        let (reply, _rejected) = oneshot::channel();
+        assert!(matches!(
+            actor.submit_owned_create(
+                message(connection_id(99), &offer),
+                attempt(proof, two, &offer),
+                reply,
+                UNIX_EPOCH,
+            ),
+            Err((
+                _,
+                OwnedAdmissionError::Authority(ownership::Error::Capacity)
+            ))
+        ));
+        drop(duplicates.pop().unwrap());
+        let (reply, response) = oneshot::channel();
+        let ticket = actor
+            .submit_owned_create(
+                message(connection_id(99), &offer),
+                attempt(proof, two, &offer),
+                reply,
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        assert_eq!(ticket, next_ticket);
+        duplicates.push(response);
+        assert!(actor.command_backlog.is_empty());
+        assert_eq!(actor.materializations.len(), 2);
+        actor.ownership.retire(&old_ticket, now);
+        assert!(actor.ownership.has_incarnation(incarnation));
+        assert_eq!(
+            actor.ownership.commit(&next_ticket, Vec::new(), now),
+            Err(ownership::Error::InvalidTransition)
+        );
+
+        let (bytes, acks) = actor
+            .begin_native_delete(
+                DeleteNative {
+                    authorization,
+                    connection_id: connection,
+                },
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        assert_eq!(
+            acks.len(),
+            3,
+            "two prior shard fences plus delayed incarnation"
+        );
+        let (reply, mut response) = oneshot::channel();
+        let task = pulsebeam_runtime::task::spawn(complete_native_delete(
+            acks,
+            NativeDeleteReply::Http(reply),
+            actor.deletion_tx.clone(),
+            bytes,
+        ));
+        for shard in &mut shards {
+            assert_eq!(shard.apply_updates(1), 1);
+        }
+        pulsebeam_runtime::task::yield_now().await;
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        actor.advance_materializations();
+        assert!(actor.command_backlog.is_empty());
+
+        shards[0].on_command(old_command, &NoFrames);
+        assert_eq!(
+            shards[0].participant_count(),
+            1,
+            "early fence did not prevent delayed install"
+        );
+        actor.advance_materializations();
+        assert!(matches!(
+            old_response.try_recv().unwrap(),
+            Err(ControllerError::Superseded)
+        ));
+        assert!(actor.command_backlog.is_empty());
+        assert_eq!(shards[1].apply_updates(1), 0);
+        assert_eq!(shards[0].apply_updates(1), 1);
+        assert_eq!(shards[0].participant_count(), 0);
+        pulsebeam_runtime::task::yield_now().await;
+        assert!(
+            matches!(
+                response.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "removal alone is not its applied receipt"
+        );
+        assert_eq!(shards[0].apply_updates(1), 1);
+        assert!(response.await.unwrap().is_ok());
+        task.await.unwrap();
+        let completed = actor.deletion_rx.recv().await.unwrap();
+        actor.release_deletion(completed);
+        assert_eq!(actor.deletion_bytes, 0);
+        assert_eq!(actor.materializations.len(), 1);
+        assert!(actor.ownership.has_incarnation(incarnation));
+        actor.advance_materializations();
+        assert!(
+            actor.command_backlog.is_empty(),
+            "native close alone does not release authority"
+        );
+
+        actor.ownership.start_retirement(&old_ticket);
+        actor.ownership.finish_retirement(&old_ticket, false, now);
+        actor.ownership.finish_retirement(&old_ticket, true, now);
+        actor.ownership.retire(&old_ticket, now);
+        assert!(actor.ownership.has_incarnation(incarnation));
+        actor.ownership.queue_retirement(incarnation);
+        actor.deletion_bytes = PENDING_NATIVE_DELETE_BYTES;
+        actor.advance_incarnation_cutoffs();
+        assert_eq!(
+            actor.ownership.next_retirement(),
+            Some((old_ticket.clone(), incarnation))
+        );
+        actor.deletion_bytes = 0;
+        actor.advance_incarnation_cutoffs();
+        assert!(actor.deletion_bytes > 0);
+        assert!(actor.ownership.next_retirement().is_none());
+        assert_eq!(shards[0].apply_updates(1), 1);
+        pulsebeam_runtime::task::yield_now().await;
+        assert!(matches!(
+            actor.deletion_rx.try_recv(),
+            Err(pulsebeam_runtime::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        actor.advance_materializations();
+        assert!(
+            actor.command_backlog.is_empty(),
+            "partial applied proof cannot issue replacement"
+        );
+        assert_eq!(shards[1].participant_count(), 1);
+        assert!(matches!(
+            next_response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(shards[1].apply_updates(1), 1);
+        let completed = actor.deletion_rx.recv().await.unwrap();
+        actor.release_deletion(completed);
+        assert!(!actor.ownership.has_incarnation(incarnation));
+        assert_eq!(actor.deletion_bytes, 0);
+        actor.ownership.finish_retirement(&old_ticket, true, now);
+        actor.advance_materializations();
+        let (destination, next_command) = actor.command_backlog.pop_front().unwrap();
+        assert_eq!(destination, ShardId::new(1));
+        assert_eq!(shards[0].participant_count(), 0);
+        assert!(matches!(
+            next_response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            actor.ownership.result(&next_ticket, now),
+            Err(ownership::Error::ReplayUnavailable)
+        ));
+        assert!(!actor.current_incarnation(next_participant, connection_id(2)));
+        shards[1].on_command(next_command, &NoFrames);
+        assert_eq!(shards[1].participant_count(), 2);
+        actor.advance_materializations();
+        let delivered = next_response.try_recv().unwrap().unwrap();
+        assert_eq!(delivered.as_ref(), expected_image);
+        for response in &mut duplicates {
+            assert_eq!(
+                response.try_recv().unwrap().unwrap().as_ref(),
+                delivered.as_ref()
+            );
+        }
+        assert_eq!(
+            actor.ownership.result(&next_ticket, now).unwrap().as_ref(),
+            delivered.as_ref(),
+            "the complete image is cached before the first success is visible"
+        );
+        assert!(actor.materializations.is_empty());
+        assert!(actor.current_incarnation(next_participant, connection_id(2)));
+        assert!(!actor.current_incarnation(participant, connection));
+        let (reply, mut replayed) = oneshot::channel();
+        let recovered = actor
+            .submit_owned_create(
+                message(connection_id(100), &offer),
+                attempt(proof, two, &offer),
+                reply,
+                UNIX_EPOCH,
+            )
+            .unwrap();
+        assert_eq!(recovered, next_ticket);
+        assert_eq!(
+            replayed.try_recv().unwrap().unwrap().as_ref(),
+            delivered.as_ref(),
+            "cached replay replies in the same actor turn without new physical work"
+        );
+        let (reply, _expired) = oneshot::channel();
+        assert!(matches!(
+            actor.submit_owned_create(
+                message(connection_id(101), &offer),
+                attempt(proof, two, &offer),
+                reply,
+                UNIX_EPOCH.checked_add(Duration::from_secs(expiry)).unwrap(),
+            ),
+            Err((
+                _,
+                OwnedAdmissionError::Request(ControllerError::AuthorizationExpired)
+            ))
+        ));
+        assert!(actor.materializations.is_empty());
+        assert!(actor.command_backlog.is_empty());
+        assert_eq!(
+            actor.ownership.result(&next_ticket, now).unwrap().as_ref(),
+            delivered.as_ref()
+        );
+        assert_eq!(shards[1].participant_count(), 2);
+
+        {
+            use axum::{
+                body::{Body, to_bytes},
+                http::{Request, StatusCode},
+            };
+            use tower::ServiceExt;
+
+            async fn mutate(
+                app: axum::Router,
+                request: Request<Body>,
+                commands: &mut mailbox::Receiver<ControllerCommand>,
+                actor: &mut ControllerActor,
+            ) -> axum::response::Response {
+                let mut response = Box::pin(app.oneshot(request));
+                let command = pulsebeam_runtime::select! {
+                    command = commands.recv() => command.unwrap(),
+                    _ = &mut response => panic!("mutation HTTP response preceded controller processing"),
+                };
+                assert!(actor.process_command(command).is_none());
+                response.await.unwrap()
+            }
+
+            let expiry = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 60;
+            let key = pulsebeam_server::insecure_dev_api_key().unwrap();
+            let issue_token = pulsebeam_server::sign_participant_token(
+                &key,
+                &full_grants("unselected"),
+                "http-native",
+                expiry,
+            )
+            .unwrap();
+            let claim_token = pulsebeam_server::sign_participant_token(
+                &key,
+                &full_grants("http-target"),
+                "http-native",
+                expiry,
+            )
+            .unwrap();
+            let (controller, mut commands) =
+                mailbox::bounded(const { std::num::NonZeroUsize::new(4).unwrap() });
+            let app = super::super::api::owned_native_router(
+                controller,
+                super::super::api::ApiConfig {
+                    base_path: "/api/v1".to_owned(),
+                    default_host: "media.example".to_owned(),
+                },
+                registry.clone(),
+            )
+            .layer(tower_http::compression::CompressionLayer::new());
+            let request = |path: &str, token: &str, body: Vec<u8>| {
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/{path}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("accept-encoding", "zstd")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::from(body))
+                    .unwrap()
+            };
+            let mut empty_object = b"{ }".to_vec();
+            empty_object.resize(1_024, b' ');
+            let mut issuing = Box::pin(app.clone().oneshot(request(
+                "native/admissions",
+                &issue_token,
+                empty_object,
+            )));
+            let command = pulsebeam_runtime::select! {
+                command = commands.recv() => command.unwrap(),
+                _ = &mut issuing => panic!("capability HTTP response preceded controller processing"),
+            };
+            let ControllerCommand::Admission(command) = command else {
+                panic!("expected issuance")
+            };
+            actor.process_admission(command, SystemTime::now());
+            let issued = issuing.await.unwrap();
+            assert_eq!(issued.status(), StatusCode::OK);
+            assert_eq!(issued.headers()["cache-control"], "no-store");
+            assert_eq!(issued.headers()["content-encoding"], "identity");
+            assert!(actor.materializations.is_empty());
+            assert!(actor.command_backlog.is_empty());
+            let issued = to_bytes(issued.into_body(), 1_024).await.unwrap();
+            let issued: serde_json::Value = serde_json::from_slice(&issued).unwrap();
+            let owner = issued["owner"].as_str().unwrap();
+            let body = serde_json::to_vec(&serde_json::json!({
+                "profile": pulsebeam_proto::state::PROFILE, "room": "http-target", "offer": offer,
+            }))
+            .unwrap();
+            let create = |token: &str| {
+                let mut request = request("native", token, body.clone());
+                request.headers_mut().insert(
+                    "pulsebeam-owner",
+                    axum::http::HeaderValue::from_str(owner).unwrap(),
+                );
+                request.headers_mut().insert(
+                    "pulsebeam-attempt",
+                    axum::http::HeaderValue::from_static("2"),
+                );
+                request
+            };
+            let mut malformed = create(&claim_token);
+            malformed.headers_mut().insert(
+                "pulsebeam-attempt",
+                axum::http::HeaderValue::from_static("1"),
+            );
+            *malformed.body_mut() = Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "profile": pulsebeam_proto::state::PROFILE,
+                    "room": "http-target",
+                    "offer": "not SDP",
+                }))
+                .unwrap(),
+            );
+            let mut malformed = Box::pin(app.clone().oneshot(malformed));
+            let command = pulsebeam_runtime::select! {
+                command = commands.recv() => command.unwrap(),
+                _ = &mut malformed => panic!("malformed offer response preceded owned admission"),
+            };
+            let ControllerCommand::Admission(command) = command else {
+                panic!("expected owned admission for malformed offer")
+            };
+            actor.process_admission(command, SystemTime::now());
+            let rejected = malformed.await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            assert!(actor.materializations.is_empty());
+            assert!(actor.command_backlog.is_empty());
+
+            let mut creating = Box::pin(app.clone().oneshot(create(&claim_token)));
+            let command = pulsebeam_runtime::select! {
+                command = commands.recv() => command.unwrap(),
+                _ = &mut creating => panic!("creation HTTP response preceded controller processing"),
+            };
+            let ControllerCommand::Admission(command) = command else {
+                panic!("expected owned creation")
+            };
+            actor.process_admission(command, SystemTime::now());
+            let pending = &actor.materializations.back().unwrap().pending;
+            let http_ticket = pending.owned.as_ref().unwrap().ticket.clone();
+            let http_participant = pending.participant;
+            let http_connection = pending.connection_id;
+            let expected_answer = pending.answer.clone();
+            assert_eq!(pending.profile, SignalingProtocol::State);
+            assert!(pending.authorization.is_some());
+            assert!(pending.native.is_some());
+            assert!(!actor.native_connections.contains_key(&http_connection));
+            let principal =
+                pulsebeam_core::auth::authenticate_participant_token(&registry, &claim_token, 0)
+                    .unwrap();
+            let pending_authority = actor
+                .authorize_native_resource(
+                    NativeResourceRequest {
+                        principal,
+                        connection_id: http_connection,
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+            assert_eq!(pending_authority.participant_id, http_participant);
+            assert_eq!(pending_authority.room_external_id.as_str(), "http-target");
+            actor.advance_materializations();
+            assert!(
+                futures_lite::future::poll_once(&mut creating)
+                    .await
+                    .is_none()
+            );
+            assert!(!actor.current_incarnation(http_participant, http_connection));
+            let (destination, command) = actor.command_backlog.pop_front().unwrap();
+            shards[destination.index()].on_command(command, &NoFrames);
+            actor.advance_materializations();
+            let lost_response = creating.await.unwrap();
+            assert_eq!(lost_response.status(), StatusCode::CREATED);
+            let expected_headers = lost_response.headers().clone();
+            drop(lost_response);
+            assert!(actor.current_incarnation(http_participant, http_connection));
+            let image = actor
+                .ownership
+                .result(&http_ticket, pulsebeam_runtime::time::Instant::now())
+                .unwrap();
+            let expected = crate::control::api::creation::into_response(creation::Delivery::new(
+                image,
+                actor.delivery_budget.reserve().unwrap(),
+            ))
+            .unwrap();
+            let expected_body = to_bytes(expected.into_body(), ownership::MAX_RESULT_BYTES)
+                .await
+                .unwrap();
+            let state: serde_json::Value = serde_json::from_slice(&expected_body).unwrap();
+            assert_eq!(state["room_external_id"], "http-target");
+            assert_eq!(state["participant_external_id"], "http-native");
+            assert_eq!(state["connection_id"], http_connection.to_string());
+            assert_eq!(state["room_id"], pending_authority.room_id.to_string());
+            assert_eq!(state["participant_id"], http_participant.to_string());
+            assert_eq!(state["profile"], pulsebeam_proto::state::PROFILE);
+            assert_eq!(
+                state["data_delivery"],
+                serde_json::json!(["LATEST", "LOSSY", "ORDERED"])
+            );
+            assert_eq!(
+                state["rtp_capabilities"],
+                serde_json::to_value(crate::control::rtp::capabilities()).unwrap()
+            );
+            assert_eq!(state["answer"], expected_answer);
+            assert!(
+                str0m::change::SdpAnswer::from_sdp_string(state["answer"].as_str().unwrap())
+                    .is_ok()
+            );
+            assert_eq!(expected_headers["content-type"], "application/json");
+            assert_eq!(
+                expected_headers["location"],
+                format!("https://media.example/api/v1/native/{http_connection}")
+            );
+            let changed_token = pulsebeam_server::sign_participant_token(
+                &key,
+                &full_grants("http-target"),
+                "http-native",
+                expiry + 1,
+            )
+            .unwrap();
+            for (token, status) in [
+                (&changed_token, StatusCode::BAD_REQUEST),
+                (&claim_token, StatusCode::CREATED),
+                (&claim_token, StatusCode::CREATED),
+            ] {
+                let mut retrying = Box::pin(app.clone().oneshot(create(token)));
+                let command = pulsebeam_runtime::select! {
+                    command = commands.recv() => command.unwrap(),
+                    _ = &mut retrying => panic!("replay HTTP response preceded controller processing"),
+                };
+                let ControllerCommand::Admission(command) = command else {
+                    panic!("expected replay")
+                };
+                actor.process_admission(command, SystemTime::now());
+                assert!(actor.materializations.is_empty());
+                assert!(actor.command_backlog.is_empty());
+                let replayed = retrying.await.unwrap();
+                assert_eq!(replayed.status(), status);
+                assert!(actor.current_incarnation(http_participant, http_connection));
+                if status != StatusCode::CREATED {
+                    continue;
+                }
+                assert_eq!(replayed.headers(), &expected_headers);
+                assert_eq!(
+                    to_bytes(replayed.into_body(), ownership::MAX_RESULT_BYTES)
+                        .await
+                        .unwrap(),
+                    expected_body
+                );
+                assert!(actor.current_incarnation(http_participant, http_connection));
+            }
+
+            let mutation = |method: &str, token: &str, connection, tag: Option<&str>| {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(format!("/api/v1/native/{connection}"))
+                    .header("authorization", format!("Bearer {token}"));
+                if let Some(tag) = tag {
+                    request = request.header("if-match", tag);
+                }
+                request.body(Body::empty()).unwrap()
+            };
+            let other_participant = pulsebeam_server::sign_participant_token(
+                &key,
+                &full_grants("http-target"),
+                "http-other",
+                expiry,
+            )
+            .unwrap();
+            let credit = actor.deletion_bytes;
+            for (method, token, connection, tag, status) in [
+                (
+                    "PATCH",
+                    &other_participant,
+                    http_connection,
+                    Some("\"auth-1\""),
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    "DELETE",
+                    &other_participant,
+                    http_connection,
+                    None,
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    "DELETE",
+                    &claim_token,
+                    ConnectionId::new(),
+                    None,
+                    StatusCode::GONE,
+                ),
+                (
+                    "PATCH",
+                    &changed_token,
+                    http_connection,
+                    Some("\"auth-9\""),
+                    StatusCode::PRECONDITION_FAILED,
+                ),
+            ] {
+                let response = mutate(
+                    app.clone(),
+                    mutation(method, token, connection, tag),
+                    &mut commands,
+                    &mut actor,
+                )
+                .await;
+                assert_eq!(response.status(), status);
+                assert!(
+                    actor.current_incarnation(http_participant, http_connection),
+                    "rejected {method} {tag:?} for {connection} removed the accepted incarnation"
+                );
+                assert_eq!(actor.deletion_bytes, credit);
+                assert!(actor.command_backlog.is_empty());
+            }
+            let accepted = mutate(
+                app.clone(),
+                mutation("PATCH", &changed_token, http_connection, Some("\"auth-1\"")),
+                &mut commands,
+                &mut actor,
+            )
+            .await;
+            assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+            assert_eq!(accepted.headers()["etag"], "\"auth-2\"");
+            assert_eq!(
+                actor
+                    .native_resource_lease(http_connection)
+                    .unwrap()
+                    .revision(),
+                2
+            );
+            while let Some((destination, command)) = actor.command_backlog.pop_front() {
+                shards[destination.index()].on_command(command, &NoFrames);
+            }
+            let stale = mutate(
+                app.clone(),
+                mutation("PATCH", &changed_token, http_connection, Some("\"auth-1\"")),
+                &mut commands,
+                &mut actor,
+            )
+            .await;
+            assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(stale.headers()["etag"], "\"auth-2\"");
+
+            let mut deleting =
+                Box::pin(app.oneshot(mutation("DELETE", &claim_token, http_connection, None)));
+            let command = pulsebeam_runtime::select! {
+                command = commands.recv() => command.unwrap(),
+                _ = &mut deleting => panic!("delete HTTP response preceded controller processing"),
+            };
+            assert!(actor.process_command(command).is_none());
+            assert!(!actor.current_incarnation(http_participant, http_connection));
+            assert!(
+                futures_lite::future::poll_once(&mut deleting)
+                    .await
+                    .is_none()
+            );
+            while shards[0].apply_updates(64) != 0 {}
+            pulsebeam_runtime::task::yield_now().await;
+            assert!(
+                futures_lite::future::poll_once(&mut deleting)
+                    .await
+                    .is_none()
+            );
+            while shards[1].apply_updates(64) != 0 {}
+            assert_eq!(deleting.await.unwrap().status(), StatusCode::NO_CONTENT);
+            let completed = actor.deletion_rx.recv().await.unwrap();
+            actor.release_deletion(completed);
+            assert_eq!(actor.deletion_bytes, credit);
+        }
     }
 
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
@@ -3385,7 +5907,14 @@ mod replacement_tests {
         let participant_id = ParticipantId::new();
         let runtime_now = pulsebeam_runtime::time::Instant::now();
         let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
-        let lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
+        let lease = authorization_lease(
+            10,
+            UNIX_EPOCH,
+            runtime_now,
+            "expiry",
+            room_id,
+            participant_id,
+        );
 
         let result = actor.commit_reserved_candidate(
             participant_id,
@@ -3418,7 +5947,14 @@ mod replacement_tests {
         let participant_id = ParticipantId::new();
         let runtime_now = pulsebeam_runtime::time::Instant::now();
         let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
-        let lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
+        let lease = authorization_lease(
+            10,
+            UNIX_EPOCH,
+            runtime_now,
+            "expiry",
+            room_id,
+            participant_id,
+        );
         actor
             .commit_reserved_candidate(
                 participant_id,
@@ -3451,7 +5987,7 @@ mod replacement_tests {
     }
 
     #[test]
-    fn renewal_rejects_identity_changes_and_shorter_expiry_without_losing_lease() {
+    fn renewal_rejects_identity_changes_but_removing_join_revokes_participation() {
         let mut actor = actor();
         let room_id = RoomId::from_external(&RoomExternalId::new("renewal-room").unwrap());
         let participant_id = ParticipantId::new();
@@ -3459,12 +5995,14 @@ mod replacement_tests {
         let now = SystemTime::now();
         let unix_now = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
         let old_expiry = unix_now + 60;
-        let old_lease = AuthorizationLease::from_expiry(
-            AuthorizationExpiry::from_unix_seconds(old_expiry),
+        let old_lease = authorization_lease(
+            old_expiry,
             now,
             pulsebeam_runtime::time::Instant::now(),
-        )
-        .unwrap();
+            "renewal-room",
+            room_id,
+            participant_id,
+        );
         let transport = actor
             .core
             .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
@@ -3476,13 +6014,14 @@ mod replacement_tests {
                 0,
                 transport,
                 connection,
-                Some(old_lease),
+                Some(old_lease.clone()),
                 SignalingProtocol::State,
                 crate::entity::ParticipantExternalId::new("alice").unwrap(),
                 now,
             )
             .unwrap();
         let verified = VerifiedAuthorization {
+            grants: full_grants("*"),
             project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
             room_external_id: RoomExternalId::new("renewal-room").unwrap(),
             room_id,
@@ -3499,6 +6038,18 @@ mod replacement_tests {
             expected_revision: 1,
             verified: Some(wrong_identity),
         });
+        let mut wrong_project = verified.clone();
+        wrong_project.project_id = pulsebeam_core::identity::ProjectId::new();
+        let mut wrong_room_name = verified.clone();
+        wrong_room_name.room_external_id = RoomExternalId::new("other-room").unwrap();
+        for invalid in [wrong_project, wrong_room_name] {
+            actor.finish_renewal(RenewalResult {
+                participant: participant_id,
+                connection_id: connection,
+                expected_revision: 1,
+                verified: Some(invalid),
+            });
+        }
         let mut shorter = verified.clone();
         shorter.expiry = AuthorizationExpiry::from_unix_seconds(old_expiry);
         actor.finish_renewal(RenewalResult {
@@ -3537,6 +6088,7 @@ mod replacement_tests {
                 .get_participant(&participant_id)
                 .unwrap()
                 .authorization
+                .as_ref()
                 .unwrap()
                 .expiry()
                 .unix_seconds(),
@@ -3569,9 +6121,15 @@ mod replacement_tests {
             .get_participant(&participant_id)
             .unwrap()
             .authorization
+            .clone()
             .unwrap();
         assert_eq!(current.revision(), 3);
         assert_eq!(current.expiry(), narrowed.expiry);
+        assert_eq!(current.authority.as_ref(), &narrowed);
+        let refreshed = current
+            .refresh_at(now, pulsebeam_runtime::time::Instant::now())
+            .unwrap();
+        assert_eq!(refreshed.authority.as_ref(), &narrowed);
         assert_eq!(
             current
                 .refresh_at(now, pulsebeam_runtime::time::Instant::now())
@@ -3592,7 +6150,7 @@ mod replacement_tests {
             participant: participant_id,
             connection_id: connection,
             expected_revision: 1,
-            verified: Some(verified),
+            verified: Some(verified.clone()),
         });
         assert_eq!(
             actor
@@ -3601,7 +6159,7 @@ mod replacement_tests {
                 .get_participant(&participant_id)
                 .unwrap()
                 .authorization,
-            Some(current)
+            Some(current.clone())
         );
         assert!(matches!(
             &actor.command_backlog.back().unwrap().1,
@@ -3631,9 +6189,26 @@ mod replacement_tests {
                 .get_participant(&participant_id)
                 .unwrap()
                 .authorization,
-            Some(current)
+            Some(current.clone())
         );
         assert_eq!(actor.command_backlog.len(), queued);
+        for invalid in [
+            {
+                let mut value = request();
+                value.authorization.project_id = pulsebeam_core::identity::ProjectId::new();
+                value
+            },
+            {
+                let mut value = request();
+                value.authorization.room_external_id = RoomExternalId::new("other-room").unwrap();
+                value
+            },
+        ] {
+            assert!(matches!(
+                actor.replace_authorization(invalid, now, pulsebeam_runtime::time::Instant::now()),
+                Err(ControllerError::AuthorizationRejected)
+            ));
+        }
         let mut wrong = request();
         wrong.expected_revision = 3;
         wrong.authorization.room_id =
@@ -3649,11 +6224,11 @@ mod replacement_tests {
             actor.replace_authorization(expired, now, pulsebeam_runtime::time::Instant::now()),
             Err(ControllerError::AuthorizationExpired)
         ));
-        let mut exhausted = current;
+        let mut exhausted = current.clone();
         exhausted.revision = u64::MAX;
         assert!(matches!(
             exhausted.replacing(
-                narrowed.expiry,
+                narrowed.clone(),
                 now,
                 pulsebeam_runtime::time::Instant::now()
             ),
@@ -3681,6 +6256,27 @@ mod replacement_tests {
                 .authorization,
             Some(current)
         );
+
+        let mut no_join = verified;
+        no_join.grants = full_grants("elsewhere");
+        no_join.expiry = AuthorizationExpiry::from_unix_seconds(unix_now + 180);
+        actor.finish_renewal(RenewalResult {
+            participant: participant_id,
+            connection_id: connection,
+            expected_revision: 3,
+            verified: Some(no_join),
+        });
+        assert!(
+            actor
+                .core
+                .registry
+                .get_participant(&participant_id)
+                .is_none()
+        );
+        assert!(matches!(
+            &actor.command_backlog.back().unwrap().1,
+            ShardCommand::AuthorizationResult { expiry: None, .. }
+        ));
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
@@ -3707,12 +6303,14 @@ mod replacement_tests {
         let connection = connection_id(1);
         let now = SystemTime::now();
         let unix_now = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let previous = AuthorizationLease::from_expiry(
-            AuthorizationExpiry::from_unix_seconds(unix_now + 60),
+        let previous = authorization_lease(
+            unix_now + 60,
             now,
             pulsebeam_runtime::time::Instant::now(),
-        )
-        .unwrap();
+            "renewal-room",
+            room_id,
+            participant,
+        );
         let transport = actor
             .core
             .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
@@ -3732,7 +6330,7 @@ mod replacement_tests {
             .unwrap();
         let token = pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
-            (room).as_str(),
+            &full_grants((room).as_str()),
             (external).as_str(),
             unix_now + 120,
         )
@@ -3769,6 +6367,7 @@ mod replacement_tests {
                 .get_participant(&participant)
                 .unwrap()
                 .authorization
+                .as_ref()
                 .unwrap()
                 .expiry()
                 .unix_seconds(),
@@ -3792,7 +6391,14 @@ mod replacement_tests {
         let runtime_now = pulsebeam_runtime::time::Instant::now();
         let old_id = connection_id(1);
         let current_id = connection_id(2);
-        let old_lease = authorization_lease(10, UNIX_EPOCH, runtime_now);
+        let old_lease = authorization_lease(
+            10,
+            UNIX_EPOCH,
+            runtime_now,
+            "expiry-fence",
+            room_id,
+            participant_id,
+        );
         let old_transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
         actor
             .commit_reserved_candidate(
@@ -3809,7 +6415,14 @@ mod replacement_tests {
             )
             .unwrap();
         let old_work = *actor.authorization_expiries.first().unwrap();
-        let current_lease = authorization_lease(20, UNIX_EPOCH, runtime_now);
+        let current_lease = authorization_lease(
+            20,
+            UNIX_EPOCH,
+            runtime_now,
+            "expiry-fence",
+            room_id,
+            participant_id,
+        );
         let current_transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
         let previous = actor
             .commit_reserved_candidate(
@@ -3826,7 +6439,12 @@ mod replacement_tests {
             )
             .unwrap()
             .unwrap();
-        actor.terminate_incarnation(participant_id, previous, false);
+        actor.terminate_incarnation(
+            participant_id,
+            previous,
+            false,
+            Some(CloseReason::ParticipantReplaced),
+        );
 
         actor.authorization_expiries.insert(old_work);
         actor.expire_authorizations(
@@ -3855,7 +6473,14 @@ mod replacement_tests {
 
         for sequence in 1..=100 {
             let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
-            let lease = authorization_lease(i64::MAX.unsigned_abs(), UNIX_EPOCH, runtime_now);
+            let lease = authorization_lease(
+                i64::MAX.unsigned_abs(),
+                UNIX_EPOCH,
+                runtime_now,
+                "bounded-expiry",
+                room_id,
+                participant_id,
+            );
             let previous = actor
                 .commit_reserved_candidate(
                     participant_id,
@@ -3871,7 +6496,12 @@ mod replacement_tests {
                 )
                 .unwrap();
             if let Some(previous) = previous {
-                actor.terminate_incarnation(participant_id, previous, false);
+                actor.terminate_incarnation(
+                    participant_id,
+                    previous,
+                    false,
+                    Some(CloseReason::ParticipantReplaced),
+                );
             }
         }
 
@@ -3881,11 +6511,51 @@ mod replacement_tests {
             .get_participant(&participant_id)
             .unwrap();
         assert_eq!(current.connection_id, connection_id(100));
-        let current_lease = current.authorization.unwrap();
+        let current_lease = current.authorization.clone().unwrap();
         assert_eq!(current_lease.native_expiry(), Ok(i64::MAX));
         assert_eq!(actor.authorization_expiries.len(), 1);
 
-        let unrepresentable = authorization_lease(u64::MAX, UNIX_EPOCH, runtime_now);
+        let alice = crate::entity::ParticipantExternalId::new("alice").unwrap();
+        for (room, participant, external) in [
+            (
+                RoomId::from_external(&RoomExternalId::new("other-room").unwrap()),
+                participant_id,
+                alice.clone(),
+            ),
+            (room_id, ParticipantId::new(), alice),
+            (
+                room_id,
+                participant_id,
+                crate::entity::ParticipantExternalId::new("mallory").unwrap(),
+            ),
+        ] {
+            assert!(matches!(
+                actor.begin_create_participant(
+                    ParticipantState {
+                        manual_sub: true,
+                        room_id: room,
+                        participant_id: participant,
+                        participant_external_id: external,
+                        connection_id: connection_id(101),
+                        old_connection_id: None,
+                        authorization: Some(current_lease.clone()),
+                        profile: SignalingProtocol::State,
+                        rtp_capabilities: Some(crate::control::rtp::capabilities()),
+                    },
+                    String::new(),
+                ),
+                Err(ControllerError::AuthorizationRejected)
+            ));
+        }
+
+        let unrepresentable = authorization_lease(
+            u64::MAX,
+            UNIX_EPOCH,
+            runtime_now,
+            "bounded-expiry",
+            room_id,
+            participant_id,
+        );
         assert_eq!(unrepresentable.expiry().unix_seconds(), u64::MAX);
         assert!(matches!(
             unrepresentable.native_expiry(),
@@ -3901,7 +6571,7 @@ mod replacement_tests {
                     participant_external_id: participant_external_id.clone(),
                     connection_id: connection_id(101),
                     old_connection_id: None,
-                    authorization: Some(unrepresentable),
+                    authorization: Some(unrepresentable.clone()),
                     profile: SignalingProtocol::State,
                     rtp_capabilities: Some(crate::control::rtp::capabilities()),
                 },
@@ -3977,6 +6647,7 @@ mod replacement_tests {
             transport,
             room_id,
             answer: "native-answer".to_owned(),
+            owned: None,
         };
         let pending_transport = actor
             .core
@@ -4000,6 +6671,7 @@ mod replacement_tests {
             ack: receiver,
             ready: None,
             superseded: false,
+            cutoffs: MaterializationCutoffs::new(),
             started: pulsebeam_runtime::time::Instant::now(),
         });
         assert_eq!(

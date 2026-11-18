@@ -109,6 +109,11 @@ impl<T> Sender<T> {
         }
     }
 
+    pub fn is_closed(&self) -> bool {
+        let shared = self.shared.lock();
+        shared.closed || !shared.receiver_present
+    }
+
     pub fn sender_count(&self) -> usize {
         self.shared.lock().sender_count
     }

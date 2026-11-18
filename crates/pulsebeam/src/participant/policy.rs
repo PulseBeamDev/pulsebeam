@@ -2,6 +2,24 @@ use crate::media::{Mid, Pt, Rid, Ssrc};
 use crate::rtp::MediaTime;
 use pulsebeam_rtc::{CompiledRtpBinding, MediaKind};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TopicPublications {
+    #[default]
+    Denied,
+    All,
+    Labels(Vec<String>),
+}
+
+impl TopicPublications {
+    pub(crate) fn allows(&self, label: &str) -> bool {
+        match self {
+            Self::Denied => false,
+            Self::All => true,
+            Self::Labels(labels) => labels.iter().any(|allowed| allowed == label),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VideoPolicy {
     pub height_ceiling: Option<u32>,

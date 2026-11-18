@@ -35,7 +35,7 @@ const development = JSON.parse(readFileSync(developmentFixture));
 assert.equal(INSECURE_DEV_API_KEY, development.apiKey);
 const devToken = signParticipantToken({
   apiKey: INSECURE_DEV_API_KEY,
-  room: "local",
+  grants: [{ rooms: ["local"], allow: ["join"] }],
   participant: "test",
   expiration: 2000000000,
 });
@@ -65,13 +65,15 @@ const fixtureApiKey =
   "p_0067MYZ1001R010000000000064.kid_0067MYZ1005R030010000000068.MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7";
 const adapt = (i) => ({
   apiKey: fixtureApiKey,
-  room: i.room,
+  grants: i.grants,
   participant: i.participant,
   expiration: BigInt(i.expiration),
 });
 for (const v of document.valid) {
   const token = signParticipantToken(adapt(v.input));
   assert.equal(token, v.token, v.name);
+  if (v.name === "encoded-token-limit")
+    assert.equal(Buffer.byteLength(token), 8192);
   const [header, claims, signature] = token.split(".");
   assert.equal(Buffer.from(header, "base64url").toString(), v.header);
   assert.equal(Buffer.from(claims, "base64url").toString(), v.claims);
@@ -88,8 +90,7 @@ for (const v of document.valid) {
   }
 }
 for (const v of document.invalid) {
-  // Only expiration must be validated locally; the SFU validates IDs.
-  if (v.field !== "expiration") continue;
+  if (!["expiration", "participant", "grants"].includes(v.field)) continue;
   const input = adapt(document.base);
   if (v.value === null) delete input[v.field];
   else if (v.representation === "number") {
@@ -114,7 +115,7 @@ arbitraryKey[0] = "unrecognized-issuer";
 arbitraryKey[1] = "unrecognized-kid";
 const opaqueToken = signParticipantToken({
   apiKey: arbitraryKey.join("."),
-  room: "room with spaces",
+  grants: [{ rooms: ["room with spaces"], allow: ["join"] }],
   participant: "participant/with/slashes",
   expiration: 2000,
 });
@@ -126,7 +127,8 @@ const opaqueClaims = JSON.parse(
 );
 assert.equal(opaqueHeader.kid, arbitraryKey[1]);
 assert.equal(opaqueClaims.iss, arbitraryKey[0]);
-assert.equal(opaqueClaims.room, "room with spaces");
+assert.equal(opaqueClaims.grants[0].rooms[0], "room with spaces");
+assert(!Object.hasOwn(opaqueClaims, "room"));
 assert.equal(opaqueClaims.sub, "participant/with/slashes");
 
 // Resolve declarations through the installed package's public export map.
@@ -134,13 +136,13 @@ writeFileSync(
   join(directory, "consumer.ts"),
   `import { signParticipantToken, INSECURE_DEV_API_KEY } from "@pulsebeam/server";
 const compactKey: string = INSECURE_DEV_API_KEY;
-const input = {apiKey:compactKey, room:"r", participant:"p", expiration:18446744073709551615n};
+const input = {apiKey:compactKey, grants:[{rooms:["r"],allow:["join"] as const}], participant:"p", expiration:18446744073709551615n};
 const token: string = signParticipantToken(input);
 signParticipantToken({...input, expiration: 2000});
 // @ts-expect-error cannot use legacy credential fields
 signParticipantToken({projectId:"p", keyId:"k", secret:"s", room:"r", participant:"p", expiration:2000});
 // @ts-expect-error expiration is mandatory
-signParticipantToken({apiKey:compactKey, room:"r", participant:"p"});
+signParticipantToken({apiKey:compactKey, grants:[], participant:"p"});
 // @ts-expect-error strings are not integer representations in the public API
 signParticipantToken({...input, expiration:"2000"});
 // @ts-expect-error booleans are not integer representations
@@ -176,7 +178,7 @@ for (const invalid of [
     () =>
       signParticipantToken({
         apiKey: invalid,
-        room: "local",
+        grants: [{ rooms: ["local"], allow: ["join"] }],
         participant: "test",
         expiration: 2000,
       }),

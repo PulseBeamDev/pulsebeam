@@ -12,8 +12,8 @@ TRANSFORMS = {
                       "for remote in &plan.remote {\n        let delivery = MediaDelivery {",
                       "for remote in plan.remote.iter().take(1) {\n        let delivery = MediaDelivery {"),
     "materialization": ("src/control/controller.rs",
-                        "let result = if materialized {\n            let transport = pending.transport;",
-                        "let result = if materialized || pending.command.is_none() {\n            let transport = pending.transport;"),
+                        "let result = if materialized {\n            if superseded {",
+                        "let result = if materialized || pending.command.is_none() {\n            if superseded {"),
 }
 
 

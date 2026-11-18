@@ -311,10 +311,43 @@ pub struct TopicState {
     pub channel_failures: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CredentialStatus {
+    Accepted,
+    Rejected,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CredentialOutcome {
+    pub revision: u64,
+    pub status: CredentialStatus,
+    pub error: Option<Failure>,
+}
+
+impl From<&model::CredentialOutcome> for CredentialOutcome {
+    fn from(value: &model::CredentialOutcome) -> Self {
+        Self {
+            revision: value.revision,
+            status: match value.status {
+                model::CredentialStatus::Accepted => CredentialStatus::Accepted,
+                model::CredentialStatus::Rejected => CredentialStatus::Rejected,
+                model::CredentialStatus::Uncertain => CredentialStatus::Uncertain,
+            },
+            error: value.error.clone().map(Into::into),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Snapshot {
     pub version: u64,
     pub desired_revision: u64,
+    pub join_revision: u64,
+    pub credential_revision: u64,
+    pub accepted_credential_revision: Option<u64>,
+    pub credential_outcome: Option<CredentialOutcome>,
+    pub desired_room: Option<String>,
     pub connection: ConnectionState,
     pub generation: Option<u64>,
     pub participant_id: Option<String>,
@@ -972,6 +1005,11 @@ impl From<&model::Snapshot> for Snapshot {
         Self {
             version: value.version,
             desired_revision: value.desired_revision,
+            join_revision: value.join_revision,
+            credential_revision: value.credential_revision,
+            accepted_credential_revision: value.accepted_credential_revision,
+            credential_outcome: value.credential_outcome.as_ref().map(Into::into),
+            desired_room: value.desired_room.clone(),
             connection: value.connection.clone().into(),
             generation: value.generation.map(model::Generation::get),
             participant_id: value.participant_external_id.clone(),
@@ -1149,6 +1187,8 @@ impl From<model::AgentError> for AgentError {
             model::AgentError::RenewalBusy => ErrorCode::RenewalBusy,
             model::AgentError::InvalidTopic(_) => ErrorCode::InvalidTopic,
             model::AgentError::RenewalNotReady
+            | model::AgentError::Replaced
+            | model::AgentError::CredentialRevisionExhausted
             | model::AgentError::InvalidOffer(_)
             | model::AgentError::InvalidSignaling(_) => ErrorCode::Runtime,
         };
@@ -1262,6 +1302,18 @@ mod tests {
             participant_id: Some("canonical-self".to_string()),
             participant_external_id: Some("local-user".to_string()),
             room_external_id: Some("room".to_string()),
+            desired_room: Some("会议/next".to_string()),
+            join_revision: u64::MAX - 3,
+            credential_revision: u64::MAX - 2,
+            accepted_credential_revision: Some(u64::MAX - 4),
+            credential_outcome: Some(model::CredentialOutcome {
+                revision: u64::MAX - 3,
+                status: model::CredentialStatus::Uncertain,
+                error: Some(model::Failure {
+                    class: model::FailureClass::Transient,
+                    message: "uncertain".into(),
+                }),
+            }),
             ..model::Snapshot::default()
         };
         for suffix in ["z", "a"] {
@@ -1288,6 +1340,30 @@ mod tests {
         let projected = Snapshot::from(&snapshot);
         assert_eq!(projected.participant_id.as_deref(), Some("local-user"));
         assert_eq!(projected.room_id.as_deref(), Some("room"));
+        snapshot.desired_room = Some("later".into());
+        assert_eq!(projected.desired_room.as_deref(), Some("会议/next"));
+        assert_eq!(projected.join_revision, u64::MAX - 3);
+        assert_eq!(projected.credential_revision, u64::MAX - 2);
+        assert_eq!(projected.accepted_credential_revision, Some(u64::MAX - 4));
+        let outcome = projected.credential_outcome.as_ref().unwrap();
+        assert_eq!(outcome.revision, u64::MAX - 3);
+        assert_eq!(outcome.status, CredentialStatus::Uncertain);
+        assert_eq!(
+            outcome.error.as_ref().unwrap().class,
+            FailureClass::Transient
+        );
+        assert_ffi_round_trip(projected.clone());
+        for status in [
+            CredentialStatus::Accepted,
+            CredentialStatus::Rejected,
+            CredentialStatus::Uncertain,
+        ] {
+            assert_ffi_round_trip(CredentialOutcome {
+                revision: u64::MAX - 3,
+                status,
+                error: None,
+            });
+        }
         assert_eq!(
             projected
                 .catalog
@@ -1510,6 +1586,15 @@ mod tests {
         assert_ffi_round_trip(Snapshot {
             version: 12,
             desired_revision: 7,
+            join_revision: u64::MAX - 3,
+            credential_revision: u64::MAX - 2,
+            accepted_credential_revision: Some(u64::MAX - 4),
+            credential_outcome: Some(CredentialOutcome {
+                revision: u64::MAX - 3,
+                status: CredentialStatus::Rejected,
+                error: Some(failure.clone()),
+            }),
+            desired_room: Some("会议/next".into()),
             connection: ConnectionState::RetryWaiting {
                 attempt: 2,
                 after_ms: 500,

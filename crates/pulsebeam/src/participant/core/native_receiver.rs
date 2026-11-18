@@ -857,6 +857,17 @@ impl Connection {
         events.set_owned_subscription(reference, source, demand);
     }
 
+    pub(super) fn quiesce_native_receivers(&mut self) {
+        for receiver in std::mem::take(&mut self.native_receivers)
+            .receivers
+            .into_values()
+        {
+            if !receiver.retiring {
+                self.close_native_receiver_transport(&receiver);
+            }
+        }
+    }
+
     fn close_native_receiver_transport(&mut self, receiver: &Receiver) {
         match &receiver.transport {
             ReceiveTransport::Sctp { .. } => {

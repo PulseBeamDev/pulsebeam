@@ -336,9 +336,20 @@ export interface MappingSnapshot {
   readonly audio: readonly TrackMapping[];
 }
 
+export interface CredentialOutcome {
+  readonly revision: bigint;
+  readonly status: "accepted" | "rejected" | "uncertain";
+  readonly error: AgentError | null;
+}
+
 export interface AgentSnapshot {
   readonly version: number;
   readonly desiredRevision: number;
+  readonly joinRevision: bigint;
+  readonly credentialRevision: bigint;
+  readonly acceptedCredentialRevision: bigint | null;
+  readonly credentialOutcome: CredentialOutcome | null;
+  readonly desiredRoom: string | null;
   readonly connection: ConnectionState;
   readonly generation: number | null;
   readonly participantId: string | null;
@@ -453,6 +464,9 @@ export interface Agent {
   data<D extends Delivery>(label: string, delivery: D): LocalDataTrack<D>;
   participant(id: string): RemoteParticipant;
   selectAudio(policy: AudioDemand): Promise<AudioSelection>;
+  /** Synchronously replace the desired room; Core owns admission and recovery. */
+  join(room: string): void;
+  renew(token: string): void;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   renewAuthorization(token: string): Promise<void>;

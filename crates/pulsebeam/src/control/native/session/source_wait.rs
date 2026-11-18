@@ -10,7 +10,7 @@ pub(super) struct SourceWait {
 }
 
 impl NativeSession {
-    pub(super) fn source_wait_changed(&mut self) {
+    pub(in crate::control) fn source_wait_changed(&mut self) {
         if self.source_waits.is_empty() {
             return;
         }
@@ -93,7 +93,7 @@ impl NativeSession {
             };
             self.source_cursor = Some(reference);
             let stale = self.preparation_spec(&wait.work).is_none();
-            if stale || (available(wait.source) && self.source(&wait.source.as_str()).is_some()) {
+            if stale || available(wait.source) {
                 self.remove_source_wait(reference);
                 self.observe_deferral(super::super::ExecutionDeferral {
                     work: wait.work,

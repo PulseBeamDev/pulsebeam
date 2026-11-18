@@ -20,6 +20,16 @@ async def witness():
     ))
     try:
         revision = agent.snapshot().desired_revision
+        assert agent.snapshot().join_revision == 0
+        assert isinstance(agent.snapshot().join_revision, int)
+        assert agent.snapshot().desired_room is None
+        assert agent.snapshot().credential_revision == 0
+        assert isinstance(agent.snapshot().credential_revision, int)
+        assert agent.snapshot().accepted_credential_revision is None
+        assert agent.snapshot().credential_outcome is None
+        assert agent.renew("renewed-token") is None
+        assert agent.snapshot().credential_revision == 1
+        assert agent.snapshot().desired_room is None
         local = agent.data("control", core.TopicMode.ORDERED)
         participant = agent.participant("remote")
         remote = participant.data("control", core.TopicMode.ORDERED)
@@ -149,7 +159,7 @@ async def witness():
         assert (await pending_room).is_CLOSED()
         assert (await pending_participant).is_CLOSED()
         try:
-            await agent.connect()
+            agent.join("room")
         except native.NativeError.Closed:
             pass
         else:
