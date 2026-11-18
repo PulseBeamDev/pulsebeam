@@ -28,9 +28,9 @@ The commands print the generated Agent class, confirming that the package and na
 
 ## Configure and connect
 
-Rust callers supply a core `AgentConfig`, optional native `MediaConfig`, and an HTTP `Host`, then call `Agent::spawn`. This selects `ThreadedRuntime` with normal native sockets. Construction validates configuration without connecting. Call `connect` to establish connection intent; use owned publications and subscriptions for media. Core remains the owner of topology, authorization, topics and recovery policy.
+Rust callers supply a core `AgentConfig`, optional native `MediaConfig`, and an HTTP `Host`, then call `Agent::spawn`. This selects `ThreadedRuntime` with normal native sockets. Construction validates configuration without connecting. Call `agent.join("conference-42".into())?` to select a room and request admission. The participant token must grant Join for that room. Use owned publications and subscriptions for media. Core remains the owner of topology, authorization, topics and recovery policy.
 
-Generated APIs construct synchronously with `new Agent(AgentConfig)` in Node and `Agent(config)` in Python. The returned Agent already exposes its real Core state, starts idle with no room intent, and performs no join, request, device acquisition or RTC setup before an explicit operation. Native-only encoder/input choices use the distinct synchronous `Agent.createWithMedia(NativeAgentConfig)` constructor in Node and `Agent.create_with_media(config)` in Python. Native configuration contains `session` and `media`, not application-owned UDP/TCP sockets. The generated interface exposes owned logical resources, not raw desired-state replacement or publication-bound submission ports. Controlled Rust hosts can still execute explicit low-level transport fixtures.
+Generated APIs construct synchronously with `new Agent(AgentConfig)` in Node and `Agent(config)` in Python. The returned Agent already exposes its real Core state, starts idle with no room intent, and performs no join, request, device acquisition or RTC setup before an explicit operation. Call `agent.join("conference-42")` in Node or Python to request admission. The call returns without waiting for admission or media readiness. Native-only encoder/input choices use the distinct synchronous `Agent.createWithMedia(NativeAgentConfig)` constructor in Node and `Agent.create_with_media(config)` in Python. Native configuration contains `session` and `media`, not application-owned UDP/TCP sockets. The generated interface exposes owned logical resources, not raw desired-state replacement or publication-bound submission ports. Controlled Rust hosts can still execute explicit low-level transport fixtures.
 
 Factory input choices are independent for audio and video:
 
@@ -95,7 +95,7 @@ let camera = agent.create_video_input(Default::default()).await?;
 let publication = agent.video("camera".into())?
     .publish(PublicationConfig { enabled: true })?;
 publication.set_source(Some(&camera)).await?;
-agent.connect().await?;
+agent.join("conference-42".into())?;
 publication.ready().await?;
 // Capture owned I420 frames and submit them through camera.submit(frame).await.
 publication.configure(PublicationConfig { enabled: false }).await?;
@@ -193,9 +193,9 @@ observations. Do not mix owned subscriptions with raw desired state for the
 same media kind.
 
 For explicit collection audio reception, retain `Agent::select_audio` with the
-shared Core `AudioSubscription` policy. Set `automatic: true` to receive all
-remote audio; use its pinned IDs, named selections and delay maps for narrower
-policies. `Subscription::configure_audio_policy` replaces that owner's policy.
+shared Core `AudioSubscription` policy. Set explicit pinned IDs or named
+selections and their delay maps. Use a bounded room watch when the application
+needs to discover sources. `Subscription::configure_audio_policy` replaces that owner's policy.
 It can coexist with named adaptive subscriptions through the same Core receive
 reconciler. Non-adaptive policy delays require exclusive audio ownership.
 Reception still requires actual negotiated receiver facts.

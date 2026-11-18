@@ -144,7 +144,6 @@ export function copyState(state: AgentState): AgentState {
           Object.freeze({ ...selector }),
         ),
       ),
-      automatic: state.audio?.automatic ?? false,
       playoutDelays: Object.freeze(
         (state.audio?.playoutDelays ?? []).map((entry) =>
           Object.freeze({

@@ -2,29 +2,6 @@ use super::*;
 use crate::entity::ParticipantExternalId;
 
 impl NativeSession {
-    pub(crate) fn apply_participants(
-        &mut self,
-        added: impl IntoIterator<Item = crate::participant::effect::RoomPeer>,
-        removed: impl IntoIterator<Item = crate::entity::ParticipantId>,
-    ) -> Result<(), OutputError> {
-        for peer in added {
-            match peer.external_id {
-                Some(external) => self.observe_participant(wire::Participant {
-                    participant_id: peer.id.as_str(),
-                    participant_external_id: external.as_str().to_owned(),
-                })?,
-                None if self.permissions.can_discover_participant(None) => {
-                    self.unavailable(Key::Participant(peer.id.as_str()))?;
-                }
-                None => self.remove_participant(peer.id.as_str())?,
-            }
-        }
-        for id in removed {
-            self.remove_participant(id.as_str())?;
-        }
-        Ok(())
-    }
-
     pub(super) fn unavailable(&mut self, key: Key) -> Result<(), OutputError> {
         self.put(key.clone(), absence(0, wire::AbsenceReason::Gone, None))?;
         if let Some(row) = self.rows.get_mut(&key)

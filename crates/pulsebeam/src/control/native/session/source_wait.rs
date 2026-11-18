@@ -11,6 +11,14 @@ pub(super) struct SourceWait {
 }
 
 impl NativeSession {
+    pub(in crate::control) fn notify_waiting_source(&mut self, source: TrackId) -> bool {
+        if !self.source_waits.values().any(|wait| wait.source == source) {
+            return false;
+        }
+        self.source_wait_changed();
+        true
+    }
+
     pub(in crate::control) fn source_wait_changed(&mut self) {
         if self.source_waits.is_empty() {
             return;

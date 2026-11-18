@@ -357,6 +357,61 @@ fn bounded_batches_emit_current_targets_for_mixed_resources() {
 }
 
 #[test]
+fn owned_lookup_waits_for_authorization_not_roster_completion() {
+    let mut client = NativeState::new(1024 * 1024, participant()).unwrap();
+    let resource = Resource::SourceLookup {
+        room: "source-room".into(),
+        participant_external_id: "alice".into(),
+        kind: wire::TrackKind::Data,
+        label: "updates".into(),
+    };
+    let spec = wire::ResourceSpec {
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+        declaration: Some(wire::resource_spec::Declaration::SourceLookup(
+            wire::SourceLookupSpec {
+                source: Some(wire::LogicalSourceAddress {
+                    room: "source-room".into(),
+                    participant_external_id: "alice".into(),
+                    kind: wire::TrackKind::Data as i32,
+                    label: "updates".into(),
+                }),
+            },
+        )),
+    };
+    client.stage(resource.clone(), Some(spec.clone())).unwrap();
+    let reference = next(&mut client)[0].0;
+    let lookup = wire::SourceLookupState {
+        spec: Some(spec),
+        participant: None,
+        track: None,
+    };
+    client
+        .apply(&frame(
+            alloc::vec![record(
+                reference,
+                wire::ConfirmedState {
+                    evaluated_revision: 1,
+                    rejection: None,
+                    value: Some(wire::confirmed_state::Value::SourceLookup(Box::new(
+                        lookup.clone(),
+                    ))),
+                },
+            )],
+            false,
+        ))
+        .unwrap();
+    assert!(client.lookup(&resource).is_none());
+    client
+        .apply(&frame(alloc::vec![session(1, 2_000_000_000, None)], false))
+        .unwrap();
+    assert!(!client.initial_complete());
+    assert_eq!(client.lookup(&resource), Some(&lookup));
+}
+
+#[test]
 fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_acceptance() {
     let mut client = NativeState::new(1024 * 1024, participant()).unwrap();
     client.stage(resource(), Some(spec(true, 1))).unwrap();

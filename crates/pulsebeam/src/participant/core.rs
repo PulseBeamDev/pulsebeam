@@ -296,7 +296,6 @@ impl Connection {
 
     pub fn apply(&mut self, effect: ParticipantEffect, track_handle: Option<TrackHandle>) {
         match effect {
-            ParticipantEffect::ParticipantsChanged { .. } => {}
             ParticipantEffect::TrackCandidateAdded { track } => {
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");

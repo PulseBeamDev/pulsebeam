@@ -177,10 +177,18 @@ assert.equal(
   true,
   "a token never selects a room",
 );
-await input(
-  document.querySelector<HTMLInputElement>('input[name="room"]')!,
-  "selected-room",
+const roomField =
+  document.querySelector<HTMLInputElement>('input[name="room"]')!;
+await input(roomField, "é".repeat(129));
+assert.equal(button("Join room").disabled, true);
+assert.match(host.textContent!, /256 UTF-8 bytes/);
+await flush(() =>
+  roomField.form!.dispatchEvent(
+    new Event("submit", { bubbles: true, cancelable: true }),
+  ),
 );
+assert.equal(runtimes.length, 0, "invalid room never starts an Agent");
+await input(roomField, "selected-room");
 assert.equal(button("Join room").disabled, false);
 await click("Mute microphone");
 await click("Turn camera off");

@@ -36,7 +36,7 @@
       video: [],
       audio: [{ receiverIndex: 0, publicationId: "A" }],
     },
-    tracks: { A: { media: track, kind: "audio" } },
+    tracks: { A: track },
   };
   snapshot.catalog.tracks = snapshot.catalog.publications;
   const agent = { getSnapshot: () => snapshot, subscribe: () => () => {} };

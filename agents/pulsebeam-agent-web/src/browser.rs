@@ -137,8 +137,6 @@ struct AudioDemandConfig {
     #[serde(default)]
     selected: Vec<TrackSelectorConfig>,
     #[serde(default)]
-    automatic: bool,
-    #[serde(default)]
     playout_delays: Vec<AudioTrackDelayConfig>,
     #[serde(default)]
     selector_delays: Vec<SelectorDelayConfig>,
@@ -324,7 +322,6 @@ impl From<AudioDemandConfig> for AudioSubscription {
         Self {
             pinned: value.pinned,
             selected: value.selected.into_iter().map(Into::into).collect(),
-            automatic: value.automatic,
             playout_delays: value
                 .playout_delays
                 .into_iter()

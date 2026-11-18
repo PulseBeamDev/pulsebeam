@@ -71,7 +71,7 @@ Video({
   ),
   onPlaybackError: (failure: PlaybackError) => void failure.retry(),
 });
-SelectAudio({ agent, policy: { automatic: true } });
+SelectAudio({ agent, policy: { pinned: ["voice"] } });
 Audio({ source: useSubscribe(remote.audio("microphone")) });
 // @ts-expect-error Logical refs cannot implicitly create a receive owner.
 Video({ source: remote.video("camera") });

@@ -67,7 +67,7 @@ export async function audioOwnershipContract(runtime) {
     connection: "connected",
     catalog: { participants: [], publications: [], tracks: [] },
     mapping: { audio: [{ receiverIndex: 0, publicationId: "voice" }] },
-    tracks: { voice: { media: borrowed } },
+    tracks: { voice: borrowed },
   };
   const agent = { getSnapshot: () => snapshot, subscribe: () => () => {} };
   const owners = new ResourceOwners(() => {});

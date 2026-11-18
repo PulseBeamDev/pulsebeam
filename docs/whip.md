@@ -27,7 +27,7 @@ With a WHIP-compatible client, configure:
 
 | Setting | Value |
 | --- | --- |
-| Endpoint | `http://localhost:7070/api/v1/whip` locally, or your server's HTTPS base URL plus `/api/v1/whip` |
+| Endpoint | `http://localhost:7070/api/v1/whip?room=demo` locally, or your server's HTTPS base URL plus `/api/v1/whip?room=demo` |
 | Authorization | `Bearer <participant-token>` |
 | Sources | Camera and microphone |
 
@@ -35,10 +35,14 @@ For a browser publisher, open the page over HTTPS or localhost, then start
 capture from a user gesture. Give the client the endpoint and participant token,
 and allow camera/microphone access.
 
+Set `room` to the percent-encoded application room name. For example, `studio A`
+becomes `?room=studio%20A`. The participant token must grant Join and Publish
+for the room; it does not select the room.
+
 The publishing flow is:
 
 1. Create a WebRTC offer with the media to send.
-2. POST the SDP offer to `/api/v1/whip` with `Content-Type: application/sdp`
+2. POST the SDP offer to `/api/v1/whip?room=demo` with `Content-Type: application/sdp`
    and the `Authorization: Bearer <participant-token>` header.
 3. Apply the SDP answer from the response to the peer connection.
 4. Retain the response's resource URL for teardown.

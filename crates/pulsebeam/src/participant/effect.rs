@@ -1,10 +1,3 @@
-use crate::entity::{ParticipantExternalId, ParticipantId};
-
-#[derive(Debug, Clone)]
-pub struct RoomPeer {
-    pub id: ParticipantId,
-    pub external_id: Option<ParticipantExternalId>,
-}
 use crate::track::Track;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,10 +8,6 @@ pub enum TrackRemoval {
 
 #[derive(Debug, Clone)]
 pub enum ParticipantEffect {
-    ParticipantsChanged {
-        added: Vec<RoomPeer>,
-        removed: Vec<ParticipantId>,
-    },
     TrackCandidateAdded {
         track: Track,
     },
@@ -43,7 +32,6 @@ pub enum ParticipantEffect {
 impl ParticipantEffect {
     pub(crate) fn track_id(&self) -> Option<crate::entity::TrackId> {
         match self {
-            Self::ParticipantsChanged { .. } => None,
             Self::TrackCandidateAdded { track } => Some(track.id()),
             Self::TrackCandidateRemoved { track_id, .. }
             | Self::TrackSubscribed { track_id }

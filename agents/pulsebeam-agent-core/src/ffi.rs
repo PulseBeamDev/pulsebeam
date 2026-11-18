@@ -115,7 +115,6 @@ pub struct AudioSubscriptionConfig {
 pub struct AudioDemand {
     pub pinned: Vec<String>,
     pub selected: Vec<TrackSelector>,
-    pub automatic: bool,
     pub playout_delays: Vec<AudioTrackDelay>,
     pub selector_delays: Vec<SelectorDelay>,
 }
@@ -926,7 +925,6 @@ impl From<AudioDemand> for model::AudioSubscription {
         Self {
             pinned: value.pinned,
             selected: value.selected.into_iter().map(Into::into).collect(),
-            automatic: value.automatic,
             playout_delays: value
                 .playout_delays
                 .into_iter()
@@ -946,7 +944,6 @@ impl From<model::AudioSubscription> for AudioDemand {
         Self {
             pinned: value.pinned,
             selected: value.selected.into_iter().map(Into::into).collect(),
-            automatic: value.automatic,
             playout_delays: value
                 .playout_delays
                 .into_iter()
@@ -1647,7 +1644,6 @@ mod tests {
         assert_ffi_round_trip(AudioDemand {
             pinned: vec!["participant/audio".to_string()],
             selected: vec![selector.clone()],
-            automatic: false,
             playout_delays: vec![AudioTrackDelay {
                 track_id: "participant/audio".to_string(),
                 playout_delay: PlayoutDelay::Fixed {

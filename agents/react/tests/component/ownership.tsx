@@ -224,7 +224,7 @@ export async function ownershipAdapters() {
         {state.selection && (
           <SelectAudio
             agent={equivalent}
-            policy={{ automatic: state.enabled }}
+            policy={{ pinned: state.enabled ? ["voice"] : [] }}
           />
         )}
         <Data
@@ -320,10 +320,10 @@ export async function ownershipAdapters() {
   assert.equal(runtime.claimedPublications.size, 1);
   assert.equal(runtime.audioSelections.size, 1);
   const selection = [...runtime.audioSelections.keys()][0]!;
-  assert.equal(runtime.audioSelections.get(selection).automatic, false);
+  assert.deepEqual(runtime.audioSelections.get(selection).pinned, []);
   await flush(() => update({ enabled: true }));
   assert.deepEqual([...runtime.audioSelections.keys()], [selection]);
-  assert.equal(runtime.audioSelections.get(selection).automatic, true);
+  assert.deepEqual(runtime.audioSelections.get(selection).pinned, ["voice"]);
   await flush(() => update({ selection: false }));
   assert.equal(runtime.audioSelections.size, 0);
   assert.equal(

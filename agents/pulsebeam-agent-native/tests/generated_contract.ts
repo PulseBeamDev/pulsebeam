@@ -281,7 +281,7 @@ if (!videoState.configuration.visible || videoState.configuration.height !== 0 |
   throw new Error("subscription defaults or current-first state were lost");
 }
 const audioSelection = await agent.selectAudio(AudioDemand.create({
-  pinned: [], selected: [], automatic: false, playoutDelays: [], selectorDelays: [],
+  pinned: [], selected: [], playoutDelays: [], selectorDelays: [],
 }));
 await audioSelection.close();
 if (audioSubscription.isClosed()) throw new Error("selection close retired named audio demand");

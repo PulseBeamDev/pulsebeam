@@ -590,25 +590,6 @@ pub(super) fn reconcile(
             );
         }
     }
-    if desired.audio.automatic {
-        for track in session
-            .state
-            .tracks()
-            .values()
-            .chain(session.state.owned().filter_map(|(resource, live)| {
-                (matches!(resource, Resource::Reception(MediaSlot::RemoteAudio(_)))
-                    && live.execution == state::ExecutionStatus::Installed as i32)
-                    .then_some(live.track.as_ref())
-                    .flatten()
-            }))
-            .filter(|track| {
-                kind(track) == state::TrackKind::Audio
-                    && track.participant_id != session.participant_id
-            })
-        {
-            audio.entry(track.track_id.clone()).or_default();
-        }
-    }
     let mut occupied = BTreeSet::new();
     let mut assigned = Vec::new();
     // Keep in-flight assignments stable before native and StateBatch confirmation.
@@ -925,21 +906,6 @@ fn media_needed(
                 || desired.audio.selected.iter().any(|selector| {
                     selected(session, selector, state::TrackKind::Audio) == Some(source.as_str())
                 })
-                || desired.audio.automatic
-                    && session
-                        .state
-                        .source(source)
-                        .or_else(|| {
-                            session
-                                .state
-                                .eligible(&want.resource)
-                                .and_then(|live| live.track.as_ref())
-                                .filter(|track| track.track_id == *source)
-                        })
-                        .is_some_and(|track| {
-                            kind(track) == state::TrackKind::Audio
-                                && track.participant_id != session.participant_id
-                        })
         }),
     }
 }

@@ -99,7 +99,7 @@ pub(super) async fn progress(
                     .cloned()
                     .collect::<BTreeSet<_>>();
                 ensure!(pinned.is_subset(&mapped), "audio preference not applied");
-                if !observed.submitted.audio.automatic {
+                if !observed.automatic_audio {
                     ensure!(
                         mapped == pinned,
                         "manual audio acquired an unrequested publication"
@@ -186,7 +186,7 @@ pub(super) async fn progress(
         audio_generation(handle)?
     ));
     let observed = observation(handle).context("audio completion observation")?;
-    witness.reach(if observed.submitted.audio.automatic {
+    witness.reach(if observed.automatic_audio {
         "audio-automatic-fresh-decode"
     } else {
         "audio-manual-fresh-decode"

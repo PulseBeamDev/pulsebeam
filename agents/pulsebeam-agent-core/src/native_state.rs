@@ -1064,8 +1064,7 @@ impl NativeState {
     }
 
     pub(crate) fn lookup(&self, resource: &Resource) -> Option<&wire::SourceLookupState> {
-        if self.terminal || !self.initial_complete || self.session.as_ref()?.authorization.is_none()
-        {
+        if self.terminal || self.session.as_ref()?.authorization.is_none() {
             return None;
         }
         let target = self.targets.get(resource)?;

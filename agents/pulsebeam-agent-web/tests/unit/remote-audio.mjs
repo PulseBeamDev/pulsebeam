@@ -116,7 +116,7 @@ test("audio route ownership, pull-read policy, automatic error reporting and rep
   let snapshot = {
     connection: "connected",
     mapping: { audio: [{ receiverIndex: 0, publicationId: "A" }] },
-    tracks: { A: { media: first } },
+    tracks: { A: first },
   };
   try {
     playback.update(snapshot);
@@ -147,7 +147,7 @@ test("audio route ownership, pull-read policy, automatic error reporting and rep
     snapshot = {
       ...snapshot,
       mapping: { audio: [{ receiverIndex: 0, publicationId: "B" }] },
-      tracks: { B: { media: first } },
+      tracks: { B: first },
     };
     playback.update(snapshot);
     playback.read("A", wave, false);
@@ -162,7 +162,7 @@ test("audio route ownership, pull-read policy, automatic error reporting and rep
     );
     assert.equal(decoders.length, 1);
     assert.equal(decoder.srcObject, decoderStream);
-    snapshot = { ...snapshot, tracks: { B: { media: second } } };
+    snapshot = { ...snapshot, tracks: { B: second } };
     playback.update(snapshot);
     assert.deepEqual(decoderStream.getAudioTracks(), [second]);
     assert.equal(context.sources.size, 1);

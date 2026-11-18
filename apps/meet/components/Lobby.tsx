@@ -22,6 +22,8 @@ export function Lobby({
 }) {
   const [token, setToken] = useState("");
   const [room, setRoom] = useState("");
+  const roomInvalid =
+    new TextEncoder().encode(room).length > 256 || /\p{Cc}/u.test(room);
   const [serverURL, setServerURL] = useState(defaultServerUrl);
   const { capture, devices } = useMeetMedia();
   const { video, audio, error, request } = capture;
@@ -82,7 +84,7 @@ export function Lobby({
             spacing={2}
             onSubmit={(event) => {
               event.preventDefault();
-              if (video && audio && endpoint && room)
+              if (video && audio && endpoint && room && !roomInvalid)
                 onJoin(token, endpoint, room);
             }}
           >
@@ -114,6 +116,11 @@ export function Lobby({
               fullWidth
               required
               value={room}
+              error={roomInvalid}
+              helperText={
+                roomInvalid &&
+                "Use at most 256 UTF-8 bytes and no control characters."
+              }
               onChange={(event) => setRoom(event.target.value)}
               autoComplete="off"
             />
@@ -122,7 +129,7 @@ export function Lobby({
               size="large"
               variant="contained"
               fullWidth
-              disabled={!video || !audio || !endpoint || !room}
+              disabled={!video || !audio || !endpoint || !room || roomInvalid}
             >
               Join room
             </Button>

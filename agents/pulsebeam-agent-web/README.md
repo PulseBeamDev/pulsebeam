@@ -17,18 +17,19 @@ const agent = new Agent({
   endpoint: "https://media.example.com",
   token: "SHORT_LIVED_PARTICIPANT_TOKEN",
 });
-await agent.connect();
+agent.join("conference-42");
 ```
 
 Construction synchronously initializes the browser runtime and validates local
 configuration. It does not connect, select a room, or acquire media. Current Core
 state is available immediately through `agent.state()`, without an initialization
 Promise.
-`connect()` records connection intent; it is not a delivery or media-readiness
-acknowledgment. `disconnect()` clears that intent without closing the Agent or
+`join(room)` selects the room and records connection intent. Use a token with
+Join permission for that room. The call does not acknowledge admission or
+media readiness. `disconnect()` clears that intent without closing the Agent or
 its resources. The Agent retries transient failures while connection is desired.
-Replace the Agent when endpoint, room identity, participant identity, or topology
-changes. Use `await agent.renewAuthorization(token)` only for the same logical
+Call `join(otherRoom)` to change rooms when the token grants access.
+Replace the Agent to change endpoint or participant identity. Use `await agent.renewAuthorization(token)` only for the same logical
 session. `await agent.close()` is terminal and releases its resources.
 
 ## Look up handles without acquiring resources
@@ -157,7 +158,9 @@ The DOM attachment performs this observation management for you.
 ```ts
 import { attachRemoteAudio } from "@pulsebeam/web";
 
-const selection = await agent.selectAudio({ automatic: true });
+const selection = await agent.selectAudio({
+  selected: [{ room: "conference-42", participantId: "alice", label: "microphone" }],
+});
 const playback = attachRemoteAudio(agent, {
   onPlaybackError(failure) {
     // Call failure.retry() directly from the application's user-gesture handler.
@@ -169,9 +172,9 @@ await playback.ready;
 
 `showEnableAudioButton` is application UI in this example. Audio selection owns
 receive policy; playback owns the decoded output route and autoplay recovery.
-Attaching playback does not implicitly select remote audio. Configure explicit
-selection with `await selection.configure({ automatic: false, selected:
-[{ room: "conference-42", participantId: "alice", label: "microphone" }] })`.
+Attaching playback does not implicitly select remote audio. Use
+`selection.configure(policy)` to replace the selected sources. To choose sources
+from the room roster, open a bounded room watch first.
 
 Close `playback` and `selection` independently when their owners end. A custom
 audio consumer can instead use `participant.audio(label).subscribe(...)` and

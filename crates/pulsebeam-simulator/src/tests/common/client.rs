@@ -745,16 +745,10 @@ impl SimClientBuilder {
             revision: 1,
             connected: true,
             topics: self.initial_topics,
-            audio: AudioSubscription {
-                automatic: self.audio_slots > 0,
-                ..Default::default()
-            },
             ..DesiredState::default()
         };
-        let audio_policy = agent.select_audio(desired.audio.clone()).await?;
-        let mut declared = desired.clone();
-        declared.audio = AudioSubscription::default();
-        agent.replace_desired(declared).await?;
+        let audio_policy = agent.select_audio(AudioSubscription::default()).await?;
+        agent.replace_desired(desired.clone()).await?;
         agent.join(room.as_str().to_owned())?;
 
         let mut snapshots = agent.snapshots();
@@ -810,9 +804,14 @@ impl SimClientBuilder {
             desired,
             video_capacity: self.video_slots,
             audio_capacity: self.audio_slots,
+            automatic_audio: self.audio_slots > 0,
             auto_subscribe: !self.manual_subscriptions,
             requested_video: None,
             video_operation: 0,
+            catalog_watch: None,
+            catalog_revision: None,
+            catalog: BTreeMap::new(),
+            catalog_participants: BTreeMap::new(),
             discovered_tracks: HashSet::new(),
             remote_tracks: HashMap::new(),
             topic_events: Vec::new(),
@@ -3525,6 +3524,7 @@ pub struct ClientObservation {
     pub submitted: DesiredState,
     pub video_capacity: usize,
     pub audio_capacity: usize,
+    pub automatic_audio: bool,
 }
 
 impl ClientObservation {
@@ -3633,6 +3633,7 @@ pub struct ClientContext {
     desired: DesiredState,
     video_capacity: usize,
     audio_capacity: usize,
+    automatic_audio: bool,
     auto_subscribe: bool,
     requested_video: Option<Vec<RequestedVideo>>,
     video_operation: u64,
@@ -3642,6 +3643,10 @@ pub struct ClientContext {
     h264_publishers: Arc<Mutex<FixturePublishers>>,
     corrupt_video_payload: bool,
     keyframe_recovery: Arc<Mutex<KeyframeRecoveryProbe>>,
+    catalog_watch: Option<(String, pulsebeam_agent_native::Watch)>,
+    catalog_revision: Option<u64>,
+    catalog: BTreeMap<String, (CatalogPublication, String)>,
+    catalog_participants: BTreeMap<String, pulsebeam_agent_native::agent_core::Participant>,
     pub discovered_tracks: HashSet<String>,
     pub remote_tracks: HashMap<String, String>,
     pub topic_events: Vec<TopicNotification>,
@@ -3664,7 +3669,21 @@ pub struct ClientContext {
 
 impl ClientContext {
     pub fn observation(&self) -> ClientObservation {
-        let snapshot = self.agent.snapshot();
+        let mut snapshot = self.agent.snapshot();
+        // The scenario oracle compares its plan with the public watch, not implicit State rows.
+        let local = snapshot.participant_id.as_deref();
+        snapshot.participants = self
+            .catalog_participants
+            .iter()
+            .filter(|(id, _)| Some(id.as_str()) != local)
+            .map(|(id, peer)| (id.clone(), peer.clone()))
+            .collect();
+        snapshot.publications = self
+            .catalog
+            .iter()
+            .filter(|(_, (publication, _))| Some(publication.participant_id.as_str()) != local)
+            .map(|(id, (publication, _))| (id.clone(), publication.clone()))
+            .collect();
         let admission = self
             .current_admission
             .filter(|(generation, _)| {
@@ -3689,6 +3708,7 @@ impl ClientContext {
             video_operation: self.video_operation,
             video_capacity: self.video_capacity,
             audio_capacity: self.audio_capacity,
+            automatic_audio: self.automatic_audio,
         }
     }
 
@@ -3759,13 +3779,16 @@ impl ClientContext {
         self.drain_events()?;
         self.refresh_admission()?;
 
-        if !self.snapshots.has_changed()? {
+        let snapshot_changed = self.snapshots.has_changed()?;
+        let room = self.snapshots.borrow().room_external_id.clone();
+        let catalog_changed = self.refresh_catalog(room.as_deref())?;
+        if !snapshot_changed && !catalog_changed {
             return Ok(());
         }
         let snapshot = self.snapshots.borrow_and_update().clone();
         self.discovered_tracks.clear();
         self.media_kinds.clear();
-        for publication in snapshot.publications.values() {
+        for (publication, _) in self.catalog.values() {
             if snapshot.participant_id.as_deref() == Some(&publication.participant_id) {
                 continue;
             }
@@ -3784,15 +3807,71 @@ impl ClientContext {
             .video_mapping
             .values()
             .filter_map(|track_id| {
-                snapshot
-                    .publications
+                self.catalog
                     .get(track_id)
-                    .map(|publication| (publication.participant_id.clone(), track_id.clone()))
+                    .map(|(publication, _)| (publication.participant_id.clone(), track_id.clone()))
             })
             .collect();
         self.sync_video_desired(&snapshot).await?;
-        self.sync_audio_desired(&snapshot, self.desired.audio.clone())
+        self.sync_audio_desired(&snapshot, self.desired.audio.clone(), self.automatic_audio)
             .await
+    }
+
+    fn refresh_catalog(&mut self, room: Option<&str>) -> anyhow::Result<bool> {
+        use pulsebeam_agent_native::agent_core::ffi::CatalogPublicationKind;
+
+        let room_changed = self.catalog_watch.as_ref().map(|(room, _)| room.as_str()) != room;
+        if room_changed {
+            self.catalog_watch = None;
+            self.catalog_revision = None;
+            self.catalog.clear();
+            self.catalog_participants.clear();
+            if let Some(room) = room {
+                let watch = self
+                    .agent
+                    .room(room.to_owned())?
+                    .watch(Default::default())?;
+                self.catalog_watch = Some((room.to_owned(), watch));
+            }
+        }
+        let Some((_, watch)) = &self.catalog_watch else {
+            return Ok(room_changed);
+        };
+        let state = watch.state();
+        if self.catalog_revision == Some(state.observation_revision) {
+            return Ok(false);
+        }
+        self.catalog_revision = Some(state.observation_revision);
+        self.catalog.clear();
+        self.catalog_participants.clear();
+        if let Some(page) = state.page {
+            anyhow::ensure!(!page.has_more(), "simulation catalog exceeds one page");
+            for participant in page.participants() {
+                self.catalog_participants.insert(
+                    participant.id.clone(),
+                    pulsebeam_agent_native::agent_core::Participant {
+                        id: participant.id.clone(),
+                        external_id: participant.external_id.clone(),
+                    },
+                );
+                for entry in participant.publications {
+                    let kind = match entry.kind {
+                        CatalogPublicationKind::Audio => MediaKind::Audio,
+                        CatalogPublicationKind::Video => MediaKind::Video,
+                        CatalogPublicationKind::Data { .. } => continue,
+                    };
+                    let publication = CatalogPublication {
+                        id: entry.id.clone(),
+                        participant_id: participant.id.clone(),
+                        kind,
+                        label: entry.label,
+                    };
+                    self.catalog
+                        .insert(entry.id, (publication, participant.external_id.clone()));
+                }
+            }
+        }
+        Ok(true)
     }
 
     async fn relabel_owned_video(&mut self, label: String) -> anyhow::Result<bool> {
@@ -4031,10 +4110,10 @@ impl ClientContext {
         let mut resolved = Vec::with_capacity(requests.len());
         let mut all_resolved = true;
         for request in requests {
-            let current = snapshot
-                .publications
+            let current = self
+                .catalog
                 .values()
-                .find(|publication| {
+                .find(|(publication, _)| {
                     publication.participant_id == request.participant_id
                         && publication.kind == MediaKind::Video
                         && request
@@ -4042,12 +4121,11 @@ impl ClientContext {
                             .as_ref()
                             .is_none_or(|label| *label == publication.label)
                 })
-                .and_then(|publication| {
-                    let track = snapshot.remote_tracks.get(&publication.id)?;
+                .and_then(|(publication, external_id)| {
                     Some((
                         TrackSelector {
                             room: snapshot.room_external_id.clone()?,
-                            participant_external_id: track.participant_id.clone(),
+                            participant_external_id: external_id.clone(),
                             label: publication.label.clone(),
                         },
                         publication.clone(),
@@ -4169,22 +4247,22 @@ impl ClientContext {
         &mut self,
         snapshot: &pulsebeam_agent_native::agent_core::Snapshot,
         mut audio: AudioSubscription,
+        automatic: bool,
     ) -> anyhow::Result<()> {
         // Materialize the scenario's audio policy as exact known source addresses.
-        let sources: Vec<_> = snapshot
-            .publications
+        let sources: Vec<_> = self
+            .catalog
             .values()
-            .filter(|publication| {
+            .filter(|(publication, _)| {
                 publication.kind == MediaKind::Audio
                     && snapshot.participant_id.as_deref() != Some(&publication.participant_id)
-                    && (audio.automatic || audio.pinned.contains(&publication.id))
+                    && (automatic || audio.pinned.contains(&publication.id))
             })
-            .filter_map(|publication| {
-                let track = snapshot.remote_tracks.get(&publication.id)?;
+            .filter_map(|(publication, external_id)| {
                 Some((
                     TrackSelector {
                         room: snapshot.room_external_id.clone()?,
-                        participant_external_id: track.participant_id.clone(),
+                        participant_external_id: external_id.clone(),
                         label: publication.label.clone(),
                     },
                     audio.playout_delays.get(&publication.id).copied(),
@@ -4196,11 +4274,16 @@ impl ClientContext {
             .filter_map(|(selector, delay)| delay.map(|delay| (selector.clone(), delay)))
             .collect();
         audio.selected = sources.into_iter().map(|(selector, _)| selector).collect();
-        if self.desired.audio != audio {
+        if self.desired.audio != audio || self.automatic_audio != automatic {
             self.audio_policy
-                .configure_audio_policy(audio.clone())
+                .configure_audio_policy(AudioSubscription {
+                    selected: audio.selected.clone(),
+                    selector_delays: audio.selector_delays.clone(),
+                    ..Default::default()
+                })
                 .await?;
             self.desired.audio = audio;
+            self.automatic_audio = automatic;
             self.desired.revision = self.desired.revision.saturating_add(1);
         }
         Ok(())
@@ -4223,7 +4306,7 @@ impl ClientContext {
         let snapshot = self.agent.snapshot();
         let mut pinned = Vec::new();
         for participant in participants {
-            let Some(publication) = snapshot.publications.values().find(|publication| {
+            let Some((publication, _)) = self.catalog.values().find(|(publication, _)| {
                 publication.participant_id == *participant && publication.kind == MediaKind::Audio
             }) else {
                 return Ok(false);
@@ -4246,11 +4329,10 @@ impl ClientContext {
             .collect();
         let audio = AudioSubscription {
             pinned,
-            automatic,
             playout_delays,
             ..Default::default()
         };
-        self.sync_audio_desired(&snapshot, audio).await?;
+        self.sync_audio_desired(&snapshot, audio, automatic).await?;
         Ok(true)
     }
 
@@ -4749,6 +4831,11 @@ impl SimClient {
             }
             let (_, _, source) = &key;
             let source = source.clone();
+            let publication = self
+                .ctx
+                .catalog
+                .get(&source)
+                .map(|(entry, _)| entry.clone());
             let policy = self.ctx.audio_policy.clone();
             let log = self.ctx.audio_rx.clone();
             let mode = self.media.audio_receive_mode;
@@ -4773,7 +4860,7 @@ impl SimClient {
                     &remote,
                     &snapshots.borrow(),
                     MediaKind::Audio,
-                    None,
+                    publication.as_ref(),
                 );
                 let mut decoders = HashMap::<NativeAudioStream, OpusReceiver>::new();
                 loop {

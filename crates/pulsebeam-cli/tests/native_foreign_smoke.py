@@ -212,11 +212,11 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         assert video_interest.is_closed(), "foreign video interest did not close"
         assert not interest.is_closed(), "video close ended the independent audio interest"
         audio_policy = core.AudioDemand(
-            pinned=[], selected=[], automatic=True,
+            pinned=["absent-source"], selected=[],
             playout_delays=[], selector_delays=[],
         )
         all_audio = await agent.select_audio(audio_policy)
-        audio_policy.automatic = False
+        audio_policy.pinned = []
         await all_audio.configure(audio_policy)
         try:
             await all_audio.observe_source("absent-source", native.ReceiveMode.DECODED)

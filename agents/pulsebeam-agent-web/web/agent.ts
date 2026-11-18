@@ -726,31 +726,12 @@ class AgentFacade implements AgentApi {
         raw.mapping.audio.map((entry) => Object.freeze({ ...entry })),
       ),
     });
-    const publicationById = new Map(
-      publications.map((publication) => [publication.id, publication]),
-    );
     const tracks: Record<string, RemoteTrack> = {};
-    for (const binding of mapping.video) {
-      const publication = publicationById.get(binding.publicationId);
-      const media = runtime.remote_track(binding.receiverIndex);
-      if (!publication || publication.kind !== "video" || !media) continue;
-      tracks[publication.id] = Object.freeze({
-        publicationId: publication.id,
-        participantId: publication.participantId,
-        kind: "video",
-        media,
-      });
-    }
-    for (const binding of mapping.audio) {
-      const publication = publicationById.get(binding.publicationId);
-      const media = runtime.remote_track(binding.receiverIndex);
-      if (!publication || publication.kind !== "audio" || !media) continue;
-      tracks[publication.id] = Object.freeze({
-        publicationId: publication.id,
-        participantId: publication.participantId,
-        kind: "audio",
-        media,
-      });
+    for (const kind of ["video", "audio"] as const) {
+      for (const binding of mapping[kind]) {
+        const media = runtime.remote_track(binding.receiverIndex);
+        if (media?.kind === kind) tracks[binding.publicationId] = media;
+      }
     }
     const next: ReconciliationSnapshot = Object.freeze({
       version: Number(raw.version),

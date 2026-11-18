@@ -111,7 +111,7 @@
         video: [],
         audio: [{ receiverIndex: 0, publicationId: "A" }],
       },
-      tracks: { A: { media: received[0], kind: "audio" } },
+      tracks: { A: received[0] },
     };
     const fake = { getSnapshot: () => snapshot, subscribe: () => () => {} };
     snapshot.catalog.tracks = snapshot.catalog.publications;
@@ -193,7 +193,7 @@
     );
     snapshot = {
       ...snapshot,
-      tracks: { A: { media: received[1], kind: "audio" } },
+      tracks: { A: received[1] },
     };
     catalog.update(snapshot);
     await wait(() => {

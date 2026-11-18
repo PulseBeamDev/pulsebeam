@@ -82,7 +82,7 @@ export class RemoteAudioPlayback {
       if (
         available &&
         binding?.publicationId === route.publicationId &&
-        snapshot.tracks[route.publicationId]?.media === route.track
+        snapshot.tracks[route.publicationId] === route.track
       )
         continue;
       route.source.disconnect();
@@ -95,7 +95,7 @@ export class RemoteAudioPlayback {
       return;
     }
     for (const [index, binding] of bindings) {
-      const track = snapshot.tracks[binding.publicationId]?.media;
+      const track = snapshot.tracks[binding.publicationId];
       if (
         this.#routes.has(index) ||
         !track ||

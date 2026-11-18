@@ -162,7 +162,7 @@ fn desired_video_intent_logs_only_accepted_semantic_changes() {
 
     let mut unrelated_change = initial;
     unrelated_change.revision = 2;
-    unrelated_change.audio.automatic = false;
+    unrelated_change.audio.pinned.clear();
     agent
         .command(AgentCommand::ReplaceDesired(unrelated_change.clone()))
         .unwrap();
@@ -292,7 +292,6 @@ fn desired(revision: u64) -> DesiredState {
         audio: AudioSubscription {
             pinned: vec!["audio-track".to_string()],
             selected: Vec::new(),
-            automatic: true,
             playout_delays: BTreeMap::new(),
             selector_delays: BTreeMap::new(),
         },
@@ -1345,7 +1344,7 @@ fn desired_revisions_are_idempotent_and_offer_events_are_correlated() {
     assert!(agent.next_effect_after_turn().is_none());
 
     let mut conflicting = state.clone();
-    conflicting.audio.automatic = false;
+    conflicting.audio.pinned.clear();
     assert_eq!(
         agent.command(AgentCommand::ReplaceDesired(conflicting)),
         Err(AgentError::ConflictingDesiredRevision(1))
@@ -2764,7 +2763,6 @@ fn pending_sender_identities_preserve_the_physical_slot_until_application_withdr
     let mut initial = desired(1);
     initial.video.clear();
     initial.audio = Default::default();
-    initial.audio.automatic = false;
     let mut audio = initial.publications[0].clone();
     audio.slot = "a0".into();
     audio.kind = MediaKind::Audio;
@@ -2834,7 +2832,6 @@ fn late_sender_observations_complete_only_matching_pending_publications() {
     let mut initial = desired(1);
     initial.video.clear();
     initial.audio = Default::default();
-    initial.audio.automatic = false;
     let mut audio = initial.publications[0].clone();
     audio.slot = "a0".into();
     audio.kind = MediaKind::Audio;
@@ -3229,7 +3226,6 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
     changed.revision = 3;
     changed.video.clear();
     changed.audio.selected.clear();
-    changed.audio.automatic = false;
     agent
         .command(AgentCommand::ReplaceDesired(changed))
         .unwrap();
@@ -3291,7 +3287,6 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             label: "camera".to_string(),
         });
         selected.audio.pinned.clear();
-        selected.audio.automatic = false;
         let audio_selector = TrackSelector {
             room: "room".into(),
             participant_external_id: "remote-user".to_string(),
@@ -3353,7 +3348,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
                 })
                 .unwrap();
             let mut conflict = selected.clone();
-            conflict.audio.automatic = true;
+            conflict.audio.pinned.push("audio-track".into());
             assert!(matches!(
                 agent.command(AgentCommand::ReplaceDesired(conflict)),
                 Err(AgentError::InvalidResource(

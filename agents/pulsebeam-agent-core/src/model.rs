@@ -118,14 +118,13 @@ pub struct VideoSubscription {
 pub struct AudioSubscription {
     pub pinned: Vec<String>,
     pub selected: Vec<TrackSelector>,
-    pub automatic: bool,
     pub playout_delays: BTreeMap<String, PlayoutDelay>,
     pub selector_delays: BTreeMap<TrackSelector, PlayoutDelay>,
 }
 
 impl AudioSubscription {
     pub(crate) fn has_demand(&self) -> bool {
-        self.automatic || !self.pinned.is_empty() || !self.selected.is_empty()
+        !self.pinned.is_empty() || !self.selected.is_empty()
     }
 }
 

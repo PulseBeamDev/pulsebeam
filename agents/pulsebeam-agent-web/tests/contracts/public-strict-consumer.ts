@@ -349,9 +349,8 @@ void [audioState, nextAudioState, audioStateTyped, audioUpdateTyped];
 const deferredAudioSubscription: Promise<unknown> = audioSubscription;
 void deferredAudioSubscription;
 await audioSubscription.close();
-const selection = await agent.selectAudio({ automatic: true });
+const selection = await agent.selectAudio({ pinned: [] });
 await selection.configure({
-  automatic: false,
   selected: [{ room: "meeting", participantId: "alice", label: "microphone" }],
 });
 await selection.close();

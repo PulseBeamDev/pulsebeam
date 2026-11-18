@@ -123,7 +123,6 @@ test("desired revisions copy nested policy and omission withdraws complete inten
       },
     ],
     audio: {
-      automatic: false,
       pinned: ["voice"],
       selected: [{ room: "room", participantId: "alice", label: "voice" }],
     },
@@ -147,7 +146,7 @@ test("desired revisions copy nested policy and omission withdraws complete inten
   assert.deepEqual(withdrawn.video, []);
   assert.deepEqual(withdrawn.topics, []);
   assert.deepEqual(withdrawn.audio.pinned, []);
-  assert.equal(withdrawn.audio.automatic, false);
+  assert.deepEqual(withdrawn.audio.selected, []);
   validatePlayoutDelay(state);
   for (const minMs of [-1, NaN, 0.5, 2 ** 32])
     assert.throws(

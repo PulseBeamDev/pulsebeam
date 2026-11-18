@@ -346,7 +346,6 @@ test("audio selection reattachment claims the latest explicit policy", async () 
     },
   });
   const initial = {
-    automatic: false,
     pinned: [],
     selected: [],
     playoutDelays: [],

@@ -109,15 +109,14 @@ slots become reusable after retirement. Relabeling a publication replaces its
 owned resource and physical binding rather than retaining a permanent
 slot-to-label association. Slot-based intent cannot replace a live owned
 publication or video presentation. Owned audio interests cannot be mixed with raw
-audio desired state. Core defaults to no automatic audio reception; hosts that
-intend global audio must opt in explicitly. `ClaimAudio` remains the separate
+audio desired state. Receive demand always names its sources. `ClaimAudio` remains the separate
 global playback reservation, while `ClaimAudioSubscription` declares a named
 source. Several owners of the same audio source share adaptive playout. A
 non-adaptive delay requires exclusive ownership; shared owners must be released
 before changing it. Delays are not merged.
 
 `ClaimAudioPolicy` owns the existing `AudioSubscription` selection policy,
-including explicit automatic, pinned and named selections. `ConfigureAudioPolicy`
+including pinned IDs and named selections. `ConfigureAudioPolicy`
 replaces that owner's policy. Policy and named owners project a deduplicated
 union into the same receiver reconciler. Non-adaptive policy delays require
 exclusive audio ownership, since opaque IDs and names can overlap after

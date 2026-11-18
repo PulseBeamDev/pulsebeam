@@ -1380,8 +1380,7 @@ impl TrackResources {
                 selector: selected, ..
             }) => selector == Some(selected),
             Some(AudioView::Policy(policy)) => {
-                policy.automatic
-                    || policy.pinned.iter().any(|id| id == source)
+                policy.pinned.iter().any(|id| id == source)
                     || selector.is_some_and(|selector| policy.selected.contains(selector))
             }
             None => false,
@@ -1402,7 +1401,6 @@ impl TrackResources {
                         .insert(selector.clone(), *playout_delay);
                 }
                 AudioView::Policy(policy) => {
-                    projection.automatic |= policy.automatic;
                     projection.pinned.extend(policy.pinned.iter().cloned());
                     projection.selected.extend(policy.selected.iter().cloned());
                     projection

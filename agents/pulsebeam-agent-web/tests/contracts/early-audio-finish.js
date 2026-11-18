@@ -82,7 +82,7 @@
           video: [],
           audio: [{ receiverIndex: 0, publicationId: "A" }],
         },
-        tracks: { A: { media: received, kind: "audio" } },
+        tracks: { A: received },
       });
     } finally {
       AudioNode.prototype.connect = connect;

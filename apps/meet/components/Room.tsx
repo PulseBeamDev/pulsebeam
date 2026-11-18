@@ -246,6 +246,7 @@ function ActiveRoom({
   const connect = useCallback(() => {
     try {
       agent.join(room);
+      joinedRoom.current = room;
     } catch (reason) {
       setFailure(
         `Connection: ${reason instanceof Error ? reason.message : String(reason)}`,
@@ -254,9 +255,8 @@ function ActiveRoom({
   }, [agent, room]);
   useEffect(() => {
     if (joinedRoom.current === room) return;
-    agent.join(room);
-    joinedRoom.current = room;
-  }, [agent, room]);
+    connect();
+  }, [connect, room]);
   const startShare = async () => {
     try {
       await requestShare();

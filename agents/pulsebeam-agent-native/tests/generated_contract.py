@@ -237,7 +237,7 @@ async def witness():
         assert (await video_updates.next()).observation_revision == video_state.observation_revision
         assert (await audio_updates.next()).observation_revision == audio_state.observation_revision
         audio_selection = await agent.select_audio(core.AudioDemand(
-            pinned=[], selected=[], automatic=False, playout_delays=[], selector_delays=[],
+            pinned=[], selected=[], playout_delays=[], selector_delays=[],
         ))
         await audio_selection.close()
         assert not audio_subscription.is_closed(), "selection close retired named audio demand"

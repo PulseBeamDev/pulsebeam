@@ -153,7 +153,7 @@ export interface TopicRegistration {
 /**
  * Complete desired state. Omitted collections are empty and retract their
  * previous desired values. Playout policy belongs to each explicitly
- * requested track, not to the connection or automatic audio.
+ * requested track, not to the connection or other audio selections.
  */
 export interface AgentState {
   readonly connected: boolean;

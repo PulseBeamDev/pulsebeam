@@ -11,12 +11,7 @@ export interface Publication {
   readonly label: string;
 }
 
-export type RemoteTrack = Readonly<{
-  publicationId: string;
-  participantId: string;
-  kind: MediaKind;
-  media: MediaStreamTrack;
-}>;
+export type RemoteTrack = MediaStreamTrack;
 
 export type CatalogTrack = Readonly<{
   id: string;

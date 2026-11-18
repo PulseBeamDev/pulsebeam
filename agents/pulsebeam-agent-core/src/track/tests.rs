@@ -870,7 +870,6 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
         resources.begin_media_observation(owner),
         Err(TrackResourceError::Released)
     );
-    assert!(!crate::AudioSubscription::default().automatic);
     let playback = resources.new_owner().unwrap();
     resources.claim_audio(playback).unwrap();
     let audio = resources.new_owner().unwrap();
@@ -972,11 +971,11 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     assert!(resources.release_audio(playback));
 
     let policy_owner = resources.new_owner().unwrap();
-    let all = crate::AudioSubscription {
-        automatic: true,
+    let policy = crate::AudioSubscription {
+        pinned: vec!["audio-one".into()],
         ..Default::default()
     };
-    resources.claim_audio_policy(policy_owner, all).unwrap();
+    resources.claim_audio_policy(policy_owner, policy).unwrap();
     assert_eq!(
         resources.begin_media_observation(policy_owner),
         Err(TrackResourceError::WrongKind)
@@ -986,7 +985,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
         .claim_audio_subscription(named, selector.clone())
         .unwrap();
     let projected = resources.audio_projection();
-    assert!(projected.automatic);
+    assert_eq!(projected.pinned, vec!["audio-one"]);
     assert_eq!(projected.selected, vec![selector.clone()]);
     let exact = resources
         .begin_audio_source_observation(policy_owner, "audio-one".into())
@@ -1048,7 +1047,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     );
     resources.release(policy_owner);
     let remaining = resources.audio_projection();
-    assert!(!remaining.automatic);
+    assert!(remaining.pinned.is_empty());
     assert_eq!(remaining.selected, vec![selector]);
     resources.release(named);
     assert_eq!(

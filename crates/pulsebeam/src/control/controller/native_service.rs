@@ -1,5 +1,4 @@
 use super::*;
-use crate::participant::ParticipantEffect;
 
 const NATIVE_BUDGET: usize = 32;
 const MAX_TERMINAL_HANDOFFS: usize = 256;
@@ -224,6 +223,7 @@ impl ControllerActor {
                 continue;
             };
             service.handler.model.source_lookup_changed();
+            service.handler.model.source_wait_changed();
             if !service.handler.handoff.schedule() {
                 self.source_lookup_index.wake_queue.push_back(key);
                 continue;
@@ -452,36 +452,7 @@ impl ControllerActor {
         self.retiring_native.insert(connection, retiring);
     }
 
-    pub(super) fn observe_native_effect(
-        &mut self,
-        participant: ParticipantId,
-        effect: ParticipantEffect,
-    ) -> Option<ParticipantEffect> {
-        let Some(connection) = self
-            .core
-            .registry
-            .get_participant(&participant)
-            .map(|meta| meta.connection_id)
-        else {
-            return Some(effect);
-        };
-        let Some(NativeService {
-            handler: native, ..
-        }) = self.native_connections.get_mut(&connection)
-        else {
-            return Some(effect);
-        };
-        let (result, effect) = match effect {
-            ParticipantEffect::ParticipantsChanged { added, removed } => {
-                (native.model.apply_participants(added, removed), None)
-            }
-            effect => return Some(effect),
-        };
-        self.finish_native_observation(connection, result);
-        effect
-    }
-
-    fn finish_native_observation(
+    pub(super) fn finish_native_observation(
         &mut self,
         connection: ConnectionId,
         result: Result<(), crate::control::native::OutputError>,
@@ -508,68 +479,7 @@ impl ControllerActor {
         }
     }
 
-    pub(super) fn seed_native_sources(&mut self, connection: ConnectionId) {
-        let Some(NativeService {
-            handler: native, ..
-        }) = self.native_connections.get_mut(&connection)
-        else {
-            return;
-        };
-        let peers = self
-            .core
-            .registry
-            .local_participant_ids_in_room(&native.room)
-            .into_iter()
-            .filter(|id| *id != native.participant)
-            .filter_map(|id| {
-                let peer = self.core.registry.get_participant(&id)?;
-                peer.materialized
-                    .then(|| crate::participant::effect::RoomPeer {
-                        id,
-                        external_id: peer.participant_external_id.clone(),
-                    })
-            });
-        let mut result = native.model.apply_participants(peers, std::iter::empty());
-        for track in self.lifecycle.sources_in_room(native.room) {
-            if result.is_err() {
-                break;
-            }
-            if self
-                .lifecycle
-                .source(
-                    native.room,
-                    native.room,
-                    native.participant,
-                    track.id(),
-                    &self.core.registry,
-                )
-                .is_none()
-            {
-                continue;
-            }
-            let Some(publisher) = self
-                .core
-                .registry
-                .get_participant(&track.meta().origin)
-                .and_then(|peer| peer.participant_external_id.as_ref())
-            else {
-                continue;
-            };
-            result = native
-                .model
-                .observe_candidate(crate::control::native::ResolvedSource { track, publisher });
-            if result.is_err() {
-                break;
-            }
-        }
-        self.finish_native_observation(connection, result);
-    }
-
-    pub(super) fn observe_native_source(
-        &mut self,
-        meta: &crate::track::TrackMeta,
-        track: Option<&crate::track::Track>,
-    ) {
+    pub(super) fn observe_native_source(&mut self, meta: &crate::track::TrackMeta, appeared: bool) {
         if let Some(label) = meta.label.as_ref()
             && let Some(publisher) = self.core.registry.get_participant(&meta.origin)
             && publisher.connection_id == meta.connection_id
@@ -581,28 +491,14 @@ impl ControllerActor {
                 label.clone(),
             );
         }
+        if !appeared {
+            return;
+        }
         for participant in self
             .core
             .registry
             .local_participant_ids_in_room(&meta.room_id)
         {
-            if participant == meta.origin {
-                continue;
-            }
-            if track.is_some()
-                && self
-                    .lifecycle
-                    .source(
-                        meta.room_id,
-                        meta.room_id,
-                        participant,
-                        meta.id,
-                        &self.core.registry,
-                    )
-                    .is_none()
-            {
-                continue;
-            }
             let Some(connection) = self
                 .core
                 .registry
@@ -611,31 +507,12 @@ impl ControllerActor {
             else {
                 continue;
             };
-            let Some(NativeService {
-                handler: native, ..
-            }) = self.native_connections.get_mut(&connection)
-            else {
+            let Some(service) = self.native_connections.get_mut(&connection) else {
                 continue;
             };
-            native.model.source_wait_changed();
-            let result =
-                match track {
-                    Some(track) => {
-                        match self
-                            .core
-                            .registry
-                            .get_participant(&track.meta().origin)
-                            .and_then(|peer| peer.participant_external_id.as_ref())
-                        {
-                            Some(publisher) => native.model.observe_candidate(
-                                crate::control::native::ResolvedSource { track, publisher },
-                            ),
-                            None => native.model.remove_track(meta.id.as_str()),
-                        }
-                    }
-                    None => native.model.remove_track(meta.id.as_str()),
-                };
-            self.finish_native_observation(connection, result);
+            if service.handler.model.notify_waiting_source(meta.id) {
+                self.finish_native_observation(connection, Ok(()));
+            }
         }
     }
 
@@ -662,11 +539,7 @@ impl ControllerActor {
             }
             Err(_) => Err(crate::control::native::OutputError::InvalidObservation),
         };
-        let changed = matches!(result, Ok(true));
         self.finish_native_observation(connection, result.map(|_| ()));
-        if changed {
-            self.seed_native_sources(connection);
-        }
     }
 }
 

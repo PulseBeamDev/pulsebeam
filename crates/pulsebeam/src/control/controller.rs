@@ -1760,7 +1760,7 @@ impl ControllerActor {
                     &self.core.registry,
                     pulsebeam_runtime::time::Instant::now(),
                 ) {
-                    self.observe_native_source(track.meta(), Some(&track));
+                    self.observe_native_source(track.meta(), true);
                     self.publish_track_lifecycle(outcome);
                 }
             }
@@ -1777,7 +1777,7 @@ impl ControllerActor {
                     &self.core.registry,
                     pulsebeam_runtime::time::Instant::now(),
                 ) {
-                    self.observe_native_source(&meta, None);
+                    self.observe_native_source(&meta, false);
                     self.apply_track_lifecycle(outcome);
                     self.publish_staged();
                 }
@@ -2090,7 +2090,7 @@ impl ControllerActor {
                 pulsebeam_runtime::time::Instant::now(),
             );
             if outcome.is_some() {
-                self.observe_native_source(&meta, None);
+                self.observe_native_source(&meta, false);
             }
             outcome.into_iter().collect()
         } else {
@@ -2646,59 +2646,12 @@ impl ControllerActor {
         participant: ParticipantId,
         effect: crate::participant::ParticipantEffect,
     ) {
-        let Some(effect) = self.observe_native_effect(participant, effect) else {
-            return;
-        };
         let Some(update) = self.updates.get_mut(shard.index()) else {
             debug_assert!(false, "participant effects must target a live shard");
             return;
         };
         update.stage_participant_effect(generation, participant, effect);
         self.mark_update_touched(shard);
-    }
-
-    fn room_peer(&self, id: ParticipantId) -> crate::participant::effect::RoomPeer {
-        crate::participant::effect::RoomPeer {
-            id,
-            external_id: self
-                .core
-                .registry
-                .get_participant(&id)
-                .and_then(|meta| meta.participant_external_id.clone()),
-        }
-    }
-
-    fn stage_participant_change_at(
-        &mut self,
-        room_id: crate::entity::RoomId,
-        generation: u64,
-        added: Option<ParticipantId>,
-        removed: Option<ParticipantId>,
-    ) {
-        let participants: Vec<_> = self
-            .core
-            .registry
-            .local_participant_ids_in_room(&room_id)
-            .into_iter()
-            .filter(|participant| Some(*participant) != added && Some(*participant) != removed)
-            .collect();
-        for participant in participants {
-            let Some(meta) = self.core.registry.get_participant(&participant) else {
-                continue;
-            };
-            if !meta.materialized {
-                continue;
-            }
-            self.stage_participant_at(
-                meta.shard_id,
-                generation,
-                participant,
-                crate::participant::ParticipantEffect::ParticipantsChanged {
-                    added: added.into_iter().map(|id| self.room_peer(id)).collect(),
-                    removed: removed.into_iter().collect(),
-                },
-            );
-        }
     }
 
     fn publish_staged(&mut self) {
@@ -3038,29 +2991,7 @@ impl ControllerActor {
                 },
             );
         }
-        let generation = self.lifecycle.next_generation();
-        self.stage_participant_change_at(room_id, generation, Some(participant_id), None);
-        if let Some(meta) = self.core.registry.get_participant(&participant_id) {
-            let participants = self
-                .core
-                .registry
-                .local_participant_ids_in_room(&room_id)
-                .into_iter()
-                .filter(|participant| *participant != participant_id)
-                .map(|id| self.room_peer(id))
-                .collect();
-            self.stage_participant_at(
-                meta.shard_id,
-                generation,
-                participant_id,
-                crate::participant::ParticipantEffect::ParticipantsChanged {
-                    added: participants,
-                    removed: Vec::new(),
-                },
-            );
-        }
         self.publish_staged();
-        self.seed_native_sources(pending.connection_id);
         let defaults = if pending.profile == SignalingProtocol::State {
             Vec::new()
         } else {
@@ -3237,7 +3168,7 @@ impl ControllerActor {
             pulsebeam_runtime::time::Instant::now(),
         );
         for source in sources {
-            self.observe_native_source(&source, None);
+            self.observe_native_source(&source, false);
         }
         let generation = outcomes
             .first()
@@ -3249,7 +3180,6 @@ impl ControllerActor {
             let outcome = outcomes.remove(0);
             self.apply_track_lifecycle(outcome);
         }
-        self.stage_participant_change_at(meta.room_id, generation, None, Some(participant));
         if remove_current {
             let _ = self
                 .core
@@ -3845,46 +3775,23 @@ mod replacement_tests {
                             .authorization(i64::MAX, 3, discovery_scope(true))
                             .unwrap()
                     );
-                    actor.seed_native_sources(connection_id(3));
-                    actor.service_native_connections();
-                    let catalog = endpoint.output().unwrap();
-                    let visible = codec::decode_server(&catalog.bytes).unwrap();
-                    assert!(visible.records.iter().any(|record| matches!(record.key.as_ref().and_then(|key| key.key.as_ref()), Some(wire::resource_key::Key::Track(id)) if *id == track.id().as_str())));
-                    assert!(visible.records.iter().any(|record| record.confirmed.as_ref().is_some_and(|value| matches!(&value.value, Some(wire::confirmed_state::Value::Participant(peer)) if peer.participant_external_id == publisher_external.as_str()))));
-                    assert!(endpoint.command().is_none());
-                    assert!(endpoint.progress(SignalingProgress {
-                        sequence: catalog.sequence,
-                        cid: catalog.cid,
-                        at: pulsebeam_runtime::time::Instant::now()
-                    }));
                     assert!(
-                        actor
-                            .native_connections
-                            .get_mut(&connection_id(3))
-                            .unwrap()
+                        actor.native_connections[&connection_id(3)]
                             .handler
-                            .model
-                            .authorization(i64::MAX, 4, discovery_scope(false))
-                            .unwrap()
+                            .handoff
+                            .schedule()
                     );
-                    actor.seed_native_sources(connection_id(3));
                     actor.service_native_connections();
-                    let withdrawn = endpoint.output().unwrap();
-                    let withdrawn = codec::decode_server(&withdrawn.bytes).unwrap();
-                    for key in [
-                        wire::resource_key::Key::Track(track.id().as_str()),
-                        wire::resource_key::Key::Participant(publisher.as_str()),
-                    ] {
-                        assert!(withdrawn.records.iter().any(|record| {
-                            record.key.as_ref().and_then(|key| key.key.as_ref()) == Some(&key)
-                                && record.confirmed.as_ref().is_some_and(|value| {
-                                    matches!(
-                                        &value.value,
-                                        Some(wire::confirmed_state::Value::Absent(_))
-                                    )
-                                })
-                        }));
-                    }
+                    let output = endpoint.output().unwrap();
+                    let state = codec::decode_server(&output.bytes).unwrap();
+                    assert!(state.records.iter().all(|record| !matches!(
+                        record.key.as_ref().and_then(|key| key.key.as_ref()),
+                        Some(wire::resource_key::Key::Track(_))
+                    )));
+                    assert!(state.records.iter().all(|record| !matches!(
+                        record.key.as_ref().and_then(|key| key.key.as_ref()),
+                        Some(wire::resource_key::Key::Participant(id)) if id == &publisher.as_str()
+                    )));
                     assert!(endpoint.command().is_none());
                 }
             } else {
@@ -4017,7 +3924,7 @@ mod replacement_tests {
         );
         actor.native_deadlines.insert((previous, connection));
 
-        actor.seed_native_sources(connection);
+        actor.finish_native_observation(connection, Ok(()));
         assert!(endpoint.failed());
         assert_eq!(actor.native_deadlines.len(), 1);
         assert!(!actor.native_deadlines.contains(&(previous, connection)));

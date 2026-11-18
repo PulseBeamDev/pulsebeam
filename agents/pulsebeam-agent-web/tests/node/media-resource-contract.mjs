@@ -113,7 +113,7 @@ export async function mediaResourceContract(pulsebeam) {
     const audio = await participant.audio("microphone").subscribe({
       playoutDelay: { mode: "adaptive" },
     });
-    const selection = await agent.selectAudio({ automatic: false });
+    const selection = await agent.selectAudio({});
     await selection.close();
     assert.equal(
       audio.isClosed(),
