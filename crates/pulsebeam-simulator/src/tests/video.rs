@@ -755,6 +755,13 @@ fn same_receiver_encoded_and_native_decoded_video_test() {
                 ..Default::default()
             }],
         },
+        Step::WaitForNativeVideo {
+            description: "Acquire Alice's adaptive 720p target before measuring steady delivery",
+            participant: "bob",
+            publisher: "alice",
+            min_resolution: (1280, 720),
+            timeout: Duration::from_secs(5),
+        },
     ];
     for (phase, room, seconds) in [(0, "room1", 3), (1, "breakout", 4), (2, "room1", 4)] {
         if phase > 0 {

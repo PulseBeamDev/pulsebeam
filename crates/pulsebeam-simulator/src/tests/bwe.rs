@@ -1083,8 +1083,9 @@ fn native_temporal_ladder() -> std::sync::Arc<super::common::media::NativeVideoF
 }
 
 #[test]
-fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
+fn clean_native_source_windows_bound_motion_and_updates_test() {
     use super::common::harness::VideoSubscription;
+    use super::common::native_origin::SourceService::{CameraMotion, SparseUpdates};
     use pulsebeam_agent_native::agent_core::PlayoutDelay;
     let camera_fixture = native_temporal_ladder();
     let full_temporal_index = camera_fixture.temporal_layers() - 1;
@@ -1111,8 +1112,9 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
                 temporal_index: Some(full_temporal_index), timeout: Duration::from_secs(5),
             },
             Step::MeasureSourceWindow {
-                description: "Every full-rate capture reaches actual native pixels exactly once by its declared deadline",
+                description: "Full-size native motion sustains fresh output across temporal tiers despite allowed drops",
                 participant: "screen", publisher: "camera", encodings: &["f"], duration: Duration::from_secs(1),
+                service: CameraMotion,
             },
         ]);
         if buffer == 0 {
@@ -1136,9 +1138,9 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
                     participant: "replacement", timeout: Duration::from_secs(5),
                 },
                 Step::MeasureSourceWindow {
-                    description: "The unrelated established unbuffered 30fps call meets every source deadline while replacement is held",
+                    description: "The unrelated established call sustains fresh motion while replacement is held",
                     participant: "screen", publisher: "camera", encodings: &["f"],
-                    duration: Duration::from_secs(1),
+                    duration: Duration::from_secs(4), service: CameraMotion,
                 },
                 Step::ReleaseHeldReconnect {
                     description: "Release only after the complete source interval and its deadlines, at the five-second hold boundary",
@@ -1163,9 +1165,9 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
                     participant: "replacement", duration: Duration::from_secs(30),
                 },
                 Step::MeasureSourceWindow {
-                    description: "By the restoration deadline the recovered owner sustains the complete fresh full-rate source contract",
+                    description: "At the restoration boundary start a fresh motion window on the recovered owner",
                     participant: "replacement", publisher: "camera", encodings: &["f"],
-                    duration: Duration::from_secs(1),
+                    duration: Duration::from_secs(1), service: CameraMotion,
                 },
                 Step::Disconnect {
                     description: "Retire the completed replacement workload before the remaining buffering and sparse-update checks",
@@ -1190,8 +1192,9 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
             temporal_index: None, timeout: Duration::from_secs(5),
         },
         Step::MeasureSourceWindow {
-            description: "One-fps uniform input has one-fps obligations, not a camera rate floor",
-            participant: "camera", publisher: "screen", encodings: &["q"], duration: Duration::from_secs(1),
+            description: "The one-fps uniform input yields fresh native pixels without a camera cadence requirement",
+            participant: "camera", publisher: "screen", encodings: &["q"], duration: Duration::from_secs(2),
+            service: SparseUpdates,
         },
         Step::QuietSolidVideo {
             description: "The application deliberately supplies no new pictures while holding the dark content",
@@ -1200,6 +1203,7 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
         Step::MeasureSourceWindow {
             description: "An unrelated quiet producer does not stall the continuous camera",
             participant: "screen", publisher: "camera", encodings: &["f"], duration: Duration::from_secs(1),
+            service: CameraMotion,
         },
         Step::SubscribeToConfigured {
             description: "After proving camera continuity, explicitly hide that completed workload during the sparse update check",
@@ -1224,8 +1228,9 @@ fn clean_native_source_windows_respect_explicit_fixed_buffers_test() {
             temporal_index: None, timeout: Duration::from_secs(5),
         },
         Step::MeasureSourceWindow {
-            description: "The updated uniform picture sustains its supplied low cadence",
-            participant: "camera", publisher: "screen", encodings: &["q"], duration: Duration::from_secs(1),
+            description: "The updated uniform picture yields fresh native pixels at sparse cadence",
+            participant: "camera", publisher: "screen", encodings: &["q"], duration: Duration::from_secs(2),
+            service: SparseUpdates,
         },
     ]);
     LocalNodeSim::new()

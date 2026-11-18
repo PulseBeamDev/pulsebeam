@@ -104,23 +104,20 @@ impl ControllerActor {
         room: &str,
     ) -> Option<crate::entity::RoomId> {
         let external = crate::entity::RoomExternalId::new(room).ok()?;
+        let meta = self.core.registry.get_participant(&subscriber)?;
+        if let Some(lease) = &meta.authorization {
+            return Some(crate::entity::RoomId::derive(
+                &lease.authority.project_id,
+                &external,
+            ));
+        }
+
+        // Synthetic controller fixtures can register participants without an admission lease.
         #[cfg(test)]
-        {
-            let _ = subscriber;
-            Some(crate::entity::RoomId::from_external(&external))
-        }
+        let fixture_room = Some(crate::entity::RoomId::from_external(&external));
         #[cfg(not(test))]
-        {
-            let project = self
-                .core
-                .registry
-                .get_participant(&subscriber)?
-                .authorization
-                .as_ref()?
-                .authority
-                .project_id;
-            Some(crate::entity::RoomId::derive(&project, &external))
-        }
+        let fixture_room = None;
+        fixture_room
     }
 
     pub(super) fn native_resource_lease(

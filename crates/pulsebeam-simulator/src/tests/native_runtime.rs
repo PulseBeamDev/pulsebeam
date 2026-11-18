@@ -1008,6 +1008,8 @@ async fn run_peer(
     drop(events);
     let (original_payloads, closed_before) =
         native_payload_channels(&runtime, first_generation, 4, None).await?;
+    // Either peer withdrawing Latest can invalidate the other peer's baseline.
+    barriers.before_reconnect.wait().await;
     let old_latest = agent
         .snapshot()
         .topics

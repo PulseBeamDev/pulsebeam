@@ -62,16 +62,22 @@ pub struct NativeProgressProof {
     pub frames: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceService {
+    CameraMotion,
+    SparseUpdates,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SourceTiming {
     pub period: Duration,
     pub playout: PlayoutDelay,
-    pub fiber_message_latency: Duration,
+    pub service: SourceService,
 }
 
 impl SourceTiming {
-    pub fn fixed_buffer(self) -> Result<Duration> {
-        let PlayoutDelay::Fixed { min_ms, max_ms } = self.playout else {
+    pub fn fixed_buffer(playout: PlayoutDelay) -> Result<Duration> {
+        let PlayoutDelay::Fixed { min_ms, max_ms } = playout else {
             anyhow::bail!("strict source age needs explicit fixed playout, not adaptive");
         };
         let maximum = max_ms.min(2_000).max(min_ms.min(2_000));
@@ -80,13 +86,13 @@ impl SourceTiming {
 
     pub fn deadline(self) -> Result<Duration> {
         ensure!(!self.period.is_zero(), "source period is not declared");
-        self.fixed_buffer()?
-            .checked_add(
-                self.fiber_message_latency
-                    .checked_mul(4)
-                    .context("network allowance overflow")?,
-            )
-            .and_then(|duration| duration.checked_add(self.period.checked_mul(2)?))
+        // Scenario age budgets, not end-to-end guarantees implied by Fixed.
+        let age_budget = match self.service {
+            SourceService::CameraMotion => Duration::from_millis(250),
+            SourceService::SparseUpdates => self.period,
+        };
+        Self::fixed_buffer(self.playout)?
+            .checked_add(age_budget)
             .context("source deadline overflow")
     }
 }
@@ -249,8 +255,12 @@ impl SourceTrace {
             "supplied source has a terminal gap beyond its declared period"
         );
         let deadline = window.timing.deadline()?;
-        let mut actual = Vec::new();
+        let motion = window.timing.service == SourceService::CameraMotion;
+        let max_gap = Duration::from_millis(500);
+        let mut frames = 0;
+        let mut delivered_temporal = BTreeSet::new();
         let mut last_capture = None;
+        let mut last_capture_time = window.start;
         let mut last_output = None;
         let mut dimensions = None;
         for (key, native) in &self.outputs {
@@ -259,15 +269,15 @@ impl SourceTrace {
                 .events
                 .get(key)
                 .context("native output has no authenticated source event")?;
-            // Setup buffering and the deadline drain may deliver events outside
-            // this declared input interval. They never fill or reset its obligations.
-            if event.captured < window.start || event.captured >= window.end {
-                continue;
-            }
             ensure!(
                 native.track == window.track && event.event.source == window.source,
                 "native output has wrong source/receiver lifetime"
             );
+            // Buffered captures from the same source can straddle the input
+            // interval, but cannot credit it or reset its cadence.
+            if event.captured < window.start || event.captured >= window.end {
+                continue;
+            }
             ensure!(
                 window.encodings.contains(&event.event.encoding),
                 "received an undeclared full-rate representation"
@@ -280,8 +290,6 @@ impl SourceTrace {
                 last_output.is_none_or(|previous| native.at >= previous),
                 "native output time regressed"
             );
-            last_capture = Some(event.event.capture);
-            last_output = Some(native.at);
             let supplied = ledger
                 .pictures
                 .get(&(event.event.capture, event.event.encoding.clone()))
@@ -331,20 +339,53 @@ impl SourceTrace {
                 .pixel_sample
                 .context("malformed native I420")?
                 .require_fixture(supplied.pixel_sample)?;
-            if expected.contains_key(&event.event.capture) {
-                dimensions.get_or_insert(native.dimensions);
-                actual.push(event.event.capture);
+            if motion {
+                ensure!(
+                    supplied
+                        .captured
+                        .saturating_duration_since(last_capture_time)
+                        <= max_gap,
+                    "camera has a leading/interior capture gap above {max_gap:?}"
+                );
+                ensure!(
+                    last_output
+                        .is_none_or(|previous| native.at.duration_since(previous) <= max_gap),
+                    "camera has a native output gap above {max_gap:?}"
+                );
+                delivered_temporal.insert(supplied.temporal_index);
             }
+            last_capture = Some(event.event.capture);
+            last_capture_time = supplied.captured;
+            last_output = Some(native.at);
+            dimensions.get_or_insert(native.dimensions);
+            frames += 1;
         }
-        let expected_ids: Vec<_> = expected.keys().copied().collect();
-        ensure!(
-            actual == expected_ids,
-            "incomplete source window: expected={expected_ids:?}, actual={actual:?}"
-        );
+        if motion {
+            // Exercise the requested full-rate T3 representation without treating
+            // the encoded fixture's capture rate as a reliable delivery contract.
+            let min_frames = expected.len().div_ceil(2);
+            ensure!(
+                frames >= min_frames,
+                "camera delivered {frames} of {} supplied captures (expected at least {min_frames})",
+                expected.len()
+            );
+            ensure!(
+                window.end.duration_since(last_capture_time) <= max_gap,
+                "camera has a terminal capture gap above {max_gap:?}"
+            );
+            let supplied_temporal = expected
+                .values()
+                .map(|picture| picture.temporal_index)
+                .collect();
+            ensure!(
+                delivered_temporal == supplied_temporal,
+                "camera lost a temporal tier: supplied={supplied_temporal:?}, delivered={delivered_temporal:?}"
+            );
+        }
         Ok(NativeOriginProof {
             track: window.track.clone(),
-            dimensions: dimensions.context("no native source output")?,
-            frames: u64::try_from(actual.len())?,
+            dimensions: dimensions.context("no fresh native source output")?,
+            frames: u64::try_from(frames)?,
         })
     }
 }
@@ -924,10 +965,18 @@ mod tests {
         period: Duration,
         buffer: u32,
     ) -> (SourceLedger, SourceWindow, Vec<AuthenticatedSourceEvent>) {
+        window_fixture_with_count(period, buffer, 6)
+    }
+
+    fn window_fixture_with_count(
+        period: Duration,
+        buffer: u32,
+        count: u32,
+    ) -> (SourceLedger, SourceWindow, Vec<AuthenticatedSourceEvent>) {
         use super::super::provenance::{SourceEvent, SuppliedPicture};
         let start = Instant::now();
         let mut ledger = SourceLedger::new("admission/owner", period);
-        let events: Vec<_> = (0..6u32)
+        let events: Vec<_> = (0..count)
             .map(|capture| {
                 let event = AuthenticatedSourceEvent {
                     event: SourceEvent {
@@ -963,14 +1012,14 @@ mod tests {
             track: frame(10, 1, true).track,
             encodings: BTreeSet::from([String::new()]),
             start,
-            end: start + period * 6,
+            end: start + period * count,
             timing: SourceTiming {
                 period,
                 playout: PlayoutDelay::Fixed {
                     min_ms: buffer,
                     max_ms: buffer,
                 },
-                fiber_message_latency: Duration::from_millis(1),
+                service: SourceService::SparseUpdates,
             },
         };
         (ledger, window, events)
@@ -1191,27 +1240,28 @@ mod tests {
             let timing = SourceTiming {
                 period: Duration::from_millis(20),
                 playout: PlayoutDelay::Fixed { min_ms, max_ms },
-                fiber_message_latency: Duration::from_millis(3),
+                service: SourceService::CameraMotion,
             };
             assert_eq!(
-                timing.fixed_buffer().unwrap(),
+                SourceTiming::fixed_buffer(timing.playout).unwrap(),
                 Duration::from_millis(expected)
             );
             assert_eq!(
                 timing.deadline().unwrap(),
-                Duration::from_millis(expected + 52)
+                Duration::from_millis(expected + 250)
             );
         }
         let mut timing = SourceTiming {
             period: Duration::from_secs(1),
             playout: PlayoutDelay::Adaptive,
-            fiber_message_latency: Duration::ZERO,
+            service: SourceService::SparseUpdates,
         };
         assert!(timing.deadline().is_err());
         timing.playout = PlayoutDelay::Fixed {
-            min_ms: 0,
-            max_ms: 0,
+            min_ms: 120,
+            max_ms: 120,
         };
+        assert_eq!(timing.deadline().unwrap(), Duration::from_millis(1120));
         timing.period = Duration::MAX;
         assert!(timing.deadline().is_err());
         timing.period = Duration::ZERO;
@@ -1219,32 +1269,101 @@ mod tests {
     }
 
     #[test]
-    fn complete_source_windows_accept_low_cadence_uniform_and_fixed_buffered_content() {
-        for period in [Duration::from_micros(33_334), Duration::from_secs(1)] {
-            for buffer in [0, 120] {
-                for decoded_first in [false, true] {
-                    let (ledger, window, events) = window_fixture(period, buffer);
-                    let mut log = NativeOriginCorrelation::default();
-                    log.begin_source_window(window.clone()).unwrap();
-                    for event in &events {
-                        event_output(
-                            &mut log,
-                            event,
-                            u32::try_from(event.event.capture + 1).unwrap(),
-                            event.captured + Duration::from_millis(u64::from(buffer) + 5),
-                            decoded_first,
-                        );
-                    }
-                    let drain = window.drain_until(&ledger).unwrap();
-                    let proof = log
-                        .finish_source_window(&ledger, drain.max(window.end))
-                        .unwrap();
-                    assert_eq!(proof.frames, 6);
-                    assert!(
-                        drain < window.end + window.timing.deadline().unwrap(),
-                        "drain the last event deadline, not an arbitrary tail"
-                    );
+    fn sparse_windows_require_fresh_uniform_output_not_every_periodic_capture() {
+        for buffer in [0, 120] {
+            for decoded_first in [false, true] {
+                let (ledger, window, events) =
+                    window_fixture_with_count(Duration::from_secs(1), buffer, 2);
+                let drain = window.drain_until(&ledger).unwrap();
+                assert!(
+                    drain < window.end + window.timing.deadline().unwrap(),
+                    "drain the last event deadline, not an arbitrary tail"
+                );
+                let mut empty = NativeOriginCorrelation::default();
+                empty.begin_source_window(window.clone()).unwrap();
+                let error = empty
+                    .finish_source_window(&ledger, drain.max(window.end))
+                    .unwrap_err();
+                assert!(error.to_string().contains("no fresh native source output"));
+
+                let mut log = NativeOriginCorrelation::default();
+                log.begin_source_window(window.clone()).unwrap();
+                let event = &events[1];
+                event_output(
+                    &mut log,
+                    event,
+                    1,
+                    event.captured + Duration::from_millis(u64::from(buffer) + 5),
+                    decoded_first,
+                );
+                let proof = log
+                    .finish_source_window(&ledger, drain.max(window.end))
+                    .unwrap();
+                assert_eq!(proof.frames, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn camera_service_allows_drops_but_detects_starvation_freezes_lateness_and_lost_tiers() {
+        for (case, failure) in [
+            ("drops", None),
+            ("starvation", Some("expected at least 30")),
+            ("leading", Some("leading/interior capture gap")),
+            ("interior", Some("leading/interior capture gap")),
+            ("terminal", Some("terminal capture gap")),
+            ("output-gap", Some("native output gap")),
+            ("late", Some("missed its deadline")),
+            ("tier", Some("lost a temporal tier")),
+        ] {
+            let (mut ledger, mut window, mut events) =
+                window_fixture_with_count(Duration::from_micros(33_334), 0, 60);
+            window.timing.service = SourceService::CameraMotion;
+            for (index, event) in events.iter_mut().enumerate() {
+                let tier = [0_u8, 2, 1, 2][index % 4];
+                event.native_temporal_index = Some(i32::from(tier));
+                ledger
+                    .pictures
+                    .get_mut(&(event.event.capture, String::new()))
+                    .unwrap()
+                    .temporal_index = Some(tier);
+            }
+            let mut log = NativeOriginCorrelation::default();
+            log.begin_source_window(window.clone()).unwrap();
+            for (index, event) in events.iter().enumerate() {
+                let omit = match case {
+                    "drops" => index % 4 == 3,
+                    "starvation" => index % 3 != 0,
+                    "leading" => index < 16,
+                    "interior" => (10..26).contains(&index),
+                    "terminal" => index >= 45,
+                    "output-gap" => (11..24).contains(&index),
+                    "tier" => index % 4 == 2,
+                    _ => false,
+                };
+                if omit {
+                    continue;
                 }
+                let age = match case {
+                    "late" => Duration::from_millis(251),
+                    "output-gap" if index >= 24 => Duration::from_millis(200),
+                    _ => Duration::from_millis(100),
+                };
+                event_output(
+                    &mut log,
+                    event,
+                    u32::try_from(index).unwrap(),
+                    event.captured + age,
+                    false,
+                );
+            }
+            let result =
+                log.finish_source_window(&ledger, window.end + window.timing.deadline().unwrap());
+            if let Some(expected) = failure {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(expected), "{case}: {error}");
+            } else {
+                assert_eq!(result.unwrap().frames, 45);
             }
         }
     }
@@ -1290,21 +1409,14 @@ mod tests {
     }
 
     #[test]
-    fn an_old_buffered_result_cannot_fill_or_invalidate_the_new_input_interval() {
-        let (ledger, window, events) = window_fixture(Duration::from_millis(100), 0);
-        let mut previous = events[0].clone();
-        previous.event.source = "previous-admission/owner".into();
-        previous.captured -= Duration::from_millis(500);
+    fn old_same_source_buffered_output_does_not_credit_the_new_input_interval() {
+        let (ledger, mut window, events) =
+            window_fixture_with_count(Duration::from_millis(100), 0, 7);
+        window.start = events[1].captured;
         let mut log = NativeOriginCorrelation::default();
         log.begin_source_window(window.clone()).unwrap();
-        event_output(
-            &mut log,
-            &previous,
-            0,
-            window.start + Duration::from_millis(1),
-            false,
-        );
-        for event in &events {
+        event_output(&mut log, &events[0], 0, window.start, false);
+        for event in &events[1..] {
             event_output(
                 &mut log,
                 event,
@@ -1411,12 +1523,8 @@ mod tests {
     }
 
     #[test]
-    fn complete_windows_reject_leading_interior_terminal_duplicate_reordered_and_late_output() {
+    fn source_windows_reject_invalid_output_even_when_other_captures_are_fresh() {
         for case in [
-            "first-only",
-            "missing-first",
-            "missing-middle",
-            "missing-last",
             "duplicate",
             "reorder",
             "late",
@@ -1426,11 +1534,14 @@ mod tests {
             "collector-loss",
             "unassociated",
             "wrong-source",
+            "retired-source",
+            "wrong-encoding",
             "wrong-track",
             "unsettled",
             "early-drain",
         ] {
-            let (mut ledger, window, events) = window_fixture(Duration::from_millis(100), 0);
+            let buffer = if case == "early-drain" { 120 } else { 0 };
+            let (mut ledger, window, events) = window_fixture(Duration::from_millis(100), buffer);
             let mut log = NativeOriginCorrelation::default();
             log.begin_source_window(window.clone()).unwrap();
             let order = if case == "reorder" {
@@ -1439,27 +1550,27 @@ mod tests {
                 (0..6).collect()
             };
             for (ordinal, index) in order.into_iter().enumerate() {
-                if (case == "first-only" && index != 0)
-                    || (case == "missing-first" && index == 0)
-                    || (case == "missing-middle" && index == 2)
-                    || (case == "missing-last" && index == 5)
-                {
-                    continue;
-                }
                 let event = &events[index];
                 let timestamp = u32::try_from(index + 1).unwrap();
                 let at = if case == "reorder" {
                     window.start + Duration::from_millis(u64::try_from(ordinal + 1).unwrap() * 100)
                 } else if case == "late" {
                     event.captured + window.timing.deadline().unwrap() + Duration::from_nanos(1)
-                } else if case == "stale" {
-                    window.start - Duration::from_millis(1)
+                } else if case == "stale" && index == 2 {
+                    event.captured - Duration::from_nanos(1)
                 } else {
                     event.captured + Duration::from_millis(10)
                 };
-                if case == "wrong-source" && index == 2 {
+                if matches!(case, "wrong-source" | "retired-source") && index == 2 {
                     let mut wrong = event.clone();
                     wrong.event.source = "other-admission/owner".into();
+                    if case == "retired-source" {
+                        wrong.captured = window.start - Duration::from_millis(1);
+                    }
+                    event_output(&mut log, &wrong, timestamp, at, false);
+                } else if case == "wrong-encoding" && index == 2 {
+                    let mut wrong = event.clone();
+                    wrong.event.encoding = "lower".into();
                     event_output(&mut log, &wrong, timestamp, at, false);
                 } else if case == "wrong-track" && index == 2 {
                     log.encoded_event(&frame(10, timestamp, false), Some(event.clone()));

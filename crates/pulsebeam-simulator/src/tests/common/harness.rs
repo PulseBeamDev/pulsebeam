@@ -761,13 +761,14 @@ pub enum Step {
         temporal_index: Option<u8>,
         timeout: Duration,
     },
-    /// Complete fixed-full-rate input interval, followed only by its event deadlines.
+    /// Validate supplied input and bounded native playback service independently.
     MeasureSourceWindow {
         description: &'static str,
         participant: &'static str,
         publisher: &'static str,
         encodings: &'static [&'static str],
         duration: Duration,
+        service: super::native_origin::SourceService,
     },
     /// Bounded first-visible-output contract, anchored at this step's start.
     WaitForNativeVideo {
@@ -3198,12 +3199,7 @@ async fn execute_plan(
                 let request = source_request(handles, participant, publisher)?;
                 let buffer = match request.playout_delay {
                     pulsebeam_agent_native::agent_core::PlayoutDelay::Adaptive => Duration::ZERO,
-                    fixed => super::native_origin::SourceTiming {
-                        period: Duration::from_secs(1),
-                        playout: fixed,
-                        fiber_message_latency: Duration::ZERO,
-                    }
-                    .fixed_buffer()?,
+                    fixed => super::native_origin::SourceTiming::fixed_buffer(fixed)?,
                 };
                 let mut pending = None;
                 tokio::time::timeout(*timeout + buffer, async {
@@ -3228,6 +3224,7 @@ async fn execute_plan(
                 publisher,
                 encodings,
                 duration,
+                service,
             } => {
                 anyhow::ensure!(
                     link.loss == 0.0
@@ -3285,7 +3282,7 @@ async fn execute_plan(
                     timing: super::native_origin::SourceTiming {
                         period,
                         playout: request.playout_delay,
-                        fiber_message_latency: link.max_latency,
+                        service: *service,
                     },
                 };
                 handle
@@ -3304,16 +3301,20 @@ async fn execute_plan(
                     }
                     tokio::time::sleep(drain.duration_since(now)).await;
                 }
+                let (current_origin, current_generation) =
+                    source_context(handles, participant, publisher)?;
+                anyhow::ensure!(
+                    current_origin == phase.source && current_generation == generation,
+                    "{description}: source or viewer lifetime changed during the source window"
+                );
                 let mut log = handle.shared.video_rx.lock().unwrap();
                 log.native_decoded
                     .require_valid_receiver(generation, phase.track.receiver)?;
                 let proof = log
                     .native_origin
                     .finish_source_window(&ledger.lock().unwrap(), Instant::now())
-                    .with_context(|| {
-                        format!("{description}: complete supplied/native source interval")
-                    })?;
-                tracing::info!(?proof, ?phase, deadline = ?phase.timing.deadline()?, "complete source interval verified");
+                    .with_context(|| format!("{description}: supplied/native source window"))?;
+                tracing::info!(?proof, ?phase, deadline = ?phase.timing.deadline()?, "native source service verified");
             }
             Step::BeginNativePlayback {
                 description,
