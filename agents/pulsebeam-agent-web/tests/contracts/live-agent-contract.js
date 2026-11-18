@@ -229,9 +229,9 @@
     while (!(await predicate())) {
       if (Date.now() > deadline) {
         const agents = [sender, receiver].map((agent) => {
-          const { connection, generation, failure, catalog, mapping, topics } =
+          const { connection, generation, failure, mapping, topics } =
             agent.snapshot();
-          return { connection, generation, failure, catalog, mapping, topics };
+          return { connection, generation, failure, mapping, topics };
         });
         const physical = await Promise.all(
           [...peers].map(async (peer) => ({
@@ -323,11 +323,32 @@
     cloneSources.set(clone, this);
     return clone;
   };
+  const presentedTrack = (element = video) =>
+    cloneSources.get(element.srcObject?.getVideoTracks()[0]);
   const presentedFrom = (source, element = video) =>
-    cloneSources.get(element.srcObject?.getVideoTracks()[0]) === source;
+    presentedTrack(element) === source;
+  const receivingTrack = (peer, kind) => {
+    const tracks = peer
+      .getTransceivers()
+      .filter(
+        (transceiver) =>
+          transceiver.mid !== null &&
+          ["recvonly", "sendrecv"].includes(transceiver.currentDirection),
+      )
+      .map((transceiver) => transceiver.receiver.track)
+      .filter((track) => track.kind === kind && track.readyState === "live");
+    return tracks.length === 1 ? tracks[0] : undefined;
+  };
   const handoffClones = [];
   let releaseReplacement;
   let attachment;
+  let discoveryWatch;
+  const discoveredPublications = () =>
+    discoveryWatch
+      ?.state()
+      .page?.participants.find(
+        (participant) => participant.externalId === "web-sender",
+      )?.publications ?? [];
   let handoffAttachment;
   let handoffVideo;
   let videoPublication;
@@ -549,16 +570,18 @@
       await steadyPublisher.send(Uint8Array.of(lifetime + 2));
       await receiveValue(steadyIterator, lifetime + 2);
     }
+    discoveryWatch = receiver.room("public-web-contract").watch({ limit: 100 });
     await until(
-      () =>
-        receiver
-          .snapshot()
-          .catalog.publications.some((p) => p.kind === "video"),
-      "video discovery",
+      () => discoveredPublications().some((p) => p.kind.tag === "Video"),
+      "bounded watch video discovery",
     );
-    const publication = receiver
-      .snapshot()
-      .catalog.publications.find((p) => p.kind === "video");
+    assert(
+      !discoveryWatch.state().page.hasMore,
+      "fixture fits one bounded page",
+    );
+    const publication = discoveredPublications().find(
+      (p) => p.kind.tag === "Video",
+    );
     const pinnedPublisher = receiver
       .room(receiver.roomId)
       .participant("web-sender");
@@ -573,11 +596,10 @@
     });
     await attachment.ready;
     await until(
-      () =>
-        receiver.snapshot().tracks[publication.id]?.media.readyState === "live",
+      () => presentedTrack()?.readyState === "live",
       "mapped fixed-delay track",
     );
-    const fixedTrack = receiver.snapshot().tracks[publication.id].media;
+    const fixedTrack = presentedTrack();
     const fixedPeer = peerForTrack(fixedTrack);
     const fixedReceiver = fixedPeer
       .getReceivers()
@@ -607,7 +629,7 @@
       const before = await decoded(fixedReceiver);
       await until(
         async () =>
-          receiver.snapshot().tracks[publication.id]?.media === fixedTrack &&
+          presentedTrack(element) === fixedTrack &&
           fixedTrack.readyState === "live" &&
           peerForTrack(fixedTrack) === fixedPeer &&
           (await decoded(fixedReceiver)) > before + 1 &&
@@ -727,8 +749,7 @@
         packetsWithoutDelay + 4,
     );
     assert(
-      receiver.snapshot().tracks[publication.id].media === fixedTrack &&
-        fixedTrack.readyState === "live",
+      presentedTrack() === fixedTrack && fixedTrack.readyState === "live",
       "mutable playout settings preserve the installed receiver",
     );
     const retired = fixedPeer
@@ -762,7 +783,7 @@
     });
     await attachment.ready;
     await until(() => {
-      const track = receiver.snapshot().tracks[publication.id]?.media;
+      const track = presentedTrack();
       return (
         track &&
         track !== fixedTrack &&
@@ -770,7 +791,7 @@
         fixedTrack.readyState === "ended"
       );
     }, "released slot receives a fresh native receiver");
-    const current = receiver.snapshot().tracks[publication.id].media;
+    const current = presentedTrack();
     const peer = peerForTrack(current);
     const rtpReceiver = peer.getReceivers().find((r) => r.track === current);
     assert(
@@ -887,22 +908,20 @@
       "fresh owner installs its capture after the stale native completion",
     );
     MediaStreamTrack.prototype.clone = observeClone;
-    const previousAudio = receiver
-      .snapshot()
-      .catalog.publications.find((publication) => publication.kind === "audio");
-    const previousAudioTrack =
-      receiver.snapshot().tracks[previousAudio.id].media;
+    const previousAudio = discoveredPublications().find(
+      (publication) => publication.kind.tag === "Audio",
+    );
+    const previousAudioTrack = receivingTrack(fixedPeer, "audio");
+    assert(previousAudioTrack, "one actual live audio receiver");
     const previousAudioTransceiver = fixedPeer
       .getTransceivers()
       .find((transceiver) => transceiver.receiver.track === previousAudioTrack);
     await audioPublication.close();
     await until(
       () =>
-        !receiver
-          .snapshot()
-          .catalog.publications.some(
-            (publication) => publication.id === previousAudio.id,
-          ) &&
+        !discoveredPublications().some(
+          (publication) => publication.id === previousAudio.id,
+        ) &&
         previousAudioTrack.readyState === "ended" &&
         previousAudioTransceiver.mid === null &&
         outputRoutes.size === 0,
@@ -911,28 +930,35 @@
     audioPublication = sender.audio("voice").publish({ enabled: true });
     audioPipe = AudioSource.fromTrack(audioTrack).pipeTo(audioPublication);
     await until(() => {
-      const snapshot = receiver.snapshot();
-      const fresh = (kind, oldId) => {
-        const publication = snapshot.catalog.publications.find(
+      const fresh = (kind, oldId, oldTrack) => {
+        const publication = discoveredPublications().find(
           (publication) =>
-            publication.kind === kind && publication.id !== oldId,
+            publication.kind.tag === kind && publication.id !== oldId,
         );
+        const track =
+          kind === "Video"
+            ? presentedTrack()
+            : receivingTrack(fixedPeer, "audio");
         return (
           publication &&
-          snapshot.tracks[publication.id]?.media.readyState === "live"
+          track &&
+          track !== oldTrack &&
+          track.readyState === "live"
         );
       };
-      return fresh("video", publication.id) && fresh("audio", previousAudio.id);
+      return (
+        fresh("Video", publication.id, current) &&
+        fresh("Audio", previousAudio.id, previousAudioTrack)
+      );
     }, "both re-added named publications have fresh actual receivers");
-    const readded = receiver.snapshot();
-    const freshVideo = readded.catalog.publications.find(
-      (publication) => publication.kind === "video",
+    const freshVideo = discoveredPublications().find(
+      (publication) => publication.kind.tag === "Video",
     );
-    const freshAudio = readded.catalog.publications.find(
-      (publication) => publication.kind === "audio",
+    const freshAudio = discoveredPublications().find(
+      (publication) => publication.kind.tag === "Audio",
     );
-    const freshVideoTrack = readded.tracks[freshVideo.id].media;
-    const freshAudioTrack = readded.tracks[freshAudio.id].media;
+    const freshVideoTrack = presentedTrack();
+    const freshAudioTrack = receivingTrack(fixedPeer, "audio");
     assert(
       freshVideoTrack !== current &&
         freshAudioTrack !== previousAudioTrack &&
@@ -1008,6 +1034,119 @@
         ),
       "in-place receiver replacement keeps the two negotiated reliable ordered SID 0 channels",
     );
+    // Real Core pages exercise the WASM projection cache without a second transport fixture.
+    const catalogAgent = new Agent({
+      endpoint,
+      token: "__CATALOG_TOKEN__",
+    });
+    const catalogWatch = catalogAgent.room("public-web-contract").watch();
+    const catalogFirst = catalogWatch.updates();
+    const catalogSecond = catalogWatch.updates();
+    let metadataPublication;
+    let deniedWatch;
+    try {
+      catalogAgent.join("public-web-contract");
+      await until(() => catalogWatch.state().status === 1, "WASM catalog page");
+      const initial = catalogWatch.state();
+      const page = initial.page;
+      assert(
+        (await catalogFirst.next()) === initial,
+        "first cursor shares state projection",
+      );
+      assert(
+        (await catalogSecond.next()).page === page,
+        "second cursor shares page projection",
+      );
+      assert(
+        catalogWatch.state().page === page,
+        "state reads share page projection",
+      );
+      const metadata = page.participants.find(
+        (participant) => participant.externalId === "web-sender",
+      );
+      assert(
+        metadata?.publications.some(
+          (publication) => publication.label === "camera",
+        ),
+        "catalog contains real publication metadata",
+      );
+      const presence = page.participants.find(
+        (participant) => participant.externalId === "web-catalog-observer",
+      );
+      assert(
+        presence?.publications.length === 0,
+        "Discover-only observer has presence without publication",
+      );
+      const frozen = (value) =>
+        value === null ||
+        typeof value !== "object" ||
+        (Object.isFrozen(value) && Object.values(value).every(frozen));
+      assert(frozen(initial), "WASM page metadata is deeply frozen");
+      const retained = JSON.stringify(page, (_, value) =>
+        typeof value === "bigint" ? String(value) : value,
+      );
+      metadataPublication = sender
+        .data("catalog-metadata", "ordered")
+        .publish();
+      await until(
+        () =>
+          catalogWatch
+            .state()
+            .page?.participants.some((participant) =>
+              participant.publications.some(
+                (publication) => publication.label === "catalog-metadata",
+              ),
+            ),
+        "WASM catalog metadata replacement",
+      );
+      const updated = await catalogFirst.next();
+      assert(
+        updated.page !== page,
+        "new Core page replaces the current projection",
+      );
+      assert(
+        (await catalogSecond.next()).page === updated.page,
+        "replacement page is shared across cursors",
+      );
+      assert(
+        JSON.stringify(page, (_, value) =>
+          typeof value === "bigint" ? String(value) : value,
+        ) === retained,
+        "retained page stays stable",
+      );
+      deniedWatch = catalogAgent.room("not-authorized").watch();
+      await until(
+        () => deniedWatch.state().status === 2,
+        "WASM catalog authorization failure",
+      );
+      const failed = deniedWatch.state();
+      assert(
+        failed.error.code === pulsebeam.ErrorCode.PermissionDenied &&
+          Object.isFrozen(failed.error),
+        "terminal catalog failure is classified and immutable",
+      );
+      deniedWatch.close();
+      assert(
+        deniedWatch.state().error === failed.error,
+        "close preserves established terminal error projection",
+      );
+      catalogWatch.close();
+      assert(
+        (await catalogFirst.next()).status === 3,
+        "watch close transfers final state",
+      );
+      assert(
+        (await catalogFirst.next()) === undefined,
+        "watch cursor terminates",
+      );
+    } finally {
+      await metadataPublication?.close();
+      await deniedWatch?.close();
+      catalogFirst.close();
+      catalogSecond.close();
+      await catalogWatch.close();
+      await catalogAgent.close();
+    }
     await attachment.close();
     assert(video.srcObject === null, "element cleanup");
     await receiver.close();
@@ -1028,6 +1167,7 @@
       steadyIterator?.close(),
       cyclingIterator?.close(),
       attachment?.close(),
+      discoveryWatch?.close(),
       handoffAttachment?.close(),
       videoPublication?.close(),
       audioPublication?.close(),

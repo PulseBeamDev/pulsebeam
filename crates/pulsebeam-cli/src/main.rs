@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pulsebeam_agent_native::agent_core::{
-    AgentConfig, ConnectionState, MediaKind, Snapshot, TrackSelector, VideoObservation,
+    AgentConfig, ConnectionState, Snapshot, TrackSelector, VideoObservation,
 };
 use pulsebeam_agent_native::{
     Agent, Config, Encoding, H264Frame, Host, InputFrame, MediaStreamUpdate, NativeStatistics,
@@ -308,6 +308,7 @@ struct AgentContext {
     api_url: String,
     room_id: usize,
     agent_id: usize,
+    users_per_room: usize,
     logger: Logger,
     assets: VideoAssets,
 }
@@ -573,7 +574,8 @@ async fn spawn_room(
         let ctx = AgentContext {
             api_url: api_url.to_string(),
             room_id,
-            agent_id: room_id.saturating_mul(1000).saturating_add(user_id),
+            agent_id: benchmark_agent_id(room_id, user_id),
+            users_per_room: config.users_per_room,
             logger: logger.clone(),
             assets: assets.clone(),
         };
@@ -634,12 +636,9 @@ async fn spawn_agent(
     );
 
     let (received_video_tx, received_video) = watch::channel(false);
-    // Catalog absence does not cancel this benchmark's named interests.
     let mut interests = BTreeSet::new();
-    let initial_snapshot = snapshots.borrow().clone();
     subscribe_remote_videos(
         &agent,
-        &initial_snapshot,
         &mut interests,
         &mut media_tasks,
         &ctx,
@@ -683,7 +682,6 @@ async fn spawn_agent(
                 }
                 subscribe_remote_videos(
                     &agent,
-                    &snapshot,
                     &mut interests,
                     &mut media_tasks,
                     &ctx,
@@ -795,13 +793,12 @@ async fn wait_until_connected(snapshots: &mut watch::Receiver<Snapshot>) -> Resu
 
 async fn subscribe_remote_videos(
     agent: &Agent,
-    snapshot: &Snapshot,
     interests: &mut BTreeSet<TrackSelector>,
     tasks: &mut JoinSet<()>,
     ctx: &AgentContext,
     received_video: &watch::Sender<bool>,
 ) -> Result<()> {
-    for selector in video_subscriptions(snapshot, interests) {
+    for selector in video_subscriptions(ctx.room_id, ctx.agent_id, ctx.users_per_room, interests) {
         let subscription = agent
             .room(selector.room.clone())?
             .participant(selector.participant_external_id.clone())?
@@ -821,8 +818,14 @@ async fn subscribe_remote_videos(
     Ok(())
 }
 
+fn benchmark_agent_id(room_id: usize, user_id: usize) -> usize {
+    room_id.saturating_mul(1000).saturating_add(user_id)
+}
+
 fn video_subscriptions(
-    snapshot: &Snapshot,
+    room_id: usize,
+    agent_id: usize,
+    users_per_room: usize,
     interests: &BTreeSet<TrackSelector>,
 ) -> Vec<TrackSelector> {
     let mut participants: BTreeSet<_> = interests
@@ -831,28 +834,22 @@ fn video_subscriptions(
         .collect();
     let remaining = usize::from(REMOTE_VIDEO_SLOTS).saturating_sub(interests.len());
     let mut subscriptions = Vec::new();
-    for publication in snapshot.publications.values() {
+    for user_id in 0..users_per_room {
         if subscriptions.len() == remaining {
             break;
         }
-        if publication.kind != MediaKind::Video
-            || snapshot.participant_id.as_deref() == Some(&publication.participant_id)
-        {
+        let peer_id = benchmark_agent_id(room_id, user_id);
+        if peer_id == agent_id {
             continue;
         }
-        let Some(participant) = snapshot.participants.get(&publication.participant_id) else {
-            continue;
-        };
-        if !participants.insert(participant.external_id.clone()) {
+        let participant_external_id = format!("bench-{peer_id}");
+        if !participants.insert(participant_external_id.clone()) {
             continue;
         }
-        let Some(room) = snapshot.room_external_id.as_ref() else {
-            continue;
-        };
         subscriptions.push(TrackSelector {
-            room: room.clone(),
-            participant_external_id: participant.external_id.clone(),
-            label: publication.label.clone(),
+            room: format!("bench-room-{room_id}"),
+            participant_external_id,
+            label: "camera".into(),
         });
     }
     subscriptions
@@ -1059,7 +1056,6 @@ fn annex_b_has_nal(data: &[u8], wanted: u8) -> bool {
 mod tests {
     use super::*;
     use clap::Parser;
-    use pulsebeam_agent_native::agent_core::Publication;
     use pulsebeam_core::auth::{
         DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID,
         KeyRegistryEntry, verify_participant_token,
@@ -1438,89 +1434,37 @@ mod tests {
     }
 
     #[test]
-    fn video_policy_excludes_self_audio_and_tracks_beyond_capacity() {
-        let mut snapshot = Snapshot {
-            participant_id: Some("self".into()),
-            room_external_id: Some("application-room".into()),
-            ..Default::default()
-        };
-        for (id, external_id) in [
-            ("self", "self-external"),
-            ("remote-audio", "audio-external"),
-        ] {
-            snapshot.participants.insert(
-                id.into(),
-                pulsebeam_agent_native::agent_core::Participant {
-                    id: id.into(),
-                    external_id: external_id.into(),
-                },
+    fn video_policy_uses_configured_peers_without_discovery() {
+        for users_per_room in [0_usize, 1, 2, 8, 10] {
+            let subscriptions = video_subscriptions(1, 1000, users_per_room, &BTreeSet::new());
+            assert_eq!(
+                subscriptions.len(),
+                users_per_room
+                    .saturating_sub(1)
+                    .min(usize::from(REMOTE_VIDEO_SLOTS))
             );
-        }
-        snapshot.publications.insert(
-            "self-video".into(),
-            Publication {
-                id: "self-video".into(),
-                participant_id: "self".into(),
-                label: "camera".into(),
-                kind: MediaKind::Video,
-            },
-        );
-        snapshot.publications.insert(
-            "remote-audio".into(),
-            Publication {
-                id: "remote-audio".into(),
-                participant_id: "remote-audio".into(),
-                label: "microphone".into(),
-                kind: MediaKind::Audio,
-            },
-        );
-        for participant in ["a", "b", "c", "d", "e", "f", "g", "h"] {
-            snapshot.participants.insert(
-                participant.into(),
-                pulsebeam_agent_native::agent_core::Participant {
-                    id: participant.into(),
-                    external_id: format!("external-{participant}"),
-                },
-            );
-            let track_id = format!("video-{participant}");
-            snapshot.publications.insert(
-                track_id.clone(),
-                Publication {
-                    id: track_id,
-                    participant_id: participant.into(),
-                    label: "camera".into(),
-                    kind: MediaKind::Video,
-                },
-            );
+            assert!(subscriptions.iter().all(|selector| {
+                selector.room == "bench-room-1"
+                    && selector.label == "camera"
+                    && selector.participant_external_id != "bench-1000"
+            }));
+            let interests: BTreeSet<_> = subscriptions.into_iter().collect();
+            assert!(video_subscriptions(1, 1000, users_per_room, &interests).is_empty());
         }
 
-        let subscriptions = video_subscriptions(&snapshot, &BTreeSet::new());
-        assert_eq!(subscriptions.len(), usize::from(REMOTE_VIDEO_SLOTS));
-        assert!(subscriptions.iter().all(|subscription| {
-            subscription.room == "application-room"
-                && subscription.label == "camera"
-                && subscription
-                    .participant_external_id
-                    .starts_with("external-")
-        }));
-        let interests: BTreeSet<_> = subscriptions.into_iter().collect();
-        assert_eq!(interests.len(), usize::from(REMOTE_VIDEO_SLOTS));
-        assert!(video_subscriptions(&snapshot, &interests).is_empty());
-        snapshot.publications.clear();
-        assert!(video_subscriptions(&snapshot, &interests).is_empty());
-        let first = interests.first().unwrap().clone();
-        snapshot.room_external_id = None;
-        assert_eq!(first.room, "application-room");
-        snapshot.publications.insert(
-            "republished".into(),
-            Publication {
-                id: "republished".into(),
-                participant_id: "a".into(),
-                label: "renamed-camera".into(),
-                kind: MediaKind::Video,
-            },
+        let subscriptions = video_subscriptions(1, 1002, 4, &BTreeSet::new());
+        assert_eq!(
+            subscriptions
+                .iter()
+                .map(|selector| selector.participant_external_id.as_str())
+                .collect::<Vec<_>>(),
+            ["bench-1000", "bench-1001", "bench-1003"]
         );
-        assert_eq!(first.participant_external_id, "external-a");
-        assert!(video_subscriptions(&snapshot, &BTreeSet::from([first])).is_empty());
+        let retained = subscriptions[0].clone();
+        let remaining = video_subscriptions(1, 1002, 4, &BTreeSet::from([retained.clone()]));
+        assert_eq!(remaining, subscriptions[1..]);
+        assert_eq!(retained.room, "bench-room-1");
+        assert_eq!(retained.participant_external_id, "bench-1000");
+        assert_eq!(retained.label, "camera");
     }
 }

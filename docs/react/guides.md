@@ -77,19 +77,30 @@ through `display.error`.
 
 ## Remote discovery and video receive policy
 
-Participants and their immutable track arrays are the discovery surface. Narrow
-by `kind` when collecting video tracks.
+Own one bounded catalog page. Give the observer Discover permission for the
+literal room; that does not grant Subscribe or start media reception. Render
+loading, failure and continuation separately. This roster deliberately does not
+fetch every page or receive every publication:
 
-```tsx
-const videos = agent.participants.flatMap((participant) =>
-  participant.tracks.filter(
-    (value): value is RemoteVideoTrack => value.kind === "video",
-  ),
-);
-```
+<<< ./Roster.tsx
 
-Create reception explicitly with `useSubscribe`. Rendering and receive demand
-have independent lifetimes; unmounting a view does not close its subscription.
+Mount this roster with a key containing `roomName` when changing rooms, so its
+continuation resets. A cursor is short-lived and bound to the room and limit.
+If a continuation expires, First page creates a fresh first-page watch. For an
+initial permission failure, correct authorization and remount the roster rather
+than treating failure as an empty page. Old application-retained pages stay
+stable; the SDK retains only its current page.
+
+Select publications only from the displayed page. A `Video` metadata entry maps
+to `room.participant(info.externalId).video(publication.label)`; use `.audio` or
+`.data` for the other kinds. Skip `info.externalId === agent.participantId` before
+creating receive owners. Presence-only entries still belong in the roster.
+Keep each selected handle stable in a mounted child with `useMemo`.
+
+For a selected pinned `remote` video handle, create reception explicitly with
+`useSubscribe`. Unmounting `Video` releases only its observation. Unmounting the
+component that called `useSubscribe` closes that subscription. Replacing a Watch
+page does not close subscriptions held independently outside those UI mounts.
 
 ```tsx
 const subscription = useSubscribe(remote, {

@@ -176,6 +176,17 @@ pub struct RoomRef {
 }
 
 impl RoomRef {
+    pub fn watch(&self, config: agent_core::ffi::WatchConfig) -> Result<super::Watch, Error> {
+        if self.closed.is_closed() || self.finished.is_closed() {
+            return Err(Error::Closed);
+        }
+        let watch = super::Watch::new(self.name.clone(), config, self.core.clone())?;
+        if self.closed.is_closed() || self.finished.is_closed() {
+            return Err(Error::Closed);
+        }
+        Ok(watch)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }

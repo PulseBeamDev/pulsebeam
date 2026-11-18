@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
+mod catalog;
 mod resource_state;
 
 pub(super) enum SubscriptionConfiguration {
@@ -238,6 +239,7 @@ pub(super) struct Control {
     >,
     pipe_observers: PipeObservers,
     resource_observers: Arc<std::sync::Mutex<Vec<resource_state::ResourceObservation>>>,
+    watch_observers: catalog::WatchObservers,
 }
 
 impl Control {
@@ -253,6 +255,7 @@ impl Control {
             publication_observers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             pipe_observers: Arc::new(std::sync::Mutex::new(Vec::new())),
             resource_observers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            watch_observers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -751,7 +754,11 @@ impl Control {
     }
 
     pub(super) fn next_notification(&self) -> Option<Notification> {
-        self.with(agent_core::Agent::next_notification)
+        let notification = self.with(agent_core::Agent::next_notification);
+        if let Some(Notification::CatalogWatchTerminated { owner, state }) = &notification {
+            self.watch_terminated(*owner, state.clone());
+        }
+        notification
     }
 
     pub(super) fn is_publishing(&self, slot: &MediaSlot) -> bool {

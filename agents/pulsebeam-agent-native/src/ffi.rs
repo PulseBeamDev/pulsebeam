@@ -57,6 +57,7 @@ impl From<RuntimeError> for NativeError {
             RuntimeError::Core(agent_core::AgentError::InvalidTopic(reason)) => Self::Topic {
                 reason: reason.into(),
             },
+            RuntimeError::Operation(info) => Self::Operation { info },
             RuntimeError::DataSend(reason) => Self::DataSend { reason },
             RuntimeError::Core(error) => Self::Core {
                 error: error.into(),
@@ -362,6 +363,16 @@ pub struct RoomRef {
 
 #[uniffi::export]
 impl RoomRef {
+    #[uniffi::method(default(config = None))]
+    pub fn watch(&self, config: Option<core_ffi::WatchConfig>) -> Result<Arc<Watch>, NativeError> {
+        Ok(Arc::new(Watch {
+            runtime: self
+                .runtime
+                .watch(config.unwrap_or_default())
+                .map_err(operation_error)?,
+        }))
+    }
+
     pub fn name(&self) -> String {
         self.runtime.name().into()
     }
@@ -370,6 +381,29 @@ impl RoomRef {
         Ok(Arc::new(Participant {
             runtime: self.runtime.participant(id)?,
         }))
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct Watch {
+    runtime: crate::Watch,
+}
+
+#[uniffi::export]
+impl Watch {
+    pub fn state(&self) -> core_ffi::WatchState {
+        self.runtime.state()
+    }
+    pub fn updates(&self) -> Result<Arc<WatchUpdates>, NativeError> {
+        Ok(Arc::new(WatchUpdates {
+            runtime: self
+                .runtime
+                .updates()
+                .map_err(resource_state::observer_limit)?,
+        }))
+    }
+    pub fn close(&self) {
+        self.runtime.close();
     }
 }
 

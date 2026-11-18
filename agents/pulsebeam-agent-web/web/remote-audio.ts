@@ -1,4 +1,5 @@
-import type { AgentSnapshot, LogLevel } from "./types.js";
+import type { LogLevel } from "./types.js";
+import type { ReconciliationSnapshot } from "./reconciliation-snapshot.js";
 
 interface Route {
   readonly publicationId: string;
@@ -49,7 +50,7 @@ export class RemoteAudioPlayback {
     }
   }
 
-  start(snapshot: AgentSnapshot): void {
+  start(snapshot: ReconciliationSnapshot): void {
     if (this.#closed) return;
     try {
       this.#contextForPlayback();
@@ -60,7 +61,7 @@ export class RemoteAudioPlayback {
     this.#update(snapshot, true);
   }
 
-  update(snapshot: AgentSnapshot): void {
+  update(snapshot: ReconciliationSnapshot): void {
     this.#update(snapshot, false);
   }
 
@@ -70,7 +71,7 @@ export class RemoteAudioPlayback {
     void this.resume().catch(() => {});
   }
 
-  #update(snapshot: AgentSnapshot, starting: boolean): void {
+  #update(snapshot: ReconciliationSnapshot, starting: boolean): void {
     if (this.#closed) return;
     const bindings = new Map(
       snapshot.mapping.audio.map((entry) => [entry.receiverIndex, entry]),

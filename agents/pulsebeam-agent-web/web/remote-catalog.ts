@@ -1,8 +1,12 @@
+import { ErrorCode } from "./schema.js";
+import type { ReconciliationSnapshot } from "./reconciliation-snapshot.js";
+import { OperationError, raise } from "./agent-observation.js";
 import {
-  attachRemoteMedia,
-  type MediaHost,
-  type MediaAttachment,
-} from "./remote-media.js";
+  ResourceObservation,
+  type NativeResourceObserver,
+} from "./resource-observation.js";
+import type { MediaHost, MediaAttachment } from "./remote-media.js";
+import { attachMedia } from "./media-attachment.js";
 import {
   claimVideoSubscription,
   defaultVideoObservation,
@@ -20,7 +24,6 @@ import type { DataRegistry, RemoteDataTrack } from "./data.js";
 import { track, type Delivery } from "./track.js";
 import type {
   Agent,
-  AgentSnapshot,
   AudioSubscriptionConfig,
   VideoObservation,
   LogLevel,
@@ -28,11 +31,12 @@ import type {
   ReceiveOptions,
   RemoteAudioTrack,
   RemoteParticipant,
-  RemotePublishedTrack,
   RemoteMediaAttachmentOptions,
   RemoteVideoTrack,
-  RemoteMedia,
   RoomRef,
+  Watch,
+  WatchConfig,
+  WatchState,
 } from "./types.js";
 
 type PlaybackCallback = (
@@ -43,9 +47,56 @@ export interface RemoteVideoAttachment extends MediaAttachment {
   readonly ready: Promise<void>;
   setPreferences(options: ReceiveOptions): void;
 }
+interface NativeWatch extends NativeResourceObserver {
+  close(): void;
+}
+
+export function watchCatalog(
+  runtime: {
+    catalog_watch(room: string, limit: number, cursor: Uint8Array): NativeWatch;
+  },
+  room: string,
+  config: WatchConfig = {},
+): Watch {
+  const invalid = () =>
+    new OperationError({
+      code: ErrorCode.InvalidArgument,
+      message: "Invalid watch configuration",
+    });
+  if (!config || typeof config !== "object") throw invalid();
+  const limit = config.limit ?? 100;
+  if (!Number.isInteger(limit) || limit < 0 || limit > 0xffff_ffff)
+    throw invalid();
+  const bytes = config.cursor ?? [];
+  if (!(bytes instanceof Uint8Array) && !Array.isArray(bytes)) throw invalid();
+  if (
+    !Array.from(bytes).every(
+      (byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255,
+    )
+  )
+    throw invalid();
+  const cursor = Uint8Array.from(bytes);
+  try {
+    const native = runtime.catalog_watch(room, limit, cursor);
+    // BrowserRuntime freezes the complete projection, including the shared page.
+    const observation = new ResourceObservation<WatchState>((value) => value);
+    observation.bind(native);
+    return Object.freeze({
+      state: () => observation.state(),
+      updates: () => observation.updates(),
+      close: () => {
+        native.close();
+        return Promise.resolve();
+      },
+    });
+  } catch (error) {
+    return raise(error);
+  }
+}
+
 const MAX_UINT32 = 0xffff_ffff;
 const videoOwners = new WeakMap<RemoteVideoTrack, VideoHandle>();
-const audioCatalogs = new WeakMap<Agent, RemoteCatalog>();
+const audioCatalogs = new WeakMap<object, RemoteCatalog>();
 
 export interface RemoteAudioAttachment {
   readonly ready: Promise<void>;
@@ -97,20 +148,8 @@ function receiveOptions(options: ReceiveOptions): ReceiveOptions {
   });
 }
 
-function collection<T>(prior: readonly T[], next: T[]): readonly T[] {
-  return prior.length === next.length &&
-    prior.every((item) => next.includes(item))
-    ? prior
-    : Object.freeze(next);
-}
-
 class VideoHandle implements RemoteVideoTrack {
   readonly kind = "video" as const;
-  publicationId: string | undefined;
-  readonly bindingListeners = new Set<() => void>();
-  readonly optionListeners = new Set<() => void>();
-  readonly #listeners = new Set<() => void>();
-  options: ReceiveOptions = validateReceiveOptions({});
   constructor(
     readonly catalog: RemoteCatalog,
     readonly room: string,
@@ -151,32 +190,10 @@ class VideoHandle implements RemoteVideoTrack {
       configuration,
     );
   }
-  bind(id: string | undefined): void {
-    if (id === this.publicationId) return;
-    this.publicationId = id;
-    for (const listener of this.bindingListeners) listener();
-    for (const listener of this.#listeners) listener();
-  }
-  setReceiveOptions(options: ReceiveOptions): void {
-    if (this.catalog.closed) return;
-    const next = validateReceiveOptions(options);
-    if (JSON.stringify(this.options) === JSON.stringify(next)) return;
-    this.options = next;
-    for (const listener of this.optionListeners) listener();
-  }
-  close(): void {
-    this.bind(undefined);
-    this.bindingListeners.clear();
-    this.optionListeners.clear();
-    this.#listeners.clear();
-  }
 }
 
 class AudioHandle implements RemoteAudioTrack {
   readonly kind = "audio" as const;
-  publicationId: string | undefined;
-  #binding: number | undefined;
-  readonly #listeners = new Set<() => void>();
   constructor(
     readonly catalog: RemoteCatalog,
     readonly room: string,
@@ -203,12 +220,6 @@ class AudioHandle implements RemoteAudioTrack {
         .mapping.audio.some((entry) => entry.publicationId === id)
     );
   }
-  bind(id: string | undefined, receiver: number | undefined): void {
-    const changed = id !== this.publicationId || receiver !== this.#binding;
-    this.publicationId = id;
-    this.#binding = receiver;
-    if (changed) for (const listener of this.#listeners) listener();
-  }
   watch(listener: () => void): () => void {
     if (this.catalog.closed) return () => {};
     let state = `${this.id}:${this.receiving}`;
@@ -230,44 +241,11 @@ class AudioHandle implements RemoteAudioTrack {
       configuration,
     );
   }
-  readWaveform(buffer: Float32Array): void {
-    this.catalog.read(this.id ?? undefined, buffer, false);
-  }
-  readSpectrum(buffer: Float32Array): void {
-    this.catalog.read(this.id ?? undefined, buffer, true);
-  }
-  close(): void {
-    this.bind(undefined, undefined);
-    this.#listeners.clear();
-  }
 }
 
 class ParticipantHandle implements RemoteParticipant {
   readonly videos = new Map<string, VideoHandle>();
   readonly audios = new Map<string, AudioHandle>();
-  videoTracks: readonly RemoteVideoTrack[] = Object.freeze([]);
-  audioTracks: readonly RemoteAudioTrack[] = Object.freeze([]);
-  #tracks: readonly RemotePublishedTrack[] = Object.freeze([]);
-  get tracks(): readonly RemotePublishedTrack[] {
-    if (this.catalog.closed || !this.catalog.isCurrentRoom(this.room))
-      return Object.freeze([]);
-    const entries = this.catalog.agent
-      .getSnapshot()
-      .catalog.tracks.filter(
-        (entry) => entry.participantId === this.participantId,
-      );
-    this.#tracks = collection(
-      this.#tracks,
-      entries.map((entry) =>
-        entry.kind === "data"
-          ? this.data(entry.label, entry.delivery)
-          : entry.kind === "video"
-            ? this.video(entry.label)
-            : this.audio(entry.label),
-      ),
-    );
-    return this.#tracks;
-  }
   get active(): boolean {
     return (
       !this.catalog.closed &&
@@ -323,7 +301,7 @@ class ParticipantHandle implements RemoteParticipant {
   }
 }
 
-export class RemoteCatalog implements RemoteMedia {
+export class RemoteCatalog {
   readonly #handles = new Map<string, ParticipantHandle>();
   readonly #publicParticipants = new WeakMap<
     ParticipantHandle,
@@ -331,31 +309,18 @@ export class RemoteCatalog implements RemoteMedia {
   >();
   readonly #publicVideos = new WeakMap<VideoHandle, RemoteVideoTrack>();
   readonly #publicAudios = new WeakMap<AudioHandle, RemoteAudioTrack>();
-  readonly #publicCollections = new WeakMap<
-    object,
-    readonly RemotePublishedTrack[]
-  >();
-  readonly #publicParticipantCollections = new WeakMap<
-    object,
-    readonly RemoteParticipant[]
-  >();
-  #facade: RemoteMedia | undefined;
   #playback: RemoteAudioPlayback | undefined;
   #closed = false;
-  #catalogRoom: string | null = null;
-  participants: readonly RemoteParticipant[] = Object.freeze([]);
-  videoTracks: readonly RemoteVideoTrack[] = Object.freeze([]);
-  audioTracks: readonly RemoteAudioTrack[] = Object.freeze([]);
   constructor(
-    readonly agent: Agent & MediaHost,
+    readonly agent: MediaHost,
     readonly data: DataRegistry,
     readonly owners: ResourceOwners,
     private logLevel: LogLevel = "warn",
+    private readonly openWatch?: (room: string, config?: WatchConfig) => Watch,
   ) {
     audioCatalogs.set(agent, this);
   }
-  facade(): RemoteMedia {
-    const thisCatalog = this;
+  #wrapParticipant(participant: ParticipantHandle): RemoteParticipant {
     const wrapVideo = (handle: VideoHandle): RemoteVideoTrack => {
       let value = this.#publicVideos.get(handle);
       if (!value) {
@@ -402,31 +367,12 @@ export class RemoteCatalog implements RemoteMedia {
     const wrapParticipant = (handle: ParticipantHandle): RemoteParticipant => {
       let value = this.#publicParticipants.get(handle);
       if (value) return value;
-      const wrapTrack = (entry: RemotePublishedTrack): RemotePublishedTrack =>
-        entry.kind === "video"
-          ? wrapVideo(entry as VideoHandle)
-          : entry.kind === "audio"
-            ? wrapAudio(entry as AudioHandle)
-            : entry;
       value = Object.freeze({
         room: handle.room,
         participantId: handle.participantId,
         id: () => handle.id(),
         get active() {
           return handle.active;
-        },
-        get tracks() {
-          let collection = thisCatalog.#publicCollections.get(
-            handle.tracks as object,
-          );
-          if (!collection) {
-            collection = Object.freeze(handle.tracks.map(wrapTrack));
-            thisCatalog.#publicCollections.set(
-              handle.tracks as object,
-              collection,
-            );
-          }
-          return collection;
         },
         video: (label: string) => wrapVideo(handle.video(label)),
         audio: (label: string) => wrapAudio(handle.audio(label)),
@@ -436,23 +382,7 @@ export class RemoteCatalog implements RemoteMedia {
       this.#publicParticipants.set(handle, value);
       return value;
     };
-    this.#facade ??= Object.freeze({
-      get participants() {
-        const source = thisCatalog.participants as readonly ParticipantHandle[];
-        let collection = thisCatalog.#publicParticipantCollections.get(
-          source as object,
-        );
-        if (!collection) {
-          collection = Object.freeze(source.map(wrapParticipant));
-          thisCatalog.#publicParticipantCollections.set(
-            source as object,
-            collection,
-          );
-        }
-        return collection;
-      },
-    });
-    return this.#facade;
+    return wrapParticipant(participant);
   }
   bindAgent(agent: Agent): void {
     audioCatalogs.set(agent, this);
@@ -552,9 +482,22 @@ export class RemoteCatalog implements RemoteMedia {
     this.requireOpen();
     return Object.freeze({
       name,
+      watch: (config?: WatchConfig) => {
+        if (this.#closed)
+          throw new OperationError({
+            code: ErrorCode.Closed,
+            message: "Agent is closed",
+          });
+        if (!this.openWatch)
+          throw new OperationError({
+            code: ErrorCode.NotReady,
+            message: "Watch runtime is inactive",
+          });
+        return this.openWatch(name, config);
+      },
       participant: (id: string) => {
         this.requireOpen();
-        return this.#discovered(name, id);
+        return this.#wrapParticipant(this.#discovered(name, id));
       },
     });
   }
@@ -581,73 +524,9 @@ export class RemoteCatalog implements RemoteMedia {
   resetPlayback(): void {
     this.#playback?.reset();
   }
-  read(id: string | undefined, buffer: Float32Array, spectrum: boolean): void {
-    if (this.#playback) this.#playback.read(id, buffer, spectrum);
-    else buffer.fill(spectrum ? -Infinity : 0);
-  }
-  update(snapshot: AgentSnapshot): void {
+  update(snapshot: ReconciliationSnapshot): void {
     if (this.#closed) return;
-    if (this.#catalogRoom !== snapshot.roomId) {
-      this.#handles.clear();
-      this.#catalogRoom = snapshot.roomId;
-    }
     this.#playback?.update(snapshot);
-    const byId = new Map<string, ParticipantHandle>();
-    const participants: ParticipantHandle[] = [];
-    for (const participant of snapshot.catalog.participants) {
-      if (participant.participantId === snapshot.participantId) continue;
-      const room = snapshot.roomId;
-      if (room === null) continue;
-      const handle = this.#discovered(room, participant.participantId);
-      byId.set(participant.participantId, handle);
-      participants.push(handle);
-    }
-    const videoIds = new Map<VideoHandle, string>();
-    const audioIds = new Map<AudioHandle, string>();
-    const videos: VideoHandle[] = [];
-    const audios: AudioHandle[] = [];
-    for (const publication of snapshot.catalog.publications) {
-      const participant = byId.get(publication.participantId);
-      if (!participant) continue;
-      if (publication.kind === "video") {
-        const handle = participant.video(publication.label);
-        videoIds.set(handle, publication.id);
-        videos.push(handle);
-      } else {
-        const handle = participant.audio(publication.label);
-        audioIds.set(handle, publication.id);
-        audios.push(handle);
-      }
-    }
-    const receivers = new Map(
-      snapshot.mapping.audio.map(({ publicationId, receiverIndex }) => [
-        publicationId,
-        receiverIndex,
-      ]),
-    );
-    for (const participant of this.#handles.values()) {
-      for (const handle of participant.videos.values())
-        handle.bind(videoIds.get(handle));
-      for (const handle of participant.audios.values()) {
-        const id = audioIds.get(handle);
-        handle.bind(id, id === undefined ? undefined : receivers.get(id));
-      }
-      participant.videoTracks = collection(
-        participant.videoTracks,
-        videos.filter(
-          (handle) => handle.participantId === participant.participantId,
-        ),
-      );
-      participant.audioTracks = collection(
-        participant.audioTracks,
-        audios.filter(
-          (handle) => handle.participantId === participant.participantId,
-        ),
-      );
-    }
-    this.participants = collection(this.participants, participants);
-    this.videoTracks = collection(this.videoTracks, videos);
-    this.audioTracks = collection(this.audioTracks, audios);
   }
   close(): void {
     if (this.#closed) return;
@@ -656,15 +535,7 @@ export class RemoteCatalog implements RemoteMedia {
     this.#playback?.close();
     this.#playback = undefined;
     audioCatalogs.delete(this.agent);
-    for (const participant of this.#handles.values()) {
-      for (const handle of participant.videos.values()) handle.close();
-      for (const handle of participant.audios.values()) handle.close();
-      participant.videoTracks = Object.freeze([]);
-      participant.audioTracks = Object.freeze([]);
-    }
-    this.participants = Object.freeze([]);
-    this.videoTracks = Object.freeze([]);
-    this.audioTracks = Object.freeze([]);
+    this.#handles.clear();
   }
 }
 
@@ -683,26 +554,6 @@ export function attachRemoteVideo(
   return attachVideoHandle(handle, element, onPlaybackBlocked, options);
 }
 
-function visibleInTree(element: HTMLElement): boolean {
-  if (element.ownerDocument.hidden) return false;
-  for (
-    let node: HTMLElement | null = element;
-    node;
-    node = node.parentElement
-  ) {
-    const style = node.ownerDocument.defaultView?.getComputedStyle(node);
-    if (
-      node.hidden ||
-      style?.display === "none" ||
-      style?.visibility === "hidden" ||
-      style?.visibility === "collapse" ||
-      Number(style?.opacity || "1") === 0
-    )
-      return false;
-  }
-  return true;
-}
-
 function attachVideoHandle(
   handle: VideoHandle,
   element: HTMLVideoElement,
@@ -713,58 +564,11 @@ function attachVideoHandle(
 ): RemoteVideoAttachment {
   if (!(element instanceof HTMLVideoElement))
     throw new TypeError("remote attachment requires a video element");
-  let preferences = validateReceiveOptions(options.preferences ?? {});
-  const claim = claimVideoSubscription(
-    handle.catalog.owners,
-    {
-      room: handle.room,
-      participantId: handle.participantId,
-      label: handle.label,
-    },
-    {
-      visible: false,
+  const configuration = (options: ReceiveOptions): VideoObservation => {
+    const preferences = validateReceiveOptions(options);
+    return {
+      visible: true,
       height: 0,
-      minHeight: 0,
-      minFps: 0,
-      priority: 0,
-      playoutDelay: { mode: "adaptive" },
-    },
-  );
-  const subscription = claim.subscription;
-  const agent = handle.catalog.agent;
-  const attachment = attachRemoteMedia(subscription, element, {
-    ready: claim.ready,
-    subscribe: agent.subscribe,
-    onPlaybackBlocked,
-    autoPlay: options.autoPlay,
-  });
-  const viewport = element.ownerDocument.defaultView;
-  let intersecting = true;
-  let closed = false;
-  const sync = () => {
-    if (closed) return;
-    const rect = element.getBoundingClientRect();
-    const visible =
-      element.isConnected &&
-      intersecting &&
-      visibleInTree(element) &&
-      rect.width > 0 &&
-      rect.height > 0 &&
-      (viewport === null ||
-        (rect.bottom > 0 &&
-          rect.right > 0 &&
-          rect.top < viewport.innerHeight &&
-          rect.left < viewport.innerWidth));
-    const height = visible
-      ? Math.min(
-          MAX_UINT32,
-          Math.ceil(rect.height * (viewport?.devicePixelRatio || 1)),
-        )
-      : 0;
-    if (subscription.isClosed()) return;
-    const observation: VideoObservation = {
-      visible,
-      height,
       minHeight: preferences.minHeight ?? 0,
       minFps: preferences.minFps ?? 0,
       priority: preferences.priority ?? 0,
@@ -772,79 +576,52 @@ function attachVideoHandle(
         ? { mode: "fixed", ...preferences.playoutDelay }
         : { mode: "adaptive" },
     };
-    void subscription.configure(observation).catch((error: unknown) => {
-      if (closed || subscription.isClosed()) return;
-      const retry = () => subscription.configure(observation);
-      onPlaybackBlocked?.(
-        {
-          message: error instanceof Error ? error.message : String(error),
-          cause: error,
-          retry,
-        },
+  };
+  const claim = claimVideoSubscription(
+    handle.catalog.owners,
+    {
+      room: handle.room,
+      participantId: handle.participantId,
+      label: handle.label,
+    },
+    configuration(options.preferences ?? {}),
+  );
+  const report = (error: unknown, retry: () => Promise<void>) =>
+    onPlaybackBlocked?.(
+      {
+        message: error instanceof Error ? error.message : String(error),
+        cause: error,
         retry,
-      );
-    });
-  };
-  let pixelRatioQuery: MediaQueryList | null = null;
-  const onPixelRatioChange = () => {
-    watchPixelRatio();
-    sync();
-  };
-  const watchPixelRatio = () => {
-    pixelRatioQuery?.removeEventListener("change", onPixelRatioChange);
-    pixelRatioQuery =
-      viewport?.matchMedia?.(
-        `(resolution: ${viewport.devicePixelRatio || 1}dppx)`,
-      ) ?? null;
-    pixelRatioQuery?.addEventListener("change", onPixelRatioChange);
-  };
-  watchPixelRatio();
-  const resize =
-    typeof ResizeObserver === "undefined" ? null : new ResizeObserver(sync);
-  resize?.observe(element);
-  const intersection =
-    typeof IntersectionObserver === "undefined"
-      ? null
-      : new IntersectionObserver(([entry]) => {
-          intersecting = entry?.isIntersecting ?? false;
-          sync();
-        });
-  intersection?.observe(element);
-  const mutation = new MutationObserver(sync);
-  mutation.observe(element.ownerDocument.documentElement, {
-    attributes: true,
-    attributeFilter: ["style", "class", "hidden"],
-    childList: true,
-    subtree: true,
-  });
-  const onResize = () => {
-    watchPixelRatio();
-    sync();
-  };
-  viewport?.addEventListener("resize", onResize);
-  viewport?.addEventListener("scroll", sync, true);
-  element.ownerDocument.addEventListener("visibilitychange", sync);
-  sync();
+      },
+      retry,
+    );
+  const attachment = attachMedia(
+    claim.subscription,
+    "video",
+    element,
+    options.autoPlay ?? true,
+    report,
+    (error) => report(error, () => claim.ready),
+    claim.ready,
+  );
+  let closing: Promise<void> | undefined;
   return {
     ready: claim.ready,
-    setAutoPlay: (autoPlay) => attachment.setAutoPlay(autoPlay),
+    setAutoPlay: attachment.setAutoPlay,
     setPreferences: (next) => {
-      if (closed) return;
-      preferences = validateReceiveOptions(next);
-      sync();
+      if (closing) return;
+      const value = configuration(next);
+      void claim.subscription
+        .configure(value)
+        .catch((error: unknown) =>
+          report(error, () => claim.subscription.configure(value)),
+        );
     },
-    retryPlayback: () => attachment.retryPlayback(),
-    close: () => {
-      if (closed) return attachment.close();
-      closed = true;
-      resize?.disconnect();
-      intersection?.disconnect();
-      mutation.disconnect();
-      pixelRatioQuery?.removeEventListener("change", onPixelRatioChange);
-      viewport?.removeEventListener("resize", onResize);
-      viewport?.removeEventListener("scroll", sync, true);
-      element.ownerDocument.removeEventListener("visibilitychange", sync);
-      return attachment.close();
-    },
+    retryPlayback: attachment.retryPlayback,
+    close: () =>
+      (closing ??= Promise.allSettled([
+        attachment.close(),
+        claim.subscription.close(),
+      ]).then(() => {})),
   };
 }

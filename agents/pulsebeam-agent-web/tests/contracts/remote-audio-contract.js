@@ -176,12 +176,20 @@
         decoderStream.getAudioTracks()[0] === received[0],
       "one private detached hidden muted receiver decoder",
     );
-    const voice = catalog.room("room").participant("alice").audio("first");
     const spectrum = new Float32Array(1024);
-    voice.readSpectrum(spectrum);
+    const readSpectrum = () => {
+      assert(output.routes.size === 1, "one SDK analysis output route");
+      const [analyser] = output.routes;
+      assert(
+        analyser instanceof AnalyserNode,
+        "SDK output is its real analyser",
+      );
+      analyser.getFloatFrequencyData(spectrum);
+    };
+    readSpectrum();
     assert(
       Math.abs((peak(spectrum) * sdkContext.sampleRate) / 2048 - 440) < 45,
-      "SDK analysis exposes the real decoded tone",
+      "SDK analyser contains the real decoded tone",
     );
     snapshot = {
       ...snapshot,
@@ -189,7 +197,7 @@
     };
     catalog.update(snapshot);
     await wait(() => {
-      voice.readSpectrum(spectrum);
+      readSpectrum();
       return (
         Math.abs((peak(spectrum) * sdkContext.sampleRate) / 2048 - 1320) < 45
       );

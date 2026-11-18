@@ -213,7 +213,8 @@ impl StateProtocolHandler {
         if self.commands.len() < PREPARATION_BUDGET
             && (self.model.revocation_pending()
                 || self.model.preparation_pending(unix_now)
-                || self.model.lookup_refresh_pending())
+                || self.model.lookup_refresh_pending()
+                || self.model.catalog.pending() && self.model.needs_poll())
             && !self.handoff.schedule()
         {
             return Err(OutputError::Capacity.into());

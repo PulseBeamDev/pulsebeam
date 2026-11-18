@@ -43,6 +43,39 @@ Factory input choices are independent for audio and video:
 
 `MediaConfig.video_publications` names local core slots and their native encodings. Raw video admits one to three encodings. Encoded H.264 admits one encoding or three simulcast encodings, not two, with a uniform L1T1 or L1T3 profile. Multiple encodings require distinct valid RIDs and appropriate scale/rate declarations. L1T3 requires dependency-descriptor configuration and actual negotiation on attached senders before encoded input is admitted. Unsupported combinations return errors rather than adding a peer, transcoding, or substituting a runtime-specific pipeline. Both runtimes explicitly register the stock H.264 decoder, including with encoded local input. For L1T1 input, an absent temporal index or explicit base index zero is accepted and normalized to the native absent-index representation; enhancement indices are rejected. Each L1T3 unit requires its genuine temporal index (0, 1 or 2), with keyframes at index zero and the producer's base-layer sync flag preserved.
 
+## Discover one bounded live page
+
+Use `agent.room(name).watch()` to own a live catalog page independently of media
+subscriptions. Generated Node and Python expose `Watch`, `WatchState`,
+`WatchUpdates`, `WatchConfig` and `WatchStatus` from the Native/Core namespaces.
+The default limit is 100 participants, maximum 500; an Agent can own eight
+pending/live watches. Supply a `WatchConfig` to select the immutable limit and
+cursor. State starts Loading, not as a successful empty page.
+
+A Live state's page contains participant IDs, application external IDs and
+publication metadata, including participants with no publications. In generated
+Python, read `state.page.participants()`, `has_more()`, `next_cursor()` and
+`cursor_expires_at_unix_seconds()`; Node uses the corresponding camelCase methods.
+Retained page values stay stable across updates. The SDK retains one current page
+per watch, not a history or every continuation.
+
+Use the next cursor only with the same room and limit by closing/replacing the
+watch. Continuations expire after 60 seconds and confer no authority. Invalid,
+expired or wrong-scope continuations fail explicitly; restart without a cursor
+for the first page. Check Failed/error instead of displaying an empty roster.
+
+Discover authorizes metadata independently of Subscribe. Select a page entry's
+external ID and label for pinned participant/track lookup; creating a reference
+receives nothing. Known-address subscriptions do not require Discover. Skip self
+when creating receive owners. Public session snapshots no longer contain a global
+catalog or receiver mapping.
+
+`updates()` is current-first and coalesced, with up to 32 independent cursors and
+one pending `next()` per cursor. Close each cursor separately. Watch close is
+synchronous in generated APIs and releases its reservation without closing
+independent subscriptions. A healthy close publishes Closed and clears the page;
+closing a failed watch preserves its terminal failure.
+
 ## Own sources and observations
 
 ### Named publications and independent inputs
@@ -167,9 +200,11 @@ It can coexist with named adaptive subscriptions through the same Core receive
 reconciler. Non-adaptive policy delays require exclusive audio ownership.
 Reception still requires actual negotiated receiver facts.
 
-Use `Subscription::observe_source(source_id, mode)` for an exact opaque source ID
-from installed `Snapshot.audio_mapping` entries. This observes existing policy
-demand; it does not pin the source or create receive demand. Each returned
+Use `Subscription::observe_source(source_id, mode)` for an exact opaque
+publication ID from an owned catalog page. Obtaining that metadata requires
+Discover independently of the audio policy's Subscribe permission. Public
+snapshots do not expose an audio mapping. This observes existing policy demand;
+it does not pin the source or create receive demand. Each returned
 observation ends permanently on source or receiver retirement. A fresh matching
 physical receiver requires a fresh observation, never a different source under
 the old handle. Removing a source from the policy ends that owner's observations
@@ -196,7 +231,7 @@ removed. Acquire observations through an owned subscription instead.
 - Rust-only `Config::decoded_video_observer` optionally observes synchronous owned I420/error facts before the unchanged polling retention queue. Do not block or synchronously control the SDK in this callback. Its native generation/receiver identity, host callback time and SDK global native callback microseconds are observational facts, not display completion. Map clock domains explicitly; polling loss and callback failure are separate. Default and generated-language configuration is unchanged. See [qualification scope](QUALIFICATION.md).
 - `RemoteMedia::next` returns owned track/frame updates, native sink drops, observer lag or terminal closure. Physical receiver retirement closes its observations even when the session generation is unchanged. Use the retained named subscription to acquire a fresh observation; Core owns readiness across reconstruction. Each physical receiver remains bound to one exact source incarnation. A replacement source requires a fresh physical receiver and observation. Each receiver has at most 32 observers, with four queued updates per observation channel. Closing a stream invalidates and releases queued observations; values already returned remain owned and valid.
 
-`NativeReceiverInfo` describes the native generation, receiver, RTC track and transceiver MID/media index, separately from Core's logical `RemoteTrack` record. `RemoteMedia::source_track_id` returns the Core-authorized opaque publication ID for an owned observation; it is not the RTC track ID. Catalog publication/selector state is a separate core snapshot. An owned PCM observation associates its exact receiver track with that publication; individual PCM blocks do not carry invented publication, SSRC or RTP timestamp fields. Optional frame metadata is populated only when the native callback supplies it.
+`NativeReceiverInfo` describes the native generation, receiver, RTC track and transceiver MID/media index, separately from Core's logical `RemoteTrack` record. `RemoteMedia::source_track_id` returns the Core-authorized opaque publication ID for an owned observation; it is not the RTC track ID. Publication/selector state is observed through owned resources; catalog metadata is obtained through an owned room Watch, not a public session snapshot. An owned PCM observation associates its exact receiver track with that publication; individual PCM blocks do not carry invented publication, SSRC or RTP timestamp fields. Optional frame metadata is populated only when the native callback supplies it.
 
 Snapshot, event and producer-feedback observations are bounded and report `Lagged`/`Closed` explicitly. Native statistics are owned SDK report JSON plus its generation and native timestamp, not synthetic transport counters.
 

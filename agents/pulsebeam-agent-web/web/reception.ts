@@ -1,3 +1,4 @@
+import { observeVideoGeometry, type VideoGeometry } from "./video-geometry.js";
 import {
   ResourceError,
   ResourceOwner,
@@ -237,8 +238,26 @@ export async function selectAudio(
   return acquire(new AudioSelection(resources, policy));
 }
 
+type ViewBinding = (
+  element: HTMLVideoElement,
+  failed: (error: unknown) => void,
+) => () => void;
+const videoViews = new WeakMap<object, ViewBinding>();
+
+export function bindVideoView(
+  source: object,
+  element: HTMLVideoElement,
+  failed: (error: unknown) => void,
+): () => void {
+  return videoViews.get(source)?.(element, failed) ?? (() => {});
+}
+
 export class VideoSubscription extends Subscription<VideoObservation> {
   readonly #observation: ResourceObservation<VideoSubscriptionState>;
+  readonly #views = new Map<object, VideoGeometry>();
+  readonly #viewClosers = new Set<() => void>();
+  #requested: VideoObservation;
+  #retiringViews = false;
   constructor(
     resources: ResourceOwners,
     selector: TrackSelector,
@@ -258,6 +277,51 @@ export class VideoSubscription extends Subscription<VideoObservation> {
         ),
     );
     this.#observation = observation;
+    this.#requested = configuration;
+    videoViews.set(this, (element, failed) => {
+      const key = {};
+      let closed = false;
+      const apply = () => {
+        if (this.isClosed() || this.#retiringViews) return;
+        void this.#applyViews().catch((error: unknown) => {
+          if (!closed && !this.isClosed()) failed(error);
+        });
+      };
+      const geometry = observeVideoGeometry(element, (next) => {
+        const previous = this.#views.get(key);
+        if (
+          previous?.visible === next.visible &&
+          previous.height === next.height
+        )
+          return;
+        this.#views.set(key, next);
+        apply();
+      });
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        geometry.close();
+        this.#views.delete(key);
+        this.#viewClosers.delete(close);
+        apply();
+      };
+      this.#viewClosers.add(close);
+      return close;
+    });
+  }
+  #applyViews(): Promise<void> {
+    if (this.#views.size === 0) return super.configure(this.#requested);
+    let visible = false;
+    let height = 0;
+    for (const view of this.#views.values()) {
+      visible ||= view.visible;
+      height = Math.max(height, view.height);
+    }
+    return super.configure({
+      ...this.#requested,
+      visible: this.#requested.visible && visible,
+      height,
+    });
   }
   state(): Readonly<VideoSubscriptionState> {
     return this.#observation.state();
@@ -265,11 +329,25 @@ export class VideoSubscription extends Subscription<VideoObservation> {
   updates(): VideoSubscriptionUpdates {
     return this.#observation.updates();
   }
-  override configure(configuration = defaultVideoObservation): Promise<void> {
-    return super.configure(configuration);
+  override async configure(
+    configuration = defaultVideoObservation,
+  ): Promise<void> {
+    const previous = this.#requested;
+    this.#requested = configuration;
+    try {
+      await this.#applyViews();
+    } catch (error) {
+      if (this.#requested === configuration) this.#requested = previous;
+      throw error;
+    }
   }
   observe(signal?: AbortSignal): Promise<MediaObservation> {
     return this.observeSource(undefined, signal);
+  }
+  override close(): Promise<void> {
+    this.#retiringViews = true;
+    for (const close of this.#viewClosers) close();
+    return super.close();
   }
 }
 

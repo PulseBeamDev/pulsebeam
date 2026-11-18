@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod catalog;
 mod native_service;
 pub(crate) mod ownership;
 
@@ -621,6 +622,7 @@ pub struct ControllerActor {
     native_connections: std::collections::HashMap<ConnectionId, NativeService>,
     retiring_native: std::collections::HashMap<ConnectionId, native_service::RetiringNative>,
     source_lookup_index: native_service::SourceLookupIndex,
+    catalog: catalog::CatalogRuntime,
     native_ready_tx: mailbox::Sender<ConnectionId>,
     native_ready_rx: mailbox::Receiver<ConnectionId>,
     native_deadlines: BTreeSet<(pulsebeam_runtime::time::Instant, ConnectionId)>,
@@ -694,6 +696,7 @@ impl ControllerActor {
             native_connections: std::collections::HashMap::new(),
             retiring_native: std::collections::HashMap::new(),
             source_lookup_index: native_service::SourceLookupIndex::default(),
+            catalog: catalog::CatalogRuntime::default(),
             native_ready_tx,
             native_ready_rx,
             native_deadlines: BTreeSet::new(),
@@ -864,6 +867,9 @@ impl ControllerActor {
         self.record_budget_hit("api_commands", commands, API_COMMAND_BUDGET);
 
         self.service_native_connections();
+        let mut catalog = std::mem::take(&mut self.catalog);
+        catalog.service(self);
+        self.catalog = catalog;
         self.advance_incarnation_cutoffs();
         let commands_ready = self.flush_command_backlog();
         let updates_ready = self.flush_update_backlogs();
@@ -2789,7 +2795,9 @@ impl ControllerActor {
     }
 
     fn has_ready_egress(&self) -> bool {
-        self.egress_ready && (!self.command_backlog.is_empty() || !self.pending_updates.is_empty())
+        self.catalog.has_work()
+            || self.egress_ready
+                && (!self.command_backlog.is_empty() || !self.pending_updates.is_empty())
     }
 
     fn record_budget_hit(&self, phase: &'static str, used: usize, budget: usize) {
@@ -3415,6 +3423,7 @@ mod replacement_tests {
         shard::metrics::ShardMetrics, shard_update::new_shard_update,
     };
 
+    mod catalog_tests;
     mod permissions;
 
     impl ControllerActor {
@@ -3530,6 +3539,7 @@ mod replacement_tests {
                 native_connections: std::collections::HashMap::new(),
                 retiring_native: std::collections::HashMap::new(),
                 source_lookup_index: native_service::SourceLookupIndex::default(),
+                catalog: catalog::CatalogRuntime::default(),
                 native_ready_tx,
                 native_ready_rx,
                 native_deadlines: BTreeSet::new(),

@@ -100,6 +100,8 @@ export type StrictBoundaries = [
         | "roomExternalId"
         | "canonicalParticipantId"
         | "canonicalRoomId"
+        | "catalog"
+        | "mapping"
       >,
       never
     >
@@ -128,6 +130,11 @@ export type StrictBoundaries = [
 // @ts-expect-error the proof type is no longer part of the generated boundary
 export type RemovedProof = GeneratedWeb.MediaRegistryProof;
 
+// @ts-expect-error Joined/global catalog metadata is not a generated public DTO.
+export type RemovedCatalogSnapshot = GeneratedWeb.CatalogSnapshot;
+// @ts-expect-error Receiver mappings are private reconciliation state.
+export type RemovedMappingSnapshot = GeneratedWeb.MappingSnapshot;
+
 // Prove the guard itself rejects both top-level and nested untyped data.
 // @ts-expect-error any cannot stand in for a generated contract
 export type RejectAny = Assert<NoAny<any>>;
@@ -152,7 +159,7 @@ const sameStream: WebMediaStream = stream;
 const bytes: Uint8Array = frame.data;
 const payload: Uint8Array = topic.payload;
 const published: string = desired.publications[0].label;
-const participantId: string = snapshot.catalog.participants[0].participantId;
+const participantId: string | undefined = snapshot.participantId;
 const publicationState: Readonly<PublicationState> = publication.state();
 const publicationUpdates: import("../web/types.js").PublicationUpdates =
   publication.updates();
@@ -163,10 +170,10 @@ const admissionStatus: PublicationAdmissionStatus =
 publicationState.closed = true;
 // @ts-expect-error nested publication observation records are readonly
 publicationState.configuration.enabled = false;
-// @ts-expect-error generated app-facing participants do not expose canonical IDs
-snapshot.catalog.participants[0].id;
-// @ts-expect-error removed generated identity alias
-snapshot.catalog.participants[0].externalId;
+// @ts-expect-error Generated session snapshots cannot enumerate joined-room metadata.
+snapshot.catalog;
+// @ts-expect-error Physical receiver mappings stay private to reconciliation.
+snapshot.mapping;
 // @ts-expect-error no parallel publisher identity
 topic.publisherId;
 // @ts-expect-error no stream incarnation identity

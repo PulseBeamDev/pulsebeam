@@ -1166,6 +1166,7 @@ impl TrackResources {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.publications.is_empty()
+            && self.data_publications.is_empty()
             && self.audio_views.is_empty()
             && self.audio.is_none()
             && self.video.is_empty()

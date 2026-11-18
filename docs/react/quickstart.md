@@ -18,12 +18,21 @@ flowchart LR
 
 Works with Next.js, Vite, Astro + React, or your existing React app.
 
+::: warning Matching builds required
+These examples describe the current source API. Compatibility with released
+SDK packages and server images has not been qualified for this revision. Obtain
+matching Web/React SDK archives and a server image from a trusted build before
+following the example. Do not assume registry latest or an older image supports
+owned publications, subscriptions and room watches.
+:::
+
 ## 1. Run the PulseBeam media server
 
-With Docker (or Podman):
+With Docker (or Podman), set `PULSEBEAM_SERVER_IMAGE` to your matching server
+image before running:
 
 ```sh
-docker run --rm --network host ghcr.io/pulsebeamdev/pulsebeam:08eb663 --dev
+docker run --rm --network host "$PULSEBEAM_SERVER_IMAGE" --dev
 ```
 
 The PulseBeam endpoint is `http://localhost:7070`.
@@ -73,10 +82,10 @@ For Rust, Go, or Python backends, use the corresponding server SDK.
 
 ## 3. Your React frontend: capture and join
 
-Install the React SDK in your application:
+Install the matching Web and React SDK archives in your application:
 
 ```sh
-npm install @pulsebeam/react
+npm install /path/to/web-package.tgz /path/to/react-package.tgz
 ```
 
 **Capture and the Agent are independent.** The parent owns the camera and
@@ -175,6 +184,15 @@ Open your app in two tabs with different participant tokens for the same
 `demo` room. Enable devices and join in both tabs. Enter the other tab's
 application participant ID, the value your backend used when issuing its token.
 Each should display the other's video and play remote audio. Use headphones to avoid feedback.
+
+## Add a roster when you need discovery
+
+This example receives from an application-known participant ID; that requires
+Subscribe, not Discover. To let users choose from room metadata, grant Discover
+separately and use [one bounded `useWatch` page with explicit navigation](/react/guides#remote-discovery-and-video-receive-policy).
+A watch includes presence-only participants, never starts reception and can close
+without closing independent subscriptions. Do not replace known-address receive
+paths with a global participant listing or an automatic all-page scan.
 
 ## Complete example
 

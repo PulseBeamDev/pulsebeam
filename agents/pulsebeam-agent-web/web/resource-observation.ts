@@ -35,8 +35,10 @@ function immutable<T>(value: T): T {
 export class ResourceObservation<S extends RevisionedState> {
   #current: BoundResourceObservation<S> | undefined;
 
+  constructor(readonly project: (value: S) => S = immutable) {}
+
   bind(observer: NativeResourceObserver): void {
-    this.#current = new BoundResourceObservation<S>(observer);
+    this.#current = new BoundResourceObservation<S>(observer, this.project);
   }
 
   #bound(): BoundResourceObservation<S> {
@@ -59,7 +61,10 @@ export class ResourceObservation<S extends RevisionedState> {
 class BoundResourceObservation<S extends RevisionedState> {
   #value: Readonly<S> | undefined;
   readonly #observer: NativeResourceObserver;
-  constructor(observer: NativeResourceObserver) {
+  constructor(
+    observer: NativeResourceObserver,
+    readonly project: (value: S) => S,
+  ) {
     this.#observer = observer;
   }
 
@@ -70,7 +75,7 @@ class BoundResourceObservation<S extends RevisionedState> {
   accept(value: S): Readonly<S> {
     if (this.#value?.observationRevision === value.observationRevision)
       return this.#value;
-    const next = immutable(value);
+    const next = this.project(value);
     if (
       !this.#value ||
       value.observationRevision > this.#value.observationRevision

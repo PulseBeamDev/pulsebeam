@@ -1,3 +1,12 @@
+import {
+  publicSnapshot,
+  type ReconciliationSnapshot,
+  type CatalogSnapshot,
+  type MappingSnapshot,
+  type Participant,
+  type Publication,
+  type RemoteTrack,
+} from "./reconciliation-snapshot.js";
 import { DataRegistry, type LocalDataTrack } from "./data.js";
 import { track, type Delivery } from "./track.js";
 import { selectAudio } from "./reception.js";
@@ -17,17 +26,11 @@ import type {
   AgentState as DesiredState,
   AgentUpdates,
   AudioDemand,
-  CatalogSnapshot,
   ConnectionState,
   CredentialOutcome,
   LogLevel,
   LocalAudioTrack,
   LocalVideoTrack,
-  MappingSnapshot,
-  Participant,
-  Publication,
-  RemoteTrack,
-  RemoteParticipant,
   RoomRef,
   Topic,
   TopicMode,
@@ -36,7 +39,7 @@ import type {
   TopicCallbacks,
   TopicPublisherStatus,
 } from "./types.js";
-import { RemoteCatalog } from "./remote-catalog.js";
+import { RemoteCatalog, watchCatalog } from "./remote-catalog.js";
 import { TopicRegistry } from "./topic.js";
 import { ResourceError, ResourceOwners } from "./resources.js";
 import { LocalMediaRegistry } from "./media.js";
@@ -111,7 +114,8 @@ function localFailureClass(error: unknown): AgentError["class"] {
 }
 
 class AgentFacade implements AgentApi {
-  #snapshot: AgentSnapshot = emptySnapshot("disconnected");
+  #snapshot: ReconciliationSnapshot = emptySnapshot("disconnected");
+  #publicSnapshot: AgentSnapshot = publicSnapshot(this.#snapshot);
   #listeners = new Set<() => void>();
   #eventListeners = new Set<(event: AgentEvent) => void>();
   readonly #snapshots = new Set<ReturnType<typeof observeSnapshots>>();
@@ -127,7 +131,11 @@ class AgentFacade implements AgentApi {
     )
       console.warn("PulseBeam resource ownership failed", error);
   });
-  readonly #data = new DataRegistry(this, this.#resources);
+  readonly #host = {
+    getSnapshot: () => this.#snapshot,
+    subscribe: (listener: () => void) => this.subscribe(listener),
+  };
+  readonly #data = new DataRegistry(this.#host, this.#resources);
   readonly #media = new LocalMediaRegistry(this.#resources);
   readonly #remote: RemoteCatalog;
   readonly #topics: TopicRegistry;
@@ -152,10 +160,20 @@ class AgentFacade implements AgentApi {
     }
     this.#runtimeConfig = runtimeConfig;
     this.#remote = new RemoteCatalog(
-      this,
+      this.#host,
       this.#data,
       this.#resources,
       runtimeConfig.logLevel,
+      (room, config) => {
+        if (!this.#runtime)
+          throw new OperationError({
+            code: this.#closed ? ErrorCode.Closed : ErrorCode.NotReady,
+            message: this.#closed
+              ? "Agent is closed"
+              : "Watch runtime is inactive",
+          });
+        return watchCatalog(this.#runtime, room, config);
+      },
     );
     this.#topics = new TopicRegistry(
       this,
@@ -313,9 +331,6 @@ class AgentFacade implements AgentApi {
   data<D extends Delivery>(label: string, delivery: D): LocalDataTrack<D> {
     return this.#data.local(track.data(label, delivery));
   }
-  get participants(): readonly RemoteParticipant[] {
-    return this.#remote.facade().participants;
-  }
   room(name: string): RoomRef {
     return this.#remote.room(name);
   }
@@ -351,11 +366,13 @@ class AgentFacade implements AgentApi {
   }
 
   snapshot(): AgentSnapshot {
-    return this.#snapshot;
+    return this.#publicSnapshot;
   }
   snapshots() {
-    const observation = observeSnapshots(this.#snapshot, this.#closed, () =>
-      this.#snapshots.delete(observation),
+    const observation = observeSnapshots(
+      this.#publicSnapshot,
+      this.#closed,
+      () => this.#snapshots.delete(observation),
     );
     if (!this.#closed) this.#snapshots.add(observation);
     return observation.stream;
@@ -368,7 +385,7 @@ class AgentFacade implements AgentApi {
     return observation.stream;
   }
 
-  readonly getSnapshot = (): AgentSnapshot => this.#snapshot;
+  readonly getSnapshot = (): AgentSnapshot => this.#publicSnapshot;
 
   readonly subscribe = (listener: () => void): (() => void) => {
     if (this.#closed) return () => {};
@@ -735,7 +752,7 @@ class AgentFacade implements AgentApi {
         media,
       });
     }
-    const next: AgentSnapshot = Object.freeze({
+    const next: ReconciliationSnapshot = Object.freeze({
       version: Number(raw.version),
       desiredRevision: Number(raw.desiredRevision),
       joinRevision: raw.joinRevision,
@@ -814,10 +831,12 @@ class AgentFacade implements AgentApi {
     this.#emit(Object.freeze({ type: "failure", ...failure }));
   }
 
-  #publish(snapshot: AgentSnapshot): void {
+  #publish(snapshot: ReconciliationSnapshot): void {
     if (snapshot === this.#snapshot) return;
     this.#snapshot = snapshot;
-    for (const observation of this.#snapshots) observation.publish(snapshot);
+    this.#publicSnapshot = publicSnapshot(snapshot);
+    for (const observation of this.#snapshots)
+      observation.publish(this.#publicSnapshot);
     this.#remote.update(snapshot);
     for (const listener of [...this.#listeners]) listener();
   }
@@ -829,7 +848,6 @@ class AgentFacade implements AgentApi {
 }
 
 export interface ManagedAgent extends AgentApi {
-  readonly participants: readonly RemoteParticipant[];
   readonly getSnapshot: () => AgentSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
   activate(): void;

@@ -38,7 +38,14 @@ export class Track extends EventTarget {
 export class Stream {
   constructor(readonly tracks: Track[] = []) {}
   getTracks() {
-    return this.tracks;
+    return [...this.tracks];
+  }
+  addTrack(track: Track) {
+    if (!this.tracks.includes(track)) this.tracks.push(track);
+  }
+  removeTrack(track: Track) {
+    const index = this.tracks.indexOf(track);
+    if (index !== -1) this.tracks.splice(index, 1);
   }
   getVideoTracks() {
     return this.tracks.filter((t) => t.kind === "video");

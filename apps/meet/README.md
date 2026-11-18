@@ -82,6 +82,21 @@ browser. Real transport, fresh decoded media and restrictive-autoplay premises
 belong to the required Web-platform owner; component models do not certify those
 boundaries or public hosting. See the [client QA boundaries](../../docs/build.md#client-qa-boundaries).
 
+## Bounded room roster
+
+Meet owns one live catalog page for the room, with explicit Next page and First
+page controls. Loading and failure are distinct from an empty page. Presence-only
+participants remain visible. An expired continuation is an error with a First
+page recovery, not an automatic scan or silent reset.
+
+The token needs Discover for roster metadata. Subscribe independently authorizes
+media/data reception; page size is not receive capacity. Meet retains its
+receive-selection policy and excludes self-subscription. Mounted consumers own
+subscriptions for selected publications on the displayed page. Moving pages can
+unmount and release those UI owners; closing/replacing a watch never closes a
+subscription held independently elsewhere. There is no receive-all or automatic
+all-page traversal.
+
 ## Media and data tracks
 
 Application identities come from admission. Remote video demand follows mounted

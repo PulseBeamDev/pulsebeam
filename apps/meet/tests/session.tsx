@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { MeetApp } from "../components/MeetApp";
+import { WatchStatus, CatalogDelivery } from "@pulsebeam/react";
 import {
   captures,
   displays,
@@ -133,7 +134,7 @@ await flush(() =>
 const password = document.querySelector<HTMLInputElement>(
   'input[type="password"]',
 )!;
-assert.ok(password);
+assert.ok(password, "token field is present");
 assert.equal(password.autocomplete, "off");
 await input(password, token);
 const endpoint = document.querySelector<HTMLInputElement>(
@@ -205,37 +206,73 @@ await flush(() =>
     generation: 1n,
   }),
 );
-await flush(() =>
-  runtime.emit({
-    participants: [{ participantId: "bob" }],
-    catalog: {
-      ...runtime.snapshot.catalog,
-      revision: 1n,
-      tracks: [
-        {
-          id: "remote-chat",
-          participantId: "bob",
-          kind: "data",
-          label: "chat",
-          delivery: "ordered",
-        },
-        {
-          id: "remote-reactions",
-          participantId: "bob",
-          kind: "data",
-          label: "reactions",
-          delivery: "lossy",
-        },
-        {
-          id: "remote-audio",
-          participantId: "bob",
-          kind: "audio",
-          label: "microphone",
-        },
-      ],
-    },
-  }),
+const activeWatch = () =>
+  [...runtime.catalogWatches].find(([, scope]) => !scope.closed)!;
+const firstParticipants = [
+  {
+    id: "self-wire",
+    externalId: "admitted-alice",
+    publications: [
+      {
+        id: "self-chat",
+        label: "chat",
+        kind: { tag: "Data", inner: { delivery: CatalogDelivery.Ordered } },
+      },
+      { id: "self-audio", label: "microphone", kind: { tag: "Audio" } },
+      { id: "self-video", label: "camera", kind: { tag: "Video" } },
+    ],
+  },
+  {
+    id: "bob-wire",
+    externalId: "bob",
+    publications: [
+      {
+        id: "remote-chat",
+        label: "chat",
+        kind: { tag: "Data", inner: { delivery: CatalogDelivery.Ordered } },
+      },
+      {
+        id: "remote-reactions",
+        label: "reactions",
+        kind: { tag: "Data", inner: { delivery: CatalogDelivery.Lossy } },
+      },
+      { id: "remote-audio", label: "microphone", kind: { tag: "Audio" } },
+      { id: "remote-camera", label: "camera", kind: { tag: "Video" } },
+      { id: "remote-screen", label: "screen", kind: { tag: "Video" } },
+    ],
+  },
+  { id: "quiet-wire", externalId: "quiet-observer", publications: [] },
+];
+const continuation = Object.freeze(
+  Array.from({ length: 32 }, (_, index) => index),
 );
+const page = (participants = firstParticipants, hasMore = true) =>
+  flush(() => {
+    const [owner] = activeWatch();
+    const current = runtime.observer(owner).state() as any;
+    runtime.setObservation(owner, {
+      ...current,
+      observationRevision: current.observationRevision + 1n,
+      status: WatchStatus.Live,
+      page: Object.freeze({
+        revision: current.observationRevision,
+        participants,
+        hasMore,
+        nextCursor: hasMore ? continuation : [],
+        cursorExpiresAtUnixSeconds: 1000n,
+      }),
+    });
+  });
+assert.match(document.body.textContent!, /Loading participants/);
+assert.equal(activeWatch()[1].limit, 100);
+assert.deepEqual(activeWatch()[1].cursor, []);
+await page();
+assert.match(
+  document.body.textContent!,
+  /quiet-observer/,
+  "presence-only entries render in the bounded roster",
+);
+assert.match(document.body.textContent!, /admitted-alice \(you\)/);
 assert.match(document.querySelector("header")!.textContent!, /admitted-alice/);
 assert.match(
   document.querySelector("header")!.textContent!,
@@ -248,18 +285,99 @@ assert.equal(
   "room-pinned chat and reaction tracks attach for each discovered endpoint",
 );
 assert.deepEqual(
-  [...runtime.audioSelections.values()],
+  [...runtime.audioSubscriptions.values()],
+  [{ room: "selected-room", participantId: "bob", label: "microphone" }],
+);
+assert.deepEqual(
+  [...runtime.videoOwners.values()]
+    .map(({ selector, observation }) => ({
+      selector,
+      minFps: observation.minFps,
+      priority: observation.priority,
+      playoutDelay: observation.playoutDelay,
+    }))
+    .sort((a, b) => a.selector.label.localeCompare(b.selector.label)),
   [
     {
-      selected: [
-        {
-          room: "selected-room",
-          participantId: "bob",
-          label: "microphone",
-        },
-      ],
+      selector: {
+        room: "selected-room",
+        participantId: "bob",
+        label: "camera",
+      },
+      minFps: 15,
+      priority: 200,
+      playoutDelay: { mode: "adaptive" },
+    },
+    {
+      selector: {
+        room: "selected-room",
+        participantId: "bob",
+        label: "screen",
+      },
+      minFps: 15,
+      priority: 10,
+      playoutDelay: { mode: "adaptive" },
     },
   ],
+  "page-derived remote videos preserve spotlight/FPS/playout policy and exclude self",
+);
+const initialWatch = activeWatch()[1];
+await click("Next page");
+assert.equal(initialWatch.closed, true);
+assert.deepEqual(activeWatch()[1].cursor, continuation);
+assert.match(document.body.textContent!, /Loading participants/);
+assert.equal(
+  runtime.dataOwners.size,
+  0,
+  "page replacement releases UI-owned subscriptions",
+);
+assert.equal(
+  runtime.videoOwners.size,
+  0,
+  "page replacement releases UI-owned video reception",
+);
+assert.equal(
+  runtime.audioSubscriptions.size,
+  0,
+  "page replacement releases UI-owned audio reception",
+);
+await page(
+  [{ id: "last-wire", externalId: "last-presence", publications: [] }],
+  false,
+);
+assert.match(document.body.textContent!, /last-presence/);
+assert.doesNotMatch(document.body.textContent!, /quiet-observer/);
+assert.equal(button("Next page").disabled, true);
+assert.equal(
+  [...runtime.catalogWatches.values()].filter((scope) => !scope.closed).length,
+  1,
+  "Meet retains one bounded page, not an all-page traversal",
+);
+await click("First page");
+assert.deepEqual(activeWatch()[1].cursor, []);
+await page();
+await click("Next page");
+await flush(() => {
+  const [owner] = activeWatch();
+  const current = runtime.observer(owner).state() as any;
+  runtime.setObservation(owner, {
+    ...current,
+    observationRevision: current.observationRevision + 1n,
+    status: WatchStatus.Failed,
+    error: { code: 0, message: "Catalog cursor expired" },
+    page: undefined,
+  });
+});
+assert.match(document.body.textContent!, /continuation is invalid or expired/);
+assert.equal(button("Next page").disabled, true);
+assert.equal(button("First page").disabled, false);
+await click("First page");
+assert.deepEqual(activeWatch()[1].cursor, []);
+await page();
+assert.equal(
+  runtime.dataOwners.size,
+  2,
+  "First-page recovery restores only non-self UI subscriptions",
 );
 const abandoned = stream();
 await flush(() => captures[0].resolve(abandoned));
@@ -267,7 +385,10 @@ assert.ok(
   abandoned.getTracks().every((track) => track.readyState === "ended"),
   "StrictMode retired capture cannot resurrect in the room",
 );
-assert.ok(owned.getTracks().every((track) => track.readyState === "live"));
+assert.ok(
+  owned.getTracks().every((track) => track.readyState === "live"),
+  "joined capture remains live",
+);
 privateSoFar();
 
 assert.ok(button("Unmute microphone"), "lobby microphone intent survives join");
@@ -442,7 +563,7 @@ await click("Send a reaction");
 const reaction = document.querySelector<HTMLElement>(
   '[aria-label="React with 👍"]',
 );
-assert.ok(reaction);
+assert.ok(reaction, "incoming reaction is rendered");
 await flush(() => reaction.click());
 assert.ok(
   runtime.sent.some(
@@ -477,7 +598,10 @@ await click("Share screen");
 const shared = stream();
 await flush(() => displays.at(-1)!.resolve(shared));
 await click("Stop sharing");
-assert.ok(shared.getTracks().every((track) => track.readyState === "ended"));
+assert.ok(
+  shared.getTracks().every((track) => track.readyState === "ended"),
+  "screen capture stops on release",
+);
 await click("Share screen");
 const sharedOnLeave = stream();
 await flush(() => displays.at(-1)!.resolve(sharedOnLeave));
@@ -514,8 +638,14 @@ const pending = captures.at(-1)!;
 await flush(() => root.unmount());
 const late = stream();
 await flush(() => pending.resolve(late));
-assert.ok(late.getTracks().every((track) => track.readyState === "ended"));
-assert.ok(runtimes.every((runtime) => runtime.closed));
+assert.ok(
+  late.getTracks().every((track) => track.readyState === "ended"),
+  "late capture is retired",
+);
+assert.ok(
+  runtimes.every((runtime) => runtime.closed),
+  "all runtimes close on unmount",
+);
 privateSoFar();
 host.remove();
 console.log(

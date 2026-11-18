@@ -4982,7 +4982,7 @@ fn observed_media(
         let generation = observation
             .snapshot
             .generation
-            .map(|generation| generation.get());
+            .map(pulsebeam_agent_core::Generation::get);
         let owned = observation
             .owned_receivers
             .iter()

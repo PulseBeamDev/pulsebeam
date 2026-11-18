@@ -24,20 +24,26 @@ fn publication() -> (
     u64,
     native_connection::PreparedData,
 ) {
-    let topics = crate::TopicRegistrations {
-        publishers: vec![crate::TopicPublisher {
-            topic: "events".into(),
-            mode: TopicMode::Lossy,
-        }],
-        subscribers: vec![],
-    };
-    let (mut agent, generation, channel) = connected(topics);
+    let (mut agent, generation, channel) = connected(Default::default());
     let ResourceResult::Owned { owner } = agent
         .resource(ResourceCommand::DeclareDataPublication { spec: data_spec() })
         .unwrap()
     else {
         panic!("publication owner")
     };
+    assert_eq!(
+        agent
+            .snapshot()
+            .topics
+            .publishers
+            .iter()
+            .map(|publisher| publisher.registration.clone())
+            .collect::<Vec<_>>(),
+        vec![crate::TopicPublisher {
+            topic: "events".into(),
+            mode: TopicMode::Lossy
+        }]
+    );
     let prepared = native_connection::prepare_data(&mut agent, generation, channel);
     (agent, generation, channel, owner, prepared)
 }
@@ -222,6 +228,59 @@ fn rejected_first_data_subscription_is_not_an_execution_failure() {
     assert_eq!(state.error.unwrap().code, ErrorCode::PermissionDenied);
     assert_eq!(state.execution, Execution::Unavailable);
     assert_eq!(state.execution_error, None);
+}
+
+#[test]
+fn closing_live_catalog_preserves_independently_owned_subscription() {
+    let (mut agent, generation, channel, owner, _) = receiver(true);
+    let before = agent.data_subscription_state(owner).unwrap();
+    assert_eq!(before.admission, Admission::Admitted);
+    assert_eq!(before.execution, Execution::Installed);
+    let topics = agent.snapshot().topics.clone();
+    let watch = agent
+        .catalog_watch("room".into(), Default::default())
+        .unwrap();
+    let opened = native_connection::drain_batches(&mut agent, generation, channel);
+    assert!(opened.iter().all(|batch| batch.records.is_empty()));
+    let commands: Vec<_> = opened
+        .into_iter()
+        .flat_map(|batch| batch.catalog_records)
+        .collect();
+    let [
+        state::CatalogClientRecord {
+            command: Some(state::catalog_client_record::Command::Open(request)),
+        },
+    ] = commands.as_slice()
+    else {
+        panic!("one catalog open, got {commands:?}");
+    };
+    assert_eq!(request.room, "room");
+    native_connection::catalog_page(&mut agent, generation, channel, request.watch_id, "room");
+    assert_eq!(
+        agent.catalog_watch_state(watch).unwrap().status,
+        crate::ffi::WatchStatus::Live
+    );
+    assert_eq!(agent.data_subscription_state(owner).unwrap(), before);
+    assert_eq!(
+        agent.close_catalog_watch(watch).unwrap().status,
+        crate::ffi::WatchStatus::Closed
+    );
+    let closed = native_connection::drain_batches(&mut agent, generation, channel);
+    assert!(closed.iter().all(|batch| batch.records.is_empty()));
+    let commands: Vec<_> = closed
+        .into_iter()
+        .flat_map(|batch| batch.catalog_records)
+        .collect();
+    assert!(matches!(commands.as_slice(), [state::CatalogClientRecord {
+        command: Some(state::catalog_client_record::Command::Close(close)),
+    }] if close.watch_id == request.watch_id));
+    assert_eq!(agent.data_subscription_state(owner).unwrap(), before);
+    assert_eq!(agent.snapshot().topics, topics);
+    assert_eq!(agent.snapshot().generation, Some(generation));
+    assert_eq!(
+        agent.snapshot().connection,
+        crate::ConnectionState::Connected
+    );
 }
 
 #[test]

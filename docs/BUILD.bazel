@@ -5,8 +5,8 @@ load("@docs_npm//docs:vitepress/package_json.bzl", vitepress = "bin")
 
 package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "Justfile", "*.json", "*.yaml"], allow_empty = True))
-exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "react/Room.tsx", "react/main.tsx", "react/index.html"])
-filegroup(name = "react_example", srcs = ["react/Room.tsx", "react/main.tsx", "react/index.html"])
+exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "react/Room.tsx", "react/Roster.tsx", "react/main.tsx", "react/index.html"])
+filegroup(name = "react_example", srcs = ["react/Room.tsx", "react/Roster.tsx", "react/main.tsx", "react/index.html"])
 
 npm_link_all_packages(name = "node_modules")
 filegroup(name = "sources", srcs = glob(["*.md", "react/*.md", "react/*.tsx", ".vitepress/*.mts", "*.json"]))

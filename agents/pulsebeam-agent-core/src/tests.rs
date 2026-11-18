@@ -5192,6 +5192,15 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
     let pipe = agent.pipe_state(input).unwrap();
     assert_eq!(pipe.status, crate::ffi::PipeStatus::Available);
     let pinned = agent.video_subscription_state(receiver).unwrap().selector;
+    let watch = agent
+        .catalog_watch(
+            "main".into(),
+            crate::ffi::WatchConfig {
+                limit: 7,
+                cursor: vec![],
+            },
+        )
+        .unwrap();
     while agent.next_effect_after_turn().is_some() {}
 
     let mut previous = None;
@@ -5314,7 +5323,26 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
         let subscription = agent.video_subscription_state(receiver).unwrap();
         assert!(!subscription.closed);
         assert_eq!(subscription.selector, pinned);
-        while agent.next_effect_after_turn().is_some() {}
+        let commands: Vec<_> = native_connection::drain_batches(&mut agent, generation, control)
+            .into_iter()
+            .flat_map(|batch| batch.catalog_records)
+            .collect();
+        let [
+            pulsebeam_proto::state::CatalogClientRecord {
+                command: Some(pulsebeam_proto::state::catalog_client_record::Command::Open(request)),
+            },
+        ] = commands.as_slice()
+        else {
+            panic!("one replay of the pinned Watch, got {commands:?}");
+        };
+        assert_eq!(request.room, "main");
+        assert_eq!(request.participant_limit, 7);
+        assert!(request.cursor.is_empty());
+        native_connection::catalog_page(&mut agent, generation, control, request.watch_id, "main");
+        let watch_state = agent.catalog_watch_state(watch).unwrap();
+        assert_eq!(watch_state.room, "main");
+        assert_eq!(watch_state.limit, 7);
+        assert_eq!(watch_state.status, crate::ffi::WatchStatus::Live);
         if let Some((old_generation, old_control, old_operation, old_response)) = previous {
             let before = agent.snapshot().clone();
             for event in [

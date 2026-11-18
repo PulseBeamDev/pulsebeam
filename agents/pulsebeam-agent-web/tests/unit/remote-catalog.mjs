@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { RemoteCatalog } from "../../unit-javascript/remote-catalog.js";
+import {
+  RemoteCatalog,
+  watchCatalog,
+  validateReceiveOptions,
+} from "../../unit-javascript/remote-catalog.js";
 import { DataRegistry } from "../../unit-javascript/data.js";
 import { ResourceOwners } from "../../unit-javascript/resources.js";
 import {
@@ -44,6 +48,38 @@ function fixture() {
     },
   };
 }
+test("watch facade preserves the runtime shared page across revisions and cursors", async () => {
+  const page = Object.freeze({ participants: Object.freeze([]) });
+  let state = Object.freeze({ observationRevision: 1n, room: "pinned", page });
+  let closed = false;
+  const runtime = {
+    catalog_watch(room, limit, cursor) {
+      assert.equal(room, "pinned");
+      assert.equal(limit, 100);
+      assert.deepEqual(cursor, new Uint8Array());
+      return {
+        state: () => state,
+        updates: () => ({ next: async () => state, close() {} }),
+        close: () => {
+          closed = true;
+        },
+      };
+    },
+  };
+  const watch = watchCatalog(runtime, "pinned");
+  const first = watch.updates();
+  const second = watch.updates();
+  assert.equal(watch.state(), state);
+  assert.equal(await first.next(), state);
+  assert.equal((await second.next()).page, page);
+  state = Object.freeze({ ...state, observationRevision: 2n });
+  assert.equal(watch.state().page, page);
+  assert.equal((await first.next()).page, page);
+  const closing = watch.close();
+  assert.equal(closed, true, "close fences synchronously");
+  await closing;
+});
+
 const alice = { participantId: "alice" };
 const camera = {
   id: "camera-id",
@@ -58,7 +94,7 @@ const microphone = {
   label: "microphone",
 };
 
-test("catalog keeps discovery identity stable across publication replacement", () => {
+test("known reference identity survives source replacement without discovery collections", () => {
   const f = fixture();
   const aliceHandle = f.catalog.room("room").participant("alice");
   const video = aliceHandle.video("camera");
@@ -75,36 +111,32 @@ test("catalog keeps discovery identity stable across publication replacement", (
   );
   assert.equal("track" in publicParticipant, false);
   assert.equal(video.active, false);
-  assert.equal(audio.receiving, false);
-  assert.deepEqual(f.catalog.participants, []);
+  assert.equal("receiving" in audio, false);
+  assert.equal("participants" in f.catalog, false);
   f.update([alice], [camera, microphone]);
-  const participants = f.catalog.participants;
-  const videos = f.catalog.videoTracks;
-  const audios = f.catalog.audioTracks;
-  assert.notEqual(participants[0], aliceHandle);
-  assert.notEqual(videos[0], video);
-  assert.notEqual(audios[0], audio);
+  assert.equal(publicParticipant, aliceHandle);
   assert.equal(video.id, camera.id);
   assert.equal(audio.id, microphone.id);
   assert.equal(aliceHandle.active, true);
-  assert.equal(aliceHandle.tracks.length, 2);
+  assert.equal("tracks" in aliceHandle, false);
+  assert.equal("catalog" in aliceHandle, false);
+  assert.equal("catalog" in video, false);
   assert.equal(video.participantId, "alice");
   assert.notEqual(aliceHandle.audio("camera"), video);
   assert.notEqual(aliceHandle.video("microphone"), audio);
   f.update([alice], [camera, microphone]);
-  assert.equal(f.catalog.participants, participants);
-  assert.equal(f.catalog.videoTracks, videos);
-  assert.equal(f.catalog.audioTracks, audios);
+  assert.equal(
+    f.catalog.room("room").participant("alice").video("camera"),
+    video,
+  );
   let notifications = 0;
   video.watch(() => notifications++);
   f.update([], []);
   assert.equal(video.active, false);
   assert.equal(aliceHandle.active, false);
-  assert.deepEqual(aliceHandle.tracks, []);
   assert.equal(notifications, 1);
   f.update([alice], [{ ...camera, id: "new-camera" }]);
-  assert.equal(f.catalog.videoTracks[0], videos[0]);
-  assert.notEqual(f.catalog.participants[0], aliceHandle);
+  assert.equal(f.catalog.room("room").participant("alice"), aliceHandle);
   assert.equal(video.active, true);
   assert.equal(notifications, 2);
   f.catalog.close();
@@ -119,13 +151,13 @@ test("audio mapping tracks discovery and clears on close", () => {
   let notifications = 0;
   audio.watch(() => notifications++);
   f.update([alice], [microphone]);
-  assert.equal(audio.receiving, false);
+  assert.equal(notifications, 1);
   f.update(
     [alice],
     [microphone],
     [{ publicationId: microphone.id, receiverIndex: 0 }],
   );
-  assert.equal(audio.receiving, true);
+  assert.equal(notifications, 2);
   const mappedNotifications = notifications;
   f.update(
     [alice],
@@ -134,32 +166,21 @@ test("audio mapping tracks discovery and clears on close", () => {
   );
   assert.equal(notifications, mappedNotifications);
   f.update([alice], [microphone]);
-  assert.equal(audio.receiving, false);
   assert.equal(notifications, mappedNotifications + 1);
   f.catalog.close();
-  const wave = new Float32Array(9).fill(1);
-  const spectrum = new Float32Array(9).fill(1);
-  audio.readWaveform(wave);
-  audio.readSpectrum(spectrum);
-  assert.ok(wave.every((value) => value === 0));
-  assert.ok(spectrum.every((value) => value === -Infinity));
 });
 
-test("self is excluded by admitted application participant identity", () => {
+test("known references expose no global or nested enumeration", () => {
   const f = fixture();
-  f.update(
-    [{ participantId: "self" }, alice],
-    [
-      { ...camera, id: "self-camera", participantId: "self" },
-      { ...microphone, participantId: "self" },
-      camera,
-    ],
-  );
-  assert.equal(f.catalog.participants.length, 1);
-  assert.equal(f.catalog.participants[0].participantId, "alice");
-  assert.equal(f.catalog.videoTracks.length, 1);
-  assert.equal(f.catalog.videoTracks[0].id, camera.id);
-  assert.deepEqual(f.catalog.audioTracks, []);
+  f.update([{ participantId: "self" }, alice], [camera, microphone]);
+  const participant = f.catalog.room("room").participant("alice");
+  assert.equal("participants" in f.catalog, false);
+  assert.equal("videoTracks" in f.catalog, false);
+  assert.equal("audioTracks" in f.catalog, false);
+  assert.equal("facade" in f.catalog, false);
+  assert.equal("tracks" in participant, false);
+  assert.equal("catalog" in participant, false);
+  assert.equal("owners" in participant.video("camera"), false);
   f.catalog.close();
 });
 
@@ -172,24 +193,25 @@ test("pinned references hide discovery metadata after a room move", () => {
   f.update([alice], [{ ...camera, id: "other-room-camera" }], [], "other-room");
   assert.equal(pinned.id, null);
   assert.equal(pinned.active, false);
-  assert.deepEqual(participant.tracks, []);
-  assert.equal(f.catalog.videoTracks[0].id, "other-room-camera");
+  assert.equal(
+    f.catalog.room("other-room").participant("alice").video("camera").id,
+    "other-room-camera",
+  );
   f.catalog.close();
 });
 
 test("receive option validation is atomic and inert", () => {
   const f = fixture();
   f.update([alice], [camera]);
-  const video = f.catalog.videoTracks[0];
   const policy = {
     minHeight: 720,
     minFps: 15,
     priority: 100,
     playoutDelay: { minMs: 5, maxMs: 30 },
   };
-  video.setReceiveOptions(policy);
+  const validated = validateReceiveOptions(policy);
   policy.playoutDelay.minMs = 0;
-  assert.deepEqual(video.options, {
+  assert.deepEqual(validated, {
     minHeight: 720,
     minFps: 15,
     priority: 100,
@@ -202,9 +224,9 @@ test("receive option validation is atomic and inert", () => {
     { minHeight: 1.5 },
     { playoutDelay: { minMs: 1, maxMs: Infinity } },
   ])
-    assert.throws(() => video.setReceiveOptions(invalid), TypeError);
+    assert.throws(() => validateReceiveOptions(invalid), TypeError);
   assert.throws(
-    () => video.setReceiveOptions({ playoutDelay: { minMs: 2, maxMs: 1 } }),
+    () => validateReceiveOptions({ playoutDelay: { minMs: 2, maxMs: 1 } }),
     RangeError,
   );
   f.catalog.close();

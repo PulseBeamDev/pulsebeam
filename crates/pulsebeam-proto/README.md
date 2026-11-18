@@ -11,9 +11,9 @@ HTTP bootstrap selects `pulsebeam.media.v1` once. Each binary message on
 negotiated channel 0 is one raw protobuf `ClientStateBatch` or `ServerStateBatch`,
 with no encoding prefix or compression. `state::codec` enforces 1..4,096 bytes and at most 16 combined resource and
 catalog records, with structural preflight before generated decoding. Catalog
-open/close commands and page/error responses use directional batch fields but
-remain a private codec foundation: runtime dispatch and live catalog delivery
-are not implemented. Use `encode_client`/`decode_client` for owned desired proposals and
+open/close commands and page/error responses use directional batch fields.
+The native State server supports bounded live catalog delivery; SDK catalog
+observation is not yet exposed. Use `encode_client`/`decode_client` for owned desired proposals and
 execution reports, and `encode_server`/`decode_server` for authoritative observations. Their record
 types share resource values, not an envelope that permits either direction.
 `state::validation::validate_spec` checks resource configuration separately:
@@ -57,10 +57,10 @@ whose omission would be unsafe, such as mandatory encryption, needs explicit
 negotiated support before use; adding an optional field is not negotiation.
 Unsupported profiles are rejected during HTTP bootstrap.
 Future compression requires an explicitly supported profile, not per-message
-negotiation. The standalone RFC288 catalog schema and bounded codec cover exact
-logical source addresses, scoped page metadata and atomic participant-entry
-fragments; they do not add an envelope variant, runtime dispatch, server delivery
-or SDK observation. Logical selectors use the application's external participant
+negotiation. The RFC288 catalog schema and bounded codec cover exact logical
+source addresses, scoped page metadata and atomic participant-entry fragments
+without an envelope variant. Server catalog selection rechecks current authority
+and streams bounded live pages through the shared State batch budgets. Logical selectors use the application's external participant
 endpoint (`sub`), not the room-scoped canonical IDs used by catalog records and
 fragments. There is no legacy codec export or fallback decoder. The signaling
 data-channel label is unchanged; it does not select a different wire protocol.
@@ -69,7 +69,7 @@ The private `SourceLookupSpec`/`SourceLookupState` contract describes an owned,
 non-forwarding lookup with an atomic optional participant/track pair, not an
 accepted receiver or transport binding. Lookup-only observation creates no
 receiver, forwarding candidate, placement or dataplane residency. Live scoped
-catalogs remain a separate codec contract.
+catalogs use separate directional batch records, not owned forwarding resources.
 
 ## Prepared media reception and failure
 

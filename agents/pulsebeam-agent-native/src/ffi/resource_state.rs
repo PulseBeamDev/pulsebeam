@@ -35,6 +35,7 @@ macro_rules! updates {
     };
 }
 
+updates!(WatchUpdates, WatchState);
 updates!(VideoSubscriptionUpdates, VideoSubscriptionState);
 updates!(AudioSubscriptionUpdates, AudioSubscriptionState);
 updates!(DataSubscriptionUpdates, DataSubscriptionState);

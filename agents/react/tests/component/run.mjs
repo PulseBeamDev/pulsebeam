@@ -57,6 +57,7 @@ await build({
   bundle: true,
   platform: "node",
   format: "esm",
+  sourcemap: "linked",
   banner: {
     js: 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url);',
   },
@@ -100,6 +101,7 @@ await build({
   ],
 });
 try {
+  process.setSourceMapsEnabled(true);
   await import(pathToFileURL(output).href);
 } finally {
   await window.happyDOM.close();

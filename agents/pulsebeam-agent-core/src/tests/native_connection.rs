@@ -21,6 +21,59 @@ pub(crate) fn observe(
         .unwrap();
 }
 
+pub(crate) fn drain_batches(
+    agent: &mut Agent,
+    generation: Generation,
+    channel: ChannelId,
+) -> Vec<state::ClientStateBatch> {
+    let mut batches = Vec::new();
+    while let Some(effect) = agent.next_effect_after_turn() {
+        if let Effect::DataChannel(DataChannelEffect::Send {
+            operation,
+            generation: actual_generation,
+            channel: actual_channel,
+            payload,
+            ..
+        }) = effect
+        {
+            assert_eq!((actual_generation, actual_channel), (generation, channel));
+            batches.push(codec::decode_client(&payload).unwrap());
+            acknowledge_send(agent, generation, channel, operation);
+        }
+    }
+    batches
+}
+
+pub(crate) fn catalog_page(
+    agent: &mut Agent,
+    generation: Generation,
+    channel: ChannelId,
+    watch_id: u64,
+    room: &str,
+) {
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+            generation,
+            channel,
+            payload: codec::encode_server(&state::ServerStateBatch {
+                catalog_records: vec![state::CatalogServerRecord {
+                    response: Some(state::catalog_server_record::Response::Page(
+                        state::CatalogPageRecord {
+                            watch_id,
+                            room: room.into(),
+                            revision: 1,
+                            complete: true,
+                            ..Default::default()
+                        },
+                    )),
+                }],
+                ..Default::default()
+            })
+            .unwrap(),
+        }))
+        .unwrap();
+}
+
 pub(crate) fn confirmed(
     key: state::resource_key::Key,
     revision: u64,

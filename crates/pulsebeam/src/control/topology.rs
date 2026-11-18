@@ -4,7 +4,7 @@ use pulsebeam_runtime::time::Instant;
 use slotmap::{SlotMap, new_key_type};
 
 use crate::{
-    entity::{ParticipantId, RoomId, TrackId, TrackKind},
+    entity::{ConnectionId, ParticipantId, RoomId, TrackId, TrackKind},
     id::ShardId,
     route::{NodeRouteAddress, PackedRoute, RouteId, SlotAllocator},
     track::{SelectionPolicy, Track, TrackSelector},
@@ -72,8 +72,10 @@ enum SubscriptionAnchor {
 
 #[derive(Debug, Default)]
 struct RoomTrackTopology {
+    catalog_version: u64,
     tracks: HashMap<TrackId, Publication>,
     by_publisher: HashMap<ParticipantId, HashSet<TrackId>>,
+    by_incarnation: HashMap<(ParticipantId, ConnectionId), HashSet<TrackId>>,
     by_kind: HashMap<TrackKind, HashSet<TrackId>>,
     by_label: HashMap<String, HashSet<TrackId>>,
     subscriptions: SlotMap<SubscriptionKey, Subscription>,
@@ -90,6 +92,7 @@ struct RoomTrackTopology {
 
 #[derive(Debug, Default)]
 pub(crate) struct TrackTopology {
+    catalog_version: u64,
     rooms: HashMap<RoomId, RoomTrackTopology>,
 }
 
@@ -102,7 +105,12 @@ impl TrackTopology {
             debug_assert!(false, "a track identity must be published once");
             return None;
         }
-        room.index_track(identity, label.as_deref());
+        self.catalog_version = self
+            .catalog_version
+            .checked_add(1)
+            .unwrap_or_else(|| pulsebeam_runtime::fatal!("publication catalog version exhausted"));
+        room.catalog_version = self.catalog_version;
+        room.index_track(identity, track.meta().connection_id, label.as_deref());
         room.tracks
             .insert(identity.track_id, Publication { track, label });
         room.add_publication_reasons(identity);
@@ -112,8 +120,17 @@ impl TrackTopology {
     pub(crate) fn unpublish(&mut self, identity: TrackAncestry) -> Option<Track> {
         let room = self.rooms.get_mut(&identity.room_id)?;
         let publication = room.tracks.remove(&identity.track_id)?;
+        self.catalog_version = self
+            .catalog_version
+            .checked_add(1)
+            .unwrap_or_else(|| pulsebeam_runtime::fatal!("publication catalog version exhausted"));
+        room.catalog_version = self.catalog_version;
         debug_assert_eq!(TrackAncestry::from_track(&publication.track), identity);
-        room.unindex_track(identity, publication.label.as_deref());
+        room.unindex_track(
+            identity,
+            publication.track.meta().connection_id,
+            publication.label.as_deref(),
+        );
         room.candidate_reasons
             .retain(|(_, track), _| *track != identity.track_id);
         room.automatic_reasons
@@ -161,12 +178,38 @@ impl TrackTopology {
             .flat_map(|room| room.tracks.values().map(|publication| &publication.track))
     }
 
+    pub(crate) fn catalog_version(&self) -> u64 {
+        self.catalog_version
+    }
+
+    pub(crate) fn room_catalog_version(&self, room: RoomId) -> u64 {
+        self.rooms.get(&room).map_or(0, |room| room.catalog_version)
+    }
+
+    pub(crate) fn publisher_sources(
+        &self,
+        room: RoomId,
+        publisher: ParticipantId,
+        connection: ConnectionId,
+    ) -> impl Iterator<Item = &Track> {
+        self.rooms.get(&room).into_iter().flat_map(move |room| {
+            room.by_incarnation
+                .get(&(publisher, connection))
+                .into_iter()
+                .flatten()
+                .filter_map(|id| room.tracks.get(id).map(|publication| &publication.track))
+        })
+    }
+
     pub(crate) fn track_mut(&mut self, identity: TrackAncestry) -> Option<&mut Track> {
-        self.rooms
-            .get_mut(&identity.room_id)?
-            .tracks
-            .get_mut(&identity.track_id)
-            .map(|publication| &mut publication.track)
+        let room = self.rooms.get_mut(&identity.room_id)?;
+        let publication = room.tracks.get_mut(&identity.track_id)?;
+        self.catalog_version = self
+            .catalog_version
+            .checked_add(1)
+            .unwrap_or_else(|| pulsebeam_runtime::fatal!("publication catalog version exhausted"));
+        room.catalog_version = self.catalog_version;
+        Some(&mut publication.track)
     }
 
     pub(crate) fn subscribe(
@@ -387,6 +430,12 @@ impl TrackTopology {
                     (publication.track.meta().origin == participant).then_some(*id)
                 })
                 .collect();
+            if !published.is_empty() {
+                self.catalog_version = self.catalog_version.checked_add(1).unwrap_or_else(|| {
+                    pulsebeam_runtime::fatal!("publication catalog version exhausted")
+                });
+                room.catalog_version = self.catalog_version;
+            }
             for track in published {
                 room.remove_track(track);
             }
@@ -404,8 +453,19 @@ impl RoomTrackTopology {
         })
     }
 
-    fn index_track(&mut self, identity: TrackAncestry, label: Option<&str>) {
+    fn index_track(
+        &mut self,
+        identity: TrackAncestry,
+        connection: ConnectionId,
+        label: Option<&str>,
+    ) {
         debug_assert!(!self.tracks.contains_key(&identity.track_id));
+        let inserted = self
+            .by_incarnation
+            .entry((identity.publisher, connection))
+            .or_default()
+            .insert(identity.track_id);
+        debug_assert!(inserted);
         let publisher_inserted = self
             .by_publisher
             .entry(identity.publisher)
@@ -428,7 +488,18 @@ impl RoomTrackTopology {
         }
     }
 
-    fn unindex_track(&mut self, identity: TrackAncestry, label: Option<&str>) {
+    fn unindex_track(
+        &mut self,
+        identity: TrackAncestry,
+        connection: ConnectionId,
+        label: Option<&str>,
+    ) {
+        let removed = remove_indexed(
+            &mut self.by_incarnation,
+            (identity.publisher, connection),
+            identity.track_id,
+        );
+        debug_assert!(removed);
         let publisher_removed = remove_indexed(
             &mut self.by_publisher,
             identity.publisher,
@@ -705,7 +776,11 @@ impl RoomTrackTopology {
             return;
         };
         let identity = TrackAncestry::from_track(&publication.track);
-        self.unindex_track(identity, publication.label.as_deref());
+        self.unindex_track(
+            identity,
+            publication.track.meta().connection_id,
+            publication.label.as_deref(),
+        );
         self.candidate_reasons
             .retain(|(_, candidate), _| *candidate != track);
         self.automatic_reasons
@@ -842,6 +917,46 @@ mod tests {
             TrackKind::Audio => Track::audio(meta, None),
             TrackKind::Video => Track::video(meta, Vec::new(), None),
         }
+    }
+
+    #[test]
+    fn catalog_sources_are_indexed_by_publisher_incarnation_and_release_on_both_cleanup_paths() {
+        let mut topology = TrackTopology::default();
+        let old = track(TrackKind::Data, 1, 1, "same-label");
+        let current = track(TrackKind::Data, 1, 1, "same-label");
+        let old_connection = old.meta().connection_id;
+        let current_connection = current.meta().connection_id;
+        let old_identity = topology.publish(old).unwrap();
+        let current_identity = topology.publish(current).unwrap();
+        assert_eq!(
+            topology
+                .publisher_sources(room(1), participant(1), old_connection)
+                .map(Track::id)
+                .collect::<Vec<_>>(),
+            vec![old_identity.track_id]
+        );
+        assert_eq!(
+            topology
+                .publisher_sources(room(1), participant(1), current_connection)
+                .map(Track::id)
+                .collect::<Vec<_>>(),
+            vec![current_identity.track_id]
+        );
+        topology.unpublish(old_identity).unwrap();
+        assert!(
+            topology
+                .publisher_sources(room(1), participant(1), old_connection)
+                .next()
+                .is_none()
+        );
+        topology.remove_participant(participant(1));
+        assert!(
+            topology
+                .publisher_sources(room(1), participant(1), current_connection)
+                .next()
+                .is_none()
+        );
+        assert!(topology.rooms[&room(1)].by_incarnation.is_empty());
     }
 
     #[test]

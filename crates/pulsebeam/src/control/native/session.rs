@@ -164,6 +164,7 @@ struct Row {
     self_context: bool,
 }
 
+mod catalog;
 mod discovery;
 mod revocation;
 mod source_wait;
@@ -189,6 +190,8 @@ const SELECT_WORK: usize = 32;
 #[derive(Default)]
 pub(crate) struct NativeSession {
     pub(crate) cid: Option<ChannelId>,
+    pub(crate) catalog: catalog::CatalogSession,
+    catalog_first: bool,
     rows: BTreeMap<Key, Row>,
     order: BTreeMap<u64, Key>,
     publications: BTreeMap<(i32, String), u64>,
@@ -514,6 +517,8 @@ impl NativeSession {
             self.permissions_changed();
         }
         self.grant_revision = revision;
+        self.cancel_unsent_catalog()?;
+        self.catalog.invalidate();
         self.put(
             Key::Session,
             confirmed(wire::confirmed_state::Value::Session(wire::SessionState {
@@ -530,6 +535,8 @@ impl NativeSession {
 
     pub(crate) fn close(&mut self, reason: wire::CloseReason) -> Result<(), OutputError> {
         self.closed = true;
+        self.cancel_unsent_catalog()?;
+        self.catalog.close();
         self.lookup_cursor = 0;
         self.closed_lookup_pending = true;
         let Some(row) = self.rows.get(&Key::Session) else {
@@ -628,10 +635,56 @@ impl NativeSession {
         Ok(commands)
     }
 
+    fn cancel_unsent_catalog(&mut self) -> Result<(), OutputError> {
+        let Some(output) = self
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.output.as_ref())
+        else {
+            return Ok(());
+        };
+        let batch =
+            codec::decode_server(&output.bytes).map_err(|_| OutputError::InvalidObservation)?;
+        if !batch.catalog_records.is_empty() {
+            // Selected resource revisions remain dirty until ACK. Only unsent output is canceled.
+            self.pending = None;
+            self.catalog.restore_unsent(batch.catalog_records)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replace_catalog(
+        &mut self,
+        id: u64,
+        revision: u64,
+        records: Vec<wire::CatalogPageRecord>,
+    ) -> Result<(), OutputError> {
+        self.cancel_unsent_catalog()?;
+        self.catalog.replace(id, revision, records)
+    }
+
+    pub(crate) fn fail_catalog(
+        &mut self,
+        id: u64,
+        code: wire::FailureCode,
+    ) -> Result<(), OutputError> {
+        self.cancel_unsent_catalog()?;
+        self.catalog.fail(id, code)
+    }
+
     pub(crate) fn apply_input(&mut self, bytes: &[u8]) -> Result<NativeInput, InputError> {
         self.source_wait_changed();
         let batch = codec::decode_client(bytes).map_err(InputError::Decode)?;
         let mut effects = NativeInput::default();
+        if !self.closed {
+            if !batch.catalog_records.is_empty() {
+                self.cancel_unsent_catalog()
+                    .map_err(|_| InputError::Capacity)?;
+            }
+            for record in batch.catalog_records {
+                self.catalog.input(record)?;
+            }
+        }
         for record in batch.records {
             let reference = record.owned;
             let revision = record
@@ -1985,7 +2038,7 @@ impl NativeSession {
         self.cid.is_some()
             && self.grant_revision != 0
             && self.pending.as_ref().map_or_else(
-                || !self.dirty.is_empty() || !self.initial_complete,
+                || !self.dirty.is_empty() || !self.initial_complete || self.catalog.pending(),
                 |pending| {
                     pending.output.is_some()
                         || self.deadline().is_some_and(|deadline| {
@@ -2081,10 +2134,18 @@ impl NativeSession {
             }
         }
         let mut batch = wire::ServerStateBatch::default();
+        if self.catalog_first && !session_dirty {
+            self.catalog.append(&mut batch);
+        }
         let mut selected = Vec::new();
         let mut selected_cursor = cursor;
         for key in keys {
-            if batch.records.len() == codec::MAX_RECORDS {
+            if batch
+                .records
+                .len()
+                .saturating_add(batch.catalog_records.len())
+                == codec::MAX_RECORDS
+            {
                 self.requeue(&key);
                 continue;
             }
@@ -2116,6 +2177,9 @@ impl NativeSession {
             }
             selected.push((key, row.version));
             batch.records.push(record);
+        }
+        if !self.catalog_first || session_dirty {
+            self.catalog.append(&mut batch);
         }
         // Do not pass an initial key that did not fit the selected batch.
         let remaining = self
@@ -2152,11 +2216,12 @@ impl NativeSession {
         if batch.encoded_len() > codec::MAX_FRAME_SIZE {
             batch.initial_complete = false;
         }
-        if batch.records.is_empty() && !batch.initial_complete {
+        if batch.records.is_empty() && batch.catalog_records.is_empty() && !batch.initial_complete {
             self.initial_cursor = selected_cursor;
             return Ok(None);
         }
         let bytes = codec::encode_server(&batch).map_err(OutputError::Encode)?;
+        self.catalog_first = !self.catalog_first;
         let sequence = self
             .output_sequence
             .checked_add(1)

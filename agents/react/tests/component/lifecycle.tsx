@@ -17,6 +17,7 @@ import {
   stalePublicationClaim,
 } from "./ownership.js";
 import { videoPreferences } from "./video.js";
+import { watchLifecycle } from "./watch.js";
 
 await concurrentRender();
 await captureLifecycle();
@@ -27,6 +28,7 @@ await stalePublicationClaim();
 await dataLifetimes();
 await staleDataClaims();
 await videoPreferences();
+await watchLifecycle();
 
 let agent: NonNullable<ReturnType<typeof useAgent>>;
 let capture: ReturnType<typeof useCapture>;

@@ -260,6 +260,7 @@ pub struct Agent {
     desired: DesiredState,
     declared: DesiredState,
     resources: crate::TrackResources,
+    catalogs: crate::catalog::Catalogs,
     local_bindings: BTreeMap<MediaSlot, String>,
     snapshot: Snapshot,
     ids: IdGenerator,
@@ -292,6 +293,7 @@ impl Agent {
             desired: DesiredState::default(),
             declared: DesiredState::default(),
             resources: crate::TrackResources::default(),
+            catalogs: crate::catalog::Catalogs::default(),
             local_bindings: BTreeMap::new(),
             snapshot: Snapshot::default(),
             ids: IdGenerator::new(),
@@ -2510,6 +2512,46 @@ impl Agent {
         }
     }
 
+    pub fn catalog_watch(
+        &mut self,
+        room: String,
+        config: crate::ffi::WatchConfig,
+    ) -> Result<crate::TrackOwner, crate::ffi::ErrorInfo> {
+        let owner = self.resources.new_owner().map_err(|_| {
+            crate::ffi::ErrorInfo::new(
+                crate::ffi::ErrorCode::CapacityExceeded,
+                "catalog owner identity exhausted",
+            )
+        })?;
+        self.catalogs.open(owner, room, config)?;
+        self.request_reconciliation();
+        Ok(owner)
+    }
+
+    pub fn catalog_watch_state(&self, owner: crate::TrackOwner) -> Option<crate::ffi::WatchState> {
+        self.catalogs.state(owner).or_else(|| {
+            self.notifications
+                .iter()
+                .chain(self.published_notifications.iter())
+                .find_map(|notification| match notification {
+                    Notification::CatalogWatchTerminated {
+                        owner: ended,
+                        state,
+                    } if *ended == owner.id() => Some(state.clone()),
+                    _ => None,
+                })
+        })
+    }
+
+    pub fn close_catalog_watch(
+        &mut self,
+        owner: crate::TrackOwner,
+    ) -> Option<crate::ffi::WatchState> {
+        let state = self.catalogs.close(owner)?;
+        self.request_reconciliation();
+        Some(state)
+    }
+
     fn reconcile_current(&mut self) {
         if self.snapshot.terminal_failure.is_some() || self.closing.is_some() {
             return;
@@ -2528,6 +2570,13 @@ impl Agent {
         else {
             return;
         };
+        if let Err(error) = self
+            .catalogs
+            .reconcile(active.generation, &mut active.state)
+        {
+            self.fail_terminal(Failure::protocol(error.to_string()));
+            return;
+        }
         if self.intent_dirty {
             self.intent_dirty = false;
             if let Err(error) = native::reconcile(
@@ -2635,6 +2684,7 @@ impl Agent {
     }
 
     fn begin_close(&mut self) {
+        self.catalogs.disconnect();
         self.admission_denial = None;
         if self.closing.is_some() {
             return;
@@ -2770,6 +2820,7 @@ impl Agent {
 
     fn finish_disconnected(&mut self) {
         agent_log!(self, Info, "agent session disconnected");
+        self.catalogs.disconnect();
         self.active = None;
         self.attempt = None;
         self.retry = None;

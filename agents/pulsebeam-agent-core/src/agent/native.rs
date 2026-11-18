@@ -1519,6 +1519,15 @@ impl Agent {
         let mut discovery_changed = false;
         for change in changes {
             match change {
+                Change::Catalog(record) => {
+                    if let Some((owner, state)) = self.catalogs.apply(*record) {
+                        if state.status == crate::ffi::WatchStatus::Failed {
+                            self.notifications.push_back(Notification::CatalogWatchTerminated { owner: owner.id(), state });
+                        } else if !self.notifications.iter().any(|notification| matches!(notification, Notification::CatalogWatchChanged { owner: current } if *current == owner.id())) {
+                            self.notifications.push_back(Notification::CatalogWatchChanged { owner: owner.id() });
+                        }
+                    }
+                }
                 Change::Session => {
                     let Some(active) = self.active.as_mut() else {
                         break;

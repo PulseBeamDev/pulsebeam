@@ -23,8 +23,15 @@ import {
   type DataSubscription,
   type VideoSource,
   type AudioSource,
+  type Watch as WebWatch,
 } from "@pulsebeam/web";
-import { usePublish, useSubscribe } from "@pulsebeam/react";
+import {
+  usePublish,
+  useSubscribe,
+  useWatch,
+  type Watch,
+  type WatchConfig,
+} from "@pulsebeam/react";
 import { createElement } from "react";
 
 // @ts-expect-error React owns Agents only through useAgent.
@@ -59,6 +66,16 @@ type AgentIdentity = Expect<
   Equal<ReturnType<typeof useAgent>, WebAgent | null>
 >;
 const actualAgent: WebAgent = nullableAgent!;
+type WatchIdentity = Expect<
+  Equal<ReturnType<typeof useWatch>, WebWatch | null>
+>;
+const watchConfig: WatchConfig = { limit: 7, cursor: Uint8Array.of(1) };
+const watch: Watch | null = useWatch(
+  actualAgent.room("pinned-room"),
+  watchConfig,
+);
+const absentWatch: WebWatch | null = useWatch(null);
+void [watch, absentWatch];
 const videoSource = null as VideoSource | null;
 const audioSource = null as AudioSource | null;
 const videoPublication = usePublish(actualAgent.video("video"), videoSource);
@@ -271,6 +288,10 @@ agent.getSnapshot();
 
 const videoSettings: VideoCaptureSettings | undefined = capture.video?.settings;
 const audioSettings: AudioCaptureSettings | undefined = capture.audio?.settings;
-void [videoSettings, audioSettings, remoteAudio, participant.tracks];
+void [videoSettings, audioSettings, remoteAudio];
+// @ts-expect-error Discovery belongs to bounded Watch pages, not pinned references.
+participant.tracks;
+// @ts-expect-error Flat publication collection aliases are not re-exported by React.
+import type { RemotePublishedTrack } from "../../src/index.js";
 agent.connect();
 agent.disconnect();

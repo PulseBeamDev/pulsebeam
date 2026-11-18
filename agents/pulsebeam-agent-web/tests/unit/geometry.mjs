@@ -5,6 +5,7 @@ import {
   attachRemoteVideo,
 } from "../../unit-javascript/remote-catalog.js";
 import { DataRegistry } from "../../unit-javascript/data.js";
+import { attachMedia } from "../../unit-javascript/media-attachment.js";
 import { ResourceOwners } from "../../unit-javascript/resources.js";
 import {
   Video,
@@ -41,11 +42,42 @@ test("production attachment reports controlled geometry and visibility to core",
   const owners = new ResourceOwners(() => {});
   owners.activate({
     video_subscription: () => ({
-      state() {},
-      updates: () => ({ async next() {}, close() {} }),
+      state: () => ({ observationRevision: 1n }),
+      updates() {
+        let first = true;
+        let resolve;
+        return {
+          next() {
+            if (first) {
+              first = false;
+              return Promise.resolve({ observationRevision: 1n });
+            }
+            return new Promise((done) => {
+              resolve = done;
+            });
+          },
+          close() {
+            resolve?.(undefined);
+          },
+        };
+      },
     }),
-    async observe_media(owner) {
-      return new Promise((_resolve, reject) => pending.set(owner, reject));
+    async observe_media(owner, _source, signal) {
+      return new Promise((_resolve, reject) => {
+        const key = {};
+        const cancel = () =>
+          finish(
+            Object.assign(new Error("closed"), { pulsebeamCode: "closed" }),
+          );
+        const finish = (error) => {
+          signal?.removeEventListener("abort", cancel);
+          pending.delete(key);
+          reject(error);
+        };
+        pending.set(key, { owner, finish });
+        signal?.addEventListener("abort", cancel, { once: true });
+        if (signal?.aborted) cancel();
+      });
     },
     async resource(command) {
       return this.resource_now(command);
@@ -58,10 +90,12 @@ test("production attachment reports controlled geometry and visibility to core",
         return { type: "updated" };
       }
       if (command.op === "release") {
-        pending.get(command.owner)?.(
-          Object.assign(new Error("closed"), { pulsebeamCode: "closed" }),
-        );
-        pending.delete(command.owner);
+        for (const reader of pending.values()) {
+          if (reader.owner === command.owner)
+            reader.finish(
+              Object.assign(new Error("closed"), { pulsebeamCode: "closed" }),
+            );
+        }
         observations.delete(command.owner);
         demand = [...observations.values()].filter(({ visible }) => visible);
         return { type: "released" };
@@ -141,7 +175,85 @@ test("production attachment reports controlled geometry and visibility to core",
   Intersection.notify([{ isIntersecting: true }]);
   viewport.dispatchEvent(new Event("resize"));
   assert.deepEqual(demand, [], "teardown cannot resurrect measured demand");
+  viewport.devicePixelRatio = 2;
+  const configuration = {
+    visible: true,
+    height: 100,
+    minHeight: 0,
+    minFps: 15,
+    priority: 10,
+    playoutDelay: { mode: "adaptive" },
+  };
+  const subscription = handle.subscribe(configuration);
+  await subscription.configure(configuration);
+  small.rect.height = 100;
+  const fail = (error) => assert.fail(error);
+  const borrowedSmall = attachMedia(
+    subscription,
+    "video",
+    small,
+    false,
+    fail,
+    fail,
+  );
+  const borrowedLarge = attachMedia(
+    subscription,
+    "video",
+    large,
+    false,
+    fail,
+    fail,
+  );
+  assert.equal(
+    observations.size,
+    1,
+    "views borrow one existing reception owner",
+  );
+  assert.equal(
+    demand[0].height,
+    460,
+    "one subscription aggregates its attached views",
+  );
+  await subscription.configure({ ...configuration, priority: 200 });
+  assert.equal(
+    demand[0].height,
+    460,
+    "preference updates preserve measured geometry",
+  );
+  assert.equal(demand[0].priority, 200);
+  assert.equal(
+    pending.size,
+    2,
+    "each view acquires its own physical observation",
+  );
+  await borrowedLarge.close();
+  assert.equal(
+    demand[0].height,
+    200,
+    "detaching one view preserves its sibling geometry",
+  );
+  assert.equal(pending.size, 1);
+  await borrowedSmall.close();
+  assert.equal(
+    subscription.isClosed(),
+    false,
+    "element teardown never closes a borrowed subscription",
+  );
+  assert.equal(
+    demand[0].height,
+    100,
+    "last detach restores the owner's explicit configuration",
+  );
+  assert.equal(pending.size, 0);
+  Mutation.notify();
+  Resize.notify();
+  assert.equal(
+    demand[0].height,
+    100,
+    "retired views cannot overwrite the owner's configuration",
+  );
+  await subscription.close();
+  assert.deepEqual(demand, []);
   catalog.close();
   assert.throws(() => attachRemoteVideo(handle, small), { code: "closed" });
-  viewport.devicePixelRatio = 2;
 });

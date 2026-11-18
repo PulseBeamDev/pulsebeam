@@ -6,9 +6,11 @@ use core::time::Duration;
 
 use crate as model;
 
+mod catalog;
 mod pipe;
 mod publication;
 mod subscription;
+pub use catalog::*;
 pub use pipe::*;
 pub use publication::*;
 pub use subscription::*;
@@ -182,80 +184,6 @@ pub struct DesiredState {
 pub enum MediaKind {
     Video,
     Audio,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct ParticipantInfo {
-    pub participant_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct Publication {
-    pub id: String,
-    pub participant_id: String,
-    pub kind: MediaKind,
-    pub label: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
-pub enum TrackSpec {
-    Video { label: String },
-    Audio { label: String },
-    Data { label: String, delivery: TopicMode },
-}
-
-impl From<model::TrackSpec> for TrackSpec {
-    fn from(value: model::TrackSpec) -> Self {
-        match value {
-            model::TrackSpec::Video { label } => Self::Video { label },
-            model::TrackSpec::Audio { label } => Self::Audio { label },
-            model::TrackSpec::Data { label, delivery } => Self::Data {
-                label,
-                delivery: delivery.into(),
-            },
-        }
-    }
-}
-
-impl From<TrackSpec> for model::TrackSpec {
-    fn from(value: TrackSpec) -> Self {
-        match value {
-            TrackSpec::Video { label } => Self::Video { label },
-            TrackSpec::Audio { label } => Self::Audio { label },
-            TrackSpec::Data { label, delivery } => Self::Data {
-                label,
-                delivery: delivery.into(),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct RemoteTrack {
-    pub id: String,
-    pub participant_id: String,
-    pub spec: TrackSpec,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct CatalogSnapshot {
-    pub revision: u64,
-    pub participants: Vec<ParticipantInfo>,
-    pub publications: Vec<Publication>,
-    pub tracks: Vec<RemoteTrack>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct TrackMapping {
-    pub receiver_index: u32,
-    pub publication_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
-pub struct MappingSnapshot {
-    pub accepted_intent_revision: u64,
-    pub video: Vec<TrackMapping>,
-    pub audio: Vec<TrackMapping>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -574,8 +502,6 @@ pub struct Snapshot {
     pub participant_id: Option<String>,
     pub room_id: Option<String>,
     pub authorization_expires_at: Option<i64>,
-    pub catalog: CatalogSnapshot,
-    pub mapping: MappingSnapshot,
     pub topics: TopicState,
     pub failure: Option<Failure>,
 }
@@ -641,6 +567,13 @@ pub enum Notification {
         to: ConnectionState,
     },
     SnapshotChanged,
+    CatalogWatchChanged {
+        owner: u64,
+    },
+    CatalogWatchTerminated {
+        owner: u64,
+        state: WatchState,
+    },
     DataReady {
         owners: Vec<u64>,
     },
@@ -1150,14 +1083,6 @@ impl From<model::MediaKind> for MediaKind {
     }
 }
 
-impl From<model::Participant> for ParticipantInfo {
-    fn from(value: model::Participant) -> Self {
-        Self {
-            participant_id: value.external_id,
-        }
-    }
-}
-
 impl From<model::ConnectionState> for ConnectionState {
     fn from(value: model::ConnectionState) -> Self {
         match value {
@@ -1253,56 +1178,6 @@ impl From<&model::Snapshot> for Snapshot {
             participant_id: value.participant_external_id.clone(),
             room_id: value.room_external_id.clone(),
             authorization_expires_at: value.authorization_expires_at,
-            catalog: CatalogSnapshot {
-                revision: value.catalog_revision,
-                tracks: value
-                    .remote_tracks
-                    .values()
-                    .map(|track| RemoteTrack {
-                        id: track.id.clone(),
-                        participant_id: track.participant_id.clone(),
-                        spec: track.spec.clone().into(),
-                    })
-                    .collect(),
-                participants: value
-                    .participants
-                    .values()
-                    .cloned()
-                    .map(Into::into)
-                    .collect(),
-                publications: value
-                    .publications
-                    .values()
-                    .filter_map(|publication| {
-                        let owner = value.participants.get(&publication.participant_id)?;
-                        Some(Publication {
-                            id: publication.id.clone(),
-                            participant_id: owner.external_id.clone(),
-                            kind: publication.kind.into(),
-                            label: publication.label.clone(),
-                        })
-                    })
-                    .collect(),
-            },
-            mapping: MappingSnapshot {
-                accepted_intent_revision: value.accepted_intent_revision,
-                video: value
-                    .video_mapping
-                    .iter()
-                    .map(|(&receiver_index, publication_id)| TrackMapping {
-                        receiver_index,
-                        publication_id: publication_id.clone(),
-                    })
-                    .collect(),
-                audio: value
-                    .audio_mapping
-                    .iter()
-                    .map(|(&receiver_index, publication_id)| TrackMapping {
-                        receiver_index,
-                        publication_id: publication_id.clone(),
-                    })
-                    .collect(),
-            },
             topics: (&value.topics).into(),
             failure: value.terminal_failure.clone().map(Into::into),
         }
@@ -1399,6 +1274,12 @@ impl From<model::Notification> for Notification {
                 to: to.into(),
             },
             model::Notification::SnapshotChanged => Self::SnapshotChanged,
+            model::Notification::CatalogWatchChanged { owner } => {
+                Self::CatalogWatchChanged { owner }
+            }
+            model::Notification::CatalogWatchTerminated { owner, state } => {
+                Self::CatalogWatchTerminated { owner, state }
+            }
             model::Notification::DataReady { owners } => Self::DataReady { owners },
             model::Notification::DataSendFinished { send, error } => Self::DataSendFinished {
                 send: send.get(),
@@ -1606,24 +1487,7 @@ mod tests {
                 error: None,
             });
         }
-        assert_eq!(
-            projected
-                .catalog
-                .participants
-                .iter()
-                .map(|value| value.participant_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["external-a", "external-z"],
-        );
-        assert_eq!(
-            projected.catalog.publications,
-            vec![Publication {
-                id: "video".to_string(),
-                participant_id: "external-a".to_string(),
-                kind: MediaKind::Video,
-                label: "camera".to_string(),
-            }]
-        );
+        let before_reconnect = Snapshot::from(&snapshot);
         snapshot.participant_id = Some("replacement-canonical-self".to_string());
         let mut participant = snapshot.participants.remove("canonical-a").unwrap();
         participant.id = "replacement-canonical-a".to_string();
@@ -1636,20 +1500,15 @@ mod tests {
         snapshot
             .publications
             .insert(publication.id.clone(), publication);
-        let reconnected = Snapshot::from(&snapshot);
-        assert_eq!(reconnected.participant_id, projected.participant_id);
-        let mut participants = reconnected.catalog.participants;
-        participants.sort_by(|left, right| left.participant_id.cmp(&right.participant_id));
-        assert_eq!(participants, projected.catalog.participants);
-        assert_eq!(
-            reconnected.catalog.publications,
-            vec![Publication {
-                id: "replacement-video".to_string(),
-                participant_id: "external-a".to_string(),
-                kind: MediaKind::Video,
-                label: "camera".to_string(),
-            }]
-        );
+        snapshot.catalog_revision += 1;
+        snapshot.accepted_intent_revision += 1;
+        snapshot.video_mapping.insert(0, "replacement-video".into());
+        assert_eq!(Snapshot::from(&snapshot), before_reconnect);
+        snapshot.participants.clear();
+        snapshot.publications.clear();
+        snapshot.remote_tracks.clear();
+        snapshot.video_mapping.clear();
+        assert_eq!(Snapshot::from(&snapshot), before_reconnect);
     }
 
     #[test]
@@ -1694,12 +1553,6 @@ mod tests {
             name: "chat".to_string(),
             mode: TopicMode::Ordered,
         };
-        let publication = Publication {
-            id: "participant/video".to_string(),
-            participant_id: "participant".to_string(),
-            kind: MediaKind::Video,
-            label: "camera".to_string(),
-        };
         let failure = Failure {
             class: FailureClass::Protocol,
             message: "invalid response".to_string(),
@@ -1738,7 +1591,7 @@ mod tests {
         });
         assert_ffi_round_trip(VideoDemand {
             slot: 1,
-            publication_id: publication.id.clone(),
+            publication_id: "participant/video".into(),
             selector: None,
             height: 720,
             min_height: 180,
@@ -1822,10 +1675,6 @@ mod tests {
             topic_publishers: vec![publisher],
             topic_subscribers: vec![subscriber],
         });
-        assert_ffi_round_trip(ParticipantInfo {
-            participant_id: "user".to_string(),
-        });
-        assert_ffi_round_trip(publication.clone());
         assert_ffi_round_trip(failure.clone());
         assert_ffi_round_trip(publisher_state);
         assert_ffi_round_trip(subscriber_state);
@@ -1850,29 +1699,6 @@ mod tests {
             participant_id: Some("user".to_string()),
             room_id: Some("room".to_string()),
             authorization_expires_at: Some(1_720_000_000),
-            catalog: CatalogSnapshot {
-                revision: 2,
-                participants: vec![ParticipantInfo {
-                    participant_id: "user".to_string(),
-                }],
-                publications: vec![publication],
-                tracks: vec![RemoteTrack {
-                    id: "data-track".into(),
-                    participant_id: "alice".into(),
-                    spec: TrackSpec::Data {
-                        label: "chat".into(),
-                        delivery: TopicMode::Ordered,
-                    },
-                }],
-            },
-            mapping: MappingSnapshot {
-                accepted_intent_revision: 4,
-                video: vec![TrackMapping {
-                    receiver_index: 2,
-                    publication_id: "video".to_string(),
-                }],
-                audio: vec![],
-            },
             topics,
             failure: Some(failure),
         });
@@ -1910,24 +1736,6 @@ mod tests {
 
     #[test]
     fn every_portable_enum_variant_survives_uniffi_serialization() {
-        for value in [
-            TrackSpec::Video {
-                label: "camera".into(),
-            },
-            TrackSpec::Audio {
-                label: "mic".into(),
-            },
-            TrackSpec::Data {
-                label: "events".into(),
-                delivery: TopicMode::Ordered,
-            },
-        ] {
-            assert_eq!(
-                TrackSpec::from(model::TrackSpec::from(value.clone())),
-                value
-            );
-            assert_ffi_round_trip(value);
-        }
         for value in [
             LogLevel::Off,
             LogLevel::Error,

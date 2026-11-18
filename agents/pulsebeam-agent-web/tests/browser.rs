@@ -53,10 +53,19 @@ async fn native_platform_smoke() -> TestResult<()> {
             .checked_add(60)
             .ok_or("renewal expiry overflow")?,
     )?;
+    let catalog = pulsebeam_server::sign_participant_token(
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
+        &serde_json::from_value(serde_json::json!([{
+            "rooms": [room.as_str()], "allow": ["join", "discover"]
+        }]))?,
+        "web-catalog-observer",
+        expires_at,
+    )?;
     let live = include_str!("contracts/live-agent-contract.js")
         .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver)
+        .replace("__CATALOG_TOKEN__", &catalog)
         .replace("__RENEWED_SENDER_TOKEN__", &renewed_sender);
     let mut browser = capabilities()?;
     browser.add_arg("--autoplay-policy=no-user-gesture-required")?;
@@ -121,6 +130,22 @@ async fn native_platform_smoke() -> TestResult<()> {
             "react-receiver",
             expires_at,
         )?;
+        let catalog_token = pulsebeam_server::sign_participant_token(
+            &pulsebeam_server::insecure_dev_api_key()?,
+            &serde_json::from_value(serde_json::json!([
+                {"rooms":[source_room.as_str()],"allow":["join", "discover"]}
+            ]))?,
+            "react-catalog-observer",
+            expires_at,
+        )?;
+        let metadata_token = pulsebeam_server::sign_participant_token(
+            &pulsebeam_server::insecure_dev_api_key()?,
+            &serde_json::from_value(serde_json::json!([
+                {"rooms":[source_room.as_str()],"allow":["join", "publish"]}
+            ]))?,
+            "react-metadata-publisher",
+            expires_at,
+        )?;
         let react = StaticServer::start(
             std::env::var_os("PULSEBEAM_REACT_FIXTURE_ROOT")
                 .ok_or("missing React fixture assets")?,
@@ -155,6 +180,21 @@ async fn native_platform_smoke() -> TestResult<()> {
             for field in ["video", "data", "wasm"] {
                 assert_eq!(result[field], true, "installed Python to React: {field}");
             }
+            let catalog_config = serde_json::json!({
+                "endpoint": destination.endpoint(),
+                "token": catalog_token,
+                "publisherToken": metadata_token,
+                "room": source_room.as_str(),
+            });
+            let catalog: bool = evaluate_json(
+                &bidi,
+                &context,
+                &format!(
+                    "import('./main.js').then(module => module.observeCatalog({catalog_config}))"
+                ),
+            )
+            .await?;
+            assert!(catalog, "real React catalog consumer and final state");
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         }
         .await;

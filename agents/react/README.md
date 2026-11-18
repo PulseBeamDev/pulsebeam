@@ -3,10 +3,13 @@
 **See and hear the other participant in a React room.**
 
 [Install the SDK and add a room](../../docs/react/quickstart.md) in your own app.
-Install the React SDK in your app:
+These examples describe the current source API. Released package/server
+compatibility for this revision has not been qualified here. Obtain matching
+SDK archives and a server build from a trusted build, then install the archives
+in your app:
 
 ```sh
-npm install @pulsebeam/react
+npm install /path/to/web-package.tgz /path/to/react-package.tgz
 ```
 
 The React SDK runs in the browser. Issue participant tokens using
@@ -64,6 +67,25 @@ React creates Agents through `useAgent`, with no `createAgent` export or
 advanced escape hatch. Non-React applications use caller-owned `new Agent(config)`
 from `@pulsebeam/web`. Managed lifecycle functions are internal, not public SDK
 APIs. Keep signing keys on your backend.
+
+## Discover a bounded roster
+
+Use `useWatch` on a memoized `agent.room(name)` reference. It returns the actual
+owned Watch or null until committed, and observes `state()` internally. Its
+immutable scope is room, limit and cursor bytes; equivalent configs do not churn
+ownership. Unmount releases the watch, not independent subscriptions.
+
+Render loading, failure, a complete page and explicit Next/First-page controls.
+The default page limit is 100, maximum 500; an Agent owns at most eight watches.
+Pages include presence-only participants and immutable publication metadata.
+Expired continuations fail visibly and can restart from the first page. Do not
+traverse every page or equate the page size with receive capacity.
+
+Discover permission grants metadata, not reception. Use a page entry's application
+`externalId` and publication label for pinned lookup, then let mounted consumers
+own `useSubscribe`; exclude self. Known-address Subscribe needs no Discover.
+`agent.participants`, `participant.tracks` and global snapshot discovery are absent.
+See the [typed bounded roster and receive guide](../../docs/react/guides.md#remote-discovery-and-video-receive-policy).
 
 ## Check changes
 

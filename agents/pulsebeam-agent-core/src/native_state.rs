@@ -171,6 +171,7 @@ pub(crate) enum Change {
     Track(String),
     Session,
     InitialComplete,
+    Catalog(Box<wire::CatalogServerRecord>),
 }
 
 pub(crate) struct NativeState {
@@ -181,6 +182,8 @@ pub(crate) struct NativeState {
     retiring: BTreeSet<u64>,
     executions: BTreeSet<u64>,
     prefer_execution: bool,
+    catalog_pending: BTreeMap<u64, wire::CatalogClientRecord>,
+    catalog_first: bool,
     retiring_resources: BTreeMap<Resource, u64>,
     cursor: Option<Resource>,
     prefer_retirement: bool,
@@ -211,6 +214,8 @@ impl NativeState {
             retiring: BTreeSet::new(),
             executions: BTreeSet::new(),
             prefer_execution: true,
+            catalog_pending: BTreeMap::new(),
+            catalog_first: true,
             retiring_resources: BTreeMap::new(),
             cursor: None,
             prefer_retirement: true,
@@ -380,12 +385,85 @@ impl NativeState {
         Ok(())
     }
 
+    pub(crate) fn queue_catalog(
+        &mut self,
+        record: wire::CatalogClientRecord,
+    ) -> Result<(), SignalingError> {
+        codec::encode_client(&wire::ClientStateBatch {
+            catalog_records: vec![record.clone()],
+            ..Default::default()
+        })
+        .map_err(|_| SignalingError::Encode)?;
+        let (id, close) = match record
+            .command
+            .as_ref()
+            .ok_or(SignalingError::MissingPayload)?
+        {
+            wire::catalog_client_record::Command::Open(request) => (request.watch_id, false),
+            wire::catalog_client_record::Command::Close(request) => (request.watch_id, true),
+        };
+        let old = self.catalog_pending.get(&id);
+        let previous = old.map_or(0, Message::encoded_len);
+        if close
+            && old.is_some_and(|record| {
+                matches!(
+                    record.command,
+                    Some(wire::catalog_client_record::Command::Open(_))
+                )
+            })
+        {
+            self.account(previous, 0)?;
+            self.catalog_pending.remove(&id);
+            return Ok(());
+        }
+        if self.catalog_pending.len() >= 16 && old.is_none() {
+            return Err(SignalingError::Encode);
+        }
+        self.account(previous, record.encoded_len())?;
+        self.catalog_pending.insert(id, record);
+        Ok(())
+    }
+
+    fn append_catalog(&mut self, batch: &mut wire::ClientStateBatch) -> Result<(), SignalingError> {
+        for _ in 0..codec::MAX_RECORDS / 2 {
+            if batch
+                .records
+                .len()
+                .saturating_add(batch.catalog_records.len())
+                >= codec::MAX_RECORDS
+            {
+                break;
+            }
+            let Some((id, record)) = self.catalog_pending.pop_first() else {
+                break;
+            };
+            let bytes = record.encoded_len();
+            batch.catalog_records.push(record);
+            if batch.encoded_len() > codec::MAX_FRAME_SIZE {
+                if let Some(record) = batch.catalog_records.pop() {
+                    self.catalog_pending.insert(id, record);
+                }
+                break;
+            }
+            self.account(bytes, 0)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn next_frame(&mut self) -> Result<Option<Vec<u8>>, SignalingError> {
         if self.terminal {
             return Ok(None);
         }
         let mut batch = wire::ClientStateBatch::default();
-        while batch.records.len() < codec::MAX_RECORDS {
+        if self.catalog_first {
+            self.append_catalog(&mut batch)?;
+        }
+        while batch
+            .records
+            .len()
+            .saturating_add(batch.catalog_records.len())
+            < codec::MAX_RECORDS
+        {
             let resource = self
                 .cursor
                 .as_ref()
@@ -431,7 +509,7 @@ impl NativeState {
                 });
                 if batch.encoded_len() > codec::MAX_FRAME_SIZE {
                     batch.records.pop();
-                    if batch.records.is_empty() {
+                    if batch.records.is_empty() && batch.catalog_records.is_empty() {
                         return Err(SignalingError::Encode);
                     }
                     break;
@@ -479,7 +557,7 @@ impl NativeState {
                 .push(desired_record(reference, revision, spec.clone()));
             if batch.encoded_len() > codec::MAX_FRAME_SIZE {
                 batch.records.pop();
-                if batch.records.is_empty() {
+                if batch.records.is_empty() && batch.catalog_records.is_empty() {
                     return Err(SignalingError::Encode);
                 }
                 break;
@@ -499,7 +577,7 @@ impl NativeState {
             let old_bytes = previous.map_or(0, Owned::retained_bytes);
             if let Err(error) = self.account(old_bytes, next.retained_bytes()) {
                 batch.records.pop();
-                if batch.records.is_empty() {
+                if batch.records.is_empty() && batch.catalog_records.is_empty() {
                     return Err(error);
                 }
                 break;
@@ -518,9 +596,13 @@ impl NativeState {
                 self.dirty.remove(&resource);
             }
         }
-        if batch.records.is_empty() {
+        if !self.catalog_first {
+            self.append_catalog(&mut batch)?;
+        }
+        if batch.records.is_empty() && batch.catalog_records.is_empty() {
             return Ok(None);
         }
+        self.catalog_first = !self.catalog_first;
         codec::encode_client(&batch)
             .map(Some)
             .map_err(|_| SignalingError::Encode)
@@ -640,6 +722,14 @@ impl NativeState {
                     changes.push(Change::Track(id));
                 }
             }
+        }
+        if !self.terminal {
+            changes.extend(
+                batch
+                    .catalog_records
+                    .into_iter()
+                    .map(|record| Change::Catalog(Box::new(record))),
+            );
         }
         if batch.initial_complete && !self.terminal {
             if self.initial_complete {

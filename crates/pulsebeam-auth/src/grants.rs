@@ -250,6 +250,16 @@ impl GrantSet {
             })
     }
 
+    /// Preflight a catalog scope without authorizing any participant or track.
+    pub fn may_discover(&self, room: &str) -> bool {
+        valid_scope(room)
+            && !room.contains('*')
+            && self.0.iter().any(|grant| {
+                grant.allow.contains(&Action::Discover)
+                    && grant.rooms.iter().any(|pattern| pattern.matches(room))
+            })
+    }
+
     /// Project room-local publication label scopes for bounded admission compilation.
     /// Each result is an exact label, or `None` for unrestricted labels.
     pub fn publication_labels<'a>(

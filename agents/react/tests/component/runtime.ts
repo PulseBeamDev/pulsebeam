@@ -1,6 +1,6 @@
 // Only the external WASM transport boundary is modeled. Facade, data,
 // resource, capture and component policy are the production implementations.
-import { PipeStatus } from "@pulsebeam/web";
+import { PipeStatus, WatchStatus } from "@pulsebeam/web";
 
 export const runtimes: BrowserRuntime[] = [];
 export const initializeSynchronously = () => {};
@@ -17,6 +17,10 @@ export class BrowserRuntime {
   sendCompletion: Promise<void> = Promise.resolve();
   tracks = new Map<number, MediaStreamTrack>();
   nextOwner = 1n;
+  catalogWatches = new Map<
+    bigint,
+    { room: string; limit: number; cursor: readonly number[]; closed: boolean }
+  >();
   videoOwners = new Map<bigint, { selector: any; observation?: any }>();
   videoSlots = new Map<string, number>();
   publicationOwners = new Map<bigint, { key: string; slot: string }>();
@@ -132,6 +136,37 @@ export class BrowserRuntime {
         admission: Object.freeze({}),
       });
     return this.observer(owner);
+  }
+  catalog_watch(room: string, limit: number, cursor: Uint8Array) {
+    const owner = this.nextOwner++;
+    const scope = {
+      room,
+      limit,
+      cursor: Object.freeze(Array.from(cursor)),
+      closed: false,
+    };
+    this.catalogWatches.set(owner, scope);
+    this.setObservation(owner, {
+      observationRevision: 1n,
+      room,
+      limit,
+      cursor: scope.cursor,
+      status: WatchStatus.Loading,
+    });
+    return {
+      ...this.observer(owner),
+      close: () => {
+        if (scope.closed) return;
+        scope.closed = true;
+        const state = this.observer(owner).state() as any;
+        this.setObservation(owner, {
+          ...state,
+          observationRevision: state.observationRevision + 1n,
+          status: WatchStatus.Closed,
+          page: undefined,
+        });
+      },
+    };
   }
   video_subscription(owner: bigint) {
     return this.observer(owner);
@@ -406,10 +441,9 @@ export class BrowserRuntime {
   remote_track(index: number) {
     return this.tracks.get(index);
   }
-  async send_data(
-    spec: { label: string; delivery: string },
-    payload: Uint8Array,
-  ) {
+  async send_owned_data(owner: bigint, payload: Uint8Array) {
+    const spec = this.dataPublications.get(owner);
+    if (!spec) throw new Error("released data publication owner");
     await this.sendCompletion;
     this.sent.push({ name: spec.label, mode: spec.delivery, payload });
   }

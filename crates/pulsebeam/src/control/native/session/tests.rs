@@ -1,5 +1,6 @@
 use super::*;
 
+mod catalog_watch;
 mod discovery;
 mod permissions;
 

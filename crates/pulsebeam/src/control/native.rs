@@ -19,7 +19,6 @@ mod session;
 
 pub(crate) use super::permissions::ResourcePermissions;
 
-#[cfg(test)]
 pub(crate) use session::track_descriptor;
 pub(crate) use session::{
     ExecutionAction, ExecutionCommand, InputError, LookupInterestChange, NativeSession,

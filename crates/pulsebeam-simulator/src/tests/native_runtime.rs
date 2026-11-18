@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use pulsebeam_agent_core::ffi as core_ffi;
-use pulsebeam_agent_native::ffi::{Agent, EventUpdate, NativeEvent, SnapshotUpdate};
+use pulsebeam_agent_native::ffi::{
+    Agent, AudioSubscription, EventUpdate, NativeEvent, SnapshotUpdate, VideoSubscription,
+};
 use pulsebeam_agent_native::{
     Agent as RuntimeAgent, AsyncHttpClient, AudioInput, Config, H264Frame, Host, InputFrame,
     MediaStreamUpdate, OpusFrame, OutputFrame, ReceiveMode, VideoInput,
@@ -752,7 +754,7 @@ async fn run_peer(
         endpoint,
         token: pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
-            &serde_json::from_value(serde_json::json!([{"rooms":[(room).as_str()],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
+            &serde_json::from_value(serde_json::json!([{"rooms":[(room).as_str()],"allow":["join","publish","subscribe"]}])).unwrap(),
             (participant).as_str(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -878,29 +880,11 @@ async fn run_peer(
     );
     barriers.before_media.wait().await;
     let mut frame_cursor = 0;
-    let initial = wait_remote_media(&agent, &video, &mut frame_cursor).await?;
-    barriers.before_media.wait().await;
-    let participant = initial
-        .participant_id
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("{name} connected without a participant ID"))?;
-    let first_generation = initial
-        .generation
-        .ok_or_else(|| anyhow::anyhow!("{name} connected without a generation"))?;
-    let remote_video_publication = initial
-        .catalog
-        .publications
-        .iter()
-        .find(|publication| {
-            publication.participant_id != participant
-                && publication.kind == core_ffi::MediaKind::Video
-        })
-        .ok_or_else(|| anyhow::anyhow!("{name} did not discover remote video"))?;
-    let remote_video_id = remote_video_publication.id.clone();
+
     let video_subscription = agent
         .room(room.as_str().to_owned())?
         .participant(remote.to_owned())?
-        .video(remote_video_publication.label.clone())?
+        .video("camera".into())?
         .subscribe(Some(core_ffi::VideoObservation {
             visible: true,
             height: 720,
@@ -909,23 +893,35 @@ async fn run_peer(
             priority: 1,
             playout_delay: core_ffi::PlayoutDelay::Adaptive,
         }))?;
-    let remote_audio_publication = initial
-        .catalog
-        .publications
-        .iter()
-        .find(|publication| {
-            publication.participant_id != participant
-                && publication.kind == core_ffi::MediaKind::Audio
-        })
-        .ok_or_else(|| anyhow::anyhow!("{name} did not discover remote audio"))?;
-    let remote_audio_id = remote_audio_publication.id.clone();
     let audio_subscription = agent
         .room(room.as_str().to_owned())?
         .participant(remote.to_owned())?
-        .audio(remote_audio_publication.label.clone())?
+        .audio("microphone".into())?
         .subscribe(Default::default())?;
-
-    wait_media_bindings(&agent, &remote_video_id, &remote_audio_id).await?;
+    let (initial, remote_video_id, remote_audio_id) = wait_remote_media(
+        &agent,
+        &video_subscription,
+        &audio_subscription,
+        &video,
+        &mut frame_cursor,
+    )
+    .await?;
+    barriers.before_media.wait().await;
+    let participant = initial
+        .participant_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("{name} connected without a participant ID"))?;
+    let first_generation = initial
+        .generation
+        .ok_or_else(|| anyhow::anyhow!("{name} connected without a generation"))?;
+    wait_media_bindings(
+        &agent,
+        &video_subscription,
+        &audio_subscription,
+        &remote_video_id,
+        &remote_audio_id,
+    )
+    .await?;
     let mut remote_video = video_subscription.observe(ReceiveMode::Decoded).await?;
     anyhow::ensure!(
         remote_video.source_track_id().as_deref() == Some(remote_video_id.as_str()),
@@ -984,12 +980,12 @@ async fn run_peer(
             && rejected.connection == core_ffi::ConnectionState::Connected,
         "unsupported audio reset the established session"
     );
+    let unchanged_video = video_subscription.state();
     anyhow::ensure!(
-        rejected
-            .mapping
-            .video
-            .iter()
-            .any(|binding| binding.publication_id == remote_video_id),
+        unchanged_video.source_status == core_ffi::SubscriptionSourceStatus::Available
+            && unchanged_video.source_track_id.as_deref() == Some(remote_video_id.as_str())
+            && unchanged_video.admission == core_ffi::PublicationAdmissionStatus::Admitted
+            && unchanged_video.execution == core_ffi::PublicationExecution::Installed,
         "unsupported audio disturbed unchanged video binding"
     );
     // The existing exchange must decode fresh audio and video after rejection.
@@ -1110,7 +1106,7 @@ async fn run_peer(
         "explicit producer retirement retained an input"
     );
     barriers.before_reconnect.wait().await;
-    wait_media_absent(&agent, &remote_video_id, &remote_audio_id).await?;
+    wait_media_absent(&video_subscription, &audio_subscription).await?;
     anyhow::ensure!(
         matches!(remote_video.next().await, MediaStreamUpdate::Closed)
             && matches!(remote_audio.next().await, MediaStreamUpdate::Closed),
@@ -1139,32 +1135,26 @@ async fn run_peer(
     video_owner.ready().await?;
     audio_owner.ready().await?;
     barriers.before_reconnect.wait().await;
-    let readded = wait_remote_media(&agent, &video, &mut frame_cursor).await?;
-    let readded_video_id = readded
-        .catalog
-        .publications
-        .iter()
-        .find(|publication| {
-            publication.participant_id != participant
-                && publication.kind == core_ffi::MediaKind::Video
-        })
-        .map(|publication| publication.id.clone())
-        .ok_or_else(|| anyhow::anyhow!("{name} did not rediscover re-added video"))?;
-    let readded_audio_id = readded
-        .catalog
-        .publications
-        .iter()
-        .find(|publication| {
-            publication.participant_id != participant
-                && publication.kind == core_ffi::MediaKind::Audio
-        })
-        .map(|publication| publication.id.clone())
-        .ok_or_else(|| anyhow::anyhow!("{name} did not rediscover re-added audio"))?;
+    let (_, readded_video_id, readded_audio_id) = wait_remote_media(
+        &agent,
+        &video_subscription,
+        &audio_subscription,
+        &video,
+        &mut frame_cursor,
+    )
+    .await?;
     anyhow::ensure!(
         readded_video_id != remote_video_id && readded_audio_id != remote_audio_id,
         "re-added media reused a retired source identity"
     );
-    let readded = wait_media_bindings(&agent, &readded_video_id, &readded_audio_id).await?;
+    let readded = wait_media_bindings(
+        &agent,
+        &video_subscription,
+        &audio_subscription,
+        &readded_video_id,
+        &readded_audio_id,
+    )
+    .await?;
     let replaced_video_input = video;
     let replaced_audio_input = audio;
     video = agent.create_video_input(Default::default()).await?;
@@ -1298,11 +1288,19 @@ async fn run_peer(
         );
         video_owner.ready().await?;
         audio_owner.ready().await?;
-        let replacement = wait_remote_media(&agent, &video, &mut frame_cursor).await?;
-        if replacement.participant_id.as_deref() != Some(participant.as_str()) {
+        let replacement = wait_remote_media(
+            &agent,
+            &video_subscription,
+            &audio_subscription,
+            &video,
+            &mut frame_cursor,
+        )
+        .await?;
+        if replacement.0.participant_id.as_deref() != Some(participant.as_str()) {
             anyhow::bail!("{name} participant identity changed across reconnect");
         }
         let replacement_generation = replacement
+            .0
             .generation
             .ok_or_else(|| anyhow::anyhow!("{name} replacement has no generation"))?;
         anyhow::ensure!(
@@ -1331,31 +1329,27 @@ async fn run_peer(
             && retired.get() == usize::from(reconnect),
         "reconstruction did not retire exactly its previous runtime owner"
     );
-    let replacement = match replacement {
-        Some(snapshot) => snapshot,
-        None => wait_remote_media(&agent, &video, &mut frame_cursor).await?,
+    let (_, expected_video_id, expected_audio_id) = match replacement {
+        Some(media) => media,
+        None => {
+            wait_remote_media(
+                &agent,
+                &video_subscription,
+                &audio_subscription,
+                &video,
+                &mut frame_cursor,
+            )
+            .await?
+        }
     };
-    let expected_video_id = replacement
-        .catalog
-        .publications
-        .iter()
-        .find(|publication| {
-            publication.participant_id != participant
-                && publication.kind == core_ffi::MediaKind::Video
-        })
-        .map(|publication| publication.id.clone())
-        .ok_or_else(|| anyhow::anyhow!("{name} did not rediscover remote video"))?;
-    let expected_audio_id = replacement
-        .catalog
-        .publications
-        .iter()
-        .find(|publication| {
-            publication.participant_id != participant
-                && publication.kind == core_ffi::MediaKind::Audio
-        })
-        .map(|publication| publication.id.clone())
-        .ok_or_else(|| anyhow::anyhow!("{name} did not rediscover remote audio"))?;
-    wait_media_bindings(&agent, &expected_video_id, &expected_audio_id).await?;
+    wait_media_bindings(
+        &agent,
+        &video_subscription,
+        &audio_subscription,
+        &expected_video_id,
+        &expected_audio_id,
+    )
+    .await?;
     anyhow::ensure!(
         matches!(remote_video.next().await, MediaStreamUpdate::Closed),
         "retired video observer stayed open"
@@ -1664,23 +1658,34 @@ async fn prove_held_creation_takeover(
     let observed_connected = connected.clone();
     let observed_superseded = superseded.clone();
     let observed_admitted = admitted.clone();
+    let publication_updates = publication.updates()?;
+    let observed_publication = publication_updates.clone();
     let observer = tokio::task::spawn_local(async move {
-        while let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await {
-            if snapshot.connection == core_ffi::ConnectionState::Connected {
-                observed_connected.set(true);
-            }
-            if snapshot.participant_id.is_some()
-                || !snapshot.catalog.participants.is_empty()
-                || !snapshot.catalog.publications.is_empty()
-                || !snapshot.mapping.video.is_empty()
-                || !snapshot.mapping.audio.is_empty()
-            {
-                observed_admitted.set(true);
-            }
-            if snapshot.failure.as_ref().is_some_and(|failure| {
-                failure.class == core_ffi::FailureClass::ParticipantSuperseded
-            }) {
-                observed_superseded.set(true);
+        loop {
+            tokio::select! {
+                update = snapshots.next() => {
+                    let SnapshotUpdate::Snapshot { snapshot } = update else { return; };
+                    if snapshot.connection == core_ffi::ConnectionState::Connected {
+                        observed_connected.set(true);
+                    }
+                    if snapshot.participant_id.is_some() {
+                        observed_admitted.set(true);
+                    }
+                    if snapshot.failure.as_ref().is_some_and(|failure| {
+                        failure.class == core_ffi::FailureClass::ParticipantSuperseded
+                    }) {
+                        observed_superseded.set(true);
+                    }
+                }
+                update = observed_publication.next() => {
+                    let Ok(Some(state)) = update else { return; };
+                    if state.admission.status == core_ffi::PublicationAdmissionStatus::Admitted
+                        || state.admission.publication_id.is_some()
+                        || state.admission.execution == core_ffi::PublicationExecution::Installed
+                    {
+                        observed_admitted.set(true);
+                    }
+                }
             }
         }
     });
@@ -1746,7 +1751,7 @@ async fn prove_held_creation_takeover(
     );
     anyhow::ensure!(
         !admitted.get(),
-        "obsolete predecessor restored participant, presence, or media state"
+        "obsolete predecessor restored an admitted session or publication"
     );
     anyhow::ensure!(
         new.snapshot().connection == core_ffi::ConnectionState::Connected
@@ -1758,11 +1763,17 @@ async fn prove_held_creation_takeover(
         requests.len(),
         superseded.get()
     );
+    anyhow::ensure!(
+        !observer.is_finished(),
+        "held admission observation ended early"
+    );
+    observer.abort();
+    let _ = observer.await;
+    publication_updates.close();
     publication.close().await?;
     video.close().await?;
     predecessor.abort().await?;
     new.close().await?;
-    observer.abort();
     Ok(())
 }
 
@@ -1908,65 +1919,79 @@ async fn wait_ordered_admitted(
     .map_err(|_| anyhow::anyhow!("native ordered topic send was not admitted"))?
 }
 
-async fn wait_media_absent(agent: &Agent, video_id: &str, audio_id: &str) -> anyhow::Result<()> {
-    let snapshots = agent.snapshots();
-    tokio::time::timeout(Duration::from_secs(20), async {
+async fn wait_media_absent(
+    video: &VideoSubscription,
+    audio: &AudioSubscription,
+) -> anyhow::Result<()> {
+    let video_updates = video.updates()?;
+    let audio_updates = audio.updates()?;
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
-                anyhow::bail!("native snapshot stream closed")
-            };
-            if snapshot
-                .catalog
-                .publications
-                .iter()
-                .all(|publication| publication.id != video_id && publication.id != audio_id)
-                && snapshot
-                    .mapping
-                    .video
-                    .iter()
-                    .all(|binding| binding.publication_id != video_id)
-                && snapshot
-                    .mapping
-                    .audio
-                    .iter()
-                    .all(|binding| binding.publication_id != audio_id)
+            let video = video.state();
+            let audio = audio.state();
+            if video.source_status == core_ffi::SubscriptionSourceStatus::Unavailable
+                && video.source_track_id.is_none()
+                && audio.source_status == core_ffi::SubscriptionSourceStatus::Unavailable
+                && audio.source_track_id.is_none()
             {
                 return Ok(());
+            }
+            tokio::select! {
+                state = video_updates.next() => {
+                    anyhow::ensure!(state?.is_some(), "video subscription observation ended");
+                }
+                state = audio_updates.next() => {
+                    anyhow::ensure!(state?.is_some(), "audio subscription observation ended");
+                }
             }
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("retired media remained in the native catalog or mapping"))?
+    .map_err(|_| anyhow::anyhow!("retired media remained available to its subscriptions"));
+    video_updates.close();
+    audio_updates.close();
+    result?
 }
 
 async fn wait_media_bindings(
     agent: &Agent,
+    video: &VideoSubscription,
+    audio: &AudioSubscription,
     video_id: &str,
     audio_id: &str,
 ) -> anyhow::Result<core_ffi::Snapshot> {
-    let snapshots = agent.snapshots();
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let video_updates = video.updates()?;
+    let audio_updates = audio.updates()?;
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
-                anyhow::bail!("native snapshot stream closed")
-            };
-            let video_ready = snapshot
-                .mapping
-                .video
-                .iter()
-                .any(|binding| binding.publication_id == video_id);
-            let audio_ready = snapshot
-                .mapping
-                .audio
-                .iter()
-                .any(|binding| binding.publication_id == audio_id);
-            if video_ready && audio_ready {
-                return Ok(snapshot);
+            let video = video.state();
+            let audio = audio.state();
+            if video.source_status == core_ffi::SubscriptionSourceStatus::Available
+                && video.source_track_id.as_deref() == Some(video_id)
+                && video.admission == core_ffi::PublicationAdmissionStatus::Admitted
+                && video.execution == core_ffi::PublicationExecution::Installed
+                && audio.source_status == core_ffi::SubscriptionSourceStatus::Available
+                && audio.source_track_id.as_deref() == Some(audio_id)
+                && audio.admission == core_ffi::PublicationAdmissionStatus::Admitted
+                && audio.execution == core_ffi::PublicationExecution::Installed
+            {
+                return Ok(agent.snapshot());
+            }
+            tokio::select! {
+                state = video_updates.next() => {
+                    anyhow::ensure!(state?.is_some(), "video subscription observation ended");
+                }
+                state = audio_updates.next() => {
+                    anyhow::ensure!(state?.is_some(), "audio subscription observation ended");
+                }
             }
         }
     })
     .await
-    .map_err(|_| anyhow::anyhow!("native media bindings did not become ready"))?
+    .map_err(|_| anyhow::anyhow!("owned native media reception did not become installed"));
+    video_updates.close();
+    audio_updates.close();
+    result?
 }
 
 // Raw transport churn is a controlled-host fixture, not a generated SDK policy path.
@@ -2059,52 +2084,45 @@ async fn prime_ordered_topic(
 
 async fn wait_remote_media(
     agent: &Agent,
+    video_subscription: &VideoSubscription,
+    audio_subscription: &AudioSubscription,
     video: &pulsebeam_agent_native::ffi::VideoSource,
     frame_number: &mut u64,
-) -> anyhow::Result<core_ffi::Snapshot> {
-    let snapshots = agent.snapshots();
+) -> anyhow::Result<(core_ffi::Snapshot, String, String)> {
+    let video_updates = video_subscription.updates()?;
+    let audio_updates = audio_subscription.updates()?;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let snapshot = tokio::select! {
+            let video_state = video_subscription.state();
+            let audio_state = audio_subscription.state();
+            if video_state.source_status == core_ffi::SubscriptionSourceStatus::Available
+                && audio_state.source_status == core_ffi::SubscriptionSourceStatus::Available
+                && let (Some(video_id), Some(audio_id)) =
+                    (video_state.source_track_id, audio_state.source_track_id)
+            {
+                return Ok((agent.snapshot(), video_id, audio_id));
+            }
+            tokio::select! {
                 _ = tick.tick() => {
                     video.submit(video_frame(video.capture_time_us().await?)).await?;
                     *frame_number = frame_number.checked_add(1).unwrap();
-                    continue;
                 }
-                update = snapshots.next() => {
-                    let SnapshotUpdate::Snapshot { snapshot } = update else {
-                        anyhow::bail!("native snapshot stream closed")
-                    };
-                    snapshot
+                state = video_updates.next() => {
+                    anyhow::ensure!(state?.is_some(), "video subscription observation ended");
                 }
-            };
-            let remote_media = snapshot.participant_id.as_ref().is_some_and(|participant| {
-                let remote: Vec<_> = snapshot
-                    .catalog
-                    .publications
-                    .iter()
-                    .filter(|publication| &publication.participant_id != participant)
-                    .collect();
-                remote
-                    .iter()
-                    .any(|publication| publication.kind == core_ffi::MediaKind::Video)
-                    && remote
-                        .iter()
-                        .any(|publication| publication.kind == core_ffi::MediaKind::Audio)
-            });
-            if remote_media {
-                return Ok(snapshot);
+                state = audio_updates.next() => {
+                    anyhow::ensure!(state?.is_some(), "audio subscription observation ended");
+                }
             }
         }
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "native agent did not discover remote media: {:?}",
-            agent.snapshot()
-        )
-    })?
+    }).await.map_err(|_| anyhow::anyhow!(
+        "native named subscriptions did not resolve media: video={:?}, audio={:?}, session={:?}",
+        video_subscription.state(), audio_subscription.state(), agent.snapshot()
+    ));
+    video_updates.close();
+    audio_updates.close();
+    result?
 }
 
 fn video_frame(timestamp_us: i64) -> InputFrame {

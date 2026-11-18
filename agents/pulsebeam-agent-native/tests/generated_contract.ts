@@ -18,6 +18,10 @@ import {
   VideoObservation,
   Agent,
   RoomRef,
+  Watch,
+  WatchConfig,
+  WatchStatus,
+  WatchUpdates,
   AudioSource,
   AudioFrames,
   VideoFrames,
@@ -76,6 +80,15 @@ if (!AgentUpdates.instanceOf(stateUpdates) ||
     (await stateUpdates.next())?.observationRevision !== initialState.observationRevision) {
   throw new Error("missing initial concrete Agent state");
 }
+if ("catalog" in agent.snapshot() || "mapping" in agent.snapshot()) {
+  throw new Error("snapshot retained joined-room discovery metadata");
+}
+if (false) {
+  // @ts-expect-error Discovery is available only through an owned room watch.
+  agent.snapshot().catalog;
+  // @ts-expect-error Receiver mappings are private runtime reconciliation state.
+  agent.snapshot().mapping;
+}
 const revision = agent.snapshot().desiredRevision;
 const joinRevision: bigint = agent.snapshot().joinRevision;
 const credentialRevision: bigint = agent.snapshot().credentialRevision;
@@ -99,6 +112,26 @@ const room = agent.room("room");
 if (!RoomRef.instanceOf(room) || room.name() !== "room" || "participant" in agent || "receive" in localData) {
   throw new Error("reference factory retained a room-wide receive surface");
 }
+const watch = room.watch();
+const watchState = watch.state();
+const watchUpdates = watch.updates();
+if (!Watch.instanceOf(watch) || !WatchUpdates.instanceOf(watchUpdates) ||
+    watchState.room !== "room" || watchState.limit !== 100 ||
+    watchState.status !== WatchStatus.Loading || watchState.page !== undefined ||
+    (await watchUpdates.next())?.observationRevision !== watchState.observationRevision) {
+  throw new Error("missing concrete default catalog watch state");
+}
+watch.close();
+watch.close();
+if ((await watchUpdates.next())?.status !== WatchStatus.Closed ||
+    await watchUpdates.next() !== undefined) {
+  throw new Error("watch close did not expose one final state");
+}
+watchUpdates.close();
+const scopedWatch = room.watch(WatchConfig.create({ limit: 3, cursor: new Uint8Array([7, 8]) }));
+if (scopedWatch.state().limit !== 3 || scopedWatch.state().cursor[0] !== 7 ||
+    scopedWatch.state().cursor[1] !== 8) throw new Error("watch scope was not retained");
+scopedWatch.close();
 const participant = room.participant("remote");
 const remoteData = participant.data("control", TopicMode.Ordered);
 const localVideo = agent.video("camera");

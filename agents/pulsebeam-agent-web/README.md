@@ -50,6 +50,38 @@ Agent into another room. Resource factories, not lookup, acquire ownership. Room
 references replace unpinned `Agent.participant(id)` lookup. The descriptor and
 `.track(spec)` APIs remain absent.
 
+## Own one catalog page
+
+These APIs describe the current source build. Use matching SDK and server
+artifacts; compatibility with a released package/server pair is not qualified by
+this README.
+
+`const watch = room.watch({ limit: 100 })` owns one bounded live page. Read
+`watch.state()` and observe its current-first, coalesced `watch.updates()` cursor.
+Distinguish `WatchStatus.Loading`, `Live`, `Failed` and `Closed`; loading is not an
+empty result. A Live `state.page` contains immutable participant metadata with
+`id`, application `externalId` and `publications`, including presence-only entries.
+
+The default limit is 100, maximum 500, with eight pending/live watches per Agent.
+Use `page.hasMore` and `page.nextCursor` to explicitly replace the watch for the
+next page with the same room and limit. Do not automatically accumulate every
+page. Continuations expire after 60 seconds; invalid/expired/wrong-scope cursors
+fail explicitly. Offer a first-page restart without a cursor. Retained page
+values stay stable while the SDK retains only its current page.
+
+Discover and Subscribe are independent permissions. Convert selected metadata to
+pinned references using `room.participant(info.externalId)` and the publication's
+kind and label; lookup does not subscribe. Known-address reception does not need
+Discover. Skip self when creating receive owners. There is no global participant
+collection, participant publication listing, or catalog/mapping/media field in
+public session snapshots.
+
+Close each update cursor with `updates.close()` and release its watch with
+`await watch.close()`. Watch close does not close independently owned subscriptions.
+A watch has at most 32 independent cursors and one pending read per cursor.
+See the [bounded React roster example](../../docs/react/guides.md#remote-discovery-and-video-receive-policy)
+for explicit Next/First-page navigation and user-visible states.
+
 ## Publish caller-owned capture
 
 ```ts

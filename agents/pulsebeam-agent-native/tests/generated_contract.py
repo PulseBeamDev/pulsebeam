@@ -59,7 +59,11 @@ async def witness():
         assert initial_state.room is None and initial_state.desired_room is None
         assert isinstance(initial_state.observation_revision, int)
         assert (await state_updates.next()).observation_revision == initial_state.observation_revision
-        revision = agent.snapshot().desired_revision
+        snapshot = agent.snapshot()
+        assert not hasattr(snapshot, "catalog") and not hasattr(snapshot, "mapping")
+        for obsolete in ["CatalogSnapshot", "ParticipantInfo", "Publication", "RemoteTrack", "TrackSpec", "MappingSnapshot", "TrackMapping"]:
+            assert not hasattr(core, obsolete), obsolete
+        revision = snapshot.desired_revision
         assert agent.snapshot().join_revision == 0
         assert isinstance(agent.snapshot().join_revision, int)
         assert agent.snapshot().desired_room is None
@@ -73,6 +77,21 @@ async def witness():
         local = agent.data("control", core.TopicMode.ORDERED)
         room = agent.room("room")
         assert isinstance(room, native.RoomRef) and room.name() == "room"
+        watch = room.watch()
+        assert isinstance(watch, native.Watch) and not inspect.isawaitable(watch)
+        watch_state = watch.state()
+        assert watch_state.room == "room" and watch_state.limit == 100
+        assert watch_state.status == core.WatchStatus.LOADING and watch_state.page is None
+        watch_updates = watch.updates()
+        assert isinstance(watch_updates, native.WatchUpdates)
+        assert (await watch_updates.next()).observation_revision == watch_state.observation_revision
+        assert watch.close() is None and watch.close() is None
+        assert (await watch_updates.next()).status == core.WatchStatus.CLOSED
+        assert await watch_updates.next() is None
+        watch_updates.close()
+        scoped_watch = room.watch(core.WatchConfig(limit=3, cursor=bytes([7, 8])))
+        assert scoped_watch.state().limit == 3 and bytes(scoped_watch.state().cursor) == bytes([7, 8])
+        scoped_watch.close()
         assert not hasattr(agent, "participant") and not hasattr(local, "receive")
         participant = room.participant("remote")
         remote = participant.data("control", core.TopicMode.ORDERED)

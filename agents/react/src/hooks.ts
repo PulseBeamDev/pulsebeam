@@ -1,4 +1,4 @@
-import { useLayoutEffect, useState } from "react";
+import { useLayoutEffect, useMemo, useState } from "react";
 import type {
   AudioPublication,
   AudioSource,
@@ -15,6 +15,9 @@ import type {
   RemoteAudioTrack,
   RemoteDataTrack,
   RemoteVideoTrack,
+  RoomRef,
+  Watch,
+  WatchConfig,
   VideoObservation,
   VideoPublication,
   VideoSource,
@@ -38,6 +41,27 @@ type Source =
 type Publication = VideoPublication | AudioPublication | DataPublication;
 type Remote = RemoteVideoTrack | RemoteAudioTrack | RemoteDataTrack;
 type Subscription = VideoSubscription | AudioSubscription | DataSubscription;
+
+export function useWatch(
+  room: RoomRef | null,
+  config?: WatchConfig,
+): Watch | null {
+  const limit = config?.limit ?? 100;
+  const cursor = Array.from(config?.cursor ?? []);
+  const scope = JSON.stringify([limit, cursor]);
+  const target = useMemo(
+    () =>
+      room
+        ? {
+            room,
+            config: Object.freeze({ limit, cursor: Object.freeze(cursor) }),
+          }
+        : null,
+    [room, scope],
+  );
+  return useResource<Watch>(target, () => target!.room.watch(target!.config))
+    .value;
+}
 
 export function usePublication(
   track: Local | null,

@@ -1,5 +1,5 @@
+import type { ReconciliationSnapshot } from "./reconciliation-snapshot.js";
 import type {
-  AgentSnapshot,
   DataPublicationUpdates,
   DataSubscriptionUpdates,
 } from "./types.js";
@@ -110,7 +110,7 @@ export interface DataRuntime extends ResourceRuntime {
   data_subscription(owner: bigint): NativeResourceObserver;
 }
 interface DataHost {
-  getSnapshot(): Pick<AgentSnapshot, "catalog" | "roomId">;
+  getSnapshot(): Pick<ReconciliationSnapshot, "catalog" | "roomId">;
   subscribe(listener: () => void): () => void;
 }
 type Source = {

@@ -362,6 +362,23 @@ impl TrackLifecycle {
         self.reconcile_all(identities, registry, now)
     }
 
+    pub(super) fn catalog_version(&self) -> u64 {
+        self.topology.catalog_version()
+    }
+
+    pub(super) fn room_catalog_version(&self, room: RoomId) -> u64 {
+        self.topology.room_catalog_version(room)
+    }
+
+    pub(super) fn publisher_sources(
+        &self,
+        room: RoomId,
+        publisher: ParticipantId,
+        connection: crate::entity::ConnectionId,
+    ) -> impl Iterator<Item = &Track> {
+        self.topology.publisher_sources(room, publisher, connection)
+    }
+
     pub(super) fn sources_in_room(&self, room_id: RoomId) -> impl Iterator<Item = &Track> {
         self.topology.sources_in_room(room_id)
     }

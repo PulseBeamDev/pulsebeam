@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { type Agent, type DataEvent } from "@pulsebeam/react";
+import { usePublish, type Agent, type DataEvent } from "@pulsebeam/react";
 import { decodeText, encodeText } from "@/lib/data-codec";
 
 type LocalMessage = {
@@ -26,6 +26,7 @@ type Gap = {
 export function useChat(agent: Agent) {
   const { participantId } = agent;
   const Chat = agent.data("chat", "ordered");
+  const publication = usePublish(Chat);
   const [messages, setMessages] = useState<
     (RemoteMessage | Gap | LocalMessage)[]
   >([]);
@@ -69,9 +70,9 @@ export function useChat(agent: Agent) {
     },
     async send(text: string): Promise<boolean> {
       const value = text.trim();
-      if (!value || !participantId) return false;
+      if (!value || !participantId || !publication) return false;
       try {
-        await Chat.send(encodeText(value));
+        await publication.send(encodeText(value));
         setMessages((current) => [
           ...current,
           {

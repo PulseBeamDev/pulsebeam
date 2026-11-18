@@ -128,6 +128,7 @@ revisioned_resource_state!(
     crate::ffi::AudioSubscriptionState,
     crate::ffi::DataSubscriptionState,
     crate::ffi::DataPublicationState,
+    crate::ffi::WatchState,
 );
 
 trait ResourceState: RevisionedState {
@@ -137,6 +138,12 @@ trait ResourceState: RevisionedState {
 impl ResourceState for crate::ffi::PublicationState {
     fn mark_closed(&mut self) {
         self.closed = true;
+    }
+}
+
+impl ResourceState for crate::ffi::WatchState {
+    fn mark_closed(&mut self) {
+        self.close();
     }
 }
 
@@ -549,6 +556,13 @@ resource_observer!(
     DataPublicationUpdates,
     DataPublicationNotification,
     crate::ffi::DataPublicationState
+);
+
+resource_observer!(
+    WatchStateObserver,
+    WatchUpdates,
+    WatchNotification,
+    crate::ffi::WatchState
 );
 
 /// Core-owned bounded latest-state publisher. Main projects actor state into it.

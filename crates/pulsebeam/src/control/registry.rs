@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::{
     control::controller::SignalingProtocol,
@@ -29,9 +30,17 @@ pub struct ParticipantMeta {
     pub materialized: bool,
 }
 
+#[derive(Default)]
+struct RoomParticipants {
+    version: u64,
+    ordered: BTreeMap<String, ParticipantId>,
+}
+
 pub struct RoomRegistry {
     room_shards: HashMap<RoomId, RoomShard>,
     participants: HashMap<ParticipantId, ParticipantMeta>,
+    participants_by_room: HashMap<RoomId, RoomParticipants>,
+    catalog_version: u64,
     connections: HashMap<ConnectionId, ParticipantId>,
 }
 
@@ -40,6 +49,8 @@ impl RoomRegistry {
         Self {
             room_shards: HashMap::new(),
             participants: HashMap::new(),
+            participants_by_room: HashMap::new(),
+            catalog_version: 0,
             connections: HashMap::new(),
         }
     }
@@ -115,8 +126,10 @@ impl RoomRegistry {
             },
         ) {
             self.connections.remove(&previous.connection_id);
+            self.unindex_participant(previous.room_id, participant_id);
             self.remove_from_room_shard(&previous.room_id, &participant_id, previous.shard_id);
         }
+        self.index_participant(room_id, participant_id);
         self.connections.insert(connection_id, participant_id);
         let room = self
             .room_shards
@@ -147,12 +160,68 @@ impl RoomRegistry {
     }
 
     pub fn local_participant_ids_in_room(&self, room_id: &RoomId) -> Vec<ParticipantId> {
-        self.room_shards
+        self.ordered_participants_in_room(room_id, None)
+            .map(|(_, participant, _)| participant)
+            .collect()
+    }
+
+    pub fn ordered_participants_in_room<'a>(
+        &'a self,
+        room_id: &RoomId,
+        after: Option<&'a str>,
+    ) -> impl Iterator<Item = (&'a str, ParticipantId, &'a ParticipantMeta)> + 'a {
+        self.participants_by_room
             .get(room_id)
             .into_iter()
-            .flat_map(RoomShard::participant_ids)
-            .copied()
-            .collect()
+            .flat_map(move |participants| {
+                participants
+                    .ordered
+                    .range::<str, _>((after.map_or(Unbounded, Excluded), Unbounded))
+            })
+            .filter_map(|(canonical, participant)| {
+                self.participants
+                    .get(participant)
+                    .map(|meta| (canonical.as_str(), *participant, meta))
+            })
+    }
+
+    pub(super) fn catalog_version(&self) -> u64 {
+        self.catalog_version
+    }
+
+    pub(super) fn room_catalog_version(&self, room: RoomId) -> u64 {
+        self.participants_by_room
+            .get(&room)
+            .map_or(0, |room| room.version)
+    }
+
+    fn touch_catalog(&mut self, room: RoomId) {
+        self.catalog_version = self
+            .catalog_version
+            .checked_add(1)
+            .unwrap_or_else(|| pulsebeam_runtime::fatal!("registry catalog version exhausted"));
+        if let Some(participants) = self.participants_by_room.get_mut(&room) {
+            participants.version = self.catalog_version;
+        }
+    }
+
+    fn index_participant(&mut self, room: RoomId, participant: ParticipantId) {
+        self.participants_by_room
+            .entry(room)
+            .or_default()
+            .ordered
+            .insert(participant.to_string(), participant);
+        self.touch_catalog(room);
+    }
+
+    fn unindex_participant(&mut self, room: RoomId, participant: ParticipantId) {
+        if let Some(participants) = self.participants_by_room.get_mut(&room) {
+            participants.ordered.remove(&participant.to_string());
+            if participants.ordered.is_empty() {
+                self.participants_by_room.remove(&room);
+            }
+            self.touch_catalog(room);
+        }
     }
 
     /// Atomically installs a prepared local incarnation when it wins UUIDv7
@@ -201,6 +270,7 @@ impl RoomRegistry {
         self.connections.insert(connection_id, participant_id);
         if let Some(previous) = &previous {
             self.connections.remove(&previous.connection_id);
+            self.unindex_participant(previous.room_id, participant_id);
             if previous.room_id == room_id {
                 // Keep the partition table alive across a same-room replacement,
                 // even when this was its only participant.
@@ -211,6 +281,7 @@ impl RoomRegistry {
                 self.remove_from_room_shard(&previous.room_id, &participant_id, previous.shard_id);
             }
         }
+        self.index_participant(room_id, participant_id);
         self.room_shards
             .entry(room_id)
             .or_insert_with(RoomShard::new)
@@ -231,6 +302,7 @@ impl RoomRegistry {
     pub fn remove_participant(&mut self, participant_id: &ParticipantId) -> Option<ShardId> {
         let meta = self.participants.remove(participant_id)?;
         self.connections.remove(&meta.connection_id);
+        self.unindex_participant(meta.room_id, *participant_id);
         self.remove_from_room_shard(&meta.room_id, participant_id, meta.shard_id);
         Some(meta.shard_id)
     }
@@ -250,6 +322,7 @@ impl RoomRegistry {
         }
         let meta = self.participants.remove(participant_id)?;
         self.connections.remove(&meta.connection_id);
+        self.unindex_participant(meta.room_id, *participant_id);
         self.remove_from_room_shard(&meta.room_id, participant_id, meta.shard_id);
         Some(meta)
     }
@@ -264,6 +337,8 @@ impl RoomRegistry {
             && meta.connection_id == connection_id
         {
             meta.authorization = Some(authorization);
+            let room = meta.room_id;
+            self.touch_catalog(room);
         }
     }
 
@@ -312,6 +387,58 @@ mod tests {
 
     fn transport(shard: usize, slot: u32) -> NodeTransportAddress {
         NodeTransportAddress::new(TransportRoute::new(ShardId::new(shard), slot), 1)
+    }
+
+    #[test]
+    fn ordered_presence_seeks_are_scoped_and_follow_registry_lifetimes() {
+        let mut registry = RoomRegistry::new();
+        let room = room_id("catalog");
+        let other = room_id("other");
+        let mut expected = Vec::new();
+        for name in ["zulu", "alpha", "bravo", "echo"] {
+            let external = ParticipantExternalId::new(name).unwrap();
+            let participant = ParticipantId::derive(&room, &external);
+            registry.add_participant(participant, room, ShardId::new(0), None);
+            expected.push(participant.to_string());
+        }
+        expected.sort();
+        let first: Vec<_> = registry
+            .ordered_participants_in_room(&room, None)
+            .take(2)
+            .map(|(canonical, _, meta)| {
+                assert_eq!(meta.room_id, room);
+                assert!(meta.transport.is_none());
+                canonical.to_owned()
+            })
+            .collect();
+        assert_eq!(first, expected[..2]);
+        let rest: Vec<_> = registry
+            .ordered_participants_in_room(&room, first.last().map(String::as_str))
+            .map(|(canonical, _, _)| canonical.to_owned())
+            .collect();
+        assert_eq!(rest, expected[2..]);
+        assert_eq!(
+            registry.ordered_participants_in_room(&other, None).count(),
+            0
+        );
+        let moving = registry
+            .ordered_participants_in_room(&room, None)
+            .next()
+            .unwrap()
+            .1;
+        registry.add_participant(moving, other, ShardId::new(1), None);
+        assert_eq!(
+            registry.ordered_participants_in_room(&room, None).count(),
+            3
+        );
+        assert_eq!(registry.local_participant_ids_in_room(&other), vec![moving]);
+        let connection = registry.get_participant(&moving).unwrap().connection_id;
+        assert!(registry.remove_incarnation(&moving, connection).is_some());
+        assert_eq!(
+            registry.ordered_participants_in_room(&other, None).count(),
+            0
+        );
+        assert!(!registry.participants_by_room.contains_key(&other));
     }
 
     #[test]

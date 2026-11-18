@@ -65,9 +65,12 @@ impl Control {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         registry.retain(ResourceObservation::alive);
-        registry
+        let mut notifications = registry
             .iter()
             .filter_map(|observer| observer.prepare(core, closing))
-            .collect()
+            .collect::<Vec<_>>();
+        drop(registry);
+        notifications.extend(self.watch_notifications(core, closing));
+        notifications
     }
 }

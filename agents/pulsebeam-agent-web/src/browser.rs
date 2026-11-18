@@ -33,6 +33,7 @@ use crate::sender_config::{
     EncodingConfig, SenderConfig, media_kind_name, normalize_sender_config,
 };
 
+mod catalog;
 mod media_observation;
 mod preparation;
 mod publication;
@@ -536,6 +537,17 @@ impl Host for BrowserHost {
             .prepare_resource_state(owner, state, closing)
     }
 
+    fn prepare_catalog_state(
+        &self,
+        owner: u64,
+        state: &agent_core::ffi::WatchState,
+        closing: bool,
+    ) -> Option<crate::engine::ResourceNotification> {
+        self.inner
+            .upgrade()?
+            .prepare_catalog_state(owner, state, closing)
+    }
+
     fn publication_input_state(&self, state: &agent_core::PublicationInputState) {
         let Some(inner) = self.inner.upgrade() else {
             return;
@@ -572,6 +584,7 @@ struct RuntimeInner {
     publication_observers:
         RefCell<BTreeMap<u64, Rc<agent_core::observer::PublicationStateObserver>>>,
     resource_observers: RefCell<BTreeMap<u64, ResourceObserver>>,
+    catalog_observers: RefCell<BTreeMap<u64, Rc<catalog::CatalogObserver>>>,
     pipe_observers: RefCell<
         Vec<(
             u64,
@@ -624,6 +637,7 @@ impl BrowserRuntime {
             )),
             publication_observers: RefCell::new(BTreeMap::new()),
             resource_observers: RefCell::new(BTreeMap::new()),
+            catalog_observers: RefCell::new(BTreeMap::new()),
             pipe_observers: RefCell::new(Vec::new()),
             pending_pipe_notifications: RefCell::new(Vec::new()),
             logger: BrowserLogger::new(config.log_level),
@@ -1349,6 +1363,7 @@ impl RuntimeInner {
     fn close_publication_observers(&self) {
         self.prepare_pipe_shutdown();
         let resources = self.prepare_resource_shutdown();
+        let catalogs = self.prepare_catalog_shutdown();
         let mut agent_state: agent_core::ffi::AgentState = (&self.snapshot()).into();
         agent_state.room = None;
         let publications = std::mem::take(&mut *self.publication_observers.borrow_mut());
@@ -1381,6 +1396,9 @@ impl RuntimeInner {
             notification.notify();
         }
         for notification in resources {
+            notification();
+        }
+        for notification in catalogs {
             notification();
         }
         self.notify_prepared_pipe_states();

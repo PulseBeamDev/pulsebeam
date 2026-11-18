@@ -1,10 +1,12 @@
 import type {
+  ReconciliationSnapshot,
+  RemoteTrack,
+} from "./reconciliation-snapshot.js";
+import type {
   AgentConfig,
-  AgentSnapshot,
   AgentState,
   ConnectionState,
   LogLevel,
-  RemoteTrack,
   TopicSnapshot,
   TopicPublisherStatus,
   TopicSubscriberStatus,
@@ -30,7 +32,9 @@ export function emptyTopics(): TopicSnapshot {
   });
 }
 
-export function emptySnapshot(connection: ConnectionState): AgentSnapshot {
+export function emptySnapshot(
+  connection: ConnectionState,
+): ReconciliationSnapshot {
   return Object.freeze({
     version: 0,
     desiredRevision: 0,

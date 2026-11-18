@@ -111,7 +111,9 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
     let mut resources = TrackResources::default();
     let owner = resources.new_owner().unwrap();
     let spec = data(TopicMode::Ordered);
+    assert!(resources.is_empty());
     resources.declare_data_publication(owner, &spec).unwrap();
+    assert!(!resources.is_empty());
     let media_owner = resources.new_owner().unwrap();
     resources
         .claim_publication(media_owner, video("events"), &BTreeSet::new())
@@ -141,6 +143,8 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
     );
     resources.release(owner);
     resources.release(owner);
+    resources.release(media_owner);
+    assert!(resources.is_empty());
     resources
         .declare_data_publication(other, &data(TopicMode::Latest))
         .unwrap();
@@ -151,6 +155,9 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
             mode: TopicMode::Latest
         }]
     );
+    assert!(!resources.is_empty());
+    resources.release(other);
+    assert!(resources.is_empty());
 }
 
 #[test]

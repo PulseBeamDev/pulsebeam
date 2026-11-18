@@ -35,10 +35,6 @@ fn config_in_room(endpoint: &str, participant: &str, discover: bool, room: &str)
     } else {
         &["join", "publish", "subscribe"]
     };
-    let expiry = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs()
-        .saturating_add(120);
     let grants = if room == ROOM {
         serde_json::json!([{"rooms":[room],"allow":allow}])
     } else {
@@ -47,6 +43,18 @@ fn config_in_room(endpoint: &str, participant: &str, discover: bool, room: &str)
             {"rooms":[ROOM],"allow":["subscribe"]}
         ])
     };
+    config_for_grants(endpoint, participant, grants)
+}
+
+fn config_for_grants(
+    endpoint: &str,
+    participant: &str,
+    grants: serde_json::Value,
+) -> Result<Config> {
+    let expiry = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs()
+        .saturating_add(120);
     Ok(Config::new(AgentConfig {
         endpoint: endpoint.into(),
         token: pulsebeam_server::sign_participant_token(
@@ -361,11 +369,19 @@ async fn production_native_i420(receiver_room: &str) -> Result<()> {
         // Reuse the bounded server and live Rust publisher for both installed consumers.
         let foreign = config(&endpoint, "foreign", true)?;
         let foreign_reader = config(&endpoint, "foreign-reader", true)?;
+        let catalog = config_for_grants(
+            &endpoint,
+            "foreign-catalog",
+            serde_json::json!([
+                {"rooms":[ROOM], "allow":["join", "discover"]}
+            ]),
+        )?;
         let mut command = tokio::process::Command::new(std::env::var("PULSEBEAM_FOREIGN_SMOKE")?);
         command
             .arg(&endpoint)
             .arg(&foreign.session.token)
             .arg(&foreign_reader.session.token)
+            .arg(&catalog.session.token)
             .arg(ROOM)
             .env_remove("LD_LIBRARY_PATH")
             .env_remove("LD_PRELOAD")

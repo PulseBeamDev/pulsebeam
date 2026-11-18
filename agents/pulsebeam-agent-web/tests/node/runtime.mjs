@@ -138,6 +138,16 @@ if (process.argv[2] === "initialization-failure") {
   assert.equal(agent.state().status, AgentStatus.Idle);
   assert.equal(agent.snapshot().desiredRoom, null);
   assert.equal(agent.snapshot().connection, "disconnected");
+  for (const field of ["catalog", "mapping", "tracks"])
+    assert.equal(field in agent.snapshot(), false, `${field} is private`);
+  assert.equal("participants" in agent, false);
+  assert.equal("remote" in agent, false);
+  const publicSnapshots = agent.snapshots();
+  const initialSnapshot = (await publicSnapshots.next()).snapshot;
+  assert.equal(initialSnapshot, agent.snapshot());
+  for (const field of ["catalog", "mapping", "tracks"])
+    assert.equal(field in initialSnapshot, false);
+  await publicSnapshots.close();
   assert.equal(requests, 0, "constructor does not fetch or connect");
   const initialization = whenInitialized();
   const inert = new BrowserRuntime(config);
@@ -312,6 +322,12 @@ if (process.argv[2] === "initialization-failure") {
   assert.equal(
     await publicContract(await import("../../node_assets/dist/index.js")),
     true,
+  );
+  const { catalogContract } = await import("./catalog-contract.mjs");
+  await catalogContract(
+    BrowserRuntime,
+    ErrorCode,
+    await import("../../node_assets/dist/index.js"),
   );
   const { resourceContract } = await import("./resource-contract.mjs");
   await resourceContract(BrowserRuntime);

@@ -5,14 +5,103 @@ import {
   Video,
   useAgent,
   useSubscribe,
+  useWatch,
+  WatchStatus,
+  type Watch,
   type Agent,
 } from "@pulsebeam/react";
+
+import { Agent as WebAgent } from "@pulsebeam/web";
 
 interface Config {
   endpoint: string;
   token: string;
   room: string;
   sourceRoom: string;
+}
+
+export async function observeCatalog(config: {
+  endpoint: string;
+  token: string;
+  publisherToken: string;
+  room: string;
+}): Promise<boolean> {
+  let ownedWatch: Watch | undefined;
+  function Catalog() {
+    const agent = useAgent({ endpoint: config.endpoint, token: config.token });
+    useEffect(() => {
+      agent?.join(config.room);
+    }, [agent]);
+    const room = useMemo(() => agent?.room(config.room) ?? null, [agent]);
+    const watch = useWatch(room, { limit: 7 });
+    const state = watch?.state();
+    useEffect(() => {
+      if (watch) ownedWatch = watch;
+    }, [watch]);
+    return createElement(
+      "output",
+      { id: "catalog", "data-status": state?.status },
+      state?.error?.message ??
+        state?.page?.participants
+          .flatMap((participant) =>
+            participant.publications.map(
+              (publication) => `${participant.externalId}/${publication.label}`,
+            ),
+          )
+          .join(","),
+    );
+  }
+  const container = document.getElementById("root");
+  if (!container) throw new Error("missing React fixture root");
+  const root = createRoot(container);
+  const publisher = new WebAgent({
+    endpoint: config.endpoint,
+    token: config.publisherToken,
+  });
+  const rendered = () => document.getElementById("catalog");
+  const until = async (predicate: () => boolean, label: string) => {
+    for (let attempt = 0; attempt < 500; attempt++) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`${label}: ${rendered()?.outerHTML}`);
+  };
+  try {
+    publisher.join(config.room);
+    root.render(createElement(Catalog));
+    await until(
+      () =>
+        rendered()?.dataset.status === String(WatchStatus.Live) &&
+        Boolean(rendered()?.textContent?.includes("native-publisher/camera")) &&
+        Boolean(
+          rendered()?.textContent?.includes("native-publisher/frame-events"),
+        ),
+      "React useWatch renders the actual Native catalog",
+    );
+    const publication = publisher.data("catalog-change", "ordered").publish();
+    await until(
+      () =>
+        Boolean(
+          rendered()?.textContent?.includes(
+            "react-metadata-publisher/catalog-change",
+          ),
+        ),
+      "React useWatch renders a real publication change",
+    );
+    if (!ownedWatch) throw new Error("React did not commit a Watch owner");
+    await ownedWatch.close();
+    await until(
+      () =>
+        rendered()?.dataset.status === String(WatchStatus.Closed) &&
+        rendered()?.textContent === "",
+      "React renders the Watch final closed state",
+    );
+    await publication.close();
+    return true;
+  } finally {
+    root.unmount();
+    await publisher.close();
+  }
 }
 
 export async function receiveNative(config: Config): Promise<{

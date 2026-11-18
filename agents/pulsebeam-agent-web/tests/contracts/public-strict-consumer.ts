@@ -8,6 +8,15 @@ import {
   AgentStatus,
   ErrorCode,
   OperationError,
+  WatchStatus,
+  type Watch,
+  type WatchConfig,
+  type WatchState,
+  type WatchUpdates,
+  type CatalogPage,
+  type CatalogParticipantInfo,
+  type CatalogPublicationInfo,
+  type CatalogPublicationKind,
   type AgentState,
   type AgentUpdates,
   type VideoSubscriptionState,
@@ -39,6 +48,10 @@ import { createWebAgent } from "../../web/index.js";
 import { track } from "../../web/index.js";
 // @ts-expect-error Desired-state mutation is not a normal public API.
 import type { DesiredState } from "../../web/index.js";
+// @ts-expect-error Joined/global catalog snapshots are private reconciliation data.
+import type { CatalogSnapshot } from "../../web/index.js";
+// @ts-expect-error Flat catalog tracks are not a second discovery API.
+import type { CatalogTrack } from "../../web/index.js";
 // @ts-expect-error JSON topic registration is not required for binary data.
 import type { Topic } from "../../web/index.js";
 
@@ -47,6 +60,36 @@ const agent = new Agent({
   token: "opaque",
 });
 agent.join("explicit-room");
+const watchConfig: WatchConfig = { limit: 7, cursor: Uint8Array.of(1) };
+const watch: Watch = agent.room("pinned-room").watch(watchConfig);
+const watchState: WatchState = watch.state();
+const watchStatus: WatchStatus = watchState.status;
+const watchUpdates: WatchUpdates = watch.updates();
+const watchNext: Promise<WatchState | undefined> = watchUpdates.next();
+const watchTyped: NoAny<ReturnType<typeof watch.state>> = true;
+// @ts-expect-error The watch has immutable room scope.
+watchState.room = "changed";
+// @ts-expect-error Cursor bytes are immutable, not a shared mutable buffer.
+watchState.cursor.push(5);
+if (watchState.page) {
+  const page: CatalogPage = watchState.page;
+  const participant: CatalogParticipantInfo | undefined = page.participants[0];
+  const publication: CatalogPublicationInfo | undefined =
+    participant?.publications[0];
+  const kind: CatalogPublicationKind | undefined = publication?.kind;
+  // @ts-expect-error A retained page cannot mutate its participants.
+  page.participants.push(participant!);
+  // @ts-expect-error Participant publications are immutable too.
+  participant?.publications.push(publication!);
+  if (publication?.kind.tag === "Data") {
+    // @ts-expect-error Nested generated payload enum fields are immutable.
+    publication.kind.inner.delivery = 0;
+  }
+  void kind;
+}
+watchUpdates.close();
+const watchClosed: Promise<void> = watch.close();
+void [watchStatus, watchNext, watchTyped, watchClosed];
 const currentState: AgentState = agent.state();
 const stateCursor: AgentUpdates = agent.updates();
 const nextState: Promise<AgentState | undefined> = stateCursor.next();
@@ -89,6 +132,16 @@ await agent.disconnect();
 await agent.renewAuthorization("renewed");
 agent.setLogging("info");
 const snapshot: AgentSnapshot = agent.snapshot();
+// @ts-expect-error Metadata discovery requires an owned bounded Watch.
+snapshot.catalog;
+// @ts-expect-error Physical transport mappings are private to the runtime.
+snapshot.mapping;
+// @ts-expect-error Physical media is observed through a subscription owner.
+snapshot.tracks;
+// @ts-expect-error Agent-wide participant enumeration has no owned scope.
+agent.participants;
+// @ts-expect-error There is no global media discovery facade.
+agent.remote;
 const joinRevision: bigint = snapshot.joinRevision;
 const desiredRoom: string | null = snapshot.desiredRoom;
 void joinRevision;
@@ -117,6 +170,10 @@ binary.send(new Uint8Array([0, 255]));
 // @ts-expect-error Reception requires a pinned remote subscription.
 binary.receive();
 const participant = agent.room("meeting").participant("alice");
+// @ts-expect-error A pinned reference is not an unbounded publication listing.
+participant.tracks;
+// @ts-expect-error Logical references do not expose their reconciliation host.
+participant.catalog;
 const participantId: string = participant.id();
 const remoteBinary = participant.data("chat", "ordered");
 const dataPublication: DataPublication = binary.publish();

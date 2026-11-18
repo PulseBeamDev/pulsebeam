@@ -319,6 +319,13 @@ pub enum Notification {
         to: ConnectionState,
     },
     SnapshotChanged,
+    CatalogWatchChanged {
+        owner: u64,
+    },
+    CatalogWatchTerminated {
+        owner: u64,
+        state: crate::ffi::WatchState,
+    },
     DataReady {
         owners: Vec<u64>,
     },

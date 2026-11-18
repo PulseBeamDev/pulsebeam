@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 
-async def witness(endpoint, token, reader_token, room, package):
+async def witness(endpoint, token, reader_token, catalog_token, room, package):
     core = importlib.import_module(f"{package}.pulsebeam_agent_core")
     native = importlib.import_module(f"{package}.pulsebeam_agent_native")
     agent = native.Agent(
@@ -30,11 +30,45 @@ async def witness(endpoint, token, reader_token, room, package):
         ),
         log_level=core.LogLevel.WARN,
     ))
+    catalog_agent = native.Agent(core.AgentConfig(
+        endpoint=endpoint, token=catalog_token,
+        retry=core.RetryPolicy(
+            initial_delay_ms=100, maximum_delay_ms=1000, maximum_attempts=2,
+        ),
+        log_level=core.LogLevel.WARN,
+    ))
+    watch = catalog_agent.room(room).watch()
+    watch_updates = watch.updates()
     assert agent.state().status == core.AgentStatus.IDLE
     assert agent.state().room is None and agent.state().desired_room is None
     assert reader.state().status == core.AgentStatus.IDLE
     assert reader.state().room is None and reader.state().desired_room is None
     try:
+        initial = await watch_updates.next()
+        assert initial.status == core.WatchStatus.LOADING and initial.page is None
+
+        async def catalog_page(predicate):
+            async def matching_page():
+                while True:
+                    state = await watch_updates.next()
+                    assert state is not None and state.error is None, state
+                    if state.page is not None and predicate(state.page.participants()):
+                        assert state.status == core.WatchStatus.LIVE
+                        return state.page
+            return await asyncio.wait_for(matching_page(), timeout=5)
+
+        catalog_agent.join(room)
+        first_page = await catalog_page(lambda participants: any(
+            participant.external_id == "publisher" and any(
+                publication.label == "production-camera" and publication.kind.is_VIDEO()
+                for publication in participant.publications
+            ) for participant in participants
+        ) and any(
+            participant.external_id == "foreign-catalog" and not participant.publications
+            for participant in participants
+        ))
+        assert not first_page.has_more() and not first_page.next_cursor()
+        assert all(participant.external_id != "foreign" for participant in first_page.participants())
         updates = agent.snapshots()
         reader_updates = reader.snapshots()
         data = agent.data("foreign-bytes", core.TopicMode.ORDERED).publish()
@@ -68,6 +102,19 @@ async def witness(endpoint, token, reader_token, room, package):
             assert not update.snapshot.connection.is_TERMINAL_FAILURE()
             if update.snapshot.connection.is_CONNECTED():
                 break
+        changed_page = await catalog_page(lambda participants: any(
+            participant.external_id == "foreign" and
+            {publication.label for publication in participant.publications} == {"foreign-camera", "foreign-bytes"}
+            for participant in participants
+        ))
+        assert changed_page.revision() > first_page.revision()
+        assert all(participant.external_id != "foreign" for participant in first_page.participants())
+        watch.close()
+        final_watch = await watch_updates.next()
+        assert final_watch.status == core.WatchStatus.CLOSED and final_watch.page is None
+        assert await watch_updates.next() is None
+        watch_updates.close()
+        # The independent data subscriptions below must keep working after watch close.
         setup = bytes([0, 255, 128, 0])
 
         async def message(cursor, expected, participant_id="foreign"):
@@ -217,9 +264,11 @@ async def witness(endpoint, token, reader_token, room, package):
         assert publication.is_closed() and not camera.is_closed(), "publication close stopped producer"
         await camera.close()
         assert camera.is_closed(), "producer close did not retire input"
-        print("installed Python synchronous Agent/dynamic RTC/real SFU/owned binary data/independent source/named media close PASS")
+        print("installed Python synchronous Agent/dynamic RTC/real SFU/live catalog/owned binary data/independent source/named media close PASS")
     finally:
-        await asyncio.wait_for(asyncio.gather(agent.close(), reader.close()), timeout=3)
+        watch.close()
+        watch_updates.close()
+        await asyncio.wait_for(asyncio.gather(agent.close(), reader.close(), catalog_agent.close()), timeout=3)
 
 
 async def publish_live(endpoint, token, room, package):
@@ -271,10 +320,10 @@ async def publish_live(endpoint, token, room, package):
 
 
 def main():
-    if len(sys.argv) == 6 and sys.argv[1] == "--witness":
+    if len(sys.argv) == 7 and sys.argv[1] == "--witness":
         package = importlib.import_module("pulsebeam_agent")
         assert Path(package.__file__).is_relative_to("/opt/lib/python3.12/site-packages")
-        asyncio.run(asyncio.wait_for(witness(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], package.__name__), timeout=25))
+        asyncio.run(asyncio.wait_for(witness(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], package.__name__), timeout=25))
         return
 
     from installer import install
@@ -313,7 +362,7 @@ def main():
             if len(sys.argv) == 5 and sys.argv[1] == "--publish":
                 asyncio.run(asyncio.wait_for(publish_live(sys.argv[2], sys.argv[3], sys.argv[4], package.__name__), timeout=30))
             else:
-                asyncio.run(asyncio.wait_for(witness(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], package.__name__), timeout=25))
+                asyncio.run(asyncio.wait_for(witness(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], package.__name__), timeout=25))
 
 
 if __name__ == "__main__":

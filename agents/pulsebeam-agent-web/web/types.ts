@@ -1,6 +1,11 @@
 import type { EventStream, SnapshotStream } from "./observation.js";
 import type {
   AgentState as ObservedAgentState,
+  ErrorInfo,
+  WatchStatus,
+  CatalogParticipantInfo as CoreCatalogParticipantInfo,
+  CatalogPublicationInfo as CoreCatalogPublicationInfo,
+  CatalogPublicationKind as CoreCatalogPublicationKind,
   PublicationState as ObservedPublicationState,
   PipeState as ObservedPipeState,
   VideoSubscriptionState as ObservedVideoSubscriptionState,
@@ -192,33 +197,6 @@ export interface AgentError {
 /** @deprecated Use AgentError. */
 export type AgentFailure = AgentError;
 
-export interface Participant {
-  readonly participantId: string;
-}
-
-export interface Publication {
-  readonly id: string;
-  readonly participantId: string;
-  readonly kind: MediaKind;
-  readonly label: string;
-}
-
-interface RemoteMediaBase {
-  readonly publicationId: string;
-  readonly participantId: string;
-  readonly media: MediaStreamTrack;
-}
-
-export interface MappedRemoteVideoTrack extends RemoteMediaBase {
-  readonly kind: "video";
-}
-
-export interface MappedRemoteAudioTrack extends RemoteMediaBase {
-  readonly kind: "audio";
-}
-
-export type RemoteTrack = MappedRemoteVideoTrack | MappedRemoteAudioTrack;
-
 export interface ReceiveOptions {
   readonly minHeight?: number;
   readonly minFps?: number;
@@ -247,29 +225,63 @@ export interface RemoteAudioTrack {
   subscribe(configuration?: AudioSubscriptionConfig): AudioSubscription;
 }
 
-export type RemotePublishedTrack =
-  | RemoteVideoTrack
-  | RemoteAudioTrack
-  | RemoteDataTrack;
-
 export interface RemoteParticipant {
   readonly room: string;
   readonly participantId: string;
   readonly active: boolean;
-  readonly tracks: readonly RemotePublishedTrack[];
   id(): string;
   video(label: string): RemoteVideoTrack;
   audio(label: string): RemoteAudioTrack;
   data<D extends Delivery>(label: string, delivery: D): RemoteDataTrack<D>;
 }
 
+export interface WatchConfig {
+  readonly limit?: number;
+  readonly cursor?: Uint8Array | readonly number[];
+}
+
+export type CatalogPublicationKind = CoreCatalogPublicationKind;
+export type CatalogPublicationInfo = CoreCatalogPublicationInfo;
+export type CatalogParticipantInfo = Omit<
+  CoreCatalogParticipantInfo,
+  "publications"
+> & {
+  readonly publications: readonly CatalogPublicationInfo[];
+};
+
+export interface CatalogPage {
+  readonly revision: bigint;
+  readonly participants: readonly CatalogParticipantInfo[];
+  readonly hasMore: boolean;
+  readonly nextCursor: readonly number[];
+  readonly cursorExpiresAtUnixSeconds: bigint;
+}
+
+export interface WatchState {
+  readonly observationRevision: bigint;
+  readonly room: string;
+  readonly limit: number;
+  readonly cursor: readonly number[];
+  readonly status: WatchStatus;
+  readonly page?: CatalogPage;
+  readonly error?: ErrorInfo;
+}
+
+export interface WatchUpdates {
+  next(): Promise<WatchState | undefined>;
+  close(): void;
+}
+
+export interface Watch {
+  state(): WatchState;
+  updates(): WatchUpdates;
+  close(): Promise<void>;
+}
+
 export interface RoomRef {
   readonly name: string;
   participant(participantId: string): RemoteParticipant;
-}
-
-export interface RemoteMedia {
-  readonly participants: readonly RemoteParticipant[];
+  watch(config?: WatchConfig): Watch;
 }
 
 export type TopicEvent<T> =
@@ -343,34 +355,6 @@ export interface TopicSnapshot {
   readonly channelFailures: number;
 }
 
-export type CatalogTrack = Readonly<{
-  id: string;
-  participantId: string;
-  label: string;
-}> &
-  (
-    | Readonly<{ kind: MediaKind }>
-    | Readonly<{ kind: "data"; delivery: TopicMode }>
-  );
-
-export interface CatalogSnapshot {
-  readonly revision: number;
-  readonly participants: readonly Participant[];
-  readonly publications: readonly Publication[];
-  readonly tracks: readonly CatalogTrack[];
-}
-
-export interface TrackMapping {
-  readonly receiverIndex: number;
-  readonly publicationId: string;
-}
-
-export interface MappingSnapshot {
-  readonly acceptedIntentRevision: number;
-  readonly video: readonly TrackMapping[];
-  readonly audio: readonly TrackMapping[];
-}
-
 export interface CredentialOutcome {
   readonly revision: bigint;
   readonly status: "accepted" | "rejected" | "uncertain";
@@ -392,10 +376,6 @@ export interface AgentSnapshot {
   readonly roomId: string | null;
   /** Current authorization deadline, in Unix seconds. */
   readonly authorizationExpiresAt: number | null;
-  readonly catalog: CatalogSnapshot;
-  readonly mapping: MappingSnapshot;
-  /** Available remote tracks, keyed by publication ID. */
-  readonly tracks: Readonly<Record<string, RemoteTrack>>;
   readonly topics: TopicSnapshot;
   readonly failure: AgentError | null;
 }

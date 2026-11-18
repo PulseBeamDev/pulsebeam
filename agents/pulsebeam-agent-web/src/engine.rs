@@ -28,6 +28,7 @@ pub(crate) enum DataSendError {
     Closed,
 }
 
+mod catalog;
 mod resource_state;
 pub(crate) use resource_state::{ResourceKind, ResourceNotification, ResourceState};
 
@@ -50,6 +51,7 @@ pub(crate) struct Turn {
     pub(crate) snapshot: Option<Snapshot>,
     pub(crate) publications: Vec<(u64, agent_core::ffi::PublicationState, bool)>,
     pub(crate) resources: Vec<(u64, ResourceState, bool)>,
+    pub(crate) watches: Vec<catalog::WatchProjection>,
     pub(crate) error: Option<TurnError>,
     logs: Vec<agent_core::DeferredLog>,
 }
@@ -77,6 +79,7 @@ struct Control {
     wake_pending: Cell<bool>,
     publication_owners: RefCell<BTreeMap<u64, ()>>,
     resource_observers: RefCell<BTreeMap<u64, ResourceKind>>,
+    watch_owners: catalog::WatchOwners,
 }
 
 impl Control {
@@ -117,6 +120,7 @@ impl Driver {
                 wake_pending: Cell::new(false),
                 publication_owners: RefCell::new(BTreeMap::new()),
                 resource_observers: RefCell::new(BTreeMap::new()),
+                watch_owners: RefCell::new(BTreeMap::new()),
             }),
             published_version: None,
         })
@@ -228,6 +232,7 @@ impl Driver {
             effects.push(effect);
         }
 
+        let watches = self.control.collect_catalog_states(&agent);
         let mut notifications = Vec::new();
         while let Some(notification) = agent.next_notification() {
             notifications.push(notification);
@@ -270,6 +275,7 @@ impl Driver {
             snapshot,
             publications,
             resources,
+            watches,
             error,
             logs: agent.drain_logs(),
         }
@@ -302,6 +308,14 @@ pub(crate) trait Host {
         &self,
         _owner: u64,
         _state: &ResourceState,
+        _closing: bool,
+    ) -> Option<ResourceNotification> {
+        None
+    }
+    fn prepare_catalog_state(
+        &self,
+        _owner: u64,
+        _state: &agent_core::ffi::WatchState,
         _closing: bool,
     ) -> Option<ResourceNotification> {
         None
@@ -406,18 +420,7 @@ impl ActorHandle {
             .borrow_mut()
             .command(command)
             .map_err(|error| error.to_string())?;
-        if !self.control.wake_pending.replace(true) {
-            match self.sender.try_send(Message::CoreChanged) {
-                Ok(()) => {}
-                // Every queued message also flushes pending core work.
-                Err(MpscTrySendError::Full(_)) => self.control.wake_pending.set(false),
-                Err(MpscTrySendError::Closed(_)) => {
-                    self.control.wake_pending.set(false);
-                    return Err("actor is not running".into());
-                }
-            }
-        }
-        Ok(())
+        self.schedule_core_change().map_err(|error| error.message)
     }
 
     pub(crate) fn snapshots(&self) -> watch::Receiver<Snapshot> {
@@ -471,19 +474,7 @@ impl ActorHandle {
             .control
             .resource(command)
             .map_err(|error| agent_core::ffi::ErrorInfo::from(&error))?;
-        if !self.control.wake_pending.replace(true) {
-            match self.sender.try_send(Message::CoreChanged) {
-                Ok(()) => {}
-                Err(MpscTrySendError::Full(_)) => self.control.wake_pending.set(false),
-                Err(MpscTrySendError::Closed(_)) => {
-                    self.control.wake_pending.set(false);
-                    return Err(agent_core::ffi::ErrorInfo::new(
-                        agent_core::ffi::ErrorCode::Closed,
-                        "Actor is not running",
-                    ));
-                }
-            }
-        }
+        self.schedule_core_change()?;
         Ok(result)
     }
 
@@ -742,8 +733,18 @@ impl<H: Host> Actor<H> {
                 self.host.prepare_resource_state(*owner, state, *closing)
             })
             .collect::<Vec<_>>();
+        let watches = turn
+            .watches
+            .iter()
+            .filter_map(|(owner, state, closing)| {
+                self.host.prepare_catalog_state(*owner, state, *closing)
+            })
+            .collect::<Vec<_>>();
         for publication in publications {
             publication.notify();
+        }
+        for notification in watches {
+            notification();
         }
         for notification in resources {
             notification();
@@ -821,6 +822,7 @@ impl<H: Host> Actor<H> {
 
         self.driver.control.accepting.set(false);
         self.running = false;
+        self.finalize_catalog_watches();
         self.set_connected(false);
     }
 
@@ -833,6 +835,7 @@ impl<H: Host> Actor<H> {
         self.closed = true;
         self.running = false;
         self.core_wake = None;
+        self.finalize_catalog_watches();
         for (_, completion) in std::mem::take(&mut self.data_sends) {
             let _ = completion.send(Err(DataSendError::Closed));
         }
@@ -1054,6 +1057,8 @@ mod tests {
         failures: RefCell<Vec<FailureClass>>,
         shutdowns: RefCell<u8>,
         on_turn: RefCell<Option<Box<dyn Fn()>>>,
+        watches: RefCell<Vec<(u64, agent_core::ffi::WatchState, bool)>>,
+        on_catalog: RefCell<Option<std::rc::Rc<dyn Fn()>>>,
     }
 
     impl FakeHost {
@@ -1073,6 +1078,21 @@ mod tests {
             if let Some(callback) = self.on_turn.borrow().as_ref() {
                 callback();
             }
+        }
+
+        fn prepare_catalog_state(
+            &self,
+            owner: u64,
+            state: &agent_core::ffi::WatchState,
+            closing: bool,
+        ) -> Option<super::ResourceNotification> {
+            self.watches
+                .borrow_mut()
+                .push((owner, state.clone(), closing));
+            self.on_catalog
+                .borrow()
+                .clone()
+                .map(|callback| Box::new(move || callback()) as super::ResourceNotification)
         }
 
         fn execute_effect(&self, effect: agent_core::Effect) {
@@ -1272,6 +1292,299 @@ mod tests {
                 .code,
             ErrorCode::Conflict
         );
+    }
+
+    #[test]
+    fn catalog_failed_state_survives_reads_until_transfer_or_close() {
+        use agent_core::ffi::{ErrorCode, WatchConfig, WatchStatus};
+        use agent_core::{DataChannelEvent, HttpEffect, HttpEvent, HttpHeader, HttpResponse};
+        use pulsebeam_proto::state::{self as wire, codec};
+
+        for close in [false, true] {
+            let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
+            let (sender, receiver) = super::channel::mpsc::channel(1);
+            let handle = actor.handle(sender);
+            handle.join("room".into()).unwrap();
+            actor.process(receiver.try_recv().unwrap());
+            while actor.wake_core() {}
+            let generation = handle.snapshot().generation.unwrap();
+            let channel = agent_core::ChannelId::new(400).unwrap();
+            actor.event(HostEvent::Rtc(RtcEvent::OfferCreated {
+                generation,
+                offer: "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:data\r\n"
+                    .into(),
+                resources: OfferResources {
+                    slots: Vec::new(),
+                    signaling_channel: channel,
+                    data_channels: Vec::new(),
+                },
+            }));
+            let operation = actor
+                .host
+                .effects
+                .borrow()
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::Http(HttpEffect::Request { operation, .. }) => Some(*operation),
+                    _ => None,
+                })
+                .expect("admission capability request");
+            actor.event(HostEvent::Http(HttpEvent::Response {
+                operation,
+                response: HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: br#"{"owner":"opaque-test-proof"}"#.to_vec(),
+                },
+            }));
+            let operation = actor
+                .host
+                .effects
+                .borrow()
+                .iter()
+                .rev()
+                .find_map(|effect| match effect {
+                    Effect::Http(HttpEffect::Request { operation, .. }) => Some(*operation),
+                    _ => None,
+                })
+                .expect("join request");
+            actor.event(HostEvent::Http(HttpEvent::Response {
+                operation,
+                response: HttpResponse {
+                    status: 201,
+                    headers: vec![HttpHeader {
+                        name: "location".into(),
+                        value: "https://example.com/participants/p1".into(),
+                    }],
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "room_external_id": "room", "room_id": "opaque room",
+                        "participant_external_id": "participant", "participant_id": "p1",
+                        "profile": "pulsebeam.media.v1", "rtp_capabilities": {},
+                        "data_delivery": ["LATEST", "LOSSY", "ORDERED"], "answer": "answer"
+                    }))
+                    .unwrap(),
+                },
+            }));
+            actor.event(HostEvent::Rtc(RtcEvent::Connected { generation }));
+            actor.event(HostEvent::DataChannel(DataChannelEvent::Opened {
+                generation,
+                channel,
+            }));
+            actor.event(HostEvent::Rtc(RtcEvent::AnswerApplied { generation }));
+            actor.event(HostEvent::DataChannel(DataChannelEvent::Message {
+                generation,
+                channel,
+                payload: codec::encode_server(&wire::ServerStateBatch {
+                    initial_complete: true,
+                    records: vec![wire::ServerStateRecord {
+                        key: Some(wire::ResourceKey {
+                            key: Some(wire::resource_key::Key::Session(true)),
+                        }),
+                        confirmed: Some(wire::ConfirmedState {
+                            evaluated_revision: 0,
+                            rejection: None,
+                            value: Some(wire::confirmed_state::Value::Session(
+                                wire::SessionState {
+                                    authorization: Some(wire::Authorization {
+                                        expires_at_unix_seconds: 10001,
+                                        revision: 1,
+                                    }),
+                                    closed: None,
+                                    diagnostic: String::new(),
+                                },
+                            )),
+                        }),
+                    }],
+                    ..Default::default()
+                })
+                .unwrap(),
+            }));
+            let (owner, _) = handle
+                .open_catalog_watch("room".into(), WatchConfig::default())
+                .unwrap();
+            actor.process(receiver.try_recv().unwrap());
+            while actor.wake_core() {}
+            let watch_id = actor
+                .host
+                .effects
+                .borrow()
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::DataChannel(agent_core::DataChannelEffect::Send {
+                        payload, ..
+                    }) => codec::decode_client(payload).ok(),
+                    _ => None,
+                })
+                .flat_map(|batch| batch.catalog_records)
+                .find_map(|record| match record.command {
+                    Some(wire::catalog_client_record::Command::Open(open)) => Some(open.watch_id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "catalog open missing: {:?}; effects: {:?}",
+                        handle.snapshot(),
+                        actor.host.effects.borrow()
+                    )
+                });
+            // Pause between Core mutation and the actor turn to exercise synchronous reads.
+            handle
+                .control
+                .agent
+                .borrow_mut()
+                .handle(HostEvent::DataChannel(DataChannelEvent::Message {
+                    generation,
+                    channel,
+                    payload: codec::encode_server(&wire::ServerStateBatch {
+                        catalog_records: vec![wire::CatalogServerRecord {
+                            response: Some(wire::catalog_server_record::Response::Error(
+                                wire::CatalogWatchError {
+                                    watch_id,
+                                    failure: Some(wire::Failure {
+                                        code: wire::FailureCode::PermissionDenied as i32,
+                                        diagnostic: "private authority".into(),
+                                    }),
+                                },
+                            )),
+                        }],
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                }))
+                .unwrap();
+            let failed = handle.catalog_states();
+            assert_eq!(handle.catalog_states(), failed);
+            assert_eq!(failed.len(), 1);
+            assert_eq!(failed[0].1.status, WatchStatus::Failed);
+            assert_eq!(
+                failed[0].1.error.as_ref().unwrap().code,
+                ErrorCode::PermissionDenied
+            );
+            assert!(
+                !failed[0]
+                    .1
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains("private authority")
+            );
+            actor.host.watches.borrow_mut().clear();
+            if close {
+                assert_eq!(handle.close_catalog_watch(owner), Some(failed[0].1.clone()));
+                assert!(handle.close_catalog_watch(owner).is_none());
+            }
+            actor.flush_core();
+            if !close {
+                assert_eq!(*actor.host.watches.borrow(), failed);
+            }
+            assert!(handle.catalog_states().is_empty());
+            actor.host.watches.borrow_mut().clear();
+            actor.flush_core();
+            assert!(
+                actor.host.watches.borrow().is_empty(),
+                "terminal state transfers once"
+            );
+            for _ in 0..8 {
+                handle
+                    .open_catalog_watch("room".into(), WatchConfig::default())
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_reservations_are_synchronous_bounded_and_reusable() {
+        use agent_core::ffi::{ErrorCode, WatchConfig, WatchStatus};
+        let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
+        let (sender, receiver) = super::channel::mpsc::channel(1);
+        let handle = actor.handle(sender);
+        handle
+            .send_public(PublicCommand::SetLogLevel(agent_core::LogLevel::Off))
+            .unwrap();
+        let owners = (0..8)
+            .map(|_| {
+                let (id, state) = handle
+                    .open_catalog_watch("other-room".into(), WatchConfig::default())
+                    .unwrap();
+                assert_eq!(state.status, WatchStatus::Loading);
+                assert_eq!(state.room, "other-room");
+                assert_eq!(state.limit, 100);
+                id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(handle.snapshot().desired_room, None);
+        assert_eq!(
+            handle
+                .open_catalog_watch("room".into(), WatchConfig::default())
+                .unwrap_err()
+                .code,
+            ErrorCode::CapacityExceeded
+        );
+        assert_eq!(handle.catalog_states().len(), 8);
+        assert_eq!(handle.catalog_states().len(), 8);
+        actor.process(receiver.try_recv().unwrap());
+        assert_eq!(actor.host.watches.borrow().len(), 8);
+        assert!(receiver.try_recv().is_none());
+        assert_eq!(
+            handle.close_catalog_watch(owners[0]).unwrap().status,
+            WatchStatus::Closed
+        );
+        assert!(handle.close_catalog_watch(owners[0]).is_none());
+        handle
+            .open_catalog_watch("new-room".into(), WatchConfig::default())
+            .unwrap();
+        actor.process(receiver.try_recv().expect("release must wake the actor"));
+        assert!(receiver.try_recv().is_none());
+        assert_eq!(handle.catalog_states().len(), 8);
+        actor.close();
+        assert!(handle.catalog_states().is_empty());
+        assert_eq!(
+            handle
+                .open_catalog_watch("room".into(), WatchConfig::default())
+                .unwrap_err()
+                .code,
+            ErrorCode::Closed
+        );
+    }
+
+    #[test]
+    fn catalog_root_finalization_prepares_all_states_before_reentrant_wakes() {
+        use agent_core::ffi::{WatchConfig, WatchStatus};
+        for abort in [false, true] {
+            let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
+            let (sender, receiver) = super::channel::mpsc::channel(1);
+            let handle = actor.handle(sender);
+            for _ in 0..2 {
+                handle
+                    .open_catalog_watch("room".into(), WatchConfig::default())
+                    .unwrap();
+            }
+            actor.process(receiver.try_recv().unwrap());
+            actor.host.watches.borrow_mut().clear();
+            let reentrant = handle.clone();
+            *actor.host.on_catalog.borrow_mut() = Some(std::rc::Rc::new(move || {
+                assert!(reentrant.catalog_states().is_empty());
+                assert!(reentrant.close_catalog_watch(1).is_none());
+            }));
+            // Root finalization cannot depend on admission or another mailbox turn.
+            handle.control.accepting.set(false);
+            if abort {
+                actor.shutdown();
+            } else {
+                actor.close();
+            }
+            let states = actor.host.watches.borrow();
+            assert_eq!(states.len(), 2);
+            assert!(
+                states
+                    .iter()
+                    .all(|(_, state, closing)| *closing && state.status == WatchStatus::Closed)
+            );
+            drop(states);
+            actor.shutdown();
+            assert_eq!(actor.host.watches.borrow().len(), 2);
+        }
     }
 
     #[test]

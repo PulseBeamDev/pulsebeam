@@ -183,21 +183,67 @@ the subscription. Configure reception through `useSubscribe`, not renderer props
 A retired view's retry does nothing; callback changes use the latest committed
 callback. Resource setup failures reach the nearest React error boundary.
 
-## Remote participants and tracks
+## Discover one bounded page with `useWatch`
+
+```tsx
+const room = useMemo(() => agent.room(roomName), [agent, roomName]);
+const watch = useWatch(room, { limit: 100, cursor });
+const state = watch?.state();
+```
+
+`useWatch(roomRef | null, config?)` returns the actual owned Web `Watch`, or
+`null` until committed ownership. It observes updates internally, so reading
+`watch.state()` in render rerenders when the state changes. A null room acquires
+nothing. Unmount closes this watch, not independently owned subscriptions.
+
+Room, limit and cursor are immutable scope. Changing the room or config values
+replaces the watch; recreating an equivalent config object does not. Cursor bytes
+are copied and compared by value. Omit the cursor for the first page.
+
+| Value | Contract |
+| --- | --- |
+| `WatchStatus.Loading` | No complete page yet; not a successful empty result. |
+| `WatchStatus.Live` | `state.page` is one complete immutable page. An empty participant array is valid. |
+| `WatchStatus.Failed` | Inspect `state.error`; correct the cause and create a new watch. |
+| `WatchStatus.Closed` | Final healthy close state; its page is cleared. A prior failure remains a failure on close. |
+| `page.participants` | Ordered participant metadata: `id`, application `externalId`, and `publications`. Presence-only participants have no publications. |
+| `publication.kind.tag` | `Video`, `Audio`, or `Data`; data also carries `kind.inner.delivery`. |
+| `page.hasMore`, `page.nextCursor` | Explicit continuation. Replace the watch to request the next page; do not append every page automatically. |
+| `page.cursorExpiresAtUnixSeconds` | Continuation expiry. Invalid, expired or wrong-scope cursors fail explicitly; offer a first-page restart. |
+
+The default limit is 100 participants, with a maximum of 500. An Agent owns at
+most eight pending/live watches. Each watch retains one current page and allows
+32 independent update cursors, with one pending `next()` per cursor. The server's
+opaque continuation expires after 60 seconds and is bound to the room and limit;
+it does not confer permission. Retained application snapshots remain stable when
+a newer page replaces the current page.
+
+Non-React callers use `agent.room(name).watch(config)`, `state()`, `updates()` and
+`close()`. Update cursors are current-first and coalesced, not an event log.
+Closing a cursor releases only that cursor; closing the watch releases its page
+and reservation. Discovery requires Discover permission independently of Subscribe.
+
+See [bounded roster navigation](/react/guides#remote-discovery-and-video-receive-policy).
+
+## Look up pinned participants and tracks
 
 ```ts
-agent.participants: readonly RemoteParticipant[]
-agent.room(room).participant(participantId): RemoteParticipant
+agent.room(room).participant(externalId): RemoteParticipant
 participant.video(label): RemoteVideoTrack
 participant.audio(label): RemoteAudioTrack
 participant.data(label, delivery): RemoteDataTrack
 ```
 
-A participant has `participantId`, `active`, and immutable `tracks`. A track has
-`kind`, `participantId`, `label`, `id`, `active`, and `subscribe`. Data tracks
-also expose `delivery`. Participant and track lookup return stable logical
-handles that survive temporary absence and replacement. Discovery arrays are
-immutable current snapshots.
+Lookup is inert. Use an application-known address or a publication from the
+current Watch page, passing the participant's `externalId` and publication label.
+These logical handles survive temporary absence and replacement but stay pinned
+to their literal room. They do not enumerate participants or publications:
+`agent.participants`, `participant.tracks` and global snapshot catalog/mapping/media
+fields are absent. Session snapshots are not a discovery API.
+
+Create receive demand with `useSubscribe`. Known-address Subscribe does not
+require Discover, and a watch never creates media reception. Skip your own
+application participant ID when turning a roster into receive owners.
 
 ## `Data`
 

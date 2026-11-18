@@ -21,6 +21,8 @@ use tokio::time::Instant;
 use crate::native_media::*;
 use crate::native_peer::{NativePeer, Observation};
 
+mod catalog;
+pub use catalog::Watch;
 mod control;
 use control::{Control, PublicationControl};
 mod data;
@@ -116,6 +118,8 @@ pub enum AgentEvent {
 pub enum Error {
     #[error(transparent)]
     Core(#[from] agent_core::AgentError),
+    #[error("SDK operation failed: {0:?}")]
+    Operation(agent_core::ffi::ErrorInfo),
     #[error("data send failed: {0}")]
     DataSend(agent_core::DataSendFailure),
     #[error("native RTC error: {0}")]
@@ -139,6 +143,7 @@ impl Error {
 
         let (code, message) = match self {
             Self::Core(error) => return ErrorInfo::from(error),
+            Self::Operation(info) => return info.clone(),
             Self::DataSend(failure) => return ErrorInfo::from(failure),
             Self::Closed => (ErrorCode::Closed, "Agent is closed"),
             Self::NotReady => (ErrorCode::NotReady, "Agent is not ready"),

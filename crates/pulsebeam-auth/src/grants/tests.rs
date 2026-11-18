@@ -193,6 +193,14 @@ fn discovery_filters_do_not_expose_zero_track_or_unrelated_descriptions() {
         .unwrap(),
     ])
     .unwrap();
+    assert!(filtered.may_discover("robots"));
+    assert!(!filtered.may_discover("other"));
+    assert!(!filtered.may_discover("*"));
+    assert!(
+        !GrantSet::new(vec![grant(&["robots"], &[Action::Subscribe])])
+            .unwrap()
+            .may_discover("robots")
+    );
     assert!(!filtered.allows(Action::Discover, "robots", Some("robot"), None, None));
     assert!(!filtered.allows(
         Action::Discover,

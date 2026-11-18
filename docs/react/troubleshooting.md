@@ -76,8 +76,12 @@ Check in order:
 2. **Published?** Sender capture is active and passed to `usePublish` with the
    intended logical handle. `{ enabled: false }` disables sending; a null source
    withdraws the input without closing publication ownership.
-3. **Discovered?** Inspect `agent.participants` and each participant's
-   `tracks`. Discovery alone does not prove receive ownership.
+3. **Discovering or addressing a known peer?** For a roster, inspect the owned
+   `useWatch(room, config)` handle's `state()`. Loading is not an empty page;
+   Failed carries an error. A Live page contains participants and publications,
+   including presence-only entries. There is no global `agent.participants` or
+   participant `tracks` listing. Known-address reception needs Subscribe, not
+   Discover; discovery alone does not create receive ownership.
 4. **Owned?** Create the matching video or audio subscription with `useSubscribe`
    and pass it to playback through `source`. Inspect its `state()` for admission
    and execution. Playback alone does not create reception. Confirm topology has capacity.
@@ -86,6 +90,21 @@ Check in order:
 
 A local preview proves capture, not delivery. Match logical handles by external
 participant ID, kind, and label.
+
+## Roster loading or failure
+
+| Symptom | Diagnosis and action |
+| --- | --- |
+| Loading roster | No complete page is available yet. Check session connectivity; do not display loading as an empty successful roster. |
+| Permission failure | Check Discover for the exact watched room. Subscribe grants do not authorize metadata. Correct authorization and create a new watch. |
+| Expired or invalid continuation | Choose First page, omitting the cursor. A token belongs to one room and limit and expires after 60 seconds; do not reuse it with a changed scope. |
+| Eight-watch capacity error | Release unused watch owners. Closing only an update cursor does not release its watch. |
+| Participant without publications | Presence-only participants are valid. Do not invent subscriptions or hide the participant because the publication list is empty. |
+| Media continues after watch close | Expected for an independently held subscription. Close the receive owner separately when it is no longer needed. |
+
+Use `page.hasMore` to enable Next page. Do not retry expired continuations in a
+loop or traverse all pages to reconstruct a global roster. See the
+[bounded roster example](/react/guides#remote-discovery-and-video-receive-policy).
 
 ## Autoplay
 

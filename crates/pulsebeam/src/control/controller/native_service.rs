@@ -273,6 +273,7 @@ impl ControllerActor {
         }
         let participant = native.participant;
         if !self.current_incarnation(participant, connection) {
+            self.catalog.remove_connection(connection);
             self.source_lookup_index.remove_connection(connection);
             return;
         }
@@ -321,6 +322,11 @@ impl ControllerActor {
             },
         ) {
             Ok(wake) => {
+                self.catalog.sync(
+                    connection,
+                    participant,
+                    native.model.catalog.requests().cloned().collect(),
+                );
                 for change in native.model.take_lookup_changes() {
                     if let Some(source_room) =
                         self.source_room_id(participant, &change.address.room)
@@ -355,6 +361,7 @@ impl ControllerActor {
                         .increment(1);
                 }
                 tracing::warn!(?error, participant_id = %participant, %connection, "native controller connection failed");
+                self.catalog.remove_connection(connection);
                 self.source_lookup_index.remove_connection(connection);
                 self.remove_incarnation(participant, connection);
             }
@@ -380,6 +387,7 @@ impl ControllerActor {
         connection: ConnectionId,
     ) -> Option<NativeService> {
         let native = self.native_connections.remove(&connection)?;
+        self.catalog.remove_connection(connection);
         self.source_lookup_index.remove_connection(connection);
         if let Some(deadline) = native.deadline {
             self.native_deadlines.remove(&(deadline, connection));

@@ -2,13 +2,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Audio,
   Data,
-  Publish,
-  SelectAudio,
+  usePublish,
+  useSubscribe,
+  useWatch,
+  WatchStatus,
+  CatalogDelivery,
   Video,
   useAgent,
   useCapture,
   type Agent,
-  type AudioDemand,
+  type VideoProps,
+  type VideoObservation,
+  type RemoteAudioTrack,
   type RemoteDataTrack,
   type RemoteVideoTrack,
 } from "@pulsebeam/react";
@@ -42,6 +47,44 @@ const latencyModes: Record<
   Balanced: { minMs: 100, maxMs: 200 },
   Zero: { minMs: 0, maxMs: 0 },
 };
+
+function RoomVideo({
+  track,
+  local,
+  preferences,
+  onPlaybackError,
+  className,
+}: {
+  track: RemoteVideoTrack | null;
+  local: VideoProps["source"];
+  preferences?: VideoObservation;
+  onPlaybackError: VideoProps["onPlaybackError"];
+  className: string;
+}) {
+  const subscription = useSubscribe(track, preferences);
+  return (
+    <Video
+      source={track ? subscription : local}
+      autoPlay
+      mirror={!track}
+      className={className}
+      onPlaybackError={onPlaybackError}
+    />
+  );
+}
+
+function RoomAudio({
+  track,
+  onPlaybackError,
+}: {
+  track: RemoteAudioTrack;
+  onPlaybackError: VideoProps["onPlaybackError"];
+}) {
+  const subscription = useSubscribe(track);
+  return (
+    <Audio source={subscription} autoPlay onPlaybackError={onPlaybackError} />
+  );
+}
 
 export function Room(props: {
   token: string;
@@ -100,6 +143,35 @@ function ActiveRoom({
   const [failure, setFailure] = useState<string | null>(null);
   const playbackRetry = useRef<(() => Promise<void>) | null>(null);
   const joinedRoom = useRef<string | null>(null);
+  const [catalogScope, setCatalogScope] = useState({
+    room,
+    cursor: [] as readonly number[],
+    retry: 0,
+  });
+  const pinnedRoom = useMemo(
+    () => agent.room(room),
+    [agent, room, catalogScope.retry],
+  );
+  const cursor = catalogScope.room === room ? catalogScope.cursor : [];
+  const watch = useWatch(pinnedRoom, { limit: 100, cursor });
+  const catalogState = watch?.state();
+  const page =
+    catalogState?.status === WatchStatus.Live ? catalogState.page : undefined;
+  const firstPage = () =>
+    setCatalogScope((scope) => ({ room, cursor: [], retry: scope.retry + 1 }));
+  usePublish(Camera, capture.video, { enabled: cameraOn });
+  usePublish(Microphone, capture.audio, { enabled: micOn });
+  const screenPublication = usePublish(Screen, screen);
+  useEffect(() => {
+    if (!screenPublication) return;
+    void screenPublication
+      .configureSender({ contentHint: "detail" })
+      .catch((error: unknown) => {
+        setFailure(
+          `Screen share: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+  }, [screenPublication]);
   const {
     messages,
     error: chatError,
@@ -116,59 +188,60 @@ function ActiveRoom({
   } = useReaction(agent);
   const {
     remoteVideoTracks,
-    remoteAudioSelectors,
+    remoteAudioTracks,
     remoteChatTracks,
     remoteReactionTracks,
   } = useMemo(() => {
     const videos: RemoteVideoTrack[] = [];
-    const audioSelectors: Array<NonNullable<AudioDemand["selected"]>[number]> =
-      [];
+    const audios: RemoteAudioTrack[] = [];
     const chats: RemoteDataTrack<"ordered">[] = [];
     const reactions: RemoteDataTrack<"lossy">[] = [];
     if (agent.roomId !== room)
       return {
         remoteVideoTracks: videos,
-        remoteAudioSelectors: audioSelectors,
+        remoteAudioTracks: audios,
         remoteChatTracks: chats,
         remoteReactionTracks: reactions,
       };
-    const pinnedRoom = agent.room(room);
-    for (const participant of agent.participants) {
-      for (const track of participant.tracks) {
-        if (track.kind === "video")
+    for (const participant of page?.participants ?? []) {
+      if (participant.externalId === agent.participantId) continue;
+      for (const track of participant.publications) {
+        if (track.kind.tag === "Video")
           videos.push(
-            pinnedRoom
-              .participant(participant.participantId)
-              .video(track.label),
+            pinnedRoom.participant(participant.externalId).video(track.label),
           );
-        if (track.kind === "audio")
-          audioSelectors.push({
-            room,
-            participantId: participant.participantId,
-            label: track.label,
-          });
-        if (track.kind !== "data") continue;
-        if (track.label === "chat" && track.delivery === "ordered")
+        if (track.kind.tag === "Audio")
+          audios.push(
+            pinnedRoom.participant(participant.externalId).audio(track.label),
+          );
+        if (track.kind.tag !== "Data") continue;
+        if (
+          track.label === "chat" &&
+          track.kind.inner.delivery === CatalogDelivery.Ordered
+        )
           chats.push(
             pinnedRoom
-              .participant(participant.participantId)
+              .participant(participant.externalId)
               .data("chat", "ordered"),
           );
-        if (track.label === "reactions" && track.delivery === "lossy")
+        if (
+          track.label === "reactions" &&
+          track.kind.inner.delivery === CatalogDelivery.Lossy
+        )
           reactions.push(
             pinnedRoom
-              .participant(participant.participantId)
+              .participant(participant.externalId)
               .data("reactions", "lossy"),
           );
       }
     }
     return {
       remoteVideoTracks: videos,
-      remoteAudioSelectors: audioSelectors,
+      remoteAudioTracks: audios,
       remoteChatTracks: chats,
       remoteReactionTracks: reactions,
     };
-  }, [agent, room, agent.roomId, agent.participants]);
+  }, [agent, room, agent.roomId, agent.participantId, pinnedRoom, page]);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(remoteVideoTracks);
   const connect = useCallback(() => {
     try {
@@ -231,19 +304,23 @@ function ActiveRoom({
     setReactionAnchor(null);
   };
   const video = (track: RemoteVideoTrack | null, fill: "contain" | "cover") => (
-    <Video
-      source={track ?? (cameraOn ? capture.video : null)}
-      receive={
+    <RoomVideo
+      track={track}
+      local={cameraOn ? capture.video : null}
+      preferences={
         track
           ? {
+              visible: true,
+              height: 0,
+              minHeight: 0,
               minFps: 15,
               priority: track === spotlight ? 200 : 10,
-              playoutDelay: latencyModes[latencyMode],
+              playoutDelay: latencyModes[latencyMode]
+                ? { mode: "fixed", ...latencyModes[latencyMode]! }
+                : { mode: "adaptive" },
             }
           : undefined
       }
-      autoPlay
-      mirror={!track}
       className={
         fill === "cover"
           ? "h-full w-full object-cover"
@@ -275,19 +352,13 @@ function ActiveRoom({
       onClickCapture={recoverPlayback}
       onKeyDownCapture={recoverPlayback}
     >
-      <Publish track={Camera} source={capture.video} enabled={cameraOn} />
-      <Publish track={Microphone} source={capture.audio} enabled={micOn} />
-      <Publish track={Screen} source={screen} content="detail" />
-      <SelectAudio agent={agent} policy={{ selected: remoteAudioSelectors }} />
-      <Audio
-        agent={agent}
-        onPlaybackError={(failure) =>
-          playbackError({
-            error: failure.cause ?? new Error(failure.message),
-            retry: failure.retry,
-          })
-        }
-      />
+      {remoteAudioTracks.map((track) => (
+        <RoomAudio
+          key={`${room}:${track.participantId}:${track.label}`}
+          track={track}
+          onPlaybackError={playbackError}
+        />
+      ))}
       {remoteChatTracks.map((track) => (
         <Data
           key={`${track.room}:${track.participantId}:${track.label}`}
@@ -505,16 +576,70 @@ function ActiveRoom({
         <Stack
           component="aside"
           spacing={1}
-          className="h-[110px] min-h-0 w-full shrink-0 lg:h-full lg:w-52"
+          className="h-[180px] min-h-0 w-full shrink-0 lg:h-full lg:w-52"
         >
           <Typography variant="overline" color="text.secondary">
-            Participants · {remoteTracks.length + 1}
+            Participants on this page · {page?.participants.length ?? "…"}
           </Typography>
+          <Stack direction="row" spacing={1}>
+            <Button
+              size="small"
+              onClick={firstPage}
+              disabled={
+                !cursor.length && catalogState?.status !== WatchStatus.Failed
+              }
+            >
+              First page
+            </Button>
+            <Button
+              size="small"
+              disabled={!page?.hasMore}
+              onClick={() => {
+                if (page?.hasMore)
+                  setCatalogScope((scope) => ({
+                    ...scope,
+                    room,
+                    cursor: [...page.nextCursor],
+                  }));
+              }}
+            >
+              Next page
+            </Button>
+          </Stack>
+          {!catalogState || catalogState.status === WatchStatus.Loading ? (
+            <Typography role="status">Loading participants…</Typography>
+          ) : null}
+          {catalogState?.status === WatchStatus.Failed && (
+            <Alert severity="error">
+              {cursor.length
+                ? "This continuation is invalid or expired. Return to the First page."
+                : "Unable to load participants."}{" "}
+              {catalogState.error?.message}
+            </Alert>
+          )}
+          {page && (
+            <Typography variant="caption">
+              {page.hasMore
+                ? "More participants are available."
+                : "End of this page list."}
+            </Typography>
+          )}
           <Stack
             direction={{ xs: "row", lg: "column" }}
             spacing={1}
             sx={{ overflow: "auto", flex: 1, minHeight: 0 }}
           >
+            {page?.participants.map((participant) => (
+              <Chip
+                key={participant.id}
+                size="small"
+                label={
+                  participant.externalId === agent.participantId
+                    ? `${participant.externalId} (you)`
+                    : participant.externalId
+                }
+              />
+            ))}
             {spotlight && tile(null)}
             {remoteTracks
               .filter((track) => track !== spotlight)

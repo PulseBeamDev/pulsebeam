@@ -3,7 +3,8 @@ import { Agent, type AgentConfig } from "@pulsebeam/web";
 import { sessionKey } from "./session-key.js";
 import { useObservation } from "./observation.js";
 
-export { usePublish, useSubscribe } from "./hooks.js";
+export { usePublish, useSubscribe, useWatch } from "./hooks.js";
+export { WatchStatus, CatalogDelivery } from "@pulsebeam/web";
 export type {
   Agent,
   AgentConfig,
@@ -30,7 +31,14 @@ export type {
   RemoteDataTrack,
   RemoteParticipant,
   RoomRef,
-  RemotePublishedTrack,
+  Watch,
+  WatchConfig,
+  WatchState,
+  WatchUpdates,
+  CatalogPage,
+  CatalogParticipantInfo,
+  CatalogPublicationInfo,
+  CatalogPublicationKind,
   RemoteVideoTrack,
   AudioPublication,
   VideoPublication,

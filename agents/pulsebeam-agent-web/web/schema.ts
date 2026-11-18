@@ -1,6 +1,8 @@
 export {
   AgentStatus,
   ErrorCode,
+  WatchStatus,
+  TopicMode as CatalogDelivery,
   MediaKind as PublicationMediaKind,
   PipeStatus,
   PublicationAdmissionStatus,
@@ -11,6 +13,9 @@ export {
 export type {
   AgentState,
   ErrorInfo,
+  CatalogParticipantInfo,
+  CatalogPublicationInfo,
+  CatalogPublicationKind,
   PipeState,
   PublicationState,
   VideoSubscriptionState,

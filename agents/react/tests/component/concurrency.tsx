@@ -148,7 +148,7 @@ export async function concurrentRender() {
   } finally {
     await flush(() => root.unmount());
     await flush();
-    preview.getTracks().forEach((track) => track.stop());
+    acquired.getTracks().forEach((track) => track.stop());
     assert.ok(
       acquired.getTracks().every((track) => track.readyState === "ended"),
     );
