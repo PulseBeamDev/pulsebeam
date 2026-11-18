@@ -38,6 +38,7 @@ macro_rules! agent_log {
 mod admission;
 mod credentials;
 mod native;
+mod publication;
 
 use admission::CreateRequest;
 
@@ -460,6 +461,19 @@ impl Agent {
                 self.resources.update_publication(owner, &spec, present)?;
                 ResourceResult::Updated
             }
+            ResourceCommand::AttachPublicationInput { owner } => {
+                let (operation, state) =
+                    self.resources.attach_publication_input(TrackOwner(owner))?;
+                ResourceResult::PublicationInput { operation, state }
+            }
+            ResourceCommand::DetachPublicationInput { input } => {
+                match self.resources.detach_publication_input(input) {
+                    Some((operation, state)) => {
+                        ResourceResult::PublicationInput { operation, state }
+                    }
+                    None => return Ok(ResourceResult::Superseded),
+                }
+            }
             ResourceCommand::BeginPublicationInput {
                 owner,
                 input,
@@ -481,19 +495,16 @@ impl Agent {
                     ResourceResult::Superseded
                 });
             }
-            ResourceCommand::CompletePublicationInput {
-                operation,
-                succeeded,
-            } => {
+            ResourceCommand::CompletePublicationInput { operation, result } => {
                 match self
                     .resources
-                    .complete_publication_input(&operation, succeeded)
+                    .complete_publication_input(&operation, result)
                 {
                     Some(state) => ResourceResult::PublicationInputState(state),
                     None => return Ok(ResourceResult::Superseded),
                 }
             }
-            ResourceCommand::CompletePublicationInputTarget { control, succeeded } => {
+            ResourceCommand::CompletePublicationInputTarget { control, result } => {
                 if control.target.is_none()
                     || control.operation.input().is_none()
                     || !self.publication_input_control_current(&control)
@@ -501,13 +512,15 @@ impl Agent {
                 {
                     return Ok(ResourceResult::Superseded);
                 }
-                if succeeded {
-                    ResourceResult::Updated
-                } else {
-                    match self.resources.fail_publication_input(&control.operation) {
+                match result {
+                    Ok(()) => ResourceResult::Updated,
+                    Err(code) => match self
+                        .resources
+                        .fail_publication_input(&control.operation, code)
+                    {
                         Some(state) => ResourceResult::PublicationInputState(state),
                         None => return Ok(ResourceResult::Superseded),
-                    }
+                    },
                 }
             }
             ResourceCommand::SetPublicationMuted { owner, muted } => {
@@ -678,6 +691,14 @@ impl Agent {
 
     pub fn next_notification(&mut self) -> Option<Notification> {
         self.published_notifications.pop_front()
+    }
+
+    /// Query attachment authority across registration work and connection incarnations.
+    pub fn publication_input_state(
+        &self,
+        input: crate::PublicationInputId,
+    ) -> Option<crate::PublicationInputState> {
+        self.resources.publication_input_state(input)
     }
 
     pub fn publication_input_control_current(

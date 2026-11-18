@@ -1,9 +1,18 @@
-use super::publication::InputTarget;
+use super::publication::{InputLease, InputTarget};
 use super::*;
-use crate::native_source::SourceKind;
+pub(super) use crate::native_source::SourceKind;
+
+fn ownership_conflict() -> Error {
+    Error::Core(agent_core::AgentError::InvalidResource(
+        agent_core::TrackResourceError::AlreadyOwned,
+    ))
+}
 
 pub(super) struct ProducerLease {
-    owner: u64,
+    pub(super) owner: u64,
+    pub(super) kind: SourceKind,
+    pub(super) binding_owner: std::sync::atomic::AtomicU64,
+    pipe_reservation: std::sync::Mutex<Option<agent_core::PublicationInputId>>,
     pub(super) closed: Arc<Signal>,
     feedback: broadcast::Sender<ProducerFeedback>,
     target: watch::Receiver<Option<SourceIdentity>>,
@@ -11,6 +20,25 @@ pub(super) struct ProducerLease {
     commands: mpsc::Sender<Command>,
     media: mpsc::Sender<MediaCommand>,
     changed: Arc<Notify>,
+}
+
+impl ProducerLease {
+    pub(super) fn release_pipe_reservation(
+        &self,
+        owner: u64,
+        input: agent_core::PublicationInputId,
+    ) {
+        let mut reservation = self
+            .pipe_reservation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *reservation == Some(input) {
+            let _ =
+                self.binding_owner
+                    .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
+            *reservation = None;
+        }
+    }
 }
 
 impl Drop for ProducerLease {
@@ -23,12 +51,119 @@ impl Drop for ProducerLease {
 /// An independently owned native producer, not a publication submission port.
 #[derive(Clone)]
 pub struct ProducerInput {
-    inner: Arc<ProducerLease>,
+    pub(super) inner: Arc<ProducerLease>,
 }
 
 impl ProducerInput {
     pub fn is_closed(&self) -> bool {
         self.inner.closed.is_closed()
+    }
+
+    /// Synchronously reserve this Agent-scoped producer for one publication.
+    pub fn pipe_to(&self, publication: &Publication) -> Result<Pipe, Error> {
+        if self.is_closed() || publication.is_closed() {
+            return Err(Error::Closed);
+        }
+        if !self
+            .inner
+            .commands
+            .same_channel(&publication.inner.commands)
+        {
+            return Err(ownership_conflict());
+        }
+        let compatible = matches!(
+            (&publication.inner.spec, self.inner.kind),
+            (agent_core::TrackSpec::Audio { .. }, SourceKind::Audio(_))
+                | (agent_core::TrackSpec::Video { .. }, SourceKind::Video(_))
+        );
+        if !compatible {
+            return Err(Error::InvalidInput(
+                "producer kind differs from the publication".into(),
+            ));
+        }
+        let serial = publication
+            .inner
+            .pipe_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_closed() || publication.is_closed() {
+            return Err(Error::Closed);
+        }
+        self.inner
+            .binding_owner
+            .compare_exchange(
+                0,
+                publication.inner.owner,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| ownership_conflict())?;
+        let (operation, observer) = match publication
+            .inner
+            .control
+            .attach_pipe(publication.inner.owner, &publication.inner.closed)
+        {
+            Ok(attached) => attached,
+            Err(error) => {
+                self.inner.binding_owner.store(0, Ordering::Release);
+                return Err(error);
+            }
+        };
+        let Some(input_id) = operation.input() else {
+            self.inner.binding_owner.store(0, Ordering::Release);
+            return Err(Error::Closed);
+        };
+        *self
+            .inner
+            .pipe_reservation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input_id);
+        let (target_tx, target) = watch::channel(None);
+        let (feedback, _) = broadcast::channel(EVENTS);
+        let inner = Arc::new(InputLease {
+            operation: operation.clone(),
+            closed: Arc::new(Signal::default()),
+            feedback,
+            target,
+            commands: self.inner.commands.clone(),
+            changed: self.inner.changed.clone(),
+        });
+        let input = PublicationInput { inner };
+        let pipe = Pipe::new(
+            operation,
+            input,
+            input_id,
+            observer,
+            publication.inner.control.clone(),
+            self.inner.clone(),
+            publication.inner.pipe.clone(),
+        );
+        let queued = self.inner.commands.try_send(Command::InstallPipe {
+            producer: self.clone(),
+            input: pipe.handle.input.clone(),
+            target: target_tx,
+        });
+        drop(serial);
+        publication
+            .inner
+            .control
+            .notify_pipe_attached(publication.inner.owner);
+        match queued {
+            Ok(()) => Ok(pipe),
+            Err(error) => {
+                let _ = publication
+                    .inner
+                    .control
+                    .detach_pipe(&pipe.handle.operation, &pipe.handle.observer);
+                self.inner
+                    .release_pipe_reservation(publication.inner.owner, input_id);
+                pipe.handle.input.inner.closed.close();
+                match error {
+                    mpsc::error::TrySendError::Full(_) => Err(Error::Backpressure),
+                    mpsc::error::TrySendError::Closed(_) => Err(Error::Closed),
+                }
+            }
+        }
     }
 
     fn target(&self) -> Result<SourceIdentity, Error> {
@@ -129,11 +264,11 @@ impl ProducerInput {
 
 pub(super) struct ProducerIo {
     pub(super) lease: Weak<ProducerLease>,
-    kind: SourceKind,
+    pub(super) kind: SourceKind,
     config: VideoSourceConfig,
     pub(super) physical: Option<SourceIdentity>,
     pub(super) target: watch::Sender<Option<SourceIdentity>>,
-    binding: Option<(u64, PublicationInput)>,
+    pub(super) binding: Option<(u64, PublicationInput)>,
     bound: watch::Sender<Option<InputTarget>>,
 }
 
@@ -201,6 +336,10 @@ where
         &mut self,
         video: Option<VideoSourceConfig>,
     ) -> Result<ProducerInput, Error> {
+        self.retire_producers();
+        if self.producers.len() >= MAX_PRODUCER_LEASES {
+            return Err(Error::CapacityExceeded);
+        }
         let (kind, config) = match video {
             Some(config) => (SourceKind::Video(self.config.media.video_input), config),
             None => (
@@ -219,6 +358,9 @@ where
         let (feedback, _) = broadcast::channel(EVENTS);
         let inner = Arc::new(ProducerLease {
             owner,
+            kind,
+            binding_owner: std::sync::atomic::AtomicU64::new(0),
+            pipe_reservation: std::sync::Mutex::new(None),
             closed: Arc::new(Signal::default()),
             feedback,
             target,
@@ -338,13 +480,27 @@ where
         owner: u64,
         input: Option<ProducerInput>,
     ) -> Result<(), Error> {
+        if !self.inputs.contains_key(&owner) && self.core.has_input(owner) {
+            return Err(ownership_conflict());
+        }
         let publication = self
             .publications
             .get(&owner)
             .and_then(Weak::upgrade)
             .filter(|lease| !lease.closed.is_closed())
             .ok_or(Error::Closed)?;
+        if self
+            .inputs
+            .get(&owner)
+            .is_some_and(|registered| registered.pipe)
+        {
+            return Err(ownership_conflict());
+        }
         let Some(input) = input else {
+            let producer_owner = self
+                .inputs
+                .get(&owner)
+                .and_then(|registered| registered.producer);
             if let Some(registered) = self.inputs.get(&owner) {
                 let operation = registered.operation.clone();
                 self.close_input(operation)?;
@@ -354,6 +510,12 @@ where
                 {
                     lease.closed.close();
                 }
+            }
+            if let Some(producer) =
+                producer_owner.and_then(|producer| self.producers.get(&producer))
+                && let Some(lease) = producer.lease.upgrade()
+            {
+                lease.binding_owner.store(0, Ordering::Release);
             }
             self.retire_producers();
             return Ok(());
@@ -380,11 +542,28 @@ where
             .as_ref()
             .is_some_and(|(bound, binding)| *bound != owner && !binding.is_closed())
         {
-            return Err(Error::InvalidInput(
-                "producer is already borrowed by another publication".into(),
-            ));
+            return Err(ownership_conflict());
         }
-        let binding = self.register_input(owner)?;
+        let already_bound = producer
+            .binding
+            .as_ref()
+            .is_some_and(|(bound, binding)| *bound == owner && !binding.is_closed());
+        if !already_bound {
+            input
+                .inner
+                .binding_owner
+                .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| ownership_conflict())?;
+        }
+        let binding = match self.register_input(owner) {
+            Ok(binding) => binding,
+            Err(error) => {
+                if !already_bound {
+                    input.inner.binding_owner.store(0, Ordering::Release);
+                }
+                return Err(error);
+            }
+        };
         self.inputs.get_mut(&owner).ok_or(Error::Closed)?.producer = Some(input.inner.owner);
         self.producers
             .get_mut(&input.inner.owner)
@@ -399,6 +578,16 @@ where
             .get_mut(&owner)
             .and_then(|producer| producer.binding.take());
         if let Some((publication, binding)) = binding {
+            if let Some(lease) = self
+                .producers
+                .get(&owner)
+                .and_then(|producer| producer.lease.upgrade())
+            {
+                lease
+                    .binding_owner
+                    .compare_exchange(publication, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .ok();
+            }
             let operation = &binding.inner.operation;
             if self
                 .inputs

@@ -365,6 +365,10 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
         ))
         .unwrap();
     assert!(client.converged(&resource()));
+    assert_eq!(
+        client.evaluation(&resource()).unwrap().evaluated_revision,
+        1
+    );
     assert!(client.eligible(&resource()).is_none());
     assert!(client.tracks().is_empty());
     assert!(client.participants().is_empty());
@@ -375,6 +379,11 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
     assert!(client.eligible(&resource()).is_some());
     client.stage(resource(), Some(spec(false, 1))).unwrap();
     assert!(client.eligible(&resource()).is_none());
+    assert!(client.evaluation(&resource()).is_none());
+    assert!(matches!(
+        client.confirmed(&resource()).unwrap().value,
+        Some(wire::confirmed_state::Value::Owned(_))
+    ));
     assert_eq!(next(&mut client)[0].1.revision, 2);
     client.stage(resource(), Some(spec(true, 1))).unwrap();
     assert!(client.next_frame().unwrap().is_none());
@@ -420,12 +429,26 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
     );
     assert!(client.eligible(&resource()).is_some());
     assert!(!client.converged(&resource()));
+    assert_eq!(
+        client
+            .evaluation(&resource())
+            .unwrap()
+            .rejection
+            .as_ref()
+            .unwrap()
+            .code,
+        wire::FailureCode::CapacityExceeded as i32
+    );
     client.stage(resource(), Some(spec(true, 1))).unwrap();
     assert!(client.next_frame().unwrap().is_none());
     client.retry(&resource());
     let retry = next(&mut client);
     assert_eq!((retry[0].0, retry[0].1.revision), (1, 4));
     assert!(client.confirmed(&resource()).unwrap().rejection.is_some());
+    assert!(
+        client.evaluation(&resource()).is_none(),
+        "old rejection is not the new retry outcome"
+    );
     assert!(client.eligible(&resource()).is_none());
 }
 

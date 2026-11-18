@@ -175,6 +175,7 @@ struct Pending {
 
 // Finite local retained-control work, not a stream-count or identity-history ceiling.
 const STATE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PUBLICATIONS: usize = 64;
 const SELECT_WORK: usize = 32;
 
 #[derive(Default)]
@@ -699,7 +700,11 @@ impl NativeSession {
                 )?;
                 continue;
             }
-            if !live_fits(spec) {
+            if !live_fits(spec)
+                || (publication_key(spec).is_some()
+                    && existing.is_none()
+                    && self.publications.len() >= MAX_PUBLICATIONS)
+            {
                 self.reject(
                     reference,
                     target,

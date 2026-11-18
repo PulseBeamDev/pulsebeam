@@ -91,6 +91,101 @@ impl<T: Clone> Hub<T> {
     }
 }
 
+trait RevisionedState: Clone + PartialEq {
+    fn set_revision(&mut self, revision: u64);
+}
+
+impl RevisionedState for AgentState {
+    fn set_revision(&mut self, revision: u64) {
+        self.observation_revision = revision;
+    }
+}
+
+impl RevisionedState for crate::ffi::PublicationState {
+    fn set_revision(&mut self, revision: u64) {
+        self.observation_revision = revision;
+    }
+}
+
+impl RevisionedState for crate::ffi::PipeState {
+    fn set_revision(&mut self, revision: u64) {
+        self.observation_revision = revision;
+    }
+}
+
+trait ResourceState: RevisionedState {
+    fn mark_closed(&mut self);
+}
+
+impl ResourceState for crate::ffi::PublicationState {
+    fn mark_closed(&mut self) {
+        self.closed = true;
+    }
+}
+
+impl ResourceState for crate::ffi::PipeState {
+    fn mark_closed(&mut self) {
+        self.status = crate::ffi::PipeStatus::Closed;
+    }
+}
+
+impl<T: RevisionedState> Hub<T> {
+    fn set(
+        &self,
+        value: T,
+        closing: bool,
+        source_revision: Option<u64>,
+    ) -> Result<PublishResult, RevisionExhausted> {
+        let result = self.prepare(value, closing, source_revision)?;
+        if result == PublishResult::Published {
+            self.notify();
+        }
+        Ok(result)
+    }
+
+    fn prepare(
+        &self,
+        mut value: T,
+        closing: bool,
+        source_revision: Option<u64>,
+    ) -> Result<PublishResult, RevisionExhausted> {
+        let mut hub = lock(&self.inner);
+        if hub.closed {
+            return Ok(PublishResult::Closed);
+        }
+        if let Some(revision) = source_revision
+            && hub
+                .source_revision
+                .is_some_and(|current| current >= revision)
+        {
+            return Ok(PublishResult::Unchanged);
+        }
+        value.set_revision(hub.revision);
+        if !closing && value == hub.value {
+            if source_revision.is_some() {
+                hub.source_revision = source_revision;
+            }
+            return Ok(PublishResult::Unchanged);
+        }
+        let revision = hub.revision.checked_add(1).ok_or(RevisionExhausted)?;
+        if source_revision.is_some() {
+            hub.source_revision = source_revision;
+        }
+        value.set_revision(revision);
+        hub.revision = revision;
+        hub.value = value;
+        hub.closed = closing;
+        Ok(PublishResult::Published)
+    }
+
+    fn notify(&self) {
+        let wakes = core::mem::take(&mut lock(&self.inner).waiters);
+        for (_, waker) in wakes {
+            waker.wake();
+        }
+    }
+}
+
 impl<T: Clone> Cursor<T> {
     fn next(&self) -> Result<Next<T>, ConcurrentNext> {
         let mut local = lock(&self.local);
@@ -216,6 +311,188 @@ pub enum PublishResult {
     Closed,
 }
 
+/// Core-internal resource snapshot; foreign APIs expose concrete records and cursors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObserverSnapshot<T> {
+    pub revision: u64,
+    pub value: T,
+}
+
+impl<T: Clone + PartialEq> RevisionedState for ObserverSnapshot<T> {
+    fn set_revision(&mut self, revision: u64) {
+        self.revision = revision;
+    }
+}
+
+pub struct BoundedUpdates<T: Clone> {
+    cursor: Cursor<ObserverSnapshot<T>>,
+}
+
+impl<T: Clone> BoundedUpdates<T> {
+    pub fn next(
+        &self,
+    ) -> Result<impl Future<Output = Option<ObserverSnapshot<T>>>, ConcurrentNext> {
+        self.cursor.next()
+    }
+
+    pub fn close(&self) {
+        self.cursor.close();
+    }
+}
+
+/// Core-internal shared coordinator, not a generic foreign observable API.
+pub struct BoundedObserver<T> {
+    hub: Hub<ObserverSnapshot<T>>,
+}
+
+impl<T: Clone + PartialEq> BoundedObserver<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            hub: Hub::new(ObserverSnapshot { revision: 1, value }, 1),
+        }
+    }
+
+    pub fn state(&self) -> ObserverSnapshot<T> {
+        lock(&self.hub.inner).value.clone()
+    }
+
+    pub fn updates(&self) -> Result<BoundedUpdates<T>, ObserverLimit> {
+        Ok(BoundedUpdates {
+            cursor: self.hub.subscribe()?,
+        })
+    }
+
+    pub fn publish(&self, value: T) -> Result<PublishResult, RevisionExhausted> {
+        self.set(value, false, None)
+    }
+
+    pub fn publish_from(
+        &self,
+        source_revision: u64,
+        value: T,
+    ) -> Result<PublishResult, RevisionExhausted> {
+        self.set(value, false, Some(source_revision))
+    }
+
+    pub fn close(&self, value: T) -> Result<PublishResult, RevisionExhausted> {
+        self.set(value, true, None)
+    }
+
+    fn set(
+        &self,
+        value: T,
+        closing: bool,
+        source_revision: Option<u64>,
+    ) -> Result<PublishResult, RevisionExhausted> {
+        self.hub.set(
+            ObserverSnapshot { revision: 0, value },
+            closing,
+            source_revision,
+        )
+    }
+}
+
+macro_rules! resource_observer {
+    ($observer:ident, $updates:ident, $notification:ident, $state:ty) => {
+        pub struct $updates {
+            cursor: Cursor<$state>,
+        }
+
+        impl $updates {
+            pub fn next(&self) -> Result<impl Future<Output = Option<$state>>, ConcurrentNext> {
+                self.cursor.next()
+            }
+
+            pub fn close(&self) {
+                self.cursor.close();
+            }
+        }
+
+        #[must_use = "notify after releasing the owner's serialization guard"]
+        pub struct $notification {
+            hub: Hub<$state>,
+            result: PublishResult,
+        }
+
+        impl $notification {
+            pub fn notify(self) -> PublishResult {
+                if self.result == PublishResult::Published {
+                    self.hub.notify();
+                }
+                self.result
+            }
+        }
+
+        pub struct $observer {
+            hub: Hub<$state>,
+        }
+
+        impl $observer {
+            pub fn new(mut initial: $state) -> Self {
+                initial.set_revision(1);
+                Self {
+                    hub: Hub::new(initial, 1),
+                }
+            }
+
+            pub fn state(&self) -> $state {
+                lock(&self.hub.inner).value.clone()
+            }
+
+            pub fn updates(&self) -> Result<$updates, ObserverLimit> {
+                Ok($updates {
+                    cursor: self.hub.subscribe()?,
+                })
+            }
+
+            /// Commit under the owner's serialization guard, then notify after releasing it.
+            /// Deferred notifications never republish a captured value or roll back newer state.
+            pub fn prepare(
+                &self,
+                mut state: $state,
+                closing: bool,
+            ) -> Result<$notification, RevisionExhausted> {
+                if closing {
+                    state.mark_closed();
+                }
+                let result = self.hub.prepare(state, closing, None)?;
+                Ok($notification {
+                    hub: Hub {
+                        inner: self.hub.inner.clone(),
+                    },
+                    result,
+                })
+            }
+
+            pub fn publish_from(
+                &self,
+                source_revision: u64,
+                state: $state,
+            ) -> Result<PublishResult, RevisionExhausted> {
+                self.hub.set(state, false, Some(source_revision))
+            }
+
+            pub fn close(&self, mut state: $state) -> Result<PublishResult, RevisionExhausted> {
+                state.mark_closed();
+                self.hub.set(state, true, None)
+            }
+        }
+    };
+}
+
+resource_observer!(
+    PublicationStateObserver,
+    PublicationUpdates,
+    PublicationNotification,
+    crate::ffi::PublicationState
+);
+resource_observer!(
+    PipeStateObserver,
+    PipeUpdates,
+    PipeNotification,
+    crate::ffi::PipeState
+);
+
 /// Core-owned bounded latest-state publisher. Main projects actor state into it.
 pub struct AgentStateObserver {
     hub: Hub<AgentState>,
@@ -263,47 +540,11 @@ impl AgentStateObserver {
 
     fn set(
         &self,
-        mut value: AgentState,
+        value: AgentState,
         closing: bool,
         source_revision: Option<u64>,
     ) -> Result<PublishResult, RevisionExhausted> {
-        let wakes = {
-            let mut hub = lock(&self.hub.inner);
-            if hub.closed {
-                return Ok(PublishResult::Closed);
-            }
-            if let Some(revision) = source_revision {
-                if hub
-                    .source_revision
-                    .is_some_and(|current| current >= revision)
-                {
-                    return Ok(PublishResult::Unchanged);
-                }
-            }
-            value.observation_revision = hub.revision;
-            if !closing && value == hub.value {
-                if source_revision.is_some() {
-                    hub.source_revision = source_revision;
-                }
-                return Ok(PublishResult::Unchanged);
-            }
-            let revision = hub.revision.checked_add(1).ok_or(RevisionExhausted)?;
-            if source_revision.is_some() {
-                hub.source_revision = source_revision;
-            }
-            value.observation_revision = revision;
-            hub.revision = revision;
-            hub.value = value;
-            hub.closed = closing;
-            core::mem::take(&mut hub.waiters)
-                .into_iter()
-                .map(|(_, waker)| waker)
-                .collect::<Vec<_>>()
-        };
-        for waker in wakes {
-            waker.wake();
-        }
-        Ok(PublishResult::Published)
+        self.hub.set(value, closing, source_revision)
     }
 }
 
@@ -358,6 +599,144 @@ mod tests {
             desired_room: None,
             status: AgentStatus::Idle,
             error: None,
+        }
+    }
+
+    #[test]
+    fn prepared_publications_commit_in_order_and_notify_without_republishing() {
+        let mut core = crate::Agent::new(crate::AgentConfig {
+            endpoint: "http://pulsebeam.test".into(),
+            token: "token".into(),
+            retry: Default::default(),
+            log_level: Default::default(),
+        })
+        .unwrap();
+        let crate::ResourceResult::Publication { owner, .. } = core
+            .resource(crate::ResourceCommand::ClaimPublication {
+                spec: crate::TrackSpec::Video {
+                    label: "camera".into(),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("expected publication");
+        };
+        let observer = PublicationStateObserver::new(core.publication_state(owner).unwrap());
+        let cursor = observer.updates().unwrap();
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+        let mut initial = Box::pin(cursor.next().unwrap());
+        assert!(initial.as_mut().poll(&mut cx).is_ready());
+        let mut pending = Box::pin(cursor.next().unwrap());
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+
+        core.resource(crate::ResourceCommand::SetPublicationMuted { owner, muted: true })
+            .unwrap();
+        let older = observer
+            .prepare(core.publication_state(owner).unwrap(), false)
+            .unwrap();
+        assert!(!observer.state().configuration.enabled);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        core.resource(crate::ResourceCommand::SetPublicationMuted {
+            owner,
+            muted: false,
+        })
+        .unwrap();
+        let newer = observer
+            .prepare(core.publication_state(owner).unwrap(), false)
+            .unwrap();
+        let latest = observer.state();
+        assert!(latest.configuration.enabled);
+        newer.notify();
+        older.notify();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(pending.as_mut().poll(&mut cx), Poll::Ready(Some(latest)));
+
+        let mut final_read = Box::pin(cursor.next().unwrap());
+        assert!(final_read.as_mut().poll(&mut cx).is_pending());
+        core.resource(crate::ResourceCommand::SetPublicationMuted { owner, muted: true })
+            .unwrap();
+        drop(
+            observer
+                .prepare(core.publication_state(owner).unwrap(), false)
+                .unwrap(),
+        );
+        let closing = observer
+            .prepare(core.publication_state(owner).unwrap(), true)
+            .unwrap();
+        assert!(observer.state().closed);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        closing.notify();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            final_read.as_mut().poll(&mut cx),
+            Poll::Ready(Some(observer.state()))
+        );
+        let mut ended = Box::pin(cursor.next().unwrap());
+        assert_eq!(ended.as_mut().poll(&mut cx), Poll::Ready(None));
+    }
+
+    #[test]
+    fn pipe_cursors_retain_runtime_failure_and_deliver_final_close() {
+        use crate::ffi::{ErrorCode, ErrorInfo, PipeState, PipeStatus};
+
+        let observer = PipeStateObserver::new(PipeState {
+            observation_revision: 0,
+            status: PipeStatus::Pending,
+            error: None,
+        });
+        let a = observer.updates().unwrap();
+        let b = observer.updates().unwrap();
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut cx = Context::from_waker(&waker);
+        for cursor in [&a, &b] {
+            let mut read = Box::pin(cursor.next().unwrap());
+            assert_eq!(
+                read.as_mut().poll(&mut cx),
+                Poll::Ready(Some(observer.state()))
+            );
+        }
+        let mut pending = Box::pin(a.next().unwrap());
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        let failed = observer
+            .prepare(
+                PipeState {
+                    observation_revision: 0,
+                    status: PipeStatus::Unavailable,
+                    error: Some(ErrorInfo::new(
+                        ErrorCode::Unsupported,
+                        "Input operation failed",
+                    )),
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(observer.state().observation_revision, 2);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        let closing = observer.prepare(observer.state(), true).unwrap();
+        let final_state = observer.state();
+        assert_eq!(final_state.status, PipeStatus::Closed);
+        assert_eq!(
+            final_state.error.as_ref().unwrap().code,
+            ErrorCode::Unsupported
+        );
+        closing.notify();
+        failed.notify();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            pending.as_mut().poll(&mut cx),
+            Poll::Ready(Some(final_state.clone()))
+        );
+        let mut coalesced = Box::pin(b.next().unwrap());
+        assert_eq!(
+            coalesced.as_mut().poll(&mut cx),
+            Poll::Ready(Some(final_state))
+        );
+        for cursor in [&a, &b] {
+            let mut ended = Box::pin(cursor.next().unwrap());
+            assert_eq!(ended.as_mut().poll(&mut cx), Poll::Ready(None));
         }
     }
 
@@ -489,6 +868,67 @@ mod tests {
         changed.status = AgentStatus::Joined;
         assert_eq!(observer.publish(changed), Ok(PublishResult::Published));
         assert_eq!(observer.state().observation_revision, 42);
+    }
+
+    #[test]
+    fn resource_observers_share_bounded_cursors_and_source_fencing() {
+        let observer = BoundedObserver::new(0_u8);
+        let cursors = (0..MAX_OBSERVERS)
+            .map(|_| observer.updates().unwrap())
+            .collect::<Vec<_>>();
+        assert!(observer.updates().is_err());
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter);
+        let mut context = Context::from_waker(&waker);
+        let mut initial = Box::pin(cursors[0].next().unwrap());
+        assert_eq!(
+            initial.as_mut().poll(&mut context),
+            Poll::Ready(Some(observer.state()))
+        );
+        drop(initial);
+        let mut pending = Box::pin(cursors[0].next().unwrap());
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+        assert!(cursors[0].next().is_err());
+        assert_eq!(observer.publish_from(4, 0), Ok(PublishResult::Unchanged));
+        assert_eq!(observer.publish_from(3, 1), Ok(PublishResult::Unchanged));
+        assert_eq!(
+            observer.state(),
+            ObserverSnapshot {
+                revision: 1,
+                value: 0
+            }
+        );
+        assert_eq!(observer.publish_from(5, 1), Ok(PublishResult::Published));
+        assert_eq!(
+            pending.as_mut().poll(&mut context),
+            Poll::Ready(Some(observer.state()))
+        );
+        drop(pending);
+        assert_eq!(observer.close(2), Ok(PublishResult::Published));
+        let final_state = observer.state();
+        assert_eq!(
+            final_state,
+            ObserverSnapshot {
+                revision: 3,
+                value: 2
+            }
+        );
+        assert_eq!(observer.publish_from(6, 3), Ok(PublishResult::Closed));
+        let mut final_read = Box::pin(cursors[1].next().unwrap());
+        assert_eq!(
+            final_read.as_mut().poll(&mut context),
+            Poll::Ready(Some(final_state))
+        );
+        drop(final_read);
+        let mut end = Box::pin(cursors[1].next().unwrap());
+        assert_eq!(end.as_mut().poll(&mut context), Poll::Ready(None));
+        drop(end);
+        let mut cancelled = Box::pin(cursors[0].next().unwrap());
+        cursors[0].close();
+        assert_eq!(cancelled.as_mut().poll(&mut context), Poll::Ready(None));
+        drop(cancelled);
+        drop(cursors);
+        assert!(observer.updates().is_ok());
     }
 
     #[test]

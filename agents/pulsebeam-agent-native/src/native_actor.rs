@@ -22,7 +22,7 @@ use crate::native_media::*;
 use crate::native_peer::{NativePeer, Observation};
 
 mod control;
-use control::Control;
+use control::{Control, PublicationControl};
 mod data;
 use data::DataIo;
 pub use data::{DataReceiver, LocalDataTrack, Participant, RemoteDataTrack};
@@ -30,8 +30,8 @@ mod producer;
 pub use producer::ProducerInput;
 use producer::ProducerIo;
 mod publication;
-pub use publication::Publication;
-use publication::{PublicationInput, PublicationLease, RegisteredInput};
+use publication::{InputTarget, PublicationInput, PublicationLease, RegisteredInput};
+pub use publication::{Pipe, Publication, PublicationUpdates};
 mod subscription;
 pub use subscription::Subscription;
 use subscription::{ObservationIo, SubscriptionLease};
@@ -44,6 +44,7 @@ const EVENTS: usize = 64;
 const STREAM_FRAMES: usize = 4;
 const OBSERVERS: usize = 32;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PRODUCER_LEASES: usize = 64;
 // Never overwrite a live consumer solely within one actor turn. Reserve one
 // channel entry for each possible SDK-drop observation, then yield before
 // draining the next native batch. Combined mode has two independent counters.
@@ -122,11 +123,33 @@ pub enum Error {
     NotReady,
     #[error("bounded admission queue is full")]
     Backpressure,
+    #[error("independent frame-source capacity exceeded")]
+    CapacityExceeded,
     #[error("unknown media slot: {0:?}")]
     UnknownSlot(MediaSlot),
     #[error("invalid media input: {0}")]
     InvalidInput(String),
 }
+impl Error {
+    pub(crate) fn error_info(&self) -> agent_core::ffi::ErrorInfo {
+        use agent_core::ffi::{ErrorCode, ErrorInfo};
+
+        let (code, message) = match self {
+            Self::Core(error) => return ErrorInfo::from(error),
+            Self::Closed => (ErrorCode::Closed, "Agent is closed"),
+            Self::NotReady => (ErrorCode::NotReady, "Agent is not ready"),
+            Self::Backpressure | Self::CapacityExceeded => {
+                (ErrorCode::CapacityExceeded, "Operation capacity exceeded")
+            }
+            Self::UnknownSlot(_) | Self::InvalidInput(_) => {
+                (ErrorCode::InvalidArgument, "Invalid operation argument")
+            }
+            Self::DataSend(_) | Self::Rtc(_) => (ErrorCode::Internal, "Operation failed"),
+        };
+        ErrorInfo::new(code, message)
+    }
+}
+
 impl From<rtc::PeerError> for Error {
     fn from(error: rtc::PeerError) -> Self {
         if error.kind == rtc::PeerErrorKind::Closed {
@@ -305,6 +328,15 @@ enum Command {
     BindProducer {
         owner: u64,
         producer: Option<ProducerInput>,
+        response: oneshot::Sender<Result<(), Error>>,
+    },
+    InstallPipe {
+        producer: ProducerInput,
+        input: PublicationInput,
+        target: watch::Sender<Option<InputTarget>>,
+    },
+    ClosePipe {
+        operation: agent_core::PublicationInputOperation,
         response: oneshot::Sender<Result<(), Error>>,
     },
     CloseProducer {
@@ -1150,6 +1182,22 @@ where
                 response,
             } => {
                 let result = self.bind_producer(owner, producer);
+                let _ = response.send(result);
+            }
+            Command::InstallPipe {
+                producer,
+                input,
+                target,
+            } => {
+                if let Err(error) = self.install_pipe(producer, input, target) {
+                    self.fail(error);
+                }
+            }
+            Command::ClosePipe {
+                operation,
+                response,
+            } => {
+                let result = self.cleanup_pipe(operation);
                 let _ = response.send(result);
             }
             Command::CloseProducer { owner, response } => {
@@ -2221,6 +2269,57 @@ async fn execute_signaling_http(
 mod tests {
     use super::*;
 
+    #[test]
+    fn error_info_preserves_core_codes_and_redacts_native_details() {
+        use agent_core::ffi::ErrorCode;
+
+        let cases = [
+            (Error::Closed, ErrorCode::Closed, "Agent is closed"),
+            (Error::NotReady, ErrorCode::NotReady, "Agent is not ready"),
+            (
+                Error::Backpressure,
+                ErrorCode::CapacityExceeded,
+                "Operation capacity exceeded",
+            ),
+            (
+                Error::CapacityExceeded,
+                ErrorCode::CapacityExceeded,
+                "Operation capacity exceeded",
+            ),
+            (
+                Error::UnknownSlot(MediaSlot::LocalAudio("secret-slot".into())),
+                ErrorCode::InvalidArgument,
+                "Invalid operation argument",
+            ),
+            (
+                Error::InvalidInput("private input detail".into()),
+                ErrorCode::InvalidArgument,
+                "Invalid operation argument",
+            ),
+            (
+                Error::DataSend(agent_core::DataSendFailure::HostRejected),
+                ErrorCode::Internal,
+                "Operation failed",
+            ),
+            (
+                Error::Rtc("private RTC detail".into()),
+                ErrorCode::Internal,
+                "Operation failed",
+            ),
+        ];
+        for (error, code, message) in cases {
+            let info = error.error_info();
+            assert_eq!(info.code, code);
+            assert_eq!(info.message, message);
+            assert!(!info.message.contains("private"));
+            assert!(info.message.len() <= 256);
+        }
+
+        let core = Error::Core(agent_core::AgentError::InvalidAuthorizationToken).error_info();
+        assert_eq!(core.code, ErrorCode::InvalidArgument);
+        assert_eq!(core.message, "Invalid operation argument");
+    }
+
     #[tokio::test]
     async fn observation_cursor_close_retires_pending_reads_without_closing_siblings() {
         let (sender, receiver) = broadcast::channel::<u8>(2);
@@ -2809,6 +2908,244 @@ mod tests {
     }
 
     #[test]
+    fn pipe_reserves_core_lifetime_and_closes_without_closing_borrowed_source() {
+        let _guard = crate::native_media::NATIVE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (agent, mut actor) = Agent::parts(
+                    config(),
+                    Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+                    || Ok((rtc::ThreadedRuntime, ())),
+                )
+                .unwrap();
+                let source = actor.create_producer(None).unwrap();
+                let publication = actor
+                    .claim_publication(agent_core::TrackSpec::Audio {
+                        label: "pipe-test".into(),
+                    })
+                    .unwrap();
+                let wrong_kind = actor
+                    .create_producer(Some(VideoSourceConfig::default()))
+                    .unwrap();
+                assert!(matches!(
+                    wrong_kind.pipe_to(&publication),
+                    Err(Error::InvalidInput(_))
+                ));
+                let (foreign_agent, mut foreign_actor) = Agent::parts(
+                    config(),
+                    Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+                    || Ok((rtc::ThreadedRuntime, ())),
+                )
+                .unwrap();
+                let foreign = foreign_actor.create_producer(None).unwrap();
+                assert!(matches!(
+                    foreign.pipe_to(&publication),
+                    Err(Error::Core(agent_core::AgentError::InvalidResource(
+                        agent_core::TrackResourceError::AlreadyOwned
+                    )))
+                ));
+                foreign_actor.shutdown();
+                drop(foreign_agent);
+                let closed_source = actor.create_producer(None).unwrap();
+                let mut close_source = Box::pin(closed_source.close());
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(
+                        close_source.as_mut().poll(cx)
+                    ))
+                    .await
+                    .is_pending()
+                );
+                let close_source_command = actor.commands.try_recv().unwrap();
+                actor.command(close_source_command);
+                close_source.await.unwrap();
+                assert!(matches!(
+                    closed_source.pipe_to(&publication),
+                    Err(Error::Closed)
+                ));
+                let pipe = source.pipe_to(&publication).unwrap();
+                let competing_source = actor.create_producer(None).unwrap();
+                assert!(matches!(
+                    competing_source.pipe_to(&publication),
+                    Err(Error::Core(agent_core::AgentError::InvalidResource(
+                        agent_core::TrackResourceError::AlreadyOwned
+                    )))
+                ));
+                let updates = pipe.updates().unwrap();
+                assert_eq!(
+                    updates.next().unwrap().await.unwrap().status,
+                    agent_core::ffi::PipeStatus::Pending
+                );
+                assert!(matches!(
+                    source.pipe_to(&publication),
+                    Err(Error::Core(agent_core::AgentError::InvalidResource(
+                        agent_core::TrackResourceError::AlreadyOwned
+                    )))
+                ));
+
+                let install = actor.commands.try_recv().unwrap();
+                actor.command(install);
+                assert_eq!(
+                    updates.next().unwrap().await.unwrap().status,
+                    agent_core::ffi::PipeStatus::Available
+                );
+                let mut close = Box::pin(pipe.close());
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                let cleanup = actor.commands.try_recv().unwrap();
+                actor.command(cleanup);
+                close.await.unwrap();
+                assert_eq!(
+                    updates.next().unwrap().await.unwrap().status,
+                    agent_core::ffi::PipeStatus::Closed
+                );
+                assert!(actor.inputs.is_empty());
+                assert!(!source.is_closed());
+                assert!(!publication.is_closed());
+                assert!(pipe.state().error.is_none());
+                pipe.close().await.unwrap();
+                updates.close();
+
+                let stale = source.pipe_to(&publication).unwrap();
+                let stale_install = actor.commands.try_recv().unwrap();
+                let mut close_stale = Box::pin(stale.close());
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(close_stale.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                let stale_cleanup = actor.commands.try_recv().unwrap();
+                actor.command(stale_cleanup);
+                close_stale.await.unwrap();
+
+                let replacement = source.pipe_to(&publication).unwrap();
+                let replacement_install = actor.commands.try_recv().unwrap();
+                actor.command(stale_install);
+                assert_eq!(
+                    source.inner.binding_owner.load(Ordering::Acquire),
+                    publication.inner.owner
+                );
+                assert!(!replacement.handle.input.is_closed());
+                assert!(matches!(
+                    competing_source.pipe_to(&publication),
+                    Err(Error::Core(agent_core::AgentError::InvalidResource(
+                        agent_core::TrackResourceError::AlreadyOwned
+                    )))
+                ));
+                actor.command(replacement_install);
+                let mut close_replacement = Box::pin(replacement.close());
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(close_replacement.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                let replacement_cleanup = actor.commands.try_recv().unwrap();
+                actor.command(replacement_cleanup);
+                close_replacement.await.unwrap();
+
+                let rebound = source.pipe_to(&publication).unwrap();
+                let stale_install = actor.commands.try_recv().unwrap();
+                let mut close_publication = Box::pin(publication.close());
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(close_publication.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                actor.command(stale_install);
+                assert!(rebound.handle.input.is_closed());
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(close_publication.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                let detach = actor.commands.try_recv().unwrap();
+                actor.command(detach);
+                assert!(
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(close_publication.as_mut().poll(cx))
+                    })
+                    .await
+                    .is_pending()
+                );
+                let release = actor.commands.try_recv().unwrap();
+                actor.command(release);
+                close_publication.await.unwrap();
+                assert_eq!(rebound.state().status, agent_core::ffi::PipeStatus::Closed);
+                assert!(!source.is_closed());
+                actor.shutdown();
+                drop(agent);
+            });
+    }
+
+    #[test]
+    fn independent_producer_capacity_is_shared_and_reclaimed_after_terminal_close() {
+        let _guard = crate::native_media::NATIVE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+            || Ok((rtc::ThreadedRuntime, ())),
+        )
+        .unwrap();
+        let mut handles = Vec::new();
+        for index in 0..MAX_PRODUCER_LEASES {
+            handles.push(if index % 2 == 0 {
+                actor.create_producer(None).unwrap()
+            } else {
+                actor
+                    .create_producer(Some(VideoSourceConfig::default()))
+                    .unwrap()
+            });
+        }
+        assert_eq!(actor.producers.len(), MAX_PRODUCER_LEASES);
+        assert!(matches!(
+            actor.create_producer(Some(VideoSourceConfig::default())),
+            Err(Error::CapacityExceeded)
+        ));
+        assert_eq!(actor.producers.len(), MAX_PRODUCER_LEASES);
+        assert!(handles.iter().all(|source| !source.is_closed()));
+        assert!(
+            actor
+                .producers
+                .values()
+                .all(|producer| producer.physical.is_none())
+        );
+
+        let closed_owner = *actor.producers.keys().next().unwrap();
+        actor.producers[&closed_owner]
+            .lease
+            .upgrade()
+            .unwrap()
+            .closed
+            .close();
+        let replacement = actor
+            .create_producer(Some(VideoSourceConfig::default()))
+            .unwrap();
+        assert!(handles[0].is_closed());
+        assert_eq!(actor.producers.len(), MAX_PRODUCER_LEASES);
+        assert!(handles[1..].iter().all(|source| !source.is_closed()));
+        assert!(!replacement.is_closed());
+        assert!(!agent.is_closed());
+        actor.shutdown();
+    }
+
+    #[test]
     fn owned_producer_survives_publication_retirement_and_fences_queued_frames() {
         let _guard = crate::native_media::NATIVE_TEST_SERIAL
             .lock()
@@ -2975,6 +3312,43 @@ mod tests {
             });
     }
 
+    #[test]
+    fn detaching_input_clears_its_target_without_retiring_publication() {
+        let (_agent, mut actor) = Agent::parts(
+            config(),
+            Host::new(Box::new(PendingHttp(Arc::new(AtomicBool::new(false))))),
+            || Ok((rtc::ThreadedRuntime, ())),
+        )
+        .unwrap();
+        let publication = actor
+            .claim_publication(agent_core::TrackSpec::Audio {
+                label: "microphone".into(),
+            })
+            .unwrap();
+        let owner = *actor.publications.keys().next().unwrap();
+        let input = actor.register_input(owner).unwrap();
+        let control = std::iter::from_fn(|| actor.core.next_effect())
+            .filter_map(|effect| match effect {
+                Effect::PublicationInput(control) => Some(control),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        let (source, _, _receiver) = source_fixture();
+        actor.inputs[&owner]
+            .target
+            .send_replace(Some(publication::InputTarget {
+                source: source.clone(),
+                control: Arc::new(control),
+            }));
+        assert!(input.target().is_ok());
+        actor.close_input(input.inner.operation.clone()).unwrap();
+        assert!(matches!(input.target(), Err(Error::NotReady)));
+        assert!(source.is_closed());
+        assert!(!publication.is_closed());
+        actor.shutdown();
+    }
+
     fn source_fixture() -> (
         PhysicalSource,
         Arc<agent_core::PublicationInputControl>,
@@ -3005,7 +3379,7 @@ mod tests {
         };
         core.resource(agent_core::ResourceCommand::CompletePublicationInput {
             operation,
-            succeeded: true,
+            result: Ok(()),
         })
         .unwrap();
         let control = std::iter::from_fn(|| core.next_effect())

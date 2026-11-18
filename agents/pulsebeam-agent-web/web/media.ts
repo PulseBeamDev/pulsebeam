@@ -4,6 +4,9 @@ import {
   VideoSource,
   watchSource,
 } from "./capture-source.js";
+import { PublicationObservation } from "./publication-observation.js";
+import type { BrowserRuntime } from "./wasm.js";
+import type { PublicationState } from "./schema.js";
 import {
   ResourceError,
   ResourceOwner,
@@ -22,6 +25,7 @@ import type {
   LocalAudioTrack,
   LocalVideoTrack,
   PublicationConfig,
+  PublicationUpdates,
   SenderConfig,
   VideoSenderConfig,
 } from "./types.js";
@@ -84,6 +88,7 @@ class Publication<S extends Source> {
   readonly #resource: ResourceOwner;
   #source: S | null;
   #sourceRevision = {};
+  readonly #observation = new PublicationObservation();
   #enabled: boolean;
   #config: SenderConfig;
   #unwatch: (() => void) | undefined;
@@ -110,7 +115,11 @@ class Publication<S extends Source> {
         spec: { kind: handle.kind, label: handle.label },
       },
       {
-        bind: () => {
+        bind: (binding) => {
+          this.#observation.bind(
+            binding.runtime as InstanceType<typeof BrowserRuntime>,
+            binding.owner,
+          );
           void this.#replace(true).catch(() => {});
         },
         unbind: () => {
@@ -127,6 +136,12 @@ class Publication<S extends Source> {
   }
   isClosed(): boolean {
     return this.#resource.isClosed();
+  }
+  state(): Readonly<PublicationState> {
+    return this.#observation.state();
+  }
+  updates(): PublicationUpdates {
+    return this.#observation.updates();
   }
   #assertOpen(): void {
     if (this.isClosed())

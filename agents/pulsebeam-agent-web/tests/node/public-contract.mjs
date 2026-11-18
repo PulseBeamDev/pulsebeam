@@ -47,11 +47,14 @@ export async function publicContract(pulsebeam) {
     stateUpdates.close();
     assert.equal(await pendingState, undefined);
     const capacity = Array.from({ length: 31 }, () => agent.updates());
-    assert.throws(() => agent.updates(), (error) => {
-      assert.equal(error instanceof OperationError, true);
-      assert.equal(error.info.code, ErrorCode.CapacityExceeded);
-      return true;
-    });
+    assert.throws(
+      () => agent.updates(),
+      (error) => {
+        assert.equal(error instanceof OperationError, true);
+        assert.equal(error.info.code, ErrorCode.CapacityExceeded);
+        return true;
+      },
+    );
     for (const cursor of capacity) cursor.close();
     const replacement = agent.updates();
     assert.equal(await replacement.next(), initialState);
@@ -128,7 +131,8 @@ export async function publicContract(pulsebeam) {
     while (true) {
       const update = await renewedUpdates.next();
       assert.notEqual(update.type, "closed");
-      const current = update.type === "snapshot" ? update.snapshot : agent.snapshot();
+      const current =
+        update.type === "snapshot" ? update.snapshot : agent.snapshot();
       if (current?.credentialRevision === 2n) break;
     }
     await renewedUpdates.close();

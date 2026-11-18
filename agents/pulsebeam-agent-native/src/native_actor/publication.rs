@@ -8,15 +8,38 @@ pub(super) struct PublicationLease {
     pub(super) owner: u64,
     pub(super) spec: TrackSpec,
     pub(super) closed: Arc<Signal>,
+    closing: std::sync::atomic::AtomicBool,
     readiness: watch::Sender<Option<PhysicalSource>>,
-    commands: mpsc::Sender<Command>,
+    pub(super) commands: mpsc::Sender<Command>,
     changed: Arc<Notify>,
+    pub(super) control: PublicationControl,
+    observer: Arc<agent_core::observer::PublicationStateObserver>,
+    pub(super) pipe: Arc<std::sync::Mutex<Option<Weak<PipeLease>>>>,
+    pub(super) pipe_serial: std::sync::Mutex<()>,
 }
 
 impl Drop for PublicationLease {
     fn drop(&mut self) {
         self.closed.close();
         self.changed.notify_one();
+    }
+}
+
+pub struct PublicationUpdates {
+    updates: agent_core::observer::PublicationUpdates,
+    _observer: Arc<agent_core::observer::PublicationStateObserver>,
+}
+
+impl PublicationUpdates {
+    pub async fn next(
+        &self,
+    ) -> Result<Option<agent_core::ffi::PublicationState>, agent_core::observer::ConcurrentNext>
+    {
+        Ok(self.updates.next()?.await)
+    }
+
+    pub fn close(&self) {
+        self.updates.close();
     }
 }
 
@@ -27,7 +50,7 @@ pub struct Publication {
 
 impl Publication {
     pub fn is_closed(&self) -> bool {
-        self.inner.closed.is_closed()
+        self.inner.closing.load(Ordering::Acquire) || self.inner.closed.is_closed()
     }
 
     pub async fn ready(&self) -> Result<(), Error> {
@@ -91,28 +114,58 @@ impl Publication {
         if self.is_closed() {
             return Err(Error::Closed);
         }
-        let (response, result) = oneshot::channel();
-        self.inner
-            .commands
-            .send(Command::Resource {
-                command: ResourceCommand::SetPublicationMuted {
-                    owner: self.inner.owner,
-                    muted: !configuration.enabled,
-                },
-                response,
-            })
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)??;
+        self.inner.control.configure(
+            self.inner.owner,
+            &self.inner.observer,
+            configuration.enabled,
+        )?;
         Ok(())
     }
 
+    pub fn state(&self) -> agent_core::ffi::PublicationState {
+        self.inner
+            .control
+            .state(self.inner.owner, &self.inner.observer)
+    }
+
+    pub fn updates(&self) -> Result<PublicationUpdates, agent_core::observer::ObserverLimit> {
+        let _ = self.state();
+        let updates = self.inner.observer.updates()?;
+        Ok(PublicationUpdates {
+            updates,
+            _observer: self.inner.observer.clone(),
+        })
+    }
+
     pub async fn close(&self) -> Result<(), Error> {
-        if self.is_closed() {
+        let (pipe, already_closed) = {
+            let _serial = self
+                .inner
+                .pipe_serial
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let already_closed =
+                self.inner.closing.swap(true, Ordering::AcqRel) || self.inner.closed.is_closed();
+            let pipe = self
+                .inner
+                .pipe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(Weak::upgrade);
+            (pipe, already_closed)
+        };
+        if already_closed {
+            if let Some(pipe) = pipe {
+                Pipe { handle: pipe }.close().await?;
+            }
             return Ok(());
         }
         self.inner.closed.close();
         self.inner.changed.notify_one();
+        if let Some(pipe) = pipe {
+            Pipe { handle: pipe }.close().await?;
+        }
         let (response, result) = oneshot::channel();
         self.inner
             .commands
@@ -139,9 +192,9 @@ pub(super) struct InputLease {
     pub(super) operation: PublicationInputOperation,
     pub(super) closed: Arc<Signal>,
     pub(super) feedback: broadcast::Sender<ProducerFeedback>,
-    target: watch::Receiver<Option<InputTarget>>,
-    commands: mpsc::Sender<Command>,
-    changed: Arc<Notify>,
+    pub(super) target: watch::Receiver<Option<InputTarget>>,
+    pub(super) commands: mpsc::Sender<Command>,
+    pub(super) changed: Arc<Notify>,
 }
 
 impl Drop for InputLease {
@@ -156,6 +209,7 @@ pub(super) struct RegisteredInput {
     pub(super) lease: Weak<InputLease>,
     pub(super) target: watch::Sender<Option<InputTarget>>,
     pub(super) producer: Option<u64>,
+    pub(super) pipe: bool,
     pending_control: Option<PublicationInputControl>,
 }
 
@@ -240,11 +294,281 @@ impl PublicationInput {
     }
 }
 
+pub(super) struct PipeLease {
+    pub(super) operation: PublicationInputOperation,
+    pub(super) input: PublicationInput,
+    pub(super) input_id: agent_core::PublicationInputId,
+    pub(super) observer: Arc<agent_core::observer::PipeStateObserver>,
+    pub(super) control: PublicationControl,
+    pub(super) producer: Arc<super::producer::ProducerLease>,
+    cleanup: Mutex<bool>,
+}
+
+impl Drop for PipeLease {
+    fn drop(&mut self) {
+        if *self.cleanup.get_mut() {
+            return;
+        }
+        self.input.inner.closed.close();
+        self.input.inner.changed.notify_one();
+        let _ = self.control.detach_pipe(&self.operation, &self.observer);
+        let (response, _result) = oneshot::channel();
+        let _ = self.input.inner.commands.try_send(Command::ClosePipe {
+            operation: self.operation.clone(),
+            response,
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct Pipe {
+    pub(super) handle: Arc<PipeLease>,
+}
+
+impl Pipe {
+    pub(super) fn new(
+        operation: PublicationInputOperation,
+        input: PublicationInput,
+        input_id: agent_core::PublicationInputId,
+        observer: Arc<agent_core::observer::PipeStateObserver>,
+        control: PublicationControl,
+        producer: Arc<super::producer::ProducerLease>,
+        publication_pipe: Arc<std::sync::Mutex<Option<Weak<PipeLease>>>>,
+    ) -> Self {
+        let handle = Arc::new(PipeLease {
+            operation,
+            input,
+            input_id,
+            observer,
+            control,
+            producer,
+            cleanup: Mutex::new(false),
+        });
+        *publication_pipe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(&handle));
+        Self { handle }
+    }
+
+    pub fn state(&self) -> agent_core::ffi::PipeState {
+        self.handle
+            .control
+            .pipe_state(self.handle.input_id, &self.handle.observer)
+    }
+
+    pub fn updates(
+        &self,
+    ) -> Result<agent_core::observer::PipeUpdates, agent_core::observer::ObserverLimit> {
+        let _ = self.state();
+        self.handle.observer.updates()
+    }
+
+    pub async fn close(&self) -> Result<(), Error> {
+        let mut complete = self.handle.cleanup.lock().await;
+        if *complete {
+            return Ok(());
+        }
+        self.handle.input.inner.closed.close();
+        self.handle.input.inner.changed.notify_one();
+        self.handle
+            .control
+            .detach_pipe(&self.handle.operation, &self.handle.observer)?;
+        let (response, result) = oneshot::channel();
+        self.handle
+            .input
+            .inner
+            .commands
+            .send(Command::ClosePipe {
+                operation: self.handle.operation.clone(),
+                response,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        let outcome = result.await.map_err(|_| Error::Closed)?;
+        self.handle
+            .producer
+            .release_pipe_reservation(self.handle.operation.owner(), self.handle.input_id);
+        *complete = true;
+        outcome
+    }
+}
+
 impl<R, F, O> Actor<R, F, O>
 where
     R: rtc::SessionRuntime,
     F: FnMut() -> Result<(R, O), Error>,
 {
+    pub(super) fn install_pipe(
+        &mut self,
+        producer: ProducerInput,
+        input: PublicationInput,
+        target: watch::Sender<Option<InputTarget>>,
+    ) -> Result<(), Error> {
+        let operation = input.inner.operation.clone();
+        let owner = operation.owner();
+        let input_id = operation.input().ok_or(Error::Closed)?;
+        if !self.core.has_pipe(input_id) {
+            input.inner.closed.close();
+            input.inner.changed.notify_one();
+            producer.inner.release_pipe_reservation(owner, input_id);
+            return Ok(());
+        }
+        if input.is_closed() {
+            producer.inner.release_pipe_reservation(owner, input_id);
+            return Ok(());
+        }
+        let invalid =
+            if producer.is_closed() {
+                Some(Error::Closed)
+            } else {
+                match self
+                    .publications
+                    .get(&owner)
+                    .and_then(Weak::upgrade)
+                    .filter(|lease| !lease.closed.is_closed())
+                {
+                    None => Some(Error::Closed),
+                    Some(publication) => {
+                        match self.producers.get(&producer.inner.owner).filter(|value| {
+                            Weak::ptr_eq(&value.lease, &Arc::downgrade(&producer.inner))
+                        }) {
+                            None => Some(Error::Closed),
+                            Some(producer_io)
+                                if producer_io.binding.as_ref().is_some_and(
+                                    |(bound, binding)| *bound != owner && !binding.is_closed(),
+                                ) =>
+                            {
+                                Some(Error::Core(agent_core::AgentError::InvalidResource(
+                                    agent_core::TrackResourceError::AlreadyOwned,
+                                )))
+                            }
+                            Some(_producer_io)
+                                if producer.inner.binding_owner.load(Ordering::Acquire)
+                                    != owner =>
+                            {
+                                Some(Error::Core(agent_core::AgentError::InvalidResource(
+                                    agent_core::TrackResourceError::AlreadyOwned,
+                                )))
+                            }
+                            Some(producer_io)
+                                if !matches!(
+                                    (&publication.spec, producer_io.kind),
+                                    (
+                                        TrackSpec::Audio { .. },
+                                        super::producer::SourceKind::Audio(_)
+                                    ) | (
+                                        TrackSpec::Video { .. },
+                                        super::producer::SourceKind::Video(_)
+                                    )
+                                ) =>
+                            {
+                                Some(Error::InvalidInput(
+                                    "producer kind differs from the publication".into(),
+                                ))
+                            }
+                            Some(_) => None,
+                        }
+                    }
+                }
+            };
+        if let Some(error) = invalid {
+            self.core
+                .resource(ResourceCommand::CompletePublicationInput {
+                    operation,
+                    result: Err(error.error_info().code),
+                })?;
+            input.inner.closed.close();
+            input.inner.changed.notify_one();
+            producer.inner.release_pipe_reservation(owner, input_id);
+            return Ok(());
+        }
+        if self.inputs.get(&owner).is_some_and(|registered| {
+            registered.operation != operation
+                && registered
+                    .operation
+                    .input()
+                    .is_some_and(|old| self.core.has_pipe(old))
+        }) {
+            let error = Error::Core(agent_core::AgentError::InvalidResource(
+                agent_core::TrackResourceError::AlreadyOwned,
+            ));
+            self.core
+                .resource(ResourceCommand::CompletePublicationInput {
+                    operation,
+                    result: Err(error.error_info().code),
+                })?;
+            input.inner.closed.close();
+            input.inner.changed.notify_one();
+            producer.inner.release_pipe_reservation(owner, input_id);
+            return Err(error);
+        }
+        if self.inputs.contains_key(&owner) {
+            self.clear_input_target(owner);
+        }
+        if let Some(stale) = self.inputs.remove(&owner)
+            && let Some(lease) = stale.lease.upgrade()
+        {
+            lease.closed.close();
+        }
+        self.inputs.insert(
+            owner,
+            RegisteredInput {
+                operation: operation.clone(),
+                lease: Arc::downgrade(&input.inner),
+                target,
+                producer: Some(producer.inner.owner),
+                pipe: true,
+                pending_control: None,
+            },
+        );
+        if let Some(value) = self.producers.get_mut(&producer.inner.owner) {
+            value.binding = Some((owner, input));
+        }
+        self.core
+            .resource(ResourceCommand::CompletePublicationInput {
+                operation,
+                result: Ok(()),
+            })?;
+        Ok(())
+    }
+
+    pub(super) fn cleanup_pipe(
+        &mut self,
+        operation: PublicationInputOperation,
+    ) -> Result<(), Error> {
+        let owner = operation.owner();
+        if self
+            .inputs
+            .get(&owner)
+            .is_some_and(|registered| registered.operation == operation)
+        {
+            self.clear_input_target(owner);
+            let producer_owner = self
+                .inputs
+                .get(&owner)
+                .and_then(|registered| registered.producer);
+            if let Some(registered) = self.inputs.remove(&owner)
+                && let Some(lease) = registered.lease.upgrade()
+            {
+                lease.closed.close();
+            }
+            if let Some(producer) =
+                producer_owner.and_then(|producer| self.producers.get_mut(&producer))
+                && producer.binding.as_ref().is_some_and(|(bound, binding)| {
+                    *bound == owner && binding.inner.operation == operation
+                })
+            {
+                producer.binding = None;
+                if let Some(lease) = producer.lease.upgrade() {
+                    if let Some(input_id) = operation.input() {
+                        lease.release_pipe_reservation(owner, input_id);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn input_submission_current(&self, control: &PublicationInputControl) -> bool {
         control.enabled
             && self.core.publication_input_control_current(control)
@@ -280,13 +604,19 @@ where
         else {
             return Err(Error::Rtc("Core did not claim a publication".into()));
         };
+        let observer = self.core.publication_observer(owner).map_err(Error::from)?;
         let inner = Arc::new(PublicationLease {
             owner,
             spec,
             closed: Arc::new(Signal::default()),
+            closing: std::sync::atomic::AtomicBool::new(false),
             readiness: watch::channel(None).0,
             commands: self.command_tx.clone(),
             changed: self.leases_changed.clone(),
+            control: self.core.publication_control(),
+            observer,
+            pipe: Arc::new(std::sync::Mutex::new(None)),
+            pipe_serial: std::sync::Mutex::new(()),
         });
         self.publications.insert(owner, Arc::downgrade(&inner));
         Ok(Publication { inner })
@@ -328,13 +658,14 @@ where
                 lease: Arc::downgrade(&inner),
                 target: target_tx,
                 producer: None,
+                pipe: false,
                 pending_control: None,
             },
         );
         self.core
             .resource(ResourceCommand::CompletePublicationInput {
                 operation,
-                succeeded: true,
+                result: Ok(()),
             })?;
         Ok(PublicationInput { inner })
     }
@@ -346,22 +677,19 @@ where
         let Some(input) = operation.input() else {
             return Ok(());
         };
-        match self.core.resource(ResourceCommand::BeginPublicationInput {
-            owner: operation.owner(),
-            input: PublicationInputIntent::Retain(input),
-            present: false,
-            muted: None,
-        }) {
+        match self
+            .core
+            .resource(ResourceCommand::DetachPublicationInput { input })
+        {
             Ok(ResourceResult::PublicationInput { operation, .. }) => {
+                self.clear_input_target(operation.owner());
                 self.core
                     .resource(ResourceCommand::CompletePublicationInput {
                         operation,
-                        succeeded: true,
+                        result: Ok(()),
                     })?;
             }
-            Err(agent_core::AgentError::InvalidResource(
-                agent_core::TrackResourceError::Released,
-            )) => {}
+            Ok(ResourceResult::Superseded) => {}
             Err(error) => return Err(error.into()),
             Ok(_) => return Err(Error::Rtc("Core did not detach a publication input".into())),
         }
@@ -416,7 +744,7 @@ where
                 self.core
                     .resource(ResourceCommand::CompletePublicationInputTarget {
                         control,
-                        succeeded: true,
+                        result: Ok(()),
                     })
             {
                 self.fail(error.into());
@@ -482,7 +810,7 @@ where
                     .core
                     .resource(ResourceCommand::CompletePublicationInputTarget {
                         control,
-                        succeeded: true,
+                        result: Ok(()),
                     }) {
                     Ok(ResourceResult::Updated) => {
                         self.publication_readiness(owner, enabled.then_some(ready_source));
@@ -496,12 +824,13 @@ where
             }
             Err(error) => {
                 self.clear_input_target(owner);
+                let code = error.error_info().code;
                 self.fail(error);
                 if let Err(error) =
                     self.core
                         .resource(ResourceCommand::CompletePublicationInputTarget {
                             control,
-                            succeeded: false,
+                            result: Err(code),
                         })
                 {
                     self.fail(error.into());
@@ -561,6 +890,33 @@ where
             self.publications.remove(&owner);
             if let Err(error) = self.core.resource(ResourceCommand::Release { owner }) {
                 self.fail(error.into());
+                continue;
+            }
+            if let Some(input) = self.inputs.remove(&owner) {
+                self.clear_input_target(owner);
+                if let Some(lease) = input.lease.upgrade() {
+                    lease.closed.close();
+                }
+                if let Some(producer_id) = input.producer
+                    && let Some(producer) = self.producers.get_mut(&producer_id)
+                    && producer.binding.as_ref().is_some_and(|(bound, binding)| {
+                        *bound == owner && binding.inner.operation == input.operation
+                    })
+                {
+                    producer.binding = None;
+                    if let Some(lease) = producer.lease.upgrade() {
+                        if input.pipe {
+                            if let Some(input_id) = input.operation.input() {
+                                lease.release_pipe_reservation(owner, input_id);
+                            }
+                        } else {
+                            lease
+                                .binding_owner
+                                .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+                                .ok();
+                        }
+                    }
+                }
             }
         }
         let dropped: Vec<_> = self

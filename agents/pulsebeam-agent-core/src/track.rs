@@ -118,6 +118,8 @@ pub enum TrackResourceError {
     OwnerSpaceExhausted,
     #[error("publication input operation identity space exhausted")]
     InputOperationSpaceExhausted,
+    #[error("publication configuration revision space exhausted")]
+    PublicationConfigurationSpaceExhausted,
     #[error("{kind:?} physical coordinate space exhausted")]
     SlotSpaceExhausted { kind: MediaKind },
     #[error("owner no longer owns this resource")]
@@ -272,6 +274,16 @@ pub struct PublicationInputState {
     pub enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublicationConfigurationState {
+    pub desired_revision: u64,
+    pub evaluated_revision: u64,
+    pub accepted_revision: u64,
+    pub desired_enabled: bool,
+    pub accepted_enabled: bool,
+    pub rejected_revision: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicationInputTarget {
     pub generation: crate::Generation,
@@ -303,17 +315,31 @@ struct PublicationOwner {
     input: Option<PublicationInputId>,
     input_revision: u64,
     pending_input: bool,
+    input_error: Option<crate::ffi::ErrorInfo>,
     muted: bool,
     last_control: Option<PublicationInputControl>,
     control_completed: bool,
-    // None defers declaration until the first input. Once declared, input loss
-    // disables the stream; only owner release ends its lifetime.
+    desired_revision: u64,
+    evaluated_revision: u64,
+    accepted_revision: u64,
+    accepted_enabled: bool,
+    rejected_revision: Option<u64>,
+    last_control_configuration_revision: Option<u64>,
+    last_control_accepted_revision: u64,
+    last_control_accepted_enabled: bool,
+    // Publication declaration is independent of current input availability.
+    // Input loss disables the stream; only owner release ends its lifetime.
     present: Option<bool>,
 }
 
 impl PublicationOwner {
     fn input_enabled(&self) -> bool {
-        self.present == Some(true) && !self.muted && !self.pending_input
+        let enabled = if self.desired_revision > self.evaluated_revision {
+            !self.muted
+        } else {
+            self.accepted_enabled
+        };
+        self.present == Some(true) && enabled && !self.pending_input
     }
 
     fn input_state(&self) -> PublicationInputState {
@@ -322,6 +348,15 @@ impl PublicationOwner {
             input: self.input,
             slot: self.slot.clone(),
             enabled: self.input_enabled(),
+        }
+    }
+
+    fn settle_configuration_without_input(&mut self) {
+        if self.input.is_none() {
+            self.evaluated_revision = self.desired_revision;
+            self.accepted_revision = self.desired_revision;
+            self.accepted_enabled = !self.muted;
+            self.rejected_revision = None;
         }
     }
 }
@@ -410,6 +445,12 @@ pub enum ResourceCommand {
         owner: u64,
         present: bool,
     },
+    AttachPublicationInput {
+        owner: u64,
+    },
+    DetachPublicationInput {
+        input: PublicationInputId,
+    },
     BeginPublicationInput {
         owner: u64,
         input: PublicationInputIntent,
@@ -421,11 +462,11 @@ pub enum ResourceCommand {
     },
     CompletePublicationInput {
         operation: PublicationInputOperation,
-        succeeded: bool,
+        result: Result<(), crate::ffi::ErrorCode>,
     },
     CompletePublicationInputTarget {
         control: PublicationInputControl,
-        succeeded: bool,
+        result: Result<(), crate::ffi::ErrorCode>,
     },
     SetPublicationMuted {
         owner: u64,
@@ -569,9 +610,18 @@ impl TrackResources {
                 input: None,
                 input_revision: 0,
                 pending_input: false,
+                input_error: None,
                 last_control: None,
                 control_completed: false,
                 muted: false,
+                desired_revision: 1,
+                evaluated_revision: 1,
+                accepted_revision: 1,
+                accepted_enabled: true,
+                rejected_revision: None,
+                last_control_configuration_revision: None,
+                last_control_accepted_revision: 1,
+                last_control_accepted_enabled: true,
                 present: None,
             },
         );
@@ -595,10 +645,79 @@ impl TrackResources {
             .ok_or(TrackResourceError::InputOperationSpaceExhausted)?;
         entry.input = None;
         entry.pending_input = false;
+        entry.settle_configuration_without_input();
         if present || entry.present.is_some() {
             entry.present = Some(present);
         }
         Ok(())
+    }
+
+    pub(crate) fn attach_publication_input(
+        &mut self,
+        owner: TrackOwner,
+    ) -> Result<(PublicationInputOperation, PublicationInputState), TrackResourceError> {
+        let entry = self
+            .publications
+            .values()
+            .find(|entry| entry.owner == owner)
+            .ok_or(TrackResourceError::Released)?;
+        if entry.input.is_some() {
+            return Err(TrackResourceError::AlreadyOwned);
+        }
+        let muted = entry.muted;
+        self.begin_publication_input(owner, PublicationInputIntent::Replace, true, muted)
+    }
+
+    pub(crate) fn publication_input_state(
+        &self,
+        input: PublicationInputId,
+    ) -> Option<PublicationInputState> {
+        self.publications
+            .values()
+            .find(|entry| entry.input == Some(input))
+            .map(PublicationOwner::input_state)
+    }
+
+    pub(crate) fn pipe_state(&self, input: PublicationInputId) -> Option<crate::ffi::PipeState> {
+        let entry = self
+            .publications
+            .values()
+            .find(|entry| entry.input == Some(input))?;
+        Some(crate::ffi::PipeState {
+            observation_revision: 0,
+            status: if entry.pending_input {
+                crate::ffi::PipeStatus::Pending
+            } else if entry.present == Some(true) {
+                crate::ffi::PipeStatus::Available
+            } else {
+                crate::ffi::PipeStatus::Unavailable
+            },
+            error: entry.input_error.clone(),
+        })
+    }
+
+    pub(crate) fn detach_publication_input(
+        &mut self,
+        input: PublicationInputId,
+    ) -> Option<(PublicationInputOperation, PublicationInputState)> {
+        let entry = self
+            .publications
+            .values_mut()
+            .find(|entry| entry.input == Some(input))?;
+        // Removing the lifetime fences earlier work without allocating another revision.
+        // Cleanup must remain possible when registration counters are exhausted.
+        entry.input = None;
+        entry.pending_input = true;
+        entry.present = entry.present.map(|_| false);
+        entry.settle_configuration_without_input();
+        let operation = PublicationInputOperation {
+            owner: entry.owner,
+            input: None,
+            revision: entry.input_revision,
+            slot: entry.slot.clone(),
+            present: false,
+        };
+        Some((operation, entry.input_state()))
     }
 
     pub(crate) fn begin_publication_input(
@@ -617,6 +736,16 @@ impl TrackResources {
             .input_revision
             .checked_add(1)
             .ok_or(TrackResourceError::InputOperationSpaceExhausted)?;
+        let configuration_revision = if entry.muted != muted {
+            Some(
+                entry
+                    .desired_revision
+                    .checked_add(1)
+                    .ok_or(TrackResourceError::PublicationConfigurationSpaceExhausted)?,
+            )
+        } else {
+            None
+        };
         let retained = match input {
             PublicationInputIntent::Replace => None,
             PublicationInputIntent::ConfigureCurrent => entry.input,
@@ -643,10 +772,17 @@ impl TrackResources {
             .values_mut()
             .find(|entry| entry.owner == owner)
             .ok_or(TrackResourceError::Released)?;
+        if entry.input != input {
+            entry.input_error = None;
+        }
         entry.input = input;
         entry.input_revision = revision;
         entry.pending_input = true;
-        entry.muted = muted;
+        if let Some(configuration_revision) = configuration_revision {
+            entry.muted = muted;
+            entry.desired_revision = configuration_revision;
+        }
+        entry.settle_configuration_without_input();
         entry.present = entry.present.map(|_| false);
         let operation = PublicationInputOperation {
             owner,
@@ -656,6 +792,25 @@ impl TrackResources {
             present,
         };
         Ok((operation, entry.input_state()))
+    }
+
+    pub(crate) fn publication_configuration(
+        &self,
+        owner: TrackOwner,
+    ) -> Result<PublicationConfigurationState, TrackResourceError> {
+        let entry = self
+            .publications
+            .values()
+            .find(|entry| entry.owner == owner)
+            .ok_or(TrackResourceError::Released)?;
+        Ok(PublicationConfigurationState {
+            desired_revision: entry.desired_revision,
+            evaluated_revision: entry.evaluated_revision,
+            accepted_revision: entry.accepted_revision,
+            desired_enabled: !entry.muted,
+            accepted_enabled: entry.accepted_enabled,
+            rejected_revision: entry.rejected_revision,
+        })
     }
 
     pub(crate) fn publication_muted(&self, owner: TrackOwner) -> Result<bool, TrackResourceError> {
@@ -677,7 +832,7 @@ impl TrackResources {
     pub(crate) fn complete_publication_input(
         &mut self,
         operation: &PublicationInputOperation,
-        succeeded: bool,
+        result: Result<(), crate::ffi::ErrorCode>,
     ) -> Option<PublicationInputState> {
         let entry = self.publications.values_mut().find(|entry| {
             entry.owner == operation.owner
@@ -686,7 +841,10 @@ impl TrackResources {
                 && entry.pending_input
         })?;
         entry.pending_input = false;
-        let present = succeeded && operation.present;
+        let present = result.is_ok() && operation.present;
+        entry.input_error = result
+            .err()
+            .map(|code| crate::ffi::ErrorInfo::new(code, "Input registration failed"));
         if present || entry.present.is_some() {
             entry.present = Some(present);
         }
@@ -744,6 +902,12 @@ impl TrackResources {
             .find(|entry| entry.owner.id() == control.operation.owner())
         {
             entry.last_control = Some(control.clone());
+            entry.last_control_configuration_revision = (entry.input.is_some()
+                && entry.desired_revision > entry.evaluated_revision
+                && control.enabled == !entry.muted)
+                .then_some(entry.desired_revision);
+            entry.last_control_accepted_revision = entry.accepted_revision;
+            entry.last_control_accepted_enabled = entry.accepted_enabled;
             entry.control_completed = false;
         }
     }
@@ -757,6 +921,19 @@ impl TrackResources {
             return false;
         };
         entry.control_completed = true;
+        if let Some(revision) = entry.last_control_configuration_revision
+            && revision == entry.desired_revision
+            && revision > entry.evaluated_revision
+        {
+            entry.evaluated_revision = revision;
+            if control.enabled == !entry.muted {
+                entry.accepted_revision = revision;
+                entry.accepted_enabled = !entry.muted;
+                entry.rejected_revision = None;
+            } else {
+                entry.rejected_revision = Some(revision);
+            }
+        }
         true
     }
 
@@ -776,14 +953,31 @@ impl TrackResources {
     pub(crate) fn fail_publication_input(
         &mut self,
         operation: &PublicationInputOperation,
+        code: crate::ffi::ErrorCode,
     ) -> Option<PublicationInputState> {
         let entry = self.publications.values_mut().find(|entry| {
             entry.owner == operation.owner
                 && entry.input == operation.input
                 && entry.input_revision == operation.revision
         })?;
+        if entry
+            .last_control
+            .as_ref()
+            .is_some_and(|control| control.operation == *operation)
+        {
+            if let Some(revision) = entry.last_control_configuration_revision
+                && revision == entry.desired_revision
+                && (revision > entry.evaluated_revision || entry.accepted_revision == revision)
+            {
+                entry.evaluated_revision = revision;
+                entry.accepted_revision = entry.last_control_accepted_revision;
+                entry.accepted_enabled = entry.last_control_accepted_enabled;
+                entry.rejected_revision = Some(revision);
+            }
+        }
         entry.present = Some(false);
         entry.pending_input = false;
+        entry.input_error = Some(crate::ffi::ErrorInfo::new(code, "Input operation failed"));
         Some(entry.input_state())
     }
 
@@ -797,7 +991,15 @@ impl TrackResources {
             .values_mut()
             .find(|entry| entry.owner == owner)
             .ok_or(TrackResourceError::Released)?;
-        entry.muted = muted;
+        if entry.muted != muted {
+            let revision = entry
+                .desired_revision
+                .checked_add(1)
+                .ok_or(TrackResourceError::PublicationConfigurationSpaceExhausted)?;
+            entry.muted = muted;
+            entry.desired_revision = revision;
+            entry.settle_configuration_without_input();
+        }
         Ok(entry.input_state())
     }
 
@@ -860,11 +1062,11 @@ impl TrackResources {
             .iter()
             .filter_map(|(spec, entry)| {
                 let kind = spec.media_kind()?;
-                entry.present.map(|active| PublicationIntent {
+                Some(PublicationIntent {
                     slot: entry.slot.clone(),
                     kind,
                     label: spec.label().into(),
-                    active,
+                    active: true,
                 })
             })
             .collect()

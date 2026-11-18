@@ -256,6 +256,7 @@ pub(super) fn error(error: AgentError) -> JsValue {
             TrackResourceError::OwnerSpaceExhausted => "owner-exhausted",
             TrackResourceError::SlotSpaceExhausted { .. } => "slot-exhausted",
             TrackResourceError::InputOperationSpaceExhausted => "input-operation-exhausted",
+            TrackResourceError::PublicationConfigurationSpaceExhausted => "capacity",
             TrackResourceError::Released => "released",
             TrackResourceError::ReceiveOverflow => "receive-overflow",
             TrackResourceError::ReceiveChannelFailed(_) => "receive-channel-failed",

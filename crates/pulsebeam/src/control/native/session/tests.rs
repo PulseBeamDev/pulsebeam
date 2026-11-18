@@ -328,6 +328,26 @@ fn publication(label: &str, enabled: bool) -> wire::ResourceSpec {
     }
 }
 
+fn subscription(track_id: &str) -> wire::ResourceSpec {
+    wire::ResourceSpec {
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(true),
+            receive: None,
+        }),
+        declaration: Some(wire::resource_spec::Declaration::Subscription(
+            wire::SubscriptionSpec {
+                track_id: track_id.to_owned(),
+                kind: wire::TrackKind::Data as i32,
+                binding: Some(wire::TrackBinding {
+                    transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
+                        stream_id: Some(1),
+                    })),
+                }),
+            },
+        )),
+    }
+}
+
 fn present(reference: u64, revision: u64, spec: wire::ResourceSpec) -> wire::ClientStateRecord {
     desired(
         reference,
@@ -627,6 +647,111 @@ fn retirement_cuts_off_unevaluated_work_without_waiting_for_preparation() {
     assert!(session.take_preparation().unwrap().is_none());
     drain(&mut session);
     assert!(!session.rows.contains_key(&Key::Owned(1)));
+}
+
+#[test]
+fn publication_admission_is_bounded_including_pending_and_releases_after_cutoff() {
+    const LIMIT: u64 = 64;
+    let capacity = usize::try_from(LIMIT).unwrap();
+    let mut session = session();
+    for reference in 1..=LIMIT {
+        input(
+            &mut session,
+            vec![present(
+                reference,
+                reference,
+                publication(&format!("topic-{reference}"), true),
+            )],
+        )
+        .unwrap();
+    }
+    assert_eq!(session.publications.len(), capacity);
+    assert!(
+        session.rows[&Key::Owned(LIMIT)]
+            .owned
+            .as_ref()
+            .unwrap()
+            .active
+            .is_none()
+    );
+    let revisions: Vec<_> = (1..=LIMIT)
+        .map(|reference| {
+            session.rows[&Key::Owned(reference)]
+                .owned
+                .as_ref()
+                .unwrap()
+                .target
+                .revision
+        })
+        .collect();
+    input(
+        &mut session,
+        vec![present(65, 65, subscription("source-65"))],
+    )
+    .unwrap();
+    assert!(session.rows[&Key::Owned(65)].owned.as_ref().unwrap().queued);
+    input(
+        &mut session,
+        vec![present(66, 66, publication("over-limit", true))],
+    )
+    .unwrap();
+    assert_eq!(
+        session.rows[&Key::Owned(66)]
+            .value
+            .rejection
+            .as_ref()
+            .unwrap()
+            .code,
+        wire::FailureCode::CapacityExceeded as i32
+    );
+    assert_eq!(session.publications.len(), capacity);
+    for _ in 1..=LIMIT {
+        let work = session.take_preparation().unwrap().unwrap();
+        assert_ne!(work.reference, 65);
+        let value = live(&session, &work);
+        assert!(session.complete(work, Ok(value), 100).unwrap());
+    }
+    let subscription_work = session.take_preparation().unwrap().unwrap();
+    assert_eq!(subscription_work.reference, 65);
+
+    assert_eq!(session.publications.len(), capacity);
+    assert_eq!(
+        revisions,
+        (1..=LIMIT)
+            .map(|reference| session.rows[&Key::Owned(reference)]
+                .owned
+                .as_ref()
+                .unwrap()
+                .target
+                .revision)
+            .collect::<Vec<_>>()
+    );
+    assert!(!session.publications.values().any(|owner| *owner == 66));
+
+    input(
+        &mut session,
+        vec![present(1, 67, publication("topic-1", true))],
+    )
+    .unwrap();
+    assert_eq!(
+        session.rows[&Key::Owned(1)]
+            .owned
+            .as_ref()
+            .unwrap()
+            .target
+            .revision,
+        67
+    );
+    input(&mut session, vec![absent(1, 68)]).unwrap();
+    assert_eq!(session.publications.len(), capacity);
+    session.cutoff_complete(1).unwrap();
+    assert_eq!(session.publications.len(), capacity - 1);
+    input(
+        &mut session,
+        vec![present(69, 69, publication("after-release", true))],
+    )
+    .unwrap();
+    assert_eq!(session.publications.len(), capacity);
 }
 
 #[test]

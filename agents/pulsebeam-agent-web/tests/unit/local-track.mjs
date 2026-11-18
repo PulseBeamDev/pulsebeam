@@ -29,6 +29,12 @@ function host(replace = async () => {}) {
       commands.push(command);
       if (command.op === "claimPublication") return { owner: ++owner };
     },
+    publication() {
+      return {
+        state: () => ({ observationRevision: 0n }),
+        updates: () => ({ next: async () => undefined, close() {} }),
+      };
+    },
     async replace_owned_track(...args) {
       commands.push({ op: "replace", args });
       if (args[1] && args[1].readyState !== "live")

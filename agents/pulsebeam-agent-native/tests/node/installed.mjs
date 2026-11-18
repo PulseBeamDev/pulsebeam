@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { Agent, InputFrame, NativeError, ReceiveMode } from "@pulsebeam/agent/native";
-import { LogLevel, PlayoutDelay, TopicMode } from "@pulsebeam/agent/core";
+import { Agent, InputFrame, NativeError, PublicationUpdates, ReceiveMode } from "@pulsebeam/agent/native";
+import { ErrorCode, LogLevel, PlayoutDelay, PublicationAdmissionStatus, PublicationDemand, TopicMode } from "@pulsebeam/agent/core";
 
 const room = process.argv[4];
 assert.ok(room, "an explicit room is required");
@@ -19,6 +19,12 @@ try {
     dependencyDescriptor: true,
   });
   const publication = await agent.video("node-camera").publish(camera, { enabled: true });
+  const publicationUpdates = publication.updates();
+  assert(PublicationUpdates.instanceOf(publicationUpdates));
+  const pendingPublication = publication.state();
+  assert.equal(pendingPublication.admission.status, PublicationAdmissionStatus.Pending);
+  assert.equal(pendingPublication.admission.demand, PublicationDemand.Unknown);
+  assert.equal((await publicationUpdates.next()).observationRevision, pendingPublication.observationRevision);
   agent.join(room);
   while (true) {
     const update = await updates.next();
@@ -32,6 +38,14 @@ try {
   }
   console.log("installed Node RTC connected");
   await publication.ready();
+  let admittedPublication = publication.state();
+  while (admittedPublication.admission.status !== PublicationAdmissionStatus.Admitted) {
+    admittedPublication = await publicationUpdates.next();
+    assert(admittedPublication, "publication observation ended before server confirmation");
+  }
+  assert.equal(admittedPublication.admission.demand, PublicationDemand.Idle);
+  assert.equal(typeof admittedPublication.admission.publicationId, "string");
+  assert.equal(admittedPublication.admission.connectionGeneration, agent.snapshot().generation);
   const timestampUs = await camera.captureTimeUs();
   assert.equal(typeof timestampUs, "bigint");
   assert(timestampUs > 0n);
@@ -98,12 +112,18 @@ try {
   assert.equal(camera.isClosed(), false);
   await assert.rejects(camera.captureTimeUs(), (error) => NativeError.NotReady.instanceOf(error));
   await publication.close();
+  assert.equal(publication.state().closed, true);
+  assert.equal((await publicationUpdates.next()).closed, true);
+  assert.equal(await publicationUpdates.next(), undefined);
+  publicationUpdates.close();
   assert.equal(camera.isClosed(), false);
   await camera.close();
   assert(camera.isClosed());
   await agent.close();
   assert(agent.isClosed());
-  assert.throws(() => agent.join(room), (error) => NativeError.Closed.instanceOf(error));
+  assert.throws(() => agent.join(room), (error) =>
+    NativeError.Operation.instanceOf(error) && error.inner.info.code === ErrorCode.Closed,
+  );
   console.log("installed Node owned data/media/real SFU/independent source/terminal close PASS");
 } finally {
   await agent.close();

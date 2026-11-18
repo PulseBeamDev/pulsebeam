@@ -126,8 +126,174 @@ fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
                 .unwrap(),
             format!("{prefix}0")
         );
-        assert_eq!(resources.publications().len(), 256);
+        assert_eq!(resources.publications().len(), 257);
     }
+}
+
+#[test]
+fn publication_configuration_revisions_settle_without_input_and_exhaust_atomically() {
+    let mut resources = TrackResources::default();
+    let owner = resources.new_owner().unwrap();
+    let spec = video("camera");
+    resources
+        .claim_publication(owner, spec.clone(), &BTreeSet::new())
+        .unwrap();
+    let initial = PublicationConfigurationState {
+        desired_revision: 1,
+        evaluated_revision: 1,
+        accepted_revision: 1,
+        desired_enabled: true,
+        accepted_enabled: true,
+        rejected_revision: None,
+    };
+    assert_eq!(resources.publication_configuration(owner), Ok(initial));
+    resources.set_publication_muted(owner, false).unwrap();
+    assert_eq!(resources.publication_configuration(owner), Ok(initial));
+    resources.set_publication_muted(owner, true).unwrap();
+    assert_eq!(
+        resources.publication_configuration(owner),
+        Ok(PublicationConfigurationState {
+            desired_revision: 2,
+            evaluated_revision: 2,
+            accepted_revision: 2,
+            desired_enabled: false,
+            accepted_enabled: false,
+            rejected_revision: None,
+        })
+    );
+    let entry = resources.publications.get_mut(&spec).unwrap();
+    entry.desired_revision = u64::MAX;
+    entry.evaluated_revision = u64::MAX;
+    let before = resources.publication_configuration(owner).unwrap();
+    assert_eq!(
+        resources.set_publication_muted(owner, false),
+        Err(TrackResourceError::PublicationConfigurationSpaceExhausted)
+    );
+    assert_eq!(resources.publication_configuration(owner), Ok(before));
+    assert_eq!(
+        crate::ffi::ErrorInfo::from(&crate::AgentError::InvalidResource(
+            TrackResourceError::PublicationConfigurationSpaceExhausted
+        ))
+        .code,
+        crate::ffi::ErrorCode::CapacityExceeded
+    );
+}
+
+#[test]
+fn publication_configuration_pending_completion_accepts_rejects_and_fences_stale_work() {
+    let mut resources = TrackResources::default();
+    let owner = resources.new_owner().unwrap();
+    let spec = video("camera");
+    resources
+        .claim_publication(owner, spec, &BTreeSet::new())
+        .unwrap();
+    let (operation, _) = resources
+        .begin_publication_input(owner, PublicationInputIntent::Replace, true, false)
+        .unwrap();
+    resources
+        .complete_publication_input(&operation, Ok(()))
+        .unwrap();
+    resources.set_publication_muted(owner, true).unwrap();
+    let mut control = resources.publication_inputs().next().unwrap();
+    control.effect = Some(crate::id::IdGenerator::new().operation());
+    resources.update_input_control(&control);
+    assert_eq!(
+        resources
+            .publication_configuration(owner)
+            .unwrap()
+            .evaluated_revision,
+        1
+    );
+    assert!(resources.complete_input_control(&control));
+    assert_eq!(
+        resources.publication_configuration(owner).unwrap(),
+        PublicationConfigurationState {
+            desired_revision: 2,
+            evaluated_revision: 2,
+            accepted_revision: 2,
+            desired_enabled: false,
+            accepted_enabled: false,
+            rejected_revision: None,
+        }
+    );
+
+    let settled = resources.publication_configuration(owner).unwrap();
+    let (input_only, _) = resources
+        .begin_publication_input(owner, PublicationInputIntent::ConfigureCurrent, true, true)
+        .unwrap();
+    resources
+        .complete_publication_input(&input_only, Err(crate::ffi::ErrorCode::Unsupported))
+        .unwrap();
+    assert_eq!(resources.publication_configuration(owner), Ok(settled));
+    let (recovered, _) = resources
+        .begin_publication_input(owner, PublicationInputIntent::Replace, true, true)
+        .unwrap();
+    resources
+        .complete_publication_input(&recovered, Ok(()))
+        .unwrap();
+    resources.set_publication_muted(owner, false).unwrap();
+    let mut failed = resources.publication_inputs().next().unwrap();
+    failed.effect = Some(crate::id::IdGenerator::new().operation());
+    resources.update_input_control(&failed);
+    assert!(resources.complete_input_control(&failed));
+    resources
+        .fail_publication_input(&failed.operation, crate::ffi::ErrorCode::Unsupported)
+        .unwrap();
+    let pipe = resources
+        .pipe_state(failed.operation.input().unwrap())
+        .unwrap();
+    assert_eq!(pipe.status, crate::ffi::PipeStatus::Unavailable);
+    assert_eq!(pipe.error.unwrap().code, crate::ffi::ErrorCode::Unsupported);
+    assert_eq!(
+        resources.publication_configuration(owner).unwrap(),
+        PublicationConfigurationState {
+            desired_revision: 3,
+            evaluated_revision: 3,
+            accepted_revision: 2,
+            desired_enabled: true,
+            accepted_enabled: false,
+            rejected_revision: Some(3),
+        }
+    );
+
+    let (operation, _) = resources
+        .begin_publication_input(owner, PublicationInputIntent::Replace, true, false)
+        .unwrap();
+    assert!(
+        !resources
+            .complete_publication_input(&operation, Ok(()))
+            .unwrap()
+            .enabled,
+        "replacing input must not silently apply the rejected setting"
+    );
+    assert_eq!(
+        resources
+            .publication_configuration(owner)
+            .unwrap()
+            .rejected_revision,
+        Some(3)
+    );
+    resources.set_publication_muted(owner, true).unwrap();
+    let mut obsolete = resources.publication_inputs().next().unwrap();
+    obsolete.effect = Some(crate::id::IdGenerator::new().operation());
+    resources.update_input_control(&obsolete);
+    resources.set_publication_muted(owner, false).unwrap();
+    let mut latest = resources.publication_inputs().next().unwrap();
+    latest.effect = Some(crate::id::IdGenerator::new().operation());
+    resources.update_input_control(&latest);
+    assert!(!resources.complete_input_control(&obsolete));
+    assert!(resources.complete_input_control(&latest));
+    assert_eq!(
+        resources.publication_configuration(owner).unwrap(),
+        PublicationConfigurationState {
+            desired_revision: 5,
+            evaluated_revision: 5,
+            accepted_revision: 5,
+            desired_enabled: true,
+            accepted_enabled: true,
+            rejected_revision: None,
+        }
+    );
 }
 
 #[test]
@@ -148,15 +314,24 @@ fn new_lifetime_fences_stale_source_updates_and_cleanup_after_reacquisition() {
         Err(TrackResourceError::Released)
     );
     assert_eq!(resources.release_publication(previous, &spec), None);
-    assert!(resources.publications().is_empty());
+    assert_eq!(resources.publications().len(), 1);
     resources.update_publication(current, &spec, true).unwrap();
-    let (obsolete, paused) = resources
-        .begin_publication_input(current, PublicationInputIntent::Replace, true, false)
-        .unwrap();
+    let (obsolete, paused) = resources.attach_publication_input(current).unwrap();
     let input = obsolete.input().unwrap();
+    let reserved = resources.next_owner;
+    assert_eq!(
+        resources.attach_publication_input(current),
+        Err(TrackResourceError::AlreadyOwned)
+    );
+    assert_eq!(resources.next_owner, reserved);
+    assert!(resources.publication_input_current(&obsolete));
+    assert_eq!(
+        resources.publication_input_state(input),
+        Some(paused.clone())
+    );
     assert_eq!(paused.input, Some(input));
     assert!(!paused.enabled);
-    assert!(!resources.publications()[0].active);
+    assert!(resources.publications()[0].active);
     let (latest, _) = resources
         .begin_publication_input(
             current,
@@ -170,20 +345,20 @@ fn new_lifetime_fences_stale_source_updates_and_cleanup_after_reacquisition() {
     assert!(!resources.publication_input_current(&obsolete));
     assert!(
         resources
-            .complete_publication_input(&obsolete, true)
+            .complete_publication_input(&obsolete, Ok(()))
             .is_none()
     );
     assert!(resources.publication_input_current(&latest));
     assert!(
         !resources
-            .complete_publication_input(&latest, true)
+            .complete_publication_input(&latest, Ok(()))
             .unwrap()
             .enabled
     );
     assert!(resources.publication_input_current(&latest));
     assert!(
         resources
-            .complete_publication_input(&latest, true)
+            .complete_publication_input(&latest, Ok(()))
             .is_none()
     );
     assert!(
@@ -230,20 +405,20 @@ fn new_lifetime_fences_stale_source_updates_and_cleanup_after_reacquisition() {
     assert_eq!(failed.input(), Some(input));
     assert!(
         !resources
-            .complete_publication_input(&failed, false)
+            .complete_publication_input(&failed, Err(crate::ffi::ErrorCode::Unsupported))
             .unwrap()
             .enabled
     );
-    assert!(!resources.publications()[0].active);
-    let (detached, state) = resources
-        .begin_publication_input(current, PublicationInputIntent::Retain(input), false, false)
-        .unwrap();
+    assert!(resources.publications()[0].active);
+    let (detached, state) = resources.detach_publication_input(input).unwrap();
+    assert_eq!(resources.publication_input_state(input), None);
+    assert_eq!(resources.detach_publication_input(input), None);
     assert_eq!(state.input, None);
     assert_eq!(detached.input(), None);
     assert!(!resources.publication_input_current(&failed));
     assert!(
         !resources
-            .complete_publication_input(&detached, true)
+            .complete_publication_input(&detached, Ok(()))
             .unwrap()
             .enabled
     );
@@ -256,10 +431,12 @@ fn new_lifetime_fences_stale_source_updates_and_cleanup_after_reacquisition() {
         ),
         Err(TrackResourceError::Released)
     );
-    let (canceled, _) = resources
-        .begin_publication_input(current, PublicationInputIntent::Replace, true, false)
-        .unwrap();
+    let (canceled, _) = resources.attach_publication_input(current).unwrap();
     assert_ne!(canceled.input(), Some(input));
+    let reserved = resources.next_owner;
+    assert_eq!(resources.detach_publication_input(input), None);
+    assert_eq!(resources.next_owner, reserved);
+    assert!(resources.publication_input_current(&canceled));
     assert_eq!(
         resources.begin_publication_input(
             current,
@@ -273,7 +450,7 @@ fn new_lifetime_fences_stale_source_updates_and_cleanup_after_reacquisition() {
     resources.update_publication(current, &spec, false).unwrap();
     assert!(
         resources
-            .complete_publication_input(&canceled, true)
+            .complete_publication_input(&canceled, Ok(()))
             .is_none()
     );
     resources.release_publication(current, &spec).unwrap();
@@ -284,40 +461,38 @@ fn new_lifetime_fences_stale_source_updates_and_cleanup_after_reacquisition() {
     assert!(!resources.publication_input_current(&latest));
     assert!(
         resources
-            .complete_publication_input(&latest, true)
+            .complete_publication_input(&latest, Ok(()))
             .is_none()
     );
-    assert!(resources.publications().is_empty());
+    assert_eq!(resources.publications().len(), 1);
 }
 
 #[test]
-fn source_withdrawal_keeps_the_declaration_and_audio_cleanup_is_owner_scoped() {
+fn source_availability_does_not_gate_declarations_and_audio_cleanup_is_owner_scoped() {
     let mut resources = TrackResources::default();
     let first = TrackOwner(1);
     let second = TrackOwner(2);
     resources
         .claim_publication(first, video("camera"), &BTreeSet::new())
         .unwrap();
-    assert!(resources.publications().is_empty());
-    resources
-        .update_publication(first, &video("camera"), false)
-        .unwrap();
-    assert!(resources.publications().is_empty());
-    resources
-        .update_publication(first, &video("camera"), true)
-        .unwrap();
-    let mut expected = PublicationIntent {
+    let expected = PublicationIntent {
         slot: "v0".into(),
         kind: MediaKind::Video,
         label: "camera".into(),
         active: true,
     };
     assert_eq!(resources.publications(), vec![expected.clone()]);
-    resources
-        .update_publication(first, &video("camera"), false)
-        .unwrap();
-    expected.active = false;
-    assert_eq!(resources.publications(), vec![expected]);
+    assert!(
+        !resources.publications[&video("camera")]
+            .input_state()
+            .enabled
+    );
+    for present in [false, true, false] {
+        resources
+            .update_publication(first, &video("camera"), present)
+            .unwrap();
+        assert_eq!(resources.publications(), vec![expected.clone()]);
+    }
     assert_eq!(
         resources
             .claim_publication(second, video("screen"), &BTreeSet::new())
@@ -337,7 +512,7 @@ fn source_withdrawal_keeps_the_declaration_and_audio_cleanup_is_owner_scoped() {
     entry.input_revision = u64::MAX;
     let before = entry.input_state();
     assert_eq!(
-        resources.begin_publication_input(first, PublicationInputIntent::Replace, true, true),
+        resources.attach_publication_input(first),
         Err(TrackResourceError::InputOperationSpaceExhausted)
     );
     assert_eq!(
@@ -345,9 +520,28 @@ fn source_withdrawal_keeps_the_declaration_and_audio_cleanup_is_owner_scoped() {
         before
     );
     resources
+        .publications
+        .get_mut(&video("camera"))
+        .unwrap()
+        .input_revision = u64::MAX - 1;
+    let (last, _) = resources.attach_publication_input(first).unwrap();
+    let (detached, state) = resources
+        .detach_publication_input(last.input().unwrap())
+        .unwrap();
+    assert!(!resources.publication_input_current(&last));
+    assert!(resources.publication_input_current(&detached));
+    assert_eq!(state.input, None);
+    assert!(!state.enabled);
+    assert!(resources.publications()[0].active);
+    assert_eq!(
+        resources.attach_publication_input(first),
+        Err(TrackResourceError::InputOperationSpaceExhausted)
+    );
+    resources
         .release_publication(first, &video("camera"))
         .unwrap();
-    assert!(resources.publications().is_empty());
+    assert_eq!(resources.publications().len(), 1);
+    assert_eq!(resources.publications()[0].label, "screen");
 }
 
 #[test]

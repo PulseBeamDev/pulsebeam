@@ -6,6 +6,11 @@ use core::time::Duration;
 
 use crate as model;
 
+mod pipe;
+mod publication;
+pub use pipe::*;
+pub use publication::*;
+
 uniffi::setup_scaffolding!();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
@@ -373,6 +378,21 @@ impl From<&model::AgentError> for ErrorInfo {
             | model::AgentError::ConflictingDesiredRevision(_) => {
                 (ErrorCode::Conflict, "Intent revision conflicts")
             }
+            model::AgentError::InvalidResource(
+                model::TrackResourceError::AlreadyOwned | model::TrackResourceError::OwnerInUse,
+            ) => (ErrorCode::Conflict, "Resource ownership conflicts"),
+            model::AgentError::InvalidResource(model::TrackResourceError::Released) => {
+                (ErrorCode::Closed, "Resource is closed")
+            }
+            model::AgentError::InvalidResource(model::TrackResourceError::NotConnected) => {
+                (ErrorCode::NotReady, "Connection is not ready")
+            }
+            model::AgentError::InvalidResource(
+                model::TrackResourceError::PublicationConfigurationSpaceExhausted
+                | model::TrackResourceError::InputOperationSpaceExhausted
+                | model::TrackResourceError::OwnerSpaceExhausted
+                | model::TrackResourceError::SlotSpaceExhausted { .. },
+            ) => (ErrorCode::CapacityExceeded, "Resource capacity exceeded"),
             model::AgentError::InvalidConfiguration(_)
             | model::AgentError::InvalidAuthorizationToken
             | model::AgentError::InvalidOffer(_)
@@ -637,6 +657,7 @@ pub enum ResourceFailure {
     OwnerInUse,
     OwnerSpaceExhausted,
     InputOperationSpaceExhausted,
+    PublicationConfigurationSpaceExhausted,
     SlotSpaceExhausted { kind: MediaKind },
     Released,
     InvalidPlayoutDelay,
@@ -657,6 +678,9 @@ impl From<model::TrackResourceError> for ResourceFailure {
             model::TrackResourceError::OwnerSpaceExhausted => Self::OwnerSpaceExhausted,
             model::TrackResourceError::InputOperationSpaceExhausted => {
                 Self::InputOperationSpaceExhausted
+            }
+            model::TrackResourceError::PublicationConfigurationSpaceExhausted => {
+                Self::PublicationConfigurationSpaceExhausted
             }
             model::TrackResourceError::SlotSpaceExhausted { kind } => {
                 Self::SlotSpaceExhausted { kind: kind.into() }
@@ -1928,6 +1952,34 @@ mod tests {
             AgentStatus::Closed,
         ] {
             assert_ffi_round_trip(status);
+        }
+        for (resource, code) in [
+            (model::TrackResourceError::AlreadyOwned, ErrorCode::Conflict),
+            (model::TrackResourceError::OwnerInUse, ErrorCode::Conflict),
+            (model::TrackResourceError::Released, ErrorCode::Closed),
+            (model::TrackResourceError::NotConnected, ErrorCode::NotReady),
+            (
+                model::TrackResourceError::InputOperationSpaceExhausted,
+                ErrorCode::CapacityExceeded,
+            ),
+            (
+                model::TrackResourceError::OwnerSpaceExhausted,
+                ErrorCode::CapacityExceeded,
+            ),
+            (
+                model::TrackResourceError::SlotSpaceExhausted {
+                    kind: model::MediaKind::Video,
+                },
+                ErrorCode::CapacityExceeded,
+            ),
+            (
+                model::TrackResourceError::PublicationConfigurationSpaceExhausted,
+                ErrorCode::CapacityExceeded,
+            ),
+        ] {
+            let info = ErrorInfo::from(&model::AgentError::InvalidResource(resource));
+            assert_eq!(info.code, code);
+            assert_ffi_round_trip(info);
         }
         let expired = ErrorInfo::from(&Failure {
             class: FailureClass::ResourceExpired,

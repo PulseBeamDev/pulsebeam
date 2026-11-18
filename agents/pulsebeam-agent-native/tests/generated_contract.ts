@@ -8,6 +8,9 @@ import {
   DataUpdate,
   PlayoutDelay,
   PublicationConfig,
+  PublicationAdmissionStatus,
+  PublicationDemand,
+  PublicationUpdates,
   LogLevel,
   ResourceFailure,
   RetryPolicy,
@@ -103,6 +106,16 @@ if (false) {
   await localVideo.publish(audioSource, publicationConfig);
 }
 const videoPublication = await localVideo.publish(videoSource, publicationConfig);
+const publicationUpdates = videoPublication.updates();
+const initialPublication = videoPublication.state();
+if (!PublicationUpdates.instanceOf(publicationUpdates) ||
+    initialPublication.admission.status !== PublicationAdmissionStatus.Pending ||
+    initialPublication.admission.demand !== PublicationDemand.Unknown ||
+    initialPublication.configuration.enabled !== true ||
+    typeof initialPublication.configuration.desiredRevision !== "bigint" ||
+    (await publicationUpdates.next())?.observationRevision !== initialPublication.observationRevision) {
+  throw new Error("publication did not expose pending Core state and local configuration");
+}
 try {
   await sameVideo.publish(videoSource, publicationConfig);
   throw new Error("equivalent lookup bypassed publication exclusivity");
@@ -111,6 +124,23 @@ try {
       !ResourceFailure.AlreadyOwned.instanceOf(error.inner.reason)) throw error;
 }
 await videoPublication.configure(PublicationConfig.create({ enabled: false }));
+const configuredPublication = videoPublication.state();
+if (configuredPublication.admission.status !== PublicationAdmissionStatus.Pending ||
+    configuredPublication.admission.demand !== PublicationDemand.Unknown ||
+    configuredPublication.configuration.enabled !== false ||
+    configuredPublication.configuration.desiredRevision <= initialPublication.configuration.desiredRevision ||
+    (await publicationUpdates.next())?.configuration.enabled !== false) {
+  throw new Error("publication configuration was confused with admission or demand");
+}
+const noOpRevision = configuredPublication.configuration.desiredRevision;
+await videoPublication.configure(PublicationConfig.create({ enabled: false }));
+if (videoPublication.state().configuration.desiredRevision !== noOpRevision) {
+  throw new Error("no-op configuration advanced its durable revision");
+}
+await videoPublication.configure(PublicationConfig.create({ enabled: true }));
+if (!videoPublication.state().configuration.enabled) throw new Error("latest configuration setter was lost");
+await videoPublication.configure(PublicationConfig.create({ enabled: false }));
+if (videoPublication.state().configuration.enabled) throw new Error("latest configuration setter was lost");
 await videoPublication.setSource(undefined);
 await videoPublication.setSource(videoSource);
 const pendingBound = videoPublication.ready().then(
@@ -118,9 +148,12 @@ const pendingBound = videoPublication.ready().then(
   (error: unknown) => error,
 );
 await videoPublication.close();
-if (!NativeError.Closed.instanceOf(await pendingBound) || videoSource.isClosed()) {
+if (!NativeError.Closed.instanceOf(await pendingBound) || videoSource.isClosed() ||
+    !videoPublication.state().closed || (await publicationUpdates.next())?.closed !== true ||
+    (await publicationUpdates.next()) !== undefined) {
   throw new Error("publication close transferred producer ownership");
 }
+publicationUpdates.close();
 const videoReplacement = await sameVideo.publish(videoSource, publicationConfig);
 const feedback = videoSource.feedback();
 const siblingFeedback = videoSource.feedback();
@@ -139,6 +172,12 @@ await videoSource.close();
 if (videoReplacement.isClosed()) throw new Error("source stop closed publication ownership");
 await videoReplacement.close();
 const audioPublication = await localAudio.publish(audioSource, publicationConfig);
+const audioPublicationUpdates = audioPublication.updates();
+const initialAudioPublication = await audioPublicationUpdates.next();
+if (!initialAudioPublication || initialAudioPublication.admission.status !== PublicationAdmissionStatus.Pending) {
+  throw new Error("audio publication did not start pending");
+}
+const pendingAudioPublication = audioPublicationUpdates.next();
 try {
   await audioSource.submit(InputFrame.Pcm.new({ frame: PcmFrame.create({
     sampleRateHz: 48000, channels: 1, samples: [-32768, 0, 32767], timestampUs: 0n,
@@ -252,6 +291,12 @@ try {
 } catch (error) {
   if (!NativeError.Operation.instanceOf(error) || error.inner.info.code !== ErrorCode.Closed) throw error;
 }
+const finalAudioPublication = await pendingAudioPublication;
+if (!finalAudioPublication?.closed || await audioPublicationUpdates.next() !== undefined ||
+    !audioPublication.state().closed) {
+  throw new Error("terminal Agent close did not finish a retained publication cursor");
+}
+audioPublicationUpdates.close();
 const finalState = await stateUpdates.next();
 if (finalState?.status !== AgentStatus.Closed ||
     finalState.desiredCredentialRevision !== agent.snapshot().credentialRevision ||

@@ -1,10 +1,235 @@
 use super::*;
+use std::collections::BTreeMap;
+
+type PipeObservers = Arc<
+    std::sync::Mutex<
+        Vec<(
+            agent_core::PublicationInputId,
+            std::sync::Weak<agent_core::observer::PipeStateObserver>,
+        )>,
+    >,
+>;
+
+#[derive(Clone)]
+pub(super) struct PublicationControl {
+    core: std::sync::Weak<std::sync::Mutex<agent_core::Agent>>,
+    changed: Arc<Notify>,
+    pipe_observers: PipeObservers,
+    publication_observers: Arc<
+        std::sync::Mutex<
+            BTreeMap<u64, std::sync::Weak<agent_core::observer::PublicationStateObserver>>,
+        >,
+    >,
+    agent_observer: Arc<agent_core::observer::AgentStateObserver>,
+}
+
+impl PublicationControl {
+    pub(super) fn configure(
+        &self,
+        owner: u64,
+        observer: &agent_core::observer::PublicationStateObserver,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        let core = self.core.upgrade().ok_or(Error::Closed)?;
+        let mut core = core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        core.resource(agent_core::ResourceCommand::SetPublicationMuted {
+            owner,
+            muted: !enabled,
+        })?;
+        let notification = core
+            .publication_state(owner)
+            .ok()
+            .and_then(|state| observer.prepare(state, false).ok());
+        drop(core);
+        if let Some(notification) = notification {
+            let _ = notification.notify();
+        }
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    pub(super) fn attach_pipe(
+        &self,
+        owner: u64,
+        publication_closed: &Signal,
+    ) -> Result<
+        (
+            agent_core::PublicationInputOperation,
+            Arc<agent_core::observer::PipeStateObserver>,
+        ),
+        Error,
+    > {
+        let core = self.core.upgrade().ok_or(Error::Closed)?;
+        let mut core = core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if publication_closed.is_closed() {
+            return Err(Error::Closed);
+        }
+        let result =
+            core.resource(agent_core::ResourceCommand::AttachPublicationInput { owner })?;
+        let agent_core::ResourceResult::PublicationInput { operation, .. } = result else {
+            return Err(Error::Rtc("Core did not claim pipe input".into()));
+        };
+        let input = operation
+            .input()
+            .ok_or_else(|| Error::Rtc("Core pipe claim omitted input identity".into()))?;
+        let state = core
+            .pipe_state(input)
+            .ok_or_else(|| Error::Rtc("Core pipe state missing after claim".into()))?;
+        let observer = Arc::new(agent_core::observer::PipeStateObserver::new(state));
+        let mut pipes = self
+            .pipe_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pipes.retain(|(id, weak)| weak.strong_count() > 0 && core.pipe_state(*id).is_some());
+        pipes.push((input, Arc::downgrade(&observer)));
+        drop(pipes);
+        drop(core);
+        Ok((operation, observer))
+    }
+
+    pub(super) fn notify_pipe_attached(&self, owner: u64) {
+        let Some(core) = self.core.upgrade() else {
+            return;
+        };
+        let core = core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let publication = self
+            .publication_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&owner)
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|observer| {
+                core.publication_state(owner)
+                    .ok()
+                    .and_then(|state| observer.prepare(state, false).ok())
+            });
+        let snapshot = core.snapshot();
+        let version = snapshot.version;
+        let agent_state = snapshot.into();
+        drop(core);
+        if let Some(notification) = publication {
+            let _ = notification.notify();
+        }
+        let _ = self.agent_observer.publish_from(version, agent_state);
+        self.changed.notify_one();
+    }
+
+    pub(super) fn detach_pipe(
+        &self,
+        operation: &agent_core::PublicationInputOperation,
+        observer: &agent_core::observer::PipeStateObserver,
+    ) -> Result<(), Error> {
+        let Some(input) = operation.input() else {
+            return Ok(());
+        };
+        let core_arc = self.core.upgrade().ok_or(Error::Closed)?;
+        let mut core = core_arc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let final_state = core.pipe_state(input).unwrap_or_else(|| observer.state());
+        match core.resource(agent_core::ResourceCommand::DetachPublicationInput { input })? {
+            agent_core::ResourceResult::PublicationInput { operation, .. } => {
+                core.resource(agent_core::ResourceCommand::CompletePublicationInput {
+                    operation,
+                    result: Ok(()),
+                })?;
+            }
+            agent_core::ResourceResult::Superseded => {}
+            _ => return Err(Error::Rtc("Core did not detach pipe input".into())),
+        }
+        let notification = observer
+            .prepare(final_state, true)
+            .map_err(|_| Error::Backpressure)?;
+        let owner = operation.owner();
+        let publication = self
+            .publication_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&owner)
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|observer| {
+                core.publication_state(owner)
+                    .ok()
+                    .and_then(|state| observer.prepare(state, false).ok())
+            });
+        let snapshot = core.snapshot();
+        let version = snapshot.version;
+        let agent_state = snapshot.into();
+        self.pipe_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(id, _)| *id != input);
+        drop(core);
+        let _ = notification.notify();
+        if let Some(notification) = publication {
+            let _ = notification.notify();
+        }
+        let _ = self.agent_observer.publish_from(version, agent_state);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    pub(super) fn pipe_state(
+        &self,
+        input: agent_core::PublicationInputId,
+        observer: &agent_core::observer::PipeStateObserver,
+    ) -> agent_core::ffi::PipeState {
+        let Some(core) = self.core.upgrade() else {
+            return observer.state();
+        };
+        let core = core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let notification = core
+            .pipe_state(input)
+            .and_then(|state| observer.prepare(state, false).ok());
+        drop(core);
+        if let Some(notification) = notification {
+            let _ = notification.notify();
+        }
+        observer.state()
+    }
+
+    pub(super) fn state(
+        &self,
+        owner: u64,
+        observer: &agent_core::observer::PublicationStateObserver,
+    ) -> agent_core::ffi::PublicationState {
+        let Some(core) = self.core.upgrade() else {
+            return observer.state();
+        };
+        let core = core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let notification = core
+            .publication_state(owner)
+            .ok()
+            .and_then(|state| observer.prepare(state, false).ok());
+        drop(core);
+        if let Some(notification) = notification {
+            let _ = notification.notify();
+        }
+        observer.state()
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct Control {
     core: Arc<std::sync::Mutex<agent_core::Agent>>,
     pub(super) changed: Arc<Notify>,
     observer: Arc<agent_core::observer::AgentStateObserver>,
+    publication_observers: Arc<
+        std::sync::Mutex<
+            BTreeMap<u64, std::sync::Weak<agent_core::observer::PublicationStateObserver>>,
+        >,
+    >,
+    pipe_observers: PipeObservers,
 }
 
 impl Control {
@@ -17,7 +242,74 @@ impl Control {
             observer,
             core: Arc::new(std::sync::Mutex::new(core)),
             changed: Arc::new(Notify::new()),
+            publication_observers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            pipe_observers: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    pub(super) fn publication_control(&self) -> PublicationControl {
+        PublicationControl {
+            core: Arc::downgrade(&self.core),
+            changed: self.changed.clone(),
+            pipe_observers: self.pipe_observers.clone(),
+            publication_observers: self.publication_observers.clone(),
+            agent_observer: self.observer.clone(),
+        }
+    }
+
+    fn publication_projection(
+        &self,
+        owner: u64,
+    ) -> Result<agent_core::ffi::PublicationState, agent_core::AgentError> {
+        self.with(|core| core.publication_state(owner))
+    }
+
+    pub(super) fn publication_state(
+        &self,
+        owner: u64,
+        observer: &agent_core::observer::PublicationStateObserver,
+    ) -> agent_core::ffi::PublicationState {
+        let core = self
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let notification = core
+            .publication_state(owner)
+            .ok()
+            .and_then(|state| observer.prepare(state, false).ok());
+        drop(core);
+        if let Some(notification) = notification {
+            let _ = notification.notify();
+        }
+        observer.state()
+    }
+
+    pub(super) fn publication_observer(
+        &self,
+        owner: u64,
+    ) -> Result<Arc<agent_core::observer::PublicationStateObserver>, agent_core::AgentError> {
+        if let Some(observer) = self
+            .publication_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&owner)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(observer);
+        }
+        let initial = self.publication_projection(owner)?;
+        let mut observers = self
+            .publication_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(observer) = observers.get(&owner).and_then(std::sync::Weak::upgrade) {
+            return Ok(observer);
+        }
+        let observer = Arc::new(agent_core::observer::PublicationStateObserver::new(initial));
+        observers.insert(owner, Arc::downgrade(&observer));
+        drop(observers);
+        self.update(|_| ());
+        Ok(observer)
     }
 
     fn with<T>(&self, operation: impl FnOnce(&mut agent_core::Agent) -> T) -> T {
@@ -29,13 +321,53 @@ impl Control {
     }
 
     fn update<T>(&self, operation: impl FnOnce(&mut agent_core::Agent) -> T) -> T {
-        let (result, version, state) = self.with(|core| {
-            let result = operation(core);
-            (result, core.snapshot().version, core.snapshot().into())
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = operation(&mut core);
+        let snapshot = core.snapshot();
+        let state = snapshot.into();
+        let version = snapshot.version;
+        let mut registry = self
+            .publication_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.retain(|_, observer| observer.strong_count() > 0);
+        let notifications = registry
+            .iter()
+            .filter_map(|(&owner, weak)| {
+                let observer = weak.upgrade()?;
+                let state = core.publication_state(owner).ok()?;
+                observer.prepare(state, false).ok()
+            })
+            .collect::<Vec<_>>();
+        drop(registry);
+        let mut pipes = self
+            .pipe_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pipes.retain(|(input, observer)| {
+            observer.strong_count() > 0 && core.pipe_state(*input).is_some()
         });
-        // Foreign cursor wake callbacks may reenter this actor. Publish only after
-        // releasing its lock, and fence projections overtaken by another caller.
+        let pipe_notifications = pipes
+            .iter()
+            .filter_map(|(input, weak)| {
+                let observer = weak.upgrade()?;
+                let state = core.pipe_state(*input)?;
+                observer.prepare(state, false).ok()
+            })
+            .collect::<Vec<_>>();
+        drop(pipes);
+        drop(core);
+        // Foreign cursor wake callbacks may reenter this actor.
         let _ = self.observer.publish_from(version, state);
+        for notification in notifications {
+            let _ = notification.notify();
+        }
+        for notification in pipe_notifications {
+            let _ = notification.notify();
+        }
         result
     }
 
@@ -52,9 +384,50 @@ impl Control {
     }
 
     pub(super) fn close_observation(&self) {
-        let mut state = self.state();
+        let core = self
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state: agent_core::ffi::AgentState = core.snapshot().into();
         state.room = None;
+        let publications = {
+            let mut registry = self
+                .publication_observers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.retain(|_, observer| observer.strong_count() > 0);
+            registry
+                .iter()
+                .filter_map(|(&owner, weak)| {
+                    let observer = weak.upgrade()?;
+                    let state = core.publication_state(owner).ok()?;
+                    observer.prepare(state, true).ok()
+                })
+                .collect::<Vec<_>>()
+        };
+        let pipe_notifications = {
+            let mut registry = self
+                .pipe_observers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.retain(|(_, weak)| weak.strong_count() > 0);
+            registry
+                .iter()
+                .filter_map(|(input, weak)| {
+                    let observer = weak.upgrade()?;
+                    let state = core.pipe_state(*input)?;
+                    observer.prepare(state, true).ok()
+                })
+                .collect::<Vec<_>>()
+        };
+        drop(core);
         let _ = self.observer.close(state);
+        for notification in publications {
+            let _ = notification.notify();
+        }
+        for notification in pipe_notifications {
+            let _ = notification.notify();
+        }
     }
 
     pub(super) fn flush_logs(&self) {
@@ -87,7 +460,146 @@ impl Control {
         &self,
         command: agent_core::ResourceCommand,
     ) -> Result<agent_core::ResourceResult, agent_core::AgentError> {
-        self.update(|core| core.resource(command))
+        if let agent_core::ResourceCommand::DetachPublicationInput { input } = &command {
+            return self.detach_input_resource(*input);
+        }
+        let Some(owner) = (match &command {
+            agent_core::ResourceCommand::Release { owner } => Some(*owner),
+            _ => None,
+        }) else {
+            return self.update(|core| core.resource(command));
+        };
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let final_state = core.publication_state(owner).ok();
+        let final_pipes = {
+            let pipes = self
+                .pipe_observers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pipes
+                .iter()
+                .filter_map(|(input, observer)| {
+                    let observer = observer.upgrade()?;
+                    let state = core.pipe_state(*input)?;
+                    (state.status != agent_core::ffi::PipeStatus::Closed)
+                        .then_some((observer, state))
+                })
+                .collect::<Vec<_>>()
+        };
+        let result = core.resource(command);
+        let snapshot = core.snapshot();
+        let snapshot_state = snapshot.into();
+        let snapshot_version = snapshot.version;
+        let mut registry = self
+            .publication_observers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.retain(|_, observer| observer.strong_count() > 0);
+        let mut publications = Vec::new();
+        let mut released_notification = None;
+        for (&observed_owner, weak) in registry.iter() {
+            let Some(observer) = weak.upgrade() else {
+                continue;
+            };
+            if observed_owner == owner {
+                if result.is_ok() {
+                    if let Some(state) = final_state.clone() {
+                        released_notification = observer.prepare(state, true).ok();
+                    }
+                }
+            } else if let Ok(state) = core.publication_state(observed_owner) {
+                if let Ok(notification) = observer.prepare(state, false) {
+                    publications.push(notification);
+                }
+            }
+        }
+        drop(registry);
+        let pipe_notifications = if result.is_ok() {
+            self.pipe_observers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|(input, _)| core.pipe_state(*input).is_some());
+            final_pipes
+                .into_iter()
+                .filter_map(|(observer, state)| observer.prepare(state, true).ok())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        drop(core);
+        let _ = self.observer.publish_from(snapshot_version, snapshot_state);
+        if let Some(notification) = released_notification {
+            let _ = notification.notify();
+        }
+        for notification in publications {
+            let _ = notification.notify();
+        }
+        for notification in pipe_notifications {
+            let _ = notification.notify();
+        }
+        result
+    }
+
+    fn detach_input_resource(
+        &self,
+        input: agent_core::PublicationInputId,
+    ) -> Result<agent_core::ResourceResult, agent_core::AgentError> {
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pipe_final = {
+            let mut pipes = self
+                .pipe_observers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pipes.retain(|(_, weak)| weak.strong_count() > 0);
+            pipes.iter().find_map(|(id, weak)| {
+                (*id == input)
+                    .then(|| weak.upgrade())
+                    .flatten()
+                    .and_then(|observer| core.pipe_state(input).map(|state| (observer, state)))
+            })
+        };
+        let result =
+            core.resource(agent_core::ResourceCommand::DetachPublicationInput { input })?;
+        let snapshot = core.snapshot();
+        let version = snapshot.version;
+        let snapshot_state = snapshot.into();
+        let publications = {
+            let mut registry = self
+                .publication_observers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.retain(|_, weak| weak.strong_count() > 0);
+            registry
+                .iter()
+                .filter_map(|(&owner, weak)| {
+                    let observer = weak.upgrade()?;
+                    let state = core.publication_state(owner).ok()?;
+                    observer.prepare(state, false).ok()
+                })
+                .collect::<Vec<_>>()
+        };
+        let pipe_notification = match (&result, pipe_final) {
+            (agent_core::ResourceResult::PublicationInput { .. }, Some((observer, state))) => {
+                observer.prepare(state, true).ok()
+            }
+            _ => None,
+        };
+        drop(core);
+        let _ = self.observer.publish_from(version, snapshot_state);
+        if let Some(notification) = pipe_notification {
+            let _ = notification.notify();
+        }
+        for notification in publications {
+            let _ = notification.notify();
+        }
+        self.changed.notify_one();
+        Ok(result)
     }
 
     pub(super) fn send_data(
@@ -123,6 +635,17 @@ impl Control {
         control: &agent_core::PublicationInputControl,
     ) -> bool {
         self.with(|core| core.publication_input_control_current(control))
+    }
+
+    pub(super) fn has_pipe(&self, input: agent_core::PublicationInputId) -> bool {
+        self.with(|core| core.pipe_state(input).is_some())
+    }
+
+    pub(super) fn has_input(&self, owner: u64) -> bool {
+        self.with(|core| {
+            core.publication_state(owner)
+                .is_ok_and(|state| state.input_attached)
+        })
     }
 }
 
@@ -204,6 +727,108 @@ mod tests {
         assert_eq!(a.next().unwrap().await, None);
         assert_eq!(b.next().unwrap().await, Some(closed));
         assert_eq!(b.next().unwrap().await, None);
+    }
+
+    #[tokio::test]
+    async fn publication_projection_tracks_core_revisions_and_closes_outside_lock() {
+        use agent_core::{ResourceCommand, ResourceResult, TrackSpec};
+
+        let control = Control::new(
+            agent_core::Agent::new(agent_core::AgentConfig {
+                endpoint: "http://pulsebeam.test".into(),
+                token: "token".into(),
+                retry: Default::default(),
+                log_level: agent_core::LogLevel::Off,
+            })
+            .unwrap(),
+        );
+        let ResourceResult::Publication { owner, .. } = control
+            .resource(ResourceCommand::ClaimPublication {
+                spec: TrackSpec::Video {
+                    label: "camera".into(),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("Core did not create publication")
+        };
+        let observer = control.publication_observer(owner).unwrap();
+        let first = observer.updates().unwrap();
+        let second = observer.updates().unwrap();
+        let initial = control.publication_state(owner, &observer);
+        assert_eq!(first.next().unwrap().await, Some(initial.clone()));
+        assert_eq!(second.next().unwrap().await, Some(initial.clone()));
+        assert_eq!(
+            initial.admission.status,
+            agent_core::ffi::PublicationAdmissionStatus::Pending
+        );
+
+        let mut pending = Box::pin(first.next().unwrap());
+        let waker = std::task::Waker::from(Arc::new(ReenterPublication {
+            control: control.clone(),
+            owner,
+            observer: observer.clone(),
+        }));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+        control
+            .resource(ResourceCommand::SetPublicationMuted { owner, muted: true })
+            .unwrap();
+        let configured = pending.await.unwrap();
+        assert_eq!(
+            configured.admission.status,
+            agent_core::ffi::PublicationAdmissionStatus::Pending
+        );
+        assert!(!configured.configuration.enabled);
+        let revision = configured.configuration.desired_revision;
+        control
+            .resource(ResourceCommand::SetPublicationMuted { owner, muted: true })
+            .unwrap();
+        assert_eq!(
+            control
+                .publication_state(owner, &observer)
+                .configuration
+                .desired_revision,
+            revision
+        );
+        assert_eq!(
+            second
+                .next()
+                .unwrap()
+                .await
+                .unwrap()
+                .configuration
+                .desired_revision,
+            revision
+        );
+
+        let mut closing = Box::pin(first.next().unwrap());
+        assert!(closing.as_mut().poll(&mut context).is_pending());
+        control
+            .resource(ResourceCommand::Release { owner })
+            .unwrap();
+        let final_state = closing.await.unwrap();
+        assert!(final_state.closed);
+        assert!(!final_state.configuration.enabled);
+        assert_eq!(first.next().unwrap().await, None);
+        assert_eq!(observer.state(), final_state);
+    }
+
+    struct ReenterPublication {
+        control: Control,
+        owner: u64,
+        observer: Arc<agent_core::observer::PublicationStateObserver>,
+    }
+
+    impl std::task::Wake for ReenterPublication {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            assert!(self.control.core.try_lock().is_ok());
+            let _ = self.control.publication_state(self.owner, &self.observer);
+        }
     }
 
     #[test]

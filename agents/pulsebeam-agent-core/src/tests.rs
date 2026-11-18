@@ -4935,6 +4935,136 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
 }
 
 #[test]
+fn owned_input_attachment_is_exclusive_and_cleanup_is_lifetime_scoped() {
+    use crate::ffi::{ErrorCode, PipeStatus};
+
+    let mut agent = Agent::new(config()).unwrap();
+    let ResourceResult::Publication { owner, slot, .. } = agent
+        .resource(ResourceCommand::ClaimPublication {
+            spec: TrackSpec::Video {
+                label: "camera".into(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("publication lease");
+    };
+    let ResourceResult::PublicationInput { operation, state } = agent
+        .resource(ResourceCommand::AttachPublicationInput { owner })
+        .unwrap()
+    else {
+        panic!("input lease");
+    };
+    let input = operation.input().unwrap();
+    assert_eq!(agent.publication_input_state(input), Some(state));
+    assert_eq!(agent.pipe_state(input).unwrap().status, PipeStatus::Pending);
+    agent
+        .resource(ResourceCommand::CompletePublicationInput {
+            operation: operation.clone(),
+            result: Err(ErrorCode::Unsupported),
+        })
+        .unwrap();
+    let failed = agent.pipe_state(input).unwrap();
+    assert_eq!(failed.status, PipeStatus::Unavailable);
+    assert_eq!(failed.error.as_ref().unwrap().code, ErrorCode::Unsupported);
+    assert_eq!(
+        agent.resource(ResourceCommand::CompletePublicationInput {
+            operation: operation.clone(),
+            result: Ok(()),
+        }),
+        Ok(ResourceResult::Superseded)
+    );
+    assert_eq!(agent.pipe_state(input), Some(failed.clone()));
+    assert_eq!(
+        agent.resource(ResourceCommand::AttachPublicationInput { owner }),
+        Err(AgentError::InvalidResource(
+            TrackResourceError::AlreadyOwned
+        ))
+    );
+    let ResourceResult::PublicationInput {
+        operation: newer, ..
+    } = agent
+        .resource(ResourceCommand::BeginPublicationInput {
+            owner,
+            input: crate::PublicationInputIntent::ConfigureCurrent,
+            present: true,
+            muted: None,
+        })
+        .unwrap()
+    else {
+        panic!("registration work");
+    };
+    assert_eq!(newer.input(), Some(input));
+    assert_ne!(operation, newer);
+    let retry = agent.pipe_state(input).unwrap();
+    assert_eq!(retry.status, PipeStatus::Pending);
+    assert_eq!(retry.error, failed.error);
+    agent
+        .resource(ResourceCommand::CompletePublicationInput {
+            operation: newer.clone(),
+            result: Ok(()),
+        })
+        .unwrap();
+    let available = agent.pipe_state(input).unwrap();
+    assert_eq!(available.status, PipeStatus::Available);
+    assert_eq!(available.error, None);
+    agent
+        .resource(ResourceCommand::SetPublicationMuted { owner, muted: true })
+        .unwrap();
+    assert_eq!(agent.pipe_state(input), Some(available));
+    let publication = agent.publication_state(owner).unwrap();
+    assert!(!publication.forwarding_requested);
+    assert_eq!(
+        publication.admission.status,
+        crate::ffi::PublicationAdmissionStatus::Pending
+    );
+    assert_eq!(publication.configuration.error, None);
+    let ResourceResult::PublicationInput {
+        operation: detached,
+        ..
+    } = agent
+        .resource(ResourceCommand::DetachPublicationInput { input })
+        .unwrap()
+    else {
+        panic!("detach work");
+    };
+    assert_eq!(detached.input(), None);
+    assert_eq!(agent.publication_input_state(input), None);
+    assert_eq!(agent.pipe_state(input), None);
+    assert_eq!(
+        agent.resource(ResourceCommand::CompletePublicationInput {
+            operation: newer,
+            result: Ok(()),
+        }),
+        Ok(ResourceResult::Superseded)
+    );
+    let ResourceResult::PublicationInput {
+        operation: replacement,
+        ..
+    } = agent
+        .resource(ResourceCommand::AttachPublicationInput { owner })
+        .unwrap()
+    else {
+        panic!("replacement lease");
+    };
+    let replacement = replacement.input().unwrap();
+    assert_ne!(replacement, input);
+    assert_eq!(
+        agent.resource(ResourceCommand::DetachPublicationInput { input }),
+        Ok(ResourceResult::Superseded)
+    );
+    assert!(agent.publication_input_state(replacement).is_some());
+    assert!(agent.is_publishing(&MediaSlot::LocalVideo(slot)));
+    agent.resource(ResourceCommand::Release { owner }).unwrap();
+    assert_eq!(agent.publication_input_state(replacement), None);
+    assert_eq!(agent.pipe_state(replacement), None);
+    assert_eq!(
+        agent.resource(ResourceCommand::DetachPublicationInput { input: replacement }),
+        Ok(ResourceResult::Superseded)
+    );
+}
+
+#[test]
 fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_cleanup() {
     let configuration = config();
     let mut agent = Agent::new(configuration).unwrap();
@@ -4954,7 +5084,16 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
     assert_eq!(slot, "v0");
     assert_eq!(after_generation, None);
     let sender = MediaSlot::LocalVideo(slot.clone());
-    assert!(!agent.is_publishing(&sender));
+    assert!(agent.is_publishing(&sender));
+    let state = agent.publication_state(owner).unwrap();
+    assert_eq!(
+        state.admission.status,
+        ffi::PublicationAdmissionStatus::Pending
+    );
+    assert_eq!(state.configuration.desired_revision, 1);
+    assert_eq!(state.configuration.accepted_revision, 1);
+    assert!(!state.input_attached);
+    assert!(!state.forwarding_requested);
     agent
         .resource(ResourceCommand::UpdatePublication {
             owner,
@@ -5038,12 +5177,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         panic!("camera owner")
     };
     assert_eq!(after_generation, None);
-    agent
-        .resource(ResourceCommand::UpdatePublication {
-            owner,
-            present: true,
-        })
-        .unwrap();
+    assert!(agent.is_publishing(&MediaSlot::LocalVideo(slot.clone())));
 
     let (mut agent, generation, channel, receivers) = native_media::connected_with(
         agent,
@@ -5054,7 +5188,25 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         },
     );
     assert!(receivers.is_empty());
+    let admitted = agent.publication_state(owner).unwrap();
+    assert_eq!(
+        admitted.admission.status,
+        ffi::PublicationAdmissionStatus::Admitted
+    );
+    assert!(admitted.admission.publication_id.is_some());
+    assert_eq!(
+        admitted.admission.connection_generation,
+        Some(generation.get())
+    );
+    assert!(!admitted.input_attached);
+    assert!(!admitted.admission.evaluation_pending);
+    assert_eq!(admitted.admission.demand, ffi::PublicationDemand::Idle);
+    assert_eq!(
+        admitted.admission.execution,
+        ffi::PublicationExecution::Installed
+    );
     agent.resource(ResourceCommand::Release { owner }).unwrap();
+    assert!(agent.publication_state(owner).is_err());
     let retired = native_media::next(&mut agent, generation, channel);
     assert_eq!(retired.len(), 1);
     assert_eq!(
@@ -5080,12 +5232,6 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
     assert_eq!(reused, slot);
     assert_ne!(replacement, owner);
     assert_eq!(after_generation, None);
-    agent
-        .resource(ResourceCommand::UpdatePublication {
-            owner: replacement,
-            present: true,
-        })
-        .unwrap();
     assert!(
         agent.next_effect_after_turn().is_none(),
         "replacement waits for the old owned cutoff"
@@ -5128,6 +5274,15 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         matches!(video.binding.as_ref().and_then(|binding| binding.transport.as_ref()),
         Some(state::track_binding::Transport::Rtp(rtp)) if rtp.mid == "fresh-sender")
     );
+    assert_eq!(
+        agent
+            .publication_state(replacement)
+            .unwrap()
+            .admission
+            .status,
+        ffi::PublicationAdmissionStatus::Pending,
+        "prepared transport and emitted intent are not admission"
+    );
     let participant = state::Participant {
         participant_id: agent.snapshot().participant_id.clone().unwrap(),
         participant_external_id: agent.snapshot().participant_external_id.clone().unwrap(),
@@ -5156,60 +5311,29 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
         }))
         .unwrap();
     assert!(agent.next_effect_after_turn().is_none());
-    agent
-        .resource(ResourceCommand::UpdatePublication {
-            owner: replacement,
-            present: false,
-        })
-        .unwrap();
-    let disabled = native_media::next(&mut agent, generation, channel);
-    assert_eq!(disabled.len(), 1);
-    assert_eq!(disabled[0].reference, fresh[0].reference);
-    assert_eq!(disabled[0].spec().declaration, fresh[0].spec().declaration);
-    assert_eq!(
-        disabled[0].spec().settings.as_ref().unwrap().enabled,
-        Some(false)
-    );
-    native_connection::observe(
-        &mut agent,
-        generation,
-        channel,
-        vec![disabled[0].installed(
-            participant.clone(),
-            native_media::track(
-                "replacement-screen-source",
-                &participant.participant_id,
-                "screen",
-                MediaKind::Video,
-            ),
-        )],
-    );
-    assert!(agent.next_effect_after_turn().is_none());
-    agent
-        .resource(ResourceCommand::UpdatePublication {
-            owner: replacement,
-            present: true,
-        })
-        .unwrap();
-    let resumed = native_media::next(&mut agent, generation, channel);
-    assert_eq!(resumed.len(), 1);
-    assert_eq!(resumed[0].reference, fresh[0].reference);
-    assert_eq!(resumed[0].spec(), fresh[0].spec());
-    native_connection::observe(
-        &mut agent,
-        generation,
-        channel,
-        vec![resumed[0].installed(
-            participant.clone(),
-            native_media::track(
-                "replacement-screen-source",
-                &participant.participant_id,
-                "screen",
-                MediaKind::Video,
-            ),
-        )],
-    );
-    assert!(agent.next_effect_after_turn().is_none());
+    for present in [false, true] {
+        agent
+            .resource(ResourceCommand::UpdatePublication {
+                owner: replacement,
+                present,
+            })
+            .unwrap();
+        assert!(agent.is_publishing(&MediaSlot::LocalVideo(slot.clone())));
+        let observed = agent.publication_state(replacement).unwrap();
+        assert_eq!(
+            observed.admission.status,
+            ffi::PublicationAdmissionStatus::Admitted
+        );
+        assert_eq!(
+            observed.admission.publication_id.as_deref(),
+            Some("replacement-screen-source")
+        );
+        assert_eq!(observed.configuration.desired_revision, 1);
+        assert!(
+            agent.next_effect_after_turn().is_none(),
+            "input availability must not mutate the admitted declaration"
+        );
+    }
     agent
         .resource(ResourceCommand::Release { owner: replacement })
         .unwrap();

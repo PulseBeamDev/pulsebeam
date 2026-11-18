@@ -894,6 +894,14 @@ impl NativeState {
         self.owned.get(&reference)?.confirmed.as_ref()
     }
 
+    pub(crate) fn evaluation(&self, resource: &Resource) -> Option<&wire::ConfirmedState> {
+        let target = self.targets.get(resource)?;
+        let owned = self.owned.get(&target.reference?)?;
+        let state = owned.confirmed.as_ref()?;
+        (specs_equal(&target.spec, &owned.sent) && state.evaluated_revision >= owned.sent_revision)
+            .then_some(state)
+    }
+
     pub(crate) fn eligible(&self, resource: &Resource) -> Option<&wire::LiveResource> {
         if self.terminal || self.session.as_ref()?.authorization.is_none() {
             return None;

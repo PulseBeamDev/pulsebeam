@@ -217,6 +217,44 @@ if (process.argv[2] === "initialization-failure") {
   first.free();
   independent.free();
   observed.free();
+  const publicationRuntime = new BrowserRuntime(config);
+  const claim = await publicationRuntime.resource({
+    op: "claimPublication",
+    spec: { kind: "video", label: "camera" },
+  });
+  const publication = publicationRuntime.publication(claim.owner);
+  const publicationUpdates = publication.updates();
+  const independentPublicationUpdates = publication.updates();
+  const initialPublication = await publicationUpdates.next();
+  assert.deepEqual(
+    await independentPublicationUpdates.next(),
+    initialPublication,
+  );
+  assert.equal(initialPublication.admission.status, 0);
+  assert.equal(initialPublication.admission.demand, 0);
+  assert.equal(initialPublication.inputAttached, false);
+  assert.equal(initialPublication.configuration.desiredRevision, 1n);
+  const pendingPublication = publicationUpdates.next();
+  const pendingIndependentPublication = independentPublicationUpdates.next();
+  await publicationRuntime.set_owned_muted(claim.owner, true);
+  const configuredPublication = await pendingPublication;
+  assert.equal(configuredPublication.configuration.desiredRevision, 2n);
+  assert.equal(publication.state().configuration.desiredRevision, 2n);
+  assert.deepEqual(await pendingIndependentPublication, configuredPublication);
+  const retainedPublicationUpdates = publication.updates();
+  publication.free();
+  await publicationRuntime.resource({ op: "release", owner: claim.owner });
+  const finalPublication = await retainedPublicationUpdates.next();
+  assert.equal(finalPublication.closed, true);
+  assert.equal((await independentPublicationUpdates.next()).closed, true);
+  publicationRuntime.abort();
+  assert.equal(await retainedPublicationUpdates.next(), undefined);
+  publicationUpdates.close();
+  independentPublicationUpdates.close();
+  publicationUpdates.free();
+  independentPublicationUpdates.free();
+  retainedPublicationUpdates.free();
+  publicationRuntime.free();
   const { localOperationContract } = await import("./local-operations.mjs");
   const local = await localOperationContract(BrowserRuntime);
   const { publicContract } = await import("./public-contract.mjs");

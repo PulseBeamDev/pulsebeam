@@ -35,6 +35,7 @@ pub(crate) struct Turn {
     pub(crate) effects: Vec<Effect>,
     pub(crate) notifications: Vec<Notification>,
     pub(crate) snapshot: Option<Snapshot>,
+    pub(crate) publications: Vec<(u64, agent_core::ffi::PublicationState, bool)>,
     pub(crate) error: Option<TurnError>,
     logs: Vec<agent_core::DeferredLog>,
 }
@@ -65,6 +66,7 @@ struct Control {
 pub(crate) struct Driver {
     control: Rc<Control>,
     published_version: Option<u64>,
+    publication_owners: BTreeMap<u64, ()>,
 }
 
 impl Driver {
@@ -78,6 +80,7 @@ impl Driver {
                 wake_pending: Cell::new(false),
             }),
             published_version: None,
+            publication_owners: BTreeMap::new(),
         })
     }
 
@@ -132,8 +135,24 @@ impl Driver {
         &mut self,
         command: agent_core::ResourceCommand,
     ) -> (Result<agent_core::ResourceResult, AgentError>, Turn) {
+        let releasing = match &command {
+            agent_core::ResourceCommand::Release { owner } => Some(*owner),
+            _ => None,
+        };
+        let final_state =
+            releasing.and_then(|owner| self.control.agent.borrow().publication_state(owner).ok());
         let result = self.control.agent.borrow_mut().resource(command);
-        let turn = self.finish_turn(None);
+        if let Ok(agent_core::ResourceResult::Publication { owner, .. }) = &result {
+            self.publication_owners.insert(*owner, ());
+        }
+        if let Some(owner) = releasing {
+            self.publication_owners.remove(&owner);
+        }
+        let mut turn = self.finish_turn(None);
+        if let (Some(owner), Some(mut state)) = (releasing, final_state) {
+            state.closed = true;
+            turn.publications.push((owner, state, true));
+        }
         (result, turn)
     }
 
@@ -149,6 +168,17 @@ impl Driver {
             notifications.push(notification);
         }
 
+        let publications = self
+            .publication_owners
+            .keys()
+            .filter_map(|owner| {
+                agent
+                    .publication_state(*owner)
+                    .ok()
+                    .map(|state| (*owner, state, false))
+            })
+            .collect();
+
         let version = agent.snapshot().version;
         let snapshot = if self.published_version == Some(version) {
             None
@@ -161,6 +191,7 @@ impl Driver {
             effects,
             notifications,
             snapshot,
+            publications,
             error,
             logs: agent.drain_logs(),
         }
@@ -181,7 +212,16 @@ pub(crate) trait Host {
     ) {
     }
     fn resource_released(&self, _owner: u64) {}
+    fn prepare_publication_state(
+        &self,
+        _owner: u64,
+        _state: &agent_core::ffi::PublicationState,
+        _closing: bool,
+    ) -> Option<agent_core::observer::PublicationNotification> {
+        None
+    }
     fn publication_input_state(&self, _state: &agent_core::PublicationInputState) {}
+    fn notify_prepared_pipe_states(&self) {}
 }
 
 pub(crate) enum PublicCommand {
@@ -296,6 +336,54 @@ impl ActorHandle {
 
     pub(crate) fn snapshots(&self) -> watch::Receiver<Snapshot> {
         self.snapshots.clone()
+    }
+
+    pub(crate) fn publication_state(
+        &self,
+        owner: u64,
+    ) -> Option<agent_core::ffi::PublicationState> {
+        self.control.agent.borrow().publication_state(owner).ok()
+    }
+
+    /// Synchronously reserve a local resource while preserving actor acceptance.
+    /// CoreChanged is coalesced, and every actor turn projects the current Core.
+    pub(crate) fn resource_now(
+        &self,
+        command: agent_core::ResourceCommand,
+    ) -> Result<agent_core::ResourceResult, agent_core::ffi::ErrorInfo> {
+        if !self.control.accepting.get() || self.sender.is_closed() {
+            return Err(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Closed,
+                "Actor is not running",
+            ));
+        }
+        let result = self
+            .control
+            .agent
+            .borrow_mut()
+            .resource(command)
+            .map_err(|error| agent_core::ffi::ErrorInfo::from(&error))?;
+        if !self.control.wake_pending.replace(true) {
+            match self.sender.try_send(Message::CoreChanged) {
+                Ok(()) => {}
+                Err(MpscTrySendError::Full(_)) => self.control.wake_pending.set(false),
+                Err(MpscTrySendError::Closed(_)) => {
+                    self.control.wake_pending.set(false);
+                    return Err(agent_core::ffi::ErrorInfo::new(
+                        agent_core::ffi::ErrorCode::Closed,
+                        "Actor is not running",
+                    ));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn pipe_state(
+        &self,
+        input: agent_core::PublicationInputId,
+    ) -> Option<agent_core::ffi::PipeState> {
+        self.control.agent.borrow().pipe_state(input)
     }
 
     pub(crate) fn send_public(&self, message: PublicCommand) -> Result<(), String> {
@@ -487,6 +575,18 @@ impl<H: Host> Actor<H> {
     }
 
     fn publish_turn(&mut self, mut turn: Turn) {
+        // Commit the entire turn before any foreign wake can reenter and change Core.
+        let publications = turn
+            .publications
+            .iter()
+            .filter_map(|(owner, state, closing)| {
+                self.host.prepare_publication_state(*owner, state, *closing)
+            })
+            .collect::<Vec<_>>();
+        for publication in publications {
+            publication.notify();
+        }
+        self.host.notify_prepared_pipe_states();
         let snapshot = if let Some(snapshot) = turn.snapshot.clone() {
             snapshot
         } else {
@@ -663,10 +763,10 @@ impl<H: Host> Actor<H> {
                 {
                     self.host.publication_input_state(state);
                 }
+                self.publish_turn(turn);
                 if let Some(owner) = release {
                     self.host.resource_released(owner);
                 }
-                self.publish_turn(turn);
                 let _ = completion.send(result);
             }
             Message::HostEvent(event) => self.event(event),
@@ -948,6 +1048,48 @@ mod tests {
         let before = handle.snapshot();
         assert!(handle.join("no-runtime".into()).is_err());
         assert_eq!(handle.snapshot(), before);
+    }
+
+    #[test]
+    fn local_resource_reservation_remains_wakeable_after_mailbox_saturation() {
+        use agent_core::{ResourceCommand, ResourceResult, TrackSpec, ffi::ErrorCode};
+
+        let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
+        let (sender, receiver) = super::channel::mpsc::channel(1);
+        let handle = actor.handle(sender);
+        handle
+            .send_public(PublicCommand::SetLogLevel(agent_core::LogLevel::Off))
+            .unwrap();
+        let ResourceResult::Publication { owner, .. } = handle
+            .resource_now(ResourceCommand::ClaimPublication {
+                spec: TrackSpec::Video {
+                    label: "pipe".into(),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("expected publication");
+        };
+        actor.process(receiver.try_recv().unwrap());
+        assert!(receiver.try_recv().is_none());
+        let ResourceResult::PublicationInput { operation, .. } = handle
+            .resource_now(ResourceCommand::AttachPublicationInput { owner })
+            .unwrap()
+        else {
+            panic!("expected pipe");
+        };
+        let wake = receiver
+            .try_recv()
+            .expect("a subsequent reservation must wake the actor");
+        actor.process(wake);
+        assert!(handle.pipe_state(operation.input().unwrap()).is_some());
+        assert_eq!(
+            handle
+                .resource_now(ResourceCommand::AttachPublicationInput { owner })
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
     }
 
     #[test]

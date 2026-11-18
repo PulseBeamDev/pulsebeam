@@ -792,6 +792,18 @@ async fn run_peer(
         .audio("microphone".into())?
         .publish(audio.clone(), Default::default())
         .await?;
+    video_owner.set_source(None).await?;
+    let video_updates = video_owner.updates()?;
+    let pending_video = video_updates
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("publication observation ended before join"))?;
+    anyhow::ensure!(
+        pending_video.admission.status == core_ffi::PublicationAdmissionStatus::Pending
+            && !pending_video.input_attached
+            && !pending_video.forwarding_requested,
+        "detached publication claimed admission or forwarding before join"
+    );
     let latest = core_ffi::TopicPublisher {
         name: "latest-state".into(),
         mode: core_ffi::TopicMode::Latest,
@@ -837,8 +849,23 @@ async fn run_peer(
     let generation = connected
         .generation
         .ok_or_else(|| anyhow::anyhow!("connected without generation"))?;
-    video_owner.ready().await?;
     audio_owner.ready().await?;
+    let admitted_video = wait_publication_admitted(&video_updates).await?;
+    anyhow::ensure!(
+        admitted_video.admission.publication_id.is_some()
+            && admitted_video.admission.demand == core_ffi::PublicationDemand::Idle
+            && !admitted_video.input_attached
+            && !admitted_video.forwarding_requested
+            && admitted_video.configuration.enabled
+            && !video.is_closed(),
+        "input-free publication was not admitted idle before the first frame"
+    );
+    video_owner.set_source(Some(video.clone())).await?;
+    video_owner.ready().await?;
+    anyhow::ensure!(
+        video_owner.state().admission.publication_id == admitted_video.admission.publication_id,
+        "attaching input replaced the admitted publication"
+    );
     barriers.before_media.wait().await;
     let mut frame_cursor = 0;
     let initial = wait_remote_media(&agent, &video, &mut frame_cursor).await?;
@@ -1053,6 +1080,14 @@ async fn run_peer(
     let retired_video_observation = remote_video.clone();
     let retired_audio_observation = remote_audio.clone();
     video_owner.close().await?;
+    let closed_video = video_updates
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("publication observation lost its final state"))?;
+    anyhow::ensure!(
+        closed_video.closed && video_updates.next().await?.is_none(),
+        "publication close did not expose a final state and end its cursor"
+    );
     audio_owner.close().await?;
     anyhow::ensure!(
         !video.is_closed() && !audio.is_closed(),
@@ -1779,6 +1814,31 @@ async fn native_payload_channels(
     })
     .await
     .map_err(|_| anyhow::anyhow!("native payload channel count did not reach {count}"))?
+}
+
+async fn wait_publication_admitted(
+    updates: &pulsebeam_agent_native::ffi::PublicationUpdates,
+) -> anyhow::Result<core_ffi::PublicationState> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = updates
+                .next()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("publication observation ended before admission"))?;
+            match state.admission.status {
+                core_ffi::PublicationAdmissionStatus::Admitted => return Ok(state),
+                core_ffi::PublicationAdmissionStatus::Pending => {}
+                core_ffi::PublicationAdmissionStatus::Rejected => {
+                    anyhow::bail!(
+                        "publication admission rejected: {:?}",
+                        state.admission.error
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("publication admission timed out"))?
 }
 
 async fn wait_connected(

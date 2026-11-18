@@ -59,6 +59,14 @@ async def witness():
         assert agent.snapshot().desired_revision == revision, "source creation published"
         configuration = core.PublicationConfig(enabled=True)
         video_publication = await local_video.publish(video_source, configuration)
+        publication_updates = video_publication.updates()
+        initial_publication = video_publication.state()
+        assert isinstance(publication_updates, native.PublicationUpdates)
+        assert initial_publication.admission.status == core.PublicationAdmissionStatus.PENDING
+        assert initial_publication.admission.demand == core.PublicationDemand.UNKNOWN
+        assert initial_publication.configuration.enabled is True
+        assert isinstance(initial_publication.configuration.desired_revision, int)
+        assert (await publication_updates.next()).observation_revision == initial_publication.observation_revision
         try:
             await same_video.publish(video_source, configuration)
         except native.NativeError.Resource as error:
@@ -66,10 +74,27 @@ async def witness():
         else:
             raise AssertionError("equivalent lookup bypassed publication exclusivity")
         await video_publication.configure(core.PublicationConfig(enabled=False))
+        configured_publication = video_publication.state()
+        assert configured_publication.admission.status == core.PublicationAdmissionStatus.PENDING
+        assert configured_publication.admission.demand == core.PublicationDemand.UNKNOWN
+        assert configured_publication.configuration.enabled is False
+        assert configured_publication.configuration.desired_revision > initial_publication.configuration.desired_revision
+        assert (await publication_updates.next()).configuration.enabled is False
+        no_op_revision = configured_publication.configuration.desired_revision
+        await video_publication.configure(core.PublicationConfig(enabled=False))
+        assert video_publication.state().configuration.desired_revision == no_op_revision
+        await video_publication.configure(core.PublicationConfig(enabled=True))
+        assert video_publication.state().configuration.enabled is True
+        await video_publication.configure(core.PublicationConfig(enabled=False))
+        assert video_publication.state().configuration.enabled is False
         await video_publication.set_source(None)
         await video_publication.set_source(video_source)
         pending_bound = asyncio.create_task(video_publication.ready())
         await video_publication.close()
+        assert video_publication.state().closed
+        assert (await publication_updates.next()).closed is True
+        assert (await publication_updates.next()) is None
+        publication_updates.close()
         try:
             await pending_bound
         except native.NativeError.Closed:
@@ -90,6 +115,10 @@ async def witness():
         assert not video_replacement.is_closed(), "source stop closed publication ownership"
         await video_replacement.close()
         audio_publication = await local_audio.publish(audio_source, configuration)
+        audio_publication_updates = audio_publication.updates()
+        initial_audio_publication = await audio_publication_updates.next()
+        assert initial_audio_publication.admission.status == core.PublicationAdmissionStatus.PENDING
+        pending_audio_publication = asyncio.create_task(audio_publication_updates.next())
         try:
             await audio_source.submit(native.InputFrame.PCM(frame=native.PcmFrame(
                 sample_rate_hz=48000, channels=1, samples=[-32768, 0, 32767], timestamp_us=0,
@@ -171,6 +200,10 @@ async def witness():
             assert error.info.code == core.ErrorCode.CLOSED
         else:
             raise AssertionError("closed Agent revived")
+        final_audio_publication = await pending_audio_publication
+        assert final_audio_publication.closed and audio_publication.state().closed
+        assert await audio_publication_updates.next() is None
+        audio_publication_updates.close()
         final_state = await state_updates.next()
         assert final_state.status == core.AgentStatus.CLOSED
         assert final_state.desired_credential_revision == agent.snapshot().credential_revision

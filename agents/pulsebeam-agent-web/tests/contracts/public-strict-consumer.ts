@@ -61,8 +61,16 @@ if (currentState.error) {
 // @ts-expect-error Concrete cursors do not expose the foreign backend.
 stateCursor.cursor;
 stateCursor.close();
-void [nextState, stateRevision, desiredJoinRevision, observedRoom, status, info,
-  stateTyped, updateTyped];
+void [
+  nextState,
+  stateRevision,
+  desiredJoinRevision,
+  observedRoom,
+  status,
+  info,
+  stateTyped,
+  updateTyped,
+];
 const renewed: void = agent.renew("opaque-renewed");
 void renewed;
 const connected: Promise<void> = agent.connect();

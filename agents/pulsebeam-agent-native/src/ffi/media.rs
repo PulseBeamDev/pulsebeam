@@ -58,6 +58,18 @@ macro_rules! publication {
             pub fn is_closed(&self) -> bool {
                 self.runtime.is_closed()
             }
+            pub fn state(&self) -> core_ffi::PublicationState {
+                self.runtime.state()
+            }
+            pub fn updates(&self) -> Result<Arc<PublicationUpdates>, NativeError> {
+                let updates = self.runtime.updates().map_err(|_| NativeError::Operation {
+                    info: core_ffi::ErrorInfo::new(
+                        core_ffi::ErrorCode::CapacityExceeded,
+                        "Publication observer capacity exceeded",
+                    ),
+                })?;
+                Ok(Arc::new(PublicationUpdates { runtime: updates }))
+            }
             pub async fn ready(&self) -> Result<(), NativeError> {
                 self.runtime.ready().await.map_err(Into::into)
             }
@@ -88,6 +100,29 @@ macro_rules! publication {
 
 publication!(VideoPublication, VideoSource);
 publication!(AudioPublication, AudioSource);
+
+#[derive(uniffi::Object)]
+pub struct PublicationUpdates {
+    runtime: crate::PublicationUpdates,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl PublicationUpdates {
+    pub async fn next(&self) -> Result<Option<core_ffi::PublicationState>, NativeError> {
+        self.runtime
+            .next()
+            .await
+            .map_err(|_| NativeError::Operation {
+                info: core_ffi::ErrorInfo::new(
+                    core_ffi::ErrorCode::Conflict,
+                    "An observation read is already pending",
+                ),
+            })
+    }
+    pub fn close(&self) {
+        self.runtime.close();
+    }
+}
 
 macro_rules! local_track {
     ($name:ident, $source:ident, $publication:ident) => {

@@ -61,6 +61,12 @@ impl From<RuntimeError> for NativeError {
             RuntimeError::Closed => Self::Closed,
             RuntimeError::NotReady => Self::NotReady,
             RuntimeError::Backpressure => Self::Backpressure,
+            RuntimeError::CapacityExceeded => Self::Operation {
+                info: core_ffi::ErrorInfo::new(
+                    core_ffi::ErrorCode::CapacityExceeded,
+                    "Frame-source capacity exceeded",
+                ),
+            },
             RuntimeError::UnknownSlot(slot) => Self::InvalidInput {
                 message: format!("unknown media slot: {slot:?}"),
             },
@@ -239,21 +245,9 @@ impl Agent {
 }
 
 fn operation_error(error: RuntimeError) -> NativeError {
-    let info = match error {
-        RuntimeError::Core(error) => core_ffi::ErrorInfo::from(&error),
-        RuntimeError::Closed => {
-            core_ffi::ErrorInfo::new(core_ffi::ErrorCode::Closed, "Agent is closed")
-        }
-        RuntimeError::Backpressure => core_ffi::ErrorInfo::new(
-            core_ffi::ErrorCode::CapacityExceeded,
-            "Operation capacity exceeded",
-        ),
-        RuntimeError::NotReady => {
-            core_ffi::ErrorInfo::new(core_ffi::ErrorCode::NotReady, "Agent is not ready")
-        }
-        _ => core_ffi::ErrorInfo::new(core_ffi::ErrorCode::Internal, "Operation failed"),
-    };
-    NativeError::Operation { info }
+    NativeError::Operation {
+        info: error.error_info(),
+    }
 }
 
 #[derive(uniffi::Object)]

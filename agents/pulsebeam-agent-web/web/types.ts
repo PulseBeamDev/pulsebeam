@@ -1,6 +1,9 @@
 import type { AudioSource, VideoSource } from "./capture-source.js";
 import type { EventStream, SnapshotStream } from "./observation.js";
-import type { AgentState as ObservedAgentState } from "./schema.js";
+import type {
+  AgentState as ObservedAgentState,
+  PublicationState as ObservedPublicationState,
+} from "./schema.js";
 import type { AudioPublication, VideoPublication } from "./media.js";
 import type {
   AudioSelection,
@@ -15,6 +18,11 @@ export type MediaKind = "audio" | "video";
 
 export interface PublicationConfig {
   readonly enabled: boolean;
+}
+
+export interface PublicationUpdates {
+  next(): Promise<Readonly<ObservedPublicationState> | undefined>;
+  close(): void;
 }
 
 export interface LocalVideoTrack {

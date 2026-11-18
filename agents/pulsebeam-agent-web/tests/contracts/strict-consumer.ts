@@ -3,7 +3,14 @@ import type {
   AgentStatus,
   ErrorCode,
   ErrorInfo,
+  PublicationState,
 } from "../web/schema.js";
+import {
+  PublicationMediaKind,
+  PublicationAdmissionStatus,
+  PublicationDemand,
+  PublicationExecution,
+} from "../web/index.js";
 import type {
   AgentConfig,
   AgentError,
@@ -49,6 +56,16 @@ export type StrictBoundaries = [
   Assert<NoAny<AgentStatus>>,
   Assert<NoAny<ErrorInfo>>,
   Assert<NoAny<ErrorCode>>,
+  Assert<NoAny<PublicationState>>,
+  Assert<Equal<PublicationState["observationRevision"], bigint>>,
+  Assert<Equal<PublicationState["kind"], PublicationMediaKind>>,
+  Assert<
+    Equal<PublicationState["admission"]["status"], PublicationAdmissionStatus>
+  >,
+  Assert<Equal<PublicationState["admission"]["demand"], PublicationDemand>>,
+  Assert<
+    Equal<PublicationState["admission"]["execution"], PublicationExecution>
+  >,
   Assert<Equal<AgentState["observationRevision"], bigint>>,
   Assert<Equal<AgentState["desiredJoinRevision"], bigint>>,
   Assert<Equal<AgentState["room"], string | undefined>>,
@@ -125,6 +142,7 @@ declare const topic: TopicMessage;
 declare const frame: MediaFrame;
 declare const statistics: TransportStatistics;
 declare const error: AgentError;
+declare const publication: import("../web/media.js").VideoPublication;
 declare const track: MediaStreamTrack;
 declare const stream: MediaStream;
 
@@ -135,6 +153,16 @@ const bytes: Uint8Array = frame.data;
 const payload: Uint8Array = topic.payload;
 const published: string = desired.publications[0].label;
 const participantId: string = snapshot.catalog.participants[0].participantId;
+const publicationState: Readonly<PublicationState> = publication.state();
+const publicationUpdates: import("../web/types.js").PublicationUpdates =
+  publication.updates();
+const publicationKind: PublicationMediaKind = publicationState.kind;
+const admissionStatus: PublicationAdmissionStatus =
+  publicationState.admission.status;
+// @ts-expect-error publication observation records are readonly
+publicationState.closed = true;
+// @ts-expect-error nested publication observation records are readonly
+publicationState.configuration.enabled = false;
 // @ts-expect-error generated app-facing participants do not expose canonical IDs
 snapshot.catalog.participants[0].id;
 // @ts-expect-error removed generated identity alias
@@ -167,5 +195,8 @@ void [
   payload,
   published,
   participantId,
+  publicationUpdates,
+  publicationKind,
+  admissionStatus,
   invalidTrack,
 ];

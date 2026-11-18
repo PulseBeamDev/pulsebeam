@@ -67,6 +67,9 @@ export class BrowserRuntime {
     };
     return { state: unsupported, updates: unsupported };
   }
+  publication(_owner: bigint) {
+    return this.observer();
+  }
   set_snapshot_listener(listener?: (snapshot: any) => void) {
     this.snapshotListener = listener;
     listener?.(this.snapshot);

@@ -35,6 +35,10 @@ use crate::sender_config::{
 
 mod media_observation;
 mod preparation;
+mod publication;
+pub use publication::{
+    BrowserPipe, BrowserPipeUpdates, BrowserPublicationObserver, BrowserPublicationUpdates,
+};
 mod resources;
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
@@ -199,8 +203,27 @@ impl LocalOperationError {
         }
     }
 
+    fn error_info(&self) -> agent_core::ffi::ErrorInfo {
+        let (code, message) = match self.class {
+            "validation" => (
+                agent_core::ffi::ErrorCode::InvalidArgument,
+                "Invalid local operation argument",
+            ),
+            _ => (
+                agent_core::ffi::ErrorCode::Internal,
+                "Local media operation failed",
+            ),
+        };
+        agent_core::ffi::ErrorInfo::new(code, message)
+    }
+
     fn into_js(self) -> JsValue {
         let error = js_sys::Error::new(&self.message);
+        let _ = Reflect::set(
+            error.as_ref(),
+            &JsValue::from_str("pulsebeamInfo"),
+            &error_info_value(&self.error_info()),
+        );
         let _ = Reflect::set(
             error.as_ref(),
             &JsValue::from_str("pulsebeamClass"),
@@ -464,6 +487,19 @@ impl Host for BrowserHost {
         inner.shutdown();
     }
 
+    fn prepare_publication_state(
+        &self,
+        owner: u64,
+        state: &agent_core::ffi::PublicationState,
+        closing: bool,
+    ) -> Option<agent_core::observer::PublicationNotification> {
+        let inner = self.inner.upgrade()?;
+        if closing {
+            inner.prepare_pipe_close(owner);
+        }
+        inner.prepare_publication(owner, state, closing)
+    }
+
     fn publication_claimed(
         &self,
         owner: u64,
@@ -490,6 +526,7 @@ impl Host for BrowserHost {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
+        inner.close_pipe_observers_for(owner);
         let binding = inner.publication_slots.borrow_mut().remove(&owner);
         if let Some(binding) = binding {
             inner.invalidate_local_slot(binding);
@@ -500,6 +537,7 @@ impl Host for BrowserHost {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
+        inner.prepare_pipe_state(state);
         if !inner
             .publication_slots
             .borrow()
@@ -517,11 +555,27 @@ impl Host for BrowserHost {
             input.track.set_enabled(state.enabled && current);
         }
     }
+
+    fn notify_prepared_pipe_states(&self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.notify_prepared_pipe_states();
+        }
+    }
 }
 
 struct RuntimeInner {
     actor: RefCell<Option<ActorHandle>>,
     agent_state: Rc<agent_core::observer::AgentStateObserver>,
+    publication_observers:
+        RefCell<BTreeMap<u64, Rc<agent_core::observer::PublicationStateObserver>>>,
+    pipe_observers: RefCell<
+        Vec<(
+            u64,
+            agent_core::PublicationInputId,
+            Weak<agent_core::observer::PipeStateObserver>,
+        )>,
+    >,
+    pending_pipe_notifications: RefCell<Vec<agent_core::observer::PipeNotification>>,
     logger: BrowserLogger,
     local_operation_gates: RefCell<BTreeMap<String, Weak<LocalSlotOperations>>>,
     local_tracks: RefCell<BTreeMap<String, LocalTrackState>>,
@@ -560,6 +614,9 @@ impl BrowserRuntime {
             agent_state: Rc::new(agent_core::observer::AgentStateObserver::new(
                 (&agent_core::Snapshot::default()).into(),
             )),
+            publication_observers: RefCell::new(BTreeMap::new()),
+            pipe_observers: RefCell::new(Vec::new()),
+            pending_pipe_notifications: RefCell::new(Vec::new()),
             logger: BrowserLogger::new(config.log_level),
             local_operation_gates: RefCell::new(BTreeMap::new()),
             local_tracks: RefCell::new(BTreeMap::new()),
@@ -868,6 +925,63 @@ impl BrowserRuntime {
         }
     }
 
+    pub fn publication(&self, owner: u64) -> Result<BrowserPublicationObserver, JsValue> {
+        let observer = self
+            .inner
+            .publication_observers
+            .borrow()
+            .get(&owner)
+            .cloned()
+            .ok_or_else(|| js_error("publication owner is not active"))?;
+        Ok(BrowserPublicationObserver { observer })
+    }
+
+    pub fn create_owned_publication_pipe(&self, owner: u64) -> Result<BrowserPipe, JsValue> {
+        self.inner.ensure_open().map_err(|_| {
+            operation_error_value(agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Closed,
+                "Browser runtime is closed",
+            ))
+        })?;
+        let actor = self
+            .inner
+            .actor
+            .borrow()
+            .clone()
+            .ok_or_else(|| js_error("runtime actor is not initialized"))?;
+        let result = actor
+            .resource_now(agent_core::ResourceCommand::AttachPublicationInput { owner })
+            .map_err(operation_error_value)?;
+        let agent_core::ResourceResult::PublicationInput {
+            operation,
+            state: _,
+        } = result
+        else {
+            return Err(js_error("Core did not reserve a publication input"));
+        };
+        let input = operation
+            .input()
+            .ok_or_else(|| js_error("Core did not allocate a publication input ID"))?;
+        let initial = actor
+            .pipe_state(input)
+            .ok_or_else(|| js_error("Core pipe state is unavailable"))?;
+        let observer = Rc::new(agent_core::observer::PipeStateObserver::new(initial));
+        self.inner
+            .pipe_observers
+            .borrow_mut()
+            .push((owner, input, Rc::downgrade(&observer)));
+        Ok(BrowserPipe {
+            actor,
+            input,
+            observer,
+            closed: Cell::new(false),
+            owner,
+            slot: operation.slot().into(),
+            inner: Rc::downgrade(&self.inner),
+            closing: RefCell::new(None),
+        })
+    }
+
     pub fn snapshot(&self) -> JsValue {
         snapshot_value(&self.inner.snapshot())
     }
@@ -1017,6 +1131,7 @@ impl RuntimeInner {
 
     fn request_close(&self) {
         self.closing.set(true);
+        self.close_publication_observers();
         self.close_agent_state();
         self.close_observations();
         self.stop_local_sources();
@@ -1031,6 +1146,7 @@ impl RuntimeInner {
 
     fn request_abort(&self) {
         self.closing.set(true);
+        self.close_publication_observers();
         self.close_agent_state();
         self.close_observations();
         self.stop_local_sources();
@@ -1058,6 +1174,179 @@ impl RuntimeInner {
             .agent_state
             .publish_from(snapshot.version, (&snapshot).into());
         self.agent_state.state()
+    }
+
+    fn close_publication_observers(&self) {
+        self.prepare_pipe_shutdown();
+        let publications = std::mem::take(&mut *self.publication_observers.borrow_mut());
+        let current = {
+            let actor = self.actor.borrow();
+            publications
+                .keys()
+                .map(|owner| {
+                    (
+                        *owner,
+                        actor
+                            .as_ref()
+                            .and_then(|actor| actor.publication_state(*owner)),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let notifications = publications
+            .into_iter()
+            .filter_map(|(owner, observer)| {
+                let state = current
+                    .get(&owner)
+                    .and_then(Clone::clone)
+                    .unwrap_or_else(|| observer.state());
+                observer.prepare(state, true).ok()
+            })
+            .collect::<Vec<_>>();
+        for notification in notifications {
+            notification.notify();
+        }
+        self.notify_prepared_pipe_states();
+    }
+
+    fn prepare_pipe_state(&self, input_state: &agent_core::PublicationInputState) {
+        let observers = self
+            .pipe_observers
+            .borrow()
+            .iter()
+            .filter(|(owner, _, _)| *owner == input_state.owner)
+            .filter_map(|(_, input, observer)| {
+                observer.upgrade().map(|observer| (*input, observer))
+            })
+            .collect::<Vec<_>>();
+        let mut notifications = self.pending_pipe_notifications.borrow_mut();
+        for (input, observer) in observers {
+            let state = self
+                .actor
+                .borrow()
+                .as_ref()
+                .and_then(|actor| actor.pipe_state(input));
+            let closed = state.is_none();
+            if let Ok(notification) =
+                observer.prepare(state.unwrap_or_else(|| observer.state()), closed)
+            {
+                notifications.push(notification);
+            }
+            if closed {
+                self.forget_pipe(input);
+            }
+        }
+    }
+
+    fn notify_prepared_pipe_states(&self) {
+        let notifications = std::mem::take(&mut *self.pending_pipe_notifications.borrow_mut());
+        for notification in notifications {
+            notification.notify();
+        }
+    }
+
+    fn prepare_pipe_close(&self, owner: u64) {
+        let observers = self
+            .pipe_observers
+            .borrow()
+            .iter()
+            .filter(|(registered_owner, _, _)| *registered_owner == owner)
+            .filter_map(|(_, _, observer)| observer.upgrade())
+            .collect::<Vec<_>>();
+        let mut notifications = self.pending_pipe_notifications.borrow_mut();
+        for observer in observers {
+            if let Ok(notification) = observer.prepare(observer.state(), true) {
+                notifications.push(notification);
+            }
+        }
+    }
+
+    fn close_pipe_observers_for(&self, owner: u64) {
+        let mut registry = self.pipe_observers.borrow_mut();
+        let mut retained = Vec::with_capacity(registry.len());
+        let mut closing = Vec::new();
+        for (registered_owner, input, observer) in registry.drain(..) {
+            if registered_owner == owner {
+                if let Some(observer) = observer.upgrade() {
+                    closing.push((input, observer));
+                }
+            } else if observer.strong_count() > 0 {
+                retained.push((registered_owner, input, observer));
+            }
+        }
+        *registry = retained;
+        drop(registry);
+        for (_, observer) in closing {
+            if let Ok(notification) = observer.prepare(observer.state(), true) {
+                notification.notify();
+            }
+        }
+    }
+
+    fn prepare_pipe_shutdown(&self) {
+        let pipes = std::mem::take(&mut *self.pipe_observers.borrow_mut());
+        let mut notifications = self.pending_pipe_notifications.borrow_mut();
+        for (_, input, observer) in pipes {
+            if let Some(observer) = observer.upgrade() {
+                let state = self
+                    .actor
+                    .borrow()
+                    .as_ref()
+                    .and_then(|actor| actor.pipe_state(input))
+                    .unwrap_or_else(|| observer.state());
+                if let Ok(notification) = observer.prepare(state, true) {
+                    notifications.push(notification);
+                }
+            }
+        }
+    }
+
+    fn forget_pipe(&self, input: agent_core::PublicationInputId) {
+        self.pipe_observers
+            .borrow_mut()
+            .retain(|(_, id, observer)| *id != input && observer.strong_count() > 0);
+    }
+
+    fn fence_pipe_input(&self, input: agent_core::PublicationInputId, slot: &str) {
+        if let Some(track) = self.local_tracks.borrow().get(slot).filter(|track| {
+            track
+                .input_operation
+                .as_ref()
+                .is_some_and(|operation| operation.input() == Some(input))
+        }) {
+            track.track.set_enabled(false);
+        }
+    }
+
+    async fn cleanup_pipe_input(
+        self: &Rc<Self>,
+        input: agent_core::PublicationInputId,
+        slot: &str,
+    ) -> Result<(), LocalOperationError> {
+        let operations = self.local_operations(slot);
+        let _permit = operations.gate.enter().await;
+        let clear = {
+            let mut tracks = self.local_tracks.borrow_mut();
+            if tracks.get(slot).is_some_and(|track| {
+                track
+                    .input_operation
+                    .as_ref()
+                    .is_some_and(|operation| operation.input() == Some(input))
+            }) {
+                if let Some(track) = tracks.remove(slot) {
+                    track.track.stop();
+                }
+                true
+            } else {
+                !tracks.contains_key(slot)
+            }
+        };
+        if clear && !self.is_closed() {
+            self.sync_local_slot(slot, None)
+                .await
+                .map_err(LocalOperationError::runtime)?;
+        }
+        Ok(())
     }
 
     fn close_agent_state(&self) {
@@ -1216,7 +1505,7 @@ impl RuntimeInner {
         }
         let previous = if let Some(track) = &track {
             let source_id = track.id();
-            let track = track.clone();
+            let track = MediaStreamTrack::clone(track);
             track.set_enabled(false);
             if let Err(error) = set_property(
                 track.as_ref(),
@@ -1227,7 +1516,7 @@ impl RuntimeInner {
                 if self
                     .input_resource(agent_core::ResourceCommand::CompletePublicationInput {
                         operation: operation.clone(),
-                        succeeded: false,
+                        result: Err(agent_core::ffi::ErrorCode::Internal),
                     })
                     .await?
                     == agent_core::ResourceResult::Superseded
@@ -1268,7 +1557,10 @@ impl RuntimeInner {
         let completed = self
             .input_resource(agent_core::ResourceCommand::CompletePublicationInput {
                 operation: operation.clone(),
-                succeeded: result.is_ok(),
+                result: result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| error.error_info().code),
             })
             .await?;
         if completed == agent_core::ResourceResult::Superseded {
@@ -1402,6 +1694,30 @@ impl RuntimeInner {
         }
         set(&value, "senders", sender_values);
         Ok(value.into())
+    }
+
+    fn prepare_publication(
+        &self,
+        owner: u64,
+        state: &agent_core::ffi::PublicationState,
+        closing: bool,
+    ) -> Option<agent_core::observer::PublicationNotification> {
+        let observer = {
+            let mut observers = self.publication_observers.borrow_mut();
+            observers
+                .entry(owner)
+                .or_insert_with(|| {
+                    Rc::new(agent_core::observer::PublicationStateObserver::new(
+                        state.clone(),
+                    ))
+                })
+                .clone()
+        };
+        let notification = observer.prepare(state.clone(), closing).ok();
+        if closing {
+            self.publication_observers.borrow_mut().remove(&owner);
+        }
+        notification
     }
 
     fn publish_turn(&self, turn: &Turn) {
@@ -2279,6 +2595,7 @@ impl RuntimeInner {
         if self.closed.replace(true) {
             return;
         }
+        self.close_publication_observers();
         self.close_agent_state();
         self.close_observations();
         self.stop_local_sources();

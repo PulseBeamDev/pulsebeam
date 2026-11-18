@@ -16,12 +16,8 @@ export class OperationError extends Error {
   }
 }
 
-function raise(error: unknown): never {
-  if (
-    typeof error === "object" &&
-    error !== null &&
-    "pulsebeamInfo" in error
-  ) {
+export function raise(error: unknown): never {
+  if (typeof error === "object" && error !== null && "pulsebeamInfo" in error) {
     throw new OperationError(error.pulsebeamInfo as ErrorInfo);
   }
   throw error;
