@@ -209,7 +209,6 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                 let track = Track::data_publication(
                     TrackMeta {
                         room: crate::entity::ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
-                        shard_id: crate::id::ShardId::new(0),
                         id: source,
                         origin: owner,
                         connection_id: connection,
@@ -603,7 +602,9 @@ fn overlapping_proposals_cannot_replace_queued_or_active_targets() {
             };
             let report = wire::ExecutionReport {
                 revision: 2,
-                failure: Some(failure(wire::FailureCode::Unsupported)),
+                outcome: Some(wire::execution_report::Outcome::Failure(failure(
+                    wire::FailureCode::Unsupported,
+                ))),
             };
             let bytes = codec::encode_client(&wire::ClientStateBatch {
                 records: vec![wire::ClientStateRecord {
@@ -1540,7 +1541,6 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
         let source = Track::data(
             TrackMeta {
                 room: crate::entity::ProjectRoomKey::fixture(room),
-                shard_id: crate::id::ShardId::new(0),
                 id,
                 origin,
                 connection_id: connection,
@@ -1638,7 +1638,9 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
                 desired: None,
                 execution: Some(wire::ExecutionReport {
                     revision: reference + 1,
-                    failure: Some(failure(wire::FailureCode::InternalFailure)),
+                    outcome: Some(wire::execution_report::Outcome::Failure(failure(
+                        wire::FailureCode::InternalFailure,
+                    ))),
                 }),
             }],
             ..Default::default()
@@ -2203,7 +2205,6 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         Track::data_publication(
             TrackMeta {
                 room: crate::entity::ProjectRoomKey::fixture(room),
-                shard_id: crate::id::ShardId::new(0),
                 id,
                 origin: publisher_id,
                 connection_id: connection,
@@ -2333,6 +2334,259 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         model.rows[&Key::Owned(51)].value.value,
         Some(wire::confirmed_state::Value::Absent(_))
     ));
+}
+
+#[test]
+fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement() {
+    use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackId, TrackKind};
+    use crate::track::{DataLane, TrackMeta};
+    use pulsebeam_core::auth::grants::{Action, Grant, GrantSet};
+    use wire::confirmed_state::Value;
+
+    let mut model = session();
+    let room = RoomId::new("source-room").unwrap();
+    let publisher = ParticipantId::new("publisher").unwrap();
+    let grant = Grant::new(
+        vec![room.to_string()],
+        vec![Action::Subscribe],
+        Some(publisher.to_string()),
+        Some(pulsebeam_core::auth::grants::TrackKind::Data),
+        Some("updates".into()),
+    )
+    .unwrap();
+    model
+        .authorization(
+            10_000,
+            2,
+            ResourcePermissions::Grants {
+                joined_room: None,
+                grants: GrantSet::new(vec![grant]).unwrap(),
+            },
+        )
+        .unwrap();
+    let subscription = |enabled, track_id: &str| wire::ResourceSpec {
+        settings: Some(wire::ResourceSettings {
+            enabled: Some(enabled),
+            receive: None,
+        }),
+        declaration: Some(wire::resource_spec::Declaration::LogicalSubscription(
+            wire::LogicalSubscriptionSpec {
+                source: Some(wire::LogicalSourceAddress {
+                    room: room.to_string(),
+                    participant_id: publisher.to_string(),
+                    kind: wire::TrackKind::Data as i32,
+                    track_id: track_id.into(),
+                }),
+            },
+        )),
+    };
+    let data_track = |label: &str| {
+        let connection = ConnectionId::new();
+        Track::data_publication(
+            TrackMeta {
+                room: crate::entity::ProjectRoomKey::fixture(room),
+                id: connection.fixture_publication(TrackKind::Data, label),
+                origin: publisher,
+                connection_id: connection,
+                track_id: Some(TrackId::new(label).unwrap()),
+            },
+            DataLane::Ordered,
+        )
+    };
+    let assert_state =
+        |model: &NativeSession, evaluated_revision, source_revision, source: Option<&Track>| {
+            let row = &model.rows[&Key::Owned(1)];
+            let Some(Value::LogicalSubscription(state)) = &row.value.value else {
+                panic!("one admitted logical subscription");
+            };
+            assert_eq!(row.value.evaluated_revision, evaluated_revision);
+            assert!(row.value.rejection.is_none());
+            assert_eq!(state.source_revision, source_revision);
+            assert_eq!(
+                state
+                    .source
+                    .as_ref()
+                    .map(|track| &track.publication_id)
+                    .cloned(),
+                source.map(|track| track.id().as_str()),
+            );
+        };
+    let offer = |model: &mut NativeSession, track| {
+        model
+            .refresh_source_lookups(32, 100, |_| {
+                Some(super::super::ResolvedSource {
+                    track,
+                    publisher: &publisher,
+                })
+            })
+            .unwrap();
+    };
+
+    assert!(
+        input(
+            &mut model,
+            vec![present(1, 1, subscription(true, "updates"))]
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert_state(&model, 1, 0, None);
+    let interests = model.take_lookup_changes();
+    assert!(matches!(
+        interests.as_slice(),
+        [LookupInterestChange {
+            reference: 1,
+            active: true,
+            ..
+        }]
+    ));
+    assert!(model.take_preparation().unwrap().is_none());
+
+    let unrelated = data_track("other");
+    offer(&mut model, &unrelated);
+    assert_state(&model, 1, 0, None);
+    let first = data_track("updates");
+    let second = data_track("updates");
+    let retained = model.retained_bytes;
+    offer(&mut model, &first);
+    offer(&mut model, &first);
+    assert_state(&model, 1, 1, Some(&first));
+    let report = |model: &mut NativeSession, revision, source_revision, stream_id| {
+        let batch = wire::ClientStateBatch {
+            records: vec![wire::ClientStateRecord {
+                owned: 1,
+                desired: None,
+                execution: Some(wire::ExecutionReport {
+                    revision,
+                    outcome: Some(wire::execution_report::Outcome::LogicalReceiver(
+                        wire::LogicalReceiverReport {
+                            source_revision,
+                            outcome: Some(wire::logical_receiver_report::Outcome::Prepared(
+                                wire::TrackBinding {
+                                    transport: Some(wire::track_binding::Transport::Sctp(
+                                        wire::SctpParameters {
+                                            stream_id: Some(stream_id),
+                                        },
+                                    )),
+                                },
+                            )),
+                        },
+                    )),
+                }),
+            }],
+            ..Default::default()
+        };
+        let commands = model
+            .receive_input(&codec::encode_client(&batch).unwrap(), 100)
+            .unwrap();
+        assert!(commands.is_empty());
+    };
+    let compile = |model: &mut NativeSession, track: &Track| {
+        let work = model.take_preparation().unwrap().unwrap();
+        let command = model
+            .prepare_execution_in_room(&work, 100, None, |room, id| {
+                assert_eq!(room, "source-room");
+                assert_eq!(id, track.id());
+                Some(super::super::ResolvedSource {
+                    track,
+                    publisher: &publisher,
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            command.into_action(),
+            ExecutionAction::Prepare { .. }
+        ));
+        work
+    };
+    let complete = |model: &mut NativeSession, work, track: &Track| {
+        model
+            .observe_completion(
+                super::super::ExecutionCompletion {
+                    work,
+                    result: Ok(ResourceExecution::Receiver(
+                        crate::participant::policy::ReceiverExecution {
+                            source: track.id(),
+                            enabled: true,
+                            ready: true,
+                            failed: false,
+                        },
+                    )),
+                    released: false,
+                    unix_now: 100,
+                },
+                &publisher,
+            )
+            .unwrap();
+    };
+    let retire = |model: &mut NativeSession, expected| {
+        let command = model.take_logical_retirement().unwrap().unwrap();
+        let ExecutionAction::Retire(scope) = command.into_action() else {
+            panic!("physical receiver cutoff");
+        };
+        assert_eq!(scope.binding, expected);
+    };
+    let released = |model: &mut NativeSession, binding| {
+        model
+            .observe_resource(crate::participant::policy::ResourceObservation::Released { binding })
+            .unwrap();
+    };
+
+    report(&mut model, 2, 1, 3);
+    let old = compile(&mut model, &first);
+    assert_eq!(old.scope().binding, 2);
+    offer(&mut model, &second);
+    assert_state(&model, 1, 2, None);
+    retire(&mut model, 2);
+    complete(&mut model, old, &first);
+    offer(&mut model, &second);
+    assert_state(&model, 1, 2, None);
+    released(&mut model, 2);
+
+    offer(&mut model, &second);
+    assert_state(&model, 1, 3, Some(&second));
+    assert_eq!(model.retained_bytes, retained);
+    assert!(model.take_lookup_changes().is_empty());
+    report(&mut model, 3, 1, 5);
+    assert!(model.take_preparation().unwrap().is_none());
+    report(&mut model, 4, 3, 7);
+    let new = compile(&mut model, &second);
+    assert_eq!(new.scope().binding, 4);
+    complete(&mut model, new, &second);
+    released(&mut model, 2);
+    assert_state(&model, 1, 3, Some(&second));
+    assert!(matches!(&model.rows[&Key::Owned(1)].value.value,
+        Some(Value::LogicalSubscription(state)) if matches!(&state.execution,
+            Some(wire::logical_subscription_state::Execution::Installed(binding))
+                if matches!(&binding.transport, Some(wire::track_binding::Transport::Sctp(sctp)) if sctp.stream_id == Some(7))
+        )
+    ));
+
+    input(
+        &mut model,
+        vec![present(1, 5, subscription(false, "updates"))],
+    )
+    .unwrap();
+    retire(&mut model, 4);
+    offer(&mut model, &second);
+    assert_state(&model, 5, 4, None);
+    released(&mut model, 4);
+    input(
+        &mut model,
+        vec![present(1, 6, subscription(true, "updates"))],
+    )
+    .unwrap();
+    offer(&mut model, &second);
+    assert_state(&model, 6, 5, Some(&second));
+
+    assert!(input(&mut model, vec![absent(1, 7)]).unwrap().is_empty());
+    assert!(matches!(
+        model.rows[&Key::Owned(1)].value.value,
+        Some(Value::Absent(_))
+    ));
+    assert!(model.lookup_interests.is_empty());
+    assert!(model.take_preparation().unwrap().is_none());
 }
 
 #[test]

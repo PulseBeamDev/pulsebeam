@@ -277,7 +277,7 @@ impl ShardRuntime {
 
     pub fn route_reverse(&self, packet: ReversePacket, plan: &InstalledTrackPlan) {
         let Some(target) = &plan.reverse_route else {
-            debug_assert!(false, "reverse packet has no compiled reverse route");
+            // Feedback can arrive before the peer provisions its reverse leg.
             return;
         };
         let _ = super::worker::send_link_frame(

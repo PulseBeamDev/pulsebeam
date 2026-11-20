@@ -51,7 +51,7 @@ fn take_lookup(
                     let Some(state::desired_state::Value::Present(spec)) = desired.value else {
                         continue;
                     };
-                    let Some(state::resource_spec::Declaration::SourceLookup(lookup)) =
+                    let Some(state::resource_spec::Declaration::LogicalSubscription(lookup)) =
                         &spec.declaration
                     else {
                         continue;
@@ -197,15 +197,12 @@ fn delivery_mismatch_fails_only_incompatible_receivers_and_revocation_keeps_the_
         state::ConfirmedState {
             evaluated_revision: revision,
             rejection: None,
-            value: Some(state::confirmed_state::Value::SourceLookup(Box::new(
-                state::SourceLookupState {
+            value: Some(state::confirmed_state::Value::LogicalSubscription(
+                Box::new(state::LogicalSubscriptionState {
                     spec: Some(*spec),
-                    participant: Some(state::Participant {
-                        participant_id: "alice".into(),
-
-                        room_id: "room".into(),
-                    }),
-                    track: Some(state::Track {
+                    source_revision: 1,
+                    execution: None,
+                    source: Some(state::Track {
                         publication_id: "opaque-source".into(),
                         participant_id: "alice".into(),
                         room_id: "room".into(),
@@ -214,8 +211,8 @@ fn delivery_mismatch_fails_only_incompatible_receivers_and_revocation_keeps_the_
                             delivery: state::DataDelivery::Ordered as i32,
                         })),
                     }),
-                },
-            ))),
+                }),
+            )),
         },
     );
     let ordered_state = agent.data_subscription_state(ordered).unwrap();
@@ -283,13 +280,14 @@ fn accepted_missing_source_remains_waiting_without_a_failed_read() {
         state::ConfirmedState {
             evaluated_revision: revision,
             rejection: None,
-            value: Some(state::confirmed_state::Value::SourceLookup(Box::new(
-                state::SourceLookupState {
+            value: Some(state::confirmed_state::Value::LogicalSubscription(
+                Box::new(state::LogicalSubscriptionState {
                     spec: Some(*spec),
-                    participant: None,
-                    track: None,
-                },
-            ))),
+                    source_revision: 0,
+                    execution: None,
+                    source: None,
+                }),
+            )),
         },
     );
     assert_waiting(&mut agent, owner);
@@ -320,15 +318,12 @@ fn resolved_source_description_does_not_claim_data_receiver_execution() {
         state::ConfirmedState {
             evaluated_revision: revision,
             rejection: None,
-            value: Some(state::confirmed_state::Value::SourceLookup(Box::new(
-                state::SourceLookupState {
+            value: Some(state::confirmed_state::Value::LogicalSubscription(
+                Box::new(state::LogicalSubscriptionState {
                     spec: Some(*spec),
-                    participant: Some(state::Participant {
-                        participant_id: "alice".into(),
-
-                        room_id: "room".into(),
-                    }),
-                    track: Some(state::Track {
+                    source_revision: 1,
+                    execution: None,
+                    source: Some(state::Track {
                         publication_id: "opaque-data-track".into(),
                         participant_id: "alice".into(),
                         room_id: "room".into(),
@@ -337,8 +332,8 @@ fn resolved_source_description_does_not_claim_data_receiver_execution() {
                             delivery: state::DataDelivery::Ordered as i32,
                         })),
                     }),
-                },
-            ))),
+                }),
+            )),
         },
     );
     let state = agent.data_subscription_state(owner).unwrap();
@@ -347,10 +342,10 @@ fn resolved_source_description_does_not_claim_data_receiver_execution() {
         crate::ffi::SubscriptionSourceStatus::Available
     );
     assert_eq!(state.source_track_id.as_deref(), Some("opaque-data-track"));
-    assert!(state.admission_pending);
+    assert!(!state.admission_pending);
     assert_eq!(
         state.admission,
-        crate::ffi::PublicationAdmissionStatus::Pending
+        crate::ffi::PublicationAdmissionStatus::Admitted
     );
     assert_eq!(
         state.execution,

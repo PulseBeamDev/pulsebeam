@@ -87,6 +87,7 @@ pub(crate) enum TrackLifecycleOperation {
     Update {
         shard: ShardId,
         op: ShardUpdateOp,
+        ingress_peer: Option<pulsebeam_link::NetworkId>,
     },
     Plans {
         shard: ShardId,
@@ -120,8 +121,20 @@ impl TrackLifecycleStager {
     }
 
     fn update(&mut self, shard: ShardId, op: ShardUpdateOp) {
-        self.operations
-            .push(TrackLifecycleOperation::Update { shard, op });
+        self.route_update(shard, op, None);
+    }
+
+    fn route_update(
+        &mut self,
+        shard: ShardId,
+        op: ShardUpdateOp,
+        ingress_peer: Option<pulsebeam_link::NetworkId>,
+    ) {
+        self.operations.push(TrackLifecycleOperation::Update {
+            shard,
+            op,
+            ingress_peer,
+        });
     }
 
     fn plans(&mut self, shard: ShardId, plans: Vec<TrackPlanUpdate>) {
@@ -162,7 +175,7 @@ impl TrackLifecycleStager {
 
 struct DesiredTrackState {
     track: Track,
-    origin: BoundParticipantLocation,
+    origin: Option<BoundParticipantLocation>,
     candidates: HashSet<Subscriber>,
     bindings: HashSet<Subscriber>,
     locations: HashMap<Subscriber, BoundParticipantLocation>,
@@ -175,7 +188,7 @@ impl DesiredTrackState {
             .iter()
             .filter_map(|participant| self.locations.get(participant))
             .map(|location| location.shard)
-            .filter(|shard| *shard != self.origin.shard)
+            .filter(|shard| self.origin.is_none_or(|origin| *shard != origin.shard))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -189,7 +202,7 @@ impl DesiredTrackState {
             .iter()
             .filter_map(|participant| self.locations.get(participant))
             .map(|location| location.shard)
-            .filter(|shard| *shard != self.origin.shard)
+            .filter(|shard| self.origin.is_none_or(|origin| *shard != origin.shard))
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
@@ -223,6 +236,7 @@ struct RuntimePlan<'a> {
 pub(crate) struct TrackLifecycle {
     topology: TrackTopology,
     allocator: TrackPlacementAllocator,
+    ingress: HashMap<TrackAncestry, pulsebeam_link::NetworkId>,
     placements: HashMap<(TrackAncestry, ShardId), TrackDestination>,
     candidates: HashMap<TrackAncestry, HashSet<Subscriber>>,
     bindings: HashMap<TrackAncestry, HashSet<Subscriber>>,
@@ -236,6 +250,7 @@ impl TrackLifecycle {
         Self {
             topology: TrackTopology::default(),
             allocator: TrackPlacementAllocator::new(shard_count),
+            ingress: HashMap::new(),
             placements: HashMap::new(),
             candidates: HashMap::new(),
             bindings: HashMap::new(),
@@ -266,6 +281,39 @@ impl TrackLifecycle {
         Some(self.reconcile(identity, registry, now))
     }
 
+    pub(super) fn publish_ingress(
+        &mut self,
+        track: Track,
+        peer: pulsebeam_link::NetworkId,
+        registry: &RoomRegistry,
+        now: Instant,
+    ) -> Option<TrackLifecycleOutcome> {
+        let identity = self.topology.publish(track)?;
+        self.ingress.insert(identity, peer);
+        Some(self.reconcile(identity, registry, now))
+    }
+
+    pub(super) fn ingress_sources(
+        &self,
+        endpoint: EndpointKey,
+    ) -> impl Iterator<Item = (&Track, pulsebeam_link::NetworkId)> {
+        self.topology
+            .sources_by_publisher(endpoint)
+            .filter_map(move |track| {
+                let peer = *self.ingress.get(&TrackAncestry::from_track(track))?;
+                Some((track, peer))
+            })
+    }
+
+    pub(super) fn ingress_peer(
+        &self,
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+    ) -> Option<pulsebeam_link::NetworkId> {
+        let track = self.topology.source(room, publication)?;
+        self.ingress.get(&TrackAncestry::from_track(track)).copied()
+    }
+
     pub(crate) fn unpublish(
         &mut self,
         endpoint: EndpointKey,
@@ -292,6 +340,7 @@ impl TrackLifecycle {
             "published track disappeared during unpublish"
         );
 
+        self.ingress.remove(&identity);
         self.release_placements(identity, now);
         Some(stager.finish())
     }
@@ -403,6 +452,12 @@ impl TrackLifecycle {
         registry: &RoomRegistry,
     ) -> Option<ShardId> {
         let source = self.topology.source(room_id, track)?;
+        if self
+            .ingress
+            .contains_key(&TrackAncestry::from_track(source))
+        {
+            return None;
+        }
         let meta = source.meta();
         let publisher = registry.get_incarnation(meta.origin, meta.connection_id)?;
         (publisher.materialized && publisher.scope.joined_room() == Some(room_id))
@@ -424,6 +479,25 @@ impl TrackLifecycle {
                 .is_some_and(crate::track::Track::requires_reverse_route)
     }
 
+    pub(super) fn allows_ingress_reverse(
+        &self,
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+        shard: ShardId,
+        peer: pulsebeam_link::NetworkId,
+    ) -> bool {
+        let Some(track) = self.topology.source(room, publication) else {
+            return false;
+        };
+        let identity = TrackAncestry::from_track(track);
+        self.ingress.get(&identity) == Some(&peer)
+            && track.requires_reverse_route()
+            && self
+                .placements
+                .get(&(identity, shard))
+                .is_some_and(|placement| placement.route_installed)
+    }
+
     pub(crate) fn source_by_address<'a>(
         &'a self,
         source_room: ProjectRoomKey,
@@ -434,15 +508,11 @@ impl TrackLifecycle {
         let kind = crate::control::native::track_kind(address.kind)?;
         let publisher = ParticipantId::new(&address.participant_id).ok()?;
         let track_id = crate::entity::TrackId::new(&address.track_id).ok()?;
-        let track = self.current_named_source(
-            EndpointKey {
-                room: source_room,
-                participant: publisher,
-            },
-            kind,
-            track_id,
-            registry,
-        )?;
+        let endpoint = EndpointKey {
+            room: source_room,
+            participant: publisher,
+        };
+        let track = self.named_source(endpoint, kind, track_id, registry.get_endpoint(endpoint))?;
         self.source_for_connection(source_room, subscriber, track.id(), registry)
     }
 
@@ -453,14 +523,32 @@ impl TrackLifecycle {
         track_id: crate::entity::TrackId,
         registry: &RoomRegistry,
     ) -> Option<&Track> {
-        let current = registry.get_endpoint(endpoint)?;
-        if !current.materialized {
-            return None;
-        }
+        self.named_source(
+            endpoint,
+            kind,
+            track_id,
+            Some(registry.get_endpoint(endpoint)?),
+        )
+    }
+
+    fn named_source(
+        &self,
+        endpoint: EndpointKey,
+        kind: crate::entity::TrackKind,
+        track_id: crate::entity::TrackId,
+        local: Option<&super::registry::ParticipantMeta>,
+    ) -> Option<&Track> {
         let mut sources = self
             .topology
             .exact_named_sources(endpoint.room, endpoint.participant, kind, track_id)?
-            .filter(|track| track.meta().connection_id == current.connection_id);
+            .filter(|track| {
+                let remote = self.ingress.contains_key(&TrackAncestry::from_track(track));
+                local.map_or(remote, |local| {
+                    !remote
+                        && local.materialized
+                        && track.meta().connection_id == local.connection_id
+                })
+            });
         let source = sources.next()?;
         sources.next().is_none().then_some(source)
     }
@@ -480,6 +568,18 @@ impl TrackLifecycle {
         let meta = source.meta();
         if meta.connection_id == subscriber {
             return None;
+        }
+        if self
+            .ingress
+            .contains_key(&TrackAncestry::from_track(source))
+        {
+            return registry
+                .get_endpoint(EndpointKey {
+                    room: source_room,
+                    participant: meta.origin,
+                })
+                .is_none()
+                .then_some(source);
         }
         let publisher = registry.get_incarnation(meta.origin, meta.connection_id)?;
         (publisher.materialized && publisher.scope.joined_room() == Some(source_room))
@@ -581,9 +681,10 @@ impl TrackLifecycle {
         now: Instant,
     ) -> Vec<TrackLifecycleOutcome> {
         let retires = |identity: TrackAncestry| {
-            endpoint.is_some_and(|endpoint| {
-                identity.publisher == endpoint.participant && identity.room_id == endpoint.room
-            })
+            !self.ingress.contains_key(&identity)
+                && endpoint.is_some_and(|endpoint| {
+                    identity.publisher == endpoint.participant && identity.room_id == endpoint.room
+                })
         };
         let subscribers = endpoint
             .map(Subscriber::Joined)
@@ -620,14 +721,12 @@ impl TrackLifecycle {
                 .remove_subscriber(Subscriber::Connection(connection));
         }
         if let Some(endpoint) = endpoint {
-            self.topology.remove_participant(endpoint);
+            self.topology.remove_subscriber(endpoint.into());
         }
 
         for identity in retiring {
-            debug_assert!(
-                !self.topology.contains(identity),
-                "participant removal must remove every published track"
-            );
+            let removed = self.topology.unpublish(identity);
+            debug_assert!(removed.is_some());
             self.release_placements(identity, now);
         }
 
@@ -657,8 +756,10 @@ impl TrackLifecycle {
         let mut stager = TrackLifecycleStager::new(self.next_generation());
         let mut desired = self.desired_state(identity, registry);
 
-        let origin = self.ensure_destination(identity, desired.origin.shard, now);
-        self.ensure_reverse_route(identity, &mut desired.track, origin.placement.route);
+        if let Some(origin) = desired.origin {
+            let placement = self.ensure_destination(identity, origin.shard, now);
+            self.ensure_reverse_route(identity, &mut desired.track, placement.placement.route);
+        }
         self.reserve_candidate_destinations(identity, &desired, now);
 
         self.stage_participant_transitions(identity, &desired, registry, &mut stager);
@@ -694,10 +795,10 @@ impl TrackLifecycle {
             room: identity.room_id,
             participant: identity.publisher,
         })));
-        let origin =
-            BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
-                .expect("published track must retain a bound publisher");
-        let mut candidate_shards = HashSet::from([origin.shard]);
+        let origin = self
+            .local_origin(identity, registry)
+            .map(|origin| origin.shard);
+        let mut candidate_shards = origin.into_iter().collect::<HashSet<_>>();
         let mut active_shards = HashSet::new();
         for participant in candidates {
             let location = BoundParticipantLocation::for_subscriber(registry, *participant)
@@ -723,7 +824,7 @@ impl TrackLifecycle {
             );
             debug_assert_eq!(
                 destination.route_installed,
-                if shard == origin.shard {
+                if Some(shard) == origin {
                     track.requires_reverse_route()
                 } else {
                     active_shards.contains(&shard)
@@ -735,7 +836,25 @@ impl TrackLifecycle {
 
     #[allow(
         clippy::expect_used,
-        reason = "reconciliation only runs for a published track whose publisher remains bound"
+        reason = "a local publication must retain its accepted publisher until withdrawal"
+    )]
+    fn local_origin(
+        &self,
+        identity: TrackAncestry,
+        registry: &RoomRegistry,
+    ) -> Option<BoundParticipantLocation> {
+        if self.ingress.contains_key(&identity) {
+            return None;
+        }
+        Some(
+            BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
+                .expect("published local track must have a bound publisher"),
+        )
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "reconciliation targets a retained publication"
     )]
     fn desired_state(&self, identity: TrackAncestry, registry: &RoomRegistry) -> DesiredTrackState {
         let track = self
@@ -743,9 +862,7 @@ impl TrackLifecycle {
             .track(identity)
             .expect("reconcile must target a published track")
             .clone();
-        let origin =
-            BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
-                .expect("a published track must have a bound live publisher in its room");
+        let origin = self.local_origin(identity, registry);
 
         let publisher_meta = registry.get_endpoint(EndpointKey {
             room: identity.room_id,
@@ -758,12 +875,21 @@ impl TrackLifecycle {
             .candidate_subscribers(identity)
             .filter_map(|subscriber| {
                 let location = BoundParticipantLocation::for_subscriber(registry, subscriber)?;
-                if location.connection == origin.connection {
+                if location.connection
+                    == origin.map_or_else(|| track.meta().connection_id, |origin| origin.connection)
+                    || origin.is_none() && publisher_meta.is_some()
+                {
                     return None;
                 }
                 let meta = registry.get_incarnation(location.participant, location.connection)?;
-                let allowed = meta.authorization.as_ref().map_or(
-                    meta.profile == super::controller::SignalingProtocol::State,
+                if meta.scope.project != identity.room_id.project {
+                    return None;
+                }
+                let allowed = meta.authorization.as_ref().map_or_else(
+                    || {
+                        origin.is_some()
+                            && meta.profile == super::controller::SignalingProtocol::State
+                    },
                     |lease| {
                         if meta.scope.joined_room() == Some(identity.room_id) {
                             lease.permissions().allows_source(
@@ -772,7 +898,9 @@ impl TrackLifecycle {
                                 &track,
                             )
                         } else {
-                            publisher_meta.is_some_and(|source| source.authorization.is_some())
+                            (origin.is_none()
+                                || publisher_meta
+                                    .is_some_and(|source| source.authorization.is_some()))
                                 && lease.permissions().allows_source_at_room(
                                     pulsebeam_core::auth::grants::Action::Subscribe,
                                     identity.room_id.room.as_str(),
@@ -918,7 +1046,7 @@ impl TrackLifecycle {
                 registry,
                 stager,
                 ParticipantEffect::TrackCandidateAdded {
-                    track: desired.track.clone(),
+                    track: Box::new(desired.track.clone()),
                 },
             );
         }
@@ -951,7 +1079,8 @@ impl TrackLifecycle {
     ) {
         let candidate_shards = desired.candidate_remote_shards();
         let active_shards = desired.active_remote_shards();
-        let destinations = self.remote_destinations(identity, desired.origin.shard);
+        let destinations =
+            self.remote_destinations(identity, desired.origin.map(|origin| origin.shard));
 
         for (shard, destination) in destinations {
             let should_be_resident = candidate_shards.contains(&shard);
@@ -962,7 +1091,7 @@ impl TrackLifecycle {
                 continue;
             }
             if !destination.route_installed && should_have_route {
-                stager.update(
+                stager.route_update(
                     shard,
                     ShardUpdateOp::InstallRoute {
                         address: destination.placement.route,
@@ -970,6 +1099,7 @@ impl TrackLifecycle {
                             publication_id: destination.placement.publication_id,
                         },
                     },
+                    self.ingress.get(&identity).copied(),
                 );
                 self.set_route_installed(identity, shard, true);
             } else if destination.route_installed && !should_have_route {
@@ -988,35 +1118,36 @@ impl TrackLifecycle {
         clippy::expect_used,
         reason = "active views are staged only after their origin and remote placements are reserved"
     )]
-    fn stage_active_views(
+    fn stage_origin_view(
         &mut self,
         identity: TrackAncestry,
         desired: &DesiredTrackState,
+        origin: BoundParticipantLocation,
         stager: &mut TrackLifecycleStager,
     ) {
-        let origin = self
+        let placement = self
             .placements
-            .get(&(identity, desired.origin.shard))
+            .get(&(identity, origin.shard))
             .copied()
             .expect("origin placement must exist before staging its track view");
-        let origin_was_resident = origin.resident;
+        let origin_was_resident = placement.resident;
 
         if desired.track.requires_reverse_route() {
-            if !origin.route_installed {
+            if !placement.route_installed {
                 stager.update(
-                    desired.origin.shard,
+                    origin.shard,
                     ShardUpdateOp::InstallRoute {
-                        address: origin.placement.route,
+                        address: placement.placement.route,
                         action: TrackRouteAction::Reverse {
-                            publication_id: origin.placement.publication_id,
+                            publication_id: placement.placement.publication_id,
                         },
                     },
                 );
-                self.set_route_installed(identity, desired.origin.shard, true);
+                self.set_route_installed(identity, origin.shard, true);
             }
         } else {
             debug_assert!(
-                !origin.route_installed,
+                !placement.route_installed,
                 "origin route must only exist for tracks with a reverse path"
             );
         }
@@ -1036,42 +1167,54 @@ impl TrackLifecycle {
         self.stage_runtime_and_plan(
             stager,
             RuntimePlan {
-                shard: desired.origin.shard,
-                origin: desired.origin.connection,
+                shard: origin.shard,
+                origin: origin.connection,
                 track: &desired.track,
-                publication_id: origin.placement.publication_id,
-                local: desired.local_bindings(desired.origin.shard),
+                publication_id: placement.placement.publication_id,
+                local: desired.local_bindings(origin.shard),
                 remote,
                 reverse: desired.track.reverse(),
             },
         );
-        self.set_resident(identity, desired.origin.shard, true);
+        self.set_resident(identity, origin.shard, true);
 
         if !origin_was_resident {
             stager.participant(
-                desired.origin,
+                origin,
                 ParticipantEffect::TrackPublished {
                     publication_id: identity.publication_id,
                 },
             );
         }
+    }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "candidate placements are reserved before staging"
+    )]
+    fn stage_active_views(
+        &mut self,
+        identity: TrackAncestry,
+        desired: &DesiredTrackState,
+        stager: &mut TrackLifecycleStager,
+    ) {
+        if let Some(origin) = desired.origin {
+            self.stage_origin_view(identity, desired, origin, stager);
+        }
+        let active = desired.active_remote_shards();
         for shard in desired.candidate_remote_shards() {
             let destination = self
                 .placements
                 .get(&(identity, shard))
                 .copied()
                 .expect("candidate remote shard must have a reserved placement");
-            debug_assert_eq!(
-                destination.route_installed,
-                desired.active_remote_shards().contains(&shard)
-            );
+            debug_assert_eq!(destination.route_installed, active.contains(&shard));
 
             self.stage_runtime_and_plan(
                 stager,
                 RuntimePlan {
                     shard,
-                    origin: desired.origin.connection,
+                    origin: desired.track.meta().connection_id,
                     track: &desired.track,
                     publication_id: destination.placement.publication_id,
                     local: desired.local_bindings(shard),
@@ -1220,8 +1363,9 @@ impl TrackLifecycle {
             );
         }
 
-        if let Some(origin) =
-            BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
+        if !self.ingress.contains_key(&identity)
+            && let Some(origin) =
+                BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
             && let Some(destination) = self.placements.get(&(identity, origin.shard))
             && destination.resident
         {
@@ -1262,7 +1406,7 @@ impl TrackLifecycle {
     ) {
         let candidate_shards = desired.candidate_remote_shards();
         let unused = self
-            .remote_destinations(identity, desired.origin.shard)
+            .remote_destinations(identity, desired.origin.map(|origin| origin.shard))
             .into_iter()
             .filter(|(shard, _)| !candidate_shards.contains(shard))
             .collect::<Vec<_>>();
@@ -1298,13 +1442,14 @@ impl TrackLifecycle {
     fn remote_destinations(
         &self,
         identity: TrackAncestry,
-        origin_shard: ShardId,
+        origin_shard: Option<ShardId>,
     ) -> Vec<(ShardId, TrackDestination)> {
         let mut destinations = self
             .placements
             .iter()
             .filter_map(|((held, shard), destination)| {
-                (*held == identity && *shard != origin_shard).then_some((*shard, *destination))
+                (*held == identity && Some(*shard) != origin_shard)
+                    .then_some((*shard, *destination))
             })
             .collect::<Vec<_>>();
         destinations.sort_by_key(|(shard, _)| shard.index());
@@ -1422,7 +1567,6 @@ mod tests {
         let publisher = participant(publisher);
         let meta = TrackMeta {
             room: room(room_seed),
-            shard_id: ShardId::new(0),
             id: connection.fixture_publication(kind, label),
             origin: publisher,
             connection_id: connection,
@@ -1546,7 +1690,9 @@ mod tests {
                         });
                     }
                 }
-                TrackLifecycleOperation::Update { shard: held, op } if *held == shard => match op {
+                TrackLifecycleOperation::Update {
+                    shard: held, op, ..
+                } if *held == shard => match op {
                     ShardUpdateOp::InstallRoute { action, .. } => match action {
                         TrackRouteAction::Forward { .. } => kinds.push(OpKind::InstallForward),
                         TrackRouteAction::Reverse { .. } => kinds.push(OpKind::InstallReverse),
@@ -1599,6 +1745,7 @@ mod tests {
                             address,
                             action: TrackRouteAction::Forward { publication_id },
                         },
+                    ..
                 } if *held == shard => Some((*address, *publication_id)),
                 _ => None,
             })
@@ -1620,6 +1767,7 @@ mod tests {
                             address,
                             action: TrackRouteAction::Reverse { publication_id },
                         },
+                    ..
                 } if *held == shard => Some((*address, *publication_id)),
                 _ => None,
             })
@@ -2556,7 +2704,6 @@ mod tests {
             Track::data_publication(
                 TrackMeta {
                     room: room_id,
-                    shard_id: ShardId::new(0),
                     id: connection.fixture_publication_at(
                         TrackKind::Data,
                         "label",
@@ -2591,7 +2738,6 @@ mod tests {
             let track = Track::data_publication(
                 TrackMeta {
                     room: room_id,
-                    shard_id: ShardId::new(0),
                     id: connection.fixture_publication_at(
                         TrackKind::Data,
                         "label",

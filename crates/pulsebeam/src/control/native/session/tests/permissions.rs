@@ -205,7 +205,6 @@ fn subscriptions_require_resolved_filters_but_no_discovery_projection() {
         let track = Track::data_publication(
             TrackMeta {
                 room: crate::entity::ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
-                shard_id: crate::id::ShardId::new(0),
                 id,
                 origin: ParticipantId::new(external).unwrap(),
                 connection_id: connection,

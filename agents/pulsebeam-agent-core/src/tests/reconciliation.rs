@@ -33,7 +33,8 @@ fn whole_state_churn_reduces_once_without_physical_work_or_wire_revisions() {
         .iter()
         .map(|target| target.desired.revision)
         .max()
-        .unwrap();
+        .unwrap()
+        + targets.len() as u64; // One prepared report per initial logical offer.
     let mut changed = native_media::scoped_desired(2);
     changed.video[0].height = 1080;
     changed.video[0].priority = 4;

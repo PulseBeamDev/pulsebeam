@@ -296,7 +296,7 @@ impl Connection {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                self.add_track_candidate(key, track);
+                self.add_track_candidate(key, *track);
             }
             ParticipantEffect::TrackCandidateRemoved {
                 publication_id,
@@ -595,7 +595,7 @@ impl Connection {
                         .set_audio_intent(crate::participant::intent::AudioIntent {
                             pinned: vec![publication],
                             auto: false,
-                        })
+                        });
                 }
                 MediaKind::Video => self.downstream.video.bind_sdp_slot(media.mid, publication),
             }
@@ -1146,7 +1146,6 @@ impl Connection {
                                 Track::data(
                                     crate::track::TrackMeta {
                                         room,
-                                        shard_id: self.shard_id,
                                         id: PublicationKey::Data(entity::PublicationId::mint()),
                                         origin: self.participant_id,
                                         connection_id: self.connection_id,
@@ -1409,7 +1408,6 @@ impl Connection {
             .add_published_track(sender.media_index, mid, kind, || {
                 let meta = track::TrackMeta {
                     room,
-                    shard_id: self.shard_id,
                     id: PublicationKey::new(kind, entity::PublicationId::mint()),
                     origin: self.participant_id,
                     connection_id: self.connection_id,

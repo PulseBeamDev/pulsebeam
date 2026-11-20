@@ -220,7 +220,6 @@ mod tests {
     use super::*;
     use crate::{
         entity::{ConnectionId, ParticipantId, RoomId, TrackKind},
-        id::ShardId,
         track::{DataLane, Topic},
     };
 
@@ -254,7 +253,6 @@ mod tests {
                     room: crate::entity::ProjectRoomKey::fixture(
                         RoomId::new("data-routing").unwrap(),
                     ),
-                    shard_id: ShardId::new(0),
                     id,
                     origin: crate::entity::fixture_participant_id(),
                     connection_id: connection,
@@ -307,7 +305,6 @@ mod tests {
         let lane = DataLane::Latest;
         let meta = TrackMeta {
             room: crate::entity::ProjectRoomKey::fixture(RoomId::new("data-lifecycle").unwrap()),
-            shard_id: ShardId::new(0),
             id: connection_id.fixture_publication(TrackKind::Data, &topic),
             origin: crate::entity::fixture_participant_id(),
             connection_id,

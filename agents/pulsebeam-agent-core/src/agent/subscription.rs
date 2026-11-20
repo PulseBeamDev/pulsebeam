@@ -218,6 +218,11 @@ fn active_agent(agent: &Agent) -> Option<&super::Session> {
     })
 }
 
+fn permission_revoked(state: &wire::ConfirmedState) -> bool {
+    matches!(state.value.as_ref(), Some(wire::confirmed_state::Value::Absent(absent))
+        if absent.reason() == wire::AbsenceReason::PermissionRevoked)
+}
+
 fn is_receiver_resource(
     resource: &Resource,
     kind: wire::TrackKind,
@@ -243,6 +248,21 @@ fn receiver_revisions(
     let Some(active) = active_agent(agent) else {
         return (0, None, None);
     };
+    if let Some(resource) = super::native::logical_resource(active, selector, kind) {
+        let evaluation = active.state.evaluation(resource);
+        let confirmed = active.state.confirmed(resource);
+        return (
+            evaluation
+                .or(confirmed)
+                .map_or(0, |state| state.evaluated_revision),
+            confirmed
+                .filter(|state| crate::native_state::logical_state(state).is_some())
+                .map(|state| state.evaluated_revision),
+            evaluation
+                .filter(|state| state.rejection.is_some() || permission_revoked(state))
+                .map(|state| state.evaluated_revision),
+        );
+    }
     for resource in active.state.resources() {
         if !is_receiver_resource(resource, kind, publication_id) {
             continue;
@@ -330,8 +350,9 @@ fn source_state(
     let Some(active) = active_agent(agent) else {
         return (SubscriptionSourceStatus::Pending, None, None);
     };
-    let resource = source_resource(selector, kind);
-    let Some(evaluation) = active.state.evaluation(&resource) else {
+    let legacy = source_resource(selector, kind);
+    let resource = super::native::logical_resource(active, selector, kind).unwrap_or(&legacy);
+    let Some(evaluation) = active.state.evaluation(resource) else {
         return (SubscriptionSourceStatus::Pending, None, None);
     };
     if let Some(failure) = evaluation.rejection.as_ref() {
@@ -342,6 +363,18 @@ fn source_state(
         );
     }
     match evaluation.value.as_ref() {
+        Some(wire::confirmed_state::Value::LogicalSubscription(state)) => {
+            state.source.as_ref().map_or(
+                (SubscriptionSourceStatus::Unavailable, None, None),
+                |source| {
+                    (
+                        SubscriptionSourceStatus::Available,
+                        Some(source.publication_id.clone()),
+                        None,
+                    )
+                },
+            )
+        }
         Some(wire::confirmed_state::Value::SourceLookup(lookup)) => {
             let source = lookup.track.as_ref();
             let participant = lookup.participant.as_ref();
@@ -406,6 +439,51 @@ fn receiver_outcome(
             failure,
         );
     };
+    if let Some(resource) = super::native::logical_resource(active, selector, kind) {
+        let evaluation = active.state.evaluation(resource);
+        if let Some(state) = active
+            .state
+            .confirmed(resource)
+            .and_then(crate::native_state::logical_state)
+        {
+            let (execution, error) = match &state.execution {
+                Some(wire::logical_subscription_state::Execution::Failure(error)) => (
+                    PublicationExecution::Failed,
+                    Some(super::publication::publication_failure(error)),
+                ),
+                Some(wire::logical_subscription_state::Execution::Installed(_))
+                    if matches!(resource, Resource::LogicalReception(slot)
+                        if super::native::receiver_track(active, slot).is_some())
+                        || super::native::logical_payload_ready(active, resource) =>
+                {
+                    (PublicationExecution::Installed, None)
+                }
+                _ if state
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.settings.as_ref())
+                    .is_some_and(|settings| settings.enabled == Some(false)) =>
+                {
+                    (PublicationExecution::Disabled, None)
+                }
+                _ => (PublicationExecution::Unavailable, None),
+            };
+            return (
+                PublicationAdmissionStatus::Admitted,
+                evaluation.is_none(),
+                execution,
+                error,
+            );
+        }
+        if evaluation.is_some_and(|state| state.rejection.is_some() || permission_revoked(state)) {
+            return (
+                PublicationAdmissionStatus::Rejected,
+                false,
+                PublicationExecution::Unavailable,
+                None,
+            );
+        }
+    }
     for resource in active.state.resources() {
         if !is_receiver_resource(resource, kind, publication_id) {
             continue;
@@ -487,6 +565,13 @@ fn admission_error(
     publication_id: Option<&str>,
 ) -> Option<ErrorInfo> {
     let active = active_agent(agent)?;
+    if let Some(resource) = super::native::logical_resource(active, selector, kind) {
+        return active
+            .state
+            .evaluation(resource)
+            .and_then(|state| state.rejection.as_ref())
+            .map(super::publication::publication_failure);
+    }
     for resource in active.state.resources() {
         if !is_receiver_resource(resource, kind, publication_id) {
             continue;

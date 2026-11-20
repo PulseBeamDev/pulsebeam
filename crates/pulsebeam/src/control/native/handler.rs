@@ -180,6 +180,12 @@ impl StateProtocolHandler {
                     .is_some_and(|source| source.track.id() == track && source.is_available())
             },
         )?;
+        while self.commands.len() < PREPARATION_BUDGET {
+            let Some(command) = self.model.take_logical_retirement()? else {
+                break;
+            };
+            self.retain(command)?;
+        }
         for _ in 0..PREPARATION_BUDGET {
             if self.commands.len() >= PREPARATION_BUDGET
                 || !self.model.preparation_pending(unix_now)
@@ -216,6 +222,7 @@ impl StateProtocolHandler {
             && (self.model.revocation_pending()
                 || self.model.preparation_pending(unix_now)
                 || self.model.lookup_refresh_pending()
+                || self.model.logical_retirement_pending()
                 || self.model.catalog.pending() && self.model.needs_poll())
             && !self.handoff.schedule()
         {

@@ -116,14 +116,30 @@ message ClientStateRecord {
   ExecutionReport execution = 3;
 }
 
-// Scoped local failure of an admitted receiver, independent of desired settings.
+// Receiver facts independent of desired settings or declaration.
 message ExecutionReport {
   // Strictly increases across all serialized client records, like desired.revision.
   // Does not advance the server's evaluated desired revision.
   uint64 revision = 1;
   reserved 2;
-  // Required. Cannot revive or retarget a lifetime.
-  Failure failure = 3;
+
+  oneof outcome {
+    // Local failure of the immutable exact receiver. Cannot revive the receiver.
+    Failure failure = 3;
+    LogicalReceiverReport logical_receiver = 4;
+  }
+}
+
+message LogicalReceiverReport {
+  // Consume only against the current offer on the enclosing owned reference.
+  uint64 source_revision = 1;
+
+  oneof outcome {
+    // Actual prepared transport, not a request for the server to allocate it.
+    TrackBinding prepared = 2;
+    // Local preparation or execution failed for this offer only.
+    Failure failure = 3;
+  }
 }
 
 message ServerStateBatch {
@@ -230,6 +246,7 @@ message ConfirmedState {
     Participant participant = 6;
     Track track = 7;
     SourceLookupState source_lookup = 8;
+    LogicalSubscriptionState logical_subscription = 9;
   }
 }
 
@@ -365,6 +382,7 @@ message ResourceSpec {
     PublicationSpec publication = 2;
     SubscriptionSpec subscription = 3;
     SourceLookupSpec source_lookup = 4;
+    LogicalSubscriptionSpec logical_subscription = 5;
   }
 }
 
@@ -372,6 +390,12 @@ message ResourceSpec {
 // Address is immutable for the owned lifetime; it is not a receiver or publisher.
 message SourceLookupSpec {
   // Required exact logical address. enabled=false permits no descriptor.
+  LogicalSourceAddress source = 1;
+}
+
+// The immutable source address for one admitted subscription. The exact
+// publication and receiver can change without replacing the owned reference.
+message LogicalSubscriptionSpec {
   LogicalSourceAddress source = 1;
 }
 
@@ -477,6 +501,25 @@ message SourceLookupState {
   // Both descriptor fields are absent while unresolved or disabled.
   Participant participant = 2;
   Track track = 3;
+}
+
+// Accepted logical intent and current authorized source offer.
+message LogicalSubscriptionState {
+  ResourceSpec spec = 1;
+
+  // Starts at zero without a source. Changes on source selection, withdrawal,
+  // or replacement, independently of the evaluated client revision.
+  uint64 source_revision = 2;
+
+  // Absent while waiting or disabled. This descriptor is not a binding.
+  Track source = 3;
+
+  // Unset while waiting, disabled, or preparing. Never present without
+  // the current source offer, and never carried forward to a different offer.
+  oneof execution {
+    TrackBinding installed = 4;
+    Failure failure = 5;
+  }
 }
 
 enum ExecutionStatus {

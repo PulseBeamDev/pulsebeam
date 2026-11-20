@@ -826,6 +826,7 @@ impl ControllerActor {
                 .map(|work| work.deadline)
                 .into_iter()
                 .chain(self.native_deadlines.first().map(|(deadline, _)| *deadline))
+                .chain(self.peer_ownership.deadline())
                 .min();
             let maintenance_due = if self.has_ready_egress() {
                 false
@@ -874,6 +875,7 @@ impl ControllerActor {
             self.release_deletion(bytes);
         }
         self.expire_authorizations(started, SystemTime::now());
+        self.expire_peer_sources(started);
         self.advance_materializations();
         if let Some(links) = &mut self.links {
             links.reap();
@@ -920,16 +922,20 @@ impl ControllerActor {
     fn process_command(&mut self, command: ControllerCommand) -> Option<RequiredAction> {
         match command {
             ControllerCommand::LinkDestinations(command) => {
-                let result = self
-                    .lifecycle
-                    .network_source(command.room, command.track, &self.core.registry)
-                    .ok_or(pulsebeam_link::BindError::Closed)
-                    .and_then(|_| {
-                        self.links
-                            .as_mut()
-                            .ok_or(pulsebeam_link::BindError::Closed)
-                            .map(|links| links.destinations(command.track))
-                    });
+                let ingress = self.lifecycle.ingress_peer(command.room, command.track);
+                let result = if ingress.is_some()
+                    || self
+                        .lifecycle
+                        .network_source(command.room, command.track, &self.core.registry)
+                        .is_some()
+                {
+                    self.links
+                        .as_mut()
+                        .ok_or(pulsebeam_link::BindError::Closed)
+                        .map(|links| links.destinations(command.track, ingress))
+                } else {
+                    Err(pulsebeam_link::BindError::Closed)
+                };
                 let _ = command.reply.send(result);
                 None
             }
@@ -981,6 +987,11 @@ impl ControllerActor {
                     command.track,
                     command.shard,
                     &self.core.registry,
+                ) || self.lifecycle.allows_ingress_reverse(
+                    command.room,
+                    command.track,
+                    command.shard,
+                    command.peer,
                 );
                 let result = allowed
                     .then_some(())
@@ -1030,6 +1041,7 @@ impl ControllerActor {
                 None
             }
             ControllerCommand::CloseLink(peer) => {
+                self.detach_peer_sources(peer);
                 let plans = self
                     .links
                     .as_mut()
@@ -2027,7 +2039,7 @@ impl ControllerActor {
                     .core
                     .registry
                     .get_incarnation(subscriber, connection_id)
-                    .and_then(|meta| meta.endpoint())
+                    .and_then(super::registry::ParticipantMeta::endpoint)
                 else {
                     return;
                 };
@@ -2051,7 +2063,7 @@ impl ControllerActor {
                     .core
                     .registry
                     .get_incarnation(subscriber, connection_id)
-                    .and_then(|meta| meta.endpoint())
+                    .and_then(super::registry::ParticipantMeta::endpoint)
                 else {
                     return;
                 };
@@ -2736,8 +2748,12 @@ impl ControllerActor {
     fn apply_track_lifecycle(&mut self, outcome: TrackLifecycleOutcome) {
         for operation in outcome.operations {
             match operation {
-                TrackLifecycleOperation::Update { shard, op } => {
-                    self.stage_update_at(shard, outcome.generation, op);
+                TrackLifecycleOperation::Update {
+                    shard,
+                    op,
+                    ingress_peer,
+                } => {
+                    self.stage_update_at(shard, outcome.generation, op, ingress_peer);
                 }
                 TrackLifecycleOperation::Plans { shard, plans } => {
                     self.stage_plans_at(shard, outcome.generation, plans);
@@ -2762,6 +2778,7 @@ impl ControllerActor {
         shard: ShardId,
         generation: u64,
         op: crate::shard_update::ShardUpdateOp,
+        ingress_peer: Option<pulsebeam_link::NetworkId>,
     ) {
         let Some(update) = self.updates.get_mut(shard.index()) else {
             debug_assert!(false, "an update must target a live shard");
@@ -2781,12 +2798,19 @@ impl ControllerActor {
         if let (Some((address, action)), Some(links)) = (installed, self.links.as_mut())
             && links.network_enabled()
         {
-            links.install_after(address, action, update.stage_cutoff(generation));
+            links.install_after(
+                address,
+                action,
+                ingress_peer,
+                update.stage_cutoff(generation),
+            );
         }
         if let (Some(address), Some(links)) = (retired, self.links.as_mut())
             && links.contains(address)
         {
-            links.retire_after(address, update.stage_cutoff(generation));
+            links.retire_after(address, |bindings| {
+                update.stage_link_cutoff(generation, bindings)
+            });
         }
         self.mark_update_touched(shard);
     }
@@ -2797,16 +2821,16 @@ impl ControllerActor {
         generation: u64,
         mut plans: Vec<crate::shard_update::TrackPlanUpdate>,
     ) {
+        let Some(update) = self.updates.get_mut(shard.index()) else {
+            debug_assert!(false, "plans must target a live shard");
+            return;
+        };
         let mut retired = Vec::new();
         if let Some(links) = &mut self.links {
             for update in &mut plans {
                 retired.extend(links.prepare_plan(shard, update));
             }
         }
-        let Some(update) = self.updates.get_mut(shard.index()) else {
-            debug_assert!(false, "plans must target a live shard");
-            return;
-        };
         update.stage_plans(generation, plans);
         if !retired.is_empty() {
             if let Some(links) = &mut self.links {
@@ -3312,9 +3336,9 @@ impl ControllerActor {
                 participant_id,
                 room,
                 pending.shard,
-                pending
-                    .partition_index
-                    .expect("joined placement reserves a partition"),
+                pending.partition_index.unwrap_or_else(|| {
+                    pulsebeam_runtime::fatal!("joined placement reserves a partition")
+                }),
                 pending.transport,
                 pending.claim,
                 pending.authorization.take(),
@@ -3461,6 +3485,7 @@ impl ControllerActor {
         if let Some(lease) = authorization {
             self.record_admitted_authorization(participant_id, connection_id, lease);
         }
+        self.reconcile_peer_sources(endpoint, pulsebeam_runtime::time::Instant::now());
         // Retain the fence with bounded in-flight work, even if the replacement
         // is removed before an older materialization acknowledges installation.
         for work in &mut self.materializations {
@@ -3499,7 +3524,9 @@ impl ControllerActor {
 
     fn candidate_is_newer(&self, endpoint: EndpointKey, claim: ownership::ClaimRank) -> bool {
         self.peer_ownership
-            .highest(endpoint, pulsebeam_runtime::time::Instant::now())
+            .highest(endpoint, pulsebeam_runtime::time::Instant::now(), |rank| {
+                !self.peer_lineage_retired(endpoint, rank)
+            })
             .is_none_or(|remote| claim > remote)
             && self
                 .core
@@ -3606,6 +3633,9 @@ impl ControllerActor {
         self.publish_staged();
         for outcome in outcomes {
             self.publish_track_lifecycle(outcome);
+        }
+        if remove_current && let Some(endpoint) = meta.endpoint() {
+            self.reconcile_peer_sources(endpoint, pulsebeam_runtime::time::Instant::now());
         }
         if let (Some(native), Some(reason)) = (native, close_reason)
             && self.begin_native_retirement(participant, meta.clone(), native.handler, reason)
@@ -3951,7 +3981,6 @@ mod replacement_tests {
             let track = crate::track::Track::data_publication(
                 crate::track::TrackMeta {
                     room: crate::entity::ProjectRoomKey::fixture(source_room),
-                    shard_id: ShardId::new(0),
                     id: connection_id(1).fixture_publication_at(
                         TrackKind::Data,
                         "private-topic",
@@ -6251,7 +6280,6 @@ mod replacement_tests {
             crate::track::Track::data(
                 crate::track::TrackMeta {
                     room: crate::entity::ProjectRoomKey::fixture(room_id),
-                    shard_id: ShardId::new(0),
                     id: connection_id(1).fixture_publication_at(
                         crate::entity::TrackKind::Data,
                         "topic",
@@ -7331,8 +7359,8 @@ mod replacement_tests {
             panic!("one live right claim");
         };
         assert_eq!(endpoint, same_endpoint);
-        assert!(low < high);
-        let (endpoint, low) = (*endpoint, *low);
+        assert!(low.claim < high.claim);
+        let endpoint = *endpoint;
         let publish = |events: &mailbox::Sender<ShardEventMessage>, connection: ConnectionId| {
             let publication = connection.fixture_publication_at(
                 crate::entity::TrackKind::Data,
@@ -7342,7 +7370,6 @@ mod replacement_tests {
             let track = crate::track::Track::data_publication(
                 crate::track::TrackMeta {
                     room: endpoint.room,
-                    shard_id: shard,
                     id: publication,
                     origin: participant,
                     connection_id: connection,
@@ -7401,9 +7428,27 @@ mod replacement_tests {
             );
         }
 
+        let left_view = left.read().await.unwrap();
+        let right_view = right.read().await.unwrap();
+        for (snapshot, publication) in [
+            (&left_view, low_publication),
+            (&right_view, high_publication),
+        ] {
+            assert_eq!(snapshot.len(), 1);
+            let (published_endpoint, fact) = &snapshot[0];
+            assert_eq!(*published_endpoint, endpoint);
+            assert!(matches!(fact.publications.as_ref(), [descriptor]
+                if descriptor.descriptor.publication_id == publication.as_str() && descriptor.descriptor.track_id == "feed"));
+        }
         assert_eq!(
             right
-                .delta(from_left, one, two, (endpoint, Some(low)), fresh_until)
+                .delta(
+                    from_left,
+                    one,
+                    two,
+                    (endpoint, Some(left_view[0].1.clone())),
+                    fresh_until
+                )
                 .await,
             Err(Error::NeedsSnapshot)
         );
@@ -7874,7 +7919,6 @@ mod replacement_tests {
             crate::track::Track::data(
                 crate::track::TrackMeta {
                     room: crate::entity::ProjectRoomKey::fixture(room_id),
-                    shard_id: ShardId::new(0),
                     id: connection_id
                         .fixture_publication(crate::entity::TrackKind::Data, "rt/chat"),
                     origin: participant,

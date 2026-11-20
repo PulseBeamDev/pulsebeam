@@ -144,11 +144,39 @@ impl Table {
     }
 
     fn retire(words: &[Fence], slot: usize, generation: u64) {
-        if let Some(word) = words.get(slot)
-            && word.load(Ordering::Relaxed) == generation
-        {
-            word.store(generation.saturating_add(1), Ordering::Release);
+        if let Some(word) = words.get(slot) {
+            let _ = word.compare_exchange(
+                generation,
+                generation.saturating_add(1),
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
         }
+    }
+}
+
+/// A generation-specific fence that a shard can apply at its lifecycle cutoff.
+/// LinkControl still owns the binding record and its cleanup.
+pub struct BindingCutoff {
+    table: Shared<Table>,
+    binding: BindingId,
+}
+
+impl std::fmt::Debug for BindingCutoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BindingCutoff")
+            .field("binding", &self.binding)
+            .finish()
+    }
+}
+
+impl BindingCutoff {
+    pub fn fence(self) {
+        Table::retire(
+            &self.table.bindings,
+            self.binding.slot,
+            self.binding.generation,
+        );
     }
 }
 
@@ -228,7 +256,7 @@ impl<P> LinkControl<P> {
                 }
                 (
                     TxDestination::Network(entry.tx(address)),
-                    BindingTarget::Network(peer),
+                    BindingTarget::NetworkSend(peer),
                 )
             }
         };
@@ -256,22 +284,27 @@ impl<P> LinkControl<P> {
     }
 
     pub fn unbind(&mut self, binding: BindingId) {
-        if binding.owner == self.owner {
-            Table::retire(&self.table.bindings, binding.slot, binding.generation);
-            self.bindings.remove(&binding);
+        if let Some(target) = self.bindings.remove(&binding) {
+            target.retire(&self.table, binding);
         }
     }
 
     pub fn close_port(&mut self, port: PortId) {
         if port.owner == self.owner && self.table.port_live(port) {
             Table::retire(&self.table.ports, port.slot, port.generation);
-            self.bindings.retain(|binding, destination| {
-                if *destination == BindingTarget::Local(port) {
-                    Table::retire(&self.table.bindings, binding.slot, binding.generation);
-                    false
-                } else {
-                    true
+            self.bindings.retain(|binding, target| {
+                let keep = match target {
+                    BindingTarget::Local(target) => *target != port,
+                    BindingTarget::NetworkReceive { destinations, .. } => {
+                        retire_receive_port(&self.table, destinations, port);
+                        !destinations.is_empty()
+                    }
+                    BindingTarget::NetworkSend(_) => true,
+                };
+                if !keep {
+                    target.retire(&self.table, *binding);
                 }
+                keep
             });
             if let Some(sender) = self.ports.remove(&port.slot) {
                 sender.close();
@@ -297,10 +330,31 @@ impl<P> Drop for LinkControl<P> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum BindingTarget {
     Local(PortId),
-    Network(NetworkId),
+    NetworkSend(NetworkId),
+    NetworkReceive {
+        peer: NetworkId,
+        destinations: Vec<(PortId, BindingId)>,
+    },
+}
+
+fn retire_receive_port(table: &Table, destinations: &mut Vec<(PortId, BindingId)>, port: PortId) {
+    if let Some(index) = destinations.iter().position(|&(target, _)| target == port) {
+        let (_, child) = destinations.swap_remove(index);
+        Table::retire(&table.bindings, child.slot, child.generation);
+    }
+}
+
+impl BindingTarget {
+    fn retire(&self, table: &Table, binding: BindingId) {
+        Table::retire(&table.bindings, binding.slot, binding.generation);
+        if let Self::NetworkReceive { destinations, .. } = self {
+            for (_, destination) in destinations {
+                Table::retire(&table.bindings, destination.slot, destination.generation);
+            }
+        }
+    }
 }
 
 enum TxDestination<P> {

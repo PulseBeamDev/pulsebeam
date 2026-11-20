@@ -260,7 +260,6 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
                 project,
                 room: source_room,
             },
-            shard_id: ShardId::new(0),
             id: publisher_connection.fixture_publication_at(
                 crate::entity::TrackKind::Data,
                 "events",

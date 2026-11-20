@@ -65,7 +65,6 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     let track = Track::data_publication(
         track::TrackMeta {
             room: participant.scope.joined_room().unwrap(),
-            shard_id: ShardId::new(0),
             id,
             origin: owner,
             connection_id: connection,
@@ -217,7 +216,9 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
                 desired: None,
                 execution: Some(wire::ExecutionReport {
                     revision: 4,
-                    failure: Some(failure(wire::FailureCode::Unsupported)),
+                    outcome: Some(wire::execution_report::Outcome::Failure(failure(
+                        wire::FailureCode::Unsupported,
+                    ))),
                 }),
             }],
             ..Default::default()

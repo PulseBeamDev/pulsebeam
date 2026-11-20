@@ -67,7 +67,10 @@ impl NativeSession {
         if self.rows.get(&Key::Owned(reference)).is_some_and(|row| {
             matches!(
                 row.value.value,
-                Some(wire::confirmed_state::Value::Owned(_))
+                Some(
+                    wire::confirmed_state::Value::Owned(_)
+                        | wire::confirmed_state::Value::LogicalSubscription(_)
+                )
             )
         }) {
             wire::AbsenceReason::PermissionRevoked
@@ -137,7 +140,7 @@ impl NativeSession {
                         .rows
                         .get(&Key::Owned(reference))
                         .and_then(|row| row.owned.as_ref())
-                        .is_some_and(|owned| is_source_lookup(&owned.declaration))
+                        .is_some_and(|owned| observed_address(&owned.declaration).is_some())
                     {
                         self.finish_source_lookup(
                             reference,

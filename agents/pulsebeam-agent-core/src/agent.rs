@@ -682,6 +682,18 @@ impl Agent {
         self.effects.pop_front()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_native_owned(
+        &self,
+        reference: u64,
+    ) -> Option<&pulsebeam_proto::state::ConfirmedState> {
+        let state = &self.active.as_ref()?.state;
+        state
+            .resources()
+            .find(|resource| state.reference(resource) == Some(reference))
+            .and_then(|resource| state.confirmed(resource))
+    }
+
     pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
@@ -1972,7 +1984,14 @@ impl Agent {
                                 .filter(|physical| physical.state == native::PayloadState::Active)
                             {
                                 physical.state = native::PayloadState::Closing;
-                                active.state.stage(physical.resource.clone(), None)?;
+                                if let Some(offer) = physical.offer {
+                                    active.state.report_logical_receiver(&physical.resource, offer,
+                                        pulsebeam_proto::state::logical_receiver_report::Outcome::Failure(
+                                            pulsebeam_proto::state::Failure { code: pulsebeam_proto::state::FailureCode::InternalFailure as i32, ..Default::default() }
+                                        ))?;
+                                } else {
+                                    active.state.stage(physical.resource.clone(), None)?;
+                                }
                                 self.intent_dirty = true;
                                 self.topics.suspend_source(generation, channel);
                                 self.effects
@@ -2037,6 +2056,13 @@ impl Agent {
                 let native_payload = self.active.as_ref().is_some_and(|active| {
                     active.generation == generation && active.payloads.contains_key(&channel)
                 });
+                let logical_payload = self.active.as_ref().is_some_and(|active| {
+                    active.generation == generation
+                        && active
+                            .payloads
+                            .get(&channel)
+                            .is_some_and(|physical| physical.offer.is_some())
+                });
                 let signaling_closed = self.active.as_ref().is_some_and(|active| {
                     active.generation == generation && active.signaling_channel == channel
                 });
@@ -2068,8 +2094,14 @@ impl Agent {
                         };
                         if physical.state != closed {
                             physical.state = closed;
-                            let resource = physical.resource.clone();
-                            active.state.stage(resource, None)?;
+                            if let Some(offer) = physical.offer {
+                                active.state.report_logical_receiver(&physical.resource, offer,
+                                    pulsebeam_proto::state::logical_receiver_report::Outcome::Failure(
+                                        pulsebeam_proto::state::Failure { code: pulsebeam_proto::state::FailureCode::ResourceGone as i32, ..Default::default() }
+                                    ))?;
+                            } else {
+                                active.state.stage(physical.resource.clone(), None)?;
+                            }
                             self.intent_dirty = true;
                         }
                     }
@@ -2108,6 +2140,15 @@ impl Agent {
                         &mut self.notifications,
                     );
                     self.start_attempt(AttemptMode::Replace);
+                } else if logical_payload {
+                    self.topics.detach_source(
+                        generation,
+                        channel,
+                        false,
+                        &mut self.snapshot,
+                        &mut self.notifications,
+                        &mut self.effects,
+                    );
                 } else {
                     let topic_closed = self.topics.channel_closed(
                         generation,
@@ -2658,7 +2699,6 @@ impl Agent {
                 active,
                 &mut self.logs,
                 &self.desired,
-                &self.topics,
                 &mut self.ids,
                 &mut self.effects,
             ) {

@@ -4090,6 +4090,7 @@ dependencies = [
  "pulsebeam-agent-core",
  "pulsebeam-agent-native",
  "pulsebeam-core",
+ "pulsebeam-link",
  "pulsebeam-membership",
  "pulsebeam-proto",
  "pulsebeam-rtc-simulation",

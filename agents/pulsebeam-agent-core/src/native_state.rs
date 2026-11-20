@@ -9,7 +9,7 @@ use pulsebeam_proto::{
     state::{self as wire, codec, validation},
 };
 
-use crate::{MediaSlot, SignalingError};
+use crate::{MediaSlot, SignalingError, TrackSelector};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Resource {
@@ -19,6 +19,8 @@ pub(crate) enum Resource {
     },
     Reception(MediaSlot),
     DataSubscription(String),
+    LogicalReception(MediaSlot),
+    LogicalData(TrackSelector),
     SourceLookup {
         room: String,
         participant_id: String,
@@ -64,6 +66,26 @@ impl Resource {
                     && subscription.kind == wire::TrackKind::Data as i32
             }
             (
+                Self::LogicalReception(slot),
+                Some(wire::resource_spec::Declaration::LogicalSubscription(subscription)),
+            ) => subscription
+                .source
+                .as_ref()
+                .is_some_and(|source| match slot {
+                    MediaSlot::RemoteAudio(_) => source.kind == wire::TrackKind::Audio as i32,
+                    MediaSlot::RemoteVideo(_) => source.kind == wire::TrackKind::Video as i32,
+                    _ => false,
+                }),
+            (
+                Self::LogicalData(selector),
+                Some(wire::resource_spec::Declaration::LogicalSubscription(subscription)),
+            ) => subscription.source.as_ref().is_some_and(|source| {
+                source.kind == wire::TrackKind::Data as i32
+                    && source.room == selector.room
+                    && source.participant_id == selector.participant_id
+                    && source.track_id == selector.track_id
+            }),
+            (
                 Self::SourceLookup {
                     room,
                     participant_id,
@@ -84,11 +106,17 @@ impl Resource {
     fn retained_bytes(&self) -> usize {
         let text = match self {
             Self::Publication { track_id, .. } => track_id.len(),
-            Self::Reception(MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name)) => {
+            Self::Reception(MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name))
+            | Self::LogicalReception(MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name)) => {
                 name.len()
             }
-            Self::Reception(_) => 0,
+            Self::Reception(_) | Self::LogicalReception(_) => 0,
             Self::DataSubscription(track) => track.len(),
+            Self::LogicalData(selector) => selector
+                .room
+                .len()
+                .saturating_add(selector.participant_id.len())
+                .saturating_add(selector.track_id.len()),
             Self::SourceLookup {
                 room,
                 participant_id,
@@ -130,12 +158,19 @@ impl Target {
 // Reserve keyed pending-work and two bounded canonical-identity indexes per live row.
 const ROW_INDEX_BYTES: usize = 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Offer {
+    pub(crate) reference: u64,
+    pub(crate) source_revision: u64,
+}
+
 struct Owned {
     resource: Resource,
     sent_revision: u64,
     sent: wire::ResourceSpec,
     confirmed: Option<wire::ConfirmedState>,
     execution: Option<Box<wire::ExecutionReport>>,
+    reported_offer: Option<(u64, bool)>,
     retiring: bool,
 }
 
@@ -407,12 +442,69 @@ impl NativeState {
         {
             return Err(SignalingError::Invalid("failure without admitted receiver"));
         }
+        self.queue_execution(reference, wire::execution_report::Outcome::Failure(failure))
+    }
+
+    pub(crate) fn report_logical_receiver(
+        &mut self,
+        resource: &Resource,
+        offer: Offer,
+        outcome: wire::logical_receiver_report::Outcome,
+    ) -> Result<(), SignalingError> {
+        let Some((current, _)) = self.logical_offer(resource) else {
+            return Ok(());
+        };
+        if current != offer {
+            return Ok(());
+        }
+        let failed = matches!(outcome, wire::logical_receiver_report::Outcome::Failure(_));
+        if self
+            .owned
+            .get(&offer.reference)
+            .and_then(|owned| owned.reported_offer)
+            .is_some_and(|(revision, reported_failure)| {
+                revision == offer.source_revision && (!failed || reported_failure)
+            })
+        {
+            return Ok(());
+        }
+        self.queue_execution(
+            offer.reference,
+            wire::execution_report::Outcome::LogicalReceiver(wire::LogicalReceiverReport {
+                source_revision: offer.source_revision,
+                outcome: Some(outcome),
+            }),
+        )?;
+        if let Some(owned) = self.owned.get_mut(&offer.reference) {
+            owned.reported_offer = Some((offer.source_revision, failed));
+        }
+        Ok(())
+    }
+
+    fn queue_execution(
+        &mut self,
+        reference: u64,
+        outcome: wire::execution_report::Outcome,
+    ) -> Result<(), SignalingError> {
+        let owned = self
+            .owned
+            .get(&reference)
+            .ok_or(SignalingError::Invalid("owned report"))?;
         let report = Box::new(wire::ExecutionReport {
             revision: u64::MAX,
-            failure: Some(failure),
+            outcome: Some(outcome),
         });
         validation::validate_execution_report(&report)
             .map_err(|_| SignalingError::Invalid("execution report"))?;
+        codec::encode_client(&wire::ClientStateBatch {
+            records: alloc::vec![wire::ClientStateRecord {
+                owned: reference,
+                desired: None,
+                execution: Some(report.as_ref().clone()),
+            }],
+            ..Default::default()
+        })
+        .map_err(|_| SignalingError::Encode)?;
         let old = owned.execution.as_ref().map_or(0, |report| {
             size_of::<wire::ExecutionReport>().saturating_add(report.encoded_len())
         });
@@ -530,15 +622,32 @@ impl NativeState {
                     || (resource.is_none() && retirement.is_none())
                     || retirement == Some(reference))
             {
-                let Some(report) = self
+                let Some((owned, report)) = self
                     .owned
                     .get(&reference)
-                    .and_then(|owned| owned.execution.as_ref())
+                    .and_then(|owned| Some((owned, owned.execution.as_ref()?)))
                 else {
                     self.executions.remove(&reference);
                     continue;
                 };
                 let bytes = size_of::<wire::ExecutionReport>().saturating_add(report.encoded_len());
+                if let Some(wire::execution_report::Outcome::LogicalReceiver(report)) =
+                    &report.outcome
+                    && self
+                        .logical_offer(&owned.resource)
+                        .is_none_or(|(offer, _)| {
+                            offer.reference != reference
+                                || offer.source_revision != report.source_revision
+                        })
+                {
+                    self.account(bytes, 0)?;
+                    if let Some(owned) = self.owned.get_mut(&reference) {
+                        owned.execution = None;
+                        owned.reported_offer = None;
+                    }
+                    self.executions.remove(&reference);
+                    continue;
+                }
                 let revision = self.next_revision()?;
                 let mut report = report.as_ref().clone();
                 report.revision = revision;
@@ -612,6 +721,7 @@ impl NativeState {
                 sent,
                 confirmed: previous.and_then(|owned| owned.confirmed.clone()),
                 execution: previous.and_then(|owned| owned.execution.clone()),
+                reported_offer: previous.and_then(|owned| owned.reported_offer),
                 retiring: retirement.is_some(),
             };
             let old_bytes = previous.map_or(0, Owned::retained_bytes);
@@ -737,8 +847,7 @@ impl NativeState {
                                     .source_references
                                     .get(&id)
                                     .and_then(|references| references.first())
-                                    .and_then(|reference| self.description(*reference))
-                                    .map(|(_, track)| track)
+                                    .and_then(|reference| self.source_track(*reference))
                                     .is_some_and(|previous| !tracks_equal(previous, &track))
                             {
                                 return Err(SignalingError::Invalid("track identity"));
@@ -809,6 +918,31 @@ impl NativeState {
         }
         if let Some((participant, track)) = source_description(&state) {
             self.validate_description(participant, track)?;
+        }
+        if let Some(wire::confirmed_state::Value::LogicalSubscription(next)) = &state.value {
+            if let Some(track) = &next.source {
+                self.validate_source_identity(track)?;
+            }
+            if let Some(wire::confirmed_state::Value::LogicalSubscription(previous)) = owned
+                .confirmed
+                .as_ref()
+                .and_then(|state| state.value.as_ref())
+            {
+                let aliased = previous.source.as_ref().map(|track| &track.publication_id)
+                    != next.source.as_ref().map(|track| &track.publication_id);
+                let revived = matches!(
+                    previous.execution,
+                    Some(wire::logical_subscription_state::Execution::Failure(_))
+                ) && !matches!(
+                    next.execution,
+                    Some(wire::logical_subscription_state::Execution::Failure(_))
+                );
+                if next.source_revision < previous.source_revision
+                    || (next.source_revision == previous.source_revision && (aliased || revived))
+                {
+                    return Err(SignalingError::Invalid("source offer revision"));
+                }
+            }
         }
         if let Some(wire::confirmed_state::Value::Owned(live)) = &state.value {
             if matches!(
@@ -896,6 +1030,15 @@ impl NativeState {
             .and_then(source_description)
             .map(identity);
         let next_source = source_description(&state).map(identity);
+        let previous_offer = owned
+            .confirmed
+            .as_ref()
+            .and_then(logical_state)
+            .and_then(|state| state.source.as_ref())
+            .map(|track| track.publication_id.clone());
+        let next_offer = logical_state(&state)
+            .and_then(|state| state.source.as_ref())
+            .map(|track| track.publication_id.clone());
         self.account(old_bytes, new_bytes)?;
         if previous_source != next_source {
             if let Some((track, participant)) = previous_source {
@@ -909,6 +1052,17 @@ impl NativeState {
                     .insert(reference);
                 self.participant_references
                     .entry(participant)
+                    .or_default()
+                    .insert(reference);
+            }
+        }
+        if previous_offer != next_offer {
+            if let Some(track) = previous_offer {
+                remove_reference(&mut self.source_references, &track, reference);
+            }
+            if let Some(track) = next_offer {
+                self.source_references
+                    .entry(track)
                     .or_default()
                     .insert(reference);
             }
@@ -985,6 +1139,23 @@ impl NativeState {
         source_description(self.owned.get(&reference)?.confirmed.as_ref()?)
     }
 
+    fn source_track(&self, reference: u64) -> Option<&wire::Track> {
+        let state = self.owned.get(&reference)?.confirmed.as_ref()?;
+        logical_state(state)
+            .and_then(|state| state.source.as_ref())
+            .or_else(|| source_description(state).map(|(_, track)| track))
+    }
+
+    fn validate_source_identity(&self, track: &wire::Track) -> Result<(), SignalingError> {
+        if self
+            .source(&track.publication_id)
+            .is_some_and(|known| !tracks_equal(known, track))
+        {
+            return Err(SignalingError::Invalid("source identity"));
+        }
+        Ok(())
+    }
+
     fn validate_description(
         &self,
         participant: &wire::Participant,
@@ -996,27 +1167,16 @@ impl NativeState {
             .get(&endpoint)
             .is_some_and(|known| known != participant)
             || self
-                .tracks
-                .get(&track.publication_id)
-                .is_some_and(|known| !tracks_equal(known, track))
-            || self
                 .participant_references
                 .get(&endpoint)
                 .and_then(|references| references.first())
                 .and_then(|reference| self.description(*reference))
                 .map(|(participant, _)| participant)
                 .is_some_and(|known| known != participant)
-            || self
-                .source_references
-                .get(&track.publication_id)
-                .and_then(|references| references.first())
-                .and_then(|reference| self.description(*reference))
-                .map(|(_, track)| track)
-                .is_some_and(|known| !tracks_equal(known, track))
         {
             return Err(SignalingError::Invalid("source identity"));
         }
-        Ok(())
+        self.validate_source_identity(track)
     }
 
     pub(crate) fn revision(&self) -> u64 {
@@ -1048,7 +1208,7 @@ impl NativeState {
     pub(crate) fn source(&self, id: &str) -> Option<&wire::Track> {
         self.tracks.get(id).or_else(|| {
             let reference = self.source_references.get(id)?.first()?;
-            Some(self.description(*reference)?.1)
+            self.source_track(*reference)
         })
     }
 
@@ -1128,6 +1288,38 @@ impl NativeState {
             }
             _ => None,
         }
+    }
+
+    pub(crate) fn logical_offer(
+        &self,
+        resource: &Resource,
+    ) -> Option<(Offer, &wire::LogicalSubscriptionState)> {
+        if self.terminal || self.session.as_ref()?.authorization.is_none() {
+            return None;
+        }
+        let target = self.targets.get(resource)?;
+        if target.spec.settings.as_ref()?.enabled != Some(true) {
+            return None;
+        }
+        let reference = target.reference?;
+        let owned = self.owned.get(&reference)?;
+        let state = logical_state(owned.confirmed.as_ref()?)?;
+        if owned.retiring
+            || state.source.is_none()
+            || matches!(
+                state.execution,
+                Some(wire::logical_subscription_state::Execution::Failure(_))
+            )
+        {
+            return None;
+        }
+        Some((
+            Offer {
+                reference,
+                source_revision: state.source_revision,
+            },
+            state,
+        ))
     }
 
     pub(crate) fn eligible(&self, resource: &Resource) -> Option<&wire::LiveResource> {
@@ -1211,6 +1403,18 @@ fn accepted_spec(state: &wire::ConfirmedState) -> Option<&wire::ResourceSpec> {
     match state.value.as_ref()? {
         wire::confirmed_state::Value::Owned(live) => live.spec.as_ref(),
         wire::confirmed_state::Value::SourceLookup(lookup) => lookup.spec.as_ref(),
+        wire::confirmed_state::Value::LogicalSubscription(subscription) => {
+            subscription.spec.as_ref()
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn logical_state(
+    state: &wire::ConfirmedState,
+) -> Option<&wire::LogicalSubscriptionState> {
+    match state.value.as_ref()? {
+        wire::confirmed_state::Value::LogicalSubscription(state) => Some(state),
         _ => None,
     }
 }

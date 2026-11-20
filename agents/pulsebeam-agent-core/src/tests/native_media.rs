@@ -6,6 +6,7 @@ use pulsebeam_proto::state::{self, codec};
 pub(super) struct Target {
     pub reference: u64,
     pub desired: state::DesiredState,
+    pub prepared: Option<state::TrackBinding>,
 }
 
 impl Target {
@@ -21,16 +22,42 @@ impl Target {
         participant: &state::Participant,
         tracks: &[state::Track],
     ) -> state::ServerStateRecord {
-        let Some(state::resource_spec::Declaration::Subscription(subscription)) =
-            &self.spec().declaration
-        else {
-            panic!("receiver")
-        };
         let track = tracks
             .iter()
-            .find(|track| track.publication_id == subscription.publication_id)
+            .find(|track| match self.spec().declaration.as_ref().unwrap() {
+                state::resource_spec::Declaration::Subscription(subscription) => {
+                    track.publication_id == subscription.publication_id
+                }
+                state::resource_spec::Declaration::LogicalSubscription(subscription) => {
+                    state::validation::matches_source_address(
+                        track,
+                        subscription.source.as_ref().unwrap(),
+                    )
+                }
+                _ => false,
+            })
             .unwrap();
         self.installed(participant.clone(), track.clone())
+    }
+
+    pub fn offer(
+        &self,
+        revision: u64,
+        source: Option<state::Track>,
+        execution: Option<state::logical_subscription_state::Execution>,
+    ) -> state::ServerStateRecord {
+        native_connection::confirmed(
+            state::resource_key::Key::Owned(self.reference),
+            self.desired.revision,
+            state::confirmed_state::Value::LogicalSubscription(Box::new(
+                state::LogicalSubscriptionState {
+                    spec: Some(self.spec().clone()),
+                    source_revision: revision,
+                    source,
+                    execution,
+                },
+            )),
+        )
     }
 
     pub fn installed(
@@ -38,6 +65,18 @@ impl Target {
         participant: state::Participant,
         track: state::Track,
     ) -> state::ServerStateRecord {
+        if matches!(
+            self.spec().declaration,
+            Some(state::resource_spec::Declaration::LogicalSubscription(_))
+        ) {
+            return self.offer(
+                1,
+                Some(track),
+                Some(state::logical_subscription_state::Execution::Installed(
+                    self.prepared.clone().expect("prepared logical receiver"),
+                )),
+            );
+        }
         native_connection::confirmed(
             state::resource_key::Key::Owned(self.reference),
             self.desired.revision,
@@ -122,6 +161,43 @@ fn next_if_ready(
     generation: Generation,
     channel: ChannelId,
 ) -> Option<Vec<Target>> {
+    Some(
+        next_state_records(agent, generation, channel)?
+            .into_iter()
+            .map(|record| Target {
+                reference: record.owned,
+                desired: record.desired.expect("desired resource"),
+                prepared: None,
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn next_reports(
+    agent: &mut Agent,
+    generation: Generation,
+    channel: ChannelId,
+) -> Vec<(u64, state::LogicalReceiverReport)> {
+    next_state_records(agent, generation, channel)
+        .expect("receiver reports")
+        .into_iter()
+        .map(|record| {
+            assert!(record.desired.is_none());
+            let Some(state::execution_report::Outcome::LogicalReceiver(report)) =
+                record.execution.expect("receiver execution report").outcome
+            else {
+                panic!("logical receiver report");
+            };
+            (record.owned, report)
+        })
+        .collect()
+}
+
+fn next_state_records(
+    agent: &mut Agent,
+    generation: Generation,
+    channel: ChannelId,
+) -> Option<Vec<state::ClientStateRecord>> {
     let effect = agent.next_effect_after_turn()?;
     let Effect::DataChannel(DataChannelEffect::Send {
         operation,
@@ -136,19 +212,7 @@ fn next_if_ready(
     assert_eq!((actual_generation, actual_channel), (generation, channel));
     let batch = codec::decode_client(&payload).unwrap();
     acknowledge_send(agent, generation, channel, operation);
-    Some(
-        batch
-            .records
-            .into_iter()
-            .map(|record| {
-                let reference = record.owned;
-                let Some(desired) = record.desired else {
-                    panic!("desired resource")
-                };
-                Target { reference, desired }
-            })
-            .collect(),
-    )
+    Some(batch.records)
 }
 
 fn current_bindings(updated: &[SlotBinding]) -> client_sdp::Bindings {
@@ -188,6 +252,14 @@ pub(super) fn confirm_missing_lookups(
                             track: None,
                         },
                     ))
+                }
+                Some(state::desired_state::Value::Present(spec))
+                    if matches!(
+                        spec.declaration,
+                        Some(state::resource_spec::Declaration::LogicalSubscription(_))
+                    ) =>
+                {
+                    return target.offer(0, None, None);
                 }
                 value => panic!("unexpected unresolved source work: {value:?}"),
             };
@@ -455,88 +527,9 @@ fn connected_with_tracks(
             .unwrap(),
         }))
         .unwrap();
-    let pending = next(&mut agent, generation, channel);
-    let lookups = pending
-        .iter()
-        .filter(|target| {
-            matches!(
-                target.spec().declaration,
-                Some(state::resource_spec::Declaration::SourceLookup(_))
-            )
-        })
-        .map(|target| {
-            let Some(state::resource_spec::Declaration::SourceLookup(lookup)) =
-                &target.spec().declaration
-            else {
-                panic!("source lookup")
-            };
-            let address = lookup.source.as_ref().unwrap();
-            let participant = state::Participant {
-                participant_id: address.participant_id.clone(),
-
-                room_id: address.room.clone(),
-            };
-            let (publication_id, kind) = match state::TrackKind::try_from(address.kind).unwrap() {
-                state::TrackKind::Video => (
-                    video_track,
-                    state::track::Kind::Video(state::VideoTrack {
-                        format: Some(format(MediaKind::Video)),
-                    }),
-                ),
-                state::TrackKind::Audio => (
-                    audio_track,
-                    state::track::Kind::Audio(state::AudioTrack {
-                        format: Some(format(MediaKind::Audio)),
-                    }),
-                ),
-                _ => panic!("media source lookup"),
-            };
-            native_connection::confirmed(
-                state::resource_key::Key::Owned(target.reference),
-                target.desired.revision,
-                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
-                    spec: Some(target.spec().clone()),
-                    participant: Some(participant.clone()),
-                    track: Some(state::Track {
-                        publication_id: publication_id.into(),
-                        participant_id: participant.participant_id,
-                        room_id: participant.room_id.clone(),
-                        track_id: address.track_id.clone(),
-                        kind: Some(kind),
-                    }),
-                })),
-            )
-        })
-        .collect::<Vec<_>>();
-    let lookup_targets = pending
-        .iter()
-        .filter(|target| {
-            matches!(
-                target.spec().declaration,
-                Some(state::resource_spec::Declaration::SourceLookup(_))
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut targets = pending
-        .into_iter()
-        .filter(|target| {
-            !matches!(
-                target.spec().declaration,
-                Some(state::resource_spec::Declaration::SourceLookup(_))
-            )
-        })
-        .collect::<Vec<_>>();
-    if !lookups.is_empty() {
-        native_connection::observe(&mut agent, generation, channel, lookups);
-        if let Some(mut resolved) = next_if_ready(&mut agent, generation, channel) {
-            targets.append(&mut resolved);
-        } else {
-            targets.extend(lookup_targets.clone());
-        }
-    }
-    let publication = targets.remove(
-        targets
+    let mut pending = next(&mut agent, generation, channel);
+    let publication = pending.remove(
+        pending
             .iter()
             .position(|target| {
                 matches!(
@@ -546,6 +539,47 @@ fn connected_with_tracks(
             })
             .unwrap(),
     );
+    let mut targets = pending;
+    let offers = targets
+        .iter()
+        .map(|target| {
+            let Some(state::resource_spec::Declaration::LogicalSubscription(subscription)) =
+                &target.spec().declaration
+            else {
+                panic!("logical receive intent");
+            };
+            let address = subscription.source.as_ref().unwrap();
+            let (publication_id, kind) = match state::TrackKind::try_from(address.kind).unwrap() {
+                state::TrackKind::Video => (video_track, MediaKind::Video),
+                state::TrackKind::Audio => (audio_track, MediaKind::Audio),
+                _ => panic!("RTP receiver"),
+            };
+            let mut source = track(
+                publication_id,
+                &address.participant_id,
+                &address.track_id,
+                kind,
+            );
+            source.room_id = address.room.clone();
+            target.offer(1, Some(source), None)
+        })
+        .collect::<Vec<_>>();
+    if !offers.is_empty() {
+        native_connection::observe(&mut agent, generation, channel, offers);
+        for (reference, report) in next_reports(&mut agent, generation, channel) {
+            assert_eq!(report.source_revision, 1);
+            let Some(state::logical_receiver_report::Outcome::Prepared(binding)) = report.outcome
+            else {
+                panic!("prepared RTP fixture");
+            };
+            targets
+                .iter_mut()
+                .find(|target| target.reference == reference)
+                .unwrap()
+                .prepared = Some(binding);
+        }
+    }
+    let lookup_targets = targets.clone();
     let participant = state::Participant {
         participant_id: agent.snapshot().participant_id.clone().unwrap(),
 

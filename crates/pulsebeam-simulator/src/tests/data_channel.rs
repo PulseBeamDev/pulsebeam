@@ -194,12 +194,9 @@ fn ordered_data_channel_does_not_loop_back_to_publisher_test() {
 /// Long per-mode labels retain independent same-label publisher tracks.
 #[test]
 fn all_topic_modes_preserve_same_label_fanin_without_cross_delivery() {
-    const LATEST_TOPIC: &str =
-        "latest-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const LOSSY_TOPIC: &str =
-        "lossy-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const ORDERED_TOPIC: &str =
-        "ordered-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const LATEST_TOPIC: &str = "latest-12345678901234567890123456789";
+    const LOSSY_TOPIC: &str = "lossy-123456789012345678901234567890";
+    const ORDERED_TOPIC: &str = "ordered-1234567890123456789012345678";
     let mut room = Room::new("data-modes");
     for name in [
         "pub-a",

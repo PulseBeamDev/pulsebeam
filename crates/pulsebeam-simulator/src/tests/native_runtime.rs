@@ -783,15 +783,21 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
     let receiver_ip = subnet_ip(subnet, 2);
     let client_ip = subnet_ip(subnet, 3);
     let (issuer, receiver) = pulsebeam::node::SimOwnershipPeer::pair();
-    for (ip, peer, node_seed) in [
-        (issuer_ip, issuer.clone(), seed),
-        (receiver_ip, receiver.clone(), !seed),
+    let (issuer_tx, issuer_link) = pulsebeam_runtime::sync::oneshot::channel();
+    let (receiver_tx, receiver_link) = pulsebeam_runtime::sync::oneshot::channel();
+    for (ip, peer, node_seed, link) in [
+        (issuer_ip, issuer.clone(), seed, issuer_tx),
+        (receiver_ip, receiver.clone(), !seed, receiver_tx),
     ] {
+        let link = Arc::new(Mutex::new(Some(link)));
         sim.host(ip, move || {
             let peer = peer.clone();
+            let link = link.clone();
             async move {
+                let link = link.lock().unwrap().take().unwrap();
                 sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(node_seed), 1)
                     .with_sim_ownership_peer(peer)
+                    .with_link_control((ip, 0).into(), link)
                     .run(tokio_util::sync::CancellationToken::new())
                     .await
                     .map_err(Into::into)
@@ -799,9 +805,16 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
         });
     }
     sim.client(client_ip, async move {
-        prove_joined_recovery(client_ip, issuer_ip, receiver_ip, issuer, receiver)
-            .await
-            .map_err(Into::into)
+        prove_joined_recovery(
+            client_ip,
+            issuer_ip,
+            receiver_ip,
+            issuer,
+            receiver,
+            [issuer_link.await?, receiver_link.await?],
+        )
+        .await
+        .map_err(Into::into)
     });
     run_sim_or_timeout(&mut sim, Duration::from_secs(20)).unwrap();
 }
@@ -812,8 +825,13 @@ async fn prove_joined_recovery(
     receiver_ip: IpAddr,
     issuer: pulsebeam::node::SimOwnershipPeer,
     receiver: pulsebeam::node::SimOwnershipPeer,
+    [issuer_link, receiver_link]: [pulsebeam::link::Control; 2],
 ) -> anyhow::Result<()> {
     let room = "native-failover";
+    let same_project = pulsebeam::entity::ProjectRoomKey {
+        project: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+        room: RoomId::new(room)?,
+    };
     let unix_now = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -835,6 +853,55 @@ async fn prove_joined_recovery(
     });
     let evidence = Arc::new(Mutex::new(CreationEvidence::default()));
     let host = NativeHost::bind(client_ip)?;
+    let subscriber_host = host.clone();
+    let subscribe_token = pulsebeam_server::sign_participant_token(
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
+        &serde_json::from_value(serde_json::json!([{"rooms":[room],"allow":["subscribe"]}]))?,
+        "viewer",
+        unix_now() + 3600,
+    )?
+    .token;
+    let (subscriber, task) = RuntimeAgent::managed_with_services(
+        Config::new(pulsebeam_agent_core::AgentConfig {
+            endpoint: format!("http://{issuer_ip}:7070"),
+            token: subscribe_token,
+            retry: Default::default(),
+            log_level: Default::default(),
+        }),
+        Host::new(create_http_client()),
+        move || subscriber_host.runtime(),
+    )?;
+    tokio::task::spawn_local(task);
+    let viewer = Agent::from_runtime(subscriber);
+    let feed = viewer
+        .room(room.into())?
+        .participant("alice".into())?
+        .data("feed".into(), core_ffi::TopicMode::Latest)?
+        .subscribe()?;
+    let feed_updates = feed.updates()?;
+    viewer.connect().await?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state = feed_updates
+                .next()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("feed closed before source joined"))?;
+            if state.admission == core_ffi::PublicationAdmissionStatus::Admitted
+                && !state.admission_pending
+            {
+                anyhow::ensure!(
+                    state.source_status == core_ffi::SubscriptionSourceStatus::Unavailable
+                );
+                anyhow::ensure!(state.source_track_id.is_none());
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("roomless feed was not admitted while its source was absent"))??;
+    let waiting = viewer.snapshot();
+    anyhow::ensure!(waiting.room_id.is_none() && waiting.generation.is_some());
+    let viewer_generation = waiting.generation;
     let (runtime, actor) = RuntimeAgent::managed_with_services(
         config,
         Host::new(Box::new(LostCreationResponse {
@@ -845,21 +912,45 @@ async fn prove_joined_recovery(
         move || host.runtime(),
     )?;
     tokio::task::spawn_local(actor);
-    let agent = Agent::from_runtime(runtime.clone());
-    replace_transport_desired(
-        &runtime,
-        core_ffi::DesiredState {
-            connected: true,
-            topic_publishers: vec![core_ffi::TopicPublisher {
-                name: "feed".into(),
-                mode: core_ffi::TopicMode::Latest,
-            }],
-            ..Default::default()
-        },
-    )
-    .await?;
-    runtime.join(room.to_owned())?;
+    let agent = Agent::from_runtime(runtime);
+    let publisher = agent
+        .data("feed".into(), core_ffi::TopicMode::Latest)?
+        .publish()?;
+    agent.join(room.into())?;
     let first = wait_connected(&agent, None).await?;
+    let initial_id = first.topics.publishers[0]
+        .publication_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("initial publication not admitted"))?;
+    let receive_payload = |expected, expected_id| {
+        let publisher = &publisher;
+        let feed = &feed;
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut ticks = tokio::time::interval(Duration::from_millis(25));
+                loop {
+                    tokio::select! {
+                        _ = ticks.tick() => publisher.send(Vec::from(expected)).await?,
+                        update = feed.next() => {
+                            use pulsebeam_agent_core::{DataEvent, DataUpdate};
+                            match update? {
+                                DataUpdate::Event { event: DataEvent::Message { publication_id, participant_id, data, .. } }
+                                    if data == expected => {
+                                        anyhow::ensure!(publication_id == expected_id && participant_id == "alice");
+                                        return anyhow::Ok(());
+                                    }
+                                DataUpdate::Closed => anyhow::bail!("feed closed during ownership change"),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }).await.map_err(|_| anyhow::anyhow!(
+                "did not receive payload for {expected_id}; subscription: {:?}", feed.state()
+            ))?
+        }
+    };
+    receive_payload(b"before".as_slice(), initial_id).await?;
     issuer.deliver_receipt_facts(unix_now() + 20);
     agent.reconnect().await?;
     let recovered = wait_connected(&agent, first.generation).await?;
@@ -900,9 +991,109 @@ async fn prove_joined_recovery(
     anyhow::ensure!(
         issuer.local_claim_count().await? == 1 && receiver.local_claim_count().await? == 1
     );
+    let [ingress, egress] = link_recovery_peers(&issuer_link, &receiver_link).await?;
+    let recovered_id = recovered.topics.publishers[0]
+        .publication_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("replacement publication not admitted"))?;
+    let replacement = pulsebeam_core::identity::PublicationKey::Data(recovered_id.parse()?);
+    let attach_relay = || {
+        let issuer_link = &issuer_link;
+        let receiver_link = &receiver_link;
+        let feed = &feed;
+        async move {
+            let addresses = tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    let destinations = issuer_link
+                        .destinations(same_project, replacement)
+                        .await
+                        .map_err(relay_error)?;
+                    if !destinations.is_empty() {
+                        anyhow::ensure!(
+                            destinations
+                                .iter()
+                                .all(|route| route.kind == pulsebeam::link::ReceiveKind::Forward)
+                        );
+                        return anyhow::Ok(
+                            destinations
+                                .into_iter()
+                                .map(|route| route.address)
+                                .collect(),
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "replacement ingress route was not installed; subscription: {:?}",
+                    feed.state()
+                )
+            })??;
+            let route = issuer_link
+                .bind_receive(ingress, addresses)
+                .await
+                .map_err(|error| anyhow::anyhow!("bind relay receive: {error:?}"))?;
+            let binding = receiver_link
+                .bind_send(same_project, replacement, egress, route.address)
+                .await
+                .map_err(|error| anyhow::anyhow!("bind relay send: {error:?}"))?;
+            Ok::<_, anyhow::Error>((route.address, binding))
+        }
+    };
+    let until = pulsebeam_runtime::time::Instant::now() + Duration::from_secs(4);
+    receiver.deliver_linked_snapshot(ingress, until).await?;
+    let (first_address, first_send) = attach_relay().await?;
+    receive_payload(b"after".as_slice(), recovered_id).await?;
+    let bound = feed.state();
+    anyhow::ensure!(bound.source_track_id.as_deref() == Some(recovered_id));
+
+    tokio::time::timeout_at(until + Duration::from_secs(2), async {
+        loop {
+            let state = feed_updates
+                .next()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("feed closed when peer evidence expired"))?;
+            if state.observation_revision > bound.observation_revision
+                && state.source_status == core_ffi::SubscriptionSourceStatus::Unavailable
+            {
+                anyhow::ensure!(
+                    state.source_track_id.is_none()
+                        && state.accepted_revision == bound.accepted_revision
+                        && state.admission == core_ffi::PublicationAdmissionStatus::Admitted
+                );
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "expired peer source was not withdrawn; subscription: {:?}",
+            feed.state()
+        )
+    })??;
+    let withdrawn = issuer_link.destinations(same_project, replacement).await;
+    anyhow::ensure!(
+        matches!(withdrawn, Err(pulsebeam_link::BindError::Closed)),
+        "expired publication is still visible to Link: {withdrawn:?}"
+    );
+    receiver_link
+        .request_unbind_send(first_send)
+        .map_err(|error| anyhow::anyhow!("unbind expired relay send: {error:?}"))?;
+
     receiver
-        .deliver_claim_snapshot(pulsebeam_runtime::time::Instant::now() + Duration::from_secs(10))
+        .deliver_linked_snapshot(
+            ingress,
+            pulsebeam_runtime::time::Instant::now() + Duration::from_secs(10),
+        )
         .await?;
+    let (new_address, _) = attach_relay().await?;
+    anyhow::ensure!(first_address != new_address);
+    receive_payload(b"refreshed".as_slice(), recovered_id).await?;
+    anyhow::ensure!(feed.state().accepted_revision == bound.accepted_revision);
+    anyhow::ensure!(viewer.snapshot().generation == viewer_generation && !feed.is_closed());
     anyhow::ensure!(
         issuer.local_claim_count().await? == 0 && receiver.local_claim_count().await? == 1,
         "sibling claims did not converge"
@@ -911,8 +1102,78 @@ async fn prove_joined_recovery(
         agent.snapshot().generation == recovered.generation
             && agent.snapshot().connection == core_ffi::ConnectionState::Connected
     );
+    viewer.close().await?;
     agent.close().await?;
     Ok(())
+}
+
+fn relay_error(error: impl std::fmt::Debug) -> anyhow::Error {
+    anyhow::anyhow!("Link relay provisioning: {error:?}")
+}
+
+async fn link_recovery_peers(
+    issuer: &pulsebeam::link::Control,
+    receiver: &pulsebeam::link::Control,
+) -> anyhow::Result<[pulsebeam_link::NetworkId; 2]> {
+    use pulsebeam_link::{NetworkClass, NetworkPeer, PeerRole, SecretCredential};
+    let left = SecretCredential::generate().map_err(relay_error)?;
+    let right = SecretCredential::generate().map_err(relay_error)?;
+    let left_fingerprint = left.fingerprint();
+    let right_fingerprint = right.fingerprint();
+    let local = issuer.health().await.map_err(relay_error)?.local_addr;
+    let remote = receiver.health().await.map_err(relay_error)?.local_addr;
+    let egress = receiver
+        .open_peer(NetworkPeer {
+            endpoint: local,
+            credential: right,
+            expected_peer: left_fingerprint,
+            role: PeerRole::Responder,
+            class: NetworkClass::Lan,
+        })
+        .await
+        .map_err(relay_error)?;
+    let installed = receiver.health().await.map_err(relay_error)?;
+    anyhow::ensure!(
+        installed
+            .peers
+            .iter()
+            .any(|peer| peer.peer == egress && peer.failure.is_none()),
+        "relay responder was not installed"
+    );
+    let ingress = issuer
+        .open_peer(NetworkPeer {
+            endpoint: remote,
+            credential: left,
+            expected_peer: right_fingerprint,
+            role: PeerRole::Initiator,
+            class: NetworkClass::Lan,
+        })
+        .await
+        .map_err(relay_error)?;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let mut ready = true;
+            for (node, id) in [(issuer, ingress), (receiver, egress)] {
+                let health = node.health().await.map_err(relay_error)?;
+                if let Some(peer) = health.peers.iter().find(|peer| peer.peer == id) {
+                    anyhow::ensure!(
+                        peer.failure.is_none(),
+                        "relay peer failed: {:?}",
+                        peer.failure
+                    );
+                    ready &= peer.transport.ready;
+                } else {
+                    ready = false;
+                }
+            }
+            if ready {
+                return anyhow::Ok([ingress, egress]);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("authenticated Link peers did not become ready"))?
 }
 
 #[test]
@@ -993,11 +1254,70 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
             {"rooms":["listen"],"allow":["join"]}
         ]),
     )?;
+    let replacement_viewer = make_agent(
+        "known-address-viewer",
+        serde_json::json!([{"rooms":["stage"],"allow":["subscribe"]}]),
+    )?;
+    let replacement_receiver = replacement_viewer
+        .room("stage".into())?
+        .participant("present-publisher".into())?
+        .data("replacement".into(), TopicMode::Lossy)?
+        .subscribe()?;
+    replacement_viewer.connect().await?;
+    let updates = &replacement_receiver.updates()?;
+    let await_source = |present| async move {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state = updates
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("logical data subscription closed"))?;
+                anyhow::ensure!(state.terminal_error.is_none());
+                if state.admission == Admission::Admitted
+                    && !state.admission_pending
+                    && if present {
+                        state.execution == core_ffi::PublicationExecution::Installed
+                    } else {
+                        state.source_status == core_ffi::SubscriptionSourceStatus::Unavailable
+                    }
+                {
+                    return anyhow::Ok(state.source_track_id);
+                }
+            }
+        })
+        .await?
+    };
+    anyhow::ensure!(await_source(false).await?.is_none());
+    let replacement_generation = replacement_viewer.snapshot().generation;
+    anyhow::ensure!(replacement_generation.is_some());
+
     let sender = publisher
         .data("events".into(), TopicMode::Ordered)?
         .publish()?;
     publisher.join("stage".into())?;
     wait_connected(&publisher, None).await?;
+
+    let replacement_topic = publisher.data("replacement".into(), TopicMode::Lossy)?;
+    let mut first_source = None;
+    for value in [b"original", b"replaced"] {
+        let source = replacement_topic.publish()?;
+        let id = await_source(true)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing installed publication ID"))?;
+        source.send(value.to_vec()).await?;
+        let update =
+            tokio::time::timeout(Duration::from_secs(3), replacement_receiver.next()).await??;
+        anyhow::ensure!(matches!(update, pulsebeam_agent_core::DataUpdate::Event {
+            event: pulsebeam_agent_core::DataEvent::Message { publication_id, participant_id, data, .. }
+        } if publication_id == id && participant_id == "present-publisher" && data == value));
+        anyhow::ensure!(first_source.as_ref() != Some(&id));
+        first_source = Some(id);
+        source.close()?;
+        anyhow::ensure!(await_source(false).await?.is_none());
+        anyhow::ensure!(!replacement_receiver.is_closed());
+        anyhow::ensure!(replacement_viewer.snapshot().generation == replacement_generation);
+    }
+    replacement_viewer.close().await?;
 
     let watch = viewer.room("stage".into())?.watch(None)?;
     let watch_updates = watch.updates()?;
@@ -1064,7 +1384,7 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
                         }
                     }
                 })
-                .await??
+                .await??;
             }
             _ => anyhow::ensure!(local.state().admission.status == Admission::Pending),
         }
@@ -1963,7 +2283,8 @@ async fn prove_takeover(config: Config, host: NativeHost, room: &str) -> anyhow:
     publication.set_source(Some(video.clone())).await?;
     predecessor.join(room.to_owned())?;
     let first = wait_connected(&old, None).await?;
-    publication.ready().await?;
+    let updates = publication.updates()?;
+    wait_publication_admitted(&updates).await?;
     old.reconnect().await?;
     wait_connected(&old, first.generation).await?;
     publication.ready().await?;

@@ -29,8 +29,8 @@ impl std::fmt::Debug for OpenPeer {
 }
 use crate::route::{NodeRouteAddress, RouteId};
 
-/// A receive binding is an exact destination snapshot. Retiring any destination
-/// retires the binding; its owner must explicitly provision a replacement.
+/// A receive binding is an exact destination snapshot. Destinations can retire
+/// independently; adding one requires an explicitly provisioned binding.
 #[derive(Debug)]
 pub struct BindReceive {
     pub peer: pulsebeam_link::NetworkId,

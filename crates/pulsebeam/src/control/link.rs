@@ -20,6 +20,25 @@ struct SendBranch {
     route: CompiledRoute,
 }
 
+#[derive(Clone, Copy)]
+struct ReceiveAction {
+    route: TrackRouteAction,
+    ingress_peer: Option<pulsebeam_link::NetworkId>,
+}
+
+enum Retirement {
+    Binding(BindingId),
+    ReceivePort(BindingId, PortId),
+}
+
+impl Retirement {
+    fn binding(&self) -> BindingId {
+        match *self {
+            Self::Binding(binding) | Self::ReceivePort(binding, _) => binding,
+        }
+    }
+}
+
 pub(super) struct Links {
     control: LinkControl<ShardFrame>,
     host: Option<pulsebeam_queue::Sender<crate::link::host::Command>>,
@@ -30,10 +49,10 @@ pub(super) struct Links {
     plans: HashMap<(ShardId, PublicationKey), TrackPlan>,
     sends: Vec<SendBranch>,
     installed: HashSet<NodeRouteAddress>,
-    route_actions: HashMap<NodeRouteAddress, TrackRouteAction>,
+    route_actions: HashMap<NodeRouteAddress, ReceiveAction>,
     installations: HashMap<NodeRouteAddress, (oneshot::Receiver<()>, Option<bool>)>,
     receives: HashMap<BindingId, (pulsebeam_link::NetworkId, Vec<NodeRouteAddress>)>,
-    retirements: Vec<(Vec<BindingId>, oneshot::Receiver<()>, bool)>,
+    retirements: Vec<(Vec<Retirement>, oneshot::Receiver<()>, bool)>,
 }
 
 impl Links {
@@ -306,7 +325,11 @@ impl Links {
         ack: oneshot::Receiver<()>,
     ) {
         if !bindings.is_empty() {
-            self.retirements.push((bindings, ack, false));
+            self.retirements.push((
+                bindings.into_iter().map(Retirement::Binding).collect(),
+                ack,
+                false,
+            ));
         }
     }
 
@@ -314,9 +337,14 @@ impl Links {
         self.host.is_some()
     }
 
+    pub(super) fn has_peer(&self, peer: pulsebeam_link::NetworkId) -> bool {
+        self.peers.contains_key(&peer)
+    }
+
     pub(super) fn destinations(
         &mut self,
         track: PublicationKey,
+        ingress_peer: Option<pulsebeam_link::NetworkId>,
     ) -> Vec<crate::link::ReceiveDestination> {
         self.reap();
         let mut destinations: Vec<_> = self
@@ -324,10 +352,10 @@ impl Links {
             .iter()
             .filter_map(|address| {
                 let action = self.route_actions.get(address)?;
-                if action.publication_id() != track {
+                if action.route.publication_id() != track || action.ingress_peer != ingress_peer {
                     return None;
                 }
-                let kind = match action {
+                let kind = match action.route {
                     TrackRouteAction::Forward { .. } => crate::link::ReceiveKind::Forward,
                     TrackRouteAction::Reverse { .. } => crate::link::ReceiveKind::Reverse,
                 };
@@ -347,10 +375,17 @@ impl Links {
         &mut self,
         address: NodeRouteAddress,
         action: TrackRouteAction,
+        ingress_peer: Option<pulsebeam_link::NetworkId>,
         ack: oneshot::Receiver<()>,
     ) {
         self.installed.remove(&address);
-        self.route_actions.insert(address, action);
+        self.route_actions.insert(
+            address,
+            ReceiveAction {
+                route: action,
+                ingress_peer,
+            },
+        );
         self.installations.insert(address, (ack, None));
     }
 
@@ -376,9 +411,13 @@ impl Links {
                 .route_actions
                 .get(address)
                 .ok_or(pulsebeam_link::BindError::Closed)?;
+            if action.ingress_peer.is_some_and(|origin| origin != peer) {
+                return Err(pulsebeam_link::BindError::Closed);
+            }
             let identity = (
-                action.publication_id(),
-                matches!(action, TrackRouteAction::Reverse { .. }),
+                action.route.publication_id(),
+                matches!(action.route, TrackRouteAction::Reverse { .. }),
+                action.ingress_peer,
             );
             if expected.is_some_and(|expected| expected != identity) {
                 return Err(pulsebeam_link::BindError::Closed);
@@ -399,7 +438,7 @@ impl Links {
         let mut owned = self.receives.remove(&binding).is_some();
         for (bindings, _, _) in &mut self.retirements {
             bindings.retain(|pending| {
-                if *pending == binding {
+                if pending.binding() == binding {
                     owned = true;
                     false
                 } else {
@@ -443,24 +482,38 @@ impl Links {
             || self.installations.contains_key(&address)
     }
 
-    pub(super) fn retire_after(&mut self, address: NodeRouteAddress, ack: oneshot::Receiver<()>) {
+    pub(super) fn retire_after(
+        &mut self,
+        address: NodeRouteAddress,
+        stage: impl FnOnce(Vec<pulsebeam_link::BindingCutoff>) -> oneshot::Receiver<()>,
+    ) {
         self.installed.remove(&address);
         self.route_actions.remove(&address);
         self.installations.remove(&address);
-        let mut bindings = Vec::new();
+        let mut retirements = Vec::new();
         if let Some((binding, _)) = self.routes.remove(&address) {
-            bindings.push(binding);
+            retirements.push(Retirement::Binding(binding));
         }
-        self.receives.retain(|binding, (_, addresses)| {
-            if addresses.contains(&address) {
-                bindings.push(*binding);
-                false
-            } else {
-                true
-            }
-        });
-        if !bindings.is_empty() {
-            self.retirements.push((bindings, ack, false));
+        if let Some(&port) = self.ports.get(address.shard().index()) {
+            self.receives.retain(|binding, (_, addresses)| {
+                if let Some(index) = addresses.iter().position(|target| *target == address) {
+                    addresses.swap_remove(index);
+                    retirements.push(Retirement::ReceivePort(*binding, port));
+                }
+                !addresses.is_empty()
+            });
+        }
+        if !retirements.is_empty() {
+            let bindings = retirements
+                .iter()
+                .filter_map(|action| match *action {
+                    Retirement::ReceivePort(binding, port) => {
+                        self.control.receive_port_cutoff(binding, port)
+                    }
+                    Retirement::Binding(_) => None,
+                })
+                .collect();
+            self.retirements.push((retirements, stage(bindings), false));
         }
     }
 
@@ -507,8 +560,13 @@ impl Links {
             let retired =
                 *done || !matches!(ack.try_recv(), Err(oneshot::error::TryRecvError::Empty));
             if retired {
-                for binding in bindings {
-                    self.control.unbind(*binding);
+                for action in bindings {
+                    match *action {
+                        Retirement::Binding(binding) => self.control.unbind(binding),
+                        Retirement::ReceivePort(binding, port) => {
+                            self.control.unbind_receive_port(binding, port)
+                        }
+                    }
                 }
             }
             !retired
@@ -565,8 +623,8 @@ mod tests {
             publication_id: track,
         };
         let (installed, wait) = oneshot::channel();
-        links.install_after(address, action, wait);
-        assert!(links.destinations(track).is_empty());
+        links.install_after(address, action, None, wait);
+        assert!(links.destinations(track, None).is_empty());
         assert_eq!(
             links.bind_receive(replacement, vec![address]),
             Err(pulsebeam_link::BindError::Closed)
@@ -587,20 +645,20 @@ mod tests {
             },
         ] {
             let (ack, wait) = oneshot::channel();
-            links.install_after(other_address, other_action, wait);
+            links.install_after(other_address, other_action, None, wait);
             ack.send(()).unwrap();
             assert_eq!(
                 links.bind_receive(replacement, vec![address, other_address]),
                 Err(pulsebeam_link::BindError::Closed)
             );
             let (ack, wait) = oneshot::channel();
-            links.retire_after(other_address, wait);
+            links.retire_after(other_address, |_| wait);
             let _ = ack.send(());
             links.reap();
         }
 
         assert_eq!(
-            links.destinations(track),
+            links.destinations(track, None),
             vec![crate::link::ReceiveDestination {
                 address,
                 kind: crate::link::ReceiveKind::Reverse,
@@ -698,24 +756,23 @@ mod tests {
         ));
 
         let (retired, wait) = oneshot::channel();
-        links.retire_after(address, wait);
+        links.retire_after(address, |_| wait);
         links.reap();
         assert_eq!(
             links.bind_receive(replacement, vec![address]),
             Err(pulsebeam_link::BindError::Closed)
         );
-        assert!(
-            links
-                .retirements
+        assert!(links.retirements.iter().any(|(bindings, _, _)| {
+            bindings
                 .iter()
-                .any(|(bindings, _, _)| bindings.contains(&receive.binding))
-        );
+                .any(|action| action.binding() == receive.binding)
+        }));
         retired.send(()).unwrap();
         links.reap();
         assert!(links.retirements.is_empty());
-        assert!(links.destinations(track).is_empty());
+        assert!(links.destinations(track, None).is_empty());
         let (failed, wait) = oneshot::channel();
-        links.install_after(address, action, wait);
+        links.install_after(address, action, None, wait);
         drop(failed);
         assert_eq!(
             links.bind_receive(replacement, vec![address]),
@@ -738,11 +795,12 @@ mod tests {
             TrackRouteAction::Forward {
                 publication_id: track,
             },
+            None,
             installation,
         );
         assert!(links.contains(address));
         let (retired, retirement) = oneshot::channel();
-        links.retire_after(address, retirement);
+        links.retire_after(address, |_| retirement);
         // Dropping the obsolete observer cancels the old installation, even if
         // that shard's queued generation applies after retirement was staged.
         assert!(installed.send(()).is_err());
@@ -751,7 +809,7 @@ mod tests {
         assert!(!links.contains(address));
         assert!(!links.installed.contains(&address));
         assert!(links.installations.is_empty());
-        assert!(links.destinations(track).is_empty());
+        assert!(links.destinations(track, None).is_empty());
         assert!(links.route_actions.is_empty());
     }
 
@@ -769,7 +827,7 @@ mod tests {
             packet: crate::participant::reverse::ReversePacket::reliable_control(vec![1]),
         };
         let (ack, wait) = oneshot::channel();
-        links.retire_after(address, wait);
+        links.retire_after(address, |_| wait);
         links.reap();
         assert!(
             compiled

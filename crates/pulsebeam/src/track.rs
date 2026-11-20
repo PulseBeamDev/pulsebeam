@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use crate::entity::PublicationKey;
 use crate::entity::{ParticipantId, TrackId, TrackKind};
-use crate::id::ShardId;
 use crate::media::{Mid, Pt, Rid, SimulcastLayer, Ssrc};
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
 use crate::rtp::sync::SenderInfo;
@@ -213,8 +212,6 @@ mod stream_writer_tests {
 #[derive(Eq, PartialEq, Hash, Clone)]
 pub struct TrackMeta {
     pub room: crate::entity::ProjectRoomKey,
-    /// The shard ID that hosts this track's publisher.
-    pub shard_id: ShardId,
     pub id: crate::entity::PublicationKey,
     pub origin: crate::entity::ParticipantId,
     /// The connection incarnation that published this track.
@@ -228,7 +225,6 @@ impl std::fmt::Debug for TrackMeta {
             .field("project", &self.room.project)
             .field("connection_id", &self.connection_id)
             .field("publication_id", &self.id)
-            .field("shard_id", &self.shard_id)
             .finish_non_exhaustive()
     }
 }
@@ -1126,7 +1122,6 @@ pub mod test_utils {
             room: crate::entity::ProjectRoomKey::fixture(
                 crate::entity::RoomId::new("test-room").unwrap(),
             ),
-            shard_id: ShardId::new(0),
             id: publication_id,
             origin: participant_id,
         };
@@ -1145,7 +1140,6 @@ pub mod test_utils {
             room: crate::entity::ProjectRoomKey::fixture(
                 crate::entity::RoomId::new("test-room").unwrap(),
             ),
-            shard_id: ShardId::new(0),
             id: publication_id,
             origin: participant_id,
         };

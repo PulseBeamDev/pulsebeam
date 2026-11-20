@@ -3140,15 +3140,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
         channel,
         targets
             .iter()
-            .map(|target| {
-                confirmed(
-                    state::resource_key::Key::Owned(target.reference),
-                    target.desired.revision,
-                    state::confirmed_state::Value::Absent(state::AbsentState {
-                        reason: state::AbsenceReason::SourceEnded as i32,
-                    }),
-                )
-            })
+            .map(|target| target.offer(2, None, None))
             .collect(),
     );
     assert!(agent.snapshot().video_mapping.is_empty());
@@ -3167,13 +3159,14 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
         })
         .collect::<Vec<_>>();
     withdrawal.push(confirmed(
-        state::resource_key::Key::Participant(participant.clone()),
+        state::resource_key::Key::Participant(participant),
         0,
         state::confirmed_state::Value::Absent(state::AbsentState {
             reason: state::AbsenceReason::Removed as i32,
         }),
     ));
     observe(&mut agent, generation, channel, withdrawal);
+    native_media::finish_retirements(&mut agent, generation, &["ra0", "rv0"], &[]);
     assert!(
         agent.next_effect_after_turn().is_none(),
         "source absence does not release logical receive ownership"
@@ -3183,7 +3176,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
     agent
         .command(AgentCommand::ReplaceDesired(waiting))
         .unwrap();
-    native_media::finish_retirements(&mut agent, generation, &["rv0"], &[]);
+    native_media::confirm_missing_lookups(&mut agent, generation, channel);
     native_media::confirm_missing_lookups(&mut agent, generation, channel);
     assert!(
         agent.next_effect_after_turn().is_none(),
@@ -3195,7 +3188,6 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
     agent
         .command(AgentCommand::ReplaceDesired(stopped))
         .unwrap();
-    native_media::finish_retirements(&mut agent, generation, &["ra0"], &[]);
     native_media::confirm_missing_lookups(&mut agent, generation, channel);
     assert!(agent.snapshot().participants.is_empty());
     assert!(agent.snapshot().publications.is_empty());
@@ -3223,19 +3215,12 @@ fn partial_native_observations_preserve_other_receivers_and_declared_desire() {
         .iter()
         .find(|target| {
             matches!(&target.spec().declaration,
-            Some(state::resource_spec::Declaration::Subscription(subscription))
-                if subscription.kind == state::TrackKind::Video as i32)
+            Some(state::resource_spec::Declaration::LogicalSubscription(subscription))
+                if subscription.source.as_ref().is_some_and(|source| source.kind == state::TrackKind::Video as i32))
         })
         .unwrap();
     let installed = video.installed(participant, tracks[0].clone());
-    let mut waiting = installed.clone();
-    let Some(confirmation) = &mut waiting.confirmed else {
-        panic!("confirmation")
-    };
-    let Some(state::confirmed_state::Value::Owned(live)) = &mut confirmation.value else {
-        panic!("owned receiver")
-    };
-    live.execution = state::ExecutionStatus::WaitingForSource as i32;
+    let waiting = video.offer(1, Some(tracks[0].clone()), None);
     native_connection::observe(&mut agent, generation, channel, vec![waiting]);
     assert!(agent.snapshot().video_mapping.is_empty());
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
@@ -3273,23 +3258,12 @@ fn partial_native_observations_preserve_other_receivers_and_declared_desire() {
     );
     assert_eq!(agent.snapshot().audio_mapping[&2], "audio-track");
     assert!(drain_notifications(&mut agent).contains(&Notification::SnapshotChanged));
-    let Effect::DataChannel(DataChannelEffect::Send { payload, .. }) = next_effect(&mut agent)
-    else {
-        panic!("receiver failure and withdrawal")
-    };
-    let records = state::codec::decode_client(&payload).unwrap().records;
-    assert!(records.iter().any(|record| {
-        record.owned == video.reference
-            && record
-                .execution
-                .as_ref()
-                .is_some_and(|report| report.failure.is_some())
-    }));
-    assert!(records.iter().any(|record| record.owned == video.reference
-        && record.desired.as_ref().is_some_and(|desired| matches!(
-            desired.value,
-            Some(state::desired_state::Value::Absent(true))
-        ))));
+    native_media::finish_retirements(&mut agent, generation, &["rv0"], &[]);
+    let reports = native_media::next_reports(&mut agent, generation, channel);
+    assert!(matches!(reports.as_slice(), [(reference, report)]
+        if *reference == video.reference && report.source_revision == 1
+            && matches!(report.outcome, Some(state::logical_receiver_report::Outcome::Failure(_)))
+    ));
 }
 
 #[test]
@@ -3338,18 +3312,19 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
     agent
         .command(AgentCommand::ReplaceDesired(changed.clone()))
         .unwrap();
-    let updated = native_media::next(&mut agent, generation, channel);
+    let mut updated = native_media::next(&mut agent, generation, channel);
     assert_eq!(updated.len(), 1);
     let video = targets
         .iter()
         .find(|target| {
             matches!(&target.spec().declaration,
-            Some(state::resource_spec::Declaration::Subscription(subscription))
-                if subscription.kind == state::TrackKind::Video as i32)
+            Some(state::resource_spec::Declaration::LogicalSubscription(subscription))
+                if subscription.source.as_ref().is_some_and(|source| source.kind == state::TrackKind::Video as i32))
         })
         .unwrap();
     assert_eq!(updated[0].reference, video.reference);
     assert_eq!(updated[0].spec().declaration, video.spec().declaration);
+    updated[0].prepared.clone_from(&video.prepared);
     assert!(
         matches!(&updated[0].spec().settings.as_ref().unwrap().receive,
         Some(state::resource_settings::Receive::Video(options)) if options.max_height == Some(1080))
@@ -3371,7 +3346,7 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
         .command(AgentCommand::ReplaceDesired(changed))
         .unwrap();
     let retired = native_media::next(&mut agent, generation, channel);
-    assert_eq!(retired.len(), 4);
+    assert_eq!(retired.len(), 2);
     for previous in &targets {
         assert!(
             retired
@@ -3417,737 +3392,128 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
 
 #[test]
 fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
-    use native_connection::{confirmed, observe};
-    use pulsebeam_proto::state;
-    for owned in [false, true] {
-        let mut selected = desired(1);
-        selected.video[0].publication_id.clear();
-        selected.video[0].selector = Some(TrackSelector {
-            room: "room".into(),
-            participant_id: "remote-user".to_string(),
-            track_id: "camera".to_string(),
-        });
-        selected.audio.pinned.clear();
-        let audio_selector = TrackSelector {
-            room: "room".into(),
-            participant_id: "remote-user".to_string(),
-            track_id: "microphone".to_string(),
-        };
-        selected.audio.selected.push(audio_selector.clone());
-        selected.audio.selector_delays.insert(
-            audio_selector.clone(),
-            PlayoutDelay::Fixed {
-                min_ms: 0,
-                max_ms: 0,
-            },
-        );
-        let mut agent = Agent::new(config()).unwrap();
-        let view = if owned {
-            let video = selected.video.remove(0);
-            let ResourceResult::Owned { owner } = agent
-                .resource(ResourceCommand::ClaimVideo {
-                    selector: video.selector.unwrap(),
-                })
-                .unwrap()
-            else {
-                panic!("video lease")
-            };
-            agent
-                .resource(ResourceCommand::ObserveVideo {
-                    owner,
-                    observation: VideoObservation {
-                        visible: true,
-                        height: video.height,
-                        min_height: video.min_height,
-                        min_fps: video.min_fps,
-                        priority: video.priority,
-                        playout_delay: video.playout_delay,
-                    },
-                })
-                .unwrap();
-            Some(owner)
-        } else {
-            None
-        };
-        let audio_view = if owned {
-            selected.audio = AudioSubscription::default();
-            let ResourceResult::Owned { owner } = agent
-                .resource(ResourceCommand::ClaimAudioSubscription {
-                    selector: audio_selector,
-                })
-                .unwrap()
-            else {
-                panic!("audio owner")
-            };
-            agent
-                .resource(ResourceCommand::ConfigureAudio {
-                    owner,
-                    playout_delay: PlayoutDelay::Fixed {
-                        min_ms: 0,
-                        max_ms: 0,
-                    },
-                })
-                .unwrap();
-            let mut conflict = selected.clone();
-            conflict.audio.pinned.push("audio-track".into());
-            assert!(matches!(
-                agent.command(AgentCommand::ReplaceDesired(conflict)),
-                Err(AgentError::InvalidResource(
-                    TrackResourceError::AlreadyOwned
-                ))
-            ));
-            Some(owner)
-        } else {
-            None
-        };
-        let (mut agent, generation, channel, resolved, lookups) =
-            native_media::connected_with(agent, selected);
-        assert_eq!(resolved.len(), 2);
-        let participant = state::Participant {
-            participant_id: "remote-user".into(),
+    use native_connection::observe;
+    use pulsebeam_proto::state::{
+        self, logical_receiver_report::Outcome, logical_subscription_state::Execution,
+    };
 
-            room_id: "room".into(),
-        };
-        let tracks = [
-            native_media::track(
-                "video-one",
-                &participant.participant_id,
-                "camera",
-                MediaKind::Video,
-            ),
-            native_media::track(
-                "audio-one",
-                &participant.participant_id,
-                "microphone",
-                MediaKind::Audio,
-            ),
-        ];
-        for target in &resolved {
-            let Some(state::resource_spec::Declaration::Subscription(subscription)) =
-                &target.spec().declaration
-            else {
-                panic!("resolved receiver")
-            };
-            match state::TrackKind::try_from(subscription.kind).unwrap() {
-                state::TrackKind::Video => assert_eq!(subscription.publication_id, "video-one"),
-                state::TrackKind::Audio => {
-                    assert_eq!(subscription.publication_id, "audio-one");
-                    assert!(matches!(&target.spec().settings.as_ref().unwrap().receive,
-                        Some(state::resource_settings::Receive::Audio(options))
-                            if options.playout_delay == Some(state::PlayoutDelay { min_ms: 0, max_ms: 0 })));
-                }
-                _ => panic!("media receiver"),
-            }
-        }
-        let video = resolved
+    let (mut agent, generation, channel, targets) = native_media::connected();
+    let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
+    assert!(agent.snapshot().video_mapping.is_empty());
+    assert!(agent.snapshot().audio_mapping.is_empty());
+    observe(
+        &mut agent,
+        generation,
+        channel,
+        targets
+            .iter()
+            .map(|target| target.receiver_installed(&participant, &tracks))
+            .collect(),
+    );
+
+    let mut assignments = Vec::new();
+    let mut retired = Vec::new();
+    for (kind, slot, old_mid, old_index, mid, index, label) in [
+        (
+            MediaKind::Video,
+            MediaSlot::RemoteVideo(0),
+            "rv0",
+            4,
+            "replacement-video",
+            7,
+            "camera",
+        ),
+        (
+            MediaKind::Audio,
+            MediaSlot::RemoteAudio(0),
+            "ra0",
+            2,
+            "replacement-audio",
+            8,
+            "microphone",
+        ),
+    ] {
+        let target = targets
             .iter()
             .find(|target| {
                 matches!(&target.spec().declaration,
-            Some(state::resource_spec::Declaration::Subscription(subscription))
-                if subscription.kind == state::TrackKind::Video as i32)
+                Some(state::resource_spec::Declaration::LogicalSubscription(subscription))
+                    if subscription.source.as_ref().is_some_and(|source| source.track_id == label))
             })
-            .unwrap();
+            .expect("one logical owned receiver");
+        let mapping = |agent: &Agent, index| {
+            let snapshot = agent.snapshot();
+            let indexes = match kind {
+                MediaKind::Video => &snapshot.video_mapping,
+                MediaKind::Audio => &snapshot.audio_mapping,
+            };
+            indexes.get(&index).cloned()
+        };
+        let old = mapping(&agent, old_index).unwrap();
         observe(
             &mut agent,
             generation,
             channel,
-            vec![
-                video.receiver_installed(&participant, &tracks),
-                resolved
-                    .iter()
-                    .find(|target| target.reference != video.reference)
-                    .unwrap()
-                    .receiver_installed(&participant, &tracks),
-            ],
+            vec![target.offer(2, None, None)],
         );
-        assert_eq!(agent.snapshot().video_mapping[&4], "video-one");
-        let observation = view.map(|owner| {
-            let ResourceResult::MediaObservation(id) = agent
-                .resource(ResourceCommand::BeginMediaObservation { owner })
-                .unwrap()
-            else {
-                panic!("observation request")
-            };
-            let Effect::MediaObservation(control) = next_effect(&mut agent) else {
-                panic!("observation target")
-            };
-            assert_eq!(control.observation, id);
-            let target = control.target.as_ref().unwrap();
-            assert_eq!(
-                (target.generation, target.reference),
-                (generation, video.reference)
-            );
-            assert_eq!(target.source, "video-one");
-            assert_eq!(target.binding.mid, "rv0");
-            assert_eq!(target.binding.media_index, 4);
-            assert_eq!(
-                agent
-                    .resource(ResourceCommand::CompleteMediaObservation {
-                        control: control.clone(),
-                        succeeded: true
-                    })
-                    .unwrap(),
-                ResourceResult::Updated
-            );
-            let settings = desired(1).video.remove(0);
-            agent
-                .resource(ResourceCommand::ObserveVideo {
-                    owner,
-                    observation: VideoObservation {
-                        visible: true,
-                        height: settings.height + 1,
-                        min_height: settings.min_height,
-                        min_fps: settings.min_fps,
-                        priority: settings.priority,
-                        playout_delay: settings.playout_delay,
-                    },
-                })
-                .unwrap();
-            let pending = native_media::next(&mut agent, generation, channel);
-            assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].reference, video.reference);
-            assert!(pending[0].desired.revision > video.desired.revision);
-            assert_eq!(
-                agent
-                    .resource(ResourceCommand::AuthorizeMediaObservation {
-                        control: control.clone()
-                    })
-                    .unwrap(),
-                ResourceResult::Updated
-            );
-            assert!(
-                agent.next_effect_after_turn().is_none(),
-                "pending settings do not replace an installed observation"
-            );
-            control
-        });
-        let audio_observation = audio_view.map(|owner| {
-            let ResourceResult::MediaObservation(id) = agent
-                .resource(ResourceCommand::BeginAudioSourceObservation {
-                    owner,
-                    source: "audio-one".into(),
-                })
-                .unwrap()
-            else {
-                panic!("audio observation")
-            };
-            let Effect::MediaObservation(control) = next_effect(&mut agent) else {
-                panic!("audio target")
-            };
-            assert_eq!(control.observation, id);
-            let target = control.target.as_ref().unwrap();
-            assert_eq!(target.source, "audio-one");
-            assert_eq!(target.generation, generation);
-            assert_eq!(target.binding.slot, MediaSlot::RemoteAudio(0));
-            assert_eq!(
-                target.reference,
-                resolved
-                    .iter()
-                    .find(|target| target.reference != video.reference)
-                    .unwrap()
-                    .reference
-            );
-            assert_eq!(
-                agent
-                    .resource(ResourceCommand::CompleteMediaObservation {
-                        control: control.clone(),
-                        succeeded: true
-                    })
-                    .unwrap(),
-                ResourceResult::Updated
-            );
-            control
-        });
-        let replacement =
-            native_media::track("video-two", "remote-user", "camera", MediaKind::Video);
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            vec![
-                confirmed(
-                    state::resource_key::Key::Publication("video-one".into()),
-                    0,
-                    state::confirmed_state::Value::Absent(state::AbsentState {
-                        reason: state::AbsenceReason::Removed as i32,
-                    }),
-                ),
-                confirmed(
-                    state::resource_key::Key::Publication(replacement.publication_id.clone()),
-                    0,
-                    state::confirmed_state::Value::Track(replacement.clone()),
-                ),
-            ],
-        );
-        assert_eq!(agent.snapshot().video_mapping[&4], "video-one");
+        assert!(mapping(&agent, old_index).is_none());
+        native_media::finish_retirements(&mut agent, generation, &[old_mid], &assignments);
+        retired.push(old_mid);
         assert!(
             agent.next_effect_after_turn().is_none(),
-            "discovery changes do not end the installed source"
-        );
-        if let Some(control) = &observation {
-            assert_eq!(
-                agent
-                    .resource(ResourceCommand::AuthorizeMediaObservation {
-                        control: control.clone()
-                    })
-                    .unwrap(),
-                ResourceResult::Updated
-            );
-        }
-        let mut waiting = video.receiver_installed(&participant, &tracks);
-        let Some(confirmation) = &mut waiting.confirmed else {
-            panic!("confirmation")
-        };
-        let Some(state::confirmed_state::Value::Owned(live)) = &mut confirmation.value else {
-            panic!("owned receiver")
-        };
-        live.execution = state::ExecutionStatus::WaitingForSource as i32;
-        observe(&mut agent, generation, channel, vec![waiting]);
-        if let Some(previous) = &observation {
-            let Effect::MediaObservation(closed) = next_effect(&mut agent) else {
-                panic!("retired observation")
-            };
-            assert!(closed.closed && closed.target.is_none());
-            assert_eq!(closed.observation, previous.observation);
-        }
-        let video_lookup = lookups
-            .iter()
-            .find(|target| matches!(
-                &target.spec().declaration,
-                Some(state::resource_spec::Declaration::SourceLookup(lookup))
-                    if lookup.source.as_ref().is_some_and(|source| source.kind == state::TrackKind::Video as i32)
-            ))
-            .unwrap();
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            vec![confirmed(
-                state::resource_key::Key::Owned(video_lookup.reference),
-                video_lookup.desired.revision,
-                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
-                    spec: Some(video_lookup.spec().clone()),
-                    participant: None,
-                    track: None,
-                })),
-            )],
-        );
-        let cutoff = native_media::next(&mut agent, generation, channel);
-        assert_eq!(cutoff.len(), 1);
-        assert_eq!(cutoff[0].reference, video.reference);
-        assert_eq!(
-            cutoff[0].desired.value,
-            Some(state::desired_state::Value::Absent(true))
-        );
-        let fresh_observation = observation.as_ref().map(|previous| {
-            assert_eq!(agent.resource(ResourceCommand::CompleteMediaObservation { control: previous.clone(), succeeded: false }).unwrap(), ResourceResult::Superseded);
-            agent.resource(ResourceCommand::Release { owner: previous.observation.request() }).unwrap();
-            assert!(matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == previous.observation));
-            let ResourceResult::MediaObservation(id) = agent.resource(ResourceCommand::BeginMediaObservation { owner: previous.observation.owner() }).unwrap() else { panic!("fresh observation") };
-            assert_ne!(id, previous.observation);
-            assert!(matches!(next_effect(&mut agent), Effect::MediaObservation(control) if !control.closed && control.target.is_none() && control.observation == id));
-            id
-        });
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            cutoff
-                .iter()
-                .map(|target| {
-                    confirmed(
-                        state::resource_key::Key::Owned(target.reference),
-                        target.desired.revision,
-                        state::confirmed_state::Value::Absent(state::AbsentState {
-                            reason: state::AbsenceReason::SourceEnded as i32,
-                        }),
-                    )
-                })
-                .collect(),
-        );
-        assert!(agent.snapshot().video_mapping.is_empty());
-        native_media::finish_retirements(&mut agent, generation, &["rv0"], &[]);
-        assert!(
-            agent.next_effect_after_turn().is_none(),
-            "an unresolved source does not allocate a replacement receiver"
-        );
-        let failed_candidate = native_media::track(
-            "video-failed-candidate",
-            &participant.participant_id,
-            "camera",
-            MediaKind::Video,
-        );
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            vec![confirmed(
-                state::resource_key::Key::Owned(video_lookup.reference),
-                video_lookup.desired.revision,
-                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
-                    spec: Some(video_lookup.spec().clone()),
-                    participant: Some(participant.clone()),
-                    track: Some(failed_candidate),
-                })),
-            )],
-        );
-        let Effect::Rtc(RtcEffect::AllocateMedia {
-            generation: allocated_generation,
-            operation,
-            allocations,
-        }) = next_effect(&mut agent)
-        else {
-            panic!("resolved replacement receiver allocation")
-        };
-        assert_eq!(allocated_generation, generation);
-        assert_eq!(allocations.len(), 1);
-        agent
-            .handle(HostEvent::Rtc(RtcEvent::MediaPrepared {
-                generation,
-                operation,
-                slots: Vec::new(),
-                outcome: crate::client_sdp::ApplyOutcome::NotApplied,
-                preparation: Err(crate::client_sdp::Error::Observation),
-            }))
-            .unwrap();
-        assert!(
-            agent.snapshot().video_mapping.is_empty(),
-            "failed replacement allocation does not revive the retired receiver"
-        );
-        assert!(
-            agent.next_effect_after_turn().is_none(),
-            "failed replacement allocation does not spin"
+            "waiting retains the same reservation"
         );
 
-        let replacement = native_media::track(
-            "video-three",
-            &participant.participant_id,
-            "camera",
-            MediaKind::Video,
-        );
+        let source = native_media::track(mid, &participant.participant_id, label, kind);
         observe(
             &mut agent,
             generation,
             channel,
-            vec![confirmed(
-                state::resource_key::Key::Owned(video_lookup.reference),
-                video_lookup.desired.revision,
-                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
-                    spec: Some(video_lookup.spec().clone()),
-                    participant: Some(participant.clone()),
-                    track: Some(replacement.clone()),
-                })),
-            )],
+            vec![target.offer(3, Some(source.clone()), None)],
         );
         let assigned = SlotBinding {
-            slot: MediaSlot::RemoteVideo(0),
-            mid: "fresh-rv0".into(),
-            media_index: 5,
-            kind: MediaKind::Video,
+            slot,
+            mid: mid.into(),
+            media_index: index,
+            kind,
             direction: MediaDirection::ReceiveOnly,
         };
-        native_media::finish_allocation(&mut agent, generation, assigned.clone(), &["rv0"], &[]);
-        let fresh = native_media::next(&mut agent, generation, channel);
-        assert_eq!(fresh.len(), 1);
-        assert!(fresh[0].reference > video.reference);
-        let Some(state::resource_spec::Declaration::Subscription(subscription)) =
-            &fresh[0].spec().declaration
-        else {
-            panic!("replacement receiver")
-        };
-        assert_eq!(subscription.publication_id, "video-three");
-        let Some(state::resource_spec::Declaration::Subscription(previous)) =
-            &video.spec().declaration
-        else {
-            panic!("previous receiver")
-        };
-        let Some(state::track_binding::Transport::Rtp(previous)) = previous
-            .binding
-            .as_ref()
-            .and_then(|binding| binding.transport.as_ref())
-        else {
-            panic!("previous RTP facts")
-        };
-        assert!(
-            matches!(subscription.binding.as_ref().and_then(|binding| binding.transport.as_ref()),
-            Some(state::track_binding::Transport::Rtp(rtp)) if rtp.mid == "fresh-rv0" && rtp.mid != previous.mid && rtp.encodings.iter().all(|encoding| previous.encodings.iter().all(|old| old.ssrc != encoding.ssrc)))
-        );
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            vec![fresh[0].installed(participant.clone(), replacement)],
-        );
-        assert_eq!(agent.snapshot().video_mapping[&5], "video-three");
-        assert!(!agent.snapshot().video_mapping.contains_key(&4));
-        let fresh_control = fresh_observation.map(|id| {
-            let Effect::MediaObservation(control) = next_effect(&mut agent) else {
-                panic!("fresh observation target")
-            };
-            assert_eq!(control.observation, id);
-            let target = control.target.as_ref().unwrap();
-            assert_eq!(target.reference, fresh[0].reference);
-            assert_eq!(target.generation, generation);
-            assert_eq!(target.source, "video-three");
-            assert_eq!(target.binding.mid, "fresh-rv0");
-            assert_eq!(target.binding.media_index, 5);
-            assert_eq!(
-                agent
-                    .resource(ResourceCommand::CompleteMediaObservation {
-                        control: observation.as_ref().unwrap().clone(),
-                        succeeded: true
-                    })
-                    .unwrap(),
-                ResourceResult::Superseded
-            );
-            assert_eq!(
-                agent
-                    .resource(ResourceCommand::CompleteMediaObservation {
-                        control: control.clone(),
-                        succeeded: true
-                    })
-                    .unwrap(),
-                ResourceResult::Updated
-            );
-            control
-        });
-        assert!(agent.next_effect_after_turn().is_none());
-        if let Some(owner) = view {
-            agent.resource(ResourceCommand::Release { owner }).unwrap();
-            assert!(
-                matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == fresh_control.as_ref().unwrap().observation)
-            );
-            assert_eq!(
-                agent
-                    .resource(ResourceCommand::CompleteMediaObservation {
-                        control: fresh_control.unwrap(),
-                        succeeded: false
-                    })
-                    .unwrap(),
-                ResourceResult::Superseded
-            );
-            let withdrawn = native_media::next(&mut agent, generation, channel);
-            assert_eq!(withdrawn.len(), 2);
-            assert!(
-                withdrawn
-                    .iter()
-                    .any(|target| target.reference == fresh[0].reference)
-            );
-            assert!(
-                withdrawn
-                    .iter()
-                    .any(|target| target.reference == video_lookup.reference)
-            );
-            assert!(withdrawn.iter().all(|target| matches!(
-                target.desired.value,
-                Some(state::desired_state::Value::Absent(true))
-            )));
-        }
-        let audio = resolved
-            .iter()
-            .find(|target| target.reference != video.reference)
-            .unwrap();
-        let replacement = native_media::track(
-            "audio-two",
-            &participant.participant_id,
-            "microphone",
-            MediaKind::Audio,
-        );
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            vec![
-                confirmed(
-                    state::resource_key::Key::Publication("audio-one".into()),
-                    0,
-                    state::confirmed_state::Value::Absent(state::AbsentState {
-                        reason: state::AbsenceReason::Removed as i32,
-                    }),
-                ),
-                confirmed(
-                    state::resource_key::Key::Publication(replacement.publication_id.clone()),
-                    0,
-                    state::confirmed_state::Value::Track(replacement.clone()),
-                ),
-            ],
-        );
-        assert!(
-            agent.next_effect_after_turn().is_none(),
-            "catalog replacement alone does not retire installed audio"
-        );
-        let mut waiting = audio.receiver_installed(&participant, &tracks);
-        let Some(confirmation) = &mut waiting.confirmed else {
-            panic!("audio confirmation")
-        };
-        let Some(state::confirmed_state::Value::Owned(live)) = &mut confirmation.value else {
-            panic!("owned audio")
-        };
-        live.execution = state::ExecutionStatus::WaitingForSource as i32;
-        observe(&mut agent, generation, channel, vec![waiting]);
-        let audio_lookup = lookups
-            .iter()
-            .find(|target| matches!(
-                &target.spec().declaration,
-                Some(state::resource_spec::Declaration::SourceLookup(lookup))
-                    if lookup.source.as_ref().is_some_and(|source| source.kind == state::TrackKind::Audio as i32)
-            ))
-            .unwrap();
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            vec![confirmed(
-                state::resource_key::Key::Owned(audio_lookup.reference),
-                audio_lookup.desired.revision,
-                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
-                    spec: Some(audio_lookup.spec().clone()),
-                    participant: None,
-                    track: None,
-                })),
-            )],
-        );
-        if let Some(old) = &audio_observation {
-            assert!(
-                matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == old.observation)
-            );
-        }
-        let cutoff = native_media::next(&mut agent, generation, channel);
-        assert_eq!(cutoff.len(), 1);
-        assert_eq!(cutoff[0].reference, audio.reference);
-        assert_eq!(
-            cutoff[0].desired.value,
-            Some(state::desired_state::Value::Absent(true))
-        );
-        let fresh_audio_request = audio_observation.as_ref().map(|old| {
-            assert_eq!(agent.resource(ResourceCommand::CompleteMediaObservation { control: old.clone(), succeeded: true }).unwrap(), ResourceResult::Superseded);
-            agent.resource(ResourceCommand::Release { owner: old.observation.request() }).unwrap();
-            assert!(matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == old.observation));
-            let ResourceResult::MediaObservation(id) = agent.resource(ResourceCommand::BeginMediaObservation { owner: old.observation.owner() }).unwrap() else { panic!("fresh audio request") };
-            assert_ne!(id, old.observation);
-            assert!(matches!(next_effect(&mut agent), Effect::MediaObservation(control) if !control.closed && control.target.is_none() && control.observation == id));
-            id
-        });
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            cutoff
-                .iter()
-                .map(|target| {
-                    confirmed(
-                        state::resource_key::Key::Owned(target.reference),
-                        target.desired.revision,
-                        state::confirmed_state::Value::Absent(state::AbsentState {
-                            reason: state::AbsenceReason::SourceEnded as i32,
-                        }),
-                    )
-                })
-                .collect(),
-        );
-        native_media::finish_retirements(
-            &mut agent,
-            generation,
-            &["ra0"],
-            core::slice::from_ref(&assigned),
-        );
-        assert!(agent.next_effect_after_turn().is_none());
-        let audio_replacement = native_media::track(
-            "audio-two",
-            &participant.participant_id,
-            "microphone",
-            MediaKind::Audio,
-        );
-        observe(
-            &mut agent,
-            generation,
-            channel,
-            vec![confirmed(
-                state::resource_key::Key::Owned(audio_lookup.reference),
-                audio_lookup.desired.revision,
-                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
-                    spec: Some(audio_lookup.spec().clone()),
-                    participant: Some(participant.clone()),
-                    track: Some(audio_replacement.clone()),
-                })),
-            )],
-        );
         native_media::finish_allocation(
             &mut agent,
             generation,
-            SlotBinding {
-                slot: MediaSlot::RemoteAudio(0),
-                mid: "fresh-ra0".into(),
-                media_index: 7,
-                kind: MediaKind::Audio,
-                direction: MediaDirection::ReceiveOnly,
-            },
-            &["ra0"],
-            core::slice::from_ref(&assigned),
+            assigned.clone(),
+            &retired,
+            &assignments,
         );
-        let fresh_audio = native_media::next(&mut agent, generation, channel);
-        assert_eq!(fresh_audio.len(), 1);
-        assert!(fresh_audio[0].reference > audio.reference);
-        assert!(matches!(&fresh_audio[0].spec().declaration,
-            Some(state::resource_spec::Declaration::Subscription(subscription)) if subscription.publication_id == "audio-two"));
+        assignments.push(assigned);
+        let mut reports = native_media::next_reports(&mut agent, generation, channel);
+        assert_eq!(reports.len(), 1);
+        let (reference, report) = reports.pop().unwrap();
+        assert_eq!(reference, target.reference);
+        assert_eq!(report.source_revision, 3);
+        let Some(Outcome::Prepared(binding)) = report.outcome else {
+            panic!("fresh prepared receiver");
+        };
+        assert!(
+            matches!(&binding.transport, Some(state::track_binding::Transport::Rtp(rtp)) if rtp.mid == mid)
+        );
+        assert!(
+            mapping(&agent, index).is_none(),
+            "preparation alone is not admission"
+        );
         observe(
             &mut agent,
             generation,
             channel,
-            vec![fresh_audio[0].installed(participant, audio_replacement)],
+            vec![target.offer(3, Some(source), Some(Execution::Installed(binding)))],
         );
-        assert_eq!(agent.snapshot().audio_mapping[&7], "audio-two");
-        if let Some(id) = fresh_audio_request {
-            let Effect::MediaObservation(control) = next_effect(&mut agent) else {
-                panic!("fresh audio target")
-            };
-            assert_eq!(control.observation, id);
-            let target = control.target.as_ref().unwrap();
-            assert_eq!(target.source, "audio-two");
-            assert_eq!(target.reference, fresh_audio[0].reference);
-            assert_eq!(target.binding.mid, "fresh-ra0");
-            assert_eq!(target.binding.media_index, 7);
-            assert_eq!(
-                agent
-                    .resource(ResourceCommand::CompleteMediaObservation {
-                        control: audio_observation.unwrap(),
-                        succeeded: false
-                    })
-                    .unwrap(),
-                ResourceResult::Superseded
-            );
-            assert_eq!(
-                agent
-                    .resource(ResourceCommand::CompleteMediaObservation {
-                        control: control.clone(),
-                        succeeded: true
-                    })
-                    .unwrap(),
-                ResourceResult::Updated
-            );
-            agent
-                .resource(ResourceCommand::Release { owner: id.owner() })
-                .unwrap();
-            assert!(
-                matches!(next_effect(&mut agent), Effect::MediaObservation(control) if control.closed && control.observation == id)
-            );
-            let withdrawn = native_media::next(&mut agent, generation, channel);
-            assert_eq!(withdrawn.len(), 2);
-            assert!(
-                withdrawn
-                    .iter()
-                    .any(|target| target.reference == fresh_audio[0].reference)
-            );
-            assert!(
-                withdrawn
-                    .iter()
-                    .any(|target| target.reference == audio_lookup.reference)
-            );
-        }
-        assert_eq!(agent.snapshot().generation, Some(generation));
-        assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-        assert!(agent.next_effect_after_turn().is_none());
+        assert_eq!(mapping(&agent, index).as_deref(), Some(mid));
+        assert!(
+            mapping(&agent, old_index).is_none(),
+            "{old} cannot reappear"
+        );
     }
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]
@@ -4493,9 +3859,13 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
     agent
         .command(AgentCommand::ReplaceDesired(per_track))
         .unwrap();
-    let fixed = native_media::next(&mut agent, generation, channel);
+    let mut fixed = native_media::next(&mut agent, generation, channel);
     assert_eq!(fixed.len(), 2);
-    for target in &fixed {
+    for target in &mut fixed {
+        target.prepared = targets
+            .iter()
+            .find(|previous| previous.reference == target.reference)
+            .and_then(|previous| previous.prepared.clone());
         assert!(
             targets
                 .iter()
@@ -4579,7 +3949,7 @@ fn native_settings_replace_per_resource_and_omitted_declarations_retire_owned_li
         .command(AgentCommand::ReplaceDesired(retracted))
         .unwrap();
     let withdrawals = native_media::next(&mut agent, generation, channel);
-    assert_eq!(withdrawals.len(), 5);
+    assert_eq!(withdrawals.len(), 3);
     assert!(
         withdrawals
             .iter()
@@ -6186,57 +5556,22 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
     };
     assert_eq!(channel, control);
     let batch = codec::decode_client(&payload).unwrap();
-    assert_eq!(batch.records.len(), 2, "retirements: {:#?}", batch.records);
-    let receiving_retirement = batch
-        .records
-        .iter()
-        .find(|record| record.owned == receiving.reference)
-        .unwrap();
-    let lookup_retirement = batch
-        .records
-        .iter()
-        .find(|record| record.owned != receiving.reference)
-        .unwrap();
-    assert!(matches!(
-        lookup_retirement
-            .desired
-            .as_ref()
-            .and_then(|desired| desired.value.as_ref()),
-        Some(state::desired_state::Value::Absent(true))
-    ));
-    for record in &batch.records {
-        assert!(matches!(
-            record
-                .desired
-                .as_ref()
-                .and_then(|desired| desired.value.as_ref()),
-            Some(state::desired_state::Value::Absent(true))
-        ));
-    }
-    assert!(matches!(
-        lookup_retirement
-            .desired
-            .as_ref()
-            .and_then(|desired| desired.value.as_ref()),
-        Some(state::desired_state::Value::Absent(true))
-    ));
-    let confirmations = batch
-        .records
-        .iter()
-        .map(|record| {
-            native_connection::confirmed(
-                state::resource_key::Key::Owned(record.owned),
-                record.desired.as_ref().unwrap().revision,
-                state::confirmed_state::Value::Absent(state::AbsentState {
-                    reason: state::AbsenceReason::Removed as i32,
-                }),
-            )
-        })
-        .collect();
+    let [retirement] = batch.records.as_slice() else {
+        panic!("one owned subscription retirement: {:?}", batch.records);
+    };
+    assert_eq!(retirement.owned, receiving.reference);
+    let desired = retirement.desired.as_ref().unwrap();
     assert_eq!(
-        receiving_retirement.owned, receiving.reference,
-        "subscription retirement remains keyed by its owned reference"
+        desired.value,
+        Some(state::desired_state::Value::Absent(true))
     );
+    let confirmations = vec![native_connection::confirmed(
+        state::resource_key::Key::Owned(retirement.owned),
+        desired.revision,
+        state::confirmed_state::Value::Absent(state::AbsentState {
+            reason: state::AbsenceReason::Removed as i32,
+        }),
+    )];
     acknowledge_send(&mut agent, generation, control, operation);
     assert!(agent.next_effect_after_turn().is_none());
     native_connection::observe(&mut agent, generation, control, confirmations);
@@ -6874,7 +6209,7 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
 }
 
 #[test]
-fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
+fn closed_logical_payload_waits_with_its_reservation_and_preserves_other_receivers() {
     use pulsebeam_proto::state;
     let pinned = |external_id: &str| TopicSubscriber {
         room: "room".into(),
@@ -6971,12 +6306,15 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
         panic!("one retirement")
     };
     assert_eq!(record.owned, left.reference);
-    let Some(desired) = &record.desired else {
-        panic!("desired")
-    };
+    assert!(
+        record.desired.is_none(),
+        "channel close does not withdraw the declaration"
+    );
     assert!(matches!(
-        desired.value,
-        Some(state::desired_state::Value::Absent(true))
+        record.execution.as_ref().and_then(|report| report.outcome.as_ref()),
+        Some(state::execution_report::Outcome::LogicalReceiver(report))
+            if report.source_revision == 1 && matches!(report.outcome,
+                Some(state::logical_receiver_report::Outcome::Failure(_)))
     ));
     acknowledge_send(&mut agent, generation, control, operation);
     assert!(agent.next_effect_after_turn().is_none());
@@ -6986,15 +6324,20 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
         control,
         vec![native_connection::confirmed(
             state::resource_key::Key::Owned(left.reference),
-            desired.revision,
-            state::confirmed_state::Value::Absent(state::AbsentState {
-                reason: state::AbsenceReason::SourceEnded as i32,
-            }),
+            left.revision,
+            state::confirmed_state::Value::LogicalSubscription(Box::new(
+                state::LogicalSubscriptionState {
+                    spec: Some(left.spec.clone()),
+                    source_revision: 2,
+                    source: None,
+                    execution: None,
+                },
+            )),
         )],
     );
     assert!(
         agent.next_effect_after_turn().is_none(),
-        "an ended exact source cannot reconstruct"
+        "a waiting subscription neither withdraws nor recreates its channel"
     );
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().generation, Some(generation));
@@ -7043,6 +6386,79 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
     assert!(
         matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { publication_id, sequence: 8, payload, .. }))] if publication_id == "right" && payload == b"after")
     );
+    let new_source = "right-replacement";
+    native_connection::observe(
+        &mut agent,
+        generation,
+        control,
+        vec![native_connection::confirmed(
+            state::resource_key::Key::Owned(right.reference),
+            right.revision,
+            state::confirmed_state::Value::LogicalSubscription(Box::new(
+                state::LogicalSubscriptionState {
+                    spec: Some(right.spec.clone()),
+                    source_revision: 3,
+                    source: Some(state::Track {
+                        publication_id: new_source.into(),
+                        participant_id: right_subscriber.participant_id.clone(),
+                        room_id: right_subscriber.room.clone(),
+                        track_id: right_subscriber.topic.clone(),
+                        kind: Some(state::track::Kind::Data(state::DataTrack {
+                            delivery: TopicMode::Lossy.delivery() as i32,
+                        })),
+                    }),
+                    execution: None,
+                },
+            )),
+        )],
+    );
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::CloseDataChannel {
+            generation,
+            channel: right.channel
+        })
+    );
+    assert!(
+        agent.next_effect_after_turn().is_none(),
+        "a coalesced replacement cannot skip local cutoff"
+    );
+    drain_notifications(&mut agent);
+    topic_input(
+        &mut agent,
+        generation,
+        right.channel,
+        wire_message("right", 9, b"stale"),
+    )
+    .unwrap();
+    assert!(drain_notifications(&mut agent).is_empty());
+    agent
+        .handle(HostEvent::DataChannel(DataChannelEvent::Closed {
+            generation,
+            channel: right.channel,
+            reset_complete: true,
+        }))
+        .unwrap();
+    let replacement = native_connection::prepare_subscription(
+        &mut agent,
+        generation,
+        control,
+        new_source,
+        &right_subscriber,
+    );
+    assert_eq!(replacement.reference, right.reference);
+    assert_ne!(replacement.channel, right.channel);
+    drain_notifications(&mut agent);
+    topic_input(
+        &mut agent,
+        generation,
+        replacement.channel,
+        wire_message(new_source, 0, b"fresh"),
+    )
+    .unwrap();
+    assert!(matches!(drain_notifications(&mut agent).as_slice(),
+        [Notification::Topic(TopicNotification::Message(TopicMessage { publication_id, sequence: 0, payload, .. }))]
+            if publication_id == new_source && payload == b"fresh"));
     assert!(agent.next_effect_after_turn().is_none());
     native_connection::observe(
         &mut agent,
@@ -7453,13 +6869,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
             ..Default::default()
         }))
         .unwrap();
-    let _ = native_connection::answer_source_lookup_batch(
-        &mut agent,
-        generation,
-        control,
-        &TopicRegistrations::default(),
-        None,
-    );
+    assert!(agent.next_effect_after_turn().is_none());
     agent
         .command(AgentCommand::ReplaceDesired(DesiredState {
             revision: 3,

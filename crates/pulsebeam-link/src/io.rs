@@ -281,12 +281,15 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             return;
         };
         for destination in &binding.destinations {
+            if !table.binding_live(destination.binding) {
+                continue;
+            }
             if !table.port_live(destination.port) {
                 health.local_closed = health.local_closed.saturating_add(1);
                 continue;
             }
             let pending = Pending {
-                binding: binding.binding,
+                binding: destination.binding,
                 expires_at: LinkTime(u64::MAX),
                 received: Received {
                     tag: destination.tag,

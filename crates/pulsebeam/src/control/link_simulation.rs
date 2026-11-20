@@ -183,6 +183,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                         TrackRouteAction::Forward {
                             publication_id: track,
                         },
+                        None,
                         writer.stage_cutoff(1),
                     );
                     assert_eq!(writer.publish(), Some(1));
@@ -190,7 +191,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                     destinations.push(address);
                     shards.push((writer, core));
                 }
-                let published = b.destinations(track);
+                let published = b.destinations(track, None);
                 assert_eq!(
                     published
                         .iter()
@@ -292,22 +293,48 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                         address: destinations[1],
                     },
                 );
-                b.retire_after(destinations[1], writer.stage_cutoff(2));
+                b.retire_after(destinations[1], |bindings| {
+                    writer.stage_link_cutoff(2, bindings)
+                });
                 assert_eq!(writer.publish(), Some(2));
                 assert_eq!(core.apply_updates(64), 1);
-                b.reap();
                 second.clear();
                 assert_eq!(receivers[1].try_recv_batch(&mut second, 8), 0);
                 assert_eq!(receivers[1].drop_counts().stale, 1);
+                first.clear();
+                assert!(receivers[0].try_recv_batch(&mut first, 4096) > 0);
+                first.clear();
+                tx.try_send(frame(b"survives"), LinkTime::from_nanos(u64::MAX))
+                    .unwrap();
+                assert_eq!(received(&b, bid, 3).await.stale, 0);
+                assert_eq!(receivers[0].try_recv_batch(&mut first, 8), 1);
+                assert_eq!(payload(&first[0].packet), b"survives");
+                assert_eq!(receivers[1].try_recv_batch(&mut second, 8), 0);
+
+                let (writer, core) = &mut shards[0];
+                writer.stage(
+                    2,
+                    ShardUpdateOp::RetireRoute {
+                        address: destinations[0],
+                    },
+                );
+                b.retire_after(destinations[0], |bindings| {
+                    writer.stage_link_cutoff(2, bindings)
+                });
+                assert_eq!(writer.publish(), Some(2));
+                assert_eq!(core.apply_updates(64), 1);
+                b.reap();
                 tx.try_send(frame(b"retired"), LinkTime::from_nanos(u64::MAX))
                     .unwrap();
-                assert_eq!(received(&b, bid, 3).await.stale, 1);
+                assert_eq!(received(&b, bid, 4).await.stale, 1);
+                first.clear();
+                assert_eq!(receivers[0].try_recv_batch(&mut first, 8), 0);
                 assert_eq!(receivers[2].try_recv_batch(&mut bystander, 8), 0);
                 let mut acknowledged = false;
                 for _ in 0..100 {
                     let snapshot = health(&a).await;
                     let peer = snapshot.peers.iter().find(|peer| peer.peer == aid).unwrap();
-                    assert_eq!(peer.transport.sent, 3);
+                    assert_eq!(peer.transport.sent, 4);
                     if peer.transport.bytes_in_flight == 0 {
                         acknowledged = true;
                         break;
@@ -338,7 +365,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 for _ in 0..100 {
                     let snapshot = health(&a).await;
                     let peer = snapshot.peers.iter().find(|peer| peer.peer == aid).unwrap();
-                    assert_eq!(peer.transport.sent, 3);
+                    assert_eq!(peer.transport.sent, 4);
                     if peer.transport.stale == 1 {
                         fenced = true;
                         break;
@@ -349,7 +376,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                     fenced,
                     "queued source work must be fenced before UDP submission"
                 );
-                assert_eq!(received(&b, bid, 3).await.received, 3);
+                assert_eq!(received(&b, bid, 4).await.received, 4);
                 shutdown.cancel();
                 a_task.await.unwrap().unwrap();
                 b_task.await.unwrap().unwrap();

@@ -318,7 +318,9 @@ pub(super) fn check(source: &Track) {
                 desired: None,
                 execution: Some(wire::ExecutionReport {
                     revision: 16,
-                    failure: Some(failure(wire::FailureCode::InternalFailure)),
+                    outcome: Some(wire::execution_report::Outcome::Failure(failure(
+                        wire::FailureCode::InternalFailure,
+                    ))),
                 }),
             }],
             ..Default::default()
@@ -349,7 +351,9 @@ pub(super) fn check(source: &Track) {
                 desired: None,
                 execution: Some(wire::ExecutionReport {
                     revision: 17,
-                    failure: Some(failure(wire::FailureCode::Unsupported)),
+                    outcome: Some(wire::execution_report::Outcome::Failure(failure(
+                        wire::FailureCode::Unsupported,
+                    ))),
                 }),
             }],
             ..Default::default()

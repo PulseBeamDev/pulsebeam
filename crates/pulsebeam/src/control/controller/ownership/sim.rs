@@ -13,6 +13,7 @@ use pulsebeam_core::{
 
 use super::{
     ClaimRank,
+    observations::Session,
     receipt::{Error, Issuer, LineageTrust, PeerTrust},
 };
 use crate::control::controller::peer_ownership::Control;
@@ -34,6 +35,7 @@ struct PeerFacts {
     local: Facts,
     received: Option<(u64, Facts)>,
     control: Option<Control>,
+    outgoing: Option<(Option<pulsebeam_link::NetworkId>, Session)>,
     revision: u64,
 }
 
@@ -71,7 +73,11 @@ impl SimOwnershipPeer {
     }
 
     pub(crate) fn attach(&self, control: Control) {
-        self.facts.lock().unwrap()[self.index].control = Some(control);
+        let mut facts = self.facts.lock().unwrap();
+        facts[self.index].control = Some(control);
+        for peer in facts.iter_mut() {
+            peer.outgoing = None;
+        }
     }
 
     pub async fn local_claim_count(&self) -> anyhow::Result<usize> {
@@ -87,7 +93,24 @@ impl SimOwnershipPeer {
     }
 
     pub async fn deliver_claim_snapshot(&self, fresh_until: Instant) -> anyhow::Result<()> {
-        let (source, destination, revision) = {
+        self.deliver_snapshot(None, fresh_until).await
+    }
+
+    pub async fn deliver_linked_snapshot(
+        &self,
+        receiver_ingress: pulsebeam_link::NetworkId,
+        fresh_until: Instant,
+    ) -> anyhow::Result<()> {
+        self.deliver_snapshot(Some(receiver_ingress), fresh_until)
+            .await
+    }
+
+    async fn deliver_snapshot(
+        &self,
+        ingress: Option<pulsebeam_link::NetworkId>,
+        fresh_until: Instant,
+    ) -> anyhow::Result<()> {
+        let (source, destination, revision, outgoing) = {
             let mut facts = self.facts.lock().unwrap();
             let source = facts[self.index]
                 .control
@@ -103,15 +126,23 @@ impl SimOwnershipPeer {
                 .and_then(NonZeroU64::new)
                 .ok_or_else(|| anyhow::anyhow!("snapshot revision exhausted"))?;
             facts[self.index].revision = next.get();
-            (source, destination, next)
+            (source, destination, next, facts[self.index].outgoing)
         };
         let map_error = |error| anyhow::anyhow!("ownership peer control: {error:?}");
         let claims = source.read().await.map_err(map_error)?;
         let from = issuer(self.index);
-        let session = destination
-            .open(from.node, from.incarnation)
-            .await
-            .map_err(map_error)?;
+        let session = match (outgoing, ingress) {
+            (Some((network, session)), _) if network == ingress => session,
+            (_, Some(network)) => destination
+                .open_linked(from.node, from.incarnation, network)
+                .await
+                .map_err(map_error)?,
+            _ => destination
+                .open(from.node, from.incarnation)
+                .await
+                .map_err(map_error)?,
+        };
+        self.facts.lock().unwrap()[self.index].outgoing = Some((ingress, session));
         destination
             .snapshot(session, revision, claims, fresh_until)
             .await
@@ -245,6 +276,10 @@ impl LineageTrust for Trust {
         } else {
             local.retired.insert((endpoint, rank.lineage()));
         }
+    }
+
+    fn is_retired(&self, endpoint: EndpointKey, rank: ClaimRank) -> bool {
+        self.peer.facts.lock().unwrap()[self.peer.index].retired((endpoint, rank.lineage()))
     }
 }
 

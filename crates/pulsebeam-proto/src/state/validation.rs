@@ -152,6 +152,12 @@ fn validate_confirmed(key: &resource_key::Key, confirmed: &ConfirmedState) -> Re
             }
             validate_source_lookup(lookup)
         }
+        (Key::Owned(reference), Some(Value::LogicalSubscription(subscription))) => {
+            if confirmed.evaluated_revision < *reference {
+                return Err(ValidationError::Confirmed);
+            }
+            validate_logical_subscription(subscription)
+        }
         (Key::Owned(_), Some(Value::Absent(absent))) => {
             if !known::<AbsenceReason>(absent.reason)
                 || absent.reason == AbsenceReason::CreateRejected as i32
@@ -231,6 +237,15 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
             let source = lookup.source.as_ref().ok_or(ValidationError::Identity)?;
             crate::catalog::validate_address(source).map_err(|_| ValidationError::Identity)
         }
+        resource_spec::Declaration::LogicalSubscription(subscription) => {
+            let source = subscription
+                .source
+                .as_ref()
+                .ok_or(ValidationError::Identity)?;
+            crate::catalog::validate_address(source).map_err(|_| ValidationError::Identity)?;
+            let kind = TrackKind::try_from(source.kind).map_err(|_| ValidationError::Binding)?;
+            validate_receive_settings(settings, kind)
+        }
         resource_spec::Declaration::Subscription(subscription) => {
             if !text(&subscription.publication_id, 128)
                 || !is_application_name(&subscription.source_room)
@@ -239,18 +254,22 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
             }
             let kind =
                 TrackKind::try_from(subscription.kind).map_err(|_| ValidationError::Binding)?;
-            match (kind, &settings.receive) {
-                (TrackKind::Audio, Some(resource_settings::Receive::Audio(options))) => {
-                    validate_playout(options.playout_delay.as_ref())?;
-                }
-                (TrackKind::Video, Some(resource_settings::Receive::Video(options))) => {
-                    validate_video(options)?;
-                }
-                (TrackKind::Data, None) => (),
-                _ => return Err(ValidationError::Settings),
-            }
+            validate_receive_settings(settings, kind)?;
             validate_binding(subscription.binding.as_ref(), kind, false)
         }
+    }
+}
+
+fn validate_receive_settings(settings: &ResourceSettings, kind: TrackKind) -> Result {
+    match (kind, &settings.receive) {
+        (TrackKind::Audio, Some(resource_settings::Receive::Audio(options))) => {
+            validate_playout(options.playout_delay.as_ref())
+        }
+        (TrackKind::Video, Some(resource_settings::Receive::Video(options))) => {
+            validate_video(options)
+        }
+        (TrackKind::Data, None) => Ok(()),
+        _ => Err(ValidationError::Settings),
     }
 }
 
@@ -299,7 +318,10 @@ pub fn validate_live(live: &LiveResource) -> Result {
     validate_spec(spec)?;
     if matches!(
         spec.declaration,
-        Some(resource_spec::Declaration::SourceLookup(_))
+        Some(
+            resource_spec::Declaration::SourceLookup(_)
+                | resource_spec::Declaration::LogicalSubscription(_)
+        )
     ) {
         return Err(ValidationError::Confirmed);
     }
@@ -336,7 +358,10 @@ pub fn validate_live(live: &LiveResource) -> Result {
                 _ => return Err(ValidationError::Identity),
             }
         }
-        resource_spec::Declaration::SourceLookup(_) => return Err(ValidationError::Confirmed),
+        resource_spec::Declaration::SourceLookup(_)
+        | resource_spec::Declaration::LogicalSubscription(_) => {
+            return Err(ValidationError::Confirmed);
+        }
         resource_spec::Declaration::Subscription(subscription) => {
             let kind = match &track.kind {
                 Some(track::Kind::Audio(_)) => TrackKind::Audio,
@@ -406,10 +431,7 @@ pub fn validate_source_lookup(lookup: &SourceLookupState) -> Result {
             validate_track(track)?;
             if participant.participant_id != track.participant_id
                 || participant.room_id != track.room_id
-                || participant.room_id != source.room
-                || participant.participant_id != source.participant_id
-                || track.track_id != source.track_id
-                || track.kind.as_ref().map(track_kind) != Some(source.kind)
+                || !matches_source_address(track, source)
             {
                 return Err(ValidationError::Identity);
             }
@@ -417,6 +439,54 @@ pub fn validate_source_lookup(lookup: &SourceLookupState) -> Result {
         }
         _ => Err(ValidationError::Confirmed),
     }
+}
+
+pub fn validate_logical_subscription(subscription: &LogicalSubscriptionState) -> Result {
+    let spec = subscription
+        .spec
+        .as_ref()
+        .ok_or(ValidationError::Confirmed)?;
+    validate_spec(spec)?;
+    let Some(resource_spec::Declaration::LogicalSubscription(declaration)) = &spec.declaration
+    else {
+        return Err(ValidationError::Confirmed);
+    };
+    if let Some(track) = &subscription.source {
+        if subscription.source_revision == 0
+            || spec.settings.as_ref().and_then(|settings| settings.enabled) != Some(true)
+        {
+            return Err(ValidationError::Confirmed);
+        }
+        validate_track(track)?;
+        let address = declaration
+            .source
+            .as_ref()
+            .ok_or(ValidationError::Identity)?;
+        if !matches_source_address(track, address) {
+            return Err(ValidationError::Identity);
+        }
+        match &subscription.execution {
+            Some(logical_subscription_state::Execution::Installed(binding)) => {
+                let kind =
+                    TrackKind::try_from(address.kind).map_err(|_| ValidationError::Binding)?;
+                validate_binding(Some(binding), kind, false)?;
+            }
+            Some(logical_subscription_state::Execution::Failure(failure)) => {
+                validate_failure(failure)?;
+            }
+            None => {}
+        }
+    } else if subscription.execution.is_some() {
+        return Err(ValidationError::Confirmed);
+    }
+    Ok(())
+}
+
+pub fn matches_source_address(track: &Track, source: &LogicalSourceAddress) -> bool {
+    track.room_id == source.room
+        && track.participant_id == source.participant_id
+        && track.track_id == source.track_id
+        && track.kind.as_ref().map(track_kind) == Some(source.kind)
 }
 
 fn track_kind(kind: &track::Kind) -> i32 {
@@ -459,7 +529,23 @@ fn validate_playout(delay: Option<&PlayoutDelay>) -> Result {
 }
 
 pub fn validate_execution_report(report: &ExecutionReport) -> Result {
-    validate_failure(report.failure.as_ref().ok_or(ValidationError::Failure)?)
+    match report.outcome.as_ref() {
+        Some(execution_report::Outcome::Failure(failure)) => validate_failure(failure),
+        Some(execution_report::Outcome::LogicalReceiver(report)) if report.source_revision != 0 => {
+            match report.outcome.as_ref() {
+                Some(logical_receiver_report::Outcome::Prepared(binding))
+                    if binding.transport.is_some() =>
+                {
+                    Ok(())
+                }
+                Some(logical_receiver_report::Outcome::Failure(failure)) => {
+                    validate_failure(failure)
+                }
+                _ => Err(ValidationError::Binding),
+            }
+        }
+        _ => Err(ValidationError::Failure),
+    }
 }
 
 fn validate_binding(binding: Option<&TrackBinding>, kind: TrackKind, publication: bool) -> Result {
@@ -599,6 +685,10 @@ pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> boo
         (Some(Declaration::SourceLookup(left)), Some(Declaration::SourceLookup(right))) => {
             left.source == right.source
         }
+        (
+            Some(Declaration::LogicalSubscription(left)),
+            Some(Declaration::LogicalSubscription(right)),
+        ) => left.source == right.source,
         _ => false,
     }
 }

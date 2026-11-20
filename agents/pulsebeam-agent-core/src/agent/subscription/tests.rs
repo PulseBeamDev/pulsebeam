@@ -222,7 +222,7 @@ fn rejected_first_data_subscription_is_not_an_execution_failure() {
         ),
     );
     let state = agent.data_subscription_state(owner).unwrap();
-    assert_eq!(state.source_status, Source::Available);
+    assert_eq!(state.source_status, Source::Rejected);
     assert_eq!(state.admission, Admission::Rejected);
     assert!(!state.admission_pending);
     assert_eq!(state.error.unwrap().code, ErrorCode::PermissionDenied);
@@ -284,41 +284,46 @@ fn closing_live_catalog_preserves_independently_owned_subscription() {
 }
 
 #[test]
-fn rejected_data_subscription_update_retains_admitted_execution() {
+fn failed_data_binding_does_not_reject_the_logical_admission() {
     let (mut agent, generation, channel, owner, prepared) = receiver(true);
-    let resource = Resource::DataSubscription("alice-track".into());
-    let mut spec = prepared.spec.clone();
-    spec.settings.as_mut().unwrap().enabled = Some(false);
-    let native = &mut agent.active.as_mut().unwrap().state;
-    native.stage(resource.clone(), Some(spec)).unwrap();
-    let frame = codec::decode_client(&native.next_frame().unwrap().unwrap()).unwrap();
-    let proposal = &frame.records[0];
-    assert_eq!(proposal.owned, prepared.reference);
-    let revision = proposal.desired.as_ref().unwrap().revision;
-    assert!(revision > prepared.revision);
-    let state::confirmed_state::Value::Owned(live) =
+    let resource = Resource::LogicalData(crate::TrackSelector {
+        room: "room".into(),
+        participant_id: "alice".into(),
+        track_id: "events".into(),
+    });
+    let native = &agent.active.as_ref().unwrap().state;
+    let state::confirmed_state::Value::LogicalSubscription(mut logical) =
         native.confirmed(&resource).unwrap().value.clone().unwrap()
     else {
         panic!("admitted receiver");
     };
+    logical.execution = Some(state::logical_subscription_state::Execution::Failure(
+        state::Failure {
+            code: state::FailureCode::CapacityExceeded as i32,
+            ..Default::default()
+        },
+    ));
     reply(
         &mut agent,
         generation,
         channel,
         prepared.reference,
-        reject(revision, state::confirmed_state::Value::Owned(live)),
+        state::ConfirmedState {
+            evaluated_revision: prepared.revision,
+            rejection: None,
+            value: Some(state::confirmed_state::Value::LogicalSubscription(logical)),
+        },
     );
     let state = agent.data_subscription_state(owner).unwrap();
     assert_eq!(state.admission, Admission::Admitted);
     assert!(!state.admission_pending);
-    assert_eq!(state.execution, Execution::Installed);
+    assert_eq!(state.execution, Execution::Failed);
+    assert_eq!(state.error, None);
     assert_eq!(
-        (
-            state.error.as_ref().map(|error| error.code),
-            state.execution_error.as_ref().map(|error| error.code),
-        ),
-        (Some(ErrorCode::PermissionDenied), None)
+        state.execution_error.unwrap().code,
+        ErrorCode::CapacityExceeded
     );
+    assert_eq!(state.terminal_error, None);
 }
 
 #[test]
@@ -352,7 +357,7 @@ fn unresolved_and_denied_selector_never_inherits_another_receiver() {
                     continue;
                 };
                 if let Some(state::desired_state::Value::Present(spec)) = desired.value {
-                    if matches!(&spec.declaration, Some(state::resource_spec::Declaration::SourceLookup(source)) if source.source.as_ref().is_some_and(|address| address.participant_id == "bob"))
+                    if matches!(&spec.declaration, Some(state::resource_spec::Declaration::LogicalSubscription(source)) if source.source.as_ref().is_some_and(|address| address.participant_id == "bob"))
                     {
                         lookup = Some((record.owned, desired.revision));
                     }
@@ -379,7 +384,7 @@ fn unresolved_and_denied_selector_never_inherits_another_receiver() {
     let denied = agent.data_subscription_state(bob).unwrap();
     assert_eq!(denied.source_status, Source::Rejected);
     assert_eq!(denied.source_track_id, None);
-    assert_eq!(denied.admission, Admission::Pending);
+    assert_eq!(denied.admission, Admission::Rejected);
     assert_eq!(denied.execution, Execution::Unavailable);
     assert_eq!(denied.error.unwrap().code, ErrorCode::PermissionDenied);
     assert_eq!(denied.execution_error, None);

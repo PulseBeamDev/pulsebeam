@@ -3,7 +3,7 @@ use super::*;
 mod source_failure;
 #[cfg(test)]
 mod tests;
-use crate::native_state::{Change, ParticipantKey, Resource};
+use crate::native_state::{Change, Offer, ParticipantKey, Resource};
 use pulsebeam_proto::state;
 
 pub(super) const STATE_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -14,7 +14,7 @@ pub(super) struct PayloadChannel {
     pub stream: u16,
     pub state: PayloadState,
     pub restart: bool,
-    wanted: bool,
+    pub offer: Option<Offer>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub(super) struct MediaLease {
     retirement_failed: bool,
     wire_retired: bool,
     source: Option<String>,
+    offer: Option<Offer>,
 }
 
 struct RetiringMedia {
@@ -49,6 +50,7 @@ pub(super) struct MediaRetirement {
 pub(super) struct MediaWant {
     resource: Resource,
     source: Option<String>,
+    offer: Option<Offer>,
     allocation: crate::client_sdp::Allocation,
 }
 
@@ -74,6 +76,7 @@ fn media_want(
     Some(MediaWant {
         resource,
         source: source.map(str::to_owned),
+        offer: None,
         allocation: crate::client_sdp::Allocation {
             slot: slot.clone(),
             format,
@@ -101,55 +104,19 @@ pub(super) fn kind(track: &state::Track) -> state::TrackKind {
     }
 }
 
-fn lookup_key(room: &str, participant: &str, kind: state::TrackKind, track_id: &str) -> Resource {
-    Resource::SourceLookup {
-        room: room.into(),
-        participant_id: participant.into(),
-        kind,
-        track_id: track_id.into(),
-    }
-}
-
 fn selected<'a>(
     session: &'a Session,
     selector: &crate::TrackSelector,
     expected: state::TrackKind,
 ) -> Option<&'a str> {
-    let resource = lookup_key(
-        &selector.room,
-        &selector.participant_id,
-        expected,
-        &selector.track_id,
-    );
+    let resource = logical_resource(session, selector, expected)?;
     session
         .state
-        .lookup(&resource)?
-        .track
+        .logical_offer(resource)?
+        .1
+        .source
         .as_ref()
         .map(|track| track.publication_id.as_str())
-}
-
-fn want_lookup(
-    wanted: &mut BTreeMap<Resource, state::ResourceSpec>,
-    room: &str,
-    participant: &str,
-    kind: state::TrackKind,
-    track_id: &str,
-) {
-    let key = lookup_key(room, participant, kind, track_id);
-    wanted.entry(key).or_insert_with(|| state::ResourceSpec {
-        settings: Some(settings(true)),
-        declaration: Some(state::resource_spec::Declaration::SourceLookup(
-            state::SourceLookupSpec {
-                source: Some(state::LogicalSourceAddress {
-                    room: room.into(),
-                    participant_id: participant.into(),
-                    kind: kind as i32,
-                    track_id: track_id.into(),
-                }),
-            },
-        )),
-    });
 }
 
 fn rtp(
@@ -196,6 +163,7 @@ fn rtp(
                         retired: !pending,
                         retirement_failed: false,
                         wire_retired: false,
+                        offer: None,
                     }
                 });
         }
@@ -222,6 +190,7 @@ fn rtp(
                 retirement_failed: false,
                 wire_retired: false,
                 source: source.map(str::to_owned),
+                offer: None,
             },
         );
     }
@@ -268,6 +237,149 @@ fn delay(value: crate::PlayoutDelay) -> Option<state::PlayoutDelay> {
             Some(state::PlayoutDelay { min_ms, max_ms })
         }
     }
+}
+
+fn audio_options(buffering: crate::PlayoutDelay) -> Option<state::resource_settings::Receive> {
+    Some(state::resource_settings::Receive::Audio(
+        state::AudioReceiveOptions {
+            playout_delay: delay(buffering),
+        },
+    ))
+}
+
+fn logical_subscription(
+    selector: &crate::TrackSelector,
+    kind: state::TrackKind,
+    receive: Option<state::resource_settings::Receive>,
+) -> state::ResourceSpec {
+    state::ResourceSpec {
+        settings: Some(state::ResourceSettings {
+            enabled: Some(true),
+            receive,
+        }),
+        declaration: Some(state::resource_spec::Declaration::LogicalSubscription(
+            state::LogicalSubscriptionSpec {
+                source: Some(state::LogicalSourceAddress {
+                    room: selector.room.clone(),
+                    participant_id: selector.participant_id.clone(),
+                    kind: kind as i32,
+                    track_id: selector.track_id.clone(),
+                }),
+            },
+        )),
+    }
+}
+
+fn matches_logical_spec(
+    spec: &state::ResourceSpec,
+    selector: &crate::TrackSelector,
+    kind: state::TrackKind,
+) -> bool {
+    matches!(&spec.declaration, Some(state::resource_spec::Declaration::LogicalSubscription(subscription))
+    if subscription.source.as_ref().is_some_and(|source| {
+        source.kind == kind as i32 && source.room == selector.room
+            && source.participant_id == selector.participant_id && source.track_id == selector.track_id
+    }))
+}
+
+pub(super) fn logical_resource<'a>(
+    session: &'a Session,
+    selector: &crate::TrackSelector,
+    kind: state::TrackKind,
+) -> Option<&'a Resource> {
+    session.state.resources().find(|resource| {
+        session
+            .state
+            .target_spec(resource)
+            .is_some_and(|spec| matches_logical_spec(spec, selector, kind))
+    })
+}
+
+fn prepared_binding<'a>(session: &'a Session, slot: &MediaSlot) -> Option<&'a state::TrackBinding> {
+    Some(
+        &session
+            .media_preparation
+            .as_ref()?
+            .as_ref()
+            .ok()?
+            .get(slot)?
+            .as_ref()
+            .ok()?
+            .binding,
+    )
+}
+
+fn reconcile_logical_media(
+    session: &mut Session,
+    media: &mut BTreeMap<MediaSlot, MediaWant>,
+    slot: &MediaSlot,
+    resource: &Resource,
+    desired: &state::ResourceSpec,
+) -> Result<(), SignalingError> {
+    let Some((offer, logical)) = session.state.logical_offer(resource) else {
+        return Ok(());
+    };
+    if !logical
+        .spec
+        .as_ref()
+        .is_some_and(|spec| state::validation::declarations_equivalent(spec, desired))
+    {
+        return Ok(());
+    }
+    let Some(source) = &logical.source else {
+        return Ok(());
+    };
+    let Some(mut want) = media_want(
+        session,
+        resource.clone(),
+        slot,
+        Some(&source.publication_id),
+    ) else {
+        return Ok(());
+    };
+    want.offer = Some(offer);
+    if !session.media_leases.contains_key(slot)
+        && !session
+            .media_allocation
+            .as_ref()
+            .is_some_and(|pending| pending.wanted.contains_key(slot))
+        && let Some(coordinate) = session.coordinates.get(slot).and_then(Option::as_ref)
+    {
+        // A never-leased bootstrap receiver can serve its first offer. Any
+        // subsequent offer must wait for retirement and fresh preparation.
+        let compatible = prepared_binding(session, slot).is_some_and(|binding| {
+            matches!(binding.transport.as_ref(), Some(state::track_binding::Transport::Rtp(rtp))
+                if rtp.mid == coordinate.mid && rtp.codec.as_ref().and_then(|codec| codec.format.as_ref())
+                    .zip(want.allocation.format.as_ref()).is_some_and(|(actual, expected)| {
+                        state::validation::formats_equivalent(actual, expected)
+                    }))
+        });
+        session.media_leases.insert(
+            slot.clone(),
+            MediaLease {
+                resource: resource.clone(),
+                mid: coordinate.mid.clone(),
+                identity_pending: false,
+                retired: !compatible,
+                retirement_failed: false,
+                wire_retired: false,
+                source: want.source.clone(),
+                offer: Some(offer),
+            },
+        );
+    }
+    media.insert(slot.clone(), want);
+    if session.media_leases.get(slot).is_some_and(|lease| {
+        !lease.retired && lease.resource == *resource && lease.offer == Some(offer)
+    }) && let Some(binding) = prepared_binding(session, slot).cloned()
+    {
+        session.state.report_logical_receiver(
+            resource,
+            offer,
+            state::logical_receiver_report::Outcome::Prepared(binding),
+        )?;
+    }
+    Ok(())
 }
 
 fn publication(
@@ -324,16 +436,6 @@ fn source_room_for_track(session: &Session, desired: &DesiredState, track: &str)
             return Some(selector.room.clone());
         }
     }
-    for subscriber in &desired.topics.subscribers {
-        let selector = crate::TrackSelector {
-            room: subscriber.room.clone(),
-            participant_id: subscriber.participant_id.clone(),
-            track_id: subscriber.topic.clone(),
-        };
-        if selected(session, &selector, state::TrackKind::Data) == Some(track) {
-            return Some(subscriber.room.clone());
-        }
-    }
     None
 }
 
@@ -341,6 +443,7 @@ fn payload(
     session: &mut Session,
     resource: &Resource,
     registration: crate::TopicChannel,
+    offer: Option<Offer>,
     ids: &mut IdGenerator,
     effects: &mut VecDeque<Effect>,
 ) -> Option<state::TrackBinding> {
@@ -390,7 +493,7 @@ fn payload(
                 stream,
                 state: PayloadState::Active,
                 restart: false,
-                wanted: true,
+                offer,
             },
         );
         session.payload_resources.insert(resource.clone(), channel);
@@ -457,42 +560,11 @@ pub(super) fn reconcile(
     session: &mut Session,
     logs: &mut crate::logging::LogBuffer,
     desired: &DesiredState,
-    topics: &crate::topic::Topics,
     ids: &mut IdGenerator,
     effects: &mut VecDeque<Effect>,
 ) -> Result<(), SignalingError> {
     let mut wanted = BTreeMap::new();
-    for selector in desired
-        .video
-        .iter()
-        .filter_map(|video| video.selector.as_ref())
-    {
-        want_lookup(
-            &mut wanted,
-            &selector.room,
-            &selector.participant_id,
-            state::TrackKind::Video,
-            &selector.track_id,
-        );
-    }
-    for selector in &desired.audio.selected {
-        want_lookup(
-            &mut wanted,
-            &selector.room,
-            &selector.participant_id,
-            state::TrackKind::Audio,
-            &selector.track_id,
-        );
-    }
-    for subscriber in &desired.topics.subscribers {
-        want_lookup(
-            &mut wanted,
-            &subscriber.room,
-            &subscriber.participant_id,
-            state::TrackKind::Data,
-            &subscriber.topic,
-        );
-    }
+
     let mut media = BTreeMap::new();
     let joined = session.room_id.is_some();
     for value in desired.publications.iter().filter(|_| joined) {
@@ -525,38 +597,37 @@ pub(super) fn reconcile(
     }
     for video in &desired.video {
         let slot = MediaSlot::RemoteVideo(video.slot);
+        let receive = Some(state::resource_settings::Receive::Video(
+            state::VideoReceiveOptions {
+                max_height: (video.height != 0).then_some(video.height),
+                min_height: (video.min_height != 0).then_some(video.min_height),
+                min_fps: (video.min_fps != 0).then_some(video.min_fps),
+                priority: (video.priority != 0).then_some(video.priority),
+                playout_delay: delay(video.playout_delay),
+            },
+        ));
+        if let Some(selector) = &video.selector {
+            let spec = logical_subscription(selector, state::TrackKind::Video, receive);
+            let resource = Resource::LogicalReception(slot.clone());
+            reconcile_logical_media(session, &mut media, &slot, &resource, &spec)?;
+            wanted.insert(resource, spec);
+            continue;
+        }
         let resource = Resource::Reception(slot.clone());
-        let track = match &video.selector {
-            Some(selector) => {
-                selected(session, selector, state::TrackKind::Video).map(str::to_owned)
-            }
-            None => Some(video.publication_id.clone()),
-        };
-        if let Some(track) = track.as_ref()
-            && let Some(want) = media_want(session, resource.clone(), &slot, Some(track))
-        {
+        let track = &video.publication_id;
+        if let Some(want) = media_want(session, resource.clone(), &slot, Some(track)) {
             media.insert(slot.clone(), want);
         }
-        if let Some(track) = track
-            && let Some(binding) = receive_rtp(session, logs, &resource, &slot, &track)
-        {
-            let Some(source_room) = source_room_for_track(session, desired, &track) else {
+        if let Some(binding) = receive_rtp(session, logs, &resource, &slot, track) {
+            let Some(source_room) = source_room_for_track(session, desired, track) else {
                 continue;
             };
             let spec = subscription(
-                track,
+                track.clone(),
                 source_room,
                 state::TrackKind::Video,
                 binding,
-                Some(state::resource_settings::Receive::Video(
-                    state::VideoReceiveOptions {
-                        max_height: (video.height != 0).then_some(video.height),
-                        min_height: (video.min_height != 0).then_some(video.min_height),
-                        min_fps: (video.min_fps != 0).then_some(video.min_fps),
-                        priority: (video.priority != 0).then_some(video.priority),
-                        playout_delay: delay(video.playout_delay),
-                    },
-                )),
+                receive,
             );
             if receiver_spec_available(session, &slot, &resource, &spec) {
                 wanted.insert(resource, spec);
@@ -578,24 +649,28 @@ pub(super) fn reconcile(
             (id, buffering)
         })
         .collect::<BTreeMap<_, _>>();
-    for selector in &desired.audio.selected {
-        if let Some(id) = selected(session, selector, state::TrackKind::Audio) {
-            audio.insert(
-                id.into(),
-                desired
-                    .audio
-                    .selector_delays
-                    .get(selector)
-                    .copied()
-                    .unwrap_or_default(),
-            );
+    let mut occupied = BTreeSet::new();
+    let mut named = BTreeMap::new();
+    for resource in session.state.resources() {
+        let Resource::LogicalReception(MediaSlot::RemoteAudio(index)) = resource else {
+            continue;
+        };
+        if let Some(selector) = desired.audio.selected.iter().find(|selector| {
+            session
+                .state
+                .target_spec(resource)
+                .is_some_and(|spec| matches_logical_spec(spec, selector, state::TrackKind::Audio))
+        }) {
+            occupied.insert(*index);
+            named.insert(selector.clone(), *index);
         }
     }
-    let mut occupied = BTreeSet::new();
     let mut assigned = Vec::new();
-    // Keep in-flight assignments stable before native and StateBatch confirmation.
+    // Keep in-flight exact assignments stable before native and StateBatch confirmation.
     for (slot, want) in &session.media_wanted {
         if let MediaSlot::RemoteAudio(index) = slot
+            && want.offer.is_none()
+            && !occupied.contains(index)
             && let Some(source) = &want.source
             && let Some(buffering) = audio.remove(source)
         {
@@ -613,12 +688,15 @@ pub(super) fn reconcile(
             assigned.push((*index, track.publication_id.clone(), buffering));
         }
     }
-    for (id, buffering) in audio {
+    let free = |occupied: &mut BTreeSet<u32>| {
         let index = (0..=u32::MAX)
             .find(|index| !occupied.contains(index))
             .ok_or(SignalingError::Invalid("audio receiver coordinate space"))?;
         occupied.insert(index);
-        assigned.push((index, id, buffering));
+        Ok::<_, SignalingError>(index)
+    };
+    for (id, buffering) in audio {
+        assigned.push((free(&mut occupied)?, id, buffering));
     }
     for (index, id, buffering) in assigned {
         let slot = MediaSlot::RemoteAudio(index);
@@ -635,24 +713,48 @@ pub(super) fn reconcile(
                 source_room,
                 state::TrackKind::Audio,
                 binding,
-                Some(state::resource_settings::Receive::Audio(
-                    state::AudioReceiveOptions {
-                        playout_delay: delay(buffering),
-                    },
-                )),
+                audio_options(buffering),
             );
             if receiver_spec_available(session, &slot, &resource, &spec) {
                 wanted.insert(resource, spec);
             }
         }
     }
+    for selector in &desired.audio.selected {
+        let index = match named.get(selector) {
+            Some(index) => *index,
+            None => free(&mut occupied)?,
+        };
+        let slot = MediaSlot::RemoteAudio(index);
+        let resource = Resource::LogicalReception(slot.clone());
+        let buffering = desired
+            .audio
+            .selector_delays
+            .get(selector)
+            .copied()
+            .unwrap_or_default();
+        let spec =
+            logical_subscription(selector, state::TrackKind::Audio, audio_options(buffering));
+        reconcile_logical_media(session, &mut media, &slot, &resource, &spec)?;
+        wanted.insert(resource, spec);
+    }
     let mut data = BTreeMap::new();
-    let subscribers = desired
-        .topics
-        .subscribers
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let subscribers: BTreeMap<_, Vec<_>> =
+        desired
+            .topics
+            .subscribers
+            .iter()
+            .fold(BTreeMap::new(), |mut by_source, subscriber| {
+                by_source
+                    .entry(crate::TrackSelector {
+                        room: subscriber.room.clone(),
+                        participant_id: subscriber.participant_id.clone(),
+                        track_id: subscriber.topic.clone(),
+                    })
+                    .or_default()
+                    .push(subscriber);
+                by_source
+            });
     for publisher in desired.topics.publishers.iter().filter(|_| joined) {
         data.insert(
             Resource::Publication {
@@ -662,57 +764,57 @@ pub(super) fn reconcile(
             crate::TopicChannel::Publisher(publisher.clone()),
         );
     }
-    for (registration, source) in topics.recovery_sources() {
-        if subscribers.contains(registration) {
-            data.insert(
-                Resource::DataSubscription(source.into()),
-                crate::TopicChannel::Subscriber(registration.clone()),
-            );
-        }
-    }
-    for registration in &subscribers {
-        let key = lookup_key(
-            &registration.room,
-            &registration.participant_id,
-            state::TrackKind::Data,
-            &registration.topic,
+    for (selector, registrations) in subscribers {
+        let resource = Resource::LogicalData(selector.clone());
+        wanted.insert(
+            resource.clone(),
+            logical_subscription(&selector, state::TrackKind::Data, None),
         );
-        let Some(track) = session
-            .state
-            .lookup(&key)
-            .and_then(|lookup| lookup.track.as_ref())
-        else {
+        let Some((offer, logical)) = session.state.logical_offer(&resource) else {
+            continue;
+        };
+        let Some(track) = logical.source.as_ref() else {
             continue;
         };
         let Some(state::track::Kind::Data(format)) = track.kind.as_ref() else {
             continue;
         };
-        if !(session.room_id.as_ref() == Some(&track.room_id)
-            && track.participant_id == session.participant_id)
-            && crate::TopicMode::from_delivery(format.delivery) == Some(registration.mode)
+        if session.room_id.as_ref() == Some(&track.room_id)
+            && session.participant_id == track.participant_id
         {
-            data.insert(
-                Resource::DataSubscription(track.publication_id.clone()),
-                crate::TopicChannel::Subscriber(registration.clone()),
-            );
+            continue;
         }
-    }
-    for physical in session
-        .payloads
-        .values()
-        .filter(|physical| physical.state == PayloadState::Active)
-    {
-        if let crate::TopicChannel::Subscriber(registration) = &physical.registration
-            && subscribers.contains(registration)
-            && (session.state.retaining(&physical.resource)
-                || session.state.target_spec(&physical.resource).is_some())
-        {
-            data.entry(physical.resource.clone())
-                .or_insert_with(|| physical.registration.clone());
+        let Some(registration) = registrations.into_iter().find(|subscriber| {
+            crate::TopicMode::from_delivery(format.delivery) == Some(subscriber.mode)
+        }) else {
+            continue;
+        };
+        if let Some(channel) = session.payload_resources.get(&resource).copied() {
+            let Some(physical) = session.payloads.get(&channel) else {
+                continue;
+            };
+            if physical.offer != Some(offer) {
+                // A replacement offer certifies that the old server binding has been cut off.
+                if !matches!(physical.state, PayloadState::Closed { .. }) {
+                    continue;
+                }
+                release_payload(session, &resource, channel);
+            }
         }
-    }
-    for physical in session.payloads.values_mut() {
-        physical.wanted = data.get(&physical.resource) == Some(&physical.registration);
+        if let Some(binding) = payload(
+            session,
+            &resource,
+            crate::TopicChannel::Subscriber(registration.clone()),
+            Some(offer),
+            ids,
+            effects,
+        ) {
+            session.state.report_logical_receiver(
+                &resource,
+                offer,
+                state::logical_receiver_report::Outcome::Prepared(binding),
+            )?;
+        }
     }
     let replaced = data
         .iter()
@@ -747,7 +849,7 @@ pub(super) fn reconcile(
     let released = session
         .payload_resources
         .iter()
-        .filter(|(resource, _)| !data_wanted.contains(*resource))
+        .filter(|(resource, _)| !data_wanted.contains(*resource) && !wanted.contains_key(*resource))
         .map(|(resource, channel)| (resource.clone(), *channel))
         .collect::<Vec<_>>();
     for (resource, channel) in released {
@@ -773,9 +875,14 @@ pub(super) fn reconcile(
         release_payload(session, &resource, channel);
     }
     for (resource, registration) in data {
-        if let Some(binding) = payload(session, &resource, registration.clone(), ids, effects) {
-            let spec = match &registration {
-                crate::TopicChannel::Publisher(publisher) => publication(
+        if let Some(binding) = payload(session, &resource, registration.clone(), None, ids, effects)
+        {
+            let crate::TopicChannel::Publisher(publisher) = registration else {
+                continue;
+            };
+            wanted.insert(
+                resource,
+                publication(
                     &publisher.topic,
                     true,
                     state::publication_spec::Kind::Data(state::DataPublication {
@@ -783,23 +890,7 @@ pub(super) fn reconcile(
                         binding: Some(binding),
                     }),
                 ),
-                crate::TopicChannel::Subscriber(_) => {
-                    let Resource::DataSubscription(id) = &resource else {
-                        continue;
-                    };
-                    let Some(source_room) = source_room_for_track(session, desired, id) else {
-                        continue;
-                    };
-                    subscription(
-                        id.clone(),
-                        source_room,
-                        state::TrackKind::Data,
-                        binding,
-                        None,
-                    )
-                }
-            };
-            wanted.insert(resource, spec);
+            );
         } else if session
             .payload_resources
             .get(&resource)
@@ -835,6 +926,12 @@ pub(super) fn reconcile(
         }
     }
     for (slot, lease) in &mut session.media_leases {
+        if let Some(offer) = lease.offer {
+            if media.get(slot).is_none_or(|want| want.offer != Some(offer)) {
+                lease.retired = true;
+            }
+            continue;
+        }
         if (lease.identity_pending || slot.direction() == crate::MediaDirection::ReceiveOnly)
             && !media.contains_key(slot)
             && !wanted.contains_key(&lease.resource)
@@ -880,6 +977,31 @@ fn media_needed(
     slot: &MediaSlot,
     want: &MediaWant,
 ) -> bool {
+    if let Some(expected) = want.offer {
+        let Some((current, confirmed)) = session.state.logical_offer(&want.resource) else {
+            return false;
+        };
+        if current != expected {
+            return false;
+        }
+        let Some(spec) = &confirmed.spec else {
+            return false;
+        };
+        return match slot {
+            MediaSlot::RemoteVideo(index) => desired.video.iter().any(|video| {
+                video.slot == *index
+                    && video.selector.as_ref().is_some_and(|selector| {
+                        matches_logical_spec(spec, selector, state::TrackKind::Video)
+                    })
+            }),
+            MediaSlot::RemoteAudio(_) => desired
+                .audio
+                .selected
+                .iter()
+                .any(|selector| matches_logical_spec(spec, selector, state::TrackKind::Audio)),
+            _ => false,
+        };
+    }
     match slot {
         MediaSlot::LocalVideo(_) | MediaSlot::LocalAudio(_) => {
             desired.publications.iter().any(|value| {
@@ -928,11 +1050,36 @@ pub(super) fn fence_unwanted_media(
         session.media_wanted.remove(&slot);
         if let Some(lease) = session.media_leases.get_mut(&slot) {
             lease.retired = true;
-            session.state.stage(lease.resource.clone(), None)?;
+            if lease.offer.is_none() {
+                session.state.stage(lease.resource.clone(), None)?;
+            }
         }
     }
     retire_media(session, ids, effects);
     Ok(())
+}
+
+pub(super) fn logical_payload_ready(session: &Session, resource: &Resource) -> bool {
+    let Some(physical) = session
+        .payload_resources
+        .get(resource)
+        .and_then(|channel| session.payloads.get(channel))
+    else {
+        return false;
+    };
+    session
+        .state
+        .logical_offer(resource)
+        .is_some_and(|(offer, logical)| {
+            physical.offer == Some(offer) && installed_payload(physical, logical)
+        })
+}
+
+fn installed_payload(physical: &PayloadChannel, state: &state::LogicalSubscriptionState) -> bool {
+    physical.state == PayloadState::Active
+        && matches!(&state.execution, Some(state::logical_subscription_state::Execution::Installed(binding))
+            if matches!(&binding.transport, Some(state::track_binding::Transport::Sctp(sctp))
+                if sctp.stream_id == Some(u32::from(physical.stream))))
 }
 
 fn release_payload(session: &mut Session, resource: &Resource, channel: ChannelId) {
@@ -956,7 +1103,12 @@ fn retire_media(session: &mut Session, ids: &mut IdGenerator, effects: &mut VecD
         .media_leases
         .iter()
         .filter(|(_, lease)| {
-            lease.retired && !lease.retirement_failed && !session.state.retaining(&lease.resource)
+            lease.retired
+                && !lease.retirement_failed
+                && (!session.state.retaining(&lease.resource)
+                    || lease.offer.is_some_and(|offer| {
+                        session.state.reference(&lease.resource) == Some(offer.reference)
+                    }))
         })
         .take(1)
         .map(|(slot, lease)| RetiringMedia {
@@ -1007,6 +1159,41 @@ fn allocate_media(session: &mut Session, ids: &mut IdGenerator, effects: &mut Ve
     session.media_allocation = Some(MediaAllocation { operation, wanted });
 }
 
+pub(super) fn receiver_track<'a>(
+    session: &'a Session,
+    slot: &MediaSlot,
+) -> Option<&'a state::Track> {
+    let lease = session.media_leases.get(slot)?;
+    let wanted = session.media_wanted.get(slot)?;
+    if lease.retired
+        || lease.identity_pending
+        || lease.source != wanted.source
+        || lease.offer != wanted.offer
+    {
+        return None;
+    }
+    let source = lease.source.as_ref()?;
+    let track = if let Some(expected) = lease.offer {
+        let (current, logical) = session.state.logical_offer(&lease.resource)?;
+        if current != expected {
+            return None;
+        }
+        let Some(state::logical_subscription_state::Execution::Installed(binding)) =
+            &logical.execution
+        else {
+            return None;
+        };
+        if !state::validation::bindings_equivalent(Some(binding), prepared_binding(session, slot)) {
+            return None;
+        }
+        logical.source.as_ref()?
+    } else {
+        let live = session.state.eligible(&lease.resource)?;
+        live.track.as_ref()?
+    };
+    (&track.publication_id == source).then_some(track)
+}
+
 impl Agent {
     pub(super) fn media_observation_target(
         &self,
@@ -1017,24 +1204,7 @@ impl Agent {
         }
         let active = self.active.as_ref()?;
         let lease = active.media_leases.get(slot)?;
-        let wanted = active.media_wanted.get(slot)?;
-        if lease.retired || lease.identity_pending || lease.source != wanted.source {
-            return None;
-        }
-        let source = lease.source.as_ref()?;
-        let confirmed = active.state.confirmed(&lease.resource)?;
-        let state::confirmed_state::Value::Owned(live) = confirmed.value.as_ref()? else {
-            return None;
-        };
-        if active
-            .media_leases
-            .get(slot)
-            .is_none_or(|lease| lease.retired)
-            || live.execution != state::ExecutionStatus::Installed as i32
-            || live.track.as_ref()?.publication_id != *source
-        {
-            return None;
-        }
+        let track = receiver_track(active, slot)?;
         let binding = active.coordinates.get(slot)?.as_ref()?;
         if binding.mid != lease.mid || binding.direction != crate::MediaDirection::ReceiveOnly {
             return None;
@@ -1042,7 +1212,7 @@ impl Agent {
         Some(crate::MediaObservationTarget {
             generation: active.generation,
             reference: active.state.reference(&lease.resource)?,
-            source: source.clone(),
+            source: track.publication_id.clone(),
             binding: binding.clone(),
         })
     }
@@ -1212,14 +1382,18 @@ impl Agent {
                     .get_mut(&slot)
                     .filter(|lease| !lease.retired)
             {
-                if let Some(reference) = active.state.reference(&lease.resource) {
-                    let _ = active.state.report_execution(
-                        reference,
-                        state::Failure {
-                            code: state::FailureCode::InternalFailure as i32,
-                            diagnostic: "configured receiver changed unexpectedly".into(),
-                        },
+                let failure = state::Failure {
+                    code: state::FailureCode::InternalFailure as i32,
+                    diagnostic: "configured receiver changed unexpectedly".into(),
+                };
+                if let Some(offer) = lease.offer {
+                    let _ = active.state.report_logical_receiver(
+                        &lease.resource,
+                        offer,
+                        state::logical_receiver_report::Outcome::Failure(failure),
                     );
+                } else if let Some(reference) = active.state.reference(&lease.resource) {
+                    let _ = active.state.report_execution(reference, failure);
                 }
                 lease.retired = true;
                 prepared.insert(slot, binding);
@@ -1373,6 +1547,7 @@ impl Agent {
                         retirement_failed: false,
                         wire_retired: false,
                         source: want.source.clone(),
+                        offer: want.offer,
                     });
             }
             if let Some(lease) = active.media_leases.get_mut(&slot)
@@ -1395,6 +1570,19 @@ impl Agent {
                 }
             }
             if !accepted {
+                if let Some(offer) = want.offer
+                    && active.media_wanted.get(&slot) == Some(&want)
+                    && media_needed(active, &self.desired, &slot, &want)
+                {
+                    let _ = active.state.report_logical_receiver(
+                        &want.resource,
+                        offer,
+                        state::logical_receiver_report::Outcome::Failure(state::Failure {
+                            code: state::FailureCode::Incompatible as i32,
+                            diagnostic: "local receiver preparation failed".into(),
+                        }),
+                    );
+                }
                 active.media_blocked.insert(slot, want);
             }
         }
@@ -1605,34 +1793,17 @@ impl Agent {
                     evaluates_current,
                     ..
                 } => {
-                    if matches!(resource, Resource::SourceLookup { .. }) {
+                    if matches!(resource, Resource::LogicalData(_)) {
                         if evaluates_current {
-                            self.apply_lookup_read_failure(&resource, &confirmed)?;
+                            self.apply_data_read_failure(&resource, &confirmed)?;
                         }
                         self.intent_dirty = true;
-                        let resolved = matches!(&confirmed.value,
-                            Some(state::confirmed_state::Value::SourceLookup(lookup)) if lookup.track.is_some());
-                        let usable = self
-                            .active
-                            .as_ref()
-                            .is_some_and(|active| active.state.lookup(&resource).is_some());
-                        agent_log!(
-                            self,
-                            Debug,
-                            "Native source lookup changed: {resource:?} evaluated={} resolved={resolved} usable={usable}",
-                            confirmed.evaluated_revision
-                        );
                     }
                     if let Some(rejection) = &confirmed.rejection {
                         if new_evaluation {
                             let message = if rejection.diagnostic.is_empty()
-                                || matches!(
-                                    resource,
-                                    Resource::SourceLookup {
-                                        kind: state::TrackKind::Data,
-                                        ..
-                                    }
-                                ) {
+                                || matches!(resource, Resource::LogicalData(_))
+                            {
                                 alloc::format!("resource rejected: {:?}", rejection.code())
                             } else {
                                 rejection.diagnostic.clone()
@@ -1715,7 +1886,10 @@ impl Agent {
                     {
                         self.intent_dirty = true;
                     }
-                    if let Resource::Reception(slot) = &resource
+                    if matches!(resource, Resource::LogicalReception(_)) {
+                        self.intent_dirty = true;
+                    }
+                    if let Resource::Reception(slot) | Resource::LogicalReception(slot) = &resource
                         && let Some(coordinate) =
                             active.coordinates.get(slot).and_then(Option::as_ref)
                     {
@@ -1724,15 +1898,73 @@ impl Agent {
                         } else {
                             &mut self.snapshot.video_mapping
                         };
-                        if let Some(live) = active.state.eligible(&resource)
-                            && let Some(track) = &live.track
-                        {
+                        let track = if matches!(resource, Resource::LogicalReception(_)) {
+                            receiver_track(active, slot)
+                        } else {
+                            active
+                                .state
+                                .eligible(&resource)
+                                .and_then(|live| live.track.as_ref())
+                        };
+                        if let Some(track) = track {
                             mappings.insert(coordinate.media_index, track.publication_id.clone());
                         } else {
                             mappings.remove(&coordinate.media_index);
                         }
                     }
                     if let Some(channel) = active.payload_resources.get(&resource).copied() {
+                        if let Some(physical) = active.payloads.get_mut(&channel)
+                            && let Some(offer) = physical.offer
+                        {
+                            let current = active
+                                .state
+                                .logical_offer(&resource)
+                                .filter(|(current, _)| *current == offer)
+                                .map(|(_, state)| state);
+                            if current.is_none() {
+                                self.topics.detach_source(
+                                    active.generation,
+                                    channel,
+                                    false,
+                                    &mut self.snapshot,
+                                    &mut self.notifications,
+                                    &mut self.effects,
+                                );
+                                if physical.state == PayloadState::Active {
+                                    physical.state = PayloadState::Closing;
+                                    self.effects.push_back(Effect::Rtc(
+                                        RtcEffect::CloseDataChannel {
+                                            generation: active.generation,
+                                            channel,
+                                        },
+                                    ));
+                                }
+                            } else if let Some(logical) = current
+                                && installed_payload(physical, logical)
+                                && let Some(track) = logical.source.as_ref()
+                            {
+                                let participant = state::Participant {
+                                    participant_id: track.participant_id.clone(),
+                                    room_id: track.room_id.clone(),
+                                };
+                                self.topics.install_source(
+                                    active.generation,
+                                    crate::topic::TopicSource {
+                                        channel,
+                                        registration: physical.registration.clone(),
+                                        track,
+                                        participant: &participant,
+                                    },
+                                    &mut self.snapshot,
+                                    &mut self.notifications,
+                                    &mut self.ids,
+                                    &mut self.effects,
+                                );
+                            } else {
+                                self.topics.suspend_source(active.generation, channel);
+                            }
+                            continue;
+                        }
                         if let Some(live) = active.state.eligible(&resource)
                             && let (Some(track), Some(participant), Some(physical)) = (
                                 &live.track,

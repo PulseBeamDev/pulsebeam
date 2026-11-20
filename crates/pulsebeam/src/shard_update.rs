@@ -145,6 +145,7 @@ pub(crate) struct ShardUpdate {
     pub participant_effects: Vec<(ConnectionId, crate::participant::ParticipantEffect)>,
     pub lifecycle: Vec<ShardUpdateOp>,
     pub plans: Vec<TrackPlanUpdate>,
+    pub cutoff_bindings: Vec<pulsebeam_link::BindingCutoff>,
     pub cutoff_acks: Vec<pulsebeam_runtime::sync::oneshot::Sender<()>>,
 }
 
@@ -156,6 +157,7 @@ impl ShardUpdate {
             participant_effects: Vec::new(),
             lifecycle: Vec::new(),
             plans: Vec::new(),
+            cutoff_bindings: Vec::new(),
             cutoff_acks: Vec::new(),
         }
     }
@@ -164,6 +166,7 @@ impl ShardUpdate {
         self.participant_effects.is_empty()
             && self.lifecycle.is_empty()
             && self.plans.is_empty()
+            && self.cutoff_bindings.is_empty()
             && self.cutoff_acks.is_empty()
     }
 
@@ -191,6 +194,14 @@ impl ShardUpdateWriter {
         &mut self,
         generation: u64,
     ) -> pulsebeam_runtime::sync::oneshot::Receiver<()> {
+        self.stage_link_cutoff(generation, Vec::new())
+    }
+
+    pub(crate) fn stage_link_cutoff(
+        &mut self,
+        generation: u64,
+        link: Vec<pulsebeam_link::BindingCutoff>,
+    ) -> pulsebeam_runtime::sync::oneshot::Receiver<()> {
         let commit = self
             .staged
             .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
@@ -198,6 +209,7 @@ impl ShardUpdateWriter {
             pulsebeam_runtime::fatal!("a cutoff fence must have its own shard generation");
         }
         let (tx, rx) = pulsebeam_runtime::sync::oneshot::channel();
+        commit.cutoff_bindings.extend(link);
         commit.cutoff_acks.push(tx);
         rx
     }

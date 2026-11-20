@@ -37,6 +37,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                 }
             },
             source: receiving.then(|| track_id.into()),
+            offer: None,
             allocation: Allocation {
                 slot: slot.clone(),
                 format: requested_format.clone(),
@@ -332,6 +333,7 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
                 retirement_failed: false,
                 wire_retired: false,
                 source: None,
+                offer: None,
             },
         );
     };
@@ -1390,34 +1392,22 @@ fn received_resource_state_projects_prejoin_and_owner_local_intent() {
 }
 
 #[test]
-fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disabled() {
+fn logical_offer_selects_exact_identity_without_discovery_and_gates_pending_disabled() {
     let (mut agent, generation, control) = connected(Default::default());
     let selector = crate::TrackSelector {
         room: "room".into(),
         participant_id: "external".into(),
         track_id: "camera".into(),
     };
-    let resource = Resource::SourceLookup {
-        room: selector.room.clone(),
-        participant_id: selector.participant_id.clone(),
-        kind: state::TrackKind::Video,
-        track_id: selector.track_id.clone(),
-    };
-    let spec = |enabled| state::ResourceSpec {
-        settings: Some(state::ResourceSettings {
-            enabled: Some(enabled),
-            receive: None,
-        }),
-        declaration: Some(state::resource_spec::Declaration::SourceLookup(
-            state::SourceLookupSpec {
-                source: Some(state::LogicalSourceAddress {
-                    room: selector.room.clone(),
-                    participant_id: selector.participant_id.clone(),
-                    kind: state::TrackKind::Video as i32,
-                    track_id: selector.track_id.clone(),
-                }),
-            },
-        )),
+    let resource = Resource::LogicalReception(MediaSlot::RemoteVideo(0));
+    let spec = |enabled| {
+        let mut spec = logical_subscription(
+            &selector,
+            state::TrackKind::Video,
+            Some(state::resource_settings::Receive::Video(Default::default())),
+        );
+        spec.settings.as_mut().unwrap().enabled = Some(enabled);
+        spec
     };
     let track = state::Track {
         publication_id: "lookup-only-source".into(),
@@ -1430,11 +1420,7 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
             ))),
         })),
     };
-    let participant = state::Participant {
-        participant_id: selector.participant_id.clone(),
 
-        room_id: selector.room.clone(),
-    };
     let stage = |agent: &mut Agent, enabled| {
         agent
             .active
@@ -1459,7 +1445,7 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
             batch.records[0].desired.as_ref().unwrap().revision,
         )
     };
-    let confirm_lookup = |agent: &mut Agent, reference, revision, enabled| {
+    let confirm_offer = |agent: &mut Agent, reference, revision, enabled| {
         observe(
             agent,
             generation,
@@ -1467,11 +1453,14 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
             vec![confirmed(
                 state::resource_key::Key::Owned(reference),
                 revision,
-                state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
-                    spec: Some(spec(enabled)),
-                    participant: enabled.then(|| participant.clone()),
-                    track: enabled.then(|| track.clone()),
-                })),
+                state::confirmed_state::Value::LogicalSubscription(Box::new(
+                    state::LogicalSubscriptionState {
+                        spec: Some(spec(enabled)),
+                        source_revision: if enabled { 1 } else { 2 },
+                        source: enabled.then(|| track.clone()),
+                        execution: None,
+                    },
+                )),
             )],
         );
     };
@@ -1485,7 +1474,7 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
         ),
         None
     );
-    confirm_lookup(&mut agent, reference, revision, true);
+    confirm_offer(&mut agent, reference, revision, true);
     let active = agent.active.as_ref().unwrap();
     assert!(active.state.tracks().is_empty());
     assert!(active.state.participants().is_empty());
@@ -1550,7 +1539,8 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
         ),
         None
     );
-    confirm_lookup(&mut agent, disabled_reference, disabled_revision, false);
+    assert_eq!(disabled_reference, reference);
+    confirm_offer(&mut agent, disabled_reference, disabled_revision, false);
     assert_eq!(
         selected(
             agent.active.as_ref().unwrap(),

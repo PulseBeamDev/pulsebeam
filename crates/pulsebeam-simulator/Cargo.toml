@@ -39,6 +39,7 @@ pulsebeam = { path = "../pulsebeam", features = ["sim"] }
 pulsebeam-agent-native = { path = "../../agents/pulsebeam-agent-native", features = ["sim"] }
 pulsebeam-agent-core = { path = "../../agents/pulsebeam-agent-core" }
 pulsebeam-core = { path = "../pulsebeam-core", features = ["sim"] }
+pulsebeam-link = { path = "../pulsebeam-link" }
 pulsebeam-proto = { path = "../pulsebeam-proto" }
 pulsebeam-rtc-simulation = { path = "../pulsebeam-rtc/simulation" }
 pulsebeam-runtime = { path = "../pulsebeam-runtime", features = ["sim"] }

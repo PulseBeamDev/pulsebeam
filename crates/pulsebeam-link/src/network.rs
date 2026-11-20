@@ -100,6 +100,7 @@ pub(crate) struct Outbound<P> {
 
 pub(crate) struct LocalDestination<P> {
     pub port: PortId,
+    pub binding: BindingId,
     pub tag: DeliveryTag,
     pub sender: pulsebeam_queue::Sender<Pending<P>>,
 }
@@ -254,25 +255,27 @@ impl<P: Clone + Send + 'static> LinkControl<P> {
         if destinations.is_empty() || destinations.len() > MAX_PORTS {
             return Err(BindError::Capacity);
         }
-        let mut fanout = Vec::with_capacity(destinations.len());
-        for &(port, tag) in destinations {
-            if port.owner != self.owner || !self.table.port_live(port) {
-                return Err(BindError::Closed);
-            }
-            if fanout
-                .iter()
-                .any(|destination: &LocalDestination<P>| destination.port == port)
-            {
-                return Err(BindError::Capacity);
-            }
-            fanout.push(LocalDestination {
-                port,
-                tag,
-                sender: self.ports.get(&port.slot).ok_or(BindError::Closed)?.clone(),
-            });
-        }
         let binding = self.allocate_binding()?;
+        let mut children = Vec::with_capacity(destinations.len());
         let result = (|| {
+            let mut fanout = Vec::with_capacity(destinations.len());
+            for &(port, tag) in destinations {
+                if port.owner != self.owner || !self.table.port_live(port) {
+                    return Err(BindError::Closed);
+                }
+                if children.iter().any(|&(existing, _)| existing == port) {
+                    return Err(BindError::Capacity);
+                }
+                let sender = self.ports.get(&port.slot).ok_or(BindError::Closed)?.clone();
+                let child = self.allocate_binding()?;
+                children.push((port, child));
+                fanout.push(LocalDestination {
+                    port,
+                    binding: child,
+                    tag,
+                    sender,
+                });
+            }
             let entry = self.networks.get_mut(&from).ok_or(BindError::Closed)?;
             if entry.state.load(Ordering::Acquire) == CLOSED {
                 return Err(BindError::Closed);
@@ -291,13 +294,17 @@ impl<P: Clone + Send + 'static> LinkControl<P> {
             entry.next_route = raw;
             Ok(key)
         })();
+        let target = BindingTarget::NetworkReceive {
+            peer: from,
+            destinations: children,
+        };
         match result {
             Ok(key) => {
-                self.bindings.insert(binding, BindingTarget::Network(from));
+                self.bindings.insert(binding, target);
                 Ok((binding, key))
             }
             Err(error) => {
-                Table::retire(&self.table.bindings, binding.slot, binding.generation);
+                target.retire(&self.table, binding);
                 Err(error)
             }
         }
@@ -305,6 +312,33 @@ impl<P: Clone + Send + 'static> LinkControl<P> {
 }
 
 impl<P> LinkControl<P> {
+    /// Get a fence for an exact destination without changing the wire route.
+    pub fn receive_port_cutoff(&self, binding: BindingId, port: PortId) -> Option<BindingCutoff> {
+        let BindingTarget::NetworkReceive { destinations, .. } = self.bindings.get(&binding)?
+        else {
+            return None;
+        };
+        let (_, child) = destinations.iter().find(|&&(target, _)| target == port)?;
+        Some(BindingCutoff {
+            table: self.table.clone(),
+            binding: *child,
+        })
+    }
+
+    /// Fence one receive port, including payloads already queued to it. The
+    /// wire route remains live until its last destination is removed.
+    pub fn unbind_receive_port(&mut self, binding: BindingId, port: PortId) {
+        let Some(BindingTarget::NetworkReceive { destinations, .. }) =
+            self.bindings.get_mut(&binding)
+        else {
+            return;
+        };
+        retire_receive_port(&self.table, destinations, port);
+        if destinations.is_empty() {
+            self.unbind(binding);
+        }
+    }
+
     /// Transfer the single association owner to the host I/O adapter exactly once.
     pub fn take_network_driver(&mut self, peer: NetworkId) -> Option<io::NetworkDriver<P>> {
         self.networks.get_mut(&peer)?.driver.take()
@@ -315,8 +349,8 @@ impl<P> LinkControl<P> {
             entry.close();
         }
         self.bindings.retain(|binding, target| {
-            if *target == BindingTarget::Network(peer) {
-                Table::retire(&self.table.bindings, binding.slot, binding.generation);
+            if matches!(target, BindingTarget::NetworkSend(owner) | BindingTarget::NetworkReceive { peer: owner, .. } if *owner == peer) {
+                target.retire(&self.table, *binding);
                 false
             } else {
                 true

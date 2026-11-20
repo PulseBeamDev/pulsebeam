@@ -54,6 +54,7 @@ pub(in crate::control) trait LineageTrust: PeerTrust + Send {
         now: u64,
     ) -> Result<(), Error>;
     fn retire(&mut self, endpoint: EndpointKey, rank: ClaimRank);
+    fn is_retired(&self, endpoint: EndpointKey, rank: ClaimRank) -> bool;
 }
 
 pub(in crate::control) fn issue_accepted(
@@ -152,6 +153,12 @@ impl LineageTrust for StandaloneTrust {
         if let Some(lineage) = self.lineages.get_mut(&(endpoint, rank.lineage())) {
             lineage.retired = true;
         }
+    }
+
+    fn is_retired(&self, endpoint: EndpointKey, rank: ClaimRank) -> bool {
+        self.lineages
+            .get(&(endpoint, rank.lineage()))
+            .is_some_and(|lineage| lineage.retired)
     }
 
     fn check_recovery(
@@ -373,6 +380,12 @@ pub(in crate::control::controller) mod tests {
             {
                 fact.retired = true;
             }
+        }
+
+        fn is_retired(&self, endpoint: EndpointKey, rank: ClaimRank) -> bool {
+            self.recovery.is_some_and(|fact| {
+                fact.endpoint == endpoint && fact.lineage == rank.lineage() && fact.retired
+            })
         }
     }
 

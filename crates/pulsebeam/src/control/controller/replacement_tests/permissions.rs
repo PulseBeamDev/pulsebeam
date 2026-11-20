@@ -483,7 +483,6 @@ pub(super) fn source(
 ) -> Track {
     let meta = TrackMeta {
         room: crate::entity::ProjectRoomKey::fixture(room),
-        shard_id: ShardId::new(0),
         id: connection.fixture_publication(kind, label),
         origin,
         connection_id: connection,

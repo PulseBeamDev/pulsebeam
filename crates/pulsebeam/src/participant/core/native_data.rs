@@ -594,7 +594,6 @@ impl Connection {
             let id = PublicationKey::Data(entity::PublicationId::mint());
             let meta = track::TrackMeta {
                 room,
-                shard_id: self.shard_id,
                 id,
                 origin: self.participant_id,
                 connection_id: self.connection_id,

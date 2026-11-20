@@ -67,8 +67,23 @@ pub(crate) async fn bind(options: &BindOptions) -> io::Result<Bound> {
             "install a host simulated batch/reuseport I/O adapter",
         ));
     }
-    let socket = turmoil::net::UdpSocket::bind(options.local_addr).await?;
-    let local_addr = socket.local_addr()?;
+    let requested = options.local_addr;
+    // Turmoil names the one external interface by its wildcard address.
+    let external = requested.ip() == turmoil::current_ip() && !requested.ip().is_loopback();
+    let interface = if external {
+        let ip = match requested.ip() {
+            std::net::IpAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
+            std::net::IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+        };
+        SocketAddr::new(ip, requested.port())
+    } else {
+        requested
+    };
+    let socket = turmoil::net::UdpSocket::bind(interface).await?;
+    let mut local_addr = socket.local_addr()?;
+    if external {
+        local_addr.set_ip(requested.ip());
+    }
     if local_addr.ip().is_unspecified() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,

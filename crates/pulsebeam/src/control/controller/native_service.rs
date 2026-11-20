@@ -525,15 +525,8 @@ impl ControllerActor {
         if participant != meta.origin || publisher.scope.joined_room() != Some(meta.room) {
             return;
         }
+        self.notify_scoped_source_changed(meta);
         let room = meta.room;
-        if let Some(track_id) = meta.track_id {
-            self.source_lookup_index.source_changed(SourceLookupKey {
-                room,
-                participant,
-                kind: meta.id.kind(),
-                track_id,
-            });
-        }
         if !appeared {
             return;
         }
@@ -550,6 +543,17 @@ impl ControllerActor {
             if service.handler.model.notify_waiting_source(meta.id) {
                 self.finish_native_observation(connection, Ok(()));
             }
+        }
+    }
+
+    pub(super) fn notify_scoped_source_changed(&mut self, meta: &crate::track::TrackMeta) {
+        if let Some(track_id) = meta.track_id {
+            self.source_lookup_index.source_changed(SourceLookupKey {
+                room: meta.room,
+                participant: meta.origin,
+                kind: meta.id.kind(),
+                track_id,
+            });
         }
     }
 

@@ -96,7 +96,8 @@ fn lookup_record(
     publication_id: &str,
     mode: Option<TopicMode>,
 ) -> state::ServerStateRecord {
-    let Some(state::resource_spec::Declaration::SourceLookup(lookup)) = &spec.declaration else {
+    let Some(state::resource_spec::Declaration::LogicalSubscription(lookup)) = &spec.declaration
+    else {
         panic!("source lookup")
     };
     let Some(address) = &lookup.source else {
@@ -127,17 +128,20 @@ fn lookup_record(
     confirmed(
         state::resource_key::Key::Owned(reference),
         revision,
-        state::confirmed_state::Value::SourceLookup(Box::new(state::SourceLookupState {
-            spec: Some(spec),
-            participant: Some(participant.clone()),
-            track: Some(state::Track {
-                publication_id: publication_id.into(),
-                participant_id: participant.participant_id,
-                room_id: participant.room_id.clone(),
-                track_id: label,
-                kind: Some(track_kind),
-            }),
-        })),
+        state::confirmed_state::Value::LogicalSubscription(Box::new(
+            state::LogicalSubscriptionState {
+                spec: Some(spec),
+                source_revision: 1,
+                execution: None,
+                source: Some(state::Track {
+                    publication_id: publication_id.into(),
+                    participant_id: participant.participant_id,
+                    room_id: participant.room_id,
+                    track_id: label,
+                    kind: Some(track_kind),
+                }),
+            },
+        )),
     )
 }
 
@@ -178,12 +182,15 @@ pub(crate) fn answer_source_lookup_batch(
                     }),
                 )),
                 state::desired_state::Value::Present(spec) => {
-                    let Some(state::resource_spec::Declaration::SourceLookup(lookup)) =
+                    let Some(state::resource_spec::Declaration::LogicalSubscription(lookup)) =
                         &spec.declaration
                     else {
                         return None;
                     };
-                    let address = lookup.source.as_ref()?;
+                    let address = lookup
+                        .source
+                        .as_ref()
+                        .filter(|address| address.kind == state::TrackKind::Data as i32)?;
                     lookup_references.push(record.owned);
                     let mode = registrations
                         .iter()
@@ -349,6 +356,7 @@ pub(crate) struct PreparedData {
     pub revision: u64,
     pub spec: state::ResourceSpec,
     pub additional: Vec<PreparedData>,
+    logical: Option<state::LogicalSubscriptionState>,
 }
 
 pub(crate) fn prepare_channel(
@@ -453,21 +461,72 @@ pub(crate) fn prepare_data_pending(
     let mut prepared = batch
         .records
         .iter()
-        .zip(channels)
-        .map(|(record, (channel, requested_channel))| {
-            let Some(desired) = &record.desired else {
-                panic!("present resource")
+        .map(|record| {
+            let (revision, spec, logical, binding) = if let Some(desired) = &record.desired {
+                let Some(state::desired_state::Value::Present(spec)) = &desired.value else {
+                    panic!("present resource")
+                };
+                let Some(state::resource_spec::Declaration::Publication(publication)) =
+                    &spec.declaration
+                else {
+                    panic!("data publication")
+                };
+                let Some(state::publication_spec::Kind::Data(data)) = &publication.kind else {
+                    panic!("data publication")
+                };
+                (
+                    desired.revision,
+                    spec.as_ref().clone(),
+                    None,
+                    data.binding.clone().unwrap(),
+                )
+            } else {
+                let Some(state::execution_report::Outcome::LogicalReceiver(report)) = record
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.outcome.as_ref())
+                else {
+                    panic!("logical receiver report")
+                };
+                let Some(state::logical_receiver_report::Outcome::Prepared(binding)) =
+                    &report.outcome
+                else {
+                    panic!("prepared payload channel")
+                };
+                let confirmed = agent.test_native_owned(record.owned).expect("source offer");
+                let Some(state::confirmed_state::Value::LogicalSubscription(logical)) =
+                    &confirmed.value
+                else {
+                    panic!("logical data state")
+                };
+                assert_eq!(logical.source_revision, report.source_revision);
+                let mut logical = logical.as_ref().clone();
+                logical.execution = Some(state::logical_subscription_state::Execution::Installed(
+                    binding.clone(),
+                ));
+                (
+                    confirmed.evaluated_revision,
+                    logical.spec.clone().unwrap(),
+                    Some(logical),
+                    binding.clone(),
+                )
             };
-            let Some(state::desired_state::Value::Present(spec)) = &desired.value else {
-                panic!("present resource")
+            let Some(state::track_binding::Transport::Sctp(sctp)) = binding.transport else {
+                panic!("SCTP binding")
             };
+            let index = channels
+                .iter()
+                .position(|(_, spec)| spec.negotiated_id.map(u32::from) == sctp.stream_id)
+                .expect("prepared stream has a local channel");
+            let (channel, requested_channel) = channels.swap_remove(index);
             PreparedData {
                 channel,
                 requested_channel,
                 reference: record.owned,
-                revision: desired.revision,
-                spec: spec.as_ref().clone(),
+                revision,
+                spec,
                 additional: Vec::new(),
+                logical,
             }
         })
         .collect::<Vec<_>>();
@@ -528,7 +587,7 @@ pub(crate) fn confirm_publication(
                 track: Some(state::Track {
                     publication_id: source.into(),
                     participant_id: participant.participant_id,
-                    room_id: participant.room_id.clone(),
+                    room_id: participant.room_id,
                     track_id: declaration.track_id.clone(),
                     kind: Some(state::track::Kind::Data(state::DataTrack {
                         delivery: data.delivery,
@@ -560,71 +619,27 @@ pub(crate) fn prepare_subscription_staged(
     subscriber: &TopicSubscriber,
     staged: Option<&PreparedData>,
 ) -> PreparedData {
-    let participant = state::Participant {
-        participant_id: subscriber.participant_id.clone(),
-
-        room_id: subscriber.room.clone(),
-    };
-    let track = state::Track {
-        publication_id: source.into(),
-        participant_id: participant.participant_id.clone(),
-        room_id: participant.room_id.clone(),
-        track_id: subscriber.topic.clone(),
-        kind: Some(state::track::Kind::Data(state::DataTrack {
-            delivery: subscriber.mode.delivery() as i32,
-        })),
-    };
-    if let Some(staged) = staged {
-        let prepared = staged
+    let prepared = if let Some(staged) = staged {
+        staged
             .additional
             .iter()
             .find(|resource| {
-                matches!(
-                    &resource.spec.declaration,
-                    Some(state::resource_spec::Declaration::Subscription(subscription))
-                        if subscription.publication_id == source
-                            && subscription.kind == state::TrackKind::Data as i32
-                )
+                resource
+                    .logical
+                    .as_ref()
+                    .and_then(|l| l.source.as_ref())
+                    .is_some_and(|track| track.publication_id == source)
             })
-            .unwrap_or_else(|| panic!("staged source subscription for {source}"))
-            .clone();
-        observe(
-            agent,
-            generation,
-            control,
-            vec![confirmed(
-                state::resource_key::Key::Owned(prepared.reference),
-                prepared.revision,
-                state::confirmed_state::Value::Owned(alloc::boxed::Box::new(state::LiveResource {
-                    spec: Some(prepared.spec.clone()),
-                    participant: Some(participant),
-                    track: Some(track),
-                    execution: state::ExecutionStatus::Installed as i32,
-                    execution_failure: None,
-                    activity: None,
-                })),
-            )],
-        );
-        if subscriber.mode == TopicMode::Ordered {
-            let (operation, channel, body) = next_topic_send(agent);
-            assert_eq!(channel, prepared.channel);
-            assert_eq!(
-                body,
-                TopicBody::Probe(TopicProbe {
-                    publication_id: source.into(),
-                    from_sequence: 0,
-                    live: true
-                })
-            );
-            acknowledge_send(agent, generation, channel, operation);
-        }
-        assert!(agent.next_effect_after_turn().is_none());
-        return prepared;
-    }
-    let prepared = prepare_data(agent, generation, control);
-    assert!(
-        matches!(&prepared.spec.declaration, Some(state::resource_spec::Declaration::Subscription(subscription)) if subscription.publication_id == source && subscription.kind == state::TrackKind::Data as i32)
-    );
+            .expect("staged data subscription")
+            .clone()
+    } else {
+        prepare_data(agent, generation, control)
+    };
+    let logical = prepared.logical.clone().expect("data source report");
+    let track = logical.source.as_ref().expect("data source");
+    assert_eq!(track.publication_id, source);
+    assert_eq!(track.participant_id, subscriber.participant_id);
+    assert_eq!(track.track_id, subscriber.topic);
     observe(
         agent,
         generation,
@@ -632,26 +647,14 @@ pub(crate) fn prepare_subscription_staged(
         vec![confirmed(
             state::resource_key::Key::Owned(prepared.reference),
             prepared.revision,
-            state::confirmed_state::Value::Owned(alloc::boxed::Box::new(state::LiveResource {
-                spec: Some(prepared.spec.clone()),
-                participant: Some(participant),
-                track: Some(track),
-                execution: state::ExecutionStatus::Installed as i32,
-                execution_failure: None,
-                activity: None,
-            })),
+            state::confirmed_state::Value::LogicalSubscription(Box::new(logical)),
         )],
     );
     if subscriber.mode == TopicMode::Ordered {
         let (operation, channel, body) = next_topic_send(agent);
         assert_eq!(channel, prepared.channel);
-        assert_eq!(
-            body,
-            TopicBody::Probe(TopicProbe {
-                publication_id: source.into(),
-                from_sequence: 0,
-                live: true
-            })
+        assert!(
+            matches!(body, TopicBody::Probe(TopicProbe { publication_id, .. }) if publication_id == source)
         );
         acknowledge_send(agent, generation, channel, operation);
     }

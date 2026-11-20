@@ -9,7 +9,7 @@ pub enum TrackRemoval {
 #[derive(Debug, Clone)]
 pub enum ParticipantEffect {
     TrackCandidateAdded {
-        track: Track,
+        track: Box<Track>,
     },
     TrackCandidateRemoved {
         publication_id: crate::entity::PublicationKey,

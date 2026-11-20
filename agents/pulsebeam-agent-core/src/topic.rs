@@ -330,6 +330,7 @@ impl Topics {
         self.unbind(TopicDropReason::ChannelClosed, snapshot, notifications);
     }
 
+    #[cfg(test)]
     pub(crate) fn recovery_sources(&self) -> impl Iterator<Item = (&TopicSubscriber, &str)> {
         self.subscribers
             .iter()
@@ -426,6 +427,9 @@ impl Topics {
             }
             TopicChannel::Subscriber(subscriber) if newly_ready && mode == TopicMode::Ordered => {
                 let cursor = self.subscribers.get_mut(&subscriber).and_then(|state| {
+                    state
+                        .ordered
+                        .retain(|id, _| id == &source.track.publication_id);
                     state
                         .ordered
                         .entry(source.track.publication_id.clone())

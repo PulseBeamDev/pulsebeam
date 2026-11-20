@@ -1,7 +1,7 @@
 use super::*;
 use crate::ffi::{ErrorCode, ErrorInfo};
 
-fn lookup_failure(confirmed: &state::ConfirmedState) -> Option<ErrorInfo> {
+fn data_subscription_failure(confirmed: &state::ConfirmedState) -> Option<ErrorInfo> {
     if let Some(failure) = &confirmed.rejection {
         let (code, message) = match failure.code() {
             state::FailureCode::PermissionDenied => (
@@ -40,34 +40,27 @@ fn lookup_failure(confirmed: &state::ConfirmedState) -> Option<ErrorInfo> {
 }
 
 impl Agent {
-    pub(super) fn apply_lookup_read_failure(
+    pub(super) fn apply_data_read_failure(
         &mut self,
         resource: &Resource,
         confirmed: &state::ConfirmedState,
     ) -> Result<(), AgentError> {
-        let Resource::SourceLookup {
-            room,
-            participant_id,
-            kind: state::TrackKind::Data,
-            track_id,
-        } = resource
-        else {
+        let Resource::LogicalData(source) = resource else {
             return Ok(());
         };
-        let source = crate::TrackSelector {
-            room: room.clone(),
-            participant_id: participant_id.clone(),
-            track_id: track_id.clone(),
-        };
-        let update = if let Some(error) = lookup_failure(confirmed) {
+        let update = if let Some(error) = data_subscription_failure(confirmed) {
             self.resources
-                .fail_receivers_for_source(&source, None, &error)
+                .fail_receivers_for_source(source, None, &error)
         } else {
-            let Some(state::confirmed_state::Value::SourceLookup(lookup)) = &confirmed.value else {
+            let Some(state::confirmed_state::Value::LogicalSubscription(subscription)) =
+                &confirmed.value
+            else {
                 return Ok(());
             };
-            let Some(state::track::Kind::Data(data)) =
-                lookup.track.as_ref().and_then(|track| track.kind.as_ref())
+            let Some(state::track::Kind::Data(data)) = subscription
+                .source
+                .as_ref()
+                .and_then(|track| track.kind.as_ref())
             else {
                 return Ok(());
             };
@@ -87,9 +80,9 @@ impl Agent {
                 if mode == delivery {
                     continue;
                 }
-                let rejected =
-                    self.resources
-                        .fail_receivers_for_source(&source, Some(mode), &error);
+                let rejected = self
+                    .resources
+                    .fail_receivers_for_source(source, Some(mode), &error);
                 update.ready.extend(rejected.ready);
                 update.registrations_changed |= rejected.registrations_changed;
             }

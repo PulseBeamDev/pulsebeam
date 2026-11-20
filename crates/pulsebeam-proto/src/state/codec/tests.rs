@@ -87,6 +87,104 @@ fn lookup_state(enabled: bool, paired: bool) -> SourceLookupState {
 }
 
 #[test]
+fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
+    let lookup = lookup_state(true, true);
+    let mut spec = lookup.spec.unwrap();
+    let Some(resource_spec::Declaration::SourceLookup(lookup_spec)) = spec.declaration.take()
+    else {
+        panic!("lookup spec");
+    };
+    spec.declaration = Some(resource_spec::Declaration::LogicalSubscription(
+        LogicalSubscriptionSpec {
+            source: lookup_spec.source,
+        },
+    ));
+    let mut subscription = LogicalSubscriptionState {
+        spec: Some(spec),
+        source_revision: 0,
+        source: None,
+        execution: None,
+    };
+    assert_eq!(
+        validation::validate_logical_subscription(&subscription),
+        Ok(())
+    );
+
+    subscription.source = lookup.track;
+    assert_eq!(
+        validation::validate_logical_subscription(&subscription),
+        Err(ValidationError::Confirmed)
+    );
+    subscription.source_revision = (1 << 53) + 1;
+    let binding = TrackBinding {
+        transport: Some(track_binding::Transport::Sctp(SctpParameters {
+            stream_id: Some(5),
+        })),
+    };
+    let mut report = LogicalReceiverReport {
+        source_revision: 0,
+        outcome: Some(logical_receiver_report::Outcome::Prepared(binding.clone())),
+    };
+    let proposal = |report| ClientStateBatch {
+        records: vec![ClientStateRecord {
+            owned: 1,
+            desired: None,
+            execution: Some(ExecutionReport {
+                revision: 2,
+                outcome: Some(execution_report::Outcome::LogicalReceiver(report)),
+            }),
+        }],
+        ..Default::default()
+    };
+    assert!(encode_client(&proposal(report.clone())).is_err());
+    report.source_revision = subscription.source_revision;
+    let client = proposal(report);
+    assert_eq!(decode_client(&encode_client(&client).unwrap()), Ok(client));
+
+    subscription.execution = Some(logical_subscription_state::Execution::Installed(binding));
+    let server = ServerStateBatch {
+        records: vec![ServerStateRecord {
+            key: Some(ResourceKey {
+                key: Some(resource_key::Key::Owned(1)),
+            }),
+            confirmed: Some(ConfirmedState {
+                evaluated_revision: 1,
+                value: Some(confirmed_state::Value::LogicalSubscription(
+                    subscription.clone().into(),
+                )),
+                ..Default::default()
+            }),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(decode_server(&encode_server(&server).unwrap()), Ok(server));
+
+    let mut missing_source = subscription.clone();
+    missing_source.source = None;
+    assert_eq!(
+        validation::validate_logical_subscription(&missing_source),
+        Err(ValidationError::Confirmed)
+    );
+    subscription.source.as_mut().unwrap().track_id = String::from("other");
+    assert_eq!(
+        validation::validate_logical_subscription(&subscription),
+        Err(ValidationError::Identity)
+    );
+    subscription
+        .spec
+        .as_mut()
+        .unwrap()
+        .settings
+        .as_mut()
+        .unwrap()
+        .enabled = Some(false);
+    assert_eq!(
+        validation::validate_logical_subscription(&subscription),
+        Err(ValidationError::Confirmed)
+    );
+}
+
+#[test]
 fn raw_protobuf_preserves_exact_revision_and_explicit_false() {
     for revision in [1, (1 << 53) + 1, u64::MAX] {
         let mut batch = publication(revision);
@@ -1244,10 +1342,10 @@ fn execution_failures_are_required_scoped_and_independently_revisioned() {
             desired: None,
             execution: Some(ExecutionReport {
                 revision: 2,
-                failure: Some(Failure {
+                outcome: Some(execution_report::Outcome::Failure(Failure {
                     code: FailureCode::InternalFailure as i32,
                     diagnostic: String::from("receiver failed after admission"),
-                }),
+                })),
             }),
         }],
         ..Default::default()
@@ -1256,15 +1354,16 @@ fn execution_failures_are_required_scoped_and_independently_revisioned() {
         decode_client(&encode_client(&batch).unwrap()),
         Ok(batch.clone())
     );
-    batch.records[0].execution.as_mut().unwrap().failure = None;
+    batch.records[0].execution.as_mut().unwrap().outcome = None;
     assert_eq!(
         encode_client(&batch),
         Err(EncodeError::Validation(ValidationError::Failure))
     );
-    batch.records[0].execution.as_mut().unwrap().failure = Some(Failure {
-        code: FailureCode::InternalFailure as i32,
-        diagnostic: String::new(),
-    });
+    batch.records[0].execution.as_mut().unwrap().outcome =
+        Some(execution_report::Outcome::Failure(Failure {
+            code: FailureCode::InternalFailure as i32,
+            diagnostic: String::new(),
+        }));
     batch.records[0].execution.as_mut().unwrap().revision = 1;
     assert_eq!(
         encode_client(&batch),

@@ -452,6 +452,7 @@ fn receive_retirement_fences_queued_payloads_without_withholding_transport_feedb
         pair.step();
     }
     assert_eq!(pair.bd.health().received, 1);
+    let late_cutoff = pair.b.receive_port_cutoff(binding, port).unwrap();
     pair.b.unbind(binding);
     old.try_send(Packet::Wire(Arc::from([2u8])), LinkTime(u64::MAX))
         .unwrap();
@@ -460,6 +461,7 @@ fn receive_retirement_fences_queued_payloads_without_withholding_transport_feedb
         .bind_receive(pair.bid, &[(port, DeliveryTag(2))])
         .unwrap();
     assert_ne!(key, replacement_key);
+    late_cutoff.fence();
     let (_, replacement) = pair
         .a
         .bind_send(Destination::Network {

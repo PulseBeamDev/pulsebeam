@@ -106,6 +106,9 @@ impl ShardUpdateApplication {
             self.generation = delta.generation;
             self.apply_pending_participant_effects(execution);
             // This fences lifecycle/plan cutoff, not delivery of observation effects.
+            for binding in delta.cutoff_bindings.drain(..) {
+                binding.fence();
+            }
             for ack in delta.cutoff_acks.drain(..) {
                 let _ = ack.send(());
             }

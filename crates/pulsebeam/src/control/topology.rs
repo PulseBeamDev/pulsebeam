@@ -103,18 +103,19 @@ struct RoomTrackTopology {
 #[derive(Debug, Default)]
 pub(crate) struct TrackTopology {
     catalog_version: u64,
+    publication_ids: HashSet<PublicationKey>,
     rooms: HashMap<ProjectRoomKey, RoomTrackTopology>,
 }
 
 impl TrackTopology {
     pub(crate) fn publish(&mut self, track: Track) -> Option<TrackAncestry> {
         let identity = TrackAncestry::from_track(&track);
-        let label = track.publication_label();
-        let room = self.rooms.entry(identity.room_id).or_default();
-        if room.tracks.contains_key(&identity.publication_id) {
-            debug_assert!(false, "a track identity must be published once");
+        // Link plans and shard runtimes use the publication key without room scope.
+        if !self.publication_ids.insert(identity.publication_id) {
             return None;
         }
+        let label = track.publication_label();
+        let room = self.rooms.entry(identity.room_id).or_default();
         self.catalog_version = self
             .catalog_version
             .checked_add(1)
@@ -129,7 +130,18 @@ impl TrackTopology {
 
     pub(crate) fn unpublish(&mut self, identity: TrackAncestry) -> Option<Track> {
         let room = self.rooms.get_mut(&identity.room_id)?;
+        if room
+            .tracks
+            .get(&identity.publication_id)?
+            .track
+            .meta()
+            .origin
+            != identity.publisher
+        {
+            return None;
+        }
         let publication = room.tracks.remove(&identity.publication_id)?;
+        self.publication_ids.remove(&identity.publication_id);
         self.catalog_version = self
             .catalog_version
             .checked_add(1)
@@ -152,6 +164,7 @@ impl TrackTopology {
 
     pub(crate) fn track(&self, identity: TrackAncestry) -> Option<&Track> {
         self.source(identity.room_id, identity.publication_id)
+            .filter(|track| track.meta().origin == identity.publisher)
     }
 
     pub(crate) fn source(&self, room_id: ProjectRoomKey, track: PublicationKey) -> Option<&Track> {
@@ -194,6 +207,22 @@ impl TrackTopology {
 
     pub(crate) fn room_catalog_version(&self, room: ProjectRoomKey) -> u64 {
         self.rooms.get(&room).map_or(0, |room| room.catalog_version)
+    }
+
+    pub(super) fn sources_by_publisher(
+        &self,
+        endpoint: EndpointKey,
+    ) -> impl Iterator<Item = &Track> {
+        self.rooms
+            .get(&endpoint.room)
+            .into_iter()
+            .flat_map(move |room| {
+                room.by_publisher
+                    .get(&endpoint.participant)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| room.tracks.get(id).map(|publication| &publication.track))
+            })
     }
 
     pub(crate) fn publisher_sources(
@@ -401,9 +430,7 @@ impl TrackTopology {
     }
 
     pub(crate) fn contains(&self, identity: TrackAncestry) -> bool {
-        self.rooms
-            .get(&identity.room_id)
-            .is_some_and(|room| room.tracks.contains_key(&identity.publication_id))
+        self.track(identity).is_some()
     }
 
     pub(crate) fn matching_tracks(
@@ -433,25 +460,15 @@ impl TrackTopology {
         }
     }
 
-    pub(crate) fn remove_participant(&mut self, endpoint: EndpointKey) {
+    #[cfg(test)]
+    fn remove_participant(&mut self, endpoint: EndpointKey) {
         self.remove_subscriber(endpoint.into());
-        if let Some(room) = self.rooms.get_mut(&endpoint.room) {
-            let published: Vec<_> = room
-                .tracks
-                .iter()
-                .filter_map(|(id, publication)| {
-                    (publication.track.meta().origin == endpoint.participant).then_some(*id)
-                })
-                .collect();
-            if !published.is_empty() {
-                self.catalog_version = self.catalog_version.checked_add(1).unwrap_or_else(|| {
-                    pulsebeam_runtime::fatal!("publication catalog version exhausted")
-                });
-                room.catalog_version = self.catalog_version;
-            }
-            for track in published {
-                room.remove_track(track);
-            }
+        let published: Vec<_> = self
+            .sources_by_publisher(endpoint)
+            .map(TrackAncestry::from_track)
+            .collect();
+        for identity in published {
+            self.unpublish(identity);
         }
     }
 }
@@ -787,24 +804,6 @@ impl RoomTrackTopology {
             debug_assert!(removed.is_some());
         }
     }
-
-    fn remove_track(&mut self, track: PublicationKey) {
-        let Some(publication) = self.tracks.remove(&track) else {
-            debug_assert!(false, "participant publication must remain indexed");
-            return;
-        };
-        let identity = TrackAncestry::from_track(&publication.track);
-        self.unindex_track(
-            identity,
-            publication.track.meta().connection_id,
-            publication.label.as_deref(),
-        );
-        self.candidate_reasons
-            .retain(|(_, candidate), _| *candidate != track);
-        self.automatic_reasons
-            .retain(|(_, candidate), _| *candidate != track);
-        self.allocated.retain(|(_, candidate)| *candidate != track);
-    }
 }
 
 fn remove_indexed<K: Eq + std::hash::Hash, V: Eq + std::hash::Hash + Copy>(
@@ -917,7 +916,6 @@ mod tests {
         let publisher = participant(publisher);
         let meta = crate::track::TrackMeta {
             room: room(room_seed),
-            shard_id: ShardId::new(0),
             id: connection.fixture_publication(kind, label),
             origin: publisher,
             connection_id: connection,
@@ -949,7 +947,10 @@ mod tests {
             project: crate::entity::ProjectId::new(),
             ..owner
         };
+        let mut collision = publication.clone();
+        collision.meta_mut().room = other;
         topology.publish(publication).unwrap();
+        assert!(topology.publish(collision).is_none());
         assert!(topology.source(owner, id).is_some());
         assert!(topology.source(other, id).is_none());
         assert_eq!(topology.sources_in_room(other).count(), 0);

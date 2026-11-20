@@ -37,7 +37,6 @@ fn track(connection: ConnectionId, owner: ParticipantId, label: &str) -> Track {
     Track::data_publication(
         TrackMeta {
             room: crate::entity::ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
-            shard_id: crate::id::ShardId::new(0),
             id: connection.fixture_publication_at(
                 TrackKind::Data,
                 label,
