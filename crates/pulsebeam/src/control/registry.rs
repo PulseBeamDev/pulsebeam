@@ -354,6 +354,7 @@ impl RoomRegistry {
         shard_id: ShardId,
         transport: NodeTransportAddress,
         connection_id: ConnectionId,
+        profile: SignalingProtocol,
     ) -> Result<(), CommitCandidateError> {
         use std::collections::hash_map::Entry;
 
@@ -369,7 +370,7 @@ impl RoomRegistry {
             },
             transport: Some(transport),
             connection_id,
-            profile: SignalingProtocol::State,
+            profile,
             authorization: None,
             materialized: true,
             claim: None,
@@ -488,11 +489,25 @@ mod tests {
         let address = NodeTransportAddress::new(crate::route::TransportRoute::new(shard, 1), 1);
 
         registry
-            .commit_unjoined(joined.project, participant, shard, address, connection)
+            .commit_unjoined(
+                joined.project,
+                participant,
+                shard,
+                address,
+                connection,
+                SignalingProtocol::State,
+            )
             .unwrap();
         assert!(
             registry
-                .commit_unjoined(joined.project, participant, shard, address, connection)
+                .commit_unjoined(
+                    joined.project,
+                    participant,
+                    shard,
+                    address,
+                    connection,
+                    SignalingProtocol::State
+                )
                 .is_err()
         );
         assert_eq!(

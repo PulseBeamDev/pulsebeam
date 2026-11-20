@@ -437,14 +437,18 @@ impl WirePeer {
             + 60;
         let token = pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key()?,
-            &serde_json::from_value(serde_json::json!([{"rooms":["native-state-wire"],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
+            &serde_json::from_value(
+                serde_json::json!([{"rooms":["native-state-wire"],"allow":["subscribe"]}]),
+            )
+            .unwrap(),
             "rtp-listener",
             expiry,
-        )?.token;
+        )?
+        .token;
         let request = http::Request::builder()
             .method("POST")
             .uri(format!(
-                "http://{server}:7070/api/v1/whep?room=native-state-wire"
+                "http://{server}:7070/api/v1/whep?track=native-state-wire.{participant}.audio.microphone"
             ))
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/sdp")
@@ -469,7 +473,7 @@ impl WirePeer {
         )
         .await?;
         let sink = receive.receiver().attach_encoded_audio_sink()?;
-        // WHEP joins an already-Active source; require media, not a redundant state event.
+        // The explicit WHEP binding selects an already-active source.
         push(&source, 20).await?;
         let mut frames = 0;
         while let Some(frame) = sink.try_next_frame() {

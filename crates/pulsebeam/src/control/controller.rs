@@ -44,7 +44,7 @@ use pulsebeam_runtime::sync::oneshot;
 
 #[derive(Debug, Clone)]
 pub struct ParticipantState {
-    pub manual_sub: bool,
+    pub(crate) selection: super::sdp::Selection,
     pub room_id: Option<RoomId>,
     pub participant_id: ParticipantId,
     pub connection_id: ConnectionId,
@@ -397,6 +397,10 @@ pub enum ControllerError {
     AuthorizationRejected,
     #[error("authorization precondition does not match")]
     AuthorizationPrecondition { revision: u64 },
+    #[error("requested receive source is unavailable")]
+    SourceUnavailable,
+    #[error("requested receive source is incompatible with the offer")]
+    SourceIncompatible,
     #[error("IO error: {0}")]
     IOError(#[from] io::Error),
     #[error("unknown error: {0}")]
@@ -457,6 +461,7 @@ struct PendingMaterialization {
     transport: crate::route::NodeTransportAddress,
     scope: crate::entity::ConnectionScope,
     answer: String,
+    whep_bindings: super::sdp::MediaTracks<(ProjectRoomKey, crate::entity::PublicationKey)>,
     owned: Option<OwnedMaterialization>,
 }
 
@@ -2966,6 +2971,88 @@ impl ControllerActor {
         Err(ControllerError::AuthorizationRejected)
     }
 
+    fn resolve_whep_sources(
+        &self,
+        sources: &super::sdp::MediaTracks<super::sdp::SourceAddress>,
+        project: crate::entity::ProjectId,
+        lease: &AuthorizationLease,
+    ) -> Result<
+        super::sdp::MediaTracks<(ProjectRoomKey, crate::entity::PublicationKey)>,
+        ControllerError,
+    > {
+        use pulsebeam_core::auth::grants::{Action, TrackKind};
+        use pulsebeam_rtc::MediaKind;
+        let kind_for = |kind| match kind {
+            MediaKind::Audio => TrackKind::Audio,
+            MediaKind::Video => TrackKind::Video,
+        };
+        if !sources.iter().all(|(kind, source)| {
+            lease.permissions().allows_at_room(
+                Action::Subscribe,
+                source.room.as_str(),
+                Some(source.participant.as_str()),
+                Some(kind_for(kind)),
+                Some(source.track.as_str()),
+            )
+        }) {
+            return Err(ControllerError::AuthorizationRejected);
+        }
+        let mut bindings = super::sdp::MediaTracks::default();
+        for (kind, source) in sources.iter() {
+            let room = ProjectRoomKey {
+                project,
+                room: source.room,
+            };
+            let track_kind = match kind {
+                MediaKind::Audio => crate::entity::TrackKind::Audio,
+                MediaKind::Video => crate::entity::TrackKind::Video,
+            };
+            let publication = self
+                .lifecycle
+                .current_named_source(
+                    EndpointKey {
+                        room,
+                        participant: source.participant,
+                    },
+                    track_kind,
+                    source.track,
+                    &self.core.registry,
+                )
+                .ok_or(ControllerError::SourceUnavailable)?;
+            bindings
+                .insert(kind, (room, publication.id()))
+                .map_err(|_| NegotiatorError::InvalidResources)?;
+        }
+        Ok(bindings)
+    }
+
+    fn validate_whep_codecs(
+        &self,
+        session: &pulsebeam_rtc::SessionInfo,
+        bindings: &super::sdp::MediaTracks<(ProjectRoomKey, crate::entity::PublicationKey)>,
+    ) -> Result<(), ControllerError> {
+        for (kind, &(room, publication)) in bindings.iter() {
+            let receiver = session
+                .senders
+                .iter()
+                .find(|sender| sender.kind == kind)
+                .ok_or(NegotiatorError::InvalidResources)?;
+            let track = self
+                .lifecycle
+                .source_exact(room, publication)
+                .ok_or(ControllerError::SourceUnavailable)?;
+            let format = match track {
+                crate::track::Track::Audio(audio) => audio.format.as_ref(),
+                crate::track::Track::Video(video) => video.format.as_ref(),
+                crate::track::Track::Data(_) => None,
+            };
+            if !format.is_some_and(|format| super::sdp::codec_compatible(format, receiver.codec)) {
+                return Err(ControllerError::SourceIncompatible);
+            }
+        }
+        Ok(())
+    }
+
     fn begin_create_participant(
         &mut self,
         mut state: ParticipantState,
@@ -2997,7 +3084,7 @@ impl ControllerActor {
         };
         let scope = match state.room_id {
             Some(room) => Self::admission_room(room, state.authorization.as_ref())?.into(),
-            None if state.profile == SignalingProtocol::State => crate::entity::ConnectionScope {
+            None if state.profile != SignalingProtocol::Whip => crate::entity::ConnectionScope {
                 project: state
                     .authorization
                     .as_ref()
@@ -3009,6 +3096,23 @@ impl ControllerActor {
             None => return Err(ControllerError::AuthorizationRejected),
         };
         let participant_id = state.participant_id;
+        let whep_bindings = match (&state.selection, state.profile) {
+            (super::sdp::Selection::Native, SignalingProtocol::State)
+            | (super::sdp::Selection::Whip(_), SignalingProtocol::Whip) => Default::default(),
+            (super::sdp::Selection::Whep(sources), SignalingProtocol::Whep)
+                if scope.room.is_none() =>
+            {
+                self.resolve_whep_sources(
+                    sources,
+                    scope.project,
+                    state
+                        .authorization
+                        .as_ref()
+                        .ok_or(ControllerError::AuthorizationRejected)?,
+                )?
+            }
+            _ => return Err(NegotiatorError::InvalidResources.into()),
+        };
         let choose = |snapshot: Option<&pulsebeam_runtime::rt::ExecutionSnapshot>| {
             let now = pulsebeam_runtime::time::Instant::now();
             let shards = self.router.shard_count();
@@ -3051,6 +3155,20 @@ impl ControllerActor {
                     return Err(error.into());
                 }
             };
+        let selected_media = match &state.selection {
+            super::sdp::Selection::Native => Ok(()),
+            super::sdp::Selection::Whip(overrides) => resources
+                .name_whip_tracks(&rtc.session, overrides)
+                .map_err(Into::into),
+            super::sdp::Selection::Whep(_) => resources
+                .bind_whep(&whep_bindings)
+                .map_err(ControllerError::from)
+                .and_then(|()| self.validate_whep_codecs(&rtc.session, &whep_bindings)),
+        };
+        if let Err(error) = selected_media {
+            self.core.release_transport(address, now);
+            return Err(error);
+        }
         if !resources.publications_allowed(
             state.profile,
             state.authorization.as_ref().map_or(
@@ -3153,6 +3271,7 @@ impl ControllerActor {
             transport: address,
             scope,
             answer,
+            whep_bindings,
             owned: None,
         })
     }
@@ -3179,6 +3298,15 @@ impl ControllerActor {
         wall_now: SystemTime,
     ) -> Result<String, ControllerError> {
         let participant_id = pending.participant;
+        for (_, &(room, publication)) in pending.whep_bindings.iter() {
+            if self
+                .lifecycle
+                .network_source(room, publication, &self.core.registry)
+                .is_none()
+            {
+                return Err(ControllerError::SourceUnavailable);
+            }
+        }
         let previous = if let Some(room) = pending.scope.joined_room() {
             self.commit_candidate(
                 participant_id,
@@ -3212,6 +3340,7 @@ impl ControllerActor {
                     pending.shard,
                     pending.transport,
                     pending.connection_id(),
+                    pending.profile,
                 )
                 .map_err(|_| ControllerError::Superseded)?;
             self.record_admitted_authorization(participant_id, pending.connection_id(), lease);
@@ -3237,26 +3366,26 @@ impl ControllerActor {
             );
         }
         self.publish_staged();
-        let Some(room) = pending
-            .scope
-            .joined_room()
-            .filter(|_| pending.profile != SignalingProtocol::State)
-        else {
-            return Ok(pending.answer);
-        };
-        let defaults = vec![
-            (TrackSelector::audio(), SelectionPolicy::All),
-            (TrackSelector::video(), SelectionPolicy::Allocated),
-        ];
-        let outcomes = self.lifecycle.subscribe_defaults(
-            room,
-            participant_id,
-            defaults,
-            &self.core.registry,
-            pulsebeam_runtime::time::Instant::now(),
-        );
-        for outcome in outcomes {
-            self.publish_track_lifecycle(outcome);
+        let now = pulsebeam_runtime::time::Instant::now();
+        for (kind, &(source_room, track)) in pending.whep_bindings.iter() {
+            let outcomes = self.lifecycle.set_owned_subscription(
+                pending.connection_id(),
+                super::topology::OwnedSubscription {
+                    source_room,
+                    subscriber: participant_id,
+                    reference: match kind {
+                        pulsebeam_rtc::MediaKind::Audio => 1,
+                        pulsebeam_rtc::MediaKind::Video => 2,
+                    },
+                    track,
+                    enabled: true,
+                },
+                &self.core.registry,
+                now,
+            );
+            for outcome in outcomes {
+                self.publish_track_lifecycle(outcome);
+            }
         }
         Ok(pending.answer)
     }
@@ -4564,6 +4693,7 @@ mod replacement_tests {
                     transport,
                     scope: ProjectRoomKey::fixture(room_id).into(),
                     answer: "answer".to_owned(),
+                    whep_bindings: Default::default(),
                     owned: None,
                 },
                 reply: MaterializationReply::Create(reply),
@@ -4894,7 +5024,6 @@ mod replacement_tests {
                 crate::control::negotiator::application_only_test_connection_and_offer();
             (
                 Box::new(crate::participant::ConnectionConfig {
-                    manual_sub: true,
                     scope: crate::entity::ProjectRoomKey::fixture(room_id).into(),
                     participant_id,
 
@@ -5024,7 +5153,9 @@ mod replacement_tests {
             actor.ownership.commit(&old_ticket, Vec::new(), now),
             Err(ownership::Error::InvalidTransition)
         );
-        let (old_config, _old_handoff, offer) = config(participant, connection, room, "alice");
+        let (old_config, _old_handoff, native_offer) =
+            config(participant, connection, room, "alice");
+        let offer = permissions::publishing_offer();
         let (ack, received) = oneshot::channel();
         let (reply, mut old_response) = oneshot::channel();
         actor.start_materialization(RequiredAction::Materialize {
@@ -5050,6 +5181,7 @@ mod replacement_tests {
                 }
                 .into(),
                 answer: "late answer".to_owned(),
+                whep_bindings: Default::default(),
                 owned: None,
             },
             reply: MaterializationReply::Create(reply),
@@ -5094,13 +5226,13 @@ mod replacement_tests {
         );
         let message = |connection_id, offer: &str| CreateParticipant {
             state: ParticipantState {
-                manual_sub: true,
                 room_id: Some(room),
                 participant_id: next_participant,
 
                 connection_id,
                 old_connection_id: None,
                 authorization: Some(next_lease.clone()),
+                selection: super::super::sdp::Selection::Whip(Default::default()),
                 profile: SignalingProtocol::Whip,
                 rtp_capabilities: None,
             },
@@ -5617,7 +5749,7 @@ mod replacement_tests {
             let issued: serde_json::Value = serde_json::from_slice(&issued).unwrap();
             let owner = issued["owner"].as_str().unwrap();
             let body = serde_json::to_vec(&serde_json::json!({
-                "profile": pulsebeam_proto::state::PROFILE, "room": "http-target", "offer": offer,
+                "profile": pulsebeam_proto::state::PROFILE, "room": "http-target", "offer": native_offer,
             }))
             .unwrap();
             let create = |token: &str| {
@@ -5942,7 +6074,7 @@ mod replacement_tests {
                     "native",
                     &issue_token,
                     serde_json::to_vec(&serde_json::json!({
-                        "profile": pulsebeam_proto::state::PROFILE, "offer": offer,
+                        "profile": pulsebeam_proto::state::PROFILE, "offer": native_offer,
                     }))
                     .unwrap(),
                 );
@@ -7018,12 +7150,12 @@ mod replacement_tests {
         let (_, offer) = crate::control::negotiator::application_only_test_connection_and_offer();
         let message = || CreateParticipant {
             state: ParticipantState {
-                manual_sub: true,
                 room_id: Some(room),
                 participant_id: participant,
                 connection_id: candidate,
                 old_connection_id: None,
                 authorization: Some(lease.clone()),
+                selection: super::super::sdp::Selection::Native,
                 profile: SignalingProtocol::State,
                 rtp_capabilities: Some(crate::control::rtp::capabilities()),
             },
@@ -7157,7 +7289,6 @@ mod replacement_tests {
             ShardCommand::MaterializeParticipant {
                 transport: address,
                 config: Box::new(crate::participant::ConnectionConfig {
-                    manual_sub: true,
                     scope: ProjectRoomKey::fixture(room).into(),
                     participant_id: subscriber,
                     connection_id: subscriber_connection,
@@ -7468,13 +7599,13 @@ mod replacement_tests {
             assert!(matches!(
                 actor.begin_create_participant(
                     ParticipantState {
-                        manual_sub: true,
                         room_id: Some(room),
                         participant_id: participant,
 
                         connection_id: connection_id(101),
                         old_connection_id: None,
                         authorization: Some(current_lease.clone()),
+                        selection: super::super::sdp::Selection::Native,
                         profile: SignalingProtocol::State,
                         rtp_capabilities: Some(crate::control::rtp::capabilities()),
                     },
@@ -7500,13 +7631,13 @@ mod replacement_tests {
         assert!(matches!(
             actor.begin_create_participant(
                 ParticipantState {
-                    manual_sub: true,
                     room_id: Some(room_id),
                     participant_id,
 
                     connection_id: connection_id(101),
                     old_connection_id: None,
                     authorization: Some(unrepresentable.clone()),
+                    selection: super::super::sdp::Selection::Native,
                     profile: SignalingProtocol::State,
                     rtp_capabilities: Some(crate::control::rtp::capabilities()),
                 },
@@ -7580,6 +7711,7 @@ mod replacement_tests {
             transport,
             scope: ProjectRoomKey::fixture(room_id).into(),
             answer: "native-answer".to_owned(),
+            whep_bindings: Default::default(),
             owned: None,
         };
         let pending_transport = actor

@@ -1061,12 +1061,28 @@ fn cross_shard_simulcast_switching_stays_decodable_test() {
         .with_room(
             Room::new("room1")
                 .with_participant(Participant::publisher("alice", &["q", "h", "f"]))
-                .with_participant(Participant::subscriber("bob")),
+                .with_participant(Participant::manual_subscriber("bob", 1)),
         )
         .run(vec![
             Step::Run {
-                description: "Establish flow and discover all three encodings",
-                duration: Duration::from_secs(6),
+                description: "Connect the publisher and receiver",
+                duration: Duration::from_secs(1),
+            },
+            Step::SubscribeTo {
+                description: "Request Alice at up to 720p on one owned subscription",
+                participant: "bob",
+                targets: &[("alice", 720)],
+            },
+            Step::Run {
+                description: "Establish flow across shards",
+                duration: Duration::from_secs(5),
+            },
+            Step::CheckVideoDecodedFromInterval {
+                description: "Bob decodes Alice's high layer before congestion",
+                participant: "bob",
+                publisher: "alice",
+                min_frames: 1,
+                min_resolution: (1280, 720),
             },
             Step::SetBandwidth {
                 description: "Force a switch down to the lowest encoding",
@@ -1087,11 +1103,11 @@ fn cross_shard_simulcast_switching_stays_decodable_test() {
                 duration: Duration::from_secs(10),
             },
             Step::CheckVideoDecodedFromInterval {
-                description: "bob independently decodes the requested source across owner shards",
+                description: "Bob independently decodes fresh 720p from Alice after restoring bandwidth",
                 participant: "bob",
                 publisher: "alice",
                 min_frames: 1,
-                min_resolution: (1, 720),
+                min_resolution: (1280, 720),
             },
             Step::CheckVideoQuality {
                 description: "Bob decodes across every switch",

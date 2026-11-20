@@ -388,6 +388,14 @@ impl TrackLifecycle {
         self.topology.sources_in_room(room_id)
     }
 
+    pub(super) fn source_exact(
+        &self,
+        room: ProjectRoomKey,
+        publication: PublicationKey,
+    ) -> Option<&Track> {
+        self.topology.source(room, publication)
+    }
+
     pub(crate) fn network_source(
         &self,
         room_id: ProjectRoomKey,
@@ -426,28 +434,35 @@ impl TrackLifecycle {
         let kind = crate::control::native::track_kind(address.kind)?;
         let publisher = ParticipantId::new(&address.participant_id).ok()?;
         let track_id = crate::entity::TrackId::new(&address.track_id).ok()?;
-        let current = registry.get_endpoint(EndpointKey {
-            room: source_room,
-            participant: publisher,
-        })?;
-        let mut result = None;
-        for track in self
-            .topology
-            .exact_named_sources(source_room, publisher, kind, track_id)?
-        {
-            if track.meta().connection_id != current.connection_id
-                || self
-                    .source_for_connection(source_room, subscriber, track.id(), registry)
-                    .is_none()
-            {
-                continue;
-            }
-            if result.is_some() {
-                return None;
-            }
-            result = Some(track);
+        let track = self.current_named_source(
+            EndpointKey {
+                room: source_room,
+                participant: publisher,
+            },
+            kind,
+            track_id,
+            registry,
+        )?;
+        self.source_for_connection(source_room, subscriber, track.id(), registry)
+    }
+
+    pub(super) fn current_named_source(
+        &self,
+        endpoint: EndpointKey,
+        kind: crate::entity::TrackKind,
+        track_id: crate::entity::TrackId,
+        registry: &RoomRegistry,
+    ) -> Option<&Track> {
+        let current = registry.get_endpoint(endpoint)?;
+        if !current.materialized {
+            return None;
         }
-        result
+        let mut sources = self
+            .topology
+            .exact_named_sources(endpoint.room, endpoint.participant, kind, track_id)?
+            .filter(|track| track.meta().connection_id == current.connection_id);
+        let source = sources.next()?;
+        sources.next().is_none().then_some(source)
     }
 
     pub(crate) fn source_for_connection(
@@ -532,28 +547,6 @@ impl TrackLifecycle {
         let identities = self
             .topology
             .matching_tracks(room_id, &subscription.selector);
-        self.reconcile_all(identities, registry, now)
-    }
-
-    pub(crate) fn subscribe_defaults(
-        &mut self,
-        room_id: ProjectRoomKey,
-        subscriber: ParticipantId,
-        subscriptions: impl IntoIterator<Item = (TrackSelector, SelectionPolicy)>,
-        registry: &RoomRegistry,
-        now: Instant,
-    ) -> Vec<TrackLifecycleOutcome> {
-        for (selector, selection) in subscriptions {
-            let _ = self
-                .topology
-                .subscribe(room_id, subscriber, selector, selection);
-        }
-
-        let identities = self
-            .topology
-            .identities()
-            .filter(|identity| identity.room_id == room_id)
-            .collect::<Vec<_>>();
         self.reconcile_all(identities, registry, now)
     }
 
@@ -3108,33 +3101,6 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_defaults_reconciles_each_matching_track() {
-        let (mut lifecycle, registry) = setup(1, &[(1, 1, 0), (2, 1, 0)]);
-        let audio = publish_audio(&mut lifecycle, &registry, 1, 1).0;
-        let video = track(TrackKind::Video, 1, 1, "video");
-        let video_identity = TrackAncestry::from_track(&video);
-        let _ = lifecycle.publish(video, &registry, Instant::now()).unwrap();
-
-        let outcomes = lifecycle.subscribe_defaults(
-            room(1),
-            participant(2),
-            [
-                (TrackSelector::audio(), SelectionPolicy::All),
-                (TrackSelector::video(), SelectionPolicy::Allocated),
-            ],
-            &registry,
-            Instant::now(),
-        );
-
-        assert_eq!(outcomes.len(), 2);
-        assert!(lifecycle.candidates[&audio].contains(&endpoint(2, 1).into()));
-        assert!(lifecycle.bindings[&audio].contains(&endpoint(2, 1).into()));
-        assert!(lifecycle.candidates[&video_identity].contains(&endpoint(2, 1).into()));
-        assert!(!lifecycle.bindings[&video_identity].contains(&endpoint(2, 1).into()));
-        assert_internal_invariants(&lifecycle, &registry);
-    }
-
-    #[test]
     fn generation_advances_once_per_reconciled_track() {
         let (mut lifecycle, registry) = setup(1, &[(1, 1, 0), (2, 1, 0)]);
         let _ = publish_audio(&mut lifecycle, &registry, 1, 1);
@@ -3142,17 +3108,18 @@ mod tests {
         let _ = lifecycle.publish(video, &registry, Instant::now()).unwrap();
         let before = lifecycle.generation;
 
-        let outcomes = lifecycle.subscribe_defaults(
+        let outcomes = lifecycle.subscribe(
             room(1),
             participant(2),
-            [(TrackSelector::audio(), SelectionPolicy::All)],
+            TrackSelector::audio(),
+            SelectionPolicy::All,
             &registry,
             Instant::now(),
         );
 
-        assert_eq!(outcomes.len(), 2);
-        assert_eq!(lifecycle.generation, before + 2);
-        assert_eq!(outcomes[0].generation + 1, outcomes[1].generation);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(lifecycle.generation, before + 1);
+        assert_eq!(outcomes[0].generation, before + 1);
     }
 
     #[test]

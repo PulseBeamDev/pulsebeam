@@ -99,7 +99,6 @@ pub enum DisconnectReason {
 }
 
 pub struct ConnectionConfig {
-    pub manual_sub: bool,
     pub scope: entity::ConnectionScope,
     pub participant_id: entity::ParticipantId,
     pub connection_id: entity::ConnectionId,
@@ -155,6 +154,7 @@ struct PendingSdpSender {
     media_index: u32,
     kind: MediaKind,
     track_id: Option<entity::TrackId>,
+    codec: Option<pulsebeam_rtc::CodecInfo>,
 }
 
 /// Shard-owned media execution for one participant connection incarnation.
@@ -238,7 +238,7 @@ impl Connection {
             upstream: UpstreamAllocator::new(ctx),
             sdp_senders: HashMap::new(),
             negotiated: cfg.resources,
-            downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
+            downstream: DownstreamAllocator::new(ctx),
             disconnect_reason: None,
             native_handoff,
             native_terminal: false,
@@ -270,8 +270,7 @@ impl Connection {
             participant.disconnect(DisconnectReason::SignalingOutput);
         }
         for media in participant.negotiated.media_sections().to_vec() {
-            let track_id = whip_media_track_id(cfg.profile, media.kind);
-            participant.install_sdp_media(media, track_id);
+            participant.install_sdp_media(media);
         }
         participant
     }
@@ -411,7 +410,7 @@ impl Connection {
 
     fn add_track_candidate(&mut self, key: TrackHandle, track: Track) {
         let publication_id = track.id();
-        let participant_id = track.meta().origin;
+        debug_assert_ne!(track.meta().connection_id, self.connection_id);
         debug_assert_eq!(publication_id.kind(), track.kind());
         if !self.downstream.register_candidate(key, &track) {
             return;
@@ -420,7 +419,6 @@ impl Connection {
             self.native_source_added(key, &track);
         }
         self.data.add_candidate(key, &track);
-        debug_assert_ne!(participant_id, self.participant_id);
         if track.kind() != TrackKind::Data {
             self.on_track_published(key, track);
         }
@@ -450,7 +448,6 @@ impl Connection {
             return;
         };
         debug_assert_eq!(candidate.publication_id, publication_id);
-        debug_assert_ne!(candidate.participant_id, self.participant_id);
         self.data.remove_candidate(key);
         if self.native_receivers.contains_source(publication_id)
             && publication_id.kind() == TrackKind::Video
@@ -574,7 +571,7 @@ impl Connection {
     }
 
     fn on_track_published(&mut self, key: TrackHandle, track: Track) {
-        if track.meta().origin == self.participant_id {
+        if track.meta().connection_id == self.connection_id {
             debug_assert!(false, "the controller must not install a loopback track");
             return;
         }
@@ -584,7 +581,25 @@ impl Connection {
             origin = %track.meta().origin,
             "participant received published track"
         );
+        let publication = track.id();
         self.downstream.install_track(key, track);
+        if let Some(media) = self
+            .negotiated
+            .media_sections()
+            .iter()
+            .find(|media| media.receive_publication == Some(publication))
+        {
+            match media.kind {
+                MediaKind::Audio => {
+                    self.downstream
+                        .set_audio_intent(crate::participant::intent::AudioIntent {
+                            pinned: vec![publication],
+                            auto: false,
+                        })
+                }
+                MediaKind::Video => self.downstream.video.bind_sdp_slot(media.mid, publication),
+            }
+        }
     }
 
     fn on_tracks_unpublished(&mut self, tracks: &[PublicationKey]) -> bool {
@@ -1350,11 +1365,7 @@ impl Connection {
         }
     }
 
-    fn install_sdp_media(
-        &mut self,
-        media: crate::control::NegotiatedMedia,
-        track_id: Option<entity::TrackId>,
-    ) {
+    fn install_sdp_media(&mut self, media: crate::control::NegotiatedMedia) {
         let Some(resource) = self.negotiated.media(media.mid) else {
             self.disconnect(DisconnectReason::InvalidMediaDirection);
             return;
@@ -1370,7 +1381,8 @@ impl Connection {
                     PendingSdpSender {
                         media_index: resource.media_index,
                         kind: media.kind,
-                        track_id,
+                        track_id: media.publish_name,
+                        codec: media.publish_codec,
                     },
                 );
             }
@@ -1403,10 +1415,22 @@ impl Connection {
                     connection_id: self.connection_id,
                     track_id: sender.track_id,
                 };
+                let format = sender.codec.and_then(crate::control::sdp::codec_format);
                 match sender.kind {
-                    MediaKind::Audio => track::new_audio(mid, meta),
+                    MediaKind::Audio => {
+                        let mut track = track::new_audio(mid, meta);
+                        if let Track::Audio(audio) = &mut track.1 {
+                            audio.format = format;
+                        }
+                        track
+                    }
                     MediaKind::Video => {
-                        track::new_video(mid, meta, self.transport.incoming_layers(mid))
+                        let mut track =
+                            track::new_video(mid, meta, self.transport.incoming_layers(mid));
+                        if let Track::Video(video) = &mut track.1 {
+                            video.format = format;
+                        }
+                        track
                     }
                 }
             })
@@ -1636,17 +1660,6 @@ impl Connection {
     }
 }
 
-pub(crate) fn whip_media_track_id(
-    profile: SignalingProtocol,
-    kind: MediaKind,
-) -> Option<entity::TrackId> {
-    match (profile, kind) {
-        (SignalingProtocol::Whip, MediaKind::Audio) => entity::TrackId::new("audio").ok(),
-        (SignalingProtocol::Whip, MediaKind::Video) => entity::TrackId::new("video").ok(),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod rtc_clock_tests {
     use super::*;
@@ -1665,17 +1678,6 @@ mod rtc_clock_tests {
     }
 
     #[test]
-    fn whip_uses_fixed_track_labels_independent_of_mid() {
-        for (kind, expected) in [(MediaKind::Audio, "audio"), (MediaKind::Video, "video")] {
-            assert_eq!(
-                whip_media_track_id(SignalingProtocol::Whip, kind),
-                Some(entity::TrackId::new(expected).unwrap())
-            );
-            assert!(whip_media_track_id(SignalingProtocol::State, kind).is_none());
-        }
-    }
-
-    #[test]
     fn sdp_resources_bootstrap_with_or_without_optional_control() {
         for profile in [SignalingProtocol::Whip, SignalingProtocol::State] {
             for control in [false, true] {
@@ -1688,13 +1690,15 @@ mod rtc_clock_tests {
                     None,
                     None,
                 );
-                changes.add_media(
-                    str0m::media::MediaKind::Audio,
-                    str0m::media::Direction::RecvOnly,
-                    None,
-                    None,
-                    None,
-                );
+                if profile == SignalingProtocol::State {
+                    changes.add_media(
+                        str0m::media::MediaKind::Audio,
+                        str0m::media::Direction::RecvOnly,
+                        None,
+                        None,
+                        None,
+                    );
+                }
                 changes.add_channel("test".into());
                 let offer = changes.apply().unwrap().0.to_sdp_string();
                 let (mut rtc, _, mut resources) =
@@ -1713,6 +1717,11 @@ mod rtc_clock_tests {
                         }),
                     )
                     .unwrap();
+                if profile == SignalingProtocol::Whip {
+                    resources
+                        .name_whip_tracks(&rtc.session, &Default::default())
+                        .unwrap();
+                }
                 let media = resources.media_sections().to_vec();
                 let (connection_id, _control) = if control {
                     rtc.connection
@@ -1733,12 +1742,12 @@ mod rtc_clock_tests {
                     rtc,
                     resources,
                     crate::control::controller::ParticipantState {
-                        manual_sub: true,
                         room_id: Some(room_id),
                         participant_id: crate::entity::fixture_participant_id(),
                         connection_id,
                         old_connection_id: None,
                         authorization: None,
+                        selection: crate::control::sdp::Selection::Native,
                         profile,
                         rtp_capabilities: None,
                     },
@@ -1772,6 +1781,12 @@ mod rtc_clock_tests {
                             assert!(connection.activate_sdp_sender(section.mid));
                             let admitted = connection.upstream.slot_for_mid(section.mid).unwrap();
                             assert_eq!(admitted.1.kind(), TrackKind::Audio);
+                            let (publication, _) =
+                                connection.upstream.announce_state_mut(section.mid).unwrap();
+                            assert_eq!(
+                                publication.meta().track_id.unwrap().as_str(),
+                                section.mid.as_str()
+                            );
                             assert!(connection.activate_sdp_sender(section.mid));
                             assert_eq!(
                                 connection.upstream.slot_for_mid(section.mid),
@@ -1809,7 +1824,6 @@ mod rtc_clock_tests {
                 invalid.get_mut(20..).unwrap().fill(0);
                 let mut participant = Connection::new(
                     ConnectionConfig {
-                        manual_sub: false,
                         scope: crate::entity::ProjectRoomKey::fixture(
                             entity::RoomId::new("route-proof").unwrap(),
                         )
@@ -1873,7 +1887,6 @@ mod rtc_clock_tests {
         resources.native_handoff = Some(endpoint);
         let mut participant = Connection::new(
             ConnectionConfig {
-                manual_sub: false,
                 scope: crate::entity::ProjectRoomKey::fixture(
                     entity::RoomId::new("native-overflow").unwrap(),
                 )
@@ -1911,7 +1924,6 @@ mod rtc_clock_tests {
         let (connection_id, _controller, _ready) = execution_handoff(&mut resources);
         let mut participant = Connection::new(
             ConnectionConfig {
-                manual_sub: false,
                 scope: crate::entity::ProjectRoomKey::fixture(
                     entity::RoomId::new("grant-proof").unwrap(),
                 )
@@ -2113,7 +2125,6 @@ mod upstream_route_table_tests {
         let connection_id = entity::ConnectionId::new();
         let mut connection = Connection::new(
             ConnectionConfig {
-                manual_sub: false,
                 scope: crate::entity::ProjectRoomKey::fixture(
                     entity::RoomId::new("late-rid").unwrap(),
                 )

@@ -140,7 +140,10 @@ impl ApiError {
             | Self::JoinError(controller::ControllerError::OfferRejected(_))
             | Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "Bad Request"),
             Self::NotFound => (StatusCode::NOT_FOUND, "Not Found"),
-            Self::NotAcceptable => (StatusCode::NOT_ACCEPTABLE, "Not Acceptable"),
+            Self::NotAcceptable
+            | Self::JoinError(controller::ControllerError::SourceIncompatible) => {
+                (StatusCode::NOT_ACCEPTABLE, "Not Acceptable")
+            }
             Self::PreconditionRequired => {
                 (StatusCode::PRECONDITION_REQUIRED, "Precondition Required")
             }
@@ -159,7 +162,10 @@ impl ApiError {
             | Self::OwnershipSuperseded => (StatusCode::CONFLICT, "Conflict"),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
             Self::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"),
-            Self::JoinError(controller::ControllerError::ServiceUnavailable)
+            Self::JoinError(
+                controller::ControllerError::ServiceUnavailable
+                | controller::ControllerError::SourceUnavailable,
+            )
             | Self::ServiceUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
         };
         let etag = match &self {
@@ -590,7 +596,7 @@ fn native_message(
     let rtp_capabilities = crate::control::rtp::capabilities();
     let message = controller::CreateParticipant {
         state: ParticipantState {
-            manual_sub: true,
+            selection: super::sdp::Selection::Native,
             room_id: authorization.room_id,
             participant_id: authorization.participant_id,
             connection_id: ConnectionId::new(),
@@ -750,44 +756,6 @@ async fn delete_native(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn requested_sdp_room(uri: &Uri) -> Result<pulsebeam_core::identity::RoomId, ApiError> {
-    let invalid = || ApiError::BadRequest("one valid room query parameter is required".to_owned());
-    let mut pairs = uri.query().ok_or_else(invalid)?.split('&');
-    let (name, encoded) = pairs
-        .next()
-        .and_then(|pair| pair.split_once('='))
-        .ok_or_else(invalid)?;
-    if name != "room"
-        || pairs.next().is_some()
-        || encoded.len() > pulsebeam_core::identity::MAX_APPLICATION_NAME_BYTES.saturating_mul(3)
-    {
-        return Err(invalid());
-    }
-    let mut decoded = Vec::with_capacity(pulsebeam_core::identity::MAX_APPLICATION_NAME_BYTES);
-    let mut bytes = encoded.bytes();
-    while let Some(byte) = bytes.next() {
-        if decoded.len() == pulsebeam_core::identity::MAX_APPLICATION_NAME_BYTES {
-            return Err(invalid());
-        }
-        decoded.push(match byte {
-            b'+' => b' ',
-            b'%' => {
-                let hex = |byte| {
-                    char::from(byte)
-                        .to_digit(16)
-                        .and_then(|value| u8::try_from(value).ok())
-                };
-                let high = bytes.next().and_then(hex).ok_or_else(invalid)?;
-                let low = bytes.next().and_then(hex).ok_or_else(invalid)?;
-                (high << 4) | low
-            }
-            byte => byte,
-        });
-    }
-    let room = std::str::from_utf8(&decoded).map_err(|_| invalid())?;
-    pulsebeam_core::identity::RoomId::new(room).map_err(|_| invalid())
-}
-
 async fn create_sdp_profile(
     state: AppState,
     request: Request,
@@ -802,9 +770,26 @@ async fn create_sdp_profile(
         .unwrap_or_default()
         .as_secs();
     let principal = authenticate_bearer(&headers, &state.key_registry, unix_now)?;
-    let room = requested_sdp_room(request.uri())?;
+    let invalid_selector = |_| ApiError::BadRequest("invalid SDP session selector".to_owned());
+    let (room, selection) = match profile {
+        SignalingProtocol::Whip => {
+            let (room, names) =
+                super::sdp::whip_query(request.uri().query()).map_err(invalid_selector)?;
+            (Some(room), super::sdp::Selection::Whip(names))
+        }
+        SignalingProtocol::Whep => {
+            let sources =
+                super::sdp::whep_query(request.uri().query()).map_err(invalid_selector)?;
+            (None, super::sdp::Selection::Whep(sources))
+        }
+        SignalingProtocol::State => {
+            return Err(ApiError::BadRequest(
+                "invalid SDP session profile".to_owned(),
+            ));
+        }
+    };
     let authorization = principal
-        .authorize_room(room)
+        .authorize_presence(room)
         .map_err(|_| controller::ControllerError::AuthorizationRejected)?;
     ensure_sdp_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SIGNALING_BODY_BYTES)
@@ -814,6 +799,8 @@ async fn create_sdp_profile(
         .map_err(|_| ApiError::BadRequest("SDP body must be UTF-8".to_owned()))?;
     validate_strict_directions(raw_offer, required_direction)?;
     validate_single_media_per_kind(raw_offer)?;
+    super::sdp::validate_mids(raw_offer)
+        .map_err(|_| ApiError::BadRequest("invalid SDP media IDs".to_owned()))?;
     let offer = raw_offer.to_owned();
     let lease = controller::AuthorizationLease::from_verified(
         authorization.clone(),
@@ -828,8 +815,8 @@ async fn create_sdp_profile(
             (
                 controller::CreateParticipant {
                     state: ParticipantState {
-                        manual_sub: false,
-                        room_id: Some(room),
+                        room_id: room,
+                        selection,
                         participant_id: authorization.participant_id,
                         connection_id,
                         old_connection_id: None,
@@ -867,7 +854,10 @@ async fn create_sdp_profile(
 #[utoipa::path(
     post,
     path = "/whip",
-    params(("room" = String, Query, description = "Explicit concrete room external ID")),
+    params(
+        ("room" = String, Query, description = "Publishing room"),
+        ("track" = Option<Vec<String>>, Query, description = "Optional kind.TrackId overrides")
+    ),
     request_body(content = String, description = "Send-only WebRTC SDP offer", content_type = "application/sdp"),
     responses(
         (status = 201, description = "WHIP connection created", body = String, content_type = "application/sdp",
@@ -893,7 +883,7 @@ async fn create_whip(
 #[utoipa::path(
     post,
     path = "/whep",
-    params(("room" = String, Query, description = "Explicit concrete room external ID")),
+    params(("track" = Vec<String>, Query, description = "Exact room.participant.kind.TrackId selectors")),
     request_body(content = String, description = "Receive-only WebRTC SDP offer", content_type = "application/sdp"),
     responses(
         (status = 201, description = "WHEP connection created", body = String, content_type = "application/sdp",
@@ -1457,7 +1447,11 @@ mod tests {
     fn sdp_post(token: &str, profile: &str, body: Vec<u8>) -> Request {
         Request::builder()
             .method("POST")
-            .uri(format!("/api/v1/{profile}?room=general"))
+            .uri(if profile == "whep" {
+                "/api/v1/whep?track=general.alice.audio.mic"
+            } else {
+                "/api/v1/whip?room=general"
+            })
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(CONTENT_TYPE, "application/sdp")
             .header("x-forwarded-proto", "https")
@@ -1500,8 +1494,6 @@ mod tests {
         let offer = valid_offer();
         let (message, capabilities) =
             native_message(&authorization, offer.clone(), SystemTime::now()).unwrap();
-        assert!(message.state.manual_sub);
-        assert_eq!(message.state.profile, SignalingProtocol::State);
         assert!(message.state.authorization.is_some());
         assert_eq!(message.state.rtp_capabilities, Some(capabilities.clone()));
         assert_eq!(message.offer, offer);
@@ -1551,7 +1543,7 @@ mod tests {
         let (controller, mut commands) =
             pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
         let app = router(controller, cfg(), auth_registry());
-        let offer = "not SDP\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
+        let offer = "not SDP\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:a0\r\na=sendonly\r\n";
         let body = offer.as_bytes().to_vec();
         let responder = pulsebeam_runtime::task::spawn(async move {
             let controller::ControllerCommand::CreateParticipant(message, reply) =
@@ -1597,10 +1589,16 @@ mod tests {
     #[test]
     fn sdp_room_query_accepts_case_preserving_names_and_decodes_once() {
         let uri: Uri = "/whip?room=%53tage_9-A".parse().unwrap();
-        assert_eq!(requested_sdp_room(&uri).unwrap().as_str(), "Stage_9-A");
+        assert_eq!(
+            super::super::sdp::whip_query(uri.query())
+                .unwrap()
+                .0
+                .as_str(),
+            "Stage_9-A"
+        );
         for invalid in ["stage.main", "stage%2Fmain", "stage%252Fmain", "caf%C3%A9"] {
             let uri: Uri = format!("/whip?room={invalid}").parse().unwrap();
-            assert!(requested_sdp_room(&uri).is_err());
+            assert!(super::super::sdp::whip_query(uri.query()).is_err());
         }
     }
 
@@ -1968,9 +1966,12 @@ mod tests {
                     panic!("expected create command")
                 };
                 assert_eq!(message.state.profile, profile);
-                assert_eq!(message.state.room_id.unwrap().as_str(), ROOM);
+                if profile == SignalingProtocol::Whep {
+                    assert!(message.state.room_id.is_none());
+                } else {
+                    assert_eq!(message.state.room_id.unwrap().as_str(), ROOM);
+                }
                 assert_eq!(message.state.participant_id.as_str(), PARTICIPANT);
-                assert!(!message.state.manual_sub);
                 let authorization = authenticate_bearer(
                     &authorization_headers(&captured_token),
                     &auth_registry(),
@@ -1992,18 +1993,28 @@ mod tests {
                     creation::CreationResponse::sdp(&location, &oversized).validate(),
                     Err(creation::Error::TooLarge)
                 ));
-                let images = cache_creation(
-                    creation::CreationResponse::sdp(&location, &answer),
-                    &authorization,
-                    profile,
-                    &message.offer,
-                    &captured_token,
-                );
+                let images = (profile == SignalingProtocol::Whip).then(|| {
+                    cache_creation(
+                        creation::CreationResponse::sdp(&location, &answer),
+                        &authorization,
+                        profile,
+                        &message.offer,
+                        &captured_token,
+                    )
+                });
                 reply.send(Ok(CreateParticipantReply { answer })).unwrap();
                 images
             });
             let mut request = sdp_post(&token, resource, offer.into_bytes());
-            *request.uri_mut() = format!("/api/v1/{resource}?room={ROOM}").parse().unwrap();
+            *request.uri_mut() = match profile {
+                SignalingProtocol::Whip => format!("/api/v1/whip?room={ROOM}&track=audio.mic"),
+                SignalingProtocol::Whep => {
+                    format!("/api/v1/whep?track={ROOM}.{PARTICIPANT}.audio.mic")
+                }
+                SignalingProtocol::State => unreachable!(),
+            }
+            .parse()
+            .unwrap();
             let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
             let mut response = std::pin::pin!(app.oneshot(request));
             let response = std::future::poll_fn(|cx| {
@@ -2031,7 +2042,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(body.starts_with(b"v=0"));
-            for image in responder.await.unwrap() {
+            for image in responder.await.unwrap().into_iter().flatten() {
                 assert_creation_replay(image, &location, "application/sdp", &body).await;
             }
         }

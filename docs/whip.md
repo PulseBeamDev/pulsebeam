@@ -35,9 +35,16 @@ For a browser publisher, open the page over HTTPS or localhost, then start
 capture from a user gesture. Give the client the endpoint and participant token,
 and allow camera/microphone access.
 
-Set `room` to the percent-encoded application room name. For example, `studio A`
-becomes `?room=studio%20A`. The participant token must grant Join and Publish
-for the room; it does not select the room.
+Set `room` to an application room name such as `studio-a`. Room, participant,
+and track names use 1 to 36 ASCII letters, digits, underscores, or hyphens.
+Names are case-sensitive. The participant token supplies the publisher's
+identity and must grant Join and Publish for the room.
+
+If receivers need stable track names, set them in the endpoint URL. For
+example, use `/api/v1/whip?room=demo&track=video.camera&track=audio.mic` for a
+camera and microphone. You can set one `track=kind.name` per sending media
+kind. Without an override, the publication uses that media section's sender
+MID as its name, so a change in MID changes the name.
 
 The publishing flow is:
 
@@ -49,14 +56,26 @@ The publishing flow is:
 
 ## Confirm media reaches a receiver
 
-A local preview only confirms capture. To check delivery, join **the same server
-and room** with a different participant token in a receiving application. The
-[React quickstart](/react/quickstart#4-try-it) provides one:
-use your existing endpoint and a token for another participant rather than
-creating a second sandbox.
+A local preview only confirms capture. To check delivery in an application,
+use the [React SDK](/react/quickstart) to explicitly subscribe to the publisher's
+tracks. Joining the room does not start playback.
 
 Confirm that the receiver shows moving publisher video and plays microphone
 audio. Browser autoplay policy may require a receiver-side user gesture.
+
+### Receive an exact source with WHEP
+
+With a WHEP client, supply one `track=room.participant.kind.name` selector per
+active receiving media kind. For example, to receive only video from the
+`camera` publication that `alice` publishes in `demo`, POST a video-only
+receive offer to `/api/v1/whep?track=demo.alice.video.camera`. For audio and
+video, repeat the `track` parameter with a selector for each kind.
+
+The receiver token must grant Subscribe to each requested source. It does not
+need Join or Discover. WHEP does not join a room or select other publications
+if a source is unavailable. If the publisher stops and republishes, create a
+new WHEP session. Use the opaque `Location` from the response to tear down the
+session.
 
 ## Stop publishing
 

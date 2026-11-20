@@ -1141,7 +1141,6 @@ mod wrong_owner_tests {
                     ShardCommand::MaterializeParticipant {
                         transport: address,
                         config: Box::new(ConnectionConfig {
-                            manual_sub: false,
                             scope: crate::entity::ProjectRoomKey::fixture(room_id).into(),
                             participant_id,
                             connection_id,
@@ -1258,7 +1257,6 @@ mod wrong_owner_tests {
                         connection_id,
                     ));
                 ConnectionConfig {
-                    manual_sub: false,
                     scope: crate::entity::ProjectRoomKey::fixture(
                         crate::entity::RoomId::new(ROOM).unwrap(),
                     )

@@ -164,7 +164,6 @@ pub(in crate::participant::core) fn participant_with_capabilities(
         &DataTrackIntent::native_signaling_config(),
     ));
     let mut config = ConnectionConfig {
-        manual_sub: true,
         scope: crate::entity::ProjectRoomKey::fixture(entity::RoomId::new("native-data").unwrap())
             .into(),
         participant_id: crate::entity::fixture_participant_id(),

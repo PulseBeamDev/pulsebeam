@@ -93,12 +93,12 @@ fn current_room_join_is_checked_before_preparation_and_commit() {
         assert!(matches!(
             actor.begin_create_participant(
                 ParticipantState {
-                    manual_sub: true,
                     room_id: Some(room),
                     participant_id: participant,
                     connection_id: connection_id(2),
                     old_connection_id: None,
                     authorization: Some(lease.clone()),
+                    selection: crate::control::sdp::Selection::Native,
                     profile: SignalingProtocol::State,
                     rtp_capabilities: None,
                 },
@@ -131,7 +131,11 @@ fn current_room_join_is_checked_before_preparation_and_commit() {
     }
 }
 
-fn publishing_offer() -> String {
+pub(super) fn publishing_offer() -> String {
+    sdp_offer(str0m::media::Direction::SendOnly)
+}
+
+fn sdp_offer(direction: str0m::media::Direction) -> String {
     let mut rtc = str0m::RtcConfig::new().build(std::time::Instant::now());
     rtc.add_local_candidate(
         str0m::Candidate::builder()
@@ -141,20 +145,8 @@ fn publishing_offer() -> String {
             .unwrap(),
     );
     let mut change = rtc.sdp_api();
-    change.add_media(
-        str0m::media::MediaKind::Audio,
-        str0m::media::Direction::SendOnly,
-        None,
-        None,
-        None,
-    );
-    change.add_media(
-        str0m::media::MediaKind::Video,
-        str0m::media::Direction::SendOnly,
-        None,
-        None,
-        None,
-    );
+    change.add_media(str0m::media::MediaKind::Audio, direction, None, None, None);
+    change.add_media(str0m::media::MediaKind::Video, direction, None, None, None);
     change.apply().unwrap().0.to_sdp_string()
 }
 
@@ -178,8 +170,11 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
     );
     let refreshed = lease.refresh_at(wall, now).unwrap();
     assert_eq!(refreshed.permissions(), lease.permissions());
+    let (_, names) =
+        crate::control::sdp::whip_query(Some("room=sdp-scope&track=video.camera&track=audio.mic"))
+            .unwrap();
     let state = |lease| ParticipantState {
-        manual_sub: false,
+        selection: crate::control::sdp::Selection::Whip(names.clone()),
         room_id: Some(room),
         participant_id: participant,
         connection_id: connection_id(1),
@@ -216,8 +211,8 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
         joined_room: Some(RoomId::new("sdp-scope").unwrap()),
         grants: GrantSet::new(
             [
-                (GrantKind::Audio, "audio"),
-                (GrantKind::Video, "video"),
+                (GrantKind::Audio, "mic"),
+                (GrantKind::Video, "camera"),
                 (GrantKind::Data, "v2/latest/chat"),
             ]
             .into_iter()
@@ -281,10 +276,11 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
     );
     for media in config.resources.media_sections() {
         assert!(matches!(
-            crate::participant::whip_media_track_id(SignalingProtocol::Whip, media.kind)
+            media
+                .publish_name
                 .as_ref()
                 .map(crate::entity::TrackId::as_str),
-            Some("audio" | "video")
+            Some("mic" | "camera")
         ));
     }
     actor.core.registry.release_partition(
@@ -293,6 +289,189 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
         connection_id(1),
     );
     actor.core.release_transport(pending.transport, now);
+}
+
+#[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
+async fn whep_authorizes_the_complete_roomless_selection_and_routes_only_exact_publications() {
+    use crate::control::sdp::{self, Selection};
+    let mut actor = actor();
+    let shard = ShardId::new(0);
+    let (writer, mut updates) = new_shard_update(shard);
+    actor.updates[0] = writer;
+    actor.negotiator = Negotiator::new(vec![pulsebeam_rtc::LocalCandidate::Udp(
+        "127.0.0.1:6000".parse().unwrap(),
+    )]);
+    let audio_room = RoomId::new("studio").unwrap();
+    let video_room = RoomId::new("stage").unwrap();
+    let audio_owner = ParticipantId::new("audio-owner").unwrap();
+    let video_owner = ParticipantId::new("video-owner").unwrap();
+    let listener = ParticipantId::new("listener").unwrap();
+    let listener_connection = connection_id(3);
+    let now = pulsebeam_runtime::time::Instant::now();
+    let wall = SystemTime::now();
+    let offer = sdp_offer(str0m::media::Direction::RecvOnly);
+    let codec_probe = actor.core.reserve_transport(shard, now);
+    let (rtc, _, _) = actor
+        .negotiator
+        .create_answer(
+            offer.clone(),
+            IceUfrag::new(0, 0, codec_probe.route, codec_probe.epoch).into_ice_creds(),
+            pulsebeam_runtime::net::ReceiveTime::now(),
+            None,
+        )
+        .unwrap();
+    actor.core.release_transport(codec_probe, now);
+
+    let mut publications = Vec::new();
+    for (index, room, owner, kind, labels) in [
+        (
+            1,
+            audio_room,
+            audio_owner,
+            TrackKind::Audio,
+            ["ambience", "mic"],
+        ),
+        (
+            2,
+            video_room,
+            video_owner,
+            TrackKind::Video,
+            ["backdrop", "camera"],
+        ),
+    ] {
+        let address = actor.core.reserve_transport(shard, now);
+        let connection = connection_id(index);
+        let expiry = wall.duration_since(UNIX_EPOCH).unwrap().as_secs() + 60;
+        let publisher = authorization_lease(expiry, wall, now, room.as_str(), room, owner);
+        actor
+            .commit_reserved_candidate(
+                owner,
+                room,
+                shard,
+                0,
+                address,
+                connection,
+                Some(publisher),
+                SignalingProtocol::State,
+                wall,
+            )
+            .unwrap();
+        actor.core.registry.mark_materialized(&owner);
+        let media_kind = if kind == TrackKind::Audio {
+            pulsebeam_rtc::MediaKind::Audio
+        } else {
+            pulsebeam_rtc::MediaKind::Video
+        };
+        let format = sdp::codec_format(
+            rtc.session
+                .senders
+                .iter()
+                .find(|sender| sender.kind == media_kind)
+                .unwrap()
+                .codec,
+        )
+        .unwrap();
+        for label in labels {
+            let mut track = source(room, owner, connection, kind, label);
+            match &mut track {
+                Track::Audio(audio) => audio.format = Some(format.clone()),
+                Track::Video(video) => video.format = Some(format.clone()),
+                Track::Data(_) => unreachable!(),
+            }
+            publications.push(track.id());
+            actor.handle_shard_event((shard, ShardEvent::TrackPublished(track)));
+        }
+    }
+    while updates.try_recv().is_ok() {}
+
+    let grant = |room: RoomId, publisher: ParticipantId, kind, label: &str| {
+        Grant::new(
+            vec![room.as_str().to_owned()],
+            vec![Action::Subscribe],
+            Some(publisher.as_str().to_owned()),
+            Some(kind),
+            Some(label.to_owned()),
+        )
+        .unwrap()
+    };
+    let state = |selector: &str| {
+        let authorization = VerifiedAuthorization {
+            token_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            grants: GrantSet::new(vec![
+                grant(audio_room, audio_owner, GrantKind::Audio, "mic"),
+                grant(video_room, video_owner, GrantKind::Video, "camera"),
+            ])
+            .unwrap(),
+            project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+            room_id: None,
+            participant_id: listener,
+            expiry: AuthorizationExpiry::from_unix_seconds(
+                wall.duration_since(UNIX_EPOCH).unwrap().as_secs() + 60,
+            ),
+        };
+        ParticipantState {
+            room_id: None,
+            participant_id: listener,
+            connection_id: listener_connection,
+            old_connection_id: None,
+            authorization: Some(
+                AuthorizationLease::from_verified(authorization, wall, now).unwrap(),
+            ),
+            selection: Selection::Whep(sdp::whep_query(Some(selector)).unwrap()),
+            profile: SignalingProtocol::Whep,
+            rtp_capabilities: None,
+        }
+    };
+    let selection = "track=studio.audio-owner.audio.mic&track=stage.video-owner.video.camera";
+    assert!(matches!(
+        actor.begin_create_participant(
+            state("track=studio.audio-owner.audio.mic&track=stage.video-owner.video.secret"),
+            offer.clone(),
+        ),
+        Err(ControllerError::AuthorizationRejected)
+    ));
+    assert!(
+        actor
+            .core
+            .registry
+            .get_connection(listener_connection)
+            .is_none()
+    );
+    let pending = actor
+        .begin_create_participant(state(selection), offer)
+        .unwrap();
+    assert!(pending.scope.room.is_none());
+    let Some(ShardCommand::MaterializeParticipant { config, .. }) = pending.command.as_ref() else {
+        panic!("authorized WHEP materialization")
+    };
+    for (media, expected) in config
+        .resources
+        .media_sections()
+        .iter()
+        .zip([publications[1], publications[3]])
+    {
+        assert_eq!(media.receive_publication, Some(expected));
+    }
+    actor.commit_materialization(pending, wall).unwrap();
+    let mut forwarded = Vec::new();
+    while let Ok(update) = updates.try_recv() {
+        forwarded.extend(update.plans.iter().filter_map(|entry| {
+            entry
+                .plan
+                .as_ref()?
+                .local
+                .contains(&listener_connection)
+                .then_some(entry.publication_id)
+        }));
+    }
+    assert_eq!(forwarded, [publications[1], publications[3]]);
+    let (_, receiver) = actor
+        .core
+        .registry
+        .get_connection(listener_connection)
+        .unwrap();
+    assert!(receiver.scope.room.is_none());
+    assert_eq!(receiver.profile, SignalingProtocol::Whep);
 }
 
 pub(super) fn source(
@@ -376,21 +555,24 @@ async fn default_subscriptions_filter_candidates_and_routes_without_destroying_b
             .unwrap();
         actor.core.registry.mark_materialized(&participant);
     }
-    assert!(
-        actor
-            .lifecycle
-            .subscribe_defaults(
-                ProjectRoomKey::fixture(room),
-                subscriber,
-                [
-                    (TrackSelector::audio(), SelectionPolicy::All),
-                    (TrackSelector::video(), SelectionPolicy::Allocated)
-                ],
-                &actor.core.registry,
-                now
-            )
-            .is_empty()
-    );
+    for (selector, selection) in [
+        (TrackSelector::audio(), SelectionPolicy::All),
+        (TrackSelector::video(), SelectionPolicy::Allocated),
+    ] {
+        assert!(
+            actor
+                .lifecycle
+                .subscribe(
+                    ProjectRoomKey::fixture(room),
+                    subscriber,
+                    selector,
+                    selection,
+                    &actor.core.registry,
+                    now
+                )
+                .is_empty()
+        );
+    }
     let connection = connection_id(1);
     let sources = [
         source(room, publisher, connection, TrackKind::Audio, "mic"),

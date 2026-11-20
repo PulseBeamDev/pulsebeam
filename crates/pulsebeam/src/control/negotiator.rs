@@ -66,6 +66,9 @@ pub struct NegotiatedMedia {
     pub mid: Mid,
     pub kind: MediaKind,
     pub direction: Direction,
+    pub(crate) publish_name: Option<crate::entity::TrackId>,
+    pub(crate) publish_codec: Option<pulsebeam_rtc::CodecInfo>,
+    pub(crate) receive_publication: Option<crate::entity::PublicationKey>,
 }
 
 #[derive(Debug)]
@@ -95,6 +98,71 @@ impl NegotiatedResources {
         &self.media
     }
 
+    pub(crate) fn name_whip_tracks(
+        &mut self,
+        session: &SessionInfo,
+        overrides: &super::sdp::MediaTracks<crate::entity::TrackId>,
+    ) -> Result<(), NegotiatorError> {
+        if self.media.is_empty()
+            || overrides
+                .iter()
+                .any(|(kind, _)| !self.media.iter().any(|media| media.kind == kind))
+        {
+            return Err(NegotiatorError::InvalidResources);
+        }
+        for media in &mut self.media {
+            if media.direction != Direction::RecvOnly {
+                return Err(NegotiatorError::InvalidResources);
+            }
+            let section = session
+                .offered_media
+                .iter()
+                .find(|section| section.media_index == media.media_index)
+                .ok_or(NegotiatorError::InvalidResources)?;
+            let codecs = &session
+                .inbound_for_sender_index(media.media_index)
+                .ok_or(NegotiatorError::InvalidResources)?
+                .codecs;
+            media.publish_codec = codecs.first().copied().filter(|codec| {
+                super::sdp::codec_format(*codec).is_some_and(|format| {
+                    codecs
+                        .iter()
+                        .all(|codec| super::sdp::codec_compatible(&format, *codec))
+                })
+            });
+            media.publish_name = Some(match overrides.get(media.kind) {
+                Some(name) => *name,
+                None => crate::entity::TrackId::new(&section.mid)
+                    .map_err(|_| NegotiatorError::InvalidResources)?,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn bind_whep(
+        &mut self,
+        bindings: &super::sdp::MediaTracks<(
+            crate::entity::ProjectRoomKey,
+            crate::entity::PublicationKey,
+        )>,
+    ) -> Result<(), NegotiatorError> {
+        if self.media.is_empty() || bindings.iter().count() != self.media.len() {
+            return Err(NegotiatorError::InvalidResources);
+        }
+        for media in &mut self.media {
+            if media.direction != Direction::SendOnly {
+                return Err(NegotiatorError::InvalidResources);
+            }
+            media.receive_publication = Some(
+                bindings
+                    .get(media.kind)
+                    .ok_or(NegotiatorError::InvalidResources)?
+                    .1,
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn publications_allowed(
         &self,
         profile: super::controller::SignalingProtocol,
@@ -116,7 +184,7 @@ impl NegotiatedResources {
                     MediaKind::Audio => TrackKind::Audio,
                     MediaKind::Video => TrackKind::Video,
                 };
-                crate::participant::whip_media_track_id(profile, media.kind).is_some_and(|id| {
+                media.publish_name.is_some_and(|id| {
                     permissions.allows(Action::Publish, None, Some(kind), Some(id.as_str()))
                 })
             }),
@@ -231,6 +299,9 @@ impl Negotiator {
                 mid,
                 kind,
                 direction,
+                publish_name: None,
+                publish_codec: None,
+                receive_publication: None,
             });
         }
         Ok(NegotiatedResources {
@@ -435,7 +506,7 @@ mod tests {
             (Direction::RecvOnly, "a=sendonly"),
         ] {
             let mut negotiator = negotiator();
-            let (_, answer, resources) = negotiator
+            let (rtc, answer, mut resources) = negotiator
                 .create_answer(
                     chrome_like_offer(offer_direction),
                     test_credentials(),
@@ -444,6 +515,11 @@ mod tests {
                 )
                 .unwrap();
             assert!(answer.contains(answer_direction));
+            if offer_direction == Direction::SendOnly {
+                resources
+                    .name_whip_tracks(&rtc.session, &Default::default())
+                    .unwrap();
+            }
             for profile in [
                 super::super::controller::SignalingProtocol::Whip,
                 super::super::controller::SignalingProtocol::Whep,

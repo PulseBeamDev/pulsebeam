@@ -117,8 +117,6 @@ impl ControllerCore {
         scope: crate::entity::ConnectionScope,
     ) -> ConnectionConfig {
         ConnectionConfig {
-            manual_sub: state.manual_sub
-                || state.profile == super::controller::SignalingProtocol::State,
             scope,
             participant_id: state.participant_id,
             connection_id: state.connection_id,

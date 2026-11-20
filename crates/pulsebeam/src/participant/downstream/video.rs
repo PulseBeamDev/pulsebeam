@@ -12,7 +12,6 @@ use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::frame_selector::DecodeTargetSelection;
 use crate::rtp::switcher::{LayerStates, Switcher};
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use indexmap::IndexSet;
 use pulsebeam_runtime::time::Instant;
 use slotmap::{SecondaryMap, SlotMap};
 use std::cmp::Ordering;
@@ -21,7 +20,7 @@ use std::time::Duration;
 
 use crate::entity::PublicationKey;
 use crate::keys::{DownstreamSlotKey, TrackHandle};
-use crate::log::{LogCtx, plog_debug, plog_error, plog_info, plog_trace, plog_warn};
+use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
 use crate::participant::intent::VideoIntent as Intent;
 use crate::track::{LayerQuality, StreamId, StreamWriter, Track, TrackLayer, TrackMeta};
 
@@ -75,7 +74,6 @@ pub struct VideoAllocator {
 
     // Cold
     ctx: LogCtx,
-    manual_sub: bool,
     tracks: SecondaryMap<TrackHandle, Track>,
     track_handles: HashMap<PublicationKey, TrackHandle>,
     active_track_handles: HashMap<PublicationKey, TrackHandle>,
@@ -98,9 +96,9 @@ pub struct DownstreamVideo {
 }
 
 impl DownstreamVideo {
-    pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
+    pub(crate) fn new(ctx: LogCtx) -> Self {
         Self {
-            allocator: VideoAllocator::new(ctx, manual_sub),
+            allocator: VideoAllocator::new(ctx),
         }
     }
 }
@@ -125,7 +123,7 @@ impl VideoAllocator {
         self.simulator_subscriber = Some(participant);
     }
 
-    pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
+    pub(crate) fn new(ctx: LogCtx) -> Self {
         let desired_ctrl = BitrateControllerConfig {
             min_bitrate: START_BANDWIDTH,
             max_bitrate: MAX_BANDWIDTH,
@@ -135,7 +133,6 @@ impl VideoAllocator {
         .build();
         Self {
             ctx,
-            manual_sub,
             tracks: SecondaryMap::new(),
             track_handles: HashMap::new(),
             active_track_handles: HashMap::new(),
@@ -169,7 +166,6 @@ impl VideoAllocator {
         plog_info!(self.ctx, publication_id = %track.meta().id, "video track added");
         let previous = self.tracks.insert(key, track);
         debug_assert!(previous.is_none(), "a TrackHandle must be installed once");
-        self.rebalance();
     }
 
     pub(crate) fn activate_track_binding(
@@ -220,7 +216,6 @@ impl VideoAllocator {
                 slot.stop();
             }
         }
-        self.rebalance();
         true
     }
 
@@ -232,6 +227,28 @@ impl VideoAllocator {
 
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    pub(crate) fn bind_sdp_slot(&mut self, mid: Mid, publication_id: PublicationKey) {
+        let Some(slot) = self
+            .slots
+            .values_mut()
+            .find(|slot| slot.mid == mid && slot.media_index.is_some())
+        else {
+            return;
+        };
+        Self::configure_slot(
+            &self.tracks,
+            &self.track_handles,
+            slot,
+            Some(&Intent {
+                publication_id,
+                target_height: u32::MAX,
+                min_height: 0,
+                min_fps: 0,
+                priority: 0,
+            }),
+        );
     }
 
     pub fn configure(&mut self, intents: &HashMap<Mid, Intent>) {
@@ -382,77 +399,10 @@ impl VideoAllocator {
         let slot = Slot::new(self.ctx, config);
         self.slots.insert(slot);
         self.negotiated_slots = self.negotiated_slots.saturating_add(1);
-        self.rebalance();
     }
 
     pub(crate) fn has_negotiated_slots(&self) -> bool {
         self.negotiated_slots > 0
-    }
-
-    fn rebalance(&mut self) {
-        if self.manual_sub {
-            return;
-        }
-
-        let already_assigned: IndexSet<PublicationKey> = self
-            .slots
-            .values()
-            .filter_map(|s| s.desired.as_ref().map(|t| t.meta.id))
-            .collect();
-
-        let mut pending_tracks = self
-            .tracks
-            .values()
-            .filter(|track| !already_assigned.contains(&track.meta().id));
-
-        let idle_slot_count = self
-            .slots
-            .values()
-            .filter(|s| s.media_index.is_some() && s.state() == SlotState::Idle)
-            .count();
-        let pending_count = self.tracks.len().saturating_sub(already_assigned.len());
-        if pending_count > 0 && idle_slot_count == 0 {
-            plog_debug!(
-                self.ctx,
-                pending_tracks = pending_count,
-                total_slots = self.slots.len(),
-                "rebalance: pending tracks but no idle slots, tracks will wait"
-            );
-        }
-
-        let mut staged = 0usize;
-        for slot in self
-            .slots
-            .values_mut()
-            .filter(|s| s.media_index.is_some() && s.state() == SlotState::Idle)
-        {
-            if let Some(track_state) = pending_tracks.next() {
-                let states = track_states(track_state);
-                let Some(layer) = track_state.lowest_healthy_quality(|l| {
-                    states
-                        .get(&l.stream_id())
-                        .is_some_and(crate::rtp::monitor::StreamStats::is_healthy)
-                }) else {
-                    continue;
-                };
-                slot.switch_to(layer, true);
-                staged = staged.saturating_add(1);
-            } else {
-                break;
-            }
-        }
-        if staged > 0 {
-            plog_debug!(
-                self.ctx,
-                staged,
-                "rebalance: staged tracks into idle slots, awaiting BWE to activate"
-            );
-        }
-
-        debug_assert!(
-            self.no_duplicate_slot_assignments(),
-            "rebalance produced duplicate track assignments: each track must map to at most one slot"
-        );
     }
 
     /// Runs one allocation pass.
@@ -803,6 +753,7 @@ impl VideoAllocator {
     /// assigned target.  A track must never be assigned to two slots
     /// simultaneously, because that would cause duplicate stream forwarding
     /// and corrupt the routing table.
+    #[cfg(test)]
     fn no_duplicate_slot_assignments(&self) -> bool {
         let mut seen = HashSet::new();
         for (slot_key, slot) in &self.slots {
@@ -823,7 +774,7 @@ impl VideoAllocator {
                     }
                 }
                 if first_slot.is_some() {
-                    plog_error!(
+                    crate::log::plog_error!(
                         self.ctx,
                         publication_id = %layer.meta.id,
                         first_slot = ?first_slot,
@@ -2231,13 +2182,12 @@ mod assignment_tests {
     use crate::entity::{ConnectionId, ParticipantId, PublicationKey, TrackKind};
     use crate::participant::event::test_utils::MockParticipantSink;
     use crate::rtp::RtpPacket;
-    use crate::track::{LayerQuality, UpstreamTrack};
+    use crate::track::LayerQuality;
 
     use crate::bitrate::Bitrate;
     use crate::media::{Mid, SimulcastLayer};
 
     struct TestTracks {
-        pub senders: Vec<UpstreamTrack>,
         pub ids: Vec<PublicationKey>,
     }
 
@@ -2248,13 +2198,12 @@ mod assignment_tests {
     }
 
     fn setup_allocator() -> VideoAllocator {
-        VideoAllocator::new(test_ctx(), false)
+        VideoAllocator::new(test_ctx())
     }
 
     fn add_tracks(allocator: &mut VideoAllocator, count: usize) -> TestTracks {
         let pid = crate::entity::fixture_participant_id();
 
-        let mut senders = Vec::new();
         let mut ids = Vec::new();
 
         for i in 0..count {
@@ -2265,10 +2214,9 @@ mod assignment_tests {
             ids.push(meta.id);
             allocator.seed_layer_states(&states);
             allocator.add_track(Track::video(meta, track.layers().to_vec(), None));
-            senders.push(tx);
         }
 
-        TestTracks { senders, ids }
+        TestTracks { ids }
     }
 
     fn add_slots(allocator: &mut VideoAllocator, count: usize) {
@@ -2716,6 +2664,7 @@ mod assignment_tests {
                 priority: 0,
             },
         );
+        allocator.bind_sdp_slot(Mid::from("s0"), publication_id);
         allocator.configure(&intents);
         // Keep the old route useful while allocation selects the funded minimum.
         let slot = allocator.slots.values().next().unwrap();
@@ -2750,11 +2699,22 @@ mod assignment_tests {
     }
 
     #[test]
-    fn rebalance_assigns_tracks_to_slots() {
+    fn available_tracks_do_not_bind_without_a_subscription() {
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 3);
-        assert_eq!(allocator.assigned_slot_count(), 3);
+        let tracks = add_tracks(&mut allocator, 4);
+        add_slots(&mut allocator, 2);
+        assert_eq!(allocator.assigned_slot_count(), 0);
+        allocator.bind_sdp_slot(Mid::from("s1"), tracks.ids[2]);
+        assert_eq!(allocator.assigned_slot_count(), 1);
+        assert_eq!(
+            allocator
+                .slots
+                .values()
+                .find(|slot| slot.mid == Mid::from("s1"))
+                .unwrap()
+                .assignment,
+            Some(tracks.ids[2])
+        );
     }
 
     #[test]
@@ -2850,10 +2810,9 @@ mod assignment_tests {
     #[test]
     fn configure_missing_requested_track_stops_slot() {
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 1);
+        let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
-
-        allocator.rebalance();
+        allocator.bind_sdp_slot(Mid::from("s0"), tracks.ids[0]);
 
         let missing_track_id = crate::entity::ConnectionId::new()
             .fixture_publication(TrackKind::Video, &Mid::from("missing"));
@@ -2906,22 +2865,6 @@ mod assignment_tests {
         allocator.deactivate_track_binding(key, publication_id);
         allocator.remove_track(&publication_id);
         assert_eq!(allocator.native_mapping_slots().count(), 0);
-    }
-
-    #[test]
-    fn more_tracks_than_slots() {
-        let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 5);
-        add_slots(&mut allocator, 2);
-        assert_eq!(allocator.assigned_slot_count(), 2);
-    }
-
-    #[test]
-    fn tracks_before_slots() {
-        let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 2);
-        add_slots(&mut allocator, 2);
-        assert_eq!(allocator.assigned_slot_count(), 2);
     }
 
     /// The fanout bindings a subscription has once its view delta has landed.
@@ -3148,6 +3091,7 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
+        allocator.bind_sdp_slot(Mid::from("s0"), tracks.ids[0]);
         assert_eq!(allocator.assigned_slot_count(), 1);
         let key = allocator.track_handles[&tracks.ids[0]];
         allocator.deactivate_track_binding(key, tracks.ids[0]);
@@ -3156,18 +3100,11 @@ mod assignment_tests {
     }
 
     #[test]
-    fn multiple_slot_candidates_exist() {
-        let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 3);
-        assert_eq!(allocator.assigned_slot_count(), 3);
-    }
-
-    #[test]
     fn allocator_returns_positive_desired_bitrate() {
         let mut allocator = setup_allocator();
-        let _tracks = add_tracks(&mut allocator, 1);
+        let tracks = add_tracks(&mut allocator, 1);
         add_slots(&mut allocator, 1);
+        allocator.bind_sdp_slot(Mid::from("s0"), tracks.ids[0]);
 
         let (desired, _, _) =
             allocator.update_allocations(Instant::now(), Bitrate::from(5_000_000));
@@ -3190,14 +3127,14 @@ mod assignment_tests {
         let mut allocator = setup_allocator();
         let tracks = add_tracks(&mut allocator, 2);
         add_slots(&mut allocator, 1);
-        allocator.rebalance();
+        allocator.bind_sdp_slot(Mid::from("s0"), tracks.ids[0]);
 
         let served = allocator
             .slots
             .iter()
             .find_map(|(key, slot)| slot.target().map(|layer| (key, layer.meta.id)));
         let Some((slot_key, served_track)) = served else {
-            panic!("rebalance must give the slot a track to serve");
+            panic!("the explicit binding must give the slot a track to serve");
         };
         let Some(&foreign) = tracks.ids.iter().find(|id| **id != served_track) else {
             panic!("two tracks were added");
@@ -3379,106 +3316,6 @@ mod assignment_tests {
         );
     }
 
-    /// Regression test for the bug where `rebalance` only checked `staging`
-    /// when building `already_assigned`, so tracks that had been promoted from
-    /// staging → active (Stable state, staging=None) were treated as
-    /// unassigned and re-allocated to idle slots on the next `rebalance` call.
-    #[test]
-    fn no_double_assignment_after_staging_promoted_to_active() {
-        let mut allocator = setup_allocator();
-        // 4 senders publishing into a 5-person room → 4 tracks, 7 recv slots.
-        let tracks = add_tracks(&mut allocator, 4);
-        add_slots(&mut allocator, 7);
-
-        // Manually promote every staged slot to Stable (simulate the normal
-        // feed path that lands the burst and makes the staged stream active).
-        for slot in allocator.slots.values_mut() {
-            slot.test_promote();
-        }
-
-        // Adding a new slot triggers rebalance().  Before the fix this would
-        // double-assign the active tracks into the newly-idle slots.
-        allocator.add_slot(SlotConfig {
-            mid: Mid::from("extra"),
-            ..SlotConfig::default()
-        });
-
-        // Every track must appear in at most one slot.
-        assert!(
-            allocator.no_duplicate_slot_assignments(),
-            "rebalance double-assigned at least one track after staging was promoted to active"
-        );
-
-        // None of the original 4 tracks should have been re-staged in a second slot.
-        let assignment_count = |id: &PublicationKey| {
-            allocator
-                .slots
-                .values()
-                .filter(|s| s.desired.as_ref().is_some_and(|l| l.meta.id == *id))
-                .count()
-        };
-        for id in &tracks.ids {
-            assert_eq!(
-                assignment_count(id),
-                1,
-                "track {id:?} was assigned to more than one slot"
-            );
-        }
-    }
-
-    /// Variant: adding a *new track* after existing tracks have been promoted
-    /// to active must assign the new track to a fresh idle slot without
-    /// disturbing the already-active assignments.
-    #[test]
-    fn no_double_assignment_when_new_track_added_after_stabilisation() {
-        let mut allocator = setup_allocator();
-        let existing = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 7);
-
-        // Promote all staged slots to Stable.
-        for slot in allocator.slots.values_mut() {
-            slot.test_promote();
-        }
-
-        // Trigger rebalance with a new incoming track.
-        let pid = crate::entity::fixture_participant_id();
-        let (tx, track, states) = video_track_with_states(pid, Mid::from("late"), vec![]);
-        allocator.seed_layer_states(&states);
-        allocator.add_track(Track::video(tx.meta, track.layers().to_vec(), None));
-
-        assert!(
-            allocator.no_duplicate_slot_assignments(),
-            "rebalance double-assigned a track when a new track arrived post-stabilisation"
-        );
-
-        // Existing tracks must still each be in exactly one slot.
-        for id in &existing.ids {
-            let count = allocator
-                .slots
-                .values()
-                .filter(|s| s.desired.as_ref().is_some_and(|l| l.meta.id == *id))
-                .count();
-            assert_eq!(count, 1, "existing track {id:?} was double-assigned");
-        }
-    }
-
-    #[test]
-    fn allocator_handles_track_churn() {
-        let mut allocator = setup_allocator();
-        let mut tracks = add_tracks(&mut allocator, 3);
-        add_slots(&mut allocator, 3);
-        let key = allocator.track_handles[&tracks.ids[1]];
-        allocator.deactivate_track_binding(key, tracks.ids[1]);
-        allocator.remove_track(&tracks.ids[1]);
-        let pid = crate::entity::fixture_participant_id();
-        let (tx, track, states) = video_track_with_states(pid, Mid::from("new_track"), vec![]);
-        let meta = tx.meta.clone();
-        tracks.senders.push(tx);
-        allocator.seed_layer_states(&states);
-        allocator.add_track(Track::video(meta, track.layers().to_vec(), None));
-        assert_eq!(allocator.assigned_slot_count(), 3);
-    }
-
     #[test]
     fn same_slot_switching_same_track_is_not_duplicate_assignment() {
         let mut allocator = setup_allocator();
@@ -3498,7 +3335,7 @@ mod assignment_tests {
         allocator.add_track(Track::video(tx.meta, track.layers().to_vec(), None));
         add_slots(&mut allocator, 1);
 
-        allocator.rebalance();
+        allocator.bind_sdp_slot(Mid::from("s0"), track.id());
         let upgraded_layer = track
             .by_quality(LayerQuality::Medium)
             .expect("track should have an upgrade layer")

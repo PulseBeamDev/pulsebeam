@@ -6,7 +6,6 @@ use crate::participant::policy::TopicPublications;
 fn connection(publications: TopicPublications) -> Connection {
     Connection::new(
         ConnectionConfig {
-            manual_sub: false,
             scope: crate::entity::ProjectRoomKey::fixture(entity::RoomId::new("topics").unwrap())
                 .into(),
             participant_id: crate::entity::fixture_participant_id(),

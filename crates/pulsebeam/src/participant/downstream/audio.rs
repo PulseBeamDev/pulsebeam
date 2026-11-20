@@ -53,9 +53,9 @@ pub struct DownstreamAudio {
 }
 
 impl DownstreamAudio {
-    pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
+    pub(crate) fn new(ctx: LogCtx) -> Self {
         Self {
-            allocator: AudioAllocator::new(ctx, manual_sub),
+            allocator: AudioAllocator::new(ctx),
         }
     }
 
@@ -148,18 +148,15 @@ pub struct Heard {
 }
 
 impl AudioAllocator {
-    pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
+    pub(crate) fn new(ctx: LogCtx) -> Self {
         Self {
             ctx,
             slots: array::from_fn(|_| None),
             owned_slots: BTreeMap::new(),
             speakers_changed: false,
-            // Manual means the client drives everything, audio included: it
-            // hears nothing until it asks, exactly as it sees no video until it
-            // sends a request.
             intent: AudioIntent {
                 pinned: Vec::new(),
-                auto: !manual_sub,
+                auto: false,
             },
             fixed_receivers: HashSet::new(),
             fixed_tracks: HashSet::new(),
@@ -566,7 +563,8 @@ mod tests {
     }
 
     fn allocator_with(slots: usize) -> AudioAllocator {
-        let mut alloc = AudioAllocator::new(test_ctx(), false);
+        let mut alloc = AudioAllocator::new(test_ctx());
+        alloc.set_intent(AudioIntent::default());
         for (mid, ssrc) in [("a0", 1000), ("a1", 1001), ("a2", 1002), ("a3", 1003)]
             .into_iter()
             .take(slots)
@@ -651,7 +649,8 @@ mod tests {
         assert_eq!(alloc.assignments()[0].mid, Mid::from("a1"));
         assert!(!alloc.default_needs_reconnect());
 
-        let mut downstream = super::super::Downstream::new(test_ctx(), false);
+        let mut downstream = super::super::Downstream::new(test_ctx());
+        downstream.audio.set_intent(AudioIntent::default());
         downstream.audio.add_slot(slot_config("a0", 1000));
         downstream.audio.add_slot(slot_config("a1", 1001));
         let speaker = origin(2);
@@ -1054,8 +1053,8 @@ mod tests {
     /// A manual subscriber hears nothing until it asks, exactly as it sees no
     /// video until it sends a request.
     #[test]
-    fn a_manual_subscriber_starts_silent() {
-        let mut alloc = AudioAllocator::new(test_ctx(), true);
+    fn a_receiver_without_a_subscription_starts_silent() {
+        let mut alloc = AudioAllocator::new(test_ctx());
         alloc.add_slot(slot_config("a0", 1000));
 
         alloc.on_rtp(origin(1), &speaking(-20), &mut StreamWriter::new());

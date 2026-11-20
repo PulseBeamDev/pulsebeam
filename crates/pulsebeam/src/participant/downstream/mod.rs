@@ -147,11 +147,11 @@ pub(crate) struct TrackCatalogEntry {
 pub type DownstreamAllocator = Downstream;
 
 impl Downstream {
-    pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
+    pub(crate) fn new(ctx: LogCtx) -> Self {
         Self {
             ctx,
-            video: DownstreamVideo::new(ctx, manual_sub),
-            audio: DownstreamAudio::new(ctx, manual_sub),
+            video: DownstreamVideo::new(ctx),
+            audio: DownstreamAudio::new(ctx),
             catalog: SecondaryMap::new(),
             audio_tracks: IndexMap::new(),
             dirty_allocation: false,
@@ -423,12 +423,9 @@ mod tests {
 
     #[test]
     fn fixed_playout_is_per_receiver_and_defaults_require_a_fresh_mid() {
-        let mut downstream = Downstream::new(
-            LogCtx {
-                connection_id: crate::entity::ConnectionId::new(),
-            },
-            false,
-        );
+        let mut downstream = Downstream::new(LogCtx {
+            connection_id: crate::entity::ConnectionId::new(),
+        });
         let fixed =
             crate::entity::ConnectionId::new().fixture_publication(TrackKind::Video, "fixed");
         let default =

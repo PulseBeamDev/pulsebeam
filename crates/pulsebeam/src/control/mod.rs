@@ -12,6 +12,7 @@ mod registry;
 mod room;
 mod router;
 pub(crate) mod rtp;
+pub(crate) mod sdp;
 pub(crate) mod stats_aggregator;
 pub mod steering;
 pub(crate) mod topology;

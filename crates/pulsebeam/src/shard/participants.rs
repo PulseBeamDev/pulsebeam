@@ -248,7 +248,6 @@ mod tests {
             let transport = NodeTransportAddress::new(TransportRoute::new(shard, index), 1);
             let handle = registry.insert(
                 ConnectionConfig {
-                    manual_sub: true,
                     scope,
                     participant_id: participant,
                     connection_id,
