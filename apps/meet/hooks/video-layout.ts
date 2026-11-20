@@ -8,7 +8,7 @@ export function useVideoLayout(tracks: readonly RemoteVideoTrack[]) {
       [...tracks].sort(
         (a, b) =>
           a.participantId.localeCompare(b.participantId) ||
-          a.label.localeCompare(b.label),
+          a.trackId.localeCompare(b.trackId),
       ),
     [tracks],
   );

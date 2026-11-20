@@ -5,7 +5,7 @@ use crate::participant::core::native_data::tests::frame_for;
 use crate::rtp::{AUDIO_FREQUENCY, MediaTime, RtpPacket};
 
 fn receiver_spec(
-    track: TrackId,
+    track: PublicationKey,
     room: &str,
     mid: &str,
     ssrc: u32,
@@ -31,7 +31,7 @@ fn receiver_spec(
     parameters.rtcp.as_mut().unwrap().cname = "component-receiver-cname".into();
     source.declaration = Some(resource_spec::Declaration::Subscription(
         wire::SubscriptionSpec {
-            track_id: track.as_str(),
+            publication_id: track.as_str(),
             kind: wire::TrackKind::Audio as i32,
             source_room: room.into(),
             binding: Some(wire::TrackBinding {
@@ -77,7 +77,7 @@ pub(super) fn check_prebound(source: &Track) {
     let handle = handles.insert(id);
     participant.add_track_candidate(handle, source.clone());
     participant.apply(
-        crate::participant::effect::ParticipantEffect::TrackSubscribed { track_id: id },
+        crate::participant::effect::ParticipantEffect::TrackSubscribed { publication_id: id },
         Some(handle),
     );
     assert!(!participant.native_receivers.contains_source(id));
@@ -197,7 +197,7 @@ pub(super) fn check(source: &Track) {
     while let Some(write) = participant.stream_writer.pop() {
         let StreamWrite::Audio {
             pkt,
-            track_id,
+            publication_id,
             mid,
             ssrc,
             pt,
@@ -205,7 +205,7 @@ pub(super) fn check(source: &Track) {
         else {
             panic!("audio output")
         };
-        assert_eq!(track_id, id);
+        assert_eq!(publication_id, id);
         assert_eq!(pt, 111u8.into());
         assert!(!pkt.marker);
         outputs.push((mid, ssrc));

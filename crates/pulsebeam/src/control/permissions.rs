@@ -67,7 +67,16 @@ impl ResourcePermissions {
             Track::Video(_) => TrackKind::Video,
             Track::Data(_) => TrackKind::Data,
         };
-        self.allows(action, publisher, Some(kind), track.meta().label.as_deref())
+        self.allows(
+            action,
+            publisher,
+            Some(kind),
+            track
+                .meta()
+                .track_id
+                .as_ref()
+                .map(crate::entity::TrackId::as_str),
+        )
     }
 
     pub(super) fn allows_source_at_room(
@@ -87,7 +96,11 @@ impl ResourcePermissions {
             room,
             publisher,
             Some(kind),
-            track.meta().label.as_deref(),
+            track
+                .meta()
+                .track_id
+                .as_ref()
+                .map(crate::entity::TrackId::as_str),
         )
     }
 

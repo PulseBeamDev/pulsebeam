@@ -8,7 +8,7 @@ use crate::media::{Mid, Pt, Ssrc};
 use pulsebeam_runtime::time::Instant;
 
 use crate::control::MAX_SEND_AUDIO_SLOTS;
-use crate::entity::{AudioOrigin, TrackId};
+use crate::entity::{AudioOrigin, PublicationKey};
 use crate::log::{LogCtx, plog_debug, plog_warn};
 use crate::participant::downstream::SlotConfig;
 use crate::participant::intent::AudioIntent;
@@ -45,7 +45,7 @@ pub struct AudioAllocator {
     /// which is what the SFU did before a client could say anything about audio.
     intent: AudioIntent,
     fixed_receivers: HashSet<Mid>,
-    fixed_tracks: HashSet<TrackId>,
+    fixed_tracks: HashSet<PublicationKey>,
 }
 
 pub struct DownstreamAudio {
@@ -185,7 +185,7 @@ impl AudioAllocator {
     pub(crate) fn set_playout_compatibility(
         &mut self,
         fixed_receivers: HashSet<Mid>,
-        fixed_tracks: HashSet<TrackId>,
+        fixed_tracks: HashSet<PublicationKey>,
     ) {
         self.fixed_receivers = fixed_receivers;
         self.fixed_tracks = fixed_tracks;
@@ -222,7 +222,7 @@ impl AudioAllocator {
                 .all(|(_, slot)| self.fixed_receivers.contains(&slot.mid))
     }
 
-    fn is_pinned(&self, track: TrackId) -> bool {
+    fn is_pinned(&self, track: PublicationKey) -> bool {
         self.intent.pinned.contains(&track)
     }
 
@@ -270,10 +270,13 @@ impl AudioAllocator {
     /// merely quiet and wrong once they have gone: the assignment naming them keeps being sent,
     /// the client keeps a publication, and the room shows a tile for somebody who is not in it.
     /// Returns whether this slot was carrying them.
-    pub fn remove_track(&mut self, track_id: &TrackId) -> bool {
+    pub fn remove_track(&mut self, publication_id: &PublicationKey) -> bool {
         let mut removed = false;
         for slot in self.slots.iter_mut().flatten() {
-            if slot.occupant.is_some_and(|o| o.origin.track == *track_id) {
+            if slot
+                .occupant
+                .is_some_and(|o| o.origin.track == *publication_id)
+            {
                 slot.occupant = None;
                 // The next speaker to take this slot starts a talk spurt, whoever they are.
                 slot.pending_marker = true;
@@ -307,7 +310,7 @@ impl AudioAllocator {
     pub(crate) fn on_owned_rtp(
         &mut self,
         mid: Mid,
-        source: TrackId,
+        source: PublicationKey,
         packet: &RtpPacket,
         writer: &mut StreamWriter,
     ) {
@@ -380,7 +383,7 @@ impl AudioAllocator {
             plog_warn!(
                 self.ctx,
                 target: crate::log::TARGET_AUDIO,
-                track_id = %origin.track,
+                publication_id = %origin.track,
                 "audio packet dropped for want of an RFC 6464 level"
             );
             return None;
@@ -468,7 +471,7 @@ impl AudioAllocator {
         plog_debug!(
             self.ctx,
             target: crate::log::TARGET_AUDIO,
-            track_id = %origin.track,
+            publication_id = %origin.track,
             incoming_power = power,
             quietest_power = quietest.last_power,
             "audio packet dropped in contention"
@@ -534,7 +537,7 @@ mod tests {
         let _rng = pulsebeam_runtime::rand::seeded_rng(seed);
         let participant = crate::entity::fixture_participant_id();
         AudioOrigin {
-            track: connection(seed).derive_track_id(TrackKind::Audio, "mic"),
+            track: connection(seed).fixture_publication(TrackKind::Audio, "mic"),
             participant,
         }
     }
@@ -593,7 +596,7 @@ mod tests {
         alloc.on_owned_rtp(mid, source, &packet, &mut writer);
         let Some(crate::track::StreamWrite::Audio {
             pkt: first,
-            track_id,
+            publication_id,
             mid: written_mid,
             ssrc,
             pt,
@@ -602,7 +605,7 @@ mod tests {
             panic!("fixed receiver must forward audio without an audio-level extension");
         };
         assert_eq!(
-            (track_id, written_mid, ssrc, pt),
+            (publication_id, written_mid, ssrc, pt),
             (source, mid, 42u32.into(), 109u8.into())
         );
         assert!(!first.marker);
@@ -1074,11 +1077,11 @@ mod tests {
         let mut alloc = allocator_with(1);
         let participant = origin(1).participant;
         let mic = AudioOrigin {
-            track: connection(1).derive_track_id(TrackKind::Audio, "mic"),
+            track: connection(1).fixture_publication(TrackKind::Audio, "mic"),
             participant,
         };
         let screen = AudioOrigin {
-            track: connection(1).derive_track_id(TrackKind::Audio, "screen"),
+            track: connection(1).fixture_publication(TrackKind::Audio, "screen"),
             participant,
         };
         assert_ne!(mic.track, screen.track);

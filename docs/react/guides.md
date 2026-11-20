@@ -92,8 +92,8 @@ than treating failure as an empty page. Old application-retained pages stay
 stable; the SDK retains only its current page.
 
 Select publications only from the displayed page. A `Video` metadata entry maps
-to `room.participant(info.externalId).video(publication.label)`; use `.audio` or
-`.data` for the other kinds. Skip `info.externalId === agent.participantId` before
+to `room.participant(info.id).video(publication.trackId)`; use `.audio` or
+`.data` for the other kinds. Skip `info.id === agent.participantId` before
 creating receive owners. Presence-only entries still belong in the roster.
 Keep each selected handle stable in a mounted child with `useMemo`.
 
@@ -118,8 +118,8 @@ const subscription = useSubscribe(remote, {
 />
 ```
 
-Track handles follow the participant and label across temporary absence and
-replacement. Use participant ID plus label for React keys.
+Track handles follow the participant and track ID across temporary absence and
+replacement. Use participant ID and track ID for React keys within the same kind.
 
 ## Remote audio and autoplay
 

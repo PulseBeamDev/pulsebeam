@@ -66,7 +66,7 @@ fn participant() -> wire::Participant {
 fn resource() -> Resource {
     Resource::Publication {
         kind: wire::TrackKind::Data,
-        label: "updates".into(),
+        track_id: "updates".into(),
     }
 }
 
@@ -86,7 +86,7 @@ fn spec(enabled: bool, stream: u32) -> wire::ResourceSpec {
         }),
         declaration: Some(wire::resource_spec::Declaration::Publication(
             wire::PublicationSpec {
-                label: "updates".into(),
+                track_id: "updates".into(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
                     delivery: wire::DataDelivery::Ordered as i32,
                     binding: Some(binding(stream)),
@@ -124,10 +124,10 @@ fn live(revision: u64, spec: wire::ResourceSpec) -> wire::ConfirmedState {
                 spec: Some(spec),
                 participant: Some(participant()),
                 track: Some(wire::Track {
-                    track_id: "source".into(),
+                    publication_id: "source".into(),
                     participant_id: "self".into(),
                     room_id: "room".into(),
-                    label: "updates".into(),
+                    track_id: "updates".into(),
                     kind: Some(wire::track::Kind::Data(wire::DataTrack {
                         delivery: wire::DataDelivery::Ordered as i32,
                     })),
@@ -219,7 +219,7 @@ fn pending_resource_coalesces_without_blocking_other_resources_or_retirement() {
 
     let other = Resource::Publication {
         kind: wire::TrackKind::Data,
-        label: "other".into(),
+        track_id: "other".into(),
     };
     let mut other_spec = spec(true, 2);
     let Some(wire::resource_spec::Declaration::Publication(publication)) =
@@ -227,7 +227,7 @@ fn pending_resource_coalesces_without_blocking_other_resources_or_retirement() {
     else {
         panic!("publication")
     };
-    publication.label = "other".into();
+    publication.track_id = "other".into();
     client
         .stage(other.clone(), Some(other_spec.clone()))
         .unwrap();
@@ -238,8 +238,8 @@ fn pending_resource_coalesces_without_blocking_other_resources_or_retirement() {
         panic!("owned")
     };
     let track = accepted_live.track.as_mut().unwrap();
-    track.label = "other".into();
-    track.track_id = "other-source".into();
+    track.track_id = "other".into();
+    track.publication_id = "other-source".into();
     client
         .apply(&frame(alloc::vec![record(2, accepted.clone())], false))
         .unwrap();
@@ -289,6 +289,38 @@ fn pending_resource_coalesces_without_blocking_other_resources_or_retirement() {
     );
 }
 
+fn audio_parameters(cname: String) -> wire::RtpParameters {
+    wire::RtpParameters {
+        mid: "receive".into(),
+        codec: Some(wire::RtpCodecParameters {
+            payload_type: Some(111),
+            format: Some(wire::CodecFormat::from(wire::codec_format::Codec::Opus(
+                wire::OpusParameters::default(),
+            ))),
+            feedback: vec![wire::RtcpFeedback::TransportCc.into()],
+            ..Default::default()
+        }),
+        header_extensions: vec![
+            wire::RtpHeaderExtensionParameters {
+                id: 1,
+                uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.into(),
+            },
+            wire::RtpHeaderExtensionParameters {
+                id: 2,
+                uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.into(),
+            },
+        ],
+        encodings: vec![wire::RtpEncodingParameters {
+            ssrc: Some(77),
+            ..Default::default()
+        }],
+        rtcp: Some(wire::RtcpParameters {
+            cname,
+            reduced_size: false,
+        }),
+    }
+}
+
 #[test]
 fn bounded_batches_emit_current_targets_for_mixed_resources() {
     for long in [false, true] {
@@ -299,8 +331,8 @@ fn bounded_batches_emit_current_targets_for_mixed_resources() {
             let id = alloc::format!("{index:03}{suffix}");
             let stream = u32::try_from(index + 1).unwrap();
             let (resource, desired) = if index % 2 == 0 {
-                let label = if long {
-                    alloc::format!("{id}{}", "y".repeat(140))
+                let track_id = if long {
+                    alloc::format!("{index:03}{}", "y".repeat(33))
                 } else {
                     id
                 };
@@ -310,28 +342,55 @@ fn bounded_batches_emit_current_targets_for_mixed_resources() {
                 else {
                     panic!("publication")
                 };
-                publication.label = label.clone();
-                (
-                    Resource::Publication {
-                        kind: wire::TrackKind::Data,
-                        label,
-                    },
-                    desired,
-                )
+                publication.track_id = track_id.clone();
+                let kind = if long {
+                    publication.kind = Some(wire::publication_spec::Kind::Audio(
+                        wire::AudioPublication {
+                            binding: Some(wire::TrackBinding {
+                                transport: Some(wire::track_binding::Transport::Rtp(
+                                    audio_parameters("x".repeat(256)),
+                                )),
+                            }),
+                        },
+                    ));
+                    wire::TrackKind::Audio
+                } else {
+                    wire::TrackKind::Data
+                };
+                (Resource::Publication { kind, track_id }, desired)
             } else {
+                let (resource, kind, binding, receive) = if long {
+                    (
+                        Resource::Reception(MediaSlot::RemoteAudio(stream)),
+                        wire::TrackKind::Audio,
+                        wire::TrackBinding {
+                            transport: Some(wire::track_binding::Transport::Rtp(audio_parameters(
+                                "x".repeat(256),
+                            ))),
+                        },
+                        Some(wire::resource_settings::Receive::Audio(Default::default())),
+                    )
+                } else {
+                    (
+                        Resource::DataSubscription(id.clone()),
+                        wire::TrackKind::Data,
+                        binding(stream),
+                        None,
+                    )
+                };
                 (
-                    Resource::DataSubscription(id.clone()),
+                    resource,
                     wire::ResourceSpec {
                         settings: Some(wire::ResourceSettings {
                             enabled: Some(true),
-                            receive: None,
+                            receive,
                         }),
                         declaration: Some(wire::resource_spec::Declaration::Subscription(
                             wire::SubscriptionSpec {
-                                track_id: id,
-                                kind: wire::TrackKind::Data as i32,
+                                publication_id: id,
+                                kind: kind as i32,
                                 source_room: "room".into(),
-                                binding: Some(binding(stream)),
+                                binding: Some(binding),
                             },
                         )),
                     },
@@ -361,10 +420,12 @@ fn bounded_batches_emit_current_targets_for_mixed_resources() {
                     panic!("present")
                 };
                 let resource = remaining
-                    .keys()
-                    .find(|resource| resource.matches_spec(spec))
-                    .unwrap()
-                    .clone();
+                    .iter()
+                    .find_map(|(resource, expected)| {
+                        (expected == spec.as_ref() && resource.matches_spec(spec))
+                            .then(|| resource.clone())
+                    })
+                    .unwrap();
                 assert_eq!(**spec, remaining.remove(&resource).unwrap());
                 if first_sent.is_none() {
                     first_sent = Some((resource, (**spec).clone(), record.owned));
@@ -417,7 +478,7 @@ fn owned_lookup_waits_for_authorization_not_roster_completion() {
         room: "source-room".into(),
         participant_id: "alice".into(),
         kind: wire::TrackKind::Data,
-        label: "updates".into(),
+        track_id: "updates".into(),
     };
     let spec = wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
@@ -430,7 +491,7 @@ fn owned_lookup_waits_for_authorization_not_roster_completion() {
                     room: "source-room".into(),
                     participant_id: "alice".into(),
                     kind: wire::TrackKind::Data as i32,
-                    label: "updates".into(),
+                    track_id: "updates".into(),
                 }),
             },
         )),
@@ -493,7 +554,7 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
                 room: "room".into(),
                 participant_id: "alice".into(),
                 kind: wire::TrackKind::Data as i32,
-                label: "updates".into(),
+                track_id: "updates".into(),
             }),
         },
     ));
@@ -688,7 +749,7 @@ fn scoped_memory_failure_preserves_existing_work_and_refuses_unbounded_staging()
     let before = client.retained_bytes;
     let other = Resource::Publication {
         kind: wire::TrackKind::Data,
-        label: "other".into(),
+        track_id: "other".into(),
     };
     let mut other_spec = spec(true, 2);
     let Some(wire::resource_spec::Declaration::Publication(publication)) =
@@ -696,7 +757,7 @@ fn scoped_memory_failure_preserves_existing_work_and_refuses_unbounded_staging()
     else {
         panic!("publication")
     };
-    publication.label = "other".into();
+    publication.track_id = "other".into();
     client.memory_limit = before;
     assert!(client.stage(other, Some(other_spec)).is_err());
     assert_eq!(client.retained_bytes, before);

@@ -3,7 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use crate::entity::{ConnectionId, TrackId};
+use crate::entity::{ConnectionId, PublicationKey};
 use crate::id::ShardId;
 use crate::route::{NodeRouteAddress, NodeTransportAddress};
 use pulsebeam_queue as mailbox;
@@ -76,20 +76,20 @@ where
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrackPlanUpdate {
-    pub track_id: TrackId,
+    pub publication_id: PublicationKey,
     pub plan: Option<TrackPlan>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TrackRouteAction {
-    Forward { track_id: TrackId },
-    Reverse { track_id: TrackId },
+    Forward { publication_id: PublicationKey },
+    Reverse { publication_id: PublicationKey },
 }
 
 impl TrackRouteAction {
-    pub(crate) fn track_id(self) -> TrackId {
+    pub(crate) fn publication_id(self) -> PublicationKey {
         match self {
-            Self::Forward { track_id } | Self::Reverse { track_id } => track_id,
+            Self::Forward { publication_id } | Self::Reverse { publication_id } => publication_id,
         }
     }
 }
@@ -129,11 +129,11 @@ pub(crate) enum ShardUpdateOp {
         address: NodeTransportAddress,
     },
     InsertTrackRuntime {
-        track_id: TrackId,
+        publication_id: PublicationKey,
         runtime: TrackRuntime,
     },
     RemoveTrackRuntime {
-        track_id: TrackId,
+        publication_id: PublicationKey,
     },
     Placeholder,
 }
@@ -359,14 +359,14 @@ impl ShardUpdateOp {
 mod tests {
     use super::*;
 
-    fn track_plan() -> (TrackId, Vec<TrackPlanUpdate>) {
-        let track_id = crate::entity::ConnectionId::new()
-            .derive_track_id(crate::entity::TrackKind::Audio, "audio");
+    fn track_plan() -> (PublicationKey, Vec<TrackPlanUpdate>) {
+        let publication_id = crate::entity::ConnectionId::new()
+            .fixture_publication(crate::entity::TrackKind::Audio, "audio");
         let plans = vec![TrackPlanUpdate {
-            track_id,
+            publication_id,
             plan: Some(TrackPlan::default()),
         }];
-        (track_id, plans)
+        (publication_id, plans)
     }
 
     #[test]

@@ -399,7 +399,7 @@ fn publication(channel: u32, enabled: bool) -> wire::ResourceSpec {
         }),
         declaration: Some(wire::resource_spec::Declaration::Publication(
             wire::PublicationSpec {
-                label: "camera/updates".into(),
+                track_id: "camera-updates".into(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
                     delivery: wire::DataDelivery::Ordered as i32,
                     binding: Some(wire::TrackBinding {
@@ -432,14 +432,14 @@ fn live(value: wire::ConfirmedState, spec: &wire::ResourceSpec, participant: &st
     );
     let track = live.track.unwrap();
     assert_eq!(track.participant_id, participant);
-    assert_eq!(track.label, "camera/updates");
+    assert_eq!(track.track_id, "camera-updates");
     assert_eq!(
         track.kind,
         Some(wire::track::Kind::Data(wire::DataTrack {
             delivery: wire::DataDelivery::Ordered as i32
         }))
     );
-    assert!(!track.track_id.is_empty());
+    assert!(!track.publication_id.is_empty());
     track
 }
 
@@ -451,7 +451,7 @@ fn subscription(source: &wire::Track, channel: u32, enabled: bool) -> wire::Reso
         }),
         declaration: Some(wire::resource_spec::Declaration::Subscription(
             wire::SubscriptionSpec {
-                track_id: source.track_id.clone(),
+                publication_id: source.publication_id.clone(),
                 kind: wire::TrackKind::Data as i32,
                 source_room: DATA_ROOM.into(),
                 binding: Some(wire::TrackBinding {
@@ -468,7 +468,7 @@ fn message(source: &wire::Track, sequence: u64, payload: u8) -> pulsebeam_proto:
     pulsebeam_proto::topic::TopicFrame {
         body: Some(pulsebeam_proto::topic::topic_frame::Body::Message(
             pulsebeam_proto::topic::TopicMessage {
-                data_track_id: source.track_id.clone(),
+                publication_id: source.publication_id.clone(),
                 sequence,
                 payload: vec![payload],
             },
@@ -511,7 +511,7 @@ async fn run_publisher(
     peer.send_payload(0, &message(&first, 1, 43));
     let probe = peer.payload(0).await?;
     assert!(probe.is_subscriber_control());
-    assert_eq!(probe.data_track_id(), Some(first.track_id.as_str()));
+    assert_eq!(probe.publication_id(), Some(first.publication_id.as_str()));
     peer.send_payload(0, &message(&first, 2, 44));
     assert!(matches!(rx.recv().await, Some(PeerStep::Delivered)));
     peer.desire(1, 4, None);
@@ -532,7 +532,7 @@ async fn run_publisher(
     let spec = publication(2, true);
     peer.desire(6, 6, Some(spec.clone()));
     let second = live(peer.confirmed(6, 6).await?, &spec, &participant);
-    assert_ne!(first.track_id, second.track_id);
+    assert_ne!(first.publication_id, second.publication_id);
     tx.send(PeerStep::Source(second.clone())).await?;
     assert!(matches!(rx.recv().await, Some(PeerStep::Ready)));
     peer.send_payload(1, &message(&second, 0, 46));
@@ -583,7 +583,7 @@ async fn run_receiver(
         &pulsebeam_proto::topic::TopicFrame {
             body: Some(pulsebeam_proto::topic::topic_frame::Body::Probe(
                 pulsebeam_proto::topic::TopicProbe {
-                    data_track_id: first.track_id.clone(),
+                    publication_id: first.publication_id.clone(),
                     from_sequence: 2,
                     live: true,
                 },

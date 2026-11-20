@@ -12,11 +12,11 @@ fn config() -> AgentConfig {
     }
 }
 
-fn selector(label: &str) -> TrackSelector {
+fn selector(track_id: &str) -> TrackSelector {
     TrackSelector {
         room: "room".into(),
         participant_id: "alice".into(),
-        label: label.into(),
+        track_id: track_id.into(),
     }
 }
 
@@ -49,7 +49,7 @@ fn named_resources_project_their_own_prejoin_configuration() {
         },
     );
     let data = TrackSpec::Data {
-        label: "chat".into(),
+        track_id: "chat".into(),
         delivery: TopicMode::Ordered,
     };
     let publication = owner(
@@ -91,7 +91,7 @@ fn named_resources_project_their_own_prejoin_configuration() {
         (
             state.selector.room.as_str(),
             state.selector.participant_id.as_str(),
-            state.selector.label.as_str()
+            state.selector.track_id.as_str()
         ),
         ("room", "alice", "camera")
     );
@@ -109,7 +109,7 @@ fn named_resources_project_their_own_prejoin_configuration() {
         (
             state.selector.room.as_str(),
             state.selector.participant_id.as_str(),
-            state.selector.label.as_str()
+            state.selector.track_id.as_str()
         ),
         ("room", "alice", "microphone")
     );
@@ -126,7 +126,7 @@ fn named_resources_project_their_own_prejoin_configuration() {
     else {
         panic!("expected data publication projection")
     };
-    assert_eq!(state.label, "chat");
+    assert_eq!(state.track_id, "chat");
     assert_eq!(state.delivery, agent_core::ffi::TopicMode::Ordered);
     assert!(!state.closed);
     let Some(ResourceState::DataSubscription(state)) =
@@ -138,7 +138,7 @@ fn named_resources_project_their_own_prejoin_configuration() {
         (
             state.selector.room.as_str(),
             state.selector.participant_id.as_str(),
-            state.selector.label.as_str()
+            state.selector.track_id.as_str()
         ),
         ("room", "alice", "chat")
     );
@@ -174,9 +174,9 @@ fn driver_release_projects_final_state_and_retires_only_that_owner() {
     let mut actor = Actor::new(config(), TestHost).unwrap();
     let (sender, _receiver) = mpsc::channel(4);
     let handle = actor.handle(sender);
-    let claim = |actor: &mut Actor<TestHost>, label: &str| {
+    let claim = |actor: &mut Actor<TestHost>, track_id: &str| {
         let (result, _) = actor.driver.resource(ResourceCommand::ClaimVideo {
-            selector: selector(label),
+            selector: selector(track_id),
         });
         let ResourceResult::Owned { owner } = result.unwrap() else {
             panic!("expected video owner");
@@ -230,7 +230,7 @@ fn driver_release_projects_final_state_and_retires_only_that_owner() {
     };
     assert!(*closing);
     assert!(final_state.closed);
-    assert_eq!(final_state.selector.label, "camera");
+    assert_eq!(final_state.selector.track_id, "camera");
     assert!(final_state.local_enabled);
     assert_eq!(final_state.configuration.height, 720);
     assert!(handle.observed_resource_state(first).is_none());
@@ -262,7 +262,7 @@ fn queued_owned_data_send_cannot_outlive_its_owner_or_join() {
         let ResourceResult::Owned { owner } = handle
             .resource_now(ResourceCommand::DeclareDataPublication {
                 spec: TrackSpec::Data {
-                    label: "chat".into(),
+                    track_id: "chat".into(),
                     delivery: TopicMode::Ordered,
                 },
             })

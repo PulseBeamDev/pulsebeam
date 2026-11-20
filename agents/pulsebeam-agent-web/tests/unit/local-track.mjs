@@ -209,7 +209,7 @@ test("data subscription close awaits retired and current runtime cleanup", async
       assert.deepEqual(command.source, {
         room: "room",
         participantId: "alice",
-        label: "messages",
+        trackId: "messages",
       });
       return { owner };
     },

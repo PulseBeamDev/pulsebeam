@@ -105,7 +105,7 @@ impl NativeAudioReceiver {
             }),
             declaration: Some(wire::resource_spec::Declaration::Subscription(
                 wire::SubscriptionSpec {
-                    track_id: source.track_id.clone(),
+                    publication_id: source.publication_id.clone(),
                     kind: wire::TrackKind::Audio as i32,
                     source_room: "native-state-wire".into(),
                     binding: Some(wire::TrackBinding {

@@ -13,7 +13,7 @@ fn fixture() -> (ApplicationStateOracle, ClientObservation) {
     let viewer = ParticipantId::new("viewer").unwrap();
     let source_connection = ConnectionId::new();
     let receiver_connection = ConnectionId::new();
-    let canonical = source_connection.derive_track_id(TrackKind::Video, "opaque-owned-source");
+    let canonical = pulsebeam::entity::PublicationId::mint();
     let model = ApplicationStateOracle {
         participants: [
             (publisher, "publisher", true, source_connection),
@@ -37,7 +37,7 @@ fn fixture() -> (ApplicationStateOracle, ClientObservation) {
                     id: canonical.as_str(),
                     participant_id: id.as_str().to_owned(),
                     kind: MediaKind::Video,
-                    label: "video".into(),
+                    track_id: "video".into(),
                 }]
             } else {
                 Vec::new()
@@ -83,14 +83,10 @@ fn audio_fixture(capacity: u32) -> (ApplicationStateOracle, ClientObservation) {
             ..model.participants[0].clone()
         };
         source.media = vec![Publication {
-            id: source
-                .connection
-                .unwrap()
-                .derive_track_id(TrackKind::Audio, "opaque-audio-source")
-                .as_str(),
+            id: pulsebeam::entity::PublicationId::mint().as_str(),
             participant_id: source.id.as_str().to_owned(),
             kind: MediaKind::Audio,
-            label: "audio".into(),
+            track_id: "audio".into(),
         }];
         let publication = source.publications().next().unwrap();
         client.snapshot.participants.insert(
@@ -112,7 +108,7 @@ fn audio_fixture(capacity: u32) -> (ApplicationStateOracle, ClientObservation) {
                 .participants
                 .iter()
                 .filter(|peer| peer.audio)
-                .map(|peer| peer.track_id(TrackKind::Audio, "audio").as_str()),
+                .map(|peer| peer.publication_id(TrackKind::Audio, "audio").as_str()),
         )
         .collect();
     (model, client)
@@ -251,7 +247,7 @@ fn transition_safety_allows_pending_withdrawal_but_rejects_invalid_assignments()
             track: pulsebeam_agent_native::NativeReceiverInfo {
                 generation: generation.get(),
                 receiver: 1,
-                track_id: "native-receiver".into(),
+                publication_id: "native-receiver".into(),
                 mid: "v0".into(),
                 media_index: 0,
             },
@@ -486,7 +482,7 @@ fn publishers_expose_distinct_public_bindings_for_declared_registrations() {
             .push(TopicPublisherStatus {
                 registration,
                 channel: None,
-                data_track_id: Some(id.into()),
+                publication_id: Some(id.into()),
                 next_sequence: 0,
                 accepted_history: 0,
                 queued_messages: 0,
@@ -497,19 +493,19 @@ fn publishers_expose_distinct_public_bindings_for_declared_registrations() {
     model
         .check_client(&model.participants[1], &client, &requested)
         .unwrap();
-    client.snapshot.topics.publishers[0].data_track_id = None;
+    client.snapshot.topics.publishers[0].publication_id = None;
     assert!(
         model
             .check_client(&model.participants[1], &client, &requested)
             .is_err()
     );
-    client.snapshot.topics.publishers[0].data_track_id = Some("ordered-id".into());
+    client.snapshot.topics.publishers[0].publication_id = Some("ordered-id".into());
     assert!(
         model
             .check_client(&model.participants[1], &client, &requested)
             .is_err()
     );
-    client.snapshot.topics.publishers[0].data_track_id = Some("latest-id".into());
+    client.snapshot.topics.publishers[0].publication_id = Some("latest-id".into());
     client.snapshot.topics.publishers[0].registration.mode = TopicMode::Lossy;
     assert!(
         model
@@ -530,27 +526,20 @@ fn public_catalog_binding_preserves_opaque_identity_and_declared_constraints() {
         .collect::<Vec<_>>();
     assert!(!publisher.bind_media(&[]).unwrap());
     assert!(publisher.bind_media(&descriptors).unwrap());
-    let canonical = publisher.track_id(TrackKind::Video, "video");
-    assert_ne!(
-        canonical,
-        publisher
-            .connection
-            .unwrap()
-            .derive_track_id(TrackKind::Video, "video")
-    );
+    let canonical = publisher.publication_id(TrackKind::Video, "video");
+    assert_eq!(canonical.as_str(), descriptors[0].id);
     descriptors.push(descriptors[0].clone());
     assert!(publisher.bind_media(&descriptors).is_err());
     descriptors.pop();
-    descriptors[0].label = "wrong".into();
+    descriptors[0].track_id = "wrong".into();
     assert!(!publisher.bind_media(&descriptors).unwrap());
-    descriptors[0].label = "video".into();
+    descriptors[0].track_id = "video".into();
     descriptors[0].participant_id = model.participants[1].id.as_str().to_owned();
     assert!(!publisher.bind_media(&descriptors).unwrap());
     descriptors[0].participant_id = publisher.id.as_str().to_owned();
-    descriptors[0].id = publisher
-        .connection
-        .unwrap()
-        .derive_track_id(TrackKind::Audio, "opaque-wrong-kind")
-        .as_str();
+    descriptors[0].kind = MediaKind::Audio;
+    assert!(!publisher.bind_media(&descriptors).unwrap());
+    descriptors[0].kind = MediaKind::Video;
+    descriptors[0].id = "vid_04NCB5P75CY1FN9ZPW5ZQEXDNXG".into();
     assert!(publisher.bind_media(&descriptors).is_err());
 }

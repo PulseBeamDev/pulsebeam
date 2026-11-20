@@ -43,7 +43,7 @@ impl TrackPacket {
 
 #[derive(Debug, Clone)]
 pub struct RoutedTrackPacket {
-    pub track_id: crate::entity::TrackId,
+    pub publication_id: crate::entity::PublicationKey,
     pub packet: TrackPacket,
 }
 

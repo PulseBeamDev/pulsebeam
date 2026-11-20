@@ -1,16 +1,31 @@
 use super::*;
+use crate::entity::{TrackId, TrackKind};
 
 const NATIVE_BUDGET: usize = 32;
 const MAX_TERMINAL_HANDOFFS: usize = 256;
 const TERMINAL_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
 const LOOKUP_WAKE_BUDGET: usize = 32;
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SourceLookupKey {
     room: ProjectRoomKey,
-    participant: String,
-    kind: i32,
-    label: String,
+    participant: ParticipantId,
+    kind: TrackKind,
+    track_id: TrackId,
+}
+
+impl SourceLookupKey {
+    fn from_address(
+        room: ProjectRoomKey,
+        address: &pulsebeam_proto::state::LogicalSourceAddress,
+    ) -> Option<Self> {
+        Some(Self {
+            room,
+            participant: ParticipantId::new(&address.participant_id).ok()?,
+            kind: crate::control::native::track_kind(address.kind)?,
+            track_id: TrackId::new(&address.track_id).ok()?,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -34,12 +49,6 @@ impl SourceLookupIndex {
         change: crate::control::native::LookupInterestChange,
     ) {
         let owner = (connection, change.reference);
-        let key = SourceLookupKey {
-            room: source_room,
-            participant: change.address.participant_id,
-            kind: change.address.kind,
-            label: change.address.label,
-        };
         if let Some(previous) = self.by_owner.remove(&owner) {
             if let Some(owners) = self.by_source.get_mut(&previous) {
                 owners.remove(&owner);
@@ -48,8 +57,10 @@ impl SourceLookupIndex {
                 }
             }
         }
-        if change.active {
-            self.by_source.entry(key.clone()).or_default().insert(owner);
+        if change.active
+            && let Some(key) = SourceLookupKey::from_address(source_room, &change.address)
+        {
+            self.by_source.entry(key).or_default().insert(owner);
             self.by_owner.insert(owner, key);
         }
     }
@@ -76,7 +87,7 @@ impl SourceLookupIndex {
         if !self.by_source.contains_key(&key) {
             return;
         }
-        if self.wake_queued.insert(key.clone()) {
+        if self.wake_queued.insert(key) {
             self.wake_queue.push_back(key);
         } else {
             self.wake_again.insert(key);
@@ -203,9 +214,7 @@ impl ControllerActor {
                 self.source_lookup_index.wake_queue.push_back(key);
                 continue;
             }
-            self.source_lookup_index
-                .wake_cursor
-                .insert(key.clone(), owner);
+            self.source_lookup_index.wake_cursor.insert(key, owner);
             let more = self
                 .source_lookup_index
                 .by_source
@@ -458,18 +467,12 @@ impl ControllerActor {
             return;
         }
         let room = publisher.room;
-        if let Some(label) = meta.label.as_ref() {
-            use pulsebeam_proto::state::TrackKind as WireKind;
-            let kind = match meta.id.kind() {
-                crate::entity::TrackKind::Audio => WireKind::Audio,
-                crate::entity::TrackKind::Video => WireKind::Video,
-                crate::entity::TrackKind::Data => WireKind::Data,
-            };
+        if let Some(track_id) = meta.track_id {
             self.source_lookup_index.source_changed(SourceLookupKey {
                 room,
-                participant: participant.as_str().to_owned(),
-                kind: kind as i32,
-                label: label.clone(),
+                participant,
+                kind: meta.id.kind(),
+                track_id,
             });
         }
         if !appeared {
@@ -527,7 +530,7 @@ mod source_lookup_index_tests {
             room: String::from("source-room"),
             participant_id: String::from("publisher"),
             kind: pulsebeam_proto::state::TrackKind::Data as i32,
-            label: String::from("topic"),
+            track_id: String::from("topic"),
         };
         let change = |reference, active| crate::control::native::LookupInterestChange {
             reference,
@@ -543,25 +546,20 @@ mod source_lookup_index_tests {
             project: crate::entity::ProjectId::new(),
             ..room
         };
-        let key = SourceLookupKey {
-            room,
-            participant: address.participant_id.clone(),
-            kind: address.kind,
-            label: address.label.clone(),
-        };
+        let key = SourceLookupKey::from_address(room, &address).unwrap();
         index.change(first, room, change(1, true));
         index.change(second, room, change(2, true));
         index.source_changed(SourceLookupKey {
             room: other_project_room,
-            ..key.clone()
+            ..key
         });
         index.source_changed(SourceLookupKey {
-            kind: pulsebeam_proto::state::TrackKind::Video as i32,
-            ..key.clone()
+            kind: TrackKind::Video,
+            ..key
         });
         assert!(index.wake_queue.is_empty());
         for _ in 0..2 {
-            index.source_changed(key.clone());
+            index.source_changed(key);
         }
         assert_eq!(index.wake_queue.len(), 1);
         assert!(index.wake_again.contains(index.wake_queue.front().unwrap()));

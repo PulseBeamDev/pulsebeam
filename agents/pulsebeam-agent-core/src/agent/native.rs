@@ -101,12 +101,12 @@ pub(super) fn kind(track: &state::Track) -> state::TrackKind {
     }
 }
 
-fn lookup_key(room: &str, participant: &str, kind: state::TrackKind, label: &str) -> Resource {
+fn lookup_key(room: &str, participant: &str, kind: state::TrackKind, track_id: &str) -> Resource {
     Resource::SourceLookup {
         room: room.into(),
         participant_id: participant.into(),
         kind,
-        label: label.into(),
+        track_id: track_id.into(),
     }
 }
 
@@ -119,14 +119,14 @@ fn selected<'a>(
         &selector.room,
         &selector.participant_id,
         expected,
-        &selector.label,
+        &selector.track_id,
     );
     session
         .state
         .lookup(&resource)?
         .track
         .as_ref()
-        .map(|track| track.track_id.as_str())
+        .map(|track| track.publication_id.as_str())
 }
 
 fn want_lookup(
@@ -134,9 +134,9 @@ fn want_lookup(
     room: &str,
     participant: &str,
     kind: state::TrackKind,
-    label: &str,
+    track_id: &str,
 ) {
-    let key = lookup_key(room, participant, kind, label);
+    let key = lookup_key(room, participant, kind, track_id);
     wanted.entry(key).or_insert_with(|| state::ResourceSpec {
         settings: Some(settings(true)),
         declaration: Some(state::resource_spec::Declaration::SourceLookup(
@@ -145,7 +145,7 @@ fn want_lookup(
                     room: room.into(),
                     participant_id: participant.into(),
                     kind: kind as i32,
-                    label: label.into(),
+                    track_id: track_id.into(),
                 }),
             },
         )),
@@ -235,7 +235,7 @@ fn receive_rtp(
     slot: &MediaSlot,
     source: &str,
 ) -> Option<state::TrackBinding> {
-    if session.state.target_spec(resource).and_then(|spec| spec.declaration.as_ref()).is_some_and(|declaration| matches!(declaration, state::resource_spec::Declaration::Subscription(value) if value.track_id != source)) {
+    if session.state.target_spec(resource).and_then(|spec| spec.declaration.as_ref()).is_some_and(|declaration| matches!(declaration, state::resource_spec::Declaration::Subscription(value) if value.publication_id != source)) {
         return None;
     }
     rtp(session, logs, resource, slot, Some(source))
@@ -271,7 +271,7 @@ fn delay(value: crate::PlayoutDelay) -> Option<state::PlayoutDelay> {
 }
 
 fn publication(
-    label: &str,
+    track_id: &str,
     enabled: bool,
     kind: state::publication_spec::Kind,
 ) -> state::ResourceSpec {
@@ -279,7 +279,7 @@ fn publication(
         settings: Some(settings(enabled)),
         declaration: Some(state::resource_spec::Declaration::Publication(
             state::PublicationSpec {
-                label: label.into(),
+                track_id: track_id.into(),
                 kind: Some(kind),
             },
         )),
@@ -300,7 +300,7 @@ fn subscription(
         }),
         declaration: Some(state::resource_spec::Declaration::Subscription(
             state::SubscriptionSpec {
-                track_id: track,
+                publication_id: track,
                 kind: kind as i32,
                 binding: Some(binding),
                 source_room,
@@ -328,7 +328,7 @@ fn source_room_for_track(session: &Session, desired: &DesiredState, track: &str)
         let selector = crate::TrackSelector {
             room: subscriber.room.clone(),
             participant_id: subscriber.participant_id.clone(),
-            label: subscriber.topic.clone(),
+            track_id: subscriber.topic.clone(),
         };
         if selected(session, &selector, state::TrackKind::Data) == Some(track) {
             return Some(subscriber.room.clone());
@@ -472,7 +472,7 @@ pub(super) fn reconcile(
             &selector.room,
             &selector.participant_id,
             state::TrackKind::Video,
-            &selector.label,
+            &selector.track_id,
         );
     }
     for selector in &desired.audio.selected {
@@ -481,7 +481,7 @@ pub(super) fn reconcile(
             &selector.room,
             &selector.participant_id,
             state::TrackKind::Audio,
-            &selector.label,
+            &selector.track_id,
         );
     }
     for subscriber in &desired.topics.subscribers {
@@ -504,7 +504,7 @@ pub(super) fn reconcile(
         };
         let resource = Resource::Publication {
             kind: wire_kind,
-            label: value.label.clone(),
+            track_id: value.track_id.clone(),
         };
         if let Some(want) = media_want(session, resource.clone(), &slot, None) {
             media.insert(slot.clone(), want);
@@ -519,7 +519,7 @@ pub(super) fn reconcile(
                     binding: Some(binding),
                 })
             };
-            wanted.insert(resource, publication(&value.label, value.active, kind));
+            wanted.insert(resource, publication(&value.track_id, value.active, kind));
         }
     }
     for video in &desired.video {
@@ -529,7 +529,7 @@ pub(super) fn reconcile(
             Some(selector) => {
                 selected(session, selector, state::TrackKind::Video).map(str::to_owned)
             }
-            None => Some(video.track_id.clone()),
+            None => Some(video.publication_id.clone()),
         };
         if let Some(track) = track.as_ref()
             && let Some(want) = media_want(session, resource.clone(), &slot, Some(track))
@@ -606,10 +606,10 @@ pub(super) fn reconcile(
         if let Resource::Reception(MediaSlot::RemoteAudio(index)) = resource
             && !occupied.contains(index)
             && let Some(track) = live.track.as_ref()
-            && let Some(buffering) = audio.remove(&track.track_id)
+            && let Some(buffering) = audio.remove(&track.publication_id)
         {
             occupied.insert(*index);
-            assigned.push((*index, track.track_id.clone(), buffering));
+            assigned.push((*index, track.publication_id.clone(), buffering));
         }
     }
     for (id, buffering) in audio {
@@ -656,7 +656,7 @@ pub(super) fn reconcile(
         data.insert(
             Resource::Publication {
                 kind: state::TrackKind::Data,
-                label: publisher.topic.clone(),
+                track_id: publisher.topic.clone(),
             },
             crate::TopicChannel::Publisher(publisher.clone()),
         );
@@ -690,7 +690,7 @@ pub(super) fn reconcile(
             && crate::TopicMode::from_delivery(format.delivery) == Some(registration.mode)
         {
             data.insert(
-                Resource::DataSubscription(track.track_id.clone()),
+                Resource::DataSubscription(track.publication_id.clone()),
                 crate::TopicChannel::Subscriber(registration.clone()),
             );
         }
@@ -889,7 +889,7 @@ fn media_needed(
                             } else {
                                 state::TrackKind::Video
                             },
-                            label: value.label.clone(),
+                            track_id: value.track_id.clone(),
                         })
             })
         }
@@ -898,7 +898,7 @@ fn media_needed(
                 && want.source.as_deref()
                     == match &value.selector {
                         Some(selector) => selected(session, selector, state::TrackKind::Video),
-                        None => Some(value.track_id.as_str()),
+                        None => Some(value.publication_id.as_str()),
                     }
         }),
         MediaSlot::RemoteAudio(_) => want.source.as_ref().is_some_and(|source| {
@@ -1029,7 +1029,7 @@ impl Agent {
             .get(slot)
             .is_none_or(|lease| lease.retired)
             || live.execution != state::ExecutionStatus::Installed as i32
-            || live.track.as_ref()?.track_id != *source
+            || live.track.as_ref()?.publication_id != *source
         {
             return None;
         }
@@ -1096,7 +1096,7 @@ impl Agent {
                     .find(|publication| {
                         publication.slot == *name && publication.kind == slot.kind()
                     })
-                    .map(|publication| publication.label.as_str())
+                    .map(|publication| publication.track_id.as_str())
             }
             _ => None,
         };
@@ -1565,7 +1565,7 @@ impl Agent {
                             .cloned()
                             .collect::<Vec<_>>();
                         for track in tracks {
-                            self.project_native_track(&track.track_id);
+                            self.project_native_track(&track.publication_id);
                         }
                     }
                     self.intent_dirty = true;
@@ -1700,7 +1700,7 @@ impl Agent {
                         if let Some(live) = active.state.eligible(&resource)
                             && let Some(track) = &live.track
                         {
-                            mappings.insert(coordinate.media_index, track.track_id.clone());
+                            mappings.insert(coordinate.media_index, track.publication_id.clone());
                         } else {
                             mappings.remove(&coordinate.media_index);
                         }
@@ -1818,7 +1818,7 @@ impl Agent {
                     id: id.into(),
                     participant_id: track.participant_id.clone(),
                     kind,
-                    label: track.label.clone(),
+                    track_id: track.track_id.clone(),
                 },
             );
         }

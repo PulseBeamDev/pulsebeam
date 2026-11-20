@@ -10,7 +10,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use pulsebeam_agent_native::agent_core::{
     AgentConfig, ConnectionState, Snapshot, TrackSelector, VideoObservation,
 };
@@ -23,10 +23,7 @@ use pulsebeam_core::auth::{
     ApiKey, ApiSigningKey, DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_SIGNING_KEY,
     DEVELOPMENT_PROJECT_ID, KeyRegistry, KeyRegistryEntry,
 };
-use pulsebeam_core::identity::{
-    ApiKeyId, AudioTrackId, ConnectionId, DataTrackId, ParticipantId, ProjectId, RoomId,
-    VideoTrackId,
-};
+use pulsebeam_core::identity::{ApiKeyId, ParticipantId, ProjectId, RoomId};
 use std::{
     collections::BTreeSet,
     io::Read,
@@ -243,7 +240,6 @@ struct TokenConfig {
 enum IdCommand {
     Room(RoomIdConfig),
     Participant(ParticipantIdConfig),
-    Track(TrackIdConfig),
 }
 
 #[derive(Args)]
@@ -262,23 +258,6 @@ struct ParticipantIdConfig {
     room_id: RoomId,
     #[arg(long)]
     participant_id: ParticipantId,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum TrackKindArg {
-    Audio,
-    Video,
-    Data,
-}
-
-#[derive(Args)]
-struct TrackIdConfig {
-    #[arg(long)]
-    connection_id: ConnectionId,
-    #[arg(long, value_enum)]
-    kind: TrackKindArg,
-    #[arg(long)]
-    label: String,
 }
 
 #[derive(Parser, Clone)]
@@ -470,17 +449,6 @@ fn derive_id(command: IdCommand) -> String {
     match command {
         IdCommand::Room(config) => config.room_id.to_string(),
         IdCommand::Participant(config) => config.participant_id.to_string(),
-        IdCommand::Track(config) => match config.kind {
-            TrackKindArg::Audio => {
-                AudioTrackId::derive(&config.connection_id, &config.label).as_str()
-            }
-            TrackKindArg::Video => {
-                VideoTrackId::derive(&config.connection_id, &config.label).as_str()
-            }
-            TrackKindArg::Data => {
-                DataTrackId::derive(&config.connection_id, &config.label).as_str()
-            }
-        },
     }
 }
 
@@ -797,7 +765,7 @@ async fn subscribe_remote_videos(
         let subscription = agent
             .room(selector.room.clone())?
             .participant(selector.participant_id.clone())?
-            .video(selector.label.clone())?
+            .video(selector.track_id.clone())?
             .subscribe(VideoObservation {
                 visible: true,
                 height: 720,
@@ -844,7 +812,7 @@ fn video_subscriptions(
         subscriptions.push(TrackSelector {
             room: format!("bench-room-{room_id}"),
             participant_id,
-            label: "camera".into(),
+            track_id: "camera".into(),
         });
     }
     subscriptions
@@ -1296,34 +1264,11 @@ mod tests {
     }
 
     #[test]
-    fn identity_commands_use_the_canonical_core_derivation() {
+    fn identity_commands_echo_canonical_application_names() {
         let project = ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
         let project_text = project.as_str();
-        let connection =
-            ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
-        let connection_text = connection.as_str();
-        let track_cli = Cli::try_parse_from([
-            "pulsebeam-cli",
-            "id",
-            "track",
-            "--connection-id",
-            &connection_text,
-            "--kind",
-            "video",
-            "--label",
-            "camera",
-        ])
-        .expect("documented identity arguments must parse");
-        let Commands::Id { command } = track_cli.command else {
-            panic!("id command must parse as id");
-        };
-
         let room = RoomId::new("general").unwrap();
         let participant = ParticipantId::new("alice").unwrap();
-        assert_eq!(
-            derive_id(command),
-            VideoTrackId::derive(&connection, "camera").as_str()
-        );
 
         let room_cli = Cli::try_parse_from([
             "pulsebeam-cli",
@@ -1435,7 +1380,7 @@ mod tests {
             );
             assert!(subscriptions.iter().all(|selector| {
                 selector.room == "bench-room-1"
-                    && selector.label == "camera"
+                    && selector.track_id == "camera"
                     && selector.participant_id != "bench-1000"
             }));
             let interests: BTreeSet<_> = subscriptions.into_iter().collect();
@@ -1455,6 +1400,6 @@ mod tests {
         assert_eq!(remaining, subscriptions[1..]);
         assert_eq!(retained.room, "bench-room-1");
         assert_eq!(retained.participant_id, "bench-1000");
-        assert_eq!(retained.label, "camera");
+        assert_eq!(retained.track_id, "camera");
     }
 }

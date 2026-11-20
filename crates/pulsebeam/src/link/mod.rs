@@ -44,7 +44,7 @@ pub struct BindReceive {
 #[derive(Debug)]
 pub struct BindSend {
     pub room: crate::entity::ProjectRoomKey,
-    pub track: crate::entity::TrackId,
+    pub track: crate::entity::PublicationKey,
     pub peer: pulsebeam_link::NetworkId,
     pub address: pulsebeam_link::NodeRouteKey,
     pub reply: pulsebeam_runtime::sync::oneshot::Sender<
@@ -57,7 +57,7 @@ pub struct BindSend {
 #[derive(Debug)]
 pub struct BindReverse {
     pub room: crate::entity::ProjectRoomKey,
-    pub track: crate::entity::TrackId,
+    pub track: crate::entity::PublicationKey,
     pub shard: crate::id::ShardId,
     pub peer: pulsebeam_link::NetworkId,
     pub address: pulsebeam_link::NodeRouteKey,
@@ -84,7 +84,7 @@ pub struct ReceiveDestination {
 #[derive(Debug)]
 pub struct Destinations {
     pub room: crate::entity::ProjectRoomKey,
-    pub track: crate::entity::TrackId,
+    pub track: crate::entity::PublicationKey,
     pub reply: pulsebeam_runtime::sync::oneshot::Sender<
         Result<Vec<ReceiveDestination>, pulsebeam_link::BindError>,
     >,

@@ -40,15 +40,19 @@ impl NativeSession {
             Some(descriptor) => self.observe_track(descriptor, source.publisher),
             None => {
                 let id = source.track.id().as_str();
-                if self.rows.get(&Key::Track(id.clone())).is_some_and(|row| {
-                    matches!(
-                        row.value.value,
-                        Some(wire::confirmed_state::Value::Track(_))
-                    )
-                }) {
+                if self
+                    .rows
+                    .get(&Key::Publication(id.clone()))
+                    .is_some_and(|row| {
+                        matches!(
+                            row.value.value,
+                            Some(wire::confirmed_state::Value::Track(_))
+                        )
+                    })
+                {
                     self.remove_track(id.clone())?;
                 }
-                self.unavailable(Key::Track(id))
+                self.unavailable(Key::Publication(id))
             }
         }
     }
@@ -122,9 +126,9 @@ impl NativeSession {
             .permissions
             .can_discover_track(publisher.as_str(), &track)
         {
-            return self.remove_track(track.track_id);
+            return self.remove_track(track.publication_id);
         }
-        let key = Key::Track(track.track_id.clone());
+        let key = Key::Publication(track.publication_id.clone());
         let previous = self.rows.get(&key).and_then(|row| match &row.value.value {
             Some(wire::confirmed_state::Value::Track(current)) => Some(current),
             _ => None,
@@ -153,7 +157,7 @@ impl NativeSession {
     }
 
     pub(crate) fn remove_track(&mut self, id: String) -> Result<(), OutputError> {
-        let key = Key::Track(id);
+        let key = Key::Publication(id);
         let Some(row) = self.rows.get(&key) else {
             return Ok(());
         };
@@ -222,14 +226,25 @@ impl NativeSession {
     pub(super) fn reconcile_discovery<'a>(
         &mut self,
         key: &Key,
-        source: &impl Fn(TrackId) -> Option<super::super::ResolvedSource<'a>>,
+        source: &impl Fn(PublicationKey) -> Option<super::super::ResolvedSource<'a>>,
     ) -> Result<(), OutputError> {
         match key {
-            Key::Track(id) => {
-                if let Some(source) = id
-                    .parse::<TrackId>()
-                    .ok()
-                    .and_then(|target| source(target).filter(|source| source.track.id() == target))
+            Key::Publication(id) => {
+                if let Some(source) =
+                    id.parse::<crate::entity::PublicationId>()
+                        .ok()
+                        .and_then(|id| {
+                            [
+                                crate::entity::TrackKind::Audio,
+                                crate::entity::TrackKind::Video,
+                                crate::entity::TrackKind::Data,
+                            ]
+                            .into_iter()
+                            .map(|kind| PublicationKey::new(kind, id))
+                            .find_map(|target| {
+                                source(target).filter(|source| source.track.id() == target)
+                            })
+                        })
                 {
                     self.observe_candidate(source)
                 } else {

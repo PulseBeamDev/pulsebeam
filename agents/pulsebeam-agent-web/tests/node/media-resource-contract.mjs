@@ -34,7 +34,7 @@ export async function mediaResourceContract(pulsebeam) {
     assert.equal(input.state(), input.state());
     const initial = first.state();
     assert.equal(initial.kind, pulsebeam.PublicationMediaKind.Video);
-    assert.equal(initial.label, "camera");
+    assert.equal(initial.trackId, "camera");
     assert.equal(initial.closed, false);
     assert.equal(
       initial.admission.status,
@@ -150,7 +150,7 @@ async function ownedPipeContract() {
     token: "owned-pipe-contract",
   });
   try {
-    const declaration = { kind: "video", label: "pipe-contract" };
+    const declaration = { kind: "video", trackId: "pipe-contract" };
     const publication = runtime.claim_owned_publication(declaration);
     assert.equal(publication.then, undefined, "declaration is synchronous");
     const observation = runtime.publication(publication.owner);
@@ -245,7 +245,7 @@ async function ownedPipeContract() {
 
     const legacyPublication = await runtime.resource({
       op: "claimPublication",
-      spec: { kind: "video", label: "legacy-replacement" },
+      spec: { kind: "video", trackId: "legacy-replacement" },
     });
     const superseded = runtime.create_owned_publication_pipe(
       legacyPublication.owner,
@@ -279,7 +279,7 @@ async function ownedPipeContract() {
 
     const second = await runtime.resource({
       op: "claimPublication",
-      spec: { kind: "video", label: "release-pipe-contract" },
+      spec: { kind: "video", trackId: "release-pipe-contract" },
     });
     const released = runtime.create_owned_publication_pipe(second.owner);
     const releaseCursor = released.updates();
@@ -292,7 +292,7 @@ async function ownedPipeContract() {
 
     const racePublication = await runtime.resource({
       op: "claimPublication",
-      spec: { kind: "video", label: "install-close-race-contract" },
+      spec: { kind: "video", trackId: "install-close-race-contract" },
     });
     const racingPipe = runtime.create_owned_publication_pipe(
       racePublication.owner,
@@ -321,7 +321,7 @@ async function ownedPipeContract() {
 
     const third = await runtime.resource({
       op: "claimPublication",
-      spec: { kind: "video", label: "shutdown-pipe-contract" },
+      spec: { kind: "video", trackId: "shutdown-pipe-contract" },
     });
     const retained = runtime.create_owned_publication_pipe(third.owner);
     const shutdownCursor = retained.updates();
@@ -339,7 +339,7 @@ async function ownedPipeContract() {
     try {
       const publication = await abortRuntime.resource({
         op: "claimPublication",
-        spec: { kind: "video", label: "abort" },
+        spec: { kind: "video", trackId: "abort" },
       });
       const pipe = abortRuntime.create_owned_publication_pipe(
         publication.owner,

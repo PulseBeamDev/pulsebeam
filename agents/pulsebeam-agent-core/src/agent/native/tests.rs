@@ -23,7 +23,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
         });
         let receiving = slot.direction() == crate::MediaDirection::ReceiveOnly;
         let requested_format = receiving.then_some(format.clone());
-        let want = |label: &str| MediaWant {
+        let want = |track_id: &str| MediaWant {
             resource: if receiving {
                 Resource::Reception(slot.clone())
             } else {
@@ -33,10 +33,10 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                     } else {
                         state::TrackKind::Audio
                     },
-                    label: label.into(),
+                    track_id: track_id.into(),
                 }
             },
-            source: receiving.then(|| label.into()),
+            source: receiving.then(|| track_id.into()),
             allocation: Allocation {
                 slot: slot.clone(),
                 format: requested_format.clone(),
@@ -227,13 +227,13 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
             .into_iter()
             .map(|id| {
                 confirmed(
-                    state::resource_key::Key::Track(id.into()),
+                    state::resource_key::Key::Publication(id.into()),
                     0,
                     state::confirmed_state::Value::Track(state::Track {
-                        track_id: id.into(),
+                        publication_id: id.into(),
                         participant_id: "remote".into(),
                         room_id: "room".into(),
-                        label: "voice".into(),
+                        track_id: "voice".into(),
                         kind: Some(state::track::Kind::Audio(state::AudioTrack {
                             format: Some(state::CodecFormat::from(
                                 state::codec_format::Codec::Opus(Default::default()),
@@ -298,7 +298,7 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
     let slot = MediaSlot::LocalVideo("v0".into());
     let resource = Resource::Publication {
         kind: state::TrackKind::Video,
-        label: "camera".into(),
+        track_id: "camera".into(),
     };
     let cached = |mid: &str| crate::rtc_preparation::PreparedRtp {
         binding: state::TrackBinding {
@@ -526,7 +526,7 @@ fn media_retirement_is_correlated_and_cannot_clear_replacement_facts() {
 #[test]
 fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serialized_frame() {
     let publisher = crate::TopicPublisher {
-        topic: "literal/Δ label".into(),
+        topic: "Literal_name".into(),
         mode: crate::TopicMode::Ordered,
     };
     let (mut agent, generation, control) = connected(crate::TopicRegistrations {
@@ -577,7 +577,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     );
     assert!(
         agent.snapshot().topics.publishers[0]
-            .data_track_id
+            .publication_id
             .is_none()
     );
     agent
@@ -661,7 +661,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
     else {
         panic!("publication")
     };
-    assert_eq!(declaration.label, publisher.topic);
+    assert_eq!(declaration.track_id, publisher.topic);
     agent
         .handle(HostEvent::DataChannel(DataChannelEvent::SendFailed {
             generation,
@@ -728,10 +728,10 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
                     room_id: "room".into(),
                 }),
                 track: Some(state::Track {
-                    track_id: "server-canonical-source".into(),
+                    publication_id: "server-canonical-source".into(),
                     participant_id: "p1".into(),
                     room_id: "room".into(),
-                    label: publisher.topic.clone(),
+                    track_id: publisher.topic.clone(),
                     kind: Some(state::track::Kind::Data(state::DataTrack {
                         delivery: state::DataDelivery::Ordered as i32,
                     })),
@@ -1318,7 +1318,7 @@ fn received_resource_state_projects_prejoin_and_owner_local_intent() {
     let selector = crate::TrackSelector {
         room: "main".into(),
         participant_id: "alice-device".into(),
-        label: "camera".into(),
+        track_id: "camera".into(),
     };
     let mut claim_video = || {
         let crate::ResourceResult::Owned { owner } = agent
@@ -1368,7 +1368,7 @@ fn received_resource_state_projects_prejoin_and_owner_local_intent() {
     let crate::ResourceResult::Owned { owner: publication } = agent
         .resource(crate::ResourceCommand::DeclareDataPublication {
             spec: crate::TrackSpec::Data {
-                label: "events".into(),
+                track_id: "events".into(),
                 delivery: crate::TopicMode::Ordered,
             },
         })
@@ -1395,13 +1395,13 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
     let selector = crate::TrackSelector {
         room: "room".into(),
         participant_id: "external".into(),
-        label: "camera".into(),
+        track_id: "camera".into(),
     };
     let resource = Resource::SourceLookup {
         room: selector.room.clone(),
         participant_id: selector.participant_id.clone(),
         kind: state::TrackKind::Video,
-        label: selector.label.clone(),
+        track_id: selector.track_id.clone(),
     };
     let spec = |enabled| state::ResourceSpec {
         settings: Some(state::ResourceSettings {
@@ -1414,16 +1414,16 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
                     room: selector.room.clone(),
                     participant_id: selector.participant_id.clone(),
                     kind: state::TrackKind::Video as i32,
-                    label: selector.label.clone(),
+                    track_id: selector.track_id.clone(),
                 }),
             },
         )),
     };
     let track = state::Track {
-        track_id: "lookup-only-source".into(),
+        publication_id: "lookup-only-source".into(),
         participant_id: selector.participant_id.clone(),
         room_id: selector.room.clone(),
-        label: selector.label.clone(),
+        track_id: selector.track_id.clone(),
         kind: Some(state::track::Kind::Video(state::VideoTrack {
             format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
                 state::Vp8Parameters {},
@@ -1491,12 +1491,12 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
     assert!(active.state.participants().is_empty());
     assert_eq!(
         selected(active, &selector, state::TrackKind::Video),
-        Some(track.track_id.as_str())
+        Some(track.publication_id.as_str())
     );
     let desired = crate::DesiredState {
         video: vec![crate::VideoSubscription {
             slot: 0,
-            track_id: track.track_id.clone(),
+            publication_id: track.publication_id.clone(),
             selector: Some(selector.clone()),
             height: 0,
             min_height: 0,
@@ -1507,11 +1507,15 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
         ..Default::default()
     };
     assert_eq!(
-        source_room_for_track(active, &desired, &track.track_id),
+        source_room_for_track(active, &desired, &track.publication_id),
         Some(selector.room.clone())
     );
     assert_eq!(
-        source_room_for_track(active, &crate::DesiredState::default(), &track.track_id),
+        source_room_for_track(
+            active,
+            &crate::DesiredState::default(),
+            &track.publication_id
+        ),
         None
     );
     assert_eq!(

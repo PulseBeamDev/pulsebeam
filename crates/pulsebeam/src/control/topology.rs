@@ -4,7 +4,7 @@ use pulsebeam_runtime::time::Instant;
 use slotmap::{SlotMap, new_key_type};
 
 use crate::{
-    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, TrackId, TrackKind},
+    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, PublicationKey, TrackKind},
     id::ShardId,
     route::{NodeRouteAddress, PackedRoute, RouteId, SlotAllocator},
     track::{SelectionPolicy, Track, TrackSelector},
@@ -18,7 +18,7 @@ new_key_type! {
 pub(crate) struct TrackAncestry {
     pub room_id: ProjectRoomKey,
     pub publisher: ParticipantId,
-    pub track_id: TrackId,
+    pub publication_id: PublicationKey,
 }
 
 impl TrackAncestry {
@@ -26,12 +26,12 @@ impl TrackAncestry {
         Self {
             room_id: track.meta().room,
             publisher: track.meta().origin,
-            track_id: track.id(),
+            publication_id: track.id(),
         }
     }
 
     pub(crate) fn kind(self) -> TrackKind {
-        self.track_id.kind()
+        self.publication_id.kind()
     }
 }
 
@@ -41,7 +41,7 @@ pub(crate) struct OwnedSubscription {
     pub(crate) source_room: ProjectRoomKey,
     pub(crate) subscriber: ParticipantId,
     pub(crate) reference: u64,
-    pub(crate) track: TrackId,
+    pub(crate) track: PublicationKey,
     pub(crate) enabled: bool,
 }
 
@@ -62,7 +62,7 @@ struct Publication {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SubscriptionAnchor {
-    Track(TrackId),
+    Track(PublicationKey),
     Publisher(ParticipantId),
     Label(String),
     Kind(TrackKind),
@@ -72,21 +72,21 @@ enum SubscriptionAnchor {
 #[derive(Debug, Default)]
 struct RoomTrackTopology {
     catalog_version: u64,
-    tracks: HashMap<TrackId, Publication>,
-    by_publisher: HashMap<ParticipantId, HashSet<TrackId>>,
-    by_incarnation: HashMap<(ParticipantId, ConnectionId), HashSet<TrackId>>,
-    by_kind: HashMap<TrackKind, HashSet<TrackId>>,
-    by_label: HashMap<String, HashSet<TrackId>>,
+    tracks: HashMap<PublicationKey, Publication>,
+    by_publisher: HashMap<ParticipantId, HashSet<PublicationKey>>,
+    by_incarnation: HashMap<(ParticipantId, ConnectionId), HashSet<PublicationKey>>,
+    by_kind: HashMap<TrackKind, HashSet<PublicationKey>>,
+    by_label: HashMap<String, HashSet<PublicationKey>>,
     subscriptions: SlotMap<SubscriptionKey, Subscription>,
     owned: HashMap<(EndpointKey, u64), SubscriptionKey>,
-    by_track: HashMap<TrackId, HashSet<SubscriptionKey>>,
+    by_track: HashMap<PublicationKey, HashSet<SubscriptionKey>>,
     by_subscriber_publisher: HashMap<ParticipantId, HashSet<SubscriptionKey>>,
     by_subscription_kind: HashMap<TrackKind, HashSet<SubscriptionKey>>,
     by_subscription_label: HashMap<String, HashSet<SubscriptionKey>>,
     unconstrained: HashSet<SubscriptionKey>,
-    candidate_reasons: HashMap<(EndpointKey, TrackId), HashSet<SubscriptionKey>>,
-    automatic_reasons: HashMap<(EndpointKey, TrackId), HashSet<SubscriptionKey>>,
-    allocated: HashSet<(EndpointKey, TrackId)>,
+    candidate_reasons: HashMap<(EndpointKey, PublicationKey), HashSet<SubscriptionKey>>,
+    automatic_reasons: HashMap<(EndpointKey, PublicationKey), HashSet<SubscriptionKey>>,
+    allocated: HashSet<(EndpointKey, PublicationKey)>,
 }
 
 #[derive(Debug, Default)]
@@ -100,7 +100,7 @@ impl TrackTopology {
         let identity = TrackAncestry::from_track(&track);
         let label = track.publication_label();
         let room = self.rooms.entry(identity.room_id).or_default();
-        if room.tracks.contains_key(&identity.track_id) {
+        if room.tracks.contains_key(&identity.publication_id) {
             debug_assert!(false, "a track identity must be published once");
             return None;
         }
@@ -111,14 +111,14 @@ impl TrackTopology {
         room.catalog_version = self.catalog_version;
         room.index_track(identity, track.meta().connection_id, label.as_deref());
         room.tracks
-            .insert(identity.track_id, Publication { track, label });
+            .insert(identity.publication_id, Publication { track, label });
         room.add_publication_reasons(identity);
         Some(identity)
     }
 
     pub(crate) fn unpublish(&mut self, identity: TrackAncestry) -> Option<Track> {
         let room = self.rooms.get_mut(&identity.room_id)?;
-        let publication = room.tracks.remove(&identity.track_id)?;
+        let publication = room.tracks.remove(&identity.publication_id)?;
         self.catalog_version = self
             .catalog_version
             .checked_add(1)
@@ -131,31 +131,31 @@ impl TrackTopology {
             publication.label.as_deref(),
         );
         room.candidate_reasons
-            .retain(|(_, track), _| *track != identity.track_id);
+            .retain(|(_, track), _| *track != identity.publication_id);
         room.automatic_reasons
-            .retain(|(_, track), _| *track != identity.track_id);
+            .retain(|(_, track), _| *track != identity.publication_id);
         room.allocated
-            .retain(|(_, track)| *track != identity.track_id);
+            .retain(|(_, track)| *track != identity.publication_id);
         Some(publication.track)
     }
 
     pub(crate) fn track(&self, identity: TrackAncestry) -> Option<&Track> {
-        self.source(identity.room_id, identity.track_id)
+        self.source(identity.room_id, identity.publication_id)
     }
 
-    pub(crate) fn source(&self, room_id: ProjectRoomKey, track: TrackId) -> Option<&Track> {
+    pub(crate) fn source(&self, room_id: ProjectRoomKey, track: PublicationKey) -> Option<&Track> {
         Some(&self.rooms.get(&room_id)?.tracks.get(&track)?.track)
     }
 
     // Publisher publications are capped at 64 by admission. Logical labels are
     // metadata; routing-label indexes deliberately omit audio and video.
-    pub(crate) fn exact_labeled_sources<'a: 'b, 'b>(
-        &'a self,
+    pub(crate) fn exact_named_sources(
+        &self,
         room_id: ProjectRoomKey,
         publisher: ParticipantId,
         kind: TrackKind,
-        label: &'b str,
-    ) -> Option<impl Iterator<Item = &'a Track> + 'b> {
+        track_id: crate::entity::TrackId,
+    ) -> Option<impl Iterator<Item = &Track>> {
         let room = self.rooms.get(&room_id)?;
         let publications = room.by_publisher.get(&publisher)?;
         let kinds = room.by_kind.get(&kind)?;
@@ -166,7 +166,7 @@ impl TrackTopology {
                 .filter_map(move |track| {
                     room.tracks.get(track).map(|publication| &publication.track)
                 })
-                .filter(move |track| track.meta().label.as_deref() == Some(label)),
+                .filter(move |track| track.meta().track_id == Some(track_id)),
         )
     }
 
@@ -202,7 +202,7 @@ impl TrackTopology {
 
     pub(crate) fn track_mut(&mut self, identity: TrackAncestry) -> Option<&mut Track> {
         let room = self.rooms.get_mut(&identity.room_id)?;
-        let publication = room.tracks.get_mut(&identity.track_id)?;
+        let publication = room.tracks.get_mut(&identity.publication_id)?;
         self.catalog_version = self
             .catalog_version
             .checked_add(1)
@@ -240,7 +240,7 @@ impl TrackTopology {
         room_id: ProjectRoomKey,
         subscriber: ParticipantId,
         reference: u64,
-        track: TrackId,
+        track: PublicationKey,
         enabled: bool,
     ) -> bool {
         self.set_owned_scoped(room_id, room_id, subscriber, reference, track, enabled)
@@ -252,7 +252,7 @@ impl TrackTopology {
         source_room: ProjectRoomKey,
         subscriber: ParticipantId,
         reference: u64,
-        track: TrackId,
+        track: PublicationKey,
         enabled: bool,
     ) -> bool {
         if source_room.project != subscriber_room.project {
@@ -337,7 +337,7 @@ impl TrackTopology {
     pub(crate) fn has_candidate(&self, identity: TrackAncestry, endpoint: EndpointKey) -> bool {
         self.rooms.get(&identity.room_id).is_some_and(|room| {
             room.candidate_reasons
-                .contains_key(&(endpoint, identity.track_id))
+                .contains_key(&(endpoint, identity.publication_id))
         })
     }
 
@@ -348,7 +348,7 @@ impl TrackTopology {
         self.rooms
             .get(&identity.room_id)
             .into_iter()
-            .flat_map(move |room| room.candidate_subscribers(identity.track_id))
+            .flat_map(move |room| room.candidate_subscribers(identity.publication_id))
     }
 
     pub(crate) fn active_subscribers(
@@ -358,7 +358,7 @@ impl TrackTopology {
         self.rooms
             .get(&identity.room_id)
             .into_iter()
-            .flat_map(move |room| room.active_subscribers(identity.track_id))
+            .flat_map(move |room| room.active_subscribers(identity.publication_id))
     }
 
     pub(crate) fn activate(&mut self, identity: TrackAncestry, subscriber: EndpointKey) -> bool {
@@ -369,19 +369,20 @@ impl TrackTopology {
             debug_assert!(false, "activation must target a live room catalog");
             return false;
         };
-        room.activate(identity.track_id, subscriber)
+        room.activate(identity.publication_id, subscriber)
     }
 
     pub(crate) fn deactivate(&mut self, identity: TrackAncestry, subscriber: EndpointKey) -> bool {
-        self.rooms
-            .get_mut(&identity.room_id)
-            .is_some_and(|room| room.allocated.remove(&(subscriber, identity.track_id)))
+        self.rooms.get_mut(&identity.room_id).is_some_and(|room| {
+            room.allocated
+                .remove(&(subscriber, identity.publication_id))
+        })
     }
 
     pub(crate) fn contains(&self, identity: TrackAncestry) -> bool {
         self.rooms
             .get(&identity.room_id)
-            .is_some_and(|room| room.tracks.contains_key(&identity.track_id))
+            .is_some_and(|room| room.tracks.contains_key(&identity.publication_id))
     }
 
     pub(crate) fn matching_tracks(
@@ -431,12 +432,12 @@ impl TrackTopology {
 }
 
 impl RoomTrackTopology {
-    fn identity(&self, room_id: ProjectRoomKey, track: TrackId) -> Option<TrackAncestry> {
+    fn identity(&self, room_id: ProjectRoomKey, track: PublicationKey) -> Option<TrackAncestry> {
         let publication = self.tracks.get(&track)?;
         Some(TrackAncestry {
             room_id,
             publisher: publication.track.meta().origin,
-            track_id: track,
+            publication_id: track,
         })
     }
 
@@ -446,31 +447,31 @@ impl RoomTrackTopology {
         connection: ConnectionId,
         label: Option<&str>,
     ) {
-        debug_assert!(!self.tracks.contains_key(&identity.track_id));
+        debug_assert!(!self.tracks.contains_key(&identity.publication_id));
         let inserted = self
             .by_incarnation
             .entry((identity.publisher, connection))
             .or_default()
-            .insert(identity.track_id);
+            .insert(identity.publication_id);
         debug_assert!(inserted);
         let publisher_inserted = self
             .by_publisher
             .entry(identity.publisher)
             .or_default()
-            .insert(identity.track_id);
+            .insert(identity.publication_id);
         debug_assert!(publisher_inserted);
         let kind_inserted = self
             .by_kind
             .entry(identity.kind())
             .or_default()
-            .insert(identity.track_id);
+            .insert(identity.publication_id);
         debug_assert!(kind_inserted);
         if let Some(label) = label {
             let label_inserted = self
                 .by_label
                 .entry(label.to_owned())
                 .or_default()
-                .insert(identity.track_id);
+                .insert(identity.publication_id);
             debug_assert!(label_inserted);
         }
     }
@@ -484,25 +485,29 @@ impl RoomTrackTopology {
         let removed = remove_indexed(
             &mut self.by_incarnation,
             (identity.publisher, connection),
-            identity.track_id,
+            identity.publication_id,
         );
         debug_assert!(removed);
         let publisher_removed = remove_indexed(
             &mut self.by_publisher,
             identity.publisher,
-            identity.track_id,
+            identity.publication_id,
         );
         debug_assert!(publisher_removed);
-        let kind_removed = remove_indexed(&mut self.by_kind, identity.kind(), identity.track_id);
+        let kind_removed =
+            remove_indexed(&mut self.by_kind, identity.kind(), identity.publication_id);
         debug_assert!(kind_removed);
         if let Some(label) = label {
-            let label_removed =
-                remove_indexed(&mut self.by_label, label.to_owned(), identity.track_id);
+            let label_removed = remove_indexed(
+                &mut self.by_label,
+                label.to_owned(),
+                identity.publication_id,
+            );
             debug_assert!(label_removed);
         }
     }
 
-    fn selector_tracks(&self, selector: &TrackSelector) -> Vec<TrackId> {
+    fn selector_tracks(&self, selector: &TrackSelector) -> Vec<PublicationKey> {
         let candidates: Vec<_> = if let Some(track) = selector.track {
             self.tracks
                 .contains_key(&track)
@@ -604,13 +609,13 @@ impl RoomTrackTopology {
     }
 
     fn matching_subscription_keys(&self, identity: TrackAncestry) -> HashSet<SubscriptionKey> {
-        let Some(publication) = self.tracks.get(&identity.track_id) else {
+        let Some(publication) = self.tracks.get(&identity.publication_id) else {
             return HashSet::new();
         };
         debug_assert_eq!(TrackAncestry::from_track(&publication.track), identity);
         let mut candidates = self.unconstrained.clone();
         for ids in [
-            self.by_track.get(&identity.track_id),
+            self.by_track.get(&identity.publication_id),
             self.by_subscriber_publisher.get(&identity.publisher),
             self.by_subscription_kind.get(&identity.kind()),
         ]
@@ -644,7 +649,7 @@ impl RoomTrackTopology {
 
     fn add_publication_reasons(&mut self, identity: TrackAncestry) {
         for id in self.matching_subscription_keys(identity) {
-            self.add_reason(identity.track_id, id);
+            self.add_reason(identity.publication_id, id);
         }
     }
 
@@ -658,7 +663,7 @@ impl RoomTrackTopology {
         }
     }
 
-    fn add_reason(&mut self, track: TrackId, id: SubscriptionKey) {
+    fn add_reason(&mut self, track: PublicationKey, id: SubscriptionKey) {
         let Some(subscription) = self.subscriptions.get(id) else {
             debug_assert!(false, "reason must reference a live subscription");
             return;
@@ -711,20 +716,23 @@ impl RoomTrackTopology {
         Some(subscription)
     }
 
-    fn candidate_subscribers(&self, track: TrackId) -> impl Iterator<Item = EndpointKey> + '_ {
+    fn candidate_subscribers(
+        &self,
+        track: PublicationKey,
+    ) -> impl Iterator<Item = EndpointKey> + '_ {
         self.candidate_reasons
             .keys()
             .filter_map(move |(subscriber, candidate)| (*candidate == track).then_some(*subscriber))
     }
 
-    fn active_subscribers(&self, track: TrackId) -> impl Iterator<Item = EndpointKey> + '_ {
+    fn active_subscribers(&self, track: PublicationKey) -> impl Iterator<Item = EndpointKey> + '_ {
         self.candidate_subscribers(track).filter(move |subscriber| {
             self.automatic_reasons.contains_key(&(*subscriber, track))
                 || self.allocated.contains(&(*subscriber, track))
         })
     }
 
-    fn activate(&mut self, track: TrackId, subscriber: EndpointKey) -> bool {
+    fn activate(&mut self, track: PublicationKey, subscriber: EndpointKey) -> bool {
         let key = (subscriber, track);
         let valid = self
             .candidate_reasons
@@ -755,7 +763,7 @@ impl RoomTrackTopology {
         }
     }
 
-    fn remove_track(&mut self, track: TrackId) {
+    fn remove_track(&mut self, track: PublicationKey) {
         let Some(publication) = self.tracks.remove(&track) else {
             debug_assert!(false, "participant publication must remain indexed");
             return;
@@ -790,8 +798,8 @@ fn remove_indexed<K: Eq + std::hash::Hash, V: Eq + std::hash::Hash + Copy>(
 }
 
 fn remove_reason(
-    reasons: &mut HashMap<(EndpointKey, TrackId), HashSet<SubscriptionKey>>,
-    key: (EndpointKey, TrackId),
+    reasons: &mut HashMap<(EndpointKey, PublicationKey), HashSet<SubscriptionKey>>,
+    key: (EndpointKey, PublicationKey),
     id: SubscriptionKey,
 ) -> bool {
     let Some(ids) = reasons.get_mut(&key) else {
@@ -806,7 +814,7 @@ fn remove_reason(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TrackPlacement {
-    pub track_id: TrackId,
+    pub publication_id: PublicationKey,
     pub route: NodeRouteAddress,
 }
 
@@ -847,7 +855,7 @@ impl TrackPlacementAllocator {
         let (slot, epoch) = allocator.allocate(now);
 
         TrackPlacement {
-            track_id: identity.track_id,
+            publication_id: identity.publication_id,
             route: NodeRouteAddress::new(RouteId::new(shard, slot), epoch),
         }
     }
@@ -885,10 +893,12 @@ mod tests {
         let meta = crate::track::TrackMeta {
             room: room(room_seed),
             shard_id: ShardId::new(0),
-            id: connection.derive_track_id(kind, label),
+            id: connection.fixture_publication(kind, label),
             origin: publisher,
             connection_id: connection,
-            label: Some(label.to_owned()),
+            track_id: Some(
+                crate::entity::TrackId::new(label.strip_prefix("rel:").unwrap_or(label)).unwrap(),
+            ),
         };
         match kind {
             TrackKind::Data => {
@@ -946,14 +956,14 @@ mod tests {
                 .publisher_sources(room(1), participant(1), old_connection)
                 .map(Track::id)
                 .collect::<Vec<_>>(),
-            vec![old_identity.track_id]
+            vec![old_identity.publication_id]
         );
         assert_eq!(
             topology
                 .publisher_sources(room(1), participant(1), current_connection)
                 .map(Track::id)
                 .collect::<Vec<_>>(),
-            vec![current_identity.track_id]
+            vec![current_identity.publication_id]
         );
         topology.unpublish(old_identity).unwrap();
         assert!(
@@ -980,7 +990,8 @@ mod tests {
         let mut topology = TrackTopology::default();
         for kind in [TrackKind::Audio, TrackKind::Video, TrackKind::Data] {
             let mut publication = track(kind, 1, 1, "routing-label");
-            publication.meta_mut().label = Some("logical-label".into());
+            publication.meta_mut().track_id =
+                Some(crate::entity::TrackId::new("logical-label").unwrap());
             let id = publication.id();
             topology.publish(publication).unwrap();
             topology
@@ -990,14 +1001,24 @@ mod tests {
                 .publish(track(kind, 1, 2, "logical-label"))
                 .unwrap();
             let found: Vec<_> = topology
-                .exact_labeled_sources(room(1), participant(1), kind, "logical-label")
+                .exact_named_sources(
+                    room(1),
+                    participant(1),
+                    kind,
+                    crate::entity::TrackId::new("logical-label").unwrap(),
+                )
                 .unwrap()
                 .map(Track::id)
                 .collect();
             assert_eq!(found, [id]);
             assert_eq!(
                 topology
-                    .exact_labeled_sources(room(1), participant(1), kind, "routing-label")
+                    .exact_named_sources(
+                        room(1),
+                        participant(1),
+                        kind,
+                        crate::entity::TrackId::new("routing-label").unwrap()
+                    )
                     .unwrap()
                     .count(),
                 0
@@ -1059,7 +1080,7 @@ mod tests {
             .publish(track(TrackKind::Audio, 1, 1, "audio"))
             .unwrap();
         let subscriber = participant(3);
-        let exact = TrackSelector::track(identity.track_id);
+        let exact = TrackSelector::track(identity.publication_id);
         let _ = topology.subscribe(
             room(1),
             subscriber,
@@ -1093,11 +1114,11 @@ mod tests {
             SelectionPolicy::Allocated,
         );
         assert_eq!(topology.active_subscribers(identity).count(), 0);
-        topology.set_owned(room(1), subscriber, 1, identity.track_id, true);
+        topology.set_owned(room(1), subscriber, 1, identity.publication_id, true);
         let unrelated = topology
             .publish(track(TrackKind::Audio, 2, 1, "other"))
             .unwrap();
-        assert!(!topology.set_owned(room(1), subscriber, 1, unrelated.track_id, true));
+        assert!(!topology.set_owned(room(1), subscriber, 1, unrelated.publication_id, true));
         let second_endpoint = EndpointKey {
             room: room(2),
             participant: subscriber,
@@ -1110,7 +1131,7 @@ mod tests {
             room(1),
             subscriber,
             1,
-            identity.track_id,
+            identity.publication_id,
             true
         ));
         assert!(topology.set_owned_scoped(
@@ -1118,7 +1139,7 @@ mod tests {
             room(1),
             subscriber,
             1,
-            identity.track_id,
+            identity.publication_id,
             true
         ));
         assert_eq!(topology.active_subscribers(identity).count(), 2);
@@ -1126,9 +1147,9 @@ mod tests {
         assert_eq!(topology.active_subscribers(unrelated).count(), 0);
         assert_eq!(topology.active_subscribers(identity).count(), 1);
         topology.unpublish(unrelated).unwrap();
-        topology.set_owned(room(1), subscriber, 2, identity.track_id, true);
+        topology.set_owned(room(1), subscriber, 2, identity.publication_id, true);
         assert_eq!(topology.active_subscribers(identity).count(), 1);
-        topology.set_owned(room(1), subscriber, 1, identity.track_id, false);
+        topology.set_owned(room(1), subscriber, 1, identity.publication_id, false);
         assert_eq!(topology.active_subscribers(identity).count(), 1);
         assert!(
             topology
@@ -1150,10 +1171,10 @@ mod tests {
             Some(2)
         );
         assert_eq!(topology.active_subscribers(identity).count(), 0);
-        topology.set_owned(room(1), subscriber, 1, identity.track_id, true);
+        topology.set_owned(room(1), subscriber, 1, identity.publication_id, true);
         assert_eq!(topology.rooms[&room(1)].subscriptions.len(), 2);
         let other = participant(4);
-        topology.set_owned(room(1), other, 1, identity.track_id, true);
+        topology.set_owned(room(1), other, 1, identity.publication_id, true);
         topology
             .remove_owned(
                 room(1),
@@ -1234,7 +1255,7 @@ mod tests {
         allocator.release(first, Instant::now());
         let replacement = allocator.allocate(ShardId::new(1), track, Instant::now());
 
-        assert_eq!(first.track_id, replacement.track_id);
+        assert_eq!(first.publication_id, replacement.publication_id);
         assert_ne!(first.route, replacement.route);
     }
 
@@ -1248,7 +1269,7 @@ mod tests {
         let _ = topology.subscribe(
             room(1),
             owner,
-            TrackSelector::track(identity.track_id),
+            TrackSelector::track(identity.publication_id),
             SelectionPolicy::All,
         );
 

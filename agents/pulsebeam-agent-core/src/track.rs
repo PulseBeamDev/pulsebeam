@@ -18,50 +18,46 @@ pub const DATA_RECEIVE_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TrackSpec {
-    Video { label: String },
-    Audio { label: String },
-    Data { label: String, delivery: TopicMode },
+    Video {
+        track_id: String,
+    },
+    Audio {
+        track_id: String,
+    },
+    Data {
+        track_id: String,
+        delivery: TopicMode,
+    },
 }
 
 impl TrackSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
-        match self {
-            Self::Video { label } | Self::Audio { label } => {
-                if label.is_empty() || label.len() > 256 {
-                    Err(ValidationError::Identifier {
-                        field: "publication label",
-                    })
-                } else {
-                    Ok(())
-                }
+        let track_id = match self {
+            Self::Audio { track_id } | Self::Video { track_id } | Self::Data { track_id, .. } => {
+                track_id
             }
-            Self::Data { label, delivery } => TopicRegistrations {
-                publishers: vec![TopicPublisher {
-                    topic: label.clone(),
-                    mode: *delivery,
-                }],
-                subscribers: Vec::new(),
-            }
-            .validate(),
-        }
+        };
+        crate::model::validate_track_id(track_id)
     }
 
     pub(crate) fn from_state(track: &pulsebeam_proto::state::Track) -> Option<Self> {
         use pulsebeam_proto::state::track::Kind;
-        let label = track.label.clone();
+        let track_id = track.track_id.clone();
         Some(match track.kind.as_ref()? {
-            Kind::Audio(_) => Self::Audio { label },
-            Kind::Video(_) => Self::Video { label },
+            Kind::Audio(_) => Self::Audio { track_id },
+            Kind::Video(_) => Self::Video { track_id },
             Kind::Data(format) => Self::Data {
-                label,
+                track_id,
                 delivery: TopicMode::from_delivery(format.delivery)?,
             },
         })
     }
 
-    pub fn label(&self) -> &str {
+    pub fn track_id(&self) -> &str {
         match self {
-            Self::Video { label } | Self::Audio { label } | Self::Data { label, .. } => label,
+            Self::Video { track_id } | Self::Audio { track_id } | Self::Data { track_id, .. } => {
+                track_id
+            }
         }
     }
 
@@ -76,8 +72,8 @@ impl TrackSpec {
     pub(crate) fn publisher(&self) -> Result<TopicPublisher, TrackResourceError> {
         self.validate()?;
         match self {
-            Self::Data { label, delivery } => Ok(TopicPublisher {
-                topic: label.clone(),
+            Self::Data { track_id, delivery } => Ok(TopicPublisher {
+                topic: track_id.clone(),
                 mode: *delivery,
             }),
             _ => Err(TrackResourceError::WrongKind),
@@ -90,9 +86,9 @@ impl TrackSpec {
     ) -> Result<TopicSubscriber, TrackResourceError> {
         source.validate()?;
         let publisher = self.publisher()?;
-        if publisher.topic != source.label {
+        if publisher.topic != source.track_id {
             return Err(ValidationError::Identifier {
-                field: "data source label",
+                field: "data source track_id",
             }
             .into());
         }
@@ -160,13 +156,13 @@ pub enum TrackResourceError {
 pub enum DataEvent {
     Message {
         participant_id: String,
-        track_id: String,
+        publication_id: String,
         sequence: u64,
         data: Vec<u8>,
     },
     Gap {
         participant_id: String,
-        track_id: String,
+        publication_id: String,
         from: u64,
         to: u64,
     },
@@ -183,14 +179,14 @@ impl DataEvent {
         match self {
             Self::Message {
                 participant_id,
-                track_id,
+                publication_id,
                 ..
             }
             | Self::Gap {
                 participant_id,
-                track_id,
+                publication_id,
                 ..
-            } => (participant_id, track_id),
+            } => (participant_id, publication_id),
         }
     }
 
@@ -434,7 +430,7 @@ impl DataReceiver {
             };
             let gap = DataEvent::Gap {
                 participant_id: identity.0.into(),
-                track_id: identity.1.into(),
+                publication_id: identity.1.into(),
                 from: earlier.from(),
                 to: earlier_end.max(later_end),
             };
@@ -625,8 +621,8 @@ impl TrackResources {
     pub(crate) fn data_publication(&self, owner: TrackOwner) -> Option<(&str, TopicMode)> {
         self.data_publications
             .iter()
-            .find_map(|(label, (current, mode))| {
-                (*current == owner).then_some((label.as_str(), *mode))
+            .find_map(|(track_id, (current, mode))| {
+                (*current == owner).then_some((track_id.as_str(), *mode))
             })
     }
 
@@ -716,10 +712,10 @@ impl TrackResources {
         spec: &TrackSpec,
     ) -> Result<(), TrackResourceError> {
         spec.validate()?;
-        let TrackSpec::Data { label, .. } = spec else {
+        let TrackSpec::Data { track_id, .. } = spec else {
             return Err(TrackResourceError::WrongKind);
         };
-        if self.data_publications.contains_key(label) {
+        if self.data_publications.contains_key(track_id) {
             return Err(TrackResourceError::AlreadyOwned);
         }
         if self.owned_publication_capacity_exceeded() {
@@ -734,10 +730,10 @@ impl TrackResources {
         spec: &TrackSpec,
     ) -> Result<(), TrackResourceError> {
         spec.validate()?;
-        let TrackSpec::Data { label, delivery } = spec else {
+        let TrackSpec::Data { track_id, delivery } = spec else {
             return Err(TrackResourceError::WrongKind);
         };
-        if let Some((current, mode)) = self.data_publications.get(label) {
+        if let Some((current, mode)) = self.data_publications.get(track_id) {
             return if *current == owner && *mode == *delivery {
                 Ok(())
             } else {
@@ -755,7 +751,7 @@ impl TrackResources {
         }
         self.begin_intent(owner)?;
         self.data_publications
-            .insert(label.clone(), (owner, *delivery));
+            .insert(track_id.clone(), (owner, *delivery));
         Ok(())
     }
 
@@ -1200,7 +1196,7 @@ impl TrackResources {
                 Some(PublicationIntent {
                     slot: entry.slot.clone(),
                     kind,
-                    label: spec.label().into(),
+                    track_id: spec.track_id().into(),
                     active: true,
                 })
             })
@@ -1235,7 +1231,7 @@ impl TrackResources {
             true,
         )?;
         TrackSpec::Audio {
-            label: selector.label.clone(),
+            track_id: selector.track_id.clone(),
         }
         .validate()?;
         if self.audio_views.contains_key(&owner) {
@@ -1431,7 +1427,7 @@ impl TrackResources {
             true,
         )?;
         TrackSpec::Video {
-            label: selector.label.clone(),
+            track_id: selector.track_id.clone(),
         }
         .validate()?;
         if self.video.contains_key(&owner) {
@@ -1522,7 +1518,7 @@ impl TrackResources {
             self.video_slots.insert(selector.clone(), slot);
             projection.push(VideoSubscription {
                 slot,
-                track_id: String::new(),
+                publication_id: String::new(),
                 selector: Some(selector),
                 height: observation.height,
                 min_height: observation.min_height,
@@ -1537,7 +1533,7 @@ impl TrackResources {
 
     pub fn retain_producer(&mut self, spec: &TrackSpec) -> Result<(), TrackResourceError> {
         let publisher = spec.publisher()?;
-        if let Some((_, mode)) = self.data_publications.get(spec.label()) {
+        if let Some((_, mode)) = self.data_publications.get(spec.track_id()) {
             if *mode != publisher.mode {
                 return Err(TrackResourceError::AlreadyOwned);
             }
@@ -1640,7 +1636,7 @@ impl TrackResources {
             if receiver.failure.is_some()
                 || subscriber.room != source.room
                 || subscriber.participant_id != source.participant_id
-                || subscriber.topic != source.label
+                || subscriber.topic != source.track_id
                 || mode.is_some_and(|mode| subscriber.mode != mode)
             {
                 continue;
@@ -1667,14 +1663,14 @@ impl TrackResources {
                 {
                     receiver.push(DataEvent::Message {
                         participant_id: message.participant_id.clone(),
-                        track_id: message.data_track_id.clone(),
+                        publication_id: message.publication_id.clone(),
                         sequence: message.sequence,
                         data: message.payload.clone(),
                     });
                 }
                 TopicNotification::RecoveryGap {
                     subscriber,
-                    data_track_id,
+                    publication_id,
                     participant_id,
                     expected_sequence,
                     available_sequence,
@@ -1683,7 +1679,7 @@ impl TrackResources {
                 {
                     receiver.push(DataEvent::Gap {
                         participant_id: participant_id.clone(),
-                        track_id: data_track_id.clone(),
+                        publication_id: publication_id.clone(),
                         from: *expected_sequence,
                         to: *available_sequence,
                     });

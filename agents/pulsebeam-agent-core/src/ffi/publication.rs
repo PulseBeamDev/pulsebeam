@@ -51,7 +51,7 @@ pub struct PublicationAdmission {
 pub struct PublicationState {
     pub observation_revision: u64,
     pub kind: MediaKind,
-    pub label: String,
+    pub track_id: String,
     pub closed: bool,
     pub configuration: PublicationConfigurationSnapshot,
     pub admission: PublicationAdmission,

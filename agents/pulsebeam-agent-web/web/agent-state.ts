@@ -134,7 +134,7 @@ export function copyState(state: AgentState): AgentState {
               ...fields,
               selector: Object.freeze({ ...demand.selector }),
             })
-          : Object.freeze({ ...fields, trackId: demand.trackId! });
+          : Object.freeze({ ...fields, publicationId: demand.publicationId! });
       }),
     ),
     audio: Object.freeze({
@@ -147,7 +147,7 @@ export function copyState(state: AgentState): AgentState {
       playoutDelays: Object.freeze(
         (state.audio?.playoutDelays ?? []).map((entry) =>
           Object.freeze({
-            trackId: entry.trackId,
+            publicationId: entry.publicationId,
             playoutDelay: Object.freeze({ ...entry.playoutDelay }),
           }),
         ),

@@ -148,7 +148,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 }
                 assert!(connected);
                 let track = crate::entity::ConnectionId::from_bytes([8; 16])
-                    .derive_track_id(crate::entity::TrackKind::Data, "fanout");
+                    .fixture_publication(crate::entity::TrackKind::Data, "fanout");
                 let mut destinations = Vec::new();
                 let mut shards = Vec::new();
                 for index in 0..2 {
@@ -165,7 +165,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                     writer.stage(
                         1,
                         ShardUpdateOp::InsertTrackRuntime {
-                            track_id: track,
+                            publication_id: track,
                             runtime: TrackRuntime::default(),
                         },
                     );
@@ -173,12 +173,16 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                         1,
                         ShardUpdateOp::InstallRoute {
                             address,
-                            action: TrackRouteAction::Forward { track_id: track },
+                            action: TrackRouteAction::Forward {
+                                publication_id: track,
+                            },
                         },
                     );
                     b.install_after(
                         address,
-                        TrackRouteAction::Forward { track_id: track },
+                        TrackRouteAction::Forward {
+                            publication_id: track,
+                        },
                         writer.stage_cutoff(1),
                     );
                     assert_eq!(writer.publish(), Some(1));
@@ -202,7 +206,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 let receive = b.bind_receive(bid, destinations.clone()).unwrap();
                 let source = ShardId::new(0);
                 let mut plan = TrackPlanUpdate {
-                    track_id: track,
+                    publication_id: track,
                     plan: Some(TrackPlan::default()),
                 };
                 assert!(a.prepare_plan(source, &mut plan).is_empty());
@@ -220,7 +224,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                 source_writer.stage(
                     1,
                     ShardUpdateOp::InsertTrackRuntime {
-                        track_id: track,
+                        publication_id: track,
                         runtime: TrackRuntime::default(),
                     },
                 );
@@ -233,7 +237,7 @@ fn udp_host_fanout_saturation_and_cutoffs_preserve_delivery_boundaries() {
                         playout_ntp32: 7,
                     },
                     payload: RoutedTrackPacket {
-                        track_id: track,
+                        publication_id: track,
                         packet: TrackPacket::Data {
                             lane: DataLane::Lossy,
                             bytes: bytes::Bytes::from_static(bytes),

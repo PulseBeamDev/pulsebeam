@@ -122,7 +122,7 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
                 update = await cursor.next()
                 assert update.is_EVENT() and update.event.is_MESSAGE(), update
                 event = update.event
-                assert event.participant_id == participant_id and event.track_id
+                assert event.participant_id == participant_id and event.publication_id
                 if event.data == expected:
                     return event
                 assert event.data == setup, "unexpected ordered data"
@@ -184,7 +184,7 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         frame = await received.next()
         assert isinstance(frame, native.VideoFrame), frame
         assert isinstance(frame.track, native.NativeReceiverInfo)
-        assert frame.track.track_id and frame.track.mid
+        assert frame.track.publication_id and frame.track.mid
         assert isinstance(frame.metadata, native.FrameMetadata)
         pixels = frame.frame
         assert isinstance(pixels, native.I420Frame)

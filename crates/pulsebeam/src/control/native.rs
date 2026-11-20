@@ -1,4 +1,4 @@
-use crate::entity::{ParticipantId, TrackId, TrackKind};
+use crate::entity::{ParticipantId, PublicationKey, TrackId, TrackKind};
 use crate::media::ChannelId;
 use crate::participant::Connection;
 use crate::participant::policy::{
@@ -32,7 +32,7 @@ pub(crate) struct ResolvedSource<'a> {
 
 impl ResolvedSource<'_> {
     fn is_available(&self) -> bool {
-        self.track.meta().label.is_some()
+        self.track.meta().track_id.is_some()
             && match self.track {
                 Track::Audio(track) => track.format.is_some(),
                 Track::Video(track) => track.format.is_some(),
@@ -42,7 +42,7 @@ impl ResolvedSource<'_> {
 }
 
 pub(crate) struct ReceiverTarget {
-    pub(crate) source: TrackId,
+    pub(crate) source: PublicationKey,
     pub(crate) source_room: String,
     pub(crate) wait_for_source: bool,
 }
@@ -113,7 +113,7 @@ enum ExecutionDisposition {
 }
 
 pub(crate) enum ReceiverPreparation {
-    Waiting(TrackId),
+    Waiting(PublicationKey),
     Ready(Box<Receiver>),
     Policy(ReceiverPolicy),
 }
@@ -136,6 +136,15 @@ pub(crate) struct ReceiverPolicy {
     pub(crate) video: Option<VideoPolicy>,
 }
 
+pub(crate) fn track_kind(kind: i32) -> Option<TrackKind> {
+    match wire::TrackKind::try_from(kind).ok()? {
+        wire::TrackKind::Audio => Some(TrackKind::Audio),
+        wire::TrackKind::Video => Some(TrackKind::Video),
+        wire::TrackKind::Data => Some(TrackKind::Data),
+        wire::TrackKind::Unspecified => None,
+    }
+}
+
 pub(crate) fn receiver_target(
     spec: &wire::ResourceSpec,
 ) -> Result<ReceiverTarget, wire::FailureCode> {
@@ -143,16 +152,12 @@ pub(crate) fn receiver_target(
     else {
         return Err(wire::FailureCode::Unsupported);
     };
-    if !matches!(
-        wire::TrackKind::try_from(subscription.kind),
-        Ok(wire::TrackKind::Audio | wire::TrackKind::Video | wire::TrackKind::Data)
-    ) {
-        return Err(wire::FailureCode::Unsupported);
-    }
-    let source = subscription
-        .track_id
+    let kind = track_kind(subscription.kind).ok_or(wire::FailureCode::Unsupported)?;
+    let id = subscription
+        .publication_id
         .parse()
         .map_err(|_| wire::FailureCode::InvalidConfiguration)?;
+    let source = PublicationKey::new(kind, id);
     Ok(ReceiverTarget {
         source,
         source_room: subscription.source_room.clone(),
@@ -252,14 +257,14 @@ pub(crate) fn receiver_policy(
 }
 
 pub(crate) struct DataPublication {
-    pub(crate) label: String,
+    pub(crate) track_id: TrackId,
     pub(crate) lane: DataLane,
     pub(crate) channel: ChannelId,
     pub(crate) enabled: bool,
 }
 
 pub(crate) struct RtpPublication {
-    pub(crate) label: String,
+    pub(crate) track_id: TrackId,
     pub(crate) kind: TrackKind,
     pub(crate) binding: CompiledRtpBinding,
     pub(crate) format: Option<wire::CodecFormat>,
@@ -274,7 +279,7 @@ pub(crate) enum Publication {
 impl Publication {
     pub(crate) fn execution_bytes(&self, spec_bytes: usize) -> usize {
         match self {
-            Self::Data(data) => Connection::native_data_execution_bytes(&data.label),
+            Self::Data(data) => Connection::native_data_execution_bytes(data.track_id.as_str()),
             Self::Rtp(rtp) => Connection::native_rtp_execution_bytes(
                 spec_bytes,
                 rtp.binding.description().encodings.len(),
@@ -312,7 +317,8 @@ pub(crate) fn publication(
                 .map(ChannelId::from_value)
                 .ok_or(wire::FailureCode::Unsupported)?;
             Publication::Data(DataPublication {
-                label: declaration.label.clone(),
+                track_id: TrackId::new(&declaration.track_id)
+                    .map_err(|_| wire::FailureCode::InvalidConfiguration)?,
                 lane,
                 channel,
                 enabled,
@@ -320,7 +326,7 @@ pub(crate) fn publication(
         }
         _ => {
             let capabilities = capabilities.ok_or(wire::FailureCode::Unsupported)?;
-            let (label, kind, binding) = policy::publication(spec, capabilities)?;
+            let (track_id, kind, binding) = policy::publication(spec, capabilities)?;
             let kind = match kind {
                 wire::TrackKind::Audio => TrackKind::Audio,
                 wire::TrackKind::Video => TrackKind::Video,
@@ -329,7 +335,7 @@ pub(crate) fn publication(
             let format = policy::publication_declaration(spec)
                 .and_then(|(_, _, parameters)| parameters.codec.as_ref()?.format.clone());
             Publication::Rtp(Box::new(RtpPublication {
-                label,
+                track_id,
                 kind,
                 binding,
                 format,

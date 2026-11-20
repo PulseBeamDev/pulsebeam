@@ -10,12 +10,12 @@ use pulsebeam_runtime::time::Instant;
 use crate::route::NodeRouteAddress;
 use crate::shard::worker::ShardFrame;
 use crate::shard_update::{CompiledRoute, TrackPlan, TrackPlanUpdate, TrackRouteAction};
-use crate::{entity::TrackId, id::ShardId};
+use crate::{entity::PublicationKey, id::ShardId};
 
 struct SendBranch {
     binding: BindingId,
     peer: pulsebeam_link::NetworkId,
-    source: (ShardId, TrackId),
+    source: (ShardId, PublicationKey),
     reverse: bool,
     route: CompiledRoute,
 }
@@ -27,7 +27,7 @@ pub(super) struct Links {
     ports: Vec<PortId>,
     clock_origin: Instant,
     routes: HashMap<NodeRouteAddress, (BindingId, CompiledRoute)>,
-    plans: HashMap<(ShardId, TrackId), TrackPlan>,
+    plans: HashMap<(ShardId, PublicationKey), TrackPlan>,
     sends: Vec<SendBranch>,
     installed: HashSet<NodeRouteAddress>,
     route_actions: HashMap<NodeRouteAddress, TrackRouteAction>,
@@ -152,7 +152,7 @@ impl Links {
                 updates.push((
                     branch.source.0,
                     TrackPlanUpdate {
-                        track_id: branch.source.1,
+                        publication_id: branch.source.1,
                         plan: Some(plan.clone()),
                     },
                 ));
@@ -165,7 +165,7 @@ impl Links {
     pub(super) fn bind_send(
         &mut self,
         shard: ShardId,
-        track: TrackId,
+        track: PublicationKey,
         peer: pulsebeam_link::NetworkId,
         address: pulsebeam_link::NodeRouteKey,
     ) -> Result<(BindingId, TrackPlanUpdate), pulsebeam_link::BindError> {
@@ -175,7 +175,7 @@ impl Links {
     pub(super) fn bind_reverse(
         &mut self,
         shard: ShardId,
-        track: TrackId,
+        track: PublicationKey,
         peer: pulsebeam_link::NetworkId,
         address: pulsebeam_link::NodeRouteKey,
     ) -> Result<(BindingId, TrackPlanUpdate), pulsebeam_link::BindError> {
@@ -185,7 +185,7 @@ impl Links {
     fn bind_branch(
         &mut self,
         shard: ShardId,
-        track: TrackId,
+        track: PublicationKey,
         peer: pulsebeam_link::NetworkId,
         address: pulsebeam_link::NodeRouteKey,
         reverse: bool,
@@ -224,7 +224,7 @@ impl Links {
         Ok((
             binding,
             TrackPlanUpdate {
-                track_id: track,
+                publication_id: track,
                 plan: Some(plan),
             },
         ))
@@ -243,7 +243,7 @@ impl Links {
         Some((
             branch.source.0,
             TrackPlanUpdate {
-                track_id: branch.source.1,
+                publication_id: branch.source.1,
                 plan: Some(plan),
             },
         ))
@@ -254,7 +254,7 @@ impl Links {
         shard: ShardId,
         update: &mut TrackPlanUpdate,
     ) -> Vec<BindingId> {
-        let source = (shard, update.track_id);
+        let source = (shard, update.publication_id);
         match &mut update.plan {
             Some(plan) => {
                 let mut base = plan.clone();
@@ -314,14 +314,17 @@ impl Links {
         self.host.is_some()
     }
 
-    pub(super) fn destinations(&mut self, track: TrackId) -> Vec<crate::link::ReceiveDestination> {
+    pub(super) fn destinations(
+        &mut self,
+        track: PublicationKey,
+    ) -> Vec<crate::link::ReceiveDestination> {
         self.reap();
         let mut destinations: Vec<_> = self
             .installed
             .iter()
             .filter_map(|address| {
                 let action = self.route_actions.get(address)?;
-                if action.track_id() != track {
+                if action.publication_id() != track {
                     return None;
                 }
                 let kind = match action {
@@ -374,7 +377,7 @@ impl Links {
                 .get(address)
                 .ok_or(pulsebeam_link::BindError::Closed)?;
             let identity = (
-                action.track_id(),
+                action.publication_id(),
                 matches!(action, TrackRouteAction::Reverse { .. }),
             );
             if expected.is_some_and(|expected| expected != identity) {
@@ -557,8 +560,10 @@ mod tests {
             Err(pulsebeam_link::BindError::Closed)
         );
         let track = crate::entity::ConnectionId::from_bytes([5; 16])
-            .derive_track_id(crate::entity::TrackKind::Video, "network-source");
-        let action = TrackRouteAction::Reverse { track_id: track };
+            .fixture_publication(crate::entity::TrackKind::Video, "network-source");
+        let action = TrackRouteAction::Reverse {
+            publication_id: track,
+        };
         let (installed, wait) = oneshot::channel();
         links.install_after(address, action, wait);
         assert!(links.destinations(track).is_empty());
@@ -572,11 +577,13 @@ mod tests {
         let other_address =
             NodeRouteAddress::new(crate::route::RouteId::new(ShardId::new(1), 2), 1);
         let other_track = crate::entity::ConnectionId::from_bytes([5; 16])
-            .derive_track_id(crate::entity::TrackKind::Video, "other-source");
+            .fixture_publication(crate::entity::TrackKind::Video, "other-source");
         for other_action in [
-            TrackRouteAction::Forward { track_id: track },
+            TrackRouteAction::Forward {
+                publication_id: track,
+            },
             TrackRouteAction::Reverse {
-                track_id: other_track,
+                publication_id: other_track,
             },
         ] {
             let (ack, wait) = oneshot::channel();
@@ -601,7 +608,7 @@ mod tests {
         );
         let shard = ShardId::new(0);
         let mut source = TrackPlanUpdate {
-            track_id: track,
+            publication_id: track,
             plan: Some(TrackPlan {
                 reverse_route: Some(address),
                 ..Default::default()
@@ -659,7 +666,7 @@ mod tests {
             SendErrorKind::Stale
         );
         let mut withdrawal = TrackPlanUpdate {
-            track_id: track,
+            publication_id: track,
             plan: None,
         };
         let bindings = links.prepare_plan(shard, &mut withdrawal);
@@ -724,11 +731,13 @@ mod tests {
         let mut links = Links::new(control, Vec::new(), Instant::now());
         let address = NodeRouteAddress::new(crate::route::RouteId::new(ShardId::new(0), 7), 1);
         let track = crate::entity::ConnectionId::from_bytes([9; 16])
-            .derive_track_id(crate::entity::TrackKind::Audio, "retired");
+            .fixture_publication(crate::entity::TrackKind::Audio, "retired");
         let (installed, installation) = oneshot::channel();
         links.install_after(
             address,
-            TrackRouteAction::Forward { track_id: track },
+            TrackRouteAction::Forward {
+                publication_id: track,
+            },
             installation,
         );
         assert!(links.contains(address));

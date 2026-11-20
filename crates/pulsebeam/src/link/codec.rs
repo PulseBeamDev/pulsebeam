@@ -11,7 +11,7 @@ use pulsebeam_core::dd::{
 use pulsebeam_link::{CodecError, WireCodec};
 use pulsebeam_runtime::time::Instant;
 
-use crate::entity::{AudioTrackId, DataTrackId, TrackId, VideoTrackId};
+use crate::entity::{PublicationId, PublicationKey};
 use crate::participant::{RoutedTrackPacket, TrackPacket};
 use crate::route::{MediaDelivery, NodeRouteAddress, RouteId};
 use crate::rtp::{Frequency, MediaTime, RtpExtensions, RtpPacket};
@@ -59,10 +59,10 @@ impl WireCodec<ShardFrame> for ShardCodec {
                 ShardFrame::Reverse { address, packet }
             }
             kind @ (1 | 2) => {
-                let track_id = reader.track_id()?;
+                let publication_id = reader.publication_id()?;
                 let playout_ntp32 = reader.u32()?;
                 let packet = if kind == 1 {
-                    if !matches!(track_id, TrackId::Data(_)) {
+                    if !matches!(publication_id, PublicationKey::Data(_)) {
                         return Err(CodecError::Malformed);
                     }
                     let lane = match reader.u8()? {
@@ -73,7 +73,7 @@ impl WireCodec<ShardFrame> for ShardCodec {
                     };
                     TrackPacket::data(lane, reader.blob()?)
                 } else {
-                    if matches!(track_id, TrackId::Data(_)) {
+                    if matches!(publication_id, PublicationKey::Data(_)) {
                         return Err(CodecError::Malformed);
                     }
                     TrackPacket::Rtp(reader.rtp(self.origin)?)
@@ -83,7 +83,10 @@ impl WireCodec<ShardFrame> for ShardCodec {
                         address,
                         playout_ntp32,
                     },
-                    payload: RoutedTrackPacket { track_id, packet },
+                    payload: RoutedTrackPacket {
+                        publication_id,
+                        packet,
+                    },
                 }
             }
             _ => return Err(CodecError::Malformed),
@@ -138,16 +141,16 @@ fn encode(frame: &ShardFrame, writer: &mut Writer<'_>) -> Result<(), CodecError>
                 TrackPacket::Data { .. } => 1,
                 TrackPacket::Rtp(_) => 2,
             })?;
-            writer.u8(match payload.track_id {
-                TrackId::Audio(_) => 0,
-                TrackId::Video(_) => 1,
-                TrackId::Data(_) => 2,
+            writer.u8(match payload.publication_id {
+                PublicationKey::Audio(_) => 0,
+                PublicationKey::Video(_) => 1,
+                PublicationKey::Data(_) => 2,
             })?;
-            writer.bytes(payload.track_id.as_bytes())?;
+            writer.bytes(payload.publication_id.as_bytes())?;
             writer.u32(delivery.playout_ntp32)?;
             match &payload.packet {
                 TrackPacket::Data { lane, bytes } => {
-                    if !matches!(payload.track_id, TrackId::Data(_)) {
+                    if !matches!(payload.publication_id, PublicationKey::Data(_)) {
                         return Err(CodecError::Unsupported);
                     }
                     writer.u8(match lane {
@@ -158,7 +161,7 @@ fn encode(frame: &ShardFrame, writer: &mut Writer<'_>) -> Result<(), CodecError>
                     writer.blob(bytes)
                 }
                 TrackPacket::Rtp(packet) => {
-                    if matches!(payload.track_id, TrackId::Data(_)) {
+                    if matches!(payload.publication_id, PublicationKey::Data(_)) {
                         return Err(CodecError::Unsupported);
                     }
                     writer.rtp(packet)
@@ -360,13 +363,13 @@ impl<'a> Reader<'a> {
             height: self.u16()?,
         })
     }
-    fn track_id(&mut self) -> Result<TrackId, CodecError> {
+    fn publication_id(&mut self) -> Result<PublicationKey, CodecError> {
         let kind = self.u8()?;
-        let bytes = self.array()?;
+        let id = PublicationId::try_from_bytes(self.array()?).map_err(|_| CodecError::Malformed)?;
         match kind {
-            0 => Ok(TrackId::Audio(AudioTrackId::from_bytes(bytes))),
-            1 => Ok(TrackId::Video(VideoTrackId::from_bytes(bytes))),
-            2 => Ok(TrackId::Data(DataTrackId::from_bytes(bytes))),
+            0 => Ok(PublicationKey::Audio(id)),
+            1 => Ok(PublicationKey::Video(id)),
+            2 => Ok(PublicationKey::Data(id)),
             _ => Err(CodecError::Malformed),
         }
     }

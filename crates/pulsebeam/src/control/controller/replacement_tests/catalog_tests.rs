@@ -129,7 +129,7 @@ fn install_receiver(
                         }),
                         declaration: Some(wire::resource_spec::Declaration::Subscription(
                             wire::SubscriptionSpec {
-                                track_id: track.id().as_str(),
+                                publication_id: track.id().as_str(),
                                 kind: wire::TrackKind::Data as i32,
                                 source_room: "catalog-source".into(),
                                 binding: Some(wire::TrackBinding {
@@ -261,14 +261,14 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
                 room: source_room,
             },
             shard_id: ShardId::new(0),
-            id: publisher_connection.derive_publication_track_id(
+            id: publisher_connection.fixture_publication_at(
                 crate::entity::TrackKind::Data,
                 "events",
                 std::num::NonZeroU64::new(1).unwrap(),
             ),
             origin: publisher,
             connection_id: publisher_connection,
-            label: Some("events".into()),
+            track_id: Some(crate::entity::TrackId::new("events").unwrap()),
         },
         crate::track::DataLane::Ordered,
     );
@@ -358,7 +358,7 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         entry
             .tracks
             .iter()
-            .any(|visible| visible.track_id == track.id().as_str())
+            .any(|visible| visible.publication_id == track.id().as_str())
     }));
     assert!(!second.has_more);
     assert!(second.next_cursor.is_empty());
@@ -474,7 +474,7 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         entry
             .tracks
             .iter()
-            .any(|visible| visible.track_id == track.id().as_str())
+            .any(|visible| visible.publication_id == track.id().as_str())
     }));
     assert!(
         endpoint.command().is_none(),
@@ -564,7 +564,7 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         entry
             .tracks
             .iter()
-            .any(|visible| visible.track_id == track.id().as_str())
+            .any(|visible| visible.publication_id == track.id().as_str())
     }));
     assert!(endpoint.command().is_none());
 }

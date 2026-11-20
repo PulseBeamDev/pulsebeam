@@ -23,7 +23,7 @@ impl ResourcePermissions {
             Action::Discover,
             Some(publisher),
             Some(kind),
-            Some(&track.label),
+            Some(&track.track_id),
         )
     }
 
@@ -56,7 +56,7 @@ impl ResourcePermissions {
                 &source.room,
                 Some(&source.participant_id),
                 Some(kind),
-                Some(&source.label),
+                Some(&source.track_id),
             ),
         }
     }
@@ -68,7 +68,12 @@ impl ResourcePermissions {
             Some(wire::publication_spec::Kind::Data(_)) => TrackKind::Data,
             None => return false,
         };
-        self.allows(Action::Publish, None, Some(kind), Some(&publication.label))
+        self.allows(
+            Action::Publish,
+            None,
+            Some(kind),
+            Some(&publication.track_id),
+        )
     }
 
     pub(super) fn may_subscribe_in_room(&self, room: &str, kind: i32) -> bool {
@@ -89,7 +94,7 @@ impl ResourcePermissions {
             source_room,
             Some(&participant.participant_id),
             Some(kind),
-            Some(&track.label),
+            Some(&track.track_id),
         )
     }
 }

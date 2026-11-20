@@ -4,7 +4,12 @@ use crate::participant::{effect::TrackRemoval, event::test_utils::MockParticipan
 use pulsebeam_proto::state::resource_spec;
 use std::num::NonZeroU64;
 
-fn subscription(source: TrackId, room: &str, channel: u32, enabled: bool) -> wire::ResourceSpec {
+fn subscription(
+    source: PublicationKey,
+    room: &str,
+    channel: u32,
+    enabled: bool,
+) -> wire::ResourceSpec {
     wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
             enabled: Some(enabled),
@@ -12,7 +17,7 @@ fn subscription(source: TrackId, room: &str, channel: u32, enabled: bool) -> wir
         }),
         declaration: Some(resource_spec::Declaration::Subscription(
             wire::SubscriptionSpec {
-                track_id: source.as_str(),
+                publication_id: source.as_str(),
                 kind: wire::TrackKind::Data as i32,
                 source_room: room.into(),
                 binding: Some(wire::TrackBinding {
@@ -54,11 +59,8 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     let mut participant = participant();
     let mut sink = MockParticipantSink::new();
     let connection = entity::ConnectionId::new();
-    let id = connection.derive_publication_track_id(
-        TrackKind::Data,
-        "literal",
-        NonZeroU64::new(1).unwrap(),
-    );
+    let id =
+        connection.fixture_publication_at(TrackKind::Data, "literal", NonZeroU64::new(1).unwrap());
     let owner = crate::entity::fixture_participant_id();
     let track = Track::data_publication(
         track::TrackMeta {
@@ -67,7 +69,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
             id,
             origin: owner,
             connection_id: connection,
-            label: Some("literal".into()),
+            track_id: Some(crate::entity::TrackId::new("literal").unwrap()),
         },
         DataLane::Ordered,
     );

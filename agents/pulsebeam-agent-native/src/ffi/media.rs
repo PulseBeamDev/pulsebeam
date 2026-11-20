@@ -392,14 +392,14 @@ impl AudioSelection {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Agent {
-    pub fn video(&self, label: String) -> Result<Arc<LocalVideoTrack>, NativeError> {
+    pub fn video(&self, track_id: String) -> Result<Arc<LocalVideoTrack>, NativeError> {
         Ok(Arc::new(LocalVideoTrack {
-            runtime: self.runtime.video(label)?,
+            runtime: self.runtime.video(track_id)?,
         }))
     }
-    pub fn audio(&self, label: String) -> Result<Arc<LocalAudioTrack>, NativeError> {
+    pub fn audio(&self, track_id: String) -> Result<Arc<LocalAudioTrack>, NativeError> {
         Ok(Arc::new(LocalAudioTrack {
-            runtime: self.runtime.audio(label)?,
+            runtime: self.runtime.audio(track_id)?,
         }))
     }
     pub async fn create_video_input(
@@ -427,14 +427,14 @@ impl Agent {
 
 #[uniffi::export]
 impl Participant {
-    pub fn video(&self, label: String) -> Result<Arc<RemoteVideoTrack>, NativeError> {
+    pub fn video(&self, track_id: String) -> Result<Arc<RemoteVideoTrack>, NativeError> {
         Ok(Arc::new(RemoteVideoTrack {
-            runtime: self.runtime.video(label)?,
+            runtime: self.runtime.video(track_id)?,
         }))
     }
-    pub fn audio(&self, label: String) -> Result<Arc<RemoteAudioTrack>, NativeError> {
+    pub fn audio(&self, track_id: String) -> Result<Arc<RemoteAudioTrack>, NativeError> {
         Ok(Arc::new(RemoteAudioTrack {
-            runtime: self.runtime.audio(label)?,
+            runtime: self.runtime.audio(track_id)?,
         }))
     }
 }

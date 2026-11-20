@@ -184,7 +184,7 @@ localVideo.setEnabled(false);
 // @ts-expect-error Local handles do not expose borrowed capture.
 localVideo.source;
 // @ts-expect-error Descriptors are not React lookup API.
-agent.track({ kind: "video", label: "camera" });
+agent.track({ kind: "video", trackId: "camera" });
 // @ts-expect-error Delivery is required.
 agent.data("chat");
 
@@ -195,7 +195,7 @@ const remoteVideo = participant.video("camera");
 const remoteAudio = participant.audio("microphone");
 const remoteChat = participant.data("chat", "ordered");
 // @ts-expect-error Participant descriptor lookup was removed.
-participant.track({ kind: "video", label: "camera" });
+participant.track({ kind: "video", trackId: "camera" });
 // @ts-expect-error Remote delivery is also required.
 participant.data("chat");
 Data({
@@ -242,7 +242,7 @@ createElement(Data, {
   track: remoteChat,
   onEvent(event) {
     const participantId: string = event.participantId;
-    const trackId: string = event.trackId;
+    const publicationId: string = event.publicationId;
     if (event.type === "message") {
       const bytes: Uint8Array = event.data;
       const sequence: bigint = event.sequence;
@@ -252,7 +252,7 @@ createElement(Data, {
       const to: bigint = event.to;
       void [from, to];
     }
-    void [participantId, trackId];
+    void [participantId, publicationId];
   },
 });
 // @ts-expect-error Local publications cannot be received by the same endpoint.

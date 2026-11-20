@@ -112,29 +112,29 @@ test("desired revisions copy nested policy and omission withdraws complete inten
   const input = {
     connected: true,
     publications: [
-      { slot: "v0", kind: "video", label: "camera", active: true },
+      { slot: "v0", kind: "video", trackId: "camera", active: true },
     ],
     video: [
       {
         slot: 0,
-        selector: { room: "room", participantId: "alice", label: "camera" },
+        selector: { room: "room", participantId: "alice", trackId: "camera" },
         height: 180,
         playoutDelay: { mode: "fixed", minMs: 10, maxMs: 20 },
       },
     ],
     audio: {
       pinned: ["voice"],
-      selected: [{ room: "room", participantId: "alice", label: "voice" }],
+      selected: [{ room: "room", participantId: "alice", trackId: "voice" }],
     },
     topics: [{ name: "chat", mode: "ordered", publish: true }],
   };
   const state = copyState(input);
-  input.video[0].selector.label = "changed";
+  input.video[0].selector.trackId = "changed";
   input.video[0].playoutDelay.minMs = 99;
   input.audio.pinned.push("other");
   input.publications[0].active = false;
   input.topics[0].publish = false;
-  assert.equal(state.video[0].selector.label, "camera");
+  assert.equal(state.video[0].selector.trackId, "camera");
   assert.equal(state.video[0].playoutDelay.minMs, 10);
   assert.deepEqual(state.audio.pinned, ["voice"]);
   assert.equal(state.publications[0].active, true);

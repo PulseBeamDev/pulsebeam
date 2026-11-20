@@ -44,7 +44,7 @@ fn whole_state_churn_reduces_once_without_physical_work_or_wire_revisions() {
             max_ms: 40,
         },
     );
-    changed.publications[0].label = "temporary-camera".into();
+    changed.publications[0].track_id = "temporary-camera".into();
     changed
         .topics
         .publishers
@@ -118,7 +118,7 @@ fn creation_release_before_first_boundary_has_no_physical_or_wire_lifetime() {
     let ResourceResult::Publication { owner, .. } = agent
         .resource(ResourceCommand::ClaimPublication {
             spec: TrackSpec::Video {
-                label: "canceled-camera".into(),
+                track_id: "canceled-camera".into(),
             },
         })
         .unwrap()
@@ -158,7 +158,7 @@ fn released_preparation_cannot_install_or_serialize_its_late_success() {
     let ResourceResult::Publication { owner, slot, .. } = agent
         .resource(ResourceCommand::ClaimPublication {
             spec: TrackSpec::Video {
-                label: "extra-camera".into(),
+                track_id: "extra-camera".into(),
             },
         })
         .unwrap()

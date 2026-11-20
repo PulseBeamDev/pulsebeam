@@ -10,13 +10,13 @@ fn receive(agent: &mut Agent, room: &str, participant: &str, delivery: TopicMode
     let ResourceResult::Owned { owner } = agent
         .resource(ResourceCommand::ReceiveData {
             spec: TrackSpec::Data {
-                label: "events".into(),
+                track_id: "events".into(),
                 delivery,
             },
             source: crate::TrackSelector {
                 room: room.into(),
                 participant_id: participant.into(),
-                label: "events".into(),
+                track_id: "events".into(),
             },
         })
         .unwrap()
@@ -206,10 +206,10 @@ fn delivery_mismatch_fails_only_incompatible_receivers_and_revocation_keeps_the_
                         room_id: "room".into(),
                     }),
                     track: Some(state::Track {
-                        track_id: "opaque-source".into(),
+                        publication_id: "opaque-source".into(),
                         participant_id: "alice".into(),
                         room_id: "room".into(),
-                        label: "events".into(),
+                        track_id: "events".into(),
                         kind: Some(state::track::Kind::Data(state::DataTrack {
                             delivery: state::DataDelivery::Ordered as i32,
                         })),
@@ -329,10 +329,10 @@ fn resolved_source_description_does_not_claim_data_receiver_execution() {
                         room_id: "room".into(),
                     }),
                     track: Some(state::Track {
-                        track_id: "opaque-data-track".into(),
+                        publication_id: "opaque-data-track".into(),
                         participant_id: "alice".into(),
                         room_id: "room".into(),
-                        label: "events".into(),
+                        track_id: "events".into(),
                         kind: Some(state::track::Kind::Data(state::DataTrack {
                             delivery: state::DataDelivery::Ordered as i32,
                         })),

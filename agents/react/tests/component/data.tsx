@@ -8,7 +8,7 @@ import { runtimes } from "./runtime.js";
 const message = (sequence: bigint): DataEvent<"ordered"> => ({
   type: "message",
   participantId: "alice",
-  trackId: "chat-id",
+  publicationId: "chat-id",
   sequence,
   data: Uint8Array.of(Number(sequence)),
 });
@@ -18,7 +18,7 @@ export async function dataLifetimes() {
   let update!: (
     patch: Partial<{
       version: number;
-      label: string;
+      trackId: string;
       mounted: boolean;
       generation: number;
     }>,
@@ -37,7 +37,7 @@ export async function dataLifetimes() {
     agent = current;
     const [state, setState] = useState({
       version: 1,
-      label: "chat",
+      trackId: "chat",
       mounted: true,
       generation: 0,
     });
@@ -51,11 +51,11 @@ export async function dataLifetimes() {
             track={equivalent
               .room("selected-room")
               .participant("alice")
-              .data(state.label, "ordered")}
+              .data(state.trackId, "ordered")}
             onEvent={async (event) => {
               assert.equal(event.type, "message");
               if (event.type !== "message") return;
-              calls.push(`${state.label}:${state.version}:${event.sequence}`);
+              calls.push(`${state.trackId}:${state.version}:${event.sequence}`);
               if (event.sequence === 1n) await pending.promise;
               if (event.sequence === 4n) await retired.promise;
               if (fail) throw new Error("processing failed");
@@ -156,7 +156,7 @@ export async function dataLifetimes() {
     await flush(() => update({ generation: 1 }));
     assert.equal(runtime.dataOwners.size, 2, "remount restarts reception");
     await flush(() => runtime.deliverData("chat", message(4n)));
-    await flush(() => update({ label: "replacement" }));
+    await flush(() => update({ trackId: "replacement" }));
     assert.equal(
       runtime.dataOwners.size,
       2,
@@ -178,7 +178,7 @@ export async function dataLifetimes() {
       if (
         command.op === "readData" &&
         rejectRead &&
-        runtime.dataOwners.get(command.owner)?.spec.label === "replacement"
+        runtime.dataOwners.get(command.owner)?.spec.trackId === "replacement"
       ) {
         rejectRead = false;
         throw new Error("receive failed");

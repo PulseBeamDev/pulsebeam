@@ -45,7 +45,10 @@ fn publication_admission_precedes_reservations_and_preserves_other_channels() {
     let first = crate::media::ChannelId::from_value(1);
     connection.handle_event(now, opened(1, "v2/latest/pub/chat"), &mut sink);
     let original = connection.data.publication(first).unwrap().clone();
-    assert_eq!(original.label.as_deref(), Some("v2/latest/chat"));
+    assert_eq!(
+        original.track_id.as_ref().map(entity::TrackId::as_str),
+        Some("chat")
+    );
     assert_eq!(sink.publish_track_calls, vec![original.id]);
 
     for label in ["v2/ordered/pub/chat", "v2/latest/pub/Chat"]
@@ -85,12 +88,9 @@ fn publication_admission_precedes_reservations_and_preserves_other_channels() {
         .data
         .publication(crate::media::ChannelId::from_value(3))
         .unwrap();
-    assert_eq!(
-        reopened.id,
-        connection
-            .connection_id
-            .derive_track_id(TrackKind::Data, "v2/latest/chat/2")
-    );
+    assert_eq!(reopened.id.kind(), TrackKind::Data);
+    assert!(reopened.id.as_str().starts_with("pub_0"));
+    assert_eq!(reopened.track_id, original.track_id);
     assert_ne!(reopened.id, original.id);
     assert_eq!(reopened.connection_id, original.connection_id);
     assert_eq!(sink.publish_track_calls, vec![original.id, reopened.id]);
@@ -119,10 +119,14 @@ fn expired_authority_cannot_admit_topic_publications_or_subscription_intent() {
     connection.authorization_expiry = None;
     connection.handle_event(now, opened(3, "v2/latest/pub/chat"), &mut sink);
     assert_eq!(sink.publish_track_calls.len(), 1);
+    let admitted = connection
+        .data
+        .publication(crate::media::ChannelId::from_value(3))
+        .unwrap();
+    assert_eq!(sink.publish_track_calls, vec![admitted.id]);
     assert_eq!(
-        sink.publish_track_calls[0],
-        connection
-            .connection_id
-            .derive_track_id(TrackKind::Data, "v2/latest/chat/1")
+        admitted.track_id.as_ref().map(entity::TrackId::as_str),
+        Some("chat")
     );
+    assert!(admitted.id.as_str().starts_with("pub_0"));
 }

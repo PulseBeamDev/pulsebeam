@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU64;
 
 use super::*;
 use crate::control::native::Preparation;
@@ -57,12 +56,12 @@ impl NativeRtp {
             rid,
             encoding: crate::track::SourceEncoding::Ssrc(ssrc.into()),
             upstream_slot: source.slot,
-            track_id: source.track.id(),
+            publication_id: source.track.id(),
             fanout: source.fanout,
         })
     }
 
-    pub(super) fn bind_source(&mut self, track: TrackId, handle: TrackHandle) -> bool {
+    pub(super) fn bind_source(&mut self, track: PublicationKey, handle: TrackHandle) -> bool {
         let Some(reference) = self.tracks.get(track.as_bytes()).copied() else {
             return false;
         };
@@ -78,7 +77,7 @@ impl NativeRtp {
 
     pub(super) fn keyframe_mid(
         &self,
-        track: TrackId,
+        track: PublicationKey,
         encoding: crate::track::SourceEncoding,
     ) -> Option<Mid> {
         let source = self.publications.get(self.tracks.get(track.as_bytes())?)?;
@@ -113,12 +112,12 @@ impl NativeRtp {
         }
     }
 
-    fn detach(&mut self, reference: u64) -> Option<(TrackId, Option<TrackHandle>)> {
+    fn detach(&mut self, reference: u64) -> Option<(PublicationKey, Option<TrackHandle>)> {
         let source = self.publications.get_mut(&reference)?;
         self.active.remove(&reference);
-        let track_id = source.track.id();
-        if self.tracks.get(track_id.as_bytes()) == Some(&reference) {
-            self.tracks.remove(track_id.as_bytes());
+        let publication_id = source.track.id();
+        if self.tracks.get(publication_id.as_bytes()) == Some(&reference) {
+            self.tracks.remove(publication_id.as_bytes());
         }
         if let Ok(mid) = Mid::new(&source.binding.description().mid)
             && self.mids.get(&mid) == Some(&reference)
@@ -130,7 +129,7 @@ impl NativeRtp {
                 self.ssrcs.remove(&encoding.primary);
             }
         }
-        Some((track_id, source.fanout.take()))
+        Some((publication_id, source.fanout.take()))
     }
 }
 
@@ -144,7 +143,7 @@ fn execution_bytes(spec_bytes: usize, encodings: usize) -> usize {
         )>())
         .saturating_add(std::mem::size_of::<((u8, [u8; 16]), UpstreamSlotKey)>())
         .saturating_add(std::mem::size_of::<((u8, [u8; 16]), TrackHandle)>())
-        .saturating_add(std::mem::size_of::<(u64, TrackId)>())
+        .saturating_add(std::mem::size_of::<(u64, PublicationKey)>())
         .saturating_add(256)
         .saturating_mul(12)
         .saturating_add(
@@ -174,7 +173,7 @@ impl Connection {
             return;
         };
         let RtpPublicationPlan {
-            label,
+            track_id,
             kind,
             mut binding,
             format,
@@ -236,10 +235,10 @@ impl Connection {
             }
             return;
         }
-        let Some(incarnation) = NonZeroU64::new(reference) else {
+        if reference == 0 {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Invalid.into()));
             return;
-        };
+        }
         let Ok(mid) = Mid::new(&binding.description().mid) else {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Unsupported.into()));
             return;
@@ -254,50 +253,36 @@ impl Connection {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Conflict.into()));
             return;
         }
-        let id = self
-            .connection_id
-            .derive_publication_track_id(kind, &label, incarnation);
-        let meta = track::TrackMeta {
-            room: self.room,
-            shard_id: self.shard_id,
-            id,
-            origin: self.participant_id,
-            connection_id: self.connection_id,
-            label: Some(label),
-        };
-        let (upstream, mut track) = if kind == TrackKind::Audio {
-            track::new_audio(mid, meta)
-        } else {
-            let encodings = binding
-                .description()
-                .encodings
-                .iter()
-                .map(|encoding| {
-                    encoding
-                        .rid
-                        .as_deref()
-                        .map(crate::media::Rid::new)
-                        .transpose()
-                        .map(|rid| (encoding.primary.into(), rid))
-                })
-                .collect::<Result<Vec<_>, _>>();
-            let Ok(encodings) = encodings else {
-                self.complete_native_preparation(
-                    work,
-                    Err(ExecutionFailureKind::Unsupported.into()),
-                );
-                return;
-            };
-            track::new_video_ssrcs(mid, meta, encodings)
-        };
-        match &mut track {
-            Track::Audio(audio) => audio.format = format,
-            Track::Video(video) => video.format = format,
-            Track::Data(_) => {
+        let video_encodings = match kind {
+            TrackKind::Audio => None,
+            TrackKind::Video => {
+                let encodings = binding
+                    .description()
+                    .encodings
+                    .iter()
+                    .map(|encoding| {
+                        encoding
+                            .rid
+                            .as_deref()
+                            .map(crate::media::Rid::new)
+                            .transpose()
+                            .map(|rid| (encoding.primary.into(), rid))
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                let Ok(encodings) = encodings else {
+                    self.complete_native_preparation(
+                        work,
+                        Err(ExecutionFailureKind::Unsupported.into()),
+                    );
+                    return;
+                };
+                Some(encodings)
+            }
+            TrackKind::Data => {
                 self.complete_native_preparation(work, Err(ExecutionFailureKind::Internal.into()));
                 return;
             }
-        }
+        };
         if let Err(error) = self
             .transport
             .update_compiled_rtp(CompiledRtpConfigurationPatch {
@@ -308,11 +293,6 @@ impl Connection {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::from(error).into()));
             return;
         }
-        let execution = PublicationExecution {
-            track: track.clone(),
-            enabled,
-            active: false,
-        };
         let Some(now) = self.native_preparation_time(work) else {
             if self
                 .transport
@@ -333,7 +313,27 @@ impl Connection {
             }
             return;
         };
-        let Some(slot) = self.upstream.insert_managed_track(mid, upstream) else {
+        let Some((slot, track)) = self.upstream.insert_managed_track(mid, kind, || {
+            let id = PublicationKey::new(kind, entity::PublicationId::mint());
+            let meta = track::TrackMeta {
+                room: self.room,
+                shard_id: self.shard_id,
+                id,
+                origin: self.participant_id,
+                connection_id: self.connection_id,
+                track_id: Some(track_id),
+            };
+            let (upstream, mut track) = match video_encodings {
+                Some(encodings) => track::new_video_ssrcs(mid, meta, encodings),
+                None => track::new_audio(mid, meta),
+            };
+            match &mut track {
+                Track::Audio(audio) => audio.format = format,
+                Track::Video(video) => video.format = format,
+                Track::Data(_) => {}
+            }
+            (upstream, track)
+        }) else {
             if self
                 .transport
                 .update_compiled_rtp(CompiledRtpConfigurationPatch {
@@ -354,6 +354,7 @@ impl Connection {
             return;
         };
         self.native_execution.finish(work.scope());
+        let id = track.id();
         self.native_rtp.tracks.insert(*id.as_bytes(), reference);
         self.native_rtp.mids.insert(mid, reference);
         for encoding in &binding.description().encodings {
@@ -377,11 +378,19 @@ impl Connection {
             track = ?id,
             "native RTP publication advertised"
         );
-        events.publish_track(track);
-        self.record_native_publication(work, execution, now);
+        events.publish_track(track.clone());
+        self.record_native_publication(
+            work,
+            PublicationExecution {
+                track,
+                enabled,
+                active: false,
+            },
+            now,
+        );
     }
 
-    pub(crate) fn native_rtp_demand(&mut self, track: TrackId, demanded: bool) {
+    pub(crate) fn native_rtp_demand(&mut self, track: PublicationKey, demanded: bool) {
         let Some(reference) = self.native_rtp.tracks.get(track.as_bytes()).copied() else {
             return;
         };
@@ -569,10 +578,10 @@ impl Connection {
             self.disconnect(DisconnectReason::SignalingOutput);
             return;
         }
-        let track_id = source.track.id();
+        let publication_id = source.track.id();
         let slot = source.slot;
         self.native_rtp.publications.remove(&reference);
-        self.upstream.remove_managed_track(slot, track_id);
+        self.upstream.remove_managed_track(slot, publication_id);
         self.record_native_resource_observation(
             crate::participant::policy::ResourceObservation::Released { binding: reference },
         );

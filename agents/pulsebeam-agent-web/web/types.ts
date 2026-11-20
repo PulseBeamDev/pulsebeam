@@ -58,13 +58,13 @@ export interface DataSubscriptionUpdates {
 
 export interface LocalVideoTrack {
   readonly kind: "video";
-  readonly label: string;
+  readonly trackId: string;
   publish(configuration?: PublicationConfig): VideoPublication;
 }
 
 export interface LocalAudioTrack {
   readonly kind: "audio";
-  readonly label: string;
+  readonly trackId: string;
   publish(configuration?: PublicationConfig): AudioPublication;
 }
 export type TopicMode = "latest" | "lossy" | "ordered";
@@ -86,14 +86,14 @@ export interface AgentConfig {
 export interface PublicationIntent {
   readonly slot: string;
   readonly kind: MediaKind;
-  readonly label: string;
+  readonly trackId: string;
   readonly active: boolean;
 }
 
 export interface TrackSelector {
   readonly room: string;
   readonly participantId: string;
-  readonly label: string;
+  readonly trackId: string;
 }
 
 export type VideoDemand = {
@@ -104,8 +104,8 @@ export type VideoDemand = {
   readonly priority: number;
   readonly playoutDelay?: FixedPlayoutDelay;
 } & (
-  | { readonly trackId: string; readonly selector?: never }
-  | { readonly trackId?: never; readonly selector: TrackSelector }
+  | { readonly publicationId: string; readonly selector?: never }
+  | { readonly publicationId?: never; readonly selector: TrackSelector }
 );
 
 export interface AudioDemand {
@@ -113,7 +113,7 @@ export interface AudioDemand {
   readonly selected?: readonly TrackSelector[];
   readonly automatic?: boolean;
   readonly playoutDelays?: readonly {
-    readonly trackId: string;
+    readonly publicationId: string;
     readonly playoutDelay: FixedPlayoutDelay;
   }[];
   readonly selectorDelays?: readonly {
@@ -209,7 +209,7 @@ export interface RemoteVideoTrack {
   readonly id: string | null;
   /** External application participant identity, not a canonical runtime ID. */
   readonly participantId: string;
-  readonly label: string;
+  readonly trackId: string;
   readonly active: boolean;
   watch(listener: () => void): () => void;
   subscribe(configuration?: VideoObservation): VideoSubscription;
@@ -220,7 +220,7 @@ export interface RemoteAudioTrack {
   readonly id: string | null;
   readonly active: boolean;
   readonly participantId: string;
-  readonly label: string;
+  readonly trackId: string;
   watch(listener: () => void): () => void;
   subscribe(configuration?: AudioSubscriptionConfig): AudioSubscription;
 }
@@ -230,9 +230,9 @@ export interface RemoteParticipant {
   readonly participantId: string;
   readonly active: boolean;
   id(): string;
-  video(label: string): RemoteVideoTrack;
-  audio(label: string): RemoteAudioTrack;
-  data<D extends Delivery>(label: string, delivery: D): RemoteDataTrack<D>;
+  video(trackId: string): RemoteVideoTrack;
+  audio(trackId: string): RemoteAudioTrack;
+  data<D extends Delivery>(trackId: string, delivery: D): RemoteDataTrack<D>;
 }
 
 export interface WatchConfig {
@@ -287,7 +287,7 @@ export interface RoomRef {
 export type TopicEvent<T> =
   | {
       readonly type: "message";
-      readonly dataTrackId: string;
+      readonly publicationId: string;
       readonly sequence: bigint;
       readonly participantId: string;
       readonly topic: string;
@@ -295,7 +295,7 @@ export type TopicEvent<T> =
     }
   | {
       readonly type: "gap";
-      readonly dataTrackId: string;
+      readonly publicationId: string;
       readonly participantId: string;
       readonly topic: string;
       readonly expectedSequence: bigint;
@@ -331,7 +331,7 @@ export interface TopicPublisherStatus {
   readonly name: string;
   readonly mode: TopicMode;
   readonly connected: boolean;
-  readonly dataTrackId: string | null;
+  readonly publicationId: string | null;
   readonly nextSequence: bigint;
   readonly acceptedHistory: number;
   readonly queued: number;
@@ -430,7 +430,7 @@ export type AgentEvent =
       readonly mode: TopicMode;
       readonly topic: string;
       readonly participantId: string;
-      readonly dataTrackId: string;
+      readonly publicationId: string;
       readonly sequence: bigint;
       readonly payload: Uint8Array;
     }
@@ -438,7 +438,7 @@ export type AgentEvent =
       readonly type: "topic-recovery-gap";
       readonly topic: string;
       readonly participantId: string;
-      readonly dataTrackId: string;
+      readonly publicationId: string;
       readonly expectedSequence: bigint;
       readonly availableSequence: bigint;
     }
@@ -447,7 +447,7 @@ export type AgentEvent =
       readonly topic: string;
       readonly mode: TopicMode;
       readonly operation: bigint;
-      readonly dataTrackId: string;
+      readonly publicationId: string;
       readonly sequence: bigint;
     }
   | {
@@ -479,9 +479,9 @@ export interface Agent {
   readonly participantId: string | null;
   readonly roomId: string | null;
   readonly authorizationExpiresAt: number | null;
-  video(label: string): LocalVideoTrack;
-  audio(label: string): LocalAudioTrack;
-  data<D extends Delivery>(label: string, delivery: D): LocalDataTrack<D>;
+  video(trackId: string): LocalVideoTrack;
+  audio(trackId: string): LocalAudioTrack;
+  data<D extends Delivery>(trackId: string, delivery: D): LocalDataTrack<D>;
   room(name: string): RoomRef;
   selectAudio(policy: AudioDemand): Promise<AudioSelection>;
   /** Synchronously replace the desired room; Core owns admission and recovery. */

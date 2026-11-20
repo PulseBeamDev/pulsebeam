@@ -34,7 +34,7 @@ export function Roster({
             {participant.id}
             {participant.publications.length === 0
               ? " · present, no publications"
-              : ` · ${participant.publications.map((publication) => publication.label).join(", ")}`}
+              : ` · ${participant.publications.map((publication) => publication.trackId).join(", ")}`}
           </li>
         ))}
       </ul>

@@ -31,7 +31,7 @@ impl Agent {
                 crate::MediaKind::Audio => wire::TrackKind::Audio,
                 crate::MediaKind::Video => wire::TrackKind::Video,
             },
-            label: spec.label().into(),
+            track_id: spec.track_id().into(),
         };
         let mut admission = PublicationAdmission {
             status: PublicationAdmissionStatus::Pending,
@@ -62,7 +62,10 @@ impl Agent {
                 confirmed.and_then(|state| state.value.as_ref())
             {
                 admission.status = PublicationAdmissionStatus::Admitted;
-                admission.publication_id = live.track.as_ref().map(|track| track.track_id.clone());
+                admission.publication_id = live
+                    .track
+                    .as_ref()
+                    .map(|track| track.publication_id.clone());
                 admission.execution = match live.execution() {
                     wire::ExecutionStatus::Disabled => PublicationExecution::Disabled,
                     wire::ExecutionStatus::Installed => PublicationExecution::Installed,
@@ -96,7 +99,7 @@ impl Agent {
         Ok(PublicationState {
             observation_revision: 0,
             kind: kind.into(),
-            label: spec.label().into(),
+            track_id: spec.track_id().into(),
             closed: false,
             configuration: PublicationConfigurationSnapshot {
                 desired_revision: configuration.desired_revision,

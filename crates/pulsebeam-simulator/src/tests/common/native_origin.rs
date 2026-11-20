@@ -933,7 +933,7 @@ mod tests {
             track: NativeReceiverInfo {
                 generation: 1,
                 receiver,
-                track_id: "unit".into(),
+                publication_id: "unit".into(),
                 mid: "1".into(),
                 media_index: 1,
             },
@@ -1145,8 +1145,8 @@ mod tests {
                     decoded.track.generation = 2;
                 }
                 1 => {
-                    encoded.track.track_id = "replacement".into();
-                    decoded.track.track_id = "replacement".into();
+                    encoded.track.publication_id = "replacement".into();
+                    decoded.track.publication_id = "replacement".into();
                 }
                 _ => {
                     if let OutputFrame::I420 { frame } = &mut decoded.frame {
@@ -1575,7 +1575,7 @@ mod tests {
                 } else if case == "wrong-track" && index == 2 {
                     log.encoded_event(&frame(10, timestamp, false), Some(event.clone()));
                     let mut wrong = frame(10, timestamp, true);
-                    wrong.track.track_id = "retired-track".into();
+                    wrong.track.publication_id = "retired-track".into();
                     log.decoded(&wrong, at, false);
                 } else if case == "unassociated" && index == 2 {
                     log.encoded_event(&frame(10, timestamp, false), None);
@@ -1782,7 +1782,7 @@ mod tests {
                 let encoded = frame(10, 1, false);
                 let mut decoded = frame(10, 1, true);
                 match field {
-                    0 => decoded.track.track_id = "another-native-track".into(),
+                    0 => decoded.track.publication_id = "another-native-track".into(),
                     1 => decoded.track.mid = "another-mid".into(),
                     _ => decoded.track.media_index += 1,
                 }

@@ -42,10 +42,10 @@ verified ProjectId + requested RoomId + JWT sub (ParticipantId)
 connection admission
     -> ConnectionId
 
-ConnectionId + TrackKind + TrackLabel + publication incarnation
-    -> TrackId
+publication admission on the owning connection
+    -> PublicationId
 
-TrackId + current placement
+PublicationId + current placement
     -> RouteAddress
     -> destination shard resolves TrackHandle
 ```
@@ -65,22 +65,12 @@ channel ownership select execution. Subscription defaults and permission to open
 legacy topic channels are explicit connection policy. Authorization expiry fences
 negotiated ingress as well as configured resources.
 
-`ConnectionId::derive_publication_track_id`
-derives a UUIDv8 `TrackId` from the connection, track kind, immutable label and
-nonzero publication incarnation. For desired/confirmed resources, the incarnation
-is the first desired revision (owned ref), not each later settings revision.
-Disabling a continuing publication preserves it; retirement and same-label
-republishing require a fresh one. The transcript is the publication domain
-`pulsebeam.identity.publication.v1`, connection UUID bytes, kind byte, incarnation
-as big-endian uint64, then the label's big-endian uint32 byte length and UTF-8
-bytes. UUID version/variant bits are applied to the first 16 SHA3-256 bytes.
-
-`derive_track_id` retains the single bootstrap-lifetime transcript for SDP and
-legacy sources without owned refs. It cannot identify multiple same-label
-lifetimes on one connection. Both derivations retain the existing canonical
-encoding; a reconnect creates fresh track IDs. The V0 runtime text encodings
-are `aud_0...`, `vid_0...`, `dat_0...`, and `conn_0...`. Only the canonical
-identity implementation may derive, mint, parse, or format these values.
+The server mints a UUIDv7 `PublicationId` at admission. The canonical text form
+is `pub_0...` for audio, video, and data. Media kind, connection ownership, and
+logical name are separate metadata. Use the ID from confirmed state or the
+catalog rather than trying to derive it. Disabling a continuing publication
+preserves its ID; retiring it and publishing again creates a new one. A
+connection's canonical text form is `conn_0...`.
 
 Address scope is explicit:
 

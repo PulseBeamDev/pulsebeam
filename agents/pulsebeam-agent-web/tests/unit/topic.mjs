@@ -5,7 +5,7 @@ import { TopicRegistry } from "../../unit-javascript/topic.js";
 function message(value, sequence, identity = {}) {
   return {
     type: "message",
-    dataTrackId: "track-a",
+    publicationId: "track-a",
     participantId: "alice",
     topic: "chat",
     sequence,
@@ -51,9 +51,9 @@ function fixture(send = async () => {}) {
       );
     },
     bytes(topic, mode, payload, identity = {}) {
-      const dataTrackId = identity.dataTrackId ?? "track-a";
-      const sequence = identity.sequence ?? sequences.get(dataTrackId) ?? 0n;
-      sequences.set(dataTrackId, sequence + 1n);
+      const publicationId = identity.publicationId ?? "track-a";
+      const sequence = identity.sequence ?? sequences.get(publicationId) ?? 0n;
+      sequences.set(publicationId, sequence + 1n);
       this.event({
         type: "topic-message",
         topic,
@@ -61,7 +61,7 @@ function fixture(send = async () => {}) {
         payload,
         participantId: "alice",
         ...identity,
-        dataTrackId,
+        publicationId,
         sequence,
       });
     },
@@ -126,7 +126,7 @@ test("same-name modes stay distinct and ordered gaps are inline in listener arri
   assert.equal(f.registrations.length, 3);
   f.emit("chat", "ordered", "before", { sequence: 0n });
   const gap = {
-    dataTrackId: "track-a",
+    publicationId: "track-a",
     participantId: "alice",
     topic: "chat",
     expectedSequence: 1n,
@@ -171,7 +171,7 @@ test("ordered overflow compacts missing messages into an inline gap before incre
   assert.deepEqual((await iterator.next()).value, {
     type: "gap",
     topic: "chat",
-    dataTrackId: "track-a",
+    publicationId: "track-a",
     participantId: "alice",
     expectedSequence: 0n,
     availableSequence: 45n,
@@ -198,7 +198,7 @@ test("ordered overflow keeps an explicit contiguous cursor independently for eac
     for (const participantId of ["alice", "bob"])
       f.emit("chat", "ordered", Number(sequence), {
         participantId,
-        dataTrackId: participantId,
+        publicationId: participantId,
         sequence,
       });
   const cursors = new Map([
@@ -207,13 +207,13 @@ test("ordered overflow keeps an explicit contiguous cursor independently for eac
   ]);
   for (let i = 0; i < 256; i++) {
     const event = (await iterator.next()).value;
-    assert.equal(event.dataTrackId, event.participantId);
+    assert.equal(event.publicationId, event.participantId);
     assert.equal(
       event.type === "gap" ? event.expectedSequence : event.sequence,
-      cursors.get(event.dataTrackId),
+      cursors.get(event.publicationId),
     );
     cursors.set(
-      event.dataTrackId,
+      event.publicationId,
       event.type === "gap" ? event.availableSequence : event.sequence + 1n,
     );
   }
@@ -232,19 +232,19 @@ test("latest coalesces only per track and resolves pending reads without delayin
   for (let value = 0; value < 300; value++) {
     f.emit("chat", "latest", value);
     f.emit("chat", "latest", value, {
-      dataTrackId: "track-b",
+      publicationId: "track-b",
       participantId: "bob",
     });
   }
   assert.deepEqual((await first).value, message(0, 0n));
   assert.deepEqual(
     (await second).value,
-    message(0, 0n, { dataTrackId: "track-b", participantId: "bob" }),
+    message(0, 0n, { publicationId: "track-b", participantId: "bob" }),
   );
   assert.deepEqual((await iterator.next()).value, message(299, 299n));
   assert.deepEqual(
     (await iterator.next()).value,
-    message(299, 299n, { dataTrackId: "track-b", participantId: "bob" }),
+    message(299, 299n, { publicationId: "track-b", participantId: "bob" }),
   );
   await iterator.return();
 });
@@ -272,7 +272,7 @@ for (const mode of ["latest", "ordered"]) {
       .subscribe()
       [Symbol.asyncIterator]();
     for (let track = 0; track < 257; track++)
-      f.emit("chat", mode, track, { dataTrackId: `track-${track}` });
+      f.emit("chat", mode, track, { publicationId: `track-${track}` });
     await assert.rejects(iterator.next(), RangeError);
     assert.equal(f.listeners.size, 0);
     assert.deepEqual(f.registrations, []);

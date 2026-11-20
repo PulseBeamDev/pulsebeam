@@ -188,7 +188,7 @@ impl NativeDecodedVideoLog {
             receiver
                 .track
                 .as_ref()
-                .is_some_and(|actual| actual.track_id == track.track_id
+                .is_some_and(|actual| actual.publication_id == track.publication_id
                     && actual.mid == track.mid
                     && actual.media_index == track.media_index),
             "native playback track identity changed"
@@ -477,7 +477,7 @@ mod tests {
             track: NativeReceiverInfo {
                 generation,
                 receiver: 7,
-                track_id: "unit".into(),
+                publication_id: "unit".into(),
                 mid: "1".into(),
                 media_index: 1,
             },

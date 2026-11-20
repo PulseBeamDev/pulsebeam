@@ -43,7 +43,7 @@ function decodeEvent<T>(
   if (event.type === "topic-message" && event.mode === entry.mode) {
     return Object.freeze({
       type: "message",
-      dataTrackId: event.dataTrackId,
+      publicationId: event.publicationId,
       sequence: event.sequence,
       participantId: event.participantId,
       topic: event.topic,
@@ -53,7 +53,7 @@ function decodeEvent<T>(
   if (event.type === "topic-recovery-gap" && entry.mode === "ordered") {
     return Object.freeze({
       type: "gap",
-      dataTrackId: event.dataTrackId,
+      publicationId: event.publicationId,
       participantId: event.participantId,
       topic: event.topic,
       expectedSequence: event.expectedSequence,
@@ -158,7 +158,7 @@ class TopicIterator<T> implements AsyncIterableIterator<TopicEvent<T>> {
     }
     if (this.#entry.mode === "latest") {
       const previous = this.#queue.findIndex(
-        (queued) => queued.dataTrackId === event.dataTrackId,
+        (queued) => queued.publicationId === event.publicationId,
       );
       if (previous !== -1) this.#queue.splice(previous, 1);
     }
@@ -179,9 +179,9 @@ class TopicIterator<T> implements AsyncIterableIterator<TopicEvent<T>> {
     const firstByTrack = new Map<string, number>();
     for (let second = 0; second < this.#queue.length; second += 1) {
       const later = this.#queue[second]!;
-      const first = firstByTrack.get(later.dataTrackId);
+      const first = firstByTrack.get(later.publicationId);
       if (first === undefined) {
-        firstByTrack.set(later.dataTrackId, second);
+        firstByTrack.set(later.publicationId, second);
         continue;
       }
       const earlier = this.#queue[first]!;
@@ -195,7 +195,7 @@ class TopicIterator<T> implements AsyncIterableIterator<TopicEvent<T>> {
           : end;
       this.#queue[first] = Object.freeze({
         type: "gap",
-        dataTrackId: earlier.dataTrackId,
+        publicationId: earlier.publicationId,
         participantId: earlier.participantId,
         topic: earlier.topic,
         expectedSequence,

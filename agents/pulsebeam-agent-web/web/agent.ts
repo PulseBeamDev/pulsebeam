@@ -90,8 +90,8 @@ interface RuntimeSnapshot {
     Record<RuntimeTopicCounter, bigint> & {
       readonly publishers: readonly (Omit<
         TopicPublisherStatus,
-        "dataTrackId"
-      > & { readonly dataTrackId?: string })[];
+        "publicationId"
+      > & { readonly publicationId?: string })[];
     };
   readonly failure?: AgentError;
 }
@@ -322,14 +322,14 @@ class AgentFacade implements AgentApi {
     this.#remote.bindAgent(agent);
   }
 
-  video(label: string): LocalVideoTrack {
-    return this.#media.track(track.video(label));
+  video(trackId: string): LocalVideoTrack {
+    return this.#media.track(track.video(trackId));
   }
-  audio(label: string): LocalAudioTrack {
-    return this.#media.track(track.audio(label));
+  audio(trackId: string): LocalAudioTrack {
+    return this.#media.track(track.audio(trackId));
   }
-  data<D extends Delivery>(label: string, delivery: D): LocalDataTrack<D> {
-    return this.#data.local(track.data(label, delivery));
+  data<D extends Delivery>(trackId: string, delivery: D): LocalDataTrack<D> {
+    return this.#data.local(track.data(trackId, delivery));
   }
   room(name: string): RoomRef {
     return this.#remote.room(name);
@@ -586,10 +586,10 @@ class AgentFacade implements AgentApi {
     return new Promise((resolve, reject) => {
       let runtime: Runtime | undefined;
       let generation: bigint | null = null;
-      let dataTrackId =
+      let publicationId =
         this.#snapshot.topics.publishers.find(
           (status) => status.name === name && status.mode === mode,
-        )?.dataTrackId ?? null;
+        )?.publicationId ?? null;
       let dispatching = false;
       let settled = false;
       let unsubscribe = () => {};
@@ -640,27 +640,30 @@ class AgentFacade implements AgentApi {
         const publisher = this.#snapshot.topics.publishers.find(
           (status) => status.name === name && status.mode === mode,
         );
-        if (publisher?.connected || publisher?.dataTrackId)
+        if (publisher?.connected || publisher?.publicationId)
           generation ??= this.#runtimeGeneration;
-        if (dataTrackId !== null && publisher?.dataTrackId !== dataTrackId) {
+        if (
+          publicationId !== null &&
+          publisher?.publicationId !== publicationId
+        ) {
           fail(new Error("topic publication binding was replaced"));
           return;
         }
-        dataTrackId ??= publisher?.dataTrackId ?? null;
+        publicationId ??= publisher?.publicationId ?? null;
         if (
           dispatching ||
           !runtime ||
           this.#snapshot.connection !== "connected" ||
           generation === null ||
           !publisher?.connected ||
-          dataTrackId === null
+          publicationId === null
         )
           return;
         dispatching = true;
         try {
           this.#requireCurrentRuntime(runtime);
           void runtime
-            .send_topic(name, mode, payload, BigInt(generation), dataTrackId)
+            .send_topic(name, mode, payload, BigInt(generation), publicationId)
             .then(() => {
               if (settled) return;
               settled = true;
@@ -766,7 +769,7 @@ class AgentFacade implements AgentApi {
         ...raw.topics,
         publishers: raw.topics.publishers.map((publisher) => ({
           ...publisher,
-          dataTrackId: publisher.dataTrackId ?? null,
+          publicationId: publisher.publicationId ?? null,
         })),
         acceptedSends: Number(raw.topics.acceptedSends),
         droppedSends: Number(raw.topics.droppedSends),
@@ -865,10 +868,10 @@ export class Agent implements AgentApi {
     return this.#raw.authorizationExpiresAt;
   }
 
-  readonly video: AgentApi["video"] = (label) => this.#raw.video(label);
-  readonly audio: AgentApi["audio"] = (label) => this.#raw.audio(label);
-  readonly data: AgentApi["data"] = (label, delivery) =>
-    this.#raw.data(label, delivery);
+  readonly video: AgentApi["video"] = (trackId) => this.#raw.video(trackId);
+  readonly audio: AgentApi["audio"] = (trackId) => this.#raw.audio(trackId);
+  readonly data: AgentApi["data"] = (trackId, delivery) =>
+    this.#raw.data(trackId, delivery);
   readonly room: AgentApi["room"] = (name) => this.#raw.room(name);
   readonly selectAudio: AgentApi["selectAudio"] = (policy) =>
     this.#raw.selectAudio(policy);

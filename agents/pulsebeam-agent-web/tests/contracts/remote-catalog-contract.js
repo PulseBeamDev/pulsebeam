@@ -14,7 +14,7 @@
           id: "video-1",
           kind: "video",
           participantId: "alice",
-          label: "camera",
+          trackId: "camera",
         },
       ],
     },

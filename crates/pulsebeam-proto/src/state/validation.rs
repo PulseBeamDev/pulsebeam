@@ -123,7 +123,7 @@ fn validate_key(key: &resource_key::Key) -> Result {
         resource_key::Key::Participant(endpoint) => {
             validate_participant(endpoint).map_err(|_| ValidationError::Key)
         }
-        resource_key::Key::Track(id) if text(id, 128) => Ok(()),
+        resource_key::Key::Publication(id) if text(id, 128) => Ok(()),
         resource_key::Key::Session(true) => Ok(()),
         _ => Err(ValidationError::Key),
     }
@@ -166,10 +166,10 @@ fn validate_confirmed(key: &resource_key::Key, confirmed: &ConfirmedState) -> Re
         {
             validate_participant(participant)
         }
-        (Key::Track(id), Some(Value::Track(track))) if id == &track.track_id => {
+        (Key::Publication(id), Some(Value::Track(track))) if id == &track.publication_id => {
             validate_track(track)
         }
-        (Key::Participant(_) | Key::Track(_), Some(Value::Absent(absent)))
+        (Key::Participant(_) | Key::Publication(_), Some(Value::Absent(absent)))
             if absent.reason == AbsenceReason::Removed as i32
                 || absent.reason == AbsenceReason::Gone as i32 =>
         {
@@ -200,7 +200,7 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
     }
     match spec.declaration.as_ref().ok_or(ValidationError::Binding)? {
         resource_spec::Declaration::Publication(publication) => {
-            if !text(&publication.label, 256) || settings.receive.is_some() {
+            if !is_application_name(&publication.track_id) || settings.receive.is_some() {
                 return Err(ValidationError::Settings);
             }
             match publication.kind.as_ref().ok_or(ValidationError::Binding)? {
@@ -226,7 +226,8 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
             crate::catalog::validate_address(source).map_err(|_| ValidationError::Identity)
         }
         resource_spec::Declaration::Subscription(subscription) => {
-            if !text(&subscription.track_id, 128) || !is_application_name(&subscription.source_room)
+            if !text(&subscription.publication_id, 128)
+                || !is_application_name(&subscription.source_room)
             {
                 return Err(ValidationError::Identity);
             }
@@ -264,10 +265,10 @@ pub fn validate_participant(participant: &Participant) -> Result {
 }
 
 pub fn validate_track(track: &Track) -> Result {
-    if !text(&track.track_id, 128)
+    if !text(&track.publication_id, 128)
         || !is_application_name(&track.room_id)
         || !is_application_name(&track.participant_id)
-        || !text(&track.label, 256)
+        || !is_application_name(&track.track_id)
     {
         return Err(ValidationError::Identity);
     }
@@ -309,7 +310,7 @@ pub fn validate_live(live: &LiveResource) -> Result {
         .ok_or(ValidationError::Confirmed)?
     {
         resource_spec::Declaration::Publication(publication) => {
-            if publication.label != track.label {
+            if publication.track_id != track.track_id {
                 return Err(ValidationError::Identity);
             }
             match (&publication.kind, &track.kind) {
@@ -337,7 +338,7 @@ pub fn validate_live(live: &LiveResource) -> Result {
                 Some(track::Kind::Data(_)) => TrackKind::Data,
                 None => return Err(ValidationError::Identity),
             };
-            if subscription.track_id != track.track_id
+            if subscription.publication_id != track.publication_id
                 || subscription.source_room != track.room_id
                 || subscription.kind != kind as i32
             {
@@ -401,7 +402,7 @@ pub fn validate_source_lookup(lookup: &SourceLookupState) -> Result {
                 || participant.room_id != track.room_id
                 || participant.room_id != source.room
                 || participant.participant_id != source.participant_id
-                || track.label != source.label
+                || track.track_id != source.track_id
                 || track.kind.as_ref().map(track_kind) != Some(source.kind)
             {
                 return Err(ValidationError::Identity);
@@ -568,7 +569,7 @@ pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> boo
     use resource_spec::Declaration;
     match (&left.declaration, &right.declaration) {
         (Some(Declaration::Publication(left)), Some(Declaration::Publication(right))) => {
-            left.label == right.label
+            left.track_id == right.track_id
                 && match (&left.kind, &right.kind) {
                     (Some(Kind::Audio(left)), Some(Kind::Audio(right))) => {
                         bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())
@@ -584,7 +585,7 @@ pub fn declarations_equivalent(left: &ResourceSpec, right: &ResourceSpec) -> boo
                 }
         }
         (Some(Declaration::Subscription(left)), Some(Declaration::Subscription(right))) => {
-            left.track_id == right.track_id
+            left.publication_id == right.publication_id
                 && left.kind == right.kind
                 && left.source_room == right.source_room
                 && bindings_equivalent(left.binding.as_ref(), right.binding.as_ref())

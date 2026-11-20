@@ -28,7 +28,7 @@ use pulsebeam_runtime::time::Instant;
 use std::sync::Arc;
 pub use time::{Frequency, MediaTime};
 
-use crate::entity::{ParticipantId, TrackId};
+use crate::entity::{ParticipantId, PublicationKey};
 
 /// The standard 90kHz clock rate for video RTP, used for all internal timestamp math.
 /// TODO: get these clocks from SDP instead.
@@ -44,7 +44,7 @@ pub enum Codec {
 #[derive(Clone, Debug)]
 pub struct AudioRtpPacket {
     pub participant_id: ParticipantId,
-    pub track_id: TrackId,
+    pub publication_id: PublicationKey,
     pub packet: RtpPacket,
 }
 

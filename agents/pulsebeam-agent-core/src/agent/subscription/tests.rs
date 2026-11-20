@@ -12,7 +12,7 @@ use pulsebeam_proto::state::{self, codec};
 
 fn data_spec() -> TrackSpec {
     TrackSpec::Data {
-        label: "events".into(),
+        track_id: "events".into(),
         delivery: TopicMode::Lossy,
     }
 }
@@ -116,7 +116,7 @@ fn rejected_data_publication_update_retains_admitted_execution() {
     spec.settings.as_mut().unwrap().enabled = Some(false);
     let resource = Resource::Publication {
         kind: state::TrackKind::Data,
-        label: "events".into(),
+        track_id: "events".into(),
     };
     let native = &mut agent.active.as_mut().unwrap().state;
     native.stage(resource, Some(spec)).unwrap();
@@ -128,7 +128,7 @@ fn rejected_data_publication_update_retains_admitted_execution() {
     let state::confirmed_state::Value::Owned(live) = native
         .confirmed(&Resource::Publication {
             kind: state::TrackKind::Data,
-            label: "events".into(),
+            track_id: "events".into(),
         })
         .unwrap()
         .value
@@ -159,7 +159,7 @@ fn receive(agent: &mut Agent, participant: &str) -> u64 {
             source: TrackSelector {
                 room: "room".into(),
                 participant_id: participant.into(),
-                label: "events".into(),
+                track_id: "events".into(),
             },
         })
         .unwrap()

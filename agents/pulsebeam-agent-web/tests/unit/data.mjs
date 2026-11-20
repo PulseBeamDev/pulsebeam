@@ -16,7 +16,7 @@ test("data sends preserve shared codes for local admission and backend failure",
   );
   const local = registry.local({
     kind: "data",
-    label: "events",
+    trackId: "events",
     delivery: "ordered",
   });
   const publication = local.publish();
@@ -127,8 +127,8 @@ test("exact-source failures wake pending reads and preserve their shared cause a
   };
   owners.activate(runtime);
   const receiver = registry.subscribe(
-    { kind: "data", label: "events", delivery: "ordered" },
-    { room: "room", participantId: "alice", label: "events" },
+    { kind: "data", trackId: "events", delivery: "ordered" },
+    { room: "room", participantId: "alice", trackId: "events" },
   );
   const pending = [receiver.next(), receiver.next()];
   const outcomes = Promise.allSettled(pending);

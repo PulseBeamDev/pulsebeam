@@ -5,13 +5,13 @@ use std::ops::Bound::{Excluded, Unbounded};
 #[derive(Clone)]
 pub(super) struct SourceWait {
     pub(super) work: Preparation,
-    pub(super) source: TrackId,
+    pub(super) source: PublicationKey,
     pub(super) source_room: String,
     pub(super) deadline: Instant,
 }
 
 impl NativeSession {
-    pub(in crate::control) fn notify_waiting_source(&mut self, source: TrackId) -> bool {
+    pub(in crate::control) fn notify_waiting_source(&mut self, source: PublicationKey) -> bool {
         if !self.source_waits.values().any(|wait| wait.source == source) {
             return false;
         }
@@ -34,7 +34,7 @@ impl NativeSession {
     pub(super) fn retain_source_wait(
         &mut self,
         work: Preparation,
-        source: TrackId,
+        source: PublicationKey,
         source_room: String,
     ) -> Result<(), OutputError> {
         if self.source_waits.contains_key(&work.reference) {
@@ -68,7 +68,7 @@ impl NativeSession {
         &mut self,
         unix_now: u64,
         now: Instant,
-        available: impl Fn(TrackId) -> bool,
+        available: impl Fn(PublicationKey) -> bool,
     ) -> Result<(), OutputError> {
         self.service_source_waits_in_room(unix_now, now, |_, track| available(track))
     }
@@ -77,7 +77,7 @@ impl NativeSession {
         &mut self,
         unix_now: u64,
         now: Instant,
-        available: impl Fn(&str, TrackId) -> bool,
+        available: impl Fn(&str, PublicationKey) -> bool,
     ) -> Result<(), OutputError> {
         for _ in 0..16 {
             let Some(&(deadline, reference)) = self.source_deadlines.first() else {

@@ -1,4 +1,5 @@
 use super::{failure_code, publication_binding, receiving_binding, transport_capabilities};
+use crate::entity::TrackId;
 use crate::media::{Mid, Rid};
 use crate::participant::policy::{ReceiverRtpConfiguration, VideoPolicy};
 use crate::rtp::MediaTime;
@@ -26,15 +27,16 @@ pub(crate) fn publication_declaration(
     let wire::track_binding::Transport::Rtp(parameters) = binding.transport.as_ref()? else {
         return None;
     };
-    Some((&publication.label, kind, parameters))
+    Some((&publication.track_id, kind, parameters))
 }
 
 pub(crate) fn publication(
     spec: &wire::ResourceSpec,
     capabilities: &wire::RtpCapabilities,
-) -> Result<(String, wire::TrackKind, CompiledRtpBinding), wire::FailureCode> {
+) -> Result<(TrackId, wire::TrackKind, CompiledRtpBinding), wire::FailureCode> {
     let (label, kind, parameters) =
         publication_declaration(spec).ok_or(wire::FailureCode::Unsupported)?;
+    let track_id = TrackId::new(label).map_err(|_| wire::FailureCode::InvalidConfiguration)?;
     let binding = publication_binding(parameters, kind, capabilities)?;
     // Only the existing production processors qualify a declaration. Temporal
     // H.264 requires its declared dependency descriptor, not inferred layers.
@@ -64,7 +66,7 @@ pub(crate) fn publication(
         RtpBindingCompiler::new(transport_capabilities(capabilities).map_err(failure_code)?)
             .map_err(failure_code)?;
     Ok((
-        label.to_owned(),
+        track_id,
         kind,
         compiler.compile(binding).map_err(failure_code)?,
     ))

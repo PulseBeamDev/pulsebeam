@@ -146,13 +146,13 @@ async fn foreign_witness(
                         DataEvent::Message {
                             data,
                             participant_id,
-                            track_id,
+                            publication_id,
                             ..
                         },
                 }) => {
                     ensure!(
                         data == expected,
-                        "unexpected installed consumer bytes from {participant_id}/{track_id}: {data:?}; expected {expected:?}"
+                        "unexpected installed consumer bytes from {participant_id}/{publication_id}: {data:?}; expected {expected:?}"
                     );
                     let mut payload = b"rust-ack:".to_vec();
                     payload.extend(data);

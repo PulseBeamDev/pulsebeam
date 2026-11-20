@@ -196,7 +196,7 @@ fn selector_value(selector: &ffi::TrackSelector) -> JsValue {
     let value = Object::new();
     set(&value, "room", selector.room.clone());
     set(&value, "participantId", selector.participant_id.clone());
-    set(&value, "label", selector.label.clone());
+    set(&value, "trackId", selector.track_id.clone());
     value.into()
 }
 
@@ -240,7 +240,7 @@ fn audio_value(state: &ffi::AudioSubscriptionState) -> JsValue {
 
 fn data_publication_value(state: &ffi::DataPublicationState) -> JsValue {
     let value = resource_value!(state);
-    set(&value, "label", state.label.clone());
+    set(&value, "trackId", state.track_id.clone());
     set(&value, "delivery", state.delivery as u32);
     value.into()
 }

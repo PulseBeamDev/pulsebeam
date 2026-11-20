@@ -54,7 +54,7 @@ fn requested_tracks(observed: &ClientObservation) -> BTreeSet<String> {
         .submitted
         .video
         .iter()
-        .map(|video| video.track_id.clone())
+        .map(|video| video.publication_id.clone())
         .collect()
 }
 
@@ -219,7 +219,7 @@ impl Transition {
                     }
                 };
                 ensure!(
-                    publication.label == label,
+                    publication.track_id == label,
                     "unexpected history publication label"
                 );
                 if !self.bindings.iter().any(|b| {
@@ -233,7 +233,7 @@ impl Transition {
                                 b.expected.audio
                             }
                         })
-                        && b.expected.track_id(kind, label).as_str() == publication.id
+                        && b.expected.publication_id(kind, label).as_str() == publication.id
                 }) {
                     ensure!(
                         !self.admitting.is_empty(),
@@ -369,7 +369,7 @@ impl Transition {
                         .find(|b| b.expected.id.as_str() == *id && b.retired.is_none())
                         .map(|b| {
                             b.expected
-                                .track_id(pulsebeam::entity::TrackKind::Video, "video")
+                                .publication_id(pulsebeam::entity::TrackKind::Video, "video")
                                 .as_str()
                         })
                         .context("issued receive target has no live incarnation")
@@ -578,7 +578,7 @@ async fn execute_inner(
                         })
                         .context("held source admission binding")?;
                     witness.record(format!("held-media participant={id} admission={} publication={} native_generation={} held_at_us={} baseline_us={} ending_us={} old_senders={:?} ending_senders={:?}",
-                        held.admission, binding.expected.track_id(pulsebeam::entity::TrackKind::Video, "video").as_str(),
+                        held.admission, binding.expected.publication_id(pulsebeam::entity::TrackKind::Video, "video").as_str(),
                         held.baseline.generation, held.held_at_us, held.baseline.timestamp_us, ending.timestamp_us,
                         held.baseline.outbound_video, ending.outbound_video));
                     witness.reach("previous-generation-in-flight");
@@ -988,7 +988,7 @@ async fn recover(state: &mut Transition, handles: &PlanHandles, final_check: boo
                     binding.id.as_str() == **id
                         && state.desired_tracks.contains(
                             &binding
-                                .track_id(pulsebeam::entity::TrackKind::Video, "video")
+                                .publication_id(pulsebeam::entity::TrackKind::Video, "video")
                                 .as_str(),
                         )
                 })
@@ -1039,7 +1039,7 @@ async fn recover(state: &mut Transition, handles: &PlanHandles, final_check: boo
         })
         .map(|binding| {
             binding
-                .track_id(pulsebeam::entity::TrackKind::Video, "video")
+                .publication_id(pulsebeam::entity::TrackKind::Video, "video")
                 .as_str()
         })
         .collect::<BTreeSet<_>>();

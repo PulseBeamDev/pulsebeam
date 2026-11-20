@@ -12,7 +12,7 @@ use pulsebeam_runtime::time::Instant;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use crate::entity::TrackId;
+use crate::entity::PublicationKey;
 use crate::rtp::RtpPacket;
 use crate::rtp::cache::{StreamCache, TrackStreamCache};
 use crate::rtp::frame_selector::{
@@ -205,27 +205,27 @@ impl Switcher {
     /// the switch lands the moment its keyframe is decodable, without waiting for
     /// the next staging packet to drive it.
     ///
-    /// Each role is guarded on `stream.0 == track_id` so a slot briefly
+    /// Each role is guarded on `stream.0 == publication_id` so a slot briefly
     /// subscribed to two tracks (a track change in flight) never translates one
     /// track's encoding through another track's cache.
     pub fn feed(
         &mut self,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         cache: &TrackStreamCache,
         now: Instant,
         emit: &mut impl FnMut(RtpPacket),
     ) {
-        if let Some(active) = self.active.filter(|s| s.0 == track_id)
+        if let Some(active) = self.active.filter(|s| s.0 == publication_id)
             && let Some(encoding) = cache.encoding(active.1)
         {
             self.pull_active(encoding, emit);
         }
-        if let Some(draining) = self.draining.filter(|s| s.0 == track_id)
+        if let Some(draining) = self.draining.filter(|s| s.0 == publication_id)
             && let Some(encoding) = cache.encoding(draining.1)
         {
             self.drain_tail(encoding, now, emit);
         }
-        if let Some(staging) = self.staging.filter(|s| s.0 == track_id)
+        if let Some(staging) = self.staging.filter(|s| s.0 == publication_id)
             && let Some(encoding) = cache.encoding(staging.1)
         {
             self.try_switch(encoding, now, emit);
@@ -651,7 +651,7 @@ mod test {
 
     /// Two distinct streams (two simulcast layers of one track) to switch between.
     fn two_streams() -> (StreamId, StreamId) {
-        let track = crate::entity::ConnectionId::new().derive_track_id(TrackKind::Video, "v");
+        let track = crate::entity::ConnectionId::new().fixture_publication(TrackKind::Video, "v");
         (
             (track, Some(Rid::from("q")).into()),
             (track, Some(Rid::from("h")).into()),

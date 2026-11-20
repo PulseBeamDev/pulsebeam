@@ -231,11 +231,11 @@ impl Agent {
     }
     pub fn data(
         &self,
-        label: String,
+        track_id: String,
         delivery: core_ffi::TopicMode,
     ) -> Result<Arc<LocalDataTrack>, NativeError> {
         Ok(Arc::new(LocalDataTrack {
-            runtime: self.runtime.data(label, delivery.into())?,
+            runtime: self.runtime.data(track_id, delivery.into())?,
         }))
     }
     pub fn room(&self, name: String) -> Result<Arc<RoomRef>, NativeError> {
@@ -419,11 +419,11 @@ impl Participant {
     }
     pub fn data(
         &self,
-        label: String,
+        track_id: String,
         delivery: core_ffi::TopicMode,
     ) -> Result<Arc<RemoteDataTrack>, NativeError> {
         Ok(Arc::new(RemoteDataTrack {
-            runtime: self.runtime.data(label, delivery.into())?,
+            runtime: self.runtime.data(track_id, delivery.into())?,
         }))
     }
 }
@@ -623,7 +623,7 @@ mod tests {
             slot: "publication".into(),
             kind: core_ffi::MediaKind::Video,
             active: true,
-            label: String::new(),
+            track_id: String::new(),
         });
         assert!(matches!(
             agent.runtime.replace_foreign_desired(desired).await,

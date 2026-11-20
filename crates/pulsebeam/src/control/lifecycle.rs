@@ -7,7 +7,7 @@ use crate::{
         registry::RoomRegistry,
         topology::{TrackAncestry, TrackPlacement, TrackPlacementAllocator, TrackTopology},
     },
-    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, TrackId},
+    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, PublicationKey},
     id::ShardId,
     participant::ParticipantEffect,
     route::NodeRouteAddress,
@@ -115,8 +115,14 @@ impl TrackLifecycleStager {
         }
     }
 
-    fn plan(&mut self, shard: ShardId, track_id: TrackId, plan: Option<TrackPlan>) {
-        self.plans(shard, vec![TrackPlanUpdate { track_id, plan }]);
+    fn plan(&mut self, shard: ShardId, publication_id: PublicationKey, plan: Option<TrackPlan>) {
+        self.plans(
+            shard,
+            vec![TrackPlanUpdate {
+                publication_id,
+                plan,
+            }],
+        );
     }
 
     fn participant(&mut self, location: BoundParticipantLocation, effect: ParticipantEffect) {
@@ -192,7 +198,7 @@ struct RuntimePlan<'a> {
     shard: ShardId,
     origin: ConnectionId,
     track: &'a Track,
-    track_id: TrackId,
+    publication_id: PublicationKey,
     local: Vec<ConnectionId>,
     remote: Vec<NodeRouteAddress>,
     reverse: Option<NodeRouteAddress>,
@@ -247,14 +253,14 @@ impl TrackLifecycle {
     pub(crate) fn unpublish(
         &mut self,
         endpoint: EndpointKey,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         registry: &RoomRegistry,
         now: Instant,
     ) -> Option<TrackLifecycleOutcome> {
         let identity = TrackAncestry {
             room_id: endpoint.room,
             publisher: endpoint.participant,
-            track_id,
+            publication_id,
         };
 
         if !self.topology.contains(identity) {
@@ -278,7 +284,7 @@ impl TrackLifecycle {
         &mut self,
         room_id: ProjectRoomKey,
         publisher: ParticipantId,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         subscriber: EndpointKey,
         registry: &RoomRegistry,
         now: Instant,
@@ -286,7 +292,7 @@ impl TrackLifecycle {
         let identity = TrackAncestry {
             room_id,
             publisher,
-            track_id,
+            publication_id,
         };
         let _ = self.topology.activate(identity, subscriber);
         self.reconcile(identity, registry, now)
@@ -296,7 +302,7 @@ impl TrackLifecycle {
         &mut self,
         room_id: ProjectRoomKey,
         publisher: ParticipantId,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         subscriber: EndpointKey,
         registry: &RoomRegistry,
         now: Instant,
@@ -304,7 +310,7 @@ impl TrackLifecycle {
         let identity = TrackAncestry {
             room_id,
             publisher,
-            track_id,
+            publication_id,
         };
         let _ = self.topology.deactivate(identity, subscriber);
         self.reconcile(identity, registry, now)
@@ -369,7 +375,7 @@ impl TrackLifecycle {
     pub(crate) fn network_source(
         &self,
         room_id: ProjectRoomKey,
-        track: TrackId,
+        track: PublicationKey,
         registry: &RoomRegistry,
     ) -> Option<ShardId> {
         let source = self.topology.source(room_id, track)?;
@@ -381,7 +387,7 @@ impl TrackLifecycle {
     pub(crate) fn allows_network_reverse(
         &self,
         room: ProjectRoomKey,
-        track: TrackId,
+        track: PublicationKey,
         shard: ShardId,
         registry: &RoomRegistry,
     ) -> bool {
@@ -401,13 +407,9 @@ impl TrackLifecycle {
         address: &pulsebeam_proto::state::LogicalSourceAddress,
         registry: &'a RoomRegistry,
     ) -> Option<&'a Track> {
-        let kind = match pulsebeam_proto::state::TrackKind::try_from(address.kind).ok()? {
-            pulsebeam_proto::state::TrackKind::Audio => crate::entity::TrackKind::Audio,
-            pulsebeam_proto::state::TrackKind::Video => crate::entity::TrackKind::Video,
-            pulsebeam_proto::state::TrackKind::Data => crate::entity::TrackKind::Data,
-            pulsebeam_proto::state::TrackKind::Unspecified => return None,
-        };
+        let kind = crate::control::native::track_kind(address.kind)?;
         let publisher = ParticipantId::new(&address.participant_id).ok()?;
+        let track_id = crate::entity::TrackId::new(&address.track_id).ok()?;
         let current = registry.get_endpoint(EndpointKey {
             room: source_room,
             participant: publisher,
@@ -416,9 +418,9 @@ impl TrackLifecycle {
             return None;
         }
         let mut result = None;
-        for track in
-            self.topology
-                .exact_labeled_sources(source_room, publisher, kind, &address.label)?
+        for track in self
+            .topology
+            .exact_named_sources(source_room, publisher, kind, track_id)?
         {
             if track.meta().connection_id != current.connection_id
                 || self
@@ -446,7 +448,7 @@ impl TrackLifecycle {
         subscriber_room: ProjectRoomKey,
         source_room: ProjectRoomKey,
         subscriber: ParticipantId,
-        track: TrackId,
+        track: PublicationKey,
         registry: &RoomRegistry,
     ) -> Option<&Track> {
         if source_room.project != subscriber_room.project {
@@ -665,7 +667,10 @@ impl TrackLifecycle {
                 .placements
                 .get(&(identity, shard))
                 .expect("committed candidate shard must retain its placement");
-            debug_assert_eq!(destination.placement.track_id, identity.track_id);
+            debug_assert_eq!(
+                destination.placement.publication_id,
+                identity.publication_id
+            );
             debug_assert_eq!(destination.placement.route.shard(), shard);
             debug_assert!(
                 destination.resident,
@@ -838,7 +843,7 @@ impl TrackLifecycle {
                 registry,
                 stager,
                 ParticipantEffect::TrackUnsubscribed {
-                    track_id: identity.track_id,
+                    publication_id: identity.publication_id,
                 },
             );
         }
@@ -855,7 +860,7 @@ impl TrackLifecycle {
                 registry,
                 stager,
                 ParticipantEffect::TrackCandidateRemoved {
-                    track_id: identity.track_id,
+                    publication_id: identity.publication_id,
                     reason: crate::participant::effect::TrackRemoval::Withdrawn,
                 },
             );
@@ -894,7 +899,7 @@ impl TrackLifecycle {
                 registry,
                 stager,
                 ParticipantEffect::TrackSubscribed {
-                    track_id: identity.track_id,
+                    publication_id: identity.publication_id,
                 },
             );
         }
@@ -924,7 +929,7 @@ impl TrackLifecycle {
                     ShardUpdateOp::InstallRoute {
                         address: destination.placement.route,
                         action: TrackRouteAction::Forward {
-                            track_id: destination.placement.track_id,
+                            publication_id: destination.placement.publication_id,
                         },
                     },
                 );
@@ -965,7 +970,7 @@ impl TrackLifecycle {
                     ShardUpdateOp::InstallRoute {
                         address: origin.placement.route,
                         action: TrackRouteAction::Reverse {
-                            track_id: origin.placement.track_id,
+                            publication_id: origin.placement.publication_id,
                         },
                     },
                 );
@@ -996,7 +1001,7 @@ impl TrackLifecycle {
                 shard: desired.origin.shard,
                 origin: desired.origin.connection,
                 track: &desired.track,
-                track_id: origin.placement.track_id,
+                publication_id: origin.placement.publication_id,
                 local: desired.local_bindings(desired.origin.shard),
                 remote,
                 reverse: desired.track.reverse(),
@@ -1008,7 +1013,7 @@ impl TrackLifecycle {
             stager.participant(
                 desired.origin,
                 ParticipantEffect::TrackPublished {
-                    track_id: identity.track_id,
+                    publication_id: identity.publication_id,
                 },
             );
         }
@@ -1030,7 +1035,7 @@ impl TrackLifecycle {
                     shard,
                     origin: desired.origin.connection,
                     track: &desired.track,
-                    track_id: destination.placement.track_id,
+                    publication_id: destination.placement.publication_id,
                     local: desired.local_bindings(shard),
                     remote: Vec::new(),
                     reverse: desired.track.reverse(),
@@ -1044,7 +1049,7 @@ impl TrackLifecycle {
         stager.update(
             runtime.shard,
             ShardUpdateOp::InsertTrackRuntime {
-                track_id: runtime.track_id,
+                publication_id: runtime.publication_id,
                 runtime: TrackRuntime {
                     descriptor: Some(TrackDescriptor {
                         origin: runtime.origin,
@@ -1066,7 +1071,7 @@ impl TrackLifecycle {
         stager.update(runtime.shard, ShardUpdateOp::Placeholder);
         stager.plan(
             runtime.shard,
-            runtime.track_id,
+            runtime.publication_id,
             Some(TrackPlan::new(
                 runtime.local,
                 runtime.remote,
@@ -1084,7 +1089,7 @@ impl TrackLifecycle {
         debug_assert!(destination.resident);
 
         // Stop publishing the view before retiring anything it references.
-        stager.plan(shard, destination.placement.track_id, None);
+        stager.plan(shard, destination.placement.publication_id, None);
         if destination.route_installed {
             stager.update(
                 shard,
@@ -1096,7 +1101,7 @@ impl TrackLifecycle {
         stager.update(
             shard,
             ShardUpdateOp::RemoveTrackRuntime {
-                track_id: destination.placement.track_id,
+                publication_id: destination.placement.publication_id,
             },
         );
     }
@@ -1154,7 +1159,7 @@ impl TrackLifecycle {
                 registry,
                 stager,
                 ParticipantEffect::TrackUnsubscribed {
-                    track_id: identity.track_id,
+                    publication_id: identity.publication_id,
                 },
             );
         }
@@ -1168,7 +1173,7 @@ impl TrackLifecycle {
                 registry,
                 stager,
                 ParticipantEffect::TrackCandidateRemoved {
-                    track_id: identity.track_id,
+                    publication_id: identity.publication_id,
                     reason: crate::participant::effect::TrackRemoval::SourceEnded,
                 },
             );
@@ -1182,7 +1187,7 @@ impl TrackLifecycle {
             stager.participant(
                 origin,
                 ParticipantEffect::TrackUnpublished {
-                    track_id: identity.track_id,
+                    publication_id: identity.publication_id,
                 },
             );
         }
@@ -1377,10 +1382,12 @@ mod tests {
         let meta = TrackMeta {
             room: room(room_seed),
             shard_id: ShardId::new(0),
-            id: connection.derive_track_id(kind, label),
+            id: connection.fixture_publication(kind, label),
             origin: publisher,
             connection_id: connection,
-            label: Some(label.to_owned()),
+            track_id: Some(
+                crate::entity::TrackId::new(label.strip_prefix("rel:").unwrap_or(label)).unwrap(),
+            ),
         };
         match kind {
             TrackKind::Data => {
@@ -1515,7 +1522,10 @@ mod tests {
         kinds
     }
 
-    fn plan_updates_on(outcome: &TrackLifecycleOutcome, shard: usize) -> Vec<(TrackId, bool)> {
+    fn plan_updates_on(
+        outcome: &TrackLifecycleOutcome,
+        shard: usize,
+    ) -> Vec<(PublicationKey, bool)> {
         let shard = ShardId::new(shard);
         outcome
             .operations
@@ -1524,7 +1534,7 @@ mod tests {
                 TrackLifecycleOperation::Plans { shard: held, plans } if *held == shard => Some(
                     plans
                         .iter()
-                        .map(|update| (update.track_id, update.plan.is_some())),
+                        .map(|update| (update.publication_id, update.plan.is_some())),
                 ),
                 _ => None,
             })
@@ -1535,7 +1545,7 @@ mod tests {
     fn forward_install_on(
         outcome: &TrackLifecycleOutcome,
         shard: usize,
-    ) -> Option<(NodeRouteAddress, TrackId)> {
+    ) -> Option<(NodeRouteAddress, PublicationKey)> {
         let shard = ShardId::new(shard);
         outcome
             .operations
@@ -1546,9 +1556,9 @@ mod tests {
                     op:
                         ShardUpdateOp::InstallRoute {
                             address,
-                            action: TrackRouteAction::Forward { track_id },
+                            action: TrackRouteAction::Forward { publication_id },
                         },
-                } if *held == shard => Some((*address, *track_id)),
+                } if *held == shard => Some((*address, *publication_id)),
                 _ => None,
             })
     }
@@ -1556,7 +1566,7 @@ mod tests {
     fn reverse_install_on(
         outcome: &TrackLifecycleOutcome,
         shard: usize,
-    ) -> Option<(NodeRouteAddress, TrackId)> {
+    ) -> Option<(NodeRouteAddress, PublicationKey)> {
         let shard = ShardId::new(shard);
         outcome
             .operations
@@ -1567,22 +1577,22 @@ mod tests {
                     op:
                         ShardUpdateOp::InstallRoute {
                             address,
-                            action: TrackRouteAction::Reverse { track_id },
+                            action: TrackRouteAction::Reverse { publication_id },
                         },
-                } if *held == shard => Some((*address, *track_id)),
+                } if *held == shard => Some((*address, *publication_id)),
                 _ => None,
             })
     }
 
-    fn published_track_id(outcome: &TrackLifecycleOutcome) -> Option<TrackId> {
+    fn published_track_id(outcome: &TrackLifecycleOutcome) -> Option<PublicationKey> {
         outcome
             .operations
             .iter()
             .find_map(|operation| match operation {
                 TrackLifecycleOperation::ParticipantEffect {
-                    effect: ParticipantEffect::TrackPublished { track_id },
+                    effect: ParticipantEffect::TrackPublished { publication_id },
                     ..
-                } => Some(*track_id),
+                } => Some(*publication_id),
                 _ => None,
             })
     }
@@ -1766,7 +1776,7 @@ mod tests {
         assert!(origin.resident);
         assert_eq!(
             published_track_id(&outcome),
-            Some(origin.placement.track_id)
+            Some(origin.placement.publication_id)
         );
         assert!(operations_on(&outcome, 0).contains(&OpKind::InsertRuntime));
         assert!(operations_on(&outcome, 0).contains(&OpKind::PlanSet));
@@ -1851,7 +1861,7 @@ mod tests {
         let activate = lifecycle.activate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),
@@ -1862,7 +1872,7 @@ mod tests {
         let deactivate = lifecycle.deactivate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),
@@ -1896,7 +1906,7 @@ mod tests {
         assert!(!remote.route_installed);
         assert!(forward_install_on(&outcome, 1).is_none());
         assert!(operations_on(&outcome, 1).contains(&OpKind::InsertRuntime));
-        assert!(plan_updates_on(&outcome, 1).contains(&(remote.placement.track_id, true)));
+        assert!(plan_updates_on(&outcome, 1).contains(&(remote.placement.publication_id, true)));
         assert_eq!(lifecycle.placements.len(), 2);
         assert_internal_invariants(&lifecycle, &registry);
     }
@@ -1917,7 +1927,7 @@ mod tests {
         let outcome = lifecycle.activate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),
@@ -1928,7 +1938,7 @@ mod tests {
         assert!(remote.route_installed);
         assert_eq!(
             forward_install_on(&outcome, 1),
-            Some((remote.placement.route, remote.placement.track_id))
+            Some((remote.placement.route, remote.placement.publication_id))
         );
         assert_eq!(
             operations_on(&outcome, 1),
@@ -1942,7 +1952,7 @@ mod tests {
         );
         assert_eq!(
             plan_updates_on(&outcome, 1),
-            vec![(remote.placement.track_id, true)]
+            vec![(remote.placement.publication_id, true)]
         );
         assert_internal_invariants(&lifecycle, &registry);
     }
@@ -1962,7 +1972,7 @@ mod tests {
         let _ = lifecycle.activate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),
@@ -1972,7 +1982,7 @@ mod tests {
         let outcome = lifecycle.deactivate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),
@@ -2007,7 +2017,7 @@ mod tests {
         for kind in [TrackKind::Audio, TrackKind::Video] {
             let mut publication = track(kind, 1, 1, "network");
             publication.meta_mut().connection_id = connection;
-            publication.meta_mut().id = connection.derive_track_id(kind, "network");
+            publication.meta_mut().id = connection.fixture_publication(kind, "network");
             let id = publication.id();
             assert!(
                 lifecycle
@@ -2050,7 +2060,7 @@ mod tests {
             .unwrap()
             .connection_id;
         publication.meta_mut().connection_id = connection;
-        publication.meta_mut().id = connection.derive_track_id(TrackKind::Audio, "audio");
+        publication.meta_mut().id = connection.fixture_publication(TrackKind::Audio, "audio");
         let identity = TrackAncestry::from_track(&publication);
         let _ = lifecycle.publish(publication, &registry, Instant::now());
         assert!(
@@ -2059,7 +2069,7 @@ mod tests {
                     room(1),
                     room(1),
                     participant(2),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_some()
@@ -2070,7 +2080,7 @@ mod tests {
                     room(2),
                     room(1),
                     participant(3),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_some()
@@ -2081,7 +2091,7 @@ mod tests {
                     room(1),
                     room(1),
                     participant(3),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_none()
@@ -2092,7 +2102,7 @@ mod tests {
                     room(2),
                     room(2),
                     participant(3),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_none()
@@ -2103,7 +2113,7 @@ mod tests {
                     room(1),
                     room(1),
                     participant(1),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_none()
@@ -2114,7 +2124,7 @@ mod tests {
                     room(1),
                     room(1),
                     participant(9),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_none()
@@ -2124,7 +2134,7 @@ mod tests {
             source_room: room(2),
             subscriber: participant(3),
             reference: 1,
-            track: identity.track_id,
+            track: identity.publication_id,
             enabled: true,
         };
         assert!(
@@ -2146,7 +2156,9 @@ mod tests {
             &registry,
             Instant::now(),
         );
-        let remote_track_id = destination(&lifecycle, identity, 1).placement.track_id;
+        let remote_track_id = destination(&lifecycle, identity, 1)
+            .placement
+            .publication_id;
 
         let outcome = lifecycle
             .unsubscribe(
@@ -2174,7 +2186,7 @@ mod tests {
                     room(1),
                     room(1),
                     participant(2),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_some()
@@ -2186,7 +2198,7 @@ mod tests {
                     room(1),
                     room(1),
                     participant(2),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_none()
@@ -2197,7 +2209,7 @@ mod tests {
                     room(2),
                     room(1),
                     participant(3),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_some()
@@ -2209,7 +2221,7 @@ mod tests {
                     room(1),
                     room(1),
                     participant(2),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_some()
@@ -2221,7 +2233,7 @@ mod tests {
                     room(2),
                     room(1),
                     participant(3),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_none()
@@ -2233,7 +2245,7 @@ mod tests {
                     room(1),
                     room(1),
                     participant(2),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_none()
@@ -2244,7 +2256,7 @@ mod tests {
                     room(2),
                     room(1),
                     participant(3),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_none()
@@ -2254,14 +2266,14 @@ mod tests {
                 room: identity.room_id,
                 participant: identity.publisher,
             },
-            identity.track_id,
+            identity.publication_id,
             &registry,
             Instant::now(),
         );
         assert!(
             lifecycle
                 .topology
-                .source(room(1), identity.track_id)
+                .source(room(1), identity.publication_id)
                 .is_none()
         );
         assert!(
@@ -2270,7 +2282,7 @@ mod tests {
                     room(2),
                     room(1),
                     participant(3),
-                    identity.track_id,
+                    identity.publication_id,
                     &registry
                 )
                 .is_none()
@@ -2428,7 +2440,7 @@ mod tests {
     fn overlapping_subscriptions_do_not_duplicate_candidate_or_binding_state() {
         let (mut lifecycle, registry) = setup(1, &[(1, 1, 0), (2, 1, 0)]);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
-        let exact = TrackSelector::track(identity.track_id);
+        let exact = TrackSelector::track(identity.publication_id);
 
         let first = lifecycle
             .subscribe(
@@ -2516,14 +2528,14 @@ mod tests {
                 TrackMeta {
                     room: room_id,
                     shard_id: ShardId::new(0),
-                    id: connection.derive_publication_track_id(
+                    id: connection.fixture_publication_at(
                         TrackKind::Data,
                         "label",
                         NonZeroU64::new(incarnation).unwrap(),
                     ),
                     origin: publisher,
                     connection_id: connection,
-                    label: Some("label".into()),
+                    track_id: Some(crate::entity::TrackId::new("label").unwrap()),
                 },
                 DataLane::Latest,
             )
@@ -2551,14 +2563,14 @@ mod tests {
                 TrackMeta {
                     room: room_id,
                     shard_id: ShardId::new(0),
-                    id: connection.derive_publication_track_id(
+                    id: connection.fixture_publication_at(
                         TrackKind::Data,
                         "label",
                         NonZeroU64::new(1).unwrap(),
                     ),
                     origin: other,
                     connection_id: connection,
-                    label: Some("label".into()),
+                    track_id: Some(crate::entity::TrackId::new("label").unwrap()),
                 },
                 DataLane::Latest,
             );
@@ -2568,7 +2580,7 @@ mod tests {
             room: "lifecycle-1".into(),
             participant_id: publisher_external.as_str().into(),
             kind: pulsebeam_proto::state::TrackKind::Data as i32,
-            label: "label".into(),
+            track_id: "label".into(),
         };
         assert!(
             lifecycle
@@ -2641,7 +2653,7 @@ mod tests {
             .connection_id;
         let mut publication = track(TrackKind::Audio, 1, 1, "audio");
         publication.meta_mut().connection_id = connection;
-        publication.meta_mut().id = connection.derive_track_id(TrackKind::Audio, "audio");
+        publication.meta_mut().id = connection.fixture_publication(TrackKind::Audio, "audio");
         let identity = TrackAncestry::from_track(&publication);
         lifecycle
             .publish(publication, &registry, Instant::now())
@@ -2673,7 +2685,7 @@ mod tests {
             source_room: room(1),
             subscriber: participant(2),
             reference: 1,
-            track: identity.track_id,
+            track: identity.publication_id,
             enabled: true,
         };
         let admitted = lifecycle.set_owned_subscription(owned(), &registry, Instant::now());
@@ -2796,7 +2808,7 @@ mod tests {
                 .subscribe(
                     room(1),
                     participant(2),
-                    TrackSelector::track(identity.track_id),
+                    TrackSelector::track(identity.publication_id),
                     SelectionPolicy::All,
                     &registry,
                     Instant::now(),
@@ -2831,7 +2843,7 @@ mod tests {
                     room: room(1),
                     participant: participant(1),
                 },
-                identity.track_id,
+                identity.publication_id,
                 &registry,
                 Instant::now(),
             )
@@ -2895,7 +2907,7 @@ mod tests {
                     room: room(1),
                     participant: participant(1),
                 },
-                identity.track_id,
+                identity.publication_id,
                 &registry,
                 Instant::now(),
             )
@@ -3121,7 +3133,7 @@ mod tests {
         let first_activate = lifecycle.activate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),
@@ -3132,7 +3144,7 @@ mod tests {
         let second_activate = lifecycle.activate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),
@@ -3143,7 +3155,7 @@ mod tests {
         let first_deactivate = lifecycle.deactivate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),
@@ -3157,7 +3169,7 @@ mod tests {
         let second_deactivate = lifecycle.deactivate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),
@@ -3257,7 +3269,7 @@ mod tests {
                 let _ = lifecycle.activate(
                     room(1),
                     participant(1),
-                    identity.track_id,
+                    identity.publication_id,
                     EndpointKey {
                         room: room(1),
                         participant: subscriber,
@@ -3270,7 +3282,7 @@ mod tests {
                 let _ = lifecycle.deactivate(
                     room(1),
                     participant(1),
-                    identity.track_id,
+                    identity.publication_id,
                     EndpointKey {
                         room: room(1),
                         participant: subscriber,
@@ -3328,7 +3340,7 @@ mod tests {
             let activate = lifecycle.activate(
                 room(1),
                 participant(1),
-                identity.track_id,
+                identity.publication_id,
                 endpoint(2, 1),
                 &registry,
                 Instant::now(),
@@ -3340,7 +3352,7 @@ mod tests {
             let deactivate = lifecycle.deactivate(
                 room(1),
                 participant(1),
-                identity.track_id,
+                identity.publication_id,
                 endpoint(2, 1),
                 &registry,
                 Instant::now(),
@@ -3373,7 +3385,7 @@ mod tests {
             assert!(remote.route_installed);
             assert_eq!(
                 forward_install_on(&outcome, shard),
-                Some((remote.placement.route, remote.placement.track_id))
+                Some((remote.placement.route, remote.placement.publication_id))
             );
             assert_internal_invariants(&lifecycle, &registry);
         }
@@ -3447,10 +3459,12 @@ mod tests {
                 _ => None,
             });
 
-        assert_eq!(effect_track_id, Some(remote.placement.track_id));
+        assert_eq!(effect_track_id, Some(remote.placement.publication_id));
         assert_eq!(
-            remote.placement.track_id,
-            destination(&lifecycle, identity, 0).placement.track_id
+            remote.placement.publication_id,
+            destination(&lifecycle, identity, 0)
+                .placement
+                .publication_id
         );
     }
 
@@ -3470,7 +3484,7 @@ mod tests {
         let outcome = lifecycle.activate(
             room(1),
             participant(1),
-            identity.track_id,
+            identity.publication_id,
             endpoint(2, 1),
             &registry,
             Instant::now(),

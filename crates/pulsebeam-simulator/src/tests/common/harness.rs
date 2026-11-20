@@ -2161,7 +2161,7 @@ async fn execute_plan(
                                     .any(|publisher| {
                                         publisher.registration.topic == *topic
                                             && publisher.registration.mode == *mode
-                                            && publisher.data_track_id.is_some()
+                                            && publisher.publication_id.is_some()
                                             && !publisher.send_pending
                                             && publisher.queued_messages == 0
                                             && publisher.next_sequence == *next_sequence
@@ -2869,7 +2869,7 @@ async fn execute_plan(
                     .find(|peer| peer.id.as_str() == id)
                     .context("relabel publisher has no plan binding")?;
                 let publication = publisher
-                    .track_id(pulsebeam::entity::TrackKind::Video, &publisher.video_label)
+                    .publication_id(pulsebeam::entity::TrackKind::Video, &publisher.video_label)
                     .as_str();
                 for (name, receiver) in handles.iter() {
                     let receivers = receiver
@@ -3406,7 +3406,7 @@ async fn execute_plan(
                     anyhow::ensure!(
                         previous.generation != proof.track.generation
                             || (previous.receiver != proof.track.receiver
-                                && previous.track_id != proof.track.track_id
+                                && previous.publication_id != proof.track.publication_id
                                 && previous.mid != proof.track.mid),
                         "replacement source reused the previous physical receiver or track"
                     );
@@ -3841,13 +3841,13 @@ async fn execute_plan(
                     .context("publication publisher has no admission")?;
                 let label = publisher_binding.video_label.as_str();
                 let source_inputs = publisher_handle.shared.h264_publishers.clone();
-                let track_id = publisher_binding
-                    .track_id(pulsebeam::entity::TrackKind::Video, label)
+                let publication_id = publisher_binding
+                    .publication_id(pulsebeam::entity::TrackKind::Video, label)
                     .as_str();
                 let baseline = relabel_baselines.get(&(*publisher, *participant));
                 if let Some(baseline) = baseline {
                     anyhow::ensure!(
-                        baseline.publication != track_id,
+                        baseline.publication != publication_id,
                         "{description}: relabel reused the retired publication ID"
                     );
                 }
@@ -3859,16 +3859,18 @@ async fn execute_plan(
                         .context("publication receiver has no observation")?
                         .snapshot;
                     anyhow::ensure!(
-                        snapshot.video_mapping.values().any(|id| id == &track_id)
-                            && snapshot
-                                .publications
-                                .get(&track_id)
-                                .is_some_and(|publication| {
+                        snapshot
+                            .video_mapping
+                            .values()
+                            .any(|id| id == &publication_id)
+                            && snapshot.publications.get(&publication_id).is_some_and(
+                                |publication| {
                                     publication.kind
                                         == pulsebeam_agent_native::agent_core::MediaKind::Video
-                                        && publication.label == label
-                                }),
-                        "{description}: receiver is not bound to publication {track_id} ({label})"
+                                        && publication.track_id == label
+                                }
+                            ),
+                        "{description}: receiver is not bound to publication {publication_id} ({label})"
                     );
                     if let Some(baseline) = baseline {
                         anyhow::ensure!(
@@ -3884,7 +3886,7 @@ async fn execute_plan(
                         *snapshot
                             .video_mapping
                             .iter()
-                            .find(|(_, id)| *id == &track_id)
+                            .find(|(_, id)| *id == &publication_id)
                             .context("publication has no receiver")?
                             .0,
                     )
@@ -3901,7 +3903,7 @@ async fn execute_plan(
                 .context("publication has no constructed fixture source")?;
                 let received = receiver.video_rx();
                 received.require_decoded_from_incarnation(&origin, 0, *min_frames)
-                    .with_context(|| format!("{description}: publication {track_id} ({label}) has no current-source decode"))?;
+                    .with_context(|| format!("{description}: publication {publication_id} ({label}) has no current-source decode"))?;
                 let frames = received
                     .by_receiver
                     .iter()
@@ -3927,7 +3929,7 @@ async fn execute_plan(
                     .sum::<u64>();
                 anyhow::ensure!(
                     frames >= *min_frames,
-                    "{description}: publication {track_id} has {frames} authenticated decodes on current fresh receivers, expected {min_frames}"
+                    "{description}: publication {publication_id} has {frames} authenticated decodes on current fresh receivers, expected {min_frames}"
                 );
             }
 
@@ -4775,7 +4777,7 @@ async fn execute_plan(
                                     status.registration.topic == *topic
                                         && status.registration.mode == *mode
                                 })
-                                .and_then(|status| status.data_track_id.clone())
+                                .and_then(|status| status.publication_id.clone())
                         })
                         .ok_or_else(|| {
                             anyhow::anyhow!(
@@ -4807,13 +4809,13 @@ async fn execute_plan(
                             anyhow::ensure!(
                                 message.topic == *topic
                                     && expected.get(&message.participant_id)
-                                        == Some(&message.data_track_id),
+                                        == Some(&message.publication_id),
                                 "{description}: message identity is not the publisher's authoritative track: {message:?}"
                             );
                             seen.insert(message.participant_id.clone());
                             if *mode == TopicMode::Latest {
                                 if let Some(previous) = latest_sequence
-                                    .insert(message.data_track_id.clone(), message.sequence)
+                                    .insert(message.publication_id.clone(), message.sequence)
                                 {
                                     anyhow::ensure!(
                                         message.sequence > previous,
@@ -4821,14 +4823,14 @@ async fn execute_plan(
                                     );
                                 }
                             } else if *mode == TopicMode::Ordered {
-                                if let Some(next) = next_sequence.get(&message.data_track_id) {
+                                if let Some(next) = next_sequence.get(&message.publication_id) {
                                     anyhow::ensure!(
                                         message.sequence == *next,
                                         "{description}: ordered message skipped a sequence without an inline gap"
                                     );
                                 }
                                 next_sequence.insert(
-                                    message.data_track_id.clone(),
+                                    message.publication_id.clone(),
                                     message
                                         .sequence
                                         .checked_add(1)
@@ -4838,24 +4840,24 @@ async fn execute_plan(
                         }
                         TopicNotification::RecoveryGap {
                             subscriber,
-                            data_track_id,
+                            publication_id,
                             participant_id,
                             expected_sequence,
                             available_sequence,
                         } if *mode == TopicMode::Ordered => {
                             anyhow::ensure!(
                                 subscriber.mode == *mode
-                                    && expected.get(participant_id) == Some(data_track_id)
+                                    && expected.get(participant_id) == Some(publication_id)
                                     && expected_sequence < available_sequence,
                                 "{description}: invalid inline gap identity or range"
                             );
-                            if let Some(next) = next_sequence.get(data_track_id) {
+                            if let Some(next) = next_sequence.get(publication_id) {
                                 anyhow::ensure!(
                                     next == expected_sequence,
                                     "{description}: gap does not start at the last confirmed sequence"
                                 );
                             }
-                            next_sequence.insert(data_track_id.clone(), *available_sequence);
+                            next_sequence.insert(publication_id.clone(), *available_sequence);
                             gaps.push((*expected_sequence, *available_sequence));
                         }
                         _ => {}

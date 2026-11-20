@@ -7,8 +7,8 @@ export async function resourceContract(BrowserRuntime) {
     logLevel: "off",
   });
   const resource = (command) => runtime.resource(command);
-  const camera = { kind: "video", label: "camera" };
-  const screen = { kind: "video", label: "screen" };
+  const camera = { kind: "video", trackId: "camera" };
+  const screen = { kind: "video", trackId: "screen" };
   try {
     const first = await resource({ op: "claimPublication", spec: camera });
     assert.equal(typeof first.owner, "bigint");
@@ -24,7 +24,7 @@ export async function resourceContract(BrowserRuntime) {
     assert.notEqual(concurrentVideo.owner, first.owner);
     const microphone = await resource({
       op: "claimPublication",
-      spec: { kind: "audio", label: "microphone" },
+      spec: { kind: "audio", trackId: "microphone" },
     });
     assert.equal(microphone.slot, "a0");
     await resource({ op: "release", owner: microphone.owner });
@@ -52,8 +52,8 @@ export async function resourceContract(BrowserRuntime) {
       owner: second.owner,
       present: true,
     });
-    const spec = { kind: "data", label: "events", delivery: "ordered" };
-    const source = { room: "room", participantId: "alice", label: "events" };
+    const spec = { kind: "data", trackId: "events", delivery: "ordered" };
+    const source = { room: "room", participantId: "alice", trackId: "events" };
     const receiver = await resource({ op: "receiveData", spec, source });
     assert.equal(
       await resource({ op: "readData", owner: receiver.owner }),

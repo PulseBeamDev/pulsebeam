@@ -3548,14 +3548,14 @@ mod replacement_tests {
                 crate::track::TrackMeta {
                     room: crate::entity::ProjectRoomKey::fixture(source_room),
                     shard_id: ShardId::new(0),
-                    id: connection_id(1).derive_publication_track_id(
+                    id: connection_id(1).fixture_publication_at(
                         TrackKind::Data,
                         "private-topic",
                         std::num::NonZeroU64::new(1).unwrap(),
                     ),
                     origin: publisher,
                     connection_id: connection_id(1),
-                    label: Some("private-topic".into()),
+                    track_id: Some(crate::entity::TrackId::new("private-topic").unwrap()),
                 },
                 crate::track::DataLane::Ordered,
             );
@@ -3613,7 +3613,7 @@ mod replacement_tests {
                                 }),
                                 declaration: Some(wire::resource_spec::Declaration::Subscription(
                                     wire::SubscriptionSpec {
-                                        track_id: track.id().as_str(),
+                                        publication_id: track.id().as_str(),
                                         kind: wire::TrackKind::Data as i32,
                                         source_room: "source-authority".into(),
                                         binding: Some(wire::TrackBinding {
@@ -3643,7 +3643,7 @@ mod replacement_tests {
                 };
                 assert_eq!(plan.source.id(), track.id());
                 assert_eq!(plan.source.meta().origin, publisher);
-                assert_eq!(plan.source.meta().label, track.meta().label);
+                assert_eq!(plan.source.meta().track_id, track.meta().track_id);
                 assert!(endpoint.progress(SignalingProgress {
                     sequence: output.sequence,
                     cid: output.cid,
@@ -3788,7 +3788,7 @@ mod replacement_tests {
                     let state = codec::decode_server(&output.bytes).unwrap();
                     assert!(state.records.iter().all(|record| !matches!(
                         record.key.as_ref().and_then(|key| key.key.as_ref()),
-                        Some(wire::resource_key::Key::Track(_))
+                        Some(wire::resource_key::Key::Publication(_))
                     )));
                     assert!(state.records.iter().all(|record| !matches!(
                         record.key.as_ref().and_then(|key| key.key.as_ref()),
@@ -3801,7 +3801,7 @@ mod replacement_tests {
             }
             assert!(records.iter().all(|record| !matches!(
                 record.key.as_ref().and_then(|key| key.key.as_ref()),
-                Some(wire::resource_key::Key::Track(_))
+                Some(wire::resource_key::Key::Publication(_))
             )));
             assert!(records.iter().all(|record| {
                 match record.key.as_ref().and_then(|key| key.key.as_ref()) {
@@ -3854,7 +3854,7 @@ mod replacement_tests {
                                             room: "handler-room".into(),
                                             participant_id: "publisher".into(),
                                             kind: wire::TrackKind::Data as i32,
-                                            label: "label".into(),
+                                            track_id: "label".into(),
                                         }),
                                     },
                                 )),
@@ -5710,14 +5710,14 @@ mod replacement_tests {
                 crate::track::TrackMeta {
                     room: crate::entity::ProjectRoomKey::fixture(room_id),
                     shard_id: ShardId::new(0),
-                    id: connection_id(1).derive_publication_track_id(
+                    id: connection_id(1).fixture_publication_at(
                         crate::entity::TrackKind::Data,
                         "topic",
                         std::num::NonZeroU64::new(reference).unwrap(),
                     ),
                     origin: publisher,
                     connection_id: connection_id(1),
-                    label: Some("topic".into()),
+                    track_id: Some(crate::entity::TrackId::new("topic").unwrap()),
                 },
                 crate::track::Topic::for_test("topic"),
                 crate::track::DataLane::Ordered,
@@ -6850,10 +6850,11 @@ mod replacement_tests {
                 crate::track::TrackMeta {
                     room: crate::entity::ProjectRoomKey::fixture(room_id),
                     shard_id: ShardId::new(0),
-                    id: connection_id.derive_track_id(crate::entity::TrackKind::Data, "rt/chat"),
+                    id: connection_id
+                        .fixture_publication(crate::entity::TrackKind::Data, "rt/chat"),
                     origin: participant,
                     connection_id,
-                    label: Some("rt/chat".to_owned()),
+                    track_id: Some(crate::entity::TrackId::new("chat").unwrap()),
                 },
                 crate::track::Topic::for_test("chat"),
                 crate::track::DataLane::Latest,
@@ -6866,7 +6867,7 @@ mod replacement_tests {
             room: stale_meta.room,
             participant,
         };
-        let track_id = current.derive_track_id(crate::entity::TrackKind::Data, "rt/chat");
+        let publication_id = current.fixture_publication(crate::entity::TrackKind::Data, "rt/chat");
 
         actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(stale_track)));
         assert!(
@@ -6892,7 +6893,7 @@ mod replacement_tests {
                 .lifecycle
                 .unpublish(
                     endpoint,
-                    track_id,
+                    publication_id,
                     &actor.core.registry,
                     pulsebeam_runtime::time::Instant::now(),
                 )

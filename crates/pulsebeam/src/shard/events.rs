@@ -214,7 +214,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
         &mut self,
         reference: u64,
         source_room: crate::entity::ProjectRoomKey,
-        track: crate::entity::TrackId,
+        track: crate::entity::PublicationKey,
         enabled: bool,
     ) {
         self.pipeline

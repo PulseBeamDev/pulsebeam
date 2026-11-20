@@ -1,7 +1,7 @@
 use super::handler::StateProtocolHandler;
 use super::handoff::{self, EndpointHandoff};
 use super::{InputError, NativeSession, OutputError, ResolvedSource};
-use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackId};
+use crate::entity::{ConnectionId, ParticipantId, PublicationKey, RoomId};
 use crate::track::Track;
 use std::collections::BTreeMap;
 
@@ -94,7 +94,7 @@ impl NativeControl {
 
     pub(crate) fn service<'a>(
         &mut self,
-        source: impl Fn(TrackId) -> Option<&'a Track>,
+        source: impl Fn(PublicationKey) -> Option<&'a Track>,
     ) -> Result<(), InputError> {
         while self.ready.try_recv().is_ok() {}
         let now = std::time::SystemTime::now()

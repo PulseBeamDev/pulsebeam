@@ -93,7 +93,7 @@ fn lookup_record(
     reference: u64,
     revision: u64,
     spec: state::ResourceSpec,
-    track_id: &str,
+    publication_id: &str,
     mode: Option<TopicMode>,
 ) -> state::ServerStateRecord {
     let Some(state::resource_spec::Declaration::SourceLookup(lookup)) = &spec.declaration else {
@@ -102,7 +102,7 @@ fn lookup_record(
     let Some(address) = &lookup.source else {
         panic!("logical source")
     };
-    let label = address.label.clone();
+    let label = address.track_id.clone();
     let participant = state::Participant {
         participant_id: address.participant_id.clone(),
 
@@ -131,10 +131,10 @@ fn lookup_record(
             spec: Some(spec),
             participant: Some(participant.clone()),
             track: Some(state::Track {
-                track_id: track_id.into(),
+                publication_id: publication_id.into(),
                 participant_id: participant.participant_id,
                 room_id: participant.room_id.clone(),
-                label,
+                track_id: label,
                 kind: Some(track_kind),
             }),
         })),
@@ -190,10 +190,10 @@ pub(crate) fn answer_source_lookup_batch(
                         .find(|subscriber| {
                             subscriber.room == address.room
                                 && subscriber.participant_id == address.participant_id
-                                && subscriber.topic == address.label
+                                && subscriber.topic == address.track_id
                         })
                         .map(|subscriber| subscriber.mode);
-                    let track_id = remote_source_override.unwrap_or_else(|| {
+                    let publication_id = remote_source_override.unwrap_or_else(|| {
                         if address.participant_id == "remote-app-user" {
                             REMOTE_SOURCE
                         } else {
@@ -204,7 +204,7 @@ pub(crate) fn answer_source_lookup_batch(
                         record.owned,
                         revision,
                         spec.as_ref().clone(),
-                        track_id,
+                        publication_id,
                         mode,
                     ))
                 }
@@ -522,10 +522,10 @@ pub(crate) fn confirm_publication(
                 spec: Some(publication.spec.clone()),
                 participant: Some(participant.clone()),
                 track: Some(state::Track {
-                    track_id: source.into(),
+                    publication_id: source.into(),
                     participant_id: participant.participant_id,
                     room_id: participant.room_id.clone(),
-                    label: declaration.label.clone(),
+                    track_id: declaration.track_id.clone(),
                     kind: Some(state::track::Kind::Data(state::DataTrack {
                         delivery: data.delivery,
                     })),
@@ -562,10 +562,10 @@ pub(crate) fn prepare_subscription_staged(
         room_id: subscriber.room.clone(),
     };
     let track = state::Track {
-        track_id: source.into(),
+        publication_id: source.into(),
         participant_id: participant.participant_id.clone(),
         room_id: participant.room_id.clone(),
-        label: subscriber.topic.clone(),
+        track_id: subscriber.topic.clone(),
         kind: Some(state::track::Kind::Data(state::DataTrack {
             delivery: subscriber.mode.delivery() as i32,
         })),
@@ -578,7 +578,7 @@ pub(crate) fn prepare_subscription_staged(
                 matches!(
                     &resource.spec.declaration,
                     Some(state::resource_spec::Declaration::Subscription(subscription))
-                        if subscription.track_id == source
+                        if subscription.publication_id == source
                             && subscription.kind == state::TrackKind::Data as i32
                 )
             })
@@ -607,7 +607,7 @@ pub(crate) fn prepare_subscription_staged(
             assert_eq!(
                 body,
                 TopicBody::Probe(TopicProbe {
-                    data_track_id: source.into(),
+                    publication_id: source.into(),
                     from_sequence: 0,
                     live: true
                 })
@@ -619,7 +619,7 @@ pub(crate) fn prepare_subscription_staged(
     }
     let prepared = prepare_data(agent, generation, control);
     assert!(
-        matches!(&prepared.spec.declaration, Some(state::resource_spec::Declaration::Subscription(subscription)) if subscription.track_id == source && subscription.kind == state::TrackKind::Data as i32)
+        matches!(&prepared.spec.declaration, Some(state::resource_spec::Declaration::Subscription(subscription)) if subscription.publication_id == source && subscription.kind == state::TrackKind::Data as i32)
     );
     observe(
         agent,
@@ -644,7 +644,7 @@ pub(crate) fn prepare_subscription_staged(
         assert_eq!(
             body,
             TopicBody::Probe(TopicProbe {
-                data_track_id: source.into(),
+                publication_id: source.into(),
                 from_sequence: 0,
                 live: true
             })

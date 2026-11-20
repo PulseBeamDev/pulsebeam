@@ -207,7 +207,7 @@ const deferredDataSubscription: Promise<unknown> = dataSubscription;
 // @ts-expect-error Payloads remain binary.
 dataPublication.send("text");
 // @ts-expect-error Core selectors are readonly.
-dataSubscriptionState.selector.label = "other";
+dataSubscriptionState.selector.trackId = "other";
 dataPublicationUpdates.close();
 dataSubscriptionUpdates.close();
 await dataPublication.close();
@@ -301,7 +301,7 @@ const videoUpdateTyped: NoAny<
   Awaited<ReturnType<VideoSubscriptionUpdates["next"]>>
 > = true;
 // @ts-expect-error Core selector values are readonly.
-videoState.selector.label = "other";
+videoState.selector.trackId = "other";
 // @ts-expect-error The concrete cursor does not expose the foreign backend.
 videoUpdates.cursor;
 videoUpdates.close();
@@ -340,7 +340,7 @@ const audioUpdateTyped: NoAny<
   Awaited<ReturnType<AudioSubscriptionUpdates["next"]>>
 > = true;
 // @ts-expect-error Core selector values are readonly.
-audioState.selector.label = "other";
+audioState.selector.trackId = "other";
 // @ts-expect-error The concrete cursor does not expose the foreign backend.
 audioUpdates.cursor;
 audioUpdates.close();
@@ -351,16 +351,18 @@ void deferredAudioSubscription;
 await audioSubscription.close();
 const selection = await agent.selectAudio({ pinned: [] });
 await selection.configure({
-  selected: [{ room: "meeting", participantId: "alice", label: "microphone" }],
+  selected: [
+    { room: "meeting", participantId: "alice", trackId: "microphone" },
+  ],
 });
 await selection.close();
 void observedTrack;
 // @ts-expect-error Receive ownership is not a reactive callback subscription.
 remoteVideo.subscribe(() => {});
 // @ts-expect-error Kind-agnostic descriptor lookup was removed.
-participant.track({ kind: "video", label: "camera" });
+participant.track({ kind: "video", trackId: "camera" });
 // @ts-expect-error Local descriptor lookup was removed.
-agent.track({ kind: "video", label: "camera" });
+agent.track({ kind: "video", trackId: "camera" });
 // @ts-expect-error The removed Agent.remote alias cannot bypass room pinning.
 agent.remote.participant("alice");
 // @ts-expect-error Raw desired state cannot override owned resources.

@@ -170,7 +170,7 @@ fn desired_video_intent_logs_only_accepted_semantic_changes() {
 
     let mut changed_video = unrelated_change.clone();
     changed_video.revision = 3;
-    changed_video.video[0].track_id = "replacement-video-track".to_string();
+    changed_video.video[0].publication_id = "replacement-video-track".to_string();
     changed_video.video[0].height = 1080;
     agent
         .command(AgentCommand::ReplaceDesired(changed_video.clone()))
@@ -276,12 +276,12 @@ fn desired(revision: u64) -> DesiredState {
         publications: vec![PublicationIntent {
             slot: "v0".to_string(),
             kind: MediaKind::Video,
-            label: "camera".to_string(),
+            track_id: "camera".to_string(),
             active: true,
         }],
         video: vec![VideoSubscription {
             slot: 0,
-            track_id: "video-track".to_string(),
+            publication_id: "video-track".to_string(),
             selector: None,
             height: 720,
             min_height: 180,
@@ -409,7 +409,7 @@ fn topic_input(
 
 fn wire_message(id: &str, sequence: u64, payload: &[u8]) -> TopicBody {
     TopicBody::Message(WireTopicMessage {
-        data_track_id: id.into(),
+        publication_id: id.into(),
         sequence,
         payload: payload.to_vec(),
     })
@@ -857,7 +857,7 @@ fn native_resource_rejection_is_nonfatal_without_advancing_accepted_state() {
         let (_, output, body) = next_topic_send(&mut agent);
         assert_eq!(output, accepted.channel);
         assert!(matches!(body, TopicBody::Message(message)
-            if message.data_track_id == native_connection::SOURCE
+            if message.publication_id == native_connection::SOURCE
                 && message.payload == b"still accepted"));
     }
 }
@@ -1119,7 +1119,7 @@ fn publication_labels_can_change_after_desire_is_cleared() {
 
     let mut relabelled = original.clone();
     relabelled.revision = 3;
-    relabelled.publications[0].label = "different camera".into();
+    relabelled.publications[0].track_id = "Different_camera".into();
     agent
         .command(AgentCommand::ReplaceDesired(relabelled))
         .unwrap();
@@ -1131,7 +1131,7 @@ fn publication_labels_can_change_after_desire_is_cleared() {
     audio.publications = vec![PublicationIntent {
         slot: "a0".into(),
         kind: MediaKind::Audio,
-        label: "camera".into(),
+        track_id: "camera".into(),
         active: true,
     }];
     agent.command(AgentCommand::ReplaceDesired(audio)).unwrap();
@@ -2033,7 +2033,7 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
                 }),
             ),
             native_connection::confirmed(
-                state::resource_key::Key::Track("old-video".into()),
+                state::resource_key::Key::Publication("old-video".into()),
                 0,
                 state::confirmed_state::Value::Track(native_media::track(
                     "old-video",
@@ -2537,7 +2537,7 @@ fn explicit_connect_waits_for_a_concrete_join_before_preparing_a_peer() {
 fn explicit_disconnect_preserves_resource_owners_and_declared_intent() {
     let mut agent = Agent::new(config()).unwrap();
     let spec = TrackSpec::Audio {
-        label: "microphone".into(),
+        track_id: "microphone".into(),
     };
     let ResourceResult::Publication { owner, slot, .. } = agent
         .resource(ResourceCommand::ClaimPublication { spec: spec.clone() })
@@ -2559,7 +2559,7 @@ fn explicit_disconnect_preserves_resource_owners_and_declared_intent() {
             publications: vec![PublicationIntent {
                 slot: "camera".into(),
                 kind: MediaKind::Video,
-                label: "camera".into(),
+                track_id: "camera".into(),
                 active: true,
             }],
             ..Default::default()
@@ -2702,13 +2702,13 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
                         }),
                     ),
                     confirmed(
-                        state::resource_key::Key::Track("video-track".into()),
+                        state::resource_key::Key::Publication("video-track".into()),
                         0,
                         state::confirmed_state::Value::Track(state::Track {
-                            track_id: "video-track".into(),
+                            publication_id: "video-track".into(),
                             participant_id: "publisher".into(),
                             room_id: "room".into(),
-                            label: "camera".into(),
+                            track_id: "camera".into(),
                             kind: Some(state::track::Kind::Video(state::VideoTrack {
                                 format: Some(state::CodecFormat::from(
                                     state::codec_format::Codec::Vp8(state::Vp8Parameters {}),
@@ -2732,7 +2732,10 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().authorization_expires_at, Some(10_001));
     assert_eq!(agent.snapshot().participants["publisher"].id, "publisher");
-    assert_eq!(agent.snapshot().publications["video-track"].label, "camera");
+    assert_eq!(
+        agent.snapshot().publications["video-track"].track_id,
+        "camera"
+    );
     assert_eq!(
         agent.snapshot().remote_tracks["video-track"].participant_id,
         "publisher"
@@ -2757,7 +2760,7 @@ fn pending_sender_identities_preserve_the_physical_slot_until_application_withdr
     let mut audio = initial.publications[0].clone();
     audio.slot = "a0".into();
     audio.kind = MediaKind::Audio;
-    audio.label = "voice".into();
+    audio.track_id = "voice".into();
     initial.publications.push(audio);
     let mut actual = None;
     let (mut agent, generation, channel) =
@@ -2776,7 +2779,7 @@ fn pending_sender_identities_preserve_the_physical_slot_until_application_withdr
     assert_eq!(available.len(), 1);
     assert!(matches!(&available[0].spec().declaration,
         Some(state::resource_spec::Declaration::Publication(publication))
-            if publication.label == "voice" && matches!(publication.kind, Some(state::publication_spec::Kind::Audio(_)))));
+            if publication.track_id == "voice" && matches!(publication.kind, Some(state::publication_spec::Kind::Audio(_)))));
     let participant = state::Participant {
         participant_id: agent.snapshot().participant_id.clone().unwrap(),
 
@@ -2827,7 +2830,7 @@ fn late_sender_observations_complete_only_matching_pending_publications() {
     let mut audio = initial.publications[0].clone();
     audio.slot = "a0".into();
     audio.kind = MediaKind::Audio;
-    audio.label = "voice".into();
+    audio.track_id = "voice".into();
     initial.publications.push(audio);
     let mut actual = None;
     let (mut agent, generation, channel) =
@@ -2910,7 +2913,7 @@ fn late_sender_observations_complete_only_matching_pending_publications() {
     else {
         panic!("publication")
     };
-    assert_eq!(publication.label, "camera");
+    assert_eq!(publication.track_id, "camera");
     let Some(pulsebeam_proto::state::publication_spec::Kind::Video(video)) = &publication.kind
     else {
         panic!("video")
@@ -2964,9 +2967,12 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
     assert_eq!(agent.snapshot().participants.len(), 1);
     assert_eq!(agent.snapshot().publications.len(), 2);
     assert_eq!(agent.snapshot().participants["publisher"].id, "publisher");
-    assert_eq!(agent.snapshot().publications["video-track"].label, "camera");
     assert_eq!(
-        agent.snapshot().publications["audio-track"].label,
+        agent.snapshot().publications["video-track"].track_id,
+        "camera"
+    );
+    assert_eq!(
+        agent.snapshot().publications["audio-track"].track_id,
         "microphone"
     );
     assert!(agent.snapshot().video_mapping.is_empty());
@@ -3007,7 +3013,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
         .iter()
         .map(|track| {
             confirmed(
-                state::resource_key::Key::Track(track.track_id.clone()),
+                state::resource_key::Key::Publication(track.publication_id.clone()),
                 0,
                 state::confirmed_state::Value::Absent(state::AbsentState {
                     reason: state::AbsenceReason::Removed as i32,
@@ -3028,7 +3034,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
         "source absence does not release logical receive ownership"
     );
     let mut waiting = native_media::scoped_desired(2);
-    waiting.video[0].selector.as_mut().unwrap().label = "future-camera".into();
+    waiting.video[0].selector.as_mut().unwrap().track_id = "future-camera".into();
     agent
         .command(AgentCommand::ReplaceDesired(waiting))
         .unwrap();
@@ -3161,7 +3167,7 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
         .iter()
         .map(|track| {
             confirmed(
-                state::resource_key::Key::Track(track.track_id.clone()),
+                state::resource_key::Key::Publication(track.publication_id.clone()),
                 0,
                 state::confirmed_state::Value::Absent(state::AbsentState {
                     reason: state::AbsenceReason::Removed as i32,
@@ -3270,17 +3276,17 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
     use pulsebeam_proto::state;
     for owned in [false, true] {
         let mut selected = desired(1);
-        selected.video[0].track_id.clear();
+        selected.video[0].publication_id.clear();
         selected.video[0].selector = Some(TrackSelector {
             room: "room".into(),
             participant_id: "remote-user".to_string(),
-            label: "camera".to_string(),
+            track_id: "camera".to_string(),
         });
         selected.audio.pinned.clear();
         let audio_selector = TrackSelector {
             room: "room".into(),
             participant_id: "remote-user".to_string(),
-            label: "microphone".to_string(),
+            track_id: "microphone".to_string(),
         };
         selected.audio.selected.push(audio_selector.clone());
         selected.audio.selector_delays.insert(
@@ -3378,9 +3384,9 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
                 panic!("resolved receiver")
             };
             match state::TrackKind::try_from(subscription.kind).unwrap() {
-                state::TrackKind::Video => assert_eq!(subscription.track_id, "video-one"),
+                state::TrackKind::Video => assert_eq!(subscription.publication_id, "video-one"),
                 state::TrackKind::Audio => {
-                    assert_eq!(subscription.track_id, "audio-one");
+                    assert_eq!(subscription.publication_id, "audio-one");
                     assert!(matches!(&target.spec().settings.as_ref().unwrap().receive,
                         Some(state::resource_settings::Receive::Audio(options))
                             if options.playout_delay == Some(state::PlayoutDelay { min_ms: 0, max_ms: 0 })));
@@ -3515,14 +3521,14 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             channel,
             vec![
                 confirmed(
-                    state::resource_key::Key::Track("video-one".into()),
+                    state::resource_key::Key::Publication("video-one".into()),
                     0,
                     state::confirmed_state::Value::Absent(state::AbsentState {
                         reason: state::AbsenceReason::Removed as i32,
                     }),
                 ),
                 confirmed(
-                    state::resource_key::Key::Track(replacement.track_id.clone()),
+                    state::resource_key::Key::Publication(replacement.publication_id.clone()),
                     0,
                     state::confirmed_state::Value::Track(replacement.clone()),
                 ),
@@ -3704,7 +3710,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         else {
             panic!("replacement receiver")
         };
-        assert_eq!(subscription.track_id, "video-three");
+        assert_eq!(subscription.publication_id, "video-three");
         let Some(state::resource_spec::Declaration::Subscription(previous)) =
             &video.spec().declaration
         else {
@@ -3808,14 +3814,14 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             channel,
             vec![
                 confirmed(
-                    state::resource_key::Key::Track("audio-one".into()),
+                    state::resource_key::Key::Publication("audio-one".into()),
                     0,
                     state::confirmed_state::Value::Absent(state::AbsentState {
                         reason: state::AbsenceReason::Removed as i32,
                     }),
                 ),
                 confirmed(
-                    state::resource_key::Key::Track(replacement.track_id.clone()),
+                    state::resource_key::Key::Publication(replacement.publication_id.clone()),
                     0,
                     state::confirmed_state::Value::Track(replacement.clone()),
                 ),
@@ -3938,7 +3944,7 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         assert_eq!(fresh_audio.len(), 1);
         assert!(fresh_audio[0].reference > audio.reference);
         assert!(matches!(&fresh_audio[0].spec().declaration,
-            Some(state::resource_spec::Declaration::Subscription(subscription)) if subscription.track_id == "audio-two"));
+            Some(state::resource_spec::Declaration::Subscription(subscription)) if subscription.publication_id == "audio-two"));
         observe(
             &mut agent,
             generation,
@@ -4021,13 +4027,13 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
                 }),
             ),
             native_connection::confirmed(
-                state::resource_key::Key::Track("video-track".into()),
+                state::resource_key::Key::Publication("video-track".into()),
                 0,
                 state::confirmed_state::Value::Track(state::Track {
-                    track_id: "video-track".into(),
+                    publication_id: "video-track".into(),
                     participant_id: "remote".into(),
                     room_id: "room".into(),
-                    label: "camera".into(),
+                    track_id: "camera".into(),
                     kind: Some(state::track::Kind::Video(state::VideoTrack {
                         format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
                             state::Vp8Parameters {},
@@ -4074,7 +4080,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
                     state::confirmed_state::Value::Participant(participant),
                 ),
                 native_connection::confirmed(
-                    state::resource_key::Key::Track("video-track".into()),
+                    state::resource_key::Key::Publication("video-track".into()),
                     0,
                     state::confirmed_state::Value::Track(other_room_track),
                 ),
@@ -4661,7 +4667,7 @@ fn failed_control_send_retries_its_frame_before_coalesced_successors() {
     else {
         panic!("publication")
     };
-    assert_eq!(publication.label, "final");
+    assert_eq!(publication.track_id, "final");
     let Some(state::publication_spec::Kind::Data(data)) = &publication.kind else {
         panic!("data")
     };
@@ -4686,7 +4692,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     };
     let mut omitted = Vec::new();
     let mut omitted_lookup_refs = BTreeSet::new();
-    for (index, (label, mode, local, remote_external, remote_source)) in [
+    for (index, (track_id, mode, local, remote_external, remote_source)) in [
         (
             "state",
             TopicMode::Latest,
@@ -4702,7 +4708,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
             "opaque/server/remote-b",
         ),
         (
-            "chat/Δ",
+            "Chat_orders",
             TopicMode::Ordered,
             "local-c",
             "remote-app-user",
@@ -4712,7 +4718,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     .into_iter()
     .enumerate()
     {
-        registrations.publishers.push(publisher(label, mode));
+        registrations.publishers.push(publisher(track_id, mode));
         let revision = 2 + 2 * u64::try_from(index).unwrap();
         agent
             .command(AgentCommand::ReplaceDesired(DesiredState {
@@ -4724,7 +4730,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
             .unwrap();
         let publication = native_connection::prepare_data(&mut agent, generation, control);
         assert!(
-            matches!(&publication.spec.declaration, Some(state::resource_spec::Declaration::Publication(spec)) if spec.label == label)
+            matches!(&publication.spec.declaration, Some(state::resource_spec::Declaration::Publication(spec)) if spec.track_id == track_id)
         );
         native_connection::confirm_publication(
             &mut agent,
@@ -4733,7 +4739,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
             &publication,
             local,
         );
-        let remote_subscriber = pinned_subscriber(label, mode, remote_external);
+        let remote_subscriber = pinned_subscriber(track_id, mode, remote_external);
         registrations.subscribers.push(remote_subscriber.clone());
         agent
             .command(AgentCommand::ReplaceDesired(DesiredState {
@@ -4797,15 +4803,15 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
             .topics
             .publishers
             .iter()
-            .all(|status| status.channel.is_some() && status.data_track_id.is_some())
+            .all(|status| status.channel.is_some() && status.publication_id.is_some())
     );
     let retained = DesiredState {
         revision: 8,
         connected: true,
         topics: TopicRegistrations {
-            publishers: vec![publisher("chat/Δ", TopicMode::Ordered)],
+            publishers: vec![publisher("Chat_orders", TopicMode::Ordered)],
             subscribers: vec![pinned_subscriber(
-                "chat/Δ",
+                "Chat_orders",
                 TopicMode::Ordered,
                 "remote-app-user",
             )],
@@ -4902,14 +4908,16 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
         .push(publisher("", TopicMode::Latest));
     assert!(matches!(
         agent.command(AgentCommand::ReplaceDesired(invalid)),
-        Err(AgentError::InvalidConfiguration(ValidationError::Topic(_)))
+        Err(AgentError::InvalidConfiguration(
+            ValidationError::Identifier { field: "track ID" }
+        ))
     ));
     let mut duplicate = retained.clone();
     duplicate.revision = 6;
     duplicate
         .topics
         .subscribers
-        .push(subscriber("chat/Δ", TopicMode::Ordered));
+        .push(subscriber("Chat_orders", TopicMode::Ordered));
     assert!(matches!(
         agent.command(AgentCommand::ReplaceDesired(duplicate)),
         Err(AgentError::InvalidConfiguration(
@@ -4921,7 +4929,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     conflicting_delivery
         .topics
         .publishers
-        .push(publisher("chat/Δ", TopicMode::Lossy));
+        .push(publisher("Chat_orders", TopicMode::Lossy));
     assert!(matches!(
         agent.command(AgentCommand::ReplaceDesired(conflicting_delivery)),
         Err(AgentError::InvalidConfiguration(
@@ -5018,7 +5026,7 @@ fn native_owned_source_readiness_does_not_wait_for_discovery_completion() {
             Effect::DataChannel(DataChannelEffect::Send { channel, payload, .. })
                 if *channel == receiving.channel
                     && matches!(TopicFrame::decode_bounded(payload).unwrap().body,
-                        Some(TopicBody::Probe(probe)) if probe.data_track_id == native_connection::REMOTE_SOURCE))));
+                        Some(TopicBody::Probe(probe)) if probe.publication_id == native_connection::REMOTE_SOURCE))));
         assert!(effects.iter().all(|effect| match effect {
             Effect::Rtc(RtcEffect::CreateOffer { .. }) => false,
             Effect::Timer(TimerEffect::Schedule { after, .. }) => *after == Duration::from_secs(2),
@@ -5076,7 +5084,7 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
     };
     assert_eq!(first_message.payload, b"first");
     assert_eq!(first_message.sequence, 0);
-    assert_eq!(first_message.data_track_id, native_connection::SOURCE);
+    assert_eq!(first_message.publication_id, native_connection::SOURCE);
     assert!(agent.next_effect_after_turn().is_none());
     assert_eq!(agent.snapshot().topics.accepted_sends, 3);
     assert_eq!(agent.snapshot().topics.dropped_sends, 1);
@@ -5135,7 +5143,7 @@ fn latest_topic_send_admission_freshness_and_failures_are_explicit() {
             .collect::<Vec<_>>(),
         vec![5, 6]
     );
-    assert!(messages.iter().all(|message| message.data_track_id == id
+    assert!(messages.iter().all(|message| message.publication_id == id
         && message.participant_id == "remote-app-user"
         && message.mode == TopicMode::Latest));
     assert!(matches!(
@@ -5153,7 +5161,7 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
     let ResourceResult::Publication { owner, slot, .. } = agent
         .resource(ResourceCommand::ClaimPublication {
             spec: TrackSpec::Video {
-                label: "camera".into(),
+                track_id: "camera".into(),
             },
         })
         .unwrap()
@@ -5181,7 +5189,7 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
             selector: TrackSelector {
                 room: "main".into(),
                 participant_id: "remote-device".into(),
-                label: "camera".into(),
+                track_id: "camera".into(),
             },
         })
         .unwrap()
@@ -5315,7 +5323,7 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
         assert_eq!(agent.pipe_state(input), Some(pipe.clone()));
         let publication = agent.publication_state(owner).unwrap();
         assert!(publication.input_attached && !publication.closed);
-        assert_eq!(publication.label, "camera");
+        assert_eq!(publication.track_id, "camera");
         assert_eq!(
             publication.admission.connection_generation,
             Some(generation.get())
@@ -5384,7 +5392,7 @@ fn owned_input_attachment_is_exclusive_and_cleanup_is_lifetime_scoped() {
     let ResourceResult::Publication { owner, slot, .. } = agent
         .resource(ResourceCommand::ClaimPublication {
             spec: TrackSpec::Video {
-                label: "camera".into(),
+                track_id: "camera".into(),
             },
         })
         .unwrap()
@@ -5511,7 +5519,7 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
     let configuration = config();
     let mut agent = Agent::new(configuration).unwrap();
     let spec = TrackSpec::Video {
-        label: "camera".into(),
+        track_id: "camera".into(),
     };
     let ResourceResult::Publication {
         owner,
@@ -5554,7 +5562,7 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
         publications: vec![PublicationIntent {
             slot: slot.clone(),
             kind: MediaKind::Video,
-            label: "legacy".into(),
+            track_id: "legacy".into(),
             active: true,
         }],
         ..DesiredState::default()
@@ -5575,7 +5583,7 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
     } = agent
         .resource(ResourceCommand::ClaimPublication {
             spec: TrackSpec::Video {
-                label: "screen".into(),
+                track_id: "screen".into(),
             },
         })
         .unwrap()
@@ -5606,7 +5614,7 @@ fn owned_publications_reconcile_without_legacy_lifetime_binding_or_cross_owner_c
 fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
     let mut agent = Agent::new(config()).unwrap();
     let camera = TrackSpec::Video {
-        label: "camera".into(),
+        track_id: "camera".into(),
     };
     let ResourceResult::Publication {
         owner,
@@ -5664,7 +5672,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
     } = agent
         .resource(ResourceCommand::ClaimPublication {
             spec: TrackSpec::Video {
-                label: "screen".into(),
+                track_id: "screen".into(),
             },
         })
         .unwrap()
@@ -5708,7 +5716,7 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
     else {
         panic!("screen publication")
     };
-    assert_eq!(publication.label, "screen");
+    assert_eq!(publication.track_id, "screen");
     let Some(state::publication_spec::Kind::Video(video)) = &publication.kind else {
         panic!("video publication")
     };
@@ -5798,13 +5806,13 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
     assert_eq!(
         agent.resource(ResourceCommand::DeclareDataPublication {
             spec: TrackSpec::Video {
-                label: "not-data".into(),
+                track_id: "not-data".into(),
             },
         }),
         Err(AgentError::InvalidResource(TrackResourceError::WrongKind))
     );
     let first = TrackSpec::Data {
-        label: "same-label".into(),
+        track_id: "same-label".into(),
         delivery: TopicMode::Ordered,
     };
     let ResourceResult::Owned { owner } = agent
@@ -5817,7 +5825,7 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
     assert_eq!(
         agent.resource(ResourceCommand::DeclareDataPublication {
             spec: TrackSpec::Data {
-                label: "same-label".into(),
+                track_id: "same-label".into(),
                 delivery: TopicMode::Latest,
             }
         }),
@@ -5828,7 +5836,7 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
     let ResourceResult::Owned { owner: next } = agent
         .resource(ResourceCommand::DeclareDataPublication {
             spec: TrackSpec::Data {
-                label: "another-label".into(),
+                track_id: "another-label".into(),
                 delivery: TopicMode::Latest,
             },
         })
@@ -5846,11 +5854,11 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
     for index in 0..32 {
         let spec = if index % 2 == 0 {
             TrackSpec::Video {
-                label: format!("media-{index}"),
+                track_id: format!("media-{index}"),
             }
         } else {
             TrackSpec::Audio {
-                label: format!("media-{index}"),
+                track_id: format!("media-{index}"),
             }
         };
         let ResourceResult::Publication { owner, .. } = agent
@@ -5864,7 +5872,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
     let mut data_owners = Vec::new();
     for index in 0..32 {
         let spec = TrackSpec::Data {
-            label: format!("data-{index}"),
+            track_id: format!("data-{index}"),
             delivery: TopicMode::Ordered,
         };
         let ResourceResult::Owned { owner } = agent
@@ -5878,7 +5886,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
     assert_eq!(
         agent.resource(ResourceCommand::ClaimPublication {
             spec: TrackSpec::Video {
-                label: "over-capacity-media".into(),
+                track_id: "over-capacity-media".into(),
             },
         }),
         Err(AgentError::InvalidResource(
@@ -5886,7 +5894,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
         ))
     );
     let rejected = TrackSpec::Data {
-        label: "over-capacity".into(),
+        track_id: "over-capacity".into(),
         delivery: TopicMode::Latest,
     };
     assert_eq!(
@@ -5922,7 +5930,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
     let ResourceResult::Owned { owner: next } = agent
         .resource(ResourceCommand::DeclareDataPublication {
             spec: TrackSpec::Data {
-                label: "after-stale-release".into(),
+                track_id: "after-stale-release".into(),
                 delivery: TopicMode::Lossy,
             },
         })
@@ -5949,7 +5957,7 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
         &subscriber("events", TopicMode::Lossy),
     );
     let spec = TrackSpec::Data {
-        label: "events".into(),
+        track_id: "events".into(),
         delivery: TopicMode::Lossy,
     };
     let mut owners = Vec::new();
@@ -5960,7 +5968,7 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
                 source: TrackSelector {
                     room: "room".into(),
                     participant_id: "remote-app-user".into(),
-                    label: "events".into(),
+                    track_id: "events".into(),
                 },
             })
             .unwrap()
@@ -5999,7 +6007,7 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
             ResourceResult::Event {
                 event: Some(DataEvent::Message {
                     participant_id: "remote-app-user".into(),
-                    track_id: remote.clone(),
+                    publication_id: remote.clone(),
                     sequence: 0,
                     data: vec![255, 0],
                 })
@@ -6146,7 +6154,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
             panic!("message");
         };
         assert_eq!(
-            (message.data_track_id, message.sequence),
+            (message.publication_id, message.sequence),
             (local.clone(), sequence)
         );
         acknowledge_send(&mut agent, generation, channel, operation);
@@ -6158,7 +6166,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
         generation,
         subscribe_channel,
         TopicBody::Frontier(TopicFrontier {
-            data_track_id: remote.clone(),
+            publication_id: remote.clone(),
             next_sequence: 0,
         }),
     )
@@ -6182,7 +6190,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
     assert_eq!(
         body,
         TopicBody::Nack(TopicNack {
-            data_track_id: remote.clone(),
+            publication_id: remote.clone(),
             from_sequence: 1
         })
     );
@@ -6215,7 +6223,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
         generation,
         publish_channel,
         TopicBody::Nack(TopicNack {
-            data_track_id: local,
+            publication_id: local,
             from_sequence: 1,
         }),
     )
@@ -6237,7 +6245,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
     assert_eq!(
         body,
         TopicBody::Nack(TopicNack {
-            data_track_id: remote.clone(),
+            publication_id: remote.clone(),
             from_sequence: 3
         })
     );
@@ -6247,7 +6255,7 @@ fn ordered_topics_reorder_deduplicate_nack_replay_and_emit_inline_gaps() {
         generation,
         subscribe_channel,
         TopicBody::Floor(TopicFloor {
-            data_track_id: remote,
+            publication_id: remote,
             available_sequence: 259,
         }),
     )
@@ -6301,7 +6309,7 @@ fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint()
         generation,
         channel,
         TopicBody::Probe(TopicProbe {
-            data_track_id: id.clone(),
+            publication_id: id.clone(),
             from_sequence: 0,
             live: true,
         }),
@@ -6311,7 +6319,7 @@ fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint()
     assert_eq!(
         body,
         TopicBody::Frontier(TopicFrontier {
-            data_track_id: id.clone(),
+            publication_id: id.clone(),
             next_sequence: 3
         })
     );
@@ -6322,7 +6330,7 @@ fn late_receiver_starts_live_and_existing_receiver_replays_from_its_checkpoint()
         generation,
         channel,
         TopicBody::Probe(TopicProbe {
-            data_track_id: id,
+            publication_id: id,
             from_sequence: 1,
             live: false,
         }),
@@ -6365,7 +6373,7 @@ fn recovery_floor_reports_only_missing_confirmed_sequences() {
         generation,
         channel,
         TopicBody::Floor(TopicFloor {
-            data_track_id: id.clone(),
+            publication_id: id.clone(),
             available_sequence: 5,
         }),
     )
@@ -6376,7 +6384,7 @@ fn recovery_floor_reports_only_missing_confirmed_sequences() {
         generation,
         channel,
         TopicBody::Frontier(TopicFrontier {
-            data_track_id: id.clone(),
+            publication_id: id.clone(),
             next_sequence: 5,
         }),
     )
@@ -6399,7 +6407,7 @@ fn recovery_floor_reports_only_missing_confirmed_sequences() {
         generation,
         channel,
         TopicBody::Frontier(TopicFrontier {
-            data_track_id: id.clone(),
+            publication_id: id.clone(),
             next_sequence: 99,
         }),
     )
@@ -6409,7 +6417,7 @@ fn recovery_floor_reports_only_missing_confirmed_sequences() {
         generation,
         channel,
         TopicBody::Floor(TopicFloor {
-            data_track_id: id.clone(),
+            publication_id: id.clone(),
             available_sequence: 9,
         }),
     )
@@ -6471,7 +6479,7 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
         generation,
         channel,
         TopicBody::Nack(TopicNack {
-            data_track_id: id.clone(),
+            publication_id: id.clone(),
             from_sequence: 0,
         }),
     )
@@ -6480,7 +6488,7 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
     assert_eq!(
         body,
         TopicBody::Floor(TopicFloor {
-            data_track_id: id.clone(),
+            publication_id: id.clone(),
             available_sequence: 1
         })
     );
@@ -6506,7 +6514,7 @@ fn ordered_replay_exhaustion_emits_floor_before_the_retained_window() {
         generation,
         channel,
         TopicBody::Probe(TopicProbe {
-            data_track_id: id,
+            publication_id: id,
             from_sequence: 256,
             live: false,
         }),
@@ -6584,7 +6592,7 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
             );
             assert_eq!(agent.snapshot().topics.publishers[0].queued_messages, 0);
             assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
-            assert_eq!(agent.snapshot().topics.publishers[0].data_track_id, None);
+            assert_eq!(agent.snapshot().topics.publishers[0].publication_id, None);
             assert_eq!(
                 agent.snapshot().topics.channel_failures,
                 u64::from(!cutoff_first)
@@ -6675,7 +6683,7 @@ fn topic_send_queue_overflow_and_channel_close_drop_every_admitted_message() {
             let (operation, output, body) = next_topic_send(&mut agent);
             assert_eq!(output, fresh.channel);
             assert!(
-                matches!(body, TopicBody::Message(message) if message.data_track_id == "opaque/recovered/source" && message.sequence == 0 && message.payload == b"fresh")
+                matches!(body, TopicBody::Message(message) if message.publication_id == "opaque/recovered/source" && message.sequence == 0 && message.payload == b"fresh")
             );
             let before = agent.snapshot().clone();
             acknowledge_send(&mut agent, generation, channel, late);
@@ -6888,7 +6896,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
     )
     .unwrap();
     assert!(
-        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { data_track_id, sequence: 8, payload, .. }))] if data_track_id == "right" && payload == b"after")
+        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { publication_id, sequence: 8, payload, .. }))] if publication_id == "right" && payload == b"after")
     );
     assert!(agent.next_effect_after_turn().is_none());
     native_connection::observe(
@@ -6968,7 +6976,7 @@ fn explicit_disconnect_cancels_pending_topic_sends_and_releases_binding() {
         .unwrap();
     assert_eq!(agent.snapshot().topics.dropped_sends, 2);
     assert_eq!(agent.snapshot().topics.publishers[0].queued_messages, 0);
-    assert_eq!(agent.snapshot().topics.publishers[0].data_track_id, None);
+    assert_eq!(agent.snapshot().topics.publishers[0].publication_id, None);
     assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
     assert!(
         drain_notifications(&mut agent)
@@ -7046,7 +7054,7 @@ fn topic_boundaries_reject_malformed_cross_mode_unknown_and_oversized_input() {
             generation,
             latest.channel,
             TopicBody::Nack(TopicNack {
-                data_track_id: native_connection::SOURCE.into(),
+                publication_id: native_connection::SOURCE.into(),
                 from_sequence: 0,
             })
         ),
@@ -7210,7 +7218,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
         generation,
         control,
         vec![native_connection::confirmed(
-            state::resource_key::Key::Track(native_connection::REMOTE_SOURCE.into()),
+            state::resource_key::Key::Publication(native_connection::REMOTE_SOURCE.into()),
             0,
             state::confirmed_state::Value::Absent(state::AbsentState {
                 reason: state::AbsenceReason::Removed as i32,
@@ -7227,7 +7235,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
     )
     .unwrap();
     assert!(
-        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { data_track_id, sequence: 5, .. }))] if data_track_id == native_connection::REMOTE_SOURCE)
+        matches!(drain_notifications(&mut agent).as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { publication_id, sequence: 5, .. }))] if publication_id == native_connection::REMOTE_SOURCE)
     );
     agent
         .command(AgentCommand::SendTopic(TopicSend {
@@ -7373,7 +7381,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
     .unwrap();
     let notifications = drain_notifications(&mut agent);
     assert!(
-        matches!(notifications.as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { participant_id, data_track_id, sequence: 0, payload, .. }))] if participant_id == NEW_REMOTE && data_track_id == NEW_REMOTE && payload == b"new"),
+        matches!(notifications.as_slice(), [Notification::Topic(TopicNotification::Message(TopicMessage { participant_id, publication_id, sequence: 0, payload, .. }))] if participant_id == NEW_REMOTE && publication_id == NEW_REMOTE && payload == b"new"),
         "notifications: {notifications:#?}"
     );
     agent
@@ -7385,7 +7393,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
     let (operation, channel, body) = next_topic_send(&mut agent);
     assert_eq!(channel, publication.channel);
     assert!(
-        matches!(body, TopicBody::Message(message) if message.data_track_id == NEW_LOCAL && message.sequence == 0)
+        matches!(body, TopicBody::Message(message) if message.publication_id == NEW_LOCAL && message.sequence == 0)
     );
     let before = agent.snapshot().clone();
     acknowledge_send(&mut agent, generation, old_channel, old_operation);
@@ -7515,7 +7523,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         Some("opaque/remote/root-two"),
     );
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p2"));
-    assert_eq!(agent.snapshot().topics.publishers[0].data_track_id, None);
+    assert_eq!(agent.snapshot().topics.publishers[0].publication_id, None);
     assert_eq!(agent.snapshot().topics.publishers[0].next_sequence, 0);
     assert_eq!(agent.snapshot().topics.publishers[0].accepted_history, 0);
     assert!(matches!(
@@ -7572,7 +7580,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
     let TopicBody::Message(new_message) = body else {
         panic!("new message")
     };
-    assert_ne!(new_message.data_track_id, old_message.data_track_id);
+    assert_ne!(new_message.publication_id, old_message.publication_id);
     assert_eq!(new_message.sequence, 0);
     assert_eq!(
         topic_input(
@@ -7580,7 +7588,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
             generation,
             new_publish_channel,
             TopicBody::Nack(TopicNack {
-                data_track_id: old_message.data_track_id,
+                publication_id: old_message.publication_id,
                 from_sequence: 0
             })
         ),
@@ -7591,7 +7599,7 @@ fn reconnect_starts_fresh_publications_without_old_history_or_generation_output(
         generation,
         new_publish_channel,
         TopicBody::Nack(TopicNack {
-            data_track_id: new_message.data_track_id.clone(),
+            publication_id: new_message.publication_id.clone(),
             from_sequence: 0,
         }),
     )

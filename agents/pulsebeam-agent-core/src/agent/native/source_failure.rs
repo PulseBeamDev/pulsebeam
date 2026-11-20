@@ -49,7 +49,7 @@ impl Agent {
             room,
             participant_id,
             kind: state::TrackKind::Data,
-            label,
+            track_id,
         } = resource
         else {
             return Ok(());
@@ -57,7 +57,7 @@ impl Agent {
         let source = crate::TrackSelector {
             room: room.clone(),
             participant_id: participant_id.clone(),
-            label: label.clone(),
+            track_id: track_id.clone(),
         };
         let update = if let Some(error) = lookup_failure(confirmed) {
             self.resources

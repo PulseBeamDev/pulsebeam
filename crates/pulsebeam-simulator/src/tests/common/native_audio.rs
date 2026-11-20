@@ -311,7 +311,7 @@ mod tests {
             track: NativeReceiverInfo {
                 generation,
                 receiver: 3,
-                track_id: "unit".into(),
+                publication_id: "unit".into(),
                 mid: "2".into(),
                 media_index: 2,
             },

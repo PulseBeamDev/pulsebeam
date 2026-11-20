@@ -278,7 +278,7 @@ async def witness():
         assert not inspect.isawaitable(data_publication)
         data_state = data_publication.state()
         assert isinstance(data_state, core.DataPublicationState)
-        assert data_state.label == "control" and data_state.delivery == core.TopicMode.ORDERED
+        assert data_state.track_id == "control" and data_state.delivery == core.TopicMode.ORDERED
         data_updates = data_publication.updates()
         sibling_data_updates = data_publication.updates()
         assert isinstance(data_updates, native.DataPublicationUpdates)

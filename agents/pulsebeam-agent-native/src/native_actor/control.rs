@@ -729,7 +729,7 @@ impl Control {
             let publication = core.data_publication_state(owner)?;
             core.send_data(
                 agent_core::TrackSpec::Data {
-                    label: publication.label,
+                    track_id: publication.track_id,
                     delivery: publication.delivery.into(),
                 },
                 data,
@@ -884,7 +884,7 @@ mod tests {
         let ResourceResult::Publication { owner, .. } = control
             .resource(ResourceCommand::ClaimPublication {
                 spec: TrackSpec::Video {
-                    label: "camera".into(),
+                    track_id: "camera".into(),
                 },
             })
             .unwrap()

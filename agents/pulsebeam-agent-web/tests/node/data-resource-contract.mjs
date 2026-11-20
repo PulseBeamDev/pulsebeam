@@ -59,20 +59,20 @@ export async function dataResourceContract(pulsebeam) {
       return true;
     });
 
-    const longLabel = "é".repeat(128);
+    const longLabel = "x".repeat(36);
     const longNamed = agent.data(longLabel, "ordered");
     assert.equal(
-      longNamed.label,
+      longNamed.trackId,
       longLabel,
-      "local track labels retain their existing Core limit",
+      "local track IDs preserve their exact maximum-length name",
     );
-    for (const label of ["", "x".repeat(65), "é".repeat(33)]) {
+    for (const trackId of ["", "x".repeat(37), "é", "chat/updates"]) {
       assert.throws(
         () =>
           agent
             .room("room")
             .participant("alice")
-            .data(label, "ordered")
+            .data(trackId, "ordered")
             .subscribe(),
         (error) => {
           assert.ok(error instanceof pulsebeam.OperationError);

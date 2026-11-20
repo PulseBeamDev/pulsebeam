@@ -124,7 +124,7 @@ impl Agent {
         let selector = crate::TrackSelector {
             room: subscriber.room.clone(),
             participant_id: subscriber.participant_id.clone(),
-            label: subscriber.topic.clone(),
+            track_id: subscriber.topic.clone(),
         };
         let intent_revision = self.resources.intent_revision(owner).unwrap_or(0);
         let (mut source_status, source_track_id, mut error) =
@@ -179,22 +179,22 @@ impl Agent {
 
     pub fn data_publication_state(&self, owner: u64) -> Result<DataPublicationState, AgentError> {
         let owner = crate::TrackOwner(owner);
-        let (label, delivery) = self
+        let (track_id, delivery) = self
             .resources
             .data_publication(owner)
             .ok_or(crate::TrackResourceError::Released)?;
         let intent_revision = self.resources.intent_revision(owner).unwrap_or(0);
         let (evaluated_revision, accepted_revision, rejected_revision) =
-            publication_revisions(self, label);
+            publication_revisions(self, track_id);
         let (admission, admission_pending, error, execution, execution_error) =
-            publication_outcome(self, label);
+            publication_outcome(self, track_id);
         Ok(DataPublicationState {
             observation_revision: 0,
             intent_revision,
             evaluated_revision,
             accepted_revision,
             rejected_revision,
-            label: label.into(),
+            track_id: track_id.into(),
             delivery: delivery.into(),
             local_enabled: true,
             closed: false,
@@ -221,14 +221,14 @@ fn active_agent(agent: &Agent) -> Option<&super::Session> {
 fn is_receiver_resource(
     resource: &Resource,
     kind: wire::TrackKind,
-    track_id: Option<&str>,
+    publication_id: Option<&str>,
 ) -> bool {
     match (resource, kind) {
         (Resource::Reception(_), wire::TrackKind::Audio | wire::TrackKind::Video) => {
-            track_id.is_some()
+            publication_id.is_some()
         }
         (Resource::DataSubscription(id), wire::TrackKind::Data) => {
-            track_id.is_some_and(|track| track == id)
+            publication_id.is_some_and(|track| track == id)
         }
         _ => false,
     }
@@ -238,13 +238,13 @@ fn receiver_revisions(
     agent: &Agent,
     selector: &crate::TrackSelector,
     kind: wire::TrackKind,
-    track_id: Option<&str>,
+    publication_id: Option<&str>,
 ) -> (u64, Option<u64>, Option<u64>) {
     let Some(active) = active_agent(agent) else {
         return (0, None, None);
     };
     for resource in active.state.resources() {
-        if !is_receiver_resource(resource, kind, track_id) {
+        if !is_receiver_resource(resource, kind, publication_id) {
             continue;
         }
         let Some(spec) = active.state.target_spec(resource) else {
@@ -257,7 +257,7 @@ fn receiver_revisions(
         };
         if subscription.source_room != selector.room
             || subscription.kind != kind as i32
-            || track_id.is_some_and(|track| subscription.track_id != track)
+            || publication_id.is_some_and(|track| subscription.publication_id != track)
         {
             continue;
         }
@@ -284,13 +284,13 @@ fn receiver_revisions(
     (0, None, None)
 }
 
-fn publication_revisions(agent: &Agent, label: &str) -> (u64, Option<u64>, Option<u64>) {
+fn publication_revisions(agent: &Agent, track_id: &str) -> (u64, Option<u64>, Option<u64>) {
     let Some(active) = active_agent(agent) else {
         return (0, None, None);
     };
     let resource = Resource::Publication {
         kind: wire::TrackKind::Data,
-        label: label.into(),
+        track_id: track_id.into(),
     };
     let confirmed = active.state.confirmed(&resource);
     let evaluation = active.state.evaluation(&resource);
@@ -318,7 +318,7 @@ fn source_resource(selector: &crate::TrackSelector, kind: wire::TrackKind) -> Re
         room: selector.room.clone(),
         participant_id: selector.participant_id.clone(),
         kind,
-        label: selector.label.clone(),
+        track_id: selector.track_id.clone(),
     }
 }
 
@@ -349,12 +349,12 @@ fn source_state(
                 && source.participant_id == participant.participant_id
                 && participant.room_id == selector.room
                 && participant.participant_id == selector.participant_id
-                && source.label == selector.label
+                && source.track_id == selector.track_id
                 && Agent::native_track_kind(source) == Some(kind)
             {
                 return (
                     SubscriptionSourceStatus::Available,
-                    Some(source.track_id.clone()),
+                    Some(source.publication_id.clone()),
                     None,
                 );
             }
@@ -382,7 +382,7 @@ fn receiver_outcome(
     agent: &Agent,
     selector: &crate::TrackSelector,
     kind: wire::TrackKind,
-    track_id: Option<&str>,
+    publication_id: Option<&str>,
 ) -> (
     PublicationAdmissionStatus,
     bool,
@@ -407,7 +407,7 @@ fn receiver_outcome(
         );
     };
     for resource in active.state.resources() {
-        if !is_receiver_resource(resource, kind, track_id) {
+        if !is_receiver_resource(resource, kind, publication_id) {
             continue;
         }
         let Some(spec) = active.state.target_spec(resource) else {
@@ -420,7 +420,7 @@ fn receiver_outcome(
         };
         if subscription.source_room != selector.room
             || subscription.kind != kind as i32
-            || track_id.is_some_and(|track| subscription.track_id != track)
+            || publication_id.is_some_and(|track| subscription.publication_id != track)
         {
             continue;
         }
@@ -484,11 +484,11 @@ fn admission_error(
     agent: &Agent,
     selector: &crate::TrackSelector,
     kind: wire::TrackKind,
-    track_id: Option<&str>,
+    publication_id: Option<&str>,
 ) -> Option<ErrorInfo> {
     let active = active_agent(agent)?;
     for resource in active.state.resources() {
-        if !is_receiver_resource(resource, kind, track_id) {
+        if !is_receiver_resource(resource, kind, publication_id) {
             continue;
         }
         let Some(spec) = active.state.target_spec(resource) else {
@@ -501,7 +501,7 @@ fn admission_error(
         };
         if subscription.source_room != selector.room
             || subscription.kind != kind as i32
-            || track_id.is_some_and(|track| subscription.track_id != track)
+            || publication_id.is_some_and(|track| subscription.publication_id != track)
         {
             continue;
         }
@@ -518,7 +518,7 @@ fn admission_error(
 
 fn publication_outcome(
     agent: &Agent,
-    label: &str,
+    track_id: &str,
 ) -> (
     PublicationAdmissionStatus,
     bool,
@@ -537,7 +537,7 @@ fn publication_outcome(
     };
     let resource = Resource::Publication {
         kind: wire::TrackKind::Data,
-        label: label.into(),
+        track_id: track_id.into(),
     };
     let evaluation = active.state.evaluation(&resource);
     let confirmed = active.state.confirmed(&resource);
@@ -626,7 +626,7 @@ impl From<&crate::TrackSelector> for crate::ffi::TrackSelector {
         Self {
             room: value.room.clone(),
             participant_id: value.participant_id.clone(),
-            label: value.label.clone(),
+            track_id: value.track_id.clone(),
         }
     }
 }

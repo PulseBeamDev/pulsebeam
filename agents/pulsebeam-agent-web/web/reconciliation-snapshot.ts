@@ -8,7 +8,7 @@ export interface Publication {
   readonly id: string;
   readonly participantId: string;
   readonly kind: MediaKind;
-  readonly label: string;
+  readonly trackId: string;
 }
 
 export type RemoteTrack = MediaStreamTrack;
@@ -16,7 +16,7 @@ export type RemoteTrack = MediaStreamTrack;
 export type CatalogTrack = Readonly<{
   id: string;
   participantId: string;
-  label: string;
+  trackId: string;
 }> &
   (
     | Readonly<{ kind: MediaKind }>

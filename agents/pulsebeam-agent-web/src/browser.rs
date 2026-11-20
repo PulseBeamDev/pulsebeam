@@ -119,7 +119,7 @@ struct DesiredConfig {
 struct VideoSubscriptionConfig {
     slot: u32,
     #[serde(default)]
-    track_id: String,
+    publication_id: String,
     selector: Option<TrackSelectorConfig>,
     height: u32,
     min_height: u32,
@@ -147,7 +147,7 @@ struct AudioDemandConfig {
 struct TrackSelectorConfig {
     room: String,
     participant_id: String,
-    label: String,
+    track_id: String,
 }
 
 impl From<TrackSelectorConfig> for TrackSelector {
@@ -155,7 +155,7 @@ impl From<TrackSelectorConfig> for TrackSelector {
         Self {
             room: value.room,
             participant_id: value.participant_id,
-            label: value.label,
+            track_id: value.track_id,
         }
     }
 }
@@ -170,7 +170,7 @@ struct SelectorDelayConfig {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AudioTrackDelayConfig {
-    track_id: String,
+    publication_id: String,
     playout_delay: PlayoutDelayConfig,
 }
 
@@ -293,7 +293,7 @@ impl DesiredConfig {
                 .into_iter()
                 .map(|video| VideoSubscription {
                     slot: video.slot,
-                    track_id: video.track_id,
+                    publication_id: video.publication_id,
                     selector: video.selector.map(Into::into),
                     height: video.height,
                     min_height: video.min_height,
@@ -325,7 +325,7 @@ impl From<AudioDemandConfig> for AudioSubscription {
             playout_delays: value
                 .playout_delays
                 .into_iter()
-                .map(|entry| (entry.track_id, entry.playout_delay.into()))
+                .map(|entry| (entry.publication_id, entry.playout_delay.into()))
                 .collect(),
             selector_delays: value
                 .selector_delays
@@ -1865,7 +1865,7 @@ impl RuntimeInner {
             set(&sender_value, "kind", kind);
             set(
                 &sender_value,
-                "trackId",
+                "publicationId",
                 sender.track().map(|track| track.id()),
             );
             set(
@@ -2849,7 +2849,7 @@ fn topic_registrations(topics: &[TopicRegistrationConfig]) -> Result<TopicRegist
             let source = topic
                 .source
                 .as_ref()
-                .filter(|source| source.label == topic.name)
+                .filter(|source| source.track_id == topic.name)
                 .ok_or_else(|| {
                     LocalOperationError::validation("data reception requires an exact source")
                         .into_js()
@@ -3207,7 +3207,7 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         set(&item, "id", publication.id.clone());
         set(&item, "participantId", owner.id.clone());
         set(&item, "kind", media_kind_name(publication.kind));
-        set(&item, "label", publication.label.clone());
+        set(&item, "trackId", publication.track_id.clone());
         publications.push(&item);
     }
     set(&value, "publications", publications.clone());
@@ -3220,7 +3220,7 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         let item = Object::new();
         set(&item, "id", track.id.clone());
         set(&item, "participantId", track.participant_id.clone());
-        set(&item, "label", track.spec.label());
+        set(&item, "trackId", track.spec.track_id());
         match &track.spec {
             agent_core::TrackSpec::Video { .. } => set(&item, "kind", "video"),
             agent_core::TrackSpec::Audio { .. } => set(&item, "kind", "audio"),
@@ -3270,7 +3270,7 @@ fn topic_snapshot_value(snapshot: &agent_core::TopicSnapshot) -> JsValue {
         set(&item, "name", status.registration.topic.clone());
         set(&item, "mode", topic_mode_name(status.registration.mode));
         set(&item, "connected", status.channel.is_some());
-        set(&item, "dataTrackId", status.data_track_id.clone());
+        set(&item, "publicationId", status.publication_id.clone());
         set(&item, "nextSequence", BigInt::from(status.next_sequence));
         set(&item, "acceptedHistory", status.accepted_history);
         set(&item, "queued", status.queued_messages);
@@ -3312,7 +3312,7 @@ fn notification_value(notification: &Notification) -> JsValue {
             set(&value, "mode", topic_mode_name(message.mode));
             set(&value, "topic", &message.topic);
             set(&value, "participantId", &message.participant_id);
-            set(&value, "dataTrackId", &message.data_track_id);
+            set(&value, "publicationId", &message.publication_id);
             set(&value, "sequence", BigInt::from(message.sequence));
             set(
                 &value,
@@ -3322,7 +3322,7 @@ fn notification_value(notification: &Notification) -> JsValue {
         }
         Notification::Topic(TopicNotification::RecoveryGap {
             subscriber,
-            data_track_id,
+            publication_id,
             participant_id,
             expected_sequence,
             available_sequence,
@@ -3330,7 +3330,7 @@ fn notification_value(notification: &Notification) -> JsValue {
             set(&value, "type", "topic-recovery-gap");
             set(&value, "topic", &subscriber.topic);
             set(&value, "participantId", participant_id);
-            set(&value, "dataTrackId", data_track_id);
+            set(&value, "publicationId", publication_id);
             set(&value, "expectedSequence", BigInt::from(*expected_sequence));
             set(
                 &value,
@@ -3341,14 +3341,14 @@ fn notification_value(notification: &Notification) -> JsValue {
         Notification::Topic(TopicNotification::SendAdmitted {
             publisher,
             operation,
-            data_track_id,
+            publication_id,
             sequence,
         }) => {
             set(&value, "type", "topic-send-admitted");
             set(&value, "topic", &publisher.topic);
             set(&value, "mode", topic_mode_name(publisher.mode));
             set(&value, "operation", operation.get());
-            set(&value, "dataTrackId", data_track_id);
+            set(&value, "publicationId", publication_id);
             set(&value, "sequence", BigInt::from(*sequence));
         }
         Notification::Topic(TopicNotification::SendDropped { publisher, reason }) => {

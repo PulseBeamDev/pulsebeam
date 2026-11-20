@@ -80,11 +80,11 @@ impl NativeReceiver {
                 kind: rtc::PeerErrorKind::InvalidState,
                 message: "native receiver has no track".into(),
             })?;
-        let track_id = session.media_track_id(track);
+        let publication_id = session.media_track_id(track);
         let released = session.release_media_track_reference(track);
-        let track_id = track_id?;
+        let publication_id = publication_id?;
         released?;
-        let track_id = String::from_utf8(track_id).map_err(|error| rtc::PeerError {
+        let publication_id = String::from_utf8(publication_id).map_err(|error| rtc::PeerError {
             kind: rtc::PeerErrorKind::InvalidParameter,
             message: format!("native track ID is not UTF-8: {error}"),
         })?;
@@ -93,7 +93,7 @@ impl NativeReceiver {
             track: NativeReceiverInfo {
                 generation,
                 receiver: id.get(),
-                track_id,
+                publication_id,
                 mid,
                 media_index,
             },

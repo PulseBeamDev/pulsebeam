@@ -66,7 +66,7 @@
         id: "A",
         participantId: "alice",
         kind: "audio",
-        label: "voice",
+        trackId: "voice",
       };
       catalog.update({
         connection: "connected",

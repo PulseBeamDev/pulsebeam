@@ -158,19 +158,19 @@ fn reduced_permissions_fence_pending_and_installed_resources_before_absence() {
 #[test]
 fn subscriptions_require_resolved_filters_but_no_discovery_projection() {
     let connection = ConnectionId::new();
-    let id = connection.derive_publication_track_id(
+    let id = connection.fixture_publication_at(
         TrackKind::Data,
         "allowed",
         std::num::NonZeroU64::new(1).unwrap(),
     );
-    let spec = |id: crate::entity::TrackId| wire::ResourceSpec {
+    let spec = |id: crate::entity::PublicationKey| wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
             enabled: Some(true),
             receive: None,
         }),
         declaration: Some(wire::resource_spec::Declaration::Subscription(
             wire::SubscriptionSpec {
-                track_id: id.as_str(),
+                publication_id: id.as_str(),
                 kind: wire::TrackKind::Data as i32,
                 source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
@@ -195,7 +195,7 @@ fn subscriptions_require_resolved_filters_but_no_discovery_projection() {
             )
             .unwrap();
         assert!(settle_sweep(&mut model).is_empty());
-        let id = connection.derive_publication_track_id(
+        let id = connection.fixture_publication_at(
             TrackKind::Data,
             label,
             std::num::NonZeroU64::new(1).unwrap(),
@@ -209,7 +209,7 @@ fn subscriptions_require_resolved_filters_but_no_discovery_projection() {
                 id,
                 origin: ParticipantId::new(external).unwrap(),
                 connection_id: connection,
-                label: Some(label.into()),
+                track_id: Some(crate::entity::TrackId::new(&label).unwrap()),
             },
             DataLane::Ordered,
         );
@@ -272,7 +272,7 @@ fn subscriptions_require_resolved_filters_but_no_discovery_projection() {
             model
                 .rows
                 .keys()
-                .all(|key| !matches!(key, Key::Participant(_) | Key::Track(_)))
+                .all(|key| !matches!(key, Key::Participant(_) | Key::Publication(_)))
         );
     }
     let mut model = session();

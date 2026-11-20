@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use super::handoff::{ControllerHandoff, Fact};
 use super::{ExecutionCommand, InputError, NativeSession, OutputError, ResolvedSource};
-use crate::entity::{ParticipantId, RoomId, TrackId};
+use crate::entity::{ParticipantId, PublicationKey, RoomId};
 
 const FACT_BUDGET: usize = 32;
 const PREPARATION_BUDGET: usize = 32;
@@ -114,8 +114,8 @@ impl StateProtocolHandler {
     pub(in crate::control) fn service<'a>(
         &mut self,
         unix_now: u64,
-        source: impl Fn(TrackId) -> Option<ResolvedSource<'a>>,
-        source_in_room: impl Fn(&str, TrackId) -> Option<ResolvedSource<'a>>,
+        source: impl Fn(PublicationKey) -> Option<ResolvedSource<'a>>,
+        source_in_room: impl Fn(&str, PublicationKey) -> Option<ResolvedSource<'a>>,
         lookup_source: impl Fn(
             &pulsebeam_proto::state::LogicalSourceAddress,
         ) -> Option<ResolvedSource<'a>>,

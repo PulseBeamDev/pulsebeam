@@ -223,23 +223,23 @@ impl Participant {
         &self.id
     }
 
-    pub(super) fn source(&self, label: String) -> agent_core::TrackSelector {
+    pub(super) fn source(&self, track_id: String) -> agent_core::TrackSelector {
         agent_core::TrackSelector {
             room: self.room.clone(),
             participant_id: self.id.clone(),
-            label,
+            track_id,
         }
     }
 
-    pub fn data(&self, label: String, delivery: TopicMode) -> Result<RemoteDataTrack, Error> {
-        let source = self.source(label.clone());
+    pub fn data(&self, track_id: String, delivery: TopicMode) -> Result<RemoteDataTrack, Error> {
+        let source = self.source(track_id.clone());
         Ok(RemoteDataTrack {
             address: data_address(
                 &self.commands,
                 &self.core,
                 &self.closed,
                 &self.finished,
-                label,
+                track_id,
                 delivery,
                 Some(source),
             )?,
@@ -263,14 +263,14 @@ fn data_address(
     core: &Control,
     closed: &Arc<Signal>,
     finished: &Arc<Signal>,
-    label: String,
+    track_id: String,
     delivery: TopicMode,
     source: Option<agent_core::TrackSelector>,
 ) -> Result<DataAddress, Error> {
     if closed.is_closed() || finished.is_closed() {
         return Err(Error::Closed);
     }
-    let spec = TrackSpec::Data { label, delivery };
+    let spec = TrackSpec::Data { track_id, delivery };
     spec.validate()
         .map_err(|error| Error::Core(agent_core::AgentError::InvalidResource(error.into())))?;
     if let Some(source) = &source {
@@ -289,7 +289,7 @@ fn data_address(
 }
 
 impl Agent {
-    pub fn data(&self, label: String, delivery: TopicMode) -> Result<LocalDataTrack, Error> {
+    pub fn data(&self, track_id: String, delivery: TopicMode) -> Result<LocalDataTrack, Error> {
         if self.is_closed() {
             return Err(Error::Closed);
         }
@@ -299,7 +299,7 @@ impl Agent {
                 &self.core,
                 &self.lease.close,
                 &self.lease.finished,
-                label,
+                track_id,
                 delivery,
                 None,
             )?,

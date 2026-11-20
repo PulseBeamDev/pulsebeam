@@ -1,8 +1,8 @@
-use crate::entity::TrackId;
+use crate::entity::PublicationKey;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioIntent {
-    pub pinned: Vec<TrackId>,
+    pub pinned: Vec<PublicationKey>,
     pub auto: bool,
 }
 
@@ -17,7 +17,7 @@ impl Default for AudioIntent {
 
 #[derive(Clone)]
 pub struct VideoIntent {
-    pub track_id: TrackId,
+    pub publication_id: PublicationKey,
     pub target_height: u32,
     pub min_height: u32,
     pub min_fps: u32,

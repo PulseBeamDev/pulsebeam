@@ -1,6 +1,6 @@
 pub use pulsebeam_core::identity::{
-    AudioTrackId, ConnectionId, DataTrackId, IdValidationError, ParticipantId, ProjectId, RoomId,
-    TrackId, TrackKind, VideoTrackId,
+    ConnectionId, IdValidationError, ParticipantId, ProjectId, PublicationId, PublicationKey,
+    RoomId, TrackId, TrackKind,
 };
 
 #[cfg(test)]
@@ -53,5 +53,5 @@ impl std::fmt::Debug for EndpointKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AudioOrigin {
     pub participant: ParticipantId,
-    pub track: TrackId,
+    pub track: PublicationKey,
 }

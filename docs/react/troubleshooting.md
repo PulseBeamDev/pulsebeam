@@ -36,7 +36,7 @@ as permission denial; codes vary by browser.
 
 ## Admission and connection
 
-Read `agent.connection`, `agent.error`, admitted external IDs, and expiry directly.
+Read `agent.connection`, `agent.error`, admitted room and participant IDs, and expiry directly.
 `useAgent` keeps those properties reactive; calling `connect()` is intent, not proof of admission.
 
 | Symptom | Check |
@@ -72,7 +72,7 @@ Native Linux host networking avoids this extra VM boundary.
 
 Check in order:
 
-1. **Joined?** Both participants show `connected`, with distinct external IDs in the same room.
+1. **Joined?** Both participants show `connected`, with distinct participant IDs in the same room.
 2. **Published?** Sender capture is active and passed to `usePublish` with the
    intended logical handle. `{ enabled: false }` disables sending; a null source
    withdraws the input without closing publication ownership.
@@ -89,7 +89,7 @@ Check in order:
    Also check sender silence and browser or OS output.
 
 A local preview proves capture, not delivery. Match logical handles by external
-participant ID, kind, and label.
+participant ID, kind, and track ID.
 
 ## Roster loading or failure
 
@@ -141,13 +141,13 @@ ignored or reported by the application without ending the SDK event stream.
 
 | Symptom | Diagnosis and action |
 | --- | --- |
-| Send rejects | Check connection intent, matching server and SDK versions, logical label and delivery, payload size, and queue capacity. Retry as a new application action after recovery. |
+| Send rejects | Check connection intent, matching server and SDK versions, track ID and delivery, payload size, and queue capacity. Retry as a new application action after recovery. |
 | `onError` fires | A receive operation or application handler failed and this mount released its subscription. Correct the cause, then remount to restart. Catch expected processing errors inside `onEvent` when reception should continue. |
 | An inline `gap` arrives | An ordered range was skipped. Display the notice before later messages from that track and reload backend state if completeness matters. |
 | Latest values disappear | Supersession is expected per data track. Use `lossy` for distinct transient events or `ordered` when ordered recovery matters. |
 | No old messages after subscribing or reconnecting | Subscriptions start live; replacement tracks have fresh IDs and sequence spaces. There is no offline replay. |
 | Metadata fails to serialize as JSON | Sequence and gap fields are `bigint`. Store decimal strings; never round through `number`. |
 
-Confirm with two participants using the same logical label and delivery.
+Confirm with two participants using the same track ID and delivery.
 Sending does not loop back to its publisher. Accepted sends are not delivery
 acknowledgments. Queues and recovery are finite. See the [data reference](/react/reference#data).

@@ -35,10 +35,10 @@ effect has created and initialized the Agent; render a mounted child component
 for Agent-dependent hooks. React owns the runtime lifecycle. Use a React `key` to
 replace logical sessions.
 Capture hooks own the devices: disconnecting an Agent does not stop capture.
-Look up local handles with `agent.video(label)`, `agent.audio(label)`, or
-`agent.data(label, delivery)`. Look up a room-pinned remote handle with
-`agent.room(room).participant(externalId).video(label)`, `.audio(label)`, or
-`.data(label, delivery)`. The room and external participant identity are fixed
+Look up local handles with `agent.video(trackId)`, `agent.audio(trackId)`, or
+`agent.data(trackId, delivery)`. Look up a room-pinned remote handle with
+`agent.room(room).participant(id).video(trackId)`, `.audio(trackId)`, or
+`.data(trackId, delivery)`. The room and participant ID are fixed
 by that reference and do not follow Agent room changes. Lookup is inert.
 `usePublish` owns publication; `useSubscribe` owns reception. Pass the resulting
 subscription to `Video` or `Audio` through `source`. Playback owns only its
@@ -81,8 +81,8 @@ Pages include presence-only participants and immutable publication metadata.
 Expired continuations fail visibly and can restart from the first page. Do not
 traverse every page or equate the page size with receive capacity.
 
-Discover permission grants metadata, not reception. Use a page entry's application
-`externalId` and publication label for pinned lookup, then let mounted consumers
+Discover permission grants metadata, not reception. Use the participant's `id`
+and the publication's `trackId` for pinned lookup, then let mounted consumers
 own `useSubscribe`; exclude self. Known-address Subscribe needs no Discover.
 `agent.participants`, `participant.tracks` and global snapshot discovery are absent.
 See the [typed bounded roster and receive guide](../../docs/react/guides.md#remote-discovery-and-video-receive-policy).

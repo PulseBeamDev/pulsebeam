@@ -116,8 +116,8 @@ impl NegotiatedResources {
                     MediaKind::Audio => TrackKind::Audio,
                     MediaKind::Video => TrackKind::Video,
                 };
-                crate::participant::whip_media_label(profile, media.kind).is_some_and(|label| {
-                    permissions.allows(Action::Publish, None, Some(kind), Some(label))
+                crate::participant::whip_media_track_id(profile, media.kind).is_some_and(|id| {
+                    permissions.allows(Action::Publish, None, Some(kind), Some(id.as_str()))
                 })
             }),
         }

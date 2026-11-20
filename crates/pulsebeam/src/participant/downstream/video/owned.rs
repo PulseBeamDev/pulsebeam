@@ -28,7 +28,7 @@ impl VideoAllocator {
     pub(crate) fn configure_owned_slot(
         &mut self,
         mid: Mid,
-        source: TrackId,
+        source: PublicationKey,
         options: &VideoPolicy,
         active: bool,
     ) {
@@ -42,7 +42,7 @@ impl VideoAllocator {
         let previous_ceiling = slot.height_ceiling;
         slot.height_ceiling = options.height_ceiling;
         let intent = Intent {
-            track_id: source,
+            publication_id: source,
             target_height: options.height_ceiling.unwrap_or(u32::MAX),
             min_height: options.minimum_height,
             min_fps: options.minimum_fps,
@@ -69,10 +69,10 @@ impl VideoAllocator {
         }
     }
 
-    pub(crate) fn forget_owned_track(&mut self, key: TrackHandle, track_id: TrackId) {
-        if self.track_handles.get(&track_id) == Some(&key) {
-            self.track_handles.remove(&track_id);
-            self.active_track_handles.remove(&track_id);
+    pub(crate) fn forget_owned_track(&mut self, key: TrackHandle, publication_id: PublicationKey) {
+        if self.track_handles.get(&publication_id) == Some(&key) {
+            self.track_handles.remove(&publication_id);
+            self.active_track_handles.remove(&publication_id);
             self.tracks.remove(key);
         }
     }
@@ -80,7 +80,7 @@ impl VideoAllocator {
     pub(crate) fn on_owned_rtp(
         &mut self,
         mid: Mid,
-        track: TrackId,
+        track: PublicationKey,
         arrival: Instant,
         cache: Option<&TrackStreamCache>,
         writer: &mut StreamWriter,

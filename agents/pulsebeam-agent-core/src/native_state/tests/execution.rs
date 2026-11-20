@@ -7,37 +7,11 @@ fn receiver_failure_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
     let format = wire::CodecFormat::from(wire::codec_format::Codec::Opus(
         wire::OpusParameters::default(),
     ));
-    let parameters = wire::RtpParameters {
-        mid: "receive".into(),
-        codec: Some(wire::RtpCodecParameters {
-            payload_type: Some(111),
-            format: Some(format.clone()),
-            feedback: vec![wire::RtcpFeedback::TransportCc.into()],
-            ..Default::default()
-        }),
-        header_extensions: vec![
-            wire::RtpHeaderExtensionParameters {
-                id: 1,
-                uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionMid.into(),
-            },
-            wire::RtpHeaderExtensionParameters {
-                id: 2,
-                uri: wire::RtpHeaderExtensionType::RtpHeaderExtensionTransportCcDraft01.into(),
-            },
-        ],
-        encodings: vec![wire::RtpEncodingParameters {
-            ssrc: Some(77),
-            ..Default::default()
-        }],
-        rtcp: Some(wire::RtcpParameters {
-            cname: "receiver-proof".into(),
-            reduced_size: false,
-        }),
-    };
+    let parameters = audio_parameters("receiver-proof".into());
     let mut desired = wire::ResourceSpec {
         declaration: Some(wire::resource_spec::Declaration::Subscription(
             wire::SubscriptionSpec {
-                track_id: "source".into(),
+                publication_id: "source".into(),
                 kind: wire::TrackKind::Audio as i32,
                 source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
@@ -69,10 +43,10 @@ fn receiver_failure_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
                     room_id: "room".into(),
                 }),
                 track: Some(wire::Track {
-                    track_id: "source".into(),
+                    publication_id: "source".into(),
                     participant_id: "peer".into(),
                     room_id: "room".into(),
-                    label: "microphone".into(),
+                    track_id: "microphone".into(),
                     kind: Some(wire::track::Kind::Audio(wire::AudioTrack {
                         format: Some(format),
                     })),

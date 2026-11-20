@@ -16,7 +16,7 @@ fn media(packet: TrackPacket, kind: TrackKind) -> ShardFrame {
             playout_ntp32: 0x12345678,
         },
         payload: RoutedTrackPacket {
-            track_id: ConnectionId::from_bytes([3; 16]).derive_track_id(kind, "source"),
+            publication_id: ConnectionId::from_bytes([3; 16]).fixture_publication(kind, "source"),
             packet,
         },
     }
@@ -50,6 +50,9 @@ fn data_lanes_round_trip_without_trusting_application_destination() {
             },
             TrackKind::Data,
         );
+        let ShardFrame::Media { payload: sent, .. } = &frame else {
+            unreachable!();
+        };
         let wire = encoded(&codec, &frame);
         let ShardFrame::Media { delivery, payload } = codec.decode(&wire).unwrap() else {
             panic!("media expected");
@@ -59,6 +62,7 @@ fn data_lanes_round_trip_without_trusting_application_destination() {
             NodeRouteAddress::new(RouteId::from_raw(0), 0)
         );
         assert_eq!(delivery.playout_ntp32, 0x12345678);
+        assert_eq!(payload.publication_id, sent.publication_id);
         let TrackPacket::Data {
             lane: decoded_lane,
             bytes,
@@ -71,6 +75,10 @@ fn data_lanes_round_trip_without_trusting_application_destination() {
         for length in 0..wire.len() {
             assert!(codec.decode(&wire[..length]).is_err());
         }
+        let mut legacy = wire.clone();
+        // Frame version, frame kind, and media kind precede the UUID.
+        legacy[3 + 6] = (legacy[3 + 6] & 0x0f) | 0x80;
+        assert!(codec.decode(&legacy).is_err());
         let mut trailing = wire;
         trailing.push(0);
         assert!(codec.decode(&trailing).is_err());

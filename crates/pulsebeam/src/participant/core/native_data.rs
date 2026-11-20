@@ -74,19 +74,37 @@ impl NativeExecution {
     }
 }
 
+struct AdmittedDataPublication {
+    meta: track::TrackMeta,
+    source_id: String,
+}
+
+enum DataPublicationState {
+    Pending(entity::TrackId),
+    Admitted(AdmittedDataPublication),
+}
+
 struct DataPublication {
     channel: crate::media::ChannelId,
-    track: Track,
-    source_id: String,
+    lane: DataLane,
+    state: DataPublicationState,
     fanout: Option<TrackHandle>,
     enabled: bool,
     opened: bool,
     installation: pulsebeam_rtc::DataChannelInstallation,
-    published: bool,
     retiring: bool,
     preparation: Option<Preparation>,
     storage_sequence: u64,
     deadline: Option<Instant>,
+}
+
+impl DataPublication {
+    fn admitted(&self) -> Option<&AdmittedDataPublication> {
+        match &self.state {
+            DataPublicationState::Pending(_) => None,
+            DataPublicationState::Admitted(admitted) => Some(admitted),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -108,7 +126,7 @@ impl NativeData {
             .get(&channel)
             .and_then(|reference| self.publications.get(reference))
             .is_some_and(|publication| {
-                publication.enabled && publication.published && !publication.retiring
+                publication.enabled && publication.admitted().is_some() && !publication.retiring
             })
     }
 
@@ -116,10 +134,9 @@ impl NativeData {
         self.deadlines.first().map(|(deadline, _)| *deadline)
     }
 
-    pub(super) fn bind_source(&mut self, track: TrackId, handle: TrackHandle) {
+    pub(super) fn bind_source(&mut self, track: PublicationKey, handle: TrackHandle) {
         if let Some(reference) = self.tracks.get(track.as_bytes())
             && let Some(publication) = self.publications.get_mut(reference)
-            && publication.published
         {
             if let Some(previous) = publication.fanout
                 && self.fanouts.get(&previous.data().as_ffi()) == Some(reference)
@@ -136,8 +153,10 @@ impl NativeData {
         if self.channels.get(&publication.channel) == Some(&reference) {
             self.channels.remove(&publication.channel);
         }
-        if self.tracks.get(publication.track.id().as_bytes()) == Some(&reference) {
-            self.tracks.remove(publication.track.id().as_bytes());
+        if let Some(admitted) = publication.admitted()
+            && self.tracks.get(admitted.meta.id.as_bytes()) == Some(&reference)
+        {
+            self.tracks.remove(admitted.meta.id.as_bytes());
         }
         if let Some(handle) = publication.fanout
             && self.fanouts.get(&handle.data().as_ffi()) == Some(&reference)
@@ -410,7 +429,7 @@ impl Connection {
             }
         };
         let DataPublicationPlan {
-            label,
+            track_id,
             lane,
             channel,
             enabled,
@@ -429,10 +448,10 @@ impl Connection {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Conflict.into()));
             return;
         }
-        let Some(incarnation) = NonZeroU64::new(work.reference) else {
+        if work.reference == 0 {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Invalid.into()));
             return;
-        };
+        }
         let installation = match self.transport.open_native_data(channel, lane) {
             Ok(installation) => installation,
             Err(code) => {
@@ -440,37 +459,21 @@ impl Connection {
                 return;
             }
         };
-        let id =
-            self.connection_id
-                .derive_publication_track_id(TrackKind::Data, &label, incarnation);
-        let track = Track::data_publication(
-            track::TrackMeta {
-                room: self.room,
-                shard_id: self.shard_id,
-                id,
-                origin: self.participant_id,
-                connection_id: self.connection_id,
-                label: Some(label),
-            },
-            lane,
-        );
         let reference = work.reference;
         let now = Instant::now();
         let deadline = now.checked_add(Duration::from_secs(30)).unwrap_or(now);
         self.native_data.channels.insert(channel, reference);
-        self.native_data.tracks.insert(*id.as_bytes(), reference);
         self.native_data.deadlines.insert((deadline, reference));
         self.native_data.publications.insert(
             reference,
             DataPublication {
                 channel,
-                track,
-                source_id: id.as_str(),
+                lane,
+                state: DataPublicationState::Pending(track_id),
                 fanout: None,
                 enabled,
                 opened: false,
                 installation,
-                published: false,
                 retiring: false,
                 preparation: Some(work),
                 storage_sequence: work.scope().sequence,
@@ -509,11 +512,8 @@ impl Connection {
         ) {
             return;
         }
-        let Track::Data(data) = &publication.track else {
-            return;
-        };
-        if config != super::super::transport::native_data_config(channel, data.lane) {
-            if publication.published {
+        if config != super::super::transport::native_data_config(channel, publication.lane) {
+            if publication.admitted().is_some() {
                 self.native_data_closed(channel, events);
             } else {
                 self.fail_native_data(reference, ExecutionFailureKind::Conflict);
@@ -548,33 +548,65 @@ impl Connection {
         let Some(work) = self.current_native_preparation(work) else {
             return;
         };
-        let reference = work.reference;
-        let Some(publication) = self.native_data.publications.get(&reference) else {
+        let Some(reference) = NonZeroU64::new(work.reference) else {
             return;
         };
-        if !matches!(publication.track, Track::Data(_)) {
+        if !self.native_data.publications.contains_key(&reference.get()) {
             return;
         }
-        let execution = crate::participant::policy::PublicationExecution {
-            track: publication.track.clone(),
-            enabled,
-            active: false,
-        };
         let Some(now) = self.finish_native_preparation(work) else {
             return;
         };
-        if let Some(publication) = self.native_data.publications.get_mut(&reference) {
-            publication.enabled = enabled;
-            if !enabled {
-                self.transport
-                    .discard_channel_mutations(publication.channel);
-            }
-            if !publication.published {
-                publication.published = true;
-                events.publish_track(publication.track.clone());
-            }
+        let Some((publication, first_admission)) = self.admit_native_data(reference) else {
+            return;
+        };
+        publication.enabled = enabled;
+        let channel = publication.channel;
+        let Some(admitted) = publication.admitted() else {
+            return;
+        };
+        let track = Track::data_publication(admitted.meta.clone(), publication.lane);
+        if !enabled {
+            self.transport.discard_channel_mutations(channel);
         }
-        self.record_native_publication(work, execution, now);
+        if first_admission {
+            events.publish_track(track.clone());
+        }
+        self.record_native_publication(
+            work,
+            crate::participant::policy::PublicationExecution {
+                track,
+                enabled,
+                active: false,
+            },
+            now,
+        );
+    }
+
+    fn admit_native_data(&mut self, reference: NonZeroU64) -> Option<(&mut DataPublication, bool)> {
+        let publication = self.native_data.publications.get_mut(&reference.get())?;
+        let first_admission = if let DataPublicationState::Pending(track_id) = &publication.state {
+            let id = PublicationKey::Data(entity::PublicationId::mint());
+            let meta = track::TrackMeta {
+                room: self.room,
+                shard_id: self.shard_id,
+                id,
+                origin: self.participant_id,
+                connection_id: self.connection_id,
+                track_id: Some(*track_id),
+            };
+            self.native_data
+                .tracks
+                .insert(*id.as_bytes(), reference.get());
+            publication.state = DataPublicationState::Admitted(AdmittedDataPublication {
+                meta,
+                source_id: id.as_str(),
+            });
+            true
+        } else {
+            false
+        };
+        Some((publication, first_admission))
     }
 
     fn drop_unpublished_native_data(&mut self, work: Preparation) {
@@ -583,7 +615,7 @@ impl Connection {
             .native_data
             .publications
             .get(&reference)
-            .is_some_and(|publication| !publication.published)
+            .is_some_and(|publication| publication.admitted().is_none())
             && let Some(publication) = self.native_data.remove(reference)
         {
             self.transport
@@ -642,12 +674,12 @@ impl Connection {
         if let Some(work) = publication.preparation.take() {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Retired.into()));
         }
-        if publication.published {
+        if let Some(admitted) = publication.admitted() {
+            let meta = admitted.meta.clone();
             publication.enabled = false;
             publication.fanout = None;
             publication.deadline = None;
             publication.retiring = true;
-            let meta = publication.track.meta().clone();
             self.native_data.publications.insert(reference, publication);
             events.unpublish_owned_track(meta, reference);
         } else {
@@ -801,17 +833,17 @@ impl Connection {
         let Some(publication) = self.native_data.publications.get(reference) else {
             return;
         };
-        let Track::Data(data) = &publication.track else {
+        let Some(admitted) = publication.admitted() else {
             return;
         };
-        if !publication.enabled || !publication.published || data.lane != DataLane::Ordered {
+        if !publication.enabled || publication.lane != DataLane::Ordered {
             return;
         }
         let Ok(frame) = TopicFrame::decode_bounded(&bytes) else {
             return;
         };
         if !frame.is_subscriber_control()
-            || frame.data_track_id() != Some(publication.source_id.as_str())
+            || frame.publication_id() != Some(admitted.source_id.as_str())
         {
             return;
         }
@@ -851,15 +883,15 @@ impl Connection {
         let Some(publication) = self.native_data.publications.get(&reference) else {
             return;
         };
-        let Track::Data(data) = &publication.track else {
+        let Some(admitted) = publication.admitted() else {
             return;
         };
         let Ok(frame) = TopicFrame::decode_bounded(bytes) else {
             return;
         };
-        if frame.data_track_id() != Some(publication.source_id.as_str())
+        if frame.publication_id() != Some(admitted.source_id.as_str())
             || !frame.is_publisher_output()
-            || (data.lane != DataLane::Ordered
+            || (publication.lane != DataLane::Ordered
                 && !matches!(
                     frame.body,
                     Some(pulsebeam_proto::topic::topic_frame::Body::Message(_))
@@ -868,10 +900,9 @@ impl Connection {
             return;
         }
         if publication.enabled
-            && publication.published
             && let Some(fanout) = publication.fanout
         {
-            events.publish_track_packet(Some(fanout), TrackPacket::data(data.lane, bytes));
+            events.publish_track_packet(Some(fanout), TrackPacket::data(publication.lane, bytes));
         }
     }
 }

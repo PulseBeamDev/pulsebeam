@@ -2637,13 +2637,13 @@ mod tests {
         let cursor = actor
             .receive_data(
                 agent_core::TrackSpec::Data {
-                    label: "control".into(),
+                    track_id: "control".into(),
                     delivery: agent_core::TopicMode::Ordered,
                 },
                 agent_core::TrackSelector {
                     room: "room".into(),
                     participant_id: "remote".into(),
-                    label: "control".into(),
+                    track_id: "control".into(),
                 },
             )
             .unwrap();
@@ -2740,7 +2740,7 @@ mod tests {
         assert!(room.participant(String::new()).is_err());
 
         let spec = agent_core::TrackSpec::Data {
-            label: "control".into(),
+            track_id: "control".into(),
             delivery: agent_core::TopicMode::Ordered,
         };
         let (response, result) = oneshot::channel();
@@ -2793,7 +2793,7 @@ mod tests {
         let (_, snapshots) = agent.snapshot_events();
         let publication = agent
             .publication(agent_core::TrackSpec::Video {
-                label: "camera".into(),
+                track_id: "camera".into(),
             })
             .await
             .unwrap();
@@ -2803,7 +2803,7 @@ mod tests {
                 agent_core::TrackSelector {
                     room: "room".into(),
                     participant_id: "remote".into(),
-                    label: "camera".into(),
+                    track_id: "camera".into(),
                 },
                 agent_core::VideoObservation {
                     visible: true,
@@ -2827,7 +2827,7 @@ mod tests {
             .audio_subscription(agent_core::TrackSelector {
                 room: "room".into(),
                 participant_id: "remote".into(),
-                label: "microphone".into(),
+                track_id: "microphone".into(),
             })
             .await
             .unwrap();
@@ -2868,7 +2868,7 @@ mod tests {
             .audio_subscription(agent_core::TrackSelector {
                 room: "room".into(),
                 participant_id: "remote".into(),
-                label: "microphone".into(),
+                track_id: "microphone".into(),
             })
             .await
             .unwrap();
@@ -2899,7 +2899,7 @@ mod tests {
         assert!(matches!(
             agent
                 .publication(agent_core::TrackSpec::Audio {
-                    label: "late".into()
+                    track_id: "late".into()
                 })
                 .await,
             Err(Error::Closed)
@@ -2955,7 +2955,7 @@ mod tests {
             let events = agent.events();
             let publication = agent
                 .publication(agent_core::TrackSpec::Audio {
-                    label: "microphone".into(),
+                    track_id: "microphone".into(),
                 })
                 .await
                 .unwrap();
@@ -3173,7 +3173,7 @@ mod tests {
             .core
             .declare_publication(
                 agent_core::TrackSpec::Audio {
-                    label: "rollback".into(),
+                    track_id: "rollback".into(),
                 },
                 true,
             )
@@ -3191,7 +3191,7 @@ mod tests {
             .core
             .declare_publication(
                 agent_core::TrackSpec::Audio {
-                    label: "closed-queue".into(),
+                    track_id: "closed-queue".into(),
                 },
                 true,
             )
@@ -3219,7 +3219,7 @@ mod tests {
                 let source = actor.create_producer(None).unwrap();
                 let publication = actor
                     .claim_publication(agent_core::TrackSpec::Audio {
-                        label: "pipe-test".into(),
+                        track_id: "pipe-test".into(),
                     })
                     .unwrap();
                 let wrong_kind = actor
@@ -3474,7 +3474,7 @@ mod tests {
                 assert_eq!(actor.core.snapshot(), initial);
                 assert!(matches!(source.submit(pcm()).await, Err(Error::NotReady)));
                 let spec = agent_core::TrackSpec::Audio {
-                    label: "microphone".into(),
+                    track_id: "microphone".into(),
                 };
                 let publication = microphone.publish(Default::default()).unwrap();
                 let mut binding = Box::pin(publication.set_source(Some(&source)));
@@ -3630,7 +3630,7 @@ mod tests {
         .unwrap();
         let publication = actor
             .claim_publication(agent_core::TrackSpec::Audio {
-                label: "microphone".into(),
+                track_id: "microphone".into(),
             })
             .unwrap();
         let owner = *actor.publications.keys().next().unwrap();
@@ -3667,7 +3667,7 @@ mod tests {
         let agent_core::ResourceResult::Publication { owner, .. } = core
             .resource(agent_core::ResourceCommand::ClaimPublication {
                 spec: agent_core::TrackSpec::Audio {
-                    label: "microphone".into(),
+                    track_id: "microphone".into(),
                 },
             })
             .unwrap()
@@ -3775,7 +3775,7 @@ mod tests {
         .unwrap();
         let publication = actor
             .claim_publication(agent_core::TrackSpec::Audio {
-                label: "microphone".into(),
+                track_id: "microphone".into(),
             })
             .unwrap();
         let owner = *actor.publications.keys().next().unwrap();
@@ -3861,7 +3861,7 @@ mod tests {
         let producer_owner = *actor.producers.keys().next().unwrap();
         let _publication = actor
             .claim_publication(agent_core::TrackSpec::Video {
-                label: "encoder".into(),
+                track_id: "encoder".into(),
             })
             .unwrap();
         let owner = *actor.publications.keys().next_back().unwrap();
@@ -4004,7 +4004,7 @@ mod tests {
             track: NativeReceiverInfo {
                 generation: 1,
                 receiver: 7,
-                track_id: "native-track".into(),
+                publication_id: "native-track".into(),
                 mid: "4".into(),
                 media_index: 4,
             },

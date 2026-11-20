@@ -78,13 +78,13 @@ const Microphone = agent.audio("microphone");
 const Chat = agent.data("chat", "ordered");
 ```
 
-Labels are application-defined identities. Lookup returns a stable logical
+Track IDs are application-defined names. Lookup returns a stable logical
 handle but does not reserve capacity, publish, subscribe, or play media. Local
-media refs expose `kind`, `label`, and `publish()`. Local data refs also expose
+media refs expose `kind`, `trackId`, and `publish()`. Local data refs also expose
 `delivery`; their publications send bytes. Remote refs expose `subscribe()`.
 
 Equivalent SDK-issued handles within an Agent identify the same logical target.
-Agent scope, local versus participant selection, participant ID, kind, label,
+Agent scope, local versus participant selection, participant ID, kind, track ID,
 and data delivery distinguish targets. Re-rendering with an equivalent handle
 preserves its owner. A different target releases the old owner and acquires a
 new one after commit. Fabricated handles are unsupported.
@@ -95,9 +95,8 @@ methods, and local media setters. There are no deprecated aliases. The
 caller-owned Web SDK also uses typed lookups, synchronous factories, and explicit
 resource lifetimes.
 
-Core validates portable label rules when an owner acquires the resource. Media
-and data labels are nonempty UTF-8 strings of at most 256 bytes. Limits count
-encoded bytes, not JavaScript characters.
+Track IDs are case-sensitive. Use 1 to 36 ASCII letters, digits, underscores,
+or hyphens (`[A-Za-z0-9_-]{1,36}`).
 
 Data delivery is `"latest" | "lossy" | "ordered"`:
 
@@ -206,7 +205,8 @@ are copied and compared by value. Omit the cursor for the first page.
 | `WatchStatus.Live` | `state.page` is one complete immutable page. An empty participant array is valid. |
 | `WatchStatus.Failed` | Inspect `state.error`; correct the cause and create a new watch. |
 | `WatchStatus.Closed` | Final healthy close state; its page is cleared. A prior failure remains a failure on close. |
-| `page.participants` | Ordered participant metadata: `id`, application `externalId`, and `publications`. Presence-only participants have no publications. |
+| `page.participants` | Ordered participant metadata: application `id` and `publications`. Presence-only participants have no publications. |
+| `publication.trackId`, `publication.id` | Application track name and exact admitted publication ID, respectively. Use `trackId` for logical lookup. |
 | `publication.kind.tag` | `Video`, `Audio`, or `Data`; data also carries `kind.inner.delivery`. |
 | `page.hasMore`, `page.nextCursor` | Explicit continuation. Replace the watch to request the next page; do not append every page automatically. |
 | `page.cursorExpiresAtUnixSeconds` | Continuation expiry. Invalid, expired or wrong-scope cursors fail explicitly; offer a first-page restart. |
@@ -228,14 +228,14 @@ See [bounded roster navigation](/react/guides#remote-discovery-and-video-receive
 ## Look up pinned participants and tracks
 
 ```ts
-agent.room(room).participant(externalId): RemoteParticipant
-participant.video(label): RemoteVideoTrack
-participant.audio(label): RemoteAudioTrack
-participant.data(label, delivery): RemoteDataTrack
+agent.room(room).participant(id): RemoteParticipant
+participant.video(trackId): RemoteVideoTrack
+participant.audio(trackId): RemoteAudioTrack
+participant.data(trackId, delivery): RemoteDataTrack
 ```
 
 Lookup is inert. Use an application-known address or a publication from the
-current Watch page, passing the participant's `externalId` and publication label.
+current Watch page, passing the participant's `id` and the publication's `trackId`.
 These logical handles survive temporary absence and replacement but stay pinned
 to their literal room. They do not enumerate participants or publications:
 `agent.participants`, `participant.tracks` and global snapshot catalog/mapping/media

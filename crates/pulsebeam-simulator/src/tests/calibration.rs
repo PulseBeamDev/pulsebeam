@@ -140,11 +140,9 @@ async fn ready(peer: &Peer) -> anyhow::Result<api::Snapshot> {
                 && snapshot.participant_id.as_deref() == Some(peer.name.as_str())
                 && snapshot.topics.publishers.len() == usize::from(peer.publishes)
                 && snapshot.topics.subscribers.len() == usize::from(!peer.publishes)
-                && snapshot
-                    .topics
-                    .publishers
-                    .iter()
-                    .all(|p| p.publisher == publisher() && p.connected && p.data_track_id.is_some())
+                && snapshot.topics.publishers.iter().all(|p| {
+                    p.publisher == publisher() && p.connected && p.publication_id.is_some()
+                })
                 && snapshot.topics.subscribers.iter().all(|s| {
                     s.subscriber.name == TOPIC
                         && s.subscriber.mode == api::TopicMode::Lossy

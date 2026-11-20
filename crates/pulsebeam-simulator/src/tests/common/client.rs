@@ -2189,7 +2189,7 @@ mod tests {
             track: pulsebeam_agent_native::NativeReceiverInfo {
                 generation: 1,
                 receiver,
-                track_id: "unit-native-track".into(),
+                publication_id: "unit-native-track".into(),
                 mid: "v0".into(),
                 media_index: 0,
             },
@@ -2289,7 +2289,7 @@ mod tests {
         for (index, publisher) in ["ann", "ben", "cal"].into_iter().enumerate() {
             let payload = references.lock().unwrap()[publisher].frames[0].to_vec();
             let mut frame = owned_video(u64::try_from(index).unwrap(), 90_000, true, payload);
-            frame.track.track_id = "foreign-catalog-name".into();
+            frame.track.publication_id = "foreign-catalog-name".into();
             let mut decoder = H264ReferenceDecoder::new(publisher, "unit input");
             record_video_frame(
                 &log,
@@ -2385,7 +2385,7 @@ mod tests {
         let references = Arc::new(Mutex::new(references));
         let log = Arc::new(Mutex::new(VideoReceiveLog::default()));
         let mut frame = owned_video(1, 90_000, true, payload);
-        frame.track.track_id = "protected".into();
+        frame.track.publication_id = "protected".into();
         record_video_frame(
             &log,
             &references,
@@ -3806,10 +3806,10 @@ impl ClientContext {
         self.remote_tracks = snapshot
             .video_mapping
             .values()
-            .filter_map(|track_id| {
-                self.catalog
-                    .get(track_id)
-                    .map(|(publication, _)| (publication.participant_id.clone(), track_id.clone()))
+            .filter_map(|publication_id| {
+                self.catalog.get(publication_id).map(|(publication, _)| {
+                    (publication.participant_id.clone(), publication_id.clone())
+                })
             })
             .collect();
         self.sync_video_desired(&snapshot).await?;
@@ -3863,7 +3863,7 @@ impl ClientContext {
                         id: entry.id.clone(),
                         participant_id: participant.id.clone(),
                         kind,
-                        label: entry.label,
+                        track_id: entry.track_id,
                     };
                     self.catalog
                         .insert(entry.id, (publication, participant.id.clone()));
@@ -4118,14 +4118,14 @@ impl ClientContext {
                         && request
                             .label
                             .as_ref()
-                            .is_none_or(|label| *label == publication.label)
+                            .is_none_or(|label| *label == publication.track_id)
                 })
                 .and_then(|(publication, external_id)| {
                     Some((
                         TrackSelector {
                             room: snapshot.room_id.clone()?,
                             participant_id: external_id.clone(),
-                            label: publication.label.clone(),
+                            track_id: publication.track_id.clone(),
                         },
                         publication.clone(),
                     ))
@@ -4143,7 +4143,7 @@ impl ClientContext {
                                     && request
                                         .label
                                         .as_ref()
-                                        .is_none_or(|label| *label == selector.label)
+                                        .is_none_or(|label| *label == selector.track_id)
                             })
                     else {
                         all_resolved = false;
@@ -4180,7 +4180,7 @@ impl ClientContext {
             if visible {
                 resolved.push(VideoSubscription {
                     slot: u32::try_from(resolved.len())?,
-                    track_id: publication.id.clone(),
+                    publication_id: publication.id.clone(),
                     selector: None,
                     height: request.height,
                     min_height: request.min_height,
@@ -4222,7 +4222,7 @@ impl ClientContext {
                     .agent
                     .room(selector.room.clone())?
                     .participant(selector.participant_id.clone())?
-                    .video(selector.label.clone())?
+                    .video(selector.track_id.clone())?
                     .subscribe(observation.clone())?;
                 self.video_subscriptions.insert(
                     selector,
@@ -4262,7 +4262,7 @@ impl ClientContext {
                     TrackSelector {
                         room: snapshot.room_id.clone()?,
                         participant_id: external_id.clone(),
-                        label: publication.label.clone(),
+                        track_id: publication.track_id.clone(),
                     },
                     audio.playout_delays.get(&publication.id).copied(),
                 ))
@@ -4355,7 +4355,7 @@ impl ClientContext {
             .any(|status| {
                 status.registration == registration
                     && status.channel.is_some()
-                    && status.data_track_id.is_some()
+                    && status.publication_id.is_some()
             }))
     }
 
@@ -4396,7 +4396,7 @@ impl ClientContext {
             .any(|status| {
                 status.registration == publisher
                     && status.channel.is_some()
-                    && status.data_track_id.is_some()
+                    && status.publication_id.is_some()
             });
         if !ready {
             return Ok(false);

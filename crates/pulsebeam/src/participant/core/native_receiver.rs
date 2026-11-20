@@ -31,7 +31,7 @@ pub(super) struct NativeReceivers {
 
 pub(super) struct Receiver {
     transport: ReceiveTransport,
-    source: TrackId,
+    source: PublicationKey,
     source_room: crate::entity::ProjectRoomKey,
     source_id: String,
     handle: Option<TrackHandle>,
@@ -88,7 +88,7 @@ struct Source {
 }
 
 impl NativeReceivers {
-    pub(super) fn contains_source(&self, source: TrackId) -> bool {
+    pub(super) fn contains_source(&self, source: PublicationKey) -> bool {
         self.sources.contains_key(source.as_bytes())
     }
 
@@ -138,7 +138,13 @@ impl NativeReceivers {
         self.mids.contains_key(&mid)
     }
 
-    pub(super) fn can_write_rtp(&self, mid: Mid, track: TrackId, ssrc: Ssrc, pt: Pt) -> bool {
+    pub(super) fn can_write_rtp(
+        &self,
+        mid: Mid,
+        track: PublicationKey,
+        ssrc: Ssrc,
+        pt: Pt,
+    ) -> bool {
         let Some(receiver) = self
             .mids
             .get(&mid)
@@ -305,7 +311,7 @@ impl Connection {
             || prior.room != current.room
             || prior.origin != current.origin
             || prior.connection_id != current.connection_id
-            || prior.label != current.label
+            || prior.track_id != current.track_id
         {
             self.disconnect(DisconnectReason::SignalingInput);
             return;
@@ -321,7 +327,7 @@ impl Connection {
 
     pub(in crate::participant::core) fn native_source_removed(
         &mut self,
-        track: TrackId,
+        track: PublicationKey,
         reason: crate::participant::effect::TrackRemoval,
     ) {
         let id = *track.as_bytes();
@@ -336,7 +342,7 @@ impl Connection {
 
     pub(in crate::participant::core) fn native_source_binding(
         &mut self,
-        track: TrackId,
+        track: PublicationKey,
         handle: TrackHandle,
         bound: bool,
     ) {
@@ -483,7 +489,7 @@ impl Connection {
                         || previous.room != metadata.room
                         || previous.origin != metadata.origin
                         || previous.connection_id != metadata.connection_id
-                        || previous.label != metadata.label
+                        || previous.track_id != metadata.track_id
                 })
         {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Retired.into()));
@@ -1016,7 +1022,7 @@ impl Connection {
             return;
         };
         if frame.is_subscriber_control()
-            && frame.data_track_id() == Some(receiver.source_id.as_str())
+            && frame.publication_id() == Some(receiver.source_id.as_str())
             && let Some(handle) = receiver.handle
         {
             events.request_reverse(handle, ReversePacket::reliable_control(bytes.to_vec()));
@@ -1063,7 +1069,7 @@ impl Connection {
             };
             if received_lane == lane
                 && self.native_receivers.receiver_ready(receiver)
-                && frame.data_track_id() == Some(receiver.source_id.as_str())
+                && frame.publication_id() == Some(receiver.source_id.as_str())
             {
                 failed |= !self.transport.enqueue_mutation(TransportMutation::Data {
                     channel,

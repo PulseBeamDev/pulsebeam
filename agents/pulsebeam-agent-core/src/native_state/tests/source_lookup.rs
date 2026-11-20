@@ -6,7 +6,7 @@ fn lookup() -> (Resource, wire::ResourceSpec) {
             room: "room".into(),
             participant_id: "bob".into(),
             kind: wire::TrackKind::Data,
-            label: "updates".into(),
+            track_id: "updates".into(),
         },
         wire::ResourceSpec {
             settings: Some(wire::ResourceSettings {
@@ -19,7 +19,7 @@ fn lookup() -> (Resource, wire::ResourceSpec) {
                         room: "room".into(),
                         participant_id: "bob".into(),
                         kind: wire::TrackKind::Data as i32,
-                        label: "updates".into(),
+                        track_id: "updates".into(),
                     }),
                 },
             )),
@@ -44,10 +44,10 @@ fn confirmation(
                     room_id: "room".into(),
                 }),
                 track: source.map(|id| wire::Track {
-                    track_id: id.into(),
+                    publication_id: id.into(),
                     participant_id: "bob".into(),
                     room_id: "room".into(),
-                    label: "updates".into(),
+                    track_id: "updates".into(),
                     kind: Some(wire::track::Kind::Data(wire::DataTrack {
                         delivery: wire::DataDelivery::Ordered as i32,
                     })),
@@ -72,7 +72,7 @@ fn lookup_key_rejects_address_changes_before_staging() {
             0 => source.room = "other-room".into(),
             1 => source.participant_id = "other-participant".into(),
             2 => source.kind = wire::TrackKind::Audio as i32,
-            _ => source.label = "other-label".into(),
+            _ => source.track_id = "other-label".into(),
         }
         assert!(matches!(
             client.stage(resource, Some(spec)),
@@ -129,7 +129,7 @@ fn lookup_replacement_updates_private_indexes_without_discovery_or_execution() {
             client
                 .lookup(&resource)
                 .and_then(|lookup| lookup.track.as_ref())
-                .map(|track| track.track_id.as_str()),
+                .map(|track| track.publication_id.as_str()),
             source
         );
         assert!(
@@ -163,13 +163,13 @@ fn lookup_replacement_updates_private_indexes_without_discovery_or_execution() {
         room: "other-room".into(),
         participant_id: "bob".into(),
         kind: wire::TrackKind::Data,
-        label: "updates".into(),
+        track_id: "updates".into(),
     };
     let other_participant = Resource::SourceLookup {
         room: "room".into(),
         participant_id: "other-participant".into(),
         kind: wire::TrackKind::Data,
-        label: "updates".into(),
+        track_id: "updates".into(),
     };
     assert!(client.lookup(&other_room).is_none());
     assert!(client.lookup(&other_participant).is_none());

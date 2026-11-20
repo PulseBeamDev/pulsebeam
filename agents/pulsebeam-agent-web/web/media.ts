@@ -53,7 +53,7 @@ const configurePipe = Symbol("sender configuration");
 
 class LocalVideoHandle implements LocalVideoTrack {
   readonly kind = "video";
-  constructor(readonly label: string) {}
+  constructor(readonly trackId: string) {}
   publish(
     configuration: PublicationConfig = { enabled: true },
   ): VideoPublication {
@@ -62,7 +62,7 @@ class LocalVideoHandle implements LocalVideoTrack {
 }
 class LocalAudioHandle implements LocalAudioTrack {
   readonly kind = "audio";
-  constructor(readonly label: string) {}
+  constructor(readonly trackId: string) {}
   publish(
     configuration: PublicationConfig = { enabled: true },
   ): AudioPublication {
@@ -195,7 +195,7 @@ class Publication<S extends Source> {
     this.#resource = resources.acquire(
       {
         op: "claimPublication",
-        spec: { kind: handle.kind, label: handle.label },
+        spec: { kind: handle.kind, trackId: handle.trackId },
       },
       {
         bind: (binding) => {
@@ -305,14 +305,16 @@ export class LocalMediaRegistry {
   ): LocalVideoTrack | LocalAudioTrack {
     if (this.#closed) throw new ResourceError("closed", "agent is closed");
     const normalized =
-      spec.kind === "video" ? track.video(spec.label) : track.audio(spec.label);
+      spec.kind === "video"
+        ? track.video(spec.trackId)
+        : track.audio(spec.trackId);
     const key = trackKey(normalized);
     let handle = this.#handles.get(key);
     if (!handle) {
       handle =
         normalized.kind === "video"
-          ? new LocalVideoHandle(normalized.label)
-          : new LocalAudioHandle(normalized.label);
+          ? new LocalVideoHandle(normalized.trackId)
+          : new LocalAudioHandle(normalized.trackId);
       this.#handles.set(key, handle);
       owners.set(handle, this);
     }

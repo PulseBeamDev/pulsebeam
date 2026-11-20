@@ -686,7 +686,7 @@ mod tests {
         let crate::ResourceResult::Publication { owner, .. } = core
             .resource(crate::ResourceCommand::ClaimPublication {
                 spec: crate::TrackSpec::Video {
-                    label: "camera".into(),
+                    track_id: "camera".into(),
                 },
             })
             .unwrap()
@@ -828,7 +828,7 @@ mod tests {
             selector: TrackSelector {
                 room: "source-room".into(),
                 participant_id: "publisher-endpoint".into(),
-                label: "events".into(),
+                track_id: "events".into(),
             },
             delivery: TopicMode::Ordered,
             local_enabled: true,

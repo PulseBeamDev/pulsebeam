@@ -4,7 +4,7 @@ use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::test_utils::H264StreamBuilder;
 
 fn receiver_spec(
-    track: TrackId,
+    track: PublicationKey,
     room: &str,
     mid: &str,
     ssrc: u32,
@@ -24,7 +24,7 @@ fn receiver_spec(
         .unwrap();
     wire::ResourceSpec {
         declaration: Some(resource_spec::Declaration::Subscription(wire::SubscriptionSpec {
-            track_id: track.as_str(),
+            publication_id: track.as_str(),
             kind: wire::TrackKind::Video as i32,
             source_room: room.into(),
             binding: Some(wire::TrackBinding { transport: Some(wire::track_binding::Transport::Rtp(wire::RtpParameters {
@@ -85,16 +85,22 @@ fn feed(
     tx.poll_stats(last_arrival);
 }
 
-fn outputs(participant: &mut NativeParticipant, id: TrackId) -> std::collections::BTreeSet<Mid> {
+fn outputs(
+    participant: &mut NativeParticipant,
+    id: PublicationKey,
+) -> std::collections::BTreeSet<Mid> {
     let mut mids = std::collections::BTreeSet::new();
     while let Some(write) = participant.stream_writer.pop() {
         let StreamWrite::Video {
-            track_id, mid, pt, ..
+            publication_id,
+            mid,
+            pt,
+            ..
         } = write
         else {
             panic!("video output")
         };
-        assert_eq!(track_id, id);
+        assert_eq!(publication_id, id);
         assert_eq!(pt, 96u8.into());
         mids.insert(mid);
     }
@@ -104,16 +110,16 @@ fn outputs(participant: &mut NativeParticipant, id: TrackId) -> std::collections
 pub(super) fn check(
     participant: &mut NativeParticipant,
     sink: &mut MockParticipantSink,
-    handles: &mut slotmap::SlotMap<TrackHandle, TrackId>,
+    handles: &mut slotmap::SlotMap<TrackHandle, PublicationKey>,
     audio: &Track,
 ) {
     let mut meta = audio.meta().clone();
-    meta.id = meta.connection_id.derive_publication_track_id(
+    meta.id = meta.connection_id.fixture_publication_at(
         TrackKind::Video,
         "camera",
-        NonZeroU64::new(2).unwrap(),
+        std::num::NonZeroU64::new(2).unwrap(),
     );
-    meta.label = Some("camera".into());
+    meta.track_id = Some(entity::TrackId::new("camera").unwrap());
     let id = meta.id;
     participant
         .downstream

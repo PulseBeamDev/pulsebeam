@@ -1,5 +1,5 @@
 use crate::control::controller::{ControllerCommand, ControllerSender};
-use crate::entity::{ProjectRoomKey, TrackId};
+use crate::entity::{ProjectRoomKey, PublicationKey};
 use crate::id::ShardId;
 use crate::route::NodeRouteAddress;
 use pulsebeam_link::{BindError, BindingId, LinkError, NetworkId, NodeRouteKey, PeerConfig};
@@ -53,7 +53,7 @@ impl Control {
     pub async fn destinations(
         &self,
         room: ProjectRoomKey,
-        track: TrackId,
+        track: PublicationKey,
     ) -> Result<Vec<super::ReceiveDestination>, BindError> {
         let (reply, result) = oneshot::channel();
         self.submit_binding(ControllerCommand::LinkDestinations(super::Destinations {
@@ -82,7 +82,7 @@ impl Control {
     pub async fn bind_send(
         &self,
         room: ProjectRoomKey,
-        track: TrackId,
+        track: PublicationKey,
         peer: NetworkId,
         address: NodeRouteKey,
     ) -> Result<BindingId, BindError> {
@@ -100,7 +100,7 @@ impl Control {
     pub async fn bind_reverse(
         &self,
         room: ProjectRoomKey,
-        track: TrackId,
+        track: PublicationKey,
         shard: ShardId,
         peer: NetworkId,
         address: NodeRouteKey,

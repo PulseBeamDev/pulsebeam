@@ -281,7 +281,7 @@ if (process.argv[2] === "initialization-failure") {
   const publicationRuntime = new BrowserRuntime(config);
   const claim = await publicationRuntime.resource({
     op: "claimPublication",
-    spec: { kind: "video", label: "camera" },
+    spec: { kind: "video", trackId: "camera" },
   });
   const publication = publicationRuntime.publication(claim.owner);
   const publicationUpdates = publication.updates();

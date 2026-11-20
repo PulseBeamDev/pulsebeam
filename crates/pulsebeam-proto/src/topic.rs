@@ -19,7 +19,7 @@ impl TopicFrame {
             return Err(FrameError::TooLarge);
         }
         let frame = Self::decode(input).map_err(|_| FrameError::Malformed)?;
-        let id = frame.data_track_id().ok_or(FrameError::Malformed)?;
+        let id = frame.publication_id().ok_or(FrameError::Malformed)?;
         if id.is_empty() || id.len() > 128 {
             return Err(FrameError::InvalidIdentity);
         }
@@ -34,13 +34,13 @@ impl TopicFrame {
         Ok(frame)
     }
 
-    pub fn data_track_id(&self) -> Option<&str> {
+    pub fn publication_id(&self) -> Option<&str> {
         Some(match self.body.as_ref()? {
-            topic_frame::Body::Message(value) => &value.data_track_id,
-            topic_frame::Body::Nack(value) => &value.data_track_id,
-            topic_frame::Body::Probe(value) => &value.data_track_id,
-            topic_frame::Body::Frontier(value) => &value.data_track_id,
-            topic_frame::Body::Floor(value) => &value.data_track_id,
+            topic_frame::Body::Message(value) => &value.publication_id,
+            topic_frame::Body::Nack(value) => &value.publication_id,
+            topic_frame::Body::Probe(value) => &value.publication_id,
+            topic_frame::Body::Frontier(value) => &value.publication_id,
+            topic_frame::Body::Floor(value) => &value.publication_id,
         })
     }
 
@@ -73,7 +73,7 @@ mod tests {
     fn common_envelope_preserves_full_payload_and_lossless_sequence() {
         let frame = TopicFrame {
             body: Some(topic_frame::Body::Message(TopicMessage {
-                data_track_id: "opaque-server-data-track".to_string(),
+                publication_id: "opaque-server-data-track".to_string(),
                 sequence: u64::MAX.saturating_sub(1),
                 payload: vec![42; MAX_PAYLOAD_BYTES],
             })),
@@ -81,7 +81,7 @@ mod tests {
         let wire = frame.encode_to_vec();
         assert!(wire.len() > MAX_PAYLOAD_BYTES);
         assert_eq!(TopicFrame::decode_bounded(&wire), Ok(frame.clone()));
-        assert_eq!(frame.data_track_id(), Some("opaque-server-data-track"));
+        assert_eq!(frame.publication_id(), Some("opaque-server-data-track"));
         assert!(frame.is_publisher_output());
         assert!(!frame.is_subscriber_control());
     }
@@ -90,7 +90,7 @@ mod tests {
     fn controls_are_distinct_from_messages_and_input_is_bounded() {
         let probe = TopicFrame {
             body: Some(topic_frame::Body::Probe(TopicProbe {
-                data_track_id: "opaque".to_string(),
+                publication_id: "opaque".to_string(),
                 from_sequence: u64::MAX,
                 live: false,
             })),
@@ -112,7 +112,7 @@ mod tests {
         ] {
             let frame = TopicFrame {
                 body: Some(topic_frame::Body::Message(TopicMessage {
-                    data_track_id: id.to_string(),
+                    publication_id: id.to_string(),
                     sequence,
                     payload: vec![],
                 })),

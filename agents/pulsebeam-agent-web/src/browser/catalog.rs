@@ -260,7 +260,7 @@ fn page_value(page: &ffi::CatalogPage) -> JsValue {
         for publication in participant.publications {
             let value = Object::new();
             set(&value, "id", publication.id);
-            set(&value, "label", publication.label);
+            set(&value, "trackId", publication.track_id);
             let kind = Object::new();
             match publication.kind {
                 ffi::CatalogPublicationKind::Audio => set(&kind, "tag", "Audio"),

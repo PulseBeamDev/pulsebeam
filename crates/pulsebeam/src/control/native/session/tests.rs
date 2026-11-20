@@ -32,7 +32,7 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
             .authorization(99, 1, ResourcePermissions::RoomBound)
             .unwrap();
         let connection = ConnectionId::new();
-        let source = connection.derive_publication_track_id(
+        let source = connection.fixture_publication_at(
             TrackKind::Data,
             "not-yet-observed",
             NonZeroU64::new(1).unwrap(),
@@ -44,7 +44,7 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
             }),
             declaration: Some(wire::resource_spec::Declaration::Subscription(
                 wire::SubscriptionSpec {
-                    track_id: source.as_str(),
+                    publication_id: source.as_str(),
                     kind: wire::TrackKind::Data as i32,
                     source_room: "room".into(),
                     binding: Some(wire::TrackBinding {
@@ -181,14 +181,14 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                         id: source,
                         origin: owner,
                         connection_id: connection,
-                        label: Some("not-yet-observed".into()),
+                        track_id: Some(crate::entity::TrackId::new("not-yet-observed").unwrap()),
                     },
                     DataLane::Ordered,
                 );
                 let publisher = owner;
                 if matches!(outcome, Outcome::SourceArrivesWithoutDiscovery) {
                     let mut incomplete = track.clone();
-                    incomplete.meta_mut().label = None;
+                    incomplete.meta_mut().track_id = None;
                     let unresolved = super::super::ResolvedSource {
                         track: &incomplete,
                         publisher: &publisher,
@@ -225,7 +225,7 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                     let mut replacement = track.clone();
                     let replacement_connection = ConnectionId::new();
                     replacement.meta_mut().connection_id = replacement_connection;
-                    replacement.meta_mut().id = replacement_connection.derive_publication_track_id(
+                    replacement.meta_mut().id = replacement_connection.fixture_publication_at(
                         TrackKind::Data,
                         "not-yet-observed",
                         NonZeroU64::new(1).unwrap(),
@@ -269,7 +269,7 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                         model
                             .rows
                             .keys()
-                            .all(|key| !matches!(key, Key::Participant(_) | Key::Track(_)))
+                            .all(|key| !matches!(key, Key::Participant(_) | Key::Publication(_)))
                     );
                     let retained = model.rows[&Key::Owned(1)]
                         .owned
@@ -313,7 +313,7 @@ fn publication(label: &str, enabled: bool) -> wire::ResourceSpec {
         }),
         declaration: Some(wire::resource_spec::Declaration::Publication(
             wire::PublicationSpec {
-                label: label.to_owned(),
+                track_id: label.to_owned(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
                     delivery: wire::DataDelivery::Ordered as i32,
                     binding: Some(wire::TrackBinding {
@@ -327,7 +327,7 @@ fn publication(label: &str, enabled: bool) -> wire::ResourceSpec {
     }
 }
 
-fn subscription(track_id: &str) -> wire::ResourceSpec {
+fn subscription(publication_id: &str) -> wire::ResourceSpec {
     wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
             enabled: Some(true),
@@ -335,7 +335,7 @@ fn subscription(track_id: &str) -> wire::ResourceSpec {
         }),
         declaration: Some(wire::resource_spec::Declaration::Subscription(
             wire::SubscriptionSpec {
-                track_id: track_id.to_owned(),
+                publication_id: publication_id.to_owned(),
                 kind: wire::TrackKind::Data as i32,
                 source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
@@ -393,10 +393,10 @@ fn input(
 
 fn source(reference: u64, label: &str) -> wire::Track {
     wire::Track {
-        track_id: format!("source-{reference}"),
+        publication_id: format!("source-{reference}"),
         participant_id: "owner".into(),
         room_id: "room".into(),
-        label: label.into(),
+        track_id: label.into(),
         kind: Some(wire::track::Kind::Data(wire::DataTrack {
             delivery: wire::DataDelivery::Ordered as i32,
         })),
@@ -415,7 +415,7 @@ fn live(session: &NativeSession, work: &Preparation) -> wire::LiveResource {
 
             room_id: "room".into(),
         }),
-        track: Some(source(work.reference, &publication.label)),
+        track: Some(source(work.reference, &publication.track_id)),
         execution: if spec.settings.as_ref().unwrap().enabled == Some(true) {
             wire::ExecutionStatus::Installed
         } else {
@@ -547,7 +547,11 @@ fn evaluated_proposal_allows_the_next_target_without_waiting_for_output() {
             .enabled,
         Some(false)
     );
-    assert!(!session.rows.contains_key(&Key::Track("source-1".into())));
+    assert!(
+        !session
+            .rows
+            .contains_key(&Key::Publication("source-1".into()))
+    );
 }
 
 #[test]
@@ -871,7 +875,7 @@ fn rejected_update_preserves_acceptance_and_publication_reservation() {
                     room: "room".into(),
                     participant_id: "Owner".into(),
                     kind: wire::TrackKind::Data as i32,
-                    label: "topic".into(),
+                    track_id: "topic".into(),
                 }),
             },
         )),
@@ -1321,7 +1325,9 @@ fn selected_output_is_frozen_and_commit_does_not_clear_newer_state() {
 #[test]
 fn discovery_requires_real_immutable_descriptors_and_does_not_delay_initial_grant() {
     let mut session = session();
-    session.unavailable(Key::Track("source-1".into())).unwrap();
+    session
+        .unavailable(Key::Publication("source-1".into()))
+        .unwrap();
     let first = output(&mut session).unwrap();
     assert_eq!(first.records.len(), 1);
     assert!(!first.initial_complete);
@@ -1332,7 +1338,7 @@ fn discovery_requires_real_immutable_descriptors_and_does_not_delay_initial_gran
     ));
     session
         .observe_track(
-            source(1, "literal topic"),
+            source(1, "Literal_topic"),
             &crate::entity::ParticipantId::new("Owner").unwrap(),
         )
         .unwrap();
@@ -1461,7 +1467,7 @@ fn preparation_completion_cannot_replace_the_model_owned_target() {
             else {
                 panic!("publication")
             };
-            declaration.label = "different".into();
+            declaration.track_id = "different".into();
         } else {
             spec.settings.as_mut().unwrap().enabled = Some(false);
         }
@@ -1497,8 +1503,8 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
     .into_iter()
     .enumerate()
     {
-        let label = format!("literal label ✓ {lane:?}");
-        let id = connection.derive_track_id(TrackKind::Data, &label);
+        let label = format!("Literal_{lane:?}");
+        let id = connection.fixture_publication(TrackKind::Data, &label);
         let source = Track::data(
             TrackMeta {
                 room: crate::entity::ProjectRoomKey::fixture(room),
@@ -1506,7 +1512,7 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
                 id,
                 origin,
                 connection_id: connection,
-                label: Some(label.clone()),
+                track_id: Some(crate::entity::TrackId::new(&label).unwrap()),
             },
             Topic::for_test("application-topic"),
             lane,
@@ -1520,16 +1526,16 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
             .unwrap();
         let Some(wire::confirmed_state::Value::Track(observed)) = &session
             .rows
-            .get(&Key::Track(id.as_str()))
+            .get(&Key::Publication(id.as_str()))
             .unwrap()
             .value
             .value
         else {
             panic!("discovered track")
         };
-        assert_eq!(observed.track_id, id.as_str());
+        assert_eq!(observed.publication_id, id.as_str());
         assert_eq!(observed.participant_id, origin.as_str());
-        assert_eq!(observed.label, label);
+        assert_eq!(observed.track_id, label);
         assert_eq!(
             observed.kind,
             Some(wire::track::Kind::Data(wire::DataTrack {
@@ -1685,8 +1691,8 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
     };
     let mut track = source(1, "literal");
     let source_id = crate::entity::ConnectionId::new()
-        .derive_track_id(crate::entity::TrackKind::Data, "literal");
-    track.track_id = source_id.as_str();
+        .fixture_publication(crate::entity::TrackKind::Data, "literal");
+    track.publication_id = source_id.as_str();
     let execution = crate::participant::policy::ReceiverExecution {
         source: source_id,
         enabled: true,
@@ -1713,7 +1719,7 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
         }),
         declaration: Some(wire::resource_spec::Declaration::Subscription(
             wire::SubscriptionSpec {
-                track_id: track.track_id.clone(),
+                publication_id: track.publication_id.clone(),
                 kind: wire::TrackKind::Data as i32,
                 source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
@@ -1754,12 +1760,12 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
         .unwrap()
         .bytes();
     assert_eq!(session.retained_bytes, before + 8192 + source_bytes);
-    session.remove_track(track.track_id.clone()).unwrap();
+    session.remove_track(track.publication_id.clone()).unwrap();
     session
         .remove_participant(owner.room_id.clone(), owner.participant_id.clone())
         .unwrap();
     assert!(matches!(
-        session.rows[&Key::Track(track.track_id.clone())]
+        session.rows[&Key::Publication(track.publication_id.clone())]
             .value
             .value,
         Some(wire::confirmed_state::Value::Absent(_))
@@ -1910,7 +1916,7 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
     };
     let wrong_source = crate::participant::policy::ReceiverExecution {
         source: crate::entity::ConnectionId::new()
-            .derive_track_id(crate::entity::TrackKind::Data, "wrong-source"),
+            .fixture_publication(crate::entity::TrackKind::Data, "wrong-source"),
         ..disabled_execution
     };
     assert!(
@@ -2083,7 +2089,7 @@ fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
                         room: room.into(),
                         participant_id: "denied-publisher".into(),
                         kind: wire::TrackKind::Data as i32,
-                        label: "label".into(),
+                        track_id: "label".into(),
                     }),
                 },
             )),
@@ -2147,7 +2153,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         room: "room".into(),
         participant_id: publisher.as_str().into(),
         kind: wire::TrackKind::Data as i32,
-        label: label.into(),
+        track_id: label.into(),
     };
     let lookup = |enabled| wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
@@ -2161,7 +2167,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         )),
     };
     let data_track = |connection: ConnectionId| {
-        let id = connection.derive_track_id(TrackKind::Data, label);
+        let id = connection.fixture_publication(TrackKind::Data, label);
         Track::data_publication(
             TrackMeta {
                 room: crate::entity::ProjectRoomKey::fixture(room),
@@ -2169,7 +2175,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
                 id,
                 origin: publisher_id,
                 connection_id: connection,
-                label: Some(label.into()),
+                track_id: Some(crate::entity::TrackId::new(&label).unwrap()),
             },
             DataLane::Ordered,
         )
@@ -2209,7 +2215,12 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
                 publisher: &publisher,
             })
     );
-    assert!(!model.rows.keys().any(|key| matches!(key, Key::Track(_))));
+    assert!(
+        !model
+            .rows
+            .keys()
+            .any(|key| matches!(key, Key::Publication(_)))
+    );
     model
         .refresh_source_lookups(32, 100, |_| {
             Some(super::super::ResolvedSource {
@@ -2228,7 +2239,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         "publisher"
     );
     assert_eq!(
-        available.track.as_ref().unwrap().track_id,
+        available.track.as_ref().unwrap().publication_id,
         first.id().as_str()
     );
 
@@ -2275,7 +2286,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         panic!("republished lookup state")
     };
     assert_eq!(
-        republished.track.as_ref().unwrap().track_id,
+        republished.track.as_ref().unwrap().publication_id,
         replacement.id().as_str()
     );
 
@@ -2309,7 +2320,7 @@ fn source_lookup_revocation_and_close_finish_locally_without_execution_commands(
                     room: "room".into(),
                     participant_id: "publisher".into(),
                     kind: wire::TrackKind::Data as i32,
-                    label: "label".into(),
+                    track_id: "label".into(),
                 }),
             },
         )),
@@ -2365,7 +2376,7 @@ fn source_lookup_revocation_and_close_finish_locally_without_execution_commands(
                             room: "room".into(),
                             participant_id: "publisher".into(),
                             kind: wire::TrackKind::Data as i32,
-                            label: "label".into(),
+                            track_id: "label".into(),
                         }),
                     },
                 )),
@@ -2393,7 +2404,7 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
         room: "room".into(),
         participant_id: "publisher".into(),
         kind: wire::TrackKind::Data as i32,
-        label: "label".into(),
+        track_id: "label".into(),
     };
     let spec = || wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {

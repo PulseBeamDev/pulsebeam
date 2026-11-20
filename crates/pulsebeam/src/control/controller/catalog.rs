@@ -520,7 +520,7 @@ fn catalog_entry(
     if !presence && tracks.is_empty() {
         return Ok(None);
     }
-    tracks.sort_by(|left, right| left.track_id.cmp(&right.track_id));
+    tracks.sort_by(|left, right| left.publication_id.cmp(&right.publication_id));
     Ok(Some(wire::CatalogParticipantEntry {
         participant: Some(wire::Participant {
             participant_id: participant.as_str().to_owned(),

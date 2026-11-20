@@ -11,7 +11,7 @@ use pulsebeam_runtime::net::RecvPacketBatch;
 use pulsebeam_runtime::time::Instant;
 
 use crate::bitrate::Bitrate;
-use crate::entity::TrackId;
+use crate::entity::PublicationKey;
 use crate::ice_tcp::{FlowRoute, TcpFlow, TcpFlowId, TcpPacket};
 use crate::media::{
     ChannelId, KeyframeRequest, KeyframeRequestKind, MediaKind, Mid, Pt, Rid, SeqNo, Ssrc,
@@ -160,7 +160,7 @@ pub(crate) enum TransportMutation {
 
 pub(crate) struct RtpWriteCommand {
     pub(crate) pkt: RtpPacket,
-    pub(crate) track_id: TrackId,
+    pub(crate) publication_id: PublicationKey,
     pub(crate) mid: Mid,
     pub(crate) rid: Option<Rid>,
     pub(crate) ssrc: Ssrc,
@@ -213,7 +213,7 @@ struct Sender {
     sequence_origin: Option<u64>,
     highest_accepted: Option<u64>,
     highest_reported: Option<u64>,
-    source: Option<(TrackId, Ssrc)>,
+    source: Option<(PublicationKey, Ssrc)>,
     descriptor_writer: pulsebeam_core::dd::DependencyDescriptorWriter,
     extensions: Vec<pulsebeam_rtc::RtpExtensionInfo>,
 }
@@ -987,7 +987,7 @@ impl RtcDriver {
         if command.rid.is_some() || sender.ssrc != command.ssrc || sender.pt != command.pt {
             return AppliedMutation::RtpNotWritten;
         }
-        let source = (command.track_id, command.pkt.ssrc);
+        let source = (command.publication_id, command.pkt.ssrc);
         if sender.source != Some(source) {
             if self.rtc.discard_pending_rtp(command.mid.as_str()).is_err() {
                 return AppliedMutation::RtpNotWritten;

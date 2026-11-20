@@ -28,14 +28,14 @@ import { track, trackKey, type DataTrackSpec, type Delivery } from "./track.js";
 export interface DataMessage {
   readonly type: "message";
   readonly participantId: string;
-  readonly trackId: string;
+  readonly publicationId: string;
   readonly sequence: bigint;
   readonly data: Uint8Array;
 }
 export interface DataGap {
   readonly type: "gap";
   readonly participantId: string;
-  readonly trackId: string;
+  readonly publicationId: string;
   readonly from: bigint;
   readonly to: bigint;
 }
@@ -48,7 +48,7 @@ export type DataUpdate<D extends Delivery = Delivery> =
 
 interface DataTrack<D extends Delivery> {
   readonly kind: "data";
-  readonly label: string;
+  readonly trackId: string;
   readonly delivery: D;
 }
 export interface LocalDataTrack<D extends Delivery = Delivery>
@@ -116,7 +116,7 @@ interface DataHost {
 type Source = {
   readonly room: string;
   readonly participantId: string;
-  readonly label: string;
+  readonly trackId: string;
 };
 type PendingRead<D extends Delivery> = {
   resolve(result: DataUpdate<D>): void;
@@ -139,13 +139,13 @@ export class DataRegistry {
 
   local<D extends Delivery>(value: DataTrackSpec<D>): LocalDataTrack<D> {
     this.#requireOpen();
-    const spec = track.data(value.label, value.delivery);
+    const spec = track.data(value.trackId, value.delivery);
     const key = trackKey(spec);
     let handle = this.#locals.get(key);
     if (!handle) {
       handle = Object.freeze({
         kind: "data" as const,
-        label: spec.label,
+        trackId: spec.trackId,
         delivery: spec.delivery,
         publish: () => {
           this.#requireOpen();
@@ -166,7 +166,7 @@ export class DataRegistry {
     source: { readonly room: string; readonly participantId: string },
   ): RemoteDataTrack<D> {
     this.#requireOpen();
-    const spec = track.data(value.label, value.delivery);
+    const spec = track.data(value.trackId, value.delivery);
     const { room, participantId } = source;
     const key = JSON.stringify([room, participantId, trackKey(spec)]);
     let handle = this.#remotes.get(key);
@@ -174,7 +174,7 @@ export class DataRegistry {
       const selector = Object.freeze({
         room,
         participantId,
-        label: spec.label,
+        trackId: spec.trackId,
       });
       const id = () =>
         this.host
@@ -184,12 +184,12 @@ export class DataRegistry {
               this.host.getSnapshot().roomId === room &&
               entry.participantId === participantId &&
               entry.kind === "data" &&
-              entry.label === spec.label &&
+              entry.trackId === spec.trackId &&
               entry.delivery === spec.delivery,
           )?.id ?? null;
       handle = Object.freeze({
         kind: "data" as const,
-        label: spec.label,
+        trackId: spec.trackId,
         delivery: spec.delivery,
         room,
         participantId,

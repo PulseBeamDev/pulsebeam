@@ -32,8 +32,8 @@ message LogicalSourceAddress {
   string room = 1; // Exact application room ID.
   // Exact application participant ID (sub), scoped to room.
   string participant_id = 2; // Both IDs match [A-Za-z0-9_-]{1,36}.
-  TrackKind kind = 3; // AUDIO, VIDEO or DATA; never inferred from a label.
-  string label = 4; // Nonempty exact-case label, <=256 UTF-8 bytes.
+  TrackKind kind = 3; // AUDIO, VIDEO or DATA; never inferred from the ID.
+  string track_id = 4; // Case-sensitive [A-Za-z0-9_-]{1,36}.
 }
 
 // One connection-local, never-reused nonzero watch ID owns an immutable room,
@@ -165,8 +165,8 @@ message ResourceKey {
     // Exact participant in a room of the authenticated project.
     Participant participant = 5;
 
-    // Nonempty opaque canonical string, <=128 UTF-8 bytes; matches track_id.
-    string track = 3;
+    // Nonempty opaque canonical string, <=128 UTF-8 bytes; matches publication_id.
+    string publication = 3;
 
     // Must be true. Selects the single read-only SessionState record.
     bool session = 4;
@@ -292,16 +292,16 @@ message Participant {
 // Immutable publication descriptor. Visibility is observation, not authorization.
 // Also embedded in LiveResource so binding correctness never awaits other keys.
 message Track {
-  // Nonempty opaque canonical string, <=128 UTF-8 bytes, assigned by the server
-  // identity implementation for one publication lifetime. SDK never derives it.
-  string track_id = 1;
+  // Opaque canonical pub_* ID assigned by the server for one publication
+  // lifetime. SDK never derives it.
+  string publication_id = 1;
 
   // The publisher endpoint is (room_id, participant_id) in this project.
   string participant_id = 2;
   string room_id = 7;
 
-  // Nonempty literal label, <=256 UTF-8 bytes; not a transport routing authority.
-  string label = 3;
+  // Case-sensitive [A-Za-z0-9_-]{1,36}; not a transport coordinate.
+  string track_id = 3;
 
   oneof kind {
     AudioTrack audio = 4;
@@ -380,8 +380,8 @@ message ResourceSettings {
 // Immutable publication declaration; the server assigns TrackId on admission.
 // At most one live/pending publication per connection/(kind, label).
 message PublicationSpec {
-  // Nonempty literal UTF-8, <=256 bytes.
-  string label = 1;
+  // Case-sensitive [A-Za-z0-9_-]{1,36}, scoped to publisher and kind.
+  string track_id = 1;
 
   oneof kind {
     AudioPublication audio = 2;
@@ -411,9 +411,9 @@ message DataPublication {
 
 // Exact source and independently prepared receiver binding for one lifetime.
 message SubscriptionSpec {
-  // Nonempty opaque canonical TrackId string, <=128 UTF-8 bytes. Owner
-  // revalidates source eligibility/authority; SDK never parses its encoding.
-  string track_id = 1;
+  // Opaque canonical pub_* ID. Owner revalidates source eligibility and
+  // authority; SDK never derives this ID.
+  string publication_id = 1;
 
   // Required expected kind, matching the exact source.
   TrackKind kind = 2;
@@ -423,7 +423,7 @@ message SubscriptionSpec {
   TrackBinding binding = 3;
 
   // Literal source-room admission domain for this immutable receiver lifetime.
-  // It is never inferred from track_id or the subscriber's joined room.
+  // It is never inferred from publication_id or the subscriber's joined room.
   string source_room = 4;
 }
 

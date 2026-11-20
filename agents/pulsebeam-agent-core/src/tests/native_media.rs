@@ -28,7 +28,7 @@ impl Target {
         };
         let track = tracks
             .iter()
-            .find(|track| track.track_id == subscription.track_id)
+            .find(|track| track.publication_id == subscription.publication_id)
             .unwrap();
         self.installed(participant.clone(), track.clone())
     }
@@ -68,13 +68,13 @@ fn format(kind: MediaKind) -> state::CodecFormat {
     })
 }
 
-pub(super) fn track(id: &str, participant: &str, label: &str, kind: MediaKind) -> state::Track {
+pub(super) fn track(id: &str, participant: &str, track_id: &str, kind: MediaKind) -> state::Track {
     let format = Some(format(kind));
     state::Track {
-        track_id: id.into(),
+        publication_id: id.into(),
         participant_id: participant.into(),
         room_id: "room".into(),
-        label: label.into(),
+        track_id: track_id.into(),
         kind: Some(match kind {
             MediaKind::Video => state::track::Kind::Video(state::VideoTrack { format }),
             MediaKind::Audio => state::track::Kind::Audio(state::AudioTrack { format }),
@@ -103,7 +103,7 @@ pub(super) fn discover_receivers(
     )];
     records.extend(tracks.iter().map(|track| {
         native_connection::confirmed(
-            state::resource_key::Key::Track(track.track_id.clone()),
+            state::resource_key::Key::Publication(track.publication_id.clone()),
             0,
             state::confirmed_state::Value::Track(track.clone()),
         )
@@ -330,17 +330,17 @@ pub(super) fn prepared_media(
 
 pub(super) fn scoped_desired(revision: u64) -> DesiredState {
     let mut state = desired(revision);
-    state.video[0].track_id.clear();
+    state.video[0].publication_id.clear();
     state.video[0].selector = Some(TrackSelector {
         room: "room".into(),
         participant_id: "publisher".into(),
-        label: "camera".into(),
+        track_id: "camera".into(),
     });
     state.audio.pinned.clear();
     state.audio.selected = vec![TrackSelector {
         room: "room".into(),
         participant_id: "publisher".into(),
-        label: "microphone".into(),
+        track_id: "microphone".into(),
     }];
     state
 }
@@ -476,7 +476,7 @@ fn connected_with_tracks(
 
                 room_id: address.room.clone(),
             };
-            let (track_id, kind) = match state::TrackKind::try_from(address.kind).unwrap() {
+            let (publication_id, kind) = match state::TrackKind::try_from(address.kind).unwrap() {
                 state::TrackKind::Video => (
                     video_track,
                     state::track::Kind::Video(state::VideoTrack {
@@ -498,10 +498,10 @@ fn connected_with_tracks(
                     spec: Some(target.spec().clone()),
                     participant: Some(participant.clone()),
                     track: Some(state::Track {
-                        track_id: track_id.into(),
+                        publication_id: publication_id.into(),
                         participant_id: participant.participant_id,
                         room_id: participant.room_id.clone(),
-                        label: address.label.clone(),
+                        track_id: address.track_id.clone(),
                         kind: Some(kind),
                     }),
                 })),

@@ -4,7 +4,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 use pulsebeam_proto::prelude::Message;
 use pulsebeam_proto::state::{self as wire, codec, validation};
 
-use crate::entity::TrackId;
+use crate::entity::PublicationKey;
 use crate::media::ChannelId;
 use crate::participant::signaling::{SignalingOutput, SignalingProgress};
 use crate::track::Track;
@@ -16,7 +16,7 @@ enum Key {
     Session,
     Owned(u64),
     Participant((String, String)),
-    Track(String),
+    Publication(String),
 }
 
 impl Key {
@@ -32,7 +32,7 @@ impl Key {
                         participant_id: participant_id.clone(),
                     })
                 }
-                Self::Track(value) => Value::Track(value.clone()),
+                Self::Publication(value) => Value::Publication(value.clone()),
             }),
         }
     }
@@ -265,7 +265,10 @@ impl NativeSession {
         if self.rows.get(&key).is_some_and(|row| row.value == value) {
             return Ok(());
         }
-        if matches!(&key, Key::Track(_) | Key::Participant(_) | Key::Session) {
+        if matches!(
+            &key,
+            Key::Publication(_) | Key::Participant(_) | Key::Session
+        ) {
             self.source_wait_changed();
         }
         let previous = self.rows.get(&key).map_or(0, |row| row.value.encoded_len());
@@ -947,7 +950,7 @@ impl NativeSession {
         std::mem::size_of::<(u64, wire::LogicalSourceAddress)>()
             .saturating_add(address.room.len())
             .saturating_add(address.participant_id.len())
-            .saturating_add(address.label.len())
+            .saturating_add(address.track_id.len())
     }
 
     fn sync_lookup_interest(&mut self, reference: u64) -> Result<(), OutputError> {
@@ -1287,7 +1290,7 @@ impl NativeSession {
                     let track = track_descriptor(source.track)?;
                     (track.room_id == address.room
                         && track.participant_id == address.participant_id
-                        && track.label == address.label
+                        && track.track_id == address.track_id
                         && track.kind.as_ref().is_some_and(|kind| match kind {
                             wire::track::Kind::Audio(_) => {
                                 address.kind == wire::TrackKind::Audio as i32
@@ -1369,7 +1372,7 @@ impl NativeSession {
         work: &Preparation,
         unix_now: u64,
         capabilities: Option<&wire::RtpCapabilities>,
-        source: impl FnOnce(TrackId) -> Option<super::ResolvedSource<'a>>,
+        source: impl FnOnce(PublicationKey) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<Option<ExecutionCommand>, OutputError> {
         self.prepare_execution_in_room(work, unix_now, capabilities, |_, track| source(track))
     }
@@ -1379,7 +1382,7 @@ impl NativeSession {
         work: &Preparation,
         unix_now: u64,
         capabilities: Option<&wire::RtpCapabilities>,
-        source: impl FnOnce(&str, TrackId) -> Option<super::ResolvedSource<'a>>,
+        source: impl FnOnce(&str, PublicationKey) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<Option<ExecutionCommand>, OutputError> {
         match self.compile_execution_in_room(work, capabilities, source) {
             Ok(ExecutionCommand(ExecutionAction::Prepare {
@@ -1417,7 +1420,7 @@ impl NativeSession {
         &mut self,
         work: &Preparation,
         capabilities: Option<&wire::RtpCapabilities>,
-        source: impl FnOnce(TrackId) -> Option<super::ResolvedSource<'a>>,
+        source: impl FnOnce(PublicationKey) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<ExecutionCommand, wire::Failure> {
         self.compile_execution_in_room(work, capabilities, |_, track| source(track))
     }
@@ -1426,7 +1429,7 @@ impl NativeSession {
         &mut self,
         work: &Preparation,
         capabilities: Option<&wire::RtpCapabilities>,
-        source: impl FnOnce(&str, TrackId) -> Option<super::ResolvedSource<'a>>,
+        source: impl FnOnce(&str, PublicationKey) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<ExecutionCommand, wire::Failure> {
         use crate::control::native::PreparedResource;
         self.preparation_spec(work)
@@ -1482,7 +1485,7 @@ impl NativeSession {
         &mut self,
         work: &Preparation,
         capabilities: Option<&wire::RtpCapabilities>,
-        source: impl FnOnce(&str, TrackId) -> Option<super::ResolvedSource<'a>>,
+        source: impl FnOnce(&str, PublicationKey) -> Option<super::ResolvedSource<'a>>,
     ) -> Result<crate::control::native::ReceiverPreparation, wire::Failure> {
         use crate::control::native::{ReceiveTransport, Receiver, ReceiverPreparation};
         let spec = self
@@ -1550,12 +1553,12 @@ impl NativeSession {
         let plan = Receiver {
             source_room: source.track.meta().room,
             source: source.track.clone(),
-            source_id: track.track_id.clone(),
+            source_id: track.publication_id.clone(),
             transport,
             policy,
         };
         let bytes = crate::participant::Connection::native_receiver_execution_bytes(
-            &track.label,
+            &track.track_id,
             &plan.source_id,
             match &plan.transport {
                 ReceiveTransport::Rtp(rtp) => Some(rtp.kind),
@@ -1947,7 +1950,7 @@ impl NativeSession {
                         _ => None,
                     })
             })
-            .filter(|(_, track)| track.track_id == execution.source.as_str())
+            .filter(|(_, track)| track.publication_id == execution.source.as_str())
             .ok_or_else(|| failure(wire::FailureCode::ResourceGone))?;
         let (status, execution_failure) = self
             .receiver_result(work.reference, execution)
@@ -2156,7 +2159,8 @@ impl NativeSession {
             let Some(row) = self.rows.get(&key) else {
                 continue;
             };
-            if self.discovery_reconciling && matches!(key, Key::Participant(_) | Key::Track(_))
+            if self.discovery_reconciling
+                && matches!(key, Key::Participant(_) | Key::Publication(_))
                 || row.owned.as_ref().is_some_and(|owned| {
                     owned.cutoff_pending || !owned.retired && row.value.evaluated_revision == 0
                 })
@@ -2382,11 +2386,11 @@ fn progress_deadline(at: pulsebeam_runtime::time::Instant) -> pulsebeam_runtime:
 fn key_cost(key: &Key) -> usize {
     let text = match key {
         Key::Participant((room, participant)) => room.len().saturating_add(participant.len()),
-        Key::Track(id) => id.len(),
+        Key::Publication(id) => id.len(),
         _ => 0,
     };
     // Track observations fund the indexed native source runtime and its bounded work queue.
-    let source = if matches!(key, Key::Track(_)) {
+    let source = if matches!(key, Key::Publication(_)) {
         4096
     } else {
         0
@@ -2420,10 +2424,10 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
         min_packet_time_ms: Some(120),
     }));
     let track = wire::Track {
-        track_id: identity.clone(),
+        publication_id: identity.clone(),
         participant_id: participant.participant_id.clone(),
         room_id: participant.room_id.clone(),
-        label: diagnostic.clone(),
+        track_id: diagnostic.clone(),
         kind: Some(wire::track::Kind::Audio(wire::AudioTrack {
             format: Some(format),
         })),
@@ -2522,10 +2526,10 @@ pub(crate) fn track_descriptor(track: &crate::track::Track) -> Option<wire::Trac
         }),
     };
     Some(wire::Track {
-        track_id: track.id().as_str(),
+        publication_id: track.id().as_str(),
         participant_id: track.meta().origin.as_str().to_owned(),
         room_id: track.meta().room.room.as_str().to_owned(),
-        label: track.meta().label.clone()?,
+        track_id: track.meta().track_id?.to_string(),
         kind: Some(kind),
     })
 }
@@ -2558,7 +2562,7 @@ fn publication_key(spec: &wire::ResourceSpec) -> Option<(i32, String)> {
         wire::publication_spec::Kind::Video(_) => wire::TrackKind::Video,
         wire::publication_spec::Kind::Data(_) => wire::TrackKind::Data,
     };
-    Some((kind as i32, publication.label.clone()))
+    Some((kind as i32, publication.track_id.clone()))
 }
 
 #[cfg(test)]

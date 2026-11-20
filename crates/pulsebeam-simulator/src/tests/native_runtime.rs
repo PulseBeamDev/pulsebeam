@@ -585,7 +585,7 @@ impl OwnedData {
             };
             let pulsebeam_agent_core::DataEvent::Message {
                 participant_id,
-                track_id,
+                publication_id,
                 data,
                 ..
             } = &event
@@ -593,7 +593,7 @@ impl OwnedData {
                 anyhow::bail!("owned data cursor unexpectedly lost ordered messages");
             };
             anyhow::ensure!(
-                participant_id == &self.remote && !track_id.is_empty(),
+                participant_id == &self.remote && !publication_id.is_empty(),
                 "data cursor lost publisher identity"
             );
             if data == expected {
@@ -1016,7 +1016,7 @@ async fn run_peer(
         .publishers
         .into_iter()
         .find(|publisher| publisher.publisher == latest)
-        .and_then(|publisher| publisher.data_track_id)
+        .and_then(|publisher| publisher.publication_id)
         .ok_or_else(|| anyhow::anyhow!("latest source was not installed"))?;
     let mut reduced = desired.clone();
     reduced
@@ -1047,7 +1047,7 @@ async fn run_peer(
         .publishers
         .iter()
         .find(|publisher| publisher.publisher == latest)
-        .and_then(|publisher| publisher.data_track_id.as_ref())
+        .and_then(|publisher| publisher.publication_id.as_ref())
         .ok_or_else(|| anyhow::anyhow!("latest replacement was not installed"))?;
     anyhow::ensure!(
         new_latest != &old_latest,
@@ -1878,7 +1878,7 @@ async fn wait_connected(
                 .topics
                 .publishers
                 .iter()
-                .all(|publisher| publisher.connected && publisher.data_track_id.is_some())
+                .all(|publisher| publisher.connected && publisher.publication_id.is_some())
                 && snapshot
                     .topics
                     .subscribers

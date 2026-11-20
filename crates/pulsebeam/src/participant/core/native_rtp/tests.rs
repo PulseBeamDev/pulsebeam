@@ -59,7 +59,7 @@ fn spec(enabled: bool) -> wire::ResourceSpec {
     wire::ResourceSpec {
         settings: Some(wire::ResourceSettings { enabled: Some(enabled), receive: None }),
         declaration: Some(resource_spec::Declaration::Publication(wire::PublicationSpec {
-            label: "microphone".into(),
+            track_id: "microphone".into(),
             kind: Some(wire::publication_spec::Kind::Audio(wire::AudioPublication {
                 binding: Some(wire::TrackBinding { transport: Some(wire::track_binding::Transport::Rtp(wire::RtpParameters {
                     mid: "mic".into(),
@@ -117,7 +117,7 @@ fn video_spec(
         settings: spec(true).settings,
         declaration: Some(resource_spec::Declaration::Publication(
             wire::PublicationSpec {
-                label: mid.into(),
+                track_id: mid.into(),
                 kind: Some(wire::publication_spec::Kind::Video(
                     wire::VideoPublication {
                         binding: Some(wire::TrackBinding {
@@ -240,6 +240,30 @@ fn unsupported_congestion_control_rejects_before_source_installation() {
 }
 
 #[test]
+fn invalid_logical_name_does_not_admit_an_rtp_publication() {
+    let mut participant =
+        participant_with_capabilities(native_data::unix_now() + 60, Some(capabilities()));
+    let mut sink = MockParticipantSink::new();
+    let mut invalid = spec(true);
+    let Some(resource_spec::Declaration::Publication(publication)) = invalid.declaration.as_mut()
+    else {
+        panic!("publication")
+    };
+    publication.track_id = "room/camera".into();
+    participant.handle_native_signaling(
+        &frame(1, wire::desired_state::Value::Present(Box::new(invalid))),
+        &mut sink,
+    );
+    let outcome = confirmations(&mut participant).pop().unwrap();
+    assert_eq!(
+        outcome.rejection.unwrap().code,
+        wire::FailureCode::InvalidConfiguration as i32
+    );
+    assert!(participant.native_rtp.publications.is_empty());
+    assert!(sink.publish_track_calls.is_empty());
+}
+
+#[test]
 fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire() {
     let mut participant =
         participant_with_capabilities(native_data::unix_now() + 60, Some(capabilities()));
@@ -257,20 +281,8 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     assert_eq!(live.spec, Some(spec(true)));
     let source = participant.native_rtp.publications.get(&1).unwrap();
     let id = source.track.id();
-    assert_eq!(
-        id,
-        participant.connection_id.derive_publication_track_id(
-            TrackKind::Audio,
-            "microphone",
-            NonZeroU64::new(1).unwrap()
-        )
-    );
-    assert_ne!(
-        id,
-        participant
-            .connection_id
-            .derive_track_id(TrackKind::Audio, "microphone")
-    );
+    assert_eq!(id.kind(), TrackKind::Audio);
+    assert!(id.as_str().starts_with("pub_0"));
     assert_eq!(live.track, track_descriptor(&source.track));
     assert_eq!(
         live.track.as_ref().unwrap().kind,
@@ -287,10 +299,10 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     assert_eq!(sink.publish_track_calls, vec![id]);
     assert_eq!(participant.upstream.mid_for_track_id(id), None);
     assert!(participant.native_rtp.owns_encoding(0));
-    let mut source_handles = slotmap::SlotMap::<TrackHandle, TrackId>::with_key();
+    let mut source_handles = slotmap::SlotMap::<TrackHandle, PublicationKey>::with_key();
     let source_fanout = source_handles.insert(id);
     participant.apply(
-        ParticipantEffect::TrackPublished { track_id: id },
+        ParticipantEffect::TrackPublished { publication_id: id },
         Some(source_fanout),
     );
     assert_eq!(
@@ -347,7 +359,7 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
     else {
         unreachable!()
     };
-    publication.label = "different-source".into();
+    publication.track_id = "different-source".into();
     participant.handle_native_signaling(
         &frame(
             4,
@@ -467,10 +479,12 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         encodings,
         [77, 79, 81].map(|ssrc| track::SourceEncoding::Ssrc(ssrc.into()))
     );
-    let mut handles = slotmap::SlotMap::<TrackHandle, TrackId>::with_key();
+    let mut handles = slotmap::SlotMap::<TrackHandle, PublicationKey>::with_key();
     let fanout = handles.insert(video_id);
     participant.apply(
-        ParticipantEffect::TrackPublished { track_id: video_id },
+        ParticipantEffect::TrackPublished {
+            publication_id: video_id,
+        },
         Some(fanout),
     );
     assert_eq!(
@@ -478,7 +492,7 @@ fn admitted_source_keeps_birth_identity_demand_and_cutoff_independent_of_desire(
         Some(video_id)
     );
     participant.native_rtp_demand(video_id, true);
-    let other_kind = TrackId::Audio(entity::AudioTrackId::from_bytes(*video_id.as_bytes()));
+    let other_kind = PublicationKey::Audio(video_id.publication_id());
     participant.native_rtp_demand(other_kind, false);
     assert!(participant.native_rtp.publications[&7].demanded);
     assert!(!participant.native_rtp.bind_source(other_kind, fanout));

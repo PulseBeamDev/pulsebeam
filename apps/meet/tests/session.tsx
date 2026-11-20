@@ -222,11 +222,11 @@ const firstParticipants = [
     publications: [
       {
         id: "self-chat",
-        label: "chat",
+        trackId: "chat",
         kind: { tag: "Data", inner: { delivery: CatalogDelivery.Ordered } },
       },
-      { id: "self-audio", label: "microphone", kind: { tag: "Audio" } },
-      { id: "self-video", label: "camera", kind: { tag: "Video" } },
+      { id: "self-audio", trackId: "microphone", kind: { tag: "Audio" } },
+      { id: "self-video", trackId: "camera", kind: { tag: "Video" } },
     ],
   },
   {
@@ -234,17 +234,17 @@ const firstParticipants = [
     publications: [
       {
         id: "remote-chat",
-        label: "chat",
+        trackId: "chat",
         kind: { tag: "Data", inner: { delivery: CatalogDelivery.Ordered } },
       },
       {
         id: "remote-reactions",
-        label: "reactions",
+        trackId: "reactions",
         kind: { tag: "Data", inner: { delivery: CatalogDelivery.Lossy } },
       },
-      { id: "remote-audio", label: "microphone", kind: { tag: "Audio" } },
-      { id: "remote-camera", label: "camera", kind: { tag: "Video" } },
-      { id: "remote-screen", label: "screen", kind: { tag: "Video" } },
+      { id: "remote-audio", trackId: "microphone", kind: { tag: "Audio" } },
+      { id: "remote-camera", trackId: "camera", kind: { tag: "Video" } },
+      { id: "remote-screen", trackId: "screen", kind: { tag: "Video" } },
     ],
   },
   { id: "quiet-observer", publications: [] },
@@ -292,7 +292,7 @@ assert.equal(
 );
 assert.deepEqual(
   [...runtime.audioSubscriptions.values()],
-  [{ room: "selected-room", participantId: "bob", label: "microphone" }],
+  [{ room: "selected-room", participantId: "bob", trackId: "microphone" }],
 );
 assert.deepEqual(
   [...runtime.videoOwners.values()]
@@ -302,13 +302,13 @@ assert.deepEqual(
       priority: observation.priority,
       playoutDelay: observation.playoutDelay,
     }))
-    .sort((a, b) => a.selector.label.localeCompare(b.selector.label)),
+    .sort((a, b) => a.selector.trackId.localeCompare(b.selector.trackId)),
   [
     {
       selector: {
         room: "selected-room",
         participantId: "bob",
-        label: "camera",
+        trackId: "camera",
       },
       minFps: 15,
       priority: 200,
@@ -318,7 +318,7 @@ assert.deepEqual(
       selector: {
         room: "selected-room",
         participantId: "bob",
-        label: "screen",
+        trackId: "screen",
       },
       minFps: 15,
       priority: 10,
@@ -347,10 +347,7 @@ assert.equal(
   0,
   "page replacement releases UI-owned audio reception",
 );
-await page(
-  [{ id: "last-presence", publications: [] }],
-  false,
-);
+await page([{ id: "last-presence", publications: [] }], false);
 assert.match(document.body.textContent!, /last-presence/);
 assert.doesNotMatch(document.body.textContent!, /quiet-observer/);
 assert.equal(button("Next page").disabled, true);
@@ -421,7 +418,7 @@ const payload = "delivered through production data tracks";
 await flush(() =>
   deliver({
     type: "message",
-    trackId: "remote-chat",
+    publicationId: "remote-chat",
     participantId: "bob",
     sequence: 0n,
     data: new TextEncoder().encode(JSON.stringify(payload)),
@@ -431,11 +428,11 @@ assert.match(
   document.body.textContent!,
   /delivered through production data tracks/,
 );
-const remoteChat = (trackId: string, sequence: bigint) =>
+const remoteChat = (publicationId: string, sequence: bigint) =>
   deliver({
     type: "message",
     participantId: "bob",
-    trackId,
+    publicationId,
     sequence,
     data: new TextEncoder().encode(JSON.stringify(payload)),
   });
@@ -451,7 +448,7 @@ await flush(() =>
   deliver({
     type: "gap",
     participantId: "bob",
-    trackId: "remote-chat",
+    publicationId: "remote-chat",
     from: 2n,
     to: 4n,
   }),
@@ -468,7 +465,7 @@ await flush(() =>
   deliver({
     type: "message",
     participantId: "bob",
-    trackId: "remote-chat",
+    publicationId: "remote-chat",
     sequence: 4n,
     data: new TextEncoder().encode(JSON.stringify("after the gap")),
   }),
@@ -481,14 +478,14 @@ await flush(() => {
   ]) {
     deliver({
       type: "message",
-      trackId: "remote-chat",
+      publicationId: "remote-chat",
       participantId: "bob",
       sequence: 5n,
       data,
     });
     runtime.deliverData("reactions", {
       type: "message",
-      trackId: "remote-reactions",
+      publicationId: "remote-reactions",
       participantId: "bob",
       sequence: 5n,
       data,
@@ -555,7 +552,7 @@ privateSoFar();
 await flush(() =>
   runtime.deliverData("reactions", {
     type: "message",
-    trackId: "remote-reactions",
+    publicationId: "remote-reactions",
     participantId: "bob",
     sequence: 0n,
     data: new TextEncoder().encode(JSON.stringify("👍")),

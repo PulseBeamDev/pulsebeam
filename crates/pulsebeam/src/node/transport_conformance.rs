@@ -313,7 +313,7 @@ async fn ready(
         let topics_ready = snapshot.topics.publishers.iter().any(|status| {
             status.registration == publisher()
                 && status.channel.is_some()
-                && status.data_track_id.is_some()
+                && status.publication_id.is_some()
         }) && snapshot.topics.subscribers.iter().any(|status| {
             status.registration.topic == TOPIC && status.channel.is_some() && status.publishers >= 1
         });
@@ -763,7 +763,7 @@ fn qualification_rejects_missing_payload_sequential_peers_and_unretired_graphs()
         room: ROOM.into(),
         topic: TOPIC.into(),
         mode: TopicMode::Latest,
-        data_track_id: "publication".into(),
+        publication_id: "publication".into(),
         sequence: 0,
         participant_id: "v4".into(),
         payload: A_TO_B.to_vec(),

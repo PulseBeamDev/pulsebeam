@@ -270,8 +270,8 @@ impl Catalogs {
                             },
                         };
                         Ok(CatalogPublicationInfo {
-                            id: track.track_id,
-                            label: track.label,
+                            id: track.publication_id,
+                            track_id: track.track_id,
                             kind,
                         })
                     })

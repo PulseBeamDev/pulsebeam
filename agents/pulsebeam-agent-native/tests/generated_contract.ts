@@ -333,7 +333,7 @@ const dataPublication = localData.publish();
 const dataState = dataPublication.state();
 const dataUpdates = dataPublication.updates();
 const siblingDataUpdates = dataPublication.updates();
-if (dataPublication instanceof Promise || dataState.label !== "control" ||
+if (dataPublication instanceof Promise || dataState.trackId !== "control" ||
     dataState.delivery !== TopicMode.Ordered ||
     (await dataUpdates.next())?.observationRevision !== dataState.observationRevision ||
     (await siblingDataUpdates.next())?.observationRevision !== dataState.observationRevision) {

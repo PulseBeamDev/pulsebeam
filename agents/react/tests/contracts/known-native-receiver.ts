@@ -45,7 +45,7 @@ export async function observeCatalog(config: {
         state?.page?.participants
           .flatMap((participant) =>
             participant.publications.map(
-              (publication) => `${participant.id}/${publication.label}`,
+              (publication) => `${participant.id}/${publication.trackId}`,
             ),
           )
           .join(","),
@@ -175,7 +175,7 @@ export async function receiveNative(config: Config): Promise<{
           if (
             event.type !== "message" ||
             event.participantId !== "native-publisher" ||
-            !event.trackId ||
+            !event.publicationId ||
             event.data.length !== 11 ||
             event.data[0] !== 0 ||
             event.data[1] !== 255 ||

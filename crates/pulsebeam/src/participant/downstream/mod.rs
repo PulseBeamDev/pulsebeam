@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::bitrate::Bitrate;
 use crate::entity::AudioOrigin;
 use crate::entity::ParticipantId;
-use crate::entity::TrackId;
+use crate::entity::PublicationKey;
 use crate::entity::TrackKind;
 use crate::keys::TrackHandle;
 use crate::log::{LogCtx, plog_trace};
@@ -127,20 +127,20 @@ pub struct Downstream {
     /// it, but the roster does: a client cannot pin a speaker it was never told
     /// exists, and until someone is loud enough to be forwarded there is
     /// otherwise nothing that names them.
-    audio_tracks: IndexMap<TrackId, TrackMeta>,
+    audio_tracks: IndexMap<PublicationKey, TrackMeta>,
 
     available_bandwidth: BweFilter,
     last_desired: Bitrate,
     /// When forwarding fell below the rate needed to keep measuring the link, while demand
     /// exists, and the estimate it was at then.
-    desired_playout: HashMap<TrackId, (MediaTime, MediaTime)>,
+    desired_playout: HashMap<PublicationKey, (MediaTime, MediaTime)>,
     fixed_receivers: HashMap<Mid, FixedReceiver>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct TrackCatalogEntry {
     pub(crate) participant_id: ParticipantId,
-    pub(crate) track_id: TrackId,
+    pub(crate) publication_id: PublicationKey,
     bound: bool,
 }
 
@@ -166,11 +166,11 @@ impl Downstream {
     pub(crate) fn register_candidate(&mut self, key: TrackHandle, track: &Track) -> bool {
         let entry = TrackCatalogEntry {
             participant_id: track.meta().origin,
-            track_id: track.id(),
+            publication_id: track.id(),
             bound: false,
         };
         if let Some(previous) = self.catalog.get(key) {
-            debug_assert_eq!(previous.track_id, entry.track_id);
+            debug_assert_eq!(previous.publication_id, entry.publication_id);
             debug_assert_eq!(previous.participant_id, entry.participant_id);
             return false;
         }
@@ -187,20 +187,20 @@ impl Downstream {
         self.catalog.get(key).copied()
     }
 
-    pub(crate) fn candidate_binding(&self, track: TrackId) -> Option<(TrackHandle, bool)> {
-        self.catalog
-            .iter()
-            .find_map(|(handle, entry)| (entry.track_id == track).then_some((handle, entry.bound)))
+    pub(crate) fn candidate_binding(&self, track: PublicationKey) -> Option<(TrackHandle, bool)> {
+        self.catalog.iter().find_map(|(handle, entry)| {
+            (entry.publication_id == track).then_some((handle, entry.bound))
+        })
     }
 
     /// A fixed receiver cannot return to native defaults during this transport generation.
     /// The caller must send Reconnect and suppress the incompatible packet.
     pub fn playout_delay_to_stamp(
         &mut self,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         mid: Mid,
     ) -> Result<Option<(MediaTime, MediaTime)>, ()> {
-        let Some(&bounds) = self.desired_playout.get(&track_id) else {
+        let Some(&bounds) = self.desired_playout.get(&publication_id) else {
             return if self.fixed_receivers.contains_key(&mid) {
                 Err(())
             } else {
@@ -218,7 +218,7 @@ impl Downstream {
             receiver.confirm = None;
         }
         let stamp = receiver.pending.then_some(bounds);
-        if track_id.kind() == TrackKind::Audio {
+        if publication_id.kind() == TrackKind::Audio {
             self.audio.mark_fixed_receiver(mid);
         }
         Ok(stamp)
@@ -257,21 +257,29 @@ impl Downstream {
         self.audio_tracks.insert(id, track.meta().clone());
     }
 
-    pub(crate) fn activate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
+    pub(crate) fn activate_track_binding(
+        &mut self,
+        key: TrackHandle,
+        publication_id: PublicationKey,
+    ) {
         if let Some(entry) = self.catalog.get_mut(key) {
             entry.bound = true;
         }
-        if track_id.kind() == TrackKind::Video {
-            self.video.activate_track_binding(key, track_id);
+        if publication_id.kind() == TrackKind::Video {
+            self.video.activate_track_binding(key, publication_id);
         }
     }
 
-    pub(crate) fn deactivate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
+    pub(crate) fn deactivate_track_binding(
+        &mut self,
+        key: TrackHandle,
+        publication_id: PublicationKey,
+    ) {
         if let Some(entry) = self.catalog.get_mut(key) {
             entry.bound = false;
         }
-        if track_id.kind() == TrackKind::Video {
-            self.video.deactivate_track_binding(key, track_id);
+        if publication_id.kind() == TrackKind::Video {
+            self.video.deactivate_track_binding(key, publication_id);
         }
     }
 
@@ -280,7 +288,9 @@ impl Downstream {
         self.audio.set_intent(intent);
     }
 
-    pub(crate) fn native_assignments(&self) -> (Vec<(u32, TrackId)>, Vec<(u32, TrackId)>) {
+    pub(crate) fn native_assignments(
+        &self,
+    ) -> (Vec<(u32, PublicationKey)>, Vec<(u32, PublicationKey)>) {
         let video = self.video.native_mapping_slots().collect();
         let audio = self
             .audio_assignments()
@@ -294,16 +304,16 @@ impl Downstream {
         (video, audio)
     }
 
-    pub(super) fn remove_track(&mut self, track_id: &TrackId) -> bool {
-        let removed = self.video.remove_track(track_id);
+    pub(super) fn remove_track(&mut self, publication_id: &PublicationKey) -> bool {
+        let removed = self.video.remove_track(publication_id);
         if removed {
             self.dirty_allocation = true;
         }
         // Audio too, and not folded into `removed`: that flag drives the *video* allocator's
         // rebalance. A speaker leaving still has to stop being announced, or the room keeps a
         // tile for somebody who is not in it.
-        let audio_removed = self.audio.remove_track(track_id);
-        let announced = self.audio_tracks.shift_remove(track_id).is_some();
+        let audio_removed = self.audio.remove_track(publication_id);
+        let announced = self.audio_tracks.shift_remove(publication_id).is_some();
         removed || audio_removed || announced
     }
 
@@ -419,9 +429,10 @@ mod tests {
             },
             false,
         );
-        let fixed = crate::entity::ConnectionId::new().derive_track_id(TrackKind::Video, "fixed");
+        let fixed =
+            crate::entity::ConnectionId::new().fixture_publication(TrackKind::Video, "fixed");
         let default =
-            crate::entity::ConnectionId::new().derive_track_id(TrackKind::Video, "default");
+            crate::entity::ConnectionId::new().fixture_publication(TrackKind::Video, "default");
         let first = Mid::from("0");
         let fresh = Mid::from("1");
         let bounds = (

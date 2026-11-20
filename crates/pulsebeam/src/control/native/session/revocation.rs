@@ -99,7 +99,7 @@ impl NativeSession {
     pub(in crate::control) fn service_revocations<'a>(
         &mut self,
         capacity: usize,
-        source: impl Fn(TrackId) -> Option<super::super::ResolvedSource<'a>>,
+        source: impl Fn(PublicationKey) -> Option<super::super::ResolvedSource<'a>>,
     ) -> Result<Vec<ExecutionCommand>, OutputError> {
         let mut commands = Vec::new();
         let Some(mut sweep) = self.permission_sweep else {

@@ -198,7 +198,7 @@ pub(crate) enum ShardFrame {
         address: crate::route::NodeTransportAddress,
         source_shard: ShardId,
     },
-    /// Forward payload, addressed by the destination's own route. `TrackId`
+    /// Forward payload, addressed by the destination's own route. `PublicationKey`
     /// validates that the route still names the intended stable entity; the
     /// destination resolves its own local handle from the route entry.
     Media {

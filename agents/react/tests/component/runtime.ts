@@ -41,7 +41,7 @@ export class BrowserRuntime {
   observationWaiters = new Map<bigint, Set<(error: unknown) => void>>();
   dataOwners = new Map<
     bigint,
-    { spec: { label: string; delivery: string }; events: any[] }
+    { spec: { trackId: string; delivery: string }; events: any[] }
   >();
   snapshot = {
     version: 1n,
@@ -222,7 +222,7 @@ export class BrowserRuntime {
       return { type: "updated" };
     }
     if (command.op === "claimPublication") {
-      const key = `${command.spec.kind}:${command.spec.label}`;
+      const key = `${command.spec.kind}:${command.spec.trackId}`;
       if (this.claimedPublications.has(key)) {
         const error = new Error("publication already has an owner") as Error & {
           pulsebeamCode?: string;
@@ -344,7 +344,7 @@ export class BrowserRuntime {
     const grouped = new Map<string, { selector: any; views: any[] }>();
     for (const { selector, observation } of this.videoOwners.values()) {
       if (!observation?.visible || observation.height <= 0) continue;
-      const key = `${selector.participantId}\u0000${selector.label}`;
+      const key = `${selector.participantId}\u0000${selector.trackId}`;
       const entry = grouped.get(key) ?? { selector, views: [] };
       entry.views.push(observation);
       grouped.set(key, entry);
@@ -356,7 +356,7 @@ export class BrowserRuntime {
         (item: any) =>
           item.kind === "video" &&
           item.participantId === selector.participantId &&
-          item.label === selector.label,
+          item.trackId === selector.trackId,
       );
       if (!publication) continue;
       let slot = this.videoSlots.get(key);
@@ -371,7 +371,7 @@ export class BrowserRuntime {
       );
       video.push({
         slot,
-        trackId: publication.id,
+        publicationId: publication.id,
         height: Math.max(...views.map((view) => view.height)),
         minHeight: Math.max(...views.map((view) => view.minHeight)),
         minFps: Math.max(...views.map((view) => view.minFps)),
@@ -445,12 +445,12 @@ export class BrowserRuntime {
     const spec = this.dataPublications.get(owner);
     if (!spec) throw new Error("released data publication owner");
     await this.sendCompletion;
-    this.sent.push({ name: spec.label, mode: spec.delivery, payload });
+    this.sent.push({ name: spec.trackId, mode: spec.delivery, payload });
   }
-  deliverData(label: string, event: unknown) {
+  deliverData(trackId: string, event: unknown) {
     const owners: bigint[] = [];
     for (const [owner, receiver] of this.dataOwners) {
-      if (receiver.spec.label !== label) continue;
+      if (receiver.spec.trackId !== trackId) continue;
       receiver.events.push(event);
       owners.push(owner);
     }

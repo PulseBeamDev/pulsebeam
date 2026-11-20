@@ -38,14 +38,14 @@ fn track(connection: ConnectionId, owner: ParticipantId, label: &str) -> Track {
         TrackMeta {
             room: crate::entity::ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
             shard_id: crate::id::ShardId::new(0),
-            id: connection.derive_publication_track_id(
+            id: connection.fixture_publication_at(
                 TrackKind::Data,
                 label,
                 std::num::NonZeroU64::new(1).unwrap(),
             ),
             origin: owner,
             connection_id: connection,
-            label: Some(label.into()),
+            track_id: Some(crate::entity::TrackId::new(&label).unwrap()),
         },
         DataLane::Ordered,
     )
@@ -105,7 +105,7 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
         crate::entity::fixture_participant_id(),
         "preparing",
     );
-    incomplete.meta_mut().label = None;
+    incomplete.meta_mut().track_id = None;
     let hidden = track(connection, owner, "hidden");
     let before = model.retained_bytes;
     for source in [
@@ -121,7 +121,7 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
         let id = source.track.id();
         model.observe_candidate(source).unwrap();
         model.remove_track(id.as_str()).unwrap();
-        assert!(!model.rows.contains_key(&Key::Track(id.as_str())));
+        assert!(!model.rows.contains_key(&Key::Publication(id.as_str())));
     }
     assert_eq!(model.retained_bytes, before);
     assert_eq!(model.unavailable, 0);
@@ -139,7 +139,7 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
     );
     settle(&mut model, std::slice::from_ref(&allowed), &publisher);
     let batches = drain(&mut model);
-    assert!(batches.iter().any(|batch| batch.records.iter().any(|record| matches!(record.key.as_ref().and_then(|key| key.key.as_ref()), Some(wire::resource_key::Key::Track(id)) if *id == allowed.id().as_str()))));
+    assert!(batches.iter().any(|batch| batch.records.iter().any(|record| matches!(record.key.as_ref().and_then(|key| key.key.as_ref()), Some(wire::resource_key::Key::Publication(id)) if *id == allowed.id().as_str()))));
     model.remove_track(allowed.id().as_str()).unwrap();
     assert!(matches!(
         &model.rows[&Key::Participant(("room".into(), owner.as_str().into()))]
@@ -177,7 +177,7 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
         0
     );
     let mut preparing = track(connection, owner, "authorized-preparing");
-    preparing.meta_mut().label = None;
+    preparing.meta_mut().track_id = None;
     let before = model.retained_bytes;
     model
         .observe_candidate(ResolvedSource {
@@ -194,7 +194,8 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
     )));
     commit_sent(&mut model);
     assert!(matches!(model.poll(), Err(OutputError::InvalidObservation)));
-    preparing.meta_mut().label = Some("authorized-preparing".into());
+    preparing.meta_mut().track_id =
+        Some(crate::entity::TrackId::new("authorized-preparing").unwrap());
     model
         .observe_candidate(ResolvedSource {
             track: &preparing,
@@ -203,9 +204,9 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
         .unwrap();
     assert_eq!(model.unavailable, 0);
     let ready = drain(&mut model);
-    assert!(ready.iter().flat_map(|batch| &batch.records).any(|record| record.confirmed.as_ref().is_some_and(|value| matches!(&value.value, Some(wire::confirmed_state::Value::Track(track)) if track.label == "authorized-preparing"))));
+    assert!(ready.iter().flat_map(|batch| &batch.records).any(|record| record.confirmed.as_ref().is_some_and(|value| matches!(&value.value, Some(wire::confirmed_state::Value::Track(track)) if track.track_id == "authorized-preparing"))));
     let mut never_exposed = track(connection, owner, "never-exposed");
-    never_exposed.meta_mut().label = None;
+    never_exposed.meta_mut().track_id = None;
     let hidden_id = never_exposed.id();
     model
         .observe_candidate(ResolvedSource {
@@ -227,9 +228,13 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
         .unwrap();
     settle(&mut model, &[preparing, never_exposed], &publisher);
     assert_eq!(model.unavailable, 0);
-    assert!(!model.rows.contains_key(&Key::Track(hidden_id.as_str())));
+    assert!(
+        !model
+            .rows
+            .contains_key(&Key::Publication(hidden_id.as_str()))
+    );
     let withdrawn = drain(&mut model);
-    assert!(withdrawn.iter().flat_map(|batch| &batch.records).all(|record| !matches!(record.key.as_ref().and_then(|key| key.key.as_ref()), Some(wire::resource_key::Key::Track(id)) if *id == hidden_id.as_str())));
+    assert!(withdrawn.iter().flat_map(|batch| &batch.records).all(|record| !matches!(record.key.as_ref().and_then(|key| key.key.as_ref()), Some(wire::resource_key::Key::Publication(id)) if *id == hidden_id.as_str())));
 }
 
 #[test]
@@ -259,7 +264,7 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
         }),
         declaration: Some(wire::resource_spec::Declaration::Subscription(
             wire::SubscriptionSpec {
-                track_id: target.as_str(),
+                publication_id: target.as_str(),
                 kind: wire::TrackKind::Data as i32,
                 source_room: "room".into(),
                 binding: Some(wire::TrackBinding {
@@ -363,7 +368,7 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
         model
             .rows
             .keys()
-            .all(|key| !matches!(key, Key::Participant(_) | Key::Track(_)))
+            .all(|key| !matches!(key, Key::Participant(_) | Key::Publication(_)))
     );
     model
         .authorization(
@@ -381,7 +386,7 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
         model
             .rows
             .keys()
-            .all(|key| !matches!(key, Key::Participant(_) | Key::Track(_)))
+            .all(|key| !matches!(key, Key::Participant(_) | Key::Publication(_)))
     );
     for track in &tracks {
         model
@@ -391,7 +396,7 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
             })
             .unwrap();
     }
-    assert!(model.rows.contains_key(&Key::Track(target.as_str())));
+    assert!(model.rows.contains_key(&Key::Publication(target.as_str())));
     assert_eq!(
         model.rows[&Key::Participant(("room".into(), owner.as_str().into()))].discovered_tracks,
         1
@@ -400,7 +405,7 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
         model
             .rows
             .keys()
-            .filter(|key| matches!(key, Key::Track(_)))
+            .filter(|key| matches!(key, Key::Publication(_)))
             .count(),
         1
     );

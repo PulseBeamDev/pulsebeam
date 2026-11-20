@@ -12,32 +12,32 @@ pub enum ParticipantEffect {
         track: Track,
     },
     TrackCandidateRemoved {
-        track_id: crate::entity::TrackId,
+        publication_id: crate::entity::PublicationKey,
         reason: TrackRemoval,
     },
     TrackSubscribed {
-        track_id: crate::entity::TrackId,
+        publication_id: crate::entity::PublicationKey,
     },
     TrackUnsubscribed {
-        track_id: crate::entity::TrackId,
+        publication_id: crate::entity::PublicationKey,
     },
     TrackPublished {
-        track_id: crate::entity::TrackId,
+        publication_id: crate::entity::PublicationKey,
     },
     TrackUnpublished {
-        track_id: crate::entity::TrackId,
+        publication_id: crate::entity::PublicationKey,
     },
 }
 
 impl ParticipantEffect {
-    pub(crate) fn track_id(&self) -> Option<crate::entity::TrackId> {
+    pub(crate) fn publication_id(&self) -> Option<crate::entity::PublicationKey> {
         match self {
             Self::TrackCandidateAdded { track } => Some(track.id()),
-            Self::TrackCandidateRemoved { track_id, .. }
-            | Self::TrackSubscribed { track_id }
-            | Self::TrackUnsubscribed { track_id }
-            | Self::TrackPublished { track_id }
-            | Self::TrackUnpublished { track_id } => Some(*track_id),
+            Self::TrackCandidateRemoved { publication_id, .. }
+            | Self::TrackSubscribed { publication_id }
+            | Self::TrackUnsubscribed { publication_id }
+            | Self::TrackPublished { publication_id }
+            | Self::TrackUnpublished { publication_id } => Some(*publication_id),
         }
     }
 }

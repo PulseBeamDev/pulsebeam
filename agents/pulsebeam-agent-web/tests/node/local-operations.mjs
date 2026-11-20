@@ -24,7 +24,7 @@ export async function localOperationContract(BrowserRuntime) {
     assert.equal(runtime.set_local_muted, undefined);
     const initial = await runtime.resource({
       op: "claimPublication",
-      spec: { kind: "video", label: "camera" },
+      spec: { kind: "video", trackId: "camera" },
     });
     await runtime.replace_owned_track(
       initial.owner,
@@ -70,7 +70,7 @@ export async function localOperationContract(BrowserRuntime) {
 
     const publication = await runtime.resource({
       op: "claimPublication",
-      spec: { kind: "video", label: "camera" },
+      spec: { kind: "video", trackId: "camera" },
     });
     await runtime.replace_owned_track(
       publication.owner,
@@ -98,7 +98,7 @@ export async function localOperationContract(BrowserRuntime) {
     );
     const reused = await runtime.resource({
       op: "claimPublication",
-      spec: { kind: "video", label: "screen" },
+      spec: { kind: "video", trackId: "screen" },
     });
     assert.equal(reused.slot, publication.slot);
     assert.notEqual(reused.owner, publication.owner);

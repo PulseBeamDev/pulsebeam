@@ -107,7 +107,7 @@ fn declaration(binding: &client::Binding) -> anyhow::Result<wire::ResourceSpec> 
         }),
         declaration: Some(wire::resource_spec::Declaration::Publication(
             wire::PublicationSpec {
-                label: "microphone".into(),
+                track_id: "microphone".into(),
                 kind: Some(wire::publication_spec::Kind::Audio(
                     wire::AudioPublication {
                         binding: Some(wire::TrackBinding {
@@ -345,7 +345,9 @@ impl WirePeer {
             )
             .await?;
         anyhow::ensure!(
-            id.label == "microphone" && id.participant_id == participant && !id.track_id.is_empty(),
+            id.track_id == "microphone"
+                && id.participant_id == participant
+                && !id.publication_id.is_empty(),
             "canonical audio source owner/label/identity"
         );
 

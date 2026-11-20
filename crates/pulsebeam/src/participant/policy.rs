@@ -135,7 +135,7 @@ pub(crate) struct ReceiverBinding {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ReceiverExecution {
-    pub source: crate::entity::TrackId,
+    pub source: crate::entity::PublicationKey,
     pub enabled: bool,
     pub ready: bool,
     pub failed: bool,

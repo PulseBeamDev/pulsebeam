@@ -85,13 +85,13 @@ const camera = {
   id: "camera-id",
   participantId: alice.participantId,
   kind: "video",
-  label: "camera",
+  trackId: "camera",
 };
 const microphone = {
   id: "microphone-id",
   participantId: alice.participantId,
   kind: "audio",
-  label: "microphone",
+  trackId: "microphone",
 };
 
 test("known reference identity survives source replacement without discovery collections", () => {
@@ -259,7 +259,7 @@ test("subscription close drains a late physical observation without adopting it"
       return pending;
     },
   });
-  const selector = { room: "room", participantId: "alice", label: "camera" };
+  const selector = { room: "room", participantId: "alice", trackId: "camera" };
   const configuration = {
     visible: true,
     height: 720,
@@ -320,7 +320,7 @@ test("invalid initial subscription configuration retires its claim in the same t
     () =>
       subscribeVideo(
         resources,
-        { room: "room", participantId: "alice", label: "camera" },
+        { room: "room", participantId: "alice", trackId: "camera" },
         {},
       ),
     (error) => {
@@ -353,7 +353,7 @@ test("audio selection reattachment claims the latest explicit policy", async () 
   const selection = await selectAudio(resources, initial);
   const next = {
     ...initial,
-    selected: [{ room: "room", participantId: "alice", label: "microphone" }],
+    selected: [{ room: "room", participantId: "alice", trackId: "microphone" }],
   };
   await selection.configure(next);
   let configured;

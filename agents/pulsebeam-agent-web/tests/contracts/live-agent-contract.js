@@ -346,9 +346,8 @@
   const discoveredPublications = () =>
     discoveryWatch
       ?.state()
-      .page?.participants.find(
-        (participant) => participant.id === "web-sender",
-      )?.publications ?? [];
+      .page?.participants.find((participant) => participant.id === "web-sender")
+      ?.publications ?? [];
   let handoffAttachment;
   let handoffVideo;
   let videoPublication;
@@ -447,7 +446,7 @@
                 publisher.name === name &&
                 publisher.mode === "ordered" &&
                 publisher.connected &&
-                typeof publisher.dataTrackId === "string",
+                typeof publisher.publicationId === "string",
             ) &&
           receiver
             .snapshot()
@@ -1066,7 +1065,7 @@
       );
       assert(
         metadata?.publications.some(
-          (publication) => publication.label === "camera",
+          (publication) => publication.trackId === "camera",
         ),
         "catalog contains real publication metadata",
       );
@@ -1094,7 +1093,7 @@
             .state()
             .page?.participants.some((participant) =>
               participant.publications.some(
-                (publication) => publication.label === "catalog-metadata",
+                (publication) => publication.trackId === "catalog-metadata",
               ),
             ),
         "WASM catalog metadata replacement",

@@ -1,7 +1,7 @@
 use super::packet::TrackPacket;
 use super::reverse::ReversePacket;
 #[cfg(test)]
-use crate::entity::TrackId;
+use crate::entity::PublicationKey;
 use crate::keys::TrackHandle;
 use crate::track::{SelectionPolicy, Track, TrackMeta, TrackSelector};
 
@@ -22,7 +22,7 @@ pub(crate) trait ParticipantSink {
         &mut self,
         reference: u64,
         source_room: crate::entity::ProjectRoomKey,
-        track: crate::entity::TrackId,
+        track: crate::entity::PublicationKey,
         enabled: bool,
     );
     fn unsubscribe_owned(&mut self, reference: u64, source_room: crate::entity::ProjectRoomKey);
@@ -50,9 +50,9 @@ pub mod test_utils {
         )>,
         pub activate_track_calls: Vec<TrackMeta>,
         pub deactivate_track_calls: Vec<TrackMeta>,
-        pub publish_track_calls: Vec<TrackId>,
-        pub unpublish_track_calls: Vec<TrackId>,
-        pub owned_subscriptions: Vec<(u64, TrackId, bool)>,
+        pub publish_track_calls: Vec<PublicationKey>,
+        pub unpublish_track_calls: Vec<PublicationKey>,
+        pub owned_subscriptions: Vec<(u64, PublicationKey, bool)>,
         pub owned_unsubscribes: Vec<u64>,
         pub reverse_requests: Vec<TrackHandle>,
         pub reverse_packets: Vec<ReversePacket>,
@@ -101,7 +101,7 @@ pub mod test_utils {
             &mut self,
             reference: u64,
             _source_room: crate::entity::ProjectRoomKey,
-            track: TrackId,
+            track: PublicationKey,
             enabled: bool,
         ) {
             self.owned_subscriptions.push((reference, track, enabled));

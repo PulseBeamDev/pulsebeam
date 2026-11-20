@@ -28,7 +28,7 @@
       revision: 1,
       participants: [{ participantId: "alice" }],
       publications: [
-        { id: "A", participantId: "alice", kind: "audio", label: "voice" },
+        { id: "A", participantId: "alice", kind: "audio", trackId: "voice" },
       ],
     },
     mapping: {

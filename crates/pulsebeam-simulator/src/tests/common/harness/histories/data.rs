@@ -51,7 +51,7 @@ async fn application_agent(
 impl DataLane {
     fn spec(&self) -> TrackSpec {
         TrackSpec::Data {
-            label: self.topic.clone(),
+            track_id: self.topic.clone(),
             delivery: self.delivery.mode(),
         }
     }
@@ -68,7 +68,7 @@ impl DataLane {
                 source: TrackSelector {
                     room: self.source_room.clone(),
                     participant_id: participant_id.unwrap_or_else(|| self.participant_id.clone()),
-                    label: self.topic.clone(),
+                    track_id: self.topic.clone(),
                 },
             })
             .await?
@@ -151,7 +151,7 @@ impl DataLane {
                                     mode: delivery.mode(),
                                 }
                                 && status.channel.is_some()
-                                && status.data_track_id.is_some()
+                                && status.publication_id.is_some()
                         });
                 let receiver_ready =
                     lane.receiver
@@ -258,7 +258,7 @@ impl DataLane {
                         mode: self.delivery.mode(),
                     }
             })
-            .and_then(|status| status.data_track_id.clone());
+            .and_then(|status| status.publication_id.clone());
         for _ in 0..64 {
             let ResourceResult::Event { event } = self
                 .receiver
@@ -284,13 +284,14 @@ impl DataLane {
             match event {
                 DataEvent::Message {
                     participant_id,
-                    track_id,
+                    publication_id,
                     sequence,
                     data,
                 } => {
                     ensure!(
-                        participant_id == self.participant_id && Some(&track_id) == track.as_ref(),
-                        "data payload identity ({participant_id}, {track_id}) differs from external publisher {} / track {track:?}",
+                        participant_id == self.participant_id
+                            && Some(&publication_id) == track.as_ref(),
+                        "data payload identity ({participant_id}, {publication_id}) differs from external publisher {} / track {track:?}",
                         self.participant_id
                     );
                     ensure!(
@@ -320,14 +321,14 @@ impl DataLane {
                 }
                 DataEvent::Gap {
                     participant_id,
-                    track_id,
+                    publication_id,
                     from,
                     to,
                 } => {
                     ensure!(
                         self.delivery == Delivery::Ordered
                             && participant_id == self.participant_id
-                            && Some(&track_id) == track.as_ref()
+                            && Some(&publication_id) == track.as_ref()
                             && to > from
                             && self
                                 .last

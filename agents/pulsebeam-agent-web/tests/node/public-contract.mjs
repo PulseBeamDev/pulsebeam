@@ -204,7 +204,7 @@ export async function publicContract(pulsebeam) {
         selector: {
           room: "observation-room",
           participantId: "alice",
-          label: "camera",
+          trackId: "camera",
         },
         initial: {
           ...videoConfig,
@@ -223,7 +223,7 @@ export async function publicContract(pulsebeam) {
         selector: {
           room: "observation-room",
           participantId: "alice",
-          label: "microphone",
+          trackId: "microphone",
         },
         initial: { tag: "Fixed", inner: { minMs: 20, maxMs: 50 } },
         changed: { playoutDelay: { mode: "adaptive" } },
@@ -259,7 +259,7 @@ export async function publicContract(pulsebeam) {
       assert.equal(Object.isFrozen(delay), true);
       assert.equal(Object.isFrozen(delay.inner), true);
       assert.throws(() => {
-        first.selector.label = "other";
+        first.selector.trackId = "other";
       }, TypeError);
       const cursor = handle.updates();
       const siblingCursor = handle.updates();
@@ -312,12 +312,12 @@ export async function publicContract(pulsebeam) {
     assert.equal(dataSubscription instanceof Promise, false);
     const publicationState = publication.state();
     const subscriptionState = dataSubscription.state();
-    assert.equal(publicationState.label, "owned-events");
+    assert.equal(publicationState.trackId, "owned-events");
     assert.equal(publicationState.delivery, 2); // Core TopicMode.Ordered
     assert.deepEqual(subscriptionState.selector, {
       room: "observation-room",
       participantId: "alice",
-      label: "owned-events",
+      trackId: "owned-events",
     });
     assert.equal(subscriptionState.delivery, publicationState.delivery);
     assert.equal(unrelatedData.state().delivery, 1); // Core TopicMode.Lossy

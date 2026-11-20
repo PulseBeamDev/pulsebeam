@@ -91,9 +91,9 @@
       () => received.length === 2 && received.every((track) => !track.muted),
       "real decoded receivers",
     );
-    const publication = (id, label) => ({
+    const publication = (id, trackId) => ({
       id,
-      label,
+      trackId,
       kind: "audio",
       participantId: "alice",
     });

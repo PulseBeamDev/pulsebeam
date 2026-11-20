@@ -131,7 +131,7 @@ impl Topics {
             let binding = self
                 .publishers
                 .get(&publisher)
-                .and_then(|state| state.data_track_id.clone());
+                .and_then(|state| state.publication_id.clone());
             let failure = if !connected_intent {
                 Some(DataSendFailure::Disconnected)
             } else if let Some(failure) = &snapshot.terminal_failure {

@@ -80,7 +80,7 @@ impl Default for PublicationConfig {
 pub struct PublicationIntent {
     pub slot: String,
     pub kind: MediaKind,
-    pub label: String,
+    pub track_id: String,
     pub active: bool,
 }
 
@@ -121,7 +121,7 @@ pub struct AudioDemand {
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AudioTrackDelay {
-    pub track_id: String,
+    pub publication_id: String,
     pub playout_delay: PlayoutDelay,
 }
 
@@ -129,7 +129,7 @@ pub struct AudioTrackDelay {
 pub struct TrackSelector {
     pub room: String,
     pub participant_id: String,
-    pub label: String,
+    pub track_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
@@ -434,7 +434,7 @@ impl From<&Failure> for ErrorInfo {
 pub struct TopicPublisherState {
     pub publisher: TopicPublisher,
     pub connected: bool,
-    pub data_track_id: Option<String>,
+    pub publication_id: Option<String>,
     pub next_sequence: u64,
     pub accepted_history: u64,
     pub queued_messages: u64,
@@ -523,7 +523,7 @@ pub struct TopicMessage {
     pub room: String,
     pub name: String,
     pub mode: TopicMode,
-    pub data_track_id: String,
+    pub publication_id: String,
     pub sequence: u64,
     pub participant_id: String,
     pub payload: Vec<u8>,
@@ -534,7 +534,7 @@ pub enum TopicNotification {
     SendAdmitted {
         publisher: TopicPublisher,
         operation_id: u64,
-        data_track_id: String,
+        publication_id: String,
         sequence: u64,
     },
     SendDropped {
@@ -552,7 +552,7 @@ pub enum TopicNotification {
     },
     RecoveryGap {
         subscriber: TopicSubscriber,
-        data_track_id: String,
+        publication_id: String,
         participant_id: String,
         expected_sequence: u64,
         available_sequence: u64,
@@ -847,7 +847,7 @@ impl From<PublicationIntent> for model::PublicationIntent {
         Self {
             slot: value.slot,
             kind: value.kind.into(),
-            label: value.label,
+            track_id: value.track_id,
             active: value.active,
         }
     }
@@ -858,7 +858,7 @@ impl From<model::PublicationIntent> for PublicationIntent {
         Self {
             slot: value.slot,
             kind: value.kind.into(),
-            label: value.label,
+            track_id: value.track_id,
             active: value.active,
         }
     }
@@ -868,7 +868,7 @@ impl From<VideoDemand> for model::VideoSubscription {
     fn from(value: VideoDemand) -> Self {
         Self {
             slot: value.slot,
-            track_id: value.publication_id,
+            publication_id: value.publication_id,
             selector: value.selector.map(Into::into),
             height: value.height,
             min_height: value.min_height,
@@ -883,7 +883,7 @@ impl From<model::VideoSubscription> for VideoDemand {
     fn from(value: model::VideoSubscription) -> Self {
         Self {
             slot: value.slot,
-            publication_id: value.track_id,
+            publication_id: value.publication_id,
             selector: value.selector.map(Into::into),
             height: value.height,
             min_height: value.min_height,
@@ -928,7 +928,7 @@ impl From<AudioDemand> for model::AudioSubscription {
             playout_delays: value
                 .playout_delays
                 .into_iter()
-                .map(|entry| (entry.track_id, entry.playout_delay.into()))
+                .map(|entry| (entry.publication_id, entry.playout_delay.into()))
                 .collect(),
             selector_delays: value
                 .selector_delays
@@ -947,8 +947,8 @@ impl From<model::AudioSubscription> for AudioDemand {
             playout_delays: value
                 .playout_delays
                 .into_iter()
-                .map(|(track_id, playout_delay)| AudioTrackDelay {
-                    track_id,
+                .map(|(publication_id, playout_delay)| AudioTrackDelay {
+                    publication_id,
                     playout_delay: playout_delay.into(),
                 })
                 .collect(),
@@ -969,7 +969,7 @@ impl From<TrackSelector> for model::TrackSelector {
         Self {
             room: value.room,
             participant_id: value.participant_id,
-            label: value.label,
+            track_id: value.track_id,
         }
     }
 }
@@ -979,7 +979,7 @@ impl From<model::TrackSelector> for TrackSelector {
         Self {
             room: value.room,
             participant_id: value.participant_id,
-            label: value.label,
+            track_id: value.track_id,
         }
     }
 }
@@ -1134,7 +1134,7 @@ impl From<&model::TopicSnapshot> for TopicState {
                 .map(|status| TopicPublisherState {
                     publisher: status.registration.into(),
                     connected: status.channel.is_some(),
-                    data_track_id: status.data_track_id,
+                    publication_id: status.publication_id,
                     next_sequence: status.next_sequence,
                     accepted_history: count(status.accepted_history),
                     queued_messages: count(status.queued_messages),
@@ -1203,7 +1203,7 @@ impl From<model::TopicMessage> for TopicMessage {
             room: value.room,
             name: value.topic,
             mode: value.mode.into(),
-            data_track_id: value.data_track_id,
+            publication_id: value.publication_id,
             sequence: value.sequence,
             participant_id: value.participant_id,
             payload: value.payload,
@@ -1217,12 +1217,12 @@ impl From<model::TopicNotification> for TopicNotification {
             model::TopicNotification::SendAdmitted {
                 publisher,
                 operation,
-                data_track_id,
+                publication_id,
                 sequence,
             } => Self::SendAdmitted {
                 publisher: publisher.into(),
                 operation_id: operation.get(),
-                data_track_id,
+                publication_id,
                 sequence,
             },
             model::TopicNotification::SendDropped { publisher, reason } => Self::SendDropped {
@@ -1248,13 +1248,13 @@ impl From<model::TopicNotification> for TopicNotification {
             }
             model::TopicNotification::RecoveryGap {
                 subscriber,
-                data_track_id,
+                publication_id,
                 participant_id,
                 expected_sequence,
                 available_sequence,
             } => Self::RecoveryGap {
                 subscriber: subscriber.into(),
-                data_track_id,
+                publication_id,
                 participant_id,
                 expected_sequence,
                 available_sequence,
@@ -1391,7 +1391,7 @@ mod tests {
             publications: vec![PublicationIntent {
                 slot: "v0".to_string(),
                 kind: MediaKind::Video,
-                label: "camera".to_string(),
+                track_id: "camera".to_string(),
                 active: true,
             }],
             topic_publishers: vec![
@@ -1448,7 +1448,7 @@ mod tests {
                     id: id.to_string(),
                     participant_id: owner.to_string(),
                     kind: model::MediaKind::Video,
-                    label: "camera".to_string(),
+                    track_id: "camera".to_string(),
                 },
             );
         }
@@ -1510,7 +1510,7 @@ mod tests {
                 topic: "chat".to_string(),
                 mode: model::TopicMode::Ordered,
                 participant_id: "participant".to_string(),
-                data_track_id: "data-track".to_string(),
+                publication_id: "data-track".to_string(),
                 sequence: 9,
                 payload: vec![1, 2, 3],
             }));
@@ -1523,7 +1523,7 @@ mod tests {
                         name: "chat".to_string(),
                         mode: TopicMode::Ordered,
                         participant_id: "participant".to_string(),
-                        data_track_id: "data-track".to_string(),
+                        publication_id: "data-track".to_string(),
                         sequence: 9,
                         payload: vec![1, 2, 3],
                     },
@@ -1551,7 +1551,7 @@ mod tests {
         let publisher_state = TopicPublisherState {
             publisher: publisher.clone(),
             connected: true,
-            data_track_id: Some("data-track".to_string()),
+            publication_id: Some("data-track".to_string()),
             next_sequence: 9,
             accepted_history: 3,
             queued_messages: 1,
@@ -1577,7 +1577,7 @@ mod tests {
         assert_ffi_round_trip(PublicationIntent {
             slot: "v0".to_string(),
             kind: MediaKind::Video,
-            label: "camera".to_string(),
+            track_id: "camera".to_string(),
             active: true,
         });
         assert_ffi_round_trip(VideoDemand {
@@ -1628,7 +1628,7 @@ mod tests {
         let selector = TrackSelector {
             room: "room".into(),
             participant_id: "web-sender".to_string(),
-            label: "camera".to_string(),
+            track_id: "camera".to_string(),
         };
         assert_ffi_round_trip(selector.clone());
         assert_ffi_round_trip(SelectorDelay {
@@ -1639,7 +1639,7 @@ mod tests {
             pinned: vec!["participant/audio".to_string()],
             selected: vec![selector.clone()],
             playout_delays: vec![AudioTrackDelay {
-                track_id: "participant/audio".to_string(),
+                publication_id: "participant/audio".to_string(),
                 playout_delay: PlayoutDelay::Fixed {
                     min_ms: 0,
                     max_ms: 0,
@@ -1657,7 +1657,7 @@ mod tests {
             publications: vec![PublicationIntent {
                 slot: "v0".to_string(),
                 kind: MediaKind::Video,
-                label: "camera".to_string(),
+                track_id: "camera".to_string(),
                 active: true,
             }],
             video: vec![],
@@ -1950,7 +1950,7 @@ mod tests {
                 name: "chat".to_string(),
                 mode,
                 participant_id: "participant".to_string(),
-                data_track_id: "data-track".to_string(),
+                publication_id: "data-track".to_string(),
                 sequence: u64::MAX.saturating_sub(1),
                 payload: vec![2],
             });
@@ -1969,7 +1969,7 @@ mod tests {
             TopicNotification::SendAdmitted {
                 publisher: publisher.clone(),
                 operation_id: 1,
-                data_track_id: "data-track".to_string(),
+                publication_id: "data-track".to_string(),
                 sequence: 3,
             },
             TopicNotification::SendDropped {
@@ -1981,7 +1981,7 @@ mod tests {
                     room: "room".into(),
                     name: "chat".to_string(),
                     mode: TopicMode::Latest,
-                    data_track_id: "data-track".to_string(),
+                    publication_id: "data-track".to_string(),
                     participant_id: "participant".to_string(),
                     sequence: 0,
                     payload: vec![1, 2],
@@ -1996,7 +1996,7 @@ mod tests {
             TopicNotification::RecoveryGap {
                 subscriber,
                 participant_id: "participant".to_string(),
-                data_track_id: "data-track".to_string(),
+                publication_id: "data-track".to_string(),
                 expected_sequence: 2,
                 available_sequence: 3,
             },

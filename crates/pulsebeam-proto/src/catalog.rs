@@ -37,16 +37,11 @@ pub enum CatalogError {
     OutOfOrder,
 }
 
-fn valid_text(value: &str, max_bytes: usize) -> bool {
-    !value.is_empty() && value.len() <= max_bytes
-}
-
 /// Validate the exact logical selector without normalizing or changing identity.
 pub fn validate_address(address: &LogicalSourceAddress) -> Result<(), CatalogError> {
     if !is_application_name(&address.room)
         || !is_application_name(&address.participant_id)
-        || address.participant_id.chars().any(char::is_control)
-        || !valid_text(&address.label, 256)
+        || !is_application_name(&address.track_id)
         || !matches!(address.kind, 1..=3)
     {
         return Err(CatalogError::InvalidAddress);
@@ -559,10 +554,10 @@ mod tests {
             }),
             tracks: (0..tracks)
                 .map(|i| Track {
-                    track_id: format!("{id}-{i}"),
+                    publication_id: format!("pub_00000000001R0100000000{i:04}0"),
                     participant_id: id.into(),
                     room_id: "room".into(),
-                    label: "x".repeat(256),
+                    track_id: format!("track-{i:030}"),
                     kind: Some(track::Kind::Data(crate::state::DataTrack {
                         delivery: DataDelivery::Ordered as i32,
                     })),
@@ -629,7 +624,7 @@ mod tests {
             room: "room".into(),
             participant_id: "App_User".into(),
             kind: 2,
-            label: "camera".into(),
+            track_id: "camera".into(),
         };
         assert_eq!(validate_address(&address), Ok(()));
         for participant in ["p".repeat(36), "P".into(), "_".into()] {
@@ -659,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn sixty_four_long_labels_fragment_under_full_protobuf_record_bound() {
+    fn sixty_four_canonical_track_names_fragment_under_full_protobuf_record_bound() {
         let value = entry("p", MAX_TRACKS_PER_PARTICIPANT);
         let fragments = completed_records(9, 0, &value);
         assert!(value.encoded_len() > MAX_CATALOG_RECORD_BYTES);

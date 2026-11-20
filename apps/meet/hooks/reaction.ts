@@ -19,7 +19,7 @@ export function useReaction(agent: Agent) {
     onEvent(event: DataEvent<"lossy">) {
       const emoji = decodeText(event.data);
       if (emoji !== null && reactionEmojis.includes(emoji)) {
-        add({ key: `${event.trackId}:${event.sequence}`, emoji });
+        add({ key: `${event.publicationId}:${event.sequence}`, emoji });
       }
     },
     dismiss(key: string) {

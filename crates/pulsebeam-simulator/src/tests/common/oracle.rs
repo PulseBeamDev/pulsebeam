@@ -1,6 +1,6 @@
 use super::client::ClientObservation;
 use anyhow::{Result, ensure};
-use pulsebeam::entity::{ConnectionId, ParticipantId, RoomId, TrackId, TrackKind};
+use pulsebeam::entity::{ConnectionId, ParticipantId, PublicationKey, RoomId, TrackKind};
 use pulsebeam_agent_native::agent_core::{
     ConnectionState, MediaKind, Publication, TopicRegistrations,
 };
@@ -33,14 +33,9 @@ impl ExpectedParticipant {
 
     pub fn bind_media(&mut self, catalog: &[Publication]) -> Result<bool> {
         self.media.clear();
-        for (enabled, kind, track_kind, label) in [
-            (
-                self.video,
-                MediaKind::Video,
-                TrackKind::Video,
-                self.video_label.as_str(),
-            ),
-            (self.audio, MediaKind::Audio, TrackKind::Audio, "audio"),
+        for (enabled, kind, label) in [
+            (self.video, MediaKind::Video, self.video_label.as_str()),
+            (self.audio, MediaKind::Audio, "audio"),
         ] {
             if !enabled {
                 continue;
@@ -48,7 +43,7 @@ impl ExpectedParticipant {
             let mut descriptors = catalog.iter().filter(|publication| {
                 publication.participant_id == self.id.as_str()
                     && publication.kind == kind
-                    && publication.label == label
+                    && publication.track_id == label
             });
             let Some(descriptor) = descriptors.next() else {
                 return Ok(false);
@@ -57,26 +52,23 @@ impl ExpectedParticipant {
                 descriptors.next().is_none(),
                 "duplicate publisher descriptor for {kind:?}/{label}"
             );
-            let id: TrackId = descriptor.id.parse()?;
-            ensure!(
-                id.kind() == track_kind,
-                "publisher descriptor has wrong ID kind"
-            );
+            descriptor.id.parse::<pulsebeam::entity::PublicationId>()?;
             self.media.push(Publication {
                 id: descriptor.id.clone(),
                 participant_id: self.id.as_str().to_owned(),
                 kind,
-                label: label.into(),
+                track_id: label.into(),
             });
         }
         Ok(true)
     }
 
-    pub fn track_id(&self, kind: TrackKind, label: &str) -> TrackId {
-        self.media
+    pub fn publication_id(&self, kind: TrackKind, label: &str) -> PublicationKey {
+        let id = self
+            .media
             .iter()
             .find(|publication| {
-                publication.label == label
+                publication.track_id == label
                     && matches!(
                         (kind, publication.kind),
                         (TrackKind::Video, MediaKind::Video) | (TrackKind::Audio, MediaKind::Audio)
@@ -85,7 +77,8 @@ impl ExpectedParticipant {
             .expect("bound publisher descriptor")
             .id
             .parse()
-            .expect("canonical publication")
+            .expect("canonical publication");
+        PublicationKey::new(kind, id)
     }
 
     pub fn publications(&self) -> impl Iterator<Item = Publication> + '_ {
@@ -208,10 +201,12 @@ impl ApplicationStateOracle {
                     peer.media
                         .iter()
                         .any(|publication| publication.kind == MediaKind::Video
-                            && publication.label == peer.video_label),
+                            && publication.track_id == peer.video_label),
                     "requested video has no current publisher descriptor"
                 );
-                Ok(peer.track_id(TrackKind::Video, &peer.video_label).as_str())
+                Ok(peer
+                    .publication_id(TrackKind::Video, &peer.video_label)
+                    .as_str())
             })
             .collect::<Result<BTreeSet<_>>>()?;
         let allowed_video_origins = requested_video.iter().cloned().collect();
@@ -257,7 +252,7 @@ impl ApplicationStateOracle {
                     .iter()
                     .find(|peer| peer.id.as_str() == *id && peer.audio)
             })
-            .map(|peer| peer.track_id(TrackKind::Audio, "audio").as_str())
+            .map(|peer| peer.publication_id(TrackKind::Audio, "audio").as_str())
             .filter(|id| available_audio.contains(id))
             .collect::<BTreeSet<_>>();
         ensure!(pinned.is_subset(&audio), "pinned audio assignment missing");
@@ -265,7 +260,7 @@ impl ApplicationStateOracle {
             let expected_automatic = peers
                 .iter()
                 .filter(|peer| peer.required && peer.audio)
-                .map(|peer| peer.track_id(TrackKind::Audio, "audio").as_str())
+                .map(|peer| peer.publication_id(TrackKind::Audio, "audio").as_str())
                 .filter(|track| !pinned.contains(track))
                 .collect::<BTreeSet<_>>();
             ensure!(
@@ -319,7 +314,7 @@ impl ApplicationStateOracle {
         let mut data_ids = BTreeSet::new();
         for publisher in &snapshot.topics.publishers {
             let id = publisher
-                .data_track_id
+                .publication_id
                 .as_ref()
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("publisher has no public data binding"))?;

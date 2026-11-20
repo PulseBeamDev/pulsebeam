@@ -35,7 +35,7 @@ pub(crate) struct ForwardingContext<'a> {
 }
 
 struct TrackRuntime {
-    id: crate::entity::TrackId,
+    id: crate::entity::PublicationKey,
     origin: Option<ParticipantHandle>,
     cache: Option<TrackStreamCache>,
     publisher: Option<ParticipantHandle>,
@@ -98,7 +98,7 @@ fn forward_track(
 
 pub(crate) struct ShardRuntime {
     tracks: SlotMap<TrackHandle, TrackRuntime>,
-    track_handles: HashMap<crate::entity::TrackId, TrackHandle>,
+    track_handles: HashMap<crate::entity::PublicationKey, TrackHandle>,
     pub(crate) routes: RouteRuntime,
 }
 
@@ -111,11 +111,17 @@ impl ShardRuntime {
         }
     }
 
-    pub(crate) fn track_handle(&self, track_id: crate::entity::TrackId) -> Option<TrackHandle> {
-        self.track_handles.get(&track_id).copied()
+    pub(crate) fn track_handle(
+        &self,
+        publication_id: crate::entity::PublicationKey,
+    ) -> Option<TrackHandle> {
+        self.track_handles.get(&publication_id).copied()
     }
 
-    pub(crate) fn track_id(&self, handle: TrackHandle) -> Option<crate::entity::TrackId> {
+    pub(crate) fn publication_id(
+        &self,
+        handle: TrackHandle,
+    ) -> Option<crate::entity::PublicationKey> {
         self.tracks.get(handle).map(|runtime| runtime.id)
     }
 
@@ -123,8 +129,8 @@ impl ShardRuntime {
         self.tracks.get(handle).and_then(|runtime| runtime.origin)
     }
 
-    pub(crate) fn retire_track(&mut self, track_id: crate::entity::TrackId) {
-        let Some(handle) = self.track_handles.remove(&track_id) else {
+    pub(crate) fn retire_track(&mut self, publication_id: crate::entity::PublicationKey) {
+        let Some(handle) = self.track_handles.remove(&publication_id) else {
             return;
         };
         let _ = self.tracks.remove(handle);
@@ -132,7 +138,7 @@ impl ShardRuntime {
 
     pub(crate) fn install_track(
         &mut self,
-        track_id: crate::entity::TrackId,
+        publication_id: crate::entity::PublicationKey,
         descriptor: Option<&crate::shard_update::TrackDescriptor>,
         origin: Option<ParticipantHandle>,
         publisher: Option<ParticipantHandle>,
@@ -143,7 +149,7 @@ impl ShardRuntime {
                 debug_assert!(descriptor.encodings.len() <= 3);
                 TrackStreamCache::with_encodings(&descriptor.encodings)
             });
-        if let Some(handle) = self.track_handles.get(&track_id).copied() {
+        if let Some(handle) = self.track_handles.get(&publication_id).copied() {
             let Some(runtime) = self.tracks.get_mut(handle) else {
                 debug_assert!(false, "a track identity must resolve to its shard handle");
                 return handle;
@@ -157,12 +163,12 @@ impl ShardRuntime {
             return handle;
         }
         let handle = self.tracks.insert(TrackRuntime {
-            id: track_id,
+            id: publication_id,
             origin,
             cache,
             publisher,
         });
-        self.track_handles.insert(track_id, handle);
+        self.track_handles.insert(publication_id, handle);
         handle
     }
 
@@ -203,9 +209,9 @@ impl ShardRuntime {
         });
         if origin.is_local() {
             let playout = ctx.wall.to_ntp(packet.playout_time);
-            let track_id = runtime.id;
+            let publication_id = runtime.id;
             fanout_remote(plan, playout.middle32(), || RoutedTrackPacket {
-                track_id,
+                publication_id,
                 packet: TrackPacket::Rtp(packet.to_transit()),
             });
         }
@@ -258,9 +264,9 @@ impl ShardRuntime {
         });
         if origin.is_local() {
             let playout = ctx.wall.ntp();
-            let track_id = runtime.id;
+            let publication_id = runtime.id;
             fanout_remote(plan, playout.middle32(), || RoutedTrackPacket {
-                track_id,
+                publication_id,
                 packet: TrackPacket::Data {
                     lane,
                     bytes: packet.clone(),
@@ -300,8 +306,11 @@ mod tests {
     use super::*;
     use crate::id::ShardId;
     use slotmap::SlotMap;
-    fn track_id(kind: crate::entity::TrackKind, label: &str) -> crate::entity::TrackId {
-        crate::entity::ConnectionId::new().derive_track_id(kind, label)
+    fn publication_id(
+        kind: crate::entity::TrackKind,
+        label: &str,
+    ) -> crate::entity::PublicationKey {
+        crate::entity::ConnectionId::new().fixture_publication(kind, label)
     }
 
     #[test]
@@ -315,8 +324,8 @@ mod tests {
             kind: crate::entity::TrackKind::Video,
             encodings: vec![Some(crate::media::Rid::from("q")).into()],
         };
-        let track_id = track_id(crate::entity::TrackKind::Video, "video");
-        let key = runtime.install_track(track_id, Some(&descriptor), Some(origin_key), None);
+        let publication_id = publication_id(crate::entity::TrackKind::Video, "video");
+        let key = runtime.install_track(publication_id, Some(&descriptor), Some(origin_key), None);
         let origin_before = runtime.tracks.get(key).unwrap().origin;
         let descriptor = crate::shard_update::TrackDescriptor {
             origin: descriptor.origin,
@@ -324,7 +333,7 @@ mod tests {
             encodings: vec![Some(crate::media::Rid::from("f")).into()],
         };
         assert_eq!(
-            runtime.install_track(track_id, Some(&descriptor), Some(origin_key), None),
+            runtime.install_track(publication_id, Some(&descriptor), Some(origin_key), None),
             key
         );
 
@@ -345,7 +354,7 @@ mod tests {
             encodings: Vec::new(),
         };
         let key = runtime.install_track(
-            track_id(crate::entity::TrackKind::Video, "empty"),
+            publication_id(crate::entity::TrackKind::Video, "empty"),
             Some(&descriptor),
             Some(origin_key),
             None,
@@ -372,7 +381,7 @@ mod tests {
             encodings: Vec::new(),
         };
         let key = runtime.install_track(
-            track_id(crate::entity::TrackKind::Audio, "audio"),
+            publication_id(crate::entity::TrackKind::Audio, "audio"),
             Some(&descriptor),
             Some(origin_key),
             None,
@@ -389,10 +398,10 @@ mod tests {
     #[test]
     fn reinserting_a_live_data_runtime_preserves_cache_state() {
         let mut runtime = ShardRuntime::new(ShardId::new(0));
-        let track_id = track_id(crate::entity::TrackKind::Data, "data");
-        let key = runtime.install_track(track_id, None, None, None);
+        let publication_id = publication_id(crate::entity::TrackKind::Data, "data");
+        let key = runtime.install_track(publication_id, None, None, None);
         runtime.tracks.get_mut(key).unwrap().cache = Some(TrackStreamCache::new());
-        assert_eq!(runtime.install_track(track_id, None, None, None), key);
+        assert_eq!(runtime.install_track(publication_id, None, None, None), key);
 
         assert!(runtime.tracks.get(key).unwrap().cache.is_some());
     }

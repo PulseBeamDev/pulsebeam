@@ -34,7 +34,7 @@ impl Transcript {
                         message.topic == self.topic
                             && message.mode == TopicMode::Ordered
                             && message.participant_id == self.publisher
-                            && message.data_track_id == self.track,
+                            && message.publication_id == self.track,
                         "ordered message has wrong topic, mode or source: {message:?}"
                     );
                     let index = usize::try_from(message.sequence)?;
@@ -47,7 +47,7 @@ impl Transcript {
                 }
                 TopicNotification::RecoveryGap {
                     subscriber,
-                    data_track_id,
+                    publication_id,
                     participant_id,
                     expected_sequence,
                     available_sequence,
@@ -55,7 +55,7 @@ impl Transcript {
                     ensure!(
                         subscriber.topic == self.topic
                             && subscriber.mode == TopicMode::Ordered
-                            && *data_track_id == self.track
+                            && *publication_id == self.track
                             && *participant_id == self.publisher,
                         "ordered gap has wrong topic, mode or source: {event:?}"
                     );
@@ -136,7 +136,7 @@ impl Scenario<'_> {
                     })?;
                     Some((
                         observed.snapshot.participant_id.clone()?,
-                        status.data_track_id.clone()?,
+                        status.publication_id.clone()?,
                         status.next_sequence,
                     ))
                 })
@@ -185,7 +185,7 @@ impl Scenario<'_> {
                     })
                 }) {
                     ensure!(
-                        status.data_track_id.as_ref() == Some(&self.transcript.track)
+                        status.publication_id.as_ref() == Some(&self.transcript.track)
                             && status.next_sequence <= target,
                         "ordered publisher identity or input sequence changed"
                     );
@@ -490,7 +490,7 @@ mod tests {
             topic: "state".into(),
             mode: TopicMode::Ordered,
             participant_id: "publisher".into(),
-            data_track_id: "track".into(),
+            publication_id: "track".into(),
             sequence,
             payload: format!("input:{sequence}").into_bytes(),
         })
@@ -504,7 +504,7 @@ mod tests {
                 topic: "state".into(),
                 mode: TopicMode::Ordered,
             },
-            data_track_id: "track".into(),
+            publication_id: "track".into(),
             participant_id: "publisher".into(),
             expected_sequence,
             available_sequence,
@@ -569,7 +569,7 @@ mod tests {
             };
             match field {
                 0 => value.payload = b"substituted".to_vec(),
-                1 => value.data_track_id = "replacement".into(),
+                1 => value.publication_id = "replacement".into(),
                 2 => value.participant_id = "bystander".into(),
                 3 => value.topic = "other".into(),
                 _ => value.mode = TopicMode::Latest,

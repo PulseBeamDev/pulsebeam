@@ -97,7 +97,7 @@ pub struct TopicMessage {
     pub room: String,
     pub topic: String,
     pub mode: TopicMode,
-    pub data_track_id: String,
+    pub publication_id: String,
     pub sequence: u64,
     pub participant_id: String,
     pub payload: Vec<u8>,
@@ -127,7 +127,7 @@ pub enum TopicNotification {
     SendAdmitted {
         publisher: TopicPublisher,
         operation: OperationId,
-        data_track_id: String,
+        publication_id: String,
         sequence: u64,
     },
     SendDropped {
@@ -141,7 +141,7 @@ pub enum TopicNotification {
     },
     RecoveryGap {
         subscriber: TopicSubscriber,
-        data_track_id: String,
+        publication_id: String,
         participant_id: String,
         expected_sequence: u64,
         available_sequence: u64,
@@ -162,7 +162,7 @@ pub struct TopicSnapshot {
 pub struct TopicPublisherStatus {
     pub registration: TopicPublisher,
     pub channel: Option<ChannelId>,
-    pub data_track_id: Option<String>,
+    pub publication_id: Option<String>,
     pub next_sequence: u64,
     pub accepted_history: usize,
     pub queued_messages: usize,
@@ -234,7 +234,7 @@ struct QueuedMessage {
 
 #[derive(Default)]
 struct PublisherState {
-    data_track_id: Option<String>,
+    publication_id: Option<String>,
     next_sequence: u64,
     history: VecDeque<WireMessage>,
     queue: VecDeque<QueuedMessage>,
@@ -400,15 +400,15 @@ impl Topics {
         active.channels.insert(source.channel, registration);
         active
             .channel_sources
-            .insert(source.channel, source.track.track_id.clone());
+            .insert(source.channel, source.track.publication_id.clone());
         self.catalog.insert(
-            source.track.track_id.clone(),
+            source.track.publication_id.clone(),
             CatalogBinding {
                 room: match &source.registration {
                     TopicChannel::Publisher(_) => None,
                     TopicChannel::Subscriber(subscriber) => Some(subscriber.room.clone()),
                 },
-                topic: source.track.label.clone(),
+                topic: source.track.track_id.clone(),
                 mode,
                 participant_id: source.participant.participant_id.clone(),
                 local: source.track.participant_id == active.canonical_participant_id,
@@ -417,10 +417,10 @@ impl Topics {
         match source.registration {
             TopicChannel::Publisher(publisher) => {
                 let state = self.publishers.entry(publisher.clone()).or_default();
-                if state.data_track_id.as_ref() != Some(&source.track.track_id) {
+                if state.publication_id.as_ref() != Some(&source.track.publication_id) {
                     state.history.clear();
                     state.next_sequence = 0;
-                    state.data_track_id = Some(source.track.track_id.clone());
+                    state.publication_id = Some(source.track.publication_id.clone());
                 }
                 self.dispatch_publisher(&publisher, ids, effects);
             }
@@ -428,7 +428,7 @@ impl Topics {
                 let cursor = self.subscribers.get_mut(&subscriber).and_then(|state| {
                     state
                         .ordered
-                        .entry(source.track.track_id.clone())
+                        .entry(source.track.publication_id.clone())
                         .or_default()
                         .next_sequence
                 });
@@ -437,7 +437,7 @@ impl Topics {
                     source.channel,
                     TopicChannel::Subscriber(subscriber),
                     Body::Probe(TopicProbe {
-                        data_track_id: source.track.track_id.clone(),
+                        publication_id: source.track.publication_id.clone(),
                         from_sequence: cursor.unwrap_or(0),
                         live: cursor.is_none(),
                     }),
@@ -560,7 +560,7 @@ impl Topics {
                     *channel,
                     subscriber.clone(),
                     TopicProbe {
-                        data_track_id: id.clone(),
+                        publication_id: id.clone(),
                         from_sequence: cursor.unwrap_or(0),
                         live: cursor.is_none(),
                     },
@@ -756,8 +756,8 @@ impl Topics {
             self.refresh_snapshot(snapshot);
             return Err(TopicError::PublisherUnavailable(send.publisher.topic));
         };
-        let Some(data_track_id) = state
-            .data_track_id
+        let Some(publication_id) = state
+            .publication_id
             .as_ref()
             .filter(|_| channel.is_some())
             .cloned()
@@ -793,7 +793,7 @@ impl Topics {
         let sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.saturating_add(1);
         let message = WireMessage {
-            data_track_id: data_track_id.clone(),
+            publication_id: publication_id.clone(),
             sequence,
             payload: send.payload,
         };
@@ -813,7 +813,7 @@ impl Topics {
         notifications.push_back(Notification::Topic(TopicNotification::SendAdmitted {
             publisher: send.publisher.clone(),
             operation: ids.operation(),
-            data_track_id,
+            publication_id,
             sequence,
         }));
         self.dispatch_publisher(&send.publisher, ids, effects);
@@ -938,7 +938,7 @@ impl Topics {
         let frame =
             TopicFrame::decode_bounded(&payload).map_err(|_| TopicError::MalformedMessage)?;
         let id = frame
-            .data_track_id()
+            .publication_id()
             .ok_or(TopicError::MalformedMessage)?
             .to_string();
         if active
@@ -953,14 +953,15 @@ impl Topics {
                 let Some(state) = self.publishers.get(&publisher) else {
                     return Err(TopicError::InvalidControl);
                 };
-                if publisher.mode != TopicMode::Ordered || state.data_track_id.as_ref() != Some(&id)
+                if publisher.mode != TopicMode::Ordered
+                    || state.publication_id.as_ref() != Some(&id)
                 {
                     return Err(TopicError::InvalidControl);
                 }
                 let response = match frame.body {
                     Some(Body::Probe(probe)) if probe.live => {
                         alloc::vec![Body::Frontier(TopicFrontier {
-                            data_track_id: id,
+                            publication_id: id,
                             next_sequence: state.next_sequence
                         })]
                     }
@@ -1048,7 +1049,7 @@ impl Topics {
                             notifications.push_back(Notification::Topic(
                                 TopicNotification::RecoveryGap {
                                     subscriber: subscriber.clone(),
-                                    data_track_id: id.clone(),
+                                    publication_id: id.clone(),
                                     participant_id: binding.participant_id.clone(),
                                     expected_sequence,
                                     available_sequence,
@@ -1062,7 +1063,7 @@ impl Topics {
                                 channel,
                                 TopicChannel::Subscriber(subscriber),
                                 Body::Nack(TopicNack {
-                                    data_track_id: id,
+                                    publication_id: id,
                                     from_sequence,
                                 }),
                                 ids,
@@ -1158,8 +1159,8 @@ impl Topics {
         let mut result = Vec::new();
         if from < floor {
             result.push(Body::Floor(TopicFloor {
-                data_track_id: state
-                    .data_track_id
+                publication_id: state
+                    .publication_id
                     .clone()
                     .ok_or(TopicError::InvalidControl)?,
                 available_sequence: floor,
@@ -1190,7 +1191,7 @@ impl Topics {
                     room: subscriber.room.clone(),
                     topic: subscriber.topic.clone(),
                     mode: subscriber.mode,
-                    data_track_id: message.data_track_id,
+                    publication_id: message.publication_id,
                     sequence: message.sequence,
                     participant_id: binding.participant_id.clone(),
                     payload: message.payload,
@@ -1264,7 +1265,7 @@ impl Topics {
         let Some(state) = self.publishers.get_mut(publisher) else {
             return;
         };
-        if state.pending.is_some() || state.data_track_id.is_none() {
+        if state.pending.is_some() || state.publication_id.is_none() {
             return;
         }
         let Some(message) = state.queue.pop_front() else {
@@ -1388,7 +1389,7 @@ impl Topics {
                     TopicPublisherStatus {
                         registration: registration.clone(),
                         channel: self.channel_for_publisher(registration),
-                        data_track_id: state.and_then(|state| state.data_track_id.clone()),
+                        publication_id: state.and_then(|state| state.publication_id.clone()),
                         next_sequence: state.map_or(0, |state| state.next_sequence),
                         accepted_history: state.map_or(0, |state| state.history.len()),
                         queued_messages: state.map_or(0, |state| state.queue.len()),
@@ -1516,10 +1517,7 @@ impl OrderedDelivery {
 }
 
 fn validate_topic(topic: &str) -> Result<(), ValidationError> {
-    if topic.is_empty() || topic.len() > 256 {
-        return Err(ValidationError::Topic(topic.to_string()));
-    }
-    Ok(())
+    crate::model::validate_track_id(topic)
 }
 
 fn datagram_spec(label: String) -> DataChannelSpec {
@@ -1545,7 +1543,7 @@ mod tests {
 
     fn message(sequence: u64) -> WireMessage {
         WireMessage {
-            data_track_id: "authoritative".into(),
+            publication_id: "authoritative".into(),
             sequence,
             payload: alloc::vec![42],
         }
@@ -1683,10 +1681,10 @@ mod tests {
 
         let channel = ChannelId::new(2).unwrap();
         let track = pulsebeam_proto::state::Track {
-            track_id: "authoritative".into(),
+            publication_id: "authoritative".into(),
             participant_id: "remote-owner".into(),
             room_id: "room".into(),
-            label: subscriber.topic.clone(),
+            track_id: subscriber.topic.clone(),
             kind: Some(pulsebeam_proto::state::track::Kind::Data(
                 pulsebeam_proto::state::DataTrack {
                     delivery: subscriber.mode.delivery() as i32,
@@ -1734,7 +1732,7 @@ mod tests {
         let Some(Body::Probe(probe)) = frame.body else {
             panic!("ordered recovery probe");
         };
-        assert_eq!(probe.data_track_id, "authoritative");
+        assert_eq!(probe.publication_id, "authoritative");
         assert_eq!(probe.from_sequence, 4);
         assert!(!probe.live, "reconnect is not a new live-only subscription");
         topics.detach_source(
@@ -1856,7 +1854,7 @@ mod tests {
             topics.publishers.insert(
                 publisher.clone(),
                 PublisherState {
-                    data_track_id: Some("authoritative".into()),
+                    publication_id: Some("authoritative".into()),
                     next_sequence: u64::MAX.saturating_sub(1),
                     ..PublisherState::default()
                 },
@@ -1914,17 +1912,17 @@ mod tests {
             registrations.subscribers.push(TopicSubscriber {
                 room: "room".into(),
                 participant_id: "remote-app-user".into(),
-                topic: "literal/Δ label".into(),
+                topic: "Literal_name".into(),
                 mode,
             });
         }
         registrations.publishers.push(TopicPublisher {
-            topic: "literal/Δ label".into(),
+            topic: "Literal_name".into(),
             mode: TopicMode::Latest,
         });
         registrations.validate().unwrap();
         registrations.publishers.push(TopicPublisher {
-            topic: "literal/Δ label".into(),
+            topic: "Literal_name".into(),
             mode: TopicMode::Ordered,
         });
         assert!(matches!(

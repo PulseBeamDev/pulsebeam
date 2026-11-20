@@ -41,23 +41,22 @@ These concepts explain the quickstart after you have tried it:
 2. **Capture:** `useCapture("device", options)` and
    `useCapture("display", options)` own local capture tracks. Start capture
    from a user gesture. Connect alone does not open devices.
-3. **Publication:** look up a local handle with `agent.video(label)` or
-   `agent.audio(label)` and pass it to `usePublish` to own publication. Lookup alone
+3. **Publication:** look up a local handle with `agent.video(trackId)` or
+   `agent.audio(trackId)` and pass it to `usePublish` to own publication. Lookup alone
    does not publish or reserve a slot.
 4. **Remote media:** look up a known source with
-   `agent.room(room).participant(id).video(label)` or `.audio(label)`. Lookup is
+   `agent.room(room).participant(id).video(trackId)` or `.audio(trackId)`. Lookup is
    inert and room-pinned. `useSubscribe` owns exact reception independently of
    discovery and returns the SDK subscription; its `state()` reports execution.
 
-A room groups participants authorized to join it. The admitted external IDs are
-your application's room and participant identities, not opaque transport IDs.
-The `camera` and `microphone` strings are labels chosen by your application,
-not protocol constants. Logical track handles use participant identity and label
-to follow media across temporary absence or replacement. Keep labels stable.
+A room groups participants authorized to join it. Room and participant IDs are
+your application's names, not opaque connection IDs. The `camera` and `microphone`
+strings are track IDs chosen by your application. Keep IDs stable so logical
+track handles can follow media across temporary absence or replacement.
 
-For live application messages, pass `agent.data(label, delivery)` to `usePublish`.
+For live application messages, pass `agent.data(trackId, delivery)` to `usePublish`.
 To receive from one participant, pass
-`agent.room(room).participant(id).data(label, delivery)` to `useSubscribe` and read
+`agent.room(room).participant(id).data(trackId, delivery)` to `useSubscribe` and read
 its typed events. Data payloads are bytes; your application owns encoding,
 decoding, validation, and malformed-payload policy. It is not
 durable message storage. See [data tracks](/react/guides#data-tracks) for

@@ -249,7 +249,7 @@ fn publication_state_value(state: &ffi::PublicationState) -> JsValue {
     let value = Object::new();
     set(&value, "observationRevision", state.observation_revision);
     set(&value, "kind", state.kind as u32);
-    set(&value, "label", state.label.clone());
+    set(&value, "trackId", state.track_id.clone());
     set(&value, "closed", state.closed);
     let configuration = Object::new();
     set(

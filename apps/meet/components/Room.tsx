@@ -208,30 +208,26 @@ function ActiveRoom({
       for (const track of participant.publications) {
         if (track.kind.tag === "Video")
           videos.push(
-            pinnedRoom.participant(participant.id).video(track.label),
+            pinnedRoom.participant(participant.id).video(track.trackId),
           );
         if (track.kind.tag === "Audio")
           audios.push(
-            pinnedRoom.participant(participant.id).audio(track.label),
+            pinnedRoom.participant(participant.id).audio(track.trackId),
           );
         if (track.kind.tag !== "Data") continue;
         if (
-          track.label === "chat" &&
+          track.trackId === "chat" &&
           track.kind.inner.delivery === CatalogDelivery.Ordered
         )
           chats.push(
-            pinnedRoom
-              .participant(participant.id)
-              .data("chat", "ordered"),
+            pinnedRoom.participant(participant.id).data("chat", "ordered"),
           );
         if (
-          track.label === "reactions" &&
+          track.trackId === "reactions" &&
           track.kind.inner.delivery === CatalogDelivery.Lossy
         )
           reactions.push(
-            pinnedRoom
-              .participant(participant.id)
-              .data("reactions", "lossy"),
+            pinnedRoom.participant(participant.id).data("reactions", "lossy"),
           );
       }
     }
@@ -332,7 +328,7 @@ function ActiveRoom({
   const tile = (track: RemoteVideoTrack | null) => (
     <Box
       component="button"
-      key={track ? `${track.participantId}:${track.label}` : "local"}
+      key={track ? `${track.participantId}:${track.trackId}` : "local"}
       aria-label={`Spotlight ${track?.participantId ?? "your camera"}`}
       onClick={() => setPin(track ?? "local")}
       className="relative aspect-video w-36 shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 border-transparent bg-slate-900 p-0 hover:border-blue-500 focus-visible:border-blue-500 lg:w-full"
@@ -354,14 +350,14 @@ function ActiveRoom({
     >
       {remoteAudioTracks.map((track) => (
         <RoomAudio
-          key={`${room}:${track.participantId}:${track.label}`}
+          key={`${room}:${track.participantId}:${track.trackId}`}
           track={track}
           onPlaybackError={playbackError}
         />
       ))}
       {remoteChatTracks.map((track) => (
         <Data
-          key={`${track.room}:${track.participantId}:${track.label}`}
+          key={`${track.room}:${track.participantId}:${track.trackId}`}
           track={track}
           onEvent={receiveChat}
           onError={onChatError}
@@ -369,7 +365,7 @@ function ActiveRoom({
       ))}
       {remoteReactionTracks.map((track) => (
         <Data
-          key={`${track.room}:${track.participantId}:${track.label}`}
+          key={`${track.room}:${track.participantId}:${track.trackId}`}
           track={track}
           onEvent={receiveReaction}
         />
@@ -677,7 +673,7 @@ function ActiveRoom({
               {messages.map((message) =>
                 message.type === "gap" ? (
                   <Alert
-                    key={`gap:${message.dataTrackId}:${message.expectedSequence}:${message.availableSequence}`}
+                    key={`gap:${message.publicationId}:${message.expectedSequence}:${message.availableSequence}`}
                     severity="warning"
                   >
                     Some messages could not be recovered.
@@ -687,7 +683,7 @@ function ActiveRoom({
                     key={
                       message.type === "local"
                         ? message.key
-                        : `${message.dataTrackId}:${message.sequence}`
+                        : `${message.publicationId}:${message.sequence}`
                     }
                     className={`max-w-[90%] ${message.participantId === agent.participantId ? "self-end" : "self-start"}`}
                   >

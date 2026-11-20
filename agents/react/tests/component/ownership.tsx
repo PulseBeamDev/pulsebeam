@@ -279,7 +279,7 @@ export async function ownershipAdapters() {
   const publicationOwner = [...runtime.publicationOwners.keys()][0];
   const dataOwner = [...runtime.dataOwners.keys()][0];
   const audioOwner = [...runtime.audioSubscriptions.keys()][0];
-  assert.deepEqual(Object.keys(agent.video("camera")), ["kind", "label"]);
+  assert.deepEqual(Object.keys(agent.video("camera")), ["kind", "trackId"]);
   assert.equal("track" in agent, false);
   assert.equal(
     "track" in agent.room("selected-room").participant("alice"),
@@ -290,7 +290,7 @@ export async function ownershipAdapters() {
   runtime.deliverData("messages", {
     type: "message",
     participantId: "alice",
-    trackId: "message-id",
+    publicationId: "message-id",
     sequence: 1n,
     data: new Uint8Array([0, 255]),
   });

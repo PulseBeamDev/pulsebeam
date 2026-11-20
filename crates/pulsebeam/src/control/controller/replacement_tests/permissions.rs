@@ -281,7 +281,9 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
     );
     for media in config.resources.media_sections() {
         assert!(matches!(
-            crate::participant::whip_media_label(SignalingProtocol::Whip, media.kind),
+            crate::participant::whip_media_track_id(SignalingProtocol::Whip, media.kind)
+                .as_ref()
+                .map(crate::entity::TrackId::as_str),
             Some("audio" | "video")
         ));
     }
@@ -302,10 +304,10 @@ pub(super) fn source(
     let meta = TrackMeta {
         room: crate::entity::ProjectRoomKey::fixture(room),
         shard_id: ShardId::new(0),
-        id: connection.derive_track_id(kind, label),
+        id: connection.fixture_publication(kind, label),
         origin,
         connection_id: connection,
-        label: Some(label.into()),
+        track_id: Some(crate::entity::TrackId::new(&label).unwrap()),
     };
     match kind {
         TrackKind::Audio => Track::audio(meta, None),

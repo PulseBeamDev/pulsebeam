@@ -28,7 +28,7 @@ import { track } from "@pulsebeam/react";
 // @ts-expect-error Descriptor types are not part of the packed React surface.
 import type { TrackSpec } from "@pulsebeam/react";
 // @ts-expect-error React does not expose descriptor lookups.
-agent.track({ kind: "video", label: "camera" });
+agent.track({ kind: "video", trackId: "camera" });
 // @ts-expect-error Local media mutations belong to Publish.
 camera.setEnabled(false);
 // @ts-expect-error Local media does not expose capture sources.

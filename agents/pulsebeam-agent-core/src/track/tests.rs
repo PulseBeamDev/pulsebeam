@@ -1,15 +1,15 @@
 use super::*;
 use crate::TopicMessage;
 
-fn video(label: &str) -> TrackSpec {
+fn video(track_id: &str) -> TrackSpec {
     TrackSpec::Video {
-        label: label.into(),
+        track_id: track_id.into(),
     }
 }
 
 fn data(delivery: TopicMode) -> TrackSpec {
     TrackSpec::Data {
-        label: "events".into(),
+        track_id: "events".into(),
         delivery,
     }
 }
@@ -25,7 +25,7 @@ fn message(
         room: "room".into(),
         topic: "events".into(),
         mode: delivery,
-        data_track_id: track.into(),
+        publication_id: track.into(),
         sequence,
         participant_id: participant.into(),
         payload: bytes.into(),
@@ -37,7 +37,7 @@ fn per_owner_subscription_views_keep_independent_intent_and_shared_demand() {
     let selector = TrackSelector {
         room: "source-room".into(),
         participant_id: "publisher-endpoint".into(),
-        label: "camera".into(),
+        track_id: "camera".into(),
     };
     let mut resources = TrackResources::default();
     let first = resources.new_owner().unwrap();
@@ -77,33 +77,35 @@ fn descriptors_preserve_wire_identity_and_delivery() {
     assert_ne!(
         video("camera"),
         TrackSpec::Audio {
-            label: "camera".into()
+            track_id: "camera".into()
         }
     );
     assert_ne!(data(TopicMode::Latest), data(TopicMode::Ordered));
-    for label in ["", &"x".repeat(257), &"é".repeat(129)] {
-        assert!(video(label).validate().is_err(), "{label:?}");
+    for track_id in ["", &"x".repeat(37), "é", "with/slash", "control\n"] {
+        assert!(video(track_id).validate().is_err(), "{track_id:?}");
+        assert!(
+            TrackSpec::Data {
+                track_id: track_id.into(),
+                delivery: TopicMode::Ordered
+            }
+            .validate()
+            .is_err(),
+            "{track_id:?}"
+        );
     }
-    for label in ["é", "with/slash", "control\n", &"é".repeat(128)] {
-        assert!(video(label).validate().is_ok(), "{label:?}");
-        assert_eq!(video(label).label(), label);
+    for track_id in ["Camera_7-preview", &"x".repeat(36)] {
+        assert!(video(track_id).validate().is_ok(), "{track_id:?}");
+        assert_eq!(video(track_id).track_id(), track_id);
+        assert!(
+            TrackSpec::Data {
+                track_id: track_id.into(),
+                delivery: TopicMode::Ordered
+            }
+            .validate()
+            .is_ok(),
+            "{track_id:?}"
+        );
     }
-    assert!(
-        TrackSpec::Data {
-            label: "x".repeat(256),
-            delivery: TopicMode::Ordered
-        }
-        .validate()
-        .is_ok()
-    );
-    assert!(
-        TrackSpec::Data {
-            label: "with/slash".into(),
-            delivery: TopicMode::Ordered
-        }
-        .validate()
-        .is_ok()
-    );
 }
 
 #[test]
@@ -164,12 +166,12 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
 fn publication_claim_is_atomic_exclusive_and_reuses_released_coordinates() {
     for kind in [MediaKind::Video, MediaKind::Audio] {
         let mut resources = TrackResources::default();
-        let spec = |label: &str| match kind {
+        let spec = |track_id: &str| match kind {
             MediaKind::Video => TrackSpec::Video {
-                label: label.into(),
+                track_id: track_id.into(),
             },
             MediaKind::Audio => TrackSpec::Audio {
-                label: label.into(),
+                track_id: track_id.into(),
             },
         };
         let prefix = if kind == MediaKind::Video { 'v' } else { 'a' };
@@ -577,7 +579,7 @@ fn source_availability_does_not_gate_declarations_and_audio_cleanup_is_owner_sco
     let expected = PublicationIntent {
         slot: "v0".into(),
         kind: MediaKind::Video,
-        label: "camera".into(),
+        track_id: "camera".into(),
         active: true,
     };
     assert_eq!(resources.publications(), vec![expected.clone()]);
@@ -640,7 +642,7 @@ fn source_availability_does_not_gate_declarations_and_audio_cleanup_is_owner_sco
         .release_publication(first, &video("camera"))
         .unwrap();
     assert_eq!(resources.publications().len(), 1);
-    assert_eq!(resources.publications()[0].label, "screen");
+    assert_eq!(resources.publications()[0].track_id, "screen");
 }
 
 #[test]
@@ -652,12 +654,12 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     let selector = TrackSelector {
         room: "room".into(),
         participant_id: "alice".into(),
-        label: "camera".into(),
+        track_id: "camera".into(),
     };
     let other = TrackSelector {
         room: "room".into(),
         participant_id: "bob".into(),
-        label: "camera".into(),
+        track_id: "camera".into(),
     };
     resources.claim_video(first, selector.clone()).unwrap();
     resources.claim_video(second, selector.clone()).unwrap();
@@ -689,7 +691,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
         projection,
         vec![VideoSubscription {
             slot: 0,
-            track_id: String::new(),
+            publication_id: String::new(),
             selector: Some(selector.clone()),
             height: 720,
             min_height: 240,
@@ -735,7 +737,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
                 TrackSelector {
                     room: "room".into(),
                     participant_id: participant,
-                    label: "camera".into(),
+                    track_id: "camera".into(),
                 },
             )
             .unwrap();
@@ -771,7 +773,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     let selector = TrackSelector {
         room: "room".into(),
         participant_id: "alice".into(),
-        label: "camera".into(),
+        track_id: "camera".into(),
     };
     resources.claim_video(owner, selector.clone()).unwrap();
     let request = resources.begin_media_observation(owner).unwrap();
@@ -876,7 +878,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     let selector = TrackSelector {
         room: "room".into(),
         participant_id: "alice".into(),
-        label: "microphone".into(),
+        track_id: "microphone".into(),
     };
     resources
         .claim_audio_subscription(audio, selector.clone())
@@ -892,7 +894,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
             TrackSelector {
                 room: "room".into(),
                 participant_id: "bob".into(),
-                label: "microphone".into(),
+                track_id: "microphone".into(),
             },
         )
         .unwrap();
@@ -905,7 +907,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
                 TrackSelector {
                     room: "room".into(),
                     participant_id: format!("extra-{index}"),
-                    label: "microphone".into(),
+                    track_id: "microphone".into(),
                 },
             )
             .unwrap();
@@ -1069,7 +1071,7 @@ fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
             TrackSelector {
                 room: "room".into(),
                 participant_id: "alice".into(),
-                label: "events".into(),
+                track_id: "events".into(),
             },
         )
         .unwrap();
@@ -1080,7 +1082,7 @@ fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
             TrackSelector {
                 room: "room".into(),
                 participant_id: "alice".into(),
-                label: "events".into(),
+                track_id: "events".into(),
             },
         )
         .unwrap();
@@ -1100,7 +1102,7 @@ fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
             resources.read(alice).unwrap(),
             Some(DataEvent::Message {
                 participant_id: "alice".into(),
-                track_id: track.into(),
+                publication_id: track.into(),
                 sequence: 1,
                 data: vec![255, 0],
             })
@@ -1123,7 +1125,7 @@ fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct()
     let source = TrackSelector {
         room: "room-a".into(),
         participant_id: "alice".into(),
-        label: "events".into(),
+        track_id: "events".into(),
     };
     resources.receive(first, &spec, source.clone()).unwrap();
     resources.receive(second, &spec, source.clone()).unwrap();
@@ -1152,7 +1154,7 @@ fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct()
         resources.read(second).unwrap(),
         Some(DataEvent::Message {
             participant_id: "alice".into(),
-            track_id: "a-track".into(),
+            publication_id: "a-track".into(),
             sequence: 0,
             data: b"a".to_vec()
         })
@@ -1174,7 +1176,7 @@ fn latest_coalesces_per_track_and_lossy_drops_oldest() {
                 TrackSelector {
                     room: "room".into(),
                     participant_id: "alice".into(),
-                    label: "events".into(),
+                    track_id: "events".into(),
                 },
             )
             .unwrap();
@@ -1204,7 +1206,7 @@ fn ordered_overflow_reports_loss_inline_instead_of_implying_continuity() {
             TrackSelector {
                 room: "room".into(),
                 participant_id: "alice".into(),
-                label: "events".into(),
+                track_id: "events".into(),
             },
         )
         .unwrap();
@@ -1221,7 +1223,7 @@ fn ordered_overflow_reports_loss_inline_instead_of_implying_continuity() {
         resources.read(owner).unwrap(),
         Some(DataEvent::Gap {
             participant_id: "alice".into(),
-            track_id: "track".into(),
+            publication_id: "track".into(),
             from: 0,
             to: 45,
         })
@@ -1248,7 +1250,7 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
                 TrackSelector {
                     room: "room".into(),
                     participant_id: "alice".into(),
-                    label: "events".into(),
+                    track_id: "events".into(),
                 },
             )
             .unwrap();
@@ -1259,7 +1261,7 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
                 TrackSelector {
                     room: "room".into(),
                     participant_id: "bob".into(),
-                    label: "events".into(),
+                    track_id: "events".into(),
                 },
             )
             .unwrap();
@@ -1270,7 +1272,7 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
                 TrackSelector {
                     room: "room".into(),
                     participant_id: "alice".into(),
-                    label: "events".into(),
+                    track_id: "events".into(),
                 },
             )
             .unwrap();
@@ -1314,7 +1316,7 @@ fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
     for index in 0..65 {
         resources
             .retain_producer(&TrackSpec::Data {
-                label: format!("topic-{index}"),
+                track_id: format!("topic-{index}"),
                 delivery: TopicMode::Lossy,
             })
             .unwrap();
@@ -1324,13 +1326,13 @@ fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
             .receive(
                 TrackOwner(1),
                 &TrackSpec::Data {
-                    label: "x".repeat(257),
+                    track_id: "x".repeat(257),
                     delivery: TopicMode::Lossy
                 },
                 TrackSelector {
                     room: "room".into(),
                     participant_id: "alice".into(),
-                    label: "events".into()
+                    track_id: "events".into()
                 }
             )
             .is_err()
@@ -1344,7 +1346,7 @@ fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
     assert!(
         resources
             .retain_producer(&TrackSpec::Data {
-                label: "topic-0".into(),
+                track_id: "topic-0".into(),
                 delivery: TopicMode::Ordered
             })
             .is_err()
@@ -1357,7 +1359,7 @@ fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
             TrackSelector {
                 room: "room".into(),
                 participant_id: "alice".into(),
-                label: "events".into(),
+                track_id: "events".into(),
             },
         )
         .unwrap();

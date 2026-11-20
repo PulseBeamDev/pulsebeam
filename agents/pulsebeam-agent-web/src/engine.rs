@@ -184,7 +184,7 @@ impl Driver {
                     }
                     let publication = agent.data_publication_state(owner)?;
                     agent_core::TrackSpec::Data {
-                        label: publication.label,
+                        track_id: publication.track_id,
                         delivery: publication.delivery.into(),
                     }
                 }
@@ -677,7 +677,7 @@ impl<H: Host> Actor<H> {
             .publishers
             .iter()
             .find(|publisher| publisher.registration == send.publisher)
-            .and_then(|publisher| publisher.data_track_id.as_deref());
+            .and_then(|publisher| publisher.publication_id.as_deref());
         if binding != Some(expected_data_track_id) {
             self.flush_core();
             return Err("topic publication binding was replaced".to_owned());
@@ -1147,7 +1147,7 @@ mod tests {
     fn intent_commits_without_actor_progress_and_wakes_through_a_full_mailbox() {
         use agent_core::{TopicMode, TrackSpec, ffi::ErrorCode};
         let data = TrackSpec::Data {
-            label: "events".into(),
+            track_id: "events".into(),
             delivery: TopicMode::Ordered,
         };
         let mut actor = Actor::new(config(), FakeHost::default()).unwrap();
@@ -1265,7 +1265,7 @@ mod tests {
         let ResourceResult::Publication { owner, .. } = handle
             .resource_now(ResourceCommand::ClaimPublication {
                 spec: TrackSpec::Video {
-                    label: "pipe".into(),
+                    track_id: "pipe".into(),
                 },
             })
             .unwrap()
@@ -1883,7 +1883,7 @@ mod tests {
         let (completion, mut pending) = oneshot::channel();
         actor.process(Message::DataSend {
             target: DataSendTarget::Track(agent_core::TrackSpec::Data {
-                label: "pending".into(),
+                track_id: "pending".into(),
                 delivery: agent_core::TopicMode::Lossy,
             }),
             payload: vec![0, 255],

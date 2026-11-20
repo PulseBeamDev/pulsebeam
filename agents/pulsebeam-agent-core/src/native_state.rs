@@ -15,7 +15,7 @@ use crate::{MediaSlot, SignalingError};
 pub(crate) enum Resource {
     Publication {
         kind: wire::TrackKind,
-        label: String,
+        track_id: String,
     },
     Reception(MediaSlot),
     DataSubscription(String),
@@ -23,7 +23,7 @@ pub(crate) enum Resource {
         room: String,
         participant_id: String,
         kind: wire::TrackKind,
-        label: String,
+        track_id: String,
     },
 }
 
@@ -31,10 +31,10 @@ impl Resource {
     fn matches_spec(&self, spec: &wire::ResourceSpec) -> bool {
         match (self, spec.declaration.as_ref()) {
             (
-                Self::Publication { kind, label },
+                Self::Publication { kind, track_id },
                 Some(wire::resource_spec::Declaration::Publication(publication)),
             ) => {
-                label == &publication.label
+                track_id == &publication.track_id
                     && match publication.kind.as_ref() {
                         Some(wire::publication_spec::Kind::Audio(_)) => {
                             *kind == wire::TrackKind::Audio
@@ -60,21 +60,22 @@ impl Resource {
                 Self::DataSubscription(track),
                 Some(wire::resource_spec::Declaration::Subscription(subscription)),
             ) => {
-                track == &subscription.track_id && subscription.kind == wire::TrackKind::Data as i32
+                track == &subscription.publication_id
+                    && subscription.kind == wire::TrackKind::Data as i32
             }
             (
                 Self::SourceLookup {
                     room,
                     participant_id,
                     kind,
-                    label,
+                    track_id,
                 },
                 Some(wire::resource_spec::Declaration::SourceLookup(lookup)),
             ) => lookup.source.as_ref().is_some_and(|source| {
                 room == &source.room
                     && participant_id == &source.participant_id
                     && *kind as i32 == source.kind
-                    && label == &source.label
+                    && track_id == &source.track_id
             }),
             _ => false,
         }
@@ -82,7 +83,7 @@ impl Resource {
 
     fn retained_bytes(&self) -> usize {
         let text = match self {
-            Self::Publication { label, .. } => label.len(),
+            Self::Publication { track_id, .. } => track_id.len(),
             Self::Reception(MediaSlot::LocalVideo(name) | MediaSlot::LocalAudio(name)) => {
                 name.len()
             }
@@ -91,14 +92,14 @@ impl Resource {
             Self::SourceLookup {
                 room,
                 participant_id,
-                label,
+                track_id,
                 ..
             } => {
                 // Target, pending work, retirement, cursor and owned keys can retain the address.
                 return size_of::<Self>()
                     .saturating_add(room.len())
                     .saturating_add(participant_id.len())
-                    .saturating_add(label.len())
+                    .saturating_add(track_id.len())
                     .saturating_mul(5);
             }
         };
@@ -724,7 +725,7 @@ impl NativeState {
                     }
                     changes.push(Change::Participant(id));
                 }
-                wire::resource_key::Key::Track(id) => {
+                wire::resource_key::Key::Publication(id) => {
                     let old = self.tracks.get(&id);
                     let next = match state.value {
                         Some(wire::confirmed_state::Value::Track(track)) => {
@@ -881,7 +882,10 @@ impl NativeState {
                 .saturating_add(state.encoded_len())
         };
         let identity = |(participant, track): (&wire::Participant, &wire::Track)| {
-            (track.track_id.clone(), ParticipantKey::from(participant))
+            (
+                track.publication_id.clone(),
+                ParticipantKey::from(participant),
+            )
         };
         let previous_source = owned
             .confirmed
@@ -990,7 +994,7 @@ impl NativeState {
             .is_some_and(|known| known != participant)
             || self
                 .tracks
-                .get(&track.track_id)
+                .get(&track.publication_id)
                 .is_some_and(|known| !tracks_equal(known, track))
             || self
                 .participant_references
@@ -1001,7 +1005,7 @@ impl NativeState {
                 .is_some_and(|known| known != participant)
             || self
                 .source_references
-                .get(&track.track_id)
+                .get(&track.publication_id)
                 .and_then(|references| references.first())
                 .and_then(|reference| self.description(*reference))
                 .map(|(_, track)| track)
@@ -1225,10 +1229,10 @@ fn specs_equal(left: &wire::ResourceSpec, right: &wire::ResourceSpec) -> bool {
 }
 
 fn tracks_equal(left: &wire::Track, right: &wire::Track) -> bool {
-    left.track_id == right.track_id
+    left.publication_id == right.publication_id
         && left.room_id == right.room_id
         && left.participant_id == right.participant_id
-        && left.label == right.label
+        && left.track_id == right.track_id
         && match (&left.kind, &right.kind) {
             (Some(wire::track::Kind::Audio(left)), Some(wire::track::Kind::Audio(right))) => {
                 matches!((&left.format, &right.format), (Some(left), Some(right)) if validation::formats_equivalent(left, right))

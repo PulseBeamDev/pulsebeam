@@ -154,7 +154,7 @@ class VideoHandle implements RemoteVideoTrack {
     readonly catalog: RemoteCatalog,
     readonly room: string,
     readonly participantId: string,
-    readonly label: string,
+    readonly trackId: string,
   ) {
     videoOwners.set(this, this);
   }
@@ -163,7 +163,7 @@ class VideoHandle implements RemoteVideoTrack {
       this.room,
       this.participantId,
       "video",
-      this.label,
+      this.trackId,
     );
   }
   get active(): boolean {
@@ -185,7 +185,7 @@ class VideoHandle implements RemoteVideoTrack {
       {
         room: this.room,
         participantId: this.participantId,
-        label: this.label,
+        trackId: this.trackId,
       },
       configuration,
     );
@@ -198,14 +198,14 @@ class AudioHandle implements RemoteAudioTrack {
     readonly catalog: RemoteCatalog,
     readonly room: string,
     readonly participantId: string,
-    readonly label: string,
+    readonly trackId: string,
   ) {}
   get id(): string | null {
     return this.catalog.resolve(
       this.room,
       this.participantId,
       "audio",
-      this.label,
+      this.trackId,
     );
   }
   get active(): boolean {
@@ -236,7 +236,7 @@ class AudioHandle implements RemoteAudioTrack {
       {
         room: this.room,
         participantId: this.participantId,
-        label: this.label,
+        trackId: this.trackId,
       },
       configuration,
     );
@@ -260,8 +260,8 @@ class ParticipantHandle implements RemoteParticipant {
   id(): string {
     return this.participantId;
   }
-  data<D extends Delivery>(label: string, delivery: D): RemoteDataTrack<D> {
-    return this.catalog.data.remote(track.data(label, delivery), {
+  data<D extends Delivery>(trackId: string, delivery: D): RemoteDataTrack<D> {
+    return this.catalog.data.remote(track.data(trackId, delivery), {
       room: this.room,
       participantId: this.participantId,
     });
@@ -271,31 +271,31 @@ class ParticipantHandle implements RemoteParticipant {
     readonly room: string,
     readonly participantId: string,
   ) {}
-  video(label: string): VideoHandle {
+  video(trackId: string): VideoHandle {
     this.catalog.requireOpen();
-    let handle = this.videos.get(label);
+    let handle = this.videos.get(trackId);
     if (!handle) {
       handle = new VideoHandle(
         this.catalog,
         this.room,
         this.participantId,
-        label,
+        trackId,
       );
-      this.videos.set(label, handle);
+      this.videos.set(trackId, handle);
     }
     return handle;
   }
-  audio(label: string): AudioHandle {
+  audio(trackId: string): AudioHandle {
     this.catalog.requireOpen();
-    let handle = this.audios.get(label);
+    let handle = this.audios.get(trackId);
     if (!handle) {
       handle = new AudioHandle(
         this.catalog,
         this.room,
         this.participantId,
-        label,
+        trackId,
       );
-      this.audios.set(label, handle);
+      this.audios.set(trackId, handle);
     }
     return handle;
   }
@@ -326,7 +326,7 @@ export class RemoteCatalog {
       if (!value) {
         value = Object.freeze({
           kind: handle.kind,
-          label: handle.label,
+          trackId: handle.trackId,
           participantId: handle.participantId,
           get id() {
             return handle.id;
@@ -348,7 +348,7 @@ export class RemoteCatalog {
       if (!value) {
         value = Object.freeze({
           kind: handle.kind,
-          label: handle.label,
+          trackId: handle.trackId,
           participantId: handle.participantId,
           get id() {
             return handle.id;
@@ -374,10 +374,10 @@ export class RemoteCatalog {
         get active() {
           return handle.active;
         },
-        video: (label: string) => wrapVideo(handle.video(label)),
-        audio: (label: string) => wrapAudio(handle.audio(label)),
-        data: <D extends Delivery>(label: string, delivery: D) =>
-          handle.data(label, delivery),
+        video: (trackId: string) => wrapVideo(handle.video(trackId)),
+        audio: (trackId: string) => wrapAudio(handle.audio(trackId)),
+        data: <D extends Delivery>(trackId: string, delivery: D) =>
+          handle.data(trackId, delivery),
       });
       this.#publicParticipants.set(handle, value);
       return value;
@@ -464,7 +464,7 @@ export class RemoteCatalog {
     room: string,
     participantId: string,
     kind: "audio" | "video",
-    label: string,
+    trackId: string,
   ): string | null {
     if (this.#closed || !this.isCurrentRoom(room)) return null;
     return (
@@ -474,7 +474,7 @@ export class RemoteCatalog {
           (publication) =>
             publication.participantId === participantId &&
             publication.kind === kind &&
-            publication.label === label,
+            publication.trackId === trackId,
         )?.id ?? null
     );
   }
@@ -582,7 +582,7 @@ function attachVideoHandle(
     {
       room: handle.room,
       participantId: handle.participantId,
-      label: handle.label,
+      trackId: handle.trackId,
     },
     configuration(options.preferences ?? {}),
   );

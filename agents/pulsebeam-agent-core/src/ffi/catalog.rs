@@ -40,7 +40,7 @@ pub enum CatalogPublicationKind {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct CatalogPublicationInfo {
     pub id: String,
-    pub label: String,
+    pub track_id: String,
     pub kind: CatalogPublicationKind,
 }
 

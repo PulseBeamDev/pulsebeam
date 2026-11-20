@@ -98,14 +98,14 @@ pub struct DesiredState {
 pub struct PublicationIntent {
     pub slot: String,
     pub kind: MediaKind,
-    pub label: String,
+    pub track_id: String,
     pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoSubscription {
     pub slot: u32,
-    pub track_id: String,
+    pub publication_id: String,
     pub selector: Option<TrackSelector>,
     pub height: u32,
     pub min_height: u32,
@@ -132,7 +132,7 @@ impl AudioSubscription {
 pub struct TrackSelector {
     pub room: String,
     pub participant_id: String,
-    pub label: String,
+    pub track_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -201,7 +201,7 @@ pub struct Publication {
     pub id: String,
     pub participant_id: String,
     pub kind: MediaKind,
-    pub label: String,
+    pub track_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -344,7 +344,7 @@ pub enum ValidationError {
     Identifier { field: &'static str },
     #[error("duplicate {field}: {value}")]
     Duplicate { field: &'static str, value: String },
-    #[error("local publication binding conflicts with a reserved slot or label: {0}")]
+    #[error("local publication binding conflicts with a reserved slot or track ID: {0}")]
     PublicationBinding(String),
     #[error("audio playout policy refers to an unpinned track: {0}")]
     UnknownAudioTrack(String),
@@ -402,24 +402,20 @@ impl DesiredState {
 
     pub(crate) fn validate(&self) -> Result<(), ValidationError> {
         let mut publications = BTreeSet::new();
-        let mut labels = BTreeSet::new();
+        let mut track_ids = BTreeSet::new();
         for publication in &self.publications {
             validate_identifier("publication slot", &publication.slot, 256, false)?;
-            if publication.label.is_empty() || publication.label.len() > 256 {
-                return Err(ValidationError::Identifier {
-                    field: "publication label",
-                });
-            }
+            validate_track_id(&publication.track_id)?;
             if !publications.insert(publication.media_slot()) {
                 return Err(ValidationError::Duplicate {
                     field: "publication slot",
                     value: publication.slot.clone(),
                 });
             }
-            if !labels.insert((publication.kind, publication.label.clone())) {
+            if !track_ids.insert((publication.kind, publication.track_id.clone())) {
                 return Err(ValidationError::Duplicate {
-                    field: "publication label",
-                    value: publication.label.clone(),
+                    field: "publication track ID",
+                    value: publication.track_id.clone(),
                 });
             }
         }
@@ -427,14 +423,14 @@ impl DesiredState {
         let mut video_tracks = BTreeSet::new();
         for video in &self.video {
             if let Some(selector) = &video.selector {
-                if !video.track_id.is_empty() {
+                if !video.publication_id.is_empty() {
                     return Err(ValidationError::Identifier {
-                        field: "video track_id with selector",
+                        field: "video publication_id with selector",
                     });
                 }
                 selector.validate()?;
             } else {
-                validate_identifier("video track_id", &video.track_id, 256, true)?;
+                validate_identifier("video publication_id", &video.publication_id, 256, true)?;
             }
             if !video_slots.insert(video.slot) {
                 return Err(ValidationError::Duplicate {
@@ -442,20 +438,20 @@ impl DesiredState {
                     value: video.slot.to_string(),
                 });
             }
-            if !video_tracks.insert((video.selector.as_ref(), video.track_id.as_str())) {
+            if !video_tracks.insert((video.selector.as_ref(), video.publication_id.as_str())) {
                 return Err(ValidationError::Duplicate {
                     field: "video track",
-                    value: video.track_id.clone(),
+                    value: video.publication_id.clone(),
                 });
             }
         }
         let mut pins = BTreeSet::new();
-        for track_id in &self.audio.pinned {
-            validate_identifier("audio track_id", track_id, 256, true)?;
-            if !pins.insert(track_id.clone()) {
+        for publication_id in &self.audio.pinned {
+            validate_identifier("audio publication_id", publication_id, 256, true)?;
+            if !pins.insert(publication_id.clone()) {
                 return Err(ValidationError::Duplicate {
                     field: "audio pin",
-                    value: track_id.clone(),
+                    value: publication_id.clone(),
                 });
             }
         }
@@ -465,13 +461,13 @@ impl DesiredState {
             if !selectors.insert(selector) {
                 return Err(ValidationError::Duplicate {
                     field: "audio selector",
-                    value: alloc::format!("{}:{}", selector.participant_id, selector.label),
+                    value: alloc::format!("{}:{}", selector.participant_id, selector.track_id),
                 });
             }
         }
-        for track_id in self.audio.playout_delays.keys() {
-            if !pins.contains(track_id) {
-                return Err(ValidationError::UnknownAudioTrack(track_id.clone()));
+        for publication_id in self.audio.playout_delays.keys() {
+            if !pins.contains(publication_id) {
+                return Err(ValidationError::UnknownAudioTrack(publication_id.clone()));
             }
         }
         for selector in self.audio.selector_delays.keys() {
@@ -490,7 +486,7 @@ impl TrackSelector {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_room_name(&self.room)?;
         validate_participant_id(&self.participant_id)?;
-        validate_identifier("track label", &self.label, 64, true)
+        validate_track_id(&self.track_id)
     }
 }
 
@@ -500,6 +496,10 @@ pub fn validate_room_name(room: &str) -> Result<(), ValidationError> {
 
 pub fn validate_participant_id(id: &str) -> Result<(), ValidationError> {
     validate_application_name("participant ID", id)
+}
+
+pub(crate) fn validate_track_id(id: &str) -> Result<(), ValidationError> {
+    validate_application_name("track ID", id)
 }
 
 fn validate_application_name(field: &'static str, value: &str) -> Result<(), ValidationError> {

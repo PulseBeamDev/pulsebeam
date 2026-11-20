@@ -3,7 +3,7 @@ use pulsebeam_proto::state;
 
 fn spec(mode: TopicMode) -> TrackSpec {
     TrackSpec::Data {
-        label: "state".into(),
+        track_id: "state".into(),
         delivery: mode,
     }
 }
@@ -133,13 +133,13 @@ fn owned_send_waits_for_its_first_authoritative_owned_binding() {
         generation,
         signal,
         vec![native_connection::confirmed(
-            state::resource_key::Key::Track(native_connection::SOURCE.into()),
+            state::resource_key::Key::Publication(native_connection::SOURCE.into()),
             0,
             state::confirmed_state::Value::Track(state::Track {
-                track_id: native_connection::SOURCE.into(),
+                publication_id: native_connection::SOURCE.into(),
                 participant_id: "p1".into(),
                 room_id: "room".into(),
-                label: "state".into(),
+                track_id: "state".into(),
                 kind: Some(state::track::Kind::Data(state::DataTrack {
                     delivery: state::DataDelivery::Lossy as i32,
                 })),
@@ -163,7 +163,7 @@ fn owned_send_waits_for_its_first_authoritative_owned_binding() {
         panic!("bound message")
     };
     assert_eq!(channel, publication.channel);
-    assert_eq!(message.data_track_id, native_connection::SOURCE);
+    assert_eq!(message.publication_id, native_connection::SOURCE);
     assert_eq!(message.payload, [255]);
     acknowledge_send(&mut agent, generation, channel, operation);
     assert_eq!(finished(&mut agent), vec![(ticket, None)]);
@@ -199,7 +199,7 @@ fn owned_send_binding_wait_is_bounded_and_timeout_releases_only_its_admission() 
     assert!(matches!(
         agent.send_data(
             TrackSpec::Data {
-                label: "oversized".into(),
+                track_id: "oversized".into(),
                 delivery: TopicMode::Lossy
             },
             vec![0; MAX_TOPIC_PAYLOAD_BYTES + 1]

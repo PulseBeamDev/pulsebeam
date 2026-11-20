@@ -253,7 +253,7 @@ pub enum OutputFrame {
 pub struct NativeReceiverInfo {
     pub generation: u64,
     pub receiver: u64,
-    pub track_id: String,
+    pub publication_id: String,
     pub mid: String,
     pub media_index: u32,
 }

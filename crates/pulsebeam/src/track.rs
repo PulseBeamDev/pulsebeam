@@ -9,8 +9,8 @@ use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::entity::TrackId;
-use crate::entity::{ParticipantId, TrackKind};
+use crate::entity::PublicationKey;
+use crate::entity::{ParticipantId, TrackId, TrackKind};
 use crate::id::ShardId;
 use crate::media::{Mid, Pt, Rid, SimulcastLayer, Ssrc};
 use crate::rtp::normalize::{Normalization, StreamFacts, StreamNormalizer};
@@ -56,7 +56,7 @@ impl Display for SourceEncoding {
     }
 }
 
-pub type StreamId = (TrackId, SourceEncoding);
+pub type StreamId = (PublicationKey, SourceEncoding);
 
 pub struct ProcessedRtp {
     pub first: Option<RtpPacket>,
@@ -74,7 +74,7 @@ pub const MAX_SIMULCAST_LAYERS: usize = 3;
 pub enum StreamWrite {
     Video {
         pkt: RtpPacket,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         mid: Mid,
         rid: Option<Rid>,
         ssrc: Ssrc,
@@ -82,7 +82,7 @@ pub enum StreamWrite {
     },
     Audio {
         pkt: RtpPacket,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         mid: Mid,
         ssrc: Ssrc,
         pt: Pt,
@@ -113,7 +113,7 @@ impl StreamWriter {
     pub fn write_video_owned(
         &mut self,
         pkt: RtpPacket,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         mid: Mid,
         rid: Option<Rid>,
         ssrc: Ssrc,
@@ -121,7 +121,7 @@ impl StreamWriter {
     ) {
         self.push(StreamWrite::Video {
             pkt,
-            track_id,
+            publication_id,
             mid,
             rid,
             ssrc,
@@ -132,14 +132,14 @@ impl StreamWriter {
     pub fn write_audio_owned(
         &mut self,
         pkt: RtpPacket,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         mid: Mid,
         ssrc: Ssrc,
         pt: Pt,
     ) {
         self.push(StreamWrite::Audio {
             pkt,
-            track_id,
+            publication_id,
             mid,
             ssrc,
             pt,
@@ -178,8 +178,8 @@ mod stream_writer_tests {
     #[test]
     fn pending_fanout_is_bounded_and_preserves_accepted_order() {
         let connection = crate::entity::ConnectionId::new();
-        let audio = connection.derive_track_id(TrackKind::Audio, "a");
-        let video = connection.derive_track_id(TrackKind::Video, "v");
+        let audio = connection.fixture_publication(TrackKind::Audio, "a");
+        let video = connection.fixture_publication(TrackKind::Video, "v");
         let mut writer = StreamWriter::new();
         for index in 0..MAX_PENDING_STREAM_WRITES.saturating_mul(2) {
             let packet = RtpPacket {
@@ -215,12 +215,11 @@ pub struct TrackMeta {
     pub room: crate::entity::ProjectRoomKey,
     /// The shard ID that hosts this track's publisher.
     pub shard_id: ShardId,
-    pub id: crate::entity::TrackId,
+    pub id: crate::entity::PublicationKey,
     pub origin: crate::entity::ParticipantId,
     /// The connection incarnation that published this track.
     pub connection_id: crate::entity::ConnectionId,
-    /// Application-facing media identity. Pending native senders have no label.
-    pub label: Option<String>,
+    pub track_id: Option<TrackId>,
 }
 
 impl std::fmt::Debug for TrackMeta {
@@ -228,7 +227,7 @@ impl std::fmt::Debug for TrackMeta {
         f.debug_struct("TrackMeta")
             .field("project", &self.room.project)
             .field("connection_id", &self.connection_id)
-            .field("track_id", &self.id)
+            .field("publication_id", &self.id)
             .field("shard_id", &self.shard_id)
             .finish_non_exhaustive()
     }
@@ -236,7 +235,7 @@ impl std::fmt::Debug for TrackMeta {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TrackSelector {
-    pub(crate) track: Option<TrackId>,
+    pub(crate) track: Option<PublicationKey>,
     pub(crate) publisher: Option<ParticipantId>,
     pub(crate) kind: Option<TrackKind>,
     pub(crate) label: Option<String>,
@@ -264,7 +263,7 @@ impl TrackSelector {
         Self::kind(TrackKind::Data)
     }
 
-    pub(crate) fn track(track: TrackId) -> Self {
+    pub(crate) fn track(track: PublicationKey) -> Self {
         Self {
             track: Some(track),
             publisher: None,
@@ -822,7 +821,7 @@ impl Track {
         }
     }
 
-    pub fn id(&self) -> TrackId {
+    pub fn id(&self) -> PublicationKey {
         self.meta().id
     }
 
@@ -849,7 +848,7 @@ impl Track {
     pub fn publication_label(&self) -> Option<String> {
         match self {
             Self::Data(track) => track.topic.as_ref().map_or_else(
-                || track.meta.label.clone(),
+                || track.meta.track_id.map(|id| id.to_string()),
                 |topic| Some(publication_label(track.lane, topic)),
             ),
             Self::Audio(_) | Self::Video(_) => None,
@@ -1087,7 +1086,7 @@ fn new_video_encodings(
     senders.sort_by_key(|e| std::cmp::Reverse(e.quality));
     layers.sort_by_key(|e| std::cmp::Reverse(e.quality));
 
-    tracing::info!(track_id = ?meta.id, layers = ?layers.len(), "discovered video layers mapping");
+    tracing::info!(publication_id = ?meta.id, layers = ?layers.len(), "discovered video layers mapping");
     let stats = VideoStats::new(&layers);
     let track = Track::Video(VideoTrack {
         meta: meta.clone(),
@@ -1120,15 +1119,15 @@ pub mod test_utils {
         mid: Mid,
         layers: Vec<SimulcastLayer>,
     ) -> (UpstreamTrack, Track) {
-        let track_id = connection_id.derive_track_id(TrackKind::Video, &mid);
+        let publication_id = connection_id.fixture_publication(TrackKind::Video, &mid);
         let meta = TrackMeta {
             connection_id,
-            label: None,
+            track_id: None,
             room: crate::entity::ProjectRoomKey::fixture(
                 crate::entity::RoomId::new("test-room").unwrap(),
             ),
             shard_id: ShardId::new(0),
-            id: track_id,
+            id: publication_id,
             origin: participant_id,
         };
         crate::track::new_video(mid, meta, layers)
@@ -1139,15 +1138,15 @@ pub mod test_utils {
         connection_id: crate::entity::ConnectionId,
         mid: Mid,
     ) -> (UpstreamTrack, Track) {
-        let track_id = connection_id.derive_track_id(TrackKind::Audio, &mid);
+        let publication_id = connection_id.fixture_publication(TrackKind::Audio, &mid);
         let meta = TrackMeta {
             connection_id,
-            label: None,
+            track_id: None,
             room: crate::entity::ProjectRoomKey::fixture(
                 crate::entity::RoomId::new("test-room").unwrap(),
             ),
             shard_id: ShardId::new(0),
-            id: track_id,
+            id: publication_id,
             origin: participant_id,
         };
         crate::track::new_audio(mid, meta)

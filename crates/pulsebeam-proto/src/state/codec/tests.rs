@@ -26,7 +26,7 @@ fn publication(revision: u64) -> ClientStateBatch {
                         }),
                         declaration: Some(resource_spec::Declaration::Publication(
                             PublicationSpec {
-                                label: String::from("cursor"),
+                                track_id: String::from("cursor"),
                                 kind: Some(publication_spec::Kind::Data(DataPublication {
                                     delivery: DataDelivery::Lossy as i32,
                                     binding: Some(TrackBinding {
@@ -61,7 +61,7 @@ fn lookup_spec(enabled: bool) -> ResourceSpec {
                 room: String::from("room"),
                 participant_id: String::from("alice"),
                 kind: TrackKind::Data as i32,
-                label: String::from("cursor"),
+                track_id: String::from("cursor"),
             }),
         })),
     }
@@ -75,10 +75,10 @@ fn lookup_state(enabled: bool, paired: bool) -> SourceLookupState {
             room_id: String::from("room"),
         }),
         track: paired.then(|| Track {
-            track_id: String::from("replacement-track"),
+            publication_id: String::from("replacement-track"),
             participant_id: String::from("alice"),
             room_id: String::from("room"),
-            label: String::from("cursor"),
+            track_id: String::from("cursor"),
             kind: Some(track::Kind::Data(DataTrack {
                 delivery: DataDelivery::Lossy as i32,
             })),
@@ -183,7 +183,7 @@ fn source_lookup_is_a_bounded_owned_nonforwarding_observation() {
     );
     assert_eq!(
         validation::validate_server_batch(&record(
-            resource_key::Key::Track(String::from("replacement-track")),
+            resource_key::Key::Publication(String::from("replacement-track")),
             0,
             valid.clone()
         )),
@@ -207,7 +207,7 @@ fn source_lookup_is_a_bounded_owned_nonforwarding_observation() {
             receive: None,
         }),
         declaration: Some(resource_spec::Declaration::Publication(PublicationSpec {
-            label: String::from("cursor"),
+            track_id: String::from("cursor"),
             kind: Some(publication_spec::Kind::Data(DataPublication {
                 delivery: DataDelivery::Lossy as i32,
                 binding: Some(TrackBinding {
@@ -242,7 +242,7 @@ fn source_lookup_is_a_bounded_owned_nonforwarding_observation() {
         Err(ValidationError::Identity)
     );
     let mut invalid = valid.clone();
-    invalid.track.as_mut().unwrap().label = String::from("other-label");
+    invalid.track.as_mut().unwrap().track_id = String::from("other-label");
     assert_eq!(
         validation::validate_source_lookup(&invalid),
         Err(ValidationError::Identity)
@@ -515,7 +515,7 @@ fn rtp_presence_and_source_coordinates_are_not_conflated_with_zero() {
         panic!("present")
     };
     spec.declaration = Some(resource_spec::Declaration::Publication(PublicationSpec {
-        label: String::from("mic"),
+        track_id: String::from("mic"),
         kind: Some(publication_spec::Kind::Audio(AudioPublication {
             binding: Some(TrackBinding {
                 transport: Some(track_binding::Transport::Rtp(binding.clone())),
@@ -616,7 +616,7 @@ fn receive_replacements_preserve_explicit_zero_and_reject_not_clamp() {
             receive: Some(resource_settings::Receive::Video(options)),
         }),
         declaration: Some(resource_spec::Declaration::Subscription(SubscriptionSpec {
-            track_id: String::from("opaque-track"),
+            publication_id: String::from("opaque-track"),
             kind: TrackKind::Video as i32,
             source_room: String::from("room"),
             binding: Some(TrackBinding {
@@ -695,10 +695,10 @@ fn owned_confirmation_is_self_contained_and_execution_failure_is_not_rejection()
             room_id: String::from("room"),
         }),
         track: Some(Track {
-            track_id: String::from("track"),
+            publication_id: String::from("track"),
             participant_id: String::from("participant"),
             room_id: String::from("room"),
-            label: String::from("cursor"),
+            track_id: String::from("cursor"),
             kind: Some(track::Kind::Data(DataTrack {
                 delivery: DataDelivery::Lossy as i32,
             })),
@@ -777,7 +777,7 @@ fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
             receive: None,
         }),
         declaration: Some(resource_spec::Declaration::Publication(PublicationSpec {
-            label: String::from("camera"),
+            track_id: String::from("camera"),
             kind: Some(publication_spec::Kind::Video(VideoPublication {
                 binding: Some(TrackBinding {
                     transport: Some(track_binding::Transport::Rtp(binding)),
@@ -840,7 +840,7 @@ fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
         assert_eq!(validation::validate_spec(&changed), Ok(()));
         assert!(!validation::declarations_equivalent(&original, &changed));
     }
-    let subscription = |track_id: &str| ResourceSpec {
+    let subscription = |publication_id: &str| ResourceSpec {
         settings: Some(ResourceSettings {
             enabled: Some(true),
             receive: Some(resource_settings::Receive::Video(
@@ -848,7 +848,7 @@ fn immutable_declarations_use_codec_defaults_without_reassociating_sources() {
             )),
         }),
         declaration: Some(resource_spec::Declaration::Subscription(SubscriptionSpec {
-            track_id: String::from(track_id),
+            publication_id: String::from(publication_id),
             kind: TrackKind::Video as i32,
             source_room: String::from("room"),
             binding: Some(TrackBinding {
@@ -1110,10 +1110,10 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
     };
     assert_eq!(future_format.known_codec(), None);
     let unknown = Track {
-        track_id: String::from("track"),
+        publication_id: String::from("track"),
         participant_id: String::from("participant"),
         room_id: String::from("room"),
-        label: String::from("camera"),
+        track_id: String::from("camera"),
         kind: Some(track::Kind::Video(VideoTrack {
             format: Some(future_format.clone()),
         })),

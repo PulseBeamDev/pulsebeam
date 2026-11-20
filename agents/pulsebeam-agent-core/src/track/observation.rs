@@ -67,7 +67,7 @@ impl TrackResources {
         owner: TrackOwner,
         source: String,
     ) -> Result<MediaObservationId, TrackResourceError> {
-        validate_identifier("audio track_id", &source, 256, true)?;
+        validate_identifier("audio publication_id", &source, 256, true)?;
         if !self.audio_views.contains_key(&owner) {
             return Err(if self.video.contains_key(&owner) {
                 TrackResourceError::WrongKind

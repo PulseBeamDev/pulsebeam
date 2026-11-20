@@ -272,7 +272,7 @@ impl ShardExecution {
         debug_assert!(op.is_owned_by(self.shard_id));
         match op {
             crate::shard_update::ShardUpdateOp::InstallRoute { address, action } => {
-                let Some(handle) = self.runtime.track_handle(action.track_id()) else {
+                let Some(handle) = self.runtime.track_handle(action.publication_id()) else {
                     debug_assert!(false, "a route must target a live shard track");
                     return;
                 };
@@ -321,16 +321,19 @@ impl ShardExecution {
                     let _ = self.add_participant(transport, config);
                 }
             }
-            crate::shard_update::ShardUpdateOp::InsertTrackRuntime { track_id, runtime } => {
+            crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
+                publication_id,
+                runtime,
+            } => {
                 let descriptor = runtime.descriptor.as_ref();
                 let origin = descriptor
                     .and_then(|descriptor| self.registry.resolve_connection(descriptor.origin));
                 let publisher = runtime
                     .publisher
                     .and_then(|publisher| self.registry.resolve_connection(publisher));
-                let track_handle = self
-                    .runtime
-                    .install_track(*track_id, descriptor, origin, publisher);
+                let track_handle =
+                    self.runtime
+                        .install_track(*publication_id, descriptor, origin, publisher);
                 if let (Some(publisher), Some(effect)) =
                     (runtime.publisher, runtime.publisher_effect.as_ref())
                 {
@@ -349,14 +352,14 @@ impl ShardExecution {
                     meta.apply(effect.clone(), Some(track_handle));
                 }
             }
-            crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { track_id } => {
+            crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { publication_id } => {
                 debug_assert!(
                     self.runtime
-                        .track_handle(*track_id)
+                        .track_handle(*publication_id)
                         .is_none_or(|handle| !self.plans.contains_key(handle)),
                     "track plan removal must precede runtime retirement"
                 );
-                self.runtime.retire_track(*track_id);
+                self.runtime.retire_track(*publication_id);
             }
         }
     }
@@ -366,9 +369,10 @@ impl ShardExecution {
         connection: crate::entity::ConnectionId,
         effect: crate::participant::ParticipantEffect,
     ) -> bool {
-        let track_id = effect.track_id();
-        let track_handle = track_id.and_then(|track_id| self.runtime.track_handle(track_id));
-        if track_id.is_some() && track_handle.is_none() {
+        let publication_id = effect.publication_id();
+        let track_handle =
+            publication_id.and_then(|publication_id| self.runtime.track_handle(publication_id));
+        if publication_id.is_some() && track_handle.is_none() {
             return false;
         }
         let Some(handle) = self.registry.resolve_connection(connection) else {
@@ -383,7 +387,7 @@ impl ShardExecution {
     }
 
     pub(super) fn apply_plan(&mut self, operation: &crate::shard_update::TrackPlanUpdate) -> usize {
-        let Some(track_handle) = self.runtime.track_handle(operation.track_id) else {
+        let Some(track_handle) = self.runtime.track_handle(operation.publication_id) else {
             debug_assert!(false, "a track plan must target a live shard track");
             return 0;
         };
@@ -451,7 +455,7 @@ impl ShardExecution {
             && let Some(publisher) = self.runtime.source_origin(track_handle)
             && let Some(meta) = self.registry.resolve_mut(publisher)
         {
-            meta.native_rtp_demand(operation.track_id, active);
+            meta.native_rtp_demand(operation.publication_id, active);
             self.dirty.mark(publisher, meta);
         }
         cost
@@ -480,7 +484,7 @@ impl ShardExecution {
             debug_assert!(false, "a media envelope must resolve to a forward route");
             return;
         };
-        if self.runtime.track_id(key) != Some(payload.track_id) {
+        if self.runtime.publication_id(key) != Some(payload.publication_id) {
             record_routing_drop("packet", "identity", "remote");
             return;
         }
@@ -1058,14 +1062,14 @@ mod wrong_owner_tests {
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
             update_rx,
         );
-        let track_id = crate::entity::ConnectionId::new()
-            .derive_track_id(crate::entity::TrackKind::Audio, "consistent");
+        let publication_id = crate::entity::ConnectionId::new()
+            .fixture_publication(crate::entity::TrackKind::Audio, "consistent");
         let route = crate::route::NodeRouteAddress::new(crate::route::RouteId::new(shard, 7), 1);
 
         writer.stage(
             1,
             crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
-                track_id,
+                publication_id,
                 runtime: crate::shard_update::TrackRuntime::default(),
             },
         );
@@ -1073,11 +1077,11 @@ mod wrong_owner_tests {
             1,
             crate::shard_update::ShardUpdateOp::InstallRoute {
                 address: route,
-                action: crate::shard_update::TrackRouteAction::Forward { track_id },
+                action: crate::shard_update::TrackRouteAction::Forward { publication_id },
             },
         );
         let plans = vec![crate::shard_update::TrackPlanUpdate {
-            track_id,
+            publication_id,
             plan: Some(crate::shard_update::TrackPlan::default()),
         }];
         writer.stage_plans(1, plans);
@@ -1086,7 +1090,7 @@ mod wrong_owner_tests {
         assert_eq!(core.apply_updates(1), 1);
         assert!(core.execution.runtime.routes.resolve(route).is_some());
         let plans = &core.execution.plans;
-        let track_handle = core.execution.runtime.track_handle(track_id).unwrap();
+        let track_handle = core.execution.runtime.track_handle(publication_id).unwrap();
         assert!(plans.get(track_handle).is_some());
     }
 
@@ -1301,25 +1305,25 @@ mod wrong_owner_tests {
                 core.execution.registry.resolve_connection(old_id),
                 Some(old_handle)
             );
-            let track_id = crate::entity::ConnectionId::new()
-                .derive_track_id(crate::entity::TrackKind::Audio, "mic");
+            let publication_id = crate::entity::ConnectionId::new()
+                .fixture_publication(crate::entity::TrackKind::Audio, "mic");
             writer.stage(
                 1,
                 ShardUpdateOp::InsertTrackRuntime {
-                    track_id,
+                    publication_id,
                     runtime: TrackRuntime::default(),
                 },
             );
             writer.stage_plans(
                 1,
                 vec![TrackPlanUpdate {
-                    track_id,
+                    publication_id,
                     plan: Some(TrackPlan::new([old_id], [], None)),
                 }],
             );
             writer.publish();
             assert_eq!(core.apply_updates(1), 1);
-            let track_handle = core.execution.runtime.track_handle(track_id).unwrap();
+            let track_handle = core.execution.runtime.track_handle(publication_id).unwrap();
             assert_eq!(
                 core.execution.plans.get(track_handle).unwrap().local,
                 vec![old_handle]
@@ -1358,7 +1362,7 @@ mod wrong_owner_tests {
             writer.stage_plans(
                 2,
                 vec![TrackPlanUpdate {
-                    track_id,
+                    publication_id,
                     plan: Some(TrackPlan::default()),
                 }],
             );
@@ -1469,7 +1473,7 @@ mod wrong_owner_tests {
             writer.stage_plans(
                 4,
                 vec![TrackPlanUpdate {
-                    track_id,
+                    publication_id,
                     plan: Some(TrackPlan::new([replacement_id], [], None)),
                 }],
             );
@@ -1494,12 +1498,12 @@ mod wrong_owner_tests {
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, origin),
             update_rx,
         );
-        let track_id = crate::entity::ConnectionId::from_bytes([6; 16])
-            .derive_track_id(crate::entity::TrackKind::Video, "compiled");
+        let publication_id = crate::entity::ConnectionId::from_bytes([6; 16])
+            .fixture_publication(crate::entity::TrackKind::Video, "compiled");
         let handle = core
             .execution
             .runtime
-            .install_track(track_id, None, None, None);
+            .install_track(publication_id, None, None, None);
         let mut control =
             pulsebeam_link::LinkControl::new(|| pulsebeam_link::LinkTime::from_nanos(0)).unwrap();
         let (port, _rx) = control.create_port().unwrap();
@@ -1535,7 +1539,7 @@ mod wrong_owner_tests {
         assert_eq!(
             core.execution
                 .apply_plan(&crate::shard_update::TrackPlanUpdate {
-                    track_id,
+                    publication_id,
                     plan: Some(plan)
                 }),
             3
@@ -1558,18 +1562,18 @@ mod wrong_owner_tests {
             WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, Instant::now()),
             update_rx,
         );
-        let track_id = crate::entity::ConnectionId::new()
-            .derive_track_id(crate::entity::TrackKind::Audio, "audio");
+        let publication_id = crate::entity::ConnectionId::new()
+            .fixture_publication(crate::entity::TrackKind::Audio, "audio");
         core.execution
             .runtime
-            .install_track(track_id, None, None, None);
+            .install_track(publication_id, None, None, None);
         core.execution
             .apply_plan(&crate::shard_update::TrackPlanUpdate {
-                track_id,
+                publication_id,
                 plan: Some(crate::shard_update::TrackPlan::default()),
             });
         core.execution.apply_lifecycle_op(
-            &crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { track_id },
+            &crate::shard_update::ShardUpdateOp::RemoveTrackRuntime { publication_id },
         );
     }
 
@@ -1588,22 +1592,22 @@ mod wrong_owner_tests {
         let connection = crate::entity::ConnectionId::new();
         let track_ids = (0..=crate::shard::worker::SHARD_PLAN_OPERATION_BUDGET)
             .map(|index| {
-                connection.derive_track_id(crate::entity::TrackKind::Audio, &index.to_string())
+                connection.fixture_publication(crate::entity::TrackKind::Audio, &index.to_string())
             })
             .collect::<Vec<_>>();
-        for track_id in &track_ids {
+        for publication_id in &track_ids {
             writer.stage(
                 1,
                 crate::shard_update::ShardUpdateOp::InsertTrackRuntime {
-                    track_id: *track_id,
+                    publication_id: *publication_id,
                     runtime: crate::shard_update::TrackRuntime::default(),
                 },
             );
         }
         let plans = track_ids
             .iter()
-            .map(|track_id| crate::shard_update::TrackPlanUpdate {
-                track_id: *track_id,
+            .map(|publication_id| crate::shard_update::TrackPlanUpdate {
+                publication_id: *publication_id,
                 plan: Some(crate::shard_update::TrackPlan::default()),
             })
             .collect();
@@ -1613,7 +1617,7 @@ mod wrong_owner_tests {
             crate::shard_update::ShardUpdateOp::InstallRoute {
                 address: route,
                 action: crate::shard_update::TrackRouteAction::Forward {
-                    track_id: track_ids[0],
+                    publication_id: track_ids[0],
                 },
             },
         );
@@ -1647,7 +1651,7 @@ mod wrong_owner_tests {
             crate::shard_update::ShardUpdateOp::InstallRoute {
                 address: route,
                 action: crate::shard_update::TrackRouteAction::Forward {
-                    track_id: track_ids[0],
+                    publication_id: track_ids[0],
                 },
             },
         );
@@ -1655,8 +1659,8 @@ mod wrong_owner_tests {
             3,
             track_ids
                 .iter()
-                .map(|track_id| crate::shard_update::TrackPlanUpdate {
-                    track_id: *track_id,
+                .map(|publication_id| crate::shard_update::TrackPlanUpdate {
+                    publication_id: *publication_id,
                     plan: None,
                 })
                 .collect(),
@@ -1665,11 +1669,11 @@ mod wrong_owner_tests {
             3,
             crate::shard_update::ShardUpdateOp::RetireRoute { address: route },
         );
-        for track_id in &track_ids {
+        for publication_id in &track_ids {
             writer.stage(
                 3,
                 crate::shard_update::ShardUpdateOp::RemoveTrackRuntime {
-                    track_id: *track_id,
+                    publication_id: *publication_id,
                 },
             );
         }

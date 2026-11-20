@@ -11,16 +11,21 @@ use super::{
 };
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 enum SpecConfig {
     Video {
-        label: String,
+        track_id: String,
     },
     Audio {
-        label: String,
+        track_id: String,
     },
     Data {
-        label: String,
+        track_id: String,
         delivery: TopicModeConfig,
     },
 }
@@ -28,10 +33,10 @@ enum SpecConfig {
 impl From<SpecConfig> for TrackSpec {
     fn from(value: SpecConfig) -> Self {
         match value {
-            SpecConfig::Video { label } => Self::Video { label },
-            SpecConfig::Audio { label } => Self::Audio { label },
-            SpecConfig::Data { label, delivery } => Self::Data {
-                label,
+            SpecConfig::Video { track_id } => Self::Video { track_id },
+            SpecConfig::Audio { track_id } => Self::Audio { track_id },
+            SpecConfig::Data { track_id, delivery } => Self::Data {
+                track_id,
                 delivery: delivery.into(),
             },
         }
@@ -211,25 +216,25 @@ fn data_event(event: DataEvent) -> JsValue {
     match event {
         DataEvent::Message {
             participant_id,
-            track_id,
+            publication_id,
             sequence,
             data,
         } => {
             set(&value, "type", "message");
             set(&value, "participantId", participant_id);
-            set(&value, "trackId", track_id);
+            set(&value, "publicationId", publication_id);
             set(&value, "sequence", BigInt::from(sequence));
             set(&value, "data", js_sys::Uint8Array::from(data.as_slice()));
         }
         DataEvent::Gap {
             participant_id,
-            track_id,
+            publication_id,
             from,
             to,
         } => {
             set(&value, "type", "gap");
             set(&value, "participantId", participant_id);
-            set(&value, "trackId", track_id);
+            set(&value, "publicationId", publication_id);
             set(&value, "from", BigInt::from(from));
             set(&value, "to", BigInt::from(to));
         }

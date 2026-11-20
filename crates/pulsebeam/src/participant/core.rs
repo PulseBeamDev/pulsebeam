@@ -17,7 +17,7 @@ use pulsebeam_runtime::time::Instant;
 use std::time::Duration;
 
 use crate::control::{NegotiatedResources, controller::SignalingProtocol};
-use crate::entity::{self, TrackId, TrackKind};
+use crate::entity::{self, PublicationKey, TrackKind};
 use crate::id::ShardId;
 use crate::keys::TrackHandle;
 use crate::log::{LogCtx, plog_debug, plog_info, plog_trace, plog_warn};
@@ -64,7 +64,7 @@ fn inline_rtc_timeout(deadline: Instant, wall_now: Instant) -> Option<Instant> {
 
 pub struct TrackMapping {
     pub mid: Mid,
-    pub track_id: TrackId,
+    pub publication_id: PublicationKey,
     pub kind: MediaKind,
 }
 
@@ -151,6 +151,12 @@ impl ConnectionConfig {
     }
 }
 
+struct PendingSdpSender {
+    media_index: u32,
+    kind: MediaKind,
+    track_id: Option<entity::TrackId>,
+}
+
 /// Shard-owned media execution for one participant connection incarnation.
 pub struct Connection {
     // Hot: touched on every packet
@@ -159,6 +165,7 @@ pub struct Connection {
     stream_writer: StreamWriter,
     // Warm: touched per poll cycle
     upstream: UpstreamAllocator,
+    sdp_senders: HashMap<Mid, PendingSdpSender>,
     negotiated: NegotiatedResources,
     allow_topic_channels: bool,
     topic_publications: super::policy::TopicPublications,
@@ -228,7 +235,8 @@ impl Connection {
             connection_id: cfg.connection_id,
             allow_topic_channels: cfg.allow_topic_channels,
             topic_publications: cfg.topic_publications,
-            upstream: UpstreamAllocator::new(ctx, cfg.connection_id),
+            upstream: UpstreamAllocator::new(ctx),
+            sdp_senders: HashMap::new(),
             negotiated: cfg.resources,
             downstream: DownstreamAllocator::new(ctx, cfg.manual_sub),
             disconnect_reason: None,
@@ -262,8 +270,8 @@ impl Connection {
             participant.disconnect(DisconnectReason::SignalingOutput);
         }
         for media in participant.negotiated.media_sections().to_vec() {
-            let label = whip_media_label(cfg.profile, media.kind);
-            participant.install_sdp_media(media, label);
+            let track_id = whip_media_track_id(cfg.profile, media.kind);
+            participant.install_sdp_media(media, track_id);
         }
         participant
     }
@@ -272,14 +280,6 @@ impl Connection {
         LogCtx {
             connection_id: self.connection_id,
         }
-    }
-
-    #[allow(
-        dead_code,
-        reason = "the replacement signaling path consumes negotiated sender coordinates in Plan 07"
-    )]
-    pub(crate) fn track_for_sender_index(&self, sender_index: u32) -> Option<TrackId> {
-        self.upstream.track_for_sender_index(sender_index)
     }
 
     #[allow(
@@ -299,68 +299,71 @@ impl Connection {
                 };
                 self.add_track_candidate(key, track);
             }
-            ParticipantEffect::TrackCandidateRemoved { track_id, reason } => {
-                self.native_source_removed(track_id, reason);
+            ParticipantEffect::TrackCandidateRemoved {
+                publication_id,
+                reason,
+            } => {
+                self.native_source_removed(publication_id, reason);
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                self.remove_track_candidate(key, track_id);
+                self.remove_track_candidate(key, publication_id);
             }
-            ParticipantEffect::TrackSubscribed { track_id } => {
+            ParticipantEffect::TrackSubscribed { publication_id } => {
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                if self.native_receivers.contains_source(track_id) {
-                    self.native_source_binding(track_id, key, true);
+                if self.native_receivers.contains_source(publication_id) {
+                    self.native_source_binding(publication_id, key, true);
                 } else {
-                    self.activate_track_binding(key, track_id);
+                    self.activate_track_binding(key, publication_id);
                 }
             }
-            ParticipantEffect::TrackUnsubscribed { track_id } => {
+            ParticipantEffect::TrackUnsubscribed { publication_id } => {
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                if self.native_receivers.contains_source(track_id) {
-                    self.native_source_binding(track_id, key, false);
+                if self.native_receivers.contains_source(publication_id) {
+                    self.native_source_binding(publication_id, key, false);
                 } else {
-                    self.deactivate_track_binding(key, track_id);
+                    self.deactivate_track_binding(key, publication_id);
                 }
             }
-            ParticipantEffect::TrackPublished { track_id } => {
+            ParticipantEffect::TrackPublished { publication_id } => {
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                if track_id.kind() != TrackKind::Data {
-                    if self.native_rtp.bind_source(track_id, key)
-                        || (!self.upstream.owns_managed_track(track_id)
-                            && self.upstream.mid_for_track_id(track_id).is_some())
+                if publication_id.kind() != TrackKind::Data {
+                    if self.native_rtp.bind_source(publication_id, key)
+                        || (!self.upstream.owns_managed_track(publication_id)
+                            && self.upstream.mid_for_track_id(publication_id).is_some())
                     {
-                        self.upstream.bind_track_handle(track_id, key);
+                        self.upstream.bind_track_handle(publication_id, key);
                     }
                     return;
                 }
-                self.native_data.bind_source(track_id, key);
-                if self.data.bind_source(track_id, key) {
-                    self.upstream.bind_track_handle(track_id, key);
+                self.native_data.bind_source(publication_id, key);
+                if self.data.bind_source(publication_id, key) {
+                    self.upstream.bind_track_handle(publication_id, key);
                 }
             }
-            ParticipantEffect::TrackUnpublished { track_id } => {
+            ParticipantEffect::TrackUnpublished { publication_id } => {
                 let Some(key) = track_handle else {
                     debug_assert!(false, "a track effect must resolve to a local handle");
                     return;
                 };
-                if track_id.kind() != TrackKind::Data {
-                    if !self.upstream.owns_managed_track(track_id) {
-                        self.upstream.unbind_track_handle(track_id, key);
+                if publication_id.kind() != TrackKind::Data {
+                    if !self.upstream.owns_managed_track(publication_id) {
+                        self.upstream.unbind_track_handle(publication_id, key);
                     }
                     return;
                 }
-                self.upstream.unbind_track_handle(track_id, key);
-                self.data.unpublish(track_id, key);
+                self.upstream.unbind_track_handle(publication_id, key);
+                self.data.unpublish(publication_id, key);
             }
         }
     }
@@ -407,13 +410,13 @@ impl Connection {
     }
 
     fn add_track_candidate(&mut self, key: TrackHandle, track: Track) {
-        let track_id = track.id();
+        let publication_id = track.id();
         let participant_id = track.meta().origin;
-        debug_assert_eq!(track_id.kind(), track.kind());
+        debug_assert_eq!(publication_id.kind(), track.kind());
         if !self.downstream.register_candidate(key, &track) {
             return;
         }
-        if self.native_receivers.contains_source(track_id) {
+        if self.native_receivers.contains_source(publication_id) {
             self.native_source_added(key, &track);
         }
         self.data.add_candidate(key, &track);
@@ -423,36 +426,41 @@ impl Connection {
         }
     }
 
-    fn activate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
+    fn activate_track_binding(&mut self, key: TrackHandle, publication_id: PublicationKey) {
         let Some(candidate) = self.downstream.track_candidate(key) else {
             debug_assert!(false, "binding activation requires a candidate");
             return;
         };
-        debug_assert_eq!(candidate.track_id, track_id);
-        self.downstream.activate_track_binding(key, track_id);
+        debug_assert_eq!(candidate.publication_id, publication_id);
+        self.downstream.activate_track_binding(key, publication_id);
     }
 
-    fn deactivate_track_binding(&mut self, key: TrackHandle, track_id: TrackId) {
+    fn deactivate_track_binding(&mut self, key: TrackHandle, publication_id: PublicationKey) {
         let Some(candidate) = self.downstream.track_candidate(key) else {
             debug_assert!(false, "binding deactivation requires a candidate");
             return;
         };
-        debug_assert_eq!(candidate.track_id, track_id);
-        self.downstream.deactivate_track_binding(key, track_id);
+        debug_assert_eq!(candidate.publication_id, publication_id);
+        self.downstream
+            .deactivate_track_binding(key, publication_id);
     }
 
-    fn remove_track_candidate(&mut self, key: TrackHandle, track_id: TrackId) {
+    fn remove_track_candidate(&mut self, key: TrackHandle, publication_id: PublicationKey) {
         let Some(candidate) = self.downstream.remove_track_candidate(key) else {
             return;
         };
-        debug_assert_eq!(candidate.track_id, track_id);
+        debug_assert_eq!(candidate.publication_id, publication_id);
         debug_assert_ne!(candidate.participant_id, self.participant_id);
         self.data.remove_candidate(key);
-        if self.native_receivers.contains_source(track_id) && track_id.kind() == TrackKind::Video {
-            self.downstream.video.forget_owned_track(key, track_id);
+        if self.native_receivers.contains_source(publication_id)
+            && publication_id.kind() == TrackKind::Video
+        {
+            self.downstream
+                .video
+                .forget_owned_track(key, publication_id);
             self.downstream.dirty_allocation = true;
-        } else if track_id.kind() != TrackKind::Data {
-            let _ = self.on_tracks_unpublished(std::slice::from_ref(&track_id));
+        } else if publication_id.kind() != TrackKind::Data {
+            let _ = self.on_tracks_unpublished(std::slice::from_ref(&publication_id));
         }
     }
 
@@ -507,9 +515,9 @@ impl Connection {
             debug_assert!(false, "a participant must never receive its own track");
             return;
         }
-        let kind = entry.track_id.kind();
+        let kind = entry.publication_id.kind();
         let participant_id = entry.participant_id;
-        let track_id = entry.track_id;
+        let publication_id = entry.publication_id;
         self.native_rtp_delivery(key, packet, cache);
         match kind {
             TrackKind::Video if self.downstream.video.has_negotiated_slots() => {
@@ -530,7 +538,7 @@ impl Connection {
                 debug_assert!(cache.is_none(), "audio forwarding has no video cache");
                 let origin = crate::entity::AudioOrigin {
                     participant: participant_id,
-                    track: track_id,
+                    track: publication_id,
                 };
                 self.downstream
                     .on_forward_audio_rtp(origin, packet, &mut self.stream_writer);
@@ -579,10 +587,10 @@ impl Connection {
         self.downstream.install_track(key, track);
     }
 
-    fn on_tracks_unpublished(&mut self, tracks: &[TrackId]) -> bool {
+    fn on_tracks_unpublished(&mut self, tracks: &[PublicationKey]) -> bool {
         let mut removed = false;
-        for track_id in tracks {
-            removed |= self.downstream.remove_track(track_id);
+        for publication_id in tracks {
+            removed |= self.downstream.remove_track(publication_id);
         }
         removed
     }
@@ -599,14 +607,14 @@ impl Connection {
     fn on_reverse(&mut self, stream: TrackHandle, packet: ReversePacket) {
         match packet.decode() {
             Some(ReverseInput::Keyframe { encoding, kind }) => {
-                let Some(track_id) = self.upstream.track_for_fanout(stream) else {
+                let Some(publication_id) = self.upstream.track_for_fanout(stream) else {
                     debug_assert!(
                         false,
                         "a reverse keyframe route must name a published track"
                     );
                     return;
                 };
-                self.enqueue_remote_keyframe((track_id, encoding), kind);
+                self.enqueue_remote_keyframe((publication_id, encoding), kind);
             }
             Some(ReverseInput::ReliableControl(bytes)) => {
                 if self.native_data.owns_fanout(stream) {
@@ -623,7 +631,7 @@ impl Connection {
                     return;
                 };
                 if !frame.is_subscriber_control()
-                    || frame.data_track_id() != Some(publication.id.as_str().as_str())
+                    || frame.publication_id() != Some(publication.id.as_str().as_str())
                 {
                     return;
                 }
@@ -700,31 +708,34 @@ impl Connection {
             return false;
         }
         if let Some(write) = self.stream_writer.pop() {
-            let (pkt, track_id, mid, rid, ssrc, pt, kind) = match write {
+            let (pkt, publication_id, mid, rid, ssrc, pt, kind) = match write {
                 StreamWrite::Video {
                     pkt,
-                    track_id,
+                    publication_id,
                     mid,
                     rid,
                     ssrc,
                     pt,
-                } => (pkt, track_id, mid, rid, ssrc, pt, MediaKind::Video),
+                } => (pkt, publication_id, mid, rid, ssrc, pt, MediaKind::Video),
                 StreamWrite::Audio {
                     pkt,
-                    track_id,
+                    publication_id,
                     mid,
                     ssrc,
                     pt,
-                } => (pkt, track_id, mid, None, ssrc, pt, MediaKind::Audio),
+                } => (pkt, publication_id, mid, None, ssrc, pt, MediaKind::Audio),
             };
             let seq_no = pkt.seq_no;
             let playout_delay = if self.native_receivers.owns_mid(mid) {
-                if !self.native_receivers.can_write_rtp(mid, track_id, ssrc, pt) {
+                if !self
+                    .native_receivers
+                    .can_write_rtp(mid, publication_id, ssrc, pt)
+                {
                     return true;
                 }
                 self.native_receivers.playout_delay(mid)
             } else {
-                let Ok(delay) = self.downstream.playout_delay_to_stamp(track_id, mid) else {
+                let Ok(delay) = self.downstream.playout_delay_to_stamp(publication_id, mid) else {
                     self.send_playout_reconnect();
                     return true;
                 };
@@ -732,7 +743,7 @@ impl Connection {
             };
             let result = self.transport.apply_rtp_command(RtpWriteCommand {
                 pkt,
-                track_id,
+                publication_id,
                 mid,
                 rid,
                 ssrc,
@@ -1020,7 +1031,7 @@ impl Connection {
                     if let Some(report) = self.transport.register_owned_encoding(info) {
                         self.handle_sender_report(report);
                     }
-                } else if self.upstream.slot_for_mid(mid).is_some() {
+                } else if self.activate_sdp_sender(mid) {
                     if let Some(report) = self.transport.register_encoding(info) {
                         self.handle_sender_report(report);
                     }
@@ -1095,12 +1106,17 @@ impl Connection {
                 match intent {
                     DataTrackIntent::InternalSignaling => {}
                     DataTrackIntent::UserTopic(channel) => {
-                        let label = (channel.direction == DataTrackDirection::Publish)
+                        let Ok(track_id) = entity::TrackId::new(&channel.topic) else {
+                            self.transport.close_native_data(cid);
+                            return;
+                        };
+                        let publishing = channel.direction == DataTrackDirection::Publish;
+                        let policy_label = publishing
                             .then(|| crate::track::publication_label(channel.lane, &channel.topic));
                         if self
                             .authorization_expiry
                             .is_some_and(|expiry| expiry.is_expired_at(native_data::unix_now()))
-                            || label
+                            || policy_label
                                 .as_deref()
                                 .is_some_and(|label| !self.topic_publications.allows(label))
                         {
@@ -1110,41 +1126,36 @@ impl Connection {
                         if let Some(previous) = self.data.close(cid) {
                             self.release_data_channel(previous, events);
                         }
-                        let publication = if let Some(label) = label {
-                            let Some(id) =
-                                self.data.allocate_publication(self.connection_id, &label)
-                            else {
-                                self.disconnect(DisconnectReason::SignalingOutput);
+                        let publication = match self.data.open(cid, channel.clone(), || {
+                            publishing.then(|| {
+                                Track::data(
+                                    crate::track::TrackMeta {
+                                        room: self.room,
+                                        shard_id: self.shard_id,
+                                        id: PublicationKey::Data(entity::PublicationId::mint()),
+                                        origin: self.participant_id,
+                                        connection_id: self.connection_id,
+                                        track_id: Some(track_id),
+                                    },
+                                    channel.topic.clone(),
+                                    channel.lane,
+                                    None,
+                                )
+                            })
+                        }) {
+                            Ok(publication) => publication,
+                            Err(error) => {
+                                self.disconnect(match error {
+                                    DataOpenError::DuplicateDataChannelLabel(channel) => {
+                                        DisconnectReason::DuplicateDataChannelLabel(channel)
+                                    }
+                                    DataOpenError::TooManyDataTopicChannels => {
+                                        DisconnectReason::TooManyDataTopicChannels
+                                    }
+                                });
                                 return;
-                            };
-                            Some(Track::data(
-                                crate::track::TrackMeta {
-                                    room: self.room,
-                                    shard_id: self.shard_id,
-                                    id,
-                                    origin: self.participant_id,
-                                    connection_id: self.connection_id,
-                                    label: Some(label),
-                                },
-                                channel.topic.clone(),
-                                channel.lane,
-                                None,
-                            ))
-                        } else {
-                            None
+                            }
                         };
-                        let meta = publication.as_ref().map(|track| track.meta().clone());
-                        if let Err(error) = self.data.open(cid, channel.clone(), meta) {
-                            self.disconnect(match error {
-                                DataOpenError::DuplicateDataChannelLabel(channel) => {
-                                    DisconnectReason::DuplicateDataChannelLabel(channel)
-                                }
-                                DataOpenError::TooManyDataTopicChannels => {
-                                    DisconnectReason::TooManyDataTopicChannels
-                                }
-                            });
-                            return;
-                        }
                         if let Some(track) = publication {
                             events.publish_track(track);
                         } else {
@@ -1231,13 +1242,14 @@ impl Connection {
                         if !control.is_subscriber_control() {
                             return;
                         }
-                        let Some(track_id) = control
-                            .data_track_id()
-                            .and_then(|id| id.parse::<TrackId>().ok())
-                        else {
+                        let Some(publication_id) = control.publication_id().and_then(|id| {
+                            id.parse::<entity::PublicationId>()
+                                .ok()
+                                .map(|id| PublicationKey::Data(id))
+                        }) else {
                             return;
                         };
-                        if let Some(stream) = self.data.subscribed_stream(cid, track_id) {
+                        if let Some(stream) = self.data.subscribed_stream(cid, publication_id) {
                             events.request_reverse(
                                 stream,
                                 ReversePacket::reliable_control(bytes.to_vec()),
@@ -1308,8 +1320,7 @@ impl Connection {
         events: &mut impl ParticipantSink,
     ) {
         if active {
-            let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid, true)
-            else {
+            let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid) else {
                 return;
             };
             if *in_topology {
@@ -1321,7 +1332,7 @@ impl Connection {
             return;
         }
 
-        let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid, false) else {
+        let Some((descriptor, in_topology)) = self.upstream.announce_state_mut(mid) else {
             return;
         };
         if !*in_topology {
@@ -1339,7 +1350,11 @@ impl Connection {
         }
     }
 
-    fn install_sdp_media(&mut self, media: crate::control::NegotiatedMedia, label: Option<&str>) {
+    fn install_sdp_media(
+        &mut self,
+        media: crate::control::NegotiatedMedia,
+        track_id: Option<entity::TrackId>,
+    ) {
         let Some(resource) = self.negotiated.media(media.mid) else {
             self.disconnect(DisconnectReason::InvalidMediaDirection);
             return;
@@ -1350,55 +1365,53 @@ impl Connection {
         }
         match media.direction {
             Direction::RecvOnly => {
-                let kind = match media.kind {
-                    MediaKind::Audio => TrackKind::Audio,
-                    MediaKind::Video => TrackKind::Video,
-                };
-                let track_id = self
-                    .connection_id
-                    .derive_track_id(kind, label.unwrap_or(&media.mid));
-                let track_meta = track::TrackMeta {
-                    room: self.room,
-                    shard_id: self.shard_id,
-                    id: track_id,
-                    origin: self.participant_id,
-                    connection_id: self.connection_id,
-                    label: label.map(str::to_owned),
-                };
-                match media.kind {
-                    MediaKind::Audio => {
-                        let (tx, track) = track::new_audio(media.mid, track_meta);
-                        if !self.upstream.add_published_track(
-                            resource.media_index,
-                            media.mid,
-                            tx,
-                            track,
-                        ) {
-                            self.disconnect(DisconnectReason::TooManyUpstreamTracks);
-                        }
-                    }
-                    MediaKind::Video => {
-                        let (tx, track) = track::new_video(
-                            media.mid,
-                            track_meta,
-                            self.transport.incoming_layers(media.mid),
-                        );
-                        if !self.upstream.add_published_track(
-                            resource.media_index,
-                            media.mid,
-                            tx,
-                            track,
-                        ) {
-                            self.disconnect(DisconnectReason::TooManyUpstreamTracks);
-                        }
-                    }
-                }
+                self.sdp_senders.insert(
+                    media.mid,
+                    PendingSdpSender {
+                        media_index: resource.media_index,
+                        kind: media.kind,
+                        track_id,
+                    },
+                );
             }
             Direction::SendOnly => {
                 self.try_add_downstream_slot(resource.media_index, media.mid, media.kind);
             }
             _ => self.disconnect(DisconnectReason::InvalidMediaDirection),
         }
+    }
+
+    fn activate_sdp_sender(&mut self, mid: Mid) -> bool {
+        let Some(sender) = self.sdp_senders.remove(&mid) else {
+            return self.upstream.slot_for_mid(mid).is_some();
+        };
+        let kind = match sender.kind {
+            MediaKind::Audio => TrackKind::Audio,
+            MediaKind::Video => TrackKind::Video,
+        };
+        if !self
+            .upstream
+            .add_published_track(sender.media_index, mid, kind, || {
+                let meta = track::TrackMeta {
+                    room: self.room,
+                    shard_id: self.shard_id,
+                    id: PublicationKey::new(kind, entity::PublicationId::mint()),
+                    origin: self.participant_id,
+                    connection_id: self.connection_id,
+                    track_id: sender.track_id,
+                };
+                match sender.kind {
+                    MediaKind::Audio => track::new_audio(mid, meta),
+                    MediaKind::Video => {
+                        track::new_video(mid, meta, self.transport.incoming_layers(mid))
+                    }
+                }
+            })
+        {
+            self.disconnect(DisconnectReason::TooManyUpstreamTracks);
+            return false;
+        }
+        true
     }
 
     fn preferred_send_pt(&self, mid: Mid, kind: MediaKind) -> Option<Pt> {
@@ -1481,15 +1494,16 @@ impl Connection {
             self.transport
                 .convert_rtp(rtp, mid, rid)
                 .and_then(|incoming| {
-                    let (upstream_slot, track_id) = self.upstream.slot_for_mid(incoming.mid)?;
+                    let (upstream_slot, publication_id) =
+                        self.upstream.slot_for_mid(incoming.mid)?;
                     let route = IncomingRtpRoute {
                         ssrc,
                         mid: incoming.mid,
                         rid: incoming.rid,
                         encoding: incoming.rid.into(),
                         upstream_slot,
-                        track_id,
-                        fanout: self.upstream.track_fanout(track_id),
+                        publication_id,
+                        fanout: self.upstream.track_fanout(publication_id),
                     };
                     self.upstream.cache_route(route);
                     Some((route, incoming))
@@ -1519,7 +1533,7 @@ impl Connection {
             return;
         }
         self.forward_processed_rtp(
-            route.track_id,
+            route.publication_id,
             route.encoding,
             route.fanout,
             processed,
@@ -1529,14 +1543,14 @@ impl Connection {
 
     fn forward_processed_rtp(
         &mut self,
-        track_id: TrackId,
+        publication_id: PublicationKey,
         encoding: SourceEncoding,
         fanout: Option<TrackHandle>,
         processed: track::ProcessedRtp,
         events: &mut impl ParticipantSink,
     ) {
         if processed.request_keyframe {
-            self.enqueue_remote_keyframe((track_id, encoding), KeyframeRequestKind::Pli);
+            self.enqueue_remote_keyframe((publication_id, encoding), KeyframeRequestKind::Pli);
         }
         if let Some(packet) = processed.first {
             events.publish_track_packet(fanout, TrackPacket::Rtp(packet));
@@ -1549,6 +1563,7 @@ impl Connection {
     fn handle_sender_report(&mut self, report: pulsebeam_rtc::SenderReport) {
         let owned = self.native_rtp.owns_encoding(report.ssrc);
         if !owned
+            && self.sdp_senders.is_empty()
             && !self
                 .negotiated
                 .media_sections()
@@ -1618,13 +1633,13 @@ impl Connection {
     }
 }
 
-pub(crate) fn whip_media_label(
+pub(crate) fn whip_media_track_id(
     profile: SignalingProtocol,
     kind: MediaKind,
-) -> Option<&'static str> {
+) -> Option<entity::TrackId> {
     match (profile, kind) {
-        (SignalingProtocol::Whip, MediaKind::Audio) => Some("audio"),
-        (SignalingProtocol::Whip, MediaKind::Video) => Some("video"),
+        (SignalingProtocol::Whip, MediaKind::Audio) => entity::TrackId::new("audio").ok(),
+        (SignalingProtocol::Whip, MediaKind::Video) => entity::TrackId::new("video").ok(),
         _ => None,
     }
 }
@@ -1648,18 +1663,12 @@ mod rtc_clock_tests {
 
     #[test]
     fn whip_uses_fixed_track_labels_independent_of_mid() {
-        let connection = entity::ConnectionId::new();
-        for (kind, track_kind, expected) in [
-            (MediaKind::Audio, TrackKind::Audio, "audio"),
-            (MediaKind::Video, TrackKind::Video, "video"),
-        ] {
-            let label = whip_media_label(SignalingProtocol::Whip, kind).unwrap();
-            assert_eq!(label, expected);
+        for (kind, expected) in [(MediaKind::Audio, "audio"), (MediaKind::Video, "video")] {
             assert_eq!(
-                connection.derive_track_id(track_kind, label),
-                connection.derive_track_id(track_kind, expected)
+                whip_media_track_id(SignalingProtocol::Whip, kind),
+                Some(entity::TrackId::new(expected).unwrap())
             );
-            assert!(whip_media_label(SignalingProtocol::State, kind).is_none());
+            assert!(whip_media_track_id(SignalingProtocol::State, kind).is_none());
         }
     }
 
@@ -1741,7 +1750,7 @@ mod rtc_clock_tests {
                         media.len()
                     }
                 );
-                let connection = Connection::new(config, ShardId::new(0), 8);
+                let mut connection = Connection::new(config, ShardId::new(0), 8);
                 assert!(connection.disconnect_reason.is_none());
                 for section in media {
                     if profile == SignalingProtocol::State {
@@ -1755,12 +1764,15 @@ mod rtc_clock_tests {
                     }
                     match section.direction {
                         Direction::RecvOnly => {
-                            let label = whip_media_label(profile, section.kind);
-                            let id = connection_id
-                                .derive_track_id(TrackKind::Audio, label.unwrap_or(&section.mid));
+                            assert!(connection.sdp_senders.contains_key(&section.mid));
+                            assert!(connection.upstream.slot_for_mid(section.mid).is_none());
+                            assert!(connection.activate_sdp_sender(section.mid));
+                            let admitted = connection.upstream.slot_for_mid(section.mid).unwrap();
+                            assert_eq!(admitted.1.kind(), TrackKind::Audio);
+                            assert!(connection.activate_sdp_sender(section.mid));
                             assert_eq!(
-                                connection.upstream.slot_for_mid(section.mid).unwrap().1,
-                                id
+                                connection.upstream.slot_for_mid(section.mid),
+                                Some(admitted)
                             );
                         }
                         Direction::SendOnly => assert_eq!(
@@ -2072,8 +2084,8 @@ mod upstream_route_table_tests {
     use super::*;
     use pulsebeam_runtime::rand::{RngCore, seeded_rng};
 
-    fn track_id(label: &str) -> TrackId {
-        entity::ConnectionId::new().derive_track_id(entity::TrackKind::Video, label)
+    fn publication_id(label: &str) -> PublicationKey {
+        entity::ConnectionId::new().fixture_publication(entity::TrackKind::Video, label)
     }
 
     fn route(ssrc: u32) -> IncomingRtpRoute {
@@ -2083,7 +2095,7 @@ mod upstream_route_table_tests {
             rid: None,
             encoding: SourceEncoding::Rid(None),
             upstream_slot: UpstreamSlotKey::Audio(0),
-            track_id: track_id("t"),
+            publication_id: publication_id("t"),
             fanout: None,
         }
     }
@@ -2119,24 +2131,27 @@ mod upstream_route_table_tests {
             mid,
             vec![crate::media::SimulcastLayer { rid }],
         );
-        let track_id = descriptor.id();
+        let publication_id = descriptor.id();
         assert!(
             connection
                 .upstream
-                .add_published_track(0, mid, track, descriptor)
+                .add_published_track(0, mid, TrackKind::Video, || (track, descriptor))
         );
         let slot = connection.upstream.slot_for_mid(mid).unwrap().0;
         let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
         let old = handles.insert(());
         let current = handles.insert(());
-        connection.apply(ParticipantEffect::TrackPublished { track_id }, Some(old));
+        connection.apply(
+            ParticipantEffect::TrackPublished { publication_id },
+            Some(old),
+        );
         connection.upstream.cache_route(IncomingRtpRoute {
             ssrc: 77u32.into(),
             mid,
             rid: None,
             encoding: SourceEncoding::Rid(None),
             upstream_slot: slot,
-            track_id,
+            publication_id,
             fanout: Some(old),
         });
         connection
@@ -2190,15 +2205,21 @@ mod upstream_route_table_tests {
         );
 
         connection.apply(
-            ParticipantEffect::TrackPublished { track_id },
+            ParticipantEffect::TrackPublished { publication_id },
             Some(current),
         );
-        connection.apply(ParticipantEffect::TrackUnpublished { track_id }, Some(old));
-        assert_eq!(connection.upstream.track_fanout(track_id), Some(current));
+        connection.apply(
+            ParticipantEffect::TrackUnpublished { publication_id },
+            Some(old),
+        );
+        assert_eq!(
+            connection.upstream.track_fanout(publication_id),
+            Some(current)
+        );
         assert_eq!(connection.upstream.track_for_fanout(old), None);
         assert_eq!(
             connection.upstream.track_for_fanout(current),
-            Some(track_id)
+            Some(publication_id)
         );
         assert_eq!(
             connection

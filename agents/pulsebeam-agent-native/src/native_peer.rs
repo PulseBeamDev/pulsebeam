@@ -1517,7 +1517,7 @@ mod tests {
             .attach(&remote, ReceiveMode::Decoded, None, None)
             .unwrap();
         assert_eq!(track.generation, generation.get());
-        assert!(!track.track_id.is_empty());
+        assert!(!track.publication_id.is_empty());
         assert!(peer.frame(&remote, false).unwrap().is_none());
         assert!(
             peer.attach(&remote, ReceiveMode::Encoded, None, None)

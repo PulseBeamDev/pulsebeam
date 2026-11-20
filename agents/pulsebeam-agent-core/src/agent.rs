@@ -425,7 +425,7 @@ impl Agent {
                 if self
                     .local_bindings
                     .iter()
-                    .any(|(slot, label)| slot.kind() == kind && label == spec.label())
+                    .any(|(slot, track_id)| slot.kind() == kind && track_id == spec.track_id())
                 {
                     return Err(TrackResourceError::AlreadyOwned.into());
                 }
@@ -899,10 +899,10 @@ impl Agent {
         for publication in &desired.publications {
             let spec = match publication.kind {
                 crate::MediaKind::Video => crate::TrackSpec::Video {
-                    label: publication.label.clone(),
+                    track_id: publication.track_id.clone(),
                 },
                 crate::MediaKind::Audio => crate::TrackSpec::Audio {
-                    label: publication.label.clone(),
+                    track_id: publication.track_id.clone(),
                 },
             };
             if owned_slots.contains(&publication.slot) || self.resources.has_publication(&spec) {
@@ -918,7 +918,7 @@ impl Agent {
         self.local_bindings.clear();
         for publication in &desired.publications {
             self.local_bindings
-                .insert(publication.media_slot(), publication.label.clone());
+                .insert(publication.media_slot(), publication.track_id.clone());
         }
         self.declared = desired;
         self.apply_desired(effective)

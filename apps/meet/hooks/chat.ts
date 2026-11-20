@@ -10,14 +10,14 @@ type LocalMessage = {
 };
 type RemoteMessage = {
   type: "message";
-  dataTrackId: string;
+  publicationId: string;
   sequence: bigint;
   participantId: string;
   value: string;
 };
 type Gap = {
   type: "gap";
-  dataTrackId: string;
+  publicationId: string;
   participantId: string;
   expectedSequence: bigint;
   availableSequence: bigint;
@@ -44,7 +44,7 @@ export function useChat(agent: Agent) {
           ...current,
           {
             type: "gap",
-            dataTrackId: event.trackId,
+            publicationId: event.publicationId,
             participantId: event.participantId,
             expectedSequence: event.from,
             availableSequence: event.to,
@@ -58,7 +58,7 @@ export function useChat(agent: Agent) {
         ...current,
         {
           type: "message",
-          dataTrackId: event.trackId,
+          publicationId: event.publicationId,
           sequence: event.sequence,
           participantId: event.participantId,
           value,

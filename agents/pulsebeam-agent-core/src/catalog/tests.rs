@@ -45,10 +45,10 @@ fn records(
         }),
         tracks: (0..tracks)
             .map(|index| wire::Track {
-                track_id: format!("{participant}-{index:02}"),
+                publication_id: format!("pub_00000000001R0100000000{index:04}0"),
                 participant_id: participant.into(),
                 room_id: "room".into(),
-                label: "x".repeat(256),
+                track_id: format!("track-{index:030}"),
                 kind: Some(wire::track::Kind::Data(wire::DataTrack {
                     delivery: wire::DataDelivery::Latest as i32,
                 })),
@@ -269,7 +269,12 @@ fn atomic_replacements_ignore_stale_fragments_and_share_the_published_page() {
     let published = catalogs.state(owner).unwrap();
     assert_eq!(published.status, WatchStatus::Live);
     assert!(!published.page.as_ref().unwrap().has_more());
-    let replacement = records(id, 2, "b", 32);
+    let replacement = records(
+        id,
+        2,
+        "b",
+        pulsebeam_proto::catalog::MAX_TRACKS_PER_PARTICIPANT,
+    );
     assert!(replacement.len() > 1);
     assert!(catalogs.apply(page(replacement[0].clone())).is_none());
     assert!(core::ptr::eq(
@@ -319,7 +324,7 @@ fn raw_catalog_commands_share_resource_budgets_and_reconnect_reissues_pinned_sco
             .stage(
                 Resource::Publication {
                     kind: wire::TrackKind::Data,
-                    label: label.clone(),
+                    track_id: label.clone(),
                 },
                 Some(wire::ResourceSpec {
                     settings: Some(wire::ResourceSettings {
@@ -328,7 +333,7 @@ fn raw_catalog_commands_share_resource_budgets_and_reconnect_reissues_pinned_sco
                     }),
                     declaration: Some(wire::resource_spec::Declaration::Publication(
                         wire::PublicationSpec {
-                            label,
+                            track_id: label,
                             kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
                                 delivery: wire::DataDelivery::Latest as i32,
                                 binding: Some(wire::TrackBinding {

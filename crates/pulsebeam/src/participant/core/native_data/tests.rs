@@ -99,7 +99,7 @@ impl NativeParticipant {
     pub(in crate::participant::core) fn remove_track_candidate(
         &mut self,
         handle: TrackHandle,
-        track: TrackId,
+        track: PublicationKey,
     ) {
         self.signaling.remove_track(track.as_str()).unwrap();
         self.sources.remove(track.as_bytes());
@@ -210,7 +210,7 @@ fn declaration() -> wire::ResourceSpec {
         }),
         declaration: Some(resource_spec::Declaration::Publication(
             wire::PublicationSpec {
-                label: "camera/updates".into(),
+                track_id: "camera-updates".into(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
                     delivery: wire::DataDelivery::Ordered as i32,
                     binding: Some(wire::TrackBinding {
@@ -228,35 +228,13 @@ fn retain_publication(
     participant: &mut NativeParticipant,
     work: Preparation,
     deadline: Option<Instant>,
-) -> (TrackId, ChannelId, pulsebeam_rtc::DataChannelInstallation) {
-    let id = participant.connection_id.derive_publication_track_id(
-        TrackKind::Data,
-        "camera/updates",
-        NonZeroU64::new(work.reference).unwrap(),
-    );
+) -> (ChannelId, pulsebeam_rtc::DataChannelInstallation) {
     let channel = crate::media::ChannelId::from_value(1);
-    let track = Track::data_publication(
-        track::TrackMeta {
-            room: participant.room,
-            shard_id: participant.shard_id,
-            id,
-            origin: participant.participant_id,
-            connection_id: participant.connection_id,
-            label: Some("camera/updates".into()),
-        },
-        DataLane::Ordered,
-    );
-    assert_eq!(track.publication_label().as_deref(), Some("camera/updates"));
-    assert!(track.requires_reverse_route());
     // Exercise the retained runtime receipt directly, not SCTP admission or an Installed claim.
     participant
         .native_data
         .channels
         .insert(channel, work.reference);
-    participant
-        .native_data
-        .tracks
-        .insert(*id.as_bytes(), work.reference);
     let installation = participant
         .transport
         .install_data_channel(crate::participant::transport::native_data_config(
@@ -268,13 +246,12 @@ fn retain_publication(
         work.reference,
         DataPublication {
             channel,
-            track,
-            source_id: id.as_str(),
+            lane: DataLane::Ordered,
+            state: DataPublicationState::Pending(entity::TrackId::new("camera-updates").unwrap()),
             fanout: None,
             enabled: false,
             opened: false,
             installation,
-            published: false,
             retiring: false,
             preparation: Some(work),
             storage_sequence: work.scope().sequence,
@@ -287,7 +264,7 @@ fn retain_publication(
             .deadlines
             .insert((deadline, work.reference));
     }
-    (id, channel, installation)
+    (channel, installation)
 }
 
 pub(in crate::participant::core) fn frame(
@@ -507,7 +484,7 @@ fn terminal_handoff_fences_prefetched_and_in_flight_work_without_blocking_output
         assert!(participant.native_scope_authorized(work.scope(), unix_now()));
         let retained = if in_flight {
             assert!(participant.admit_native_preparation(work));
-            let (_, _, installation) = retain_publication(
+            let (_, installation) = retain_publication(
                 &mut participant,
                 work,
                 Some(Instant::now() + Duration::from_secs(1)),
@@ -614,7 +591,7 @@ fn contradictory_execution_fact_terminates_its_connection() {
             crate::participant::policy::ReceiverExecution {
                 source: participant
                     .connection_id
-                    .derive_track_id(TrackKind::Data, "contradiction"),
+                    .fixture_publication(TrackKind::Data, "contradiction"),
                 enabled: true,
                 ready: true,
                 failed: false,
@@ -666,7 +643,7 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
         .prepare_execution(&work, unix_now(), None, |_| panic!("publication context"))
         .unwrap()
         .unwrap();
-    let (id, channel, installation) = retain_publication(&mut participant, work, None);
+    let (channel, installation) = retain_publication(&mut participant, work, None);
     let mut sink = MockParticipantSink::new();
     participant.execute_native_command(in_flight_duplicate, &mut sink);
     assert!(participant.native_execution.contains(work.scope()));
@@ -691,12 +668,22 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
         &mut sink,
     );
     let pending = participant.native_data.publications.get_mut(&1).unwrap();
-    assert!(
-        !pending.opened && !pending.published && !pending.retiring && pending.preparation.is_some()
-    );
-    pending.enabled = true;
+    assert!(!pending.opened && !pending.retiring && pending.preparation.is_some());
+    assert!(pending.admitted().is_none());
     pending.opened = true;
-    pending.published = true;
+    assert!(participant.native_data.tracks.is_empty());
+    let reference = NonZeroU64::new(work.reference).unwrap();
+    let (publication, first) = participant.admit_native_data(reference).unwrap();
+    assert!(first);
+    publication.enabled = true;
+    let admitted = publication.admitted().unwrap();
+    let track = Track::data_publication(admitted.meta.clone(), publication.lane);
+    assert_eq!(track.publication_label().as_deref(), Some("camera-updates"));
+    assert!(track.requires_reverse_route());
+    let id = track.id();
+    let (publication, first) = participant.admit_native_data(reference).unwrap();
+    assert!(!first);
+    assert_eq!(publication.admitted().unwrap().meta.id, id);
     use pulsebeam_proto::prelude::Message;
     let mut handles = slotmap::SlotMap::<TrackHandle, ()>::with_key();
     let handle = handles.insert(());
@@ -705,7 +692,7 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
         TopicFrame {
             body: Some(pulsebeam_proto::topic::topic_frame::Body::Message(
                 pulsebeam_proto::topic::TopicMessage {
-                    data_track_id: source,
+                    publication_id: source,
                     sequence: 0,
                     payload: vec![42],
                 },
@@ -721,7 +708,7 @@ fn repeated_retirement_keeps_the_receipt_and_does_not_erase_a_reused_channel_ind
         TopicFrame {
             body: Some(pulsebeam_proto::topic::topic_frame::Body::Probe(
                 pulsebeam_proto::topic::TopicProbe {
-                    data_track_id: source,
+                    publication_id: source,
                     from_sequence: 0,
                     live: true,
                 },

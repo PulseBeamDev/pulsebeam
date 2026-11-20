@@ -79,7 +79,7 @@ pub struct DataPublicationState {
     pub evaluated_revision: u64,
     pub accepted_revision: Option<u64>,
     pub rejected_revision: Option<u64>,
-    pub label: String,
+    pub track_id: String,
     pub delivery: TopicMode,
     pub local_enabled: bool,
     pub closed: bool,

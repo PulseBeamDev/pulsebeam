@@ -146,10 +146,10 @@ macro_rules! local_track {
         }
 
         impl Agent {
-            pub fn $lookup(&self, label: String) -> Result<$name, Error> {
+            pub fn $lookup(&self, track_id: String) -> Result<$name, Error> {
                 Ok($name {
                     address: MediaAddress::new(
-                        TrackSpec::$kind { label },
+                        TrackSpec::$kind { track_id },
                         None,
                         &self.commands,
                         &self.core,
@@ -200,11 +200,11 @@ impl RemoteAudioTrack {
 }
 
 impl Participant {
-    pub fn video(&self, label: String) -> Result<RemoteVideoTrack, Error> {
-        let source = self.source(label.clone());
+    pub fn video(&self, track_id: String) -> Result<RemoteVideoTrack, Error> {
+        let source = self.source(track_id.clone());
         Ok(RemoteVideoTrack {
             address: MediaAddress::new(
-                TrackSpec::Video { label },
+                TrackSpec::Video { track_id },
                 Some(source),
                 &self.commands,
                 &self.core,
@@ -214,11 +214,11 @@ impl Participant {
         })
     }
 
-    pub fn audio(&self, label: String) -> Result<RemoteAudioTrack, Error> {
-        let source = self.source(label.clone());
+    pub fn audio(&self, track_id: String) -> Result<RemoteAudioTrack, Error> {
+        let source = self.source(track_id.clone());
         Ok(RemoteAudioTrack {
             address: MediaAddress::new(
-                TrackSpec::Audio { label },
+                TrackSpec::Audio { track_id },
                 Some(source),
                 &self.commands,
                 &self.core,
@@ -250,11 +250,11 @@ mod tests {
         let selector = TrackSelector {
             room: "pinned-room".into(),
             participant_id: "remote-endpoint".into(),
-            label: "camera".into(),
+            track_id: "camera".into(),
         };
         let address = MediaAddress::new(
             TrackSpec::Video {
-                label: selector.label.clone(),
+                track_id: selector.track_id.clone(),
             },
             Some(selector.clone()),
             &commands,
