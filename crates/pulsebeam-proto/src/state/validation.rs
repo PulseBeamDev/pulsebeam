@@ -120,9 +120,10 @@ pub fn validate_server_batch(batch: &ServerStateBatch) -> Result {
 fn validate_key(key: &resource_key::Key) -> Result {
     match key {
         resource_key::Key::Owned(v) if *v != 0 => Ok(()),
-        resource_key::Key::Participant(id) | resource_key::Key::Track(id) if text(id, 128) => {
-            Ok(())
+        resource_key::Key::Participant(endpoint) => {
+            validate_participant(endpoint).map_err(|_| ValidationError::Key)
         }
+        resource_key::Key::Track(id) if text(id, 128) => Ok(()),
         resource_key::Key::Session(true) => Ok(()),
         _ => Err(ValidationError::Key),
     }
@@ -160,8 +161,8 @@ fn validate_confirmed(key: &resource_key::Key, confirmed: &ConfirmedState) -> Re
             }
             Ok(())
         }
-        (Key::Participant(id), Some(Value::Participant(participant)))
-            if id == &participant.participant_id =>
+        (Key::Participant(endpoint), Some(Value::Participant(participant)))
+            if endpoint == participant =>
         {
             validate_participant(participant)
         }
@@ -225,7 +226,8 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
             crate::catalog::validate_address(source).map_err(|_| ValidationError::Identity)
         }
         resource_spec::Declaration::Subscription(subscription) => {
-            if !text(&subscription.track_id, 128) || !text(&subscription.source_room, 256) {
+            if !text(&subscription.track_id, 128) || !is_application_name(&subscription.source_room)
+            {
                 return Err(ValidationError::Identity);
             }
             let kind =
@@ -245,15 +247,27 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
     }
 }
 
+pub fn is_application_name(value: &str) -> bool {
+    (1..=36).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 pub fn validate_participant(participant: &Participant) -> Result {
-    if !text(&participant.participant_id, 128) || !text(&participant.participant_external_id, 256) {
+    if !is_application_name(&participant.room_id)
+        || !is_application_name(&participant.participant_id)
+    {
         return Err(ValidationError::Identity);
     }
     Ok(())
 }
 
 pub fn validate_track(track: &Track) -> Result {
-    if !text(&track.track_id, 128) || !text(&track.participant_id, 128) || !text(&track.label, 256)
+    if !text(&track.track_id, 128)
+        || !is_application_name(&track.room_id)
+        || !is_application_name(&track.participant_id)
+        || !text(&track.label, 256)
     {
         return Err(ValidationError::Identity);
     }
@@ -286,7 +300,7 @@ pub fn validate_live(live: &LiveResource) -> Result {
     let track = live.track.as_ref().ok_or(ValidationError::Identity)?;
     validate_participant(participant)?;
     validate_track(track)?;
-    if participant.participant_id != track.participant_id {
+    if participant.participant_id != track.participant_id || participant.room_id != track.room_id {
         return Err(ValidationError::Identity);
     }
     let media_publication = match spec
@@ -323,7 +337,10 @@ pub fn validate_live(live: &LiveResource) -> Result {
                 Some(track::Kind::Data(_)) => TrackKind::Data,
                 None => return Err(ValidationError::Identity),
             };
-            if subscription.track_id != track.track_id || subscription.kind != kind as i32 {
+            if subscription.track_id != track.track_id
+                || subscription.source_room != track.room_id
+                || subscription.kind != kind as i32
+            {
                 return Err(ValidationError::Identity);
             }
             false
@@ -381,7 +398,9 @@ pub fn validate_source_lookup(lookup: &SourceLookupState) -> Result {
             validate_participant(participant)?;
             validate_track(track)?;
             if participant.participant_id != track.participant_id
-                || participant.participant_external_id != source.participant_external_id
+                || participant.room_id != track.room_id
+                || participant.room_id != source.room
+                || participant.participant_id != source.participant_id
                 || track.label != source.label
                 || track.kind.as_ref().map(track_kind) != Some(source.kind)
             {

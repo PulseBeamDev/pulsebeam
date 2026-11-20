@@ -32,18 +32,18 @@ or signing secrets.
 
 ## Inputs and codecs
 
-Public signing inputs are one opaque API key, grants, participant external ID,
+Public signing inputs are one opaque API key, grants, participant ID,
 and absolute expiration in Unix seconds. The API key is a dot-separated
 triple of canonical `ProjectId.ApiKeyId` strings and a base64url PKCS#8 private key
 (see [the internal format specification](api-key.md)). Server SDKs pass the
 already-formatted identities into the JWT and import a standard Ed25519 private key.
 Expiration is an exact unsigned integer in `0..18446744073709551615`. No clock,
-TTL, normalization of external IDs, or service lookup is involved.
+TTL, normalization of participant IDs, or service lookup is involved.
 Zero and past expiration can be signed, but authorize nothing at or after expiry.
 
-Room and participant IDs are nonempty UTF-8 strings of at most 256 bytes,
-without control characters. Preserve case and exact text, including spaces and
-slashes; do not normalize Unicode. Project and key IDs have exact case-sensitive `p_` and `kid_` prefixes,
+Participant IDs match `[A-Za-z0-9_-]{1,36}` and preserve case. Grant room
+patterns and filters follow the rules below. Project and key IDs have exact
+case-sensitive `p_` and `kid_` prefixes,
 followed by V0 marker (`0`, `O`, or `o`) and 26 Crockford Base32 characters. Encode
 UUID bytes in big-endian bit order, with two zero **low** padding bits. Require
 UUID v7 (high nibble of byte 6 equals 7) and RFC4122 variant (byte 8 high bits 10).
@@ -81,7 +81,8 @@ of at most 256 bytes. No Unicode normalization or case folding is performed.
 Unknown fields, malformed shapes, duplicate JSON members and incompatible filters
 are rejected. The verifier parses only this fixed schema, not arbitrary JSON trees.
 
-Admission requires an explicitly selected concrete room and a matching join grant.
+Admission requires an explicitly selected room ID matching `[A-Za-z0-9_-]{1,36}`
+and a matching join grant. Room IDs preserve case.
 The JWT never supplies a default room. Renewal and exact-resource cleanup first
 bind the authenticated project and participant to the accepted resource. A valid
 renewal can reduce grants, including removal of join, which terminates that resource.

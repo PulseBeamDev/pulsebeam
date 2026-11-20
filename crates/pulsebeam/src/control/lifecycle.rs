@@ -7,7 +7,7 @@ use crate::{
         registry::RoomRegistry,
         topology::{TrackAncestry, TrackPlacement, TrackPlacementAllocator, TrackTopology},
     },
-    entity::{ParticipantId, RoomId, TrackId},
+    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, TrackId},
     id::ShardId,
     participant::ParticipantEffect,
     route::NodeRouteAddress,
@@ -18,41 +18,30 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy)]
-struct ParticipantLocation {
-    shard: ShardId,
-    room_id: RoomId,
-    materialized: bool,
-}
-
-impl ParticipantLocation {
-    fn lookup(registry: &RoomRegistry, participant: &ParticipantId) -> Option<Self> {
-        registry.get_participant(participant).map(|meta| Self {
-            shard: meta.shard_id,
-            room_id: meta.room_id,
-            materialized: meta.materialized,
-        })
-    }
-
-    fn bound_in_room(
-        registry: &RoomRegistry,
-        participant: &ParticipantId,
-        room_id: RoomId,
-    ) -> Option<BoundParticipantLocation> {
-        let location = Self::lookup(registry, participant)?;
-        if location.room_id != room_id || !location.materialized {
-            return None;
-        }
-        Some(BoundParticipantLocation {
-            shard: location.shard,
-            participant: *participant,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 struct BoundParticipantLocation {
     shard: ShardId,
     participant: ParticipantId,
+    room: ProjectRoomKey,
+    connection: ConnectionId,
+}
+
+impl BoundParticipantLocation {
+    fn in_room(
+        registry: &RoomRegistry,
+        participant: &ParticipantId,
+        room: ProjectRoomKey,
+    ) -> Option<Self> {
+        let meta = registry.get_endpoint(EndpointKey {
+            room,
+            participant: *participant,
+        })?;
+        meta.materialized.then_some(Self {
+            shard: meta.shard_id,
+            participant: *participant,
+            room,
+            connection: meta.connection_id,
+        })
+    }
 }
 
 /// Routable placement held for one track on one shard.
@@ -89,6 +78,8 @@ pub(crate) enum TrackLifecycleOperation {
     },
     ParticipantEffect {
         shard: ShardId,
+        connection: ConnectionId,
+        #[cfg(test)]
         participant: ParticipantId,
         effect: ParticipantEffect,
     },
@@ -128,16 +119,13 @@ impl TrackLifecycleStager {
         self.plans(shard, vec![TrackPlanUpdate { track_id, plan }]);
     }
 
-    fn participant(
-        &mut self,
-        shard: ShardId,
-        participant: ParticipantId,
-        effect: ParticipantEffect,
-    ) {
+    fn participant(&mut self, location: BoundParticipantLocation, effect: ParticipantEffect) {
         self.operations
             .push(TrackLifecycleOperation::ParticipantEffect {
-                shard,
-                participant,
+                shard: location.shard,
+                connection: location.connection,
+                #[cfg(test)]
+                participant: location.participant,
                 effect,
             });
     }
@@ -153,9 +141,9 @@ impl TrackLifecycleStager {
 struct DesiredTrackState {
     track: Track,
     origin: BoundParticipantLocation,
-    candidates: HashSet<ParticipantId>,
-    bindings: HashSet<ParticipantId>,
-    locations: HashMap<ParticipantId, BoundParticipantLocation>,
+    candidates: HashSet<EndpointKey>,
+    bindings: HashSet<EndpointKey>,
+    locations: HashMap<EndpointKey, BoundParticipantLocation>,
 }
 
 impl DesiredTrackState {
@@ -187,32 +175,25 @@ impl DesiredTrackState {
         shards
     }
 
-    #[allow(
-        clippy::expect_used,
-        reason = "bindings are filtered from the same location map they are read from"
-    )]
-    fn local_bindings(&self, shard: ShardId) -> Vec<ParticipantId> {
-        let mut participants = self
+    fn local_bindings(&self, shard: ShardId) -> Vec<ConnectionId> {
+        let mut connections = self
             .bindings
             .iter()
-            .copied()
-            .filter(|participant| {
-                self.locations
-                    .get(participant)
-                    .is_some_and(|location| location.shard == shard)
-            })
+            .filter_map(|participant| self.locations.get(participant))
+            .filter(|location| location.shard == shard)
+            .map(|location| location.connection)
             .collect::<Vec<_>>();
-        participants.sort();
-        participants.into_iter().collect()
+        connections.sort();
+        connections
     }
 }
 
 struct RuntimePlan<'a> {
     shard: ShardId,
-    origin: ParticipantId,
+    origin: ConnectionId,
     track: &'a Track,
     track_id: TrackId,
-    local: Vec<ParticipantId>,
+    local: Vec<ConnectionId>,
     remote: Vec<NodeRouteAddress>,
     reverse: Option<NodeRouteAddress>,
 }
@@ -221,8 +202,10 @@ pub(crate) struct TrackLifecycle {
     topology: TrackTopology,
     allocator: TrackPlacementAllocator,
     placements: HashMap<(TrackAncestry, ShardId), TrackDestination>,
-    candidates: HashMap<TrackAncestry, HashSet<ParticipantId>>,
-    bindings: HashMap<TrackAncestry, HashSet<ParticipantId>>,
+    candidates: HashMap<TrackAncestry, HashSet<EndpointKey>>,
+    bindings: HashMap<TrackAncestry, HashSet<EndpointKey>>,
+    // Removal effects still need the applied endpoint after its subscription is gone.
+    locations: HashMap<TrackAncestry, HashMap<EndpointKey, BoundParticipantLocation>>,
     generation: u64,
 }
 
@@ -234,6 +217,7 @@ impl TrackLifecycle {
             placements: HashMap::new(),
             candidates: HashMap::new(),
             bindings: HashMap::new(),
+            locations: HashMap::new(),
             generation: 0,
         }
     }
@@ -262,15 +246,14 @@ impl TrackLifecycle {
 
     pub(crate) fn unpublish(
         &mut self,
-        origin: ParticipantId,
+        endpoint: EndpointKey,
         track_id: TrackId,
         registry: &RoomRegistry,
         now: Instant,
     ) -> Option<TrackLifecycleOutcome> {
-        let room_id = ParticipantLocation::lookup(registry, &origin)?.room_id;
         let identity = TrackAncestry {
-            room_id,
-            publisher: origin,
+            room_id: endpoint.room,
+            publisher: endpoint.participant,
             track_id,
         };
 
@@ -293,10 +276,10 @@ impl TrackLifecycle {
 
     pub(crate) fn activate(
         &mut self,
-        room_id: RoomId,
+        room_id: ProjectRoomKey,
         publisher: ParticipantId,
         track_id: TrackId,
-        subscriber: ParticipantId,
+        subscriber: EndpointKey,
         registry: &RoomRegistry,
         now: Instant,
     ) -> TrackLifecycleOutcome {
@@ -311,10 +294,10 @@ impl TrackLifecycle {
 
     pub(crate) fn deactivate(
         &mut self,
-        room_id: RoomId,
+        room_id: ProjectRoomKey,
         publisher: ParticipantId,
         track_id: TrackId,
-        subscriber: ParticipantId,
+        subscriber: EndpointKey,
         registry: &RoomRegistry,
         now: Instant,
     ) -> TrackLifecycleOutcome {
@@ -329,7 +312,7 @@ impl TrackLifecycle {
 
     pub(crate) fn subscribe(
         &mut self,
-        room_id: RoomId,
+        room_id: ProjectRoomKey,
         subscriber: ParticipantId,
         selector: TrackSelector,
         selection: SelectionPolicy,
@@ -345,7 +328,7 @@ impl TrackLifecycle {
 
     pub(crate) fn unsubscribe(
         &mut self,
-        room_id: RoomId,
+        room_id: ProjectRoomKey,
         subscriber: ParticipantId,
         selector: TrackSelector,
         registry: &RoomRegistry,
@@ -366,41 +349,38 @@ impl TrackLifecycle {
         self.topology.catalog_version()
     }
 
-    pub(super) fn room_catalog_version(&self, room: RoomId) -> u64 {
+    pub(super) fn room_catalog_version(&self, room: ProjectRoomKey) -> u64 {
         self.topology.room_catalog_version(room)
     }
 
     pub(super) fn publisher_sources(
         &self,
-        room: RoomId,
+        room: ProjectRoomKey,
         publisher: ParticipantId,
-        connection: crate::entity::ConnectionId,
+        connection: ConnectionId,
     ) -> impl Iterator<Item = &Track> {
         self.topology.publisher_sources(room, publisher, connection)
     }
 
-    pub(super) fn sources_in_room(&self, room_id: RoomId) -> impl Iterator<Item = &Track> {
+    pub(super) fn sources_in_room(&self, room_id: ProjectRoomKey) -> impl Iterator<Item = &Track> {
         self.topology.sources_in_room(room_id)
     }
 
     pub(crate) fn network_source(
         &self,
-        room_id: RoomId,
+        room_id: ProjectRoomKey,
         track: TrackId,
         registry: &RoomRegistry,
     ) -> Option<ShardId> {
         let source = self.topology.source(room_id, track)?;
         let meta = source.meta();
-        let publisher = registry.get_participant(&meta.origin)?;
-        (publisher.materialized
-            && publisher.room_id == room_id
-            && publisher.connection_id == meta.connection_id)
-            .then_some(publisher.shard_id)
+        let publisher = registry.get_incarnation(meta.origin, meta.connection_id)?;
+        (publisher.materialized && publisher.room == room_id).then_some(publisher.shard_id)
     }
 
     pub(crate) fn allows_network_reverse(
         &self,
-        room: RoomId,
+        room: ProjectRoomKey,
         track: TrackId,
         shard: ShardId,
         registry: &RoomRegistry,
@@ -415,26 +395,24 @@ impl TrackLifecycle {
 
     pub(crate) fn source_by_address<'a>(
         &'a self,
-        subscriber_room: RoomId,
-        source_room: RoomId,
+        subscriber_room: ProjectRoomKey,
+        source_room: ProjectRoomKey,
         subscriber: ParticipantId,
         address: &pulsebeam_proto::state::LogicalSourceAddress,
         registry: &'a RoomRegistry,
-    ) -> Option<(&'a Track, &'a crate::entity::ParticipantExternalId)> {
+    ) -> Option<&'a Track> {
         let kind = match pulsebeam_proto::state::TrackKind::try_from(address.kind).ok()? {
             pulsebeam_proto::state::TrackKind::Audio => crate::entity::TrackKind::Audio,
             pulsebeam_proto::state::TrackKind::Video => crate::entity::TrackKind::Video,
             pulsebeam_proto::state::TrackKind::Data => crate::entity::TrackKind::Data,
             pulsebeam_proto::state::TrackKind::Unspecified => return None,
         };
-        let external =
-            crate::entity::ParticipantExternalId::new(&address.participant_external_id).ok()?;
-        let publisher = ParticipantId::derive(&source_room, &external);
-        let current = registry.get_participant(&publisher)?;
-        if !current.materialized
-            || current.room_id != source_room
-            || current.participant_external_id.as_ref() != Some(&external)
-        {
+        let publisher = ParticipantId::new(&address.participant_id).ok()?;
+        let current = registry.get_endpoint(EndpointKey {
+            room: source_room,
+            participant: publisher,
+        })?;
+        if !current.materialized {
             return None;
         }
         let mut result = None;
@@ -458,30 +436,30 @@ impl TrackLifecycle {
             if result.is_some() {
                 return None;
             }
-            result = Some((track, current.participant_external_id.as_ref()?));
+            result = Some(track);
         }
         result
     }
 
     pub(crate) fn source(
         &self,
-        subscriber_room: RoomId,
-        source_room: RoomId,
+        subscriber_room: ProjectRoomKey,
+        source_room: ProjectRoomKey,
         subscriber: ParticipantId,
         track: TrackId,
         registry: &RoomRegistry,
     ) -> Option<&Track> {
-        ParticipantLocation::bound_in_room(registry, &subscriber, subscriber_room)?;
-        let source = self.topology.source(source_room, track)?;
-        let meta = source.meta();
-        if meta.origin == subscriber {
+        if source_room.project != subscriber_room.project {
             return None;
         }
-        let publisher = registry.get_participant(&meta.origin)?;
-        if !publisher.materialized
-            || publisher.room_id != source_room
-            || publisher.connection_id != meta.connection_id
-        {
+        BoundParticipantLocation::in_room(registry, &subscriber, subscriber_room)?;
+        let source = self.topology.source(source_room, track)?;
+        let meta = source.meta();
+        if meta.origin == subscriber && source_room == subscriber_room {
+            return None;
+        }
+        let publisher = registry.get_incarnation(meta.origin, meta.connection_id)?;
+        if !publisher.materialized || publisher.room != source_room {
             return None;
         }
         Some(source)
@@ -523,8 +501,8 @@ impl TrackLifecycle {
 
     pub(crate) fn unsubscribe_owned(
         &mut self,
-        room_id: RoomId,
-        subscriber: ParticipantId,
+        room_id: ProjectRoomKey,
+        subscriber: EndpointKey,
         reference: u64,
         registry: &RoomRegistry,
         now: Instant,
@@ -540,7 +518,7 @@ impl TrackLifecycle {
 
     pub(crate) fn subscribe_defaults(
         &mut self,
-        room_id: RoomId,
+        room_id: ProjectRoomKey,
         subscriber: ParticipantId,
         subscriptions: impl IntoIterator<Item = (TrackSelector, SelectionPolicy)>,
         registry: &RoomRegistry,
@@ -562,26 +540,25 @@ impl TrackLifecycle {
 
     pub(crate) fn remove_participant(
         &mut self,
-        participant: ParticipantId,
+        endpoint: EndpointKey,
         registry: &RoomRegistry,
         now: Instant,
     ) -> Vec<TrackLifecycleOutcome> {
+        let retires = |identity: TrackAncestry| {
+            identity.publisher == endpoint.participant && identity.room_id == endpoint.room
+        };
         let mut affected = self
             .topology
             .identities()
             .filter(|identity| {
-                identity.publisher == participant
-                    || self
-                        .topology
-                        .candidate_subscribers(*identity)
-                        .any(|subscriber| subscriber == participant)
+                retires(*identity) || self.topology.has_candidate(*identity, endpoint)
             })
             .collect::<Vec<_>>();
 
         let retiring = affected
             .iter()
             .copied()
-            .filter(|identity| identity.publisher == participant)
+            .filter(|identity| retires(*identity))
             .collect::<Vec<_>>();
 
         let mut outcomes = Vec::new();
@@ -593,7 +570,7 @@ impl TrackLifecycle {
             outcomes.push(stager.finish());
         }
 
-        self.topology.remove_participant(participant);
+        self.topology.remove_participant(endpoint);
 
         for identity in retiring {
             debug_assert!(
@@ -640,6 +617,7 @@ impl TrackLifecycle {
 
         self.candidates.insert(identity, desired.candidates);
         self.bindings.insert(identity, desired.bindings);
+        self.locations.insert(identity, desired.locations);
         #[cfg(debug_assertions)]
         self.assert_committed_track(identity, registry);
         stager.finish()
@@ -661,17 +639,20 @@ impl TrackLifecycle {
             bindings.is_subset(candidates),
             "bindings must be candidates"
         );
-        debug_assert!(!candidates.contains(&identity.publisher));
+        debug_assert!(!candidates.contains(&EndpointKey {
+            room: identity.room_id,
+            participant: identity.publisher,
+        }));
         let origin =
-            ParticipantLocation::bound_in_room(registry, &identity.publisher, identity.room_id)
+            BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
                 .expect("published track must retain a bound publisher");
         let mut candidate_shards = HashSet::from([origin.shard]);
         let mut active_shards = HashSet::new();
         for participant in candidates {
-            let location = ParticipantLocation::bound_in_room(
+            let location = BoundParticipantLocation::in_room(
                 registry,
-                participant,
-                self.topology.subscriber_room(identity, *participant),
+                &participant.participant,
+                participant.room,
             )
             .expect("retained candidate must remain bound in its admitted room");
             candidate_shards.insert(location.shard);
@@ -713,42 +694,44 @@ impl TrackLifecycle {
             .expect("reconcile must target a published track")
             .clone();
         let origin =
-            ParticipantLocation::bound_in_room(registry, &identity.publisher, identity.room_id)
+            BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
                 .expect("a published track must have a bound live publisher in its room");
 
-        let publisher = registry
-            .get_participant(&identity.publisher)
-            .and_then(|meta| meta.participant_external_id.as_ref())
-            .map(crate::entity::ParticipantExternalId::as_str);
+        let publisher_meta = registry.get_endpoint(EndpointKey {
+            room: identity.room_id,
+            participant: identity.publisher,
+        });
+        let publisher = Some(identity.publisher.as_str());
         let mut locations = HashMap::new();
         let candidates = self
             .topology
             .candidate_subscribers(identity)
-            .filter(|participant| *participant != identity.publisher)
-            .filter_map(|participant| {
-                let location = ParticipantLocation::bound_in_room(
+            .filter(|endpoint| {
+                endpoint.room != identity.room_id || endpoint.participant != identity.publisher
+            })
+            .filter_map(|endpoint| {
+                let location = BoundParticipantLocation::in_room(
                     registry,
-                    &participant,
-                    self.topology.subscriber_room(identity, participant),
+                    &endpoint.participant,
+                    endpoint.room,
                 )?;
-                let meta = registry.get_participant(&participant)?;
+                let meta = registry.get_endpoint(endpoint)?;
                 let allowed = meta.authorization.as_ref().map_or(
                     meta.profile == super::controller::SignalingProtocol::State,
                     |lease| {
-                        if meta.room_id == identity.room_id {
+                        if meta.room == identity.room_id {
                             lease.permissions().allows_source(
                                 pulsebeam_core::auth::grants::Action::Subscribe,
                                 publisher,
                                 &track,
                             )
                         } else {
-                            registry
-                                .get_participant(&identity.publisher)
+                            publisher_meta
                                 .and_then(|source| source.authorization.as_ref())
                                 .is_some_and(|source| {
                                     lease.permissions().allows_source_at_room(
                                         pulsebeam_core::auth::grants::Action::Subscribe,
-                                        source.room_external_id().as_str(),
+                                        source.room_id().as_str(),
                                         publisher,
                                         &track,
                                     )
@@ -759,8 +742,8 @@ impl TrackLifecycle {
                 if !allowed {
                     return None;
                 }
-                locations.insert(participant, location);
-                Some(participant)
+                locations.insert(endpoint, location);
+                Some(endpoint)
             })
             .collect::<HashSet<_>>();
 
@@ -842,6 +825,7 @@ impl TrackLifecycle {
 
         // Remove active state before removing candidate state. Sort participant
         // transitions so one semantic generation always compiles to one operation order.
+        let previous = self.locations.get(&identity);
         let mut removed_bindings = previous_bindings
             .difference(&desired.bindings)
             .copied()
@@ -850,7 +834,7 @@ impl TrackLifecycle {
         for participant in removed_bindings {
             self.stage_track_effect(
                 identity,
-                participant,
+                previous.and_then(|locations| locations.get(&participant)),
                 registry,
                 stager,
                 ParticipantEffect::TrackUnsubscribed {
@@ -867,7 +851,7 @@ impl TrackLifecycle {
         for participant in removed_candidates {
             self.stage_track_effect(
                 identity,
-                participant,
+                previous.and_then(|locations| locations.get(&participant)),
                 registry,
                 stager,
                 ParticipantEffect::TrackCandidateRemoved {
@@ -887,7 +871,7 @@ impl TrackLifecycle {
         for participant in added_candidates {
             self.stage_track_effect(
                 identity,
-                participant,
+                desired.locations.get(&participant),
                 registry,
                 stager,
                 ParticipantEffect::TrackCandidateAdded {
@@ -906,7 +890,7 @@ impl TrackLifecycle {
             debug_assert!(desired.candidates.contains(&participant));
             self.stage_track_effect(
                 identity,
-                participant,
+                desired.locations.get(&participant),
                 registry,
                 stager,
                 ParticipantEffect::TrackSubscribed {
@@ -1010,7 +994,7 @@ impl TrackLifecycle {
             stager,
             RuntimePlan {
                 shard: desired.origin.shard,
-                origin: desired.origin.participant,
+                origin: desired.origin.connection,
                 track: &desired.track,
                 track_id: origin.placement.track_id,
                 local: desired.local_bindings(desired.origin.shard),
@@ -1022,8 +1006,7 @@ impl TrackLifecycle {
 
         if !origin_was_resident {
             stager.participant(
-                desired.origin.shard,
-                desired.origin.participant,
+                desired.origin,
                 ParticipantEffect::TrackPublished {
                     track_id: identity.track_id,
                 },
@@ -1045,7 +1028,7 @@ impl TrackLifecycle {
                 stager,
                 RuntimePlan {
                     shard,
-                    origin: desired.origin.participant,
+                    origin: desired.origin.connection,
                     track: &desired.track,
                     track_id: destination.placement.track_id,
                     local: desired.local_bindings(shard),
@@ -1121,19 +1104,18 @@ impl TrackLifecycle {
     fn stage_track_effect(
         &self,
         identity: TrackAncestry,
-        participant: ParticipantId,
+        location: Option<&BoundParticipantLocation>,
         registry: &RoomRegistry,
         stager: &mut TrackLifecycleStager,
         effect: ParticipantEffect,
     ) {
-        let Some(location) = ParticipantLocation::lookup(registry, &participant) else {
-            // The participant may already have been removed from the registry;
-            // there is no local participant state left to update in that case.
+        let Some(location) = location.and_then(|location| {
+            BoundParticipantLocation::in_room(registry, &location.participant, location.room)
+                .filter(|current| current.connection == location.connection)
+        }) else {
             return;
         };
-        if !location.materialized {
-            return;
-        }
+        let participant = location.participant;
         let requires_placement = matches!(
             effect,
             ParticipantEffect::TrackCandidateAdded { .. }
@@ -1150,7 +1132,7 @@ impl TrackLifecycle {
             return;
         }
 
-        stager.participant(location.shard, participant, effect);
+        stager.participant(location, effect);
     }
 
     fn stage_track_removal(
@@ -1159,6 +1141,7 @@ impl TrackLifecycle {
         registry: &RoomRegistry,
         stager: &mut TrackLifecycleStager,
     ) {
+        let locations = self.locations.remove(&identity).unwrap_or_default();
         let bindings = self.bindings.remove(&identity).unwrap_or_default();
         let candidates = self.candidates.remove(&identity).unwrap_or_default();
 
@@ -1167,7 +1150,7 @@ impl TrackLifecycle {
         for participant in bindings {
             self.stage_track_effect(
                 identity,
-                participant,
+                locations.get(&participant),
                 registry,
                 stager,
                 ParticipantEffect::TrackUnsubscribed {
@@ -1181,7 +1164,7 @@ impl TrackLifecycle {
         for participant in candidates {
             self.stage_track_effect(
                 identity,
-                participant,
+                locations.get(&participant),
                 registry,
                 stager,
                 ParticipantEffect::TrackCandidateRemoved {
@@ -1191,14 +1174,13 @@ impl TrackLifecycle {
             );
         }
 
-        if let Some(origin) = ParticipantLocation::lookup(registry, &identity.publisher)
-            && origin.materialized
+        if let Some(origin) =
+            BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
             && let Some(destination) = self.placements.get(&(identity, origin.shard))
             && destination.resident
         {
             stager.participant(
-                origin.shard,
-                identity.publisher,
+                origin,
                 ParticipantEffect::TrackUnpublished {
                     track_id: identity.track_id,
                 },
@@ -1331,7 +1313,7 @@ impl TrackLifecycle {
 mod tests {
     use super::*;
     use crate::{
-        entity::{RoomExternalId, TrackKind},
+        entity::{RoomId, TrackKind},
         track::{DataLane, Topic, TrackMeta},
     };
 
@@ -1363,22 +1345,29 @@ mod tests {
         PlanClear,
     }
 
-    fn room(seed: u8) -> RoomId {
+    fn room(seed: u8) -> ProjectRoomKey {
         let name = match seed {
             1 => "lifecycle-1",
             2 => "lifecycle-2",
             _ => "lifecycle-other",
         };
-        RoomId::from_external(&RoomExternalId::new(name).unwrap())
+        ProjectRoomKey::fixture(RoomId::new(name).unwrap())
+    }
+
+    fn endpoint(seed: u8, room_seed: u8) -> EndpointKey {
+        EndpointKey {
+            room: room(room_seed),
+            participant: participant(seed),
+        }
     }
 
     fn participant(seed: u8) -> ParticipantId {
-        ParticipantId::from_bytes([seed; 16])
+        ParticipantId::new(&format!("participant-{seed}")).unwrap()
     }
 
-    fn register(registry: &mut RoomRegistry, seed: u8, room_id: RoomId, shard: usize) {
+    fn register(registry: &mut RoomRegistry, seed: u8, room_id: ProjectRoomKey, shard: usize) {
         let participant = participant(seed);
-        registry.add_participant(participant, room_id, ShardId::new(shard), None);
+        registry.add_participant(participant, room_id.room, ShardId::new(shard), None);
         registry.mark_materialized(&participant);
     }
 
@@ -1386,7 +1375,7 @@ mod tests {
         let connection = crate::entity::ConnectionId::new();
         let publisher = participant(publisher);
         let meta = TrackMeta {
-            room_id: room(room_seed),
+            room: room(room_seed),
             shard_id: ShardId::new(0),
             id: connection.derive_track_id(kind, label),
             origin: publisher,
@@ -1619,7 +1608,7 @@ mod tests {
             .bindings
             .get_mut(&identity)
             .unwrap()
-            .insert(participant(2));
+            .insert(endpoint(2, 1));
         lifecycle.assert_committed_track(identity, &registry);
     }
 
@@ -1647,10 +1636,10 @@ mod tests {
 
         for (identity, candidates) in &lifecycle.candidates {
             for participant in candidates {
-                let location = ParticipantLocation::bound_in_room(
+                let location = BoundParticipantLocation::in_room(
                     registry,
-                    participant,
-                    lifecycle.topology.subscriber_room(*identity, *participant),
+                    &participant.participant,
+                    participant.room,
                 )
                 .expect("retained candidate must remain bound in its admitted room");
                 assert!(
@@ -1674,7 +1663,7 @@ mod tests {
                 );
             }
             let origin =
-                ParticipantLocation::bound_in_room(registry, &identity.publisher, identity.room_id)
+                BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
                     .expect("published track must retain a bound publisher");
             if *shard == origin.shard {
                 let track = lifecycle
@@ -1688,18 +1677,18 @@ mod tests {
                 );
             } else {
                 let has_candidate = lifecycle.candidates[identity].iter().any(|participant| {
-                    ParticipantLocation::bound_in_room(
+                    BoundParticipantLocation::in_room(
                         registry,
-                        participant,
-                        lifecycle.topology.subscriber_room(*identity, *participant),
+                        &participant.participant,
+                        participant.room,
                     )
                     .is_some_and(|location| location.shard == *shard)
                 });
                 let has_binding = lifecycle.bindings[identity].iter().any(|participant| {
-                    ParticipantLocation::bound_in_room(
+                    BoundParticipantLocation::in_room(
                         registry,
-                        participant,
-                        lifecycle.topology.subscriber_room(*identity, *participant),
+                        &participant.participant,
+                        participant.room,
                     )
                     .is_some_and(|location| location.shard == *shard)
                 });
@@ -1716,7 +1705,7 @@ mod tests {
 
         for identity in lifecycle.topology.identities() {
             let origin =
-                ParticipantLocation::bound_in_room(registry, &identity.publisher, identity.room_id)
+                BoundParticipantLocation::in_room(registry, &identity.publisher, identity.room_id)
                     .expect("published track must retain a bound publisher");
             let destination = lifecycle
                 .placements
@@ -1806,8 +1795,8 @@ mod tests {
                 EffectKind::Published,
             ]
         );
-        assert!(lifecycle.candidates[&identity].contains(&participant(2)));
-        assert!(lifecycle.bindings[&identity].contains(&participant(2)));
+        assert!(lifecycle.candidates[&identity].contains(&endpoint(2, 1)));
+        assert!(lifecycle.bindings[&identity].contains(&endpoint(2, 1)));
         assert_internal_invariants(&lifecycle, &registry);
     }
 
@@ -1832,8 +1821,8 @@ mod tests {
             effect_kinds(&outcome),
             vec![EffectKind::CandidateAdded, EffectKind::Subscribed]
         );
-        assert!(lifecycle.candidates[&identity].contains(&participant(2)));
-        assert!(lifecycle.bindings[&identity].contains(&participant(2)));
+        assert!(lifecycle.candidates[&identity].contains(&endpoint(2, 1)));
+        assert!(lifecycle.bindings[&identity].contains(&endpoint(2, 1)));
         assert!(forward_install_on(&outcome, 0).is_none());
         assert_eq!(lifecycle.placements.len(), 1);
         assert_internal_invariants(&lifecycle, &registry);
@@ -1856,31 +1845,31 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(effect_kinds(&subscribe), vec![EffectKind::CandidateAdded]);
-        assert!(lifecycle.candidates[&identity].contains(&participant(2)));
-        assert!(!lifecycle.bindings[&identity].contains(&participant(2)));
+        assert!(lifecycle.candidates[&identity].contains(&endpoint(2, 1)));
+        assert!(!lifecycle.bindings[&identity].contains(&endpoint(2, 1)));
 
         let activate = lifecycle.activate(
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );
         assert_eq!(effect_kinds(&activate), vec![EffectKind::Subscribed]);
-        assert!(lifecycle.bindings[&identity].contains(&participant(2)));
+        assert!(lifecycle.bindings[&identity].contains(&endpoint(2, 1)));
 
         let deactivate = lifecycle.deactivate(
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );
         assert_eq!(effect_kinds(&deactivate), vec![EffectKind::Unsubscribed]);
-        assert!(lifecycle.candidates[&identity].contains(&participant(2)));
-        assert!(!lifecycle.bindings[&identity].contains(&participant(2)));
+        assert!(lifecycle.candidates[&identity].contains(&endpoint(2, 1)));
+        assert!(!lifecycle.bindings[&identity].contains(&endpoint(2, 1)));
         assert_internal_invariants(&lifecycle, &registry);
     }
 
@@ -1929,7 +1918,7 @@ mod tests {
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );
@@ -1974,7 +1963,7 @@ mod tests {
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );
@@ -1984,7 +1973,7 @@ mod tests {
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );
@@ -1993,8 +1982,8 @@ mod tests {
         assert_eq!(remote.placement, held);
         assert!(remote.resident);
         assert!(!remote.route_installed);
-        assert!(lifecycle.candidates[&identity].contains(&participant(2)));
-        assert!(!lifecycle.bindings[&identity].contains(&participant(2)));
+        assert!(lifecycle.candidates[&identity].contains(&endpoint(2, 1)));
+        assert!(!lifecycle.bindings[&identity].contains(&endpoint(2, 1)));
         assert_eq!(
             operations_on(&outcome, 1),
             vec![
@@ -2037,7 +2026,15 @@ mod tests {
             );
             assert!(
                 lifecycle
-                    .unpublish(participant(1), id, &registry, Instant::now())
+                    .unpublish(
+                        EndpointKey {
+                            room: room(1),
+                            participant: participant(1)
+                        },
+                        id,
+                        &registry,
+                        Instant::now()
+                    )
                     .is_some()
             );
             assert_eq!(lifecycle.network_source(room(1), id, &registry), None);
@@ -2138,7 +2135,7 @@ mod tests {
         assert!(
             lifecycle
                 .topology
-                .remove_owned(room(2), participant(3), 1)
+                .remove_owned(room(2), endpoint(3, 2), 1)
                 .is_none()
         );
         let _ = lifecycle.subscribe(
@@ -2182,7 +2179,7 @@ mod tests {
                 )
                 .is_some()
         );
-        registry.add_participant(participant(2), room(1), ShardId::new(1), None);
+        registry.add_participant(participant(2), room(1).room, ShardId::new(1), None);
         assert!(
             lifecycle
                 .source(
@@ -2217,7 +2214,7 @@ mod tests {
                 )
                 .is_some()
         );
-        registry.add_participant(participant(1), room(1), ShardId::new(0), None);
+        registry.add_participant(participant(1), room(1).room, ShardId::new(0), None);
         assert!(
             lifecycle
                 .source(
@@ -2253,7 +2250,10 @@ mod tests {
                 .is_none()
         );
         let _ = lifecycle.unpublish(
-            identity.publisher,
+            EndpointKey {
+                room: identity.room_id,
+                participant: identity.publisher,
+            },
             identity.track_id,
             &registry,
             Instant::now(),
@@ -2464,8 +2464,8 @@ mod tests {
             .pop()
             .unwrap();
         assert!(effect_kinds(&remove_exact).is_empty());
-        assert!(lifecycle.candidates[&identity].contains(&participant(2)));
-        assert!(lifecycle.bindings[&identity].contains(&participant(2)));
+        assert!(lifecycle.candidates[&identity].contains(&endpoint(2, 1)));
+        assert!(lifecycle.bindings[&identity].contains(&endpoint(2, 1)));
 
         let remove_last = lifecycle
             .unsubscribe(
@@ -2488,15 +2488,15 @@ mod tests {
     fn indexed_exact_source_lookup_fences_self_stale_and_ambiguous_publications() {
         use crate::{
             control::controller::SignalingProtocol,
-            entity::{ConnectionId, ParticipantExternalId},
+            entity::{ConnectionId, ParticipantId},
             route::{NodeTransportAddress, TransportRoute},
         };
         use std::num::NonZeroU64;
 
         let room_id = room(1);
         let subscriber = participant(1);
-        let publisher_external = ParticipantExternalId::new("publisher").unwrap();
-        let publisher = ParticipantId::derive(&room_id, &publisher_external);
+        let publisher_external = ParticipantId::new("publisher").unwrap();
+        let publisher = publisher_external;
         let mut registry = RoomRegistry::new();
         register(&mut registry, 1, room_id, 0);
         let connection = ConnectionId::new();
@@ -2509,13 +2509,12 @@ mod tests {
                 NodeTransportAddress::new(TransportRoute::new(ShardId::new(0), 7), 1),
                 connection,
                 SignalingProtocol::State,
-                Some(publisher_external.clone()),
             )
             .unwrap();
         let publication = |incarnation| {
             Track::data_publication(
                 TrackMeta {
-                    room_id,
+                    room: room_id,
                     shard_id: ShardId::new(0),
                     id: connection.derive_publication_track_id(
                         TrackKind::Data,
@@ -2534,8 +2533,8 @@ mod tests {
         let mut lifecycle = TrackLifecycle::new(1);
         lifecycle.publish(first, &registry, Instant::now()).unwrap();
         for index in 0..65_u32 {
-            let external = ParticipantExternalId::new(&format!("other-{index}")).unwrap();
-            let other = ParticipantId::derive(&room_id, &external);
+            let external = ParticipantId::new(&format!("other-{index}")).unwrap();
+            let other = external;
             let connection = ConnectionId::new();
             registry
                 .commit_candidate(
@@ -2546,12 +2545,11 @@ mod tests {
                     NodeTransportAddress::new(TransportRoute::new(ShardId::new(0), index + 9), 1),
                     connection,
                     SignalingProtocol::State,
-                    Some(external),
                 )
                 .unwrap();
             let track = Track::data_publication(
                 TrackMeta {
-                    room_id,
+                    room: room_id,
                     shard_id: ShardId::new(0),
                     id: connection.derive_publication_track_id(
                         TrackKind::Data,
@@ -2568,7 +2566,7 @@ mod tests {
         }
         let address = pulsebeam_proto::state::LogicalSourceAddress {
             room: "lifecycle-1".into(),
-            participant_external_id: publisher_external.as_str().into(),
+            participant_id: publisher_external.as_str().into(),
             kind: pulsebeam_proto::state::TrackKind::Data as i32,
             label: "label".into(),
         };
@@ -2602,7 +2600,6 @@ mod tests {
                 NodeTransportAddress::new(TransportRoute::new(ShardId::new(0), 8), 1),
                 replacement,
                 SignalingProtocol::State,
-                Some(publisher_external),
             )
             .unwrap();
         assert!(
@@ -2683,15 +2680,11 @@ mod tests {
         assert!(!admitted.is_empty());
         assert_eq!(
             lifecycle.candidates[&identity],
-            HashSet::from([participant(2)])
+            HashSet::from([endpoint(2, 2)])
         );
         assert_eq!(
             lifecycle.bindings[&identity],
-            HashSet::from([participant(2)])
-        );
-        assert_eq!(
-            lifecycle.topology.subscriber_room(identity, participant(2)),
-            room(2)
+            HashSet::from([endpoint(2, 2)])
         );
         assert_internal_invariants(&lifecycle, &registry);
 
@@ -2705,28 +2698,44 @@ mod tests {
         );
         assert_eq!(
             lifecycle.candidates[&identity],
-            HashSet::from([participant(2)])
+            HashSet::from([endpoint(2, 2)])
         );
         assert!(lifecycle.bindings[&identity].is_empty());
         assert_internal_invariants(&lifecycle, &registry);
 
-        lifecycle.unsubscribe_owned(room(1), participant(2), 1, &registry, Instant::now());
+        lifecycle.unsubscribe_owned(room(1), endpoint(2, 2), 1, &registry, Instant::now());
         assert!(lifecycle.candidates[&identity].is_empty());
         assert!(lifecycle.bindings[&identity].is_empty());
-        assert_eq!(
-            lifecycle.topology.subscriber_room(identity, participant(2)),
-            room(1)
-        );
         assert_internal_invariants(&lifecycle, &registry);
 
         lifecycle.set_owned_subscription(owned(), &registry, Instant::now());
-        lifecycle.remove_participant(participant(2), &registry, Instant::now());
+        assert!(
+            lifecycle
+                .remove_participant(
+                    EndpointKey {
+                        room: room(1),
+                        participant: participant(2),
+                    },
+                    &registry,
+                    Instant::now(),
+                )
+                .iter()
+                .all(|outcome| effect_kinds(outcome).is_empty())
+        );
+        assert_eq!(
+            lifecycle.bindings[&identity],
+            HashSet::from([endpoint(2, 2)])
+        );
+        lifecycle.remove_participant(
+            EndpointKey {
+                room: room(2),
+                participant: participant(2),
+            },
+            &registry,
+            Instant::now(),
+        );
         assert!(lifecycle.candidates[&identity].is_empty());
         assert!(lifecycle.bindings[&identity].is_empty());
-        assert_eq!(
-            lifecycle.topology.subscriber_room(identity, participant(2)),
-            room(1)
-        );
         assert_internal_invariants(&lifecycle, &registry);
     }
 
@@ -2734,7 +2743,7 @@ mod tests {
     fn unbound_subscriber_is_not_compiled_into_the_track() {
         let mut registry = RoomRegistry::new();
         register(&mut registry, 1, room(1), 0);
-        registry.add_participant(participant(2), room(1), ShardId::new(1), None);
+        registry.add_participant(participant(2), room(1).room, ShardId::new(1), None);
         let mut lifecycle = TrackLifecycle::new(2);
         let (identity, _) = publish_audio(&mut lifecycle, &registry, 1, 1);
 
@@ -2817,7 +2826,15 @@ mod tests {
         let origin = destination(&lifecycle, identity, 0);
 
         let outcome = lifecycle
-            .unpublish(participant(1), identity.track_id, &registry, Instant::now())
+            .unpublish(
+                EndpointKey {
+                    room: room(1),
+                    participant: participant(1),
+                },
+                identity.track_id,
+                &registry,
+                Instant::now(),
+            )
             .unwrap();
 
         let origin_ops = operations_on(&outcome, 0);
@@ -2873,7 +2890,15 @@ mod tests {
         );
 
         let outcome = lifecycle
-            .unpublish(participant(1), identity.track_id, &registry, Instant::now())
+            .unpublish(
+                EndpointKey {
+                    room: room(1),
+                    participant: participant(1),
+                },
+                identity.track_id,
+                &registry,
+                Instant::now(),
+            )
             .unwrap();
 
         assert_eq!(
@@ -2911,7 +2936,14 @@ mod tests {
             Instant::now(),
         );
 
-        let outcomes = lifecycle.remove_participant(participant(2), &registry, Instant::now());
+        let outcomes = lifecycle.remove_participant(
+            EndpointKey {
+                room: room(1),
+                participant: participant(2),
+            },
+            &registry,
+            Instant::now(),
+        );
         assert_eq!(outcomes.len(), 1);
         assert_eq!(
             effect_kinds(&outcomes[0]),
@@ -2951,7 +2983,14 @@ mod tests {
             Instant::now(),
         );
 
-        let outcomes = lifecycle.remove_participant(participant(1), &registry, Instant::now());
+        let outcomes = lifecycle.remove_participant(
+            EndpointKey {
+                room: room(1),
+                participant: participant(1),
+            },
+            &registry,
+            Instant::now(),
+        );
 
         assert_eq!(
             outcomes.len(),
@@ -2971,7 +3010,14 @@ mod tests {
         let _ = publish_audio(&mut lifecycle, &registry, 1, 1);
         let generation = lifecycle.generation;
 
-        let outcomes = lifecycle.remove_participant(participant(2), &registry, Instant::now());
+        let outcomes = lifecycle.remove_participant(
+            EndpointKey {
+                room: room(1),
+                participant: participant(2),
+            },
+            &registry,
+            Instant::now(),
+        );
         assert!(outcomes.is_empty());
         assert_eq!(lifecycle.generation, generation);
         assert_internal_invariants(&lifecycle, &registry);
@@ -2991,7 +3037,14 @@ mod tests {
         );
         registry.remove_participant(&participant(2));
 
-        let outcomes = lifecycle.remove_participant(participant(2), &registry, Instant::now());
+        let outcomes = lifecycle.remove_participant(
+            EndpointKey {
+                room: room(1),
+                participant: participant(2),
+            },
+            &registry,
+            Instant::now(),
+        );
         assert_eq!(outcomes.len(), 1);
         assert!(effect_kinds(&outcomes[0]).is_empty());
         assert!(
@@ -3024,10 +3077,10 @@ mod tests {
         );
 
         assert_eq!(outcomes.len(), 2);
-        assert!(lifecycle.candidates[&audio].contains(&participant(2)));
-        assert!(lifecycle.bindings[&audio].contains(&participant(2)));
-        assert!(lifecycle.candidates[&video_identity].contains(&participant(2)));
-        assert!(!lifecycle.bindings[&video_identity].contains(&participant(2)));
+        assert!(lifecycle.candidates[&audio].contains(&endpoint(2, 1)));
+        assert!(lifecycle.bindings[&audio].contains(&endpoint(2, 1)));
+        assert!(lifecycle.candidates[&video_identity].contains(&endpoint(2, 1)));
+        assert!(!lifecycle.bindings[&video_identity].contains(&endpoint(2, 1)));
         assert_internal_invariants(&lifecycle, &registry);
     }
 
@@ -3069,7 +3122,7 @@ mod tests {
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );
@@ -3080,7 +3133,7 @@ mod tests {
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );
@@ -3091,7 +3144,7 @@ mod tests {
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );
@@ -3105,7 +3158,7 @@ mod tests {
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );
@@ -3205,7 +3258,10 @@ mod tests {
                     room(1),
                     participant(1),
                     identity.track_id,
-                    subscriber,
+                    EndpointKey {
+                        room: room(1),
+                        participant: subscriber,
+                    },
                     &registry,
                     Instant::now(),
                 );
@@ -3215,14 +3271,23 @@ mod tests {
                     room(1),
                     participant(1),
                     identity.track_id,
-                    subscriber,
+                    EndpointKey {
+                        room: room(1),
+                        participant: subscriber,
+                    },
                     &registry,
                     Instant::now(),
                 );
                 active.remove(&subscriber);
             }
 
-            assert_eq!(&lifecycle.bindings[&identity], &active);
+            assert_eq!(
+                lifecycle.bindings[&identity]
+                    .iter()
+                    .map(|endpoint| endpoint.participant)
+                    .collect::<HashSet<_>>(),
+                active
+            );
             assert_eq!(
                 destination(&lifecycle, identity, 1).placement,
                 placements[0]
@@ -3264,7 +3329,7 @@ mod tests {
                 room(1),
                 participant(1),
                 identity.track_id,
-                participant(2),
+                endpoint(2, 1),
                 &registry,
                 Instant::now(),
             );
@@ -3276,7 +3341,7 @@ mod tests {
                 room(1),
                 participant(1),
                 identity.track_id,
-                participant(2),
+                endpoint(2, 1),
                 &registry,
                 Instant::now(),
             );
@@ -3406,7 +3471,7 @@ mod tests {
             room(1),
             participant(1),
             identity.track_id,
-            participant(2),
+            endpoint(2, 1),
             &registry,
             Instant::now(),
         );

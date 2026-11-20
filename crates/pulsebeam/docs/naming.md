@@ -6,25 +6,20 @@ value.
 
 | Suffix | Owner and lifetime | Meaning |
 | --- | --- | --- |
-| `ExternalId` | User application/backend | Public opaque identity supplied to PulseBeam. |
-| `Id` | PulseBeam | Stable canonical entity identity minted or derived by PulseBeam. |
+| `Id` | Application for room and participant names; PulseBeam for runtime IDs | Canonical entity identity, interpreted in its declared scope. |
 | `Address` | PulseBeam control plane | Routable placement information that may cross nodes. |
 | `Handle` | One runtime shard | Ephemeral incarnation valid only in its owning shard. |
 | `Key` | One private component | Internal lookup discriminator with no public or cross-component identity meaning. |
 
-An `Id` answers **which entity?** PulseBeam always owns it, even when an SDK
-carries it. Clients and SDKs may retain, compare, and return an `Id` received
-from PulseBeam, but they never mint or derive one.
+An `Id` answers **which entity?** Applications supply `RoomId` and
+`ParticipantId` as case-sensitive names of 1 to 36 ASCII letters, digits,
+underscores, or hyphens. PulseBeam preserves the spelling exactly. A room is
+scoped to its project; a participant endpoint is scoped to its project and room.
+Neither name is a routing destination or a production log identifier.
 
-The agent crates intentionally define same-named opaque string wrappers such as
-`RoomId`, `ParticipantId`, `ConnectionId`, and `TrackId`. Those wrappers allow
-cloning, exact equality, hashing, string access, and protocol forwarding. They
-do not parse, validate, format, derive, mint, or expose the canonical encoding.
-
-An `ExternalId` enters the server through the `room` and `sub` JWT claims. The
-user backend owns these values; PulseBeam validates them and derives the
-corresponding canonical IDs. External IDs are not routing destinations or the
-entity identity used in production logs.
+PulseBeam mints each `ConnectionId`. SDKs carry connection IDs without deriving
+them. A connection ID identifies one physical incarnation of an endpoint, not
+its application identity.
 
 An `Address` answers **where is the entity's current placement?** It may cross
 nodes and can change without changing the entity's `Id`. A `Handle` directly
@@ -41,14 +36,8 @@ needs a distinct `Key`. Natural domain nouns such as `MetricSeries`,
 ## Identity and routing flow
 
 ```text
-JWT claims: room + sub
-    -> RoomExternalId + ParticipantExternalId
-
-ProjectId + RoomExternalId
-    -> RoomId
-
-RoomId + ParticipantExternalId
-    -> ParticipantId
+verified ProjectId + requested RoomId + JWT sub (ParticipantId)
+    -> (project, room, participant) endpoint
 
 connection admission
     -> ConnectionId
@@ -61,13 +50,11 @@ TrackId + current placement
     -> destination shard resolves TrackHandle
 ```
 
-`RoomId` and `ParticipantId` are deterministic hierarchical UUIDv8 identities.
-`ConnectionId` is minted UUIDv7. The controller tracks participant identity and
-room resources alongside the current connection ID. A shard's `Connection` owns
-media execution for one participant connection incarnation; replacing that
-incarnation constructs a new runtime. The shard currently keeps at most one
-runtime per participant. Its `RtcDriver` drives the lower-level
-`pulsebeam_rtc::RtcConnection` WebRTC engine.
+`ConnectionId` is minted UUIDv7. The controller tracks the scoped endpoint
+alongside its current connection ID. A shard's `Connection` owns media
+execution for one incarnation; replacing that incarnation constructs a new
+runtime. Its `RtcDriver` drives the lower-level `pulsebeam_rtc::RtcConnection`
+WebRTC engine.
 
 SDP bootstrap installs admitted initial publications and receiver slots into that
 runtime. WHIP/WHEP admit those resources from SDP; the State adapter retains SDP
@@ -91,9 +78,9 @@ bytes. UUID version/variant bits are applied to the first 16 SHA3-256 bytes.
 `derive_track_id` retains the single bootstrap-lifetime transcript for SDP and
 legacy sources without owned refs. It cannot identify multiple same-label
 lifetimes on one connection. Both derivations retain the existing canonical
-encoding; a reconnect creates fresh track IDs. The V0 text encodings are `rm_0...`, `pa_0...`, `aud_0...` / `vid_0...` / `dat_0...`, and `c_0...`.
-Only the canonical identity implementation may derive, mint, parse, or format
-these values.
+encoding; a reconnect creates fresh track IDs. The V0 runtime text encodings
+are `aud_0...`, `vid_0...`, `dat_0...`, and `conn_0...`. Only the canonical
+identity implementation may derive, mint, parse, or format these values.
 
 Address scope is explicit:
 
@@ -127,7 +114,7 @@ POST /api/v1/whep
 ```
 
 Each successful request returns an absolute `Location` ending in a canonical
-V0 `ConnectionId`, for example `/api/v1/native/c_0...`. Native JSON exposes
+V0 `ConnectionId`, for example `/api/v1/native/conn_0...`. Native JSON exposes
 canonical room, participant, and connection IDs where the agent needs to carry
 them; WHIP and WHEP clients treat the complete returned `Location` as opaque.
 The Utoipa annotations in `control/api.rs` are the source of truth for generated

@@ -135,7 +135,7 @@ impl Scenario<'_> {
                             && status.registration.mode == TopicMode::Ordered
                     })?;
                     Some((
-                        observed.snapshot.participant_external_id.clone()?,
+                        observed.snapshot.participant_id.clone()?,
                         status.data_track_id.clone()?,
                         status.next_sequence,
                     ))
@@ -500,7 +500,7 @@ mod tests {
         TopicNotification::RecoveryGap {
             subscriber: TopicSubscriber {
                 room: "room".into(),
-                participant_external_id: "publisher".into(),
+                participant_id: "publisher".into(),
                 topic: "state".into(),
                 mode: TopicMode::Ordered,
             },

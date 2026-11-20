@@ -1,5 +1,5 @@
 use super::*;
-use pulsebeam::entity::ParticipantExternalId;
+use pulsebeam::entity::ParticipantId;
 use pulsebeam_agent_native::agent_core::{
     Participant, Snapshot, TopicMode, TopicPublisher, TopicPublisherStatus, TopicSubscriber,
     TopicSubscriberStatus,
@@ -8,12 +8,9 @@ use pulsebeam_agent_native::agent_core::{
 type Mutation<T> = (&'static str, fn(&mut T));
 
 fn fixture() -> (ApplicationStateOracle, ClientObservation) {
-    let room = RoomId::derive(
-        &DEVELOPMENT_PROJECT_ID,
-        &RoomExternalId::new("room").unwrap(),
-    );
-    let publisher = ParticipantId::derive(&room, &ParticipantExternalId::new("publisher").unwrap());
-    let viewer = ParticipantId::derive(&room, &ParticipantExternalId::new("viewer").unwrap());
+    let room = RoomId::new("room").unwrap();
+    let publisher = ParticipantId::new("publisher").unwrap();
+    let viewer = ParticipantId::new("viewer").unwrap();
     let source_connection = ConnectionId::new();
     let receiver_connection = ConnectionId::new();
     let canonical = source_connection.derive_track_id(TrackKind::Video, "opaque-owned-source");
@@ -38,7 +35,7 @@ fn fixture() -> (ApplicationStateOracle, ClientObservation) {
             media: if video {
                 vec![Publication {
                     id: canonical.as_str(),
-                    participant_id: id.as_str(),
+                    participant_id: id.as_str().to_owned(),
                     kind: MediaKind::Video,
                     label: "video".into(),
                 }]
@@ -51,13 +48,12 @@ fn fixture() -> (ApplicationStateOracle, ClientObservation) {
     let publication = model.participants[0].publications().next().unwrap();
     let snapshot = Snapshot {
         connection: ConnectionState::Connected,
-        participant_id: Some(viewer.as_str()),
-        room_external_id: Some("room".into()),
+        participant_id: Some(viewer.as_str().to_owned()),
+        room_id: Some("room".into()),
         participants: BTreeMap::from([(
-            publisher.as_str(),
+            publisher.as_str().to_owned(),
             Participant {
-                id: publisher.as_str(),
-                external_id: "publisher".into(),
+                id: publisher.as_str().to_owned(),
             },
         )]),
         video_mapping: BTreeMap::from([(0, publication.id.clone())]),
@@ -80,10 +76,7 @@ fn audio_fixture(capacity: u32) -> (ApplicationStateOracle, ClientObservation) {
     for name in ["audio-first", "audio-second", "audio-third"] {
         let mut source = ExpectedParticipant {
             external_id: name.into(),
-            id: ParticipantId::derive(
-                &model.participants[0].room_id().unwrap(),
-                &ParticipantExternalId::new(name).unwrap(),
-            ),
+            id: ParticipantId::new(name).unwrap(),
             video: false,
             audio: true,
             connection: Some(ConnectionId::new()),
@@ -95,16 +88,15 @@ fn audio_fixture(capacity: u32) -> (ApplicationStateOracle, ClientObservation) {
                 .unwrap()
                 .derive_track_id(TrackKind::Audio, "opaque-audio-source")
                 .as_str(),
-            participant_id: source.id.as_str(),
+            participant_id: source.id.as_str().to_owned(),
             kind: MediaKind::Audio,
             label: "audio".into(),
         }];
         let publication = source.publications().next().unwrap();
         client.snapshot.participants.insert(
-            source.id.as_str(),
+            source.id.as_str().to_owned(),
             Participant {
-                id: source.id.as_str(),
-                external_id: name.into(),
+                id: source.id.as_str().to_owned(),
             },
         );
         client
@@ -129,7 +121,7 @@ fn audio_fixture(capacity: u32) -> (ApplicationStateOracle, ClientObservation) {
 #[test]
 fn automatic_audio_oracle_requires_every_uncontended_live_source() {
     let (mut model, mut client) = audio_fixture(3);
-    let requested = [model.participants[0].id.as_str()];
+    let requested = [model.participants[0].id.as_str().to_owned()];
     model
         .check_client(&model.participants[1], &client, &requested)
         .unwrap();
@@ -160,7 +152,7 @@ fn automatic_audio_oracle_requires_every_uncontended_live_source() {
                 .check_client(
                     &model.participants[1],
                     &client,
-                    &[model.participants[0].id.as_str()],
+                    &[model.participants[0].id.as_str().to_owned()],
                 )
                 .is_err(),
             "accepted {name}"
@@ -172,7 +164,7 @@ fn automatic_audio_oracle_requires_every_uncontended_live_source() {
 fn automatic_audio_oracle_requires_all_sources_without_a_fixed_receiver_inventory() {
     let (mut model, mut client) = audio_fixture(3);
     client.audio_capacity = 1;
-    let requested = [model.participants[0].id.as_str()];
+    let requested = [model.participants[0].id.as_str().to_owned()];
     model
         .check_client(&model.participants[1], &client, &requested)
         .unwrap();
@@ -211,7 +203,11 @@ fn automatic_audio_oracle_requires_all_sources_without_a_fixed_receiver_inventor
 #[test]
 fn transition_safety_allows_pending_withdrawal_but_rejects_invalid_assignments() {
     let (model, mut client) = fixture();
-    let allowed = model.participants.iter().map(|p| p.id.as_str()).collect();
+    let allowed = model
+        .participants
+        .iter()
+        .map(|p| p.id.as_str().to_owned())
+        .collect();
     ApplicationStateOracle::check_client_safety(&client, &allowed).unwrap();
     assert!(
         model
@@ -270,7 +266,7 @@ fn transition_safety_allows_pending_withdrawal_but_rejects_invalid_assignments()
     cross_room.participants[0].room = "other-room";
     client.snapshot.participants.clear();
     client.snapshot.remote_tracks.clear();
-    let requested = [cross_room.participants[0].id.as_str()];
+    let requested = [cross_room.participants[0].id.as_str().to_owned()];
     assert!(client.snapshot.publications.is_empty());
     cross_room
         .check_client(&cross_room.participants[1], &client, &requested)
@@ -325,7 +321,7 @@ fn client_oracle_rejects_wrong_missing_duplicate_and_stale_assignments() {
         .check_client(
             &model.participants[1],
             &client,
-            &[model.participants[0].id.as_str()],
+            &[model.participants[0].id.as_str().to_owned()],
         )
         .unwrap();
     let mutations: &[Mutation<ClientObservation>] = &[
@@ -379,7 +375,7 @@ fn client_oracle_rejects_wrong_missing_duplicate_and_stale_assignments() {
                 .check_client(
                     &model.participants[1],
                     &client,
-                    &[model.participants[0].id.as_str()]
+                    &[model.participants[0].id.as_str().to_owned()]
                 )
                 .is_err(),
             "accepted {name}"
@@ -399,7 +395,7 @@ fn subscriber_bindings_follow_declared_room_topic_and_mode() {
         });
     let registration = TopicSubscriber {
         room: model.participants[0].room.to_owned(),
-        participant_external_id: model.participants[0].external_id.clone(),
+        participant_id: model.participants[0].external_id.clone(),
         topic: "updates".into(),
         mode: TopicMode::Ordered,
     };
@@ -417,7 +413,7 @@ fn subscriber_bindings_follow_declared_room_topic_and_mode() {
             publishers: 1,
             buffered_messages: 0,
         });
-    let requested = [model.participants[0].id.as_str()];
+    let requested = [model.participants[0].id.as_str().to_owned()];
     model
         .check_client(&model.participants[1], &client, &requested)
         .unwrap();
@@ -497,7 +493,7 @@ fn publishers_expose_distinct_public_bindings_for_declared_registrations() {
                 send_pending: false,
             });
     }
-    let requested = [model.participants[0].id.as_str()];
+    let requested = [model.participants[0].id.as_str().to_owned()];
     model
         .check_client(&model.participants[1], &client, &requested)
         .unwrap();
@@ -548,9 +544,9 @@ fn public_catalog_binding_preserves_opaque_identity_and_declared_constraints() {
     descriptors[0].label = "wrong".into();
     assert!(!publisher.bind_media(&descriptors).unwrap());
     descriptors[0].label = "video".into();
-    descriptors[0].participant_id = model.participants[1].id.as_str();
+    descriptors[0].participant_id = model.participants[1].id.as_str().to_owned();
     assert!(!publisher.bind_media(&descriptors).unwrap());
-    descriptors[0].participant_id = publisher.id.as_str();
+    descriptors[0].participant_id = publisher.id.as_str().to_owned();
     descriptors[0].id = publisher
         .connection
         .unwrap()

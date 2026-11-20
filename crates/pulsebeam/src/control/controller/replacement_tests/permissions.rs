@@ -2,7 +2,7 @@ use super::*;
 use crate::control::lifecycle::{TrackLifecycleOperation, TrackLifecycleOutcome};
 use crate::control::permissions::ResourcePermissions;
 use crate::control::topology::TrackAncestry;
-use crate::entity::{ParticipantExternalId, TrackKind};
+use crate::entity::{ParticipantId, TrackKind};
 use crate::participant::ParticipantEffect;
 use crate::track::{Track, TrackMeta};
 use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind as GrantKind};
@@ -14,7 +14,7 @@ fn permissions(
     label: Option<&str>,
 ) -> ResourcePermissions {
     ResourcePermissions::Grants {
-        room: RoomExternalId::new("sdp-scope").unwrap(),
+        room: RoomId::new("sdp-scope").unwrap(),
         grants: GrantSet::new(vec![
             Grant::new(
                 vec!["sdp-scope".into()],
@@ -40,10 +40,10 @@ fn permissions(
 #[test]
 fn current_room_join_is_checked_before_preparation_and_commit() {
     let mut actor = actor();
-    let room_external = RoomExternalId::new("sdp-scope").unwrap();
-    let room = RoomId::from_external(&room_external);
-    let participant = ParticipantId::new();
-    let external = ParticipantExternalId::new("alice").unwrap();
+    let room_external = RoomId::new("sdp-scope").unwrap();
+    let room = room_external;
+    let participant = crate::entity::fixture_participant_id();
+    let external = ParticipantId::new("alice").unwrap();
     let now = pulsebeam_runtime::time::Instant::now();
     let wall = SystemTime::now();
     let previous = authorization_lease(i64::MAX as u64, wall, now, "sdp-scope", room, participant);
@@ -59,7 +59,6 @@ fn current_room_join_is_checked_before_preparation_and_commit() {
             connection_id(1),
             Some(previous.clone()),
             SignalingProtocol::State,
-            external.clone(),
             wall,
         )
         .unwrap();
@@ -84,7 +83,7 @@ fn current_room_join_is_checked_before_preparation_and_commit() {
             grants: grant_set("other", Action::Join),
         },
         ResourcePermissions::Grants {
-            room: RoomExternalId::new("other").unwrap(),
+            room: RoomId::new("other").unwrap(),
             grants: grant_set("*", Action::Join),
         },
     ] {
@@ -97,7 +96,6 @@ fn current_room_join_is_checked_before_preparation_and_commit() {
                     manual_sub: true,
                     room_id: room,
                     participant_id: participant,
-                    participant_external_id: external.clone(),
                     connection_id: connection_id(2),
                     old_connection_id: None,
                     authorization: Some(lease.clone()),
@@ -119,7 +117,6 @@ fn current_room_join_is_checked_before_preparation_and_commit() {
                 connection_id(2),
                 Some(lease),
                 SignalingProtocol::State,
-                external.clone(),
                 wall
             ),
             Err(ControllerError::AuthorizationRejected)
@@ -168,8 +165,8 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
     actor.negotiator = Negotiator::new(vec![pulsebeam_rtc::LocalCandidate::Udp(
         "127.0.0.1:6000".parse().unwrap(),
     )]);
-    let room = RoomId::from_external(&RoomExternalId::new("sdp-scope").unwrap());
-    let participant = ParticipantId::new();
+    let room = RoomId::new("sdp-scope").unwrap();
+    let participant = crate::entity::fixture_participant_id();
     let now = pulsebeam_runtime::time::Instant::now();
     let wall = SystemTime::now();
     let mut lease = authorization_lease(i64::MAX as u64, wall, now, "sdp-scope", room, participant);
@@ -185,7 +182,6 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
         manual_sub: false,
         room_id: room,
         participant_id: participant,
-        participant_external_id: ParticipantExternalId::new("alice").unwrap(),
         connection_id: connection_id(1),
         old_connection_id: None,
         authorization: Some(lease),
@@ -201,11 +197,23 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
         "{rejected:?}"
     );
     assert!(actor.core.registry.get_participant(&participant).is_none());
-    assert!(actor.core.registry.get_room_shard(&room).is_none());
-    assert_eq!(actor.lifecycle.sources_in_room(room).count(), 0);
+    assert!(
+        actor
+            .core
+            .registry
+            .get_room_shard(&ProjectRoomKey::fixture(room))
+            .is_none()
+    );
+    assert_eq!(
+        actor
+            .lifecycle
+            .sources_in_room(ProjectRoomKey::fixture(room))
+            .count(),
+        0
+    );
     assert!(actor.command_backlog.is_empty());
     lease.permissions = ResourcePermissions::Grants {
-        room: RoomExternalId::new("sdp-scope").unwrap(),
+        room: RoomId::new("sdp-scope").unwrap(),
         grants: GrantSet::new(
             [
                 (GrantKind::Audio, "audio"),
@@ -241,7 +249,7 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
         .begin_create_participant(state(lease), publishing_offer())
         .unwrap();
     assert!(actor.core.registry.partition_reserved(
-        room,
+        pending.room,
         participant,
         connection_id(1),
         pending.shard,
@@ -280,7 +288,7 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
     actor
         .core
         .registry
-        .release_partition(room, participant, connection_id(1));
+        .release_partition(pending.room, participant, connection_id(1));
     actor.core.release_transport(pending.transport, now);
 }
 
@@ -292,7 +300,7 @@ pub(super) fn source(
     label: &str,
 ) -> Track {
     let meta = TrackMeta {
-        room_id: room,
+        room: crate::entity::ProjectRoomKey::fixture(room),
         shard_id: ShardId::new(0),
         id: connection.derive_track_id(kind, label),
         origin,
@@ -327,10 +335,10 @@ fn subscriber_effects(
 #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
 async fn default_subscriptions_filter_candidates_and_routes_without_destroying_broad_intent() {
     let mut actor = actor_with_shards(2);
-    let room = RoomId::from_external(&RoomExternalId::new("sdp-scope").unwrap());
-    let publisher = ParticipantId::new();
-    let other = ParticipantId::new();
-    let subscriber = ParticipantId::new();
+    let room = RoomId::new("sdp-scope").unwrap();
+    let publisher = ParticipantId::new("publisher").unwrap();
+    let other = ParticipantId::new("other").unwrap();
+    let subscriber = ParticipantId::new("alice").unwrap();
     let now = pulsebeam_runtime::time::Instant::now();
     let wall = SystemTime::now();
     let mut lease = authorization_lease(i64::MAX as u64, wall, now, "sdp-scope", room, subscriber);
@@ -340,13 +348,9 @@ async fn default_subscriptions_filter_candidates_and_routes_without_destroying_b
         Some(GrantKind::Audio),
         None,
     );
-    for (index, (participant, external, shard)) in [
-        (publisher, "publisher", 0),
-        (other, "other", 0),
-        (subscriber, "alice", 1),
-    ]
-    .into_iter()
-    .enumerate()
+    for (index, (participant, shard)) in [(publisher, 0), (other, 0), (subscriber, 1)]
+        .into_iter()
+        .enumerate()
     {
         let shard = ShardId::new(shard);
         let transport = actor.core.reserve_transport(shard, now);
@@ -364,7 +368,6 @@ async fn default_subscriptions_filter_candidates_and_routes_without_destroying_b
                 } else {
                     SignalingProtocol::State
                 },
-                ParticipantExternalId::new(external).unwrap(),
                 wall,
             )
             .unwrap();
@@ -374,7 +377,7 @@ async fn default_subscriptions_filter_candidates_and_routes_without_destroying_b
         actor
             .lifecycle
             .subscribe_defaults(
-                room,
+                ProjectRoomKey::fixture(room),
                 subscriber,
                 [
                     (TrackSelector::audio(), SelectionPolicy::All),
@@ -462,10 +465,13 @@ async fn default_subscriptions_filter_candidates_and_routes_without_destroying_b
     );
     assert!(subscriber_effects(&preserved, subscriber).is_empty());
     let denied = actor.lifecycle.activate(
-        room,
+        ProjectRoomKey::fixture(room),
         publisher,
         sources[3].id(),
-        subscriber,
+        EndpointKey {
+            room: ProjectRoomKey::fixture(room),
+            participant: subscriber,
+        },
         &actor.core.registry,
         now,
     );

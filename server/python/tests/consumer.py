@@ -106,7 +106,7 @@ with tempfile.TemporaryDirectory() as directory:
     opaque[0], opaque[1] = "unknown-issuer", "unknown-key"
     signed = sign(
         ".".join(opaque), grants=[{"rooms": ["room with spaces"], "allow": ["join"]}],
-        participant="participant/with/slashes", expiration=2000
+        participant="Participant_With-MixedCase", expiration=2000
     )
     head, claims = (
         json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
@@ -116,7 +116,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert claims["iss"] == opaque[0]
     assert claims["grants"][0]["rooms"][0] == "room with spaces"
     assert "room" not in claims
-    assert claims["sub"] == "participant/with/slashes"
+    assert claims["sub"] == "Participant_With-MixedCase"
 
     for invalid in (
         sdk.INSECURE_DEV_API_KEY.replace(".MC4CAQ", ".invalid", 1),

@@ -3,12 +3,12 @@
 use super::*;
 use crate::{
     control::controller::SignalingProtocol,
-    entity::{ConnectionId, RoomExternalId},
+    entity::{ConnectionId, RoomId},
 };
 use pulsebeam_runtime::rt::WorkerSnapshot;
 
 fn room_id(name: &str) -> RoomId {
-    RoomId::from_external(&RoomExternalId::new(name).unwrap())
+    RoomId::new(name).unwrap()
 }
 
 fn commit(
@@ -22,13 +22,12 @@ fn commit(
     core.registry
         .commit_candidate(
             participant,
-            room,
+            ProjectRoomKey::fixture(room),
             shard,
             slot,
             transport,
             ConnectionId::new(),
             SignalingProtocol::State,
-            None,
         )
         .unwrap();
 }
@@ -41,7 +40,14 @@ fn admit(
     snapshot: Option<&ExecutionSnapshot>,
 ) -> Option<(usize, ShardId)> {
     let now = snapshot.map_or_else(Instant::now, |snapshot| snapshot.at);
-    Placement::default().admit(core, room, participant, shards, snapshot, now)
+    Placement::default().admit(
+        core,
+        &ProjectRoomKey::fixture(*room),
+        participant,
+        shards,
+        snapshot,
+        now,
+    )
 }
 
 // Rates are thousandths of one worker. Counters use microseconds, timestamps milliseconds.
@@ -79,7 +85,7 @@ fn admission_uses_the_registry_preserves_bindings_and_reuses_empty_partitions() 
     let room = room_id("placement");
     let mut participants = Vec::new();
     for index in 0..8 {
-        let participant = ParticipantId::new();
+        let participant = crate::entity::fixture_participant_id();
         let (slot, shard) = admit(&core, &room, &participant, 4, None).unwrap();
         assert_eq!((slot, shard.index()), (index / 2, index / 2));
         commit(&mut core, room, participant, slot, shard);
@@ -94,14 +100,20 @@ fn admission_uses_the_registry_preserves_bindings_and_reuses_empty_partitions() 
     }
     for _ in 0..4 {
         core.registry.add_participant(
-            ParticipantId::new(),
+            crate::entity::fixture_participant_id(),
             room_id("other"),
             ShardId::new(0),
             None,
         );
     }
     assert_eq!(
-        admit(&core, &room, &ParticipantId::new(), 4, None),
+        admit(
+            &core,
+            &room,
+            &crate::entity::fixture_participant_id(),
+            4,
+            None
+        ),
         Some((0, ShardId::new(1)))
     );
 }
@@ -110,16 +122,40 @@ fn admission_uses_the_registry_preserves_bindings_and_reuses_empty_partitions() 
 fn uncommitted_admission_leaves_no_reservation_and_explicit_round_robin_is_preserved() {
     let mut core = ControllerCore::with_shards(3, 1, RoomPartitionPlacement::RoundRobin);
     let room = room_id("explicit");
-    let first = admit(&core, &room, &ParticipantId::new(), 3, None);
-    assert_eq!(first, admit(&core, &room, &ParticipantId::new(), 3, None));
+    let first = admit(
+        &core,
+        &room,
+        &crate::entity::fixture_participant_id(),
+        3,
+        None,
+    );
+    assert_eq!(
+        first,
+        admit(
+            &core,
+            &room,
+            &crate::entity::fixture_participant_id(),
+            3,
+            None
+        )
+    );
     assert_eq!(core.registry.participants().count(), 0);
     for index in 0..7 {
-        let participant = ParticipantId::new();
+        let participant = crate::entity::fixture_participant_id();
         let (slot, shard) = admit(&core, &room, &participant, 3, None).unwrap();
         assert_eq!((slot, shard.index()), (index, index % 3));
         commit(&mut core, room, participant, slot, shard);
     }
-    assert!(admit(&core, &room, &ParticipantId::new(), 0, None).is_none());
+    assert!(
+        admit(
+            &core,
+            &room,
+            &crate::entity::fixture_participant_id(),
+            0,
+            None
+        )
+        .is_none()
+    );
     assert_eq!(initial_worker(ShardId::new(5), 2), Some(1));
     assert_eq!(initial_worker(ShardId::new(5), 0), None);
 }
@@ -128,17 +164,33 @@ fn uncommitted_admission_leaves_no_reservation_and_explicit_round_robin_is_prese
 fn fallback_reads_actual_residency_without_keeping_a_second_map() {
     let mut core = ControllerCore::with_shards(4, 1, RoomPartitionPlacement::Balanced);
     let room = room_id("cores");
-    core.registry
-        .add_participant(ParticipantId::new(), room, ShardId::new(0), None);
+    core.registry.add_participant(
+        crate::entity::fixture_participant_id(),
+        room,
+        ShardId::new(0),
+        None,
+    );
     let now = Instant::now();
     let snapshot = cohort(now, 0, &[&[(0, 0), (1, 0)], &[(2, 0), (3, 0)]]);
     assert_eq!(
-        admit(&core, &room, &ParticipantId::new(), 4, Some(&snapshot)),
+        admit(
+            &core,
+            &room,
+            &crate::entity::fixture_participant_id(),
+            4,
+            Some(&snapshot)
+        ),
         Some((1, ShardId::new(2)))
     );
     let moved = cohort(now, 1, &[&[(0, 0), (2, 0)], &[(1, 0), (3, 0)]]);
     assert_eq!(
-        admit(&core, &room, &ParticipantId::new(), 4, Some(&moved)),
+        admit(
+            &core,
+            &room,
+            &crate::entity::fixture_participant_id(),
+            4,
+            Some(&moved)
+        ),
         Some((1, ShardId::new(1)))
     );
 }
@@ -147,12 +199,16 @@ fn fallback_reads_actual_residency_without_keeping_a_second_map() {
 fn measured_admission_prefers_a_quieter_worker_even_with_more_participants() {
     let mut core = ControllerCore::with_shards(4, 1, RoomPartitionPlacement::Balanced);
     let existing = room_id("existing");
-    core.registry
-        .add_participant(ParticipantId::new(), existing, ShardId::new(0), None);
+    core.registry.add_participant(
+        crate::entity::fixture_participant_id(),
+        existing,
+        ShardId::new(0),
+        None,
+    );
     for shard in [2, 3] {
         for _ in 0..10 {
             core.registry.add_participant(
-                ParticipantId::new(),
+                crate::entity::fixture_participant_id(),
                 existing,
                 ShardId::new(shard),
                 None,
@@ -169,14 +225,20 @@ fn measured_admission_prefers_a_quieter_worker_even_with_more_participants() {
     let snapshot = cohort(base, 10_000, layout);
     let room = room_id("incoming");
     assert_eq!(
-        admit(&core, &room, &ParticipantId::new(), 4, Some(&snapshot)),
+        admit(
+            &core,
+            &room,
+            &crate::entity::fixture_participant_id(),
+            4,
+            Some(&snapshot)
+        ),
         Some((0, ShardId::new(1)))
     );
     assert_eq!(
         policy.admit(
             &core,
-            &room,
-            &ParticipantId::new(),
+            &ProjectRoomKey::fixture(room),
+            &crate::entity::fixture_participant_id(),
             4,
             Some(&snapshot),
             snapshot.at
@@ -187,8 +249,8 @@ fn measured_admission_prefers_a_quieter_worker_even_with_more_participants() {
     assert_eq!(
         policy.admit(
             &core,
-            &room,
-            &ParticipantId::new(),
+            &ProjectRoomKey::fixture(room),
+            &crate::entity::fixture_participant_id(),
             4,
             Some(&snapshot),
             stale_at

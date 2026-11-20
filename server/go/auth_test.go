@@ -221,7 +221,7 @@ func grants(pattern string) []pulsebeam.Grant {
 func TestOpaqueIdentityStrings(t *testing.T) {
 	parts := strings.Split(pulsebeam.InsecureDevAPIKey(), ".")
 	parts[0], parts[1] = "unknown-issuer", "unknown-key"
-	token, err := pulsebeam.SignParticipantToken(strings.Join(parts, "."), grants("room with spaces"), "participant/with/slashes", 2000)
+	token, err := pulsebeam.SignParticipantToken(strings.Join(parts, "."), grants("room with spaces"), "Participant_With-MixedCase", 2000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestOpaqueIdentityStrings(t *testing.T) {
 	if json.Unmarshal(header, &h) != nil || json.Unmarshal(claims, &c) != nil {
 		t.Fatal("invalid signed JWT")
 	}
-	if h.Kid != parts[1] || c.Iss != parts[0] || len(c.Grants) != 1 || c.Grants[0].Rooms[0] != "room with spaces" || c.Sub != "participant/with/slashes" {
+	if h.Kid != parts[1] || c.Iss != parts[0] || len(c.Grants) != 1 || c.Grants[0].Rooms[0] != "room with spaces" || c.Sub != "Participant_With-MixedCase" {
 		t.Fatal("signer modified opaque identities")
 	}
 }

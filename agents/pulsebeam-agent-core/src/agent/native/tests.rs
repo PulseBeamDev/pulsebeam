@@ -232,6 +232,7 @@ fn media_allocation_fences_callbacks_and_retires_superseded_physical_facts() {
                     state::confirmed_state::Value::Track(state::Track {
                         track_id: id.into(),
                         participant_id: "remote".into(),
+                        room_id: "room".into(),
                         label: "voice".into(),
                         kind: Some(state::track::Kind::Audio(state::AudioTrack {
                             format: Some(state::CodecFormat::from(
@@ -723,11 +724,13 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
                 spec: Some(spec.as_ref().clone()),
                 participant: Some(state::Participant {
                     participant_id: "p1".into(),
-                    participant_external_id: "participant".into(),
+
+                    room_id: "room".into(),
                 }),
                 track: Some(state::Track {
                     track_id: "server-canonical-source".into(),
                     participant_id: "p1".into(),
+                    room_id: "room".into(),
                     label: publisher.topic.clone(),
                     kind: Some(state::track::Kind::Data(state::DataTrack {
                         delivery: state::DataDelivery::Ordered as i32,
@@ -1314,7 +1317,7 @@ fn received_resource_state_projects_prejoin_and_owner_local_intent() {
     .unwrap();
     let selector = crate::TrackSelector {
         room: "main".into(),
-        participant_external_id: "alice-device".into(),
+        participant_id: "alice-device".into(),
         label: "camera".into(),
     };
     let mut claim_video = || {
@@ -1391,12 +1394,12 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
     let (mut agent, generation, control) = connected(Default::default());
     let selector = crate::TrackSelector {
         room: "room".into(),
-        participant_external_id: "external".into(),
+        participant_id: "external".into(),
         label: "camera".into(),
     };
     let resource = Resource::SourceLookup {
         room: selector.room.clone(),
-        participant_external_id: selector.participant_external_id.clone(),
+        participant_id: selector.participant_id.clone(),
         kind: state::TrackKind::Video,
         label: selector.label.clone(),
     };
@@ -1409,7 +1412,7 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
             state::SourceLookupSpec {
                 source: Some(state::LogicalSourceAddress {
                     room: selector.room.clone(),
-                    participant_external_id: selector.participant_external_id.clone(),
+                    participant_id: selector.participant_id.clone(),
                     kind: state::TrackKind::Video as i32,
                     label: selector.label.clone(),
                 }),
@@ -1418,7 +1421,8 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
     };
     let track = state::Track {
         track_id: "lookup-only-source".into(),
-        participant_id: "remote".into(),
+        participant_id: selector.participant_id.clone(),
+        room_id: selector.room.clone(),
         label: selector.label.clone(),
         kind: Some(state::track::Kind::Video(state::VideoTrack {
             format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
@@ -1427,8 +1431,9 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
         })),
     };
     let participant = state::Participant {
-        participant_id: track.participant_id.clone(),
-        participant_external_id: selector.participant_external_id.clone(),
+        participant_id: selector.participant_id.clone(),
+
+        room_id: selector.room.clone(),
     };
     let stage = |agent: &mut Agent, enabled| {
         agent
@@ -1524,7 +1529,7 @@ fn source_lookup_selects_exact_identity_without_discovery_and_gates_pending_disa
         selected(
             active,
             &crate::TrackSelector {
-                participant_external_id: "other-participant".into(),
+                participant_id: "other-participant".into(),
                 ..selector.clone()
             },
             state::TrackKind::Video,

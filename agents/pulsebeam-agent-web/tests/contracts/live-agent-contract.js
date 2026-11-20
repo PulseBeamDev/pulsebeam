@@ -347,7 +347,7 @@
     discoveryWatch
       ?.state()
       .page?.participants.find(
-        (participant) => participant.externalId === "web-sender",
+        (participant) => participant.id === "web-sender",
       )?.publications ?? [];
   let handoffAttachment;
   let handoffVideo;
@@ -1062,7 +1062,7 @@
         "state reads share page projection",
       );
       const metadata = page.participants.find(
-        (participant) => participant.externalId === "web-sender",
+        (participant) => participant.id === "web-sender",
       );
       assert(
         metadata?.publications.some(
@@ -1071,7 +1071,7 @@
         "catalog contains real publication metadata",
       );
       const presence = page.participants.find(
-        (participant) => participant.externalId === "web-catalog-observer",
+        (participant) => participant.id === "web-catalog-observer",
       );
       assert(
         presence?.publications.length === 0,

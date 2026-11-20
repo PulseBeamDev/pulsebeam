@@ -3,7 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use crate::entity::{ParticipantId, TrackId};
+use crate::entity::{ConnectionId, TrackId};
 use crate::id::ShardId;
 use crate::route::{NodeRouteAddress, NodeTransportAddress};
 use pulsebeam_queue as mailbox;
@@ -17,7 +17,7 @@ pub(crate) struct CompiledRoute {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TrackPlan {
-    pub local: Vec<ParticipantId>,
+    pub local: Vec<ConnectionId>,
     pub remote: Vec<NodeRouteAddress>,
     pub reverse_route: Option<NodeRouteAddress>,
     pub compiled_remote: Vec<CompiledRoute>,
@@ -28,7 +28,7 @@ pub(crate) struct TrackPlan {
 
 impl TrackPlan {
     pub(crate) fn new(
-        local: impl IntoIterator<Item = ParticipantId>,
+        local: impl IntoIterator<Item = ConnectionId>,
         remote: impl IntoIterator<Item = NodeRouteAddress>,
         reverse_route: Option<NodeRouteAddress>,
     ) -> Self {
@@ -96,7 +96,7 @@ impl TrackRouteAction {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrackDescriptor {
-    pub origin: ParticipantId,
+    pub origin: ConnectionId,
     pub kind: crate::entity::TrackKind,
     pub encodings: Vec<crate::track::SourceEncoding>,
 }
@@ -104,7 +104,7 @@ pub(crate) struct TrackDescriptor {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TrackRuntime {
     pub descriptor: Option<TrackDescriptor>,
-    pub publisher: Option<ParticipantId>,
+    pub publisher: Option<ConnectionId>,
     pub publisher_effect: Option<crate::participant::ParticipantEffect>,
 }
 
@@ -125,7 +125,7 @@ pub(crate) enum ShardUpdateOp {
         address: NodeTransportAddress,
     },
     RemoveParticipant {
-        participant: ParticipantId,
+        connection: ConnectionId,
         address: NodeTransportAddress,
     },
     InsertTrackRuntime {
@@ -142,7 +142,7 @@ pub(crate) enum ShardUpdateOp {
 pub(crate) struct ShardUpdate {
     pub shard: ShardId,
     pub generation: u64,
-    pub participant_effects: Vec<(ParticipantId, crate::participant::ParticipantEffect)>,
+    pub participant_effects: Vec<(ConnectionId, crate::participant::ParticipantEffect)>,
     pub lifecycle: Vec<ShardUpdateOp>,
     pub plans: Vec<TrackPlanUpdate>,
     pub cutoff_acks: Vec<pulsebeam_runtime::sync::oneshot::Sender<()>>,
@@ -214,7 +214,7 @@ impl ShardUpdateWriter {
     pub fn stage_participant_effect(
         &mut self,
         generation: u64,
-        participant: ParticipantId,
+        connection: ConnectionId,
         effect: crate::participant::ParticipantEffect,
     ) {
         let commit = self
@@ -223,7 +223,7 @@ impl ShardUpdateWriter {
         if commit.generation != generation {
             pulsebeam_runtime::fatal!("a shard generation cannot mix participant effects");
         }
-        commit.participant_effects.push((participant, effect));
+        commit.participant_effects.push((connection, effect));
     }
 
     pub fn stage_plans(&mut self, generation: u64, plans: Vec<TrackPlanUpdate>) {

@@ -15,7 +15,7 @@ fn receive(agent: &mut Agent, room: &str, participant: &str, delivery: TopicMode
             },
             source: crate::TrackSelector {
                 room: room.into(),
-                participant_external_id: participant.into(),
+                participant_id: participant.into(),
                 label: "events".into(),
             },
         })
@@ -57,7 +57,7 @@ fn take_lookup(
                         continue;
                     };
                     let address = lookup.source.as_ref().unwrap();
-                    if address.room == "room" && address.participant_external_id == "alice" {
+                    if address.room == "room" && address.participant_id == "alice" {
                         return (record.owned, desired.revision, spec);
                     }
                 }
@@ -201,12 +201,14 @@ fn delivery_mismatch_fails_only_incompatible_receivers_and_revocation_keeps_the_
                 state::SourceLookupState {
                     spec: Some(*spec),
                     participant: Some(state::Participant {
-                        participant_id: "opaque-participant".into(),
-                        participant_external_id: "alice".into(),
+                        participant_id: "alice".into(),
+
+                        room_id: "room".into(),
                     }),
                     track: Some(state::Track {
                         track_id: "opaque-source".into(),
-                        participant_id: "opaque-participant".into(),
+                        participant_id: "alice".into(),
+                        room_id: "room".into(),
                         label: "events".into(),
                         kind: Some(state::track::Kind::Data(state::DataTrack {
                             delivery: state::DataDelivery::Ordered as i32,
@@ -322,12 +324,14 @@ fn resolved_source_description_does_not_claim_data_receiver_execution() {
                 state::SourceLookupState {
                     spec: Some(*spec),
                     participant: Some(state::Participant {
-                        participant_id: "opaque-participant".into(),
-                        participant_external_id: "alice".into(),
+                        participant_id: "alice".into(),
+
+                        room_id: "room".into(),
                     }),
                     track: Some(state::Track {
                         track_id: "opaque-data-track".into(),
-                        participant_id: "opaque-participant".into(),
+                        participant_id: "alice".into(),
+                        room_id: "room".into(),
                         label: "events".into(),
                         kind: Some(state::track::Kind::Data(state::DataTrack {
                             delivery: state::DataDelivery::Ordered as i32,

@@ -90,7 +90,7 @@ mod tests {
     use super::*;
 
     fn id(value: u8) -> ParticipantId {
-        ParticipantId::from_bytes([value; 16])
+        ParticipantId::new(&format!("participant-{value}")).unwrap()
     }
 
     fn key(index: u32, version: u32) -> ParticipantHandle {

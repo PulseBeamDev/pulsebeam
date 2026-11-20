@@ -4,6 +4,7 @@ use data_encoding_macro::new_encoding;
 use uuid::{Uuid, Variant, Version};
 
 pub const UUID_TEXT_LEN: usize = 26;
+pub const MAX_APPLICATION_NAME_BYTES: usize = 36;
 const VERSION: u8 = b'0';
 pub(crate) const CROCKFORD: Encoding = new_encoding! {
     symbols: "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
@@ -90,6 +91,22 @@ pub fn parse_id(
     Ok(uuid)
 }
 
+pub fn validate_application_name(value: &str) -> Result<(), IdValidationError> {
+    if value.is_empty() {
+        return Err(IdValidationError::Empty);
+    }
+    if value.len() > MAX_APPLICATION_NAME_BYTES {
+        return Err(IdValidationError::TooLong(MAX_APPLICATION_NAME_BYTES));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(IdValidationError::InvalidCharacters);
+    }
+    Ok(())
+}
+
 pub fn validate_external(value: &str) -> Result<(), IdValidationError> {
     if value.is_empty() {
         return Err(IdValidationError::Empty);
@@ -101,4 +118,28 @@ pub fn validate_external(value: &str) -> Result<(), IdValidationError> {
         return Err(IdValidationError::InvalidCharacters);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_names_accept_only_the_address_segment_grammar() {
+        for valid in ["A", "z", "7", "-", "_", "Stage-A_9"] {
+            assert_eq!(validate_application_name(valid), Ok(()));
+        }
+        assert_eq!(validate_application_name(&"A".repeat(36)), Ok(()));
+        assert_eq!(
+            validate_application_name(&"A".repeat(37)),
+            Err(IdValidationError::TooLong(36))
+        );
+        assert_eq!(validate_application_name(""), Err(IdValidationError::Empty));
+        for invalid in ["stage.main", "x/y", "x%2Fy", " x", "x\n", "é", "*"] {
+            assert_eq!(
+                validate_application_name(invalid),
+                Err(IdValidationError::InvalidCharacters)
+            );
+        }
+    }
 }

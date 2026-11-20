@@ -3,10 +3,63 @@ use super::*;
 mod execution;
 mod source_lookup;
 
+#[test]
+fn participant_withdrawal_is_scoped_to_exact_room() {
+    let mut client = NativeState::new(64 * 1024, participant()).unwrap();
+    let endpoint = |room: &str| wire::Participant {
+        participant_id: "Shared_Name".into(),
+        room_id: room.into(),
+    };
+    let left = endpoint("Main");
+    let right = endpoint("main");
+    let observation = |endpoint: &wire::Participant, value| wire::ServerStateRecord {
+        key: Some(wire::ResourceKey {
+            key: Some(wire::resource_key::Key::Participant(endpoint.clone())),
+        }),
+        confirmed: Some(wire::ConfirmedState {
+            value: Some(value),
+            ..Default::default()
+        }),
+    };
+    use wire::confirmed_state::Value;
+    client
+        .apply(&frame(
+            alloc::vec![
+                observation(&left, Value::Participant(left.clone())),
+                observation(&right, Value::Participant(right.clone())),
+            ],
+            false,
+        ))
+        .unwrap();
+    assert_eq!(client.participants().len(), 2);
+
+    client
+        .apply(&frame(
+            alloc::vec![observation(
+                &left,
+                Value::Absent(wire::AbsentState {
+                    reason: wire::AbsenceReason::Removed as i32,
+                })
+            )],
+            false,
+        ))
+        .unwrap();
+    assert!(
+        !client
+            .participants()
+            .contains_key(&ParticipantKey::from(&left))
+    );
+    assert_eq!(
+        client.participants().get(&ParticipantKey::from(&right)),
+        Some(&right)
+    );
+}
+
 fn participant() -> wire::Participant {
     wire::Participant {
         participant_id: "self".into(),
-        participant_external_id: "alice".into(),
+
+        room_id: "room".into(),
     }
 }
 
@@ -73,6 +126,7 @@ fn live(revision: u64, spec: wire::ResourceSpec) -> wire::ConfirmedState {
                 track: Some(wire::Track {
                     track_id: "source".into(),
                     participant_id: "self".into(),
+                    room_id: "room".into(),
                     label: "updates".into(),
                     kind: Some(wire::track::Kind::Data(wire::DataTrack {
                         delivery: wire::DataDelivery::Ordered as i32,
@@ -361,7 +415,7 @@ fn owned_lookup_waits_for_authorization_not_roster_completion() {
     let mut client = NativeState::new(1024 * 1024, participant()).unwrap();
     let resource = Resource::SourceLookup {
         room: "source-room".into(),
-        participant_external_id: "alice".into(),
+        participant_id: "alice".into(),
         kind: wire::TrackKind::Data,
         label: "updates".into(),
     };
@@ -374,7 +428,7 @@ fn owned_lookup_waits_for_authorization_not_roster_completion() {
             wire::SourceLookupSpec {
                 source: Some(wire::LogicalSourceAddress {
                     room: "source-room".into(),
-                    participant_external_id: "alice".into(),
+                    participant_id: "alice".into(),
                     kind: wire::TrackKind::Data as i32,
                     label: "updates".into(),
                 }),
@@ -437,7 +491,7 @@ fn ordered_session_and_latest_evaluation_gate_media_without_discarding_rejected_
         wire::SourceLookupSpec {
             source: Some(wire::LogicalSourceAddress {
                 room: "room".into(),
-                participant_external_id: "alice".into(),
+                participant_id: "alice".into(),
                 kind: wire::TrackKind::Data as i32,
                 label: "updates".into(),
             }),

@@ -131,7 +131,7 @@ impl AudioSubscription {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TrackSelector {
     pub room: String,
-    pub participant_external_id: String,
+    pub participant_id: String,
     pub label: String,
 }
 
@@ -194,7 +194,6 @@ impl MediaSlot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Participant {
     pub id: String,
-    pub external_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,8 +247,7 @@ pub struct Snapshot {
     pub connection: ConnectionState,
     pub generation: Option<Generation>,
     pub participant_id: Option<String>,
-    pub participant_external_id: Option<String>,
-    pub room_external_id: Option<String>,
+    pub room_id: Option<String>,
     pub authorization_expires_at: Option<i64>,
     pub catalog_revision: u64,
     pub accepted_intent_revision: u64,
@@ -277,8 +275,7 @@ impl Default for Snapshot {
             connection: ConnectionState::Disconnected,
             generation: None,
             participant_id: None,
-            participant_external_id: None,
-            room_external_id: None,
+            room_id: None,
             authorization_expires_at: None,
             catalog_revision: 0,
             accepted_intent_revision: 0,
@@ -468,11 +465,7 @@ impl DesiredState {
             if !selectors.insert(selector) {
                 return Err(ValidationError::Duplicate {
                     field: "audio selector",
-                    value: alloc::format!(
-                        "{}:{}",
-                        selector.participant_external_id,
-                        selector.label
-                    ),
+                    value: alloc::format!("{}:{}", selector.participant_id, selector.label),
                 });
             }
         }
@@ -496,17 +489,24 @@ impl DesiredState {
 impl TrackSelector {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_room_name(&self.room)?;
-        validate_participant_id(&self.participant_external_id)?;
+        validate_participant_id(&self.participant_id)?;
         validate_identifier("track label", &self.label, 64, true)
     }
 }
 
 pub fn validate_room_name(room: &str) -> Result<(), ValidationError> {
-    validate_identifier("room external id", room, 256, true)
+    validate_application_name("room ID", room)
 }
 
 pub fn validate_participant_id(id: &str) -> Result<(), ValidationError> {
-    validate_identifier("participant external id", id, 256, true)
+    validate_application_name("participant ID", id)
+}
+
+fn validate_application_name(field: &'static str, value: &str) -> Result<(), ValidationError> {
+    if !pulsebeam_proto::state::validation::is_application_name(value) {
+        return Err(ValidationError::Identifier { field });
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_identifier(

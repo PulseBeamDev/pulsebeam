@@ -1,3 +1,4 @@
+use crate::entity::EndpointKey;
 use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::net;
 use pulsebeam_runtime::time::Instant;
@@ -293,13 +294,13 @@ impl ShardExecution {
             }
             crate::shard_update::ShardUpdateOp::Placeholder => {}
             crate::shard_update::ShardUpdateOp::RemoveParticipant {
-                participant,
+                connection,
                 address,
             } => {
                 self.pending_replacements.retain(|(transport, config)| {
-                    *transport != *address || config.participant_id != *participant
+                    *transport != *address || config.connection_id != *connection
                 });
-                if let Some(handle) = self.registry.resolve(participant)
+                if let Some(handle) = self.registry.resolve_connection(*connection)
                     && self
                         .registry
                         .resolve_mut(handle)
@@ -307,12 +308,12 @@ impl ShardExecution {
                 {
                     self.timers.cancel(handle);
                 }
-                let removed = self.registry.remove(*participant, *address);
-                if removed.is_some()
-                    && let Some(index) = self
-                        .pending_replacements
-                        .iter()
-                        .position(|(_, config)| config.participant_id == *participant)
+                let removed = self.registry.remove(*connection, *address);
+                if let Some(removed) = removed
+                    && let Some(index) = self.pending_replacements.iter().position(|(_, config)| {
+                        config.room == removed.room
+                            && config.participant_id == removed.participant_id
+                    })
                     && let Some((transport, config)) = self.pending_replacements.remove(index)
                 {
                     // The retiring generation has already replaced its plans. Only
@@ -322,21 +323,21 @@ impl ShardExecution {
             }
             crate::shard_update::ShardUpdateOp::InsertTrackRuntime { track_id, runtime } => {
                 let descriptor = runtime.descriptor.as_ref();
-                let origin =
-                    descriptor.and_then(|descriptor| self.registry.resolve(&descriptor.origin));
+                let origin = descriptor
+                    .and_then(|descriptor| self.registry.resolve_connection(descriptor.origin));
                 let publisher = runtime
                     .publisher
-                    .and_then(|publisher| self.registry.resolve(&publisher));
+                    .and_then(|publisher| self.registry.resolve_connection(publisher));
                 let track_handle = self
                     .runtime
                     .install_track(*track_id, descriptor, origin, publisher);
                 if let (Some(publisher), Some(effect)) =
                     (runtime.publisher, runtime.publisher_effect.as_ref())
                 {
-                    let Some(handle) = self.registry.resolve(&publisher) else {
+                    let Some(handle) = self.registry.resolve_connection(publisher) else {
                         debug_assert!(
                             false,
-                            "a published topic must be live shard={} participant={publisher}",
+                            "a published topic must be live shard={} connection={publisher}",
                             self.shard_id
                         );
                         return;
@@ -362,7 +363,7 @@ impl ShardExecution {
 
     pub(super) fn apply_participant_effect(
         &mut self,
-        participant: crate::entity::ParticipantId,
+        connection: crate::entity::ConnectionId,
         effect: crate::participant::ParticipantEffect,
     ) -> bool {
         let track_id = effect.track_id();
@@ -370,7 +371,7 @@ impl ShardExecution {
         if track_id.is_some() && track_handle.is_none() {
             return false;
         }
-        let Some(handle) = self.registry.resolve(&participant) else {
+        let Some(handle) = self.registry.resolve_connection(connection) else {
             return false;
         };
         let Some(meta) = self.registry.resolve_mut(handle) else {
@@ -406,12 +407,9 @@ impl ShardExecution {
                 let local = plan
                     .local
                     .iter()
-                    .filter_map(|participant| {
-                        let handle = self.registry.resolve(participant);
-                        debug_assert!(
-                            handle.is_some(),
-                            "a track plan must name a live participant"
-                        );
+                    .filter_map(|connection| {
+                        let handle = self.registry.resolve_connection(*connection);
+                        debug_assert!(handle.is_some(), "a track plan must name a live connection");
                         handle
                     })
                     .collect();
@@ -708,7 +706,11 @@ impl ShardExecution {
                     let _ = ack.send(false);
                     return Some(());
                 }
-                let materialized = if self.registry.resolve(&config.participant_id).is_some() {
+                let endpoint = EndpointKey {
+                    room: config.room,
+                    participant: config.participant_id,
+                };
+                let materialized = if self.registry.resolve_endpoint(endpoint).is_some() {
                     // Materialization and plan updates use independent mailboxes. The
                     // controller acknowledges this command before it can stage old
                     // incarnation cleanup, so defer insertion until that cleanup retires
@@ -731,27 +733,21 @@ impl ShardExecution {
                 #[cfg(feature = "sim")]
                 crate::sim_metrics::record_routing_counter("demux_flow_authenticated");
             }
-            ShardCommand::NativeReady {
-                participant,
-                connection_id,
-            } => {
-                if let Some(key) = self.registry.resolve(&participant)
+            ShardCommand::NativeReady { connection_id } => {
+                if let Some(key) = self.registry.resolve_connection(connection_id)
                     && let Some(current) = self.registry.resolve_mut(key)
-                    && current.connection_id == connection_id
                 {
                     current.native_ready();
                     self.dirty.mark(key, current);
                 }
             }
             ShardCommand::PublicationCutoffResult {
-                participant,
                 connection_id,
                 reference,
                 success,
             } => {
-                if let Some(key) = self.registry.resolve(&participant)
+                if let Some(key) = self.registry.resolve_connection(connection_id)
                     && let Some(current) = self.registry.resolve_mut(key)
-                    && current.connection_id == connection_id
                 {
                     current.input(crate::participant::ParticipantInput::PublicationCutoff {
                         reference,
@@ -761,14 +757,12 @@ impl ShardExecution {
                 }
             }
             ShardCommand::AuthorizationResult {
-                participant,
                 connection_id,
                 revision,
                 expiry,
             } => {
-                if let Some(key) = self.registry.resolve(&participant)
+                if let Some(key) = self.registry.resolve_connection(connection_id)
                     && let Some(current) = self.registry.resolve_mut(key)
-                    && current.connection_id == connection_id
                 {
                     current.input(crate::participant::ParticipantInput::Authorization {
                         revision,
@@ -858,7 +852,11 @@ impl ShardExecution {
         cfg: ConnectionConfig,
     ) -> bool {
         debug_assert_eq!(transport.shard(), self.shard_id);
-        if let Some(previous) = self.registry.resolve(&cfg.participant_id) {
+        let endpoint = EndpointKey {
+            room: cfg.room,
+            participant: cfg.participant_id,
+        };
+        if let Some(previous) = self.registry.resolve_endpoint(endpoint) {
             self.timers.cancel(previous);
         }
         let key = self.registry.insert(cfg, transport);
@@ -914,7 +912,7 @@ impl ShardExecution {
                 participant_id: participant.participant_id,
                 connection_id: participant.connection_id,
                 handle: key,
-                room_id: participant.room_id,
+                room_id: participant.room,
             };
             let mut sink = self.pipeline.participant_sink(who);
             if let Some(deadline) = participant.poll(now, &mut sink) {
@@ -1114,11 +1112,9 @@ mod wrong_owner_tests {
             let router = CaptureTransport {
                 frames: std::cell::RefCell::new(Vec::new()),
             };
-            let participant_id = crate::entity::ParticipantId::new();
+            let participant_id = crate::entity::fixture_participant_id();
             let connection_id = crate::entity::ConnectionId::new();
-            let room_id = crate::entity::RoomId::from_external(
-                &crate::entity::RoomExternalId::new("connected-flow").unwrap(),
-            );
+            let room_id = crate::entity::RoomId::new("connected-flow").unwrap();
             let address = NodeTransportAddress::new(TransportRoute::new(owner, 51), 7);
             let handoffs = std::cell::RefCell::new(Vec::new());
             let materialize = |core: &mut ShardCore| {
@@ -1135,12 +1131,8 @@ mod wrong_owner_tests {
                         transport: address,
                         config: Box::new(ConnectionConfig {
                             manual_sub: false,
-                            room_id,
+                            room: crate::entity::ProjectRoomKey::fixture(room_id),
                             participant_id,
-                            participant_external_id: crate::entity::ParticipantExternalId::new(
-                                "peer",
-                            )
-                            .unwrap(),
                             connection_id,
                             profile: crate::control::controller::SignalingProtocol::State,
                             allow_topic_channels: false,
@@ -1160,11 +1152,26 @@ mod wrong_owner_tests {
                 crate::sim_metrics::fail_next_materialization();
                 assert!(!materialize(&mut core).await.unwrap());
                 assert_eq!(core.participant_count(), 0);
-                assert!(core.execution.registry.resolve(&participant_id).is_none());
+                assert!(
+                    core.execution
+                        .registry
+                        .resolve_endpoint(EndpointKey {
+                            room: crate::entity::ProjectRoomKey::fixture(room_id),
+                            participant: participant_id
+                        })
+                        .is_none()
+                );
                 assert!(core.execution.registry.resolve_transport(address).is_none());
             }
             assert!(materialize(&mut core).await.unwrap());
-            let handle = core.execution.registry.resolve(&participant_id).unwrap();
+            let handle = core
+                .execution
+                .registry
+                .resolve_endpoint(EndpointKey {
+                    room: crate::entity::ProjectRoomKey::fixture(room_id),
+                    participant: participant_id,
+                })
+                .unwrap();
             assert_eq!(
                 core.execution.registry.resolve_transport(address),
                 Some(handle)
@@ -1179,7 +1186,7 @@ mod wrong_owner_tests {
                     participant_id,
                     connection_id,
                     handle,
-                    room_id,
+                    room_id: crate::entity::ProjectRoomKey::fixture(room_id),
                 })
                 .connected(source, destination, ingress);
             assert_eq!(core.flush_participant_events(&router, 1), 1);
@@ -1202,7 +1209,12 @@ mod wrong_owner_tests {
     fn replacement_waits_for_old_plans_to_release_the_participant_handle() {
         use crate::route::NodeTransportAddress;
         use crate::shard_update::{ShardUpdateOp, TrackPlan, TrackPlanUpdate, TrackRuntime};
+        use std::io::{Read, Seek};
         use std::time::Duration;
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        const ROOM: &str = "RoomTraceSentinel";
+        const PARTICIPANT: &str = "ParticipantTraceSentinel";
 
         let host_ip = pulsebeam_runtime::testing::test_host_ip("192.168.250.12");
         pulsebeam_runtime::testing::run_local(host_ip, async move {
@@ -1221,7 +1233,7 @@ mod wrong_owner_tests {
             let router = CaptureTransport {
                 frames: std::cell::RefCell::new(Vec::new()),
             };
-            let participant = crate::entity::ParticipantId::new();
+            let participant = crate::entity::ParticipantId::new(PARTICIPANT).unwrap();
             let old_address = NodeTransportAddress::new(TransportRoute::new(shard, 51), 1);
             let new_address = NodeTransportAddress::new(TransportRoute::new(shard, 52), 1);
             let handoffs = std::cell::RefCell::new(Vec::new());
@@ -1236,12 +1248,10 @@ mod wrong_owner_tests {
                     ));
                 ConnectionConfig {
                     manual_sub: false,
-                    room_id: crate::entity::RoomId::from_external(
-                        &crate::entity::RoomExternalId::new("room").unwrap(),
+                    room: crate::entity::ProjectRoomKey::fixture(
+                        crate::entity::RoomId::new(ROOM).unwrap(),
                     ),
                     participant_id: participant,
-                    participant_external_id: crate::entity::ParticipantExternalId::new("peer")
-                        .unwrap(),
                     connection_id,
                     profile: crate::control::controller::SignalingProtocol::State,
                     allow_topic_channels: false,
@@ -1263,8 +1273,34 @@ mod wrong_owner_tests {
                 );
                 received
             };
-            assert!(materialize(&mut core, old_address, config()).await.unwrap());
-            let old_handle = core.execution.registry.resolve(&participant).unwrap();
+            let old = config();
+            let old_id = old.connection_id;
+            let endpoint = EndpointKey {
+                room: old.room,
+                participant,
+            };
+            let mut trace = tempfile::tempfile().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_span_events(FmtSpan::NEW)
+                .with_writer(trace.try_clone().unwrap())
+                .finish();
+            let received = tracing::subscriber::with_default(subscriber, || {
+                materialize(&mut core, old_address, old)
+            });
+            assert!(received.await.unwrap());
+            trace.rewind().unwrap();
+            let mut output = String::new();
+            trace.read_to_string(&mut output).unwrap();
+            assert!(output.contains("participant added to shard"));
+            assert!(output.contains(&format!("connection_id={old_id}")));
+            assert!(!output.contains(ROOM));
+            assert!(!output.contains(PARTICIPANT));
+            let old_handle = core.execution.registry.resolve_endpoint(endpoint).unwrap();
+            assert_eq!(
+                core.execution.registry.resolve_connection(old_id),
+                Some(old_handle)
+            );
             let track_id = crate::entity::ConnectionId::new()
                 .derive_track_id(crate::entity::TrackKind::Audio, "mic");
             writer.stage(
@@ -1278,7 +1314,7 @@ mod wrong_owner_tests {
                 1,
                 vec![TrackPlanUpdate {
                     track_id,
-                    plan: Some(TrackPlan::new([participant], [], None)),
+                    plan: Some(TrackPlan::new([old_id], [], None)),
                 }],
             );
             writer.publish();
@@ -1291,14 +1327,26 @@ mod wrong_owner_tests {
 
             // A rejected candidate and its successor arrive before plan cleanup.
             let rejected_address = NodeTransportAddress::new(TransportRoute::new(shard, 53), 1);
+            let rejected = config();
+            let rejected_id = rejected.connection_id;
             assert!(
-                materialize(&mut core, rejected_address, config())
+                materialize(&mut core, rejected_address, rejected)
                     .await
                     .unwrap()
             );
-            assert!(materialize(&mut core, new_address, config()).await.unwrap());
+            let replacement = config();
+            let replacement_id = replacement.connection_id;
+            assert!(
+                materialize(&mut core, new_address, replacement)
+                    .await
+                    .unwrap()
+            );
             assert_eq!(
-                core.execution.registry.resolve(&participant),
+                core.execution.registry.resolve_connection(replacement_id),
+                None
+            );
+            assert_eq!(
+                core.execution.registry.resolve_endpoint(endpoint),
                 Some(old_handle)
             );
             assert_eq!(core.execution.registry.resolve_transport(new_address), None);
@@ -1317,7 +1365,7 @@ mod wrong_owner_tests {
             writer.stage(
                 2,
                 ShardUpdateOp::RemoveParticipant {
-                    participant,
+                    connection: rejected_id,
                     address: rejected_address,
                 },
             );
@@ -1330,7 +1378,7 @@ mod wrong_owner_tests {
             writer.stage(
                 2,
                 ShardUpdateOp::RemoveParticipant {
-                    participant,
+                    connection: old_id,
                     address: old_address,
                 },
             );
@@ -1338,8 +1386,13 @@ mod wrong_owner_tests {
             let turn_started = Instant::now();
             pulsebeam_runtime::time::sleep(Duration::from_millis(50)).await;
             assert_eq!(core.apply_updates(1), 1);
-            let new_handle = core.execution.registry.resolve(&participant).unwrap();
+            let new_handle = core.execution.registry.resolve_endpoint(endpoint).unwrap();
             assert_ne!(new_handle, old_handle);
+            assert_eq!(core.execution.registry.resolve_connection(old_id), None);
+            assert_eq!(
+                core.execution.registry.resolve_connection(replacement_id),
+                Some(new_handle)
+            );
             assert!(core.execution.pending_replacements.is_empty());
             assert_eq!(
                 core.execution.registry.resolve_transport(rejected_address),
@@ -1376,17 +1429,56 @@ mod wrong_owner_tests {
             writer.stage(
                 3,
                 ShardUpdateOp::RemoveParticipant {
-                    participant,
+                    connection: old_id,
                     address: old_address,
                 },
             );
             writer.publish();
             assert_eq!(core.apply_updates(1), 1);
             assert_eq!(
-                core.execution.registry.resolve(&participant),
+                core.execution.registry.resolve_endpoint(endpoint),
                 Some(new_handle)
             );
             assert!(core.next_timer_deadline().is_some());
+
+            let mut other = config();
+            other.room.project = crate::entity::ProjectId::new();
+            let other_connection = other.connection_id;
+            let other_endpoint = EndpointKey {
+                room: other.room,
+                participant,
+            };
+            let other_address = NodeTransportAddress::new(TransportRoute::new(shard, 54), 1);
+            assert!(materialize(&mut core, other_address, other).await.unwrap());
+            let other_handle = core
+                .execution
+                .registry
+                .resolve_endpoint(other_endpoint)
+                .unwrap();
+            assert_ne!(other_handle, new_handle);
+            assert_eq!(
+                core.execution.registry.resolve_connection(other_connection),
+                Some(other_handle)
+            );
+            assert_eq!(
+                core.execution.registry.resolve_endpoint(endpoint),
+                Some(new_handle)
+            );
+            assert!(core.execution.pending_replacements.is_empty());
+
+            writer.stage_plans(
+                4,
+                vec![TrackPlanUpdate {
+                    track_id,
+                    plan: Some(TrackPlan::new([replacement_id], [], None)),
+                }],
+            );
+            writer.publish();
+            assert_eq!(core.apply_updates(1), 1);
+            assert_eq!(
+                core.execution.plans.get(track_handle).unwrap().local,
+                [new_handle]
+            );
         });
     }
 

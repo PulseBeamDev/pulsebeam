@@ -85,6 +85,8 @@ pub struct VideoAllocator {
     fairness: AllocationFairness,
     #[cfg(feature = "sim")]
     allocation_pass: u64,
+    #[cfg(feature = "sim")]
+    simulator_subscriber: Option<crate::entity::ParticipantId>,
     #[cfg(test)]
     test_keys: SlotMap<TrackHandle, ()>,
     #[cfg(test)]
@@ -118,6 +120,11 @@ impl DerefMut for DownstreamVideo {
 }
 
 impl VideoAllocator {
+    #[cfg(feature = "sim")]
+    pub(crate) fn set_simulator_subscriber(&mut self, participant: crate::entity::ParticipantId) {
+        self.simulator_subscriber = Some(participant);
+    }
+
     pub(crate) fn new(ctx: LogCtx, manual_sub: bool) -> Self {
         let desired_ctrl = BitrateControllerConfig {
             min_bitrate: START_BANDWIDTH,
@@ -142,6 +149,8 @@ impl VideoAllocator {
             fairness: AllocationFairness::default(),
             #[cfg(feature = "sim")]
             allocation_pass: 0,
+            #[cfg(feature = "sim")]
+            simulator_subscriber: None,
             #[cfg(test)]
             test_keys: SlotMap::with_key(),
             #[cfg(test)]
@@ -506,11 +515,13 @@ impl VideoAllocator {
         // out without the `sim` feature.
         #[cfg(feature = "sim")]
         if !views.is_empty() {
-            crate::sim_metrics::record_downstream_bwe_for(
-                self.ctx.participant_id,
-                crate::bitrate::saturating_bps(available_bandwidth.as_f64()),
-                crate::bitrate::saturating_bps(desired.as_f64()),
-            );
+            if let Some(subscriber) = self.simulator_subscriber {
+                crate::sim_metrics::record_downstream_bwe_for(
+                    subscriber,
+                    crate::bitrate::saturating_bps(available_bandwidth.as_f64()),
+                    crate::bitrate::saturating_bps(desired.as_f64()),
+                );
+            }
             for view in &views {
                 if tracing::enabled!(target: "pulsebeam_sim_qos", tracing::Level::DEBUG) {
                     let layers: Vec<_> = view
@@ -522,10 +533,10 @@ impl VideoAllocator {
                     // Exact frozen inputs and charged decision from this pass.
                     // Layer measurements are ingress estimates, not wire egress.
                     tracing::debug!(target: "pulsebeam_sim_qos",
-                        participant = ?self.ctx.participant_id,
+                        connection_id = %self.ctx.connection_id,
                         pass = self.allocation_pass,
                         slot = ?view.key,
-                        origin = ?view.track.meta().origin,
+                        source_connection_id = %view.track.meta().connection_id,
                         target_height = view.max_height,
                         min_height = view.min_height,
                         min_fps = view.min_fps,
@@ -2204,7 +2215,7 @@ mod assignment_tests {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::alloc_test_support::*;
     use super::*;
-    use crate::entity::{ParticipantId, TrackId, TrackKind};
+    use crate::entity::{ConnectionId, ParticipantId, TrackId, TrackKind};
     use crate::participant::event::test_utils::MockParticipantSink;
     use crate::rtp::RtpPacket;
     use crate::track::{LayerQuality, UpstreamTrack};
@@ -2218,10 +2229,8 @@ mod assignment_tests {
     }
 
     fn test_ctx() -> LogCtx {
-        use crate::entity::{RoomExternalId, RoomId};
         LogCtx {
-            room_id: RoomId::from_external(&RoomExternalId::new("test").unwrap()),
-            participant_id: ParticipantId::new(),
+            connection_id: ConnectionId::new(),
         }
     }
 
@@ -2230,7 +2239,7 @@ mod assignment_tests {
     }
 
     fn add_tracks(allocator: &mut VideoAllocator, count: usize) -> TestTracks {
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
 
         let mut senders = Vec::new();
         let mut ids = Vec::new();
@@ -2260,7 +2269,7 @@ mod assignment_tests {
 
     #[test]
     fn allocation_snapshot_exposes_per_encoding_decode_target_count() {
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let (tx, built, mut states) = video_track_with_states(
             pid,
             Mid::from("v0"),
@@ -2326,7 +2335,7 @@ mod assignment_tests {
     #[test]
     fn native_h264_t1_capacity_does_not_create_cheaper_temporal_choices() {
         let (tx, built, mut states) = video_track_with_states(
-            ParticipantId::new(),
+            crate::entity::fixture_participant_id(),
             Mid::from("v0"),
             vec![SimulcastLayer::new("f")],
         );
@@ -2379,7 +2388,7 @@ mod assignment_tests {
     #[test]
     fn congestion_resume_uses_native_minimum_headroom_without_dwell() {
         let (tx, built, mut states) = video_track_with_states(
-            ParticipantId::new(),
+            crate::entity::fixture_participant_id(),
             Mid::from("v0"),
             vec![SimulcastLayer::new("f")],
         );
@@ -2467,7 +2476,7 @@ mod assignment_tests {
     #[test]
     fn congestion_resume_selects_temporal_target_with_reserve() {
         let (tx, built, mut states) = video_track_with_states(
-            ParticipantId::new(),
+            crate::entity::fixture_participant_id(),
             Mid::from("v0"),
             vec![SimulcastLayer::new("f")],
         );
@@ -2477,7 +2486,7 @@ mod assignment_tests {
             .update_for_test()
             .bitrate(820_000);
         let (tx, built, background_states) = video_track_with_states(
-            ParticipantId::new(),
+            crate::entity::fixture_participant_id(),
             Mid::from("v1"),
             vec![SimulcastLayer::new("f")],
         );
@@ -2554,7 +2563,7 @@ mod assignment_tests {
 
     #[test]
     fn retention_uses_headroom_without_overspending_the_estimate() {
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let (tx, built, mut states) = video_track_with_states(
             pid,
             Mid::from("v0"),
@@ -2605,7 +2614,7 @@ mod assignment_tests {
 
     #[test]
     fn spatial_minimum_raises_target_and_degrades_when_source_cannot_meet_it() {
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let (tx, built, mut states) = video_track_with_states(
             pid,
             Mid::from("v0"),
@@ -2669,7 +2678,7 @@ mod assignment_tests {
     #[test]
     fn configuring_an_unavailable_spatial_minimum_keeps_best_effort_forwarding() {
         let mut allocator = setup_allocator();
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let (tx, built, states) = video_track_with_states(
             pid,
             Mid::from("v0"),
@@ -2975,7 +2984,7 @@ mod assignment_tests {
 
     #[test]
     fn staging_preserves_old_route_until_switch_complete() {
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -3080,7 +3089,7 @@ mod assignment_tests {
 
     #[test]
     fn does_not_promote_staging_before_staging_packets() {
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -3229,7 +3238,7 @@ mod assignment_tests {
 
     #[test]
     fn switch_to_accepts_ongoing_upgrade() {
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -3260,7 +3269,7 @@ mod assignment_tests {
 
     #[test]
     fn switch_to_cancels_transition_when_target_reverts_to_active() {
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -3292,7 +3301,7 @@ mod assignment_tests {
 
     #[test]
     fn switch_to_allows_downgrade_during_transition() {
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let mut allocator = setup_allocator();
 
         let mid = Mid::from("v0");
@@ -3416,7 +3425,7 @@ mod assignment_tests {
         }
 
         // Trigger rebalance with a new incoming track.
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let (tx, track, states) = video_track_with_states(pid, Mid::from("late"), vec![]);
         allocator.seed_layer_states(&states);
         allocator.add_track(Track::video(tx.meta, track.layers().to_vec(), None));
@@ -3445,7 +3454,7 @@ mod assignment_tests {
         let key = allocator.track_handles[&tracks.ids[1]];
         allocator.deactivate_track_binding(key, tracks.ids[1]);
         allocator.remove_track(&tracks.ids[1]);
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let (tx, track, states) = video_track_with_states(pid, Mid::from("new_track"), vec![]);
         let meta = tx.meta.clone();
         tracks.senders.push(tx);
@@ -3457,7 +3466,7 @@ mod assignment_tests {
     #[test]
     fn same_slot_switching_same_track_is_not_duplicate_assignment() {
         let mut allocator = setup_allocator();
-        let pid = ParticipantId::new();
+        let pid = crate::entity::fixture_participant_id();
         let (tx, track, states) = video_track_with_states(
             pid,
             Mid::from("t"),
@@ -3504,7 +3513,7 @@ mod slot_switch_tests {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::alloc_test_support::*;
     use super::*;
-    use crate::entity::ParticipantId;
+    use crate::entity::{ConnectionId, ParticipantId};
     use crate::log::LogCtx;
     use crate::rtp::conformance::assert_decodable;
     use crate::rtp::test_utils::{H264StreamBuilder, ParameterSetStyle};
@@ -3514,10 +3523,8 @@ mod slot_switch_tests {
     use crate::media::SimulcastLayer;
 
     fn test_ctx() -> LogCtx {
-        use crate::entity::{RoomExternalId, RoomId};
         LogCtx {
-            room_id: RoomId::from_external(&RoomExternalId::new("test").unwrap()),
-            participant_id: ParticipantId::new(),
+            connection_id: ConnectionId::new(),
         }
     }
 
@@ -3533,7 +3540,7 @@ mod slot_switch_tests {
 
     impl Fixture {
         fn new() -> Self {
-            let pid = ParticipantId::new();
+            let pid = crate::entity::fixture_participant_id();
             let (_, track, _states) = video_track_with_states(
                 pid,
                 Mid::from("v0"),

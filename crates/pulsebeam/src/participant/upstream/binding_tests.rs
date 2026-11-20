@@ -2,14 +2,11 @@ use super::*;
 use crate::{entity, track};
 
 fn publisher() -> (Upstream, entity::ParticipantId, entity::ConnectionId) {
-    let room_id =
-        entity::RoomId::from_external(&entity::RoomExternalId::new("binding-room").unwrap());
-    let participant_id = entity::ParticipantId::new();
-    let ctx = LogCtx {
-        room_id,
-        participant_id,
-    };
+    let participant_id = crate::entity::fixture_participant_id();
     let connection = entity::ConnectionId::new();
+    let ctx = LogCtx {
+        connection_id: connection,
+    };
     (Upstream::new(ctx, connection), participant_id, connection)
 }
 

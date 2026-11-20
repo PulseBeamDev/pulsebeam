@@ -4,7 +4,7 @@
 )]
 mod rtp_relay;
 
-use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
+use pulsebeam_core::identity::{ParticipantId, RoomId};
 use std::env;
 use std::error::Error;
 use std::io;
@@ -35,8 +35,8 @@ use tokio::task::{JoinHandle, JoinSet};
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 pub fn mint_development_token(
-    room: &RoomExternalId,
-    participant: &ParticipantExternalId,
+    room: &RoomId,
+    participant: &ParticipantId,
     expires_at: u64,
 ) -> TestResult<String> {
     Ok(pulsebeam_server::sign_participant_token(

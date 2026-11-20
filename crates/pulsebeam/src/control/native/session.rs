@@ -15,7 +15,7 @@ use super::{ExecutionDisposition, ResourceExecution, ResourcePermissions};
 enum Key {
     Session,
     Owned(u64),
-    Participant(String),
+    Participant((String, String)),
     Track(String),
 }
 
@@ -26,7 +26,12 @@ impl Key {
             key: Some(match self {
                 Self::Session => Value::Session(true),
                 Self::Owned(value) => Value::Owned(*value),
-                Self::Participant(value) => Value::Participant(value.clone()),
+                Self::Participant((room_id, participant_id)) => {
+                    Value::Participant(wire::Participant {
+                        room_id: room_id.clone(),
+                        participant_id: participant_id.clone(),
+                    })
+                }
                 Self::Track(value) => Value::Track(value.clone()),
             }),
         }
@@ -787,7 +792,7 @@ impl NativeSession {
                 || matches!(
                     spec.declaration.as_ref(),
                     Some(wire::resource_spec::Declaration::Subscription(subscription))
-                        if crate::entity::RoomExternalId::new(&subscription.source_room).is_err()
+                        if crate::entity::RoomId::new(&subscription.source_room).is_err()
                 )
                 || existing.is_some_and(|owned| {
                     !validation::declarations_equivalent(&owned.declaration, spec)
@@ -941,7 +946,7 @@ impl NativeSession {
     fn lookup_interest_bytes(address: &wire::LogicalSourceAddress) -> usize {
         std::mem::size_of::<(u64, wire::LogicalSourceAddress)>()
             .saturating_add(address.room.len())
-            .saturating_add(address.participant_external_id.len())
+            .saturating_add(address.participant_id.len())
             .saturating_add(address.label.len())
     }
 
@@ -1280,9 +1285,8 @@ impl NativeSession {
                     .ok_or(OutputError::InvalidObservation)?;
                 source(address).and_then(|source| {
                     let track = track_descriptor(source.track)?;
-                    let publisher = source.publisher.as_str();
-                    (track.participant_id == source.track.meta().origin.as_str()
-                        && source.publisher.as_str() == address.participant_external_id
+                    (track.room_id == address.room
+                        && track.participant_id == address.participant_id
                         && track.label == address.label
                         && track.kind.as_ref().is_some_and(|kind| match kind {
                             wire::track::Kind::Audio(_) => {
@@ -1298,8 +1302,8 @@ impl NativeSession {
                     .then(|| {
                         (
                             wire::Participant {
-                                participant_id: source.track.meta().origin.as_str(),
-                                participant_external_id: publisher.to_owned(),
+                                participant_id: track.participant_id.clone(),
+                                room_id: track.room_id.clone(),
                             },
                             track,
                         )
@@ -1524,8 +1528,8 @@ impl NativeSession {
         let track = track_descriptor(source.track)
             .ok_or_else(|| failure(wire::FailureCode::Incompatible))?;
         let participant = wire::Participant {
-            participant_id: source.track.meta().origin.as_str(),
-            participant_external_id: source.publisher.as_str().to_owned(),
+            participant_id: track.participant_id.clone(),
+            room_id: track.room_id.clone(),
         };
         validation::validate_participant(&participant)
             .and_then(|_| validation::validate_track(&track))
@@ -1544,7 +1548,7 @@ impl NativeSession {
                 },
             )?;
         let plan = Receiver {
-            source_room: source.track.meta().room_id,
+            source_room: source.track.meta().room,
             source: source.track.clone(),
             source_id: track.track_id.clone(),
             transport,
@@ -1627,7 +1631,7 @@ impl NativeSession {
     pub(crate) fn observe_completion(
         &mut self,
         completion: super::ExecutionCompletion,
-        external_id: &crate::entity::ParticipantExternalId,
+        external_id: &crate::entity::ParticipantId,
     ) -> Result<(), OutputError> {
         let super::ExecutionCompletion {
             work,
@@ -1660,7 +1664,7 @@ impl NativeSession {
         &mut self,
         work: Preparation,
         result: Result<ResourceExecution, crate::participant::policy::ExecutionFailure>,
-        external_id: &crate::entity::ParticipantExternalId,
+        external_id: &crate::entity::ParticipantId,
         unix_now: u64,
     ) -> Result<ExecutionDisposition, OutputError> {
         let projected = result
@@ -1886,7 +1890,7 @@ impl NativeSession {
         &self,
         work: &Preparation,
         execution: &crate::participant::policy::PublicationExecution,
-        external_id: &crate::entity::ParticipantExternalId,
+        external_id: &crate::entity::ParticipantId,
     ) -> Result<ProjectedExecution, wire::Failure> {
         let spec = self
             .preparation_spec(work)
@@ -1900,8 +1904,8 @@ impl NativeSession {
         let live = wire::LiveResource {
             spec: Some(spec.clone()),
             participant: Some(wire::Participant {
-                participant_id: execution.track.meta().origin.as_str(),
-                participant_external_id: external_id.as_str().to_owned(),
+                participant_id: execution.track.meta().origin.as_str().to_owned(),
+                room_id: execution.track.meta().room.room.as_str().to_owned(),
             }),
             track: track_descriptor(&execution.track),
             execution: if execution.enabled {
@@ -2377,7 +2381,8 @@ fn progress_deadline(at: pulsebeam_runtime::time::Instant) -> pulsebeam_runtime:
 
 fn key_cost(key: &Key) -> usize {
     let text = match key {
-        Key::Participant(id) | Key::Track(id) => id.len(),
+        Key::Participant((room, participant)) => room.len().saturating_add(participant.len()),
+        Key::Track(id) => id.len(),
         _ => 0,
     };
     // Track observations fund the indexed native source runtime and its bounded work queue.
@@ -2400,8 +2405,8 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
     let identity = "x".repeat(128);
     let diagnostic = "x".repeat(256);
     let participant = wire::Participant {
-        participant_id: identity.clone(),
-        participant_external_id: diagnostic.clone(),
+        participant_id: "x".repeat(36),
+        room_id: "x".repeat(36),
     };
     let format = wire::CodecFormat::from(wire::codec_format::Codec::Opus(wire::OpusParameters {
         stereo: Some(true),
@@ -2416,7 +2421,8 @@ fn live_fits(spec: &wire::ResourceSpec) -> bool {
     }));
     let track = wire::Track {
         track_id: identity.clone(),
-        participant_id: identity,
+        participant_id: participant.participant_id.clone(),
+        room_id: participant.room_id.clone(),
         label: diagnostic.clone(),
         kind: Some(wire::track::Kind::Audio(wire::AudioTrack {
             format: Some(format),
@@ -2517,7 +2523,8 @@ pub(crate) fn track_descriptor(track: &crate::track::Track) -> Option<wire::Trac
     };
     Some(wire::Track {
         track_id: track.id().as_str(),
-        participant_id: track.meta().origin.as_str(),
+        participant_id: track.meta().origin.as_str().to_owned(),
+        room_id: track.meta().room.room.as_str().to_owned(),
         label: track.meta().label.clone()?,
         kind: Some(kind),
     })

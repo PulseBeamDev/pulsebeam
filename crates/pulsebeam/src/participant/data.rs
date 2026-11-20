@@ -232,7 +232,7 @@ impl DataState {
 mod tests {
     use super::*;
     use crate::{
-        entity::{ConnectionId, ParticipantId, RoomExternalId, RoomId, TrackKind},
+        entity::{ConnectionId, ParticipantId, RoomId, TrackKind},
         id::ShardId,
         track::{DataLane, Topic},
     };
@@ -264,10 +264,12 @@ mod tests {
         let make_track = |id, label: &str| {
             Track::data(
                 TrackMeta {
-                    room_id: RoomId::from_external(&RoomExternalId::new("data-routing").unwrap()),
+                    room: crate::entity::ProjectRoomKey::fixture(
+                        RoomId::new("data-routing").unwrap(),
+                    ),
                     shard_id: ShardId::new(0),
                     id,
-                    origin: ParticipantId::new(),
+                    origin: crate::entity::fixture_participant_id(),
                     connection_id: connection,
                     label: Some(label.into()),
                 },
@@ -343,10 +345,10 @@ mod tests {
         let lane = DataLane::Latest;
         let label = crate::track::publication_label(lane, &topic);
         let meta = TrackMeta {
-            room_id: RoomId::from_external(&RoomExternalId::new("data-lifecycle").unwrap()),
+            room: crate::entity::ProjectRoomKey::fixture(RoomId::new("data-lifecycle").unwrap()),
             shard_id: ShardId::new(0),
             id: connection_id.derive_track_id(TrackKind::Data, &label),
-            origin: ParticipantId::new(),
+            origin: crate::entity::fixture_participant_id(),
             connection_id,
             label: Some(label),
         };

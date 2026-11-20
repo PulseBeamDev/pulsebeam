@@ -24,8 +24,8 @@ use pulsebeam_core::auth::{
     DEVELOPMENT_PROJECT_ID, KeyRegistry, KeyRegistryEntry,
 };
 use pulsebeam_core::identity::{
-    ApiKeyId, AudioTrackId, ConnectionId, DataTrackId, ParticipantExternalId, ParticipantId,
-    ProjectId, RoomExternalId, RoomId, VideoTrackId,
+    ApiKeyId, AudioTrackId, ConnectionId, DataTrackId, ParticipantId, ProjectId, RoomId,
+    VideoTrackId,
 };
 use std::{
     collections::BTreeSet,
@@ -231,9 +231,9 @@ enum KeyCommand {
 #[derive(Args)]
 struct TokenConfig {
     #[arg(long)]
-    room: RoomExternalId,
+    room: RoomId,
     #[arg(long)]
-    participant: ParticipantExternalId,
+    participant: ParticipantId,
     /// Token lifetime in seconds
     #[arg(long, default_value_t = 3_600)]
     ttl: u64,
@@ -251,7 +251,7 @@ struct RoomIdConfig {
     #[arg(long)]
     project_id: ProjectId,
     #[arg(long)]
-    room_external_id: RoomExternalId,
+    room_id: RoomId,
 }
 
 #[derive(Args)]
@@ -259,9 +259,9 @@ struct ParticipantIdConfig {
     #[arg(long)]
     project_id: ProjectId,
     #[arg(long)]
-    room_external_id: RoomExternalId,
+    room_id: RoomId,
     #[arg(long)]
-    participant_external_id: ParticipantExternalId,
+    participant_id: ParticipantId,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -360,8 +360,8 @@ fn main() -> Result<()> {
 }
 
 fn mint_development_token(
-    room: &RoomExternalId,
-    participant: &ParticipantExternalId,
+    room: &RoomId,
+    participant: &ParticipantId,
     expiration: u64,
 ) -> Result<String> {
     if room.as_str().contains('*') {
@@ -468,13 +468,8 @@ fn print_key_material(api_key: &str, registry: &KeyRegistry) -> Result<()> {
 
 fn derive_id(command: IdCommand) -> String {
     match command {
-        IdCommand::Room(config) => {
-            RoomId::derive(&config.project_id, &config.room_external_id).as_str()
-        }
-        IdCommand::Participant(config) => {
-            let room = RoomId::derive(&config.project_id, &config.room_external_id);
-            ParticipantId::derive(&room, &config.participant_external_id).as_str()
-        }
+        IdCommand::Room(config) => config.room_id.to_string(),
+        IdCommand::Participant(config) => config.participant_id.to_string(),
         IdCommand::Track(config) => match config.kind {
             TrackKindArg::Audio => {
                 AudioTrackId::derive(&config.connection_id, &config.label).as_str()
@@ -712,8 +707,8 @@ fn benchmark_agent_config(
     duration: Duration,
     now: u64,
 ) -> Result<AgentConfig> {
-    let room = RoomExternalId::new(room_name)?;
-    let participant = ParticipantExternalId::new(&format!("bench-{agent_id}"))?;
+    let room = RoomId::new(room_name)?;
+    let participant = ParticipantId::new(&format!("bench-{agent_id}"))?;
     let exp = now.saturating_add(duration.as_secs()).saturating_add(60);
     Ok(AgentConfig {
         endpoint: api_url.to_string(),
@@ -801,7 +796,7 @@ async fn subscribe_remote_videos(
     for selector in video_subscriptions(ctx.room_id, ctx.agent_id, ctx.users_per_room, interests) {
         let subscription = agent
             .room(selector.room.clone())?
-            .participant(selector.participant_external_id.clone())?
+            .participant(selector.participant_id.clone())?
             .video(selector.label.clone())?
             .subscribe(VideoObservation {
                 visible: true,
@@ -830,7 +825,7 @@ fn video_subscriptions(
 ) -> Vec<TrackSelector> {
     let mut participants: BTreeSet<_> = interests
         .iter()
-        .map(|selector| selector.participant_external_id.clone())
+        .map(|selector| selector.participant_id.clone())
         .collect();
     let remaining = usize::from(REMOTE_VIDEO_SLOTS).saturating_sub(interests.len());
     let mut subscriptions = Vec::new();
@@ -842,13 +837,13 @@ fn video_subscriptions(
         if peer_id == agent_id {
             continue;
         }
-        let participant_external_id = format!("bench-{peer_id}");
-        if !participants.insert(participant_external_id.clone()) {
+        let participant_id = format!("bench-{peer_id}");
+        if !participants.insert(participant_id.clone()) {
             continue;
         }
         subscriptions.push(TrackSelector {
             room: format!("bench-room-{room_id}"),
-            participant_external_id,
+            participant_id,
             label: "camera".into(),
         });
     }
@@ -1206,21 +1201,21 @@ mod tests {
         let alice_auth = verify_participant_token(
             &development_registry(),
             &alice.token,
-            RoomExternalId::new("bench-room-7").unwrap(),
+            RoomId::new("bench-room-7").unwrap(),
             1_000,
         )
         .unwrap();
         let bob_auth = verify_participant_token(
             &development_registry(),
             &bob.token,
-            RoomExternalId::new("bench-room-7").unwrap(),
+            RoomId::new("bench-room-7").unwrap(),
             1_000,
         )
         .unwrap();
-        assert_eq!(alice_auth.room_external_id.as_str(), "bench-room-7");
-        assert_eq!(bob_auth.room_external_id.as_str(), "bench-room-7");
-        assert_eq!(alice_auth.participant_external_id.as_str(), "bench-7000");
-        assert_eq!(bob_auth.participant_external_id.as_str(), "bench-7001");
+        assert_eq!(alice_auth.room_id.as_str(), "bench-room-7");
+        assert_eq!(bob_auth.room_id.as_str(), "bench-room-7");
+        assert_eq!(alice_auth.participant_id.as_str(), "bench-7000");
+        assert_eq!(bob_auth.participant_id.as_str(), "bench-7001");
         assert_ne!(alice_auth.participant_id, bob_auth.participant_id);
         assert_eq!(alice_auth.expiry.unix_seconds(), 1_180);
         assert_eq!(bob_auth.expiry.unix_seconds(), 1_180);
@@ -1244,14 +1239,10 @@ mod tests {
         };
         let token = development_token_at(config, 1_000).unwrap();
         let registry = development_registry();
-        let verified = verify_participant_token(
-            &registry,
-            &token,
-            RoomExternalId::new("general").unwrap(),
-            1_999,
-        )
-        .unwrap();
-        assert_eq!(verified.participant_external_id.as_str(), "alice");
+        let verified =
+            verify_participant_token(&registry, &token, RoomId::new("general").unwrap(), 1_999)
+                .unwrap();
+        assert_eq!(verified.participant_id.as_str(), "alice");
         assert_eq!(verified.expiry.unix_seconds(), 2_000);
         assert_eq!(
             serde_json::to_value(verified.grants).unwrap(),
@@ -1291,14 +1282,14 @@ mod tests {
     #[test]
     fn token_command_rejects_zero_or_overflowing_ttl() {
         let config = TokenConfig {
-            room: RoomExternalId::new("general").unwrap(),
-            participant: ParticipantExternalId::new("alice").unwrap(),
+            room: RoomId::new("general").unwrap(),
+            participant: ParticipantId::new("alice").unwrap(),
             ttl: 0,
         };
         assert!(development_token_at(config, 1_000).is_err());
         let config = TokenConfig {
-            room: RoomExternalId::new("general").unwrap(),
-            participant: ParticipantExternalId::new("alice").unwrap(),
+            room: RoomId::new("general").unwrap(),
+            participant: ParticipantId::new("alice").unwrap(),
             ttl: 1,
         };
         assert!(development_token_at(config, u64::MAX).is_err());
@@ -1327,9 +1318,8 @@ mod tests {
             panic!("id command must parse as id");
         };
 
-        let room = RoomId::derive(&project, &RoomExternalId::new("general").unwrap());
-        let participant =
-            ParticipantId::derive(&room, &ParticipantExternalId::new("alice").unwrap());
+        let room = RoomId::new("general").unwrap();
+        let participant = ParticipantId::new("alice").unwrap();
         assert_eq!(
             derive_id(command),
             VideoTrackId::derive(&connection, "camera").as_str()
@@ -1341,7 +1331,7 @@ mod tests {
             "room",
             "--project-id",
             &project_text,
-            "--room-external-id",
+            "--room-id",
             "general",
         ])
         .expect("room identity arguments must parse");
@@ -1356,9 +1346,9 @@ mod tests {
             "participant",
             "--project-id",
             &project_text,
-            "--room-external-id",
+            "--room-id",
             "general",
-            "--participant-external-id",
+            "--participant-id",
             "alice",
         ])
         .expect("participant identity arguments must parse");
@@ -1446,7 +1436,7 @@ mod tests {
             assert!(subscriptions.iter().all(|selector| {
                 selector.room == "bench-room-1"
                     && selector.label == "camera"
-                    && selector.participant_external_id != "bench-1000"
+                    && selector.participant_id != "bench-1000"
             }));
             let interests: BTreeSet<_> = subscriptions.into_iter().collect();
             assert!(video_subscriptions(1, 1000, users_per_room, &interests).is_empty());
@@ -1456,7 +1446,7 @@ mod tests {
         assert_eq!(
             subscriptions
                 .iter()
-                .map(|selector| selector.participant_external_id.as_str())
+                .map(|selector| selector.participant_id.as_str())
                 .collect::<Vec<_>>(),
             ["bench-1000", "bench-1001", "bench-1003"]
         );
@@ -1464,7 +1454,7 @@ mod tests {
         let remaining = video_subscriptions(1, 1002, 4, &BTreeSet::from([retained.clone()]));
         assert_eq!(remaining, subscriptions[1..]);
         assert_eq!(retained.room, "bench-room-1");
-        assert_eq!(retained.participant_external_id, "bench-1000");
+        assert_eq!(retained.participant_id, "bench-1000");
         assert_eq!(retained.label, "camera");
     }
 }

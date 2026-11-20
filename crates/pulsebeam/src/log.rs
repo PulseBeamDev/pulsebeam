@@ -1,29 +1,26 @@
 //! This module defines cross-cutting tracing targets.
 
-use crate::entity::{ParticipantId, RoomId};
+use crate::entity::ConnectionId;
 
 pub(crate) const TARGET_VIDEO: &str = "pulsebeam::x::video";
 pub(crate) const TARGET_AUDIO: &str = "pulsebeam::x::audio";
 
 #[derive(Clone, Copy)]
 pub(crate) struct LogCtx {
-    pub room_id: RoomId,
-    pub participant_id: ParticipantId,
+    pub connection_id: ConnectionId,
 }
 
 macro_rules! plog {
     ($level:ident, $ctx:expr, target: $target:expr, $($rest:tt)*) => {
         ::tracing::$level!(
             target: $target,
-            room_id = %$ctx.room_id,
-            participant_id = %$ctx.participant_id,
+            connection_id = %$ctx.connection_id,
             $($rest)*
         )
     };
     ($level:ident, $ctx:expr, $($rest:tt)*) => {
         ::tracing::$level!(
-            room_id = %$ctx.room_id,
-            participant_id = %$ctx.participant_id,
+            connection_id = %$ctx.connection_id,
             $($rest)*
         )
     };

@@ -445,7 +445,7 @@ impl Connection {
                 .derive_publication_track_id(TrackKind::Data, &label, incarnation);
         let track = Track::data_publication(
             track::TrackMeta {
-                room_id: self.room_id,
+                room: self.room,
                 shard_id: self.shard_id,
                 id,
                 origin: self.participant_id,

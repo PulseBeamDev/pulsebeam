@@ -21,11 +21,11 @@ pub(crate) trait ParticipantSink {
     fn set_owned_subscription(
         &mut self,
         reference: u64,
-        source_room: crate::entity::RoomId,
+        source_room: crate::entity::ProjectRoomKey,
         track: crate::entity::TrackId,
         enabled: bool,
     );
-    fn unsubscribe_owned(&mut self, reference: u64, source_room: crate::entity::RoomId);
+    fn unsubscribe_owned(&mut self, reference: u64, source_room: crate::entity::ProjectRoomKey);
     fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy);
     fn unsubscribe_tracks(&mut self, selector: TrackSelector);
     fn request_reverse(&mut self, stream: TrackHandle, packet: ReversePacket);
@@ -100,13 +100,17 @@ pub mod test_utils {
         fn set_owned_subscription(
             &mut self,
             reference: u64,
-            _source_room: crate::entity::RoomId,
+            _source_room: crate::entity::ProjectRoomKey,
             track: TrackId,
             enabled: bool,
         ) {
             self.owned_subscriptions.push((reference, track, enabled));
         }
-        fn unsubscribe_owned(&mut self, reference: u64, _source_room: crate::entity::RoomId) {
+        fn unsubscribe_owned(
+            &mut self,
+            reference: u64,
+            _source_room: crate::entity::ProjectRoomKey,
+        ) {
             self.owned_unsubscribes.push(reference);
         }
 

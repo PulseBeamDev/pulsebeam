@@ -61,7 +61,7 @@ this README.
 `watch.state()` and observe its current-first, coalesced `watch.updates()` cursor.
 Distinguish `WatchStatus.Loading`, `Live`, `Failed` and `Closed`; loading is not an
 empty result. A Live `state.page` contains immutable participant metadata with
-`id`, application `externalId` and `publications`, including presence-only entries.
+application `id` and `publications`, including presence-only entries.
 
 The default limit is 100, maximum 500, with eight pending/live watches per Agent.
 Use `page.hasMore` and `page.nextCursor` to explicitly replace the watch for the
@@ -71,7 +71,7 @@ fail explicitly. Offer a first-page restart without a cursor. Retained page
 values stay stable while the SDK retains only its current page.
 
 Discover and Subscribe are independent permissions. Convert selected metadata to
-pinned references using `room.participant(info.externalId)` and the publication's
+pinned references using `room.participant(info.id)` and the publication's
 kind and label; lookup does not subscribe. Known-address reception does not need
 Discover. Skip self when creating receive owners. There is no global participant
 collection, participant publication listing, or catalog/mapping/media field in

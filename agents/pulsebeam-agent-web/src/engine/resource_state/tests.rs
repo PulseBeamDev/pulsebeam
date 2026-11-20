@@ -15,7 +15,7 @@ fn config() -> AgentConfig {
 fn selector(label: &str) -> TrackSelector {
     TrackSelector {
         room: "room".into(),
-        participant_external_id: "alice".into(),
+        participant_id: "alice".into(),
         label: label.into(),
     }
 }

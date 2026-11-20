@@ -132,7 +132,13 @@ export function signParticipantToken({
   /** Absolute Unix seconds. Use bigint beyond Number.MAX_SAFE_INTEGER. */
   expiration: bigint | number;
 }): string {
-  if (!scope(participant)) invalid("participant");
+  if (
+    typeof participant !== "string" ||
+    participant.length === 0 ||
+    participant.length > 36 ||
+    /[^A-Za-z0-9_-]/u.test(participant)
+  )
+    invalid("participant");
   const checked = checkedGrants(grants);
   const { project, key, privateKey } = parseApiKey(apiKey);
   if (

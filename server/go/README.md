@@ -43,8 +43,9 @@ string, or out-of-range arguments. Do not cast an inexact caller value to uint64
 validate external data before passing it to the typed API. No clock is consulted.
 Zero and past expiration can be signed, but the server rejects at and after expiry.
 
-Participant IDs, room patterns and labels are nonempty UTF-8 strings of at most
-256 bytes, without control characters. The SDK validates these bounds and the
+Participant IDs match `[A-Za-z0-9_-]{1,36}` and preserve case. Grant room
+patterns and labels are nonempty UTF-8 strings of at most 256 bytes,
+without control characters. The SDK validates these bounds and the
 [grant schema](../auth/README.md#grants), preserving exact text and case.
 Optional grant filters use pointers: nil omits a filter. A nil or empty grant
 slice grants no access. The API key remains opaque to applications.

@@ -1,4 +1,4 @@
-use crate::entity::RoomExternalId;
+use crate::entity::RoomId;
 use crate::track::Track;
 use pulsebeam_core::auth::grants::{Action, GrantSet, TrackKind};
 
@@ -10,7 +10,7 @@ pub(crate) enum ResourcePermissions {
     #[cfg(test)]
     RoomBound,
     Grants {
-        room: RoomExternalId,
+        room: RoomId,
         grants: GrantSet,
     },
 }
@@ -33,7 +33,7 @@ impl ResourcePermissions {
         }
     }
 
-    pub(super) fn allows_join(&self, room: &RoomExternalId) -> bool {
+    pub(super) fn allows_join(&self, room: &RoomId) -> bool {
         if matches!(self, Self::Grants { room: scoped, .. } if scoped != room) {
             return false;
         }

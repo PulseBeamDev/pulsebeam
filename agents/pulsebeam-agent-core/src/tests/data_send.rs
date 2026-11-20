@@ -138,6 +138,7 @@ fn owned_send_waits_for_its_first_authoritative_owned_binding() {
             state::confirmed_state::Value::Track(state::Track {
                 track_id: native_connection::SOURCE.into(),
                 participant_id: "p1".into(),
+                room_id: "room".into(),
                 label: "state".into(),
                 kind: Some(state::track::Kind::Data(state::DataTrack {
                     delivery: state::DataDelivery::Lossy as i32,

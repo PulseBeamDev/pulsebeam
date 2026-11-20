@@ -13,9 +13,9 @@ use crate::{
     AgentConfig, ChannelId, ConnectionState, DataChannelEffect, DataChannelEvent,
     DataChannelReliability, DataChannelSpec, DesiredState, Effect, Failure, FailureClass,
     Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader, HttpMethod, HttpRequest,
-    HttpResponse, MediaSlot, Notification, OfferResources, OperationId, ParticipantId, RoomId,
-    RtcEffect, RtcEvent, SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicDropReason,
-    TopicError, TopicSend, ValidationError,
+    HttpResponse, MediaSlot, Notification, OfferResources, OperationId, RtcEffect, RtcEvent,
+    SlotBinding, Snapshot, TimerEffect, TimerEvent, TimerId, TopicDropReason, TopicError,
+    TopicSend, ValidationError,
     id::IdGenerator,
     signaling::{self, SignalingError},
     topic::Topics,
@@ -127,10 +127,7 @@ struct Session {
     generation: Generation,
     resource_uri: String,
     participant_id: String,
-    room_external_id: String,
-    _room_id: RoomId,
-    participant_external_id: String,
-    _opaque_participant_id: ParticipantId,
+    room_id: String,
     coordinates: BTreeMap<MediaSlot, Option<SlotBinding>>,
     state: NativeState,
     payloads: BTreeMap<ChannelId, native::PayloadChannel>,
@@ -172,11 +169,8 @@ struct Candidate {
     credential: Credential,
     capabilities: crate::BootstrapCapabilities,
     resource_uri: String,
-    room_external_id: String,
-    room_id: RoomId,
-    participant_external_id: String,
+    room_id: String,
     participant_id: String,
-    opaque_participant_id: ParticipantId,
 }
 
 #[derive(Serialize)]
@@ -191,9 +185,7 @@ struct NativeResponse {
     profile: String,
     rtp_capabilities: pulsebeam_proto::state::RtpCapabilities,
     data_delivery: Vec<serde_json::Value>,
-    room_external_id: String,
     room_id: String,
-    participant_external_id: String,
     participant_id: String,
     answer: String,
 }
@@ -1751,7 +1743,7 @@ impl Agent {
             .attempt
             .as_ref()
             .and_then(|attempt| attempt.room.as_deref())
-            .is_some_and(|room| room != candidate.room_external_id)
+            .is_some_and(|room| room != candidate.room_id)
         {
             self.emit_untracked_delete(candidate.resource_uri, candidate.credential.token);
             self.fail_uncertain_admission(
@@ -2215,7 +2207,7 @@ impl Agent {
             native::STATE_MEMORY_BYTES,
             pulsebeam_proto::state::Participant {
                 participant_id: candidate.participant_id.clone(),
-                participant_external_id: candidate.participant_external_id.clone(),
+                room_id: candidate.room_id.clone(),
             },
         )?;
         self.retry_attempts = 0;
@@ -2228,10 +2220,7 @@ impl Agent {
             generation: attempt.generation,
             resource_uri: candidate.resource_uri,
             participant_id: candidate.participant_id,
-            room_external_id: candidate.room_external_id,
-            _room_id: candidate.room_id,
-            participant_external_id: candidate.participant_external_id,
-            _opaque_participant_id: candidate.opaque_participant_id,
+            room_id: candidate.room_id,
             coordinates,
             state,
             payloads: BTreeMap::new(),
@@ -2275,8 +2264,7 @@ impl Agent {
         if let Some(active) = &self.active {
             self.snapshot.generation = Some(active.generation);
             self.snapshot.participant_id = Some(active.participant_id.clone());
-            self.snapshot.participant_external_id = Some(active.participant_external_id.clone());
-            self.snapshot.room_external_id = Some(active.room_external_id.clone());
+            self.snapshot.room_id = Some(active.room_id.clone());
             self.snapshot.authorization_expires_at = None;
             self.snapshot.accepted_credential_revision = Some(active.credential.revision);
             self.topics.bind_native(
@@ -2827,8 +2815,7 @@ impl Agent {
         self.pending_signal = None;
         self.snapshot.generation = None;
         self.snapshot.participant_id = None;
-        self.snapshot.participant_external_id = None;
-        self.snapshot.room_external_id = None;
+        self.snapshot.room_id = None;
         self.snapshot.accepted_join_revision = None;
         self.snapshot.authorization_expires_at = None;
         self.snapshot.accepted_credential_revision = None;
@@ -3071,6 +3058,10 @@ fn parse_create_response(
         .map_err(|_| "create response contains invalid RTP capabilities".to_string())?;
     let data_delivery = supported_data_delivery(&body.data_delivery)?;
     validate_answer(&body.answer)?;
+    crate::validate_room_name(&body.room_id)
+        .map_err(|_| "create response contains invalid room ID".to_string())?;
+    crate::validate_participant_id(&body.participant_id)
+        .map_err(|_| "create response contains invalid participant ID".to_string())?;
     Ok((
         Candidate {
             credential,
@@ -3079,11 +3070,8 @@ fn parse_create_response(
                 data_delivery,
             },
             resource_uri: resource_uri.to_string(),
-            room_external_id: body.room_external_id,
-            room_id: RoomId::from_server(body.room_id),
-            participant_external_id: body.participant_external_id,
-            participant_id: body.participant_id.clone(),
-            opaque_participant_id: ParticipantId::from_server(body.participant_id),
+            room_id: body.room_id,
+            participant_id: body.participant_id,
         },
         body.answer,
     ))
@@ -3309,12 +3297,10 @@ mod response_tests {
     }
 
     #[test]
-    fn native_response_requires_fields_and_types_but_keeps_values_opaque() {
+    fn native_response_requires_canonical_names_and_keeps_location_opaque() {
         let complete = serde_json::json!({
-            "room_external_id": "room",
-            "room_id": "not canonical / room",
-            "participant_external_id": "participant",
-            "participant_id": "not canonical / participant",
+            "room_id": "Stage_9",
+            "participant_id": "Stage_Participant",
             "profile": "pulsebeam.media.v1",
             "rtp_capabilities": {},
             "data_delivery": ["LATEST", "LOSSY", "ORDERED"],
@@ -3338,18 +3324,12 @@ mod response_tests {
             candidate.resource_uri,
             "https://elsewhere.test/exact%2Fopaque?x=a%2Fb"
         );
-        assert_eq!(candidate.room_id.as_str(), "not canonical / room");
-        assert_eq!(candidate.participant_id, "not canonical / participant");
-        assert_eq!(
-            candidate.opaque_participant_id.as_str(),
-            "not canonical / participant"
-        );
+        assert_eq!(candidate.room_id, "Stage_9");
+        assert_eq!(candidate.participant_id, "Stage_Participant");
         assert_eq!(answer, "v=0\r\n");
 
         for field in [
-            "room_external_id",
             "room_id",
-            "participant_external_id",
             "participant_id",
             "profile",
             "rtp_capabilities",
@@ -3363,6 +3343,7 @@ mod response_tests {
 
         for (field, value) in [
             ("profile", serde_json::json!(true)),
+            ("participant_id", serde_json::json!("not / a name")),
             ("profile", serde_json::json!("legacy")),
             ("rtp_capabilities", serde_json::json!({"codecs": [{}]})),
             ("rtp_capabilities", serde_json::json!({"rtcp_modes": [""]})),

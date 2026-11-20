@@ -1,5 +1,5 @@
 use crate::control::controller::{ControllerCommand, ControllerSender};
-use crate::entity::{RoomId, TrackId};
+use crate::entity::{ProjectRoomKey, TrackId};
 use crate::id::ShardId;
 use crate::route::NodeRouteAddress;
 use pulsebeam_link::{BindError, BindingId, LinkError, NetworkId, NodeRouteKey, PeerConfig};
@@ -52,7 +52,7 @@ impl Control {
     /// This neither creates a runtime nor guarantees the snapshot remains current.
     pub async fn destinations(
         &self,
-        room: RoomId,
+        room: ProjectRoomKey,
         track: TrackId,
     ) -> Result<Vec<super::ReceiveDestination>, BindError> {
         let (reply, result) = oneshot::channel();
@@ -81,7 +81,7 @@ impl Control {
 
     pub async fn bind_send(
         &self,
-        room: RoomId,
+        room: ProjectRoomKey,
         track: TrackId,
         peer: NetworkId,
         address: NodeRouteKey,
@@ -99,7 +99,7 @@ impl Control {
 
     pub async fn bind_reverse(
         &self,
-        room: RoomId,
+        room: ProjectRoomKey,
         track: TrackId,
         shard: ShardId,
         peer: NetworkId,

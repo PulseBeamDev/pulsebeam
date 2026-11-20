@@ -3,7 +3,13 @@ use crate::media::{Rid, SimulcastLayer};
 use crate::rtp::cache::TrackStreamCache;
 use crate::rtp::test_utils::H264StreamBuilder;
 
-fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, fixed: bool) -> wire::ResourceSpec {
+fn receiver_spec(
+    track: TrackId,
+    room: &str,
+    mid: &str,
+    ssrc: u32,
+    fixed: bool,
+) -> wire::ResourceSpec {
     let format = capabilities()
         .codecs
         .into_iter()
@@ -20,7 +26,7 @@ fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, fixed: bool) -> wire::Res
         declaration: Some(resource_spec::Declaration::Subscription(wire::SubscriptionSpec {
             track_id: track.as_str(),
             kind: wire::TrackKind::Video as i32,
-            source_room: "room".into(),
+            source_room: room.into(),
             binding: Some(wire::TrackBinding { transport: Some(wire::track_binding::Transport::Rtp(wire::RtpParameters {
                 mid: mid.into(),
                 codec: Some(wire::RtpCodecParameters { payload_type: Some(96), format: Some(format), feedback: vec![wire::RtcpFeedback::TransportCc.as_str().into()], ..Default::default() }),
@@ -114,7 +120,7 @@ pub(super) fn check(
         .update_bitrate(Instant::now(), crate::bitrate::Bitrate::from(2_000_000));
     let (mut tx, mut video) =
         track::new_video(Mid::from("camera"), meta, vec![SimulcastLayer::new("q")]);
-    let first = receiver_spec(id, "video-a", 801, true);
+    let first = receiver_spec(id, audio.meta().room.room.as_str(), "video-a", 801, true);
     let Some(resource_spec::Declaration::Subscription(subscription)) = &first.declaration else {
         unreachable!()
     };
@@ -136,7 +142,10 @@ pub(super) fn check(
     participant.add_track_candidate(handle, video);
     for (reference, spec) in [
         (5, first.clone()),
-        (7, receiver_spec(id, "video-b", 803, false)),
+        (
+            7,
+            receiver_spec(id, audio.meta().room.room.as_str(), "video-b", 803, false),
+        ),
     ] {
         pulsebeam_proto::state::validation::validate_spec(&spec).unwrap();
         desire(participant, sink, reference, reference, Some(spec));
@@ -157,7 +166,13 @@ pub(super) fn check(
                 sink,
                 6,
                 6,
-                Some(receiver_spec(id, "blocked", 803, false)),
+                Some(receiver_spec(
+                    id,
+                    audio.meta().room.room.as_str(),
+                    "blocked",
+                    803,
+                    false,
+                )),
             );
             let rejected = native_data::tests::confirmations_for(participant, 6)
                 .pop()
@@ -225,12 +240,18 @@ pub(super) fn check(
         sink,
         5,
         8,
-        Some(receiver_spec(id, "video-a", 801, false)),
+        Some(receiver_spec(
+            id,
+            audio.meta().room.room.as_str(),
+            "video-a",
+            801,
+            false,
+        )),
     );
     confirmations(participant);
     assert!(participant.native_receivers.playout_delay(a).is_none());
     assert_eq!(outputs(participant, id), [b].into());
-    let mut bounded = receiver_spec(id, "video-a", 801, false);
+    let mut bounded = receiver_spec(id, audio.meta().room.room.as_str(), "video-a", 801, false);
     let Some(wire::resource_settings::Receive::Video(options)) = bounded
         .settings
         .as_mut()

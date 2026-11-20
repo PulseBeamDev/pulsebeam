@@ -1357,8 +1357,8 @@ mod tests {
                         value: "https://example.com/participants/p1".into(),
                     }],
                     body: serde_json::to_vec(&serde_json::json!({
-                        "room_external_id": "room", "room_id": "opaque room",
-                        "participant_external_id": "participant", "participant_id": "p1",
+                        "room_id": "room",
+                        "participant_id": "p1",
                         "profile": "pulsebeam.media.v1", "rtp_capabilities": {},
                         "data_delivery": ["LATEST", "LOSSY", "ORDERED"], "answer": "answer"
                     }))

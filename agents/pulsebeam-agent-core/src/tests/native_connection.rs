@@ -103,18 +103,10 @@ fn lookup_record(
         panic!("logical source")
     };
     let label = address.label.clone();
-    let participant_id = match address.participant_external_id.as_str() {
-        "left" => "pa_22222222222222222222222222",
-        "right" => "pa_33333333333333333333333333",
-        "opaque/server/remote-a" => "pa_44444444444444444444444444",
-        "opaque/server/remote-b" => "pa_55555555555555555555555555",
-        "opaque/server/remote-c" => "pa_66666666666666666666666666",
-        "opaque/server/remote/replacement" => "pa_77777777777777777777777777",
-        _ => "pa_11111111111111111111111111",
-    };
     let participant = state::Participant {
-        participant_id: participant_id.into(),
-        participant_external_id: address.participant_external_id.clone(),
+        participant_id: address.participant_id.clone(),
+
+        room_id: address.room.clone(),
     };
     let track_kind = match state::TrackKind::try_from(address.kind).unwrap() {
         state::TrackKind::Video => state::track::Kind::Video(state::VideoTrack {
@@ -141,6 +133,7 @@ fn lookup_record(
             track: Some(state::Track {
                 track_id: track_id.into(),
                 participant_id: participant.participant_id,
+                room_id: participant.room_id.clone(),
                 label,
                 kind: Some(track_kind),
             }),
@@ -196,16 +189,15 @@ pub(crate) fn answer_source_lookup_batch(
                         .iter()
                         .find(|subscriber| {
                             subscriber.room == address.room
-                                && subscriber.participant_external_id
-                                    == address.participant_external_id
+                                && subscriber.participant_id == address.participant_id
                                 && subscriber.topic == address.label
                         })
                         .map(|subscriber| subscriber.mode);
                     let track_id = remote_source_override.unwrap_or_else(|| {
-                        if address.participant_external_id == "remote-app-user" {
+                        if address.participant_id == "remote-app-user" {
                             REMOTE_SOURCE
                         } else {
-                            &address.participant_external_id
+                            &address.participant_id
                         }
                     });
                     Some(lookup_record(
@@ -516,7 +508,8 @@ pub(crate) fn confirm_publication(
     };
     let participant = state::Participant {
         participant_id: agent.snapshot().participant_id.clone().unwrap(),
-        participant_external_id: agent.snapshot().participant_external_id.clone().unwrap(),
+
+        room_id: agent.snapshot().room_id.clone().unwrap(),
     };
     observe(
         agent,
@@ -531,6 +524,7 @@ pub(crate) fn confirm_publication(
                 track: Some(state::Track {
                     track_id: source.into(),
                     participant_id: participant.participant_id,
+                    room_id: participant.room_id.clone(),
                     label: declaration.label.clone(),
                     kind: Some(state::track::Kind::Data(state::DataTrack {
                         delivery: data.delivery,
@@ -562,22 +556,15 @@ pub(crate) fn prepare_subscription_staged(
     subscriber: &TopicSubscriber,
     staged: Option<&PreparedData>,
 ) -> PreparedData {
-    let participant_id = match subscriber.participant_external_id.as_str() {
-        "left" => "pa_22222222222222222222222222",
-        "right" => "pa_33333333333333333333333333",
-        "opaque/server/remote-a" => "pa_44444444444444444444444444",
-        "opaque/server/remote-b" => "pa_55555555555555555555555555",
-        "opaque/server/remote-c" => "pa_66666666666666666666666666",
-        "opaque/server/remote/replacement" => "pa_77777777777777777777777777",
-        _ => "pa_11111111111111111111111111",
-    };
     let participant = state::Participant {
-        participant_id: participant_id.into(),
-        participant_external_id: subscriber.participant_external_id.clone(),
+        participant_id: subscriber.participant_id.clone(),
+
+        room_id: subscriber.room.clone(),
     };
     let track = state::Track {
         track_id: source.into(),
         participant_id: participant.participant_id.clone(),
+        room_id: participant.room_id.clone(),
         label: subscriber.topic.clone(),
         kind: Some(state::track::Kind::Data(state::DataTrack {
             delivery: subscriber.mode.delivery() as i32,

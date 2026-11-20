@@ -59,7 +59,7 @@ fn lookup_spec(enabled: bool) -> ResourceSpec {
         declaration: Some(resource_spec::Declaration::SourceLookup(SourceLookupSpec {
             source: Some(LogicalSourceAddress {
                 room: String::from("room"),
-                participant_external_id: String::from("alice"),
+                participant_id: String::from("alice"),
                 kind: TrackKind::Data as i32,
                 label: String::from("cursor"),
             }),
@@ -71,12 +71,13 @@ fn lookup_state(enabled: bool, paired: bool) -> SourceLookupState {
     SourceLookupState {
         spec: Some(lookup_spec(enabled)),
         participant: paired.then(|| Participant {
-            participant_id: String::from("canonical-owner"),
-            participant_external_id: String::from("alice"),
+            participant_id: String::from("alice"),
+            room_id: String::from("room"),
         }),
         track: paired.then(|| Track {
             track_id: String::from("replacement-track"),
-            participant_id: String::from("canonical-owner"),
+            participant_id: String::from("alice"),
+            room_id: String::from("room"),
             label: String::from("cursor"),
             kind: Some(track::Kind::Data(DataTrack {
                 delivery: DataDelivery::Lossy as i32,
@@ -234,11 +235,8 @@ fn source_lookup_is_a_bounded_owned_nonforwarding_observation() {
         Err(ValidationError::Identity)
     );
     let mut invalid = valid.clone();
-    invalid
-        .participant
-        .as_mut()
-        .unwrap()
-        .participant_external_id = String::from("bob");
+    invalid.participant.as_mut().unwrap().room_id = String::from("OtherRoom");
+    invalid.track.as_mut().unwrap().room_id = String::from("OtherRoom");
     assert_eq!(
         validation::validate_source_lookup(&invalid),
         Err(ValidationError::Identity)
@@ -266,7 +264,7 @@ fn source_lookup_is_a_bounded_owned_nonforwarding_observation() {
     );
     let mut bad_spec = lookup_spec(true);
     if let Some(resource_spec::Declaration::SourceLookup(source)) = bad_spec.declaration.as_mut() {
-        source.source.as_mut().unwrap().participant_external_id = String::from("bad\nendpoint");
+        source.source.as_mut().unwrap().participant_id = String::from("bad\nendpoint");
     }
     assert_eq!(
         validation::validate_spec(&bad_spec),
@@ -694,11 +692,12 @@ fn owned_confirmation_is_self_contained_and_execution_failure_is_not_rejection()
         spec: Some(*spec),
         participant: Some(Participant {
             participant_id: String::from("participant"),
-            participant_external_id: String::from("alice"),
+            room_id: String::from("room"),
         }),
         track: Some(Track {
             track_id: String::from("track"),
             participant_id: String::from("participant"),
+            room_id: String::from("room"),
             label: String::from("cursor"),
             kind: Some(track::Kind::Data(DataTrack {
                 delivery: DataDelivery::Lossy as i32,
@@ -1113,6 +1112,7 @@ fn capability_identity_uses_typed_defaults_without_guessing_unsupported_formats(
     let unknown = Track {
         track_id: String::from("track"),
         participant_id: String::from("participant"),
+        room_id: String::from("room"),
         label: String::from("camera"),
         kind: Some(track::Kind::Video(VideoTrack {
             format: Some(future_format.clone()),

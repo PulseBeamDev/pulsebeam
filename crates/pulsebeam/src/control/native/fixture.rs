@@ -1,7 +1,7 @@
 use super::handler::StateProtocolHandler;
 use super::handoff::{self, EndpointHandoff};
 use super::{InputError, NativeSession, OutputError, ResolvedSource};
-use crate::entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId, TrackId};
+use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackId};
 use crate::track::Track;
 use std::collections::BTreeMap;
 
@@ -21,7 +21,7 @@ pub(crate) fn execution_handoff(
 pub(crate) struct NativeControl {
     handler: StateProtocolHandler,
     ready: pulsebeam_queue::Receiver<ConnectionId>,
-    publishers: BTreeMap<ParticipantId, ParticipantExternalId>,
+    publishers: BTreeMap<ParticipantId, ParticipantId>,
 }
 
 impl NativeControl {
@@ -29,16 +29,14 @@ impl NativeControl {
         participant: ParticipantId,
         connection: ConnectionId,
         room: RoomId,
-        external: ParticipantExternalId,
         capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
         expiry: u64,
     ) -> (Self, EndpointHandoff) {
         let (sender, ready) = pulsebeam_queue::bounded(std::num::NonZeroUsize::MIN);
         let (controller, endpoint) = handoff::pair(connection, sender);
-        let publishers = BTreeMap::from([(participant, external.clone())]);
+        let publishers = BTreeMap::from([(participant, participant)]);
         let mut handler =
-            StateProtocolHandler::new(participant, room, external, capabilities, controller)
-                .unwrap();
+            StateProtocolHandler::new(participant, room, capabilities, controller).unwrap();
         handler
             .model
             .authorization(
@@ -65,7 +63,7 @@ impl NativeControl {
             .participant_id
             .parse()
             .map_err(|_| OutputError::InvalidObservation)?;
-        let external = ParticipantExternalId::new(&participant.participant_external_id)
+        let external = ParticipantId::new(&participant.participant_id)
             .map_err(|_| OutputError::InvalidObservation)?;
         self.handler.model.observe_participant(participant)?;
         self.publishers.insert(id, external);

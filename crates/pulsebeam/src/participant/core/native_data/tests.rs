@@ -165,11 +165,8 @@ pub(in crate::participant::core) fn participant_with_capabilities(
     ));
     let mut config = ConnectionConfig {
         manual_sub: true,
-        room_id: entity::RoomId::from_external(
-            &entity::RoomExternalId::new("native-data").unwrap(),
-        ),
-        participant_id: entity::ParticipantId::new(),
-        participant_external_id: entity::ParticipantExternalId::new("publisher").unwrap(),
+        room: crate::entity::ProjectRoomKey::fixture(entity::RoomId::new("native-data").unwrap()),
+        participant_id: crate::entity::fixture_participant_id(),
         connection_id: entity::ConnectionId::new(),
         profile: SignalingProtocol::State,
         allow_topic_channels: false,
@@ -183,8 +180,7 @@ pub(in crate::participant::core) fn participant_with_capabilities(
     let (signaling, endpoint) = crate::control::native::fixture::NativeControl::new(
         config.participant_id,
         config.connection_id,
-        config.room_id,
-        config.participant_external_id.clone(),
+        config.room.room,
         Some(capabilities),
         expiry,
     );
@@ -241,7 +237,7 @@ fn retain_publication(
     let channel = crate::media::ChannelId::from_value(1);
     let track = Track::data_publication(
         track::TrackMeta {
-            room_id: participant.room_id,
+            room: participant.room,
             shard_id: participant.shard_id,
             id,
             origin: participant.participant_id,

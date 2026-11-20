@@ -3,7 +3,7 @@ use super::*;
 mod source_failure;
 #[cfg(test)]
 mod tests;
-use crate::native_state::{Change, Resource};
+use crate::native_state::{Change, ParticipantKey, Resource};
 use pulsebeam_proto::state;
 
 pub(super) const STATE_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -104,7 +104,7 @@ pub(super) fn kind(track: &state::Track) -> state::TrackKind {
 fn lookup_key(room: &str, participant: &str, kind: state::TrackKind, label: &str) -> Resource {
     Resource::SourceLookup {
         room: room.into(),
-        participant_external_id: participant.into(),
+        participant_id: participant.into(),
         kind,
         label: label.into(),
     }
@@ -117,7 +117,7 @@ fn selected<'a>(
 ) -> Option<&'a str> {
     let resource = lookup_key(
         &selector.room,
-        &selector.participant_external_id,
+        &selector.participant_id,
         expected,
         &selector.label,
     );
@@ -143,7 +143,7 @@ fn want_lookup(
             state::SourceLookupSpec {
                 source: Some(state::LogicalSourceAddress {
                     room: room.into(),
-                    participant_external_id: participant.into(),
+                    participant_id: participant.into(),
                     kind: kind as i32,
                     label: label.into(),
                 }),
@@ -327,7 +327,7 @@ fn source_room_for_track(session: &Session, desired: &DesiredState, track: &str)
     for subscriber in &desired.topics.subscribers {
         let selector = crate::TrackSelector {
             room: subscriber.room.clone(),
-            participant_external_id: subscriber.participant_external_id.clone(),
+            participant_id: subscriber.participant_id.clone(),
             label: subscriber.topic.clone(),
         };
         if selected(session, &selector, state::TrackKind::Data) == Some(track) {
@@ -470,7 +470,7 @@ pub(super) fn reconcile(
         want_lookup(
             &mut wanted,
             &selector.room,
-            &selector.participant_external_id,
+            &selector.participant_id,
             state::TrackKind::Video,
             &selector.label,
         );
@@ -479,7 +479,7 @@ pub(super) fn reconcile(
         want_lookup(
             &mut wanted,
             &selector.room,
-            &selector.participant_external_id,
+            &selector.participant_id,
             state::TrackKind::Audio,
             &selector.label,
         );
@@ -488,7 +488,7 @@ pub(super) fn reconcile(
         want_lookup(
             &mut wanted,
             &subscriber.room,
-            &subscriber.participant_external_id,
+            &subscriber.participant_id,
             state::TrackKind::Data,
             &subscriber.topic,
         );
@@ -672,7 +672,7 @@ pub(super) fn reconcile(
     for registration in &subscribers {
         let key = lookup_key(
             &registration.room,
-            &registration.participant_external_id,
+            &registration.participant_id,
             state::TrackKind::Data,
             &registration.topic,
         );
@@ -1543,23 +1543,25 @@ impl Agent {
                     let Some(active) = self.active.as_ref() else {
                         continue;
                     };
-                    if id != active.participant_id {
-                        if let Some(value) = active.state.participants().get(&id) {
+                    if id.room_id == active.room_id && id.participant_id != active.participant_id {
+                        if active.state.participants().contains_key(&id) {
                             self.snapshot.participants.insert(
-                                id.clone(),
+                                id.participant_id.clone(),
                                 crate::Participant {
-                                    id: id.clone(),
-                                    external_id: value.participant_external_id.clone(),
+                                    id: id.participant_id.clone(),
                                 },
                             );
                         } else {
-                            self.snapshot.participants.remove(&id);
+                            self.snapshot.participants.remove(&id.participant_id);
                         }
                         let tracks = active
                             .state
                             .tracks()
                             .values()
-                            .filter(|track| track.participant_id == id)
+                            .filter(|track| {
+                                track.room_id == id.room_id
+                                    && track.participant_id == id.participant_id
+                            })
                             .cloned()
                             .collect::<Vec<_>>();
                         for track in tracks {
@@ -1801,12 +1803,9 @@ impl Agent {
         let Some(active) = self.active.as_ref() else {
             return;
         };
-        let Some(track) = active
-            .state
-            .tracks()
-            .get(id)
-            .filter(|track| track.participant_id != active.participant_id)
-        else {
+        let Some(track) = active.state.tracks().get(id).filter(|track| {
+            track.room_id == active.room_id && track.participant_id != active.participant_id
+        }) else {
             return;
         };
         let Some(spec) = crate::TrackSpec::from_state(track) else {
@@ -1823,12 +1822,15 @@ impl Agent {
                 },
             );
         }
-        if let Some(participant) = active.state.source_participant(&track.participant_id) {
+        if let Some(participant) = active
+            .state
+            .source_participant(&ParticipantKey::from(track))
+        {
             self.snapshot.remote_tracks.insert(
                 id.into(),
                 crate::RemoteTrack {
                     id: id.into(),
-                    participant_id: participant.participant_external_id.clone(),
+                    participant_id: participant.participant_id.clone(),
                     spec,
                 },
             );

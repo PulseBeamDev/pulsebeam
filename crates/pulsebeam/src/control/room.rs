@@ -202,8 +202,8 @@ mod tests {
     #[test]
     fn pending_claims_hold_capacity_through_out_of_order_commit_and_departure() {
         let mut room = RoomShard::new();
-        let first = ParticipantId::new();
-        let second = ParticipantId::new();
+        let first = crate::entity::fixture_participant_id();
+        let second = crate::entity::fixture_participant_id();
         let a = ConnectionId::new();
         let b = ConnectionId::new();
         room.reserve(first, a, ShardId::new(0), 0);
@@ -219,7 +219,10 @@ mod tests {
         assert_eq!(room.partition_owner(0), Some(ShardId::new(0)));
         room.release(first, a);
         assert!(room.is_empty());
-        assert_eq!(room.next_partition_index(&ParticipantId::new(), 1), 0);
+        assert_eq!(
+            room.next_partition_index(&crate::entity::fixture_participant_id(), 1),
+            0
+        );
         room.reserve(second, b, ShardId::new(2), 0);
         assert!(!room.reserved(first, a, ShardId::new(0), 0));
         assert!(room.reserved(second, b, ShardId::new(2), 0));
@@ -230,14 +233,17 @@ mod tests {
     #[test]
     fn pending_replacements_share_one_placement_until_commit_or_cancellation() {
         let mut room = RoomShard::new();
-        let participant = ParticipantId::new();
+        let participant = crate::entity::fixture_participant_id();
         let a = ConnectionId::new();
         let b = ConnectionId::new();
         let shard = ShardId::new(0);
         room.add_participant(&participant, shard, 0);
         room.reserve(participant, a, shard, 0);
         room.reserve(participant, b, shard, 0);
-        assert_eq!(room.next_partition_index(&ParticipantId::new(), 1), 1);
+        assert_eq!(
+            room.next_partition_index(&crate::entity::fixture_participant_id(), 1),
+            1
+        );
         room.remove_participant(&participant, shard);
         room.release(participant, a);
         assert_eq!(room.participant_count(), 0);
@@ -245,7 +251,10 @@ mod tests {
         room.add_participant(&participant, shard, 0);
         room.release(participant, b);
         room.release(participant, a);
-        assert_eq!(room.next_partition_index(&ParticipantId::new(), 1), 1);
+        assert_eq!(
+            room.next_partition_index(&crate::entity::fixture_participant_id(), 1),
+            1
+        );
         room.remove_participant(&participant, shard);
         assert!(room.is_empty());
         assert_eq!(room.partition_owner(0), None);
@@ -254,7 +263,9 @@ mod tests {
     #[test]
     fn partition_capacity_survives_departures_and_reconnects() {
         let mut room = RoomShard::new();
-        let participants: Vec<_> = (0..5).map(|_| ParticipantId::new()).collect();
+        let participants: Vec<_> = (0..5)
+            .map(|_| crate::entity::fixture_participant_id())
+            .collect();
         for (index, participant) in participants.iter().enumerate() {
             let slot = room.next_partition_index(participant, 2);
             assert_eq!(slot, index / 2);
@@ -264,13 +275,13 @@ mod tests {
 
         room.remove_participant(&participants[0], ShardId::new(0));
         assert_eq!(room.next_partition_index(&participants[4], 2), 2);
-        let newcomer = ParticipantId::new();
+        let newcomer = crate::entity::fixture_participant_id();
         assert_eq!(room.next_partition_index(&newcomer, 2), 0);
         room.add_participant(&newcomer, ShardId::new(0), 0);
 
         room.remove_participant(&participants[1], ShardId::new(0));
         room.remove_participant(&newcomer, ShardId::new(0));
-        let another = ParticipantId::new();
+        let another = crate::entity::fixture_participant_id();
         assert_eq!(room.next_partition_index(&another, 2), 0);
         room.add_participant(&another, ShardId::new(0), 0);
         assert_eq!(room.participant_count(), 4);

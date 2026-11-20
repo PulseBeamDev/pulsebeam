@@ -1,5 +1,5 @@
 use super::*;
-use crate::entity::ParticipantExternalId;
+use crate::entity::ParticipantId;
 
 impl NativeSession {
     pub(super) fn unavailable(&mut self, key: Key) -> Result<(), OutputError> {
@@ -17,7 +17,10 @@ impl NativeSession {
         &mut self,
         participant: wire::Participant,
     ) -> Result<(), OutputError> {
-        let key = Key::Participant(participant.participant_id.clone());
+        let key = Key::Participant((
+            participant.room_id.clone(),
+            participant.participant_id.clone(),
+        ));
         self.put_participant(participant)?;
         self.rows
             .get_mut(&key)
@@ -53,7 +56,10 @@ impl NativeSession {
     fn put_participant(&mut self, participant: wire::Participant) -> Result<(), OutputError> {
         validation::validate_participant(&participant)
             .map_err(|_| OutputError::InvalidObservation)?;
-        let key = Key::Participant(participant.participant_id.clone());
+        let key = Key::Participant((
+            participant.room_id.clone(),
+            participant.participant_id.clone(),
+        ));
         if self.rows.get(&key).is_some_and(|row| matches!(&row.value.value, Some(wire::confirmed_state::Value::Participant(current)) if current != &participant)) {
             return Err(OutputError::InvalidObservation);
         }
@@ -69,10 +75,13 @@ impl NativeSession {
     ) -> Result<(), OutputError> {
         validation::validate_participant(&participant)
             .map_err(|_| OutputError::InvalidObservation)?;
-        let key = Key::Participant(participant.participant_id.clone());
+        let key = Key::Participant((
+            participant.room_id.clone(),
+            participant.participant_id.clone(),
+        ));
         if self
             .permissions
-            .can_discover_participant(Some(&participant.participant_external_id))
+            .can_discover_participant(Some(&participant.participant_id))
             || self
                 .rows
                 .get(&key)
@@ -80,12 +89,16 @@ impl NativeSession {
         {
             self.put_participant(participant)
         } else {
-            self.remove_participant(participant.participant_id)
+            self.remove_participant(participant.room_id, participant.participant_id)
         }
     }
 
-    pub(crate) fn remove_participant(&mut self, id: String) -> Result<(), OutputError> {
-        let key = Key::Participant(id);
+    pub(crate) fn remove_participant(
+        &mut self,
+        room: String,
+        id: String,
+    ) -> Result<(), OutputError> {
+        let key = Key::Participant((room, id));
         let Some(row) = self.rows.get(&key) else {
             return Ok(());
         };
@@ -102,7 +115,7 @@ impl NativeSession {
     pub(crate) fn observe_track(
         &mut self,
         track: wire::Track,
-        publisher: &ParticipantExternalId,
+        publisher: &ParticipantId,
     ) -> Result<(), OutputError> {
         validation::validate_track(&track).map_err(|_| OutputError::InvalidObservation)?;
         if !self
@@ -120,10 +133,10 @@ impl NativeSession {
             return Err(OutputError::InvalidObservation);
         }
         let added = previous.is_none();
-        let owner = Key::Participant(track.participant_id.clone());
+        let owner = Key::Participant((track.room_id.clone(), track.participant_id.clone()));
         self.put_participant(wire::Participant {
             participant_id: track.participant_id.clone(),
-            participant_external_id: publisher.as_str().to_owned(),
+            room_id: track.room_id.clone(),
         })?;
         self.put(key, confirmed(wire::confirmed_state::Value::Track(track)))?;
         if added {
@@ -145,9 +158,10 @@ impl NativeSession {
             return Ok(());
         };
         let owner = match &row.value.value {
-            Some(wire::confirmed_state::Value::Track(track)) => {
-                Some(Key::Participant(track.participant_id.clone()))
-            }
+            Some(wire::confirmed_state::Value::Track(track)) => Some(Key::Participant((
+                track.room_id.clone(),
+                track.participant_id.clone(),
+            ))),
             _ => None,
         };
         self.withdraw(&key)?;
@@ -175,7 +189,7 @@ impl NativeSession {
         }
         let external = match &row.value.value {
             Some(wire::confirmed_state::Value::Participant(participant)) => {
-                Some(participant.participant_external_id.as_str())
+                Some(participant.participant_id.as_str())
             }
             _ => None,
         };

@@ -41,8 +41,9 @@ not accepted. Invalid values raise without returning a token. No clock is
 consulted: zero and past timestamps can be signed, but the server rejects tokens
 at and after their expiration.
 
-Participant IDs, room patterns and labels are nonempty UTF-8 strings of at most
-256 bytes, without control characters. The SDK validates these bounds and the
+Participant IDs match `[A-Za-z0-9_-]{1,36}` and preserve case. Grant room
+patterns and labels are nonempty UTF-8 strings of at most 256 bytes,
+without control characters. The SDK validates these bounds and the
 [grant schema](../auth/README.md#grants), preserving exact text and case.
 The exported `Grant` TypedDict describes the input. Omit unrestricted filters;
 explicit None is invalid. Empty grants grant no access. The SFU validates issuer

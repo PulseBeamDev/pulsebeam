@@ -249,7 +249,7 @@ mod tests {
         let finished = Arc::new(Signal::default());
         let selector = TrackSelector {
             room: "pinned-room".into(),
-            participant_external_id: "remote-endpoint".into(),
+            participant_id: "remote-endpoint".into(),
             label: "camera".into(),
         };
         let address = MediaAddress::new(

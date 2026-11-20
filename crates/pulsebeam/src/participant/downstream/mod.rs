@@ -415,10 +415,7 @@ mod tests {
     fn fixed_playout_is_per_receiver_and_defaults_require_a_fresh_mid() {
         let mut downstream = Downstream::new(
             LogCtx {
-                room_id: crate::entity::RoomId::from_external(
-                    &crate::entity::RoomExternalId::new("room").unwrap(),
-                ),
-                participant_id: ParticipantId::new(),
+                connection_id: crate::entity::ConnectionId::new(),
             },
             false,
         );

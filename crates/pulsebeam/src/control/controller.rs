@@ -23,7 +23,7 @@ use crate::{
         negotiator::{Negotiator, NegotiatorError},
         ufrag::IceUfrag,
     },
-    entity::{ConnectionId, ParticipantId, RoomId},
+    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, RoomId},
     id::ShardId,
     shard::{
         ShardContext,
@@ -46,7 +46,6 @@ pub struct ParticipantState {
     pub manual_sub: bool,
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
-    pub participant_external_id: crate::entity::ParticipantExternalId,
     pub connection_id: ConnectionId,
     pub old_connection_id: Option<ConnectionId>,
     pub authorization: Option<AuthorizationLease>,
@@ -85,7 +84,7 @@ impl AuthorizationLease {
         runtime_now: pulsebeam_runtime::time::Instant,
     ) -> Result<Self, TokenError> {
         let permissions = super::permissions::ResourcePermissions::Grants {
-            room: authorization.room_external_id.clone(),
+            room: authorization.room_id.clone(),
             grants: authorization.grants.clone(),
         };
         Self::from_authority(Box::new(authorization), permissions, wall_now, runtime_now)
@@ -148,13 +147,12 @@ impl AuthorizationLease {
         &self.permissions
     }
 
-    pub(super) fn room_external_id(&self) -> &crate::entity::RoomExternalId {
-        &self.authority.room_external_id
+    pub(super) fn room_id(&self) -> &crate::entity::RoomId {
+        &self.authority.room_id
     }
 
     fn allows_current_room(&self) -> bool {
-        self.permissions
-            .allows_join(&self.authority.room_external_id)
+        self.permissions.allows_join(&self.authority.room_id)
     }
 
     fn replacing(
@@ -187,23 +185,18 @@ impl AuthorizationLease {
         self.authority.expiry
     }
 
-    fn matches_participant(
-        &self,
-        room: RoomId,
-        participant: ParticipantId,
-        external: &crate::entity::ParticipantExternalId,
-    ) -> bool {
-        self.authority.room_id == room
-            && self.authority.participant_id == participant
-            && &self.authority.participant_external_id == external
+    fn matches_participant(&self, room: RoomId, participant: ParticipantId) -> bool {
+        self.authority.room_id == room && self.authority.participant_id == participant
+    }
+
+    fn matches_endpoint(&self, room: ProjectRoomKey, participant: ParticipantId) -> bool {
+        self.authority.project_id == room.project
+            && self.matches_participant(room.room, participant)
     }
 
     fn matches_identity(&self, authorization: &VerifiedAuthorization) -> bool {
-        self.authority.project_id == authorization.project_id
-            && self.authority.room_external_id == authorization.room_external_id
-            && self.authority.room_id == authorization.room_id
-            && self.authority.participant_external_id == authorization.participant_external_id
-            && self.authority.participant_id == authorization.participant_id
+        let endpoint = endpoint_for_authorization(authorization);
+        self.matches_endpoint(endpoint.room, endpoint.participant)
     }
 }
 
@@ -297,7 +290,7 @@ impl AdmissionCommand {
             .ok_or(ControllerError::AuthorizationRejected)?;
         let binding = ownership::RequestBinding::for_request(
             message.state.profile,
-            &lease.authority.room_external_id,
+            &lease.authority.room_id,
             &message.offer,
             credential,
         )?;
@@ -452,12 +445,11 @@ struct PendingMaterialization {
     command: Option<ShardCommand>,
     ack: Option<oneshot::Receiver<bool>>,
     participant: ParticipantId,
-    participant_external_id: crate::entity::ParticipantExternalId,
     connection_id: ConnectionId,
     authorization: Option<AuthorizationLease>,
     profile: SignalingProtocol,
     transport: crate::route::NodeTransportAddress,
-    room_id: RoomId,
+    room: ProjectRoomKey,
     answer: String,
     owned: Option<OwnedMaterialization>,
 }
@@ -473,6 +465,13 @@ enum MaterializationSuccess {
 }
 
 impl PendingMaterialization {
+    fn endpoint(&self) -> EndpointKey {
+        EndpointKey {
+            room: self.room,
+            participant: self.participant,
+        }
+    }
+
     fn incarnation(&self) -> ownership::Incarnation {
         ownership::Incarnation {
             participant: self.participant,
@@ -538,15 +537,23 @@ impl MaterializationWork {
         connection: ConnectionId,
     ) -> bool {
         let pending = &self.pending;
-        pending.participant == authorization.participant_id
+        pending.endpoint() == endpoint_for_authorization(authorization)
             && pending.connection_id == connection
-            && pending.room_id == authorization.room_id
             && pending.profile == SignalingProtocol::State
-            && pending.participant_external_id == authorization.participant_external_id
             && pending
                 .authorization
                 .as_ref()
                 .is_some_and(|lease| lease.matches_identity(authorization))
+    }
+}
+
+fn endpoint_for_authorization(authorization: &VerifiedAuthorization) -> EndpointKey {
+    EndpointKey {
+        room: ProjectRoomKey {
+            project: authorization.project_id,
+            room: authorization.room_id,
+        },
+        participant: authorization.participant_id,
     }
 }
 
@@ -1028,9 +1035,9 @@ impl ControllerActor {
                 if self
                     .core
                     .registry
-                    .get_participant(&message.participant_id)
+                    .get_incarnation(message.participant_id, message.connection_id)
                     .is_some_and(|meta| {
-                        meta.room_id == message.room_id && meta.profile == message.profile
+                        meta.room_id() == message.room_id && meta.profile == message.profile
                     })
                 {
                     self.remove_incarnation(message.participant_id, message.connection_id);
@@ -1056,8 +1063,8 @@ impl ControllerActor {
                     if let Some(authorization) = authorization {
                         for work in &mut self.materializations {
                             if work.pending.connection_id == message.connection_id
-                                && work.pending.participant == authorization.participant_id
-                                && work.pending.room_id == authorization.room_id
+                                && work.pending.endpoint()
+                                    == endpoint_for_authorization(&authorization)
                                 && work.pending.profile == message.profile
                             {
                                 work.superseded = true;
@@ -1249,11 +1256,8 @@ impl ControllerActor {
             .authorization
             .as_ref()
             .ok_or(ControllerError::AuthorizationRejected)?;
-        if !lease.matches_participant(
-            state.room_id,
-            state.participant_id,
-            &state.participant_external_id,
-        ) || !lease.allows_current_room()
+        if !lease.matches_participant(state.room_id, state.participant_id)
+            || !lease.allows_current_room()
         {
             return Err(ControllerError::AuthorizationRejected.into());
         }
@@ -1415,11 +1419,8 @@ impl ControllerActor {
             let previous = self
                 .core
                 .registry
-                .get_participant(&incarnation.participant)
-                .filter(|meta| {
-                    meta.connection_id == incarnation.connection
-                        && meta.transport == Some(incarnation.transport)
-                })
+                .get_incarnation(incarnation.participant, incarnation.connection)
+                .filter(|meta| meta.transport == Some(incarnation.transport))
                 .cloned();
             if let Some(meta) = previous {
                 self.terminate_incarnation(
@@ -1446,7 +1447,7 @@ impl ControllerActor {
         {
             return Err(ControllerError::AuthorizationExpired);
         }
-        if !self.candidate_is_newer(pending.participant, pending.connection_id) {
+        if !self.candidate_is_newer(pending.endpoint(), pending.connection_id) {
             return Err(ControllerError::Superseded);
         }
         match self.ownership.submit(pending.incarnation()) {
@@ -1472,7 +1473,7 @@ impl ControllerActor {
             pulsebeam_runtime::time::Instant::now(),
         );
         self.core.registry.release_partition(
-            pending.room_id,
+            pending.room,
             pending.participant,
             pending.connection_id,
         );
@@ -1584,13 +1585,13 @@ impl ControllerActor {
         let owned = pending.owned.take();
         let superseded = superseded
             || !cutoffs.is_empty()
-            || !self.candidate_is_newer(pending.participant, pending.connection_id);
+            || !self.candidate_is_newer(pending.endpoint(), pending.connection_id);
         metrics::histogram!("control_materialization_wait_us")
             .record(started.elapsed().as_micros() as f64);
         let result = if materialized {
             if superseded {
                 self.core.registry.release_partition(
-                    pending.room_id,
+                    pending.room,
                     pending.participant,
                     pending.connection_id,
                 );
@@ -1600,7 +1601,7 @@ impl ControllerActor {
             }
         } else {
             self.core.registry.release_partition(
-                pending.room_id,
+                pending.room,
                 pending.participant,
                 pending.connection_id,
             );
@@ -1632,8 +1633,7 @@ impl ControllerActor {
                 let meta = self
                     .core
                     .registry
-                    .get_participant(&incarnation.participant)
-                    .filter(|meta| meta.connection_id == incarnation.connection)
+                    .get_incarnation(incarnation.participant, incarnation.connection)
                     .cloned()
                     .unwrap_or_else(|| {
                         pulsebeam_runtime::fatal!("committed materialization lost its incarnation");
@@ -1659,7 +1659,7 @@ impl ControllerActor {
         cutoffs: MaterializationCutoffs,
     ) {
         let ownership::Incarnation {
-            participant,
+            connection,
             transport,
             ..
         } = incarnation;
@@ -1671,7 +1671,7 @@ impl ControllerActor {
         update.stage(
             generation,
             crate::shard_update::ShardUpdateOp::RemoveParticipant {
-                participant,
+                connection,
                 address: transport,
             },
         );
@@ -1745,8 +1745,8 @@ impl ControllerActor {
     fn current_incarnation(&self, participant: ParticipantId, connection_id: ConnectionId) -> bool {
         self.core
             .registry
-            .get_participant(&participant)
-            .is_some_and(|meta| meta.connection_id == connection_id)
+            .get_incarnation(participant, connection_id)
+            .is_some()
     }
 
     fn handle_shard_event(&mut self, (_shard, event): ShardEventMessage) {
@@ -1772,7 +1772,10 @@ impl ControllerActor {
                     return;
                 }
                 if let Some(outcome) = self.lifecycle.unpublish(
-                    meta.origin,
+                    EndpointKey {
+                        room: meta.room,
+                        participant: meta.origin,
+                    },
                     meta.id,
                     &self.core.registry,
                     pulsebeam_runtime::time::Instant::now(),
@@ -1790,10 +1793,9 @@ impl ControllerActor {
                     || !self
                         .core
                         .registry
-                        .get_participant(&request.subscriber)
+                        .get_incarnation(request.subscriber, connection_id)
                         .is_some_and(|meta| {
-                            meta.connection_id == connection_id
-                                && meta.room_id == request.subscriber_room
+                            meta.room == request.subscriber_room
                                 && self.native_connections.contains_key(&connection_id)
                         })
                 {
@@ -1830,14 +1832,21 @@ impl ControllerActor {
                 track,
                 ..
             } => {
-                if !self.current_incarnation(subscriber, connection_id) {
+                let Some(meta) = self
+                    .core
+                    .registry
+                    .get_incarnation(subscriber, connection_id)
+                else {
                     return;
-                }
+                };
                 let outcome = self.lifecycle.activate(
-                    track.room_id,
+                    track.room,
                     track.origin,
                     track.id,
-                    subscriber,
+                    EndpointKey {
+                        room: meta.room,
+                        participant: subscriber,
+                    },
                     &self.core.registry,
                     pulsebeam_runtime::time::Instant::now(),
                 );
@@ -1849,14 +1858,21 @@ impl ControllerActor {
                 track,
                 ..
             } => {
-                if !self.current_incarnation(subscriber, connection_id) {
+                let Some(meta) = self
+                    .core
+                    .registry
+                    .get_incarnation(subscriber, connection_id)
+                else {
                     return;
-                }
+                };
                 let outcome = self.lifecycle.deactivate(
-                    track.room_id,
+                    track.room,
                     track.origin,
                     track.id,
-                    subscriber,
+                    EndpointKey {
+                        room: meta.room,
+                        participant: subscriber,
+                    },
                     &self.core.registry,
                     pulsebeam_runtime::time::Instant::now(),
                 );
@@ -2009,14 +2025,15 @@ impl ControllerActor {
             );
         }
         if let Some(result) = completed.publication
-            && let Some(meta) = self.core.registry.get_participant(&result.participant)
-            && meta.connection_id == result.connection_id
+            && let Some(meta) = self
+                .core
+                .registry
+                .get_incarnation(result.participant, result.connection_id)
             && self.native_connections.contains_key(&result.connection_id)
         {
             self.command_backlog.push_back((
                 meta.shard_id,
                 ShardCommand::PublicationCutoffResult {
-                    participant: result.participant,
                     connection_id: result.connection_id,
                     reference: result.reference,
                     success: result.success,
@@ -2030,8 +2047,8 @@ impl ControllerActor {
             meta.origin,
             meta.connection_id,
             reference,
-            meta.room_id,
-            meta.room_id,
+            meta.room,
+            meta.room,
             Some(meta),
         );
     }
@@ -2041,19 +2058,17 @@ impl ControllerActor {
         participant: ParticipantId,
         connection_id: ConnectionId,
         reference: u64,
-        room_id: RoomId,
-        source_room: RoomId,
+        room_id: ProjectRoomKey,
+        source_room: ProjectRoomKey,
         publication: Option<crate::track::TrackMeta>,
     ) {
         let Some(shard) = self
             .core
             .registry
-            .get_participant(&participant)
+            .get_incarnation(participant, connection_id)
             .and_then(|current| {
-                (current.connection_id == connection_id
-                    && current.room_id == room_id
-                    && self.native_connections.contains_key(&connection_id))
-                .then_some(current.shard_id)
+                (current.room == room_id && self.native_connections.contains_key(&connection_id))
+                    .then_some(current.shard_id)
             })
         else {
             return;
@@ -2084,7 +2099,10 @@ impl ControllerActor {
         self.publish_staged();
         let outcomes = if let Some(meta) = publication {
             let outcome = self.lifecycle.unpublish(
-                meta.origin,
+                EndpointKey {
+                    room: meta.room,
+                    participant: meta.origin,
+                },
                 meta.id,
                 &self.core.registry,
                 pulsebeam_runtime::time::Instant::now(),
@@ -2096,7 +2114,10 @@ impl ControllerActor {
         } else {
             self.lifecycle.unsubscribe_owned(
                 source_room,
-                participant,
+                EndpointKey {
+                    room: room_id,
+                    participant,
+                },
                 reference,
                 &self.core.registry,
                 pulsebeam_runtime::time::Instant::now(),
@@ -2169,8 +2190,7 @@ impl ControllerActor {
         if let Some((participant, meta)) = self.core.registry.get_connection(connection)
             && meta.profile == profile
             && let Some(lease) = &meta.authorization
-            && let Some(external) = &meta.participant_external_id
-            && lease.matches_participant(meta.room_id, participant, external)
+            && lease.matches_endpoint(meta.room, participant)
         {
             return Some(lease);
         }
@@ -2179,11 +2199,7 @@ impl ControllerActor {
             let lease = pending.authorization.as_ref()?;
             (pending.connection_id == connection
                 && pending.profile == profile
-                && lease.matches_participant(
-                    pending.room_id,
-                    pending.participant,
-                    &pending.participant_external_id,
-                ))
+                && lease.matches_endpoint(pending.room, pending.participant))
             .then_some(lease)
         })
     }
@@ -2205,8 +2221,7 @@ impl ControllerActor {
             .native_resource_lease(request.connection_id)
             .ok_or(ControllerError::GrantGone)?;
         if request.principal.project_id() != accepted.authority.project_id
-            || request.principal.participant_external_id()
-                != &accepted.authority.participant_external_id
+            || request.principal.participant_id() != &accepted.authority.participant_id
         {
             return Err(ControllerError::AuthorizationRejected);
         }
@@ -2281,16 +2296,14 @@ impl ControllerActor {
         if self
             .core
             .registry
-            .get_participant(&verified.participant_id)
+            .get_incarnation(verified.participant_id, request.connection_id)
             .is_some_and(|meta| {
-                meta.room_id == verified.room_id
+                meta.room_id() == verified.room_id
                     && meta
                         .authorization
                         .as_ref()
                         .is_some_and(|lease| lease.matches_identity(&verified))
                     && meta.profile == SignalingProtocol::State
-                    && meta.participant_external_id.as_ref()
-                        == Some(&verified.participant_external_id)
             })
         {
             self.remove_incarnation(verified.participant_id, request.connection_id);
@@ -2319,14 +2332,12 @@ impl ControllerActor {
         let meta = self
             .core
             .registry
-            .get_participant(&verified.participant_id)
+            .get_incarnation(verified.participant_id, request.connection_id)
             .ok_or(ControllerError::GrantGone)?;
-        if meta.connection_id != request.connection_id || meta.profile != SignalingProtocol::State {
+        if meta.profile != SignalingProtocol::State {
             return Err(ControllerError::GrantGone);
         }
-        if meta.room_id != verified.room_id
-            || meta.participant_external_id.as_ref() != Some(&verified.participant_external_id)
-        {
+        if meta.room_id() != verified.room_id {
             return Err(ControllerError::AuthorizationRejected);
         }
         let previous = meta
@@ -2363,13 +2374,7 @@ impl ControllerActor {
         let lease = previous.replacing(verified, wall_now, runtime_now)?;
         let revision = lease.revision();
         self.install_authorization(participant, request.connection_id, &previous, lease)?;
-        self.send_renewal_result(
-            shard,
-            participant,
-            request.connection_id,
-            revision,
-            Some(expiry),
-        );
+        self.send_renewal_result(shard, request.connection_id, revision, Some(expiry));
         Ok(revision)
     }
 
@@ -2383,10 +2388,8 @@ impl ControllerActor {
         let meta = self
             .core
             .registry
-            .get_participant(&participant)
-            .filter(|meta| {
-                meta.connection_id == connection_id && meta.authorization.as_ref() == Some(previous)
-            })
+            .get_incarnation(participant, connection_id)
+            .filter(|meta| meta.authorization.as_ref() == Some(previous))
             .ok_or(ControllerError::GrantGone)?;
         if !previous.matches_identity(&lease.authority) {
             return Err(ControllerError::AuthorizationRejected);
@@ -2414,7 +2417,7 @@ impl ControllerActor {
             participant_id: participant,
             connection_id,
         });
-        self.observe_native_authorization(participant, &lease);
+        self.observe_native_authorization(connection_id, &lease);
         Ok(())
     }
 
@@ -2425,13 +2428,14 @@ impl ControllerActor {
         connection_id: ConnectionId,
         token: String,
     ) {
-        let Some(meta) = self.core.registry.get_participant(&participant) else {
+        let Some(meta) = self
+            .core
+            .registry
+            .get_incarnation(participant, connection_id)
+        else {
             return;
         };
-        if meta.connection_id != connection_id
-            || meta.shard_id != shard
-            || meta.authorization.is_none()
-        {
+        if meta.shard_id != shard {
             return;
         }
         let Some(accepted) = meta.authorization.as_ref() else {
@@ -2440,11 +2444,11 @@ impl ControllerActor {
         let expected_revision = accepted.revision();
         let accepted = accepted.authority.clone();
         let Some(registry) = self.key_registry.clone() else {
-            self.send_renewal_result(shard, participant, connection_id, expected_revision, None);
+            self.send_renewal_result(shard, connection_id, expected_revision, None);
             return;
         };
         if token.len() > MAX_COMPACT_TOKEN_LEN || self.renewals_inflight >= MAX_PENDING_RENEWALS {
-            self.send_renewal_result(shard, participant, connection_id, expected_revision, None);
+            self.send_renewal_result(shard, connection_id, expected_revision, None);
             return;
         }
         self.renewals_inflight = self.renewals_inflight.saturating_add(1);
@@ -2468,10 +2472,14 @@ impl ControllerActor {
 
     fn finish_renewal(&mut self, result: RenewalResult) {
         self.renewals_inflight = self.renewals_inflight.saturating_sub(1);
-        let Some(meta) = self.core.registry.get_participant(&result.participant) else {
+        let Some(meta) = self
+            .core
+            .registry
+            .get_incarnation(result.participant, result.connection_id)
+        else {
             return;
         };
-        if meta.connection_id != result.connection_id || meta.profile != SignalingProtocol::State {
+        if meta.profile != SignalingProtocol::State {
             return;
         }
         let shard = meta.shard_id;
@@ -2479,8 +2487,7 @@ impl ControllerActor {
         let wall_now = SystemTime::now();
         let expiry = result.verified.and_then(|verified| {
             if verified.participant_id != result.participant
-                || verified.room_id != meta.room_id
-                || Some(&verified.participant_external_id) != meta.participant_external_id.as_ref()
+                || verified.room_id != meta.room_id()
                 || previous.as_ref().is_none_or(|lease| {
                     !lease.matches_identity(&verified)
                         || lease.revision() != result.expected_revision
@@ -2509,19 +2516,12 @@ impl ControllerActor {
         {
             unix_expiry = None;
         }
-        self.send_renewal_result(
-            shard,
-            result.participant,
-            result.connection_id,
-            revision,
-            unix_expiry,
-        );
+        self.send_renewal_result(shard, result.connection_id, revision, unix_expiry);
     }
 
     fn send_renewal_result(
         &mut self,
         shard: ShardId,
-        participant: ParticipantId,
         connection_id: ConnectionId,
         revision: u64,
         expiry: Option<i64>,
@@ -2529,7 +2529,6 @@ impl ControllerActor {
         self.command_backlog.push_back((
             shard,
             ShardCommand::AuthorizationResult {
-                participant,
                 connection_id,
                 revision,
                 expiry,
@@ -2550,9 +2549,10 @@ impl ControllerActor {
                 }
                 TrackLifecycleOperation::ParticipantEffect {
                     shard,
-                    participant,
+                    connection,
                     effect,
-                } => self.stage_participant_at(shard, outcome.generation, participant, effect),
+                    ..
+                } => self.stage_participant_at(shard, outcome.generation, connection, effect),
             }
         }
     }
@@ -2643,14 +2643,14 @@ impl ControllerActor {
         &mut self,
         shard: ShardId,
         generation: u64,
-        participant: ParticipantId,
+        connection: ConnectionId,
         effect: crate::participant::ParticipantEffect,
     ) {
         let Some(update) = self.updates.get_mut(shard.index()) else {
             debug_assert!(false, "participant effects must target a live shard");
             return;
         };
-        update.stage_participant_effect(generation, participant, effect);
+        update.stage_participant_effect(generation, connection, effect);
         self.mark_update_touched(shard);
     }
 
@@ -2760,17 +2760,30 @@ impl ControllerActor {
         }
     }
 
+    fn admission_room(
+        room: RoomId,
+        authorization: Option<&AuthorizationLease>,
+    ) -> Result<ProjectRoomKey, ControllerError> {
+        if let Some(lease) = authorization {
+            return Ok(ProjectRoomKey {
+                project: lease.authority.project_id,
+                room,
+            });
+        }
+        #[cfg(test)]
+        return Ok(ProjectRoomKey::fixture(room));
+        #[cfg(not(test))]
+        Err(ControllerError::AuthorizationRejected)
+    }
+
     fn begin_create_participant(
         &mut self,
         mut state: ParticipantState,
         offer: String,
     ) -> Result<PendingMaterialization, ControllerError> {
         if state.authorization.as_ref().is_some_and(|lease| {
-            !lease.matches_participant(
-                state.room_id,
-                state.participant_id,
-                &state.participant_external_id,
-            ) || !lease.allows_current_room()
+            !lease.matches_participant(state.room_id, state.participant_id)
+                || !lease.allows_current_room()
         }) {
             return Err(ControllerError::AuthorizationRejected);
         }
@@ -2792,11 +2805,12 @@ impl ControllerActor {
         } else {
             None
         };
+        let room = Self::admission_room(state.room_id, state.authorization.as_ref())?;
         let participant_id = state.participant_id;
         let choose = |snapshot: Option<&pulsebeam_runtime::rt::ExecutionSnapshot>| {
             self.placement.admit(
                 &self.core,
-                &state.room_id,
+                &room,
                 &participant_id,
                 self.router.shard_count(),
                 snapshot,
@@ -2879,7 +2893,6 @@ impl ControllerActor {
             }
         }
         let connection_id = state.connection_id;
-        let participant_external_id = state.participant_external_id.clone();
         let authorization = state.authorization.clone();
         let profile = state.profile;
         let native = if let Some(capabilities) = resources.native_rtp_capabilities.take() {
@@ -2889,7 +2902,6 @@ impl ControllerActor {
             let Ok(mut native) = StateProtocolHandler::new(
                 participant_id,
                 state.room_id,
-                participant_external_id.clone(),
                 Some(capabilities),
                 control,
             ) else {
@@ -2912,12 +2924,11 @@ impl ControllerActor {
         } else {
             None
         };
-        let config = self.core.prepare_participant(rtc, resources, state);
-        let room_id = config.room_id;
+        let config = self.core.prepare_participant(rtc, resources, state, room);
         let (ack_tx, ack_rx) = oneshot::channel();
         self.core
             .registry
-            .reserve_partition(room_id, participant_id, connection_id, shard, slot);
+            .reserve_partition(room, participant_id, connection_id, shard, slot);
         Ok(PendingMaterialization {
             native,
             shard,
@@ -2929,12 +2940,11 @@ impl ControllerActor {
             }),
             ack: Some(ack_rx),
             participant: participant_id,
-            participant_external_id,
             connection_id,
             authorization,
             profile,
             transport: address,
-            room_id,
+            room,
             answer,
             owned: None,
         })
@@ -2946,7 +2956,7 @@ impl ControllerActor {
         wall_now: SystemTime,
     ) -> Result<String, ControllerError> {
         let (room, participant, connection) =
-            (pending.room_id, pending.participant, pending.connection_id);
+            (pending.room, pending.participant, pending.connection_id);
         let result = self.commit_materialization(pending, wall_now);
         self.core
             .registry
@@ -2960,17 +2970,16 @@ impl ControllerActor {
         wall_now: SystemTime,
     ) -> Result<String, ControllerError> {
         let participant_id = pending.participant;
-        let room_id = pending.room_id;
+        let room = pending.room;
         let previous = self.commit_candidate(
             participant_id,
-            room_id,
+            pending.room,
             pending.shard,
             pending.partition_index,
             pending.transport,
             pending.connection_id,
             pending.authorization,
             pending.profile,
-            pending.participant_external_id,
             wall_now,
         )?;
         if let Some(previous) = previous {
@@ -3001,7 +3010,7 @@ impl ControllerActor {
             ]
         };
         let outcomes = self.lifecycle.subscribe_defaults(
-            room_id,
+            room,
             participant_id,
             defaults,
             &self.core.registry,
@@ -3020,18 +3029,18 @@ impl ControllerActor {
     fn commit_candidate(
         &mut self,
         participant_id: ParticipantId,
-        room_id: RoomId,
+        room: ProjectRoomKey,
         shard: ShardId,
         partition_index: usize,
         transport: crate::route::NodeTransportAddress,
         connection_id: ConnectionId,
         authorization: Option<AuthorizationLease>,
         profile: SignalingProtocol,
-        participant_external_id: crate::entity::ParticipantExternalId,
         wall_now: SystemTime,
     ) -> Result<Option<crate::control::registry::ParticipantMeta>, ControllerError> {
         if authorization.as_ref().is_some_and(|lease| {
-            !lease.matches_participant(room_id, participant_id, &participant_external_id)
+            lease.authority.project_id != room.project
+                || !lease.matches_endpoint(room, participant_id)
                 || !lease.allows_current_room()
         }) {
             return Err(ControllerError::AuthorizationRejected);
@@ -3049,13 +3058,17 @@ impl ControllerActor {
                 .native_expiry()
                 .map_err(|_| ControllerError::AuthorizationRejected)?;
         }
-        if !self.candidate_is_newer(participant_id, connection_id) {
+        let endpoint = EndpointKey {
+            room,
+            participant: participant_id,
+        };
+        if !self.candidate_is_newer(endpoint, connection_id) {
             return Err(ControllerError::Superseded);
         }
         // The exact claim holds the room slot and its shard through concurrent
         // joins and departures. A fresh placement choice is not a reservation.
         if !self.core.registry.partition_reserved(
-            room_id,
+            room,
             participant_id,
             connection_id,
             shard,
@@ -3068,13 +3081,12 @@ impl ControllerActor {
             .registry
             .commit_candidate(
                 participant_id,
-                room_id,
+                room,
                 shard,
                 partition_index,
                 transport,
                 connection_id,
                 profile,
-                Some(participant_external_id),
             )
             .map_err(|_| ControllerError::Superseded)?;
         if let Some(lease) = authorization {
@@ -3091,19 +3103,17 @@ impl ControllerActor {
         // Retain the fence with bounded in-flight work, even if the replacement
         // is removed before an older materialization acknowledges installation.
         for work in &mut self.materializations {
-            if work.pending.participant == participant_id
-                && work.pending.connection_id < connection_id
-            {
+            if work.pending.endpoint() == endpoint && work.pending.connection_id < connection_id {
                 work.superseded = true;
             }
         }
         Ok(previous)
     }
 
-    fn candidate_is_newer(&self, participant: ParticipantId, connection_id: ConnectionId) -> bool {
+    fn candidate_is_newer(&self, endpoint: EndpointKey, connection_id: ConnectionId) -> bool {
         self.core
             .registry
-            .get_participant(&participant)
+            .get_endpoint(endpoint)
             .map(|meta| meta.connection_id)
             .is_none_or(|current| connection_id > current)
     }
@@ -3116,7 +3126,10 @@ impl ControllerActor {
         let current = self
             .core
             .registry
-            .get_participant(&state.participant_id)
+            .get_endpoint(EndpointKey {
+                room: Self::admission_room(state.room_id, state.authorization.as_ref())?,
+                participant: state.participant_id,
+            })
             .map(|meta| meta.connection_id);
         if current != state.old_connection_id {
             return Err(ControllerError::Superseded);
@@ -3128,9 +3141,8 @@ impl ControllerActor {
         let Some(meta) = self
             .core
             .registry
-            .get_participant(&participant)
+            .get_incarnation(participant, connection_id)
             .cloned()
-            .filter(|meta| meta.connection_id == connection_id)
         else {
             return;
         };
@@ -3155,7 +3167,7 @@ impl ControllerActor {
         }
         let sources: Vec<_> = self
             .lifecycle
-            .sources_in_room(meta.room_id)
+            .sources_in_room(meta.room)
             .filter(|track| {
                 track.meta().origin == participant
                     && track.meta().connection_id == meta.connection_id
@@ -3163,7 +3175,10 @@ impl ControllerActor {
             .map(|track| track.meta().clone())
             .collect();
         let mut outcomes = self.lifecycle.remove_participant(
-            participant,
+            EndpointKey {
+                room: meta.room,
+                participant,
+            },
             &self.core.registry,
             pulsebeam_runtime::time::Instant::now(),
         );
@@ -3214,7 +3229,7 @@ impl ControllerActor {
             update.stage(
                 generation,
                 crate::shard_update::ShardUpdateOp::RemoveParticipant {
-                    participant,
+                    connection: meta.connection_id,
                     address,
                 },
             );
@@ -3246,9 +3261,8 @@ impl ControllerActor {
             let Some(meta) = self
                 .core
                 .registry
-                .get_participant(&work.participant_id)
+                .get_incarnation(work.participant_id, work.connection_id)
                 .cloned()
-                .filter(|meta| meta.connection_id == work.connection_id)
             else {
                 continue;
             };
@@ -3349,8 +3363,8 @@ pub type ControllerSender = mailbox::Sender<ControllerCommand>;
 mod replacement_tests {
     use super::*;
     use crate::{
-        control::registry::CommitCandidateError, entity::RoomExternalId,
-        shard::metrics::ShardMetrics, shard_update::new_shard_update,
+        control::registry::CommitCandidateError, entity::RoomId, shard::metrics::ShardMetrics,
+        shard_update::new_shard_update,
     };
 
     mod catalog_tests;
@@ -3371,11 +3385,11 @@ mod replacement_tests {
             connection_id: ConnectionId,
             authorization: Option<AuthorizationLease>,
             profile: SignalingProtocol,
-            participant_external_id: crate::entity::ParticipantExternalId,
             wall_now: SystemTime,
         ) -> Result<Option<crate::control::registry::ParticipantMeta>, ControllerError> {
+            let room = Self::admission_room(room_id, authorization.as_ref())?;
             self.core.registry.reserve_partition(
-                room_id,
+                room,
                 participant_id,
                 connection_id,
                 shard,
@@ -3383,19 +3397,18 @@ mod replacement_tests {
             );
             let result = self.commit_candidate(
                 participant_id,
-                room_id,
+                room,
                 shard,
                 partition_index,
                 transport,
                 connection_id,
                 authorization,
                 profile,
-                participant_external_id,
                 wall_now,
             );
             self.core
                 .registry
-                .release_partition(room_id, participant_id, connection_id);
+                .release_partition(room, participant_id, connection_id);
             result
         }
     }
@@ -3484,48 +3497,31 @@ mod replacement_tests {
             ExecutionAction, ExecutionCompletion, PreparedResource, ReceiverPreparation,
             ResourceExecution, handoff,
         };
-        use crate::entity::{ParticipantExternalId, TrackKind};
+        use crate::entity::{ParticipantId, TrackKind};
         use crate::participant::policy::ReceiverExecution;
         use crate::participant::signaling::SignalingProgress;
         use pulsebeam_proto::state::{self as wire, codec};
 
-        for (publisher_known, same_room) in
+        for (source_published, same_room) in
             [(true, true), (true, false), (false, true), (false, false)]
         {
             let (mut actor, _receivers) = actor_with_receivers(2);
-            let room = RoomId::from_external(
-                &RoomExternalId::new(if same_room {
-                    "source-authority"
-                } else {
-                    "subscriber-room"
-                })
-                .unwrap(),
-            );
-            let source_room =
-                RoomId::from_external(&RoomExternalId::new("source-authority").unwrap());
-            let publisher = ParticipantId::new();
-            let subscriber = ParticipantId::new();
-            let publisher_external = ParticipantExternalId::new("server-publisher").unwrap();
-            let subscriber_external = ParticipantExternalId::new("subscriber").unwrap();
-            for (participant, connection, shard, partition, external, participant_room) in [
-                (
-                    publisher,
-                    connection_id(1),
-                    0,
-                    0,
-                    if publisher_known {
-                        Some(publisher_external.clone())
-                    } else {
-                        None
-                    },
-                    source_room,
-                ),
+            let room = RoomId::new(if same_room {
+                "source-authority"
+            } else {
+                "subscriber-room"
+            })
+            .unwrap();
+            let source_room = RoomId::new("source-authority").unwrap();
+            let publisher = ParticipantId::new("server-publisher").unwrap();
+            let subscriber = ParticipantId::new("subscriber").unwrap();
+            for (participant, connection, shard, partition, participant_room) in [
+                (publisher, connection_id(1), 0, 0, source_room),
                 (
                     subscriber,
                     connection_id(3),
                     1,
-                    if same_room { 1 } else { 0 },
-                    Some(subscriber_external.clone()),
+                    usize::from(same_room),
                     room,
                 ),
             ] {
@@ -3538,20 +3534,19 @@ mod replacement_tests {
                     .registry
                     .commit_candidate(
                         participant,
-                        participant_room,
+                        ProjectRoomKey::fixture(participant_room),
                         ShardId::new(shard),
                         partition,
                         address,
                         connection,
                         SignalingProtocol::State,
-                        external,
                     )
                     .unwrap();
                 actor.core.registry.mark_materialized(&participant);
             }
             let track = crate::track::Track::data_publication(
                 crate::track::TrackMeta {
-                    room_id: source_room,
+                    room: crate::entity::ProjectRoomKey::fixture(source_room),
                     shard_id: ShardId::new(0),
                     id: connection_id(1).derive_publication_track_id(
                         TrackKind::Data,
@@ -3576,12 +3571,15 @@ mod replacement_tests {
                 .core
                 .registry
                 .update_authorization(&publisher, connection_id(1), publisher_lease);
-            actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(track.clone())));
+            if source_published {
+                actor.handle_shard_event((
+                    ShardId::new(0),
+                    ShardEvent::TrackPublished(track.clone()),
+                ));
+            }
             let (controller, mut endpoint) =
                 handoff::pair(connection_id(3), actor.native_ready_tx.clone());
-            let mut native =
-                StateProtocolHandler::new(subscriber, room, subscriber_external, None, controller)
-                    .unwrap();
+            let mut native = StateProtocolHandler::new(subscriber, room, None, controller).unwrap();
             native
                 .model
                 .authorization(
@@ -3635,7 +3633,7 @@ mod replacement_tests {
             actor.service_native_connections();
             let output = endpoint.output().unwrap();
             let mut records = codec::decode_server(&output.bytes).unwrap().records;
-            if publisher_known {
+            if source_published {
                 let ExecutionAction::Prepare {
                     work,
                     resource: PreparedResource::Receiver(ReceiverPreparation::Ready(plan)),
@@ -3679,8 +3677,12 @@ mod replacement_tests {
                     })
                     .unwrap();
                 assert_eq!(
-                    live.participant.as_ref().unwrap().participant_external_id,
-                    publisher_external.as_str()
+                    live.participant.as_ref().unwrap().participant_id,
+                    publisher.as_str()
+                );
+                assert_eq!(
+                    live.participant.as_ref().unwrap().room_id,
+                    track.meta().room.room.as_str()
                 );
                 assert_eq!(live.track, crate::control::native::track_descriptor(&track));
                 records.extend(batch.records);
@@ -3761,7 +3763,7 @@ mod replacement_tests {
                             );
                         }
                         crate::control::native::ResourcePermissions::Grants {
-                            room: RoomExternalId::new("source-authority").unwrap(),
+                            room: RoomId::new("source-authority").unwrap(),
                             grants: GrantSet::new(grants).unwrap(),
                         }
                     };
@@ -3790,7 +3792,7 @@ mod replacement_tests {
                     )));
                     assert!(state.records.iter().all(|record| !matches!(
                         record.key.as_ref().and_then(|key| key.key.as_ref()),
-                        Some(wire::resource_key::Key::Participant(id)) if id == &publisher.as_str()
+                        Some(wire::resource_key::Key::Participant(id)) if id.participant_id == publisher.as_str()
                     )));
                     assert!(endpoint.command().is_none());
                 }
@@ -3803,7 +3805,9 @@ mod replacement_tests {
             )));
             assert!(records.iter().all(|record| {
                 match record.key.as_ref().and_then(|key| key.key.as_ref()) {
-                    Some(wire::resource_key::Key::Participant(id)) => id != &publisher.as_str(),
+                    Some(wire::resource_key::Key::Participant(id)) => {
+                        id.participant_id != publisher.as_str()
+                    }
                     _ => true,
                 }
             }));
@@ -3818,11 +3822,10 @@ mod replacement_tests {
         let connection = connection_id(37);
         let (ready_tx, mut ready_rx) = mailbox::bounded(std::num::NonZeroUsize::new(4).unwrap());
         let (handoff, mut endpoint) = handoff::pair(connection, ready_tx);
-        let participant = ParticipantId::new();
-        let room = RoomId::from_external(&RoomExternalId::new("handler-room").unwrap());
-        let external = crate::entity::ParticipantExternalId::new("subscriber").unwrap();
-        let mut handler =
-            StateProtocolHandler::new(participant, room, external, None, handoff).unwrap();
+        let participant = crate::entity::fixture_participant_id();
+        let room = RoomId::new("handler-room").unwrap();
+        let external = crate::entity::ParticipantId::new("subscriber").unwrap();
+        let mut handler = StateProtocolHandler::new(participant, room, None, handoff).unwrap();
         handler
             .model
             .authorization(
@@ -3849,7 +3852,7 @@ mod replacement_tests {
                                     wire::SourceLookupSpec {
                                         source: Some(wire::LogicalSourceAddress {
                                             room: "handler-room".into(),
-                                            participant_external_id: "publisher".into(),
+                                            participant_id: "publisher".into(),
                                             kind: wire::TrackKind::Data as i32,
                                             label: "label".into(),
                                         }),
@@ -3888,10 +3891,10 @@ mod replacement_tests {
         actor.native_ready_tx = sender;
         actor.native_ready_rx = receiver;
         actor.native_ready_tx.try_send(connection_id(99)).unwrap();
-        let participant = ParticipantId::new();
+        let participant = crate::entity::fixture_participant_id();
         let connection = connection_id(1);
-        let room = RoomId::from_external(&RoomExternalId::new("native-overflow").unwrap());
-        let external = crate::entity::ParticipantExternalId::new("alice").unwrap();
+        let room = RoomId::new("native-overflow").unwrap();
+        let external = crate::entity::ParticipantId::new("alice").unwrap();
         let shard = ShardId::new(0);
         let transport = actor
             .core
@@ -3906,13 +3909,12 @@ mod replacement_tests {
                 connection,
                 None,
                 SignalingProtocol::State,
-                external.clone(),
                 SystemTime::now(),
             )
             .unwrap();
         let (handoff, endpoint) =
             super::super::native::handoff::pair(connection, actor.native_ready_tx.clone());
-        let native = StateProtocolHandler::new(participant, room, external, None, handoff).unwrap();
+        let native = StateProtocolHandler::new(participant, room, None, handoff).unwrap();
         assert!(native.model.deadline().is_none());
         let previous = pulsebeam_runtime::time::Instant::now() + Duration::from_secs(60);
         actor.native_connections.insert(
@@ -3943,8 +3945,8 @@ mod replacement_tests {
             [(true, false), (false, false), (true, true), (false, true)]
         {
             let mut actor = actor();
-            let participant = ParticipantId::new();
-            let room = RoomId::from_external(&RoomExternalId::new("terminal-replacement").unwrap());
+            let participant = crate::entity::fixture_participant_id();
+            let room = RoomId::new("terminal-replacement").unwrap();
             let wall = SystemTime::now();
             let now = pulsebeam_runtime::time::Instant::now();
             let lease = authorization_lease(
@@ -3955,7 +3957,7 @@ mod replacement_tests {
                 room,
                 participant,
             );
-            let external = crate::entity::ParticipantExternalId::new("alice").unwrap();
+            let external = crate::entity::ParticipantId::new("alice").unwrap();
             let shard = ShardId::new(0);
             let old = connection_id(1);
             let winner = connection_id(2);
@@ -3972,15 +3974,12 @@ mod replacement_tests {
                     old,
                     Some(lease.clone()),
                     SignalingProtocol::State,
-                    external.clone(),
                     wall,
                 )
                 .unwrap();
             let (handoff, mut endpoint) =
                 super::super::native::handoff::pair(old, actor.native_ready_tx.clone());
-            let mut native =
-                StateProtocolHandler::new(participant, room, external.clone(), None, handoff)
-                    .unwrap();
+            let mut native = StateProtocolHandler::new(participant, room, None, handoff).unwrap();
             native
                 .model
                 .authorization(
@@ -4016,14 +4015,20 @@ mod replacement_tests {
                 .publish(source, &actor.core.registry, now)
                 .unwrap();
             actor.publish_track_lifecycle(outcome);
-            assert_eq!(actor.lifecycle.sources_in_room(room).count(), 1);
+            assert_eq!(
+                actor
+                    .lifecycle
+                    .sources_in_room(ProjectRoomKey::fixture(room))
+                    .count(),
+                1
+            );
             let reason = if revoke_join {
                 use pulsebeam_core::auth::grants::{Action, Grant, GrantSet};
                 let mut joined = lease
                     .replacing((*lease.authority).clone(), wall, now)
                     .unwrap();
                 joined.permissions = crate::control::permissions::ResourcePermissions::Grants {
-                    room: RoomExternalId::new("terminal-replacement").unwrap(),
+                    room: RoomId::new("terminal-replacement").unwrap(),
                     grants: GrantSet::new(vec![
                         Grant::new(
                             vec!["terminal-replacement".into()],
@@ -4064,7 +4069,7 @@ mod replacement_tests {
                     .replacing((*lease.authority).clone(), wall, now)
                     .unwrap();
                 next.permissions = crate::control::permissions::ResourcePermissions::Grants {
-                    room: RoomExternalId::new("terminal-replacement").unwrap(),
+                    room: RoomId::new("terminal-replacement").unwrap(),
                     grants: pulsebeam_core::auth::grants::GrantSet::default(),
                 };
                 assert!(matches!(
@@ -4096,7 +4101,6 @@ mod replacement_tests {
                         winner,
                         None,
                         SignalingProtocol::State,
-                        external,
                         wall,
                     )
                     .unwrap()
@@ -4110,7 +4114,13 @@ mod replacement_tests {
                 CloseReason::ParticipantReplaced
             };
             assert!(actor.authorization_expiries.is_empty());
-            assert_eq!(actor.lifecycle.sources_in_room(room).count(), 0);
+            assert_eq!(
+                actor
+                    .lifecycle
+                    .sources_in_room(ProjectRoomKey::fixture(room))
+                    .count(),
+                0
+            );
             assert!(!actor.native_connections.contains_key(&old));
             assert!(actor.retiring_native.contains_key(&old));
             let cleanup_context = actor.native_resource_lease(old).unwrap();
@@ -4193,9 +4203,7 @@ mod replacement_tests {
         let (mut actor, mut receivers) = actor_with_receivers(2);
         let blocked = ShardId::new(0);
         let ready = ShardId::new(1);
-        let participant = ParticipantId::new();
         let command = |reference| ShardCommand::PublicationCutoffResult {
-            participant,
             connection_id: connection_id(1),
             reference,
             success: true,
@@ -4236,8 +4244,11 @@ mod replacement_tests {
     #[test]
     fn pending_materialization_does_not_block_other_completion_or_teardown() {
         let (mut actor, _receivers) = actor_with_receivers(2);
-        let room_id = RoomId::from_external(&RoomExternalId::new("materializations").unwrap());
-        let participants = [ParticipantId::new(), ParticipantId::new()];
+        let room_id = RoomId::new("materializations").unwrap();
+        let participants = [
+            crate::entity::fixture_participant_id(),
+            crate::entity::fixture_participant_id(),
+        ];
         let mut acknowledgements = VecDeque::new();
         let mut replies = Vec::new();
         for (index, participant) in participants.into_iter().enumerate() {
@@ -4249,9 +4260,12 @@ mod replacement_tests {
             let (reply, response) = oneshot::channel();
             acknowledgements.push_back(ack);
             replies.push(response);
-            let partition_index = actor.core.next_room_partition(&room_id, &participant).0;
+            let partition_index = actor
+                .core
+                .next_room_partition(&ProjectRoomKey::fixture(room_id), &participant)
+                .0;
             actor.core.registry.reserve_partition(
-                room_id,
+                ProjectRoomKey::fixture(room_id),
                 participant,
                 connection_id(1),
                 shard,
@@ -4265,13 +4279,12 @@ mod replacement_tests {
                     command: None,
                     ack: None,
                     participant,
-                    participant_external_id: crate::entity::ParticipantExternalId::new("fixture")
-                        .unwrap(),
+
                     connection_id: connection_id(1),
                     authorization: None,
                     profile: SignalingProtocol::Whip,
                     transport,
-                    room_id,
+                    room: ProjectRoomKey::fixture(room_id),
                     answer: "answer".to_owned(),
                     owned: None,
                 },
@@ -4411,7 +4424,7 @@ mod replacement_tests {
         expiry: u64,
         wall_now: SystemTime,
         runtime_now: pulsebeam_runtime::time::Instant,
-        room: &str,
+        _room: &str,
         room_id: RoomId,
         participant_id: ParticipantId,
     ) -> AuthorizationLease {
@@ -4419,10 +4432,7 @@ mod replacement_tests {
             VerifiedAuthorization {
                 grants: full_grants("*"),
                 project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
-                room_external_id: RoomExternalId::new(room).unwrap(),
                 room_id,
-                participant_external_id: crate::entity::ParticipantExternalId::new("alice")
-                    .unwrap(),
                 participant_id,
                 expiry: AuthorizationExpiry::from_unix_seconds(expiry),
             },
@@ -4440,10 +4450,8 @@ mod replacement_tests {
         actor.updates = vec![writer, former_writer];
         actor.update_touched = vec![false; 2];
         actor.update_queued = vec![false; 2];
-        let room_external_id = RoomExternalId::new("delete").unwrap();
-        let room_id = RoomId::from_external(&room_external_id);
-        let participant_id = ParticipantId::new();
-        let participant_external_id = crate::entity::ParticipantExternalId::new("alice").unwrap();
+        let room_id = RoomId::new("delete").unwrap();
+        let participant_id = crate::entity::fixture_participant_id();
         let transport = actor
             .core
             .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
@@ -4464,16 +4472,13 @@ mod replacement_tests {
                     participant_id,
                 )),
                 SignalingProtocol::State,
-                participant_external_id.clone(),
                 UNIX_EPOCH,
             )
             .unwrap();
         let authorization = VerifiedAuthorization {
             grants: full_grants("*"),
             project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
-            room_external_id,
             room_id,
-            participant_external_id,
             participant_id,
             expiry: AuthorizationExpiry::from_unix_seconds(100),
         };
@@ -4609,10 +4614,9 @@ mod replacement_tests {
             (
                 Box::new(crate::participant::ConnectionConfig {
                     manual_sub: true,
-                    room_id,
+                    room: crate::entity::ProjectRoomKey::fixture(room_id),
                     participant_id,
-                    participant_external_id: crate::entity::ParticipantExternalId::new(external)
-                        .unwrap(),
+
                     connection_id,
                     profile: SignalingProtocol::State,
                     allow_topic_channels: false,
@@ -4625,8 +4629,8 @@ mod replacement_tests {
                 offer,
             )
         };
-        let participant = ParticipantId::new();
-        let room = RoomId::from_external(&RoomExternalId::new("late-cutoff").unwrap());
+        let participant = ParticipantId::new("alice").unwrap();
+        let room = RoomId::new("late-cutoff").unwrap();
         let connection = connection_id(1);
         let expiry = u64::try_from(i64::MAX).unwrap();
         let lease = authorization_lease(expiry, UNIX_EPOCH, now, "late-cutoff", room, participant);
@@ -4688,13 +4692,19 @@ mod replacement_tests {
         );
         let original = proofs[0];
         let transport = actor.core.reserve_transport(ShardId::new(0), now);
-        actor
-            .core
-            .registry
-            .reserve_partition(room, participant, connection, ShardId::new(0), 0);
+        actor.core.registry.reserve_partition(
+            ProjectRoomKey {
+                project: authorization.project_id,
+                room,
+            },
+            participant,
+            connection,
+            ShardId::new(0),
+            0,
+        );
         let binding = ownership::RequestBinding::for_request(
             SignalingProtocol::State,
-            &authorization.room_external_id,
+            &authorization.room_id,
             "original offer",
             "original credential",
         )
@@ -4747,12 +4757,15 @@ mod replacement_tests {
                 }),
                 ack: Some(received),
                 participant,
-                participant_external_id: authorization.participant_external_id.clone(),
+
                 connection_id: connection,
                 authorization: Some(lease),
                 profile: SignalingProtocol::State,
                 transport,
-                room_id: room,
+                room: ProjectRoomKey {
+                    project: authorization.project_id,
+                    room,
+                },
                 answer: "late answer".to_owned(),
                 owned: None,
             },
@@ -4761,8 +4774,8 @@ mod replacement_tests {
         let (owner, old_command) = actor.command_backlog.pop_front().unwrap();
         assert_eq!(owner, ShardId::new(0));
 
-        let other = ParticipantId::new();
-        let other_room = RoomId::from_external(&RoomExternalId::new("unblocked").unwrap());
+        let other = crate::entity::fixture_participant_id();
+        let other_room = RoomId::new("unblocked").unwrap();
         let other_transport = actor.core.reserve_transport(ShardId::new(1), now);
         let (other_config, _other_handoff, _) = config(other, connection_id(10), other_room, "bob");
         let (ack, other_ready) = oneshot::channel();
@@ -4783,7 +4796,7 @@ mod replacement_tests {
         );
         assert_eq!(shards[1].participant_count(), 1);
 
-        let next_participant = ParticipantId::new();
+        let next_participant = participant;
         let next_lease = authorization_lease(
             expiry,
             UNIX_EPOCH,
@@ -4801,7 +4814,7 @@ mod replacement_tests {
                 manual_sub: true,
                 room_id: other_room,
                 participant_id: next_participant,
-                participant_external_id: next_lease.authority.participant_external_id.clone(),
+
                 connection_id,
                 old_connection_id: None,
                 authorization: Some(next_lease.clone()),
@@ -4823,7 +4836,7 @@ mod replacement_tests {
             location: axum::http::HeaderValue::from_static("https://edge.test/whip/first"),
             binding: ownership::RequestBinding::for_request(
                 SignalingProtocol::Whip,
-                &next_lease.authority.room_external_id,
+                &next_lease.authority.room_id,
                 offer,
                 "next credential",
             )
@@ -4892,7 +4905,7 @@ mod replacement_tests {
             Ok(ownership::Admission::Pending(old_ticket.clone()))
         );
         assert!(!actor.core.registry.partition_reserved(
-            other_room,
+            ProjectRoomKey::fixture(other_room),
             next_participant,
             connection_id(3),
             ShardId::new(1),
@@ -5388,7 +5401,7 @@ mod replacement_tests {
                 )
                 .unwrap();
             assert_eq!(pending_authority.participant_id, http_participant);
-            assert_eq!(pending_authority.room_external_id.as_str(), "http-target");
+            assert_eq!(pending_authority.room_id.as_str(), "http-target");
             actor.advance_materializations();
             assert!(
                 futures_lite::future::poll_once(&mut creating)
@@ -5417,10 +5430,10 @@ mod replacement_tests {
                 .await
                 .unwrap();
             let state: serde_json::Value = serde_json::from_slice(&expected_body).unwrap();
-            assert_eq!(state["room_external_id"], "http-target");
-            assert_eq!(state["participant_external_id"], "http-native");
+            assert!(state.get("room_external_id").is_none());
+            assert_eq!(state["room_id"], "http-target");
+            assert!(state.get("participant_external_id").is_none());
             assert_eq!(state["connection_id"], http_connection.to_string());
-            assert_eq!(state["room_id"], pending_authority.room_id.to_string());
             assert_eq!(state["participant_id"], http_participant.to_string());
             assert_eq!(state["profile"], pulsebeam_proto::state::PROFILE);
             assert_eq!(
@@ -5652,9 +5665,9 @@ mod replacement_tests {
             actor.updates.push(writer);
             receivers.push(receiver);
         }
-        let room_id = RoomId::from_external(&RoomExternalId::new("owned-cutoff").unwrap());
-        let publisher = ParticipantId::new();
-        let subscriber = ParticipantId::new();
+        let room_id = RoomId::new("owned-cutoff").unwrap();
+        let publisher = crate::entity::fixture_participant_id();
+        let subscriber = crate::entity::fixture_participant_id();
         let mut endpoints = Vec::new();
         for (participant, shard) in [(publisher, 0), (subscriber, 1)] {
             let connection = if shard == 0 {
@@ -5670,22 +5683,19 @@ mod replacement_tests {
                 .registry
                 .commit_candidate(
                     participant,
-                    room_id,
+                    ProjectRoomKey::fixture(room_id),
                     ShardId::new(shard),
                     shard,
                     address,
                     connection,
                     SignalingProtocol::State,
-                    None,
                 )
                 .unwrap();
             actor.core.registry.mark_materialized(&participant);
             let (handoff, endpoint) =
                 super::super::native::handoff::pair(connection, actor.native_ready_tx.clone());
-            let external =
-                crate::entity::ParticipantExternalId::new(&format!("cutoff-{shard}")).unwrap();
-            let handler =
-                StateProtocolHandler::new(participant, room_id, external, None, handoff).unwrap();
+            let external = crate::entity::ParticipantId::new(&format!("cutoff-{shard}")).unwrap();
+            let handler = StateProtocolHandler::new(participant, room_id, None, handoff).unwrap();
             actor.native_connections.insert(
                 connection,
                 NativeService {
@@ -5698,7 +5708,7 @@ mod replacement_tests {
         let make_track = |reference| {
             crate::track::Track::data(
                 crate::track::TrackMeta {
-                    room_id,
+                    room: crate::entity::ProjectRoomKey::fixture(room_id),
                     shard_id: ShardId::new(0),
                     id: connection_id(1).derive_publication_track_id(
                         crate::entity::TrackKind::Data,
@@ -5718,7 +5728,7 @@ mod replacement_tests {
         actor.handle_shard_event((
             ShardId::new(0),
             ShardEvent::TrackSubscriptionAdded {
-                room_id,
+                room_id: ProjectRoomKey::fixture(room_id),
                 subscriber,
                 connection_id: connection_id(3),
                 selector: TrackSelector::track(first.id()),
@@ -5764,7 +5774,7 @@ mod replacement_tests {
         let completed = actor.deletion_rx.recv().await.unwrap();
         actor.release_deletion(completed);
         assert!(
-            matches!(actor.command_backlog.pop_front(), Some((shard, ShardCommand::PublicationCutoffResult { participant, connection_id: connection, reference: 1, success: true })) if shard == ShardId::new(0) && participant == publisher && connection == connection_id(1))
+            matches!(actor.command_backlog.pop_front(), Some((shard, ShardCommand::PublicationCutoffResult { connection_id: connection, reference: 1, success: true })) if shard == ShardId::new(0) && connection == connection_id(1))
         );
         let released = actor.deletion_rx.recv().await.unwrap();
         actor.release_deletion(released);
@@ -5780,8 +5790,8 @@ mod replacement_tests {
             ShardEvent::OwnedSubscriptionSet {
                 connection_id: connection_id(3),
                 request: super::super::topology::OwnedSubscription {
-                    subscriber_room: room_id,
-                    source_room: room_id,
+                    subscriber_room: ProjectRoomKey::fixture(room_id),
+                    source_room: ProjectRoomKey::fixture(room_id),
                     subscriber,
                     reference: 2,
                     track: received.id(),
@@ -5795,8 +5805,8 @@ mod replacement_tests {
         actor.handle_shard_event((
             ShardId::new(1),
             ShardEvent::OwnedSubscriptionRemoved {
-                room_id,
-                source_room: room_id,
+                room_id: ProjectRoomKey::fixture(room_id),
+                source_room: ProjectRoomKey::fixture(room_id),
                 subscriber,
                 connection_id: connection_id(3),
                 reference: 2,
@@ -5818,7 +5828,7 @@ mod replacement_tests {
             actor.release_deletion(completed);
         }
         assert!(
-            matches!(actor.command_backlog.pop_front(), Some((shard, ShardCommand::PublicationCutoffResult { participant, reference: 2, success: true, .. })) if participant == subscriber && shard == ShardId::new(1))
+            matches!(actor.command_backlog.pop_front(), Some((shard, ShardCommand::PublicationCutoffResult { connection_id: connection, reference: 2, success: true })) if connection == connection_id(3) && shard == ShardId::new(1))
         );
         assert_eq!(actor.deletion_bytes, 0);
         actor.handle_shard_event((
@@ -5858,7 +5868,10 @@ mod replacement_tests {
             actor
                 .lifecycle
                 .unpublish(
-                    publisher,
+                    EndpointKey {
+                        room: rejected.meta().room,
+                        participant: publisher
+                    },
                     rejected.id(),
                     &actor.core.registry,
                     pulsebeam_runtime::time::Instant::now()
@@ -5890,13 +5903,12 @@ mod replacement_tests {
             .registry
             .commit_candidate(
                 publisher,
-                room_id,
+                ProjectRoomKey::fixture(room_id),
                 ShardId::new(0),
                 0,
                 address,
                 connection_id(2),
                 SignalingProtocol::State,
-                None,
             )
             .unwrap();
         for receiver in &mut receivers {
@@ -5927,7 +5939,7 @@ mod replacement_tests {
     async fn owned_publication_timeout_reports_failure_but_retains_fence_credit() {
         let (ack, pending) = oneshot::channel();
         let (completed, mut results) = pulsebeam_runtime::sync::mpsc::channel(2);
-        let participant = ParticipantId::new();
+        let participant = crate::entity::fixture_participant_id();
         let task = pulsebeam_runtime::task::spawn(complete_native_delete(
             vec![pending],
             NativeDeleteReply::Publication {
@@ -5956,8 +5968,8 @@ mod replacement_tests {
     #[test]
     fn preparation_crossing_authorization_expiry_cannot_commit() {
         let mut actor = actor();
-        let room_id = RoomId::from_external(&RoomExternalId::new("expired-prepare").unwrap());
-        let participant_id = ParticipantId::new();
+        let room_id = RoomId::new("expired-prepare").unwrap();
+        let participant_id = crate::entity::fixture_participant_id();
         let runtime_now = pulsebeam_runtime::time::Instant::now();
         let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
         let lease = authorization_lease(
@@ -5978,7 +5990,6 @@ mod replacement_tests {
             connection_id(1),
             Some(lease),
             SignalingProtocol::State,
-            crate::entity::ParticipantExternalId::new("alice").unwrap(),
             UNIX_EPOCH + Duration::from_secs(10),
         );
 
@@ -5996,8 +6007,8 @@ mod replacement_tests {
     #[pulsebeam_runtime::test(start_paused = true, crate = "pulsebeam_runtime::__harness")]
     async fn current_connection_closes_at_authorization_deadline_without_grace() {
         let mut actor = actor();
-        let room_id = RoomId::from_external(&RoomExternalId::new("expiry").unwrap());
-        let participant_id = ParticipantId::new();
+        let room_id = RoomId::new("expiry").unwrap();
+        let participant_id = crate::entity::fixture_participant_id();
         let runtime_now = pulsebeam_runtime::time::Instant::now();
         let transport = actor.core.reserve_transport(ShardId::new(0), runtime_now);
         let lease = authorization_lease(
@@ -6018,7 +6029,6 @@ mod replacement_tests {
                 connection_id(1),
                 Some(lease),
                 SignalingProtocol::State,
-                crate::entity::ParticipantExternalId::new("alice").unwrap(),
                 UNIX_EPOCH,
             )
             .unwrap();
@@ -6042,8 +6052,8 @@ mod replacement_tests {
     #[test]
     fn renewal_rejects_identity_changes_but_removing_join_revokes_participation() {
         let mut actor = actor();
-        let room_id = RoomId::from_external(&RoomExternalId::new("renewal-room").unwrap());
-        let participant_id = ParticipantId::new();
+        let room_id = RoomId::new("renewal-room").unwrap();
+        let participant_id = crate::entity::fixture_participant_id();
         let connection = connection_id(1);
         let now = SystemTime::now();
         let unix_now = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -6069,22 +6079,18 @@ mod replacement_tests {
                 connection,
                 Some(old_lease.clone()),
                 SignalingProtocol::State,
-                crate::entity::ParticipantExternalId::new("alice").unwrap(),
                 now,
             )
             .unwrap();
         let verified = VerifiedAuthorization {
             grants: full_grants("*"),
             project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
-            room_external_id: RoomExternalId::new("renewal-room").unwrap(),
             room_id,
-            participant_external_id: crate::entity::ParticipantExternalId::new("alice").unwrap(),
             participant_id,
             expiry: AuthorizationExpiry::from_unix_seconds(unix_now + 120),
         };
         let mut wrong_identity = verified.clone();
-        wrong_identity.participant_external_id =
-            crate::entity::ParticipantExternalId::new("mallory").unwrap();
+        wrong_identity.participant_id = crate::entity::ParticipantId::new("mallory").unwrap();
         actor.finish_renewal(RenewalResult {
             participant: participant_id,
             connection_id: connection,
@@ -6094,7 +6100,7 @@ mod replacement_tests {
         let mut wrong_project = verified.clone();
         wrong_project.project_id = pulsebeam_core::identity::ProjectId::new();
         let mut wrong_room_name = verified.clone();
-        wrong_room_name.room_external_id = RoomExternalId::new("other-room").unwrap();
+        wrong_room_name.room_id = RoomId::new("other-room").unwrap();
         for invalid in [wrong_project, wrong_room_name] {
             actor.finish_renewal(RenewalResult {
                 participant: participant_id,
@@ -6253,7 +6259,7 @@ mod replacement_tests {
             },
             {
                 let mut value = request();
-                value.authorization.room_external_id = RoomExternalId::new("other-room").unwrap();
+                value.authorization.room_id = RoomId::new("other-room").unwrap();
                 value
             },
         ] {
@@ -6264,8 +6270,7 @@ mod replacement_tests {
         }
         let mut wrong = request();
         wrong.expected_revision = 3;
-        wrong.authorization.room_id =
-            RoomId::from_external(&RoomExternalId::new("other-room").unwrap());
+        wrong.authorization.room_id = RoomId::new("other-room").unwrap();
         assert!(matches!(
             actor.replace_authorization(wrong, now, pulsebeam_runtime::time::Instant::now()),
             Err(ControllerError::AuthorizationRejected)
@@ -6349,10 +6354,10 @@ mod replacement_tests {
             )
             .unwrap(),
         ));
-        let room = RoomExternalId::new("renewal-room").unwrap();
-        let external = crate::entity::ParticipantExternalId::new("alice").unwrap();
-        let room_id = RoomId::derive(&DEVELOPMENT_PROJECT_ID, &room);
-        let participant = ParticipantId::derive(&room_id, &external);
+        let room = RoomId::new("renewal-room").unwrap();
+        let external = crate::entity::ParticipantId::new("alice").unwrap();
+        let room_id = room;
+        let participant = external;
         let connection = connection_id(1);
         let now = SystemTime::now();
         let unix_now = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -6377,7 +6382,6 @@ mod replacement_tests {
                 connection,
                 Some(previous),
                 SignalingProtocol::State,
-                external.clone(),
                 now,
             )
             .unwrap();
@@ -6439,8 +6443,8 @@ mod replacement_tests {
     #[test]
     fn old_expiry_work_cannot_close_replacement() {
         let mut actor = actor();
-        let room_id = RoomId::from_external(&RoomExternalId::new("expiry-fence").unwrap());
-        let participant_id = ParticipantId::new();
+        let room_id = RoomId::new("expiry-fence").unwrap();
+        let participant_id = crate::entity::fixture_participant_id();
         let runtime_now = pulsebeam_runtime::time::Instant::now();
         let old_id = connection_id(1);
         let current_id = connection_id(2);
@@ -6463,7 +6467,6 @@ mod replacement_tests {
                 old_id,
                 Some(old_lease),
                 SignalingProtocol::State,
-                crate::entity::ParticipantExternalId::new("alice").unwrap(),
                 UNIX_EPOCH,
             )
             .unwrap();
@@ -6487,7 +6490,6 @@ mod replacement_tests {
                 current_id,
                 Some(current_lease),
                 SignalingProtocol::State,
-                crate::entity::ParticipantExternalId::new("alice").unwrap(),
                 UNIX_EPOCH,
             )
             .unwrap()
@@ -6520,8 +6522,8 @@ mod replacement_tests {
     #[test]
     fn distant_expiry_and_replacement_keep_bounded_live_state() {
         let mut actor = actor();
-        let room_id = RoomId::from_external(&RoomExternalId::new("bounded-expiry").unwrap());
-        let participant_id = ParticipantId::new();
+        let room_id = RoomId::new("bounded-expiry").unwrap();
+        let participant_id = crate::entity::fixture_participant_id();
         let runtime_now = pulsebeam_runtime::time::Instant::now();
 
         for sequence in 1..=100 {
@@ -6544,7 +6546,6 @@ mod replacement_tests {
                     connection_id(sequence),
                     Some(lease),
                     SignalingProtocol::State,
-                    crate::entity::ParticipantExternalId::new("alice").unwrap(),
                     UNIX_EPOCH,
                 )
                 .unwrap();
@@ -6568,19 +6569,9 @@ mod replacement_tests {
         assert_eq!(current_lease.native_expiry(), Ok(i64::MAX));
         assert_eq!(actor.authorization_expiries.len(), 1);
 
-        let alice = crate::entity::ParticipantExternalId::new("alice").unwrap();
-        for (room, participant, external) in [
-            (
-                RoomId::from_external(&RoomExternalId::new("other-room").unwrap()),
-                participant_id,
-                alice.clone(),
-            ),
-            (room_id, ParticipantId::new(), alice),
-            (
-                room_id,
-                participant_id,
-                crate::entity::ParticipantExternalId::new("mallory").unwrap(),
-            ),
+        for (room, participant) in [
+            (RoomId::new("other-room").unwrap(), participant_id),
+            (room_id, ParticipantId::new("mallory").unwrap()),
         ] {
             assert!(matches!(
                 actor.begin_create_participant(
@@ -6588,7 +6579,7 @@ mod replacement_tests {
                         manual_sub: true,
                         room_id: room,
                         participant_id: participant,
-                        participant_external_id: external,
+
                         connection_id: connection_id(101),
                         old_connection_id: None,
                         authorization: Some(current_lease.clone()),
@@ -6614,14 +6605,13 @@ mod replacement_tests {
             unrepresentable.native_expiry(),
             Err(TokenError::Invalid)
         ));
-        let participant_external_id = crate::entity::ParticipantExternalId::new("alice").unwrap();
         assert!(matches!(
             actor.begin_create_participant(
                 ParticipantState {
                     manual_sub: true,
                     room_id,
                     participant_id,
-                    participant_external_id: participant_external_id.clone(),
+
                     connection_id: connection_id(101),
                     old_connection_id: None,
                     authorization: Some(unrepresentable.clone()),
@@ -6643,7 +6633,6 @@ mod replacement_tests {
                 connection_id(101),
                 Some(unrepresentable),
                 SignalingProtocol::State,
-                participant_external_id,
                 UNIX_EPOCH,
             ),
             Err(ControllerError::AuthorizationRejected)
@@ -6662,8 +6651,8 @@ mod replacement_tests {
     #[test]
     fn controller_orders_commits_and_fences_every_stale_teardown_source() {
         let mut actor = actor();
-        let room_id = RoomId::from_external(&RoomExternalId::new("replacement").unwrap());
-        let participant_id = ParticipantId::new();
+        let room_id = RoomId::new("replacement").unwrap();
+        let participant_id = crate::entity::fixture_participant_id();
         let old = connection_id(1);
         let current = connection_id(3);
         let old_transport = actor
@@ -6677,13 +6666,12 @@ mod replacement_tests {
             .registry
             .commit_candidate(
                 participant_id,
-                room_id,
+                ProjectRoomKey::fixture(room_id),
                 ShardId::new(0),
                 0,
                 old_transport,
                 old,
                 SignalingProtocol::State,
-                None,
             )
             .unwrap();
         let prepared = |connection_id, transport| PendingMaterialization {
@@ -6693,12 +6681,12 @@ mod replacement_tests {
             command: None,
             ack: None,
             participant: participant_id,
-            participant_external_id: crate::entity::ParticipantExternalId::new("alice").unwrap(),
+
             connection_id,
             authorization: None,
             profile: SignalingProtocol::State,
             transport,
-            room_id,
+            room: ProjectRoomKey::fixture(room_id),
             answer: "native-answer".to_owned(),
             owned: None,
         };
@@ -6708,16 +6696,19 @@ mod replacement_tests {
         let (ack, receiver) = oneshot::channel();
         let (reply, mut response) = oneshot::channel();
         actor.core.registry.reserve_partition(
-            room_id,
+            ProjectRoomKey::fixture(room_id),
             participant_id,
             connection_id(2),
             ShardId::new(0),
             0,
         );
-        actor
-            .core
-            .registry
-            .reserve_partition(room_id, participant_id, current, ShardId::new(0), 0);
+        actor.core.registry.reserve_partition(
+            ProjectRoomKey::fixture(room_id),
+            participant_id,
+            current,
+            ShardId::new(0),
+            0,
+        );
         actor.materializations.push_back(MaterializationWork {
             pending: prepared(connection_id(2), pending_transport),
             reply: MaterializationReply::Create(reply),
@@ -6741,13 +6732,12 @@ mod replacement_tests {
         assert_eq!(
             actor.core.registry.commit_candidate(
                 participant_id,
-                room_id,
+                ProjectRoomKey::fixture(room_id),
                 ShardId::new(0),
                 0,
                 old_transport,
                 old,
                 SignalingProtocol::State,
-                None,
             ),
             Err(CommitCandidateError::Superseded)
         );
@@ -6833,8 +6823,8 @@ mod replacement_tests {
     #[test]
     fn stale_media_events_cannot_republish_or_unpublish_the_replacement() {
         let mut actor = actor();
-        let room_id = RoomId::from_external(&RoomExternalId::new("media-fence").unwrap());
-        let participant = ParticipantId::new();
+        let room_id = RoomId::new("media-fence").unwrap();
+        let participant = crate::entity::fixture_participant_id();
         let stale = connection_id(1);
         let current = connection_id(2);
         for connection_id in [stale, current] {
@@ -6846,20 +6836,19 @@ mod replacement_tests {
                 .registry
                 .commit_candidate(
                     participant,
-                    room_id,
+                    ProjectRoomKey::fixture(room_id),
                     ShardId::new(0),
                     0,
                     address,
                     connection_id,
                     SignalingProtocol::State,
-                    None,
                 )
                 .unwrap();
         }
         let make_track = |connection_id: ConnectionId| {
             crate::track::Track::data(
                 crate::track::TrackMeta {
-                    room_id,
+                    room: crate::entity::ProjectRoomKey::fixture(room_id),
                     shard_id: ShardId::new(0),
                     id: connection_id.derive_track_id(crate::entity::TrackKind::Data, "rt/chat"),
                     origin: participant,
@@ -6873,6 +6862,10 @@ mod replacement_tests {
         };
         let stale_track = make_track(stale);
         let stale_meta = stale_track.meta().clone();
+        let endpoint = EndpointKey {
+            room: stale_meta.room,
+            participant,
+        };
         let track_id = current.derive_track_id(crate::entity::TrackKind::Data, "rt/chat");
 
         actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(stale_track)));
@@ -6880,7 +6873,7 @@ mod replacement_tests {
             actor
                 .lifecycle
                 .unpublish(
-                    participant,
+                    endpoint,
                     stale_meta.id,
                     &actor.core.registry,
                     pulsebeam_runtime::time::Instant::now(),
@@ -6898,7 +6891,7 @@ mod replacement_tests {
             actor
                 .lifecycle
                 .unpublish(
-                    participant,
+                    endpoint,
                     track_id,
                     &actor.core.registry,
                     pulsebeam_runtime::time::Instant::now(),

@@ -75,8 +75,9 @@ copies issuer and key IDs unchanged, and imports the PKCS#8 Ed25519 private key.
 Applications never supply separate credential fields.
 
 The expiration must be an absolute safe-integer number or bigint within the
-unsigned 64-bit range; it is not a TTL. Participant IDs, room patterns and labels
-are nonempty UTF-8 strings of at most 256 bytes, without control characters.
+unsigned 64-bit range; it is not a TTL. Participant IDs match `[A-Za-z0-9_-]{1,36}` and preserve case. Grant room
+patterns and labels are nonempty UTF-8 strings of at most 256 bytes,
+without control characters.
 The SDK validates these bounds and the [grant schema](../auth/README.md#grants).
 Case and exact text are preserved. Exported `Grant`, `Action` and `TrackKind`
 types describe the input. Empty grants grant no access. Offline signing cannot

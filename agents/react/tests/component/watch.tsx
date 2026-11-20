@@ -107,8 +107,7 @@ export async function watchLifecycle() {
       page: Object.freeze({
         participants: Object.freeze([
           {
-            id: "participant",
-            externalId: "presence",
+            id: "presence",
             publications: Object.freeze([]),
           },
         ]),

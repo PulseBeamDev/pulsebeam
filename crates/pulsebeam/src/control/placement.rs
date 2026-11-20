@@ -9,7 +9,7 @@ use std::{
 
 use super::core::{ControllerCore, RoomPartitionPlacement};
 use crate::{
-    entity::{ParticipantId, RoomId},
+    entity::{EndpointKey, ParticipantId, ProjectRoomKey},
     id::ShardId,
 };
 
@@ -131,14 +131,17 @@ impl Placement {
     pub fn admit(
         &self,
         core: &ControllerCore,
-        room: &RoomId,
+        room: &ProjectRoomKey,
         participant: &ParticipantId,
         shards: usize,
         execution: Option<&ExecutionSnapshot>,
         now: Instant,
     ) -> Option<(usize, ShardId)> {
         let (slot, mode) = core.next_room_partition(room, participant);
-        if let Some(current) = core.registry.get_participant(participant) {
+        if let Some(current) = core.registry.get_endpoint(EndpointKey {
+            room: *room,
+            participant: *participant,
+        }) {
             return Some((slot, current.shard_id));
         }
         if let Some(owner) = core

@@ -17,7 +17,7 @@ use pulsebeam_agent_native::{
     Agent, AgentEvent, AsyncHttpClient, AudioInput, Config, Encoding, Host, InputFrame,
     MediaConfig, ProducerInput, VideoInput, VideoPublicationConfig, VideoSourceConfig,
 };
-use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
+use pulsebeam_core::identity::{ParticipantId, RoomId};
 use pulsebeam_core::net::{HttpError, HttpRequest, HttpResult};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -54,7 +54,7 @@ pub(super) fn token_for_rooms(participant: &str, rooms: &[&str]) -> anyhow::Resu
 
 pub struct SimClientBuilder {
     ip: IpAddr,
-    participant_external_id: Option<&'static str>,
+    participant_id: Option<&'static str>,
     admission: Arc<Mutex<AdmissionRecords>>,
     bootstrap_hold: BootstrapHold,
     native_host: NativeHost,
@@ -236,7 +236,7 @@ impl SimClientBuilder {
         let admission = Arc::new(Mutex::new(AdmissionRecords::default()));
         Ok(Self {
             ip,
-            participant_external_id: None,
+            participant_id: None,
             admission,
             bootstrap_hold: BootstrapHold::default(),
             native_host,
@@ -271,8 +271,8 @@ impl SimClientBuilder {
         })
     }
 
-    pub fn with_participant_external_id(mut self, external_id: Option<&'static str>) -> Self {
-        self.participant_external_id = external_id;
+    pub fn with_participant_id(mut self, external_id: Option<&'static str>) -> Self {
+        self.participant_id = external_id;
         self
     }
 
@@ -451,9 +451,9 @@ impl SimClientBuilder {
     }
 
     pub(crate) async fn connect(self, room: &str) -> anyhow::Result<SimClient> {
-        let participant = planned_external_id(self.ip, self.participant_external_id);
-        let room = RoomExternalId::new(room)?;
-        let participant = ParticipantExternalId::new(&participant)?;
+        let participant = planned_external_id(self.ip, self.participant_id);
+        let room = RoomId::new(room)?;
+        let participant = ParticipantId::new(&participant)?;
         let session = AgentConfig {
             endpoint: self.endpoint,
             token: token_for_rooms(participant.as_str(), &[room.as_str()])?,
@@ -3780,7 +3780,7 @@ impl ClientContext {
         self.refresh_admission()?;
 
         let snapshot_changed = self.snapshots.has_changed()?;
-        let room = self.snapshots.borrow().room_external_id.clone();
+        let room = self.snapshots.borrow().room_id.clone();
         let catalog_changed = self.refresh_catalog(room.as_deref())?;
         if !snapshot_changed && !catalog_changed {
             return Ok(());
@@ -3851,7 +3851,6 @@ impl ClientContext {
                     participant.id.clone(),
                     pulsebeam_agent_native::agent_core::Participant {
                         id: participant.id.clone(),
-                        external_id: participant.external_id.clone(),
                     },
                 );
                 for entry in participant.publications {
@@ -3867,7 +3866,7 @@ impl ClientContext {
                         label: entry.label,
                     };
                     self.catalog
-                        .insert(entry.id, (publication, participant.external_id.clone()));
+                        .insert(entry.id, (publication, participant.id.clone()));
                 }
             }
         }
@@ -4124,8 +4123,8 @@ impl ClientContext {
                 .and_then(|(publication, external_id)| {
                     Some((
                         TrackSelector {
-                            room: snapshot.room_external_id.clone()?,
-                            participant_external_id: external_id.clone(),
+                            room: snapshot.room_id.clone()?,
+                            participant_id: external_id.clone(),
                             label: publication.label.clone(),
                         },
                         publication.clone(),
@@ -4157,7 +4156,7 @@ impl ClientContext {
                             .iter()
                             .any(|requested| requested.participant_id == request.participant_id)
                     }) && snapshot
-                        .room_external_id
+                        .room_id
                         .as_ref()
                         .is_some_and(|room| *room != selector.room);
                     all_resolved &= cross_room;
@@ -4222,7 +4221,7 @@ impl ClientContext {
                 let subscription = self
                     .agent
                     .room(selector.room.clone())?
-                    .participant(selector.participant_external_id.clone())?
+                    .participant(selector.participant_id.clone())?
                     .video(selector.label.clone())?
                     .subscribe(observation.clone())?;
                 self.video_subscriptions.insert(
@@ -4261,8 +4260,8 @@ impl ClientContext {
             .filter_map(|(publication, external_id)| {
                 Some((
                     TrackSelector {
-                        room: snapshot.room_external_id.clone()?,
-                        participant_external_id: external_id.clone(),
+                        room: snapshot.room_id.clone()?,
+                        participant_id: external_id.clone(),
                         label: publication.label.clone(),
                     },
                     audio.playout_delays.get(&publication.id).copied(),
@@ -5494,7 +5493,7 @@ mod admission_tests {
 
     #[test]
     fn repeated_offers_for_one_admission_cannot_escape_storage_budget() {
-        let connection = "c_0065WZSBA3DRZ12SEBDSTC0DHA0".parse().unwrap();
+        let connection = "conn_0065WZSBA3DRZ12SEBDSTC0DHA0".parse().unwrap();
         let mut records = AdmissionRecords::default();
         let offer = |index| {
             (0..32)
@@ -5512,8 +5511,8 @@ mod admission_tests {
 
     #[test]
     fn candidate_response_does_not_replace_the_reported_active_offer() {
-        let incumbent = "c_0065WZSBA3DRZ12SEBDSTC0DHA0".parse().unwrap();
-        let candidate = "c_0065WZSB8ENS0727ZKNJVMDGCTM".parse().unwrap();
+        let incumbent = "conn_0065WZSBA3DRZ12SEBDSTC0DHA0".parse().unwrap();
+        let candidate = "conn_0065WZSB8ENS0727ZKNJVMDGCTM".parse().unwrap();
         let mut records = AdmissionRecords::default();
         records
             .record(

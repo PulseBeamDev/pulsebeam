@@ -278,7 +278,7 @@ fn desired(remote_participant: &str) -> DesiredState {
             publishers: vec![publisher()],
             subscribers: vec![TopicSubscriber {
                 room: ROOM.into(),
-                participant_external_id: remote_participant.into(),
+                participant_id: remote_participant.into(),
                 topic: TOPIC.into(),
                 mode: TopicMode::Latest,
             }],
@@ -449,12 +449,12 @@ async fn witness(
     );
     let sender_a = a
         .snapshot()
-        .participant_external_id
-        .context("IPv4 external participant identity missing")?;
+        .participant_id
+        .context("IPv4 participant ID missing")?;
     let sender_b = b
         .snapshot()
-        .participant_external_id
-        .context("IPv6 external participant identity missing")?;
+        .participant_id
+        .context("IPv6 participant ID missing")?;
     pulsebeam_runtime::time::timeout(DELIVERY, async {
         pulsebeam_runtime::try_join!(
             a.send_topic(TopicSend {

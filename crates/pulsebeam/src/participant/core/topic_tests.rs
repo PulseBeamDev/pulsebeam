@@ -7,9 +7,8 @@ fn connection(publications: TopicPublications) -> Connection {
     Connection::new(
         ConnectionConfig {
             manual_sub: false,
-            room_id: entity::RoomId::from_external(&entity::RoomExternalId::new("topics").unwrap()),
-            participant_id: entity::ParticipantId::new(),
-            participant_external_id: entity::ParticipantExternalId::new("peer").unwrap(),
+            room: crate::entity::ProjectRoomKey::fixture(entity::RoomId::new("topics").unwrap()),
+            participant_id: crate::entity::fixture_participant_id(),
             connection_id: entity::ConnectionId::new(),
             profile: SignalingProtocol::Whip,
             allow_topic_channels: true,

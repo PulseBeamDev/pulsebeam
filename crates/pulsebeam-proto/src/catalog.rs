@@ -1,4 +1,5 @@
 //! Bounded, standalone RFC288 catalog records and atomic participant assembly.
+use crate::state::validation::is_application_name;
 use alloc::{string::String, vec, vec::Vec};
 use prost::Message;
 
@@ -42,12 +43,9 @@ fn valid_text(value: &str, max_bytes: usize) -> bool {
 
 /// Validate the exact logical selector without normalizing or changing identity.
 pub fn validate_address(address: &LogicalSourceAddress) -> Result<(), CatalogError> {
-    if !valid_text(&address.room, 256)
-        || !valid_text(&address.participant_external_id, 256)
-        || address
-            .participant_external_id
-            .chars()
-            .any(char::is_control)
+    if !is_application_name(&address.room)
+        || !is_application_name(&address.participant_id)
+        || address.participant_id.chars().any(char::is_control)
         || !valid_text(&address.label, 256)
         || !matches!(address.kind, 1..=3)
     {
@@ -65,7 +63,7 @@ pub fn validate_request(
     cursor: &[u8],
 ) -> Result<u32, CatalogError> {
     if watch_id == 0
-        || !valid_text(room, 256)
+        || !is_application_name(room)
         || (participant_limit != 0 && !(1..=MAX_CATALOG_PAGE_SIZE).contains(&participant_limit))
         || cursor.len() > MAX_CATALOG_CURSOR_BYTES
     {
@@ -101,7 +99,7 @@ pub fn decode_page_record(bytes: &[u8]) -> Result<CatalogPageRecord, CatalogErro
 pub(crate) fn validate_page_record(record: &CatalogPageRecord) -> Result<(), CatalogError> {
     if record.watch_id == 0
         || record.revision == 0
-        || !valid_text(&record.room, 256)
+        || !is_application_name(&record.room)
         || record.fragments.len() > MAX_CATALOG_RECORDS
         || record.next_cursor.len() > MAX_CATALOG_CURSOR_BYTES
         || record.has_more != !record.next_cursor.is_empty()
@@ -131,7 +129,7 @@ impl CatalogPageRecord {
 fn validate_fragment(fragment: &CatalogParticipantFragment) -> Result<(), CatalogError> {
     if fragment.watch_id == 0
         || fragment.revision == 0
-        || !valid_text(&fragment.participant_id, 128)
+        || !is_application_name(&fragment.participant_id)
         || fragment.participant_index >= MAX_CATALOG_PAGE_SIZE
         || fragment.fragment_count == 0
         || fragment.fragment_count as usize > MAX_CATALOG_ENTRY_FRAGMENTS
@@ -198,7 +196,7 @@ pub fn fragment_entry(
     }
     if metadata.watch_id == 0
         || metadata.revision == 0
-        || !valid_text(&metadata.room, 256)
+        || !is_application_name(&metadata.room)
         || metadata.next_cursor.len() > MAX_CATALOG_CURSOR_BYTES
         || metadata.has_more != !metadata.next_cursor.is_empty()
         || metadata.has_more && metadata.cursor_expires_at_unix_seconds <= 0
@@ -211,9 +209,11 @@ pub fn fragment_entry(
         .participant
         .as_ref()
         .ok_or(CatalogError::InvalidEntry)?;
-    if crate::state::validation::validate_participant(participant).is_err()
+    if participant.room_id != metadata.room
+        || crate::state::validation::validate_participant(participant).is_err()
         || entry.tracks.iter().any(|track| {
             track.participant_id != participant.participant_id
+                || track.room_id != participant.room_id
                 || crate::state::validation::validate_track(track).is_err()
         })
     {
@@ -333,7 +333,7 @@ pub struct CatalogAssembler {
 
 impl CatalogAssembler {
     pub fn new(watch_id: u64, room: String, minimum_revision: u64) -> Result<Self, CatalogError> {
-        if watch_id == 0 || !valid_text(&room, 256) {
+        if watch_id == 0 || !is_application_name(&room) {
             return Err(CatalogError::InvalidRequest);
         }
         Ok(Self {
@@ -491,11 +491,13 @@ impl CatalogAssembler {
             .participant
             .as_ref()
             .ok_or(CatalogError::InvalidEntry)?;
-        if participant.participant_id != pending.participant_id
+        if participant.room_id != self.room
+            || participant.participant_id != pending.participant_id
             || crate::state::validation::validate_participant(participant).is_err()
             || entry.tracks.len() > MAX_TRACKS_PER_PARTICIPANT
             || entry.tracks.iter().any(|track| {
                 track.participant_id != participant.participant_id
+                    || track.room_id != participant.room_id
                     || crate::state::validation::validate_track(track).is_err()
             })
         {
@@ -553,12 +555,13 @@ mod tests {
         CatalogParticipantEntry {
             participant: Some(crate::state::Participant {
                 participant_id: id.into(),
-                participant_external_id: "external".into(),
+                room_id: "room".into(),
             }),
             tracks: (0..tracks)
                 .map(|i| Track {
                     track_id: format!("{id}-{i}"),
                     participant_id: id.into(),
+                    room_id: "room".into(),
                     label: "x".repeat(256),
                     kind: Some(track::Kind::Data(crate::state::DataTrack {
                         delivery: DataDelivery::Ordered as i32,
@@ -624,29 +627,30 @@ mod tests {
         );
         let mut address = LogicalSourceAddress {
             room: "room".into(),
-            participant_external_id: "app/user".into(),
+            participant_id: "App_User".into(),
             kind: 2,
             label: "camera".into(),
         };
         assert_eq!(validate_address(&address), Ok(()));
-        for external_id in ["p".repeat(129), "p".repeat(256), "é".repeat(128)] {
-            address.participant_external_id = external_id;
+        for participant in ["p".repeat(36), "P".into(), "_".into()] {
+            address.participant_id = participant;
             assert_eq!(validate_address(&address), Ok(()));
         }
-        for external_id in [
+        for participant in [
             String::new(),
-            "p".repeat(257),
-            "é".repeat(129),
+            "p".repeat(37),
+            "é".into(),
+            "app/user".into(),
             "p\n".into(),
             "p\u{0085}".into(),
         ] {
-            address.participant_external_id = external_id;
+            address.participant_id = participant;
             assert_eq!(
                 validate_address(&address),
                 Err(CatalogError::InvalidAddress)
             );
         }
-        address.participant_external_id = "app/user".into();
+        address.participant_id = "App_User".into();
         address.kind = 0;
         assert_eq!(
             validate_address(&address),

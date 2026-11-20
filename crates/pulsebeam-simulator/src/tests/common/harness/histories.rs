@@ -190,7 +190,7 @@ impl Transition {
                 .bindings
                 .iter()
                 .filter(|b| b.expected.room == handle.room_name)
-                .map(|b| b.expected.id.as_str())
+                .map(|b| b.expected.id.as_str().to_owned())
                 .collect::<BTreeSet<_>>();
             // Peer Catalog can beat the admitting client's HTTP response. Retain unknown
             // origins until that value boundary binds them, rather than inventing an ID.
@@ -269,7 +269,7 @@ impl Transition {
                         !observed
                             .snapshot
                             .participants
-                            .contains_key(&bound.expected.id.as_str()),
+                            .contains_key(bound.expected.id.as_str()),
                         "crashed participant exceeded client retirement bound at {name}"
                     );
                 }

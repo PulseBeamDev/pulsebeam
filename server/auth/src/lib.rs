@@ -86,9 +86,7 @@ mod tests {
             ApiSigningKey, DEVELOPMENT_PROJECT_ID, KeyRegistry, KeyRegistryEntry, TokenError,
             authenticate_participant_token as verify_participant_token,
         },
-        identity::{
-            ApiKeyId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId, RoomId,
-        },
+        identity::{ApiKeyId, ParticipantId, ProjectId, RoomId},
     };
 
     #[test]
@@ -185,36 +183,15 @@ mod tests {
             }
             let principal = verify_participant_token(&registry, &golden.token, exp - 1).unwrap();
             assert_eq!(principal.project_id(), project);
-            assert_eq!(
-                principal.participant_external_id().as_str(),
-                input.participant
-            );
+            assert_eq!(principal.participant_id().as_str(), input.participant);
             assert_eq!(principal.expiry().unix_seconds(), exp);
-            let selected =
-                principal.authorize_room(RoomExternalId::new(&input.requested_room).unwrap());
+            let selected = principal.authorize_room(RoomId::new(&input.requested_room).unwrap());
             assert_eq!(selected.is_ok(), golden.name != "deny-all");
             if let Ok(authorization) = selected {
                 assert_eq!(authorization.grants, input.grants);
-                assert_eq!(
-                    authorization.room_external_id.as_str(),
-                    input.requested_room
-                );
-                assert_eq!(
-                    authorization.participant_external_id.as_str(),
-                    input.participant
-                );
+                assert_eq!(authorization.room_id.as_str(), input.requested_room);
+                assert_eq!(authorization.participant_id.as_str(), input.participant);
                 assert_eq!(authorization.expiry.unix_seconds(), exp);
-                assert_eq!(
-                    authorization.room_id,
-                    RoomId::derive(&project, &authorization.room_external_id)
-                );
-                assert_eq!(
-                    authorization.participant_id,
-                    ParticipantId::derive(
-                        &authorization.room_id,
-                        &authorization.participant_external_id
-                    )
-                );
             }
             assert_eq!(
                 verify_participant_token(&registry, &golden.token, exp),
@@ -324,7 +301,16 @@ mod tests {
                 "project_id" => value.parse::<ProjectId>().is_err(),
                 "key_id" => value.parse::<ApiKeyId>().is_err(),
                 "secret" => value.parse::<ApiSigningKey>().is_err(),
-                "participant" => ParticipantExternalId::new(value).is_err(),
+                "participant" => pulsebeam_server::sign_participant_token(
+                    &format!(
+                        "{}.{}.{}",
+                        vectors.base.project_id, vectors.base.key_id, vectors.base.secret
+                    ),
+                    &GrantSet::default(),
+                    value,
+                    2000,
+                )
+                .is_err(),
                 "expiration" => continue,
                 _ => panic!("unknown conformance field"),
             };

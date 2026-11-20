@@ -193,11 +193,12 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "requested_room": " meeting/会議/main ",
+        "requested_room": "Meeting_Main",
         "grants": [
           {
             "rooms": [
-              " meeting/会議/main "
+              " meeting/会議/main ",
+              "Meeting_Main"
             ],
             "allow": [
               "join",
@@ -207,7 +208,7 @@
             ]
           }
         ],
-        "participant": " café/device-1 ",
+        "participant": "Cafe_Device-1",
         "expiration": "2000"
       },
       "canonical_project_id": "p_0067MYZ1001R010000000000064",
@@ -215,10 +216,10 @@
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
       "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
       "header": "{\"alg\":\"EdDSA\",\"kid\":\"kid_0067MYZ1005R030010000000068\",\"typ\":\"pb+jwt\"}",
-      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\" café/device-1 \",\"exp\":2000,\"grants\":[{\"rooms\":[\" meeting/会議/main \"],\"allow\":[\"join\",\"publish\",\"discover\",\"subscribe\"]}]}",
-      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiIGNhZsOpL2RldmljZS0xICIsImV4cCI6MjAwMCwiZ3JhbnRzIjpbeyJyb29tcyI6WyIgbWVldGluZy_kvJrorbAvbWFpbiAiXSwiYWxsb3ciOlsiam9pbiIsInB1Ymxpc2giLCJkaXNjb3ZlciIsInN1YnNjcmliZSJdfV19",
-      "signature": "nQyoZpVmi5TxlgiKUhitD_ZY1-ODrE0dxvCQ0DB19by7oPkyr-8I8y36SOxvJXGzcr-i1T4EWWyHG5yHnpU4DQ",
-      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiIGNhZsOpL2RldmljZS0xICIsImV4cCI6MjAwMCwiZ3JhbnRzIjpbeyJyb29tcyI6WyIgbWVldGluZy_kvJrorbAvbWFpbiAiXSwiYWxsb3ciOlsiam9pbiIsInB1Ymxpc2giLCJkaXNjb3ZlciIsInN1YnNjcmliZSJdfV19.nQyoZpVmi5TxlgiKUhitD_ZY1-ODrE0dxvCQ0DB19by7oPkyr-8I8y36SOxvJXGzcr-i1T4EWWyHG5yHnpU4DQ"
+      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"Cafe_Device-1\",\"exp\":2000,\"grants\":[{\"rooms\":[\" meeting/会議/main \",\"Meeting_Main\"],\"allow\":[\"join\",\"publish\",\"discover\",\"subscribe\"]}]}",
+      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQ2FmZV9EZXZpY2UtMSIsImV4cCI6MjAwMCwiZ3JhbnRzIjpbeyJyb29tcyI6WyIgbWVldGluZy_kvJrorbAvbWFpbiAiLCJNZWV0aW5nX01haW4iXSwiYWxsb3ciOlsiam9pbiIsInB1Ymxpc2giLCJkaXNjb3ZlciIsInN1YnNjcmliZSJdfV19",
+      "signature": "YzMbppDPp50vtFgsxGSOvvTWzaCdO3cj_ayxlDUH3mljKChgIYd_ER1JBaX9UIsCZo3kFtStuFzMtPcXkrKDCA",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQ2FmZV9EZXZpY2UtMSIsImV4cCI6MjAwMCwiZ3JhbnRzIjpbeyJyb29tcyI6WyIgbWVldGluZy_kvJrorbAvbWFpbiAiLCJNZWV0aW5nX01haW4iXSwiYWxsb3ciOlsiam9pbiIsInB1Ymxpc2giLCJkaXNjb3ZlciIsInN1YnNjcmliZSJdfV19.YzMbppDPp50vtFgsxGSOvvTWzaCdO3cj_ayxlDUH3mljKChgIYd_ER1JBaX9UIsCZo3kFtStuFzMtPcXkrKDCA"
     },
     {
       "name": "utf8-byte-boundary",
@@ -226,11 +227,12 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "requested_room": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+        "requested_room": "Boundary_Room",
         "grants": [
           {
             "rooms": [
-              "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+              "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+              "Boundary_Room"
             ],
             "allow": [
               "join",
@@ -240,7 +242,7 @@
             ]
           }
         ],
-        "participant": "🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀",
+        "participant": "Crab_1",
         "expiration": "2000"
       },
       "canonical_project_id": "p_0067MYZ1001R010000000000064",
@@ -248,10 +250,10 @@
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
       "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
       "header": "{\"alg\":\"EdDSA\",\"kid\":\"kid_0067MYZ1005R030010000000068\",\"typ\":\"pb+jwt\"}",
-      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀\",\"exp\":2000,\"grants\":[{\"rooms\":[\"éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\"],\"allow\":[\"join\",\"publish\",\"discover\",\"subscribe\"]}]}",
-      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoi8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgCIsImV4cCI6MjAwMCwiZ3JhbnRzIjpbeyJyb29tcyI6WyLDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpIl0sImFsbG93IjpbImpvaW4iLCJwdWJsaXNoIiwiZGlzY292ZXIiLCJzdWJzY3JpYmUiXX1dfQ",
-      "signature": "XL8XUg1kX0K1O_6Vg0LwpafnMVCjz85fCkPxWj5LM-dCCXVpAjJzDD9mmeq7ewgA_ymxQvS1Qj6ALmapDQOVAA",
-      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoi8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgPCfpoDwn6aA8J-mgCIsImV4cCI6MjAwMCwiZ3JhbnRzIjpbeyJyb29tcyI6WyLDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpIl0sImFsbG93IjpbImpvaW4iLCJwdWJsaXNoIiwiZGlzY292ZXIiLCJzdWJzY3JpYmUiXX1dfQ.XL8XUg1kX0K1O_6Vg0LwpafnMVCjz85fCkPxWj5LM-dCCXVpAjJzDD9mmeq7ewgA_ymxQvS1Qj6ALmapDQOVAA"
+      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"Crab_1\",\"exp\":2000,\"grants\":[{\"rooms\":[\"éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\",\"Boundary_Room\"],\"allow\":[\"join\",\"publish\",\"discover\",\"subscribe\"]}]}",
+      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQ3JhYl8xIiwiZXhwIjoyMDAwLCJncmFudHMiOlt7InJvb21zIjpbIsOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6kiLCJCb3VuZGFyeV9Sb29tIl0sImFsbG93IjpbImpvaW4iLCJwdWJsaXNoIiwiZGlzY292ZXIiLCJzdWJzY3JpYmUiXX1dfQ",
+      "signature": "dR3ssuLDtdO9vZcc9jUjgWephp9oA8yRiLVeZZEwYxYkrmSGHwN66FXXF-pY8KvIKps66bQQios-Y1gRNnSPCw",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQ3JhYl8xIiwiZXhwIjoyMDAwLCJncmFudHMiOlt7InJvb21zIjpbIsOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6nDqcOpw6kiLCJCb3VuZGFyeV9Sb29tIl0sImFsbG93IjpbImpvaW4iLCJwdWJsaXNoIiwiZGlzY292ZXIiLCJzdWJzY3JpYmUiXX1dfQ.dR3ssuLDtdO9vZcc9jUjgWephp9oA8yRiLVeZZEwYxYkrmSGHwN66FXXF-pY8KvIKps66bQQios-Y1gRNnSPCw"
     },
     {
       "name": "aliases",
@@ -292,11 +294,12 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "requested_room": "workspace/main",
+        "requested_room": "Workspace_Main",
         "grants": [
           {
             "rooms": [
-              "workspace/*"
+              "workspace/*",
+              "Workspace_Main"
             ],
             "allow": [
               "join"
@@ -333,10 +336,10 @@
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
       "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
       "header": "{\"alg\":\"EdDSA\",\"kid\":\"kid_0067MYZ1005R030010000000068\",\"typ\":\"pb+jwt\"}",
-      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"Alice_-9\",\"exp\":2000,\"grants\":[{\"rooms\":[\"workspace/*\"],\"allow\":[\"join\"]},{\"rooms\":[\"workspace/*\"],\"allow\":[\"publish\"],\"kind\":\"data\",\"label\":\"chat/会議\"},{\"rooms\":[\"*\"],\"allow\":[\"discover\",\"subscribe\"],\"participant\":\"café/device\",\"kind\":\"video\",\"label\":\"camera/main\"}]}",
-      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJleHAiOjIwMDAsImdyYW50cyI6W3sicm9vbXMiOlsid29ya3NwYWNlLyoiXSwiYWxsb3ciOlsiam9pbiJdfSx7InJvb21zIjpbIndvcmtzcGFjZS8qIl0sImFsbG93IjpbInB1Ymxpc2giXSwia2luZCI6ImRhdGEiLCJsYWJlbCI6ImNoYXQv5Lya6K2wIn0seyJyb29tcyI6WyIqIl0sImFsbG93IjpbImRpc2NvdmVyIiwic3Vic2NyaWJlIl0sInBhcnRpY2lwYW50IjoiY2Fmw6kvZGV2aWNlIiwia2luZCI6InZpZGVvIiwibGFiZWwiOiJjYW1lcmEvbWFpbiJ9XX0",
-      "signature": "OUyDhcHiUP_ufXy3ykXSQFJdP9q5iMg2f-VizzO7pFi22g0NxF_Ok4_hTE7gyCi-5kFHlkK6mJOMWPK9P6NRCw",
-      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJleHAiOjIwMDAsImdyYW50cyI6W3sicm9vbXMiOlsid29ya3NwYWNlLyoiXSwiYWxsb3ciOlsiam9pbiJdfSx7InJvb21zIjpbIndvcmtzcGFjZS8qIl0sImFsbG93IjpbInB1Ymxpc2giXSwia2luZCI6ImRhdGEiLCJsYWJlbCI6ImNoYXQv5Lya6K2wIn0seyJyb29tcyI6WyIqIl0sImFsbG93IjpbImRpc2NvdmVyIiwic3Vic2NyaWJlIl0sInBhcnRpY2lwYW50IjoiY2Fmw6kvZGV2aWNlIiwia2luZCI6InZpZGVvIiwibGFiZWwiOiJjYW1lcmEvbWFpbiJ9XX0.OUyDhcHiUP_ufXy3ykXSQFJdP9q5iMg2f-VizzO7pFi22g0NxF_Ok4_hTE7gyCi-5kFHlkK6mJOMWPK9P6NRCw"
+      "claims": "{\"iss\":\"p_0067MYZ1001R010000000000064\",\"aud\":\"pb\",\"sub\":\"Alice_-9\",\"exp\":2000,\"grants\":[{\"rooms\":[\"workspace/*\",\"Workspace_Main\"],\"allow\":[\"join\"]},{\"rooms\":[\"workspace/*\"],\"allow\":[\"publish\"],\"kind\":\"data\",\"label\":\"chat/会議\"},{\"rooms\":[\"*\"],\"allow\":[\"discover\",\"subscribe\"],\"participant\":\"café/device\",\"kind\":\"video\",\"label\":\"camera/main\"}]}",
+      "signing_input": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJleHAiOjIwMDAsImdyYW50cyI6W3sicm9vbXMiOlsid29ya3NwYWNlLyoiLCJXb3Jrc3BhY2VfTWFpbiJdLCJhbGxvdyI6WyJqb2luIl19LHsicm9vbXMiOlsid29ya3NwYWNlLyoiXSwiYWxsb3ciOlsicHVibGlzaCJdLCJraW5kIjoiZGF0YSIsImxhYmVsIjoiY2hhdC_kvJrorbAifSx7InJvb21zIjpbIioiXSwiYWxsb3ciOlsiZGlzY292ZXIiLCJzdWJzY3JpYmUiXSwicGFydGljaXBhbnQiOiJjYWbDqS9kZXZpY2UiLCJraW5kIjoidmlkZW8iLCJsYWJlbCI6ImNhbWVyYS9tYWluIn1dfQ",
+      "signature": "Y257v5KoENstesgQcaYjtBUxq_uilt9pkLdwEAMZS5XZhZMGgbkTrCO0zqrsnRap0LrvnPcpcC7fiW7lVMzTAw",
+      "token": "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDY3TVlaMTAwNVIwMzAwMTAwMDAwMDAwNjgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwNjdNWVoxMDAxUjAxMDAwMDAwMDAwMDA2NCIsImF1ZCI6InBiIiwic3ViIjoiQWxpY2VfLTkiLCJleHAiOjIwMDAsImdyYW50cyI6W3sicm9vbXMiOlsid29ya3NwYWNlLyoiLCJXb3Jrc3BhY2VfTWFpbiJdLCJhbGxvdyI6WyJqb2luIl19LHsicm9vbXMiOlsid29ya3NwYWNlLyoiXSwiYWxsb3ciOlsicHVibGlzaCJdLCJraW5kIjoiZGF0YSIsImxhYmVsIjoiY2hhdC_kvJrorbAifSx7InJvb21zIjpbIioiXSwiYWxsb3ciOlsiZGlzY292ZXIiLCJzdWJzY3JpYmUiXSwicGFydGljaXBhbnQiOiJjYWbDqS9kZXZpY2UiLCJraW5kIjoidmlkZW8iLCJsYWJlbCI6ImNhbWVyYS9tYWluIn1dfQ.Y257v5KoENstesgQcaYjtBUxq_uilt9pkLdwEAMZS5XZhZMGgbkTrCO0zqrsnRap0LrvnPcpcC7fiW7lVMzTAw"
     },
     {
       "name": "deny-all",
@@ -507,7 +510,17 @@
     {
       "name": "participant-long",
       "field": "participant",
-      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "name": "participant-non-ascii",
+      "field": "participant",
+      "value": "café"
+    },
+    {
+      "name": "participant-separator",
+      "field": "participant",
+      "value": "stage.alice"
     },
     {
       "name": "participant-newline",

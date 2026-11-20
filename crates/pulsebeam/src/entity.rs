@@ -1,7 +1,50 @@
 pub use pulsebeam_core::identity::{
-    AudioTrackId, ConnectionId, DataTrackId, IdValidationError, ParticipantExternalId,
-    ParticipantId, ProjectId, RoomExternalId, RoomId, TrackId, TrackKind, VideoTrackId,
+    AudioTrackId, ConnectionId, DataTrackId, IdValidationError, ParticipantId, ProjectId, RoomId,
+    TrackId, TrackKind, VideoTrackId,
 };
+
+#[cfg(test)]
+pub(crate) fn fixture_participant_id() -> ParticipantId {
+    ParticipantId::new(&ConnectionId::new().as_str()).unwrap()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProjectRoomKey {
+    pub project: ProjectId,
+    pub room: RoomId,
+}
+
+impl std::fmt::Debug for ProjectRoomKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectRoomKey")
+            .field("project", &self.project)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProjectRoomKey {
+    #[cfg(test)]
+    pub(crate) fn fixture(room: RoomId) -> Self {
+        Self {
+            project: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
+            room,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct EndpointKey {
+    pub room: ProjectRoomKey,
+    pub participant: ParticipantId,
+}
+
+impl std::fmt::Debug for EndpointKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EndpointKey")
+            .field("room", &self.room)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Who a forwarded audio packet came from.
 ///

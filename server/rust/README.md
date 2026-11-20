@@ -52,8 +52,9 @@ and overflowing constants before signing. Validate externally supplied values
 instead of casting them to `u64`. No clock is consulted. Zero and past expiration
 may be signed, but authorize nothing at or after expiry.
 
-Participant IDs, room patterns and labels are nonempty UTF-8 strings of at most
-256 bytes, without control characters. Case and exact text are preserved.
+Participant IDs match `[A-Za-z0-9_-]{1,36}` and preserve case. Grant room
+patterns and labels are nonempty UTF-8 strings of at most 256 bytes,
+without control characters. Case and exact text are preserved.
 The SDK validates these bounds and grant structure. Project/key identifiers
 remain opaque; the SFU validates their format, registry membership and authority.
 See the [grant schema and limits](../auth/README.md#grants).

@@ -13,7 +13,7 @@ pub(super) struct DataLane {
     topic: String,
     publisher: Agent,
     receiver: Agent,
-    participant_external_id: String,
+    participant_id: String,
     source_room: String,
     owner: u64,
     excluded: u64,
@@ -67,8 +67,7 @@ impl DataLane {
                 spec: self.spec(),
                 source: TrackSelector {
                     room: self.source_room.clone(),
-                    participant_external_id: participant_id
-                        .unwrap_or_else(|| self.participant_external_id.clone()),
+                    participant_id: participant_id.unwrap_or_else(|| self.participant_id.clone()),
                     label: self.topic.clone(),
                 },
             })
@@ -97,33 +96,33 @@ impl DataLane {
             .push(PendingDriverOp::DeclareSubscribeTopic(vec![
                 TopicSubscriber {
                     room: handles["anchor"].room_name.to_owned(),
-                    participant_external_id: handles["anchor"].endpoint.clone(),
+                    participant_id: handles["anchor"].endpoint.clone(),
                     topic: topic.clone(),
                     mode: delivery.mode(),
                 },
                 TopicSubscriber {
                     room: handles["continuing"].room_name.to_owned(),
-                    participant_external_id: handles["continuing"].endpoint.clone(),
+                    participant_id: handles["continuing"].endpoint.clone(),
                     topic: topic.clone(),
                     mode: delivery.mode(),
                 },
             ]));
         let publisher = application_agent(state, handles, "anchor").await?;
         let receiver = application_agent(state, handles, "continuing").await?;
-        let participant_external_id = publisher
+        let participant_id = publisher
             .snapshot()
-            .participant_external_id
+            .participant_id
             .context("data publisher external admission identity")?;
         let excluded_external_id = receiver
             .snapshot()
-            .participant_external_id
+            .participant_id
             .context("excluded data receiver external identity")?;
         let mut lane = Self {
             delivery,
             topic,
             publisher,
             receiver,
-            participant_external_id,
+            participant_id,
             source_room: handles["anchor"].room_name.to_owned(),
             owner: 0,
             excluded: 0,
@@ -164,7 +163,7 @@ impl DataLane {
                             status.registration
                                 == TopicSubscriber {
                                     room: lane.source_room.clone(),
-                                    participant_external_id: lane.participant_external_id.clone(),
+                                    participant_id: lane.participant_id.clone(),
                                     topic: lane.topic.clone(),
                                     mode: delivery.mode(),
                                 }
@@ -290,10 +289,9 @@ impl DataLane {
                     data,
                 } => {
                     ensure!(
-                        participant_id == self.participant_external_id
-                            && Some(&track_id) == track.as_ref(),
+                        participant_id == self.participant_id && Some(&track_id) == track.as_ref(),
                         "data payload identity ({participant_id}, {track_id}) differs from external publisher {} / track {track:?}",
-                        self.participant_external_id
+                        self.participant_id
                     );
                     ensure!(
                         self.supplied.contains_key(&data),
@@ -328,7 +326,7 @@ impl DataLane {
                 } => {
                     ensure!(
                         self.delivery == Delivery::Ordered
-                            && participant_id == self.participant_external_id
+                            && participant_id == self.participant_id
                             && Some(&track_id) == track.as_ref()
                             && to > from
                             && self

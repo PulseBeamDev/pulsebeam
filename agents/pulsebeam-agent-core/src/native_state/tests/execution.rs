@@ -65,11 +65,13 @@ fn receiver_failure_has_its_own_revision_and_cannot_retarget_or_revive_a_lifetim
                 spec: Some(desired.clone()),
                 participant: Some(wire::Participant {
                     participant_id: "peer".into(),
-                    participant_external_id: "bob".into(),
+
+                    room_id: "room".into(),
                 }),
                 track: Some(wire::Track {
                     track_id: "source".into(),
                     participant_id: "peer".into(),
+                    room_id: "room".into(),
                     label: "microphone".into(),
                     kind: Some(wire::track::Kind::Audio(wire::AudioTrack {
                         format: Some(format),

@@ -21,7 +21,7 @@ pub(crate) enum Resource {
     DataSubscription(String),
     SourceLookup {
         room: String,
-        participant_external_id: String,
+        participant_id: String,
         kind: wire::TrackKind,
         label: String,
     },
@@ -65,14 +65,14 @@ impl Resource {
             (
                 Self::SourceLookup {
                     room,
-                    participant_external_id,
+                    participant_id,
                     kind,
                     label,
                 },
                 Some(wire::resource_spec::Declaration::SourceLookup(lookup)),
             ) => lookup.source.as_ref().is_some_and(|source| {
                 room == &source.room
-                    && participant_external_id == &source.participant_external_id
+                    && participant_id == &source.participant_id
                     && *kind as i32 == source.kind
                     && label == &source.label
             }),
@@ -90,14 +90,14 @@ impl Resource {
             Self::DataSubscription(track) => track.len(),
             Self::SourceLookup {
                 room,
-                participant_external_id,
+                participant_id,
                 label,
                 ..
             } => {
                 // Target, pending work, retirement, cursor and owned keys can retain the address.
                 return size_of::<Self>()
                     .saturating_add(room.len())
-                    .saturating_add(participant_external_id.len())
+                    .saturating_add(participant_id.len())
                     .saturating_add(label.len())
                     .saturating_mul(5);
             }
@@ -167,11 +167,47 @@ pub(crate) enum Change {
         new_evaluation: bool,
         evaluates_current: bool,
     },
-    Participant(String),
+    Participant(ParticipantKey),
     Track(String),
     Session,
     InitialComplete,
     Catalog(Box<wire::CatalogServerRecord>),
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ParticipantKey {
+    pub(crate) room_id: String,
+    pub(crate) participant_id: String,
+}
+
+impl core::fmt::Debug for ParticipantKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ParticipantKey").finish_non_exhaustive()
+    }
+}
+
+impl From<&wire::Participant> for ParticipantKey {
+    fn from(participant: &wire::Participant) -> Self {
+        Self {
+            room_id: participant.room_id.clone(),
+            participant_id: participant.participant_id.clone(),
+        }
+    }
+}
+
+impl From<&wire::Track> for ParticipantKey {
+    fn from(track: &wire::Track) -> Self {
+        Self {
+            room_id: track.room_id.clone(),
+            participant_id: track.participant_id.clone(),
+        }
+    }
+}
+
+impl ParticipantKey {
+    fn retained_bytes(&self) -> usize {
+        self.room_id.len().saturating_add(self.participant_id.len())
+    }
 }
 
 pub(crate) struct NativeState {
@@ -187,10 +223,10 @@ pub(crate) struct NativeState {
     retiring_resources: BTreeMap<Resource, u64>,
     cursor: Option<Resource>,
     prefer_retirement: bool,
-    participants: BTreeMap<String, wire::Participant>,
+    participants: BTreeMap<ParticipantKey, wire::Participant>,
     tracks: BTreeMap<String, wire::Track>,
     source_references: BTreeMap<String, BTreeSet<u64>>,
-    participant_references: BTreeMap<String, BTreeSet<u64>>,
+    participant_references: BTreeMap<ParticipantKey, BTreeSet<u64>>,
     self_participant: wire::Participant,
     session: Option<wire::SessionState>,
     initial_complete: bool,
@@ -652,14 +688,12 @@ impl NativeState {
                     self.session = Some(session);
                     changes.push(Change::Session);
                 }
-                wire::resource_key::Key::Participant(id) => {
+                wire::resource_key::Key::Participant(endpoint) => {
+                    let id = ParticipantKey::from(&endpoint);
                     let old = self.participants.get(&id);
                     let next = match state.value {
                         Some(wire::confirmed_state::Value::Participant(participant)) => {
                             if old.is_some_and(|old| old != &participant)
-                                || participant.participant_id
-                                    == self.self_participant.participant_id
-                                    && participant != self.self_participant
                                 || self
                                     .participant_references
                                     .get(&id)
@@ -678,9 +712,11 @@ impl NativeState {
                     if old == next.as_ref() {
                         continue;
                     }
-                    let old_bytes = old.map_or(0, |value| entry_bytes(&id, value));
-                    let new_bytes = next.as_ref().map_or(0, |value| entry_bytes(&id, value));
-                    self.account(old_bytes, new_bytes)?;
+                    let bytes = |participant: &wire::Participant| {
+                        id.retained_bytes()
+                            .saturating_add(participant.encoded_len())
+                    };
+                    self.account(old.map_or(0, bytes), next.as_ref().map_or(0, bytes))?;
                     if let Some(next) = next {
                         self.participants.insert(id.clone(), next);
                     } else {
@@ -845,7 +881,7 @@ impl NativeState {
                 .saturating_add(state.encoded_len())
         };
         let identity = |(participant, track): (&wire::Participant, &wire::Track)| {
-            (track.track_id.clone(), participant.participant_id.clone())
+            (track.track_id.clone(), ParticipantKey::from(participant))
         };
         let previous_source = owned
             .confirmed
@@ -947,19 +983,18 @@ impl NativeState {
         participant: &wire::Participant,
         track: &wire::Track,
     ) -> Result<(), SignalingError> {
-        if participant.participant_id == self.self_participant.participant_id
-            && participant != &self.self_participant
-            || self
-                .participants
-                .get(&participant.participant_id)
-                .is_some_and(|known| known != participant)
+        let endpoint = ParticipantKey::from(participant);
+        if self
+            .participants
+            .get(&endpoint)
+            .is_some_and(|known| known != participant)
             || self
                 .tracks
                 .get(&track.track_id)
                 .is_some_and(|known| !tracks_equal(known, track))
             || self
                 .participant_references
-                .get(&participant.participant_id)
+                .get(&endpoint)
                 .and_then(|references| references.first())
                 .and_then(|reference| self.description(*reference))
                 .map(|(participant, _)| participant)
@@ -1010,8 +1045,10 @@ impl NativeState {
         })
     }
 
-    pub(crate) fn source_participant(&self, id: &str) -> Option<&wire::Participant> {
-        if id == self.self_participant.participant_id {
+    pub(crate) fn source_participant(&self, id: &ParticipantKey) -> Option<&wire::Participant> {
+        if id.room_id == self.self_participant.room_id
+            && id.participant_id == self.self_participant.participant_id
+        {
             return Some(&self.self_participant);
         }
         self.participants.get(id).or_else(|| {
@@ -1024,7 +1061,7 @@ impl NativeState {
         self.session.as_ref()
     }
 
-    pub(crate) fn participants(&self) -> &BTreeMap<String, wire::Participant> {
+    pub(crate) fn participants(&self) -> &BTreeMap<ParticipantKey, wire::Participant> {
         &self.participants
     }
 
@@ -1189,6 +1226,7 @@ fn specs_equal(left: &wire::ResourceSpec, right: &wire::ResourceSpec) -> bool {
 
 fn tracks_equal(left: &wire::Track, right: &wire::Track) -> bool {
     left.track_id == right.track_id
+        && left.room_id == right.room_id
         && left.participant_id == right.participant_id
         && left.label == right.label
         && match (&left.kind, &right.kind) {
@@ -1205,7 +1243,7 @@ fn tracks_equal(left: &wire::Track, right: &wire::Track) -> bool {
         }
 }
 
-fn remove_reference(index: &mut BTreeMap<String, BTreeSet<u64>>, key: &str, reference: u64) {
+fn remove_reference<K: Ord>(index: &mut BTreeMap<K, BTreeSet<u64>>, key: &K, reference: u64) {
     if let Some(references) = index.get_mut(key) {
         references.remove(&reference);
         if references.is_empty() {

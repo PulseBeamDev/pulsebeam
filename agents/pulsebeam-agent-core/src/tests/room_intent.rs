@@ -22,17 +22,24 @@ fn begin_join(agent: &mut Agent, room: &str) -> (Generation, OperationId) {
 #[test]
 fn join_validates_before_mutation_and_retries_a_settled_denial_once() {
     let mut agent = Agent::new(config()).unwrap();
-    for room in [String::new(), "a\n".into(), "é".repeat(129)] {
+    for room in [
+        String::new(),
+        "a\n".into(),
+        "é".into(),
+        "room/main".into(),
+        "A".repeat(37),
+    ] {
         let before = agent.snapshot().clone();
         assert!(agent.command(AgentCommand::Join(room)).is_err());
         assert_eq!(agent.snapshot(), &before);
         assert!(agent.next_effect().is_none());
     }
-    let (generation, operation) = begin_join(&mut agent, &"é".repeat(128));
+    let room = "A_".repeat(18);
+    let (generation, operation) = begin_join(&mut agent, &room);
     assert_eq!(agent.snapshot().join_revision, 1);
     assert_eq!(agent.snapshot().evaluated_join_revision, 0);
     assert_eq!(agent.snapshot().accepted_join_revision, None);
-    agent.command(AgentCommand::Join("é".repeat(128))).unwrap();
+    agent.command(AgentCommand::Join(room.clone())).unwrap();
     assert_eq!(agent.snapshot().join_revision, 1);
     assert!(agent.next_effect().is_none());
     agent
@@ -63,12 +70,12 @@ fn join_validates_before_mutation_and_retries_a_settled_denial_once() {
         Effect::Rtc(RtcEffect::Close { generation })
     );
     assert!(agent.next_effect().is_none());
-    let (next, _) = begin_join(&mut agent, &"é".repeat(128));
+    let (next, _) = begin_join(&mut agent, &room);
     assert_ne!(next, generation);
     assert_eq!(agent.snapshot().join_revision, 2);
     assert_eq!(agent.snapshot().evaluated_join_revision, 1);
     assert_eq!(agent.snapshot().accepted_join_revision, None);
-    agent.command(AgentCommand::Join("é".repeat(128))).unwrap();
+    agent.command(AgentCommand::Join(room.clone())).unwrap();
     assert_eq!(agent.snapshot().join_revision, 2);
     assert!(agent.next_effect().is_none());
 }
@@ -302,7 +309,7 @@ fn latest_join_fences_old_admission_and_coalesces_while_closing() {
             .any(|header| header.name == "Authorization" && header.value == "Bearer private-token")
     );
     assert!(agent.snapshot().participant_id.is_none());
-    assert!(agent.snapshot().room_external_id.is_none());
+    assert!(agent.snapshot().room_id.is_none());
     assert!(agent.next_effect().is_none());
     agent
         .handle(HostEvent::Rtc(RtcEvent::Closed { generation: old }))
@@ -350,7 +357,7 @@ fn matching_join_activates_and_cannot_reclaim_after_supersession() {
     assert_eq!(agent.snapshot().credential_revision, 2);
     assert_eq!(agent.snapshot().accepted_credential_revision, Some(1));
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-    assert_eq!(agent.snapshot().room_external_id.as_deref(), Some("room"));
+    assert_eq!(agent.snapshot().room_id.as_deref(), Some("room"));
     assert_eq!(agent.snapshot().desired_room.as_deref(), Some("room"));
     assert_eq!(
         agent.snapshot().evaluated_join_revision,
@@ -389,11 +396,11 @@ fn unresolved_admissions_are_bounded_without_forgetting_late_cleanup() {
     let mut agent = Agent::new(config()).unwrap();
     let mut oldest = None;
     for index in 0..crate::agent::MAX_ORPHANED_CREATES {
-        let room = format!("room/{index}");
+        let room = format!("room-{index}");
         let (generation, operation) = begin_join(&mut agent, &room);
         oldest.get_or_insert(operation);
         agent
-            .command(AgentCommand::Join(format!("room/{}", index + 1)))
+            .command(AgentCommand::Join(format!("room-{}", index + 1)))
             .unwrap();
         assert_eq!(
             next_effect(&mut agent),
@@ -426,7 +433,7 @@ fn unresolved_admissions_are_bounded_without_forgetting_late_cleanup() {
     assert!(agent.next_effect().is_none());
     begin_join(
         &mut agent,
-        &format!("room/{}", crate::agent::MAX_ORPHANED_CREATES),
+        &format!("room-{}", crate::agent::MAX_ORPHANED_CREATES),
     );
 }
 
@@ -569,7 +576,7 @@ fn mismatched_admission_room_is_cleaned_up_without_applying_answer() {
         FailureClass::Protocol
     );
     assert_eq!(agent.snapshot().desired_room.as_deref(), Some("selected"));
-    assert!(agent.snapshot().room_external_id.is_none());
+    assert!(agent.snapshot().room_id.is_none());
     let outcome = agent.snapshot().credential_outcome.as_ref().unwrap();
     assert_eq!(outcome.revision, 0);
     assert_eq!(outcome.status, CredentialStatus::Uncertain);

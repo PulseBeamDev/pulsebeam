@@ -6,7 +6,7 @@ use pulsebeam_runtime::net::RecvPacketBatch;
 use slotmap::SlotMap;
 
 use crate::{
-    entity::ParticipantId,
+    entity::{ConnectionId, EndpointKey},
     id::ShardId,
     participant::{Connection, ConnectionConfig},
     route::NodeTransportAddress,
@@ -41,7 +41,8 @@ pub(crate) struct ParticipantRegistry {
     /// Boxing keeps `SlotMap` growth from copying full participants on the
     /// shard's real-time media thread.
     participants: SlotMap<ParticipantHandle, Box<ParticipantMeta>>,
-    by_id: HashMap<ParticipantId, ParticipantHandle>,
+    by_endpoint: HashMap<EndpointKey, ParticipantHandle>,
+    by_connection: HashMap<ConnectionId, ParticipantHandle>,
     transports: Vec<Option<(NodeTransportAddress, ParticipantHandle)>>,
     demuxer: Demuxer,
     pending_close: VecDeque<(NodeTransportAddress, Vec<SocketAddr>)>,
@@ -58,7 +59,8 @@ impl ParticipantRegistry {
             shard_id,
             max_gso_segments,
             participants: SlotMap::with_key(),
-            by_id: HashMap::new(),
+            by_endpoint: HashMap::new(),
+            by_connection: HashMap::new(),
             transports: Vec::new(),
             demuxer: Demuxer::for_node(0, 0, shard_count),
             pending_close: VecDeque::new(),
@@ -71,8 +73,12 @@ impl ParticipantRegistry {
         ingress: NodeTransportAddress,
     ) -> ParticipantHandle {
         debug_assert_eq!(ingress.shard(), self.shard_id);
-        let participant_id = cfg.participant_id;
-        if let Some(previous) = self.by_id.get(&participant_id).copied() {
+        let endpoint = EndpointKey {
+            room: cfg.room,
+            participant: cfg.participant_id,
+        };
+        let connection_id = cfg.connection_id;
+        if let Some(previous) = self.by_endpoint.get(&endpoint).copied() {
             let _ = self.remove_handle(previous);
         }
         let connection = Connection::new(cfg, self.shard_id, self.max_gso_segments);
@@ -81,18 +87,20 @@ impl ParticipantRegistry {
             queued_dirty: false,
             ingress,
         }));
-        self.by_id.insert(participant_id, handle);
+        self.by_endpoint.insert(endpoint, handle);
+        let prior = self.by_connection.insert(connection_id, handle);
+        debug_assert!(prior.is_none(), "a connection must be materialized once");
         self.install_transport(ingress, handle);
-        tracing::info!(%participant_id, "participant added to shard");
+        tracing::info!(%connection_id, "participant added to shard");
         handle
     }
 
     pub fn remove(
         &mut self,
-        participant: ParticipantId,
+        connection: ConnectionId,
         address: NodeTransportAddress,
     ) -> Option<Box<ParticipantMeta>> {
-        let handle = self.resolve(&participant)?;
+        let handle = self.resolve_connection(connection)?;
         if self.participants.get(handle)?.ingress != address {
             return None;
         }
@@ -101,17 +109,26 @@ impl ParticipantRegistry {
 
     fn remove_handle(&mut self, handle: ParticipantHandle) -> Option<Box<ParticipantMeta>> {
         let meta = self.participants.remove(handle)?;
-        if self.by_id.get(&meta.participant_id) == Some(&handle) {
-            self.by_id.remove(&meta.participant_id);
+        let endpoint = EndpointKey {
+            room: meta.room,
+            participant: meta.participant_id,
+        };
+        if self.by_endpoint.get(&endpoint) == Some(&handle) {
+            self.by_endpoint.remove(&endpoint);
         }
+        self.by_connection.remove(&meta.connection_id);
         self.retire_transport(meta.ingress);
         let addrs = self.demuxer.unregister(meta.ingress.route);
         self.pending_close.push_back((meta.ingress, addrs));
         Some(meta)
     }
 
-    pub fn resolve(&self, participant_id: &ParticipantId) -> Option<ParticipantHandle> {
-        self.by_id.get(participant_id).copied()
+    pub fn resolve_endpoint(&self, endpoint: EndpointKey) -> Option<ParticipantHandle> {
+        self.by_endpoint.get(&endpoint).copied()
+    }
+
+    pub fn resolve_connection(&self, connection_id: ConnectionId) -> Option<ParticipantHandle> {
+        self.by_connection.get(&connection_id).copied()
     }
 
     pub fn resolve_mut(&mut self, key: ParticipantHandle) -> Option<&mut ParticipantMeta> {

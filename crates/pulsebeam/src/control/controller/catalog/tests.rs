@@ -3,7 +3,7 @@ use super::*;
 fn viewer_scope(endpoint: &str) -> Scope {
     Scope {
         project: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
-        endpoint: ParticipantExternalId::new(endpoint).unwrap(),
+        endpoint: ParticipantId::new(endpoint).unwrap(),
         room: "room".into(),
         limit: 100,
         ordering_version: ORDERING_VERSION,
@@ -37,7 +37,7 @@ fn continuations_are_scoped_expiring_and_bounded_without_granting_authority() {
             ..scope.clone()
         },
         Scope {
-            endpoint: ParticipantExternalId::new("other").unwrap(),
+            endpoint: ParticipantId::new("other").unwrap(),
             ..scope.clone()
         },
         Scope {

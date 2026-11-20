@@ -1,8 +1,6 @@
 use super::*;
 use crate::control::native::{ExecutionCompletion, ResolvedSource};
-use crate::entity::{
-    ConnectionId, ParticipantExternalId, ParticipantId, RoomExternalId, RoomId, TrackKind,
-};
+use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
 use crate::participant::policy::ReceiverExecution;
 use crate::track::{DataLane, TrackMeta};
 use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind as GrantKind};
@@ -13,7 +11,7 @@ fn scope(
     label: Option<&str>,
 ) -> ResourcePermissions {
     ResourcePermissions::Grants {
-        room: RoomExternalId::new("room").unwrap(),
+        room: RoomId::new("room").unwrap(),
         grants: GrantSet::new(vec![
             Grant::new(
                 vec!["room".into()],
@@ -28,17 +26,17 @@ fn scope(
     }
 }
 
-fn participant(id: ParticipantId, external: &ParticipantExternalId) -> wire::Participant {
+fn participant(id: ParticipantId, _external: &ParticipantId) -> wire::Participant {
     wire::Participant {
-        participant_id: id.as_str(),
-        participant_external_id: external.as_str().to_owned(),
+        participant_id: id.as_str().to_owned(),
+        room_id: "room".into(),
     }
 }
 
 fn track(connection: ConnectionId, owner: ParticipantId, label: &str) -> Track {
     Track::data_publication(
         TrackMeta {
-            room_id: RoomId::from_external(&RoomExternalId::new("room").unwrap()),
+            room: crate::entity::ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
             shard_id: crate::id::ShardId::new(0),
             id: connection.derive_publication_track_id(
                 TrackKind::Data,
@@ -53,7 +51,7 @@ fn track(connection: ConnectionId, owner: ParticipantId, label: &str) -> Track {
     )
 }
 
-fn settle(model: &mut NativeSession, tracks: &[Track], publisher: &ParticipantExternalId) {
+fn settle(model: &mut NativeSession, tracks: &[Track], publisher: &ParticipantId) {
     for _ in 0..16 {
         if !model.revocation_pending() {
             return;
@@ -74,10 +72,10 @@ fn settle(model: &mut NativeSession, tracks: &[Track], publisher: &ParticipantEx
 #[test]
 fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_reference_counted() {
     let mut model = session();
-    let publisher = ParticipantExternalId::new("publisher").unwrap();
-    let other = ParticipantExternalId::new("other").unwrap();
-    let owner = ParticipantId::new();
-    let myself = ParticipantId::new();
+    let publisher = ParticipantId::new("publisher").unwrap();
+    let other = ParticipantId::new("other").unwrap();
+    let owner = publisher;
+    let myself = crate::entity::fixture_participant_id();
     let connection = ConnectionId::new();
     model.observe_self(participant(myself, &other)).unwrap();
     assert!(
@@ -96,9 +94,17 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
     model
         .observe_participant(participant(owner, &publisher))
         .unwrap();
-    assert!(!model.rows.contains_key(&Key::Participant(owner.as_str())));
+    assert!(
+        !model
+            .rows
+            .contains_key(&Key::Participant(("room".into(), owner.as_str().into())))
+    );
     let allowed = track(connection, owner, "allowed");
-    let mut incomplete = track(connection, ParticipantId::new(), "preparing");
+    let mut incomplete = track(
+        connection,
+        crate::entity::fixture_participant_id(),
+        "preparing",
+    );
     incomplete.meta_mut().label = None;
     let hidden = track(connection, owner, "hidden");
     let before = model.retained_bytes;
@@ -128,7 +134,7 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
             .unwrap();
     }
     assert_eq!(
-        model.rows[&Key::Participant(owner.as_str())].discovered_tracks,
+        model.rows[&Key::Participant(("room".into(), owner.as_str().into()))].discovered_tracks,
         1
     );
     settle(&mut model, std::slice::from_ref(&allowed), &publisher);
@@ -136,15 +142,23 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
     assert!(batches.iter().any(|batch| batch.records.iter().any(|record| matches!(record.key.as_ref().and_then(|key| key.key.as_ref()), Some(wire::resource_key::Key::Track(id)) if *id == allowed.id().as_str()))));
     model.remove_track(allowed.id().as_str()).unwrap();
     assert!(matches!(
-        &model.rows[&Key::Participant(owner.as_str())].value.value,
+        &model.rows[&Key::Participant(("room".into(), owner.as_str().into()))]
+            .value
+            .value,
         Some(wire::confirmed_state::Value::Absent(_))
     ));
     assert!(matches!(
-        &model.rows[&Key::Participant(myself.as_str())].value.value,
+        &model.rows[&Key::Participant(("room".into(), myself.as_str().into()))]
+            .value
+            .value,
         Some(wire::confirmed_state::Value::Participant(_))
     ));
     drain(&mut model);
-    assert!(!model.rows.contains_key(&Key::Participant(owner.as_str())));
+    assert!(
+        !model
+            .rows
+            .contains_key(&Key::Participant(("room".into(), owner.as_str().into())))
+    );
     model
         .authorization(10_000, 3, scope(vec![Action::Discover], None, None))
         .unwrap();
@@ -153,11 +167,13 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
         .unwrap();
     settle(&mut model, &[], &publisher);
     assert!(matches!(
-        &model.rows[&Key::Participant(owner.as_str())].value.value,
+        &model.rows[&Key::Participant(("room".into(), owner.as_str().into()))]
+            .value
+            .value,
         Some(wire::confirmed_state::Value::Participant(_))
     ));
     assert_eq!(
-        model.rows[&Key::Participant(owner.as_str())].discovered_tracks,
+        model.rows[&Key::Participant(("room".into(), owner.as_str().into()))].discovered_tracks,
         0
     );
     let mut preparing = track(connection, owner, "authorized-preparing");
@@ -219,9 +235,9 @@ fn discovery_filters_do_not_expose_or_fund_hidden_sources_and_context_is_referen
 #[test]
 fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_receivers() {
     let mut model = session();
-    let publisher = ParticipantExternalId::new("publisher").unwrap();
+    let publisher = ParticipantId::new("publisher").unwrap();
     settle(&mut model, &[], &publisher);
-    let owner = ParticipantId::new();
+    let owner = publisher;
     let connection = ConnectionId::new();
     let mut tracks = vec![track(connection, owner, "allowed")];
     for index in 0..SELECT_WORK + 4 {
@@ -377,7 +393,7 @@ fn scope_reconciliation_withholds_stale_catalog_rows_and_preserves_independent_r
     }
     assert!(model.rows.contains_key(&Key::Track(target.as_str())));
     assert_eq!(
-        model.rows[&Key::Participant(owner.as_str())].discovered_tracks,
+        model.rows[&Key::Participant(("room".into(), owner.as_str().into()))].discovered_tracks,
         1
     );
     assert_eq!(

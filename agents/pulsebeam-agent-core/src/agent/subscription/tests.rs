@@ -158,7 +158,7 @@ fn receive(agent: &mut Agent, participant: &str) -> u64 {
             spec: data_spec(),
             source: TrackSelector {
                 room: "room".into(),
-                participant_external_id: participant.into(),
+                participant_id: participant.into(),
                 label: "events".into(),
             },
         })
@@ -352,7 +352,7 @@ fn unresolved_and_denied_selector_never_inherits_another_receiver() {
                     continue;
                 };
                 if let Some(state::desired_state::Value::Present(spec)) = desired.value {
-                    if matches!(&spec.declaration, Some(state::resource_spec::Declaration::SourceLookup(source)) if source.source.as_ref().is_some_and(|address| address.participant_external_id == "bob"))
+                    if matches!(&spec.declaration, Some(state::resource_spec::Declaration::SourceLookup(source)) if source.source.as_ref().is_some_and(|address| address.participant_id == "bob"))
                     {
                         lookup = Some((record.owned, desired.revision));
                     }

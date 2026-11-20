@@ -73,6 +73,7 @@ pub(super) fn track(id: &str, participant: &str, label: &str, kind: MediaKind) -
     state::Track {
         track_id: id.into(),
         participant_id: participant.into(),
+        room_id: "room".into(),
         label: label.into(),
         kind: Some(match kind {
             MediaKind::Video => state::track::Kind::Video(state::VideoTrack { format }),
@@ -88,14 +89,15 @@ pub(super) fn discover_receivers(
 ) -> (state::Participant, [state::Track; 2]) {
     let participant = state::Participant {
         participant_id: "publisher".into(),
-        participant_external_id: "publisher-external".into(),
+
+        room_id: "room".into(),
     };
     let tracks = [
         track("video-track", "publisher", "camera", MediaKind::Video),
         track("audio-track", "publisher", "microphone", MediaKind::Audio),
     ];
     let mut records = vec![native_connection::confirmed(
-        state::resource_key::Key::Participant(participant.participant_id.clone()),
+        state::resource_key::Key::Participant(participant.clone()),
         0,
         state::confirmed_state::Value::Participant(participant.clone()),
     )];
@@ -331,13 +333,13 @@ pub(super) fn scoped_desired(revision: u64) -> DesiredState {
     state.video[0].track_id.clear();
     state.video[0].selector = Some(TrackSelector {
         room: "room".into(),
-        participant_external_id: "publisher-external".into(),
+        participant_id: "publisher".into(),
         label: "camera".into(),
     });
     state.audio.pinned.clear();
     state.audio.selected = vec![TrackSelector {
         room: "room".into(),
-        participant_external_id: "publisher-external".into(),
+        participant_id: "publisher".into(),
         label: "microphone".into(),
     }];
     state
@@ -430,13 +432,7 @@ pub(super) fn connected_with(
     agent: Agent,
     initial: DesiredState,
 ) -> (Agent, Generation, ChannelId, Vec<Target>, Vec<Target>) {
-    connected_with_tracks(
-        agent,
-        initial,
-        "pa_11111111111111111111111111",
-        "video-one",
-        "audio-one",
-    )
+    connected_with_tracks(agent, initial, "remote-user", "video-one", "audio-one")
 }
 
 fn connected_with_tracks(
@@ -476,8 +472,9 @@ fn connected_with_tracks(
             };
             let address = lookup.source.as_ref().unwrap();
             let participant = state::Participant {
-                participant_id: participant_id.into(),
-                participant_external_id: address.participant_external_id.clone(),
+                participant_id: address.participant_id.clone(),
+
+                room_id: address.room.clone(),
             };
             let (track_id, kind) = match state::TrackKind::try_from(address.kind).unwrap() {
                 state::TrackKind::Video => (
@@ -503,6 +500,7 @@ fn connected_with_tracks(
                     track: Some(state::Track {
                         track_id: track_id.into(),
                         participant_id: participant.participant_id,
+                        room_id: participant.room_id.clone(),
                         label: address.label.clone(),
                         kind: Some(kind),
                     }),
@@ -550,7 +548,8 @@ fn connected_with_tracks(
     );
     let participant = state::Participant {
         participant_id: agent.snapshot().participant_id.clone().unwrap(),
-        participant_external_id: agent.snapshot().participant_external_id.clone().unwrap(),
+
+        room_id: agent.snapshot().room_id.clone().unwrap(),
     };
     native_connection::observe(
         &mut agent,

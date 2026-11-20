@@ -100,9 +100,8 @@ pub enum DisconnectReason {
 
 pub struct ConnectionConfig {
     pub manual_sub: bool,
-    pub room_id: entity::RoomId,
+    pub room: entity::ProjectRoomKey,
     pub participant_id: entity::ParticipantId,
-    pub participant_external_id: entity::ParticipantExternalId,
     pub connection_id: entity::ConnectionId,
     pub profile: SignalingProtocol,
     pub allow_topic_channels: bool,
@@ -115,10 +114,8 @@ pub struct ConnectionConfig {
 impl std::fmt::Debug for ConnectionConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionConfig")
-            .field("participant_id", &self.participant_id)
             .field("connection_id", &self.connection_id)
             .field("profile", &self.profile)
-            .field("resources", &self.resources)
             .finish_non_exhaustive()
     }
 }
@@ -204,7 +201,7 @@ pub struct Connection {
     authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
     authorization_revision: u64,
     last_slow_poll: Instant,
-    pub(crate) room_id: entity::RoomId,
+    pub(crate) room: entity::ProjectRoomKey,
     pub(crate) shard_id: ShardId,
 }
 
@@ -212,17 +209,12 @@ impl Connection {
     pub fn new(mut cfg: ConnectionConfig, shard_id: ShardId, udp_gso_size: usize) -> Self {
         let rtc = cfg.rtc;
         let ctx = LogCtx {
-            room_id: cfg.room_id,
-            participant_id: cfg.participant_id,
+            connection_id: cfg.connection_id,
         };
         let native_handoff = cfg.resources.native_handoff.take();
         let now = Instant::now();
         #[cfg(feature = "sim")]
-        let sim_span = tracing::info_span!(
-            "peer",
-            participant_id = %cfg.participant_id,
-            room_id = %cfg.room_id
-        );
+        let sim_span = tracing::info_span!("peer", connection_id = %cfg.connection_id);
         let mut participant = Self {
             transport: RtcDriver::new(
                 rtc,
@@ -256,9 +248,14 @@ impl Connection {
             native_preparation_budget: NATIVE_PREPARATION_BUDGET,
             native_receivers: native_receiver::NativeReceivers::default(),
             native_rtp: native_rtp::NativeRtp::default(),
-            room_id: cfg.room_id,
+            room: cfg.room,
             shard_id,
         };
+        #[cfg(feature = "sim")]
+        participant
+            .downstream
+            .video
+            .set_simulator_subscriber(cfg.participant_id);
         if participant.negotiated.signaling_channel.is_some()
             && participant.native_handoff.is_none()
         {
@@ -273,8 +270,7 @@ impl Connection {
 
     fn log_ctx(&self) -> LogCtx {
         LogCtx {
-            room_id: self.room_id,
-            participant_id: self.participant_id,
+            connection_id: self.connection_id,
         }
     }
 
@@ -832,7 +828,7 @@ impl Connection {
                     }
                     Err(err) => {
                         plog_warn!(self.log_ctx(), ?err, "native signaling output failed");
-                        tracing::warn!(?err, participant_id = %self.participant_id, "native signaling output failed");
+                        plog_warn!(self.log_ctx(), ?err, "native signaling output failed");
                         self.disconnect(DisconnectReason::SignalingOutput);
                         // Drain the aborted RTC below to emit its terminal lifecycle event.
                         control_blocked = true;
@@ -1123,7 +1119,7 @@ impl Connection {
                             };
                             Some(Track::data(
                                 crate::track::TrackMeta {
-                                    room_id: self.room_id,
+                                    room: self.room,
                                     shard_id: self.shard_id,
                                     id,
                                     origin: self.participant_id,
@@ -1362,7 +1358,7 @@ impl Connection {
                     .connection_id
                     .derive_track_id(kind, label.unwrap_or(&media.mid));
                 let track_meta = track::TrackMeta {
-                    room_id: self.room_id,
+                    room: self.room,
                     shard_id: self.shard_id,
                     id: track_id,
                     origin: self.participant_id,
@@ -1716,6 +1712,7 @@ mod rtc_clock_tests {
                     (entity::ConnectionId::new(), None)
                 };
                 let offered = rtc.session.offered_media.clone();
+                let room_id = entity::RoomId::new("sdp-bootstrap").unwrap();
                 let config = crate::control::core::ControllerCore::with_placement(
                     16,
                     crate::control::core::RoomPartitionPlacement::Balanced,
@@ -1725,18 +1722,15 @@ mod rtc_clock_tests {
                     resources,
                     crate::control::controller::ParticipantState {
                         manual_sub: true,
-                        room_id: entity::RoomId::from_external(
-                            &entity::RoomExternalId::new("sdp-bootstrap").unwrap(),
-                        ),
-                        participant_id: entity::ParticipantId::new(),
-                        participant_external_id: entity::ParticipantExternalId::new("peer")
-                            .unwrap(),
+                        room_id,
+                        participant_id: crate::entity::fixture_participant_id(),
                         connection_id,
                         old_connection_id: None,
                         authorization: None,
                         profile,
                         rtp_capabilities: None,
                     },
+                    entity::ProjectRoomKey::fixture(room_id),
                 );
                 assert_eq!(config.rtc.session.offered_media, offered);
                 assert_eq!(
@@ -1801,12 +1795,10 @@ mod rtc_clock_tests {
                 let mut participant = Connection::new(
                     ConnectionConfig {
                         manual_sub: false,
-                        room_id: entity::RoomId::from_external(
-                            &entity::RoomExternalId::new("route-proof").unwrap(),
+                        room: crate::entity::ProjectRoomKey::fixture(
+                            entity::RoomId::new("route-proof").unwrap(),
                         ),
-                        participant_id: entity::ParticipantId::new(),
-                        participant_external_id: entity::ParticipantExternalId::new("peer")
-                            .unwrap(),
+                        participant_id: crate::entity::fixture_participant_id(),
                         connection_id,
                         profile: SignalingProtocol::State,
                         allow_topic_channels: false,
@@ -1866,11 +1858,10 @@ mod rtc_clock_tests {
         let mut participant = Connection::new(
             ConnectionConfig {
                 manual_sub: false,
-                room_id: entity::RoomId::from_external(
-                    &entity::RoomExternalId::new("native-overflow").unwrap(),
+                room: crate::entity::ProjectRoomKey::fixture(
+                    entity::RoomId::new("native-overflow").unwrap(),
                 ),
-                participant_id: entity::ParticipantId::new(),
-                participant_external_id: entity::ParticipantExternalId::new("peer").unwrap(),
+                participant_id: crate::entity::fixture_participant_id(),
                 connection_id,
                 profile: SignalingProtocol::State,
                 allow_topic_channels: false,
@@ -1904,11 +1895,10 @@ mod rtc_clock_tests {
         let mut participant = Connection::new(
             ConnectionConfig {
                 manual_sub: false,
-                room_id: entity::RoomId::from_external(
-                    &entity::RoomExternalId::new("grant-proof").unwrap(),
+                room: crate::entity::ProjectRoomKey::fixture(
+                    entity::RoomId::new("grant-proof").unwrap(),
                 ),
-                participant_id: entity::ParticipantId::new(),
-                participant_external_id: entity::ParticipantExternalId::new("peer").unwrap(),
+                participant_id: crate::entity::fixture_participant_id(),
                 connection_id,
                 profile: SignalingProtocol::State,
                 allow_topic_channels: false,
@@ -2101,16 +2091,15 @@ mod upstream_route_table_tests {
     #[test]
     fn late_rid_and_authorization_fences_preserve_current_fanout() {
         let now = Instant::now();
-        let participant_id = entity::ParticipantId::new();
+        let participant_id = crate::entity::fixture_participant_id();
         let connection_id = entity::ConnectionId::new();
         let mut connection = Connection::new(
             ConnectionConfig {
                 manual_sub: false,
-                room_id: entity::RoomId::from_external(
-                    &entity::RoomExternalId::new("late-rid").unwrap(),
+                room: crate::entity::ProjectRoomKey::fixture(
+                    entity::RoomId::new("late-rid").unwrap(),
                 ),
                 participant_id,
-                participant_external_id: entity::ParticipantExternalId::new("peer").unwrap(),
                 connection_id,
                 profile: SignalingProtocol::Whip,
                 allow_topic_channels: true,

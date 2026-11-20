@@ -76,7 +76,7 @@ pub fn sign_participant_token(
     participant: &str,
     expiration: u64,
 ) -> Result<String, SigningError> {
-    pulsebeam_auth::identity::validate_external(participant)?;
+    pulsebeam_auth::identity::validate_application_name(participant)?;
     let mut parts = api_key.split('.');
     let (Some(project), Some(kid), Some(secret), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())

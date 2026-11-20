@@ -60,9 +60,8 @@ Future compression requires an explicitly supported profile, not per-message
 negotiation. The RFC288 catalog schema and bounded codec cover exact logical
 source addresses, scoped page metadata and atomic participant-entry fragments
 without an envelope variant. Server catalog selection rechecks current authority
-and streams bounded live pages through the shared State batch budgets. Logical selectors use the application's external participant
-endpoint (`sub`), not the room-scoped canonical IDs used by catalog records and
-fragments. There is no legacy codec export or fallback decoder. The signaling
+and streams bounded live pages through the shared State batch budgets. Logical selectors and catalog records use the same application participant ID
+(`sub`) in an explicit room. There is no legacy codec export or fallback decoder. The signaling
 data-channel label is unchanged; it does not select a different wire protocol.
 
 The private `SourceLookupSpec`/`SourceLookupState` contract describes an owned,

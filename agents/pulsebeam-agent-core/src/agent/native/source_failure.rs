@@ -47,7 +47,7 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let Resource::SourceLookup {
             room,
-            participant_external_id,
+            participant_id,
             kind: state::TrackKind::Data,
             label,
         } = resource
@@ -56,7 +56,7 @@ impl Agent {
         };
         let source = crate::TrackSelector {
             room: room.clone(),
-            participant_external_id: participant_external_id.clone(),
+            participant_id: participant_id.clone(),
             label: label.clone(),
         };
         let update = if let Some(error) = lookup_failure(confirmed) {

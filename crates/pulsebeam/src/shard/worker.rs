@@ -166,17 +166,14 @@ pub(crate) enum ShardCommand {
         address: crate::route::NodeTransportAddress,
     },
     NativeReady {
-        participant: ParticipantId,
         connection_id: crate::entity::ConnectionId,
     },
     PublicationCutoffResult {
-        participant: ParticipantId,
         connection_id: crate::entity::ConnectionId,
         reference: u64,
         success: bool,
     },
     AuthorizationResult {
-        participant: ParticipantId,
         connection_id: crate::entity::ConnectionId,
         revision: u64,
         expiry: Option<i64>,
@@ -259,21 +256,21 @@ pub(crate) enum ShardEvent {
         request: crate::control::topology::OwnedSubscription,
     },
     OwnedSubscriptionRemoved {
-        room_id: crate::entity::RoomId,
-        source_room: crate::entity::RoomId,
+        room_id: crate::entity::ProjectRoomKey,
+        source_room: crate::entity::ProjectRoomKey,
         subscriber: ParticipantId,
         connection_id: crate::entity::ConnectionId,
         reference: u64,
     },
     TrackSubscriptionAdded {
-        room_id: crate::entity::RoomId,
+        room_id: crate::entity::ProjectRoomKey,
         subscriber: ParticipantId,
         connection_id: crate::entity::ConnectionId,
         selector: crate::track::TrackSelector,
         selection: crate::track::SelectionPolicy,
     },
     TrackSubscriptionRemoved {
-        room_id: crate::entity::RoomId,
+        room_id: crate::entity::ProjectRoomKey,
         subscriber: ParticipantId,
         connection_id: crate::entity::ConnectionId,
         selector: crate::track::TrackSelector,

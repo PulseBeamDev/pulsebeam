@@ -79,7 +79,7 @@ fn public_artifact_conformance_and_diagnostics() {
         sign_participant_token(
             &arbitrary,
             &grants("room with spaces"),
-            "participant/with/slashes",
+            "Participant_With-MixedCase",
             2000
         )
         .is_ok()

@@ -3,6 +3,7 @@
 import base64
 import binascii
 import json
+import re
 import unicodedata
 from typing import Literal, TypedDict
 
@@ -93,7 +94,7 @@ def sign_participant_token(
 
     No clock, environment lookup, or network request is performed.
     """
-    if not _scope(participant):
+    if not isinstance(participant, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,36}", participant) is None:
         raise ValueError("Invalid participant identifier")
     checked = _checked_grants(grants)
     if type(api_key) is not str:

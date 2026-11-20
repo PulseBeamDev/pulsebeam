@@ -1,8 +1,6 @@
 //! Authentication keys and the shared public key registry.
 
-use crate::identity::{
-    ApiKeyId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId, RoomId,
-};
+use crate::identity::{ApiKeyId, ParticipantId, ProjectId, RoomId};
 use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 pub use pulsebeam_auth::api_key::{ApiKey, ApiKeyError};
@@ -48,7 +46,7 @@ pub static DEVELOPMENT_API_PUBLIC_KEY: LazyLock<ApiPublicKey> =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedPrincipal {
     project_id: ProjectId,
-    participant_external_id: ParticipantExternalId,
+    participant_id: ParticipantId,
     expiry: AuthorizationExpiry,
     grants: grants::GrantSet,
 }
@@ -58,8 +56,8 @@ impl VerifiedPrincipal {
         self.project_id
     }
 
-    pub fn participant_external_id(&self) -> &ParticipantExternalId {
-        &self.participant_external_id
+    pub fn participant_id(&self) -> &ParticipantId {
+        &self.participant_id
     }
 
     pub fn expiry(&self) -> AuthorizationExpiry {
@@ -68,7 +66,7 @@ impl VerifiedPrincipal {
 
     pub fn authorize_room(
         self,
-        room: RoomExternalId,
+        room: RoomId,
     ) -> Result<VerifiedAuthorization, RoomAuthorizationError> {
         if !self
             .grants
@@ -83,29 +81,18 @@ impl VerifiedPrincipal {
         self,
         accepted: &VerifiedAuthorization,
     ) -> Result<VerifiedAuthorization, RoomAuthorizationError> {
-        if self.project_id != accepted.project_id
-            || self.participant_external_id != accepted.participant_external_id
+        if self.project_id != accepted.project_id || self.participant_id != accepted.participant_id
         {
             return Err(RoomAuthorizationError::Denied);
         }
-        let authorization = self.bind_room(accepted.room_external_id.clone());
-        if authorization.room_id != accepted.room_id
-            || authorization.participant_id != accepted.participant_id
-        {
-            return Err(RoomAuthorizationError::Denied);
-        }
-        Ok(authorization)
+        Ok(self.bind_room(accepted.room_id))
     }
 
-    fn bind_room(self, room: RoomExternalId) -> VerifiedAuthorization {
-        let room_id = RoomId::derive(&self.project_id, &room);
-        let participant_id = ParticipantId::derive(&room_id, &self.participant_external_id);
+    fn bind_room(self, room: RoomId) -> VerifiedAuthorization {
         VerifiedAuthorization {
             project_id: self.project_id,
-            room_external_id: room,
-            room_id,
-            participant_external_id: self.participant_external_id,
-            participant_id,
+            room_id: room,
+            participant_id: self.participant_id,
             expiry: self.expiry,
             grants: self.grants,
         }
@@ -122,9 +109,7 @@ pub enum RoomAuthorizationError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedAuthorization {
     pub project_id: ProjectId,
-    pub room_external_id: RoomExternalId,
     pub room_id: RoomId,
-    pub participant_external_id: ParticipantExternalId,
     pub participant_id: ParticipantId,
     pub expiry: AuthorizationExpiry,
     pub grants: grants::GrantSet,
@@ -173,7 +158,7 @@ struct TokenHeader {
 struct ParticipantClaims {
     iss: ProjectId,
     aud: String,
-    sub: ParticipantExternalId,
+    sub: ParticipantId,
     exp: u64,
     grants: grants::GrantSet,
 }
@@ -197,7 +182,7 @@ fn decode_json<T: serde::de::DeserializeOwned>(segment: &str) -> Result<T, Token
 pub fn verify_participant_token(
     registry: &KeyRegistry,
     token: &str,
-    room: RoomExternalId,
+    room: RoomId,
     now: u64,
 ) -> Result<VerifiedAuthorization, TokenError> {
     let principal = authenticate_participant_token(registry, token, now)?;
@@ -260,7 +245,7 @@ pub fn authenticate_participant_token(
 
     Ok(VerifiedPrincipal {
         project_id: claims.iss,
-        participant_external_id: claims.sub,
+        participant_id: claims.sub,
         expiry,
         grants: claims.grants,
     })
@@ -368,12 +353,7 @@ mod tests {
         token: &str,
         now: u64,
     ) -> Result<VerifiedAuthorization, TokenError> {
-        super::verify_participant_token(
-            registry,
-            token,
-            RoomExternalId::new("general").unwrap(),
-            now,
-        )
+        super::verify_participant_token(registry, token, RoomId::new("general").unwrap(), now)
     }
 
     fn development_registry() -> KeyRegistry {
@@ -530,8 +510,8 @@ mod tests {
 
     #[test]
     fn development_jwt_requires_grants_and_derives_canonical_identity() {
-        let room = RoomExternalId::new("general").unwrap();
-        let participant = ParticipantExternalId::new("alice").unwrap();
+        let room = RoomId::new("general").unwrap();
+        let participant = ParticipantId::new("alice").unwrap();
         let token = "eyJhbGciOiJFZERTQSIsImtpZCI6ImtpZF8wMDAwMDAwMDAwMVIwMTAwMDAwMDAwMDAwMDgiLCJ0eXAiOiJwYitqd3QifQ.eyJpc3MiOiJwXzAwMDAwMDAwMDAxUjAxMDAwMDAwMDAwMDAwNCIsImF1ZCI6InBiIiwic3ViIjoiYWxpY2UiLCJyb29tIjoiZ2VuZXJhbCIsImV4cCI6MjAwMH0.Bp8UJVINeP0cqUiG_0qSk4wjqDg5MGZqRcBel3Qy176HoTy0OQvTpTp5Uuav5k2Wlsgdd58rPt6DLiWVt0U1AQ";
 
         assert_eq!(
@@ -543,26 +523,15 @@ mod tests {
         let authorization =
             verify_participant_token(&development_registry(), token, 1_999).unwrap();
         assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
-        assert_eq!(authorization.room_external_id, room);
-        assert_eq!(authorization.participant_external_id, participant);
-        assert_eq!(
-            authorization.room_id,
-            RoomId::derive(&DEVELOPMENT_PROJECT_ID, &authorization.room_external_id)
-        );
-        assert_eq!(
-            authorization.participant_id,
-            ParticipantId::derive(
-                &authorization.room_id,
-                &authorization.participant_external_id
-            )
-        );
+        assert_eq!(authorization.room_id, room);
+        assert_eq!(authorization.participant_id, participant);
         assert_eq!(authorization.expiry.unix_seconds(), 2_000);
         assert!(!format!("{authorization:?}").contains(token));
 
         let principal =
             authenticate_participant_token(&development_registry(), token, 1_999).unwrap();
         assert_eq!(principal.project_id(), authorization.project_id);
-        assert_eq!(principal.participant_external_id(), &participant);
+        assert_eq!(principal.participant_id(), &participant);
         assert_eq!(principal.expiry(), authorization.expiry);
         assert!(!format!("{principal:?}").contains(token));
         assert_eq!(
@@ -570,7 +539,7 @@ mod tests {
             authorization
         );
         assert_eq!(
-            principal.authorize_room(RoomExternalId::new("other").unwrap()),
+            principal.authorize_room(RoomId::new("other").unwrap()),
             Err(RoomAuthorizationError::Denied)
         );
         assert_eq!(
@@ -802,15 +771,15 @@ mod tests {
             )
         };
         let registry = development_registry();
-        let credential = token(r#"[{"rooms":["team/*"],"allow":["join"]}]"#, 2000);
+        let credential = token(r#"[{"rooms":["Team_Main"],"allow":["join"]}]"#, 2000);
         let principal = authenticate_participant_token(&registry, &credential, 1000).unwrap();
-        let room = RoomExternalId::new("team/é").unwrap();
+        let room = RoomId::new("Team_Main").unwrap();
         let accepted = principal.clone().authorize_room(room.clone()).unwrap();
-        for denied in ["team", "team-other/é", "elsewhere"] {
+        for denied in ["team", "team_main", "elsewhere"] {
             assert_eq!(
                 principal
                     .clone()
-                    .authorize_room(RoomExternalId::new(denied).unwrap()),
+                    .authorize_room(RoomId::new(denied).unwrap()),
                 Err(RoomAuthorizationError::Denied)
             );
         }
@@ -826,18 +795,9 @@ mod tests {
         assert_eq!(replacement.grants, grants::GrantSet::default());
         assert_eq!(replacement.expiry.unix_seconds(), 3000);
         let mut other = accepted.clone();
-        other.participant_external_id = ParticipantExternalId::new("other").unwrap();
+        other.participant_id = ParticipantId::new("other").unwrap();
         assert_eq!(
             revoked.clone().authorize_existing(&other),
-            Err(RoomAuthorizationError::Denied)
-        );
-        other = accepted;
-        other.room_id = RoomId::derive(
-            &other.project_id,
-            &RoomExternalId::new("different").unwrap(),
-        );
-        assert_eq!(
-            revoked.authorize_existing(&other),
             Err(RoomAuthorizationError::Denied)
         );
     }
@@ -864,6 +824,14 @@ mod tests {
             "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"grants\":[{{\"rooms\":[\"*\"],\"allow\":[\"join\"]}}]}}",
             DEVELOPMENT_PROJECT_ID.as_str()
         );
+        for invalid in ["stage.alice", "café", "alice\n", &"a".repeat(37)] {
+            let claims = claims.replace("\"alice\"", &serde_json::to_string(invalid).unwrap());
+            let token = signed_token(&header, &claims, &DEVELOPMENT_API_SIGNING_KEY);
+            assert!(matches!(
+                authenticate_participant_token(&registry, &token, 1000),
+                Err(TokenError::Invalid)
+            ));
+        }
         let array_token = signed_token(&header_array, &claims, &DEVELOPMENT_API_SIGNING_KEY);
         assert!(authenticate_participant_token(&registry, &array_token, 1000).is_err());
         let claims_array = serde_json::json!([DEVELOPMENT_PROJECT_ID.as_str(), "pb", "alice", 2000, [{"rooms":["*"],"allow":["join"]}]]).to_string();

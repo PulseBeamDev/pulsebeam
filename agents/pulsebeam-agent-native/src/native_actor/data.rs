@@ -226,7 +226,7 @@ impl Participant {
     pub(super) fn source(&self, label: String) -> agent_core::TrackSelector {
         agent_core::TrackSelector {
             room: self.room.clone(),
-            participant_external_id: self.id.clone(),
+            participant_id: self.id.clone(),
             label,
         }
     }

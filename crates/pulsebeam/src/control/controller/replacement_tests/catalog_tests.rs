@@ -79,7 +79,7 @@ fn request(endpoint: &handoff::EndpointHandoff, id: u64, cursor: Vec<u8>) {
 
 fn source_permissions(allow: &[&str]) -> ResourcePermissions {
     ResourcePermissions::Grants {
-        room: RoomExternalId::new("viewer-room").unwrap(),
+        room: RoomId::new("viewer-room").unwrap(),
         grants: serde_json::from_value(serde_json::json!([
             {"rooms":["viewer-room"],"allow":["join"]},
             {"rooms":["catalog-source"],"allow":allow}
@@ -205,13 +205,12 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
     let project = crate::entity::ProjectId::from_bytes([
         0x01, 0x8f, 0x4f, 0x7c, 0x20, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 1,
     ]);
-    let source_room = RoomId::derive(&project, &RoomExternalId::new("catalog-source").unwrap());
-    let viewer_room = RoomId::derive(&project, &RoomExternalId::new("viewer-room").unwrap());
+    let source_room = RoomId::new("catalog-source").unwrap();
+    let viewer_room = RoomId::new("viewer-room").unwrap();
     let mut ordered = Vec::new();
     for index in 1..=80u8 {
-        let external =
-            crate::entity::ParticipantExternalId::new(&format!("presence-{index}")).unwrap();
-        let participant = ParticipantId::derive(&source_room, &external);
+        let external = crate::entity::ParticipantId::new(&format!("presence-{index}")).unwrap();
+        let participant = external;
         let transport = actor
             .core
             .reserve_transport(ShardId::new(0), pulsebeam_runtime::time::Instant::now());
@@ -220,16 +219,18 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
             .registry
             .commit_candidate(
                 participant,
-                source_room,
+                ProjectRoomKey {
+                    project,
+                    room: source_room,
+                },
                 ShardId::new(0),
                 usize::from(index).saturating_sub(1),
                 transport,
                 connection_id(index),
                 SignalingProtocol::State,
-                Some(external),
             )
             .unwrap();
-        ordered.push(participant.as_str());
+        ordered.push(participant.as_str().to_owned());
     }
     ordered.sort();
     let publisher = ordered.last().unwrap().parse::<ParticipantId>().unwrap();
@@ -255,7 +256,10 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         .update_authorization(&publisher, publisher_connection, publisher_lease);
     let track = crate::track::Track::data_publication(
         crate::track::TrackMeta {
-            room_id: source_room,
+            room: crate::entity::ProjectRoomKey {
+                project,
+                room: source_room,
+            },
             shard_id: ShardId::new(0),
             id: publisher_connection.derive_publication_track_id(
                 crate::entity::TrackKind::Data,
@@ -269,8 +273,8 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         crate::track::DataLane::Ordered,
     );
     actor.handle_shard_event((ShardId::new(0), ShardEvent::TrackPublished(track.clone())));
-    let external = crate::entity::ParticipantExternalId::new("alice").unwrap();
-    let participant = ParticipantId::derive(&viewer_room, &external);
+    let external = crate::entity::ParticipantId::new("alice").unwrap();
+    let participant = external;
     let connection = connection_id(200);
     let transport = actor
         .core
@@ -280,13 +284,15 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         .registry
         .commit_candidate(
             participant,
-            viewer_room,
+            ProjectRoomKey {
+                project,
+                room: viewer_room,
+            },
             ShardId::new(0),
             0,
             transport,
             connection,
             SignalingProtocol::State,
-            Some(external.clone()),
         )
         .unwrap();
     let mut lease = authorization_lease(
@@ -304,8 +310,7 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         .registry
         .update_authorization(&participant, connection, lease.clone());
     let (controller, mut endpoint) = handoff::pair(connection, actor.native_ready_tx.clone());
-    let mut native =
-        StateProtocolHandler::new(participant, viewer_room, external, None, controller).unwrap();
+    let mut native = StateProtocolHandler::new(participant, viewer_room, None, controller).unwrap();
     native
         .model
         .authorization(i64::MAX, 1, lease.permissions().clone())

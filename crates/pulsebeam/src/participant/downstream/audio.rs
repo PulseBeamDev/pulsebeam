@@ -516,10 +516,8 @@ mod tests {
     use crate::participant::downstream::SlotConfig;
 
     fn test_ctx() -> LogCtx {
-        use crate::entity::{ParticipantId, RoomExternalId, RoomId};
         LogCtx {
-            room_id: RoomId::from_external(&RoomExternalId::new("test").unwrap()),
-            participant_id: ParticipantId::new(),
+            connection_id: crate::entity::ConnectionId::new(),
         }
     }
 
@@ -534,7 +532,7 @@ mod tests {
     fn origin(seed: u64) -> AudioOrigin {
         use crate::entity::{ParticipantId, TrackKind};
         let _rng = pulsebeam_runtime::rand::seeded_rng(seed);
-        let participant = ParticipantId::new();
+        let participant = crate::entity::fixture_participant_id();
         AudioOrigin {
             track: connection(seed).derive_track_id(TrackKind::Audio, "mic"),
             participant,

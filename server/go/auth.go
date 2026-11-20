@@ -39,6 +39,18 @@ type Grant struct {
 	Label       *string    `json:"label,omitempty"`
 }
 
+func validParticipantName(value string) bool {
+	if len(value) == 0 || len(value) > 36 {
+		return false
+	}
+	for _, b := range []byte(value) {
+		if !(b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b >= '0' && b <= '9' || b == '_' || b == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 func validScope(value string) bool {
 	if len(value) == 0 || len(value) > 256 || !utf8.ValidString(value) {
 		return false
@@ -130,7 +142,7 @@ func parseAPIKey(apiKey string) (string, string, ed25519.PrivateKey, error) {
 // SignParticipantToken signs a participant JWT using an opaque server-only API key.
 // expiration is absolute Unix seconds, not a TTL. No clock or network is consulted.
 func SignParticipantToken(apiKey string, grants []Grant, participant string, expiration uint64) (string, error) {
-	if !validScope(participant) {
+	if !validParticipantName(participant) {
 		return "", errors.New("invalid participant identifier")
 	}
 	if err := validateGrants(grants); err != nil {

@@ -1,4 +1,4 @@
-use crate::entity::{ParticipantExternalId, TrackId, TrackKind};
+use crate::entity::{ParticipantId, TrackId, TrackKind};
 use crate::media::ChannelId;
 use crate::participant::Connection;
 use crate::participant::policy::{
@@ -27,7 +27,7 @@ pub(crate) use session::{
 
 pub(crate) struct ResolvedSource<'a> {
     pub(crate) track: &'a Track,
-    pub(crate) publisher: &'a ParticipantExternalId,
+    pub(crate) publisher: &'a ParticipantId,
 }
 
 impl ResolvedSource<'_> {
@@ -119,7 +119,7 @@ pub(crate) enum ReceiverPreparation {
 }
 
 pub(crate) struct Receiver {
-    pub(crate) source_room: crate::entity::RoomId,
+    pub(crate) source_room: crate::entity::ProjectRoomKey,
     pub(crate) source: Track,
     pub(crate) source_id: String,
     pub(crate) transport: ReceiveTransport,

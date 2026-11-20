@@ -1,5 +1,5 @@
 use super::*;
-use crate::entity::{ParticipantExternalId, ProjectId, RoomExternalId};
+use crate::entity::{ParticipantId, ProjectId, RoomId};
 use pulsebeam_core::auth::grants::Action;
 use pulsebeam_proto::{catalog as limits, prelude::Message, state as wire};
 use pulsebeam_runtime::{rand::RngCore, time::Instant};
@@ -17,12 +17,12 @@ const ENDPOINT_CURSORS: usize = 64;
 const SERVER_CURSORS: usize = 4096;
 type WatchKey = (ConnectionId, u64);
 type Token = [u8; 32];
-type Endpoint = (ProjectId, ParticipantExternalId);
+type Endpoint = (ProjectId, ParticipantId);
 
 #[derive(Clone, PartialEq, Eq)]
 struct Scope {
     project: ProjectId,
-    endpoint: ParticipantExternalId,
+    endpoint: ParticipantId,
     room: String,
     limit: u32,
     ordering_version: u8,
@@ -280,8 +280,7 @@ impl CatalogRuntime {
     ) -> Result<(), wire::FailureCode> {
         let registry = &controller.core.registry;
         let meta = registry
-            .get_participant(&watch.participant)
-            .filter(|meta| meta.connection_id == key.0)
+            .get_incarnation(watch.participant, key.0)
             .ok_or(wire::FailureCode::ResourceGone)?;
         let lease = meta
             .authorization
@@ -301,10 +300,7 @@ impl CatalogRuntime {
         }
         let scope = Scope {
             project: lease.authority.project_id,
-            endpoint: meta
-                .participant_external_id
-                .clone()
-                .ok_or(wire::FailureCode::InternalFailure)?,
+            endpoint: watch.participant,
             room: watch.request.room.clone(),
             limit: watch.request.participant_limit,
             ordering_version: ORDERING_VERSION,
@@ -322,14 +318,14 @@ impl CatalogRuntime {
         } else if watch.scope.as_ref() != Some(&scope) {
             return Err(wire::FailureCode::InvalidConfiguration);
         }
-        let room = RoomId::derive(
-            &scope.project,
-            &RoomExternalId::new(&scope.room)
-                .map_err(|_| wire::FailureCode::InvalidConfiguration)?,
-        );
+        let room = RoomId::new(&scope.room).map_err(|_| wire::FailureCode::InvalidConfiguration)?;
+        let room_scope = ProjectRoomKey {
+            project: scope.project,
+            room,
+        };
         let stamp = (
-            registry.room_catalog_version(room),
-            controller.lifecycle.room_catalog_version(room),
+            registry.room_catalog_version(room_scope),
+            controller.lifecycle.room_catalog_version(room_scope),
             lease.revision,
         );
         if watch.stamp != Some(stamp) {
@@ -351,7 +347,7 @@ impl CatalogRuntime {
         };
         while *candidates != 0 {
             let candidate = registry
-                .ordered_participants_in_room(&room, build.scanned.as_deref())
+                .ordered_participants_in_room(&room_scope, build.scanned.as_deref())
                 .next();
             let Some((canonical, participant, publisher)) = candidate else {
                 return self.finish(controller, key, watch, false);
@@ -361,7 +357,7 @@ impl CatalogRuntime {
             let entry = catalog_entry(
                 controller,
                 lease.permissions(),
-                room,
+                room_scope,
                 &scope.room,
                 participant,
                 publisher,
@@ -476,7 +472,7 @@ impl CatalogRuntime {
 fn catalog_entry(
     controller: &ControllerActor,
     permissions: &super::super::permissions::ResourcePermissions,
-    room: RoomId,
+    room: ProjectRoomKey,
     literal: &str,
     participant: ParticipantId,
     publisher: &super::super::registry::ParticipantMeta,
@@ -484,13 +480,11 @@ fn catalog_entry(
     if !publisher.materialized {
         return Ok(None);
     }
-    let Some(external) = &publisher.participant_external_id else {
-        return Ok(None);
-    };
+
     let presence = permissions.allows_at_room(
         Action::Discover,
         literal,
-        Some(external.as_str()),
+        Some(participant.as_str()),
         None,
         None,
     );
@@ -514,7 +508,7 @@ fn catalog_entry(
         if permissions.allows_source_at_room(
             Action::Discover,
             literal,
-            Some(external.as_str()),
+            Some(participant.as_str()),
             track,
         ) {
             tracks.push(
@@ -529,8 +523,8 @@ fn catalog_entry(
     tracks.sort_by(|left, right| left.track_id.cmp(&right.track_id));
     Ok(Some(wire::CatalogParticipantEntry {
         participant: Some(wire::Participant {
-            participant_id: participant.as_str(),
-            participant_external_id: external.as_str().to_owned(),
+            participant_id: participant.as_str().to_owned(),
+            room_id: literal.to_owned(),
         }),
         tracks,
     }))

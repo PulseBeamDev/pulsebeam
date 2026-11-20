@@ -5,7 +5,7 @@ use crate::media::SimulcastLayer;
 
 fn camera() -> (Track, LayerStates) {
     let (tx, built, mut states) = video_track_with_states(
-        ParticipantId::new(),
+        crate::entity::fixture_participant_id(),
         Mid::from("v0"),
         ["q", "h", "f"].map(SimulcastLayer::new).to_vec(),
     );
@@ -25,7 +25,7 @@ fn camera() -> (Track, LayerStates) {
 
 fn scalable_camera() -> (Track, LayerStates) {
     let (tx, built, mut states) = video_track_with_states(
-        ParticipantId::new(),
+        crate::entity::fixture_participant_id(),
         Mid::from("v0"),
         vec![SimulcastLayer::new("f")],
     );

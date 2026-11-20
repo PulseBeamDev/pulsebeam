@@ -4,7 +4,7 @@ use crate::{
     control::{
         controller::ParticipantState, negotiator::NegotiatedResources, registry::RoomRegistry,
     },
-    entity::{ParticipantId, RoomId},
+    entity::{ParticipantId, ProjectRoomKey},
     id::ShardId,
     participant::ConnectionConfig,
     route::{NodeTransportAddress, PackedRoute, SlotAllocator, TransportRoute},
@@ -90,7 +90,7 @@ impl ControllerCore {
 
     pub fn next_room_partition(
         &self,
-        room_id: &RoomId,
+        room_id: &ProjectRoomKey,
         participant_id: &ParticipantId,
     ) -> (usize, RoomPartitionPlacement) {
         let index = self
@@ -114,13 +114,13 @@ impl ControllerCore {
         rtc: AcceptedConnection,
         resources: NegotiatedResources,
         state: ParticipantState,
+        room: ProjectRoomKey,
     ) -> ConnectionConfig {
         ConnectionConfig {
             manual_sub: state.manual_sub
                 || state.profile == super::controller::SignalingProtocol::State,
-            room_id: state.room_id,
+            room,
             participant_id: state.participant_id,
-            participant_external_id: state.participant_external_id,
             connection_id: state.connection_id,
             profile: state.profile,
             allow_topic_channels: state.profile != super::controller::SignalingProtocol::State,

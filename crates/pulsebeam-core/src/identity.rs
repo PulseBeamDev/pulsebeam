@@ -1,9 +1,9 @@
 //! Canonical PulseBeam entity identities.
 
-pub use pulsebeam_auth::identity::IdValidationError;
+pub use pulsebeam_auth::identity::{IdValidationError, MAX_APPLICATION_NAME_BYTES};
 #[cfg(test)]
 use pulsebeam_auth::identity::{UUID_TEXT_LEN, decode_uuid, encode_uuid};
-use pulsebeam_auth::identity::{format_id, parse_id, validate_external};
+use pulsebeam_auth::identity::{format_id, parse_id, validate_application_name};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use std::{fmt, num::NonZeroU64, str::FromStr};
@@ -12,8 +12,6 @@ use uuid::Variant;
 use uuid::{Uuid, Version};
 
 // These domain bytes and TrackKind discriminants are part of the V0 transcript.
-const ROOM_DOMAIN: &[u8] = b"pulsebeam.identity.room.v0";
-const PARTICIPANT_DOMAIN: &[u8] = b"pulsebeam.identity.participant.v0";
 const AUDIO_TRACK_DOMAIN: &[u8] = b"pulsebeam.identity.audio-track.v0";
 const VIDEO_TRACK_DOMAIN: &[u8] = b"pulsebeam.identity.video-track.v0";
 const DATA_TRACK_DOMAIN: &[u8] = b"pulsebeam.identity.data-track.v0";
@@ -56,20 +54,40 @@ fn derive_v8(
     Uuid::from_bytes(bytes)
 }
 
-macro_rules! external_id {
+macro_rules! application_id {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(try_from = "&str")]
-        pub struct $name(String);
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name {
+            bytes: [u8; MAX_APPLICATION_NAME_BYTES],
+            len: u8,
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct(stringify!($name))
+                    .finish_non_exhaustive()
+            }
+        }
 
         impl $name {
             pub fn new(value: &str) -> Result<Self, IdValidationError> {
-                validate_external(value)?;
-                Ok(Self(value.to_owned()))
+                validate_application_name(value)?;
+                let mut bytes = [0; MAX_APPLICATION_NAME_BYTES];
+                for (output, input) in bytes.iter_mut().zip(value.bytes()) {
+                    *output = input;
+                }
+                let len = u8::try_from(value.len())
+                    .map_err(|_| IdValidationError::TooLong(MAX_APPLICATION_NAME_BYTES))?;
+                Ok(Self { bytes, len })
             }
 
             pub fn as_str(&self) -> &str {
-                self.0.as_str()
+                // The constructor admits only ASCII and records its exact length.
+                self.bytes
+                    .get(..usize::from(self.len))
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .unwrap_or_default()
             }
         }
 
@@ -102,11 +120,23 @@ macro_rules! external_id {
                 Self::new(&value)
             }
         }
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let value = String::deserialize(deserializer)?;
+                value.parse().map_err(serde::de::Error::custom)
+            }
+        }
     };
 }
 
-external_id!(RoomExternalId);
-external_id!(ParticipantExternalId);
+application_id!(RoomId);
+application_id!(ParticipantId);
 
 macro_rules! canonical_id {
     ($name:ident, $prefix:literal, $version:expr) => {
@@ -187,9 +217,7 @@ macro_rules! canonical_id {
 
 canonical_id!(ProjectId, "p", Version::SortRand);
 canonical_id!(NodeId, "n", Version::SortRand);
-canonical_id!(RoomId, "rm", Version::Custom);
-canonical_id!(ParticipantId, "pa", Version::Custom);
-canonical_id!(ConnectionId, "c", Version::SortRand);
+canonical_id!(ConnectionId, "conn", Version::SortRand);
 canonical_id!(ApiKeyId, "kid", Version::SortRand);
 canonical_id!(AudioTrackId, "aud", Version::Custom);
 canonical_id!(VideoTrackId, "vid", Version::Custom);
@@ -215,53 +243,6 @@ minted_id!(ProjectId);
 minted_id!(NodeId);
 minted_id!(ConnectionId);
 minted_id!(ApiKeyId);
-
-impl RoomId {
-    pub fn derive(project: &ProjectId, external: &RoomExternalId) -> Self {
-        Self(derive_v8(
-            ROOM_DOMAIN,
-            project.as_bytes(),
-            None,
-            None,
-            external.as_str(),
-        ))
-    }
-
-    #[doc(hidden)]
-    pub fn from_external(external: &RoomExternalId) -> Self {
-        const LEGACY_PROJECT: ProjectId = ProjectId::from_bytes([
-            0x01, 0x8f, 0x4f, 0x7c, 0x20, 0x00, 0x70, 0x00, 0x80, 0x00, 0, 0, 0, 0, 0, 1,
-        ]);
-        Self::derive(&LEGACY_PROJECT, external)
-    }
-}
-
-impl ParticipantId {
-    pub fn derive(room: &RoomId, external: &ParticipantExternalId) -> Self {
-        Self(derive_v8(
-            PARTICIPANT_DOMAIN,
-            room.as_bytes(),
-            None,
-            None,
-            external.as_str(),
-        ))
-    }
-
-    #[doc(hidden)]
-    pub fn new() -> Self {
-        let mut bytes = *Uuid::now_v7().as_bytes();
-        if let Some(version) = bytes.get_mut(6) {
-            *version = (*version & 0x0f) | 0x80;
-        }
-        Self(Uuid::from_bytes(bytes))
-    }
-}
-
-impl Default for ParticipantId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl ConnectionId {
     /// Identity of a native publication lifetime. `incarnation` is its first
@@ -465,30 +446,20 @@ mod tests {
     #[test]
     fn golden_vectors_cover_every_prefix_version_and_uuid_contract() {
         let project = project([0; 16]);
-        let room_external = RoomExternalId::new("general").unwrap();
-        let participant_external = ParticipantExternalId::new("alice").unwrap();
-        let room = RoomId::derive(&project, &room_external);
-        let participant = ParticipantId::derive(&room, &participant_external);
         let connection =
             ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
         let values = [
             project.as_str(),
-            room.as_str(),
-            participant.as_str(),
             connection.as_str(),
             ApiKeyId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2]).as_str(),
             AudioTrackId::derive(&connection, "mic").as_str(),
             VideoTrackId::derive(&connection, "camera").as_str(),
             DataTrackId::derive(&connection, "chat").as_str(),
         ];
-        let prefixes = [
-            "p_0", "rm_0", "pa_0", "c_0", "kid_0", "aud_0", "vid_0", "dat_0",
-        ];
+        let prefixes = ["p_0", "conn_0", "kid_0", "aud_0", "vid_0", "dat_0"];
         let expected = [
             "p_00000000001R010000000000000",
-            "rm_0VPDPRVA2HP4TD2HXJYXBZH53JM",
-            "pa_0K2GMTHV9ME6YXAA5MPQ7GV7534",
-            "c_00000000001R010000000000004",
+            "conn_00000000001R010000000000004",
             "kid_00000000001R010000000000008",
             "aud_0Z91QNP7AYT6MZBQWDV1YN13G88",
             "vid_04NCB5P75CY1FN9ZPW5ZQEXDNXG",
@@ -503,14 +474,16 @@ mod tests {
             Uuid::from_bytes(*project.as_bytes()).get_version(),
             Some(Version::SortRand)
         );
-        assert_eq!(
-            Uuid::from_bytes(*room.as_bytes()).get_version(),
-            Some(Version::Custom)
-        );
-        assert_eq!(
-            Uuid::from_bytes(*room.as_bytes()).get_variant(),
-            Variant::RFC4122
-        );
+    }
+
+    #[test]
+    fn connection_id_rejects_legacy_prefix() {
+        let legacy = "c_00000000001R010000000000004";
+        assert!(matches!(
+            legacy.parse::<ConnectionId>(),
+            Err(IdValidationError::InvalidPrefix { expected: "conn" })
+        ));
+        assert!(serde_json::from_str::<ConnectionId>(&format!("\"{legacy}\"")).is_err());
     }
 
     #[test]
@@ -564,29 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn derivation_is_hierarchical_case_sensitive_and_unambiguous() {
-        let project_a = project([1; 16]);
-        let project_b = project([2; 16]);
-        let room_ab = RoomId::derive(&project_a, &RoomExternalId::new("ab").unwrap());
-        let room_a = RoomId::derive(&project_a, &RoomExternalId::new("a").unwrap());
-        assert_ne!(
-            room_ab,
-            RoomId::derive(&project_b, &RoomExternalId::new("ab").unwrap())
-        );
-
-        let participant_c =
-            ParticipantId::derive(&room_ab, &ParticipantExternalId::new("c").unwrap());
-        let participant_bc =
-            ParticipantId::derive(&room_a, &ParticipantExternalId::new("bc").unwrap());
-        assert_ne!(participant_c, participant_bc);
-        assert_eq!(
-            participant_c,
-            ParticipantId::derive(&room_ab, &ParticipantExternalId::new("c").unwrap())
-        );
-        assert_ne!(
-            participant_c,
-            ParticipantId::derive(&room_ab, &ParticipantExternalId::new("C").unwrap())
-        );
+    fn derived_track_id_preserves_kind_and_case_and_scopes_by_connection() {
         let connection_a = ConnectionId::new();
         let connection_b = ConnectionId::new();
         assert_eq!(
@@ -638,66 +589,45 @@ mod tests {
     }
 
     #[test]
-    fn external_ids_preserve_literal_utf8_with_bounded_bytes() {
-        let ascii_max = "x".repeat(256);
-        let utf8_max = "é".repeat(128);
-        let astral_max = "🦀".repeat(64);
-        for valid in [
-            "a",
-            "Z",
-            "0",
-            "_",
-            "-",
-            "aB_9-z",
-            "meeting/123/main",
-            " café/device-1 ",
-            "cafe\u{301}",
-            &ascii_max,
-            &utf8_max,
-            &astral_max,
-        ] {
-            let room = RoomExternalId::new(valid).unwrap();
-            let participant = ParticipantExternalId::new(valid).unwrap();
+    fn application_name_debug_does_not_expose_names() {
+        let room = RoomId::new("Room_Sentinel").unwrap();
+        let participant = ParticipantId::new("Participant_Sentinel").unwrap();
+        let debug = format!("{room:?} {participant:?}");
+        assert!(!debug.contains("Sentinel"));
+    }
+
+    #[test]
+    fn application_names_round_trip_without_case_folding() {
+        let longest = "a".repeat(MAX_APPLICATION_NAME_BYTES);
+        for valid in ["A", "z", "0", "_", "-", "Stage_9-a", &longest] {
+            let room = RoomId::new(valid).unwrap();
+            let participant = ParticipantId::new(valid).unwrap();
             assert_eq!(room.as_str(), valid);
             assert_eq!(participant.as_str(), valid);
             assert_eq!(
-                serde_json::from_str::<RoomExternalId>(&serde_json::to_string(&room).unwrap())
-                    .unwrap(),
-                room
+                serde_json::from_str::<RoomId>(&serde_json::to_string(&room).unwrap()).unwrap(),
+                room,
             );
             assert_eq!(
-                serde_json::from_str::<ParticipantExternalId>(
+                serde_json::from_str::<ParticipantId>(
                     &serde_json::to_string(&participant).unwrap()
                 )
                 .unwrap(),
-                participant
+                participant,
             );
         }
-        assert_ne!(
-            RoomExternalId::new("café"),
-            RoomExternalId::new("cafe\u{301}")
-        );
-        assert_ne!(
-            ParticipantExternalId::new("alice"),
-            ParticipantExternalId::new("Alice")
-        );
+        assert_ne!(RoomId::new("Stage"), RoomId::new("stage"));
+        assert_ne!(ParticipantId::new("Alice"), ParticipantId::new("alice"));
         for invalid in [
-            format!("{ascii_max}x"),
-            format!("{utf8_max}x"),
-            format!("{astral_max}x"),
+            "",
+            "stage.main",
+            "room/main",
+            " café",
+            "abc\n",
+            &format!("{longest}x"),
         ] {
-            assert_eq!(
-                RoomExternalId::new(&invalid),
-                Err(IdValidationError::TooLong(256))
-            );
-            assert_eq!(
-                ParticipantExternalId::new(&invalid),
-                Err(IdValidationError::TooLong(256))
-            );
-        }
-        for invalid in ["", "abc\n", "abc\r", "abc\t", "\0", "\u{7f}", "\u{85}"] {
-            assert!(RoomExternalId::new(invalid).is_err());
-            assert!(ParticipantExternalId::new(invalid).is_err());
+            assert!(RoomId::new(invalid).is_err());
+            assert!(ParticipantId::new(invalid).is_err());
         }
     }
 
@@ -755,9 +685,6 @@ mod tests {
             project
         );
 
-        let room = RoomId::derive(&project, &RoomExternalId::new("room").unwrap());
-        let _participant =
-            ParticipantId::derive(&room, &ParticipantExternalId::new("person").unwrap());
         let connection = ConnectionId::new();
         for track in [
             connection.derive_track_id(TrackKind::Audio, "label"),

@@ -43,7 +43,7 @@ pub struct BindReceive {
 /// shard from the existing materialized publication, never from packet bytes.
 #[derive(Debug)]
 pub struct BindSend {
-    pub room: crate::entity::RoomId,
+    pub room: crate::entity::ProjectRoomKey,
     pub track: crate::entity::TrackId,
     pub peer: pulsebeam_link::NetworkId,
     pub address: pulsebeam_link::NodeRouteKey,
@@ -56,7 +56,7 @@ pub struct BindSend {
 /// Removing the binding restores the lifecycle-owned reverse route, if any.
 #[derive(Debug)]
 pub struct BindReverse {
-    pub room: crate::entity::RoomId,
+    pub room: crate::entity::ProjectRoomKey,
     pub track: crate::entity::TrackId,
     pub shard: crate::id::ShardId,
     pub peer: pulsebeam_link::NetworkId,
@@ -83,7 +83,7 @@ pub struct ReceiveDestination {
 
 #[derive(Debug)]
 pub struct Destinations {
-    pub room: crate::entity::RoomId,
+    pub room: crate::entity::ProjectRoomKey,
     pub track: crate::entity::TrackId,
     pub reply: pulsebeam_runtime::sync::oneshot::Sender<
         Result<Vec<ReceiveDestination>, pulsebeam_link::BindError>,

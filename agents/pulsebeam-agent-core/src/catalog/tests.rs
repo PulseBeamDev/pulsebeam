@@ -14,7 +14,8 @@ fn native() -> NativeState {
         64 * 1024 * 1024,
         wire::Participant {
             participant_id: "self".into(),
-            participant_external_id: "self".into(),
+
+            room_id: "room".into(),
         },
     )
     .unwrap()
@@ -39,12 +40,14 @@ fn records(
     let entry = wire::CatalogParticipantEntry {
         participant: Some(wire::Participant {
             participant_id: participant.into(),
-            participant_external_id: "external".into(),
+
+            room_id: "room".into(),
         }),
         tracks: (0..tracks)
             .map(|index| wire::Track {
                 track_id: format!("{participant}-{index:02}"),
                 participant_id: participant.into(),
+                room_id: "room".into(),
                 label: "x".repeat(256),
                 kind: Some(wire::track::Kind::Data(wire::DataTrack {
                     delivery: wire::DataDelivery::Latest as i32,

@@ -204,15 +204,15 @@ function ActiveRoom({
         remoteReactionTracks: reactions,
       };
     for (const participant of page?.participants ?? []) {
-      if (participant.externalId === agent.participantId) continue;
+      if (participant.id === agent.participantId) continue;
       for (const track of participant.publications) {
         if (track.kind.tag === "Video")
           videos.push(
-            pinnedRoom.participant(participant.externalId).video(track.label),
+            pinnedRoom.participant(participant.id).video(track.label),
           );
         if (track.kind.tag === "Audio")
           audios.push(
-            pinnedRoom.participant(participant.externalId).audio(track.label),
+            pinnedRoom.participant(participant.id).audio(track.label),
           );
         if (track.kind.tag !== "Data") continue;
         if (
@@ -221,7 +221,7 @@ function ActiveRoom({
         )
           chats.push(
             pinnedRoom
-              .participant(participant.externalId)
+              .participant(participant.id)
               .data("chat", "ordered"),
           );
         if (
@@ -230,7 +230,7 @@ function ActiveRoom({
         )
           reactions.push(
             pinnedRoom
-              .participant(participant.externalId)
+              .participant(participant.id)
               .data("reactions", "lossy"),
           );
       }
@@ -634,9 +634,9 @@ function ActiveRoom({
                 key={participant.id}
                 size="small"
                 label={
-                  participant.externalId === agent.participantId
-                    ? `${participant.externalId} (you)`
-                    : participant.externalId
+                  participant.id === agent.participantId
+                    ? `${participant.id} (you)`
+                    : participant.id
                 }
               />
             ))}

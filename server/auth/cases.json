@@ -111,14 +111,14 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "requested_room": " meeting/会議/main ",
+        "requested_room": "Meeting_Main",
         "grants": [
           {
-            "rooms": [" meeting/会議/main "],
+            "rooms": [" meeting/会議/main ", "Meeting_Main"],
             "allow": ["join", "publish", "discover", "subscribe"]
           }
         ],
-        "participant": " café/device-1 ",
+        "participant": "Cafe_Device-1",
         "expiration": "2000"
       },
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
@@ -129,16 +129,16 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "requested_room": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+        "requested_room": "Boundary_Room",
         "grants": [
           {
             "rooms": [
-              "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+              "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé", "Boundary_Room"
             ],
             "allow": ["join", "publish", "discover", "subscribe"]
           }
         ],
-        "participant": "🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀",
+        "participant": "Crab_1",
         "expiration": "2000"
       },
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
@@ -167,10 +167,10 @@
         "project_id": "p_0067MYZ1001R010000000000064",
         "key_id": "kid_0067MYZ1005R030010000000068",
         "secret": "MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7",
-        "requested_room": "workspace/main",
+        "requested_room": "Workspace_Main",
         "grants": [
           {
-            "rooms": ["workspace/*"],
+            "rooms": ["workspace/*", "Workspace_Main"],
             "allow": ["join"]
           },
           {
@@ -343,7 +343,17 @@
     {
       "name": "participant-long",
       "field": "participant",
-      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "name": "participant-non-ascii",
+      "field": "participant",
+      "value": "café"
+    },
+    {
+      "name": "participant-separator",
+      "field": "participant",
+      "value": "stage.alice"
     },
     {
       "name": "participant-newline",

@@ -1586,7 +1586,7 @@ async fn run_participant(
         } else {
             SimClientBuilder::bind(ip, server_ip).await?
         }
-        .with_participant_external_id(config.external_id)
+        .with_participant_id(config.external_id)
         .with_bootstrap_hold(shared.bootstrap_hold.clone())
         .with_quality_references(shared.quality_references.clone())
         .with_h264_publishers(shared.h264_publishers.clone())
@@ -2821,8 +2821,8 @@ async fn execute_plan(
                         let accepted = handle.shared.observation.lock().unwrap().as_ref().is_some_and(|observation| {
                             let snapshot = &observation.snapshot;
                             snapshot.connection == pulsebeam_agent_native::agent_core::ConnectionState::Connected
-                                && snapshot.room_external_id.as_deref() == Some(*room)
-                                && snapshot.participant_external_id.as_deref() == Some(handle.endpoint.as_str())
+                                && snapshot.room_id.as_deref() == Some(*room)
+                                && snapshot.participant_id.as_deref() == Some(handle.endpoint.as_str())
                                 && snapshot.accepted_join_revision == Some(snapshot.join_revision)
                                 && snapshot.accepted_credential_revision == Some(snapshot.credential_revision)
                         });
@@ -4784,9 +4784,7 @@ async fn execute_plan(
                         })?;
                     let participant_id = observation
                         .as_ref()
-                        .and_then(|observation| {
-                            observation.snapshot.participant_external_id.clone()
-                        })
+                        .and_then(|observation| observation.snapshot.participant_id.clone())
                         .ok_or_else(|| {
                             anyhow::anyhow!(
                                 "publisher {publisher} has no admitted external identity"
@@ -5069,9 +5067,9 @@ fn planned_video(
                     || observation
                         .snapshot
                         .participants
-                        .contains_key(&peer.id.as_str()))
+                        .contains_key(peer.id.as_str()))
         })
-        .map(|peer| peer.id.as_str())
+        .map(|peer| peer.id.as_str().to_owned())
         .collect::<BTreeSet<_>>();
     let explicitly_requested = intent
         .video
@@ -6006,7 +6004,7 @@ fn initial_topic_registrations(
                     }
                     let registration = TopicSubscriber {
                         room: source_room.clone(),
-                        participant_external_id: endpoint.clone(),
+                        participant_id: endpoint.clone(),
                         topic: (*topic).into(),
                         mode: *mode,
                     };

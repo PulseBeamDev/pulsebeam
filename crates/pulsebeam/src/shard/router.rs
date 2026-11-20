@@ -311,7 +311,7 @@ mod tests {
         let mut participant_keys = SlotMap::<ParticipantHandle, ()>::with_key();
         let origin_key = participant_keys.insert(());
         let descriptor = crate::shard_update::TrackDescriptor {
-            origin: crate::entity::ParticipantId::new(),
+            origin: crate::entity::ConnectionId::new(),
             kind: crate::entity::TrackKind::Video,
             encodings: vec![Some(crate::media::Rid::from("q")).into()],
         };
@@ -340,7 +340,7 @@ mod tests {
         let origin_key = participant_keys.insert(());
 
         let descriptor = crate::shard_update::TrackDescriptor {
-            origin: crate::entity::ParticipantId::new(),
+            origin: crate::entity::ConnectionId::new(),
             kind: crate::entity::TrackKind::Video,
             encodings: Vec::new(),
         };
@@ -367,7 +367,7 @@ mod tests {
         let origin_key = participant_keys.insert(());
 
         let descriptor = crate::shard_update::TrackDescriptor {
-            origin: crate::entity::ParticipantId::new(),
+            origin: crate::entity::ConnectionId::new(),
             kind: crate::entity::TrackKind::Audio,
             encodings: Vec::new(),
         };

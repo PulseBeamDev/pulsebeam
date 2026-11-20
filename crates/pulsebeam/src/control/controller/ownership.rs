@@ -15,7 +15,7 @@ mod result;
 
 use super::SignalingProtocol;
 use crate::{
-    entity::{ConnectionId, ParticipantExternalId, ParticipantId, ProjectId, RoomExternalId},
+    entity::{ConnectionId, ParticipantId, ProjectId, RoomId},
     route::NodeTransportAddress,
 };
 pub(crate) use result::ResultBytes;
@@ -31,21 +31,21 @@ pub(super) const MAX_WAITERS: usize = 4;
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PrincipalKey {
     project: ProjectId,
-    participant: ParticipantExternalId,
+    participant: ParticipantId,
 }
 
 impl PrincipalKey {
     pub(crate) fn from_principal(principal: &VerifiedPrincipal) -> Self {
         Self {
             project: principal.project_id(),
-            participant: principal.participant_external_id().clone(),
+            participant: principal.participant_id().clone(),
         }
     }
 
     pub(crate) fn from_verified(authorization: &VerifiedAuthorization) -> Self {
         Self {
             project: authorization.project_id,
-            participant: authorization.participant_external_id.clone(),
+            participant: authorization.participant_id.clone(),
         }
     }
 }
@@ -105,7 +105,7 @@ pub(crate) struct RequestBinding([u8; 32]);
 impl RequestBinding {
     pub(crate) fn for_request(
         protocol: SignalingProtocol,
-        room: &RoomExternalId,
+        room: &RoomId,
         offer: &str,
         credential: &str,
     ) -> Result<Self, Error> {
@@ -891,7 +891,7 @@ mod tests {
     fn principal(name: &str) -> PrincipalKey {
         PrincipalKey {
             project: ProjectId::new(),
-            participant: ParticipantExternalId::new(name).unwrap(),
+            participant: ParticipantId::new(name).unwrap(),
         }
     }
 
@@ -1074,7 +1074,7 @@ mod tests {
             .unwrap();
         let ticket = start(&mut authority, &principal, proof, 1, now);
         let old = Incarnation {
-            participant: ParticipantId::new(),
+            participant: crate::entity::fixture_participant_id(),
             connection: ConnectionId::new(),
             transport: NodeTransportAddress::new(
                 crate::route::TransportRoute::new(crate::id::ShardId::new(0), 1),
@@ -1240,7 +1240,7 @@ mod tests {
         let alice = principal("alice");
         let bob = PrincipalKey {
             project: alice.project,
-            participant: ParticipantExternalId::new("bob").unwrap(),
+            participant: ParticipantId::new("bob").unwrap(),
         };
         let now = Instant::now();
         let a = authority.issue(alice.clone(), now, &mut entropy).unwrap();
@@ -1333,17 +1333,11 @@ mod tests {
         let principal = principal("private-external-name");
         let now = Instant::now();
         for room in ["main", "breakout"] {
-            let room_external_id = crate::entity::RoomExternalId::new(room).unwrap();
-            let room_id = crate::entity::RoomId::derive(&principal.project, &room_external_id);
+            let room_id = crate::entity::RoomId::new(room).unwrap();
             let authorization = VerifiedAuthorization {
                 grants: pulsebeam_core::auth::grants::GrantSet::default(),
                 project_id: principal.project,
-                participant_external_id: principal.participant.clone(),
-                participant_id: crate::entity::ParticipantId::derive(
-                    &room_id,
-                    &principal.participant,
-                ),
-                room_external_id,
+                participant_id: principal.participant,
                 room_id,
                 expiry: pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(10_000),
             };
@@ -1367,7 +1361,7 @@ mod tests {
         assert!(!diagnostic.contains(&encoded));
         assert!(!diagnostic.contains("private-external-name"));
         assert!(!diagnostic.contains("42"));
-        let main = RoomExternalId::new("main").unwrap();
+        let main = RoomId::new("main").unwrap();
         let binding =
             RequestBinding::for_request(SignalingProtocol::State, &main, "offer", "secret")
                 .unwrap();
@@ -1385,7 +1379,7 @@ mod tests {
             assert_ne!(
                 RequestBinding::for_request(
                     protocol,
-                    &RoomExternalId::new(room).unwrap(),
+                    &RoomId::new(room).unwrap(),
                     offer,
                     credential
                 ),
@@ -1395,13 +1389,13 @@ mod tests {
         assert_ne!(
             RequestBinding::for_request(
                 SignalingProtocol::State,
-                &RoomExternalId::new("ab").unwrap(),
+                &RoomId::new("ab").unwrap(),
                 "c",
                 "secret"
             ),
             RequestBinding::for_request(
                 SignalingProtocol::State,
-                &RoomExternalId::new("a").unwrap(),
+                &RoomId::new("a").unwrap(),
                 "bc",
                 "secret"
             ),

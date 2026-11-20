@@ -181,11 +181,9 @@ impl Connection {
             enabled,
         } = plan;
         tracing::debug!(
-            participant = ?self.participant_id,
-            connection = ?self.connection_id,
+            connection_id = %self.connection_id,
             reference = work.reference,
             ?kind,
-            %label,
             "native RTP publication preparation"
         );
         let reference = work.reference;
@@ -260,7 +258,7 @@ impl Connection {
             .connection_id
             .derive_publication_track_id(kind, &label, incarnation);
         let meta = track::TrackMeta {
-            room_id: self.room_id,
+            room: self.room,
             shard_id: self.shard_id,
             id,
             origin: self.participant_id,
@@ -374,8 +372,7 @@ impl Connection {
             },
         );
         tracing::debug!(
-            participant = ?self.participant_id,
-            connection = ?self.connection_id,
+            connection_id = %self.connection_id,
             reference,
             track = ?id,
             "native RTP publication advertised"

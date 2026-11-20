@@ -29,9 +29,9 @@ package pulsebeam.media.v1;
 // the exact immutable wire identity; resolving this address may create a new
 // binding but never retargets an already-live binding.
 message LogicalSourceAddress {
-  string room = 1; // Nonempty exact room, <=256 UTF-8 bytes.
-  // Exact participant endpoint (sub), <=256 UTF-8 bytes; no control characters.
-  string participant_external_id = 2;
+  string room = 1; // Exact application room ID.
+  // Exact application participant ID (sub), scoped to room.
+  string participant_id = 2; // Both IDs match [A-Za-z0-9_-]{1,36}.
   TrackKind kind = 3; // AUDIO, VIDEO or DATA; never inferred from a label.
   string label = 4; // Nonempty exact-case label, <=256 UTF-8 bytes.
 }
@@ -152,8 +152,9 @@ message CatalogWatchError {
 }
 
 // Keys are connection-scoped typed identities, never generic writable paths.
-// A record's payload must match its key kind; IDs are opaque, not credentials.
+// A record's payload must match its key kind. A key does not grant authority.
 message ResourceKey {
+  reserved 2;
   oneof key {
     // Nonzero connection-local ref, shared by publication/subscription.
     // This is not a canonical PulseBeam entity ID.
@@ -161,8 +162,8 @@ message ResourceKey {
     // Later proposals retain this ref; no second allocation counter or reuse.
     uint64 owned = 1;
 
-    // Nonempty opaque canonical string, <=128 UTF-8 bytes; matches participant_id.
-    string participant = 2;
+    // Exact participant in a room of the authenticated project.
+    Participant participant = 5;
 
     // Nonempty opaque canonical string, <=128 UTF-8 bytes; matches track_id.
     string track = 3;
@@ -280,13 +281,12 @@ message Authorization {
   uint64 revision = 2;
 }
 
-// Immutable participant descriptor during its canonical identity lifetime.
+// Exact endpoint in the authenticated project. Both IDs are case-sensitive
+// application names matching [A-Za-z0-9_-]{1,36}.
 message Participant {
-  // Nonempty opaque canonical string, <=128 UTF-8 bytes; equal to its map key.
+  reserved 2;
   string participant_id = 1;
-
-  // Nonempty exact-case UTF-8, <=256 bytes. No normalization or case folding.
-  string participant_external_id = 2;
+  string room_id = 3;
 }
 
 // Immutable publication descriptor. Visibility is observation, not authorization.
@@ -296,8 +296,9 @@ message Track {
   // identity implementation for one publication lifetime. SDK never derives it.
   string track_id = 1;
 
-  // Opaque canonical owner string, <=128 UTF-8 bytes. Discovery is independent.
+  // The publisher endpoint is (room_id, participant_id) in this project.
   string participant_id = 2;
+  string room_id = 7;
 
   // Nonempty literal label, <=256 UTF-8 bytes; not a transport routing authority.
   string label = 3;

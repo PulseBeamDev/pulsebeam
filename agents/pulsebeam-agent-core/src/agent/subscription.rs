@@ -123,7 +123,7 @@ impl Agent {
             .ok_or(crate::TrackResourceError::Released)?;
         let selector = crate::TrackSelector {
             room: subscriber.room.clone(),
-            participant_external_id: subscriber.participant_external_id.clone(),
+            participant_id: subscriber.participant_id.clone(),
             label: subscriber.topic.clone(),
         };
         let intent_revision = self.resources.intent_revision(owner).unwrap_or(0);
@@ -316,7 +316,7 @@ fn publication_revisions(agent: &Agent, label: &str) -> (u64, Option<u64>, Optio
 fn source_resource(selector: &crate::TrackSelector, kind: wire::TrackKind) -> Resource {
     Resource::SourceLookup {
         room: selector.room.clone(),
-        participant_external_id: selector.participant_external_id.clone(),
+        participant_id: selector.participant_id.clone(),
         kind,
         label: selector.label.clone(),
     }
@@ -347,7 +347,8 @@ fn source_state(
             let participant = lookup.participant.as_ref();
             if let (Some(source), Some(participant)) = (source, participant)
                 && source.participant_id == participant.participant_id
-                && participant.participant_external_id == selector.participant_external_id
+                && participant.room_id == selector.room
+                && participant.participant_id == selector.participant_id
                 && source.label == selector.label
                 && Agent::native_track_kind(source) == Some(kind)
             {
@@ -624,7 +625,7 @@ impl From<&crate::TrackSelector> for crate::ffi::TrackSelector {
     fn from(value: &crate::TrackSelector) -> Self {
         Self {
             room: value.room.clone(),
-            participant_id: value.participant_external_id.clone(),
+            participant_id: value.participant_id.clone(),
             label: value.label.clone(),
         }
     }

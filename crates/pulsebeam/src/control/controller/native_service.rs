@@ -5,10 +5,11 @@ const MAX_TERMINAL_HANDOFFS: usize = 256;
 const TERMINAL_HANDOFF_TIMEOUT: Duration = Duration::from_millis(100);
 const LOOKUP_WAKE_BUDGET: usize = 32;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SourceLookupKey {
-    room: RoomId,
+    room: ProjectRoomKey,
     participant: String,
+    kind: i32,
     label: String,
 }
 
@@ -26,16 +27,17 @@ pub(super) struct SourceLookupIndex {
 }
 
 impl SourceLookupIndex {
-    pub(super) fn change(
+    fn change(
         &mut self,
         connection: ConnectionId,
-        source_room: RoomId,
+        source_room: ProjectRoomKey,
         change: crate::control::native::LookupInterestChange,
     ) {
         let owner = (connection, change.reference);
         let key = SourceLookupKey {
             room: source_room,
-            participant: change.address.participant_external_id,
+            participant: change.address.participant_id,
+            kind: change.address.kind,
             label: change.address.label,
         };
         if let Some(previous) = self.by_owner.remove(&owner) {
@@ -70,15 +72,7 @@ impl SourceLookupIndex {
         }
     }
 
-    pub(super) fn source_changed(&mut self, room: RoomId, participant: String, label: String) {
-        self.changed(SourceLookupKey {
-            room,
-            participant,
-            label,
-        });
-    }
-
-    fn changed(&mut self, key: SourceLookupKey) {
+    fn source_changed(&mut self, key: SourceLookupKey) {
         if !self.by_source.contains_key(&key) {
             return;
         }
@@ -97,26 +91,18 @@ pub(super) struct RetiringNative {
 }
 
 impl ControllerActor {
-    fn source_room_id(
-        &self,
-        subscriber: ParticipantId,
-        room: &str,
-    ) -> Option<crate::entity::RoomId> {
-        let external = crate::entity::RoomExternalId::new(room).ok()?;
-        let meta = self.core.registry.get_participant(&subscriber)?;
-        if let Some(lease) = &meta.authorization {
-            return Some(crate::entity::RoomId::derive(
-                &lease.authority.project_id,
-                &external,
-            ));
-        }
-
-        // Synthetic controller fixtures can register participants without an admission lease.
-        #[cfg(test)]
-        let fixture_room = Some(crate::entity::RoomId::from_external(&external));
-        #[cfg(not(test))]
-        let fixture_room = None;
-        fixture_room
+    fn source_room(&self, connection: ConnectionId, room: &str) -> Option<ProjectRoomKey> {
+        let external = crate::entity::RoomId::new(room).ok()?;
+        let (_, meta) = self.core.registry.get_connection(connection)?;
+        let project = meta.room.project;
+        let room = match &meta.authorization {
+            Some(_) => external,
+            #[cfg(test)]
+            None => external,
+            #[cfg(not(test))]
+            None => return None,
+        };
+        Some(ProjectRoomKey { project, room })
     }
 
     pub(super) fn native_resource_lease(
@@ -127,12 +113,10 @@ impl ControllerActor {
             && let Some(meta) = self
                 .core
                 .registry
-                .get_participant(&native.handler.participant)
-            && meta.connection_id == connection
+                .get_incarnation(native.handler.participant, connection)
             && meta.profile == SignalingProtocol::State
             && let Some(lease) = &meta.authorization
-            && let Some(external) = &meta.participant_external_id
-            && lease.matches_participant(meta.room_id, native.handler.participant, external)
+            && lease.matches_endpoint(meta.room, native.handler.participant)
         {
             return Some(lease);
         }
@@ -141,12 +125,7 @@ impl ControllerActor {
             && retiring.meta.connection_id == connection
             && retiring.meta.profile == SignalingProtocol::State
             && let Some(lease) = &retiring.meta.authorization
-            && let Some(external) = &retiring.meta.participant_external_id
-            && lease.matches_participant(
-                retiring.meta.room_id,
-                retiring.handler.participant,
-                external,
-            )
+            && lease.matches_endpoint(retiring.meta.room, retiring.handler.participant)
         {
             return Some(lease);
         }
@@ -155,11 +134,7 @@ impl ControllerActor {
             let lease = pending.authorization.as_ref()?;
             (pending.connection_id == connection
                 && pending.profile == SignalingProtocol::State
-                && lease.matches_participant(
-                    pending.room_id,
-                    pending.participant,
-                    &pending.participant_external_id,
-                ))
+                && lease.matches_endpoint(pending.room, pending.participant))
             .then_some(lease)
         })
     }
@@ -269,12 +244,17 @@ impl ControllerActor {
             self.native_deadlines.remove(&(deadline, connection));
         }
         let participant = native.participant;
-        if !self.current_incarnation(participant, connection) {
+        let Some(meta) = self
+            .core
+            .registry
+            .get_incarnation(participant, connection)
+            .filter(|meta| meta.room_id() == native.room)
+        else {
             self.catalog.remove_connection(connection);
             self.source_lookup_index.remove_connection(connection);
             return;
-        }
-        let room = native.room;
+        };
+        let room = meta.room;
         let unix_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -285,14 +265,13 @@ impl ControllerActor {
                 let track =
                     self.lifecycle
                         .source(room, room, participant, track, &self.core.registry)?;
-                let publisher = self.core.registry.get_participant(&track.meta().origin)?;
                 Some(crate::control::native::ResolvedSource {
                     track,
-                    publisher: publisher.participant_external_id.as_ref()?,
+                    publisher: &track.meta().origin,
                 })
             },
             |source_room, track| {
-                let source_room = self.source_room_id(participant, source_room)?;
+                let source_room = self.source_room(connection, source_room)?;
                 let track = self.lifecycle.source(
                     room,
                     source_room,
@@ -300,22 +279,24 @@ impl ControllerActor {
                     track,
                     &self.core.registry,
                 )?;
-                let publisher = self.core.registry.get_participant(&track.meta().origin)?;
                 Some(crate::control::native::ResolvedSource {
                     track,
-                    publisher: publisher.participant_external_id.as_ref()?,
+                    publisher: &track.meta().origin,
                 })
             },
             |address| {
-                let source_room = self.source_room_id(participant, &address.room)?;
-                let (track, publisher) = self.lifecycle.source_by_address(
+                let source_room = self.source_room(connection, &address.room)?;
+                let track = self.lifecycle.source_by_address(
                     room,
                     source_room,
                     participant,
                     address,
                     &self.core.registry,
                 )?;
-                Some(crate::control::native::ResolvedSource { track, publisher })
+                Some(crate::control::native::ResolvedSource {
+                    track,
+                    publisher: &track.meta().origin,
+                })
             },
         ) {
             Ok(wake) => {
@@ -325,9 +306,7 @@ impl ControllerActor {
                     native.model.catalog.requests().cloned().collect(),
                 );
                 for change in native.model.take_lookup_changes() {
-                    if let Some(source_room) =
-                        self.source_room_id(participant, &change.address.room)
-                    {
+                    if let Some(source_room) = self.source_room(connection, &change.address.room) {
                         self.source_lookup_index
                             .change(connection, source_room, change);
                     }
@@ -344,7 +323,7 @@ impl ControllerActor {
                     },
                 );
                 if wake {
-                    self.wake_native_endpoint(participant, connection);
+                    self.wake_native_endpoint(connection);
                 }
             }
             Err(error) => {
@@ -357,7 +336,7 @@ impl ControllerActor {
                     metrics::counter!("native_signaling_handoff_failure", "lane" => "output_deadline")
                         .increment(1);
                 }
-                tracing::warn!(?error, participant_id = %participant, %connection, "native controller connection failed");
+                tracing::warn!(?error, connection_id = %connection, "native controller connection failed");
                 self.catalog.remove_connection(connection);
                 self.source_lookup_index.remove_connection(connection);
                 self.remove_incarnation(participant, connection);
@@ -365,17 +344,10 @@ impl ControllerActor {
         }
     }
 
-    fn wake_native_endpoint(&mut self, participant: ParticipantId, connection_id: ConnectionId) {
-        if let Some(meta) = self.core.registry.get_participant(&participant)
-            && meta.connection_id == connection_id
-        {
-            self.command_backlog.push_back((
-                meta.shard_id,
-                ShardCommand::NativeReady {
-                    participant,
-                    connection_id,
-                },
-            ));
+    fn wake_native_endpoint(&mut self, connection_id: ConnectionId) {
+        if let Some((_, meta)) = self.core.registry.get_connection(connection_id) {
+            self.command_backlog
+                .push_back((meta.shard_id, ShardCommand::NativeReady { connection_id }));
         }
     }
 
@@ -444,7 +416,6 @@ impl ControllerActor {
             self.command_backlog.push_back((
                 retiring.meta.shard_id,
                 ShardCommand::NativeReady {
-                    participant: retiring.handler.participant,
                     connection_id: connection,
                 },
             ));
@@ -462,9 +433,8 @@ impl ControllerActor {
         };
         let native = &service.handler;
         if result.is_err() || !native.handoff.schedule() {
-            tracing::warn!(?result, participant_id = %native.participant, "native controller observation failed");
+            tracing::warn!(?result, connection_id = %connection, "native controller observation failed");
             native.handoff.stop();
-            let participant = native.participant;
             let wake = native.handoff.wake_endpoint();
             if let Some(deadline) = service.deadline.take() {
                 self.native_deadlines.remove(&(deadline, connection));
@@ -474,39 +444,44 @@ impl ControllerActor {
             service.deadline = Some(deadline);
             self.native_deadlines.insert((deadline, connection));
             if wake {
-                self.wake_native_endpoint(participant, connection);
+                self.wake_native_endpoint(connection);
             }
         }
     }
 
     pub(super) fn observe_native_source(&mut self, meta: &crate::track::TrackMeta, appeared: bool) {
-        if let Some(label) = meta.label.as_ref()
-            && let Some(publisher) = self.core.registry.get_participant(&meta.origin)
-            && publisher.connection_id == meta.connection_id
-            && let Some(external) = publisher.participant_external_id.as_ref()
-        {
-            self.source_lookup_index.source_changed(
-                meta.room_id,
-                external.as_str().to_owned(),
-                label.clone(),
-            );
+        let Some((participant, publisher)) = self.core.registry.get_connection(meta.connection_id)
+        else {
+            return;
+        };
+        if participant != meta.origin || publisher.room != meta.room {
+            return;
+        }
+        let room = publisher.room;
+        if let Some(label) = meta.label.as_ref() {
+            use pulsebeam_proto::state::TrackKind as WireKind;
+            let kind = match meta.id.kind() {
+                crate::entity::TrackKind::Audio => WireKind::Audio,
+                crate::entity::TrackKind::Video => WireKind::Video,
+                crate::entity::TrackKind::Data => WireKind::Data,
+            };
+            self.source_lookup_index.source_changed(SourceLookupKey {
+                room,
+                participant: participant.as_str().to_owned(),
+                kind: kind as i32,
+                label: label.clone(),
+            });
         }
         if !appeared {
             return;
         }
-        for participant in self
+        let connections: Vec<_> = self
             .core
             .registry
-            .local_participant_ids_in_room(&meta.room_id)
-        {
-            let Some(connection) = self
-                .core
-                .registry
-                .get_participant(&participant)
-                .map(|peer| peer.connection_id)
-            else {
-                continue;
-            };
+            .ordered_participants_in_room(&room, None)
+            .map(|(_, _, peer)| peer.connection_id)
+            .collect();
+        for connection in connections {
             let Some(service) = self.native_connections.get_mut(&connection) else {
                 continue;
             };
@@ -518,13 +493,9 @@ impl ControllerActor {
 
     pub(super) fn observe_native_authorization(
         &mut self,
-        participant: ParticipantId,
+        connection: ConnectionId,
         lease: &AuthorizationLease,
     ) {
-        let Some(meta) = self.core.registry.get_participant(&participant) else {
-            return;
-        };
-        let connection = meta.connection_id;
         let Some(NativeService {
             handler: native, ..
         }) = self.native_connections.get_mut(&connection)
@@ -554,7 +525,7 @@ mod source_lookup_index_tests {
         let second = ConnectionId::new();
         let address = pulsebeam_proto::state::LogicalSourceAddress {
             room: String::from("source-room"),
-            participant_external_id: String::from("publisher"),
+            participant_id: String::from("publisher"),
             kind: pulsebeam_proto::state::TrackKind::Data as i32,
             label: String::from("topic"),
         };
@@ -564,28 +535,33 @@ mod source_lookup_index_tests {
             active,
         };
 
-        let room = RoomId::derive(
-            &crate::entity::ProjectId::new(),
-            &crate::entity::RoomExternalId::new(&address.room).unwrap(),
-        );
-        let other_project_room = RoomId::derive(
-            &crate::entity::ProjectId::new(),
-            &crate::entity::RoomExternalId::new(&address.room).unwrap(),
-        );
+        let room = ProjectRoomKey {
+            project: crate::entity::ProjectId::new(),
+            room: crate::entity::RoomId::new(&address.room).unwrap(),
+        };
+        let other_project_room = ProjectRoomKey {
+            project: crate::entity::ProjectId::new(),
+            ..room
+        };
+        let key = SourceLookupKey {
+            room,
+            participant: address.participant_id.clone(),
+            kind: address.kind,
+            label: address.label.clone(),
+        };
         index.change(first, room, change(1, true));
         index.change(second, room, change(2, true));
-        index.source_changed(
-            other_project_room,
-            address.participant_external_id.clone(),
-            address.label.clone(),
-        );
+        index.source_changed(SourceLookupKey {
+            room: other_project_room,
+            ..key.clone()
+        });
+        index.source_changed(SourceLookupKey {
+            kind: pulsebeam_proto::state::TrackKind::Video as i32,
+            ..key.clone()
+        });
         assert!(index.wake_queue.is_empty());
         for _ in 0..2 {
-            index.source_changed(
-                room,
-                address.participant_external_id.clone(),
-                address.label.clone(),
-            );
+            index.source_changed(key.clone());
         }
         assert_eq!(index.wake_queue.len(), 1);
         assert!(index.wake_again.contains(index.wake_queue.front().unwrap()));

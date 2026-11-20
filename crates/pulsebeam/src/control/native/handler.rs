@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use super::handoff::{ControllerHandoff, Fact};
 use super::{ExecutionCommand, InputError, NativeSession, OutputError, ResolvedSource};
-use crate::entity::{ParticipantExternalId, ParticipantId, RoomId, TrackId};
+use crate::entity::{ParticipantId, RoomId, TrackId};
 
 const FACT_BUDGET: usize = 32;
 const PREPARATION_BUDGET: usize = 32;
@@ -13,7 +13,6 @@ pub(in crate::control) struct StateProtocolHandler {
     pub(in crate::control) room: RoomId,
     pub(in crate::control) model: NativeSession,
     pub(in crate::control) handoff: ControllerHandoff,
-    external: ParticipantExternalId,
     capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
     commands: VecDeque<ExecutionCommand>,
 }
@@ -22,19 +21,17 @@ impl StateProtocolHandler {
     pub(in crate::control) fn new(
         participant: ParticipantId,
         room: RoomId,
-        external: ParticipantExternalId,
         capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
         handoff: ControllerHandoff,
     ) -> Result<Self, OutputError> {
         let mut model = NativeSession::default();
         model.observe_self(pulsebeam_proto::state::Participant {
-            participant_id: participant.as_str(),
-            participant_external_id: external.as_str().to_owned(),
+            participant_id: participant.as_str().to_owned(),
+            room_id: room.as_str().to_owned(),
         })?;
         Ok(Self {
             participant,
             room,
-            external,
             model,
             handoff,
             capabilities,
@@ -140,7 +137,8 @@ impl StateProtocolHandler {
             };
             match fact {
                 Fact::Completion(completion) => {
-                    self.model.observe_completion(completion, &self.external)?;
+                    self.model
+                        .observe_completion(completion, &self.participant)?;
                 }
                 Fact::Deferral(deferral) => self.model.observe_deferral(deferral)?,
                 Fact::Resource(observation) => {

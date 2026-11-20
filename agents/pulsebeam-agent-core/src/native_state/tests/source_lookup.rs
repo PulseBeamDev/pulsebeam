@@ -4,7 +4,7 @@ fn lookup() -> (Resource, wire::ResourceSpec) {
     (
         Resource::SourceLookup {
             room: "room".into(),
-            participant_external_id: "bob".into(),
+            participant_id: "bob".into(),
             kind: wire::TrackKind::Data,
             label: "updates".into(),
         },
@@ -17,7 +17,7 @@ fn lookup() -> (Resource, wire::ResourceSpec) {
                 wire::SourceLookupSpec {
                     source: Some(wire::LogicalSourceAddress {
                         room: "room".into(),
-                        participant_external_id: "bob".into(),
+                        participant_id: "bob".into(),
                         kind: wire::TrackKind::Data as i32,
                         label: "updates".into(),
                     }),
@@ -39,12 +39,14 @@ fn confirmation(
             wire::SourceLookupState {
                 spec: Some(spec.clone()),
                 participant: source.map(|_| wire::Participant {
-                    participant_id: "bob-owner".into(),
-                    participant_external_id: "bob".into(),
+                    participant_id: "bob".into(),
+
+                    room_id: "room".into(),
                 }),
                 track: source.map(|id| wire::Track {
                     track_id: id.into(),
-                    participant_id: "bob-owner".into(),
+                    participant_id: "bob".into(),
+                    room_id: "room".into(),
                     label: "updates".into(),
                     kind: Some(wire::track::Kind::Data(wire::DataTrack {
                         delivery: wire::DataDelivery::Ordered as i32,
@@ -68,7 +70,7 @@ fn lookup_key_rejects_address_changes_before_staging() {
         let source = lookup.source.as_mut().unwrap();
         match field {
             0 => source.room = "other-room".into(),
-            1 => source.participant_external_id = "other-participant".into(),
+            1 => source.participant_id = "other-participant".into(),
             2 => source.kind = wire::TrackKind::Audio as i32,
             _ => source.label = "other-label".into(),
         }
@@ -115,7 +117,12 @@ fn lookup_replacement_updates_private_indexes_without_discovery_or_execution() {
             source == Some("replacement")
         );
         assert_eq!(
-            client.source_participant("bob-owner").is_some(),
+            client
+                .source_participant(&ParticipantKey {
+                    room_id: "room".into(),
+                    participant_id: "bob".into()
+                })
+                .is_some(),
             source.is_some()
         );
         assert_eq!(
@@ -141,20 +148,26 @@ fn lookup_replacement_updates_private_indexes_without_discovery_or_execution() {
     lookup.participant.as_mut().unwrap().participant_id = "other-owner".into();
     lookup.track.as_mut().unwrap().participant_id = "other-owner".into();
     assert!(matches!(
-        client.apply(&frame(alloc::vec![record(1, aliased)], false)),
-        Err(SignalingError::Invalid("source identity"))
+        client.apply(
+            &wire::ServerStateBatch {
+                records: alloc::vec![record(1, aliased)],
+                ..Default::default()
+            }
+            .encode_to_vec()
+        ),
+        Err(SignalingError::Malformed)
     ));
     assert_eq!(client.confirmed(&resource), Some(&accepted));
     assert_eq!(client.retained_bytes, retained);
     let other_room = Resource::SourceLookup {
         room: "other-room".into(),
-        participant_external_id: "bob".into(),
+        participant_id: "bob".into(),
         kind: wire::TrackKind::Data,
         label: "updates".into(),
     };
     let other_participant = Resource::SourceLookup {
         room: "room".into(),
-        participant_external_id: "other-participant".into(),
+        participant_id: "other-participant".into(),
         kind: wire::TrackKind::Data,
         label: "updates".into(),
     };

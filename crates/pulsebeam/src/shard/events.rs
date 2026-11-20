@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use super::worker::ShardEvent;
-use crate::entity::{ConnectionId, ParticipantId, RoomId};
+use crate::entity::{ConnectionId, ParticipantId, ProjectRoomKey};
 use crate::keys::ParticipantHandle;
 use crate::keys::TrackHandle;
 use crate::participant::TrackPacket;
@@ -19,7 +19,7 @@ pub(crate) struct ParticipantBinding {
     pub participant_id: ParticipantId,
     pub connection_id: ConnectionId,
     pub handle: ParticipantHandle,
-    pub room_id: RoomId,
+    pub room_id: ProjectRoomKey,
 }
 
 pub enum ParticipantEvent {
@@ -127,7 +127,7 @@ pub struct PipelineSinkRef<'a> {
     id: ParticipantId,
     connection_id: ConnectionId,
     key: ParticipantHandle,
-    room_id: RoomId,
+    room_id: ProjectRoomKey,
     pipeline: &'a mut EventPipeline,
 }
 
@@ -213,7 +213,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     fn set_owned_subscription(
         &mut self,
         reference: u64,
-        source_room: crate::entity::RoomId,
+        source_room: crate::entity::ProjectRoomKey,
         track: crate::entity::TrackId,
         enabled: bool,
     ) {
@@ -234,7 +234,7 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             ));
     }
 
-    fn unsubscribe_owned(&mut self, reference: u64, source_room: crate::entity::RoomId) {
+    fn unsubscribe_owned(&mut self, reference: u64, source_room: crate::entity::ProjectRoomKey) {
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
@@ -322,17 +322,17 @@ mod tests {
     // Convenience only: a test is not a shard, so nothing here is
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
-    use crate::entity::RoomExternalId;
+    use crate::entity::RoomId;
     use crate::rtp::RtpPacket;
     use crate::track::DataLane;
 
     fn identity() -> ParticipantBinding {
-        let room = RoomExternalId::new("room").unwrap();
+        let room = RoomId::new("room").unwrap();
         ParticipantBinding {
-            participant_id: ParticipantId::new(),
+            participant_id: crate::entity::fixture_participant_id(),
             connection_id: ConnectionId::new(),
             handle: ParticipantHandle::default(),
-            room_id: RoomId::from_external(&room),
+            room_id: ProjectRoomKey::fixture(room),
         }
     }
 

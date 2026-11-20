@@ -54,7 +54,7 @@ impl ResourcePermissions {
             super::ResourcePermissions::Grants { grants, .. } => grants.allows(
                 Action::Subscribe,
                 &source.room,
-                Some(&source.participant_external_id),
+                Some(&source.participant_id),
                 Some(kind),
                 Some(&source.label),
             ),
@@ -87,7 +87,7 @@ impl ResourcePermissions {
         self.allows_at_room(
             Action::Subscribe,
             source_room,
-            Some(&participant.participant_external_id),
+            Some(&participant.participant_id),
             Some(kind),
             Some(&track.label),
         )

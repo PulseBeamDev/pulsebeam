@@ -28,18 +28,6 @@ macro_rules! opaque_id {
     };
 }
 
-opaque_id!(
-    /// An opaque room identifier returned by the server.
-    ///
-    /// Canonical parsing is deliberately unavailable:
-    ///
-    /// ```compile_fail
-    /// use pulsebeam_agent_core::RoomId;
-    ///
-    /// let _: RoomId = "rm_00000000000000000000000000".parse().unwrap();
-    /// ```
-    RoomId
-);
 opaque_id!(ParticipantId);
 opaque_id!(ConnectionId);
 opaque_id!(TrackId);

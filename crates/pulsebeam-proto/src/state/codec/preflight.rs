@@ -43,7 +43,7 @@ shapes! {
     CatalogPageRecord { 8 => CatalogParticipantFragment },
     CatalogParticipantFragment {},
     ServerStateRecord { 1 => ResourceKey, 2 => ConfirmedState },
-    ResourceKey {},
+    ResourceKey { 5 => Participant },
     DesiredState { 2 => ResourceSpec },
     ConfirmedState { 2 => Failure, 3 => LiveResource, 4 => AbsentState, 5 => SessionState, 6 => Participant, 7 => Track, 8 => SourceLookupState },
     AbsentState {},

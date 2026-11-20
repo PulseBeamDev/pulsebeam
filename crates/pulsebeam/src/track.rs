@@ -210,9 +210,9 @@ mod stream_writer_tests {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
+#[derive(Eq, PartialEq, Hash, Clone)]
 pub struct TrackMeta {
-    pub room_id: crate::entity::RoomId,
+    pub room: crate::entity::ProjectRoomKey,
     /// The shard ID that hosts this track's publisher.
     pub shard_id: ShardId,
     pub id: crate::entity::TrackId,
@@ -221,6 +221,17 @@ pub struct TrackMeta {
     pub connection_id: crate::entity::ConnectionId,
     /// Application-facing media identity. Pending native senders have no label.
     pub label: Option<String>,
+}
+
+impl std::fmt::Debug for TrackMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackMeta")
+            .field("project", &self.room.project)
+            .field("connection_id", &self.connection_id)
+            .field("track_id", &self.id)
+            .field("shard_id", &self.shard_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1113,8 +1124,8 @@ pub mod test_utils {
         let meta = TrackMeta {
             connection_id,
             label: None,
-            room_id: crate::entity::RoomId::from_external(
-                &crate::entity::RoomExternalId::new("test-room").unwrap(),
+            room: crate::entity::ProjectRoomKey::fixture(
+                crate::entity::RoomId::new("test-room").unwrap(),
             ),
             shard_id: ShardId::new(0),
             id: track_id,
@@ -1132,8 +1143,8 @@ pub mod test_utils {
         let meta = TrackMeta {
             connection_id,
             label: None,
-            room_id: crate::entity::RoomId::from_external(
-                &crate::entity::RoomExternalId::new("test-room").unwrap(),
+            room: crate::entity::ProjectRoomKey::fixture(
+                crate::entity::RoomId::new("test-room").unwrap(),
             ),
             shard_id: ShardId::new(0),
             id: track_id,
@@ -1848,7 +1859,7 @@ mod simulcast_pause_tests {
     /// A three-encoding video track and a starting instant.
     fn track() -> (UpstreamTrack, Instant) {
         let now = Instant::now();
-        let participant = ParticipantId::new();
+        let participant = crate::entity::fixture_participant_id();
         let (upstream, _) = test_utils::make_video_track(
             participant,
             crate::entity::ConnectionId::new(),

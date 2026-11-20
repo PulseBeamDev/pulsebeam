@@ -4,7 +4,7 @@ use crate::participant::{effect::TrackRemoval, event::test_utils::MockParticipan
 use pulsebeam_proto::state::resource_spec;
 use std::num::NonZeroU64;
 
-fn subscription(source: TrackId, channel: u32, enabled: bool) -> wire::ResourceSpec {
+fn subscription(source: TrackId, room: &str, channel: u32, enabled: bool) -> wire::ResourceSpec {
     wire::ResourceSpec {
         settings: Some(wire::ResourceSettings {
             enabled: Some(enabled),
@@ -14,7 +14,7 @@ fn subscription(source: TrackId, channel: u32, enabled: bool) -> wire::ResourceS
             wire::SubscriptionSpec {
                 track_id: source.as_str(),
                 kind: wire::TrackKind::Data as i32,
-                source_room: "room".into(),
+                source_room: room.into(),
                 binding: Some(wire::TrackBinding {
                     transport: Some(wire::track_binding::Transport::Sctp(wire::SctpParameters {
                         stream_id: Some(channel),
@@ -59,10 +59,10 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         "literal",
         NonZeroU64::new(1).unwrap(),
     );
-    let owner = entity::ParticipantId::new();
+    let owner = crate::entity::fixture_participant_id();
     let track = Track::data_publication(
         track::TrackMeta {
-            room_id: participant.room_id,
+            room: participant.room,
             shard_id: ShardId::new(0),
             id,
             origin: owner,
@@ -71,12 +71,13 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         },
         DataLane::Ordered,
     );
-    let publisher = entity::ParticipantExternalId::new("source").unwrap();
+    let publisher = owner;
+    let room = track.meta().room.room;
     participant
         .signaling
         .observe_participant(wire::Participant {
-            participant_id: owner.as_str(),
-            participant_external_id: publisher.as_str().to_owned(),
+            participant_id: owner.as_str().to_owned(),
+            room_id: room.as_str().into(),
         })
         .unwrap();
     participant.signaling.observe_candidate(&track).unwrap();
@@ -84,7 +85,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     let handle = handles.insert(id);
     participant.native_source_added(handle, &track);
     participant.native_source_binding(id, handle, true);
-    let spec = subscription(id, 1, true);
+    let spec = subscription(id, room.as_str(), 1, true);
     participant
         .signaling
         .apply_input(&frame(
@@ -121,7 +122,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         transport,
         policy,
     } = *plan;
-    assert_eq!(source_room, participant.room_id);
+    assert_eq!(source_room, participant.room);
     assert_eq!(source.id(), id);
     assert_eq!(source_id, id.as_str());
     assert!(policy.enabled && policy.video.is_none());
@@ -193,7 +194,12 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     participant.expire_native_data(deadline, &mut sink);
     assert!(confirmations(&mut participant).is_empty());
     assert!(participant.native_receivers.can_write(channel));
-    target(&mut participant, 2, subscription(id, 1, false), &mut sink);
+    target(
+        &mut participant,
+        2,
+        subscription(id, room.as_str(), 1, false),
+        &mut sink,
+    );
     let disabled_storage = participant.native_receivers.receivers[&1].storage_sequence;
     assert!(disabled_storage > work.scope().sequence);
     assert!(participant.native_receivers.sources[id.as_bytes()].bound);
@@ -218,7 +224,12 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         &mut sink,
     );
     assert!(participant.native_receivers.can_write(channel));
-    target(&mut participant, 5, subscription(id, 2, true), &mut sink);
+    target(
+        &mut participant,
+        5,
+        subscription(id, room.as_str(), 2, true),
+        &mut sink,
+    );
     assert_eq!(
         participant.native_receivers.receivers[&1].storage_sequence,
         enabled_storage

@@ -116,7 +116,7 @@ arbitraryKey[1] = "unrecognized-kid";
 const opaqueToken = signParticipantToken({
   apiKey: arbitraryKey.join("."),
   grants: [{ rooms: ["room with spaces"], allow: ["join"] }],
-  participant: "participant/with/slashes",
+  participant: "Participant_With-MixedCase",
   expiration: 2000,
 });
 const opaqueHeader = JSON.parse(
@@ -129,7 +129,7 @@ assert.equal(opaqueHeader.kid, arbitraryKey[1]);
 assert.equal(opaqueClaims.iss, arbitraryKey[0]);
 assert.equal(opaqueClaims.grants[0].rooms[0], "room with spaces");
 assert(!Object.hasOwn(opaqueClaims, "room"));
-assert.equal(opaqueClaims.sub, "participant/with/slashes");
+assert.equal(opaqueClaims.sub, "Participant_With-MixedCase");
 
 // Resolve declarations through the installed package's public export map.
 writeFileSync(

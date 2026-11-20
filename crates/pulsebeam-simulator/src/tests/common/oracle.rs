@@ -1,6 +1,6 @@
 use super::client::ClientObservation;
 use anyhow::{Result, ensure};
-use pulsebeam::entity::{ConnectionId, ParticipantId, RoomExternalId, RoomId, TrackId, TrackKind};
+use pulsebeam::entity::{ConnectionId, ParticipantId, RoomId, TrackId, TrackKind};
 use pulsebeam_agent_native::agent_core::{
     ConnectionState, MediaKind, Publication, TopicRegistrations,
 };
@@ -28,10 +28,7 @@ pub struct ExpectedParticipant {
 
 impl ExpectedParticipant {
     pub fn room_id(&self) -> Result<RoomId> {
-        Ok(RoomId::derive(
-            &DEVELOPMENT_PROJECT_ID,
-            &RoomExternalId::new(self.room)?,
-        ))
+        Ok(RoomId::new(self.room)?)
     }
 
     pub fn bind_media(&mut self, catalog: &[Publication]) -> Result<bool> {
@@ -67,7 +64,7 @@ impl ExpectedParticipant {
             );
             self.media.push(Publication {
                 id: descriptor.id.clone(),
-                participant_id: self.id.as_str(),
+                participant_id: self.id.as_str().to_owned(),
                 kind,
                 label: label.into(),
             });
@@ -150,11 +147,11 @@ impl ApplicationStateOracle {
             "required application client is not connected"
         );
         ensure!(
-            snapshot.participant_id.as_deref() == Some(&observer.id.as_str()),
+            snapshot.participant_id.as_deref() == Some(observer.id.as_str()),
             "wrong observer identity"
         );
         ensure!(
-            snapshot.room_external_id.as_deref() == Some(observer.room),
+            snapshot.room_id.as_deref() == Some(observer.room),
             "wrong observer room"
         );
         let peers = self
@@ -164,12 +161,12 @@ impl ApplicationStateOracle {
             .collect::<Vec<_>>();
         let allowed = peers
             .iter()
-            .map(|peer| peer.id.as_str())
+            .map(|peer| peer.id.as_str().to_owned())
             .collect::<BTreeSet<_>>();
         let required = peers
             .iter()
             .filter(|peer| peer.required)
-            .map(|peer| peer.id.as_str())
+            .map(|peer| peer.id.as_str().to_owned())
             .collect::<BTreeSet<_>>();
         let actual = snapshot
             .participants
@@ -333,7 +330,7 @@ impl ApplicationStateOracle {
                 .iter()
                 .filter(|peer| {
                     peer.room == subscriber.registration.room
-                        && peer.external_id == subscriber.registration.participant_external_id
+                        && peer.external_id == subscriber.registration.participant_id
                         && peer.topics.publishers.iter().any(|publisher| {
                             publisher.topic == subscriber.registration.topic
                                 && publisher.mode == subscriber.registration.mode

@@ -32,7 +32,7 @@ pub(super) struct NativeReceivers {
 pub(super) struct Receiver {
     transport: ReceiveTransport,
     source: TrackId,
-    source_room: crate::entity::RoomId,
+    source_room: crate::entity::ProjectRoomKey,
     source_id: String,
     handle: Option<TrackHandle>,
     enabled: bool,
@@ -282,8 +282,7 @@ impl Connection {
             return;
         }
         let id = *track.id().as_bytes();
-        if track.meta().room_id != self.room_id && !self.native_receivers.sources.contains_key(&id)
-        {
+        if track.meta().room != self.room && !self.native_receivers.sources.contains_key(&id) {
             return;
         }
         let source = self
@@ -303,7 +302,7 @@ impl Connection {
         let current = track.meta();
         if source.retired
             || source.track.kind() != track.kind()
-            || prior.room_id != current.room_id
+            || prior.room != current.room
             || prior.origin != current.origin
             || prior.connection_id != current.connection_id
             || prior.label != current.label
@@ -470,7 +469,8 @@ impl Connection {
         let source_track = source;
         let source = source_track.id();
         let metadata = source_track.meta();
-        if metadata.room_id != source_room
+        if metadata.room != source_room
+            || metadata.room.project != self.room.project
             || metadata.origin == self.participant_id
             || self
                 .native_receivers
@@ -480,7 +480,7 @@ impl Connection {
                     let previous = current.track.meta();
                     current.retired
                         || current.track.kind() != source_track.kind()
-                        || previous.room_id != metadata.room_id
+                        || previous.room != metadata.room
                         || previous.origin != metadata.origin
                         || previous.connection_id != metadata.connection_id
                         || previous.label != metadata.label

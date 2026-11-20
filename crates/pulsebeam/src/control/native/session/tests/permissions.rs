@@ -1,8 +1,6 @@
 use super::*;
 use crate::control::native::{PreparedResource, ReceiverPreparation, ResolvedSource};
-use crate::entity::{
-    ConnectionId, ParticipantExternalId, ParticipantId, RoomExternalId, RoomId, TrackKind,
-};
+use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
 use crate::participant::policy::ResourceObservation;
 use crate::track::{DataLane, TrackMeta};
 use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind as GrantKind};
@@ -13,7 +11,7 @@ fn permissions(
     label: Option<&str>,
 ) -> ResourcePermissions {
     ResourcePermissions::Grants {
-        room: RoomExternalId::new("room").unwrap(),
+        room: RoomId::new("room").unwrap(),
         grants: GrantSet::new(vec![
             Grant::new(
                 vec!["room".into()],
@@ -206,16 +204,16 @@ fn subscriptions_require_resolved_filters_but_no_discovery_projection() {
         let work = model.take_preparation().unwrap().unwrap();
         let track = Track::data_publication(
             TrackMeta {
-                room_id: RoomId::from_bytes([1; 16]),
+                room: crate::entity::ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
                 shard_id: crate::id::ShardId::new(0),
                 id,
-                origin: ParticipantId::new(),
+                origin: ParticipantId::new(external).unwrap(),
                 connection_id: connection,
                 label: Some(label.into()),
             },
             DataLane::Ordered,
         );
-        let publisher = ParticipantExternalId::new(external).unwrap();
+        let publisher = ParticipantId::new(external).unwrap();
         let command = model
             .prepare_execution(&work, 100, None, |_| {
                 Some(ResolvedSource {
@@ -307,7 +305,7 @@ fn permission_sweeps_are_bounded_and_new_revisions_do_not_starve_the_tail() {
         let mut track = source(u64::try_from(index).unwrap(), &format!("visible-{index}"));
         track.participant_id = format!("owner-{}", index / SELECT_WORK);
         model
-            .observe_track(track, &ParticipantExternalId::new("Owner").unwrap())
+            .observe_track(track, &ParticipantId::new("Owner").unwrap())
             .unwrap();
     }
     admit(&mut model, 1, publication("tail", true));
@@ -322,7 +320,7 @@ fn permission_sweeps_are_bounded_and_new_revisions_do_not_starve_the_tail() {
         model
             .observe_track(
                 source(1000 + revision, "new"),
-                &ParticipantExternalId::new("Owner").unwrap(),
+                &ParticipantId::new("Owner").unwrap(),
             )
             .unwrap();
         let commands = model.service_revocations(1, |_| None).unwrap();

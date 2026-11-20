@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use hyper::header::{CACHE_CONTROL, CONTENT_ENCODING};
-use pulsebeam_core::{auth::VerifiedPrincipal, identity::RoomExternalId};
+use pulsebeam_core::{auth::VerifiedPrincipal, identity::RoomId};
 use pulsebeam_queue::TrySendError;
 
 use super::{
@@ -81,7 +81,7 @@ pub(super) async fn create(
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
     let request = parse_native_request(&body)?;
-    let room = RoomExternalId::new(&request.room)
+    let room = RoomId::new(&request.room)
         .map_err(|_| ApiError::BadRequest("invalid room external id".to_owned()))?;
     let authorization = principal
         .authorize_room(room)

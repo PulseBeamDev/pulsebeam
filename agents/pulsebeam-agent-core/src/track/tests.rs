@@ -36,7 +36,7 @@ fn message(
 fn per_owner_subscription_views_keep_independent_intent_and_shared_demand() {
     let selector = TrackSelector {
         room: "source-room".into(),
-        participant_external_id: "publisher-endpoint".into(),
+        participant_id: "publisher-endpoint".into(),
         label: "camera".into(),
     };
     let mut resources = TrackResources::default();
@@ -651,12 +651,12 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
     let competing = resources.new_owner().unwrap();
     let selector = TrackSelector {
         room: "room".into(),
-        participant_external_id: "alice".into(),
+        participant_id: "alice".into(),
         label: "camera".into(),
     };
     let other = TrackSelector {
         room: "room".into(),
-        participant_external_id: "bob".into(),
+        participant_id: "bob".into(),
         label: "camera".into(),
     };
     resources.claim_video(first, selector.clone()).unwrap();
@@ -734,7 +734,7 @@ fn video_views_share_capacity_aggregate_visible_demand_and_preserve_incumbents()
                 owner,
                 TrackSelector {
                     room: "room".into(),
-                    participant_external_id: participant,
+                    participant_id: participant,
                     label: "camera".into(),
                 },
             )
@@ -770,7 +770,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     let owner = resources.new_owner().unwrap();
     let selector = TrackSelector {
         room: "room".into(),
-        participant_external_id: "alice".into(),
+        participant_id: "alice".into(),
         label: "camera".into(),
     };
     resources.claim_video(owner, selector.clone()).unwrap();
@@ -875,7 +875,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
     let audio = resources.new_owner().unwrap();
     let selector = TrackSelector {
         room: "room".into(),
-        participant_external_id: "alice".into(),
+        participant_id: "alice".into(),
         label: "microphone".into(),
     };
     resources
@@ -891,7 +891,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
             excess,
             TrackSelector {
                 room: "room".into(),
-                participant_external_id: "bob".into(),
+                participant_id: "bob".into(),
                 label: "microphone".into(),
             },
         )
@@ -904,7 +904,7 @@ fn hidden_video_demand_does_not_allocate_and_withdrawal_retains_logical_interest
                 owner,
                 TrackSelector {
                     room: "room".into(),
-                    participant_external_id: format!("extra-{index}"),
+                    participant_id: format!("extra-{index}"),
                     label: "microphone".into(),
                 },
             )
@@ -1068,7 +1068,7 @@ fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
             &spec,
             TrackSelector {
                 room: "room".into(),
-                participant_external_id: "alice".into(),
+                participant_id: "alice".into(),
                 label: "events".into(),
             },
         )
@@ -1079,7 +1079,7 @@ fn receive_owners_filter_participants_rebind_and_keep_independent_bytes() {
             &spec,
             TrackSelector {
                 room: "room".into(),
-                participant_external_id: "alice".into(),
+                participant_id: "alice".into(),
                 label: "events".into(),
             },
         )
@@ -1122,7 +1122,7 @@ fn exact_receive_references_share_until_the_last_owner_and_rooms_stay_distinct()
     let spec = data(TopicMode::Ordered);
     let source = TrackSelector {
         room: "room-a".into(),
-        participant_external_id: "alice".into(),
+        participant_id: "alice".into(),
         label: "events".into(),
     };
     resources.receive(first, &spec, source.clone()).unwrap();
@@ -1173,7 +1173,7 @@ fn latest_coalesces_per_track_and_lossy_drops_oldest() {
                 &data(mode),
                 TrackSelector {
                     room: "room".into(),
-                    participant_external_id: "alice".into(),
+                    participant_id: "alice".into(),
                     label: "events".into(),
                 },
             )
@@ -1203,7 +1203,7 @@ fn ordered_overflow_reports_loss_inline_instead_of_implying_continuity() {
             &data(TopicMode::Ordered),
             TrackSelector {
                 room: "room".into(),
-                participant_external_id: "alice".into(),
+                participant_id: "alice".into(),
                 label: "events".into(),
             },
         )
@@ -1247,7 +1247,7 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
                 &data(mode),
                 TrackSelector {
                     room: "room".into(),
-                    participant_external_id: "alice".into(),
+                    participant_id: "alice".into(),
                     label: "events".into(),
                 },
             )
@@ -1258,7 +1258,7 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
                 &data(mode),
                 TrackSelector {
                     room: "room".into(),
-                    participant_external_id: "bob".into(),
+                    participant_id: "bob".into(),
                     label: "events".into(),
                 },
             )
@@ -1269,7 +1269,7 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
                 &data(TopicMode::Lossy),
                 TrackSelector {
                     room: "room".into(),
-                    participant_external_id: "alice".into(),
+                    participant_id: "alice".into(),
                     label: "events".into(),
                 },
             )
@@ -1285,7 +1285,7 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
         resources.notify(&TopicNotification::ChannelFailed {
             channel: TopicChannel::Subscriber(TopicSubscriber {
                 room: "room".into(),
-                participant_external_id: "bob".into(),
+                participant_id: "bob".into(),
                 topic: "events".into(),
                 mode,
             }),
@@ -1300,7 +1300,7 @@ fn unrepresentable_overflow_and_channel_failure_end_only_affected_owners() {
             resources.registrations().subscribers,
             vec![TopicSubscriber {
                 room: "room".into(),
-                participant_external_id: "alice".into(),
+                participant_id: "alice".into(),
                 topic: "events".into(),
                 mode: TopicMode::Lossy
             }]
@@ -1329,7 +1329,7 @@ fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
                 },
                 TrackSelector {
                     room: "room".into(),
-                    participant_external_id: "alice".into(),
+                    participant_id: "alice".into(),
                     label: "events".into()
                 }
             )
@@ -1356,7 +1356,7 @@ fn data_admission_is_transactional_without_a_legacy_channel_count_limit() {
             &data(TopicMode::Lossy),
             TrackSelector {
                 room: "room".into(),
-                participant_external_id: "alice".into(),
+                participant_id: "alice".into(),
                 label: "events".into(),
             },
         )

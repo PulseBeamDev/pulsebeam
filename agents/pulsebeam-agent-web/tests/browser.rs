@@ -3,7 +3,7 @@ mod destination;
 mod support;
 
 use destination::DestinationServer;
-use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
+use pulsebeam_core::identity::{ParticipantId, RoomId};
 use std::{
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -34,21 +34,13 @@ fn authorization_expiry() -> TestResult<u64> {
 async fn native_platform_smoke() -> TestResult<()> {
     let destination = DestinationServer::start().await?;
     let server = StaticServer::start(root()).await?;
-    let room = RoomExternalId::new("public-web-contract")?;
+    let room = RoomId::new("public-web-contract")?;
     let expires_at = authorization_expiry()?;
-    let sender = mint_development_token(
-        &room,
-        &ParticipantExternalId::new("web-sender")?,
-        expires_at,
-    )?;
-    let receiver = mint_development_token(
-        &room,
-        &ParticipantExternalId::new("web-receiver")?,
-        expires_at,
-    )?;
+    let sender = mint_development_token(&room, &ParticipantId::new("web-sender")?, expires_at)?;
+    let receiver = mint_development_token(&room, &ParticipantId::new("web-receiver")?, expires_at)?;
     let renewed_sender = mint_development_token(
         &room,
-        &ParticipantExternalId::new("web-sender")?,
+        &ParticipantId::new("web-sender")?,
         expires_at
             .checked_add(60)
             .ok_or("renewal expiry overflow")?,
@@ -115,10 +107,10 @@ async fn native_platform_smoke() -> TestResult<()> {
             .await?;
             assert_eq!(rejections, 0, "{name}: unhandled completion");
         }
-        let source_room = RoomExternalId::new("react-native-source")?;
+        let source_room = RoomId::new("react-native-source")?;
         let publisher_token = mint_development_token(
             &source_room,
-            &ParticipantExternalId::new("native-publisher")?,
+            &ParticipantId::new("native-publisher")?,
             expires_at,
         )?;
         let receiver_token = pulsebeam_server::sign_participant_token(
@@ -307,15 +299,10 @@ async fn server_restart_fences_old_agents() -> TestResult<()> {
     let destination = DestinationServer::start().await?;
     let address = destination.address();
     let server = StaticServer::start(root()).await?;
-    let room = RoomExternalId::new("web-adapter-restart")?;
+    let room = RoomId::new("web-adapter-restart")?;
     let expires_at = authorization_expiry()?;
-    let sender =
-        mint_development_token(&room, &ParticipantExternalId::new("publisher")?, expires_at)?;
-    let receiver = mint_development_token(
-        &room,
-        &ParticipantExternalId::new("subscriber")?,
-        expires_at,
-    )?;
+    let sender = mint_development_token(&room, &ParticipantId::new("publisher")?, expires_at)?;
+    let receiver = mint_development_token(&room, &ParticipantId::new("subscriber")?, expires_at)?;
     let start = include_str!("contracts/server-restart-start.js")
         .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
         .replace("__SENDER_TOKEN__", &sender)

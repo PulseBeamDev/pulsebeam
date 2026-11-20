@@ -13,7 +13,7 @@ use pulsebeam_agent_native::{
     Agent as RuntimeAgent, AsyncHttpClient, AudioInput, Config, H264Frame, Host, InputFrame,
     MediaStreamUpdate, OpusFrame, OutputFrame, ReceiveMode, VideoInput,
 };
-use pulsebeam_core::identity::{ParticipantExternalId, RoomExternalId};
+use pulsebeam_core::identity::{ParticipantId, RoomId};
 
 use super::common::client::create_http_client;
 use super::common::native::NativeHost;
@@ -748,8 +748,8 @@ async fn run_peer(
     barriers: PeerBarriers,
 ) -> anyhow::Result<PeerReport> {
     let endpoint = format!("http://{server_ip}:7070");
-    let room = RoomExternalId::new("native-vertical")?;
-    let participant = ParticipantExternalId::new(name)?;
+    let room = RoomId::new("native-vertical")?;
+    let participant = ParticipantId::new(name)?;
     let session = pulsebeam_agent_core::AgentConfig {
         endpoint,
         token: pulsebeam_server::sign_participant_token(

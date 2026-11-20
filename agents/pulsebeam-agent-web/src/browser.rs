@@ -154,7 +154,7 @@ impl From<TrackSelectorConfig> for TrackSelector {
     fn from(value: TrackSelectorConfig) -> Self {
         Self {
             room: value.room,
-            participant_external_id: value.participant_id,
+            participant_id: value.participant_id,
             label: value.label,
         }
     }
@@ -2856,7 +2856,7 @@ fn topic_registrations(topics: &[TopicRegistrationConfig]) -> Result<TopicRegist
                 })?;
             registrations.subscribers.push(TopicSubscriber {
                 room: source.room.clone(),
-                participant_external_id: source.participant_id.clone(),
+                participant_id: source.participant_id.clone(),
                 topic: topic.name.clone(),
                 mode,
             });
@@ -3184,12 +3184,8 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         "generation",
         snapshot.generation.map(Generation::get),
     );
-    set(
-        &value,
-        "participantId",
-        snapshot.participant_external_id.clone(),
-    );
-    set(&value, "roomId", snapshot.room_external_id.clone());
+    set(&value, "participantId", snapshot.participant_id.clone());
+    set(&value, "roomId", snapshot.room_id.clone());
     set(
         &value,
         "authorizationExpiresAt",
@@ -3198,7 +3194,7 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
     let participants = Array::new();
     for participant in snapshot.participants.values() {
         let item = Object::new();
-        set(&item, "participantId", participant.external_id.clone());
+        set(&item, "participantId", participant.id.clone());
         participants.push(&item);
     }
     set(&value, "participants", participants.clone());
@@ -3209,7 +3205,7 @@ fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
         };
         let item = Object::new();
         set(&item, "id", publication.id.clone());
-        set(&item, "participantId", owner.external_id.clone());
+        set(&item, "participantId", owner.id.clone());
         set(&item, "kind", media_kind_name(publication.kind));
         set(&item, "label", publication.label.clone());
         publications.push(&item);

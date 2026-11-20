@@ -2514,12 +2514,12 @@ mod tests {
         actor.publish().await;
         assert_eq!(updates.try_next(), None);
         for revision in 0..1000 {
-            agent.join(format!("room/{revision}")).unwrap();
+            agent.join(format!("room-{revision}")).unwrap();
         }
         let newest = agent.snapshot();
-        assert_eq!(newest.desired_room.as_deref(), Some("room/999"));
+        assert_eq!(newest.desired_room.as_deref(), Some("room-999"));
         assert_eq!(newest.join_revision, 1001);
-        agent.join("room/999".into()).unwrap();
+        agent.join("room-999".into()).unwrap();
         assert_eq!(agent.snapshot(), newest);
         assert!(!attempted.load(Ordering::SeqCst));
         assert!(actor.peer.is_none() && actor.http_tasks.is_empty());
@@ -2642,7 +2642,7 @@ mod tests {
                 },
                 agent_core::TrackSelector {
                     room: "room".into(),
-                    participant_external_id: "remote".into(),
+                    participant_id: "remote".into(),
                     label: "control".into(),
                 },
             )
@@ -2802,7 +2802,7 @@ mod tests {
             .video_subscription(
                 agent_core::TrackSelector {
                     room: "room".into(),
-                    participant_external_id: "remote".into(),
+                    participant_id: "remote".into(),
                     label: "camera".into(),
                 },
                 agent_core::VideoObservation {
@@ -2826,7 +2826,7 @@ mod tests {
         let audio = agent
             .audio_subscription(agent_core::TrackSelector {
                 room: "room".into(),
-                participant_external_id: "remote".into(),
+                participant_id: "remote".into(),
                 label: "microphone".into(),
             })
             .await
@@ -2867,7 +2867,7 @@ mod tests {
         let retained = agent
             .audio_subscription(agent_core::TrackSelector {
                 room: "room".into(),
-                participant_external_id: "remote".into(),
+                participant_id: "remote".into(),
                 label: "microphone".into(),
             })
             .await

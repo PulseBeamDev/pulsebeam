@@ -287,7 +287,7 @@ impl From<&model::Snapshot> for AgentState {
                 .credential_outcome
                 .as_ref()
                 .map_or(0, |outcome| outcome.revision),
-            room: value.room_external_id.clone(),
+            room: value.room_id.clone(),
             desired_room: value.desired_room.clone(),
             status,
             error: failure.map(|failure| ErrorInfo::from(&Failure::from(failure.clone()))),
@@ -968,7 +968,7 @@ impl From<TrackSelector> for model::TrackSelector {
     fn from(value: TrackSelector) -> Self {
         Self {
             room: value.room,
-            participant_external_id: value.participant_id,
+            participant_id: value.participant_id,
             label: value.label,
         }
     }
@@ -978,7 +978,7 @@ impl From<model::TrackSelector> for TrackSelector {
     fn from(value: model::TrackSelector) -> Self {
         Self {
             room: value.room,
-            participant_id: value.participant_external_id,
+            participant_id: value.participant_id,
             label: value.label,
         }
     }
@@ -1044,7 +1044,7 @@ impl From<TopicSubscriber> for model::TopicSubscriber {
     fn from(value: TopicSubscriber) -> Self {
         Self {
             room: value.room,
-            participant_external_id: value.participant_id,
+            participant_id: value.participant_id,
             topic: value.name,
             mode: value.mode.into(),
         }
@@ -1055,7 +1055,7 @@ impl From<model::TopicSubscriber> for TopicSubscriber {
     fn from(value: model::TopicSubscriber) -> Self {
         Self {
             room: value.room,
-            participant_id: value.participant_external_id,
+            participant_id: value.participant_id,
             name: value.topic,
             mode: value.mode.into(),
         }
@@ -1172,8 +1172,8 @@ impl From<&model::Snapshot> for Snapshot {
             desired_room: value.desired_room.clone(),
             connection: value.connection.clone().into(),
             generation: value.generation.map(model::Generation::get),
-            participant_id: value.participant_external_id.clone(),
-            room_id: value.room_external_id.clone(),
+            participant_id: value.participant_id.clone(),
+            room_id: value.room_id.clone(),
             authorization_expires_at: value.authorization_expires_at,
             topics: (&value.topics).into(),
             failure: value.terminal_failure.clone().map(Into::into),
@@ -1417,11 +1417,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_are_deterministic_owned_external_identity_values() {
+    fn snapshots_are_deterministic_owned_identity_values() {
         let mut snapshot = model::Snapshot {
-            participant_id: Some("canonical-self".to_string()),
-            participant_external_id: Some("local-user".to_string()),
-            room_external_id: Some("room".to_string()),
+            participant_id: Some("local-user".to_string()),
+            room_id: Some("room".to_string()),
             desired_room: Some("会议/next".to_string()),
             join_revision: u64::MAX - 3,
             credential_revision: u64::MAX - 2,
@@ -1438,13 +1437,9 @@ mod tests {
         };
         for suffix in ["z", "a"] {
             let canonical = format!("canonical-{suffix}");
-            snapshot.participants.insert(
-                canonical.clone(),
-                model::Participant {
-                    id: canonical,
-                    external_id: format!("external-{suffix}"),
-                },
-            );
+            snapshot
+                .participants
+                .insert(canonical.clone(), model::Participant { id: canonical });
         }
         for (id, owner) in [("video", "canonical-a"), ("orphan", "absent-canonical")] {
             snapshot.publications.insert(
@@ -1485,7 +1480,6 @@ mod tests {
             });
         }
         let before_reconnect = Snapshot::from(&snapshot);
-        snapshot.participant_id = Some("replacement-canonical-self".to_string());
         let mut participant = snapshot.participants.remove("canonical-a").unwrap();
         participant.id = "replacement-canonical-a".to_string();
         snapshot

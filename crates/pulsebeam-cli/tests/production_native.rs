@@ -283,8 +283,8 @@ async fn production_native_i420(receiver_room: &str) -> Result<()> {
     })??;
 
     ensure!(
-        publisher.snapshot().room_external_id.as_deref() == Some(ROOM)
-            && subscriber.snapshot().room_external_id.as_deref() == Some(receiver_room),
+        publisher.snapshot().room_id.as_deref() == Some(ROOM)
+            && subscriber.snapshot().room_id.as_deref() == Some(receiver_room),
         "production participants did not occupy the intended room scopes"
     );
     publication.ready().await?;

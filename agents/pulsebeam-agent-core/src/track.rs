@@ -98,7 +98,7 @@ impl TrackSpec {
         }
         Ok(TopicSubscriber {
             room: source.room.clone(),
-            participant_external_id: source.participant_external_id.clone(),
+            participant_id: source.participant_id.clone(),
             topic: publisher.topic,
             mode: publisher.mode,
         })
@@ -393,7 +393,7 @@ struct DataReceiver {
 
 impl DataReceiver {
     fn push(&mut self, event: DataEvent) {
-        if self.failure.is_some() || self.subscriber.participant_external_id != event.identity().0 {
+        if self.failure.is_some() || self.subscriber.participant_id != event.identity().0 {
             return;
         }
         match self.subscriber.mode {
@@ -1230,7 +1230,7 @@ impl TrackResources {
     ) -> Result<(), TrackResourceError> {
         validate_identifier(
             "participant external id",
-            &selector.participant_external_id,
+            &selector.participant_id,
             256,
             true,
         )?;
@@ -1426,7 +1426,7 @@ impl TrackResources {
     ) -> Result<(), TrackResourceError> {
         validate_identifier(
             "participant external id",
-            &selector.participant_external_id,
+            &selector.participant_id,
             256,
             true,
         )?;
@@ -1639,7 +1639,7 @@ impl TrackResources {
             let subscriber = &receiver.subscriber;
             if receiver.failure.is_some()
                 || subscriber.room != source.room
-                || subscriber.participant_external_id != source.participant_external_id
+                || subscriber.participant_id != source.participant_id
                 || subscriber.topic != source.label
                 || mode.is_some_and(|mode| subscriber.mode != mode)
             {

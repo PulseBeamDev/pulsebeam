@@ -31,7 +31,7 @@ export function Roster({
       <ul>
         {page.participants.map((participant) => (
           <li key={participant.id}>
-            {participant.externalId}
+            {participant.id}
             {participant.publications.length === 0
               ? " · present, no publications"
               : ` · ${participant.publications.map((publication) => publication.label).join(", ")}`}

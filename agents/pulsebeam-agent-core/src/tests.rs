@@ -388,7 +388,7 @@ fn publisher(topic: &str, mode: TopicMode) -> TopicPublisher {
 fn subscriber(topic: &str, mode: TopicMode) -> TopicSubscriber {
     TopicSubscriber {
         room: "room".into(),
-        participant_external_id: "remote-app-user".into(),
+        participant_id: "remote-app-user".into(),
         topic: topic.to_string(),
         mode,
     }
@@ -439,9 +439,7 @@ pub(crate) fn create_response(participant: &str, _etag: &str, uri: &str) -> Http
             value: uri.to_string(),
         }],
         body: serde_json::to_vec(&serde_json::json!({
-            "room_external_id": "room",
-            "room_id": "opaque room",
-            "participant_external_id": "participant",
+            "room_id": "room",
             "participant_id": participant,
             "profile": "pulsebeam.media.v1",
             "rtp_capabilities": {},
@@ -1639,11 +1637,7 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
         .unwrap();
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p1"));
-    assert_eq!(
-        agent.snapshot().participant_external_id.as_deref(),
-        Some("participant")
-    );
-    assert_eq!(agent.snapshot().room_external_id.as_deref(), Some("room"));
+    assert_eq!(agent.snapshot().room_id.as_deref(), Some("room"));
     assert!(agent.next_effect_after_turn().is_none());
 
     agent
@@ -1692,8 +1686,7 @@ fn connection_waits_for_every_host_boundary_and_closes_both_resources() {
         .unwrap();
     assert_eq!(agent.snapshot().connection, ConnectionState::Disconnected);
     assert_eq!(agent.snapshot().generation, None);
-    assert_eq!(agent.snapshot().participant_external_id, None);
-    assert_eq!(agent.snapshot().room_external_id, None);
+    assert_eq!(agent.snapshot().room_id, None);
 }
 
 #[test]
@@ -2028,11 +2021,15 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
         control,
         vec![
             native_connection::confirmed(
-                state::resource_key::Key::Participant("remote".into()),
+                state::resource_key::Key::Participant(state::Participant {
+                    participant_id: "remote".into(),
+                    room_id: "room".into(),
+                }),
                 0,
                 state::confirmed_state::Value::Participant(state::Participant {
                     participant_id: "remote".into(),
-                    participant_external_id: "remote-external".into(),
+
+                    room_id: "room".into(),
                 }),
             ),
             native_connection::confirmed(
@@ -2069,11 +2066,7 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     assert_ne!(replacement_generation, old_generation);
     assert!(agent.snapshot().publications.contains_key("old-video"));
     assert_eq!(agent.snapshot().generation, Some(old_generation));
-    assert_eq!(
-        agent.snapshot().participant_external_id.as_deref(),
-        Some("participant")
-    );
-    assert_eq!(agent.snapshot().room_external_id.as_deref(), Some("room"));
+    assert_eq!(agent.snapshot().room_id.as_deref(), Some("room"));
     let replacement_cid = channel(10);
     agent
         .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
@@ -2143,11 +2136,7 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     assert!(agent.snapshot().video_mapping.is_empty());
     assert!(agent.snapshot().audio_mapping.is_empty());
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p1"));
-    assert_eq!(
-        agent.snapshot().participant_external_id.as_deref(),
-        Some("participant")
-    );
-    assert_eq!(agent.snapshot().room_external_id.as_deref(), Some("room"));
+    assert_eq!(agent.snapshot().room_id.as_deref(), Some("room"));
 }
 
 #[test]
@@ -2701,11 +2690,15 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
                 records: vec![
                     grant(1),
                     confirmed(
-                        state::resource_key::Key::Participant("publisher".into()),
+                        state::resource_key::Key::Participant(state::Participant {
+                            participant_id: "publisher".into(),
+                            room_id: "room".into(),
+                        }),
                         0,
                         state::confirmed_state::Value::Participant(state::Participant {
                             participant_id: "publisher".into(),
-                            participant_external_id: "publisher-external".into(),
+
+                            room_id: "room".into(),
                         }),
                     ),
                     confirmed(
@@ -2714,6 +2707,7 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
                         state::confirmed_state::Value::Track(state::Track {
                             track_id: "video-track".into(),
                             participant_id: "publisher".into(),
+                            room_id: "room".into(),
                             label: "camera".into(),
                             kind: Some(state::track::Kind::Video(state::VideoTrack {
                                 format: Some(state::CodecFormat::from(
@@ -2737,14 +2731,11 @@ fn native_state_received_before_activation_is_replayed_at_the_host_boundary() {
         .unwrap();
     assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
     assert_eq!(agent.snapshot().authorization_expires_at, Some(10_001));
-    assert_eq!(
-        agent.snapshot().participants["publisher"].external_id,
-        "publisher-external"
-    );
+    assert_eq!(agent.snapshot().participants["publisher"].id, "publisher");
     assert_eq!(agent.snapshot().publications["video-track"].label, "camera");
     assert_eq!(
         agent.snapshot().remote_tracks["video-track"].participant_id,
-        "publisher-external"
+        "publisher"
     );
     let activated = agent.snapshot().clone();
     agent
@@ -2788,7 +2779,8 @@ fn pending_sender_identities_preserve_the_physical_slot_until_application_withdr
             if publication.label == "voice" && matches!(publication.kind, Some(state::publication_spec::Kind::Audio(_)))));
     let participant = state::Participant {
         participant_id: agent.snapshot().participant_id.clone().unwrap(),
-        participant_external_id: agent.snapshot().participant_external_id.clone().unwrap(),
+
+        room_id: agent.snapshot().room_id.clone().unwrap(),
     };
     native_connection::observe(
         &mut agent,
@@ -2854,7 +2846,8 @@ fn late_sender_observations_complete_only_matching_pending_publications() {
     assert_eq!(available.len(), 1);
     let participant = pulsebeam_proto::state::Participant {
         participant_id: agent.snapshot().participant_id.clone().unwrap(),
-        participant_external_id: agent.snapshot().participant_external_id.clone().unwrap(),
+
+        room_id: agent.snapshot().room_id.clone().unwrap(),
     };
     native_connection::observe(
         &mut agent,
@@ -2970,10 +2963,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
     let (participant, tracks) = native_media::discover_receivers(&mut agent, generation, channel);
     assert_eq!(agent.snapshot().participants.len(), 1);
     assert_eq!(agent.snapshot().publications.len(), 2);
-    assert_eq!(
-        agent.snapshot().participants["publisher"].external_id,
-        "publisher-external"
-    );
+    assert_eq!(agent.snapshot().participants["publisher"].id, "publisher");
     assert_eq!(agent.snapshot().publications["video-track"].label, "camera");
     assert_eq!(
         agent.snapshot().publications["audio-track"].label,
@@ -3026,7 +3016,7 @@ fn native_snapshot_discovery_and_owned_receiver_lifetimes_are_independent() {
         })
         .collect::<Vec<_>>();
     withdrawal.push(confirmed(
-        state::resource_key::Key::Participant(participant.participant_id),
+        state::resource_key::Key::Participant(participant.clone()),
         0,
         state::confirmed_state::Value::Absent(state::AbsentState {
             reason: state::AbsenceReason::Removed as i32,
@@ -3180,7 +3170,7 @@ fn discovery_withdrawal_preserves_owned_receivers_until_explicit_retirement() {
         })
         .collect::<Vec<_>>();
     withdrawals.push(confirmed(
-        state::resource_key::Key::Participant(participant.participant_id.clone()),
+        state::resource_key::Key::Participant(participant.clone()),
         0,
         state::confirmed_state::Value::Absent(state::AbsentState {
             reason: state::AbsenceReason::Removed as i32,
@@ -3283,13 +3273,13 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
         selected.video[0].track_id.clear();
         selected.video[0].selector = Some(TrackSelector {
             room: "room".into(),
-            participant_external_id: "remote-user".to_string(),
+            participant_id: "remote-user".to_string(),
             label: "camera".to_string(),
         });
         selected.audio.pinned.clear();
         let audio_selector = TrackSelector {
             room: "room".into(),
-            participant_external_id: "remote-user".to_string(),
+            participant_id: "remote-user".to_string(),
             label: "microphone".to_string(),
         };
         selected.audio.selected.push(audio_selector.clone());
@@ -3363,8 +3353,9 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             native_media::connected_with(agent, selected);
         assert_eq!(resolved.len(), 2);
         let participant = state::Participant {
-            participant_id: "pa_11111111111111111111111111".into(),
-            participant_external_id: "remote-user".into(),
+            participant_id: "remote-user".into(),
+
+            room_id: "room".into(),
         };
         let tracks = [
             native_media::track(
@@ -3516,7 +3507,8 @@ fn native_selectors_create_a_fresh_receiver_after_source_cutoff() {
             );
             control
         });
-        let replacement = native_media::track("video-two", "remote", "camera", MediaKind::Video);
+        let replacement =
+            native_media::track("video-two", "remote-user", "camera", MediaKind::Video);
         observe(
             &mut agent,
             generation,
@@ -4017,11 +4009,15 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
         control,
         vec![
             native_connection::confirmed(
-                state::resource_key::Key::Participant("remote".into()),
+                state::resource_key::Key::Participant(state::Participant {
+                    participant_id: "remote".into(),
+                    room_id: "room".into(),
+                }),
                 0,
                 state::confirmed_state::Value::Participant(state::Participant {
                     participant_id: "remote".into(),
-                    participant_external_id: "stable-external".into(),
+
+                    room_id: "room".into(),
                 }),
             ),
             native_connection::confirmed(
@@ -4030,6 +4026,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
                 state::confirmed_state::Value::Track(state::Track {
                     track_id: "video-track".into(),
                     participant_id: "remote".into(),
+                    room_id: "room".into(),
                     label: "camera".into(),
                     kind: Some(state::track::Kind::Video(state::VideoTrack {
                         format: Some(state::CodecFormat::from(state::codec_format::Codec::Vp8(
@@ -4061,19 +4058,28 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
     assert_eq!(before.publications.len(), 1);
     assert_eq!(before.accepted_credential_revision, Some(0));
     let malformed = state::ServerStateBatch {
-        records: ["first", "second"]
-            .into_iter()
-            .map(|external| {
+        records: {
+            let participant = state::Participant {
+                participant_id: "prospective".into(),
+                room_id: "room".into(),
+            };
+            let other_room_track = state::Track {
+                room_id: "other-room".into(),
+                ..native_media::track("video-track", "remote", "camera", MediaKind::Video)
+            };
+            vec![
                 native_connection::confirmed(
-                    state::resource_key::Key::Participant("prospective".into()),
+                    state::resource_key::Key::Participant(participant.clone()),
                     0,
-                    state::confirmed_state::Value::Participant(state::Participant {
-                        participant_id: "prospective".into(),
-                        participant_external_id: external.into(),
-                    }),
-                )
-            })
-            .collect(),
+                    state::confirmed_state::Value::Participant(participant),
+                ),
+                native_connection::confirmed(
+                    state::resource_key::Key::Track("video-track".into()),
+                    0,
+                    state::confirmed_state::Value::Track(other_room_track),
+                ),
+            ]
+        },
         initial_complete: false,
         ..Default::default()
     }
@@ -4085,7 +4091,7 @@ fn malformed_native_state_is_transactional_and_cancels_a_pending_renewal() {
             payload: malformed,
         })),
         Err(AgentError::InvalidSignaling(SignalingError::Invalid(
-            "participant identity"
+            "track identity"
         )))
     ));
     assert_eq!(agent.snapshot().participants, before.participants);
@@ -4674,7 +4680,7 @@ fn topic_registrations_validate_and_retire_only_omitted_sources() {
     let mut registrations = TopicRegistrations::default();
     let pinned_subscriber = |topic: &str, mode, external_id: &str| TopicSubscriber {
         room: "room".into(),
-        participant_external_id: external_id.into(),
+        participant_id: external_id.into(),
         topic: topic.into(),
         mode,
     };
@@ -5174,7 +5180,7 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
         .resource(ResourceCommand::ClaimVideo {
             selector: TrackSelector {
                 room: "main".into(),
-                participant_external_id: "remote-device".into(),
+                participant_id: "remote-device".into(),
                 label: "camera".into(),
             },
         })
@@ -5262,8 +5268,7 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
         assert_eq!(requested["room"], room);
         let mut response = create_response("participant", "unused", PARTICIPANT_URI);
         let mut body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        body["room_external_id"] = room.into();
-        body["room_id"] = format!("opaque-{room}").into();
+        body["room_id"] = room.into();
         response.body = serde_json::to_vec(&body).unwrap();
         agent
             .handle(HostEvent::Http(HttpEvent::Response {
@@ -5298,7 +5303,7 @@ fn accepted_room_roundtrip_preserves_owned_input_and_pinned_selector() {
             agent.handle(event).unwrap();
         }
         assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
-        assert_eq!(agent.snapshot().room_external_id.as_deref(), Some(room));
+        assert_eq!(agent.snapshot().room_id.as_deref(), Some(room));
         assert_eq!(
             agent.snapshot().accepted_join_revision,
             Some(index as u64 + 1)
@@ -5722,7 +5727,8 @@ fn owned_publication_replacement_ends_the_lifetime_but_input_loss_does_not() {
     );
     let participant = state::Participant {
         participant_id: agent.snapshot().participant_id.clone().unwrap(),
-        participant_external_id: agent.snapshot().participant_external_id.clone().unwrap(),
+
+        room_id: agent.snapshot().room_id.clone().unwrap(),
     };
     native_connection::observe(
         &mut agent,
@@ -5953,7 +5959,7 @@ fn owned_receive_uses_transport_deduplication_and_last_owner_registration_lifeti
                 spec: spec.clone(),
                 source: TrackSelector {
                     room: "room".into(),
-                    participant_external_id: "remote-app-user".into(),
+                    participant_id: "remote-app-user".into(),
                     label: "events".into(),
                 },
             })
@@ -6719,7 +6725,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
     use pulsebeam_proto::state;
     let pinned = |external_id: &str| TopicSubscriber {
         room: "room".into(),
-        participant_external_id: external_id.into(),
+        participant_id: external_id.into(),
         topic: "state".into(),
         mode: TopicMode::Lossy,
     };
@@ -6844,7 +6850,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
     assert_eq!(
         subscribers
             .iter()
-            .find(|status| status.registration.participant_external_id == "left")
+            .find(|status| status.registration.participant_id == "left")
             .unwrap()
             .publishers,
         0
@@ -6852,7 +6858,7 @@ fn ended_exact_source_stays_terminal_without_poisoning_a_shared_subscriber() {
     assert_eq!(
         subscribers
             .iter()
-            .find(|status| status.registration.participant_external_id == "right")
+            .find(|status| status.registration.participant_id == "right")
             .unwrap()
             .publishers,
         1
@@ -7186,7 +7192,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
         &subscriber("state", TopicMode::Latest),
         Some(&old_publication),
     );
-    const NEW_REMOTE: &str = "opaque/server/remote/replacement";
+    const NEW_REMOTE: &str = "Remote_Replacement";
     const NEW_LOCAL: &str = "opaque/server/local/replacement";
     drain_notifications(&mut agent);
     assert_eq!(
@@ -7279,7 +7285,7 @@ fn discovery_withdrawal_does_not_rebind_and_retired_sources_do_not_revive() {
     }
     let replacement_subscriber = TopicSubscriber {
         room: "room".into(),
-        participant_external_id: NEW_REMOTE.into(),
+        participant_id: NEW_REMOTE.into(),
         topic: "state".into(),
         mode: TopicMode::Latest,
     };

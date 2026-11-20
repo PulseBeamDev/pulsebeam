@@ -30,7 +30,7 @@ use crate::{
     control::controller::{
         self, ControllerSender, CreateParticipantReply, ParticipantState, SignalingProtocol,
     },
-    entity::{ConnectionId, IdValidationError, ParticipantId, RoomId},
+    entity::{ConnectionId, IdValidationError, ParticipantId},
 };
 
 const MAX_SIGNALING_BODY_BYTES: usize = 1_048_576;
@@ -261,7 +261,7 @@ fn verify_bearer(
     now: u64,
 ) -> Result<VerifiedAuthorization, ApiError> {
     authenticate_bearer(headers, registry, now)?
-        .authorize_room(pulsebeam_core::identity::RoomExternalId::new("general")?)
+        .authorize_room(pulsebeam_core::identity::RoomId::new("general")?)
         .map_err(|_| controller::ControllerError::AuthorizationRejected.into())
 }
 
@@ -320,7 +320,7 @@ fn parse_native_request(body: &[u8]) -> Result<NativeRequest, ApiError> {
         return Err(invalid());
     }
     let request: NativeRequest = serde_json::from_slice(body).map_err(|_| invalid())?;
-    pulsebeam_core::identity::RoomExternalId::new(&request.room)
+    pulsebeam_core::identity::RoomId::new(&request.room)
         .map_err(|_| ApiError::BadRequest("invalid room external id".to_owned()))?;
     if request.profile != pulsebeam_proto::state::PROFILE {
         return Err(ApiError::BadRequest(
@@ -337,10 +337,7 @@ struct NativeResponse<'a> {
     rtp_capabilities: &'a pulsebeam_proto::state::RtpCapabilities,
     #[schema(value_type = Vec<String>)]
     data_delivery: [pulsebeam_proto::state::DataDelivery; 3],
-    room_external_id: &'a str,
-    #[schema(value_type = String)]
-    room_id: RoomId,
-    participant_external_id: &'a str,
+    room_id: &'a str,
     #[schema(value_type = String)]
     participant_id: ParticipantId,
     #[schema(value_type = String)]
@@ -363,9 +360,7 @@ impl<'a> NativeResponse<'a> {
                 pulsebeam_proto::state::DataDelivery::Lossy,
                 pulsebeam_proto::state::DataDelivery::Ordered,
             ],
-            room_external_id: authorization.room_external_id.as_str(),
-            room_id: authorization.room_id,
-            participant_external_id: authorization.participant_external_id.as_str(),
+            room_id: authorization.room_id.as_str(),
             participant_id: authorization.participant_id,
             connection_id,
             answer,
@@ -572,7 +567,6 @@ fn native_message(
             manual_sub: true,
             room_id: authorization.room_id,
             participant_id: authorization.participant_id,
-            participant_external_id: authorization.participant_external_id.clone(),
             connection_id: ConnectionId::new(),
             old_connection_id: None,
             authorization: Some(lease),
@@ -730,7 +724,7 @@ async fn delete_native(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn requested_sdp_room(uri: &Uri) -> Result<pulsebeam_core::identity::RoomExternalId, ApiError> {
+fn requested_sdp_room(uri: &Uri) -> Result<pulsebeam_core::identity::RoomId, ApiError> {
     let invalid = || ApiError::BadRequest("one valid room query parameter is required".to_owned());
     let mut pairs = uri.query().ok_or_else(invalid)?.split('&');
     let (name, encoded) = pairs
@@ -739,14 +733,14 @@ fn requested_sdp_room(uri: &Uri) -> Result<pulsebeam_core::identity::RoomExterna
         .ok_or_else(invalid)?;
     if name != "room"
         || pairs.next().is_some()
-        || encoded.len() > pulsebeam_core::auth::grants::MAX_SCOPE_BYTES.saturating_mul(3)
+        || encoded.len() > pulsebeam_core::identity::MAX_APPLICATION_NAME_BYTES.saturating_mul(3)
     {
         return Err(invalid());
     }
-    let mut decoded = Vec::with_capacity(pulsebeam_core::auth::grants::MAX_SCOPE_BYTES);
+    let mut decoded = Vec::with_capacity(pulsebeam_core::identity::MAX_APPLICATION_NAME_BYTES);
     let mut bytes = encoded.bytes();
     while let Some(byte) = bytes.next() {
-        if decoded.len() == pulsebeam_core::auth::grants::MAX_SCOPE_BYTES {
+        if decoded.len() == pulsebeam_core::identity::MAX_APPLICATION_NAME_BYTES {
             return Err(invalid());
         }
         decoded.push(match byte {
@@ -765,7 +759,7 @@ fn requested_sdp_room(uri: &Uri) -> Result<pulsebeam_core::identity::RoomExterna
         });
     }
     let room = std::str::from_utf8(&decoded).map_err(|_| invalid())?;
-    pulsebeam_core::identity::RoomExternalId::new(room).map_err(|_| invalid())
+    pulsebeam_core::identity::RoomId::new(room).map_err(|_| invalid())
 }
 
 async fn create_sdp_profile(
@@ -810,7 +804,6 @@ async fn create_sdp_profile(
                         manual_sub: false,
                         room_id: authorization.room_id,
                         participant_id: authorization.participant_id,
-                        participant_external_id: authorization.participant_external_id.clone(),
                         connection_id,
                         old_connection_id: None,
                         authorization: Some(lease),
@@ -1240,7 +1233,7 @@ mod tests {
             DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID,
             KeyRegistryEntry,
         },
-        identity::{ParticipantExternalId, RoomExternalId},
+        identity::{ParticipantId, RoomId},
     };
     use str0m::{
         RtcConfig,
@@ -1301,8 +1294,8 @@ mod tests {
             .as_secs();
         pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
-            &full_grants((RoomExternalId::new("general").unwrap()).as_str()),
-            (ParticipantExternalId::new("alice").unwrap()).as_str(),
+            &full_grants((RoomId::new("general").unwrap()).as_str()),
+            (ParticipantId::new("alice").unwrap()).as_str(),
             now + 60,
         )
         .unwrap()
@@ -1330,13 +1323,9 @@ mod tests {
         let proof = authority
             .issue(principal.clone(), now, &mut entropy)
             .unwrap();
-        let binding = RequestBinding::for_request(
-            profile,
-            &authorization.room_external_id,
-            offer,
-            credential,
-        )
-        .unwrap();
+        let binding =
+            RequestBinding::for_request(profile, &authorization.room_id, offer, credential)
+                .unwrap();
         let Admission::Start(ticket) = authority
             .begin(
                 &principal,
@@ -1484,6 +1473,15 @@ mod tests {
         assert!(message.state.authorization.is_some());
         assert_eq!(message.state.rtp_capabilities, Some(capabilities.clone()));
         assert_eq!(message.offer, offer);
+        let response_body = serde_json::to_value(NativeResponse::new(
+            &authorization,
+            message.state.connection_id,
+            &capabilities,
+            "v=0\r\n",
+        ))
+        .unwrap();
+        assert_eq!(response_body["room_id"], authorization.room_id.as_str());
+        assert!(response_body.get("room_external_id").is_none());
         let long_location = HeaderValue::from_bytes(&vec![b'a'; 300_000]).unwrap();
         let escaped = "\0".repeat(MAX_NATIVE_SDP_BYTES);
         assert!(matches!(
@@ -1559,6 +1557,16 @@ mod tests {
                 .contains("invalid SDP offer")
         );
         responder.await.unwrap();
+    }
+
+    #[test]
+    fn sdp_room_query_accepts_case_preserving_names_and_decodes_once() {
+        let uri: Uri = "/whip?room=%53tage_9-A".parse().unwrap();
+        assert_eq!(requested_sdp_room(&uri).unwrap().as_str(), "Stage_9-A");
+        for invalid in ["stage.main", "stage%2Fmain", "stage%252Fmain", "caf%C3%A9"] {
+            let uri: Uri = format!("/whip?room={invalid}").parse().unwrap();
+            assert!(requested_sdp_room(&uri).is_err());
+        }
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
@@ -1793,8 +1801,8 @@ mod tests {
                 assert_eq!(expected_revision, 1);
                 assert_eq!(message.principal.project_id(), observed.project_id());
                 assert_eq!(
-                    message.principal.participant_external_id(),
-                    observed.participant_external_id()
+                    message.principal.participant_id(),
+                    observed.participant_id()
                 );
                 assert_eq!(message.principal.expiry(), observed.expiry());
                 assert_eq!(format!("{message:?}"), "NativeResourceRequest([redacted])");
@@ -1865,10 +1873,7 @@ mod tests {
         };
         assert_eq!(message.connection_id, connection_id);
         assert_eq!(message.principal.project_id(), *DEVELOPMENT_PROJECT_ID);
-        assert_eq!(
-            message.principal.participant_external_id().as_str(),
-            "alice"
-        );
+        assert_eq!(message.principal.participant_id().as_str(), "alice");
         assert_eq!(format!("{message:?}"), "NativeResourceRequest([redacted])");
         assert!(
             futures_lite::future::poll_once(&mut response)
@@ -1896,6 +1901,8 @@ mod tests {
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn strict_sdp_posts_return_raw_answers_and_opaque_locations() {
+        const ROOM: &str = "RoomMetricSentinel";
+        const PARTICIPANT: &str = "ParticipantMetricSentinel";
         for (resource, direction, profile) in [
             ("whip", Direction::SendOnly, SignalingProtocol::Whip),
             ("whep", Direction::RecvOnly, SignalingProtocol::Whep),
@@ -1903,7 +1910,17 @@ mod tests {
             let (controller, mut commands) =
                 pulsebeam_queue::bounded(const { core::num::NonZeroUsize::new(1).unwrap() });
             let app = router(controller, cfg(), auth_registry());
-            let token = live_token();
+            let token = pulsebeam_server::sign_participant_token(
+                &pulsebeam_server::insecure_dev_api_key().unwrap(),
+                &full_grants(ROOM),
+                PARTICIPANT,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 60,
+            )
+            .unwrap();
             let offer = directional_offer(direction);
             let answer = offer.clone();
             let captured_token = token.clone();
@@ -1914,8 +1931,10 @@ mod tests {
                     panic!("expected create command")
                 };
                 assert_eq!(message.state.profile, profile);
+                assert_eq!(message.state.room_id.as_str(), ROOM);
+                assert_eq!(message.state.participant_id.as_str(), PARTICIPANT);
                 assert!(!message.state.manual_sub);
-                let verified = verify_bearer(
+                let authorization = authenticate_bearer(
                     &authorization_headers(&captured_token),
                     &auth_registry(),
                     SystemTime::now()
@@ -1923,8 +1942,9 @@ mod tests {
                         .unwrap()
                         .as_secs(),
                 )
+                .unwrap()
+                .authorize_room(message.state.room_id)
                 .unwrap();
-                let authorization = &verified;
                 let location = HeaderValue::from_str(&format!(
                     "https://media.example/api/v1/{resource}/{}",
                     message.state.connection_id
@@ -1937,7 +1957,7 @@ mod tests {
                 ));
                 let images = cache_creation(
                     creation::CreationResponse::sdp(&location, &answer),
-                    authorization,
+                    &authorization,
                     profile,
                     &message.offer,
                     &captured_token,
@@ -1945,16 +1965,31 @@ mod tests {
                 reply.send(Ok(CreateParticipantReply { answer })).unwrap();
                 images
             });
-            let response = app
-                .oneshot(sdp_post(&token, resource, offer.into_bytes()))
-                .await
-                .unwrap();
+            let mut request = sdp_post(&token, resource, offer.into_bytes());
+            *request.uri_mut() = format!("/api/v1/{resource}?room={ROOM}").parse().unwrap();
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let mut response = std::pin::pin!(app.oneshot(request));
+            let response = std::future::poll_fn(|cx| {
+                metrics::with_local_recorder(&recorder, || response.as_mut().poll(cx))
+            })
+            .await
+            .unwrap();
+            let metrics = recorder.handle().render();
+            assert!(metrics.contains("http_request_duration_seconds"));
+            assert!(metrics.contains(&format!("path=\"/api/v1/{resource}\"")));
+            assert!(!metrics.contains(ROOM));
+            assert!(!metrics.contains(PARTICIPANT));
             assert_eq!(response.status(), StatusCode::CREATED);
             assert_eq!(response.headers()[CONTENT_TYPE], "application/sdp");
             assert!(!response.headers().contains_key("etag"));
             assert!(!response.headers().contains_key("pb-participant-id"));
             let location = response.headers()[LOCATION].to_str().unwrap().to_owned();
-            assert!(location.starts_with(&format!("https://media.example/api/v1/{resource}/c_0")));
+            let connection_id = location
+                .strip_prefix(&format!("https://media.example/api/v1/{resource}/"))
+                .unwrap()
+                .parse::<ConnectionId>()
+                .unwrap();
+            assert!(connection_id.as_str().starts_with("conn_0"));
             let body = to_bytes(response.into_body(), MAX_SIGNALING_BODY_BYTES)
                 .await
                 .unwrap();
@@ -2173,8 +2208,8 @@ mod tests {
     async fn authorization_failures_are_secret_safe_rfc_9457_responses() {
         let token = pulsebeam_server::sign_participant_token(
             &pulsebeam_server::insecure_dev_api_key().unwrap(),
-            &full_grants((RoomExternalId::new("general").unwrap()).as_str()),
-            (ParticipantExternalId::new("alice").unwrap()).as_str(),
+            &full_grants((RoomId::new("general").unwrap()).as_str()),
+            (ParticipantId::new("alice").unwrap()).as_str(),
             2_000,
         )
         .unwrap();

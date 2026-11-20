@@ -218,8 +218,7 @@ const activeWatch = () =>
   [...runtime.catalogWatches].find(([, scope]) => !scope.closed)!;
 const firstParticipants = [
   {
-    id: "self-wire",
-    externalId: "admitted-alice",
+    id: "admitted-alice",
     publications: [
       {
         id: "self-chat",
@@ -231,8 +230,7 @@ const firstParticipants = [
     ],
   },
   {
-    id: "bob-wire",
-    externalId: "bob",
+    id: "bob",
     publications: [
       {
         id: "remote-chat",
@@ -249,7 +247,7 @@ const firstParticipants = [
       { id: "remote-screen", label: "screen", kind: { tag: "Video" } },
     ],
   },
-  { id: "quiet-wire", externalId: "quiet-observer", publications: [] },
+  { id: "quiet-observer", publications: [] },
 ];
 const continuation = Object.freeze(
   Array.from({ length: 32 }, (_, index) => index),
@@ -350,7 +348,7 @@ assert.equal(
   "page replacement releases UI-owned audio reception",
 );
 await page(
-  [{ id: "last-wire", externalId: "last-presence", publications: [] }],
+  [{ id: "last-presence", publications: [] }],
   false,
 );
 assert.match(document.body.textContent!, /last-presence/);

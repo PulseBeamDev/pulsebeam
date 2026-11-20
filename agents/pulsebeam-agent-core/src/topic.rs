@@ -75,7 +75,7 @@ pub struct TopicPublisher {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TopicSubscriber {
     pub room: String,
-    pub participant_external_id: String,
+    pub participant_id: String,
     pub topic: String,
     pub mode: TopicMode,
 }
@@ -261,7 +261,7 @@ impl CatalogBinding {
     fn matches(&self, subscriber: &TopicSubscriber) -> bool {
         !self.local
             && self.room.as_deref() == Some(subscriber.room.as_str())
-            && self.participant_id == subscriber.participant_external_id
+            && self.participant_id == subscriber.participant_id
             && self.topic == subscriber.topic
             && self.mode == subscriber.mode
     }
@@ -308,7 +308,7 @@ impl TopicRegistrations {
         let mut subscribers = BTreeSet::new();
         for subscriber in &self.subscribers {
             crate::validate_room_name(&subscriber.room)?;
-            crate::validate_participant_id(&subscriber.participant_external_id)?;
+            crate::validate_participant_id(&subscriber.participant_id)?;
             validate_topic(&subscriber.topic)?;
             if !subscribers.insert(subscriber) {
                 return Err(ValidationError::Duplicate {
@@ -410,7 +410,7 @@ impl Topics {
                 },
                 topic: source.track.label.clone(),
                 mode,
-                participant_id: source.participant.participant_external_id.clone(),
+                participant_id: source.participant.participant_id.clone(),
                 local: source.track.participant_id == active.canonical_participant_id,
             },
         );
@@ -1555,7 +1555,7 @@ mod tests {
     fn catalog_bindings_match_room_participant_topic_and_mode_together() {
         let subscriber = TopicSubscriber {
             room: "room-a".into(),
-            participant_external_id: "alice".into(),
+            participant_id: "alice".into(),
             topic: "events".into(),
             mode: TopicMode::Ordered,
         };
@@ -1563,7 +1563,7 @@ mod tests {
             room: Some(subscriber.room.clone()),
             topic: subscriber.topic.clone(),
             mode: subscriber.mode,
-            participant_id: subscriber.participant_external_id.clone(),
+            participant_id: subscriber.participant_id.clone(),
             local: false,
         };
         assert!(binding.matches(&subscriber));
@@ -1573,7 +1573,7 @@ mod tests {
                 ..subscriber.clone()
             },
             TopicSubscriber {
-                participant_external_id: "bob".into(),
+                participant_id: "bob".into(),
                 ..subscriber.clone()
             },
             TopicSubscriber {
@@ -1599,7 +1599,7 @@ mod tests {
     fn ordered_topics(ids: &mut IdGenerator) -> (Topics, TopicSubscriber, Generation) {
         let subscriber = TopicSubscriber {
             room: "room".into(),
-            participant_external_id: "remote-app".into(),
+            participant_id: "remote-app".into(),
             topic: "state".into(),
             mode: TopicMode::Ordered,
         };
@@ -1685,6 +1685,7 @@ mod tests {
         let track = pulsebeam_proto::state::Track {
             track_id: "authoritative".into(),
             participant_id: "remote-owner".into(),
+            room_id: "room".into(),
             label: subscriber.topic.clone(),
             kind: Some(pulsebeam_proto::state::track::Kind::Data(
                 pulsebeam_proto::state::DataTrack {
@@ -1694,7 +1695,8 @@ mod tests {
         };
         let participant = pulsebeam_proto::state::Participant {
             participant_id: track.participant_id.clone(),
-            participant_external_id: "remote-app".into(),
+
+            room_id: "room".into(),
         };
         for current in [generation, replacement] {
             topics.install_source(
@@ -1911,7 +1913,7 @@ mod tests {
             assert_eq!(TopicMode::from_delivery(mode.delivery() as i32), Some(mode));
             registrations.subscribers.push(TopicSubscriber {
                 room: "room".into(),
-                participant_external_id: "remote-app-user".into(),
+                participant_id: "remote-app-user".into(),
                 topic: "literal/Δ label".into(),
                 mode,
             });

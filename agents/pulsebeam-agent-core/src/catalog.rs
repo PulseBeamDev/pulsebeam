@@ -278,7 +278,6 @@ impl Catalogs {
                     .collect::<Result<Vec<_>, ErrorInfo>>()?;
                 Ok(CatalogParticipantInfo {
                     id: participant.participant_id,
-                    external_id: participant.participant_external_id,
                     publications,
                 })
             })

@@ -4,7 +4,13 @@ use super::*;
 use crate::participant::core::native_data::tests::frame_for;
 use crate::rtp::{AUDIO_FREQUENCY, MediaTime, RtpPacket};
 
-fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, enabled: bool) -> wire::ResourceSpec {
+fn receiver_spec(
+    track: TrackId,
+    room: &str,
+    mid: &str,
+    ssrc: u32,
+    enabled: bool,
+) -> wire::ResourceSpec {
     let mut source = spec(enabled);
     source.settings.as_mut().unwrap().receive =
         Some(wire::resource_settings::Receive::Audio(Default::default()));
@@ -27,7 +33,7 @@ fn receiver_spec(track: TrackId, mid: &str, ssrc: u32, enabled: bool) -> wire::R
         wire::SubscriptionSpec {
             track_id: track.as_str(),
             kind: wire::TrackKind::Audio as i32,
-            source_room: "room".into(),
+            source_room: room.into(),
             binding: Some(wire::TrackBinding {
                 transport: Some(wire::track_binding::Transport::Rtp(parameters)),
             }),
@@ -63,8 +69,8 @@ pub(super) fn check_prebound(source: &Track) {
     participant
         .signaling
         .observe_participant(wire::Participant {
-            participant_id: source.meta().origin.as_str(),
-            participant_external_id: "source".into(),
+            participant_id: source.meta().origin.as_str().to_owned(),
+            room_id: source.meta().room.room.as_str().into(),
         })
         .unwrap();
     let mut handles = slotmap::SlotMap::<TrackHandle, _>::with_key();
@@ -80,7 +86,13 @@ pub(super) fn check_prebound(source: &Track) {
         &mut sink,
         1,
         1,
-        Some(receiver_spec(id, "prebound", 321, true)),
+        Some(receiver_spec(
+            id,
+            source.meta().room.room.as_str(),
+            "prebound",
+            321,
+            true,
+        )),
     );
     let (_, live) = last_live(&mut participant);
     assert_eq!(live.execution, wire::ExecutionStatus::Installed as i32);
@@ -100,14 +112,14 @@ pub(super) fn check(source: &Track) {
     participant
         .signaling
         .observe_participant(wire::Participant {
-            participant_id: source.meta().origin.as_str(),
-            participant_external_id: "source".into(),
+            participant_id: source.meta().origin.as_str().to_owned(),
+            room_id: source.meta().room.room.as_str().into(),
         })
         .unwrap();
     let mut handles = slotmap::SlotMap::<TrackHandle, _>::with_key();
     let handle = handles.insert(id);
     participant.add_track_candidate(handle, source.clone());
-    let first = receiver_spec(id, "listen", 321, true);
+    let first = receiver_spec(id, source.meta().room.room.as_str(), "listen", 321, true);
     pulsebeam_proto::state::validation::validate_spec(&first).expect("valid receiving fixture");
     desire(&mut participant, &mut sink, 1, 1, Some(first.clone()));
     let (_, live) = last_live(&mut participant);
@@ -151,7 +163,13 @@ pub(super) fn check(source: &Track) {
         &mut sink,
         1,
         2,
-        Some(receiver_spec(id, "changed", 399, true)),
+        Some(receiver_spec(
+            id,
+            source.meta().room.room.as_str(),
+            "changed",
+            399,
+            true,
+        )),
     );
     let (rejected, live) = last_live(&mut participant);
     assert_eq!(
@@ -166,7 +184,7 @@ pub(super) fn check(source: &Track) {
             .is_none()
     );
     assert_eq!(participant.transport.stream_tx_ssrc(mid), Some(321.into()));
-    let second = receiver_spec(id, "second", 322, true);
+    let second = receiver_spec(id, source.meta().room.room.as_str(), "second", 322, true);
     desire(&mut participant, &mut sink, 3, 3, Some(second));
     confirmations(&mut participant);
     let mut packet = RtpPacket {
@@ -201,7 +219,13 @@ pub(super) fn check(source: &Track) {
         &mut sink,
         4,
         4,
-        Some(receiver_spec(id, "collision", 322, true)),
+        Some(receiver_spec(
+            id,
+            source.meta().room.room.as_str(),
+            "collision",
+            322,
+            true,
+        )),
     );
     let rejected = native_data::tests::confirmations_for(&mut participant, 4)
         .pop()
@@ -239,7 +263,13 @@ pub(super) fn check(source: &Track) {
         &mut sink,
         1,
         13,
-        Some(receiver_spec(id, "listen", 321, false)),
+        Some(receiver_spec(
+            id,
+            source.meta().room.room.as_str(),
+            "listen",
+            321,
+            false,
+        )),
     );
     assert_eq!(
         last_live(&mut participant).1.execution,
@@ -298,7 +328,16 @@ pub(super) fn check(source: &Track) {
     );
     let failed = last_live_for(&mut participant, 3).1;
     assert_eq!(failed.execution, wire::ExecutionStatus::Failed as i32);
-    assert_eq!(failed.spec, Some(receiver_spec(id, "second", 322, true)));
+    assert_eq!(
+        failed.spec,
+        Some(receiver_spec(
+            id,
+            source.meta().room.room.as_str(),
+            "second",
+            322,
+            true
+        ))
+    );
     assert_eq!(
         failed.execution_failure.unwrap().code,
         wire::FailureCode::InternalFailure as i32

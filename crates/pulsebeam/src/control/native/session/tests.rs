@@ -7,7 +7,7 @@ mod permissions;
 #[test]
 fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_the_source() {
     use crate::control::native::{PreparedResource, ReceiverPreparation};
-    use crate::entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId, TrackKind};
+    use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
     use crate::participant::policy::ResourceObservation;
     use crate::track::{DataLane, TrackMeta};
     use pulsebeam_runtime::time::Instant;
@@ -173,10 +173,10 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                         .authorization(10_000, revision, ResourcePermissions::RoomBound)
                         .unwrap();
                 }
-                let owner = ParticipantId::new();
+                let owner = ParticipantId::new("source").unwrap();
                 let track = Track::data_publication(
                     TrackMeta {
-                        room_id: RoomId::from_bytes([1; 16]),
+                        room: crate::entity::ProjectRoomKey::fixture(RoomId::new("room").unwrap()),
                         shard_id: crate::id::ShardId::new(0),
                         id: source,
                         origin: owner,
@@ -185,7 +185,7 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                     },
                     DataLane::Ordered,
                 );
-                let publisher = ParticipantExternalId::new("source").unwrap();
+                let publisher = owner;
                 if matches!(outcome, Outcome::SourceArrivesWithoutDiscovery) {
                     let mut incomplete = track.clone();
                     incomplete.meta_mut().label = None;
@@ -203,8 +203,8 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                 } else {
                     model
                         .observe_participant(wire::Participant {
-                            participant_id: owner.as_str(),
-                            participant_external_id: publisher.as_str().to_owned(),
+                            participant_id: owner.as_str().to_owned(),
+                            room_id: "room".into(),
                         })
                         .unwrap();
                     model
@@ -278,10 +278,7 @@ fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_
                         .receiver_source
                         .as_ref()
                         .unwrap();
-                    assert_eq!(
-                        retained.participant.participant_external_id,
-                        publisher.as_str()
-                    );
+                    assert_eq!(retained.participant.participant_id, publisher.as_str());
                     assert_eq!(retained.track, track_descriptor(&track).unwrap());
                 }
             }
@@ -398,6 +395,7 @@ fn source(reference: u64, label: &str) -> wire::Track {
     wire::Track {
         track_id: format!("source-{reference}"),
         participant_id: "owner".into(),
+        room_id: "room".into(),
         label: label.into(),
         kind: Some(wire::track::Kind::Data(wire::DataTrack {
             delivery: wire::DataDelivery::Ordered as i32,
@@ -414,7 +412,8 @@ fn live(session: &NativeSession, work: &Preparation) -> wire::LiveResource {
         spec: Some(spec.clone()),
         participant: Some(wire::Participant {
             participant_id: "owner".into(),
-            participant_external_id: "Owner".into(),
+
+            room_id: "room".into(),
         }),
         track: Some(source(work.reference, &publication.label)),
         execution: if spec.settings.as_ref().unwrap().enabled == Some(true) {
@@ -795,7 +794,7 @@ fn rejected_update_preserves_acceptance_and_publication_reservation() {
     use crate::participant::policy::{
         ExecutionFailure, ExecutionFailureContext as Context, ExecutionFailureKind as Kind,
     };
-    let external_id = crate::entity::ParticipantExternalId::new("Owner").unwrap();
+    let external_id = crate::entity::ParticipantId::new("Owner").unwrap();
     for (revision, (kind, context, code, diagnostic)) in (4..).zip([
         (
             Kind::Invalid,
@@ -870,7 +869,7 @@ fn rejected_update_preserves_acceptance_and_publication_reservation() {
             wire::SourceLookupSpec {
                 source: Some(wire::LogicalSourceAddress {
                     room: "room".into(),
-                    participant_external_id: "Owner".into(),
+                    participant_id: "Owner".into(),
                     kind: wire::TrackKind::Data as i32,
                     label: "topic".into(),
                 }),
@@ -1061,7 +1060,7 @@ fn terminal_lifetimes_release_rows_queues_and_byte_funding_without_history() {
                         released: true,
                         unix_now: 100,
                     },
-                    &crate::entity::ParticipantExternalId::new("Owner").unwrap(),
+                    &crate::entity::ParticipantId::new("Owner").unwrap(),
                 )
                 .unwrap();
             assert_eq!(session.retained_bytes, prepaid);
@@ -1170,7 +1169,8 @@ fn initial_enumeration_is_finite_fair_and_not_a_live_catchup_barrier() {
         session
             .observe_participant(wire::Participant {
                 participant_id: format!("initial-{index}"),
-                participant_external_id: format!("Peer {index}"),
+
+                room_id: "room".into(),
             })
             .unwrap();
     }
@@ -1184,7 +1184,8 @@ fn initial_enumeration_is_finite_fair_and_not_a_live_catchup_barrier() {
         session
             .observe_participant(wire::Participant {
                 participant_id: format!("late-{index}"),
-                participant_external_id: "Late".into(),
+
+                room_id: "room".into(),
             })
             .unwrap();
         if let Some(batch) = output(&mut session) {
@@ -1197,9 +1198,9 @@ fn initial_enumeration_is_finite_fair_and_not_a_live_catchup_barrier() {
             for record in batch.records {
                 if let Some(wire::resource_key::Key::Participant(id)) =
                     record.key.and_then(|key| key.key)
-                    && id.starts_with("initial-")
+                    && id.participant_id.starts_with("initial-")
                 {
-                    represented.insert(id);
+                    represented.insert(id.participant_id);
                 }
             }
             if batch.initial_complete {
@@ -1332,7 +1333,7 @@ fn discovery_requires_real_immutable_descriptors_and_does_not_delay_initial_gran
     session
         .observe_track(
             source(1, "literal topic"),
-            &crate::entity::ParticipantExternalId::new("Owner").unwrap(),
+            &crate::entity::ParticipantId::new("Owner").unwrap(),
         )
         .unwrap();
     assert_eq!(session.unavailable, 0);
@@ -1340,20 +1341,21 @@ fn discovery_requires_real_immutable_descriptors_and_does_not_delay_initial_gran
     assert!(matches!(
         session.observe_track(
             source(1, "relabel"),
-            &crate::entity::ParticipantExternalId::new("Owner").unwrap()
+            &crate::entity::ParticipantId::new("Owner").unwrap()
         ),
         Err(OutputError::InvalidObservation)
     ));
     session
         .observe_participant(wire::Participant {
             participant_id: "peer".into(),
-            participant_external_id: "Original".into(),
+
+            room_id: "room".into(),
         })
         .unwrap();
     assert!(matches!(
         session.observe_participant(wire::Participant {
             participant_id: "peer".into(),
-            participant_external_id: "Changed".into()
+            room_id: "not/a/room".into()
         }),
         Err(OutputError::InvalidObservation)
     ));
@@ -1389,7 +1391,8 @@ async fn delayed_admission_receipt_uses_original_open_and_admission_times() {
             session
                 .observe_participant(wire::Participant {
                     participant_id: format!("initial-{index}"),
-                    participant_external_id: format!("Initial {index}"),
+
+                    room_id: "room".into(),
                 })
                 .unwrap();
         }
@@ -1479,13 +1482,13 @@ fn preparation_completion_cannot_replace_the_model_owned_target() {
 
 #[test]
 fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_claim() {
-    use crate::entity::{ConnectionId, ParticipantId, RoomExternalId, RoomId, TrackKind};
+    use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
     use crate::track::{DataLane, Topic, Track, TrackMeta};
     let mut session = session();
     let connection = ConnectionId::new();
-    let origin = ParticipantId::new();
-    let room = RoomId::from_external(&RoomExternalId::new("discovery").unwrap());
-    let external_id = crate::entity::ParticipantExternalId::new("Owner").unwrap();
+    let origin = crate::entity::fixture_participant_id();
+    let room = RoomId::new("discovery").unwrap();
+    let external_id = crate::entity::ParticipantId::new("Owner").unwrap();
     for (index, (lane, expected)) in [
         (DataLane::Latest, wire::DataDelivery::Latest),
         (DataLane::Lossy, wire::DataDelivery::Lossy),
@@ -1498,7 +1501,7 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
         let id = connection.derive_track_id(TrackKind::Data, &label);
         let source = Track::data(
             TrackMeta {
-                room_id: room,
+                room: crate::entity::ProjectRoomKey::fixture(room),
                 shard_id: crate::id::ShardId::new(0),
                 id,
                 origin,
@@ -1563,9 +1566,10 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
         assert_eq!(live.spec, Some(spec));
         assert_eq!(live.track, Some(descriptor));
         assert_eq!(
-            live.participant.as_ref().unwrap().participant_external_id,
-            "Owner"
+            live.participant.as_ref().unwrap().participant_id,
+            origin.as_str()
         );
+        assert_eq!(live.participant.as_ref().unwrap().room_id, room.as_str());
         assert_eq!(live.execution, wire::ExecutionStatus::Installed as i32);
         assert!(live.activity.is_none());
         assert!(matches!(
@@ -1691,13 +1695,14 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
     };
     let owner = wire::Participant {
         participant_id: track.participant_id.clone(),
-        participant_external_id: "Owner".into(),
+
+        room_id: "room".into(),
     };
     session.observe_participant(owner.clone()).unwrap();
     session
         .observe_track(
             track.clone(),
-            &crate::entity::ParticipantExternalId::new(&owner.participant_external_id).unwrap(),
+            &crate::entity::ParticipantId::new(&owner.participant_id).unwrap(),
         )
         .unwrap();
     drain(&mut session);
@@ -1751,7 +1756,7 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
     assert_eq!(session.retained_bytes, before + 8192 + source_bytes);
     session.remove_track(track.track_id.clone()).unwrap();
     session
-        .remove_participant(owner.participant_id.clone())
+        .remove_participant(owner.room_id.clone(), owner.participant_id.clone())
         .unwrap();
     assert!(matches!(
         session.rows[&Key::Track(track.track_id.clone())]
@@ -1923,7 +1928,7 @@ fn receiver_response_projection_is_prepaid_and_survives_catalog_removal_until_cu
     assert_eq!(live.spec, Some(disabled.clone()));
     assert_eq!(live.participant, Some(owner));
     assert_eq!(live.track, Some(track));
-    let external_id = crate::entity::ParticipantExternalId::new("Owner").unwrap();
+    let external_id = crate::entity::ParticipantId::new("Owner").unwrap();
     assert!(matches!(
         session
             .complete_execution(
@@ -2051,7 +2056,7 @@ fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
             10_000,
             2,
             ResourcePermissions::Grants {
-                room: crate::entity::RoomExternalId::new("room").unwrap(),
+                room: crate::entity::RoomId::new("room").unwrap(),
                 grants: GrantSet::new(vec![
                     Grant::new(
                         vec!["room".into(), "other".into()],
@@ -2076,7 +2081,7 @@ fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
                 wire::SourceLookupSpec {
                     source: Some(wire::LogicalSourceAddress {
                         room: room.into(),
-                        participant_external_id: "denied-publisher".into(),
+                        participant_id: "denied-publisher".into(),
                         kind: wire::TrackKind::Data as i32,
                         label: "label".into(),
                     }),
@@ -2111,7 +2116,7 @@ fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
 
 #[test]
 fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors() {
-    use crate::entity::{ConnectionId, ParticipantExternalId, ParticipantId, RoomId, TrackKind};
+    use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
     use crate::track::{DataLane, TrackMeta};
 
     let mut model = session();
@@ -2128,19 +2133,19 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
             10_000,
             2,
             ResourcePermissions::Grants {
-                room: crate::entity::RoomExternalId::new("room").unwrap(),
+                room: crate::entity::RoomId::new("room").unwrap(),
                 grants: pulsebeam_core::auth::grants::GrantSet::new(vec![grant]).unwrap(),
             },
         )
         .unwrap();
-    let room = RoomId::from_bytes([7; 16]);
+    let room = RoomId::new("room").unwrap();
     let connection = ConnectionId::new();
-    let publisher_id = ParticipantId::new();
-    let publisher = ParticipantExternalId::new("publisher").unwrap();
+    let publisher_id = ParticipantId::new("publisher").unwrap();
+    let publisher = ParticipantId::new("publisher").unwrap();
     let label = "exact-label";
     let address = wire::LogicalSourceAddress {
         room: "room".into(),
-        participant_external_id: publisher.as_str().into(),
+        participant_id: publisher.as_str().into(),
         kind: wire::TrackKind::Data as i32,
         label: label.into(),
     };
@@ -2159,7 +2164,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
         let id = connection.derive_track_id(TrackKind::Data, label);
         Track::data_publication(
             TrackMeta {
-                room_id: room,
+                room: crate::entity::ProjectRoomKey::fixture(room),
                 shard_id: crate::id::ShardId::new(0),
                 id,
                 origin: publisher_id,
@@ -2186,8 +2191,8 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
     let first = data_track(connection);
     model
         .observe_participant(wire::Participant {
-            participant_id: publisher_id.as_str(),
-            participant_external_id: publisher.as_str().to_owned(),
+            participant_id: publisher_id.as_str().to_owned(),
+            room_id: "room".into(),
         })
         .unwrap();
     model
@@ -2219,11 +2224,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
     };
     assert_eq!(state.evaluated_revision, initial_revision);
     assert_eq!(
-        available
-            .participant
-            .as_ref()
-            .unwrap()
-            .participant_external_id,
+        available.participant.as_ref().unwrap().participant_id,
         "publisher"
     );
     assert_eq!(
@@ -2306,7 +2307,7 @@ fn source_lookup_revocation_and_close_finish_locally_without_execution_commands(
             wire::SourceLookupSpec {
                 source: Some(wire::LogicalSourceAddress {
                     room: "room".into(),
-                    participant_external_id: "publisher".into(),
+                    participant_id: "publisher".into(),
                     kind: wire::TrackKind::Data as i32,
                     label: "label".into(),
                 }),
@@ -2362,7 +2363,7 @@ fn source_lookup_revocation_and_close_finish_locally_without_execution_commands(
                     wire::SourceLookupSpec {
                         source: Some(wire::LogicalSourceAddress {
                             room: "room".into(),
-                            participant_external_id: "publisher".into(),
+                            participant_id: "publisher".into(),
                             kind: wire::TrackKind::Data as i32,
                             label: "label".into(),
                         }),
@@ -2385,12 +2386,12 @@ fn source_lookup_revocation_and_close_finish_locally_without_execution_commands(
 
 #[test]
 fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
-    use crate::entity::RoomExternalId;
+    use crate::entity::RoomId;
     use pulsebeam_core::auth::grants::{Action, Grant, GrantSet, TrackKind as GrantKind};
 
     let address = || wire::LogicalSourceAddress {
         room: "room".into(),
-        participant_external_id: "publisher".into(),
+        participant_id: "publisher".into(),
         kind: wire::TrackKind::Data as i32,
         label: "label".into(),
     };
@@ -2445,7 +2446,7 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
             10_000,
             1,
             ResourcePermissions::Grants {
-                room: RoomExternalId::new("current").unwrap(),
+                room: RoomId::new("current").unwrap(),
                 grants: GrantSet::new(vec![other_room_grant]).unwrap(),
             },
         )
@@ -2474,7 +2475,7 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
             10_000,
             1,
             ResourcePermissions::Grants {
-                room: RoomExternalId::new("current").unwrap(),
+                room: RoomId::new("current").unwrap(),
                 grants: GrantSet::default(),
             },
         )

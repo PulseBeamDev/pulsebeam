@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use pulsebeam_queue as mailbox;
 
-use crate::entity::ParticipantId;
+use crate::entity::ConnectionId;
 use crate::participant::ParticipantEffect;
 use crate::shard_update::{ShardUpdate, ShardUpdateOp};
 
@@ -16,7 +16,7 @@ pub(crate) struct ShardUpdateApplication {
     pending_update: Option<Box<ShardUpdate>>,
     pending_update_lifecycle: bool,
     pending_plan_index: usize,
-    pending_participant_effects: VecDeque<(ParticipantId, ParticipantEffect)>,
+    pending_participant_effects: VecDeque<(ConnectionId, ParticipantEffect)>,
 }
 
 impl ShardUpdateApplication {
@@ -60,10 +60,10 @@ impl ShardUpdateApplication {
             }
             if !self.pending_update_lifecycle {
                 self.apply_pending_participant_effects(execution);
-                for (participant, effect) in &delta.participant_effects {
-                    if !execution.apply_participant_effect(*participant, effect.clone()) {
+                for (connection, effect) in &delta.participant_effects {
+                    if !execution.apply_participant_effect(*connection, effect.clone()) {
                         self.pending_participant_effects
-                            .push_back((*participant, effect.clone()));
+                            .push_back((*connection, effect.clone()));
                     }
                 }
                 for op in delta
@@ -121,19 +121,19 @@ impl ShardUpdateApplication {
 
     pub(crate) fn apply_pending_participant_effects(&mut self, execution: &mut ShardExecution) {
         let pending = std::mem::take(&mut self.pending_participant_effects);
-        for (participant, effect) in pending {
-            if !execution.apply_participant_effect(participant, effect.clone()) {
+        for (connection, effect) in pending {
+            if !execution.apply_participant_effect(connection, effect.clone()) {
                 self.pending_participant_effects
-                    .push_back((participant, effect));
+                    .push_back((connection, effect));
             }
         }
     }
 
     fn apply_lifecycle_op(&mut self, execution: &mut ShardExecution, op: &ShardUpdateOp) {
         execution.apply_lifecycle_op(op);
-        if let ShardUpdateOp::RemoveParticipant { participant, .. } = op {
+        if let ShardUpdateOp::RemoveParticipant { connection, .. } = op {
             self.pending_participant_effects
-                .retain(|(pending, _)| *pending != *participant);
+                .retain(|(pending, _)| *pending != *connection);
         }
     }
 
