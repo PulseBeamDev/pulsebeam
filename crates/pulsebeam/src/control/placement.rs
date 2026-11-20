@@ -154,9 +154,20 @@ impl Placement {
         if mode == RoomPartitionPlacement::RoundRobin {
             return Some((slot, ShardId::new(slot.checked_rem(shards)?)));
         }
+        self.admit_without_partition(core, shards, execution, now)
+            .map(|shard| (slot, shard))
+    }
+
+    pub(super) fn admit_without_partition(
+        &self,
+        core: &ControllerCore,
+        shards: usize,
+        execution: Option<&ExecutionSnapshot>,
+        now: Instant,
+    ) -> Option<ShardId> {
         let mut counts = vec![0usize; shards];
-        for participant in core.registry.participants() {
-            if let Some(count) = counts.get_mut(participant.shard_id.index()) {
+        for connection in core.registry.connections() {
+            if let Some(count) = counts.get_mut(connection.shard_id.index()) {
                 *count = count.saturating_add(1);
             }
         }
@@ -209,7 +220,7 @@ impl Placement {
                 .then(a.3.cmp(&b.3))
                 .then(a.4.cmp(&b.4))
         })?;
-        Some((slot, ShardId::new(owner)))
+        Some(ShardId::new(owner))
     }
 
     pub fn rebalance(

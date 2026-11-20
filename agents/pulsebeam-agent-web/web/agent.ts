@@ -247,8 +247,10 @@ class AgentFacade implements AgentApi {
       current.set_snapshot_listener((snapshot: RuntimeSnapshot) => {
         if (active()) this.#runtimeSnapshot(current, snapshot);
       });
-      if (active() && this.#desiredRoom !== undefined)
-        current.join(this.#desiredRoom);
+      if (active() && this.#state.connected) {
+        if (this.#desiredRoom !== undefined) current.join(this.#desiredRoom);
+        else current.connect();
+      }
     } catch (error) {
       try {
         if (active() && this.#snapshot.connection !== "terminal-failure")
@@ -431,6 +433,18 @@ class AgentFacade implements AgentApi {
     }
   }
 
+  leaveRoom(): void {
+    if (this.#closed) throw new ResourceError("closed", "agent is closed");
+    const previousRoom = this.#desiredRoom;
+    this.#desiredRoom = undefined;
+    try {
+      this.#runtime?.leave_room();
+    } catch (error) {
+      if (this.#desiredRoom === undefined) this.#desiredRoom = previousRoom;
+      throw error;
+    }
+  }
+
   async connect(): Promise<void> {
     if (this.#closed) throw new ResourceError("closed", "agent is closed");
     if (this.#snapshot.connection === "terminal-failure" && !this.#runtime) {
@@ -439,7 +453,7 @@ class AgentFacade implements AgentApi {
     }
     if (!this.#state.connected)
       this.#applyState({ ...this.#state, connected: true });
-    else this.#runtime?.connect();
+    this.#runtime?.connect();
     await this.#ready;
   }
 
@@ -877,6 +891,7 @@ export class Agent implements AgentApi {
     this.#raw.selectAudio(policy);
   readonly isClosed = () => this.#raw.isClosed();
   readonly join = (room: string) => this.#raw.join(room);
+  readonly leaveRoom = () => this.#raw.leaveRoom();
   readonly renew = (token: string) => this.#raw.renew(token);
   readonly connect = () => this.#raw.connect();
   readonly disconnect = () => this.#raw.disconnect();

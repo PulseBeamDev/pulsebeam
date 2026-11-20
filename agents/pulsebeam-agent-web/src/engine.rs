@@ -407,6 +407,10 @@ impl ActorHandle {
         self.intent(AgentCommand::Join(room))
     }
 
+    pub(crate) fn leave_room(&self) -> Result<(), String> {
+        self.intent(AgentCommand::LeaveRoom)
+    }
+
     pub(crate) fn renew(&self, token: String) -> Result<(), String> {
         self.intent(AgentCommand::RenewAuthorization(token))
     }

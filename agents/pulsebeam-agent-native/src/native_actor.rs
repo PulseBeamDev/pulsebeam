@@ -713,6 +713,9 @@ impl Agent {
     pub fn join(&self, room: String) -> Result<(), Error> {
         self.intent(AgentCommand::Join(room))
     }
+    pub fn leave_room(&self) -> Result<(), Error> {
+        self.intent(AgentCommand::LeaveRoom)
+    }
     pub fn renew(&self, token: String) -> Result<(), Error> {
         self.intent(AgentCommand::RenewAuthorization(token))
     }

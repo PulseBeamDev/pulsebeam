@@ -2062,7 +2062,7 @@ fn denied_source_lookup_never_resolves_or_prepares_even_in_another_room() {
             10_000,
             2,
             ResourcePermissions::Grants {
-                room: crate::entity::RoomId::new("room").unwrap(),
+                joined_room: Some(crate::entity::RoomId::new("room").unwrap()),
                 grants: GrantSet::new(vec![
                     Grant::new(
                         vec!["room".into(), "other".into()],
@@ -2139,7 +2139,7 @@ fn source_lookup_is_owned_nonforwarding_and_updates_atomic_borrowed_descriptors(
             10_000,
             2,
             ResourcePermissions::Grants {
-                room: crate::entity::RoomId::new("room").unwrap(),
+                joined_room: Some(crate::entity::RoomId::new("room").unwrap()),
                 grants: pulsebeam_core::auth::grants::GrantSet::new(vec![grant]).unwrap(),
             },
         )
@@ -2457,7 +2457,7 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
             10_000,
             1,
             ResourcePermissions::Grants {
-                room: RoomId::new("current").unwrap(),
+                joined_room: Some(RoomId::new("current").unwrap()),
                 grants: GrantSet::new(vec![other_room_grant]).unwrap(),
             },
         )
@@ -2486,7 +2486,7 @@ fn source_lookup_work_is_cursor_bounded_and_authorized_for_other_rooms() {
             10_000,
             1,
             ResourcePermissions::Grants {
-                room: RoomId::new("current").unwrap(),
+                joined_room: Some(RoomId::new("current").unwrap()),
                 grants: GrantSet::default(),
             },
         )

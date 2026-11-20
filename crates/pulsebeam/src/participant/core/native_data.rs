@@ -428,6 +428,10 @@ impl Connection {
                 return;
             }
         };
+        if self.scope.joined_room().is_none() {
+            self.complete_native_preparation(work, Err(ExecutionFailureKind::Invalid.into()));
+            return;
+        }
         let DataPublicationPlan {
             track_id,
             lane,
@@ -584,11 +588,12 @@ impl Connection {
     }
 
     fn admit_native_data(&mut self, reference: NonZeroU64) -> Option<(&mut DataPublication, bool)> {
+        let room = self.scope.joined_room()?;
         let publication = self.native_data.publications.get_mut(&reference.get())?;
         let first_admission = if let DataPublicationState::Pending(track_id) = &publication.state {
             let id = PublicationKey::Data(entity::PublicationId::mint());
             let meta = track::TrackMeta {
-                room: self.room,
+                room,
                 shard_id: self.shard_id,
                 id,
                 origin: self.participant_id,

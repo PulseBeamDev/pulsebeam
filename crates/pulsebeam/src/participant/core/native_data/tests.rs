@@ -165,7 +165,8 @@ pub(in crate::participant::core) fn participant_with_capabilities(
     ));
     let mut config = ConnectionConfig {
         manual_sub: true,
-        room: crate::entity::ProjectRoomKey::fixture(entity::RoomId::new("native-data").unwrap()),
+        scope: crate::entity::ProjectRoomKey::fixture(entity::RoomId::new("native-data").unwrap())
+            .into(),
         participant_id: crate::entity::fixture_participant_id(),
         connection_id: entity::ConnectionId::new(),
         profile: SignalingProtocol::State,
@@ -180,7 +181,7 @@ pub(in crate::participant::core) fn participant_with_capabilities(
     let (signaling, endpoint) = crate::control::native::fixture::NativeControl::new(
         config.participant_id,
         config.connection_id,
-        config.room.room,
+        config.scope.room.unwrap(),
         Some(capabilities),
         expiry,
     );

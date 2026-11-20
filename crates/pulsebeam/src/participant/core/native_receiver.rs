@@ -288,7 +288,9 @@ impl Connection {
             return;
         }
         let id = *track.id().as_bytes();
-        if track.meta().room != self.room && !self.native_receivers.sources.contains_key(&id) {
+        if Some(track.meta().room) != self.scope.joined_room()
+            && !self.native_receivers.sources.contains_key(&id)
+        {
             return;
         }
         let source = self
@@ -476,7 +478,7 @@ impl Connection {
         let source = source_track.id();
         let metadata = source_track.meta();
         if metadata.room != source_room
-            || metadata.room.project != self.room.project
+            || metadata.room.project != self.scope.project
             || metadata.origin == self.participant_id
             || self
                 .native_receivers

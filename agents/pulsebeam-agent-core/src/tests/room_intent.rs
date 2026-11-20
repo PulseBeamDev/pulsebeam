@@ -20,6 +20,33 @@ fn begin_join(agent: &mut Agent, room: &str) -> (Generation, OperationId) {
 }
 
 #[test]
+fn roomless_bootstrap_omits_presence_and_unchanged_presence_does_not_reconnect() {
+    let mut agent = Agent::new(config()).unwrap();
+    agent.command(AgentCommand::Connect).unwrap();
+    let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = next_effect(&mut agent) else {
+        panic!("expected a roomless offer");
+    };
+    let cid = channel(1);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation,
+            offer: offer(),
+            resources: resources(cid),
+        }))
+        .unwrap();
+    let (operation, request) = native_request(&mut agent, generation);
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert!(body.get("room").is_none());
+    activate_connection(&mut agent, generation, operation, cid);
+    assert_eq!(agent.snapshot().connection, ConnectionState::Connected);
+    assert_eq!(agent.snapshot().room_id, None);
+    assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p1"));
+    let snapshot = agent.snapshot().clone();
+    agent.command(AgentCommand::LeaveRoom).unwrap();
+    assert_eq!(agent.snapshot(), &snapshot);
+}
+
+#[test]
 fn join_validates_before_mutation_and_retries_a_settled_denial_once() {
     let mut agent = Agent::new(config()).unwrap();
     for room in [

@@ -14,7 +14,7 @@ fn permissions(
     label: Option<&str>,
 ) -> ResourcePermissions {
     ResourcePermissions::Grants {
-        room: RoomId::new("sdp-scope").unwrap(),
+        joined_room: Some(RoomId::new("sdp-scope").unwrap()),
         grants: GrantSet::new(vec![
             Grant::new(
                 vec!["sdp-scope".into()],
@@ -71,19 +71,19 @@ fn current_room_join_is_checked_before_preparation_and_commit() {
     for permissions in [
         ResourcePermissions::Denied,
         ResourcePermissions::Grants {
-            room: room_external.clone(),
+            joined_room: Some(room_external),
             grants: GrantSet::default(),
         },
         ResourcePermissions::Grants {
-            room: room_external.clone(),
+            joined_room: Some(room_external),
             grants: grant_set("sdp-scope", Action::Publish),
         },
         ResourcePermissions::Grants {
-            room: room_external,
+            joined_room: Some(room_external),
             grants: grant_set("other", Action::Join),
         },
         ResourcePermissions::Grants {
-            room: RoomId::new("other").unwrap(),
+            joined_room: Some(RoomId::new("other").unwrap()),
             grants: grant_set("*", Action::Join),
         },
     ] {
@@ -94,7 +94,7 @@ fn current_room_join_is_checked_before_preparation_and_commit() {
             actor.begin_create_participant(
                 ParticipantState {
                     manual_sub: true,
-                    room_id: room,
+                    room_id: Some(room),
                     participant_id: participant,
                     connection_id: connection_id(2),
                     old_connection_id: None,
@@ -180,7 +180,7 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
     assert_eq!(refreshed.permissions(), lease.permissions());
     let state = |lease| ParticipantState {
         manual_sub: false,
-        room_id: room,
+        room_id: Some(room),
         participant_id: participant,
         connection_id: connection_id(1),
         old_connection_id: None,
@@ -213,7 +213,7 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
     );
     assert!(actor.command_backlog.is_empty());
     lease.permissions = ResourcePermissions::Grants {
-        room: RoomId::new("sdp-scope").unwrap(),
+        joined_room: Some(RoomId::new("sdp-scope").unwrap()),
         grants: GrantSet::new(
             [
                 (GrantKind::Audio, "audio"),
@@ -249,11 +249,11 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
         .begin_create_participant(state(lease), publishing_offer())
         .unwrap();
     assert!(actor.core.registry.partition_reserved(
-        pending.room,
+        pending.scope.joined_room().unwrap(),
         participant,
         connection_id(1),
         pending.shard,
-        pending.partition_index
+        pending.partition_index.unwrap()
     ));
     let Some(ShardCommand::MaterializeParticipant { config, .. }) = pending.command.as_ref() else {
         panic!("authorized materialization")
@@ -287,10 +287,11 @@ async fn whip_checks_all_canonical_publications_before_materialization_and_retai
             Some("audio" | "video")
         ));
     }
-    actor
-        .core
-        .registry
-        .release_partition(pending.room, participant, connection_id(1));
+    actor.core.registry.release_partition(
+        pending.scope.joined_room().unwrap(),
+        participant,
+        connection_id(1),
+    );
     actor.core.release_transport(pending.transport, now);
 }
 

@@ -172,6 +172,10 @@ impl Connection {
         let Some(work) = self.current_native_preparation(work) else {
             return;
         };
+        let Some(room) = self.scope.joined_room() else {
+            self.complete_native_preparation(work, Err(ExecutionFailureKind::Invalid.into()));
+            return;
+        };
         let RtpPublicationPlan {
             track_id,
             kind,
@@ -316,7 +320,7 @@ impl Connection {
         let Some((slot, track)) = self.upstream.insert_managed_track(mid, kind, || {
             let id = PublicationKey::new(kind, entity::PublicationId::mint());
             let meta = track::TrackMeta {
-                room: self.room,
+                room,
                 shard_id: self.shard_id,
                 id,
                 origin: self.participant_id,

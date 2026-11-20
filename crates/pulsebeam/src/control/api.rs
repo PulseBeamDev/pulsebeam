@@ -311,7 +311,14 @@ struct NativeRequest {
     #[schema(example = "pulsebeam.media.v1")]
     profile: String,
     offer: String,
-    room: String,
+    #[serde(default, deserialize_with = "deserialize_requested_room")]
+    room: Option<String>,
+}
+
+fn deserialize_requested_room<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 fn parse_native_request(body: &[u8]) -> Result<NativeRequest, ApiError> {
@@ -320,8 +327,6 @@ fn parse_native_request(body: &[u8]) -> Result<NativeRequest, ApiError> {
         return Err(invalid());
     }
     let request: NativeRequest = serde_json::from_slice(body).map_err(|_| invalid())?;
-    pulsebeam_core::identity::RoomId::new(&request.room)
-        .map_err(|_| ApiError::BadRequest("invalid room external id".to_owned()))?;
     if request.profile != pulsebeam_proto::state::PROFILE {
         return Err(ApiError::BadRequest(
             "unsupported native profile".to_owned(),
@@ -337,7 +342,8 @@ struct NativeResponse<'a> {
     rtp_capabilities: &'a pulsebeam_proto::state::RtpCapabilities,
     #[schema(value_type = Vec<String>)]
     data_delivery: [pulsebeam_proto::state::DataDelivery; 3],
-    room_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    room_id: Option<&'a str>,
     #[schema(value_type = String)]
     participant_id: ParticipantId,
     #[schema(value_type = String)]
@@ -360,7 +366,10 @@ impl<'a> NativeResponse<'a> {
                 pulsebeam_proto::state::DataDelivery::Lossy,
                 pulsebeam_proto::state::DataDelivery::Ordered,
             ],
-            room_id: authorization.room_id.as_str(),
+            room_id: authorization
+                .room_id
+                .as_ref()
+                .map(pulsebeam_core::identity::RoomId::as_str),
             participant_id: authorization.participant_id,
             connection_id,
             answer,
@@ -513,7 +522,10 @@ async fn create_native(state: State<AppState>, request: Request) -> Result<Respo
 
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-struct NativeAdmissionRequest {}
+struct NativeAdmissionRequest {
+    #[serde(default)]
+    roomless: bool,
+}
 
 #[derive(Serialize, ToSchema)]
 struct NativeAdmissionResponse {
@@ -776,8 +788,9 @@ async fn create_sdp_profile(
         .unwrap_or_default()
         .as_secs();
     let principal = authenticate_bearer(&headers, &state.key_registry, unix_now)?;
+    let room = requested_sdp_room(request.uri())?;
     let authorization = principal
-        .authorize_room(requested_sdp_room(request.uri())?)
+        .authorize_room(room)
         .map_err(|_| controller::ControllerError::AuthorizationRejected)?;
     ensure_sdp_content_type(&headers)?;
     let body = to_bytes(request.into_body(), MAX_SIGNALING_BODY_BYTES)
@@ -802,7 +815,7 @@ async fn create_sdp_profile(
                 controller::CreateParticipant {
                     state: ParticipantState {
                         manual_sub: false,
-                        room_id: authorization.room_id,
+                        room_id: Some(room),
                         participant_id: authorization.participant_id,
                         connection_id,
                         old_connection_id: None,
@@ -1324,9 +1337,13 @@ mod tests {
         let proof = authority
             .issue(principal.clone(), now, &mut entropy)
             .unwrap();
-        let binding =
-            RequestBinding::for_request(profile, &authorization.room_id, offer, credential)
-                .unwrap();
+        let binding = RequestBinding::for_request(
+            profile,
+            authorization.room_id.as_ref().unwrap(),
+            offer,
+            credential,
+        )
+        .unwrap();
         let Admission::Start(ticket) = authority
             .begin(
                 &principal,
@@ -1481,7 +1498,10 @@ mod tests {
             "v=0\r\n",
         ))
         .unwrap();
-        assert_eq!(response_body["room_id"], authorization.room_id.as_str());
+        assert_eq!(
+            response_body["room_id"],
+            authorization.room_id.as_ref().unwrap().as_str()
+        );
         assert!(response_body.get("room_external_id").is_none());
         let long_location = HeaderValue::from_bytes(&vec![b'a'; 300_000]).unwrap();
         let escaped = "\0".repeat(MAX_NATIVE_SDP_BYTES);
@@ -1934,7 +1954,7 @@ mod tests {
                     panic!("expected create command")
                 };
                 assert_eq!(message.state.profile, profile);
-                assert_eq!(message.state.room_id.as_str(), ROOM);
+                assert_eq!(message.state.room_id.unwrap().as_str(), ROOM);
                 assert_eq!(message.state.participant_id.as_str(), PARTICIPANT);
                 assert!(!message.state.manual_sub);
                 let authorization = authenticate_bearer(
@@ -1946,7 +1966,7 @@ mod tests {
                         .as_secs(),
                 )
                 .unwrap()
-                .authorize_room(message.state.room_id)
+                .authorize_presence(message.state.room_id)
                 .unwrap();
                 let location = HeaderValue::from_str(&format!(
                     "https://media.example/api/v1/{resource}/{}",
@@ -2092,10 +2112,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.profile, pulsebeam_proto::state::PROFILE);
-        assert_eq!(selected.room, "other");
+        assert_eq!(selected.room.as_deref(), Some("other"));
+        assert!(
+            parse_native_request(br#"{"profile":"pulsebeam.media.v1","offer":"v=0"}"#)
+                .unwrap()
+                .room
+                .is_none()
+        );
         for body in [
             br#"{"offer":"v=0"}"#.as_slice(),
-            br#"{"profile":"pulsebeam.media.v1","offer":"v=0"}"#,
             br#"["pulsebeam.media.v1","v=0","other"]"#,
             br#"{"profile":"pulsebeam.media.v1","offer":"v=0","offer":"v=1","room":"other"}"#,
             br#"{"profile":"pulsebeam.media.v1","offer":"v=0","room":"other","r\u006fom":"another"}"#,

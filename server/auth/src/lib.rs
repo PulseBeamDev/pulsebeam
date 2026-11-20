@@ -206,7 +206,10 @@ mod tests {
             assert_eq!(selected.is_ok(), golden.name != "deny-all");
             if let Ok(authorization) = selected {
                 assert_eq!(authorization.grants, input.grants);
-                assert_eq!(authorization.room_id.as_str(), input.requested_room);
+                assert_eq!(
+                    authorization.room_id.as_ref().unwrap().as_str(),
+                    input.requested_room
+                );
                 assert_eq!(authorization.participant_id.as_str(), input.participant);
                 assert_eq!(authorization.expiry.unix_seconds(), exp);
             }

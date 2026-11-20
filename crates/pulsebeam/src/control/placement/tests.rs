@@ -139,7 +139,7 @@ fn uncommitted_admission_leaves_no_reservation_and_explicit_round_robin_is_prese
             None
         )
     );
-    assert_eq!(core.registry.participants().count(), 0);
+    assert_eq!(core.registry.connections().count(), 0);
     for index in 0..7 {
         let participant = crate::entity::fixture_participant_id();
         let (slot, shard) = admit(&core, &room, &participant, 3, None).unwrap();

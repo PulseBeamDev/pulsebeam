@@ -739,6 +739,231 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
     println!("[native-lifecycle] {}", serde_json::Value::Array(semantics));
 }
 
+#[test]
+fn native_roomless_reception_survives_join_and_leave() {
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse().expect("simulation seed must be a u64"))
+        .unwrap_or(NATIVE_RUNTIME_SEED);
+    let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    pulsebeam_runtime::net::shaper::seed_impairments(seed);
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(30))
+        .rng_seed(seed)
+        .build();
+    let subnet = reserve_subnet();
+    let server_ip = subnet_ip(subnet, 1);
+    let client_ip = subnet_ip(subnet, 2);
+    sim.host(server_ip, move || async move {
+        start_sfu_node_with(
+            server_ip,
+            pulsebeam_runtime::rand::seeded_rng(seed),
+            DEFAULT_SIM_SHARDS,
+            false,
+        )
+        .await
+        .map_err(Into::into)
+    });
+    sim.client(client_ip, async move {
+        roomless_presence_scenario(client_ip, server_ip)
+            .await
+            .map_err(Into::into)
+    });
+    run_sim_or_timeout(&mut sim, Duration::from_secs(30))
+        .expect("roomless presence simulation failed");
+}
+
+async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<()> {
+    use core_ffi::{ConnectionState, PublicationAdmissionStatus as Admission, TopicMode};
+    let host = NativeHost::bind(client_ip)?;
+    let make_agent = |participant: &str, grants: serde_json::Value| -> anyhow::Result<Arc<Agent>> {
+        let key = pulsebeam_server::insecure_dev_api_key().unwrap();
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 60;
+        let token = pulsebeam_server::sign_participant_token(
+            &key,
+            &serde_json::from_value(grants)?,
+            participant,
+            expiry,
+        )?
+        .token;
+        let config = Config::new(pulsebeam_agent_core::AgentConfig {
+            endpoint: format!("http://{server_ip}:7070"),
+            token,
+            retry: Default::default(),
+            log_level: Default::default(),
+        });
+        let host = host.clone();
+        let (runtime, actor) = RuntimeAgent::managed_with_services(
+            config,
+            Host::new(create_http_client()),
+            move || host.runtime(),
+        )?;
+        tokio::task::spawn_local(actor);
+        Ok(Agent::from_runtime(runtime))
+    };
+    let publisher = make_agent(
+        "present-publisher",
+        serde_json::json!([{"rooms":["stage"],"allow":["join","publish"]}]),
+    )?;
+    let viewer = make_agent(
+        "presence-viewer",
+        serde_json::json!([
+            {"rooms":["stage"],"allow":["discover","subscribe"]},
+            {"rooms":["lobby"],"allow":["join","publish"]},
+            {"rooms":["listen"],"allow":["join"]}
+        ]),
+    )?;
+    let sender = publisher
+        .data("events".into(), TopicMode::Ordered)?
+        .publish()?;
+    publisher.join("stage".into())?;
+    wait_connected(&publisher, None).await?;
+
+    let watch = viewer.room("stage".into())?.watch(None)?;
+    let watch_updates = watch.updates()?;
+    let receiver = viewer
+        .room("stage".into())?
+        .participant("present-publisher".into())?
+        .data("events".into(), TopicMode::Ordered)?
+        .subscribe()?;
+    let local = viewer
+        .audio("microphone".into())?
+        .publish(Default::default())?;
+    let local_updates = local.updates()?;
+    viewer.connect().await?;
+    let mut previous = None;
+    let mut source = None;
+    let mut local_id = None;
+    for (room, payload) in [
+        (None, b"roomless".as_slice()),
+        (Some("lobby"), b"joined"),
+        (None, b"left"),
+        (Some("listen"), b"restricted"),
+        (Some("lobby"), b"rejoined"),
+    ] {
+        if previous.is_some() {
+            if let Some(room) = room {
+                viewer.join(room.into())?;
+            } else {
+                viewer.leave_room()?;
+            }
+            anyhow::ensure!(
+                viewer.snapshot().room_id.is_none(),
+                "old presence remained visible"
+            );
+        }
+        let active = wait_connected(&viewer, previous).await?;
+        anyhow::ensure!(active.room_id.as_deref() == room);
+        previous = active.generation;
+        match room {
+            Some("lobby") => {
+                let admitted = wait_publication_admitted(&local_updates).await?;
+                let id = admitted
+                    .admission
+                    .publication_id
+                    .ok_or_else(|| anyhow::anyhow!("admitted publication has no ID"))?;
+                anyhow::ensure!(
+                    local_id.as_ref() != Some(&id),
+                    "rejoin reused the retired publication ID"
+                );
+                local_id = Some(id);
+            }
+            Some("listen") => {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let state = local_updates
+                            .next()
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("publication observation closed"))?;
+                        if state.admission.status == Admission::Rejected {
+                            anyhow::ensure!(
+                                state.admission.publication_id.is_none(),
+                                "denied Publish produced an ID"
+                            );
+                            break anyhow::Ok(());
+                        }
+                    }
+                })
+                .await??
+            }
+            _ => anyhow::ensure!(local.state().admission.status == Admission::Pending),
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state = watch_updates
+                    .next()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("watch closed"))?;
+                if let Some(page) = state.page {
+                    let participants = page.participants();
+                    if participants.iter().any(|entry| {
+                        entry.id == "present-publisher"
+                            && entry
+                                .publications
+                                .iter()
+                                .any(|track| track.track_id == "events")
+                    }) {
+                        anyhow::ensure!(
+                            participants.len() == 1,
+                            "viewer leaked presence into the source room"
+                        );
+                        break anyhow::Ok(());
+                    }
+                }
+            }
+        })
+        .await??;
+        let publication = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut interval = tokio::time::interval(Duration::from_millis(25));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => sender.send(payload.to_vec()).await?,
+                    update = receiver.next() => match update? {
+                        pulsebeam_agent_core::DataUpdate::Event { event: pulsebeam_agent_core::DataEvent::Message {
+                            participant_id, publication_id, data, ..
+                        }} if data == payload => {
+                            anyhow::ensure!(participant_id == "present-publisher");
+                            return anyhow::Ok(publication_id);
+                        }
+                        pulsebeam_agent_core::DataUpdate::Closed => anyhow::bail!("receiver closed across presence change"),
+                        _ => {}
+                    }
+                }
+            }
+        }).await??;
+        if let Some(expected) = &source {
+            anyhow::ensure!(*expected == publication);
+        }
+        source = Some(publication);
+    }
+    viewer.join("stage".into())?;
+    let snapshots = viewer.snapshots();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
+                anyhow::bail!("viewer observation closed");
+            };
+            if snapshot.connection == ConnectionState::TerminalFailure {
+                anyhow::ensure!(snapshot.room_id.is_none(), "denied Join exposed presence");
+                anyhow::ensure!(
+                    snapshot.failure.is_some_and(
+                        |failure| failure.class == core_ffi::FailureClass::Authorization
+                    )
+                );
+                break anyhow::Ok(());
+            }
+        }
+    })
+    .await??;
+    viewer.close().await?;
+    publisher.close().await?;
+    Ok(())
+}
+
 async fn run_peer(
     name: &str,
     remote: &str,

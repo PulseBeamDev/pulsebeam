@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::entity::EndpointKey;
 use pulsebeam_queue as mailbox;
 use pulsebeam_runtime::net;
@@ -311,7 +312,8 @@ impl ShardExecution {
                 let removed = self.registry.remove(*connection, *address);
                 if let Some(removed) = removed
                     && let Some(index) = self.pending_replacements.iter().position(|(_, config)| {
-                        config.room == removed.room
+                        removed.scope.room.is_some()
+                            && config.scope == removed.scope
                             && config.participant_id == removed.participant_id
                     })
                     && let Some((transport, config)) = self.pending_replacements.remove(index)
@@ -710,11 +712,11 @@ impl ShardExecution {
                     let _ = ack.send(false);
                     return Some(());
                 }
-                let endpoint = EndpointKey {
-                    room: config.room,
-                    participant: config.participant_id,
-                };
-                let materialized = if self.registry.resolve_endpoint(endpoint).is_some() {
+                let endpoint = config.scope.endpoint(config.participant_id);
+                let materialized = if endpoint
+                    .and_then(|endpoint| self.registry.resolve_endpoint(endpoint))
+                    .is_some()
+                {
                     // Materialization and plan updates use independent mailboxes. The
                     // controller acknowledges this command before it can stage old
                     // incarnation cleanup, so defer insertion until that cleanup retires
@@ -856,11 +858,11 @@ impl ShardExecution {
         cfg: ConnectionConfig,
     ) -> bool {
         debug_assert_eq!(transport.shard(), self.shard_id);
-        let endpoint = EndpointKey {
-            room: cfg.room,
-            participant: cfg.participant_id,
-        };
-        if let Some(previous) = self.registry.resolve_endpoint(endpoint) {
+        if let Some(previous) = cfg
+            .scope
+            .endpoint(cfg.participant_id)
+            .and_then(|endpoint| self.registry.resolve_endpoint(endpoint))
+        {
             self.timers.cancel(previous);
         }
         let key = self.registry.insert(cfg, transport);
@@ -916,7 +918,7 @@ impl ShardExecution {
                 participant_id: participant.participant_id,
                 connection_id: participant.connection_id,
                 handle: key,
-                room_id: participant.room,
+                joined_room: participant.scope.joined_room(),
             };
             let mut sink = self.pipeline.participant_sink(who);
             if let Some(deadline) = participant.poll(now, &mut sink) {
@@ -1135,7 +1137,7 @@ mod wrong_owner_tests {
                         transport: address,
                         config: Box::new(ConnectionConfig {
                             manual_sub: false,
-                            room: crate::entity::ProjectRoomKey::fixture(room_id),
+                            scope: crate::entity::ProjectRoomKey::fixture(room_id).into(),
                             participant_id,
                             connection_id,
                             profile: crate::control::controller::SignalingProtocol::State,
@@ -1190,7 +1192,7 @@ mod wrong_owner_tests {
                     participant_id,
                     connection_id,
                     handle,
-                    room_id: crate::entity::ProjectRoomKey::fixture(room_id),
+                    joined_room: Some(crate::entity::ProjectRoomKey::fixture(room_id)),
                 })
                 .connected(source, destination, ingress);
             assert_eq!(core.flush_participant_events(&router, 1), 1);
@@ -1252,9 +1254,10 @@ mod wrong_owner_tests {
                     ));
                 ConnectionConfig {
                     manual_sub: false,
-                    room: crate::entity::ProjectRoomKey::fixture(
+                    scope: crate::entity::ProjectRoomKey::fixture(
                         crate::entity::RoomId::new(ROOM).unwrap(),
-                    ),
+                    )
+                    .into(),
                     participant_id: participant,
                     connection_id,
                     profile: crate::control::controller::SignalingProtocol::State,
@@ -1280,7 +1283,7 @@ mod wrong_owner_tests {
             let old = config();
             let old_id = old.connection_id;
             let endpoint = EndpointKey {
-                room: old.room,
+                room: old.scope.joined_room().unwrap(),
                 participant,
             };
             let mut trace = tempfile::tempfile().unwrap();
@@ -1446,12 +1449,9 @@ mod wrong_owner_tests {
             assert!(core.next_timer_deadline().is_some());
 
             let mut other = config();
-            other.room.project = crate::entity::ProjectId::new();
+            other.scope.project = crate::entity::ProjectId::new();
             let other_connection = other.connection_id;
-            let other_endpoint = EndpointKey {
-                room: other.room,
-                participant,
-            };
+            let other_endpoint = other.scope.endpoint(participant).unwrap();
             let other_address = NodeTransportAddress::new(TransportRoute::new(shard, 54), 1);
             assert!(materialize(&mut core, other_address, other).await.unwrap());
             let other_handle = core

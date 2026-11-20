@@ -486,6 +486,7 @@ export interface Agent {
   selectAudio(policy: AudioDemand): Promise<AudioSelection>;
   /** Synchronously replace the desired room; Core owns admission and recovery. */
   join(room: string): void;
+  leaveRoom(): void;
   renew(token: string): void;
   connect(): Promise<void>;
   disconnect(): Promise<void>;

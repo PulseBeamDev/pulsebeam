@@ -496,7 +496,12 @@ fn native_request(agent: &mut Agent, generation: Generation) -> (OperationId, Ht
     {
         assert_eq!(*actual, Some(generation));
         assert_eq!(request.method, HttpMethod::Post);
-        assert_eq!(request.body, b"{}");
+        let expected: &[u8] = if agent.snapshot().desired_room.is_some() {
+            b"{}"
+        } else {
+            br#"{"roomless":true}"#
+        };
+        assert_eq!(request.body, expected);
         assert!(
             request
                 .headers
@@ -607,10 +612,16 @@ fn activate_connection(
     } else {
         ConnectionState::ApplyingAnswer
     };
+    let mut response = create_response("p1", "etag-1", PARTICIPANT_URI);
+    if agent.snapshot().desired_room.is_none() {
+        let mut body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        body.as_object_mut().unwrap().remove("room_id");
+        response.body = serde_json::to_vec(&body).unwrap();
+    }
     agent
         .handle(HostEvent::Http(HttpEvent::Response {
             operation,
-            response: create_response("p1", "etag-1", PARTICIPANT_URI),
+            response,
         }))
         .unwrap();
     assert_eq!(
@@ -2520,15 +2531,29 @@ fn explicit_connect_retries_terminal_intent_but_not_an_in_flight_attempt() {
 }
 
 #[test]
-fn explicit_connect_waits_for_a_concrete_join_before_preparing_a_peer() {
+fn selecting_a_room_during_roomless_bootstrap_retires_the_old_peer_first() {
     let mut agent = Agent::new(config()).unwrap();
     agent.command(AgentCommand::Connect).unwrap();
-    assert!(agent.next_effect_after_turn().is_none());
+    let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = next_effect(&mut agent) else {
+        panic!("expected roomless offer");
+    };
     agent.command(AgentCommand::Join("room".into())).unwrap();
-    assert!(matches!(
+    assert_eq!(
         next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::CreateOffer { .. })
-    ));
+        Effect::Rtc(RtcEffect::Close { generation })
+    );
+    assert!(agent.next_effect_after_turn().is_none());
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Closed { generation }))
+        .unwrap();
+    let Effect::Rtc(RtcEffect::CreateOffer {
+        generation: replacement,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("expected joined offer after retirement");
+    };
+    assert_ne!(replacement, generation);
     agent.command(AgentCommand::Connect).unwrap();
     assert!(agent.next_effect_after_turn().is_none());
 }

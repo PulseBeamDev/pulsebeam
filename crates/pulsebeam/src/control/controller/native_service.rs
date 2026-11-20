@@ -105,7 +105,7 @@ impl ControllerActor {
     fn source_room(&self, connection: ConnectionId, room: &str) -> Option<ProjectRoomKey> {
         let external = crate::entity::RoomId::new(room).ok()?;
         let (_, meta) = self.core.registry.get_connection(connection)?;
-        let project = meta.room.project;
+        let project = meta.scope.project;
         let room = match &meta.authorization {
             Some(_) => external,
             #[cfg(test)]
@@ -127,7 +127,7 @@ impl ControllerActor {
                 .get_incarnation(native.handler.participant, connection)
             && meta.profile == SignalingProtocol::State
             && let Some(lease) = &meta.authorization
-            && lease.matches_endpoint(meta.room, native.handler.participant)
+            && lease.matches_scope(meta.scope, native.handler.participant)
         {
             return Some(lease);
         }
@@ -136,7 +136,7 @@ impl ControllerActor {
             && retiring.meta.connection_id == connection
             && retiring.meta.profile == SignalingProtocol::State
             && let Some(lease) = &retiring.meta.authorization
-            && lease.matches_endpoint(retiring.meta.room, retiring.handler.participant)
+            && lease.matches_scope(retiring.meta.scope, retiring.handler.participant)
         {
             return Some(lease);
         }
@@ -145,7 +145,7 @@ impl ControllerActor {
             let lease = pending.authorization.as_ref()?;
             (pending.connection_id == connection
                 && pending.profile == SignalingProtocol::State
-                && lease.matches_endpoint(pending.room, pending.participant))
+                && lease.matches_scope(pending.scope, pending.participant))
             .then_some(lease)
         })
     }
@@ -257,13 +257,13 @@ impl ControllerActor {
             .core
             .registry
             .get_incarnation(participant, connection)
-            .filter(|meta| meta.room_id() == native.room)
+            .filter(|meta| meta.scope.room == native.room)
         else {
             self.catalog.remove_connection(connection);
             self.source_lookup_index.remove_connection(connection);
             return;
         };
-        let room = meta.room;
+        let room = meta.scope.joined_room();
         let unix_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -271,9 +271,12 @@ impl ControllerActor {
         match native.service(
             unix_now,
             |track| {
-                let track =
-                    self.lifecycle
-                        .source(room, room, participant, track, &self.core.registry)?;
+                let track = self.lifecycle.source_for_connection(
+                    room?,
+                    connection,
+                    track,
+                    &self.core.registry,
+                )?;
                 Some(crate::control::native::ResolvedSource {
                     track,
                     publisher: &track.meta().origin,
@@ -281,10 +284,9 @@ impl ControllerActor {
             },
             |source_room, track| {
                 let source_room = self.source_room(connection, source_room)?;
-                let track = self.lifecycle.source(
-                    room,
+                let track = self.lifecycle.source_for_connection(
                     source_room,
-                    participant,
+                    connection,
                     track,
                     &self.core.registry,
                 )?;
@@ -296,9 +298,8 @@ impl ControllerActor {
             |address| {
                 let source_room = self.source_room(connection, &address.room)?;
                 let track = self.lifecycle.source_by_address(
-                    room,
                     source_room,
-                    participant,
+                    connection,
                     address,
                     &self.core.registry,
                 )?;
@@ -463,10 +464,10 @@ impl ControllerActor {
         else {
             return;
         };
-        if participant != meta.origin || publisher.room != meta.room {
+        if participant != meta.origin || publisher.scope.joined_room() != Some(meta.room) {
             return;
         }
-        let room = publisher.room;
+        let room = meta.room;
         if let Some(track_id) = meta.track_id {
             self.source_lookup_index.source_changed(SourceLookupKey {
                 room,

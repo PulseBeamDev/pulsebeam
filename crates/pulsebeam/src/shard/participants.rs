@@ -73,12 +73,9 @@ impl ParticipantRegistry {
         ingress: NodeTransportAddress,
     ) -> ParticipantHandle {
         debug_assert_eq!(ingress.shard(), self.shard_id);
-        let endpoint = EndpointKey {
-            room: cfg.room,
-            participant: cfg.participant_id,
-        };
+        let endpoint = cfg.scope.endpoint(cfg.participant_id);
         let connection_id = cfg.connection_id;
-        if let Some(previous) = self.by_endpoint.get(&endpoint).copied() {
+        if let Some(previous) = endpoint.and_then(|endpoint| self.resolve_endpoint(endpoint)) {
             let _ = self.remove_handle(previous);
         }
         let connection = Connection::new(cfg, self.shard_id, self.max_gso_segments);
@@ -87,7 +84,9 @@ impl ParticipantRegistry {
             queued_dirty: false,
             ingress,
         }));
-        self.by_endpoint.insert(endpoint, handle);
+        if let Some(endpoint) = endpoint {
+            self.by_endpoint.insert(endpoint, handle);
+        }
         let prior = self.by_connection.insert(connection_id, handle);
         debug_assert!(prior.is_none(), "a connection must be materialized once");
         self.install_transport(ingress, handle);
@@ -109,11 +108,9 @@ impl ParticipantRegistry {
 
     fn remove_handle(&mut self, handle: ParticipantHandle) -> Option<Box<ParticipantMeta>> {
         let meta = self.participants.remove(handle)?;
-        let endpoint = EndpointKey {
-            room: meta.room,
-            participant: meta.participant_id,
-        };
-        if self.by_endpoint.get(&endpoint) == Some(&handle) {
+        if let Some(endpoint) = meta.scope.endpoint(meta.participant_id)
+            && self.by_endpoint.get(&endpoint) == Some(&handle)
+        {
             self.by_endpoint.remove(&endpoint);
         }
         self.by_connection.remove(&meta.connection_id);
@@ -234,6 +231,57 @@ mod tests {
             std::mem::size_of::<ParticipantMeta>() > 4096,
             "a participant is small enough to inline now; revisit the Box and this test"
         );
+    }
+
+    #[test]
+    fn unjoined_transports_do_not_claim_or_replace_an_endpoint() {
+        use crate::control::{NegotiatedResources, controller::SignalingProtocol};
+        use crate::entity::{ConnectionScope, ProjectRoomKey, RoomId};
+        use crate::route::TransportRoute;
+
+        let shard = ShardId::new(0);
+        let room = ProjectRoomKey::fixture(RoomId::new("stage").unwrap());
+        let participant = crate::entity::fixture_participant_id();
+        let mut registry = ParticipantRegistry::new(shard, 1, 1);
+        let mut install = |scope, index| {
+            let connection_id = ConnectionId::new();
+            let transport = NodeTransportAddress::new(TransportRoute::new(shard, index), 1);
+            let handle = registry.insert(
+                ConnectionConfig {
+                    manual_sub: true,
+                    scope,
+                    participant_id: participant,
+                    connection_id,
+                    profile: SignalingProtocol::State,
+                    allow_topic_channels: false,
+                    topic_publications: Default::default(),
+                    authorization_expiry: None,
+                    rtc: crate::control::application_only_test_connection(),
+                    resources: NegotiatedResources::empty_for_test(),
+                },
+                transport,
+            );
+            (connection_id, transport, handle)
+        };
+        let roomless = ConnectionScope {
+            project: room.project,
+            room: None,
+        };
+        let (first, first_transport, first_handle) = install(roomless, 1);
+        let (_, _, joined_handle) = install(room.into(), 2);
+        let (second, second_transport, second_handle) = install(roomless, 3);
+        let endpoint = EndpointKey { room, participant };
+        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.resolve_endpoint(endpoint), Some(joined_handle));
+        assert_eq!(registry.resolve_connection(first), Some(first_handle));
+        assert_eq!(registry.resolve_connection(second), Some(second_handle));
+        assert!(registry.remove(first, first_transport).is_some());
+        assert!(registry.resolve_connection(first).is_none());
+        assert_eq!(
+            registry.resolve_transport(second_transport),
+            Some(second_handle)
+        );
+        assert_eq!(registry.resolve_endpoint(endpoint), Some(joined_handle));
     }
 
     #[test]

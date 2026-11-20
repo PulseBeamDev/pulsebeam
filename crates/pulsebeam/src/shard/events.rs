@@ -19,7 +19,7 @@ pub(crate) struct ParticipantBinding {
     pub participant_id: ParticipantId,
     pub connection_id: ConnectionId,
     pub handle: ParticipantHandle,
-    pub room_id: ProjectRoomKey,
+    pub joined_room: Option<ProjectRoomKey>,
 }
 
 pub enum ParticipantEvent {
@@ -84,7 +84,7 @@ impl EventPipeline {
             id: who.participant_id,
             connection_id: who.connection_id,
             key: who.handle,
-            room_id: who.room_id,
+            joined_room: who.joined_room,
             pipeline: self,
         }
     }
@@ -127,7 +127,7 @@ pub struct PipelineSinkRef<'a> {
     id: ParticipantId,
     connection_id: ConnectionId,
     key: ParticipantHandle,
-    room_id: ProjectRoomKey,
+    joined_room: Option<ProjectRoomKey>,
     pipeline: &'a mut EventPipeline,
 }
 
@@ -223,7 +223,6 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
                 ShardEvent::OwnedSubscriptionSet {
                     connection_id: self.connection_id,
                     request: crate::control::topology::OwnedSubscription {
-                        subscriber_room: self.room_id,
                         source_room,
                         subscriber: self.id,
                         reference,
@@ -239,7 +238,6 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
             .participant_events
             .push_back(ParticipantEvent::Control(
                 ShardEvent::OwnedSubscriptionRemoved {
-                    room_id: self.room_id,
                     source_room,
                     subscriber: self.id,
                     connection_id: self.connection_id,
@@ -250,11 +248,14 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
 
     #[inline]
     fn subscribe_tracks(&mut self, selector: TrackSelector, selection: SelectionPolicy) {
+        let Some(room) = self.joined_room else {
+            return;
+        };
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
                 ShardEvent::TrackSubscriptionAdded {
-                    room_id: self.room_id,
+                    room_id: room,
                     subscriber: self.id,
                     connection_id: self.connection_id,
                     selector,
@@ -264,11 +265,14 @@ impl<'a> ParticipantSink for PipelineSinkRef<'a> {
     }
 
     fn unsubscribe_tracks(&mut self, selector: TrackSelector) {
+        let Some(room) = self.joined_room else {
+            return;
+        };
         self.pipeline
             .participant_events
             .push_back(ParticipantEvent::Control(
                 ShardEvent::TrackSubscriptionRemoved {
-                    room_id: self.room_id,
+                    room_id: room,
                     subscriber: self.id,
                     connection_id: self.connection_id,
                     selector,
@@ -332,7 +336,7 @@ mod tests {
             participant_id: crate::entity::fixture_participant_id(),
             connection_id: ConnectionId::new(),
             handle: ParticipantHandle::default(),
-            room_id: ProjectRoomKey::fixture(room),
+            joined_room: Some(ProjectRoomKey::fixture(room)),
         }
     }
 

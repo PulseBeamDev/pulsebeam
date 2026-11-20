@@ -11,7 +11,7 @@ fn permissions(
     label: Option<&str>,
 ) -> ResourcePermissions {
     ResourcePermissions::Grants {
-        room: RoomId::new("room").unwrap(),
+        joined_room: Some(RoomId::new("room").unwrap()),
         grants: GrantSet::new(vec![
             Grant::new(
                 vec!["room".into()],

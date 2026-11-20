@@ -268,6 +268,10 @@ impl Agent {
         self.runtime.join(room).map_err(operation_error)
     }
 
+    pub fn leave_room(&self) -> Result<(), NativeError> {
+        self.runtime.leave_room().map_err(operation_error)
+    }
+
     pub async fn connect(&self) -> Result<(), NativeError> {
         self.runtime.connect().await.map_err(Into::into)
     }

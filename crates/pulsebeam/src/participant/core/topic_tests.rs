@@ -7,7 +7,8 @@ fn connection(publications: TopicPublications) -> Connection {
     Connection::new(
         ConnectionConfig {
             manual_sub: false,
-            room: crate::entity::ProjectRoomKey::fixture(entity::RoomId::new("topics").unwrap()),
+            scope: crate::entity::ProjectRoomKey::fixture(entity::RoomId::new("topics").unwrap())
+                .into(),
             participant_id: crate::entity::fixture_participant_id(),
             connection_id: entity::ConnectionId::new(),
             profile: SignalingProtocol::Whip,

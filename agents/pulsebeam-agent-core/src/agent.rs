@@ -48,6 +48,7 @@ pub enum AgentCommand {
     ReplaceDesired(DesiredState),
     RenewAuthorization(String),
     Join(String),
+    LeaveRoom,
     Connect,
     Disconnect,
     Reconnect,
@@ -63,6 +64,7 @@ impl core::fmt::Debug for AgentCommand {
                 .finish(),
             Self::RenewAuthorization(_) => formatter.write_str("RenewAuthorization([REDACTED])"),
             Self::Join(room) => formatter.debug_tuple("Join").field(room).finish(),
+            Self::LeaveRoom => formatter.write_str("LeaveRoom"),
             Self::Connect => formatter.write_str("Connect"),
             Self::Disconnect => formatter.write_str("Disconnect"),
             Self::Reconnect => formatter.write_str("Reconnect"),
@@ -127,7 +129,7 @@ struct Session {
     generation: Generation,
     resource_uri: String,
     participant_id: String,
-    room_id: String,
+    room_id: Option<String>,
     coordinates: BTreeMap<MediaSlot, Option<SlotBinding>>,
     state: NativeState,
     payloads: BTreeMap<ChannelId, native::PayloadChannel>,
@@ -169,7 +171,7 @@ struct Candidate {
     credential: Credential,
     capabilities: crate::BootstrapCapabilities,
     resource_uri: String,
-    room_id: String,
+    room_id: Option<String>,
     participant_id: String,
 }
 
@@ -177,7 +179,8 @@ struct Candidate {
 struct NativeRequest<'a> {
     profile: &'static str,
     offer: &'a str,
-    room: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    room: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -185,7 +188,7 @@ struct NativeResponse {
     profile: String,
     rtp_capabilities: pulsebeam_proto::state::RtpCapabilities,
     data_delivery: Vec<serde_json::Value>,
-    room_id: String,
+    room_id: Option<String>,
     participant_id: String,
     answer: String,
 }
@@ -327,7 +330,8 @@ impl Agent {
         let result = match command {
             AgentCommand::ReplaceDesired(desired) => self.replace_desired(desired),
             AgentCommand::RenewAuthorization(token) => self.renew_authorization(token),
-            AgentCommand::Join(room) => self.join(room),
+            AgentCommand::Join(room) => self.set_presence(Some(room)),
+            AgentCommand::LeaveRoom => self.set_presence(None),
             AgentCommand::Connect => self.connect(),
             AgentCommand::Disconnect => self.disconnect(),
             AgentCommand::Reconnect => {
@@ -1013,7 +1017,9 @@ impl Agent {
                 if self.snapshot.terminal_failure.is_some() {
                     return Ok(());
                 } else if self.active.is_none() {
-                    self.start_attempt(AttemptMode::Fresh);
+                    if self.snapshot.desired_room.is_some() {
+                        self.start_attempt(AttemptMode::Fresh);
+                    }
                 } else if self.intent_dirty {
                     self.request_reconciliation();
                 }
@@ -1026,21 +1032,33 @@ impl Agent {
         Ok(())
     }
 
-    fn join(&mut self, room: String) -> Result<(), AgentError> {
+    fn set_presence(&mut self, room: Option<String>) -> Result<(), AgentError> {
         if self.participant_superseded() {
             return Err(AgentError::Replaced);
         }
-        crate::validate_room_name(&room)?;
-        let same = self.desired.connected && self.snapshot.desired_room.as_ref() == Some(&room);
-        if same && self.snapshot.terminal_failure.is_none() {
+        if let Some(room) = room.as_deref() {
+            crate::validate_room_name(room)?;
+        }
+        let unchanged = self.snapshot.desired_room == room;
+        if unchanged && self.snapshot.terminal_failure.is_none() {
+            if room.is_some() && !self.desired.connected {
+                self.connect()?;
+            }
             return Ok(());
         }
-        self.snapshot.desired_room = Some(room);
+        if !unchanged {
+            self.ownership = admission::Ownership::default();
+        }
+        self.snapshot.desired_room = room;
         self.snapshot.join_revision = self.snapshot.join_revision.saturating_add(1);
-        self.bump_snapshot();
+        self.snapshot.room_id = None;
+        self.snapshot.accepted_join_revision = None;
+        self.clear_observed_state();
         self.notifications.push_back(Notification::SnapshotChanged);
         if !self.desired.connected {
-            self.connect()?;
+            if self.snapshot.desired_room.is_some() {
+                self.connect()?;
+            }
         } else {
             self.snapshot.terminal_failure = None;
             self.begin_close();
@@ -1060,6 +1078,12 @@ impl Agent {
         }
         if self.snapshot.terminal_failure.is_some() {
             self.reconnect();
+        } else if self.active.is_none()
+            && self.attempt.is_none()
+            && self.closing.is_none()
+            && self.retry.is_none()
+        {
+            self.start_attempt(AttemptMode::Fresh);
         }
         Ok(())
     }
@@ -1105,7 +1129,7 @@ impl Agent {
 
     fn start_attempt(&mut self, mode: AttemptMode) {
         self.admission_denial = None;
-        if self.snapshot.desired_room.is_none() || self.snapshot.terminal_failure.is_some() {
+        if self.snapshot.terminal_failure.is_some() {
             return;
         }
         // Retain late-response cleanup fences rather than evicting unknown admissions.
@@ -1428,7 +1452,11 @@ impl Agent {
                 method: HttpMethod::Post,
                 uri: format!("{}/api/v1/native/admissions", self.config.endpoint),
                 headers: admission_headers(&prepared.credential.token),
-                body: b"{}".to_vec(),
+                body: if attempt.room.is_none() {
+                    br#"{"roomless":true}"#.to_vec()
+                } else {
+                    b"{}".to_vec()
+                },
             },
         }));
     }
@@ -1742,8 +1770,7 @@ impl Agent {
         if self
             .attempt
             .as_ref()
-            .and_then(|attempt| attempt.room.as_deref())
-            .is_some_and(|room| room != candidate.room_id)
+            .is_none_or(|attempt| attempt.room != candidate.room_id)
         {
             self.emit_untracked_delete(candidate.resource_uri, candidate.credential.token);
             self.fail_uncertain_admission(
@@ -2205,10 +2232,13 @@ impl Agent {
             .collect();
         let state = NativeState::new(
             native::STATE_MEMORY_BYTES,
-            pulsebeam_proto::state::Participant {
-                participant_id: candidate.participant_id.clone(),
-                room_id: candidate.room_id.clone(),
-            },
+            candidate
+                .room_id
+                .as_ref()
+                .map(|room_id| pulsebeam_proto::state::Participant {
+                    participant_id: candidate.participant_id.clone(),
+                    room_id: room_id.clone(),
+                }),
         )?;
         self.retry_attempts = 0;
         self.snapshot.evaluated_join_revision = attempt.join_revision;
@@ -2264,7 +2294,7 @@ impl Agent {
         if let Some(active) = &self.active {
             self.snapshot.generation = Some(active.generation);
             self.snapshot.participant_id = Some(active.participant_id.clone());
-            self.snapshot.room_id = Some(active.room_id.clone());
+            self.snapshot.room_id = active.room_id.clone();
             self.snapshot.authorization_expires_at = None;
             self.snapshot.accepted_credential_revision = Some(active.credential.revision);
             self.topics.bind_native(
@@ -2850,10 +2880,7 @@ impl Agent {
             room: self
                 .attempt
                 .as_ref()
-                .and_then(|attempt| attempt.room.as_deref())
-                .ok_or(AgentError::InvalidOffer(
-                    "native admission requires a selected room",
-                ))?,
+                .and_then(|attempt| attempt.room.as_deref()),
         })
         .map_err(|_| AgentError::InvalidOffer("SDP offer could not be encoded"))?;
         if body.len() > admission::MAX_CREATE_BODY_BYTES {
@@ -3058,8 +3085,10 @@ fn parse_create_response(
         .map_err(|_| "create response contains invalid RTP capabilities".to_string())?;
     let data_delivery = supported_data_delivery(&body.data_delivery)?;
     validate_answer(&body.answer)?;
-    crate::validate_room_name(&body.room_id)
-        .map_err(|_| "create response contains invalid room ID".to_string())?;
+    if let Some(room) = body.room_id.as_deref() {
+        crate::validate_room_name(room)
+            .map_err(|_| "create response contains invalid room ID".to_string())?;
+    }
     crate::validate_participant_id(&body.participant_id)
         .map_err(|_| "create response contains invalid participant ID".to_string())?;
     Ok((
@@ -3324,12 +3353,21 @@ mod response_tests {
             candidate.resource_uri,
             "https://elsewhere.test/exact%2Fopaque?x=a%2Fb"
         );
-        assert_eq!(candidate.room_id, "Stage_9");
+        assert_eq!(candidate.room_id.as_deref(), Some("Stage_9"));
         assert_eq!(candidate.participant_id, "Stage_Participant");
         assert_eq!(answer, "v=0\r\n");
 
+        let mut roomless = complete.as_object().unwrap().clone();
+        let _ = roomless.remove("room_id");
+        assert!(
+            parse(&response(roomless.into()))
+                .unwrap()
+                .0
+                .room_id
+                .is_none()
+        );
+
         for field in [
-            "room_id",
             "participant_id",
             "profile",
             "rtp_capabilities",

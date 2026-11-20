@@ -32,6 +32,7 @@ pub(super) const MAX_WAITERS: usize = 4;
 pub(crate) struct PrincipalKey {
     project: ProjectId,
     participant: ParticipantId,
+    roomless_attempt: Option<Proof>,
 }
 
 impl PrincipalKey {
@@ -39,6 +40,7 @@ impl PrincipalKey {
         Self {
             project: principal.project_id(),
             participant: principal.participant_id().clone(),
+            roomless_attempt: None,
         }
     }
 
@@ -46,7 +48,13 @@ impl PrincipalKey {
         Self {
             project: authorization.project_id,
             participant: authorization.participant_id.clone(),
+            roomless_attempt: None,
         }
+    }
+
+    pub(super) fn roomless(mut self, proof: Proof) -> Self {
+        self.roomless_attempt = Some(proof);
+        self
     }
 }
 
@@ -55,6 +63,7 @@ impl Ord for PrincipalKey {
         self.project
             .cmp(&other.project)
             .then_with(|| self.participant.as_str().cmp(other.participant.as_str()))
+            .then_with(|| self.roomless_attempt.cmp(&other.roomless_attempt))
     }
 }
 
@@ -103,9 +112,9 @@ impl fmt::Debug for Proof {
 pub(crate) struct RequestBinding([u8; 32]);
 
 impl RequestBinding {
-    pub(crate) fn for_request(
+    pub(crate) fn for_request<'a>(
         protocol: SignalingProtocol,
-        room: &RoomId,
+        room: impl Into<Option<&'a RoomId>>,
         offer: &str,
         credential: &str,
     ) -> Result<Self, Error> {
@@ -118,7 +127,7 @@ impl RequestBinding {
         digest.update(b"pulsebeam.admission.request.v1");
         for part in [
             protocol.as_slice(),
-            room.as_str().as_bytes(),
+            room.into().map_or(&[][..], |room| room.as_str().as_bytes()),
             offer.as_bytes(),
             credential.as_bytes(),
         ] {
@@ -317,6 +326,37 @@ impl Authority {
         add_credit(&mut self.fresh, 1);
         self.put_record(principal, record);
         Ok(proof)
+    }
+
+    pub(super) fn issue_roomless(
+        &mut self,
+        principal: PrincipalKey,
+        now: Instant,
+        entropy: &mut (impl RngCore + rand::CryptoRng),
+    ) -> Result<Proof, Error> {
+        if self.fresh >= self.limits.fresh || self.records.len() >= self.limits.records {
+            return Err(Error::Capacity);
+        }
+        let deadline = now.checked_add(FRESH_LIFETIME).ok_or(Error::Capacity)?;
+        for _ in 0..4 {
+            let mut bytes = [0; 32];
+            entropy.fill_bytes(&mut bytes);
+            let proof = Proof(bytes);
+            let key = principal.clone().roomless(proof);
+            if self.records.contains_key(&key) {
+                continue;
+            }
+            let mut record = Record::default();
+            record.fresh.push(Fresh {
+                proof,
+                base: None,
+                deadline,
+            });
+            add_credit(&mut self.fresh, 1);
+            self.put_record(key, record);
+            return Ok(proof);
+        }
+        Err(Error::Capacity)
     }
 
     pub(crate) fn preview(
@@ -569,7 +609,13 @@ impl Authority {
         incarnation: Incarnation,
     ) -> Result<(), Error> {
         self.family(ticket)?;
-        if ticket.principal != PrincipalKey::from_verified(authorization)
+        let principal = PrincipalKey::from_verified(authorization);
+        let principal = if authorization.room_id.is_none() {
+            principal.roomless(ticket.proof)
+        } else {
+            principal
+        };
+        if ticket.principal != principal
             || incarnation.participant != authorization.participant_id
             || self.incarnations.contains_key(&incarnation)
             || !self
@@ -892,6 +938,7 @@ mod tests {
         PrincipalKey {
             project: ProjectId::new(),
             participant: ParticipantId::new(name).unwrap(),
+            roomless_attempt: None,
         }
     }
 
@@ -1241,6 +1288,7 @@ mod tests {
         let bob = PrincipalKey {
             project: alice.project,
             participant: ParticipantId::new("bob").unwrap(),
+            roomless_attempt: None,
         };
         let now = Instant::now();
         let a = authority.issue(alice.clone(), now, &mut entropy).unwrap();
@@ -1339,7 +1387,7 @@ mod tests {
                 grants: pulsebeam_core::auth::grants::GrantSet::default(),
                 project_id: principal.project,
                 participant_id: principal.participant,
-                room_id,
+                room_id: Some(room_id),
                 expiry: pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(10_000),
             };
             assert_eq!(PrincipalKey::from_verified(&authorization), principal);

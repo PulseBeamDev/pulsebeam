@@ -60,6 +60,7 @@ const agent = new Agent({
   token: "opaque",
 });
 agent.join("explicit-room");
+agent.leaveRoom();
 const watchConfig: WatchConfig = { limit: 7, cursor: Uint8Array.of(1) };
 const watch: Watch = agent.room("pinned-room").watch(watchConfig);
 const watchState: WatchState = watch.state();

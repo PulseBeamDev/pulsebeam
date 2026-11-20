@@ -114,12 +114,12 @@ impl ControllerCore {
         rtc: AcceptedConnection,
         resources: NegotiatedResources,
         state: ParticipantState,
-        room: ProjectRoomKey,
+        scope: crate::entity::ConnectionScope,
     ) -> ConnectionConfig {
         ConnectionConfig {
             manual_sub: state.manual_sub
                 || state.profile == super::controller::SignalingProtocol::State,
-            room,
+            scope,
             participant_id: state.participant_id,
             connection_id: state.connection_id,
             profile: state.profile,

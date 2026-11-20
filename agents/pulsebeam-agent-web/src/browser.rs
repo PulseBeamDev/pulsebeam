@@ -938,6 +938,19 @@ impl BrowserRuntime {
         Ok(())
     }
 
+    pub fn leave_room(&self) -> Result<(), JsValue> {
+        self.inner.ensure_open()?;
+        let actor = self
+            .inner
+            .actor
+            .borrow()
+            .clone()
+            .ok_or_else(|| js_error("runtime actor not initialized"))?;
+        actor.leave_room().map_err(js_error)?;
+        self.inner.agent_state();
+        Ok(())
+    }
+
     pub fn connect(&self) -> Result<(), JsValue> {
         self.inner.ensure_open()?;
         self.inner

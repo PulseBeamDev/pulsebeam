@@ -48,15 +48,15 @@ pub(super) async fn issue(
     let body = to_bytes(request.into_body(), MAX_CAPABILITY_BODY_BYTES)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
-    let invalid = || ApiError::BadRequest("an empty JSON object is required".to_owned());
+    let invalid = || ApiError::BadRequest("invalid native admission JSON request".to_owned());
     if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
         return Err(invalid());
     }
-    let _: NativeAdmissionRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    let request: NativeAdmissionRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
     let (reply, received) = pulsebeam_runtime::sync::oneshot::channel();
     enqueue(
         &state,
-        controller::AdmissionCommand::issue(principal, reply),
+        controller::AdmissionCommand::issue(principal, request.roomless, reply),
     )?;
     let proof = received.await.map_err(|_| ApiError::ServiceUnavailable)??;
     Ok((
@@ -81,10 +81,14 @@ pub(super) async fn create(
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
     let request = parse_native_request(&body)?;
-    let room = RoomId::new(&request.room)
+    let room = request
+        .room
+        .as_deref()
+        .map(RoomId::new)
+        .transpose()
         .map_err(|_| ApiError::BadRequest("invalid room external id".to_owned()))?;
     let authorization = principal
-        .authorize_room(room)
+        .authorize_presence(room)
         .map_err(|_| controller::ControllerError::AuthorizationRejected)?;
     let (message, _) = native_message(&authorization, request.offer, SystemTime::now())?;
     let location = build_location(

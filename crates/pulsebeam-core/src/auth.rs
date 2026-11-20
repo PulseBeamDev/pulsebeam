@@ -74,13 +74,21 @@ impl VerifiedPrincipal {
         self,
         room: RoomId,
     ) -> Result<VerifiedAuthorization, RoomAuthorizationError> {
-        if !self
-            .grants
-            .allows(grants::Action::Join, room.as_str(), None, None, None)
-        {
+        self.authorize_presence(Some(room))
+    }
+
+    pub fn authorize_presence(
+        self,
+        room: Option<RoomId>,
+    ) -> Result<VerifiedAuthorization, RoomAuthorizationError> {
+        if room.as_ref().is_some_and(|room| {
+            !self
+                .grants
+                .allows(grants::Action::Join, room.as_str(), None, None, None)
+        }) {
             return Err(RoomAuthorizationError::Denied);
         }
-        Ok(self.bind_room(room))
+        Ok(self.bind_presence(room))
     }
 
     pub fn authorize_existing(
@@ -91,10 +99,10 @@ impl VerifiedPrincipal {
         {
             return Err(RoomAuthorizationError::Denied);
         }
-        Ok(self.bind_room(accepted.room_id))
+        Ok(self.bind_presence(accepted.room_id))
     }
 
-    fn bind_room(self, room: RoomId) -> VerifiedAuthorization {
+    fn bind_presence(self, room: Option<RoomId>) -> VerifiedAuthorization {
         VerifiedAuthorization {
             project_id: self.project_id,
             room_id: room,
@@ -116,7 +124,7 @@ pub enum RoomAuthorizationError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedAuthorization {
     pub project_id: ProjectId,
-    pub room_id: RoomId,
+    pub room_id: Option<RoomId>,
     pub participant_id: ParticipantId,
     pub token_id: TokenId,
     pub expiry: AuthorizationExpiry,
@@ -571,7 +579,7 @@ mod tests {
         let authorization =
             verify_participant_token(&development_registry(), token, 1_999).unwrap();
         assert_eq!(authorization.project_id, *DEVELOPMENT_PROJECT_ID);
-        assert_eq!(authorization.room_id, room);
+        assert_eq!(authorization.room_id, Some(room));
         assert_eq!(authorization.participant_id, participant);
         assert_eq!(authorization.expiry.unix_seconds(), 2_000);
         assert!(!format!("{authorization:?}").contains(token));
@@ -837,15 +845,21 @@ mod tests {
             revoked.clone().authorize_room(room),
             Err(RoomAuthorizationError::Denied)
         );
+        let unjoined = revoked.clone().authorize_presence(None).unwrap();
+        assert!(unjoined.room_id.is_none());
+        assert_eq!(unjoined.participant_id, accepted.participant_id);
+        let unjoined_renewal = principal.authorize_existing(&unjoined).unwrap();
+        assert!(unjoined_renewal.room_id.is_none());
+
         let replacement = revoked.clone().authorize_existing(&accepted).unwrap();
         assert_eq!(replacement.room_id, accepted.room_id);
         assert_eq!(replacement.participant_id, accepted.participant_id);
         assert_eq!(replacement.grants, grants::GrantSet::default());
         assert_eq!(replacement.expiry.unix_seconds(), 3000);
-        let mut other = accepted.clone();
+        let mut other = accepted;
         other.participant_id = ParticipantId::new("other").unwrap();
         assert_eq!(
-            revoked.clone().authorize_existing(&other),
+            revoked.authorize_existing(&other),
             Err(RoomAuthorizationError::Denied)
         );
     }

@@ -228,7 +228,7 @@ pub(crate) struct NativeState {
     tracks: BTreeMap<String, wire::Track>,
     source_references: BTreeMap<String, BTreeSet<u64>>,
     participant_references: BTreeMap<ParticipantKey, BTreeSet<u64>>,
-    self_participant: wire::Participant,
+    self_participant: Option<wire::Participant>,
     session: Option<wire::SessionState>,
     initial_complete: bool,
     terminal: bool,
@@ -239,10 +239,13 @@ pub(crate) struct NativeState {
 impl NativeState {
     pub(crate) fn new(
         memory_limit: usize,
-        self_participant: wire::Participant,
+        self_participant: impl Into<Option<wire::Participant>>,
     ) -> Result<Self, SignalingError> {
-        validation::validate_participant(&self_participant)
-            .map_err(|_| SignalingError::Invalid("bootstrap participant"))?;
+        let self_participant = self_participant.into();
+        if let Some(participant) = &self_participant {
+            validation::validate_participant(participant)
+                .map_err(|_| SignalingError::Invalid("bootstrap participant"))?;
+        }
         Ok(Self {
             revision: 0,
             targets: BTreeMap::new(),
@@ -813,7 +816,7 @@ impl NativeState {
                     .as_ref()
                     .and_then(|spec| spec.declaration.as_ref()),
                 Some(wire::resource_spec::Declaration::Publication(_))
-            ) && live.participant.as_ref() != Some(&self.self_participant)
+            ) && (self.self_participant.is_none() || live.participant != self.self_participant)
             {
                 return Err(SignalingError::Invalid("source identity"));
             }
@@ -1050,10 +1053,11 @@ impl NativeState {
     }
 
     pub(crate) fn source_participant(&self, id: &ParticipantKey) -> Option<&wire::Participant> {
-        if id.room_id == self.self_participant.room_id
-            && id.participant_id == self.self_participant.participant_id
+        if let Some(participant) = self.self_participant.as_ref()
+            && id.room_id == participant.room_id
+            && id.participant_id == participant.participant_id
         {
-            return Some(&self.self_participant);
+            return Some(participant);
         }
         self.participants.get(id).or_else(|| {
             let reference = self.participant_references.get(id)?.first()?;

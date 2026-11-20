@@ -79,7 +79,7 @@ fn request(endpoint: &handoff::EndpointHandoff, id: u64, cursor: Vec<u8>) {
 
 fn source_permissions(allow: &[&str]) -> ResourcePermissions {
     ResourcePermissions::Grants {
-        room: RoomId::new("viewer-room").unwrap(),
+        joined_room: Some(RoomId::new("viewer-room").unwrap()),
         grants: serde_json::from_value(serde_json::json!([
             {"rooms":["viewer-room"],"allow":["join"]},
             {"rooms":["catalog-source"],"allow":allow}
@@ -310,7 +310,8 @@ async fn live_catalog_uses_bounded_ordered_presence_pages_and_independent_watche
         .registry
         .update_authorization(&participant, connection, lease.clone());
     let (controller, mut endpoint) = handoff::pair(connection, actor.native_ready_tx.clone());
-    let mut native = StateProtocolHandler::new(participant, viewer_room, None, controller).unwrap();
+    let mut native =
+        StateProtocolHandler::new(participant, Some(viewer_room), None, controller).unwrap();
     native
         .model
         .authorization(i64::MAX, 1, lease.permissions().clone())

@@ -36,7 +36,7 @@ impl NativeControl {
         let (controller, endpoint) = handoff::pair(connection, sender);
         let publishers = BTreeMap::from([(participant, participant)]);
         let mut handler =
-            StateProtocolHandler::new(participant, room, capabilities, controller).unwrap();
+            StateProtocolHandler::new(participant, Some(room), capabilities, controller).unwrap();
         handler
             .model
             .authorization(

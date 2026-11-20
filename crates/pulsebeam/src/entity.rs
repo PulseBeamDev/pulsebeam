@@ -32,6 +32,37 @@ impl ProjectRoomKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionScope {
+    pub project: ProjectId,
+    pub room: Option<RoomId>,
+}
+
+impl ConnectionScope {
+    pub(crate) fn joined_room(self) -> Option<ProjectRoomKey> {
+        Some(ProjectRoomKey {
+            project: self.project,
+            room: self.room?,
+        })
+    }
+
+    pub(crate) fn endpoint(self, participant: ParticipantId) -> Option<EndpointKey> {
+        Some(EndpointKey {
+            room: self.joined_room()?,
+            participant,
+        })
+    }
+}
+
+impl From<ProjectRoomKey> for ConnectionScope {
+    fn from(joined: ProjectRoomKey) -> Self {
+        Self {
+            project: joined.project,
+            room: Some(joined.room),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct EndpointKey {
     pub room: ProjectRoomKey,

@@ -4,20 +4,17 @@ use std::ops::Bound::{Excluded, Unbounded};
 use crate::{
     control::controller::SignalingProtocol,
     control::room::RoomShard,
-    entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, RoomId},
+    entity::{ConnectionId, ConnectionScope, EndpointKey, ParticipantId, ProjectRoomKey, RoomId},
     id::ShardId,
     route::NodeTransportAddress,
 };
 
-/// Everything the control plane knows about one participant.
-///
-/// The single owner of `participant -> (shard, room)`. It used to be three
-/// indexes — this registry, the lifecycle state, and a copy on every shard —
-/// which is three chances for them to disagree about where somebody is.
+/// Control-plane state owned by one physical connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParticipantMeta {
     pub shard_id: ShardId,
-    pub room: ProjectRoomKey,
+    participant_id: ParticipantId,
+    pub scope: ConnectionScope,
     /// The client's ICE association, kept so teardown can retire it. The
     /// route outlives the negotiation that produced it, so something has to
     /// remember it, and this is the record that already knows who it belongs
@@ -30,8 +27,8 @@ pub struct ParticipantMeta {
 }
 
 impl ParticipantMeta {
-    pub fn room_id(&self) -> RoomId {
-        self.room.room
+    pub(super) fn endpoint(&self) -> Option<EndpointKey> {
+        self.scope.endpoint(self.participant_id)
     }
 }
 
@@ -43,20 +40,20 @@ struct RoomParticipants {
 
 pub struct RoomRegistry {
     room_shards: HashMap<ProjectRoomKey, RoomShard>,
-    participants: HashMap<EndpointKey, ParticipantMeta>,
+    connections: HashMap<ConnectionId, ParticipantMeta>,
+    endpoints: HashMap<EndpointKey, ConnectionId>,
     participants_by_room: HashMap<ProjectRoomKey, RoomParticipants>,
     catalog_version: u64,
-    connections: HashMap<ConnectionId, EndpointKey>,
 }
 
 impl RoomRegistry {
     pub fn new() -> Self {
         Self {
             room_shards: HashMap::new(),
-            participants: HashMap::new(),
+            connections: HashMap::new(),
+            endpoints: HashMap::new(),
             participants_by_room: HashMap::new(),
             catalog_version: 0,
-            connections: HashMap::new(),
         }
     }
 
@@ -122,11 +119,12 @@ impl RoomRegistry {
             participant: participant_id,
         };
         let connection_id = ConnectionId::new();
-        if let Some(previous) = self.participants.insert(
+        if let Some(previous) = self.install_joined(
             endpoint,
             ParticipantMeta {
                 shard_id,
-                room: room_id,
+                participant_id,
+                scope: room_id.into(),
                 transport,
                 connection_id,
                 profile: SignalingProtocol::State,
@@ -134,12 +132,10 @@ impl RoomRegistry {
                 materialized: false,
             },
         ) {
-            self.connections.remove(&previous.connection_id);
-            self.unindex_participant(previous.room, participant_id);
-            self.remove_from_room_shard(&previous.room, &participant_id, previous.shard_id);
+            self.unindex_participant(room_id, participant_id);
+            self.remove_from_room_shard(&room_id, &participant_id, previous.shard_id);
         }
         self.index_participant(room_id, participant_id);
-        self.connections.insert(connection_id, endpoint);
         let room = self
             .room_shards
             .entry(room_id)
@@ -151,14 +147,14 @@ impl RoomRegistry {
         room.add_participant(&participant_id, shard_id, partition_index);
     }
 
-    pub(super) fn participants(&self) -> impl Iterator<Item = &ParticipantMeta> {
-        self.participants.values()
+    pub(super) fn connections(&self) -> impl Iterator<Item = &ParticipantMeta> {
+        self.connections.values()
     }
 
     #[cfg(test)]
     fn fixture_endpoint(&self, participant_id: &ParticipantId) -> Option<EndpointKey> {
         let mut endpoints = self
-            .participants
+            .endpoints
             .keys()
             .filter(|key| &key.participant == participant_id);
         let endpoint = endpoints.next().copied();
@@ -175,16 +171,15 @@ impl RoomRegistry {
     }
 
     pub(super) fn get_endpoint(&self, endpoint: EndpointKey) -> Option<&ParticipantMeta> {
-        self.participants.get(&endpoint)
+        self.connections.get(self.endpoints.get(&endpoint)?)
     }
 
     pub(super) fn get_connection(
         &self,
         connection: ConnectionId,
     ) -> Option<(ParticipantId, &ParticipantMeta)> {
-        let endpoint = *self.connections.get(&connection)?;
-        let meta = self.get_endpoint(endpoint)?;
-        (meta.connection_id == connection).then_some((endpoint.participant, meta))
+        let meta = self.connections.get(&connection)?;
+        Some((meta.participant_id, meta))
     }
 
     pub(super) fn get_incarnation(
@@ -286,23 +281,21 @@ impl RoomRegistry {
             room: room_id,
             participant: participant_id,
         };
-        if self
-            .connections
-            .get(&connection_id)
-            .is_some_and(|owner| *owner != endpoint)
+        if self.connections.contains_key(&connection_id)
             || self
-                .participants
+                .endpoints
                 .get(&endpoint)
-                .is_some_and(|current| current.connection_id >= connection_id)
+                .is_some_and(|current| *current >= connection_id)
         {
             return Err(CommitCandidateError::Superseded);
         }
 
-        let previous = self.participants.insert(
+        let previous = self.install_joined(
             endpoint,
             ParticipantMeta {
                 shard_id,
-                room: room_id,
+                participant_id,
+                scope: room_id.into(),
                 transport: Some(transport),
                 connection_id,
                 profile,
@@ -310,10 +303,8 @@ impl RoomRegistry {
                 materialized: true,
             },
         );
-        self.connections.insert(connection_id, endpoint);
         if let Some(previous) = &previous {
-            self.connections.remove(&previous.connection_id);
-            self.unindex_participant(previous.room, participant_id);
+            self.unindex_participant(room_id, participant_id);
             // Keep the partition table alive across replacement of its last participant.
             if let Some(room) = self.room_shards.get_mut(&room_id) {
                 room.remove_participant(&participant_id, previous.shard_id);
@@ -327,10 +318,51 @@ impl RoomRegistry {
         Ok(previous)
     }
 
+    pub(super) fn commit_unjoined(
+        &mut self,
+        project: crate::entity::ProjectId,
+        participant_id: ParticipantId,
+        shard_id: ShardId,
+        transport: NodeTransportAddress,
+        connection_id: ConnectionId,
+    ) -> Result<(), CommitCandidateError> {
+        use std::collections::hash_map::Entry;
+
+        let Entry::Vacant(entry) = self.connections.entry(connection_id) else {
+            return Err(CommitCandidateError::Superseded);
+        };
+        entry.insert(ParticipantMeta {
+            shard_id,
+            participant_id,
+            scope: ConnectionScope {
+                project,
+                room: None,
+            },
+            transport: Some(transport),
+            connection_id,
+            profile: SignalingProtocol::State,
+            authorization: None,
+            materialized: true,
+        });
+        Ok(())
+    }
+
+    fn install_joined(
+        &mut self,
+        endpoint: EndpointKey,
+        meta: ParticipantMeta,
+    ) -> Option<ParticipantMeta> {
+        let previous = self.endpoints.insert(endpoint, meta.connection_id);
+        self.connections.insert(meta.connection_id, meta);
+        previous.and_then(|connection| self.connections.remove(&connection))
+    }
+
     #[cfg(test)]
     pub fn mark_materialized(&mut self, participant_id: &ParticipantId) {
-        if let Some(endpoint) = self.fixture_endpoint(participant_id)
-            && let Some(meta) = self.participants.get_mut(&endpoint)
+        if let Some(connection) = self
+            .fixture_endpoint(participant_id)
+            .and_then(|endpoint| self.endpoints.get(&endpoint))
+            && let Some(meta) = self.connections.get_mut(connection)
         {
             meta.materialized = true;
         }
@@ -351,16 +383,13 @@ impl RoomRegistry {
         participant_id: &ParticipantId,
         connection_id: ConnectionId,
     ) -> Option<ParticipantMeta> {
-        let endpoint = *self.connections.get(&connection_id)?;
-        if endpoint.participant != *participant_id
-            || self.get_endpoint(endpoint)?.connection_id != connection_id
-        {
-            return None;
+        self.get_incarnation(*participant_id, connection_id)?;
+        let meta = self.connections.remove(&connection_id)?;
+        if let Some(endpoint) = meta.endpoint() {
+            self.endpoints.remove(&endpoint);
+            self.unindex_participant(endpoint.room, *participant_id);
+            self.remove_from_room_shard(&endpoint.room, participant_id, meta.shard_id);
         }
-        let meta = self.participants.remove(&endpoint)?;
-        self.connections.remove(&connection_id);
-        self.unindex_participant(endpoint.room, endpoint.participant);
-        self.remove_from_room_shard(&endpoint.room, participant_id, meta.shard_id);
         Some(meta)
     }
 
@@ -370,13 +399,13 @@ impl RoomRegistry {
         connection_id: ConnectionId,
         authorization: super::controller::AuthorizationLease,
     ) {
-        if let Some(endpoint) = self.connections.get(&connection_id).copied()
-            && endpoint.participant == *participant_id
-            && let Some(meta) = self.participants.get_mut(&endpoint)
-            && meta.connection_id == connection_id
+        if let Some(meta) = self.connections.get_mut(&connection_id)
+            && meta.participant_id == *participant_id
         {
             meta.authorization = Some(authorization);
-            self.touch_catalog(endpoint.room);
+            if let Some(room) = meta.scope.joined_room() {
+                self.touch_catalog(room);
+            }
         }
     }
 
@@ -410,6 +439,54 @@ mod tests {
     // cross-core. See crates/pulsebeam/docs/thread-per-core.md.
     use super::*;
     use crate::{entity::RoomId, route::TransportRoute};
+
+    #[test]
+    fn unjoined_commit_and_remove_leave_the_joined_catalog_unchanged() {
+        let mut registry = RoomRegistry::new();
+        let participant = crate::entity::fixture_participant_id();
+        let room = room_id("stage");
+        let joined = ProjectRoomKey::fixture(room);
+        let shard = ShardId::new(0);
+        registry.add_participant(participant, room, shard, None);
+        let version = registry.catalog_version();
+        let endpoint = EndpointKey {
+            room: joined,
+            participant,
+        };
+        let joined_connection = registry.get_endpoint(endpoint).unwrap().connection_id;
+        let connection = ConnectionId::new();
+        let address = NodeTransportAddress::new(crate::route::TransportRoute::new(shard, 1), 1);
+
+        registry
+            .commit_unjoined(joined.project, participant, shard, address, connection)
+            .unwrap();
+        assert!(
+            registry
+                .commit_unjoined(joined.project, participant, shard, address, connection)
+                .is_err()
+        );
+        assert_eq!(
+            registry
+                .get_incarnation(participant, connection)
+                .unwrap()
+                .endpoint(),
+            None
+        );
+        assert_eq!(
+            registry.get_endpoint(endpoint).unwrap().connection_id,
+            joined_connection
+        );
+        assert!(
+            registry
+                .remove_incarnation(&participant, connection)
+                .is_some()
+        );
+        assert_eq!(
+            registry.get_endpoint(endpoint).unwrap().connection_id,
+            joined_connection
+        );
+        assert_eq!(registry.catalog_version(), version);
+    }
 
     fn room_id(s: &str) -> RoomId {
         RoomId::new(s).unwrap()
@@ -501,9 +578,24 @@ mod tests {
             registry.local_participant_ids_in_room(&second),
             vec![participant]
         );
-        assert_eq!(registry.get_connection(connection).unwrap().1.room, first);
         assert_eq!(
-            registry.get_connection(other_connection).unwrap().1.room,
+            registry
+                .get_connection(connection)
+                .unwrap()
+                .1
+                .scope
+                .joined_room()
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            registry
+                .get_connection(other_connection)
+                .unwrap()
+                .1
+                .scope
+                .joined_room()
+                .unwrap(),
             second
         );
 
@@ -511,7 +603,9 @@ mod tests {
             registry
                 .remove_incarnation(&participant, connection)
                 .unwrap()
-                .room,
+                .scope
+                .joined_room()
+                .unwrap(),
             first
         );
         assert!(registry.local_participant_ids_in_room(&first).is_empty());
@@ -520,7 +614,13 @@ mod tests {
             vec![participant]
         );
         assert_eq!(
-            registry.get_connection(other_connection).unwrap().1.room,
+            registry
+                .get_connection(other_connection)
+                .unwrap()
+                .1
+                .scope
+                .joined_room()
+                .unwrap(),
             second
         );
     }
@@ -542,7 +642,7 @@ mod tests {
             .ordered_participants_in_room(&ProjectRoomKey::fixture(room), None)
             .take(2)
             .map(|(canonical, _, meta)| {
-                assert_eq!(meta.room_id(), room);
+                assert_eq!(meta.scope.room, Some(room));
                 assert!(meta.transport.is_none());
                 canonical.to_owned()
             })
@@ -604,7 +704,7 @@ mod tests {
 
         reg.get_room_shard(&ProjectRoomKey::fixture(rid)).unwrap();
         let meta = reg.get_participant(&pid).expect("participant should exist");
-        assert_eq!(meta.room_id(), rid);
+        assert_eq!(meta.scope.room, Some(rid));
         assert_eq!(meta.shard_id, ShardId::new(0));
     }
 
@@ -644,7 +744,7 @@ mod tests {
             1
         );
         let meta = reg.get_participant(&pid).unwrap();
-        assert_eq!(meta.room_id(), new_room);
+        assert_eq!(meta.scope.room, Some(new_room));
         assert_eq!(meta.shard_id, ShardId::new(1));
     }
 

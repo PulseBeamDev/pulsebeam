@@ -494,7 +494,8 @@ pub(super) fn reconcile(
         );
     }
     let mut media = BTreeMap::new();
-    for value in &desired.publications {
+    let joined = session.room_id.is_some();
+    for value in desired.publications.iter().filter(|_| joined) {
         let kind = value.kind;
         let slot = value.media_slot();
         let wire_kind = if kind == crate::MediaKind::Audio {
@@ -652,7 +653,7 @@ pub(super) fn reconcile(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    for publisher in &desired.topics.publishers {
+    for publisher in desired.topics.publishers.iter().filter(|_| joined) {
         data.insert(
             Resource::Publication {
                 kind: state::TrackKind::Data,
@@ -686,7 +687,8 @@ pub(super) fn reconcile(
         let Some(state::track::Kind::Data(format)) = track.kind.as_ref() else {
             continue;
         };
-        if track.participant_id != session.participant_id
+        if !(session.room_id.as_ref() == Some(&track.room_id)
+            && track.participant_id == session.participant_id)
             && crate::TopicMode::from_delivery(format.delivery) == Some(registration.mode)
         {
             data.insert(
@@ -1543,7 +1545,9 @@ impl Agent {
                     let Some(active) = self.active.as_ref() else {
                         continue;
                     };
-                    if id.room_id == active.room_id && id.participant_id != active.participant_id {
+                    if Some(&id.room_id) == active.room_id.as_ref()
+                        && id.participant_id != active.participant_id
+                    {
                         if active.state.participants().contains_key(&id) {
                             self.snapshot.participants.insert(
                                 id.participant_id.clone(),
@@ -1646,10 +1650,27 @@ impl Agent {
                     let Some(active) = self.active.as_mut() else {
                         continue;
                     };
-                    if matches!(
-                        confirmed.value,
-                        Some(state::confirmed_state::Value::Absent(_))
-                    ) {
+                    // Rotating a denied RTP binding would replace its evaluated declaration
+                    // and retry the denial without a change in intent.
+                    let denied_rtp_publication = evaluates_current
+                        && matches!(
+                            resource,
+                            Resource::Publication {
+                                kind: state::TrackKind::Audio | state::TrackKind::Video,
+                                ..
+                            }
+                        )
+                        && matches!(&confirmed.value, Some(state::confirmed_state::Value::Absent(absent))
+                            if absent.reason() == state::AbsenceReason::CreateRejected)
+                        && confirmed.rejection.as_ref().is_some_and(|failure| {
+                            failure.code() == state::FailureCode::PermissionDenied
+                        });
+                    if !denied_rtp_publication
+                        && matches!(
+                            confirmed.value,
+                            Some(state::confirmed_state::Value::Absent(_))
+                        )
+                    {
                         for (slot, lease) in active
                             .media_leases
                             .iter_mut()
@@ -1804,7 +1825,8 @@ impl Agent {
             return;
         };
         let Some(track) = active.state.tracks().get(id).filter(|track| {
-            track.room_id == active.room_id && track.participant_id != active.participant_id
+            Some(&track.room_id) == active.room_id.as_ref()
+                && track.participant_id != active.participant_id
         }) else {
             return;
         };

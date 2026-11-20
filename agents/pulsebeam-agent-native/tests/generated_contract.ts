@@ -464,6 +464,8 @@ if (
 }
 try {
   const joined: void = agent.join("room");
+  const left: void = agent.leaveRoom();
+  void left;
   void joined;
   throw new Error("closed Agent revived");
 } catch (error) {

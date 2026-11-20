@@ -64,7 +64,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
     let owner = crate::entity::fixture_participant_id();
     let track = Track::data_publication(
         track::TrackMeta {
-            room: participant.room,
+            room: participant.scope.joined_room().unwrap(),
             shard_id: ShardId::new(0),
             id,
             origin: owner,
@@ -124,7 +124,7 @@ fn receiver_binding_observations_preserve_target_rejection_and_fence_source_life
         transport,
         policy,
     } = *plan;
-    assert_eq!(source_room, participant.room);
+    assert_eq!(source_room, participant.scope.joined_room().unwrap());
     assert_eq!(source.id(), id);
     assert_eq!(source_id, id.as_str());
     assert!(policy.enabled && policy.video.is_none());

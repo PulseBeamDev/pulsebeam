@@ -10,7 +10,7 @@ const PENDING_COMMANDS: usize = 64;
 
 pub(in crate::control) struct StateProtocolHandler {
     pub(in crate::control) participant: ParticipantId,
-    pub(in crate::control) room: RoomId,
+    pub(in crate::control) room: Option<RoomId>,
     pub(in crate::control) model: NativeSession,
     pub(in crate::control) handoff: ControllerHandoff,
     capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
@@ -20,15 +20,17 @@ pub(in crate::control) struct StateProtocolHandler {
 impl StateProtocolHandler {
     pub(in crate::control) fn new(
         participant: ParticipantId,
-        room: RoomId,
+        room: Option<RoomId>,
         capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
         handoff: ControllerHandoff,
     ) -> Result<Self, OutputError> {
         let mut model = NativeSession::default();
-        model.observe_self(pulsebeam_proto::state::Participant {
-            participant_id: participant.as_str().to_owned(),
-            room_id: room.as_str().to_owned(),
-        })?;
+        if let Some(room) = room {
+            model.observe_self(pulsebeam_proto::state::Participant {
+                participant_id: participant.as_str().to_owned(),
+                room_id: room.as_str().to_owned(),
+            })?;
+        }
         Ok(Self {
             participant,
             room,

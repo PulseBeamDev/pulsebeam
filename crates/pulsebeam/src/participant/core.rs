@@ -100,7 +100,7 @@ pub enum DisconnectReason {
 
 pub struct ConnectionConfig {
     pub manual_sub: bool,
-    pub room: entity::ProjectRoomKey,
+    pub scope: entity::ConnectionScope,
     pub participant_id: entity::ParticipantId,
     pub connection_id: entity::ConnectionId,
     pub profile: SignalingProtocol,
@@ -208,7 +208,7 @@ pub struct Connection {
     authorization_expiry: Option<pulsebeam_core::auth::AuthorizationExpiry>,
     authorization_revision: u64,
     last_slow_poll: Instant,
-    pub(crate) room: entity::ProjectRoomKey,
+    pub(crate) scope: entity::ConnectionScope,
     pub(crate) shard_id: ShardId,
 }
 
@@ -256,7 +256,7 @@ impl Connection {
             native_preparation_budget: NATIVE_PREPARATION_BUDGET,
             native_receivers: native_receiver::NativeReceivers::default(),
             native_rtp: native_rtp::NativeRtp::default(),
-            room: cfg.room,
+            scope: cfg.scope,
             shard_id,
         };
         #[cfg(feature = "sim")]
@@ -1127,10 +1127,10 @@ impl Connection {
                             self.release_data_channel(previous, events);
                         }
                         let publication = match self.data.open(cid, channel.clone(), || {
-                            publishing.then(|| {
+                            self.scope.joined_room().filter(|_| publishing).map(|room| {
                                 Track::data(
                                     crate::track::TrackMeta {
-                                        room: self.room,
+                                        room,
                                         shard_id: self.shard_id,
                                         id: PublicationKey::Data(entity::PublicationId::mint()),
                                         origin: self.participant_id,
@@ -1382,6 +1382,9 @@ impl Connection {
     }
 
     fn activate_sdp_sender(&mut self, mid: Mid) -> bool {
+        let Some(room) = self.scope.joined_room() else {
+            return false;
+        };
         let Some(sender) = self.sdp_senders.remove(&mid) else {
             return self.upstream.slot_for_mid(mid).is_some();
         };
@@ -1393,7 +1396,7 @@ impl Connection {
             .upstream
             .add_published_track(sender.media_index, mid, kind, || {
                 let meta = track::TrackMeta {
-                    room: self.room,
+                    room,
                     shard_id: self.shard_id,
                     id: PublicationKey::new(kind, entity::PublicationId::mint()),
                     origin: self.participant_id,
@@ -1731,7 +1734,7 @@ mod rtc_clock_tests {
                     resources,
                     crate::control::controller::ParticipantState {
                         manual_sub: true,
-                        room_id,
+                        room_id: Some(room_id),
                         participant_id: crate::entity::fixture_participant_id(),
                         connection_id,
                         old_connection_id: None,
@@ -1739,7 +1742,7 @@ mod rtc_clock_tests {
                         profile,
                         rtp_capabilities: None,
                     },
-                    entity::ProjectRoomKey::fixture(room_id),
+                    entity::ProjectRoomKey::fixture(room_id).into(),
                 );
                 assert_eq!(config.rtc.session.offered_media, offered);
                 assert_eq!(
@@ -1807,9 +1810,10 @@ mod rtc_clock_tests {
                 let mut participant = Connection::new(
                     ConnectionConfig {
                         manual_sub: false,
-                        room: crate::entity::ProjectRoomKey::fixture(
+                        scope: crate::entity::ProjectRoomKey::fixture(
                             entity::RoomId::new("route-proof").unwrap(),
-                        ),
+                        )
+                        .into(),
                         participant_id: crate::entity::fixture_participant_id(),
                         connection_id,
                         profile: SignalingProtocol::State,
@@ -1870,9 +1874,10 @@ mod rtc_clock_tests {
         let mut participant = Connection::new(
             ConnectionConfig {
                 manual_sub: false,
-                room: crate::entity::ProjectRoomKey::fixture(
+                scope: crate::entity::ProjectRoomKey::fixture(
                     entity::RoomId::new("native-overflow").unwrap(),
-                ),
+                )
+                .into(),
                 participant_id: crate::entity::fixture_participant_id(),
                 connection_id,
                 profile: SignalingProtocol::State,
@@ -1907,9 +1912,10 @@ mod rtc_clock_tests {
         let mut participant = Connection::new(
             ConnectionConfig {
                 manual_sub: false,
-                room: crate::entity::ProjectRoomKey::fixture(
+                scope: crate::entity::ProjectRoomKey::fixture(
                     entity::RoomId::new("grant-proof").unwrap(),
-                ),
+                )
+                .into(),
                 participant_id: crate::entity::fixture_participant_id(),
                 connection_id,
                 profile: SignalingProtocol::State,
@@ -2108,9 +2114,10 @@ mod upstream_route_table_tests {
         let mut connection = Connection::new(
             ConnectionConfig {
                 manual_sub: false,
-                room: crate::entity::ProjectRoomKey::fixture(
+                scope: crate::entity::ProjectRoomKey::fixture(
                     entity::RoomId::new("late-rid").unwrap(),
-                ),
+                )
+                .into(),
                 participant_id,
                 connection_id,
                 profile: SignalingProtocol::Whip,

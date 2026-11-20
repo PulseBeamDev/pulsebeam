@@ -256,7 +256,6 @@ pub(crate) enum ShardEvent {
         request: crate::control::topology::OwnedSubscription,
     },
     OwnedSubscriptionRemoved {
-        room_id: crate::entity::ProjectRoomKey,
         source_room: crate::entity::ProjectRoomKey,
         subscriber: ParticipantId,
         connection_id: crate::entity::ConnectionId,
