@@ -181,6 +181,8 @@ struct NativeRequest<'a> {
     offer: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     room: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    successor_receipt: Option<&'a [u8]>,
 }
 
 #[derive(Deserialize)]
@@ -264,6 +266,7 @@ pub struct Agent {
     published_notifications: VecDeque<Notification>,
     active: Option<Session>,
     ownership: admission::Ownership,
+    joined_successor: Option<pulsebeam_proto::state::SuccessorReceipt>,
     attempt: Option<Attempt>,
     retry: Option<Retry>,
     retry_attempts: u8,
@@ -297,6 +300,7 @@ impl Agent {
             published_notifications: VecDeque::new(),
             active: None,
             ownership: admission::Ownership::default(),
+            joined_successor: None,
             attempt: None,
             retry: None,
             retry_attempts: 0,
@@ -1048,6 +1052,7 @@ impl Agent {
         }
         if !unchanged {
             self.ownership = admission::Ownership::default();
+            self.joined_successor = None;
         }
         self.snapshot.desired_room = room;
         self.snapshot.join_revision = self.snapshot.join_revision.saturating_add(1);
@@ -1130,6 +1135,13 @@ impl Agent {
     fn start_attempt(&mut self, mode: AttemptMode) {
         self.admission_denial = None;
         if self.snapshot.terminal_failure.is_some() {
+            return;
+        }
+        if self.replacing_joined(mode) && self.joined_successor.is_none() {
+            self.fail_terminal(Failure {
+                class: FailureClass::ResourceExpired,
+                message: "joined recovery receipt unavailable; rejoin explicitly".into(),
+            });
             return;
         }
         // Retain late-response cleanup fences rather than evicting unknown admissions.
@@ -1452,10 +1464,9 @@ impl Agent {
                 method: HttpMethod::Post,
                 uri: format!("{}/api/v1/native/admissions", self.config.endpoint),
                 headers: admission_headers(&prepared.credential.token),
-                body: if attempt.room.is_none() {
-                    br#"{"roomless":true}"#.to_vec()
-                } else {
-                    b"{}".to_vec()
+                body: match attempt.room.as_deref() {
+                    Some(room) => serde_json::json!({"room":room}).to_string().into_bytes(),
+                    None => b"{}".to_vec(),
                 },
             },
         }));
@@ -1654,6 +1665,42 @@ impl Agent {
         }
     }
 
+    fn handle_unavailable_attempt(&mut self, operation: OperationId) -> bool {
+        if let Some(attempt) = self.attempt.as_mut()
+            && let Some(request) = attempt.request.as_mut()
+            && request.is_latest_receipt(operation, &self.ownership)
+        {
+            if attempt.mode != AttemptMode::Replace
+                || attempt.room.is_none()
+                || self.joined_successor.is_none()
+            {
+                return false;
+            }
+            let answered = request.responded(operation, true).is_some();
+            if attempt.stage == AttemptStage::Requesting
+                && request.operation == operation
+                && answered
+            {
+                let revision = request.credential.revision;
+                if let Some(retry) = self.retry.take() {
+                    self.effects
+                        .push_back(Effect::Timer(TimerEffect::Cancel { timer: retry.timer }));
+                }
+                self.ownership = admission::Ownership::default();
+                self.fail_uncertain_admission(
+                    revision,
+                    Failure::transient("pinned native attempt is unavailable"),
+                );
+            }
+            return true;
+        }
+        self.active.as_ref().is_some_and(|active| {
+            active
+                .admission
+                .is_latest_receipt(operation, &self.ownership)
+        })
+    }
+
     fn http_response(
         &mut self,
         operation: OperationId,
@@ -1666,6 +1713,9 @@ impl Agent {
             return Ok(());
         }
         if self.capability_response(operation, &response) {
+            return Ok(());
+        }
+        if admission::attempt_unavailable(&response) && self.handle_unavailable_attempt(operation) {
             return Ok(());
         }
         if matches!(response.status, 409 | 410)
@@ -2244,6 +2294,7 @@ impl Agent {
         self.snapshot.evaluated_join_revision = attempt.join_revision;
         self.snapshot.accepted_join_revision = Some(attempt.join_revision);
         let previous_generation = self.active.as_ref().map(|session| session.generation);
+        self.joined_successor = None;
         if let Some(previous) = self.active.replace(Session {
             credential: candidate.credential,
             admission: admission.into_accepted_receipts(),
@@ -2402,6 +2453,12 @@ impl Agent {
         }
         if self.snapshot.terminal_failure.is_some() {
             return;
+        }
+        if matches!(
+            failure.class,
+            FailureClass::ParticipantSuperseded | FailureClass::ResourceExpired
+        ) {
+            self.joined_successor = None;
         }
         if self.attempt.is_some() {
             self.fail_attempt(failure);
@@ -2838,6 +2895,7 @@ impl Agent {
 
     fn finish_disconnected(&mut self) {
         agent_log!(self, Info, "agent session disconnected");
+        self.joined_successor = None;
         self.catalogs.disconnect();
         self.active = None;
         self.attempt = None;
@@ -2873,6 +2931,10 @@ impl Agent {
         self.bump_snapshot();
     }
 
+    fn replacing_joined(&self, mode: AttemptMode) -> bool {
+        mode == AttemptMode::Replace && self.snapshot.desired_room.is_some()
+    }
+
     fn create_request(&self, offer: &str) -> Result<HttpRequest, AgentError> {
         let body = serde_json::to_vec(&NativeRequest {
             profile: pulsebeam_proto::state::PROFILE,
@@ -2881,6 +2943,12 @@ impl Agent {
                 .attempt
                 .as_ref()
                 .and_then(|attempt| attempt.room.as_deref()),
+            successor_receipt: self
+                .attempt
+                .as_ref()
+                .filter(|attempt| self.replacing_joined(attempt.mode))
+                .and(self.joined_successor.as_ref())
+                .map(|receipt| receipt.proof.as_slice()),
         })
         .map_err(|_| AgentError::InvalidOffer("SDP offer could not be encoded"))?;
         if body.len() > admission::MAX_CREATE_BODY_BYTES {

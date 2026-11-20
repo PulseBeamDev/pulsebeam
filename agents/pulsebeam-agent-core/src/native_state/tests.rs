@@ -173,6 +173,7 @@ fn session(
                 }),
                 closed: closed.map(|reason| reason as i32),
                 diagnostic: String::new(),
+                successor_receipt: None,
             })),
         }),
     }

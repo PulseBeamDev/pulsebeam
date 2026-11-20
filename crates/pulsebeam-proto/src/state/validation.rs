@@ -184,6 +184,12 @@ fn validate_confirmed(key: &resource_key::Key, confirmed: &ConfirmedState) -> Re
                 || session.closed.is_some_and(|v| !known::<CloseReason>(v))
                 || session.diagnostic.len() > 256
                 || session.closed.is_none() && !session.diagnostic.is_empty()
+                || session.successor_receipt.as_ref().is_some_and(|receipt| {
+                    session.closed.is_some()
+                        || receipt.expires_at_unix_seconds == 0
+                        || receipt.proof.is_empty()
+                        || receipt.proof.len() > MAX_SUCCESSOR_RECEIPT_BYTES
+                })
             {
                 return Err(ValidationError::Confirmed);
             }

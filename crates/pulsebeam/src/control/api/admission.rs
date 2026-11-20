@@ -53,10 +53,16 @@ pub(super) async fn issue(
         return Err(invalid());
     }
     let request: NativeAdmissionRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
+    let room = request
+        .room
+        .as_deref()
+        .map(RoomId::new)
+        .transpose()
+        .map_err(|_| invalid())?;
     let (reply, received) = pulsebeam_runtime::sync::oneshot::channel();
     enqueue(
         &state,
-        controller::AdmissionCommand::issue(principal, request.roomless, reply),
+        controller::AdmissionCommand::issue(principal, room, reply),
     )?;
     let proof = received.await.map_err(|_| ApiError::ServiceUnavailable)??;
     Ok((
@@ -98,18 +104,28 @@ pub(super) async fn create(
     )?;
     let location = HeaderValue::from_str(&location).map_err(|_| ApiError::BadUrl)?;
     let (reply, received) = pulsebeam_runtime::sync::oneshot::channel();
-    let command = match controller::AdmissionCommand::create(
-        message,
-        proof,
-        sequence,
-        location,
-        bearer_token(&headers)?,
-        reply,
-    ) {
-        Ok(command) => command,
-        Err(error) => return Ok(ProblemResponse::from(error).into_response()),
-    };
-    enqueue(&state, command)?;
+    let binding =
+        match controller::ownership::RequestBinding::for_native(&body, bearer_token(&headers)?) {
+            Ok(binding) => binding,
+            Err(error) => {
+                return Ok(
+                    ProblemResponse::from(controller::OwnedAdmissionError::from(error))
+                        .into_response(),
+                );
+            }
+        };
+    enqueue(
+        &state,
+        controller::AdmissionCommand::create(
+            message,
+            proof,
+            sequence,
+            location,
+            binding,
+            request.successor_receipt,
+            reply,
+        ),
+    )?;
     let delivery = match received.await.map_err(|_| ApiError::ServiceUnavailable)? {
         Ok(delivery) => delivery,
         Err(problem) => return Ok(problem.into_response()),

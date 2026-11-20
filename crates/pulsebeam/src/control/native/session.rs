@@ -527,6 +527,9 @@ impl NativeSession {
         self.grant_revision = revision;
         self.cancel_unsent_catalog()?;
         self.catalog.invalidate();
+        let successor_receipt = self
+            .session_state()
+            .and_then(|session| session.successor_receipt.clone());
         self.put(
             Key::Session,
             confirmed(wire::confirmed_state::Value::Session(wire::SessionState {
@@ -536,9 +539,31 @@ impl NativeSession {
                 }),
                 closed: None,
                 diagnostic: String::new(),
+                successor_receipt,
             })),
         )?;
         Ok(changed)
+    }
+
+    fn session_state(&self) -> Option<&wire::SessionState> {
+        match self.rows.get(&Key::Session)?.value.value.as_ref()? {
+            wire::confirmed_state::Value::Session(session) => Some(session),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn successor_receipt(
+        &mut self,
+        receipt: wire::SuccessorReceipt,
+    ) -> Result<(), OutputError> {
+        let Some(mut session) = self.session_state().cloned().filter(|_| !self.closed) else {
+            return Err(OutputError::InvalidObservation);
+        };
+        session.successor_receipt = Some(receipt);
+        self.put(
+            Key::Session,
+            confirmed(wire::confirmed_state::Value::Session(session)),
+        )
     }
 
     pub(crate) fn close(&mut self, reason: wire::CloseReason) -> Result<(), OutputError> {
@@ -555,6 +580,7 @@ impl NativeSession {
             return Err(OutputError::InvalidObservation);
         };
         session.closed = Some(reason as i32);
+        session.successor_receipt = None;
         self.put(
             Key::Session,
             confirmed(wire::confirmed_state::Value::Session(session)),

@@ -31,18 +31,6 @@ impl ResultBytes {
 
     #[allow(
         clippy::disallowed_types,
-        reason = "only the control actor can originate result owners, so a sole cache reference can safely transfer its credit"
-    )]
-    fn reclaimable(&self) -> usize {
-        if std::sync::Arc::strong_count(&self.0) == 1 {
-            self.len()
-        } else {
-            0
-        }
-    }
-
-    #[allow(
-        clippy::disallowed_types,
         reason = "the HTTP byte owner retains allocation credit until the final cached or delivered byte reference drops"
     )]
     pub(crate) fn into_bytes(self) -> bytes::Bytes {
@@ -77,50 +65,22 @@ impl ResultBudget {
         Self(std::sync::Arc::new(Semaphore::new(limit)))
     }
 
-    pub fn can_reserve(&self, previous: Option<&CachedResult>) -> bool {
-        self.0
-            .available_permits()
-            .checked_add(previous.map_or(0, |result| result.bytes.reclaimable()))
-            .is_some_and(|available| available >= MAX_RESULT_BYTES)
+    pub fn can_reserve(&self) -> bool {
+        self.0.available_permits() >= MAX_RESULT_BYTES
     }
 
     #[allow(
         clippy::disallowed_types,
-        reason = "the control actor reclaims only cache-exclusive HTTP allocations; external delivery owners prevent credit transfer"
+        reason = "a pending HTTP allocation owns its quota independently of the accepted image"
     )]
-    pub fn reserve(
-        &self,
-        previous: Option<&mut Option<CachedResult>>,
-    ) -> Result<ResultReservation, Error> {
-        let reclaim = previous
-            .as_deref()
-            .and_then(Option::as_ref)
-            .map_or(0, |result| result.bytes.reclaimable());
-        let additional = MAX_RESULT_BYTES
-            .checked_sub(reclaim)
-            .ok_or(Error::InvalidTransition)?;
+    pub fn reserve(&self) -> Result<ResultReservation, Error> {
+        let permits = u32::try_from(MAX_RESULT_BYTES).map_err(|_| Error::Capacity)?;
         let credit = self
             .0
             .clone()
-            .try_acquire_many_owned(u32::try_from(additional).map_err(|_| Error::Capacity)?)
+            .try_acquire_many_owned(permits)
             .map_err(|_| Error::Capacity)?;
-        if reclaim == 0 {
-            return Ok(ResultReservation(credit));
-        }
-        let Some(previous) = previous.and_then(Option::take) else {
-            pulsebeam_runtime::fatal!("reclaimable HTTP result lost its allocation");
-        };
-        let Allocation {
-            bytes,
-            credit: mut reclaimed,
-        } = std::sync::Arc::try_unwrap(previous.bytes.0).unwrap_or_else(|_| {
-            pulsebeam_runtime::fatal!(
-                "sole HTTP result acquired an external reference during reservation"
-            )
-        });
-        reclaimed.merge(credit);
-        drop(bytes);
-        Ok(ResultReservation(reclaimed))
+        Ok(ResultReservation(credit))
     }
 }
 

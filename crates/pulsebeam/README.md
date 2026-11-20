@@ -93,6 +93,13 @@ It does not change room placement or enable cross-node rooms/media. The broader
 authenticated nor encrypted; `cluster.id` is not an authentication credential.
 Allow the dedicated gossip UDP port between peers, never on an untrusted network.
 
+To use joined Native sessions with clustering enabled on just one server, set
+`cluster.topology = "single_node"`, omit `seeds`, and use matching loopback
+addresses for `advertise_host` and `cluster.gossip.listen` (for example,
+`127.0.0.1` and `127.0.0.1:7946`). Native successor receipts are valid only for
+that running process. The default `multi_node` topology does not support Native
+ownership admission, even if its seed list is empty.
+
 With an existing server authentication configuration (`key-registry.json` in the
 working directory), save `cluster.toml` with this node's peer-reachable address:
 

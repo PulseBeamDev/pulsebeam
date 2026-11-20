@@ -496,12 +496,14 @@ fn native_request(agent: &mut Agent, generation: Generation) -> (OperationId, Ht
     {
         assert_eq!(*actual, Some(generation));
         assert_eq!(request.method, HttpMethod::Post);
-        let expected: &[u8] = if agent.snapshot().desired_room.is_some() {
-            b"{}"
-        } else {
-            br#"{"roomless":true}"#
+        let expected = match &agent.snapshot().desired_room {
+            Some(room) => serde_json::json!({"room":room}),
+            None => serde_json::json!({}),
         };
-        assert_eq!(request.body, expected);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            expected
+        );
         assert!(
             request
                 .headers
@@ -1857,6 +1859,12 @@ fn transient_failure_schedules_a_bounded_retry_that_disconnect_cancels() {
         channel(2),
     );
     activate_connection(&mut agent, first, original, channel(2));
+    native_connection::observe(
+        &mut agent,
+        first,
+        channel(2),
+        vec![native_connection::grant(1)],
+    );
     while let Some(effect) = agent.next_effect_after_turn() {
         assert!(!matches!(effect, Effect::Http(_)));
     }
@@ -2099,6 +2107,8 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
             assert_eq!(actual_generation, replacement_generation);
             assert_eq!(request.method, HttpMethod::Post);
             assert_eq!(request.uri, "https://sfu.test/api/v1/native");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["successor_receipt"], serde_json::json!([17, 29]));
             operation
         }
         effect => panic!("expected POST, got {effect:?}"),
@@ -2148,6 +2158,112 @@ fn reconnect_posts_a_new_resource_and_swaps_only_after_the_candidate_is_ready() 
     assert!(agent.snapshot().audio_mapping.is_empty());
     assert_eq!(agent.snapshot().participant_id.as_deref(), Some("p1"));
     assert_eq!(agent.snapshot().room_id.as_deref(), Some("room"));
+}
+
+#[test]
+fn unavailable_pinned_attempt_recovers_with_a_distinct_owner_and_the_same_receipt() {
+    let (mut agent, _, _) = native_connection::connected(Default::default());
+    let offer_replacement = |agent: &mut Agent, cid| {
+        let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = next_effect(agent) else {
+            panic!("replacement offer")
+        };
+        agent
+            .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+                generation,
+                offer: offer(),
+                resources: resources(cid),
+            }))
+            .unwrap();
+        generation
+    };
+    agent.command(AgentCommand::Reconnect).unwrap();
+    let first = offer_replacement(&mut agent, channel(10));
+    let (original, original_request) = native_request(&mut agent, first);
+    agent
+        .handle(HostEvent::Http(HttpEvent::Failed {
+            operation: original,
+            message: "response lost".into(),
+        }))
+        .unwrap();
+    let Effect::Timer(TimerEffect::Schedule { timer, .. }) = next_effect(&mut agent) else {
+        panic!("same-attempt retry")
+    };
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    let (retry, replay_request) = native_request(&mut agent, first);
+    assert_eq!(replay_request, original_request);
+    agent.handle(HostEvent::Http(HttpEvent::Response { operation: retry, response: HttpResponse {
+        status: 410,
+        headers: vec![],
+        body: serde_json::to_vec(&serde_json::json!({"type": pulsebeam_proto::state::ATTEMPT_UNAVAILABLE_PROBLEM})).unwrap(),
+    } })).unwrap();
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation: first })
+    );
+    let Effect::Timer(TimerEffect::Schedule { timer, .. }) = next_effect(&mut agent) else {
+        panic!("distinct joined recovery retry")
+    };
+    agent
+        .handle(HostEvent::Timer(TimerEvent::Fired { timer }))
+        .unwrap();
+    let next = offer_replacement(&mut agent, channel(11));
+    assert_ne!(first, next);
+    let Effect::Http(HttpEffect::Request {
+        operation: acquire,
+        request,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("acquire a new admission owner")
+    };
+    assert!(request.uri.ends_with("/native/admissions"));
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: acquire,
+            response: HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: br#"{"owner":"replacement-owner"}"#.to_vec(),
+            },
+        }))
+        .unwrap();
+    let Effect::Http(HttpEffect::Request {
+        generation: Some(generation),
+        request,
+        ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("distinct native POST")
+    };
+    assert_eq!(generation, next);
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|header| header.name == "PulseBeam-Owner" && header.value == "replacement-owner")
+    );
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|header| header.name == "PulseBeam-Attempt" && header.value == "1")
+    );
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["successor_receipt"], serde_json::json!([17, 29]));
+    let abandoned = "https://sfu.test/api/v1/native/abandoned";
+    agent
+        .handle(HostEvent::Http(HttpEvent::Response {
+            operation: original,
+            response: create_response("p1", "unused", abandoned),
+        }))
+        .unwrap();
+    assert!(
+        matches!(next_effect(&mut agent), Effect::Http(HttpEffect::Request { request, .. }) if request.method == HttpMethod::Delete && request.uri == abandoned)
+    );
+    assert!(agent.snapshot().terminal_failure.is_none());
+    assert_eq!(agent.snapshot().connection, ConnectionState::Reconnecting);
 }
 
 #[test]
@@ -2254,10 +2370,13 @@ fn rejected_reconnect_is_terminal_without_a_legacy_fallback() {
         "incidental work and late RTC events cannot create or schedule a retry"
     );
     agent.command(AgentCommand::Reconnect).unwrap();
-    assert!(matches!(
-        next_effect(&mut agent),
-        Effect::Rtc(RtcEffect::CreateOffer { .. })
-    ));
+    assert_eq!(
+        agent.snapshot().terminal_failure.as_ref().unwrap().class,
+        FailureClass::ResourceExpired
+    );
+    while let Some(effect) = agent.next_effect_after_turn() {
+        assert!(matches!(effect, Effect::Rtc(RtcEffect::Close { .. })));
+    }
 }
 
 #[test]
@@ -2285,6 +2404,7 @@ fn participant_superseded_notice_is_typed_and_requires_a_new_agent() {
                 }),
                 closed: Some(state::CloseReason::ParticipantReplaced as i32),
                 diagnostic: "opaque diagnostic, not a policy input".into(),
+                successor_receipt: None,
             }),
         )],
     );

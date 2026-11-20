@@ -11,8 +11,13 @@ use pulsebeam_core::auth::{VerifiedAuthorization, VerifiedPrincipal};
 use pulsebeam_runtime::{rand::RngCore, time::Instant};
 use sha3::{Digest, Sha3_256};
 
+pub(crate) mod observations;
+pub(super) mod receipt;
 mod result;
+#[cfg(feature = "sim")]
+pub(crate) mod sim;
 
+#[cfg(test)]
 use super::SignalingProtocol;
 use crate::{
     entity::{ConnectionId, ParticipantId, ProjectId, RoomId},
@@ -28,18 +33,56 @@ const IDLE_LIFETIME: Duration = Duration::from_secs(300);
 pub(crate) const MAX_RESULT_BYTES: usize = 1_048_576;
 pub(super) const MAX_WAITERS: usize = 4;
 
+/// Ordering of current joined claims for the same authenticated endpoint.
+/// Physical connection IDs only break ties within the same lineage position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ClaimRank {
+    root: ConnectionId,
+    position: u64,
+    connection: ConnectionId,
+}
+
+impl ClaimRank {
+    pub(in crate::control) fn root(connection: ConnectionId) -> Self {
+        Self {
+            root: connection,
+            position: 0,
+            connection,
+        }
+    }
+
+    pub(in crate::control) fn connection(self) -> ConnectionId {
+        self.connection
+    }
+
+    pub(super) fn lineage(self) -> ConnectionId {
+        self.root
+    }
+
+    pub(in crate::control) fn successor(self, connection: ConnectionId) -> Option<Self> {
+        (connection != self.connection).then_some(())?;
+        Some(Self {
+            root: self.root,
+            position: self.position.checked_add(1)?,
+            connection,
+        })
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PrincipalKey {
     project: ProjectId,
     participant: ParticipantId,
+    room: Option<RoomId>,
     roomless_attempt: Option<Proof>,
 }
 
 impl PrincipalKey {
-    pub(crate) fn from_principal(principal: &VerifiedPrincipal) -> Self {
+    pub(crate) fn from_principal(principal: &VerifiedPrincipal, room: Option<RoomId>) -> Self {
         Self {
             project: principal.project_id(),
-            participant: principal.participant_id().clone(),
+            participant: *principal.participant_id(),
+            room,
             roomless_attempt: None,
         }
     }
@@ -47,7 +90,8 @@ impl PrincipalKey {
     pub(crate) fn from_verified(authorization: &VerifiedAuthorization) -> Self {
         Self {
             project: authorization.project_id,
-            participant: authorization.participant_id.clone(),
+            participant: authorization.participant_id,
+            room: authorization.room_id,
             roomless_attempt: None,
         }
     }
@@ -63,6 +107,7 @@ impl Ord for PrincipalKey {
         self.project
             .cmp(&other.project)
             .then_with(|| self.participant.as_str().cmp(other.participant.as_str()))
+            .then_with(|| self.room.cmp(&other.room))
             .then_with(|| self.roomless_attempt.cmp(&other.roomless_attempt))
     }
 }
@@ -112,6 +157,14 @@ impl fmt::Debug for Proof {
 pub(crate) struct RequestBinding([u8; 32]);
 
 impl RequestBinding {
+    pub(crate) fn for_native(body: &[u8], credential: &str) -> Result<Self, Error> {
+        Self::hash(
+            b"pulsebeam.admission.native-request.v1",
+            [body, credential.as_bytes()],
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_request<'a>(
         protocol: SignalingProtocol,
         room: impl Into<Option<&'a RoomId>>,
@@ -123,14 +176,21 @@ impl RequestBinding {
             SignalingProtocol::Whip => 2,
             SignalingProtocol::Whep => 3,
         }];
+        Self::hash(
+            b"pulsebeam.admission.fixture-request.v1",
+            [
+                protocol.as_slice(),
+                room.into().map_or(&[][..], |room| room.as_str().as_bytes()),
+                offer.as_bytes(),
+                credential.as_bytes(),
+            ],
+        )
+    }
+
+    fn hash<'a>(domain: &[u8], parts: impl IntoIterator<Item = &'a [u8]>) -> Result<Self, Error> {
         let mut digest = Sha3_256::new();
-        digest.update(b"pulsebeam.admission.request.v1");
-        for part in [
-            protocol.as_slice(),
-            room.into().map_or(&[][..], |room| room.as_str().as_bytes()),
-            offer.as_bytes(),
-            credential.as_bytes(),
-        ] {
+        digest.update(domain);
+        for part in parts {
             let length = u64::try_from(part.len()).map_err(|_| Error::Capacity)?;
             digest.update(length.to_be_bytes());
             digest.update(part);
@@ -209,9 +269,16 @@ struct Family {
     binding: RequestBinding,
     pending: bool,
     retryable_materialization: bool,
-    result: Option<CachedResult>,
     idle: Option<Instant>,
     expired: bool,
+}
+
+struct Accepted {
+    proof: Proof,
+    sequence: NonZeroU64,
+    binding: RequestBinding,
+    result: Option<CachedResult>,
+    withdrawn: bool,
 }
 
 #[derive(Default)]
@@ -219,6 +286,7 @@ struct Record {
     generation: Option<Proof>,
     fresh: ArrayVec<Fresh, FRESH_PER_PRINCIPAL>,
     family: Option<Family>,
+    accepted: Option<Accepted>,
     pins: usize,
     deadline: Option<Instant>,
 }
@@ -374,6 +442,19 @@ impl Authority {
             proof,
             sequence,
         };
+        if let Some(accepted) = self.accepted(&ticket) {
+            if !self.is_current(&ticket) {
+                return Err(Error::Replaced);
+            }
+            if accepted.binding != binding {
+                return Err(Error::ChangedAttempt);
+            }
+            return accepted
+                .result
+                .as_ref()
+                .map(|_| Admission::Replay(ticket))
+                .ok_or(Error::ReplayUnavailable);
+        }
         let continuation = record
             .family
             .as_ref()
@@ -396,9 +477,6 @@ impl Authority {
                         }
                         return Ok(Admission::Pending(ticket));
                     }
-                    if family.result.is_some() {
-                        return Ok(Admission::Replay(ticket));
-                    }
                     if !family.retryable_materialization {
                         return Err(Error::ReplayUnavailable);
                     }
@@ -418,30 +496,17 @@ impl Authority {
                 Error::UnknownProof
             });
         }
-        self.admission_bytes(record)?;
+        self.admission_bytes()?;
         Ok(Admission::Start(ticket))
     }
 
-    fn admission_bytes(&self, record: &Record) -> Result<usize, Error> {
-        let cached = record
-            .family
-            .as_ref()
-            .and_then(|family| family.result.as_ref())
-            .map_or(0, |result| result.bytes.len());
+    fn admission_bytes(&self) -> Result<usize, Error> {
         let bytes = self
             .result_bytes
-            .checked_sub(cached)
-            .and_then(|bytes| bytes.checked_add(MAX_RESULT_BYTES))
+            .checked_add(MAX_RESULT_BYTES)
             .filter(|bytes| *bytes <= self.limits.result_bytes)
             .ok_or(Error::Capacity)?;
-        if self.in_flight >= self.limits.in_flight
-            || !self.result_budget.can_reserve(
-                record
-                    .family
-                    .as_ref()
-                    .and_then(|family| family.result.as_ref()),
-            )
-        {
+        if self.in_flight >= self.limits.in_flight || !self.result_budget.can_reserve() {
             return Err(Error::Capacity);
         }
         Ok(bytes)
@@ -471,16 +536,13 @@ impl Authority {
             return Ok(admission);
         };
         let record = self.records.get(principal).ok_or(Error::UnknownProof)?;
-        let bytes = self.admission_bytes(record)?;
+        let bytes = self.admission_bytes()?;
         let continuation = record
             .family
             .as_ref()
             .is_some_and(|family| family.proof == proof && !family.expired);
         self.work.try_reserve(1).map_err(|_| Error::Capacity)?;
-        let record = self.records.get_mut(principal).ok_or(Error::UnknownProof)?;
-        let reservation = self
-            .result_budget
-            .reserve(record.family.as_mut().map(|family| &mut family.result))?;
+        let reservation = self.result_budget.reserve()?;
         let mut record = self.take_record(principal).ok_or(Error::UnknownProof)?;
         if !continuation {
             release_credit(&mut self.fresh, record.fresh.len());
@@ -493,7 +555,6 @@ impl Authority {
             binding,
             pending: true,
             retryable_materialization: false,
-            result: None,
             idle: None,
             expired: false,
         });
@@ -555,7 +616,7 @@ impl Authority {
         }) {
             return Err(Error::InvalidTransition);
         }
-        if record.pins != 1 {
+        if record.pins != 1 || record.accepted.is_some() {
             return Err(Error::QuiescencePending);
         }
         if bytes.len() > MAX_RESULT_BYTES {
@@ -577,7 +638,13 @@ impl Authority {
             .ok_or(Error::UnknownProof)?;
         let family = record.family.as_mut().ok_or(Error::InvalidTransition)?;
         family.pending = false;
-        family.result = Some(CachedResult { bytes, deadline });
+        record.accepted = Some(Accepted {
+            proof: ticket.proof,
+            sequence: ticket.sequence,
+            binding: family.binding,
+            result: Some(CachedResult { bytes, deadline }),
+            withdrawn: false,
+        });
         self.work
             .get_mut(ticket)
             .ok_or(Error::InvalidTransition)?
@@ -591,7 +658,14 @@ impl Authority {
 
     pub(crate) fn result(&mut self, ticket: &Ticket, now: Instant) -> Result<ResultBytes, Error> {
         self.expire_principal(&ticket.principal, now);
-        self.family(ticket)?
+        let Some(accepted) = self.accepted(ticket) else {
+            self.family(ticket)?;
+            return Err(Error::ReplayUnavailable);
+        };
+        if !self.is_current(ticket) {
+            return Err(Error::Replaced);
+        }
+        accepted
             .result
             .as_ref()
             .map(|result| result.bytes.clone())
@@ -599,7 +673,25 @@ impl Authority {
     }
 
     pub(crate) fn is_current(&self, ticket: &Ticket) -> bool {
-        self.family(ticket).is_ok() && self.work.get(ticket).is_some_and(|work| !work.pending)
+        self.accepted(ticket)
+            .is_some_and(|accepted| !accepted.withdrawn)
+            && self.work.get(ticket).is_some_and(|work| {
+                !work.pending
+                    && work
+                        .physical
+                        .as_ref()
+                        .is_none_or(|physical| physical.retirement == Retirement::Live)
+            })
+    }
+
+    fn accepted(&self, ticket: &Ticket) -> Option<&Accepted> {
+        self.records
+            .get(&ticket.principal)?
+            .accepted
+            .as_ref()
+            .filter(|accepted| {
+                accepted.proof == ticket.proof && accepted.sequence == ticket.sequence
+            })
     }
 
     pub(crate) fn bind(
@@ -640,6 +732,50 @@ impl Authority {
         Ok(())
     }
 
+    pub(super) fn accepted_incarnation(&self, incarnation: Incarnation) -> bool {
+        self.incarnations
+            .get(&incarnation)
+            .is_some_and(|ticket| self.is_current(ticket))
+    }
+
+    pub(super) fn live_predecessor(&self, ticket: &Ticket) -> Option<Incarnation> {
+        let accepted = self.records.get(&ticket.principal)?.accepted.as_ref()?;
+        let prior = Ticket {
+            principal: ticket.principal.clone(),
+            proof: accepted.proof,
+            sequence: accepted.sequence,
+        };
+        if prior == *ticket || !self.is_current(&prior) {
+            return None;
+        }
+        Some(self.work.get(&prior)?.physical.as_ref()?.incarnation)
+    }
+
+    pub(super) fn withdraw_incarnation(&mut self, incarnation: Incarnation) {
+        let Some(ticket) = self.incarnations.get(&incarnation) else {
+            return;
+        };
+        if let Some(accepted) = self
+            .records
+            .get_mut(&ticket.principal)
+            .and_then(|record| record.accepted.as_mut())
+            && accepted.proof == ticket.proof
+            && accepted.sequence == ticket.sequence
+        {
+            accepted.withdrawn = true;
+        }
+    }
+
+    pub(super) fn selected(&self, ticket: &Ticket) -> bool {
+        self.family(ticket).is_ok()
+    }
+
+    pub(super) fn predecessors_retired(&self, ticket: &Ticket) -> bool {
+        self.records
+            .get(&ticket.principal)
+            .is_some_and(|record| record.pins == 1)
+    }
+
     pub(crate) fn predecessors(&self, ticket: &Ticket) -> Vec<Incarnation> {
         self.work
             .iter()
@@ -672,13 +808,17 @@ impl Authority {
             return Ok(());
         };
         self.family(ticket)?;
-        if self
+        let pins = self
             .records
             .get(&ticket.principal)
             .ok_or(Error::UnknownProof)?
-            .pins
-            != 1
-        {
+            .pins;
+        let permitted = if self.live_predecessor(ticket).is_some() {
+            2
+        } else {
+            1
+        };
+        if pins != permitted {
             return Err(Error::QuiescencePending);
         }
         let work = self.work.get_mut(ticket).ok_or(Error::InvalidTransition)?;
@@ -805,12 +945,15 @@ impl Authority {
         }
         if let Some(record) = self.records.get_mut(&ticket.principal) {
             release_credit(&mut record.pins, 1);
+            if record.accepted.as_ref().is_some_and(|accepted| {
+                accepted.proof == ticket.proof && accepted.sequence == ticket.sequence
+            }) && let Some(result) = record.accepted.take().and_then(|accepted| accepted.result)
+            {
+                release_credit(&mut self.result_bytes, result.bytes.len());
+            }
             if let Some(family) = record.family.as_mut() {
                 if family.proof == ticket.proof && family.sequence == ticket.sequence {
                     family.pending = false;
-                    if let Some(result) = family.result.take() {
-                        release_credit(&mut self.result_bytes, result.bytes.len());
-                    }
                 }
                 if record.pins == 0 {
                     family.idle = Some(now.checked_add(IDLE_LIFETIME).unwrap_or(now));
@@ -859,15 +1002,16 @@ impl Authority {
             .count();
         record.fresh.retain(|fresh| fresh.deadline > now);
         release_credit(&mut self.fresh, expired);
-        if let Some(family) = record.family.as_mut() {
-            if family
+        if let Some(accepted) = record.accepted.as_mut()
+            && accepted
                 .result
                 .as_ref()
                 .is_some_and(|result| result.deadline <= now)
-                && let Some(result) = family.result.take()
-            {
-                release_credit(&mut self.result_bytes, result.bytes.len());
-            }
+            && let Some(result) = accepted.result.take()
+        {
+            release_credit(&mut self.result_bytes, result.bytes.len());
+        }
+        if let Some(family) = record.family.as_mut() {
             if record.pins == 0 && family.idle.is_some_and(|deadline| deadline <= now) {
                 family.expired = true;
                 family.idle = None;
@@ -898,9 +1042,9 @@ impl Authority {
             .chain(record.family.iter().filter_map(|family| family.idle))
             .chain(
                 record
-                    .family
+                    .accepted
                     .iter()
-                    .filter_map(|family| family.result.as_ref().map(|result| result.deadline)),
+                    .filter_map(|accepted| accepted.result.as_ref().map(|result| result.deadline)),
             )
             .min();
         if let Some(deadline) = record.deadline {
@@ -938,8 +1082,61 @@ mod tests {
         PrincipalKey {
             project: ProjectId::new(),
             participant: ParticipantId::new(name).unwrap(),
+            room: Some(RoomId::new("main").unwrap()),
             roomless_attempt: None,
         }
+    }
+
+    #[test]
+    fn joined_tickets_cannot_cross_rooms_or_fence_another_room() {
+        let mut authority = Authority::default();
+        let mut entropy = StdRng::seed_from_u64(41);
+        let stage = principal("alice");
+        let workshop = PrincipalKey {
+            room: Some(RoomId::new("workshop").unwrap()),
+            ..stage.clone()
+        };
+        let now = Instant::now();
+        let proof = authority.issue(stage.clone(), now, &mut entropy).unwrap();
+        let binding = RequestBinding([1; 32]);
+        assert_eq!(
+            authority.begin(&workshop, proof, sequence(1), binding, now),
+            Err(Error::UnknownProof)
+        );
+        let first = start(&mut authority, &stage, proof, 1, now);
+        let second_proof = authority
+            .issue(workshop.clone(), now, &mut entropy)
+            .unwrap();
+        let second = start(&mut authority, &workshop, second_proof, 1, now);
+        assert_eq!(
+            authority.preview(&stage, proof, sequence(1), binding, now),
+            Ok(Admission::Pending(first))
+        );
+        assert_eq!(
+            authority.preview(&workshop, second_proof, sequence(1), binding, now),
+            Ok(Admission::Pending(second))
+        );
+    }
+
+    #[test]
+    fn claim_order_keeps_the_root_rank_and_breaks_sibling_ties_by_connection() {
+        let connection_id = |sequence| {
+            ConnectionId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, sequence])
+        };
+
+        let root = ClaimRank::root(connection_id(2));
+        let successor = root.successor(connection_id(4)).unwrap();
+        let sibling = root.successor(connection_id(5)).unwrap();
+        let later = successor.successor(connection_id(3)).unwrap();
+        assert!(root < successor && successor < sibling && sibling < later);
+        assert!(later < ClaimRank::root(connection_id(3)));
+        assert!(ClaimRank::root(connection_id(1)) < root);
+        assert!(root.successor(connection_id(2)).is_none());
+        let exhausted = ClaimRank {
+            position: u64::MAX,
+            ..root
+        };
+        assert!(exhausted.successor(connection_id(4)).is_none());
     }
 
     fn sequence(value: u64) -> NonZeroU64 {
@@ -995,8 +1192,8 @@ mod tests {
         let cached = authority
             .records
             .values()
-            .filter_map(|record| record.family.as_ref())
-            .filter_map(|family| family.result.as_ref())
+            .filter_map(|record| record.accepted.as_ref())
+            .filter_map(|accepted| accepted.result.as_ref())
             .map(|result| result.bytes.len())
             .sum::<usize>();
         assert_eq!(
@@ -1090,7 +1287,19 @@ mod tests {
             "issuing a capability cannot displace"
         );
         let new = start(&mut authority, &principal, b, 1, now);
-        assert!(!authority.is_current(&old));
+        assert!(authority.is_current(&old));
+        assert_eq!(
+            authority.begin(&principal, a, sequence(1), RequestBinding([1; 32]), now),
+            Ok(Admission::Replay(old.clone()))
+        );
+        authority.retry_failed_materialization(&new);
+        authority.retire(&new, now);
+        assert!(authority.is_current(&old));
+        assert_eq!(
+            authority.result(&old, now).unwrap().as_ref(),
+            b"first answer"
+        );
+        let new = start(&mut authority, &principal, b, 1, now);
         assert_eq!(
             authority.commit(&new, vec![], now),
             Err(Error::QuiescencePending)
@@ -1288,6 +1497,7 @@ mod tests {
         let bob = PrincipalKey {
             project: alice.project,
             participant: ParticipantId::new("bob").unwrap(),
+            room: alice.room,
             roomless_attempt: None,
         };
         let now = Instant::now();
@@ -1338,6 +1548,13 @@ mod tests {
             Err(Error::Capacity)
         );
         drop(last_frame);
+        assert_eq!(
+            authority.begin(&alice, next, sequence(1), RequestBinding([1; 32]), now),
+            Err(Error::Capacity),
+            "an admitted replay image is not evicted to fund its contender"
+        );
+        let now = now + RESULT_LIFETIME;
+        let next = authority.issue(alice.clone(), now, &mut entropy).unwrap();
         let new = start(&mut authority, &alice, next, 1, now);
         assert_eq!(
             authority.commit(&new, vec![], now),
@@ -1354,7 +1571,7 @@ mod tests {
         drop(delivery);
         let later = now + FRESH_LIFETIME;
         assert_eq!(authority.expire(later, 0), 0);
-        assert_eq!(authority.expire(later, 1), 1);
+        assert_eq!(authority.expire(later, 2), 2);
         assert_eq!(
             authority.begin(&bob, b, sequence(1), RequestBinding([1; 32]), later),
             Err(Error::UnknownProof)
@@ -1390,7 +1607,8 @@ mod tests {
                 room_id: Some(room_id),
                 expiry: pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(10_000),
             };
-            assert_eq!(PrincipalKey::from_verified(&authorization), principal);
+            let scoped = PrincipalKey::from_verified(&authorization);
+            assert_eq!(scoped == principal, room == "main");
         }
         let proof = authority
             .issue(principal.clone(), now, &mut entropy)

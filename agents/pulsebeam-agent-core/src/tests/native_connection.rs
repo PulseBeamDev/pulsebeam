@@ -228,6 +228,10 @@ pub(crate) fn grant(revision: u64) -> state::ServerStateRecord {
             }),
             closed: None,
             diagnostic: String::new(),
+            successor_receipt: Some(state::SuccessorReceipt {
+                proof: vec![17, 29],
+                expires_at_unix_seconds: 10_000 + revision,
+            }),
         }),
     )
 }

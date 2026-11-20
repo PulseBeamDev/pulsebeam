@@ -1509,6 +1509,12 @@ impl Agent {
                         active.authorization_expires_at = Some(grant.expires_at_unix_seconds);
                         self.snapshot.authorization_expires_at = active.authorization_expires_at;
                     }
+                    if active.room_id.is_some()
+                        && active.room_id == self.snapshot.desired_room
+                        && session.closed.is_none()
+                    {
+                        self.joined_successor = session.successor_receipt.clone();
+                    }
                     if let Some(reason) = session.closed {
                         let failure = match state::CloseReason::try_from(reason).ok() {
                             Some(

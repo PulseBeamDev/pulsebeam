@@ -143,7 +143,7 @@ impl ControllerActor {
         self.materializations.iter().find_map(|work| {
             let pending = &work.pending;
             let lease = pending.authorization.as_ref()?;
-            (pending.connection_id == connection
+            (pending.connection_id() == connection
                 && pending.profile == SignalingProtocol::State
                 && lease.matches_scope(pending.scope, pending.participant))
             .then_some(lease)
@@ -237,6 +237,36 @@ impl ControllerActor {
         }
     }
 
+    fn receipt_claim(
+        &self,
+        meta: &crate::control::registry::ParticipantMeta,
+        wall_now: SystemTime,
+    ) -> Option<(EndpointKey, ownership::ClaimRank)> {
+        if self.receipt_trust.is_none() || meta.profile != SignalingProtocol::State {
+            return None;
+        }
+        let endpoint = meta.endpoint()?;
+        let claim = meta.claim?;
+        let lease = meta.authorization.as_ref()?;
+        if claim.connection() != meta.connection_id
+            || lease.is_expired_at(wall_now)
+            || !lease.allows_current_room()
+            || self
+                .core
+                .registry
+                .get_endpoint(endpoint)
+                .is_none_or(|current| current.connection_id != meta.connection_id)
+            || !self.ownership.accepted_incarnation(ownership::Incarnation {
+                participant: endpoint.participant,
+                connection: meta.connection_id,
+                transport: meta.transport?,
+            })
+        {
+            return None;
+        }
+        Some((endpoint, claim))
+    }
+
     fn service_native_connection(&mut self, connection: ConnectionId) {
         if let Some(retiring) = self.retiring_native.remove(&connection) {
             self.service_native_retirement(connection, retiring);
@@ -264,51 +294,74 @@ impl ControllerActor {
             return;
         };
         let room = meta.scope.joined_room();
-        let unix_now = SystemTime::now()
+        let wall_now = SystemTime::now();
+        let unix_now = wall_now
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        match native.service(
-            unix_now,
-            |track| {
-                let track = self.lifecycle.source_for_connection(
-                    room?,
-                    connection,
-                    track,
-                    &self.core.registry,
-                )?;
-                Some(crate::control::native::ResolvedSource {
-                    track,
-                    publisher: &track.meta().origin,
-                })
-            },
-            |source_room, track| {
-                let source_room = self.source_room(connection, source_room)?;
-                let track = self.lifecycle.source_for_connection(
-                    source_room,
-                    connection,
-                    track,
-                    &self.core.registry,
-                )?;
-                Some(crate::control::native::ResolvedSource {
-                    track,
-                    publisher: &track.meta().origin,
-                })
-            },
-            |address| {
-                let source_room = self.source_room(connection, &address.room)?;
-                let track = self.lifecycle.source_by_address(
-                    source_room,
-                    connection,
-                    address,
-                    &self.core.registry,
-                )?;
-                Some(crate::control::native::ResolvedSource {
-                    track,
-                    publisher: &track.meta().origin,
-                })
-            },
-        ) {
+        let now = pulsebeam_runtime::time::Instant::now();
+        let mut refresh = Ok(());
+        if native
+            .successor_refresh
+            .is_none_or(|deadline| deadline <= now)
+        {
+            native.successor_refresh = None;
+            if let Some((endpoint, claim)) = self.receipt_claim(meta, wall_now)
+                && let Some(trust) = self.receipt_trust.as_deref_mut()
+            {
+                if let Ok(receipt) =
+                    ownership::receipt::issue_accepted(trust, endpoint, claim, unix_now)
+                {
+                    refresh = native.model.successor_receipt(receipt);
+                }
+                native.successor_refresh = now.checked_add(Duration::from_secs(60));
+            }
+        }
+        match refresh
+            .map_err(crate::control::native::InputError::from)
+            .and_then(|()| {
+                native.service(
+                    unix_now,
+                    |track| {
+                        let track = self.lifecycle.source_for_connection(
+                            room?,
+                            connection,
+                            track,
+                            &self.core.registry,
+                        )?;
+                        Some(crate::control::native::ResolvedSource {
+                            track,
+                            publisher: &track.meta().origin,
+                        })
+                    },
+                    |source_room, track| {
+                        let source_room = self.source_room(connection, source_room)?;
+                        let track = self.lifecycle.source_for_connection(
+                            source_room,
+                            connection,
+                            track,
+                            &self.core.registry,
+                        )?;
+                        Some(crate::control::native::ResolvedSource {
+                            track,
+                            publisher: &track.meta().origin,
+                        })
+                    },
+                    |address| {
+                        let source_room = self.source_room(connection, &address.room)?;
+                        let track = self.lifecycle.source_by_address(
+                            source_room,
+                            connection,
+                            address,
+                            &self.core.registry,
+                        )?;
+                        Some(crate::control::native::ResolvedSource {
+                            track,
+                            publisher: &track.meta().origin,
+                        })
+                    },
+                )
+            }) {
             Ok(wake) => {
                 self.catalog.sync(
                     connection,
@@ -321,7 +374,12 @@ impl ControllerActor {
                             .change(connection, source_room, change);
                     }
                 }
-                let deadline = native.model.deadline();
+                let deadline = native
+                    .model
+                    .deadline()
+                    .into_iter()
+                    .chain(native.successor_refresh)
+                    .min();
                 if let Some(deadline) = deadline {
                     self.native_deadlines.insert((deadline, connection));
                 }

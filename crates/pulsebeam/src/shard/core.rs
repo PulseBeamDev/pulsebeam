@@ -203,6 +203,11 @@ impl ShardCore {
         self.execution.participant_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn installed_route_count(&self) -> usize {
+        self.execution.runtime.routes.len()
+    }
+
     pub(crate) fn next_timer_deadline(&mut self) -> Option<Instant> {
         if !self.execution.dirty.is_empty() {
             Some(Instant::now())

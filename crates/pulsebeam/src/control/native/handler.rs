@@ -13,6 +13,7 @@ pub(in crate::control) struct StateProtocolHandler {
     pub(in crate::control) room: Option<RoomId>,
     pub(in crate::control) model: NativeSession,
     pub(in crate::control) handoff: ControllerHandoff,
+    pub(in crate::control) successor_refresh: Option<pulsebeam_runtime::time::Instant>,
     capabilities: Option<pulsebeam_proto::state::RtpCapabilities>,
     commands: VecDeque<ExecutionCommand>,
 }
@@ -36,6 +37,7 @@ impl StateProtocolHandler {
             room,
             model,
             handoff,
+            successor_refresh: None,
             capabilities,
             commands: VecDeque::new(),
         })

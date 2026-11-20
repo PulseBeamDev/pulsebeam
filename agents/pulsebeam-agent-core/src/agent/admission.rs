@@ -7,13 +7,28 @@ use alloc::{
 use serde::Deserialize;
 
 use super::Credential;
-use crate::{Generation, HttpEffect, HttpHeader, HttpMethod, HttpRequest, OperationId};
+use crate::{
+    Generation, HttpEffect, HttpHeader, HttpMethod, HttpRequest, HttpResponse, OperationId,
+};
 
 const MAX_CAPABILITY_BODY_BYTES: usize = 1_024;
 const MAX_PROOF_BYTES: usize = 256;
 pub(super) const MAX_CREATE_BODY_BYTES: usize = 262_144;
 const OWNER_HEADER: &str = "PulseBeam-Owner";
 const ATTEMPT_HEADER: &str = "PulseBeam-Attempt";
+
+pub(super) fn attempt_unavailable(response: &HttpResponse) -> bool {
+    #[derive(Deserialize)]
+    struct Problem<'a> {
+        #[serde(rename = "type")]
+        kind: &'a str,
+    }
+    response.status == 410
+        && response.body.len() <= MAX_CAPABILITY_BODY_BYTES
+        && serde_json::from_slice::<Problem<'_>>(&response.body).is_ok_and(|problem| {
+            problem.kind == pulsebeam_proto::state::ATTEMPT_UNAVAILABLE_PROBLEM
+        })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Error {
@@ -31,6 +46,7 @@ pub(super) enum Error {
 pub(super) struct Ownership {
     proof: Option<String>,
     sequence: u64,
+    latest_generation: Option<Generation>,
 }
 
 impl core::fmt::Debug for Ownership {
@@ -101,10 +117,10 @@ impl Ownership {
             name: String::from(ATTEMPT_HEADER),
             value: sequence.to_string(),
         });
-        let (mut captured, effect) =
+        let (captured, effect) =
             CreateRequest::capture(operation, credential, generation, request, maximum_attempts)?;
-        captured.sequence = sequence;
         self.sequence = sequence;
+        self.latest_generation = Some(generation);
         Ok((captured, effect))
     }
 }
@@ -122,18 +138,17 @@ struct Receipt {
 }
 
 pub(super) struct AcceptedReceipts {
-    sequence: u64,
+    generation: Generation,
     operations: Vec<OperationId>,
 }
 
 impl AcceptedReceipts {
     pub(super) fn is_latest_receipt(&self, operation: OperationId, ownership: &Ownership) -> bool {
-        self.sequence == ownership.sequence && self.operations.contains(&operation)
+        ownership.latest_generation == Some(self.generation) && self.operations.contains(&operation)
     }
 }
 
 pub(super) struct CreateRequest {
-    sequence: u64,
     pub(super) operation: OperationId,
     pub(super) credential: Credential,
     generation: Generation,
@@ -162,7 +177,6 @@ impl CreateRequest {
             return Err(Error::InvalidRequest);
         }
         let captured = Self {
-            sequence: 0,
             operation,
             credential,
             generation,
@@ -237,7 +251,7 @@ impl CreateRequest {
     }
 
     pub(super) fn is_latest_receipt(&self, operation: OperationId, ownership: &Ownership) -> bool {
-        self.sequence == ownership.sequence
+        ownership.latest_generation == Some(self.generation)
             && self
                 .receipts
                 .iter()
@@ -246,7 +260,7 @@ impl CreateRequest {
 
     pub(super) fn into_accepted_receipts(self) -> AcceptedReceipts {
         AcceptedReceipts {
-            sequence: self.sequence,
+            generation: self.generation,
             operations: self
                 .receipts
                 .into_iter()

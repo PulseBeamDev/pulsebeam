@@ -135,6 +135,25 @@ pub async fn start_sfu_node_with_transport(
     udp_only: bool,
     startup_notification: Option<tokio::sync::mpsc::Sender<()>>,
 ) -> anyhow::Result<()> {
+    let mut builder = sfu_node_builder(ip, rng, shards);
+    if let Some(notification) = startup_notification {
+        builder = builder.with_sim_startup_notification(notification);
+    }
+    if tcp_only {
+        builder = builder.tcp_only();
+    } else if udp_only {
+        builder = builder.udp_only();
+    }
+    builder
+        .run(tokio_util::sync::CancellationToken::new())
+        .await
+}
+
+pub fn sfu_node_builder(
+    ip: IpAddr,
+    rng: pulsebeam_runtime::rand::Rng,
+    shards: usize,
+) -> pulsebeam::node::NodeBuilder {
     let rtc_port = 3478;
     let external_addr = SocketAddr::new(ip, rtc_port);
     let local_addr = unspecified_addr(ip, rtc_port);
@@ -158,21 +177,10 @@ pub async fn start_sfu_node_with_transport(
             .expect("development registry is valid"),
         )
         .with_current_runtime();
-    if let Some(notification) = startup_notification {
-        builder = builder.with_sim_startup_notification(notification);
-    }
     if shards > 1 {
         builder = builder.room_partition_size(1).round_robin_rooms();
     }
-    if tcp_only {
-        builder = builder.tcp_only();
-    } else if udp_only {
-        builder = builder.udp_only();
-    }
     builder
-        .run(tokio_util::sync::CancellationToken::new())
-        .await?;
-    Ok(())
 }
 
 /// Run a Turmoil simulation run with a real-time timeout.

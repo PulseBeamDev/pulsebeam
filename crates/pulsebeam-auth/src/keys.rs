@@ -36,6 +36,14 @@ impl ApiPublicKey {
         &self.0
     }
 
+    #[doc(hidden)]
+    pub fn verify_message(&self, message: &[u8], signature: &[u8; 64]) -> bool {
+        VerifyingKey::from_bytes(&self.0).is_ok_and(|key| {
+            key.verify_strict(message, &ed25519_dalek::Signature::from_bytes(signature))
+                .is_ok()
+        })
+    }
+
     /// Standard RFC 8410 SubjectPublicKeyInfo DER, base64url without padding.
     #[allow(clippy::expect_used)] // Ed25519 SPKI encoding of a validated key is infallible.
     pub fn as_str(&self) -> String {

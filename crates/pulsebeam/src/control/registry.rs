@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::{
-    control::controller::SignalingProtocol,
+    control::controller::{SignalingProtocol, ownership::ClaimRank},
     control::room::RoomShard,
     entity::{ConnectionId, ConnectionScope, EndpointKey, ParticipantId, ProjectRoomKey, RoomId},
     id::ShardId,
@@ -24,6 +24,7 @@ pub struct ParticipantMeta {
     pub profile: SignalingProtocol,
     pub authorization: Option<super::controller::AuthorizationLease>,
     pub materialized: bool,
+    pub(super) claim: Option<ClaimRank>,
 }
 
 impl ParticipantMeta {
@@ -130,6 +131,7 @@ impl RoomRegistry {
                 profile: SignalingProtocol::State,
                 authorization: None,
                 materialized: false,
+                claim: Some(ClaimRank::root(connection_id)),
             },
         ) {
             self.unindex_participant(room_id, participant_id);
@@ -260,12 +262,10 @@ impl RoomRegistry {
         }
     }
 
-    /// Atomically installs a prepared local incarnation when it wins UUIDv7
-    /// ordering. The ordering is only a local convergence discriminator: this
-    /// registry is neither replicated nor durable across process restarts.
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
-        reason = "candidate identity, placement, and transport commit atomically"
+        reason = "fixtures install one complete local incarnation"
     )]
     pub fn commit_candidate(
         &mut self,
@@ -277,15 +277,43 @@ impl RoomRegistry {
         connection_id: ConnectionId,
         profile: SignalingProtocol,
     ) -> Result<Option<ParticipantMeta>, CommitCandidateError> {
+        self.commit_ranked_candidate(
+            participant_id,
+            room_id,
+            shard_id,
+            partition_index,
+            transport,
+            ClaimRank::root(connection_id),
+            profile,
+        )
+    }
+
+    /// Atomically installs a prepared local joined claim, using its validated
+    /// rank rather than comparing the physical transport IDs.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "candidate identity, placement, and transport commit atomically"
+    )]
+    pub(super) fn commit_ranked_candidate(
+        &mut self,
+        participant_id: ParticipantId,
+        room_id: ProjectRoomKey,
+        shard_id: ShardId,
+        partition_index: usize,
+        transport: NodeTransportAddress,
+        claim: ClaimRank,
+        profile: SignalingProtocol,
+    ) -> Result<Option<ParticipantMeta>, CommitCandidateError> {
+        let connection_id = claim.connection();
         let endpoint = EndpointKey {
             room: room_id,
             participant: participant_id,
         };
         if self.connections.contains_key(&connection_id)
             || self
-                .endpoints
-                .get(&endpoint)
-                .is_some_and(|current| *current >= connection_id)
+                .get_endpoint(endpoint)
+                .and_then(|current| current.claim)
+                .is_some_and(|current| current >= claim)
         {
             return Err(CommitCandidateError::Superseded);
         }
@@ -301,6 +329,7 @@ impl RoomRegistry {
                 profile,
                 authorization: None,
                 materialized: true,
+                claim: Some(claim),
             },
         );
         if let Some(previous) = &previous {
@@ -343,6 +372,7 @@ impl RoomRegistry {
             profile: SignalingProtocol::State,
             authorization: None,
             materialized: true,
+            claim: None,
         });
         Ok(())
     }
@@ -897,6 +927,37 @@ mod tests {
             Some(participant)
         );
         assert!(reg.get_connection(failed).is_none());
+    }
+
+    #[test]
+    fn joined_projection_orders_successors_by_lineage_not_physical_connection() {
+        let mut registry = RoomRegistry::new();
+        let participant = participant_id();
+        let room = ProjectRoomKey::fixture(room_id("successor"));
+        let mut install = |claim: ClaimRank, epoch| {
+            registry.commit_ranked_candidate(
+                participant,
+                room,
+                ShardId::new(0),
+                0,
+                transport(0, epoch),
+                claim,
+                SignalingProtocol::State,
+            )
+        };
+        let root = ClaimRank::root(connection_id(4));
+        let successor = root.successor(connection_id(1)).unwrap();
+        assert!(install(root, 1).unwrap().is_none());
+        let predecessor = install(successor, 2).unwrap().unwrap();
+        assert_eq!(predecessor.connection_id, root.connection());
+        assert_eq!(
+            install(ClaimRank::root(connection_id(3)), 3),
+            Err(CommitCandidateError::Superseded)
+        );
+        assert_eq!(
+            registry.get_participant(&participant).unwrap().claim,
+            Some(successor)
+        );
     }
 
     #[test]

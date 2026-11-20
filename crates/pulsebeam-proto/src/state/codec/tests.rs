@@ -1150,6 +1150,7 @@ fn session_and_owned_absence_have_distinct_failure_and_direction_rules() {
         }),
         closed: None,
         diagnostic: String::new(),
+        successor_receipt: None,
     };
     let mut session = ConfirmedState {
         value: Some(confirmed_state::Value::Session(grant.clone())),
@@ -1190,6 +1191,49 @@ fn session_and_owned_absence_have_distinct_failure_and_direction_rules() {
     };
     let batch = confirmed(resource_key::Key::Session(true), terminal);
     assert_eq!(decode_server(&encode_server(&batch).unwrap()), Ok(batch));
+}
+
+#[test]
+fn successor_receipt_round_trips_only_on_live_sessions_and_redacts_debug() {
+    let mut receipt = SuccessorReceipt {
+        proof: vec![0xA5; MAX_SUCCESSOR_RECEIPT_BYTES],
+        expires_at_unix_seconds: 1300,
+    };
+    let batch = |receipt, closed| ServerStateBatch {
+        records: vec![ServerStateRecord {
+            key: Some(ResourceKey {
+                key: Some(resource_key::Key::Session(true)),
+            }),
+            confirmed: Some(ConfirmedState {
+                value: Some(confirmed_state::Value::Session(SessionState {
+                    authorization: Some(Authorization {
+                        expires_at_unix_seconds: 2000,
+                        revision: 1,
+                    }),
+                    successor_receipt: Some(receipt),
+                    closed,
+                    ..SessionState::default()
+                })),
+                ..ConfirmedState::default()
+            }),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        alloc::format!("{receipt:?}"),
+        "SuccessorReceipt([redacted])"
+    );
+    let live = batch(receipt.clone(), None);
+    assert_eq!(decode_server(&encode_server(&live).unwrap()), Ok(live));
+    assert!(
+        encode_server(&batch(
+            receipt.clone(),
+            Some(CloseReason::ParticipantReplaced as i32)
+        ))
+        .is_err()
+    );
+    receipt.proof.push(0);
+    assert!(encode_server(&batch(receipt, None)).is_err());
 }
 
 #[test]

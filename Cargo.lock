@@ -4100,6 +4100,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "str0m 0.22.0",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tower",

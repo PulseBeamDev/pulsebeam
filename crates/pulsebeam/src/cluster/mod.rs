@@ -3,10 +3,12 @@
 mod config;
 mod identity;
 
-pub use config::{Options, ServerConfig};
+pub use config::{Options, ServerConfig, Topology};
 
 use anyhow::{Context, Result};
-use chitchat::transport::{Socket, UdpSocket};
+use chitchat::transport::Socket;
+#[cfg(not(feature = "sim"))]
+use chitchat::transport::UdpSocket;
 use pulsebeam_membership::{Config, Handle, Incarnation, Membership, Metadata};
 use pulsebeam_runtime::sync::CancellationToken;
 use pulsebeam_runtime::task::JoinHandle;
@@ -45,16 +47,31 @@ pub struct Service {
 
 impl Service {
     pub async fn start(options: Options) -> Result<Self> {
+        options.validate_topology()?;
+        #[cfg(feature = "sim")]
+        anyhow::ensure!(
+            options.topology == Topology::SingleNode,
+            "multi-node gossip requires an explicit simulation transport"
+        );
         let data_dir = options.data_dir.clone();
         let identity = pulsebeam_runtime::task::spawn_blocking(move || {
             identity::Identity::allocate(&data_dir)
         })
         .await
         .context("membership identity worker failed")??;
-        let socket = UdpSocket::open(options.listen)
-            .await
-            .context("binding gossip UDP")?;
-        Self::start_bound(options, identity, Box::new(socket)).await
+        #[cfg(not(feature = "sim"))]
+        let socket: Box<dyn Socket> = Box::new(
+            UdpSocket::open(options.listen)
+                .await
+                .context("binding gossip UDP")?,
+        );
+        #[cfg(feature = "sim")]
+        let socket = chitchat::transport::Transport::open(
+            &chitchat::transport::ChannelTransport::default(),
+            options.listen,
+        )
+        .await?;
+        Self::start_bound(options, identity, socket).await
     }
 
     async fn start_bound(
@@ -209,6 +226,7 @@ mod tests {
             assert_eq!(identity.generation, generation);
             let options = Options {
                 cluster_id: "udp-smoke".into(),
+                topology: Topology::MultiNode,
                 listen,
                 advertise: listen,
                 seeds: vec![seed],

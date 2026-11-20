@@ -20,7 +20,8 @@ use super::common::native::NativeHost;
 use super::common::native_audio::NativePcmLog;
 use super::common::native_video::NativeDecodedVideoLog;
 use super::common::{
-    DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, start_sfu_node_with, subnet_ip,
+    DEFAULT_SIM_SHARDS, reserve_subnet, run_sim_or_timeout, sfu_node_builder, start_sfu_node_with,
+    subnet_ip,
 };
 
 const NATIVE_RUNTIME_SEED: u64 = 1;
@@ -37,14 +38,26 @@ struct CreationEvidence {
 struct LostCreationResponse {
     inner: Box<dyn AsyncHttpClient>,
     evidence: Arc<Mutex<CreationEvidence>>,
+    successor_receiver: Option<IpAddr>,
 }
 
 impl AsyncHttpClient for LostCreationResponse {
     fn execute(
         &self,
-        request: pulsebeam_core::net::HttpRequest,
+        mut request: pulsebeam_core::net::HttpRequest,
     ) -> pulsebeam_core::net::HttpResult<'_> {
         Box::pin(async move {
+            let path = request.uri().path();
+            if let Some(receiver) = self.successor_receiver
+                && request.method() == http::Method::POST
+                && matches!(path, "/api/v1/native" | "/api/v1/native/admissions")
+                && self.evidence.lock().unwrap().dropped
+            {
+                *request.uri_mut() = format!("http://{receiver}:7070{path}").parse().unwrap();
+            }
+            let can_drop = self.successor_receiver.is_none()
+                || serde_json::from_slice::<serde_json::Value>(request.body())
+                    .is_ok_and(|body| body.get("successor_receipt").is_some());
             let creation = request.headers().get("PulseBeam-Owner").map(|owner| {
                 (
                     request.body().clone(),
@@ -85,7 +98,7 @@ impl AsyncHttpClient for LostCreationResponse {
                             .as_bytes()
                             .to_vec(),
                     );
-                    if !evidence.dropped {
+                    if can_drop && !evidence.dropped {
                         evidence.dropped = true;
                         return Err(
                             std::io::Error::other("simulated lost creation response").into()
@@ -648,6 +661,7 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
     fastrand::seed(seed);
     pulsebeam_runtime::net::shaper::seed_impairments(seed);
     let _ = stock_opus_fixture();
+    let cluster_dir = tempfile::tempdir().expect("single-node cluster state directory");
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(Duration::from_secs(90))
@@ -658,15 +672,28 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
     let alice_ip = subnet_ip(subnet, 2);
     let bob_ip = subnet_ip(subnet, 3);
 
-    sim.host(server_ip, move || async move {
-        start_sfu_node_with(
-            server_ip,
-            pulsebeam_runtime::rand::seeded_rng(seed),
-            DEFAULT_SIM_SHARDS,
-            false,
-        )
-        .await
-        .map_err(Into::into)
+    let state = cluster_dir.path().to_owned();
+    sim.host(server_ip, move || {
+        let state = state.clone();
+        async move {
+            let gossip = "127.0.0.1:7946".parse().unwrap();
+            sfu_node_builder(
+                server_ip,
+                pulsebeam_runtime::rand::seeded_rng(seed),
+                DEFAULT_SIM_SHARDS,
+            )
+            .with_cluster(pulsebeam::cluster::Options {
+                cluster_id: "native-reconnect".into(),
+                topology: pulsebeam::cluster::Topology::SingleNode,
+                listen: gossip,
+                advertise: gossip,
+                seeds: Vec::new(),
+                data_dir: state,
+            })
+            .run(tokio_util::sync::CancellationToken::new())
+            .await
+            .map_err(Into::into)
+        }
     });
 
     let (reports_tx, mut reports_rx) = tokio::sync::mpsc::channel(2);
@@ -737,6 +764,155 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
         })
         .collect();
     println!("[native-lifecycle] {}", serde_json::Value::Array(semantics));
+}
+
+#[test]
+fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse().expect("simulation seed must be a u64"))
+        .unwrap_or(NATIVE_RUNTIME_SEED);
+    let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(40))
+        .rng_seed(seed)
+        .build();
+    let subnet = reserve_subnet();
+    let issuer_ip = subnet_ip(subnet, 1);
+    let receiver_ip = subnet_ip(subnet, 2);
+    let client_ip = subnet_ip(subnet, 3);
+    let (issuer, receiver) = pulsebeam::node::SimOwnershipPeer::pair();
+    for (ip, peer, node_seed) in [
+        (issuer_ip, issuer.clone(), seed),
+        (receiver_ip, receiver.clone(), !seed),
+    ] {
+        sim.host(ip, move || {
+            let peer = peer.clone();
+            async move {
+                sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(node_seed), 1)
+                    .with_sim_ownership_peer(peer)
+                    .run(tokio_util::sync::CancellationToken::new())
+                    .await
+                    .map_err(Into::into)
+            }
+        });
+    }
+    sim.client(client_ip, async move {
+        prove_joined_recovery(client_ip, issuer_ip, receiver_ip, issuer, receiver)
+            .await
+            .map_err(Into::into)
+    });
+    run_sim_or_timeout(&mut sim, Duration::from_secs(20)).unwrap();
+}
+
+async fn prove_joined_recovery(
+    client_ip: IpAddr,
+    issuer_ip: IpAddr,
+    receiver_ip: IpAddr,
+    issuer: pulsebeam::node::SimOwnershipPeer,
+    receiver: pulsebeam::node::SimOwnershipPeer,
+) -> anyhow::Result<()> {
+    let room = "native-failover";
+    let unix_now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let token = pulsebeam_server::sign_participant_token(
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
+        &serde_json::from_value(serde_json::json!([{"rooms":[room],"allow":["join","publish"]}]))?,
+        "alice",
+        unix_now() + 3600,
+    )?
+    .token;
+    let config = Config::new(pulsebeam_agent_core::AgentConfig {
+        endpoint: format!("http://{issuer_ip}:7070"),
+        token,
+        retry: Default::default(),
+        log_level: Default::default(),
+    });
+    let evidence = Arc::new(Mutex::new(CreationEvidence::default()));
+    let host = NativeHost::bind(client_ip)?;
+    let (runtime, actor) = RuntimeAgent::managed_with_services(
+        config,
+        Host::new(Box::new(LostCreationResponse {
+            inner: create_http_client(),
+            evidence: evidence.clone(),
+            successor_receiver: Some(receiver_ip),
+        })),
+        move || host.runtime(),
+    )?;
+    tokio::task::spawn_local(actor);
+    let agent = Agent::from_runtime(runtime.clone());
+    replace_transport_desired(
+        &runtime,
+        core_ffi::DesiredState {
+            connected: true,
+            topic_publishers: vec![core_ffi::TopicPublisher {
+                name: "feed".into(),
+                mode: core_ffi::TopicMode::Latest,
+            }],
+            ..Default::default()
+        },
+    )
+    .await?;
+    runtime.join(room.to_owned())?;
+    let first = wait_connected(&agent, None).await?;
+    issuer.deliver_receipt_facts(unix_now() + 20);
+    agent.reconnect().await?;
+    let recovered = wait_connected(&agent, first.generation).await?;
+    anyhow::ensure!(
+        recovered.participant_id == first.participant_id && recovered.room_id == first.room_id
+    );
+    anyhow::ensure!(
+        recovered.topics.publishers[0].publication_id != first.topics.publishers[0].publication_id
+    );
+    {
+        let evidence = evidence.lock().unwrap();
+        let created = http::StatusCode::CREATED;
+        anyhow::ensure!(
+            evidence.statuses == [created, created, http::StatusCode::GONE, created],
+            "unexpected admission sequence: {:?}",
+            evidence.statuses
+        );
+        anyhow::ensure!(
+            evidence.requests[1] == evidence.requests[2],
+            "wrong-target replay changed the pinned request"
+        );
+        anyhow::ensure!(
+            evidence.requests[2].1 != evidence.requests[3].1,
+            "receiving controller reused the issuer attempt"
+        );
+        let source = issuer_ip.to_string();
+        let destination = receiver_ip.to_string();
+        anyhow::ensure!(
+            evidence.posts[1].uri().host() == Some(source.as_str())
+                && evidence.posts[2].uri().host() == Some(destination.as_str())
+        );
+        let receipt = |body: &[u8]| {
+            serde_json::from_slice::<serde_json::Value>(body).unwrap()["successor_receipt"].clone()
+        };
+        anyhow::ensure!(!receipt(&evidence.requests[1].0).is_null());
+        anyhow::ensure!(receipt(&evidence.requests[1].0) == receipt(&evidence.requests[3].0));
+    }
+    anyhow::ensure!(
+        issuer.local_claim_count().await? == 1 && receiver.local_claim_count().await? == 1
+    );
+    receiver
+        .deliver_claim_snapshot(pulsebeam_runtime::time::Instant::now() + Duration::from_secs(10))
+        .await?;
+    anyhow::ensure!(
+        issuer.local_claim_count().await? == 0 && receiver.local_claim_count().await? == 1,
+        "sibling claims did not converge"
+    );
+    anyhow::ensure!(
+        agent.snapshot().generation == recovered.generation
+            && agent.snapshot().connection == core_ffi::ConnectionState::Connected
+    );
+    agent.close().await?;
+    Ok(())
 }
 
 #[test]
@@ -1000,6 +1176,7 @@ async fn run_peer(
         Box::new(LostCreationResponse {
             inner: create_http_client(),
             evidence: creation_evidence.clone(),
+            successor_receiver: None,
         })
     } else {
         create_http_client()
@@ -1773,6 +1950,7 @@ async fn prove_takeover(config: Config, host: NativeHost, room: &str) -> anyhow:
         Host::new(Box::new(LostCreationResponse {
             inner: create_http_client(),
             evidence: evidence.clone(),
+            successor_receiver: None,
         })),
         move || predecessor_host.runtime(),
     )?;
@@ -1861,6 +2039,7 @@ async fn prove_held_creation_takeover(
         inner: Box::new(LostCreationResponse {
             inner: create_http_client(),
             evidence: evidence.clone(),
+            successor_receiver: None,
         }),
         admitted: Mutex::new(Some(admitted_tx)),
         release: Mutex::new(Some(release_rx)),

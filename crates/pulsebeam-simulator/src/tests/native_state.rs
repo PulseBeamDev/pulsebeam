@@ -136,7 +136,7 @@ impl WirePeer {
             .uri(format!("http://{server}:7070/api/v1/native/admissions"))
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
-            .body(b"{}".to_vec())?;
+            .body(serde_json::to_vec(&serde_json::json!({"room":room}))?)?;
         let admission = create_http_client()
             .execute(admission)
             .await

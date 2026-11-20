@@ -410,6 +410,7 @@ fn terminal_session_cause_survives_subscription_observer_close() {
                 }),
                 closed: Some(state::CloseReason::ParticipantReplaced as i32),
                 diagnostic: "opaque diagnostic".into(),
+                successor_receipt: None,
             }),
         )],
     );

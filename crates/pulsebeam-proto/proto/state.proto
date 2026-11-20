@@ -270,6 +270,16 @@ message SessionState {
 
   // Optional non-secret text <=256 UTF-8 bytes; only with closed present.
   string diagnostic = 3;
+
+  // Opaque successor proof for an accepted joined Native connection only.
+  SuccessorReceipt successor_receipt = 4;
+}
+
+message SuccessorReceipt {
+  // Signed server claim, 1 to 768 bytes. Never log or expose in diagnostics.
+  bytes proof = 1;
+  // Advisory client deadline; the server verifies the signed deadline.
+  uint64 expires_at_unix_seconds = 2;
 }
 
 message Authorization {

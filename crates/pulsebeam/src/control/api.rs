@@ -73,8 +73,8 @@ pub enum ApiError {
     NotFound,
     #[error("identity response encoding is required")]
     NotAcceptable,
-    #[error("ownership recovery is unavailable")]
-    RecoveryUnavailable,
+    #[error("ownership attempt is unavailable at this receiver")]
+    AttemptUnavailable,
     #[error("ownership attempt was superseded")]
     OwnershipSuperseded,
     #[error("authorization precondition required")]
@@ -144,9 +144,11 @@ impl ApiError {
             Self::PreconditionRequired => {
                 (StatusCode::PRECONDITION_REQUIRED, "Precondition Required")
             }
-            Self::JoinError(controller::ControllerError::GrantGone) | Self::RecoveryUnavailable => {
-                (StatusCode::GONE, "Gone")
-            }
+            Self::JoinError(
+                controller::ControllerError::GrantGone
+                | controller::ControllerError::RecoveryUnavailable,
+            )
+            | Self::AttemptUnavailable => (StatusCode::GONE, "Gone"),
             Self::JoinError(controller::ControllerError::AuthorizationRejected) => {
                 (StatusCode::FORBIDDEN, "Forbidden")
             }
@@ -208,7 +210,11 @@ impl ApiError {
             status,
             headers,
             problem: Some(Problem {
-                r#type: "about:blank",
+                r#type: if matches!(self, Self::AttemptUnavailable) {
+                    pulsebeam_proto::state::ATTEMPT_UNAVAILABLE_PROBLEM
+                } else {
+                    "about:blank"
+                },
                 title,
                 status: status.as_u16(),
                 detail,
@@ -223,7 +229,7 @@ impl From<controller::OwnedAdmissionError> for ProblemResponse {
         match error {
             OwnedAdmissionError::Request(error) => ApiError::JoinError(error),
             OwnedAdmissionError::Authority(Error::UnknownProof | Error::ReplayUnavailable) => {
-                ApiError::RecoveryUnavailable
+                ApiError::AttemptUnavailable
             }
             OwnedAdmissionError::Authority(Error::Replaced | Error::StaleAttempt) => {
                 ApiError::OwnershipSuperseded
@@ -313,6 +319,7 @@ struct NativeRequest {
     offer: String,
     #[serde(default, deserialize_with = "deserialize_requested_room")]
     room: Option<String>,
+    successor_receipt: Option<Vec<u8>>,
 }
 
 fn deserialize_requested_room<'de, D: serde::Deserializer<'de>>(
@@ -327,6 +334,13 @@ fn parse_native_request(body: &[u8]) -> Result<NativeRequest, ApiError> {
         return Err(invalid());
     }
     let request: NativeRequest = serde_json::from_slice(body).map_err(|_| invalid())?;
+    if request.successor_receipt.as_ref().is_some_and(|proof| {
+        request.room.is_none()
+            || proof.is_empty()
+            || proof.len() > pulsebeam_proto::state::MAX_SUCCESSOR_RECEIPT_BYTES
+    }) {
+        return Err(invalid());
+    }
     if request.profile != pulsebeam_proto::state::PROFILE {
         return Err(ApiError::BadRequest(
             "unsupported native profile".to_owned(),
@@ -505,6 +519,7 @@ fn validate_single_media_per_kind(offer: &str) -> Result<(), ApiError> {
     responses(
         (status = 201, description = "Native connection created", body = NativeResponse,
             headers(("Location" = String, description = "Absolute native resource URL"))),
+        (status = 410, description = "Pinned attempt or joined recovery authority is unavailable", body = Problem, content_type = "application/problem+json"),
         (status = 400, description = "Invalid request or SDP", body = Problem, content_type = "application/problem+json"),
         (status = 401, description = "Invalid bearer authorization", body = Problem, content_type = "application/problem+json"),
         (status = 409, description = "Candidate was superseded", body = Problem, content_type = "application/problem+json"),
@@ -523,8 +538,7 @@ async fn create_native(state: State<AppState>, request: Request) -> Result<Respo
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct NativeAdmissionRequest {
-    #[serde(default)]
-    roomless: bool,
+    room: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1330,7 +1344,7 @@ mod tests {
         let authenticated =
             pulsebeam_core::auth::authenticate_participant_token(&auth_registry(), credential, 0)
                 .unwrap();
-        let principal = PrincipalKey::from_principal(&authenticated);
+        let principal = PrincipalKey::from_principal(&authenticated, authorization.room_id);
         assert_eq!(principal, PrincipalKey::from_verified(authorization));
         let now = Instant::now();
         let mut entropy = rand::rngs::StdRng::seed_from_u64(23);
@@ -1713,7 +1727,7 @@ mod tests {
         ];
         for body in [
             b"[]".to_vec(),
-            br#"{"room":"general"}"#.to_vec(),
+            br#"{"room":"not.a.room"}"#.to_vec(),
             vec![b' '; 1_025],
         ] {
             let status = if body.len() > 1_024 {
@@ -2525,6 +2539,10 @@ mod tests {
                 .status(),
             StatusCode::CONFLICT
         );
+        let unavailable =
+            ApiError::JoinError(controller::ControllerError::RecoveryUnavailable).into_problem();
+        assert_eq!(unavailable.status(), StatusCode::GONE);
+        assert_eq!(unavailable.problem.unwrap().r#type, "about:blank");
         for (error, status) in [
             (Error::InvalidProof, StatusCode::BAD_REQUEST),
             (Error::UnknownProof, StatusCode::GONE),
@@ -2537,8 +2555,14 @@ mod tests {
             (Error::ResultTooLarge, StatusCode::PAYLOAD_TOO_LARGE),
             (Error::InvalidTransition, StatusCode::INTERNAL_SERVER_ERROR),
         ] {
-            let response =
-                ProblemResponse::from(OwnedAdmissionError::Authority(error)).into_response();
+            let response = ProblemResponse::from(OwnedAdmissionError::Authority(error));
+            if status == StatusCode::GONE {
+                assert_eq!(
+                    response.problem.as_ref().unwrap().r#type,
+                    pulsebeam_proto::state::ATTEMPT_UNAVAILABLE_PROBLEM
+                );
+            }
+            let response = response.into_response();
             assert_eq!(response.status(), status);
             assert_eq!(
                 response.headers().contains_key(RETRY_AFTER),

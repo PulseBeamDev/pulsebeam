@@ -27,6 +27,8 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::control::api;
 use crate::control::controller::ControllerActor;
+#[cfg(feature = "sim")]
+pub use crate::control::controller::ownership::sim::SimOwnershipPeer;
 use crate::control::steering::Steering;
 use crate::id::ShardId;
 use crate::shard::ShardContext;
@@ -65,6 +67,8 @@ pub struct NodeBuilder {
         Option<pulsebeam_runtime::sync::oneshot::Sender<pulsebeam_runtime::rt::MigrationHandle>>,
     #[cfg(feature = "sim")]
     sim_startup_notification: Option<pulsebeam_runtime::sync::mpsc::Sender<()>>,
+    #[cfg(feature = "sim")]
+    sim_ownership_peer: Option<SimOwnershipPeer>,
     // Data-plane topology
     //
     // `data_threads` is physical executor width. Logical shard count is derived
@@ -121,6 +125,8 @@ impl NodeBuilder {
             runtime_control: None,
             #[cfg(feature = "sim")]
             sim_startup_notification: None,
+            #[cfg(feature = "sim")]
+            sim_ownership_peer: None,
             data_threads: 1,
             shard_runtime: ExecutionConfig::default(),
             local_addr: None,
@@ -168,6 +174,13 @@ impl NodeBuilder {
         notification: pulsebeam_runtime::sync::mpsc::Sender<()>,
     ) -> Self {
         self.sim_startup_notification = Some(notification);
+        self
+    }
+
+    /// Attach a scripted peer identity and receipt-fact input in simulation.
+    #[cfg(feature = "sim")]
+    pub fn with_sim_ownership_peer(mut self, peer: SimOwnershipPeer) -> Self {
+        self.sim_ownership_peer = Some(peer);
         self
     }
 
@@ -402,15 +415,14 @@ impl NodeBuilder {
                 )
                 .await;
         };
+        use crate::{cluster::Topology, control::controller::OwnershipMode};
+        let ownership_mode = match options.topology {
+            Topology::SingleNode => OwnershipMode::Standalone,
+            Topology::MultiNode => OwnershipMode::Unavailable,
+        };
         let membership = crate::cluster::Service::start(options).await?;
         membership
-            .supervise(
-                self.run_media(
-                    shutdown.clone(),
-                    crate::control::controller::OwnershipMode::Unavailable,
-                ),
-                shutdown,
-            )
+            .supervise(self.run_media(shutdown.clone(), ownership_mode), shutdown)
             .await
     }
 
@@ -735,6 +747,10 @@ impl NodeBuilder {
             view_writers,
         );
         controller.set_ownership_mode(ownership_mode);
+        #[cfg(feature = "sim")]
+        if let Some(peer) = self.sim_ownership_peer.as_ref() {
+            controller.set_sim_ownership_peer(peer.clone());
+        }
         controller.set_links(links, frame_ports, clock_origin);
         if let Some(address) = self.link_listen {
             let (host, installs) = crate::link::host::Host::bind(address, clock_origin).await.context("binding Link UDP")?;
@@ -762,6 +778,10 @@ impl NodeBuilder {
             mailbox::bounded(const { core::num::NonZeroUsize::new(16).unwrap() });
         if let Some(ready) = self.link_control {
             let _ = ready.send(crate::link::Control::new(controller_command_tx.clone()));
+        }
+        #[cfg(feature = "sim")]
+        if let Some(peer) = self.sim_ownership_peer {
+            peer.attach(crate::control::controller::peer_ownership::Control::new(controller_command_tx.clone()));
         }
         #[cfg(feature = "sim")]
         if let Some(notification) = self.sim_startup_notification {

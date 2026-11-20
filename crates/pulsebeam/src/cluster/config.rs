@@ -73,13 +73,16 @@ impl ServerConfig {
             );
             seeds.insert(resolved);
         }
-        Ok(Some(Options {
+        let options = Options {
             cluster_id: cluster.id,
+            topology: cluster.topology,
             listen,
             advertise,
             seeds: seeds.into_iter().collect(),
             data_dir,
-        }))
+        };
+        options.validate_topology()?;
+        Ok(Some(options))
     }
 }
 
@@ -88,6 +91,8 @@ impl ServerConfig {
 pub struct ClusterConfig {
     id: String,
     advertise_host: String,
+    #[serde(default)]
+    topology: Topology,
     #[serde(default)]
     seeds: Vec<String>,
     #[serde(default)]
@@ -112,14 +117,39 @@ impl Default for GossipConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Topology {
+    #[default]
+    MultiNode,
+    SingleNode,
+}
+
 /// Resolved host-owned configuration. The membership engine never reads paths or DNS.
 #[derive(Clone, Debug)]
 pub struct Options {
     pub cluster_id: String,
+    pub topology: Topology,
     pub listen: SocketAddr,
     pub advertise: SocketAddr,
     pub seeds: Vec<SocketAddr>,
     pub data_dir: PathBuf,
+}
+
+impl Options {
+    pub(super) fn validate_topology(&self) -> Result<()> {
+        if self.topology == Topology::SingleNode {
+            ensure!(
+                self.seeds.is_empty(),
+                "cluster.topology = 'single_node' does not allow seeds"
+            );
+            ensure!(
+                self.listen.ip().is_loopback() && self.listen == self.advertise,
+                "cluster.topology = 'single_node' requires identical loopback listen and advertise endpoints"
+            );
+        }
+        Ok(())
+    }
 }
 
 async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
@@ -179,6 +209,32 @@ mod tests {
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+    async fn single_node_requires_an_explicit_isolated_endpoint() {
+        let base = "[cluster]\nid='test'\ntopology='single_node'\nadvertise_host='127.0.0.1'\n";
+        let resolve = |suffix: &str| {
+            toml::from_str::<ServerConfig>(&format!("{base}{suffix}"))
+                .unwrap()
+                .resolve(Some("state".into()))
+        };
+        let listen = "[cluster.gossip]\nlisten='127.0.0.1:7946'";
+        assert_eq!(
+            resolve(listen).await.unwrap().unwrap().topology,
+            Topology::SingleNode
+        );
+        assert!(resolve("").await.is_err());
+        assert!(
+            resolve("[cluster.gossip]\nlisten='127.0.0.2:7946'")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve(&format!("seeds=['127.0.0.2:7946']\n{listen}"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
     async fn defaults_explicit_advertise_and_required_data_directory() {
         let text = "[cluster]\nid = 'test'\nadvertise_host = '127.0.0.1'\n";
         assert!(
@@ -194,6 +250,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(config.topology, Topology::MultiNode);
         assert_eq!(config.listen, "0.0.0.0:7946".parse().unwrap());
         assert_eq!(config.advertise, "127.0.0.1:7946".parse().unwrap());
         assert!(config.seeds.is_empty());

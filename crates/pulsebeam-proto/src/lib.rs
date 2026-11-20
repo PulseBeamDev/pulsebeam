@@ -7,7 +7,17 @@ extern crate alloc;
 pub mod state {
     pub const PROFILE: &str = "pulsebeam.media.v1";
 
+    pub const MAX_SUCCESSOR_RECEIPT_BYTES: usize = 768;
+    pub const ATTEMPT_UNAVAILABLE_PROBLEM: &str =
+        "urn:pulsebeam:problem:native-attempt-unavailable";
+
     include!(concat!(env!("OUT_DIR"), "/pulsebeam.media.v1.rs"));
+
+    impl core::fmt::Debug for SuccessorReceipt {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("SuccessorReceipt([redacted])")
+        }
+    }
     #[cfg(feature = "json")]
     #[allow(
         clippy::arithmetic_side_effects,

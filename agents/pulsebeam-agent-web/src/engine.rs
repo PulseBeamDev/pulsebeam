@@ -1395,6 +1395,7 @@ mod tests {
                                     }),
                                     closed: None,
                                     diagnostic: String::new(),
+                                    successor_receipt: None,
                                 },
                             )),
                         }),

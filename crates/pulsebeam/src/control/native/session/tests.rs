@@ -5,6 +5,38 @@ mod discovery;
 mod permissions;
 
 #[test]
+fn successor_receipt_updates_independently_of_grant_and_is_cleared_on_close() {
+    let mut session = NativeSession::default();
+    let receipt = |value, expires| wire::SuccessorReceipt {
+        proof: vec![value],
+        expires_at_unix_seconds: expires,
+    };
+    session
+        .authorization(900, 1, ResourcePermissions::RoomBound)
+        .unwrap();
+    session.successor_receipt(receipt(1, 400)).unwrap();
+    session.successor_receipt(receipt(2, 460)).unwrap();
+    let state = session.session_state().unwrap();
+    assert_eq!(state.authorization.as_ref().unwrap().revision, 1);
+    assert_eq!(state.successor_receipt, Some(receipt(2, 460)));
+    session
+        .authorization(1200, 2, ResourcePermissions::RoomBound)
+        .unwrap();
+    assert_eq!(
+        session.session_state().unwrap().successor_receipt,
+        Some(receipt(2, 460))
+    );
+    session
+        .close(wire::CloseReason::ParticipantReplaced)
+        .unwrap();
+    assert!(session.session_state().unwrap().successor_receipt.is_none());
+    assert!(matches!(
+        session.successor_receipt(receipt(3, 520)),
+        Err(OutputError::InvalidObservation)
+    ));
+}
+
+#[test]
 fn missing_source_preparation_deadlines_expire_cancel_or_resolve_without_ending_the_source() {
     use crate::control::native::{PreparedResource, ReceiverPreparation};
     use crate::entity::{ConnectionId, ParticipantId, RoomId, TrackKind};
