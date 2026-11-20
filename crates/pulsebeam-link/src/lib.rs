@@ -5,9 +5,11 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
+mod control;
 pub mod io;
 mod network;
 mod wire;
+pub use control::{CONTROL_FRAME_BYTES, PeerControl};
 pub use network::{
     CodecError, LinkError, NetworkClass, NetworkId, NetworkPeer, NodeRouteKey, PeerFingerprint,
     PeerRole, SecretCredential, WireCodec,
@@ -250,6 +252,9 @@ impl<P> LinkControl<P> {
                 )
             }
             Destination::Network { peer, address } => {
+                if address.to_bytes() == control::CONTEXT {
+                    return Err(BindError::Closed);
+                }
                 let entry = self.networks.get(&peer).ok_or(BindError::Closed)?;
                 if entry.state.load(Ordering::Acquire) == network::CLOSED {
                     return Err(BindError::Closed);

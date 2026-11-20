@@ -18,7 +18,7 @@ use crate::{
 #[derive(Clone, PartialEq)]
 pub(crate) struct PublicationFact {
     pub(crate) descriptor: Track,
-    layers: Box<[(SourceEncoding, Option<Rid>, LayerQuality)]>,
+    pub(super) layers: Box<[(SourceEncoding, Option<Rid>, LayerQuality)]>,
 }
 
 impl PublicationFact {
@@ -105,7 +105,7 @@ impl std::fmt::Debug for EndpointFact {
 
 pub(crate) type Snapshot = Box<[(EndpointKey, EndpointFact)]>;
 
-fn validate_publications<'a>(
+pub(super) fn validate_publications<'a>(
     endpoints: impl IntoIterator<Item = (EndpointKey, &'a EndpointFact)>,
     limit: usize,
 ) -> Result<(), Error> {

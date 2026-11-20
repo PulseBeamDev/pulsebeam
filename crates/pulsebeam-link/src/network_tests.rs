@@ -57,6 +57,7 @@ struct Pair {
     ticks: Arc<AtomicU64>,
     a_peer: PeerConfig,
     b_peer: PeerConfig,
+    control: Option<[PeerControl; 2]>,
     a_epochs: [bool; 4],
     reject_a: bool,
     short_a: bool,
@@ -70,14 +71,14 @@ impl Pair {
     }
 
     fn with_key_limit(key_limit: Option<u64>) -> Self {
-        Self::configured(key_limit, false)
+        Self::configured(key_limit, false, false)
     }
 
     fn with_backend(quic: bool) -> Self {
-        Self::configured(None, quic)
+        Self::configured(None, quic, false)
     }
 
-    fn configured(key_limit: Option<u64>, quic: bool) -> Self {
+    fn configured(key_limit: Option<u64>, quic: bool, control: bool) -> Self {
         let ticks = Arc::new(AtomicU64::new(0));
         let clock = ticks.clone();
         let mut a = LinkControl::new(move || LinkTime(clock.load(Ordering::Relaxed))).unwrap();
@@ -130,8 +131,17 @@ impl Pair {
                 .into(),
             )
         };
-        let aid = a.open_network(a_peer.clone(), Codec).unwrap();
-        let bid = b.open_network(b_peer.clone(), Codec).unwrap();
+        let (aid, bid, control) = if control {
+            let (aid, left) = a.open_network_with_control(a_peer.clone(), Codec).unwrap();
+            let (bid, right) = b.open_network_with_control(b_peer.clone(), Codec).unwrap();
+            (aid, bid, Some([left, right]))
+        } else {
+            (
+                a.open_network(a_peer.clone(), Codec).unwrap(),
+                b.open_network(b_peer.clone(), Codec).unwrap(),
+                None,
+            )
+        };
         let mut ad = a.take_network_driver(aid).unwrap();
         let mut bd = b.take_network_driver(bid).unwrap();
         if let Some(limit) = key_limit {
@@ -155,6 +165,7 @@ impl Pair {
             ticks,
             a_peer,
             b_peer,
+            control,
             a_epochs: [false; 4],
             reject_a: false,
             short_a: false,
@@ -486,6 +497,51 @@ fn receive_retirement_fences_queued_payloads_without_withholding_transport_feedb
     assert_eq!(pair.bd.take_unknown_label(), None);
     assert_eq!(pair.ad.health().sent, 3);
     assert_eq!(pair.ad.health().bytes_in_flight, 0);
+}
+
+#[test]
+fn provisioned_control_shares_an_authenticated_link_without_entering_media_routes() {
+    let mut pair = Pair::configured(None, false, true);
+    let [left, mut right] = pair.control.take().unwrap();
+    assert_eq!(
+        left.try_send(Box::new([1]), LinkTime(u64::MAX)),
+        Err(SendErrorKind::NotReady)
+    );
+    let (port, mut rx) = pair.b.create_port().unwrap();
+    let (_, media) = pair.route(&[(port, DeliveryTag(7))]);
+    assert!(
+        pair.a
+            .bind_send(Destination::Network {
+                peer: pair.aid,
+                address: NodeRouteKey::from_bytes([0; 4]),
+            })
+            .is_err()
+    );
+    pair.connect();
+    assert!(left.is_ready() && right.is_ready());
+    assert_eq!(
+        left.try_send(
+            vec![0; CONTROL_FRAME_BYTES + 1].into_boxed_slice(),
+            LinkTime(u64::MAX)
+        ),
+        Err(SendErrorKind::TooLarge)
+    );
+    left.try_send(Box::new([2]), LinkTime(u64::MAX)).unwrap();
+    media
+        .try_send(Packet::Wire(Arc::from([3])), LinkTime(u64::MAX))
+        .unwrap();
+    for _ in 0..20 {
+        pair.step();
+    }
+    let message = futures_lite::future::block_on(futures_lite::future::poll_once(right.recv()));
+    assert_eq!(message.flatten().as_deref(), Some([2].as_slice()));
+    let mut batch = Vec::new();
+    assert_eq!(rx.try_recv_batch(&mut batch, 10), 1);
+    assert_eq!(batch[0].tag, DeliveryTag(7));
+    assert!(matches!(&batch[0].packet, Packet::Wire(bytes) if bytes.as_ref() == [3]));
+    pair.b.close_network(pair.bid);
+    assert!(right.is_closed());
+    assert!(futures_lite::future::block_on(right.recv()).is_none());
 }
 
 #[test]

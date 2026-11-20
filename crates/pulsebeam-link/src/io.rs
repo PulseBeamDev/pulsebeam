@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use super::control::{self, HostLane};
 use super::network::{self, Outbound, ReceiveBinding, WireCodec};
 use super::*;
 pub use pulsebeam_transport::{Datagram, Error, SendOutcome};
@@ -40,6 +41,8 @@ pub struct NetworkDriver<P> {
     now: LinkTime,
     health: Health,
     unknown_label: Option<NodeRouteKey>,
+    control: Option<HostLane>,
+    prefer_control: bool,
 }
 
 impl<P> Drop for NetworkDriver<P> {
@@ -56,6 +59,7 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
         table: Shared<Table>,
         outbound: pulsebeam_queue::Receiver<Outbound<P>>,
         commands: pulsebeam_queue::Receiver<ReceiveBinding<P>>,
+        control: Option<HostLane>,
     ) -> Result<Self, network::LinkError> {
         let transport = pulsebeam_transport::Transport::new(peer).map_err(|error| match error {
             Error::UnsupportedProfile => network::LinkError::UnsupportedProfile,
@@ -73,6 +77,8 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             now: LinkTime(0),
             health: Health::default(),
             unknown_label: None,
+            control,
+            prefer_control: true,
         })
     }
 
@@ -123,16 +129,35 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
         if self.transport.needs_progress() {
             return true;
         }
-        if self.pending.is_some() {
-            return self.commands.readable().await;
+        let media = async {
+            if self.pending.is_some() {
+                self.commands.readable().await
+            } else {
+                futures_lite::future::or(self.commands.readable(), self.outbound.readable()).await
+            }
+        };
+        if let Some(control) = self.control.as_mut().filter(|lane| lane.pending.is_none()) {
+            futures_lite::future::or(media, async {
+                if control.outgoing.readable().await {
+                    true
+                } else {
+                    std::future::pending().await
+                }
+            })
+            .await
+        } else {
+            media.await
         }
-        futures_lite::future::or(self.commands.readable(), self.outbound.readable()).await
     }
 
     pub fn next_deadline(&self) -> Option<LinkTime> {
         [
             self.transport.next_deadline(),
             self.pending.as_ref().map(|pending| pending.expires_at),
+            self.control
+                .as_ref()
+                .and_then(|lane| lane.pending.as_ref())
+                .map(|pending| pending.expires_at),
         ]
         .into_iter()
         .flatten()
@@ -197,17 +222,39 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             if self.pending.is_none() {
                 self.pending = self.outbound.try_recv().ok();
             }
-            self.transport.set_demand(self.pending.is_some());
+            if let Some(control) = self.control.as_mut()
+                && control.pending.is_none()
+            {
+                control.pending = control.outgoing.try_recv().ok();
+            }
+            self.transport.set_demand(
+                self.pending.is_some()
+                    || self
+                        .control
+                        .as_ref()
+                        .is_some_and(|lane| lane.pending.is_some()),
+            );
             let table = &self.table;
             let routes = &self.routes;
             let codec = &self.codec;
             let health = &mut self.health;
             let unknown_label = &mut self.unknown_label;
+            let control = self.control.as_ref();
             work = work.saturating_add(self.transport.poll(
                 now,
                 budget.saturating_sub(work),
                 &mut *send,
                 |application| {
+                    if let Some(control) = control
+                        && application.context == control::CONTEXT
+                    {
+                        if application.payload.len() > control::CONTROL_FRAME_BYTES {
+                            health.invalid = health.invalid.saturating_add(1);
+                        } else {
+                            let _ = control.incoming.try_send(application.payload.into());
+                        }
+                        return;
+                    }
                     Self::deliver(
                         table,
                         routes,
@@ -239,9 +286,33 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
     }
 
     fn prepare_next(&mut self) -> Result<bool, Error> {
+        if (self.prefer_control || self.pending.is_none())
+            && let Some(lane) = self.control.as_mut()
+            && let Some(control) = lane.pending.as_ref()
+        {
+            if control.expires_at <= self.now {
+                lane.pending = None;
+                self.prefer_control = false;
+                return Ok(true);
+            }
+            return match self.transport.try_submit(
+                control::CONTEXT,
+                &control.bytes,
+                control.expires_at,
+            ) {
+                Ok(()) => {
+                    lane.pending = None;
+                    self.prefer_control = false;
+                    Ok(true)
+                }
+                Err(Error::Blocked | Error::NotReady) => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
         let Some(pending) = &self.pending else {
             return Ok(false);
         };
+        self.prefer_control = true;
         if !self.table.binding_live(pending.binding) {
             self.pending = None;
             self.health.stale = self.health.stale.saturating_add(1);

@@ -1,3 +1,5 @@
+pub(super) mod transfer;
+
 use std::{collections::BTreeSet, num::NonZeroU64, time::Duration};
 
 use pulsebeam_core::identity::NodeId;
@@ -14,8 +16,8 @@ use ownership::{
 };
 
 const MAX_ORIGINS: usize = 64;
-const MAX_CLAIMS_PER_ORIGIN: usize = 4096;
-const MAX_PUBLICATIONS_PER_ORIGIN: usize = 4096;
+pub(super) const MAX_CLAIMS_PER_ORIGIN: usize = 4096;
+pub(super) const MAX_PUBLICATIONS_PER_ORIGIN: usize = 4096;
 const MAX_REMOTE_FRESHNESS: Duration = Duration::from_secs(30);
 type Reply<T> = oneshot::Sender<Result<T, Error>>;
 

@@ -209,7 +209,27 @@ impl<P: Clone + Send + 'static> LinkControl<P> {
         peer: impl Into<pulsebeam_transport::PeerConfig>,
         codec: C,
     ) -> Result<NetworkId, LinkError> {
-        let peer = peer.into();
+        self.open_network_inner(peer.into(), codec, Shared::new(Fence::new(NOT_READY)), None)
+    }
+
+    pub fn open_network_with_control<C: WireCodec<P> + 'static>(
+        &mut self,
+        peer: impl Into<pulsebeam_transport::PeerConfig>,
+        codec: C,
+    ) -> Result<(NetworkId, PeerControl), LinkError> {
+        let state = Shared::new(Fence::new(NOT_READY));
+        let (control, host) = control::pair(state.clone());
+        let id = self.open_network_inner(peer.into(), codec, state, Some(host))?;
+        Ok((id, control))
+    }
+
+    fn open_network_inner<C: WireCodec<P> + 'static>(
+        &mut self,
+        peer: pulsebeam_transport::PeerConfig,
+        codec: C,
+        state: Shared<Fence>,
+        host: Option<control::HostLane>,
+    ) -> Result<NetworkId, LinkError> {
         if self.networks.len() >= MAX_PORTS {
             return Err(LinkError::Capacity);
         }
@@ -228,7 +248,6 @@ impl<P: Clone + Send + 'static> LinkControl<P> {
             owner: self.owner,
             serial,
         };
-        let state = Shared::new(Fence::new(NOT_READY));
         let codec: Shared<dyn WireCodec<P>> = Shared::new(codec);
         let (sender, receiver) = pulsebeam_queue::bounded(QUEUE_CAPACITY);
         let (commands, command_rx) = pulsebeam_queue::bounded(QUEUE_CAPACITY);
@@ -239,6 +258,7 @@ impl<P: Clone + Send + 'static> LinkControl<P> {
             self.table.clone(),
             receiver,
             command_rx,
+            host,
         )?;
         self.networks.insert(
             id,

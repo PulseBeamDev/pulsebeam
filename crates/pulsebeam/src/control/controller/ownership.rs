@@ -16,6 +16,7 @@ pub(super) mod receipt;
 mod result;
 #[cfg(feature = "sim")]
 pub(crate) mod sim;
+pub(crate) mod wire;
 
 #[cfg(test)]
 use super::SignalingProtocol;
