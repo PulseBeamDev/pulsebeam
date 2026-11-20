@@ -2,7 +2,7 @@ use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signer, SigningKey};
 use pulsebeam_auth_conformance::{Cases, Golden, Vectors, decode_hex, encode_hex};
 use pulsebeam_core::{
-    auth::ApiSigningKey,
+    auth::{ApiSigningKey, TokenId},
     identity::{ApiKeyId, ProjectId},
 };
 use serde::Serialize;
@@ -21,6 +21,7 @@ struct Claims<'a> {
     aud: &'static str,
     sub: &'a str,
     exp: u64,
+    jti: &'a str,
     grants: &'a pulsebeam_core::auth::grants::GrantSet,
 }
 
@@ -31,6 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut valid = Vec::with_capacity(cases.valid.len());
     for case in cases.valid {
         let input = case.input;
+        let _: TokenId = case.jti.parse()?;
         let project: ProjectId = input.project_id.parse()?;
         let key: ApiKeyId = input.key_id.parse()?;
         let seed = decode_hex(&case.seed_hex)?;
@@ -49,6 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             aud: "pb",
             sub: &input.participant,
             exp: input.expiration.parse()?,
+            jti: &case.jti,
             grants: &input.grants,
         })?;
         let signing_input = format!(

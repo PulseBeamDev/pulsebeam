@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createPublicKey, verify } from "node:crypto";
+import { createPrivateKey, createPublicKey, verify } from "node:crypto";
 import {
   cpSync,
   mkdirSync,
@@ -40,7 +40,7 @@ const devToken = signParticipantToken({
   expiration: 2000000000,
 });
 assert.equal(
-  JSON.parse(Buffer.from(devToken.split(".")[1], "base64url")).iss,
+  JSON.parse(Buffer.from(devToken.token.split(".")[1], "base64url")).iss,
   development.projectId,
 );
 
@@ -50,7 +50,7 @@ const publicKey = createPublicKey({
   type: "spki",
 });
 assert.equal(publicKey.asymmetricKeyType, "ed25519");
-const devParts = devToken.split(".");
+const devParts = devToken.token.split(".");
 assert(
   verify(
     null,
@@ -70,24 +70,48 @@ const adapt = (i) => ({
   expiration: BigInt(i.expiration),
 });
 for (const v of document.valid) {
-  const token = signParticipantToken(adapt(v.input));
-  assert.equal(token, v.token, v.name);
+  const input = adapt(v.input);
+  const { token, jti } = signParticipantToken(input);
+  assert.match(
+    jti,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  );
   if (v.name === "encoded-token-limit")
     assert.equal(Buffer.byteLength(token), 8192);
+  const fixtureId = JSON.parse(v.claims).jti;
   const [header, claims, signature] = token.split(".");
   assert.equal(Buffer.from(header, "base64url").toString(), v.header);
-  assert.equal(Buffer.from(claims, "base64url").toString(), v.claims);
-  assert.equal(header + "." + claims, v.signing_input);
-  assert.equal(signature, v.signature);
-  if (BigInt(v.input.expiration) <= BigInt(Number.MAX_SAFE_INTEGER)) {
-    assert.equal(
-      signParticipantToken({
-        ...adapt(v.input),
-        expiration: Number(v.input.expiration),
-      }),
-      v.token,
-    );
-  }
+  assert.equal(
+    Buffer.from(claims, "base64url").toString(),
+    v.claims.replace(fixtureId, jti),
+  );
+  const key = createPublicKey(
+    createPrivateKey({
+      key: Buffer.from(fixtureApiKey.split(".")[2], "base64url"),
+      format: "der",
+      type: "pkcs8",
+    }),
+  );
+  assert(
+    verify(
+      null,
+      Buffer.from(`${header}.${claims}`),
+      key,
+      Buffer.from(signature, "base64url"),
+    ),
+  );
+  const next = signParticipantToken({
+    ...input,
+    expiration:
+      input.expiration <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(input.expiration)
+        : input.expiration,
+  });
+  assert.notEqual(next.jti, jti);
+  assert.equal(
+    Buffer.from(next.token.split(".")[1], "base64url").toString(),
+    v.claims.replace(fixtureId, next.jti),
+  );
 }
 for (const v of document.invalid) {
   if (!["expiration", "participant", "grants"].includes(v.field)) continue;
@@ -120,10 +144,10 @@ const opaqueToken = signParticipantToken({
   expiration: 2000,
 });
 const opaqueHeader = JSON.parse(
-  Buffer.from(opaqueToken.split(".")[0], "base64url"),
+  Buffer.from(opaqueToken.token.split(".")[0], "base64url"),
 );
 const opaqueClaims = JSON.parse(
-  Buffer.from(opaqueToken.split(".")[1], "base64url"),
+  Buffer.from(opaqueToken.token.split(".")[1], "base64url"),
 );
 assert.equal(opaqueHeader.kid, arbitraryKey[1]);
 assert.equal(opaqueClaims.iss, arbitraryKey[0]);
@@ -137,7 +161,7 @@ writeFileSync(
   `import { signParticipantToken, INSECURE_DEV_API_KEY } from "@pulsebeam/server";
 const compactKey: string = INSECURE_DEV_API_KEY;
 const input = {apiKey:compactKey, grants:[{rooms:["r"],allow:["join"] as const}], participant:"p", expiration:18446744073709551615n};
-const token: string = signParticipantToken(input);
+const { token, jti }: { token: string; jti: string } = signParticipantToken(input);
 signParticipantToken({...input, expiration: 2000});
 // @ts-expect-error cannot use legacy credential fields
 signParticipantToken({projectId:"p", keyId:"k", secret:"s", room:"r", participant:"p", expiration:2000});

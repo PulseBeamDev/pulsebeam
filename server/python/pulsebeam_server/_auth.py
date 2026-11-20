@@ -5,6 +5,8 @@ import binascii
 import json
 import re
 import unicodedata
+import uuid
+from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -87,9 +89,15 @@ def _base64(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
+@dataclass(frozen=True)
+class SignedParticipantToken:
+    token: str = field(repr=False)
+    jti: str
+
+
 def sign_participant_token(
     api_key: str, *, grants: list[Grant], participant: str, expiration: int
-) -> str:
+) -> SignedParticipantToken:
     """Sign a JWT offline with one opaque API key and absolute Unix expiration.
 
     No clock, environment lookup, or network request is performed.
@@ -114,8 +122,9 @@ def sign_participant_token(
     if type(expiration) is not int or not 0 <= expiration <= (1 << 64) - 1:
         raise ValueError("Invalid expiration")
     header = json.dumps({"alg": "EdDSA", "kid": key, "typ": "pb+jwt"}, separators=(",", ":"))
+    jti = str(uuid.uuid4())
     claims = json.dumps(
-        {"iss": project, "aud": "pb", "sub": participant, "exp": expiration, "grants": checked},
+        {"iss": project, "aud": "pb", "sub": participant, "exp": expiration, "jti": jti, "grants": checked},
         separators=(",", ":"),
         ensure_ascii=False,
     )
@@ -124,4 +133,4 @@ def sign_participant_token(
     if len(signing_input) + 1 + 86 > _MAX_COMPACT_TOKEN_BYTES:
         raise ValueError("Participant token exceeds the 8192-byte limit")
     signature = private_key.sign(signing_input.encode("ascii"))
-    return signing_input + "." + _base64(signature)
+    return SignedParticipantToken(signing_input + "." + _base64(signature), jti)

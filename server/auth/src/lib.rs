@@ -48,6 +48,7 @@ pub struct Vectors {
 pub struct Case {
     pub name: String,
     pub input: Input,
+    pub jti: String,
     pub seed_hex: String,
 }
 
@@ -150,18 +151,32 @@ mod tests {
                 "{}.{}.{}",
                 golden.canonical_project_id, golden.canonical_key_id, input.secret
             );
-            assert_eq!(
+            let issue = || {
                 pulsebeam_server::sign_participant_token(
                     &api_key,
                     &input.grants,
                     &input.participant,
-                    exp
+                    exp,
                 )
-                .unwrap(),
-                golden.token,
-                "{}",
-                golden.name,
-            );
+                .unwrap()
+            };
+            let issued = issue();
+            assert_ne!(issued.jti, issue().jti);
+            let parts: Vec<_> = issued.token.split('.').collect();
+            let claims: serde_json::Value =
+                serde_json::from_slice(&BASE64URL_NOPAD.decode(parts[1].as_bytes()).unwrap())
+                    .unwrap();
+            let mut expected: serde_json::Value = serde_json::from_str(&golden.claims).unwrap();
+            assert_eq!(claims["jti"], issued.jti.to_string());
+            expected["jti"] = claims["jti"].clone();
+            assert_eq!(claims, expected);
+            let signature = BASE64URL_NOPAD.decode(parts[2].as_bytes()).unwrap();
+            independent
+                .verify_strict(
+                    format!("{}.{}", parts[0], parts[1]).as_bytes(),
+                    &Signature::from_slice(&signature).unwrap(),
+                )
+                .unwrap();
             let registry = KeyRegistry::new(
                 project,
                 vec![KeyRegistryEntry {
@@ -185,6 +200,8 @@ mod tests {
             assert_eq!(principal.project_id(), project);
             assert_eq!(principal.participant_id().as_str(), input.participant);
             assert_eq!(principal.expiry().unix_seconds(), exp);
+            let live = verify_participant_token(&registry, &issued.token, exp - 1).unwrap();
+            assert_eq!(live.token_id().to_string(), issued.jti.to_string());
             let selected = principal.authorize_room(RoomId::new(&input.requested_room).unwrap());
             assert_eq!(selected.is_ok(), golden.name != "deny-all");
             if let Ok(authorization) = selected {

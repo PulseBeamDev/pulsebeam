@@ -417,7 +417,7 @@ fn config(endpoint: &str, participant: &str) -> Result<Config> {
             &pulsebeam_server::insecure_dev_api_key()?,
             &serde_json::from_value(
                 serde_json::json!([{"rooms":["dual-stack-transport"],"allow":["join","publish","discover","subscribe"]}]),
-            )?,
+            )?.token,
             participant,
             expiry,
         )?,

@@ -369,7 +369,8 @@ fn mint_development_token(
         &grants,
         participant.as_str(),
         expiration,
-    )?)
+    )?
+    .token)
 }
 
 fn development_token(config: TokenConfig) -> Result<String> {

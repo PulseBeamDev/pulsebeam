@@ -49,7 +49,8 @@ pub(super) fn token_for_rooms(participant: &str, rooms: &[&str]) -> anyhow::Resu
         )?,
         participant,
         expires_at,
-    )?)
+    )?
+    .token)
 }
 
 pub struct SimClientBuilder {

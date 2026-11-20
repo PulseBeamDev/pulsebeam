@@ -129,7 +129,8 @@ impl WirePeer {
             .unwrap(),
             subject,
             expiry,
-        )?;
+        )?
+        .token;
         let admission = http::Request::builder()
             .method("POST")
             .uri(format!("http://{server}:7070/api/v1/native/admissions"))

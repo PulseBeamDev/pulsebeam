@@ -1,5 +1,6 @@
 """Test the installed distribution, not a private source-path import."""
 import base64
+import uuid
 import importlib
 import json
 import pathlib
@@ -40,7 +41,7 @@ with tempfile.TemporaryDirectory() as directory:
 
     development_token = sign(
         sdk.INSECURE_DEV_API_KEY, grants=[{"rooms": ["demo"], "allow": ["join"]}], participant="alice", expiration=2000000000
-    )
+    ).token
     assert json.loads(base64.urlsafe_b64decode(
         development_token.split(".")[1] + "=" * (-len(development_token.split(".")[1]) % 4)
     ))["iss"] == development["projectId"]
@@ -55,19 +56,21 @@ with tempfile.TemporaryDirectory() as directory:
     public_key.verify(dev_sig, (dev_parts[0] + "." + dev_parts[1]).encode())
 
     for v in vectors["valid"]:
-        token = sign(fixture_key, **adapt(v["input"]))
-        assert token == v["token"], v["name"]
+        issued = sign(fixture_key, **adapt(v["input"]))
+        parsed = uuid.UUID(issued.jti)
+        assert parsed.version == 4 and str(parsed) == issued.jti
+        assert issued.jti != sign(fixture_key, **adapt(v["input"])).jti
         if v["name"] == "encoded-token-limit":
-            assert len(token.encode("ascii")) == 8192
-        header, claims, signature = token.split(".")
+            assert len(issued.token.encode("ascii")) == 8192
+        header, claims, signature = issued.token.split(".")
         decode = lambda value: base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
         assert decode(header).decode() == v["header"]
-        assert decode(claims).decode() == v["claims"]
-        assert header + "." + claims == v["signing_input"]
-        assert signature == v["signature"]
-        private = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(v["seed_hex"]))
-        assert private.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex() == v["public_key_hex"]
-        Ed25519PublicKey.from_public_bytes(bytes.fromhex(v["public_key_hex"])).verify(decode(signature), v["signing_input"].encode())
+        expected = json.loads(v["claims"])
+        expected["jti"] = issued.jti
+        assert json.loads(decode(claims)) == expected
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(v["public_key_hex"])).verify(
+            decode(signature), (header + "." + claims).encode()
+        )
 
     for v in vectors["invalid"]:
         if v["field"] not in ("expiration", "participant", "grants"):
@@ -110,7 +113,7 @@ with tempfile.TemporaryDirectory() as directory:
     )
     head, claims = (
         json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
-        for part in signed.split(".")[:2]
+        for part in signed.token.split(".")[:2]
     )
     assert head["kid"] == opaque[1]
     assert claims["iss"] == opaque[0]

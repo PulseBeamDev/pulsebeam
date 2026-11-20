@@ -2417,6 +2417,15 @@ impl ControllerActor {
             participant_id: participant,
             connection_id,
         });
+        if lease.authority != previous.authority {
+            tracing::info!(
+                event = "credential_renewed",
+                project = %lease.authority.project_id,
+                jti = %lease.authority.token_id,
+                conn = %connection_id,
+                "connection credential renewed"
+            );
+        }
         self.observe_native_authorization(connection_id, &lease);
         Ok(())
     }
@@ -3091,6 +3100,8 @@ impl ControllerActor {
             .map_err(|_| ControllerError::Superseded)?;
         if let Some(lease) = authorization {
             let deadline = lease.deadline();
+            let project = lease.authority.project_id;
+            let jti = lease.authority.token_id;
             self.core
                 .registry
                 .update_authorization(&participant_id, connection_id, lease);
@@ -3099,6 +3110,13 @@ impl ControllerActor {
                 participant_id,
                 connection_id,
             });
+            tracing::info!(
+                event = "connection_admitted",
+                %project,
+                %jti,
+                conn = %connection_id,
+                "connection admitted"
+            );
         }
         // Retain the fence with bounded in-flight work, even if the replacement
         // is removed before an older materialization acknowledges installation.
@@ -4430,6 +4448,7 @@ mod replacement_tests {
     ) -> AuthorizationLease {
         AuthorizationLease::from_verified(
             VerifiedAuthorization {
+                token_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
                 grants: full_grants("*"),
                 project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
                 room_id,
@@ -4476,6 +4495,7 @@ mod replacement_tests {
             )
             .unwrap();
         let authorization = VerifiedAuthorization {
+            token_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
             grants: full_grants("*"),
             project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
             room_id,
@@ -4641,7 +4661,8 @@ mod replacement_tests {
             "alice",
             2_000,
         )
-        .unwrap();
+        .unwrap()
+        .token;
         let registry = KeyRegistry::new(
             *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
             vec![pulsebeam_core::auth::KeyRegistryEntry {
@@ -5273,14 +5294,16 @@ mod replacement_tests {
                 "http-native",
                 expiry,
             )
-            .unwrap();
+            .unwrap()
+            .token;
             let claim_token = pulsebeam_server::sign_participant_token(
                 &key,
                 &full_grants("http-target"),
                 "http-native",
                 expiry,
             )
-            .unwrap();
+            .unwrap()
+            .token;
             let (controller, mut commands) =
                 mailbox::bounded(const { std::num::NonZeroUsize::new(4).unwrap() });
             let app = super::super::api::owned_native_router(
@@ -5460,7 +5483,8 @@ mod replacement_tests {
                 "http-native",
                 expiry + 1,
             )
-            .unwrap();
+            .unwrap()
+            .token;
             for (token, status) in [
                 (&changed_token, StatusCode::BAD_REQUEST),
                 (&claim_token, StatusCode::CREATED),
@@ -5509,7 +5533,8 @@ mod replacement_tests {
                 "http-other",
                 expiry,
             )
-            .unwrap();
+            .unwrap()
+            .token;
             let credit = actor.deletion_bytes;
             for (method, token, connection, tag, status) in [
                 (
@@ -6050,6 +6075,138 @@ mod replacement_tests {
     }
 
     #[test]
+    fn correlation_follows_committed_connections_and_changed_credentials() {
+        use std::io::{Read, Seek};
+
+        let key = pulsebeam_server::insecure_dev_api_key().unwrap();
+        let project = *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID;
+        let registry = KeyRegistry::new(
+            project,
+            vec![pulsebeam_core::auth::KeyRegistryEntry {
+                key_id: *pulsebeam_core::auth::DEVELOPMENT_API_KEY_ID,
+                public_key: *pulsebeam_core::auth::DEVELOPMENT_API_PUBLIC_KEY,
+            }],
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        let unix_now = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let issue = |participant, expiry| {
+            pulsebeam_server::sign_participant_token(&key, &full_grants("*"), participant, expiry)
+                .unwrap()
+        };
+        let first = issue("correlation-subject", unix_now + 60);
+        let renewed = issue("correlation-subject", unix_now + 120);
+        let rejected = issue("not-the-subject", unix_now + 120);
+        let authenticate = |token: &str| {
+            pulsebeam_core::auth::authenticate_participant_token(&registry, token, unix_now)
+                .unwrap()
+        };
+        let principal = authenticate(&first.token);
+        let participant = *principal.participant_id();
+        let room = RoomId::new("correlation-room").unwrap();
+        let connection = connection_id(1);
+        let other_connection = connection_id(2);
+        let mut actor = actor();
+        let mut trace = tempfile::tempfile().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(trace.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for (room, conn) in [
+                (room, connection),
+                (RoomId::new("other-room").unwrap(), other_connection),
+            ] {
+                let authorized = principal.clone().authorize_room(room).unwrap();
+                let runtime_now = pulsebeam_runtime::time::Instant::now();
+                let lease =
+                    AuthorizationLease::from_verified(authorized, now, runtime_now).unwrap();
+                let shard = ShardId::new(0);
+                let transport = actor.core.reserve_transport(shard, runtime_now);
+                actor
+                    .commit_reserved_candidate(
+                        participant,
+                        room,
+                        shard,
+                        0,
+                        transport,
+                        conn,
+                        Some(lease.clone()),
+                        SignalingProtocol::State,
+                        now,
+                    )
+                    .unwrap();
+                assert!(
+                    actor
+                        .commit_reserved_candidate(
+                            participant,
+                            room,
+                            shard,
+                            0,
+                            transport,
+                            conn,
+                            Some(lease),
+                            SignalingProtocol::State,
+                            now
+                        )
+                        .is_err()
+                );
+            }
+            let mut finish = |token: &str| {
+                let verified = authenticate(token).authorize_room(room).unwrap();
+                actor.finish_renewal(RenewalResult {
+                    participant,
+                    connection_id: connection,
+                    expected_revision: 1,
+                    verified: Some(verified),
+                });
+            };
+            finish(&rejected.token);
+            finish(&renewed.token);
+            finish(&renewed.token);
+            let verified = authenticate(&renewed.token).authorize_room(room).unwrap();
+            actor
+                .replace_authorization(
+                    ReplaceAuthorization {
+                        authorization: verified,
+                        connection_id: connection,
+                        expected_revision: 2,
+                    },
+                    now,
+                    pulsebeam_runtime::time::Instant::now(),
+                )
+                .unwrap();
+        });
+        trace.rewind().unwrap();
+        let mut output = String::new();
+        trace.read_to_string(&mut output).unwrap();
+        let events: Vec<_> = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|value| {
+                matches!(
+                    value["fields"]["event"].as_str(),
+                    Some("connection_admitted" | "credential_renewed")
+                )
+            })
+            .collect();
+        assert_eq!(events.len(), 3);
+        for (event, (name, conn, id)) in events.iter().zip([
+            ("connection_admitted", connection, first.jti),
+            ("connection_admitted", other_connection, first.jti),
+            ("credential_renewed", connection, renewed.jti),
+        ]) {
+            assert!(event["timestamp"].is_string());
+            let fields = event["fields"].as_object().unwrap();
+            assert_eq!(fields.len(), 5);
+            assert_eq!(fields["event"], name);
+            assert_eq!(fields["project"], project.as_str());
+            assert_eq!(fields["conn"], conn.to_string());
+            assert_eq!(fields["jti"], id.to_string());
+        }
+    }
+
+    #[test]
     fn renewal_rejects_identity_changes_but_removing_join_revokes_participation() {
         let mut actor = actor();
         let room_id = RoomId::new("renewal-room").unwrap();
@@ -6083,6 +6240,7 @@ mod replacement_tests {
             )
             .unwrap();
         let verified = VerifiedAuthorization {
+            token_id: "00000000-0000-4000-8000-000000000002".parse().unwrap(),
             grants: full_grants("*"),
             project_id: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
             room_id,
@@ -6140,19 +6298,16 @@ mod replacement_tests {
             expected_revision: 1,
             verified: Some(verified.clone()),
         });
-        assert_eq!(
-            actor
-                .core
-                .registry
-                .get_participant(&participant_id)
-                .unwrap()
-                .authorization
-                .as_ref()
-                .unwrap()
-                .expiry()
-                .unix_seconds(),
-            unix_now + 120
-        );
+        let accepted = actor
+            .core
+            .registry
+            .get_incarnation(participant_id, connection)
+            .unwrap()
+            .authorization
+            .as_ref()
+            .unwrap();
+        assert_eq!(accepted.expiry().unix_seconds(), unix_now + 120);
+        assert_eq!(accepted.authority.token_id, verified.token_id);
         assert_eq!(actor.authorization_expiries.len(), 1);
         assert!(matches!(
             &actor.command_backlog.back().unwrap().1,
@@ -6391,7 +6546,8 @@ mod replacement_tests {
             (external).as_str(),
             unix_now + 120,
         )
-        .unwrap();
+        .unwrap()
+        .token;
         assert!(
             !format!(
                 "{:?}",

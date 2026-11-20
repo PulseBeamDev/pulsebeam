@@ -440,7 +440,7 @@ impl WirePeer {
             &serde_json::from_value(serde_json::json!([{"rooms":["native-state-wire"],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
             "rtp-listener",
             expiry,
-        )?;
+        )?.token;
         let request = http::Request::builder()
             .method("POST")
             .uri(format!(

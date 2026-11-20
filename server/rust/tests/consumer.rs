@@ -1,4 +1,4 @@
-use pulsebeam_server::{GrantSet, SigningError, sign_participant_token};
+use pulsebeam_server::{GrantSet, SignedParticipantToken, SigningError, sign_participant_token};
 use serde::Deserialize;
 
 const FIXTURE_API_KEY: &str = "p_0067MYZ1001R010000000000064.kid_0067MYZ1005R030010000000068.MC4CAQAwBQYDK2VwBCIEIEzNCJso_5banbbDRuwRTg9bijGfNaumJNqM9u1PuKb7";
@@ -14,7 +14,6 @@ struct Input {
 struct Golden {
     name: String,
     input: Input,
-    token: String,
 }
 
 #[derive(Deserialize)]
@@ -30,7 +29,7 @@ struct Vectors {
     invalid: Vec<Rejection>,
 }
 
-fn sign(input: &Input) -> Result<String, SigningError> {
+fn sign(input: &Input) -> Result<SignedParticipantToken, SigningError> {
     sign_participant_token(
         FIXTURE_API_KEY,
         &input.grants,
@@ -47,10 +46,12 @@ fn grants(pattern: &str) -> GrantSet {
 fn public_artifact_conformance_and_diagnostics() {
     let vectors: Vectors = serde_json::from_str(include_str!("../../auth/vectors.json")).unwrap();
     for golden in vectors.valid {
-        let token = sign(&golden.input).unwrap();
-        assert_eq!(token, golden.token, "{}", golden.name);
+        let issued = sign(&golden.input).unwrap();
+        assert_eq!(issued.jti.get_version_num(), 4);
+        assert_ne!(issued.jti, sign(&golden.input).unwrap().jti);
+        assert!(!format!("{issued:?}").contains(&issued.token));
         if golden.name == "encoded-token-limit" {
-            assert_eq!(token.len(), 8192);
+            assert_eq!(issued.token.len(), 8192);
         }
     }
     let oversized = vectors
@@ -95,6 +96,7 @@ fn packaged_development_api_key_matches_canonical_json() {
     assert!(
         !sign_participant_token(&api_key, &grants("demo"), "alice", 2_000_000_000)
             .unwrap()
+            .token
             .is_empty()
     );
     for invalid in [

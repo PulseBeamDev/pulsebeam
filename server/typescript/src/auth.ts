@@ -1,4 +1,4 @@
-import { createPrivateKey, sign } from "node:crypto";
+import { createPrivateKey, randomUUID, sign } from "node:crypto";
 const maximumExpiration = (1n << 64n) - 1n;
 const maximumTokenBytes = 8192;
 
@@ -119,6 +119,11 @@ function parseApiKey(value: unknown): {
   }
 }
 
+export interface SignedParticipantToken {
+  readonly token: string;
+  readonly jti: string;
+}
+
 /** Sign a participant JWT using one opaque server-only API key. */
 export function signParticipantToken({
   apiKey,
@@ -131,7 +136,7 @@ export function signParticipantToken({
   participant: string;
   /** Absolute Unix seconds. Use bigint beyond Number.MAX_SAFE_INTEGER. */
   expiration: bigint | number;
-}): string {
+}): SignedParticipantToken {
   if (
     typeof participant !== "string" ||
     participant.length === 0 ||
@@ -154,10 +159,12 @@ export function signParticipantToken({
     aud: "pb",
     sub: participant,
   });
-  const claims = `${baseClaims.slice(0, -1)},"exp":${exp},"grants":${JSON.stringify(checked)}}`;
+  const jti = randomUUID();
+  const claims = `${baseClaims.slice(0, -1)},"exp":${exp},"jti":${JSON.stringify(jti)},"grants":${JSON.stringify(checked)}}`;
   const signingInput = `${Buffer.from(header).toString("base64url")}.${Buffer.from(claims).toString("base64url")}`;
   // Ed25519's 64-byte signature occupies 86 unpadded base64url characters.
   if (signingInput.length + 1 + 86 > maximumTokenBytes)
     invalid("participant token size");
-  return `${signingInput}.${sign(null, Buffer.from(signingInput), privateKey).toString("base64url")}`;
+  const token = `${signingInput}.${sign(null, Buffer.from(signingInput), privateKey).toString("base64url")}`;
+  return { token, jti };
 }

@@ -1335,6 +1335,7 @@ mod tests {
         for room in ["main", "breakout"] {
             let room_id = crate::entity::RoomId::new(room).unwrap();
             let authorization = VerifiedAuthorization {
+                token_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
                 grants: pulsebeam_core::auth::grants::GrantSet::default(),
                 project_id: principal.project,
                 participant_id: principal.participant,

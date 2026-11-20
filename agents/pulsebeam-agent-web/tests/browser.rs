@@ -57,7 +57,7 @@ async fn native_platform_smoke() -> TestResult<()> {
         .replace("__DESTINATION_ENDPOINT__", &destination.endpoint())
         .replace("__SENDER_TOKEN__", &sender)
         .replace("__RECEIVER_TOKEN__", &receiver)
-        .replace("__CATALOG_TOKEN__", &catalog)
+        .replace("__CATALOG_TOKEN__", &catalog.token)
         .replace("__RENEWED_SENDER_TOKEN__", &renewed_sender);
     let mut browser = capabilities()?;
     browser.add_arg("--autoplay-policy=no-user-gesture-required")?;
@@ -157,7 +157,7 @@ async fn native_platform_smoke() -> TestResult<()> {
         .spawn()?;
         let config = serde_json::json!({
             "endpoint": destination.endpoint(),
-            "token": receiver_token,
+            "token": receiver_token.token,
             "room": "react-native-receiver",
             "sourceRoom": source_room.as_str(),
         });
@@ -174,8 +174,8 @@ async fn native_platform_smoke() -> TestResult<()> {
             }
             let catalog_config = serde_json::json!({
                 "endpoint": destination.endpoint(),
-                "token": catalog_token,
-                "publisherToken": metadata_token,
+                "token": catalog_token.token,
+                "publisherToken": metadata_token.token,
                 "room": source_room.as_str(),
             });
             let catalog: bool = evaluate_json(

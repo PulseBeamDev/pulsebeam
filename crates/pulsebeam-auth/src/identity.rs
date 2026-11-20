@@ -35,6 +35,42 @@ pub enum IdValidationError {
     InvalidUuidVersion,
 }
 
+/// The canonical UUIDv4 carried by the signed participant JWT `jti` claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TokenId(Uuid);
+
+impl core::fmt::Display for TokenId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.hyphenated().fmt(f)
+    }
+}
+
+impl core::str::FromStr for TokenId {
+    type Err = IdValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let uuid = Uuid::parse_str(value).map_err(|_| IdValidationError::InvalidCharacters)?;
+        if value != uuid.hyphenated().encode_lower(&mut Uuid::encode_buffer()) {
+            return Err(IdValidationError::InvalidCharacters);
+        }
+        Self::try_from(uuid)
+    }
+}
+
+impl TryFrom<Uuid> for TokenId {
+    type Error = IdValidationError;
+
+    fn try_from(uuid: Uuid) -> Result<Self, Self::Error> {
+        if uuid.get_variant() != Variant::RFC4122 {
+            return Err(IdValidationError::InvalidUuidVariant);
+        }
+        if uuid.get_version() != Some(Version::Random) {
+            return Err(IdValidationError::InvalidUuidVersion);
+        }
+        Ok(Self(uuid))
+    }
+}
+
 pub fn encode_uuid(uuid: Uuid) -> String {
     CROCKFORD.encode(uuid.as_bytes())
 }

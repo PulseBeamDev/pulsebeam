@@ -760,7 +760,7 @@ async fn run_peer(
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs()
                 .saturating_add(3600),
-        )?,
+        )?.token,
         retry: pulsebeam_agent_core::RetryPolicy::default(),
         log_level: pulsebeam_agent_core::LogLevel::default(),
     };

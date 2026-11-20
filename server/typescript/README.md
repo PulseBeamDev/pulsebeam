@@ -5,6 +5,10 @@ PulseBeam room. The SDK signs locally with native Ed25519; it does not connect
 to PulseBeam at runtime. It supports ESM and TypeScript
 on **Node.js 22 or newer**.
 
+The signer returns `{ token, jti }`. Send only `token` to clients. Retain the
+signed UUIDv4 `jti` on your backend if you need incident correlation; do not log
+the JWT.
+
 Keep signing secrets on your backend. Give clients only participant tokens,
 after authenticating the caller and authorizing their room and participant ID.
 

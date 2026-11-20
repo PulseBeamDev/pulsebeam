@@ -16,4 +16,4 @@ pulsebeam-auth = { version = "0.1.0", path = "../../crates/pulsebeam-auth" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0"
-uuid = "1.23.2"
+uuid = { version = "1.23.2", features = ["v4"] }

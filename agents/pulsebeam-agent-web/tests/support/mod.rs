@@ -44,7 +44,7 @@ pub fn mint_development_token(
             &serde_json::from_value(serde_json::json!([{"rooms":[room.as_str()],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
         participant.as_str(),
         expires_at,
-    )?)
+    )?.token)
 }
 
 #[allow(

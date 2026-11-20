@@ -1299,6 +1299,7 @@ mod tests {
             now + 60,
         )
         .unwrap()
+        .token
     }
 
     fn cache_creation(
@@ -1675,7 +1676,8 @@ mod tests {
             "alice",
             u64::MAX,
         )
-        .unwrap();
+        .unwrap()
+        .token;
         let mut unrepresentable = create(Some("general"));
         unrepresentable.headers_mut().insert(
             AUTHORIZATION,
@@ -1920,7 +1922,8 @@ mod tests {
                     .as_secs()
                     + 60,
             )
-            .unwrap();
+            .unwrap()
+            .token;
             let offer = directional_offer(direction);
             let answer = offer.clone();
             let captured_token = token.clone();
@@ -2212,7 +2215,8 @@ mod tests {
             (ParticipantId::new("alice").unwrap()).as_str(),
             2_000,
         )
-        .unwrap();
+        .unwrap()
+        .token;
         let cases = [
             (
                 verify_bearer(&HeaderMap::new(), &auth_registry(), 1_000).unwrap_err(),

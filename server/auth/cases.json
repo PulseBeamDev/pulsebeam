@@ -31,6 +31,7 @@
         "participant": "Alice_-9",
         "expiration": "2000"
       },
+      "jti": "00000000-0000-4000-8000-000000000001",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -49,6 +50,7 @@
         "participant": "_",
         "expiration": "0"
       },
+      "jti": "00000000-0000-4000-8000-000000000002",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -67,6 +69,7 @@
         "participant": "Alice_-9",
         "expiration": "9007199254740991"
       },
+      "jti": "00000000-0000-4000-8000-000000000003",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -85,6 +88,7 @@
         "participant": "Alice_-9",
         "expiration": "9007199254740993"
       },
+      "jti": "00000000-0000-4000-8000-000000000004",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -103,6 +107,7 @@
         "participant": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
         "expiration": "18446744073709551615"
       },
+      "jti": "00000000-0000-4000-8000-000000000005",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -121,6 +126,7 @@
         "participant": "Cafe_Device-1",
         "expiration": "2000"
       },
+      "jti": "00000000-0000-4000-8000-000000000006",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -141,6 +147,7 @@
         "participant": "Crab_1",
         "expiration": "2000"
       },
+      "jti": "00000000-0000-4000-8000-000000000007",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -159,6 +166,7 @@
         "participant": "Alice_-9",
         "expiration": "2000"
       },
+      "jti": "00000000-0000-4000-8000-000000000008",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -190,6 +198,7 @@
         "participant": "Alice_-9",
         "expiration": "2000"
       },
+      "jti": "00000000-0000-4000-8000-000000000009",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -203,6 +212,7 @@
         "participant": "Alice_-9",
         "expiration": "2000"
       },
+      "jti": "00000000-0000-4000-8000-000000000010",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     },
     {
@@ -238,7 +248,7 @@
               "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
               "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
               "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
-              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+              "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
             ],
             "allow": ["join"]
           }
@@ -246,6 +256,7 @@
         "participant": "p",
         "expiration": "2000"
       },
+      "jti": "00000000-0000-4000-8000-000000000011",
       "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
     }
   ],

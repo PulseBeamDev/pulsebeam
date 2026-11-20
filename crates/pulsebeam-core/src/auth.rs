@@ -5,6 +5,7 @@ use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 pub use pulsebeam_auth::api_key::{ApiKey, ApiKeyError};
 pub use pulsebeam_auth::grants;
+pub use pulsebeam_auth::identity::TokenId;
 pub use pulsebeam_auth::keys::{ApiPublicKey, ApiSigningKey, KeyValidationError};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::LazyLock};
@@ -47,6 +48,7 @@ pub static DEVELOPMENT_API_PUBLIC_KEY: LazyLock<ApiPublicKey> =
 pub struct VerifiedPrincipal {
     project_id: ProjectId,
     participant_id: ParticipantId,
+    token_id: TokenId,
     expiry: AuthorizationExpiry,
     grants: grants::GrantSet,
 }
@@ -58,6 +60,10 @@ impl VerifiedPrincipal {
 
     pub fn participant_id(&self) -> &ParticipantId {
         &self.participant_id
+    }
+
+    pub fn token_id(&self) -> TokenId {
+        self.token_id
     }
 
     pub fn expiry(&self) -> AuthorizationExpiry {
@@ -93,6 +99,7 @@ impl VerifiedPrincipal {
             project_id: self.project_id,
             room_id: room,
             participant_id: self.participant_id,
+            token_id: self.token_id,
             expiry: self.expiry,
             grants: self.grants,
         }
@@ -111,6 +118,7 @@ pub struct VerifiedAuthorization {
     pub project_id: ProjectId,
     pub room_id: RoomId,
     pub participant_id: ParticipantId,
+    pub token_id: TokenId,
     pub expiry: AuthorizationExpiry,
     pub grants: grants::GrantSet,
 }
@@ -160,6 +168,7 @@ struct ParticipantClaims {
     aud: String,
     sub: ParticipantId,
     exp: u64,
+    jti: Box<str>,
     grants: grants::GrantSet,
 }
 
@@ -221,6 +230,7 @@ pub fn authenticate_participant_token(
     if claims.aud != "pb" {
         return Err(TokenError::Invalid);
     }
+    let token_id = claims.jti.parse().map_err(|_| TokenError::Invalid)?;
     let expiry = AuthorizationExpiry::from_unix_seconds(claims.exp);
     if expiry.is_expired_at(now) {
         return Err(TokenError::Expired);
@@ -246,6 +256,7 @@ pub fn authenticate_participant_token(
     Ok(VerifiedPrincipal {
         project_id: claims.iss,
         participant_id: claims.sub,
+        token_id,
         expiry,
         grants: claims.grants,
     })
@@ -406,10 +417,47 @@ mod tests {
         signed_token(
             &format!("{{\"alg\":\"{alg}\",\"kid\":\"{kid}\",\"typ\":\"{typ}\"{header_extra}}}"),
             &format!(
-                "{{\"iss\":\"{iss}\",\"aud\":\"{aud}\",\"sub\":\"{sub}\",\"exp\":{exp},\"grants\":[{{\"rooms\":[\"{room}\"],\"allow\":[\"join\",\"publish\",\"discover\",\"subscribe\"]}}]{claims_extra}}}"
+                "{{\"iss\":\"{iss}\",\"aud\":\"{aud}\",\"sub\":\"{sub}\",\"exp\":{exp},\"jti\":\"00000000-0000-4000-8000-000000000001\",\"grants\":[{{\"rooms\":[\"{room}\"],\"allow\":[\"join\",\"publish\",\"discover\",\"subscribe\"]}}]{claims_extra}}}"
             ),
             &DEVELOPMENT_API_SIGNING_KEY,
         )
+    }
+
+    #[test]
+    fn jti_must_be_present_once_and_be_a_canonical_rfc_uuid_v4() {
+        const VALID: &str = "abcd0123-4567-489a-8bcd-0123456789ab";
+        let registry = development_registry();
+        let header = format!(
+            r#"{{"alg":"EdDSA","kid":"{}","typ":"pb+jwt"}}"#,
+            DEVELOPMENT_API_KEY_ID.as_str()
+        );
+        let verify = |extra: &str| {
+            let claims = format!(
+                r#"{{"iss":"{}","aud":"pb","sub":"alice","exp":2000,"grants":[{{"rooms":["general"],"allow":["join"]}}]{extra}}}"#,
+                DEVELOPMENT_PROJECT_ID.as_str()
+            );
+            let token = signed_token(&header, &claims, &DEVELOPMENT_API_SIGNING_KEY);
+            verify_participant_token(&registry, &token, 1000)
+        };
+        assert_eq!(
+            verify(&format!(r#", "jti":"{VALID}""#))
+                .unwrap()
+                .token_id
+                .to_string(),
+            VALID
+        );
+        for bad in [
+            "",
+            r#", "jti":null"#,
+            r#", "jti":123"#,
+            r#", "jti":"ABCD0123-4567-489A-8BCD-0123456789AB""#,
+            r#", "jti":"abcd01234567489a8bcd0123456789ab""#,
+            r#", "jti":"abcd0123-4567-789a-8bcd-0123456789ab""#,
+            r#", "jti":"abcd0123-4567-489a-7bcd-0123456789ab""#,
+            r#", "jti":"abcd0123-4567-489a-8bcd-0123456789ab", "jti":"abcd0123-4567-489a-8bcd-0123456789ab""#,
+        ] {
+            assert_eq!(verify(bad), Err(TokenError::Invalid));
+        }
     }
 
     fn signing(seed: u8) -> ApiSigningKey {
@@ -555,7 +603,7 @@ mod tests {
             DEVELOPMENT_API_KEY_ID.as_str()
         );
         let claims = format!(
-            "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"p\",\"exp\":2000,\"grants\":[{{\"rooms\":[\"general\"],\"allow\":[\"join\"]}}]}}",
+            "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"p\",\"exp\":2000,\"jti\":\"00000000-0000-4000-8000-000000000001\",\"grants\":[{{\"rooms\":[\"general\"],\"allow\":[\"join\"]}}]}}",
             DEVELOPMENT_PROJECT_ID.as_str()
         );
         let fixed = BASE64URL_NOPAD.encode(claims.as_bytes()).len() + 2 + 86;
@@ -745,7 +793,7 @@ mod tests {
                 "{{\"alg\":\"EdDSA\",\"kid\":\"{key_alias}\",\"typ\":\"pb+jwt\",\"crit\":[]}}"
             ),
             &format!(
-                "{{\"iss\":\"{project_alias}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"grants\":[{{\"rooms\":[\"general\"],\"allow\":[\"join\"]}}]}}"
+                "{{\"iss\":\"{project_alias}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"jti\":\"00000000-0000-4000-8000-000000000001\",\"grants\":[{{\"rooms\":[\"general\"],\"allow\":[\"join\"]}}]}}"
             ),
             &DEVELOPMENT_API_SIGNING_KEY,
         );
@@ -764,7 +812,7 @@ mod tests {
             signed_token(
                 &header,
                 &format!(
-                    "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":{expiration},\"grants\":{grants}}}",
+                    "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":{expiration},\"jti\":\"00000000-0000-4000-8000-000000000001\",\"grants\":{grants}}}",
                     DEVELOPMENT_PROJECT_ID.as_str()
                 ),
                 &DEVELOPMENT_API_SIGNING_KEY,
@@ -821,7 +869,7 @@ mod tests {
         let header_array =
             serde_json::json!(["EdDSA", DEVELOPMENT_API_KEY_ID.as_str(), "pb+jwt", []]).to_string();
         let claims = format!(
-            "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"grants\":[{{\"rooms\":[\"*\"],\"allow\":[\"join\"]}}]}}",
+            "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"jti\":\"00000000-0000-4000-8000-000000000001\",\"grants\":[{{\"rooms\":[\"*\"],\"allow\":[\"join\"]}}]}}",
             DEVELOPMENT_PROJECT_ID.as_str()
         );
         for invalid in ["stage.alice", "café", "alice\n", &"a".repeat(37)] {
@@ -844,7 +892,7 @@ mod tests {
             r#"[{"rooms":["*"],"allow":["subscribe"],"kind":{"nested":"audio"}}]"#,
         ] {
             let claims = format!(
-                "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"grants\":{grants}}}",
+                "{{\"iss\":\"{}\",\"aud\":\"pb\",\"sub\":\"alice\",\"exp\":2000,\"jti\":\"00000000-0000-4000-8000-000000000001\",\"grants\":{grants}}}",
                 DEVELOPMENT_PROJECT_ID.as_str()
             );
             let token = signed_token(&header, &claims, &DEVELOPMENT_API_SIGNING_KEY);

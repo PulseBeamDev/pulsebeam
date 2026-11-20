@@ -61,15 +61,17 @@ import { signParticipantToken, INSECURE_DEV_API_KEY } from "@pulsebeam/server";
 function issueToken(participant: string) {
   return signParticipantToken({
     apiKey: INSECURE_DEV_API_KEY,
-    room: "demo",
+    grants: [{ rooms: ["demo"], allow: ["join", "publish", "discover", "subscribe"] }],
     participant,
     expiration: Math.floor(Date.now() / 1000) + 3600,
   });
 }
 ```
 
-Call `issueToken(participantId)` for each stable application participant ID and send the resulting token to
-your React frontend through your application's API or server-rendered props.
+Call `issueToken(participantId)` for each stable application participant ID. Send
+only the returned `token` to your React frontend through your application's API or
+server-rendered props. Your backend can retain the returned `jti` for incident
+correlation without logging the JWT.
 Never send signing credentials to the browser. **In production:** run PulseBeam
 without `--dev`, generate credentials with `./bazel run //:cli -- key`. The
 command prints a private API key and public key-registry JSON. Store the API key

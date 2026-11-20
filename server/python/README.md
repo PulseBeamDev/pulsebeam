@@ -26,13 +26,18 @@ The distribution is also buildable with standard Python build tooling from
 from pulsebeam_server import sign_participant_token
 
 def issue_token(api_key: str) -> str:
-    return sign_participant_token(
+    issued = sign_participant_token(
         api_key,
         grants=[{"rooms": ["general"], "allow": ["join", "publish", "discover", "subscribe"]}],
         participant="Alice",
         expiration=2000000000,
     )
+    return issued.token
 ```
+
+The signer returns `SignedParticipantToken` with `token` and its signed UUIDv4
+`jti`. Send only the token to the client. Retain `jti` on your backend if you need
+incident correlation; do not log the JWT.
 
 The API takes one opaque API key plus grants, participant and expiration.
 The SDK never reads the environment. Expiration must be an exact int in `0..18446744073709551615`,

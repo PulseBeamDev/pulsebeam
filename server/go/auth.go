@@ -3,10 +3,12 @@ package pulsebeam
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -139,45 +141,58 @@ func parseAPIKey(apiKey string) (string, string, ed25519.PrivateKey, error) {
 	return parts[0], parts[1], privateKey, nil
 }
 
+type SignedParticipantToken struct {
+	Token string
+	JTI   string
+}
+
 // SignParticipantToken signs a participant JWT using an opaque server-only API key.
 // expiration is absolute Unix seconds, not a TTL. No clock or network is consulted.
-func SignParticipantToken(apiKey string, grants []Grant, participant string, expiration uint64) (string, error) {
+func SignParticipantToken(apiKey string, grants []Grant, participant string, expiration uint64) (SignedParticipantToken, error) {
 	if !validParticipantName(participant) {
-		return "", errors.New("invalid participant identifier")
+		return SignedParticipantToken{}, errors.New("invalid participant identifier")
 	}
 	if err := validateGrants(grants); err != nil {
-		return "", err
+		return SignedParticipantToken{}, err
 	}
 	if grants == nil {
 		grants = []Grant{}
 	}
 	project, key, privateKey, err := parseAPIKey(apiKey)
 	if err != nil {
-		return "", err
+		return SignedParticipantToken{}, err
 	}
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return SignedParticipantToken{}, err
+	}
+	id[6] = id[6]&0x0f | 0x40
+	id[8] = id[8]&0x3f | 0x80
+	jti := fmt.Sprintf("%x-%x-%x-%x-%x", id[:4], id[4:6], id[6:8], id[8:10], id[10:])
 	header, err := json.Marshal(struct {
 		Alg string `json:"alg"`
 		Kid string `json:"kid"`
 		Typ string `json:"typ"`
 	}{"EdDSA", key, "pb+jwt"})
 	if err != nil {
-		return "", errors.New("invalid JWT header")
+		return SignedParticipantToken{}, errors.New("invalid JWT header")
 	}
 	claims, err := json.Marshal(struct {
 		Iss    string  `json:"iss"`
 		Aud    string  `json:"aud"`
 		Sub    string  `json:"sub"`
 		Exp    uint64  `json:"exp"`
+		JTI    string  `json:"jti"`
 		Grants []Grant `json:"grants"`
-	}{project, "pb", participant, expiration, grants})
+	}{project, "pb", participant, expiration, jti, grants})
 	if err != nil {
-		return "", errors.New("invalid JWT claims")
+		return SignedParticipantToken{}, errors.New("invalid JWT claims")
 	}
 	encoding := base64.RawURLEncoding
 	input := encoding.EncodeToString(header) + "." + encoding.EncodeToString(claims)
 	if len(input)+1+encoding.EncodedLen(ed25519.SignatureSize) > maxCompactTokenLen {
-		return "", errors.New("participant token exceeds the 8192-byte limit")
+		return SignedParticipantToken{}, errors.New("participant token exceeds the 8192-byte limit")
 	}
 	signature := ed25519.Sign(privateKey, []byte(input))
-	return input + "." + encoding.EncodeToString(signature), nil
+	return SignedParticipantToken{Token: input + "." + encoding.EncodeToString(signature), JTI: jti}, nil
 }

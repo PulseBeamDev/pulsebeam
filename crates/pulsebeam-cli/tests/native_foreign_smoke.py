@@ -59,16 +59,16 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
 
         catalog_agent.join(room)
         first_page = await catalog_page(lambda participants: any(
-            participant.external_id == "publisher" and any(
-                publication.label == "production-camera" and publication.kind.is_VIDEO()
+            participant.id == "publisher" and any(
+                publication.track_id == "production-camera" and publication.kind.is_VIDEO()
                 for publication in participant.publications
             ) for participant in participants
         ) and any(
-            participant.external_id == "foreign-catalog" and not participant.publications
+            participant.id == "foreign-catalog" and not participant.publications
             for participant in participants
         ))
         assert not first_page.has_more() and not first_page.next_cursor()
-        assert all(participant.external_id != "foreign" for participant in first_page.participants())
+        assert all(participant.id != "foreign" for participant in first_page.participants())
         updates = agent.snapshots()
         reader_updates = reader.snapshots()
         data = agent.data("foreign-bytes", core.TopicMode.ORDERED).publish()
@@ -103,12 +103,12 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
             if update.snapshot.connection.is_CONNECTED():
                 break
         changed_page = await catalog_page(lambda participants: any(
-            participant.external_id == "foreign" and
-            {publication.label for publication in participant.publications} == {"foreign-camera", "foreign-bytes"}
+            participant.id == "foreign" and
+            {publication.track_id for publication in participant.publications} == {"foreign-camera", "foreign-bytes"}
             for participant in participants
         ))
         assert changed_page.revision() > first_page.revision()
-        assert all(participant.external_id != "foreign" for participant in first_page.participants())
+        assert all(participant.id != "foreign" for participant in first_page.participants())
         watch.close()
         final_watch = await watch_updates.next()
         assert final_watch.status == core.WatchStatus.CLOSED and final_watch.page is None

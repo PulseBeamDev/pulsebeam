@@ -41,17 +41,13 @@ project-scoped registry.
 
 ## Verification and trust
 
-The JWT header and claims are unchanged:
+The [participant-token profile](README.md#wire-representation) defines the JWT
+header and claims, including the required signed `jti`.
 
-```text
-{"alg":"EdDSA","kid":"<ApiKeyId>","typ":"pb+jwt"}
-{"iss":"<ProjectId>","aud":"pb","sub":"<participant>","room":"<room>","exp":2000000000}
-```
-
-The SFU validates issuer/key identifiers against the configured project,
-selects its registered public key, requires EdDSA, verifies the signature,
-validates room/participant identity and expiration, then enforces authorization.
-Only the participant JWT is sent to the browser.
+The SFU validates issuer/key identifiers against the configured project, selects
+its registered public key, requires EdDSA, and verifies the signature, claims,
+and expiration before enforcing authorization. Only the participant JWT is sent
+to the browser.
 
 Key rotation creates a fresh `kid_0` and key pair, adds its SPKI key to the
 registry, and keeps the old public key registered until outstanding tokens

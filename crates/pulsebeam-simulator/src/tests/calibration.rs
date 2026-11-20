@@ -80,7 +80,7 @@ async fn peer(ip: IpAddr, server: IpAddr, name: &str, publishes: bool) -> anyhow
             &serde_json::from_value(serde_json::json!([{"rooms":["calibration"],"allow":["join","publish","discover","subscribe"]}])).unwrap(),
             name,
             u64::try_from(i64::MAX)?,
-        )?,
+        )?.token,
         retry: pulsebeam_agent_core::RetryPolicy::default(),
         log_level: pulsebeam_agent_core::LogLevel::default(),
     };

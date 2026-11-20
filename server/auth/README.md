@@ -41,6 +41,11 @@ Expiration is an exact unsigned integer in `0..18446744073709551615`. No clock,
 TTL, normalization of participant IDs, or service lookup is involved.
 Zero and past expiration can be signed, but authorize nothing at or after expiry.
 
+Each issuance, including renewal, generates a fresh UUIDv4 using a cryptographic
+random source. The SDK returns the compact token and its signed `jti`. Send only
+the token to the client. Keep `jti` with your app session if you need incident
+correlation; do not log the JWT. Reissue any older tokens that lack `jti`.
+
 Participant IDs match `[A-Za-z0-9_-]{1,36}` and preserve case. Grant room
 patterns and filters follow the rules below. Project and key IDs have exact
 case-sensitive `p_` and `kid_` prefixes,
@@ -93,7 +98,7 @@ Exactly these UTF-8 JSON fields, in this order, with no whitespace:
 
 ```text
 {"alg":"EdDSA","kid":"<canonical key ID>","typ":"pb+jwt"}
-{"iss":"<canonical project ID>","aud":"pb","sub":"<participant>","exp":<unsigned decimal digits>,"grants":[<grant objects>]}
+{"iss":"<canonical project ID>","aud":"pb","sub":"<participant>","exp":<unsigned decimal digits>,"jti":"<canonical UUIDv4>","grants":[<grant objects>]}
 ```
 
 Unpadded base64url encode each object, join with `.`, sign those literal ASCII
@@ -102,7 +107,11 @@ base64url 64-byte signature. Grant fields serialize in `rooms`, `allow`,
 `participant`, `kind`, `label` order, omitting absent filters. No `iat`, `nbf`,
 `room`, `role`, or default JWT headers are emitted. The verifier rejects unknown
 header and claim members; an optional empty `crit` header is accepted. The server matches the token project ID and key ID against the public key registry,
-verifies the signature, and requires `now < exp`.
+verifies the signature, and requires `now < exp`. The `jti` must be lowercase,
+hyphenated UUID text with version 4 and RFC variant bits. The server records it
+with the verified project and connection only after admission or renewal succeeds.
+A token can be used on multiple connections. Its ID does not enforce uniqueness,
+prevent replay, or change permissions.
 
 The complete encoded token is limited to 8,192 bytes, including both separators
 and the signature. Signers reject oversized output before signing. The server
@@ -128,8 +137,10 @@ crate for its corresponding typed boundary. Runtime adapters check grant structu
 typed APIs reject unrepresentable argument types. The server independently checks
 all received claims and enforces registry matching and resource authority.
 
-`cases.json` is the maintenance source for accepted inputs, seed bytes and
-rejections. The Rust generator uses native Ed25519 directly, not an SDK signer.
+`cases.json` is the maintenance source for accepted inputs, fixed fixture `jti`
+values, seed bytes and rejections. The Rust generator uses native Ed25519
+directly, not an SDK signer. Packaged SDK tests check that fresh IDs match the
+signed claim and verify freshly issued signatures independently.
 Run `./bazel run //server/auth:generate_vectors` and review the `vectors.json` diff.
 Golden data is committed and never regenerated during tests. Its seed/public key
 pair comes from RFC 8032 section 7.1 test 2, not development credentials.

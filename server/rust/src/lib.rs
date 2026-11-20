@@ -12,6 +12,20 @@ use data_encoding::BASE64URL_NOPAD;
 use pulsebeam_auth::api_key::ApiKeyError;
 use pulsebeam_auth::keys::ApiSigningKey;
 use serde::Serialize;
+use uuid::Uuid;
+
+pub struct SignedParticipantToken {
+    pub token: String,
+    pub jti: Uuid,
+}
+
+impl core::fmt::Debug for SignedParticipantToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SignedParticipantToken")
+            .field("jti", &self.jti)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -39,6 +53,7 @@ struct Claims<'a> {
     aud: &'a str,
     sub: &'a str,
     exp: u64,
+    jti: &'a str,
     grants: &'a GrantSet,
 }
 
@@ -75,7 +90,7 @@ pub fn sign_participant_token(
     grants: &GrantSet,
     participant: &str,
     expiration: u64,
-) -> Result<String, SigningError> {
+) -> Result<SignedParticipantToken, SigningError> {
     pulsebeam_auth::identity::validate_application_name(participant)?;
     let mut parts = api_key.split('.');
     let (Some(project), Some(kid), Some(secret), None) =
@@ -89,11 +104,13 @@ pub fn sign_participant_token(
         kid,
         typ: "pb+jwt",
     })?;
+    let jti = Uuid::new_v4();
     let claims = serde_json::to_vec(&Claims {
         iss: project,
         aud: "pb",
         sub: participant,
         exp: expiration,
+        jti: jti.hyphenated().encode_lower(&mut Uuid::encode_buffer()),
         grants,
     })?;
     let signing_input = format!(
@@ -106,8 +123,8 @@ pub fn sign_participant_token(
         return Err(SigningError::TokenTooLarge);
     }
     let signature = signing_key.sign_message(signing_input.as_bytes());
-    Ok(format!(
-        "{signing_input}.{}",
-        BASE64URL_NOPAD.encode(&signature)
-    ))
+    Ok(SignedParticipantToken {
+        token: format!("{signing_input}.{}", BASE64URL_NOPAD.encode(&signature)),
+        jti,
+    })
 }

@@ -38,7 +38,8 @@ fn token(api_key: &str) -> Result<String, Box<dyn std::error::Error>> {
         vec![Action::Join, Action::Publish, Action::Discover, Action::Subscribe],
         None, None, None,
     )?])?;
-    Ok(sign_participant_token(api_key, &grants, "Alice", 2_000_000_000)?)
+    let issued = sign_participant_token(api_key, &grants, "Alice", 2_000_000_000)?;
+    Ok(issued.token)
 }
 ```
 
@@ -59,6 +60,10 @@ The SDK validates these bounds and grant structure. Project/key identifiers
 remain opaque; the SFU validates their format, registry membership and authority.
 See the [grant schema and limits](../auth/README.md#grants).
 The SDK rejects unusable signing keys, and errors do not disclose secrets.
+
+The signer returns `SignedParticipantToken` with `token` and its signed UUIDv4
+`jti`. Send only the token to the client. Retain `jti` on your backend if you need
+incident correlation; do not log the JWT.
 
 Keep signing secrets on your server, never in clients or logs. Offline signing
 cannot check registration or whether the supplied secret belongs to the

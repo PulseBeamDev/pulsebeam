@@ -62,7 +62,8 @@ fn config_for_grants(
             &serde_json::from_value(grants)?,
             participant,
             expiry,
-        )?,
+        )?
+        .token,
         retry: Default::default(),
         log_level: pulsebeam_agent_native::agent_core::LogLevel::Debug,
     }))

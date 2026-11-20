@@ -23,7 +23,7 @@ replace github.com/PulseBeamDev/pulsebeam/server/go => /absolute/path/to/pulsebe
 import pulsebeam "github.com/PulseBeamDev/pulsebeam/server/go"
 
 func issueToken(apiKey string) (string, error) {
-    return pulsebeam.SignParticipantToken(
+    issued, err := pulsebeam.SignParticipantToken(
         apiKey,
         []pulsebeam.Grant{{
             Rooms: []string{"general"},
@@ -31,10 +31,18 @@ func issueToken(apiKey string) (string, error) {
         }},
         "Alice", uint64(2000000000),
     )
+    if err != nil {
+        return "", err
+    }
+    return issued.Token, nil
 }
 ```
 
 Pass one opaque server-only API key; the SDK imports the standard PKCS#8 private key.
+`SignParticipantToken` returns `SignedParticipantToken` with `Token` and its signed
+UUIDv4 `JTI`. Send only `Token` to the client. Retain `JTI` on your backend if you
+need incident correlation; do not log the JWT.
+
 How your application stores the key is up to you. Do not parse, log, or send it to clients.
 All credentials are explicit. The SDK never reads the environment. Expiration
 is a mandatory uint64 absolute Unix timestamp in `0..18446744073709551615`, not

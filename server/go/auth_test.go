@@ -13,6 +13,7 @@ import (
 	"go/types"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -76,30 +77,37 @@ func TestConformance(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := pulsebeam.SignParticipantToken(fixtureAPIKey, v.Input.Grants, v.Input.Participant, exp)
-			if err != nil || got != v.Token {
-				t.Fatalf("token mismatch: %v", err)
+			issue := func() pulsebeam.SignedParticipantToken {
+				t.Helper()
+				got, err := pulsebeam.SignParticipantToken(fixtureAPIKey, v.Input.Grants, v.Input.Participant, exp)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return got
 			}
-			if v.Name == "encoded-token-limit" && len(got) != 8192 {
+			got := issue()
+			if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(got.JTI) || got.JTI == issue().JTI {
+				t.Fatal("issuance did not generate a fresh canonical UUIDv4")
+			}
+			if v.Name == "encoded-token-limit" && len(got.Token) != 8192 {
 				t.Fatal("encoded token boundary changed")
 			}
-			parts := strings.Split(got, ".")
-			for i, expected := range []string{v.Header, v.Claims} {
+			parts := strings.Split(got.Token, ".")
+			var fixtureClaims struct {
+				JTI string `json:"jti"`
+			}
+			if err := json.Unmarshal([]byte(v.Claims), &fixtureClaims); err != nil {
+				t.Fatal(err)
+			}
+			for i, expected := range []string{v.Header, strings.Replace(v.Claims, fixtureClaims.JTI, got.JTI, 1)} {
 				decoded, err := base64.RawURLEncoding.DecodeString(parts[i])
 				if err != nil || string(decoded) != expected {
 					t.Fatal("JSON mismatch")
 				}
 			}
-			if strings.Join(parts[:2], ".") != v.SigningInput || parts[2] != v.Signature {
-				t.Fatal("signing input/signature mismatch")
-			}
 			pub, _ := hex.DecodeString(v.Public)
-			seed, _ := hex.DecodeString(v.Seed)
-			if !reflect.DeepEqual(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey), ed25519.PublicKey(pub)) {
-				t.Fatal("seed/public mismatch")
-			}
-			sig, _ := base64.RawURLEncoding.DecodeString(v.Signature)
-			if !ed25519.Verify(pub, []byte(v.SigningInput), sig) {
+			sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+			if !ed25519.Verify(pub, []byte(strings.Join(parts[:2], ".")), sig) {
 				t.Fatal("independent signature verification failed")
 			}
 		})
@@ -204,7 +212,7 @@ func TestInvalidInputsAndDiagnostics(t *testing.T) {
 				participant = value
 			}
 			token, err := pulsebeam.SignParticipantToken(fixtureAPIKey, grants, participant, 2000)
-			if err == nil || token != "" {
+			if err == nil || token.Token != "" {
 				t.Fatal("invalid input was accepted")
 			}
 			if strings.Contains(err.Error(), fixtureAPIKey) {
@@ -225,7 +233,7 @@ func TestOpaqueIdentityStrings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded := strings.Split(token, ".")
+	encoded := strings.Split(token.Token, ".")
 	header, err := base64.RawURLEncoding.DecodeString(encoded[0])
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +279,7 @@ func TestEmbeddedDevelopmentAPIKey(t *testing.T) {
 		t.Fatal("embedded API key differs from canonical JSON")
 	}
 	jwt, err := pulsebeam.SignParticipantToken(actual, grants("demo"), "alice", 2000000000)
-	if err != nil || jwt == "" {
+	if err != nil || jwt.Token == "" {
 		t.Fatalf("development token: %v", err)
 	}
 	publicDER, err := base64.RawURLEncoding.DecodeString(expected.PublicKey)
@@ -286,7 +294,7 @@ func TestEmbeddedDevelopmentAPIKey(t *testing.T) {
 	if !ok {
 		t.Fatal("SPKI is not an Ed25519 public key")
 	}
-	parts := strings.Split(jwt, ".")
+	parts := strings.Split(jwt.Token, ".")
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || !ed25519.Verify(publicKey, []byte(parts[0]+"."+parts[1]), signature) {
 		t.Fatal("SPKI key cannot verify development JWT")
