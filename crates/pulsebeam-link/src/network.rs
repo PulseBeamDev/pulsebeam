@@ -12,6 +12,14 @@ pub struct NetworkId {
     serial: u64,
 }
 
+impl NetworkId {
+    /// Association epoch within the Link host. Pair with the node incarnation
+    /// for diagnostics; it is not a remote identity or routing key.
+    pub const fn epoch(self) -> u64 {
+        self.serial
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeRouteKey(pub(crate) u32);
 

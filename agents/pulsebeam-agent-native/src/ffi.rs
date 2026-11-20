@@ -211,6 +211,11 @@ impl Agent {
     pub fn state(&self) -> core_ffi::AgentState {
         self.runtime.state()
     }
+    pub fn support_report(&self) -> core_ffi::SupportReport {
+        core_ffi::SupportReport {
+            connection_id: self.runtime.state().connection_id,
+        }
+    }
 
     pub fn updates(&self) -> Result<Arc<AgentUpdates>, NativeError> {
         self.runtime

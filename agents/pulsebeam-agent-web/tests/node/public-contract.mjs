@@ -119,6 +119,9 @@ export async function publicContract(pulsebeam) {
       "creation is not connection intent",
     );
     const initialState = agent.state();
+    const support = agent.supportReport();
+    assert.deepEqual(support, { connectionId: undefined });
+    assert.ok(Object.isFrozen(support));
     assert.equal(initialState.status, AgentStatus.Idle);
     assert.equal(agent.state(), initialState);
     assert.equal(Object.isFrozen(initialState), true);

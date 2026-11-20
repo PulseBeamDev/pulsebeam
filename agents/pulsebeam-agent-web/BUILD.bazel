@@ -227,7 +227,7 @@ js_run_binary(
     args = [
         "uniffi/bindings/pulsebeam_agent_core.ts",
         "web/generated/schema.ts",
-        "AgentState", "AgentStatus", "ErrorCode", "ErrorInfo", "PublicationState", "PipeState",
+        "AgentState", "AgentStatus", "SupportReport", "ErrorCode", "ErrorInfo", "PublicationState", "PipeState",
         "VideoSubscriptionState", "AudioSubscriptionState", "DataPublicationState", "DataSubscriptionState",
         "MediaKind", "PublicationAdmissionStatus", "PublicationDemand", "PublicationExecution",
         "WatchStatus", "CatalogParticipantInfo", "CatalogPublicationInfo", "CatalogPublicationKind",

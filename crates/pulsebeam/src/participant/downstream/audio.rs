@@ -234,7 +234,7 @@ impl AudioAllocator {
             plog_debug!(
                 self.ctx,
                 target: crate::log::TARGET_AUDIO,
-                mid = %slot.mid,
+                media_index = slot.media_index,
                 "audio slot already provisioned; skipping duplicate"
             );
             return;
@@ -253,7 +253,7 @@ impl AudioAllocator {
         plog_warn!(
             self.ctx,
             target: crate::log::TARGET_AUDIO,
-            mid = %slot.mid,
+            media_index = slot.media_index,
             pt = %slot.pt,
             ssrc = %slot.ssrc,
             slots = SELECTOR_SLOTS,

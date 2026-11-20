@@ -30,6 +30,15 @@ pub(crate) enum Resource {
 }
 
 impl Resource {
+    pub(crate) fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::Publication { .. } => "publication",
+            Self::Reception(_) | Self::LogicalReception(_) => "media_subscription",
+            Self::DataSubscription(_) | Self::LogicalData(_) => "data_subscription",
+            Self::SourceLookup { .. } => "source_lookup",
+        }
+    }
+
     fn matches_spec(&self, spec: &wire::ResourceSpec) -> bool {
         match (self, spec.declaration.as_ref()) {
             (

@@ -1022,11 +1022,11 @@ impl RtcDriver {
                 .write_rtp(self.rtc_clock.into(), command.mid.as_str(), packet)
         {
             metrics::counter!("participant_rtp_write_rejected").increment(1);
-            tracing::debug!(reason = ?rejected.reason, mid = %command.mid, "RTC rejected primary RTP");
+            tracing::debug!(reason = ?rejected.reason, "RTC rejected primary RTP");
             return AppliedMutation::RtpNotWritten;
         }
         if command.kind == MediaKind::Video {
-            tracing::trace!(target: crate::log::TARGET_VIDEO, mid = %command.mid, sequence, timestamp, marker, "Writing RTP packet");
+            tracing::trace!(target: crate::log::TARGET_VIDEO, sequence, timestamp, marker, "Writing RTP packet");
         }
         sender.accept_index(sequence);
         self.rtc_needs_drain = true;

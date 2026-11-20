@@ -285,7 +285,7 @@ impl VideoAllocator {
         {
             let publication_id = &intent.publication_id;
             let Some(&track_handle) = track_handles.get(publication_id) else {
-                plog_warn!(slot.ctx, publication_id=%publication_id, mid=%slot.mid, "configure_slot: requested track missing");
+                plog_warn!(slot.ctx, publication_id=%publication_id, media_index=?slot.media_index, "configure_slot: requested track missing");
                 slot.max_height = 0;
                 slot.stop();
                 return None;
@@ -393,7 +393,11 @@ impl VideoAllocator {
 
     pub fn add_slot(&mut self, config: SlotConfig) {
         if self.has_slot(config.mid) {
-            plog_debug!(self.ctx, mid = %config.mid, "video slot already provisioned; skipping duplicate");
+            plog_debug!(
+                self.ctx,
+                media_index = config.media_index,
+                "video slot already provisioned; skipping duplicate"
+            );
             return;
         }
         let slot = Slot::new(self.ctx, config);
@@ -1027,7 +1031,7 @@ impl Slot {
             self.keyframe_interval = KEYFRAME_KEEPALIVE_INTERVAL;
             plog_debug!(
                 self.ctx,
-                mid = %self.mid,
+                media_index = ?self.media_index,
                 retries = KEYFRAME_MAX_RETRIES,
                 interval = ?self.keyframe_interval,
                 "slot still waiting for a usable keyframe; using low-frequency keep-alive PLIs"
@@ -1078,13 +1082,13 @@ impl Slot {
         if before != after {
             self.pli_reset();
             changed = true;
-            plog_debug!(self.ctx, mid=%self.mid, new_target=?new_layer.stream_id(), "slot switching target");
+            plog_debug!(self.ctx, media_index=?self.media_index, new_target=?new_layer.stream_id(), "slot switching target");
         }
 
         if self.paused {
             self.paused = false;
             changed = true;
-            plog_debug!(self.ctx, mid=%self.mid, new_target=?new_layer.stream_id(), "slot resumed from paused state");
+            plog_debug!(self.ctx, media_index=?self.media_index, new_target=?new_layer.stream_id(), "slot resumed from paused state");
         }
 
         changed
@@ -1102,7 +1106,7 @@ impl Slot {
     }
 
     fn stop(&mut self) {
-        plog_debug!(self.ctx, mid=%self.mid, "slot stopped");
+        plog_debug!(self.ctx, media_index=?self.media_index, "slot stopped");
         self.desired = None;
         self.paused = true;
         self.resume_gate = ResumeGate::default();
@@ -1127,7 +1131,7 @@ impl Slot {
             self.switcher.stop();
             self.switcher.switch_to(layer.stream_id());
             changed = true;
-            plog_debug!(self.ctx, mid=%self.mid, target=?layer.stream_id(), "slot pause_at set staging target");
+            plog_debug!(self.ctx, media_index=?self.media_index, target=?layer.stream_id(), "slot pause_at set staging target");
         }
 
         if !self.paused {
@@ -1135,7 +1139,7 @@ impl Slot {
             self.resume_gate = ResumeGate { required: true };
             self.paused = true;
             changed = true;
-            plog_debug!(self.ctx, mid=%self.mid, target=?layer.stream_id(), "slot paused");
+            plog_debug!(self.ctx, media_index=?self.media_index, target=?layer.stream_id(), "slot paused");
         }
 
         changed
@@ -1149,7 +1153,7 @@ impl Slot {
         writer: &mut StreamWriter,
     ) -> bool {
         if self.paused {
-            plog_trace!(self.ctx, mid=%self.mid, track=?publication_id, "slot paused, dropping incoming packet");
+            plog_trace!(self.ctx, media_index=?self.media_index, track=?publication_id, "slot paused, dropping incoming packet");
             return false;
         }
         let Some(cache) = cache else {

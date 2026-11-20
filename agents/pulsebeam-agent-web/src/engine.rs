@@ -1363,6 +1363,7 @@ mod tests {
                     body: serde_json::to_vec(&serde_json::json!({
                         "room_id": "room",
                         "participant_id": "p1",
+                        "connection_id": "conn_0065WZSB8G1XN31RDHP9883WVRC",
                         "profile": "pulsebeam.media.v1", "rtp_capabilities": {},
                         "data_delivery": ["LATEST", "LOSSY", "ORDERED"], "answer": "answer"
                     }))

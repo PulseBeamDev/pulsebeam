@@ -4,7 +4,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 use pulsebeam_proto::prelude::Message;
 use pulsebeam_proto::state::{self as wire, codec, validation};
 
-use crate::entity::PublicationKey;
+use crate::entity::{ConnectionId, ProjectId, PublicationKey};
 use crate::media::ChannelId;
 use crate::participant::signaling::{SignalingOutput, SignalingProgress};
 use crate::track::Track;
@@ -178,6 +178,7 @@ struct Row {
 
 mod catalog;
 mod discovery;
+mod incident;
 mod logical;
 mod revocation;
 mod source_wait;
@@ -203,6 +204,7 @@ const SELECT_WORK: usize = 32;
 #[derive(Default)]
 pub(crate) struct NativeSession {
     pub(crate) cid: Option<ChannelId>,
+    incident_context: Option<(ProjectId, ConnectionId)>,
     pub(crate) catalog: catalog::CatalogSession,
     catalog_first: bool,
     rows: BTreeMap<Key, Row>,
@@ -293,6 +295,9 @@ impl NativeSession {
         self.charge(previous, confirmed_bytes(&value).saturating_add(overhead))?;
         let version = self.next_version()?;
         if let Some(row) = self.rows.get_mut(&key) {
+            if let (Some(context), Key::Owned(owned)) = (self.incident_context, &key) {
+                incident::subscription_changed(context, *owned, Some(&row.value), &value);
+            }
             row.value = value;
             row.version = version;
             if row.unavailable {
@@ -307,6 +312,9 @@ impl NativeSession {
             return Ok(());
         }
         self.ordinal = self.ordinal.checked_add(1).ok_or(OutputError::Capacity)?;
+        if let (Some(context), Key::Owned(owned)) = (self.incident_context, &key) {
+            incident::subscription_changed(context, *owned, None, &value);
+        }
         self.order.insert(self.ordinal, key.clone());
         self.rows.insert(
             key.clone(),

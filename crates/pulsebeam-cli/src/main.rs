@@ -9,6 +9,8 @@
 )]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
+mod incident;
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use pulsebeam_agent_native::agent_core::{
@@ -205,10 +207,8 @@ struct Cli {
 enum Commands {
     Key(KeyConfig),
     Bench(BenchConfig),
-    Id {
-        #[command(subcommand)]
-        command: IdCommand,
-    },
+    /// Reconstruct observed lifecycles from an authorized NDJSON log export on stdin
+    Incident(incident::IncidentArgs),
     /// Mint a bearer token for a local development server
     Token(TokenConfig),
 }
@@ -234,30 +234,6 @@ struct TokenConfig {
     /// Token lifetime in seconds
     #[arg(long, default_value_t = 3_600)]
     ttl: u64,
-}
-
-#[derive(Subcommand)]
-enum IdCommand {
-    Room(RoomIdConfig),
-    Participant(ParticipantIdConfig),
-}
-
-#[derive(Args)]
-struct RoomIdConfig {
-    #[arg(long)]
-    project_id: ProjectId,
-    #[arg(long)]
-    room_id: RoomId,
-}
-
-#[derive(Args)]
-struct ParticipantIdConfig {
-    #[arg(long)]
-    project_id: ProjectId,
-    #[arg(long)]
-    room_id: RoomId,
-    #[arg(long)]
-    participant_id: ParticipantId,
 }
 
 #[derive(Parser, Clone)]
@@ -331,7 +307,9 @@ fn main() -> Result<()> {
             Commands::Bench(config) => {
                 run_bench(cli.api_url, config).await?;
             }
-            Commands::Id { command } => println!("{}", derive_id(command)),
+            Commands::Incident(config) => {
+                config.run(std::io::stdin().lock(), std::io::stdout().lock())?;
+            }
             Commands::Token(config) => println!("{}", development_token(config)?),
         }
         anyhow::Ok(())
@@ -444,13 +422,6 @@ fn print_key_material(api_key: &str, registry: &KeyRegistry) -> Result<()> {
     println!("Key registry (public; configure the PulseBeam server with this JSON):");
     println!("{}", registry.to_pretty_json()?);
     Ok(())
-}
-
-fn derive_id(command: IdCommand) -> String {
-    match command {
-        IdCommand::Room(config) => config.room_id.to_string(),
-        IdCommand::Participant(config) => config.participant_id.to_string(),
-    }
 }
 
 async fn run_bench(api_url: String, config: BenchConfig) -> Result<()> {
@@ -1181,8 +1152,9 @@ mod tests {
             1_000,
         )
         .unwrap();
-        assert_eq!(alice_auth.room_id.as_str(), "bench-room-7");
-        assert_eq!(bob_auth.room_id.as_str(), "bench-room-7");
+        let room = RoomId::new("bench-room-7").unwrap();
+        assert_eq!(alice_auth.room_id, Some(room));
+        assert_eq!(bob_auth.room_id, Some(room));
         assert_eq!(alice_auth.participant_id.as_str(), "bench-7000");
         assert_eq!(bob_auth.participant_id.as_str(), "bench-7001");
         assert_ne!(alice_auth.participant_id, bob_auth.participant_id);
@@ -1262,46 +1234,6 @@ mod tests {
             ttl: 1,
         };
         assert!(development_token_at(config, u64::MAX).is_err());
-    }
-
-    #[test]
-    fn identity_commands_echo_canonical_application_names() {
-        let project = ProjectId::from_bytes([0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]);
-        let project_text = project.as_str();
-        let room = RoomId::new("general").unwrap();
-        let participant = ParticipantId::new("alice").unwrap();
-
-        let room_cli = Cli::try_parse_from([
-            "pulsebeam-cli",
-            "id",
-            "room",
-            "--project-id",
-            &project_text,
-            "--room-id",
-            "general",
-        ])
-        .expect("room identity arguments must parse");
-        let Commands::Id { command } = room_cli.command else {
-            panic!("room command must parse as id");
-        };
-        assert_eq!(derive_id(command), room.as_str());
-
-        let participant_cli = Cli::try_parse_from([
-            "pulsebeam-cli",
-            "id",
-            "participant",
-            "--project-id",
-            &project_text,
-            "--room-id",
-            "general",
-            "--participant-id",
-            "alice",
-        ])
-        .expect("participant identity arguments must parse");
-        let Commands::Id { command } = participant_cli.command else {
-            panic!("participant command must parse as id");
-        };
-        assert_eq!(derive_id(command), participant.as_str());
     }
 
     #[test]

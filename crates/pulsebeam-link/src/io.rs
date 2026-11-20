@@ -39,6 +39,7 @@ pub struct NetworkDriver<P> {
     pending: Option<Outbound<P>>,
     now: LinkTime,
     health: Health,
+    unknown_label: Option<NodeRouteKey>,
 }
 
 impl<P> Drop for NetworkDriver<P> {
@@ -71,7 +72,13 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             pending: None,
             now: LinkTime(0),
             health: Health::default(),
+            unknown_label: None,
         })
+    }
+
+    /// One sampled unmatched wire label, without any inferred publication.
+    pub fn take_unknown_label(&mut self) -> Option<NodeRouteKey> {
+        self.unknown_label.take()
     }
 
     /// Both clock observations must come from the same real or virtual host.
@@ -195,12 +202,20 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
             let routes = &self.routes;
             let codec = &self.codec;
             let health = &mut self.health;
+            let unknown_label = &mut self.unknown_label;
             work = work.saturating_add(self.transport.poll(
                 now,
                 budget.saturating_sub(work),
                 &mut *send,
                 |application| {
-                    Self::deliver(table, routes, codec.as_ref(), health, application);
+                    Self::deliver(
+                        table,
+                        routes,
+                        codec.as_ref(),
+                        health,
+                        unknown_label,
+                        application,
+                    );
                 },
             )?);
             if self.transport.health().ready {
@@ -266,10 +281,13 @@ impl<P: Clone + Send + 'static> NetworkDriver<P> {
         routes: &HashMap<NodeRouteKey, ReceiveBinding<P>>,
         codec: &dyn WireCodec<P>,
         health: &mut Health,
+        unknown_label: &mut Option<NodeRouteKey>,
         application: pulsebeam_transport::Application<'_>,
     ) {
-        let Some(binding) = routes.get(&NodeRouteKey::from_bytes(application.context)) else {
+        let label = NodeRouteKey::from_bytes(application.context);
+        let Some(binding) = routes.get(&label) else {
             health.stale = health.stale.saturating_add(1);
+            unknown_label.get_or_insert(label);
             return;
         };
         if !table.binding_live(binding.binding) {

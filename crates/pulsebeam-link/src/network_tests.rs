@@ -482,6 +482,8 @@ fn receive_retirement_fences_queued_payloads_without_withholding_transport_feedb
     assert!(matches!(&batch[0].packet, Packet::Wire(bytes) if bytes.as_ref() == [3]));
     assert_eq!(pair.bd.health().received, 3);
     assert_eq!(pair.bd.health().stale, 1);
+    assert_eq!(pair.bd.take_unknown_label(), Some(key));
+    assert_eq!(pair.bd.take_unknown_label(), None);
     assert_eq!(pair.ad.health().sent, 3);
     assert_eq!(pair.ad.health().bytes_in_flight, 0);
 }

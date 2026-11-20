@@ -72,6 +72,9 @@ const agent = new Agent(
 );
 if (agent instanceof Promise) throw new Error("Agent construction was asynchronous");
 const initialState = agent.state();
+if (agent.supportReport().connectionId !== undefined) {
+  throw new Error("unadmitted agent exposed a connection ID");
+}
 const stateUpdates = agent.updates();
 if (!AgentUpdates.instanceOf(stateUpdates) ||
     initialState.status !== AgentStatus.Idle ||

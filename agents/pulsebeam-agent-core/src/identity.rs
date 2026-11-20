@@ -29,7 +29,21 @@ macro_rules! opaque_id {
 }
 
 opaque_id!(ParticipantId);
-opaque_id!(ConnectionId);
+opaque_id!(
+    #[derive(Debug)]
+    ConnectionId
+);
+
+impl ConnectionId {
+    pub(crate) fn from_native_response(value: String) -> Option<Self> {
+        // Treat the admission reply as the identity authority, but never copy
+        // arbitrary response text into the support report.
+        let payload = value.strip_prefix("conn_0")?;
+        const DIGITS: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        (payload.len() == 26 && payload.bytes().all(|byte| DIGITS.contains(&byte)))
+            .then(|| Self::from_server(value))
+    }
+}
 opaque_id!(TrackId);
 
 #[cfg(test)]

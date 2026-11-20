@@ -127,6 +127,7 @@ struct Session {
     credential: Credential,
     admission: admission::AcceptedReceipts,
     generation: Generation,
+    connection_id: crate::ConnectionId,
     resource_uri: String,
     participant_id: String,
     room_id: Option<String>,
@@ -169,6 +170,7 @@ enum AttemptStage {
 
 struct Candidate {
     credential: Credential,
+    connection_id: crate::ConnectionId,
     capabilities: crate::BootstrapCapabilities,
     resource_uri: String,
     room_id: Option<String>,
@@ -188,6 +190,7 @@ struct NativeRequest<'a> {
 #[derive(Deserialize)]
 struct NativeResponse {
     profile: String,
+    connection_id: String,
     rtp_capabilities: pulsebeam_proto::state::RtpCapabilities,
     data_delivery: Vec<serde_json::Value>,
     room_id: Option<String>,
@@ -356,7 +359,12 @@ impl Agent {
         let flushed = self.flush_notifications();
         let result = result.and(flushed);
         if let Err(error) = &result {
-            agent_log!(self, Warn, "agent command rejected: {error}");
+            agent_log!(
+                self,
+                Warn,
+                "agent command rejected: code={:?}",
+                crate::ffi::ErrorInfo::from(error).code
+            );
         }
         result
     }
@@ -374,7 +382,12 @@ impl Agent {
         let flushed = self.flush_notifications();
         let result = result.and(flushed);
         if let Err(error) = &result {
-            agent_log!(self, Warn, "host event rejected: {error}");
+            agent_log!(
+                self,
+                Warn,
+                "host event rejected: code={:?}",
+                crate::ffi::ErrorInfo::from(error).code
+            );
         }
         result
     }
@@ -800,16 +813,20 @@ impl Agent {
                                 log::Level::Warn,
                                 crate::topic::LOG_TARGET,
                                 format_args!(
-                                    "topic send dropped topic={} mode={:?} reason={reason:?}",
-                                    publisher.topic, publisher.mode
+                                    "topic send dropped mode={:?} reason={reason:?}",
+                                    publisher.mode
                                 ),
                             );
                         }
-                        crate::TopicNotification::ChannelFailed { channel, message } => {
+                        crate::TopicNotification::ChannelFailed { channel, .. } => {
+                            let direction = match channel {
+                                crate::TopicChannel::Publisher(_) => "publish",
+                                crate::TopicChannel::Subscriber(_) => "subscribe",
+                            };
                             self.logs.write(
                                 log::Level::Warn,
                                 crate::topic::LOG_TARGET,
-                                format_args!("topic channel failed channel={channel:?}: {message}"),
+                                format_args!("topic channel failed direction={direction}"),
                             );
                         }
                         _ => {}
@@ -997,17 +1014,18 @@ impl Agent {
             || video_changed
             || self.desired.audio != desired.audio;
         let topics_changed = self.desired.topics != desired.topics;
-        let previous_desired = core::mem::replace(&mut self.desired, desired);
+        let previous_video_count = self.desired.video.len();
+        self.desired = desired;
         self.snapshot.desired_revision = self.desired.revision;
         self.bump_snapshot();
         if video_changed {
             agent_log!(
                 self,
                 Debug,
-                "desired video subscriptions changed revision={} previous={:?} current={:?}",
+                "desired video subscriptions changed revision={} previous_count={} current_count={}",
                 self.desired.revision,
-                previous_desired.video,
-                self.desired.video,
+                previous_video_count,
+                self.desired.video.len(),
             );
         }
         agent_log!(
@@ -2340,6 +2358,7 @@ impl Agent {
             credential: candidate.credential,
             admission: admission.into_accepted_receipts(),
             generation: attempt.generation,
+            connection_id: candidate.connection_id,
             resource_uri: candidate.resource_uri,
             participant_id: candidate.participant_id,
             room_id: candidate.room_id,
@@ -2385,6 +2404,7 @@ impl Agent {
         self.intent_dirty = true;
         if let Some(active) = &self.active {
             self.snapshot.generation = Some(active.generation);
+            self.snapshot.connection_id = Some(active.connection_id.clone());
             self.snapshot.participant_id = Some(active.participant_id.clone());
             self.snapshot.room_id = active.room_id.clone();
             self.snapshot.authorization_expires_at = None;
@@ -2527,6 +2547,7 @@ impl Agent {
                     generation: active.generation,
                 }));
             }
+            self.snapshot.connection_id = None;
             self.clear_observed_state();
         }
         self.notify_failure(failure.clone());
@@ -2942,6 +2963,7 @@ impl Agent {
         self.retry = None;
         self.pending_signal = None;
         self.snapshot.generation = None;
+        self.snapshot.connection_id = None;
         self.snapshot.participant_id = None;
         self.snapshot.room_id = None;
         self.snapshot.accepted_join_revision = None;
@@ -3189,6 +3211,8 @@ fn parse_create_response(
     if body.profile != pulsebeam_proto::state::PROFILE {
         return Err("unsupported native profile".to_string());
     }
+    let connection_id = crate::ConnectionId::from_native_response(body.connection_id)
+        .ok_or_else(|| "create response contains invalid connection ID".to_string())?;
     pulsebeam_proto::state::validation::validate_capabilities(&body.rtp_capabilities)
         .map_err(|_| "create response contains invalid RTP capabilities".to_string())?;
     let data_delivery = supported_data_delivery(&body.data_delivery)?;
@@ -3202,6 +3226,7 @@ fn parse_create_response(
     Ok((
         Candidate {
             credential,
+            connection_id,
             capabilities: crate::BootstrapCapabilities {
                 rtp: body.rtp_capabilities,
                 data_delivery,
@@ -3438,6 +3463,7 @@ mod response_tests {
         let complete = serde_json::json!({
             "room_id": "Stage_9",
             "participant_id": "Stage_Participant",
+            "connection_id": "conn_0065WZSB8G1XN31RDHP9883WVRC",
             "profile": "pulsebeam.media.v1",
             "rtp_capabilities": {},
             "data_delivery": ["LATEST", "LOSSY", "ORDERED"],
@@ -3463,6 +3489,10 @@ mod response_tests {
         );
         assert_eq!(candidate.room_id.as_deref(), Some("Stage_9"));
         assert_eq!(candidate.participant_id, "Stage_Participant");
+        assert_eq!(
+            candidate.connection_id.as_str(),
+            "conn_0065WZSB8G1XN31RDHP9883WVRC"
+        );
         assert_eq!(answer, "v=0\r\n");
 
         let mut roomless = complete.as_object().unwrap().clone();
@@ -3477,6 +3507,7 @@ mod response_tests {
 
         for field in [
             "participant_id",
+            "connection_id",
             "profile",
             "rtp_capabilities",
             "data_delivery",
@@ -3490,6 +3521,10 @@ mod response_tests {
         for (field, value) in [
             ("profile", serde_json::json!(true)),
             ("participant_id", serde_json::json!("not / a name")),
+            (
+                "connection_id",
+                serde_json::json!("https://private.test/Sentinel"),
+            ),
             ("profile", serde_json::json!("legacy")),
             ("rtp_capabilities", serde_json::json!({"codecs": [{}]})),
             ("rtp_capabilities", serde_json::json!({"rtcp_modes": [""]})),

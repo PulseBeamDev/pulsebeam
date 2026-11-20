@@ -153,11 +153,7 @@ fn desired_video_intent_logs_only_accepted_semantic_changes() {
         .unwrap();
     assert_eq!(
         take_video_intent_logs(),
-        vec![format!(
-            "desired video subscriptions changed revision=1 previous={:?} current={:?}",
-            Vec::<VideoSubscription>::new(),
-            initial.video,
-        )]
+        vec!["desired video subscriptions changed revision=1 previous_count=0 current_count=1"]
     );
 
     let mut unrelated_change = initial;
@@ -177,10 +173,7 @@ fn desired_video_intent_logs_only_accepted_semantic_changes() {
         .unwrap();
     assert_eq!(
         take_video_intent_logs(),
-        vec![format!(
-            "desired video subscriptions changed revision=3 previous={:?} current={:?}",
-            unrelated_change.video, changed_video.video,
-        )]
+        vec!["desired video subscriptions changed revision=3 previous_count=1 current_count=1"]
     );
 
     let mut conflicting = changed_video.clone();
@@ -441,6 +434,7 @@ pub(crate) fn create_response(participant: &str, _etag: &str, uri: &str) -> Http
         body: serde_json::to_vec(&serde_json::json!({
             "room_id": "room",
             "participant_id": participant,
+            "connection_id": "conn_0065WZSB8G1XN31RDHP9883WVRC",
             "profile": "pulsebeam.media.v1",
             "rtp_capabilities": {},
             "data_delivery": ["LATEST", "LOSSY", "ORDERED"],

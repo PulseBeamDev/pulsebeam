@@ -804,19 +804,72 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
             }
         });
     }
+    let witness = Arc::new(Mutex::new(None));
+    let client_witness = witness.clone();
     sim.client(client_ip, async move {
-        prove_joined_recovery(
-            client_ip,
-            issuer_ip,
-            receiver_ip,
-            issuer,
-            receiver,
-            [issuer_link.await?, receiver_link.await?],
-        )
-        .await
-        .map_err(Into::into)
+        *client_witness.lock().unwrap() = Some(
+            prove_joined_recovery(
+                client_ip,
+                issuer_ip,
+                receiver_ip,
+                issuer,
+                receiver,
+                [issuer_link.await?, receiver_link.await?],
+            )
+            .await?,
+        );
+        Ok(())
     });
-    run_sim_or_timeout(&mut sim, Duration::from_secs(20)).unwrap();
+    use std::io::{Read, Seek};
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
+    let mut logs = tempfile::tempfile().unwrap();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(logs.try_clone().unwrap())
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                meta.target() == "pulsebeam::incident"
+            })),
+    );
+    tracing::subscriber::with_default(subscriber, || {
+        run_sim_or_timeout(&mut sim, Duration::from_secs(20))
+    })
+    .unwrap();
+    logs.rewind().unwrap();
+    let mut export = String::new();
+    logs.read_to_string(&mut export).unwrap();
+    let keys = witness.lock().unwrap().take().unwrap();
+    assert!(
+        !export.contains("native-failover")
+            && !export.contains("alice")
+            && !export.contains("viewer")
+    );
+    let records = export
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let matching = |name: &str, field: &str, value: &serde_json::Value| {
+        records
+            .iter()
+            .any(|record| record["fields"]["event"] == name && &record["fields"][field] == value)
+    };
+    assert!(matching(
+        "connection_ended",
+        "winner",
+        &keys["publisher_conn"]
+    ));
+    assert!(matching("publication_admitted", "pub", &keys["pub"]));
+    assert!(matching("relay_installed", "pub", &keys["pub"]));
+    assert!(matching("relay_removed", "pub", &keys["pub"]));
+    assert!(matching("subscription_waiting", "conn", &keys["conn"]));
+    assert!(matching("subscription_bound", "pub", &keys["pub"]));
+    assert!(matching("credential_renewed", "jti", &keys["jti"]));
+    println!(
+        "[incident-witness] {}",
+        serde_json::json!({"keys": keys, "records": records})
+    );
 }
 
 async fn prove_joined_recovery(
@@ -826,7 +879,7 @@ async fn prove_joined_recovery(
     issuer: pulsebeam::node::SimOwnershipPeer,
     receiver: pulsebeam::node::SimOwnershipPeer,
     [issuer_link, receiver_link]: [pulsebeam::link::Control; 2],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<serde_json::Value> {
     let room = "native-failover";
     let same_project = pulsebeam::entity::ProjectRoomKey {
         project: *pulsebeam_core::auth::DEVELOPMENT_PROJECT_ID,
@@ -902,6 +955,12 @@ async fn prove_joined_recovery(
     let waiting = viewer.snapshot();
     anyhow::ensure!(waiting.room_id.is_none() && waiting.generation.is_some());
     let viewer_generation = waiting.generation;
+    let viewer_support = viewer.support_report();
+    let viewer_connection: pulsebeam_core::identity::ConnectionId = viewer_support
+        .connection_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("admitted subscriber has no support key"))?
+        .parse()?;
     let (runtime, actor) = RuntimeAgent::managed_with_services(
         config,
         Host::new(Box::new(LostCreationResponse {
@@ -918,6 +977,13 @@ async fn prove_joined_recovery(
         .publish()?;
     agent.join(room.into())?;
     let first = wait_connected(&agent, None).await?;
+    let first_support = agent.support_report();
+    let first_connection: pulsebeam_core::identity::ConnectionId = first_support
+        .connection_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("admitted publisher has no support key"))?
+        .parse()?;
+    anyhow::ensure!(viewer_connection != first_connection);
     let initial_id = first.topics.publishers[0]
         .publication_id
         .as_deref()
@@ -954,6 +1020,15 @@ async fn prove_joined_recovery(
     issuer.deliver_receipt_facts(unix_now() + 20);
     agent.reconnect().await?;
     let recovered = wait_connected(&agent, first.generation).await?;
+    let recovered_support = agent.support_report();
+    let recovered_connection: pulsebeam_core::identity::ConnectionId = recovered_support
+        .connection_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("replacement publisher has no support key"))?
+        .parse()?;
+    anyhow::ensure!(
+        recovered_connection != first_connection && recovered_connection != viewer_connection
+    );
     anyhow::ensure!(
         recovered.participant_id == first.participant_id && recovered.room_id == first.room_id
     );
@@ -1094,6 +1169,7 @@ async fn prove_joined_recovery(
     receive_payload(b"refreshed".as_slice(), recovered_id).await?;
     anyhow::ensure!(feed.state().accepted_revision == bound.accepted_revision);
     anyhow::ensure!(viewer.snapshot().generation == viewer_generation && !feed.is_closed());
+    anyhow::ensure!(viewer.support_report() == viewer_support);
     anyhow::ensure!(
         issuer.local_claim_count().await? == 0 && receiver.local_claim_count().await? == 1,
         "sibling claims did not converge"
@@ -1102,9 +1178,37 @@ async fn prove_joined_recovery(
         agent.snapshot().generation == recovered.generation
             && agent.snapshot().connection == core_ffi::ConnectionState::Connected
     );
+    let renewal = pulsebeam_server::sign_participant_token(
+        &pulsebeam_server::insecure_dev_api_key().unwrap(),
+        &serde_json::from_value(serde_json::json!([{"rooms":[room],"allow":["subscribe"]}]))?,
+        "viewer",
+        unix_now() + 7200,
+    )?;
+    let previous_credential = viewer.snapshot().accepted_credential_revision;
+    let snapshots = viewer.snapshots();
+    viewer.renew_authorization(renewal.token).await?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
+                anyhow::bail!("subscriber snapshot stream closed during renewal");
+            };
+            if snapshot.accepted_credential_revision > previous_credential {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("subscriber credential renewal was not accepted"))??;
+    anyhow::ensure!(viewer.support_report() == viewer_support);
     viewer.close().await?;
     agent.close().await?;
-    Ok(())
+    Ok(serde_json::json!({
+        "project": same_project.project.to_string(),
+        "conn": viewer_connection.to_string(),
+        "publisher_conn": recovered_connection.to_string(),
+        "pub": recovered_id,
+        "jti": renewal.jti.to_string(),
+    }))
 }
 
 fn relay_error(error: impl std::fmt::Debug) -> anyhow::Error {

@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt};
 
 // #[cfg(not(target_env = "msvc"))]
 // #[global_allocator]
@@ -78,16 +78,26 @@ struct Args {
     /// Persistent node identity directory, required when [cluster] is configured.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Write newline-delimited JSON instead of compact console logs.
+    #[arg(long)]
+    json_logs: bool,
 }
 
 fn main() {
     let args = Args::parse();
     let (non_blocking_writer, _guard) = tracing_appender::non_blocking(std::io::stdout());
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking_writer)
-        .with_ansi(true)
-        .compact();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(non_blocking_writer);
+    let fmt_layer = if args.json_logs {
+        fmt_layer
+            .json()
+            .with_ansi(false)
+            .with_current_span(false)
+            .with_span_list(false)
+            .boxed()
+    } else {
+        fmt_layer.with_ansi(true).compact().boxed()
+    };
 
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pulsebeam=info"));

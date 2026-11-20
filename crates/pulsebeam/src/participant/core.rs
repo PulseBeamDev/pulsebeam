@@ -854,7 +854,6 @@ impl Connection {
                     }
                     Err(err) => {
                         plog_warn!(self.log_ctx(), ?err, "native signaling output failed");
-                        plog_warn!(self.log_ctx(), ?err, "native signaling output failed");
                         self.disconnect(DisconnectReason::SignalingOutput);
                         // Drain the aborted RTC below to emit its terminal lifecycle event.
                         control_blocked = true;
@@ -1450,12 +1449,22 @@ impl Connection {
 
         let ctx = self.log_ctx();
         let Some(pt) = self.preferred_send_pt(mid, kind) else {
-            plog_warn!(ctx, %mid, ?kind, "no negotiated PT available for downstream slot");
+            plog_warn!(
+                ctx,
+                media_index,
+                ?kind,
+                "no negotiated PT available for downstream slot"
+            );
             return;
         };
 
         let Some(ssrc) = self.transport.stream_tx_ssrc(mid) else {
-            plog_warn!(ctx, %mid, ?kind, "missing stream_tx_by_mid while adding downstream slot");
+            plog_warn!(
+                ctx,
+                media_index,
+                ?kind,
+                "missing transmit stream for downstream slot"
+            );
             return;
         };
 

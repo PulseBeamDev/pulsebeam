@@ -14,6 +14,7 @@ export {
 } from "./schema.js";
 export type {
   AgentState,
+  SupportReport,
   ErrorInfo,
   PipeState,
   PublicationState,

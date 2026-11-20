@@ -3137,6 +3137,7 @@ fn agent_state_value(state: &agent_core::ffi::AgentState) -> JsValue {
     );
     set(&value, "room", state.room.clone());
     set(&value, "desiredRoom", state.desired_room.clone());
+    set(&value, "connectionId", state.connection_id.clone());
     // UBRN simple enums use their zero-based declaration order.
     set(&value, "status", state.status as u32);
     if let Some(error) = &state.error {

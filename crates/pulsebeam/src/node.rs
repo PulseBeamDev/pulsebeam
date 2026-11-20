@@ -412,6 +412,7 @@ impl NodeBuilder {
                 .run_media(
                     shutdown,
                     crate::control::controller::OwnershipMode::Standalone,
+                    None,
                 )
                 .await;
         };
@@ -421,8 +422,15 @@ impl NodeBuilder {
             Topology::MultiNode => OwnershipMode::Unavailable,
         };
         let membership = crate::cluster::Service::start(options).await?;
+        let relay_node = crate::log::RelayNode {
+            node: membership.incarnation().node_id,
+            incarnation: membership.incarnation().generation_id,
+        };
         membership
-            .supervise(self.run_media(shutdown.clone(), ownership_mode), shutdown)
+            .supervise(
+                self.run_media(shutdown.clone(), ownership_mode, Some(relay_node)),
+                shutdown,
+            )
             .await
     }
 
@@ -430,6 +438,7 @@ impl NodeBuilder {
         self,
         shutdown: CancellationToken,
         ownership_mode: crate::control::controller::OwnershipMode,
+        relay_node: Option<crate::log::RelayNode>,
     ) -> Result<()> {
         // Default to an IPv6-any listener and disable v6-only mode so one socket can serve
         // both IPv6 and IPv4 peers.
@@ -444,8 +453,14 @@ impl NodeBuilder {
             self.udp_mode,
         )
         .await?;
-        self.run_bound(udp_sockets, advertised_addrs, shutdown, ownership_mode)
-            .await
+        self.run_bound(
+            udp_sockets,
+            advertised_addrs,
+            shutdown,
+            ownership_mode,
+            relay_node,
+        )
+        .await
     }
 
     fn advertised_udp_addrs(&self) -> Result<Vec<SocketAddr>> {
@@ -497,6 +512,7 @@ impl NodeBuilder {
         advertised_addrs: Vec<SocketAddr>,
         shutdown: CancellationToken,
         ownership_mode: crate::control::controller::OwnershipMode,
+        relay_node: Option<crate::log::RelayNode>,
     ) -> Result<()> {
         let data_threads = self.data_threads;
         let shard_runtime = self.shard_runtime;
@@ -754,7 +770,7 @@ impl NodeBuilder {
         controller.set_links(links, frame_ports, clock_origin);
         if let Some(address) = self.link_listen {
             let (host, installs) = crate::link::host::Host::bind(address, clock_origin).await.context("binding Link UDP")?;
-            controller.set_link_host(installs);
+            controller.set_link_host(installs, relay_node.unwrap_or_else(crate::log::RelayNode::ephemeral));
             let cancellation = shutdown.child_token();
             let node_shutdown = shutdown.clone();
             let (report, result) = pulsebeam_runtime::sync::oneshot::channel();

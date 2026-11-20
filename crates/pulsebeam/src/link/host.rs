@@ -35,12 +35,41 @@ pub(crate) struct Install {
     pub id: NetworkId,
     pub endpoint: SocketAddr,
     pub driver: NetworkDriver<ShardFrame>,
+    pub node: Option<crate::log::RelayNode>,
 }
 
 struct Peer {
     id: NetworkId,
     driver: NetworkDriver<ShardFrame>,
     queued_input: usize,
+    node: Option<crate::log::RelayNode>,
+    next_label_report: Option<Instant>,
+}
+
+impl Peer {
+    fn new(
+        id: NetworkId,
+        driver: NetworkDriver<ShardFrame>,
+        node: Option<crate::log::RelayNode>,
+    ) -> Self {
+        Self {
+            id,
+            driver,
+            node,
+            queued_input: 0,
+            next_label_report: None,
+        }
+    }
+
+    fn report_unknown_label(&mut self, at: Instant) {
+        if self.next_label_report.is_some_and(|deadline| at < deadline) {
+            return;
+        }
+        if let (Some(node), Some(label)) = (self.node, self.driver.take_unknown_label()) {
+            self.next_label_report = at.checked_add(Duration::from_secs(1));
+            node.unknown_label(self.id, label);
+        }
+    }
 }
 
 struct Pending {
@@ -157,7 +186,7 @@ impl Host {
         let socket = &mut self.socket;
         let closed = &mut self.closed;
         self.peers.retain(|endpoint, peer| {
-            match peer.driver.poll(now, WORK, |datagram| {
+            let outcome = peer.driver.poll(now, WORK, |datagram| {
                 let sent = socket.try_send_batch(&[pulsebeam_udp::SendDatagram {
                     destination: datagram.destination,
                     payload: datagram.payload,
@@ -170,7 +199,9 @@ impl Host {
                 } else {
                     SendOutcome::Rejected
                 }
-            }) {
+            });
+            peer.report_unknown_label(instant);
+            match outcome {
                 Ok(_) => true,
                 Err(error) => {
                     remember_closed(
@@ -204,11 +235,7 @@ impl Host {
                         Ok(()) => {
                             self.peers.insert(
                                 install.endpoint,
-                                Peer {
-                                    id: install.id,
-                                    driver: install.driver,
-                                    queued_input: 0,
-                                },
+                                Peer::new(install.id, install.driver, install.node),
                             );
                         }
                         Err(error) => {

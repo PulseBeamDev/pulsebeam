@@ -87,7 +87,7 @@ pub(crate) enum TrackLifecycleOperation {
     Update {
         shard: ShardId,
         op: ShardUpdateOp,
-        ingress_peer: Option<pulsebeam_link::NetworkId>,
+        route_scope: Option<super::link::RouteScope>,
     },
     Plans {
         shard: ShardId,
@@ -128,12 +128,12 @@ impl TrackLifecycleStager {
         &mut self,
         shard: ShardId,
         op: ShardUpdateOp,
-        ingress_peer: Option<pulsebeam_link::NetworkId>,
+        route_scope: Option<super::link::RouteScope>,
     ) {
         self.operations.push(TrackLifecycleOperation::Update {
             shard,
             op,
-            ingress_peer,
+            route_scope,
         });
     }
 
@@ -277,7 +277,14 @@ impl TrackLifecycle {
         registry: &RoomRegistry,
         now: Instant,
     ) -> Option<TrackLifecycleOutcome> {
+        let connection = track.meta().connection_id;
         let identity = self.topology.publish(track)?;
+        crate::log::publication_event(
+            identity.room_id.project,
+            connection,
+            identity.publication_id,
+            None,
+        );
         Some(self.reconcile(identity, registry, now))
     }
 
@@ -339,8 +346,17 @@ impl TrackLifecycle {
             removed.is_some(),
             "published track disappeared during unpublish"
         );
-
-        self.ingress.remove(&identity);
+        if self.ingress.remove(&identity).is_none()
+            && let Some(track) = removed
+        {
+            let meta = track.meta();
+            crate::log::publication_event(
+                meta.room.project,
+                meta.connection_id,
+                meta.id,
+                Some("unpublished"),
+            );
+        }
         self.release_placements(identity, now);
         Some(stager.finish())
     }
@@ -609,12 +625,12 @@ impl TrackLifecycle {
         registry: &RoomRegistry,
         now: Instant,
     ) -> Vec<TrackLifecycleOutcome> {
-        if registry
-            .get_incarnation(request.subscriber, connection)
+        let Some(meta) = registry.get_incarnation(request.subscriber, connection) else {
+            return Vec::new();
+        };
+        if self
+            .source_for_connection(request.source_room, connection, request.track, registry)
             .is_none()
-            || self
-                .source_for_connection(request.source_room, connection, request.track, registry)
-                .is_none()
         {
             return Vec::new();
         }
@@ -629,6 +645,26 @@ impl TrackLifecycle {
             request.enabled,
         ) {
             return Vec::new();
+        }
+        if meta.profile == super::controller::SignalingProtocol::Whep {
+            let scope = (meta.scope.project, connection);
+            let kind = request.track.kind();
+            crate::log::subscription_event(
+                scope,
+                request.reference,
+                kind,
+                "subscription_admitted",
+                None,
+                None,
+            );
+            crate::log::subscription_event(
+                scope,
+                request.reference,
+                kind,
+                "subscription_bound",
+                Some(request.track.publication_id()),
+                None,
+            );
         }
         self.reconcile_all(identities, registry, now)
     }
@@ -727,6 +763,15 @@ impl TrackLifecycle {
         for identity in retiring {
             let removed = self.topology.unpublish(identity);
             debug_assert!(removed.is_some());
+            if let Some(track) = removed {
+                let meta = track.meta();
+                crate::log::publication_event(
+                    meta.room.project,
+                    meta.connection_id,
+                    meta.id,
+                    Some("connection_ended"),
+                );
+            }
             self.release_placements(identity, now);
         }
 
@@ -1099,7 +1144,10 @@ impl TrackLifecycle {
                             publication_id: destination.placement.publication_id,
                         },
                     },
-                    self.ingress.get(&identity).copied(),
+                    Some(super::link::RouteScope {
+                        project: identity.room_id.project,
+                        ingress: self.ingress.get(&identity).copied(),
+                    }),
                 );
                 self.set_route_installed(identity, shard, true);
             } else if destination.route_installed && !should_have_route {
@@ -1134,7 +1182,7 @@ impl TrackLifecycle {
 
         if desired.track.requires_reverse_route() {
             if !placement.route_installed {
-                stager.update(
+                stager.route_update(
                     origin.shard,
                     ShardUpdateOp::InstallRoute {
                         address: placement.placement.route,
@@ -1142,6 +1190,10 @@ impl TrackLifecycle {
                             publication_id: placement.placement.publication_id,
                         },
                     },
+                    Some(super::link::RouteScope {
+                        project: identity.room_id.project,
+                        ingress: None,
+                    }),
                 );
                 self.set_route_installed(identity, origin.shard, true);
             }
@@ -1351,9 +1403,25 @@ impl TrackLifecycle {
         let mut candidates = candidates.into_iter().collect::<Vec<_>>();
         candidates.sort();
         for participant in candidates {
+            let location = locations.get(&participant);
+            if let Some(location) = location
+                && let Some(meta) =
+                    registry.get_incarnation(location.participant, location.connection)
+                && meta.profile == super::controller::SignalingProtocol::Whep
+                && let Some(reference) = super::controller::whep_reference(identity.kind())
+            {
+                crate::log::subscription_event(
+                    (meta.scope.project, location.connection),
+                    reference,
+                    identity.kind(),
+                    "subscription_retired",
+                    None,
+                    Some("source_ended"),
+                );
+            }
             self.stage_track_effect(
                 identity,
-                locations.get(&participant),
+                location,
                 registry,
                 stager,
                 ParticipantEffect::TrackCandidateRemoved {

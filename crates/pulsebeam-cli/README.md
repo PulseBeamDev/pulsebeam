@@ -48,11 +48,39 @@ pulsebeam-cli token --room general --participant alice
 Use `--ttl SECONDS` to select a different positive lifetime. This command does
 not accept production signing material.
 
-Canonical entity IDs can be derived for log lookup with `id room`,
-`id participant`, and `id track`. Room and participant derivation require
-`--project-id` and the corresponding external identity chain. Track derivation
-requires the actual `--connection-id`, `--kind`, and `--label`: a reconnect
-mints a new connection and consequently new TrackIds for the same participant.
+## Reconstruct an incident
+
+Have your application backend retain the returned `jti` with the project and
+app session [when issuing or renewing credentials](../../docs/react/quickstart.md).
+For a client report, ask for the confirmed `conn_*` support key. You can also
+start with a confirmed `pub_*` publication ID. A reconnect or publisher
+replacement can change those keys, so capture them at the time of the incident.
+Do not collect JWTs, receipts, or application names for this lookup.
+
+Use an authorized NDJSON export of the server's structured logs (`--json-logs`).
+Include enough lookback to capture admission or earlier binding changes, and
+keep some time after the incident to catch accepted credential renewals. Give
+the CLI the incident window separately from the export's time range:
+
+```sh
+./bazel run //:cli -- incident --conn "$CONNECTION_ID" \
+  --from 2026-04-15T10:25:00Z --to 2026-04-15T10:30:00Z < incident.ndjson
+```
+
+Replace `--conn` with `--publication "$PUBLICATION_ID"` or
+`--project "$PROJECT_ID" --jti "$TOKEN_ID"`. Optionally narrow media evidence
+with `--kind audio`, `--kind video`, or `--kind data`. A token can match more
+than one connection. Review all reported candidates rather than choosing the
+first one.
+
+The report distinguishes observed, partial, and missing evidence. An interval
+without end evidence has no observed cutoff in the incident window. A binding
+or installed route is not proof of delivery. If lookback is missing, widen the
+export within the authorized retention period. Expired evidence cannot be
+reconstructed from names. Keep exports and reports access-restricted and
+short-lived: these runtime IDs are pseudonymous, not anonymous.
+
+## Benchmark
 
 ```text
 ./bazel run --config=release //:cli -- \

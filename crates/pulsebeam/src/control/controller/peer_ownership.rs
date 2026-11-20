@@ -5,7 +5,7 @@ use pulsebeam_link::NetworkId;
 use pulsebeam_runtime::{sync::oneshot, time::Instant};
 
 use super::{
-    CloseReason, ControllerActor, ControllerCommand, ControllerSender, SystemTime, ownership,
+    ConnectionEnd, ControllerActor, ControllerCommand, ControllerSender, SystemTime, ownership,
 };
 use crate::entity::EndpointKey;
 use ownership::{
@@ -205,6 +205,9 @@ impl ControllerActor {
         }
         let affected: Vec<_> = self.peer_ownership.endpoints_for_node(node).collect();
         let session = self.peer_ownership.open(node, incarnation, network)?;
+        if let (Some(link), Some(links)) = (network, self.links.as_mut()) {
+            links.identify_peer(link, node);
+        }
         let now = Instant::now();
         for endpoint in affected {
             self.reconcile_peer_sources(endpoint, now);
@@ -451,7 +454,7 @@ impl ControllerActor {
             endpoint.participant,
             previous,
             true,
-            Some(CloseReason::ParticipantReplaced),
+            ConnectionEnd::Replaced(Some(winner.connection())),
         );
     }
 }

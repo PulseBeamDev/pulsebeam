@@ -12,6 +12,7 @@ export {
 } from "./generated/schema.js";
 export type {
   AgentState,
+  SupportReport,
   ErrorInfo,
   CatalogParticipantInfo,
   CatalogPublicationInfo,

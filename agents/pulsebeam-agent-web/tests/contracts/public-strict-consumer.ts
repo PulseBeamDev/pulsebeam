@@ -18,6 +18,7 @@ import {
   type CatalogPublicationInfo,
   type CatalogPublicationKind,
   type AgentState,
+  type SupportReport,
   type AgentUpdates,
   type VideoSubscriptionState,
   type AudioSubscriptionState,
@@ -92,6 +93,8 @@ watchUpdates.close();
 const watchClosed: Promise<void> = watch.close();
 void [watchStatus, watchNext, watchTyped, watchClosed];
 const currentState: AgentState = agent.state();
+const support: Readonly<SupportReport> = agent.supportReport();
+void support;
 const stateCursor: AgentUpdates = agent.updates();
 const nextState: Promise<AgentState | undefined> = stateCursor.next();
 const stateRevision: bigint = currentState.observationRevision;

@@ -26,6 +26,7 @@ rand.workspace = true
 reqwest = "0.13.4"
 serde_json = "1.0.150"
 tachyonix = "0.3.1"
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -43,6 +43,7 @@ pub struct Service {
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<()>>>,
     observations: Handle,
+    incarnation: Incarnation,
 }
 
 impl Service {
@@ -104,7 +105,12 @@ impl Service {
             shutdown,
             task: Some(task),
             observations,
+            incarnation,
         })
+    }
+
+    pub(crate) fn incarnation(&self) -> &Incarnation {
+        &self.incarnation
     }
 
     pub async fn supervise(

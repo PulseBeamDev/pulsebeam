@@ -16,7 +16,7 @@ import {
   OperationError,
   raise,
 } from "./agent-observation.js";
-import { ErrorCode, type AgentState } from "./schema.js";
+import { ErrorCode, type AgentState, type SupportReport } from "./schema.js";
 import type {
   Agent as AgentApi,
   AgentConfig,
@@ -359,6 +359,10 @@ class AgentFacade implements AgentApi {
     if (!this.#observation)
       throw new ResourceError("not-ready", "agent is still initializing");
     return this.#observation.state();
+  }
+
+  supportReport(): Readonly<SupportReport> {
+    return Object.freeze({ connectionId: this.state().connectionId });
   }
 
   updates(): AgentUpdates {
@@ -899,6 +903,7 @@ export class Agent implements AgentApi {
     this.#raw.renewAuthorization(token);
   readonly setLogging = (level: LogLevel) => this.#raw.setLogging(level);
   readonly state = () => this.#raw.state();
+  readonly supportReport = () => this.#raw.supportReport();
   readonly updates = () => this.#raw.updates();
   readonly snapshot = () => this.#raw.snapshot();
   readonly snapshots = () => this.#raw.snapshots();

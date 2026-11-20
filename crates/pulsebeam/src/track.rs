@@ -376,8 +376,7 @@ impl UpstreamTrackLayer {
         }
         if first_declaration {
             tracing::info!(
-                mid = %self.mid,
-                rid = ?self.rid,
+                encoding = ?self.encoding,
                 target_kbps = target_bps / 1000,
                 reported_height = ?height,
                 allocation = ?vla,
@@ -989,7 +988,7 @@ pub fn new_audio(mid: Mid, meta: TrackMeta) -> (UpstreamTrack, Track) {
             rid: None,
             encoding: SourceEncoding::Rid(None),
             quality: LayerQuality::Low,
-            normalizer: StreamNormalizer::new(mid, None),
+            normalizer: StreamNormalizer::default(),
             monitor,
         }]),
         stats: UpstreamStats::Audio(NullStats::new()),
@@ -1069,7 +1068,7 @@ fn new_video_encodings(
             rid,
             encoding,
             quality,
-            normalizer: StreamNormalizer::new(mid, rid),
+            normalizer: StreamNormalizer::default(),
             monitor,
         });
         layers.push(TrackLayer {
@@ -1618,7 +1617,7 @@ mod dd_tests {
             rid: None,
             encoding: SourceEncoding::Rid(None),
             quality: LayerQuality::High,
-            normalizer: StreamNormalizer::new(Mid::from("0"), None),
+            normalizer: StreamNormalizer::default(),
             monitor: StreamMonitor::new(TrackKind::Video, "test".to_string(), state),
         }
     }

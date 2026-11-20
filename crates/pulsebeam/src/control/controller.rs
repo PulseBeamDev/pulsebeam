@@ -26,6 +26,7 @@ use crate::{
     },
     entity::{ConnectionId, EndpointKey, ParticipantId, ProjectRoomKey, RoomId},
     id::ShardId,
+    log::{self, ConnectionEnd},
     shard::{
         ShardContext,
         worker::{ShardCommand, ShardEvent, ShardEventMessage},
@@ -35,6 +36,7 @@ use pulsebeam_core::auth::{
     AuthorizationExpiry, KeyRegistry, MAX_COMPACT_TOKEN_LEN, TokenError, VerifiedAuthorization,
     VerifiedPrincipal, authenticate_participant_token,
 };
+#[cfg(test)]
 use pulsebeam_proto::state::CloseReason;
 use pulsebeam_queue as mailbox;
 use pulsebeam_rtc::LocalCandidate;
@@ -60,6 +62,14 @@ pub enum SignalingProtocol {
     State,
     Whip,
     Whep,
+}
+
+pub(super) const fn whep_reference(kind: crate::entity::TrackKind) -> Option<u64> {
+    match kind {
+        crate::entity::TrackKind::Audio => Some(1),
+        crate::entity::TrackKind::Video => Some(2),
+        crate::entity::TrackKind::Data => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -670,8 +680,10 @@ impl ControllerActor {
     pub(crate) fn set_link_host(
         &mut self,
         host: pulsebeam_queue::Sender<crate::link::host::Command>,
+        node: log::RelayNode,
     ) {
         if let Some(links) = &mut self.links {
+            links.set_node(node);
             links.set_host(host);
         }
     }
@@ -1589,7 +1601,7 @@ impl ControllerActor {
                     incarnation.participant,
                     meta,
                     true,
-                    Some(CloseReason::ParticipantReplaced),
+                    ConnectionEnd::Replaced(Some(winner.connection())),
                 );
             }
             self.ownership.retry_retirement(incarnation);
@@ -1853,7 +1865,12 @@ impl ControllerActor {
                     .unwrap_or_else(|| {
                         pulsebeam_runtime::fatal!("committed materialization lost its incarnation");
                     });
-                self.terminate_incarnation(incarnation.participant, meta, true, None);
+                self.terminate_incarnation(
+                    incarnation.participant,
+                    meta,
+                    true,
+                    ConnectionEnd::Closed,
+                );
             } else if materialized
                 || !cutoffs.is_empty()
                 || self.ownership.has_incarnation(incarnation)
@@ -2597,7 +2614,7 @@ impl ControllerActor {
                 participant,
                 meta.clone(),
                 true,
-                Some(CloseReason::AuthorizationRevoked),
+                ConnectionEnd::AuthorizationRevoked,
             );
             return Err(ControllerError::AuthorizationRejected);
         }
@@ -2616,12 +2633,11 @@ impl ControllerActor {
             connection_id,
         });
         if lease.authority != previous.authority {
-            tracing::info!(
-                event = "credential_renewed",
-                project = %lease.authority.project_id,
-                jti = %lease.authority.token_id,
-                conn = %connection_id,
-                "connection credential renewed"
+            log::credential_event(
+                false,
+                lease.authority.project_id,
+                lease.authority.token_id,
+                connection_id,
             );
         }
         self.observe_native_authorization(connection_id, &lease);
@@ -2751,9 +2767,9 @@ impl ControllerActor {
                 TrackLifecycleOperation::Update {
                     shard,
                     op,
-                    ingress_peer,
+                    route_scope,
                 } => {
-                    self.stage_update_at(shard, outcome.generation, op, ingress_peer);
+                    self.stage_update_at(shard, outcome.generation, op, route_scope);
                 }
                 TrackLifecycleOperation::Plans { shard, plans } => {
                     self.stage_plans_at(shard, outcome.generation, plans);
@@ -2778,7 +2794,7 @@ impl ControllerActor {
         shard: ShardId,
         generation: u64,
         op: crate::shard_update::ShardUpdateOp,
-        ingress_peer: Option<pulsebeam_link::NetworkId>,
+        route_scope: Option<super::link::RouteScope>,
     ) {
         let Some(update) = self.updates.get_mut(shard.index()) else {
             debug_assert!(false, "an update must target a live shard");
@@ -2801,7 +2817,7 @@ impl ControllerActor {
             links.install_after(
                 address,
                 action,
-                ingress_peer,
+                route_scope,
                 update.stage_cutoff(generation),
             );
         }
@@ -3376,10 +3392,13 @@ impl ControllerActor {
                 participant_id,
                 previous,
                 false,
-                Some(CloseReason::ParticipantReplaced),
+                ConnectionEnd::Replaced(Some(pending.connection_id())),
             );
         }
         if let Some(mut native) = pending.native.take() {
+            native
+                .model
+                .identify(pending.scope.project, pending.connection_id());
             let _ = native.handoff.rearm();
             self.native_connections.insert(
                 pending.connection_id(),
@@ -3391,16 +3410,16 @@ impl ControllerActor {
         }
         self.publish_staged();
         let now = pulsebeam_runtime::time::Instant::now();
-        for (kind, &(source_room, track)) in pending.whep_bindings.iter() {
+        for (_, &(source_room, track)) in pending.whep_bindings.iter() {
+            let Some(reference) = whep_reference(track.kind()) else {
+                continue;
+            };
             let outcomes = self.lifecycle.set_owned_subscription(
                 pending.connection_id(),
                 super::topology::OwnedSubscription {
                     source_room,
                     subscriber: participant_id,
-                    reference: match kind {
-                        pulsebeam_rtc::MediaKind::Audio => 1,
-                        pulsebeam_rtc::MediaKind::Video => 2,
-                    },
+                    reference,
                     track,
                     enabled: true,
                 },
@@ -3513,13 +3532,7 @@ impl ControllerActor {
             participant_id,
             connection_id,
         });
-        tracing::info!(
-            event = "connection_admitted",
-            %project,
-            %jti,
-            conn = %connection_id,
-            "connection admitted"
-        );
+        log::credential_event(true, project, jti, connection_id);
     }
 
     fn candidate_is_newer(&self, endpoint: EndpointKey, claim: ownership::ClaimRank) -> bool {
@@ -3569,7 +3582,7 @@ impl ControllerActor {
         else {
             return;
         };
-        self.terminate_incarnation(participant, meta, true, None);
+        self.terminate_incarnation(participant, meta, true, ConnectionEnd::Closed);
     }
 
     fn terminate_incarnation(
@@ -3577,7 +3590,7 @@ impl ControllerActor {
         participant: ParticipantId,
         meta: crate::control::registry::ParticipantMeta,
         remove_current: bool,
-        close_reason: Option<CloseReason>,
+        end: ConnectionEnd,
     ) {
         if let Some(transport) = meta.transport {
             self.ownership.withdraw_incarnation(ownership::Incarnation {
@@ -3637,7 +3650,10 @@ impl ControllerActor {
         if remove_current && let Some(endpoint) = meta.endpoint() {
             self.reconcile_peer_sources(endpoint, pulsebeam_runtime::time::Instant::now());
         }
-        if let (Some(native), Some(reason)) = (native, close_reason)
+        if meta.authorization.is_some() {
+            log::connection_ended(meta.scope.project, meta.connection_id, end);
+        }
+        if let (Some(native), Some(reason)) = (native, end.native_close())
             && self.begin_native_retirement(participant, meta.clone(), native.handler, reason)
         {
             return;
@@ -3699,11 +3715,16 @@ impl ControllerActor {
             else {
                 continue;
             };
-            let Some(lease) = meta.authorization else {
+            let Some(lease) = meta.authorization.as_ref() else {
                 continue;
             };
             if lease.is_expired_at(wall_now) {
-                self.remove_incarnation(work.participant_id, work.connection_id);
+                self.terminate_incarnation(
+                    work.participant_id,
+                    meta,
+                    true,
+                    ConnectionEnd::AuthorizationExpired,
+                );
             } else if let Ok(lease) = lease.refresh_at(wall_now, runtime_now) {
                 let deadline = lease.deadline();
                 self.core.registry.update_authorization(
@@ -4545,7 +4566,7 @@ mod replacement_tests {
                     participant,
                     previous,
                     false,
-                    Some(CloseReason::ParticipantReplaced),
+                    ConnectionEnd::Replaced(None),
                 );
                 CloseReason::ParticipantReplaced
             };
@@ -7566,7 +7587,7 @@ mod replacement_tests {
             participant_id,
             previous,
             false,
-            Some(CloseReason::ParticipantReplaced),
+            ConnectionEnd::Replaced(None),
         );
 
         actor.authorization_expiries.insert(old_work);
@@ -7622,7 +7643,7 @@ mod replacement_tests {
                     participant_id,
                     previous,
                     false,
-                    Some(CloseReason::ParticipantReplaced),
+                    ConnectionEnd::Replaced(None),
                 );
             }
         }

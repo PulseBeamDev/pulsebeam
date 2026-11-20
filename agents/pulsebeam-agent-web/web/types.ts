@@ -1,6 +1,7 @@
 import type { EventStream, SnapshotStream } from "./observation.js";
 import type {
   AgentState as ObservedAgentState,
+  SupportReport,
   ErrorInfo,
   WatchStatus,
   CatalogParticipantInfo as CoreCatalogParticipantInfo,
@@ -494,6 +495,7 @@ export interface Agent {
   isClosed(): boolean;
   setLogging(level: LogLevel): void;
   state(): Readonly<ObservedAgentState>;
+  supportReport(): Readonly<SupportReport>;
   updates(): AgentUpdates;
   snapshot(): AgentSnapshot;
   snapshots(): SnapshotStream;

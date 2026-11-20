@@ -144,7 +144,6 @@ fn rtp(
         Some(Err(crate::client_sdp::Error::IdentityPending))
     );
     let Some(prepared) = prepared.and_then(|prepared| prepared.as_ref().ok()) else {
-        let preparation_error = prepared.and_then(|value| value.as_ref().err()).cloned();
         if media_want(session, resource.clone(), slot, source).is_some()
             && let Some(coordinate) = session.coordinates.get(slot).and_then(Option::as_ref)
         {
@@ -153,7 +152,8 @@ fn rtp(
                 .entry(slot.clone())
                 .or_insert_with(|| {
                     logs.write(log::Level::Debug, module_path!(), format_args!(
-                        "Native bootstrap media lease awaits preparation: slot={slot:?} resource={resource:?} error={preparation_error:?} pending={pending}"
+                        "Native bootstrap media lease awaits preparation: kind={} pending={pending}",
+                        resource.diagnostic_kind()
                     ));
                     MediaLease {
                         resource: resource.clone(),
@@ -913,8 +913,9 @@ pub(super) fn reconcile(
                 log::Level::Debug,
                 module_path!(),
                 format_args!(
-                    "Native resource no longer wanted: generation={:?} resource={resource:?}",
-                    session.generation
+                    "Native resource no longer wanted: generation={:?} kind={}",
+                    session.generation,
+                    resource.diagnostic_kind()
                 ),
             );
         }
@@ -953,8 +954,8 @@ pub(super) fn reconcile(
                 log::Level::Debug,
                 module_path!(),
                 format_args!(
-                    "Native media publication wanted: generation={:?} resource={resource:?} declaration={:?}",
-                    session.generation, spec.declaration
+                    "Native media publication wanted: generation={:?}",
+                    session.generation
                 ),
             );
         }
@@ -1775,9 +1776,9 @@ impl Agent {
                         log::Level::Debug,
                         module_path!(),
                         format_args!(
-                            "Native track discovery changed: generation={:?} track={id} publication={:?}",
+                            "Native track discovery changed: generation={:?} present={}",
                             self.snapshot.generation,
-                            self.snapshot.publications.get(&id)
+                            self.snapshot.publications.contains_key(&id)
                         ),
                     );
                     self.intent_dirty = true;
@@ -1811,9 +1812,9 @@ impl Agent {
                             agent_log!(
                                 self,
                                 Warn,
-                                "Native resource {resource:?} rejected: {:?}: {}",
-                                rejection.code(),
-                                message
+                                "Native resource rejected: kind={} code={:?}",
+                                resource.diagnostic_kind(),
+                                rejection.code()
                             );
                             self.notifications
                                 .push_back(Notification::ServerError(message));

@@ -9,8 +9,6 @@
 //! reads the result and never writes to it, so the two can run on different
 //! nodes without either duplicating the other's work.
 
-use crate::media::{Mid, Rid};
-
 use pulsebeam_core::dd::{
     DdReadError, DecodeTargetIndication, DependencyDescriptorReader, TemplateDependencyStructure,
     read_mandatory,
@@ -81,8 +79,6 @@ pub struct Normalization {
 /// packets.
 #[derive(Debug)]
 pub struct StreamNormalizer {
-    mid: Mid,
-    rid: Option<Rid>,
     /// Templates only arrive on keyframes and are referenced by later packets.
     dd: DependencyDescriptorReader,
     pending_dd: PacketWindow,
@@ -100,11 +96,9 @@ pub struct StreamNormalizer {
     dd_structure_timestamp: u64,
 }
 
-impl StreamNormalizer {
-    pub fn new(mid: Mid, rid: Option<Rid>) -> Self {
+impl Default for StreamNormalizer {
+    fn default() -> Self {
         Self {
-            mid,
-            rid,
             dd: DependencyDescriptorReader::new(),
             pending_dd: PacketWindow::new(),
             cold_keyframe_requested: false,
@@ -118,7 +112,9 @@ impl StreamNormalizer {
             dd_structure_timestamp: 0,
         }
     }
+}
 
+impl StreamNormalizer {
     pub fn vla_index(&self) -> Option<u8> {
         self.vla_index
     }
@@ -369,8 +365,6 @@ impl StreamNormalizer {
         self.dd_errors = self.dd_errors.saturating_add(1);
         if self.dd_errors.is_power_of_two() {
             tracing::warn!(
-                mid = %self.mid,
-                rid = ?self.rid,
                 errors = self.dd_errors,
                 %error,
                 "dependency descriptor parse failed"
@@ -425,7 +419,7 @@ mod tests {
         }
         assert_eq!(decode_target_heights(&structure), [180, 180, 720]);
         let mut writer = pulsebeam_core::dd::DependencyDescriptorWriter::new();
-        let mut normalizer = StreamNormalizer::new(Mid::from("v0"), None);
+        let mut normalizer = StreamNormalizer::default();
         let mut high = None;
         for (template_id, height) in [(0, 180), (1, 720)] {
             let descriptor = pulsebeam_core::dd::DependencyDescriptor {
@@ -525,7 +519,7 @@ mod tests {
         let descriptors = source
             .next_frame(true, 3)
             .expect("keyframe descriptors encode");
-        let mut normalizer = StreamNormalizer::new(Mid::from("v0"), None);
+        let mut normalizer = StreamNormalizer::default();
 
         let delayed_head = packet(10, descriptors[1].clone());
         let result = normalizer.normalize(delayed_head);
@@ -583,7 +577,7 @@ mod tests {
             .write(&old, &mut bytes)
             .unwrap();
         let old = RawDependencyDescriptor(bytes[..len].iter().copied().collect());
-        let mut normalizer = StreamNormalizer::new(Mid::from("v0"), None);
+        let mut normalizer = StreamNormalizer::default();
         let input = |seq, timestamp, raw, declared_height| {
             let mut input = packet(seq, raw);
             input.rtp_ts = crate::rtp::MediaTime::new(timestamp, crate::rtp::VIDEO_FREQUENCY);
@@ -621,7 +615,7 @@ mod tests {
         let descriptors = source
             .next_frame(true, 2)
             .expect("keyframe descriptors encode");
-        let mut normalizer = StreamNormalizer::new(Mid::from("v0"), None);
+        let mut normalizer = StreamNormalizer::default();
 
         assert!(
             normalizer
@@ -687,7 +681,7 @@ mod tests {
             }
             normalizer.normalize(packet).first.unwrap().0
         };
-        let mut normalizer = StreamNormalizer::new(Mid::from("v0"), None);
+        let mut normalizer = StreamNormalizer::default();
         assert_eq!(push(&mut normalizer, 0, None).reported_height, 0);
         let old = push(&mut normalizer, 100, Some(vla(0, 180)));
         assert_eq!(old.reported_height, 180);

@@ -25,11 +25,11 @@ fn retained_input_cannot_cross_an_endpoint_replacement() {
     let replacement = control.open_network(peer(), codec()).unwrap();
     let mut peers = HashMap::from([(
         endpoint,
-        Peer {
-            id: replacement,
-            driver: control.take_network_driver(replacement).unwrap(),
-            queued_input: 0,
-        },
+        Peer::new(
+            replacement,
+            control.take_network_driver(replacement).unwrap(),
+            None,
+        ),
     )]);
     let mut pending = Pending {
         peer: old,
@@ -192,17 +192,15 @@ fn busy_quic_input_does_not_block_another_peers_real_dtls_handshake() {
         (
             blocked_addr,
             Peer {
-                id: blocked,
-                driver: blocked_driver,
                 queued_input: 1,
+                ..Peer::new(blocked, blocked_driver, None)
             },
         ),
         (
             ready_addr,
             Peer {
-                id: ready,
-                driver: ready_driver,
                 queued_input: 1,
+                ..Peer::new(ready, ready_driver, None)
             },
         ),
     ]);

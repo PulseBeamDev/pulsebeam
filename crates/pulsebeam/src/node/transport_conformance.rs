@@ -618,6 +618,7 @@ async fn run(protocol: Protocol) -> Result<()> {
         advertised,
         shutdown.clone(),
         crate::control::controller::OwnershipMode::Standalone,
+        None,
     ));
     let mut node_observed = false;
     let mut agents = Vec::new();

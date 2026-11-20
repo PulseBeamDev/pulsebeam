@@ -3,14 +3,19 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use pulsebeam_link::{BindingId, Destination, LinkControl, PortId};
+use pulsebeam_core::identity::NodeId;
+use pulsebeam_link::{BindingId, Destination, LinkControl, NetworkId, PortId};
 use pulsebeam_runtime::sync::oneshot;
 use pulsebeam_runtime::time::Instant;
 
 use crate::route::NodeRouteAddress;
 use crate::shard::worker::ShardFrame;
 use crate::shard_update::{CompiledRoute, TrackPlan, TrackPlanUpdate, TrackRouteAction};
-use crate::{entity::PublicationKey, id::ShardId};
+use crate::{
+    entity::{ProjectId, PublicationKey},
+    id::ShardId,
+    log::{RelayEvidence, RelayNode},
+};
 
 struct SendBranch {
     binding: BindingId,
@@ -20,10 +25,31 @@ struct SendBranch {
     route: CompiledRoute,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct RouteScope {
+    pub(super) project: ProjectId,
+    pub(super) ingress: Option<NetworkId>,
+}
+
 #[derive(Clone, Copy)]
 struct ReceiveAction {
     route: TrackRouteAction,
-    ingress_peer: Option<pulsebeam_link::NetworkId>,
+    scope: Option<RouteScope>,
+}
+
+struct ReceiveBranch {
+    peer: NetworkId,
+    addresses: Vec<NodeRouteAddress>,
+    live: usize,
+    evidence: Option<RelayEvidence>,
+}
+
+impl ReceiveBranch {
+    fn record(&self, event: &'static str, destinations: usize) {
+        if let Some(evidence) = self.evidence {
+            evidence.record(event, destinations);
+        }
+    }
 }
 
 enum Retirement {
@@ -42,7 +68,9 @@ impl Retirement {
 pub(super) struct Links {
     control: LinkControl<ShardFrame>,
     host: Option<pulsebeam_queue::Sender<crate::link::host::Command>>,
-    peers: HashMap<pulsebeam_link::NetworkId, std::net::SocketAddr>,
+    peers: HashMap<NetworkId, std::net::SocketAddr>,
+    peer_ids: HashMap<NetworkId, NodeId>,
+    node: Option<RelayNode>,
     ports: Vec<PortId>,
     clock_origin: Instant,
     routes: HashMap<NodeRouteAddress, (BindingId, CompiledRoute)>,
@@ -51,7 +79,7 @@ pub(super) struct Links {
     installed: HashSet<NodeRouteAddress>,
     route_actions: HashMap<NodeRouteAddress, ReceiveAction>,
     installations: HashMap<NodeRouteAddress, (oneshot::Receiver<()>, Option<bool>)>,
-    receives: HashMap<BindingId, (pulsebeam_link::NetworkId, Vec<NodeRouteAddress>)>,
+    receives: HashMap<BindingId, ReceiveBranch>,
     retirements: Vec<(Vec<Retirement>, oneshot::Receiver<()>, bool)>,
 }
 
@@ -65,6 +93,8 @@ impl Links {
             control,
             host: None,
             peers: HashMap::new(),
+            peer_ids: HashMap::new(),
+            node: None,
             ports,
             clock_origin,
             routes: HashMap::new(),
@@ -80,6 +110,14 @@ impl Links {
 
     pub(super) fn set_host(&mut self, host: pulsebeam_queue::Sender<crate::link::host::Command>) {
         self.host = Some(host);
+    }
+
+    pub(super) fn set_node(&mut self, node: RelayNode) {
+        self.node = Some(node);
+    }
+
+    pub(super) fn identify_peer(&mut self, link: NetworkId, node: NodeId) {
+        self.peer_ids.insert(link, node);
     }
 
     pub(super) fn inspect(
@@ -141,6 +179,7 @@ impl Links {
                     id,
                     endpoint,
                     driver,
+                    node: self.node,
                 },
             )))
             .is_err()
@@ -158,7 +197,14 @@ impl Links {
     ) -> Vec<(ShardId, TrackPlanUpdate)> {
         self.control.close_network(peer);
         self.peers.remove(&peer);
-        self.receives.retain(|_, (owner, _)| *owner != peer);
+        self.peer_ids.remove(&peer);
+        self.receives.retain(|_, branch| {
+            if branch.peer != peer {
+                return true;
+            }
+            branch.record("relay_removed", 0);
+            false
+        });
         let mut updates = Vec::new();
         let mut touched = HashSet::new();
         self.sends.retain(|branch| {
@@ -352,7 +398,9 @@ impl Links {
             .iter()
             .filter_map(|address| {
                 let action = self.route_actions.get(address)?;
-                if action.route.publication_id() != track || action.ingress_peer != ingress_peer {
+                if action.route.publication_id() != track
+                    || action.scope.and_then(|scope| scope.ingress) != ingress_peer
+                {
                     return None;
                 }
                 let kind = match action.route {
@@ -375,7 +423,7 @@ impl Links {
         &mut self,
         address: NodeRouteAddress,
         action: TrackRouteAction,
-        ingress_peer: Option<pulsebeam_link::NetworkId>,
+        scope: Option<RouteScope>,
         ack: oneshot::Receiver<()>,
     ) {
         self.installed.remove(&address);
@@ -383,7 +431,7 @@ impl Links {
             address,
             ReceiveAction {
                 route: action,
-                ingress_peer,
+                scope,
             },
         );
         self.installations.insert(address, (ack, None));
@@ -411,13 +459,17 @@ impl Links {
                 .route_actions
                 .get(address)
                 .ok_or(pulsebeam_link::BindError::Closed)?;
-            if action.ingress_peer.is_some_and(|origin| origin != peer) {
+            if action
+                .scope
+                .and_then(|scope| scope.ingress)
+                .is_some_and(|origin| origin != peer)
+            {
                 return Err(pulsebeam_link::BindError::Closed);
             }
             let identity = (
                 action.route.publication_id(),
                 matches!(action.route, TrackRouteAction::Reverse { .. }),
-                action.ingress_peer,
+                action.scope,
             );
             if expected.is_some_and(|expected| expected != identity) {
                 return Err(pulsebeam_link::BindError::Closed);
@@ -430,12 +482,31 @@ impl Links {
             destinations.push((port, crate::link::delivery_tag(*address)));
         }
         let (binding, address) = self.control.bind_receive(peer, &destinations)?;
-        self.receives.insert(binding, (peer, addresses));
+        let evidence = expected.and_then(|(publication, reverse, scope)| {
+            Some(RelayEvidence {
+                local: self.node?,
+                peer: self.peer_ids.get(&peer).copied(),
+                link: peer,
+                label: address,
+                project: scope?.project,
+                publication,
+                reverse,
+            })
+        });
+        let branch = ReceiveBranch {
+            peer,
+            live: addresses.len(),
+            addresses,
+            evidence,
+        };
+        branch.record("relay_installed", branch.live);
+        self.receives.insert(binding, branch);
         Ok(crate::link::ReceiveRoute { binding, address })
     }
 
     pub(super) fn unbind_receive(&mut self, binding: BindingId) {
-        let mut owned = self.receives.remove(&binding).is_some();
+        let removed = self.receives.remove(&binding);
+        let mut owned = removed.is_some();
         for (bindings, _, _) in &mut self.retirements {
             bindings.retain(|pending| {
                 if pending.binding() == binding {
@@ -448,6 +519,9 @@ impl Links {
         }
         if owned {
             self.control.unbind(binding);
+        }
+        if let Some(branch) = removed {
+            branch.record("relay_removed", 0);
         }
     }
 
@@ -495,13 +569,16 @@ impl Links {
             retirements.push(Retirement::Binding(binding));
         }
         if let Some(&port) = self.ports.get(address.shard().index()) {
-            self.receives.retain(|binding, (_, addresses)| {
-                if let Some(index) = addresses.iter().position(|target| *target == address) {
-                    addresses.swap_remove(index);
+            for (binding, branch) in &mut self.receives {
+                if let Some(index) = branch
+                    .addresses
+                    .iter()
+                    .position(|target| *target == address)
+                {
+                    branch.addresses.swap_remove(index);
                     retirements.push(Retirement::ReceivePort(*binding, port));
                 }
-                !addresses.is_empty()
-            });
+            }
         }
         if !retirements.is_empty() {
             let bindings = retirements
@@ -564,7 +641,16 @@ impl Links {
                     match *action {
                         Retirement::Binding(binding) => self.control.unbind(binding),
                         Retirement::ReceivePort(binding, port) => {
-                            self.control.unbind_receive_port(binding, port)
+                            self.control.unbind_receive_port(binding, port);
+                            if let Some(branch) = self.receives.get_mut(&binding) {
+                                branch.live -= 1;
+                                if branch.live == 0 {
+                                    branch.record("relay_removed", 0);
+                                    self.receives.remove(&binding);
+                                } else {
+                                    branch.record("relay_changed", branch.live);
+                                }
+                            }
                         }
                     }
                 }

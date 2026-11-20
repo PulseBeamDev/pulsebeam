@@ -50,6 +50,7 @@ async def witness():
     assert not inspect.isawaitable(media_agent)
     assert media_agent.state().status == core.AgentStatus.IDLE
     assert media_agent.state().room is None
+    assert media_agent.support_report().connection_id is None
     assert not inspect.isawaitable(agent)
     try:
         initial_state = agent.state()

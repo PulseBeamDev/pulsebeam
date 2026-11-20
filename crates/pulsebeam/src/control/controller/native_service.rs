@@ -1,5 +1,6 @@
 use super::*;
 use crate::entity::{TrackId, TrackKind};
+use pulsebeam_proto::state::CloseReason;
 
 const NATIVE_BUDGET: usize = 32;
 const MAX_TERMINAL_HANDOFFS: usize = 256;

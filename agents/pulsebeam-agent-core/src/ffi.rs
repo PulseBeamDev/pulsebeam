@@ -248,6 +248,12 @@ pub enum AgentStatus {
     Closed,
 }
 
+/// Name-free correlation data for the current confirmed connection.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct SupportReport {
+    pub connection_id: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct AgentState {
     pub observation_revision: u64,
@@ -257,6 +263,7 @@ pub struct AgentState {
     pub evaluated_credential_revision: u64,
     pub room: Option<String>,
     pub desired_room: Option<String>,
+    pub connection_id: Option<String>,
     pub status: AgentStatus,
     pub error: Option<ErrorInfo>,
 }
@@ -289,6 +296,7 @@ impl From<&model::Snapshot> for AgentState {
                 .map_or(0, |outcome| outcome.revision),
             room: value.room_id.clone(),
             desired_room: value.desired_room.clone(),
+            connection_id: value.connection_id.as_ref().map(|id| id.as_str().into()),
             status,
             error: failure.map(|failure| ErrorInfo::from(&Failure::from(failure.clone()))),
         }
