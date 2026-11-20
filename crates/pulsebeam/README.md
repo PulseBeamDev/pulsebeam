@@ -85,8 +85,9 @@ work. These are ownership and progress contracts, not a throughput guarantee.
 
 ## Experimental cluster membership
 
-Clustering is opt-in and currently provides local membership observations only.
-It does not change room placement or enable cross-node rooms/media. The broader
+Clustering is opt-in. Gossip provides membership observations, not ownership
+or authorization. An optional, statically provisioned pair of nodes can exchange
+Native ownership facts and relay explicitly subscribed publications. The broader
 [cluster coordination design](docs/cluster.md) remains proposed.
 
 **Use gossip only on a trusted, access-restricted network.** It is neither
@@ -97,8 +98,9 @@ To use joined Native sessions with clustering enabled on just one server, set
 `cluster.topology = "single_node"`, omit `seeds`, and use matching loopback
 addresses for `advertise_host` and `cluster.gossip.listen` (for example,
 `127.0.0.1` and `127.0.0.1:7946`). Native successor receipts are valid only for
-that running process. The default `multi_node` topology does not support Native
-ownership admission, even if its seed list is empty.
+that running process. In the default `multi_node` topology, Native admission
+requires a provisioned ownership Link and fresh peer authority, even with no
+seeds.
 
 With an existing server authentication configuration (`key-registry.json` in the
 working directory), save `cluster.toml` with this node's peer-reachable address:
@@ -149,6 +151,73 @@ restart, so consumers must validate incarnations rather than treat NodeId as
 fencing. Graceful shutdown stops gossip without a reliable leave announcement;
 peers eventually suspect/remove the incarnation. Fatal membership failure shuts
 down the node. No deployment/provisioning automation is included.
+
+### Provision a two-node Native ownership Link
+
+Deploy exactly two serving nodes for this authority epoch. Give each node a
+stable HTTP origin and route a Native admission attempt and its `Location` back
+to that node. A recovery attempt on the other node must obtain a new admission
+ticket there. Do not distribute retries for the same attempt across nodes.
+
+1. Start each node without `cluster.ownership_peer` to allocate its membership
+   identity. Record its `node_id` and committed `generation`, then stop it.
+2. Provision a distinct P-256 DTLS certificate and matching DER PKCS#8 private
+   key for each node's **next** generation. Record the SHA-256 fingerprint of
+   each DER certificate. Provision a separate Ed25519 receipt key pair on each
+   node. Do not reuse tenant signing keys.
+3. Choose a new random 16-byte authority epoch ID shared only by this pair.
+   Add the following section on both nodes, swapping local and peer values.
+   Replace every angle-bracket value. Use an absolute path to each key file and
+   make private keys readable only by the server account.
+
+```toml
+[cluster.ownership_peer]
+listen = "10.0.1.12:7443"
+local_node = "<local node_id>"
+local_generation = 2 # Use the recorded local generation plus one.
+certificate_der = "/etc/pulsebeam/link.der"
+key_pkcs8_der = "/etc/pulsebeam/link-key.der"
+peer_node = "<other node_id>"
+peer_generation = 2 # Use the recorded peer generation plus one.
+peer_endpoint = "10.0.1.11:7443"
+peer_sha256 = "<64 hexadecimal digits>"
+authority_epoch = "<32 hexadecimal digits shared by both nodes>"
+receipt_key_file = "/etc/pulsebeam/receipt-signing-key"
+peer_receipt_key = "<peer Ed25519 public key>"
+```
+
+The receipt private key file contains base64url PKCS#8; the peer receipt public
+key is base64url Ed25519 SubjectPublicKeyInfo. Allow UDP between the configured
+Link endpoints. The same mutually pinned DTLS association carries control and
+media. Gossip never grants admission or supplies a Link pin. Once both nodes
+exchange complete authority images, a Native client can explicitly subscribe
+on one node and receive a publication from the other.
+
+- A complete peer image is limited to 64 KiB, with at most 64 receipt/retirement
+  records per issuer and 128 relay labels per node. Oversized images do not
+  renew authority. Terminal retirement records are not silently evicted. If
+  retirement capacity is exhausted, replace the authority epoch.
+- Receipts expire after five minutes, with five seconds of clock skew allowed.
+  Recovery also requires issuance and retirement evidence in a complete image,
+  fresh for at most ten seconds from the receiver's pull. An issuer becoming
+  unavailable does not invalidate evidence already applied within that window.
+  No fresh evidence means no new admission or automatic recovery; a valid
+  signature alone is insufficient. An admission result is replayable only at
+  its original node within the one-minute result window.
+- There is no rolling authority-epoch restart. To replace the epoch after
+  restart or state loss, stop or externally fence **both** old serving
+  instances. Provision new keys, pins, committed generations, and an epoch ID
+  before serving again. Do not start a node with old authority settings and
+  empty retirement state. Clients must make deliberate new claims after an
+  epoch change.
+- For operational correlation, retain structured incident exports from both
+  nodes over the affected window. Use the SDK support report's connection key,
+  a publication key, or an authorized project-scoped token ID with
+  [`pulsebeam-cli incident`](../pulsebeam-cli/README.md). Logs show observed
+  lifecycle transitions, not delivery, and cannot reconstruct missing records.
+  Inspect `pulsebeam::incident::unattributed` for unrecognized relay labels by
+  peer, link epoch, and label. Those events do not establish a publication or
+  appear in a tenant-scoped incident report.
 
 ## Media TCP fallback
 

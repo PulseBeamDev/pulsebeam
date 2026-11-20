@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -12,7 +12,7 @@ use crate::route::NodeRouteAddress;
 use crate::shard::worker::ShardFrame;
 use crate::shard_update::{CompiledRoute, TrackPlan, TrackPlanUpdate, TrackRouteAction};
 use crate::{
-    entity::{ProjectId, PublicationKey},
+    entity::{ProjectRoomKey, PublicationKey},
     id::ShardId,
     log::{RelayEvidence, RelayNode},
 };
@@ -27,7 +27,7 @@ struct SendBranch {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct RouteScope {
-    pub(super) project: ProjectId,
+    pub(super) room: ProjectRoomKey,
     pub(super) ingress: Option<NetworkId>,
 }
 
@@ -147,7 +147,7 @@ impl Links {
         &mut self,
         peer: impl Into<pulsebeam_link::PeerConfig>,
     ) -> Result<pulsebeam_link::NetworkId, pulsebeam_link::LinkError> {
-        self.open_association(peer.into(), |control, peer, codec| {
+        self.open_association(peer.into(), None, |control, peer, codec| {
             control.open_network(peer, codec).map(|id| (id, ()))
         })
         .map(|(id, ())| id)
@@ -156,13 +156,19 @@ impl Links {
     pub(super) fn open_control_peer(
         &mut self,
         peer: pulsebeam_link::NetworkPeer,
+        node: NodeId,
     ) -> Result<(NetworkId, pulsebeam_link::PeerControl), pulsebeam_link::LinkError> {
-        self.open_association(peer.into(), LinkControl::open_network_with_control)
+        self.open_association(
+            peer.into(),
+            Some(node),
+            LinkControl::open_network_with_control,
+        )
     }
 
     fn open_association<T>(
         &mut self,
         peer: pulsebeam_link::PeerConfig,
+        peer_node: Option<NodeId>,
         open: impl FnOnce(
             &mut LinkControl<ShardFrame>,
             pulsebeam_link::PeerConfig,
@@ -202,6 +208,7 @@ impl Links {
                     endpoint,
                     driver,
                     node: self.node,
+                    peer_node,
                 },
             )))
             .is_err()
@@ -413,6 +420,39 @@ impl Links {
         self.peers.contains_key(&peer)
     }
 
+    pub(super) fn send_live(&self, binding: BindingId) -> bool {
+        self.sends.iter().any(|branch| branch.binding == binding)
+    }
+
+    pub(super) fn relay_targets(
+        &mut self,
+        peer: NetworkId,
+        limit: usize,
+    ) -> Option<BTreeMap<super::controller::peer_ownership::relay::Key, Vec<NodeRouteAddress>>>
+    {
+        use super::controller::peer_ownership::relay::Key;
+        self.reap();
+        let mut targets = BTreeMap::<_, Vec<_>>::new();
+        for address in &self.installed {
+            let Some(action) = self.route_actions.get(address) else {
+                continue;
+            };
+            let Some(scope) = action.scope else { continue };
+            let reverse = matches!(action.route, TrackRouteAction::Reverse { .. });
+            if (reverse && scope.ingress.is_none()) || (!reverse && scope.ingress == Some(peer)) {
+                let key = Key::new(scope.room, action.route.publication_id(), reverse);
+                if targets.len() >= limit && !targets.contains_key(&key) {
+                    return None;
+                }
+                targets.entry(key).or_default().push(*address);
+            }
+        }
+        for addresses in targets.values_mut() {
+            addresses.sort_by_key(|address| (address.route.get(), address.epoch));
+        }
+        Some(targets)
+    }
+
     pub(super) fn destinations(
         &mut self,
         track: PublicationKey,
@@ -514,7 +554,7 @@ impl Links {
                 peer: self.peer_ids.get(&peer).copied(),
                 link: peer,
                 label: address,
-                project: scope?.project,
+                project: scope?.room.project,
                 publication,
                 reverse,
             })
@@ -669,7 +709,11 @@ impl Links {
                         Retirement::ReceivePort(binding, port) => {
                             self.control.unbind_receive_port(binding, port);
                             if let Some(branch) = self.receives.get_mut(&binding) {
-                                branch.live -= 1;
+                                branch.live = branch.live.checked_sub(1).unwrap_or_else(|| {
+                                    pulsebeam_runtime::fatal!(
+                                        "receive branch lost live placement accounting"
+                                    )
+                                });
                                 if branch.live == 0 {
                                     branch.record("relay_removed", 0);
                                     self.receives.remove(&binding);

@@ -1,3 +1,5 @@
+mod provisioned;
+
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::net::IpAddr;

@@ -29,6 +29,7 @@ fn retained_input_cannot_cross_an_endpoint_replacement() {
             replacement,
             control.take_network_driver(replacement).unwrap(),
             None,
+            None,
         ),
     )]);
     let mut pending = Pending {
@@ -193,14 +194,14 @@ fn busy_quic_input_does_not_block_another_peers_real_dtls_handshake() {
             blocked_addr,
             Peer {
                 queued_input: 1,
-                ..Peer::new(blocked, blocked_driver, None)
+                ..Peer::new(blocked, blocked_driver, None, None)
             },
         ),
         (
             ready_addr,
             Peer {
                 queued_input: 1,
-                ..Peer::new(ready, ready_driver, None)
+                ..Peer::new(ready, ready_driver, None, None)
             },
         ),
     ]);

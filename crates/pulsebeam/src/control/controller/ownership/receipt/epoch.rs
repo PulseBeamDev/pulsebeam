@@ -204,21 +204,23 @@ impl Trust {
             .ok_or(Error::Unfresh)
     }
 
-    fn recover_at(
-        &self,
-        issuer: Issuer,
-        key: Key,
-        expires_at: u64,
-        now: Instant,
-    ) -> Result<(), Error> {
+    // Issuance and known retirement are monotone within an authority epoch.
+    // A covered proof can remain valid after the view expires; admission
+    // still requires a fresh view to rule out unseen retirements.
+    fn check_coverage(&self, issuer: Issuer, key: Key, expires_at: u64) -> Result<(), Error> {
         if self.retired(key) {
             return Err(Error::Retired);
         }
-        let view = self.fresh_view(now)?;
+        if self.blocked || self.view.as_ref().is_some_and(|view| view.blocked) {
+            return Err(Error::NoAuthority);
+        }
         let recorded = if issuer == self.issuer {
             self.records.get(&key).ok_or(Error::NoAuthority)?
         } else if issuer == self.remote {
-            view.records.get(&key).ok_or(Error::Unfresh)?
+            self.view
+                .as_ref()
+                .and_then(|view| view.records.get(&key))
+                .ok_or(Error::Unfresh)?
         } else {
             return Err(Error::NoAuthority);
         };
@@ -280,12 +282,7 @@ impl LineageTrust for Trust {
         expires_at: u64,
         _now: u64,
     ) -> Result<(), Error> {
-        self.recover_at(
-            issuer,
-            (endpoint, rank.lineage()),
-            expires_at,
-            Instant::now(),
-        )
+        self.check_coverage(issuer, (endpoint, rank.lineage()), expires_at)
     }
 
     fn retire(&mut self, endpoint: EndpointKey, rank: ClaimRank) {

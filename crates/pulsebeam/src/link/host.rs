@@ -36,6 +36,7 @@ pub(crate) struct Install {
     pub endpoint: SocketAddr,
     pub driver: NetworkDriver<ShardFrame>,
     pub node: Option<crate::log::RelayNode>,
+    pub peer_node: Option<pulsebeam_core::identity::NodeId>,
 }
 
 struct Peer {
@@ -43,6 +44,7 @@ struct Peer {
     driver: NetworkDriver<ShardFrame>,
     queued_input: usize,
     node: Option<crate::log::RelayNode>,
+    peer_node: Option<pulsebeam_core::identity::NodeId>,
     next_label_report: Option<Instant>,
 }
 
@@ -51,11 +53,13 @@ impl Peer {
         id: NetworkId,
         driver: NetworkDriver<ShardFrame>,
         node: Option<crate::log::RelayNode>,
+        peer_node: Option<pulsebeam_core::identity::NodeId>,
     ) -> Self {
         Self {
             id,
             driver,
             node,
+            peer_node,
             queued_input: 0,
             next_label_report: None,
         }
@@ -67,7 +71,7 @@ impl Peer {
         }
         if let (Some(node), Some(label)) = (self.node, self.driver.take_unknown_label()) {
             self.next_label_report = at.checked_add(Duration::from_secs(1));
-            node.unknown_label(self.id, label);
+            node.unknown_label(self.peer_node, self.id, label);
         }
     }
 }
@@ -235,7 +239,12 @@ impl Host {
                         Ok(()) => {
                             self.peers.insert(
                                 install.endpoint,
-                                Peer::new(install.id, install.driver, install.node),
+                                Peer::new(
+                                    install.id,
+                                    install.driver,
+                                    install.node,
+                                    install.peer_node,
+                                ),
                             );
                         }
                         Err(error) => {

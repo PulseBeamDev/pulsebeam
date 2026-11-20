@@ -39,6 +39,21 @@ impl Socket for IdentitySocket {
     }
 }
 
+/// Reserve the identity of an isolated test node before provisioning the next
+/// generation. The server still allocates and validates its own generation.
+#[cfg(feature = "sim")]
+pub fn prepare_provisioned_fixture(
+    directory: &std::path::Path,
+) -> Result<(pulsebeam_membership::NodeId, std::num::NonZeroU64)> {
+    let identity = identity::Identity::allocate(directory)?;
+    let next = identity
+        .generation
+        .checked_add(1)
+        .and_then(std::num::NonZeroU64::new)
+        .context("fixture membership generation exhausted")?;
+    Ok((identity.node_id, next))
+}
+
 pub struct Service {
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<()>>>,
@@ -51,8 +66,9 @@ impl Service {
         options.validate_topology()?;
         #[cfg(feature = "sim")]
         anyhow::ensure!(
-            options.topology == Topology::SingleNode,
-            "multi-node gossip requires an explicit simulation transport"
+            options.topology == Topology::SingleNode
+                || (options.ownership_peer.is_some() && options.seeds.is_empty()),
+            "multi-node simulation requires provisioned ownership and no gossip seeds"
         );
         let data_dir = options.data_dir.clone();
         let expected = options.ownership_peer.as_ref().map(|peer| peer.local);

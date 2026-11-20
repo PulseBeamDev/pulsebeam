@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     control::controller::peer_ownership::{
-        MAX_CLAIMS_PER_ORIGIN, MAX_PUBLICATIONS_PER_ORIGIN, transfer::MAX_IMAGE_BYTES,
+        MAX_CLAIMS_PER_ORIGIN, MAX_PUBLICATIONS_PER_ORIGIN, relay, transfer::MAX_IMAGE_BYTES,
     },
     entity::{ConnectionId, EndpointKey, ParticipantId, ProjectId, ProjectRoomKey, RoomId},
     media::Rid,
@@ -26,12 +26,14 @@ struct Image {
     revision: NonZeroU64,
     authority: Checkpoint,
     endpoints: Box<[EndpointImage]>,
+    routes: Box<[relay::Offer]>,
 }
 
 pub(in crate::control) struct Decoded {
     pub revision: NonZeroU64,
     pub authority: Checkpoint,
     pub endpoints: Snapshot,
+    pub routes: relay::Offers,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -146,6 +148,7 @@ pub(in crate::control) fn encode(
     revision: NonZeroU64,
     authority: Checkpoint,
     snapshot: &Snapshot,
+    routes: Box<[relay::Offer]>,
 ) -> Result<Vec<u8>, Error> {
     validate(snapshot)?;
     let endpoints = snapshot
@@ -171,6 +174,7 @@ pub(in crate::control) fn encode(
             revision,
             authority,
             endpoints,
+            routes,
         },
     )
     .map_err(|error| {
@@ -247,6 +251,7 @@ pub(in crate::control) fn decode(data: &[u8]) -> Result<Decoded, Error> {
         revision: image.revision,
         authority: image.authority,
         endpoints: snapshot,
+        routes: relay::decode(image.routes).ok_or(Error::Invalid)?,
     })
 }
 
@@ -340,7 +345,7 @@ mod tests {
     #[test]
     fn complete_snapshot_round_trips_with_exact_publication_and_encoding_identity() {
         let snapshot = snapshot();
-        let bytes = encode(NonZeroU64::MIN, authority(), &snapshot).unwrap();
+        let bytes = encode(NonZeroU64::MIN, authority(), &snapshot, Box::new([])).unwrap();
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.revision, NonZeroU64::MIN);
         assert_eq!(decoded.endpoints, snapshot);
@@ -352,7 +357,7 @@ mod tests {
 
     #[test]
     fn claims_without_an_authority_checkpoint_are_not_a_complete_image() {
-        let data = encode(NonZeroU64::MIN, authority(), &snapshot()).unwrap();
+        let data = encode(NonZeroU64::MIN, authority(), &snapshot(), Box::new([])).unwrap();
         let mut fields: serde_json::Map<String, serde_json::Value> =
             serde_json::from_slice(&data).unwrap();
         assert!(fields.remove("authority").is_some());
@@ -364,7 +369,7 @@ mod tests {
 
     #[test]
     fn invalid_scope_or_rank_cannot_enter_a_peer_snapshot() {
-        let data = encode(NonZeroU64::MIN, authority(), &snapshot()).unwrap();
+        let data = encode(NonZeroU64::MIN, authority(), &snapshot(), Box::new([])).unwrap();
         let mut image: Image = serde_json::from_slice(&data).unwrap();
         image.endpoints.first_mut().unwrap().position = 0;
         assert!(matches!(
@@ -374,7 +379,7 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.first_mut().unwrap().0.participant = ParticipantId::new("wrong").unwrap();
         assert_eq!(
-            encode(NonZeroU64::MIN, authority(), &snapshot),
+            encode(NonZeroU64::MIN, authority(), &snapshot, Box::new([])),
             Err(Error::Invalid)
         );
     }

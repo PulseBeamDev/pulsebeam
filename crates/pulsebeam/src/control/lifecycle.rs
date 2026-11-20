@@ -1145,7 +1145,7 @@ impl TrackLifecycle {
                         },
                     },
                     Some(super::link::RouteScope {
-                        project: identity.room_id.project,
+                        room: identity.room_id,
                         ingress: self.ingress.get(&identity).copied(),
                     }),
                 );
@@ -1191,7 +1191,7 @@ impl TrackLifecycle {
                         },
                     },
                     Some(super::link::RouteScope {
-                        project: identity.room_id.project,
+                        room: identity.room_id,
                         ingress: None,
                     }),
                 );

@@ -51,7 +51,7 @@ fn rev(value: u64) -> NonZeroU64 {
 }
 
 #[test]
-fn idle_peer_is_eligible_and_a_covered_receipt_remains_usable_until_the_original_deadline() {
+fn expired_view_does_not_revoke_a_covered_receipt_or_authorize_admission() {
     let (mut a, mut b) = pair();
     let key = endpoint();
     let rank = ClaimRank::root(ConnectionId::new());
@@ -75,16 +75,17 @@ fn idle_peer_is_eligible_and_a_covered_receipt_remains_usable_until_the_original
         rank.successor(candidate).ok_or(Error::Invalid)
     );
     let lineage = (key, rank.lineage());
-    assert_eq!(b.recover_at(a.issuer(), lineage, 1300, now), Ok(()));
     assert_eq!(
-        b.recover_at(a.issuer(), lineage, 1301, now),
+        b.check_coverage(a.issuer(), lineage, 1301),
         Err(Error::Unfresh)
     );
-    assert_eq!(
-        b.recover_at(a.issuer(), lineage, 1300, deadline),
-        Err(Error::Unfresh)
-    );
-    assert!(b.eligible_key(a.issuer()).is_some());
+    for verifier in [&a, &b] {
+        assert!(!verifier.admission_ready(deadline));
+        assert_eq!(
+            validate_successor(verifier, &issued.proof, key, candidate, 1001),
+            rank.successor(candidate).ok_or(Error::Invalid)
+        );
+    }
 }
 
 #[test]
@@ -106,7 +107,7 @@ fn retirement_cannot_be_forgotten_on_expiry_or_epoch_mismatch() {
     assert_eq!(learned, [(endpoint, rank.lineage())]);
     assert_eq!(a.apply(rev(3), old, now, deadline), Err(Error::Invalid));
     assert_eq!(
-        a.recover_at(a.issuer(), (endpoint, rank.lineage()), 1300, deadline),
+        a.check_coverage(a.issuer(), (endpoint, rank.lineage()), 1300),
         Err(Error::Retired)
     );
     assert_eq!(

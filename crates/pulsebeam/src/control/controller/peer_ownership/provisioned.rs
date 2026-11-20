@@ -13,6 +13,7 @@ use super::{
         receipt::{Authority, Issuer, epoch::Trust},
         wire,
     },
+    relay::Relays,
     transfer::{self, Frame},
 };
 
@@ -39,6 +40,7 @@ struct Association {
     session: Option<Session>,
     reader: transfer::Reader,
     sender: transfer::Sender,
+    relays: Relays,
     refresh: Instant,
     live_until: Instant,
 }
@@ -78,7 +80,9 @@ impl Peer {
         if let Some(assoc) = &mut self.association {
             assoc.step(actor, self.remote, &mut self.last_revision, now);
         } else if let Some(links) = &mut actor.links {
-            if let Ok((network, lane)) = links.open_control_peer(self.transport.clone()) {
+            if let Ok((network, lane)) =
+                links.open_control_peer(self.transport.clone(), self.remote.0)
+            {
                 self.association = Some(Association {
                     network,
                     lane,
@@ -86,6 +90,7 @@ impl Peer {
                     session: None,
                     reader: transfer::Reader::default(),
                     sender: transfer::Sender::default(),
+                    relays: Relays::default(),
                     refresh: now,
                     live_until: now.checked_add(LIVENESS).unwrap_or(now),
                 });
@@ -124,6 +129,7 @@ impl Association {
         }) else {
             return;
         };
+        self.relays.step(actor, self.network, now);
         // Schedule the local pull before responding to the peer's bulk window.
         // Both directions remain bounded even when media or the peer is stalled.
         if now >= self.refresh && !self.reader.pending(now) {
@@ -148,7 +154,12 @@ impl Association {
                         *last_revision = revision.get();
                         if let Some(Authority::Provisioned(trust)) = actor.receipt_trust.as_ref()
                             && let Ok(snapshot) = actor.local_endpoint_snapshot()
-                            && let Ok(bytes) = wire::encode(revision, trust.checkpoint(), &snapshot)
+                            && let Ok(bytes) = wire::encode(
+                                revision,
+                                trust.checkpoint(),
+                                &snapshot,
+                                self.relays.offers(),
+                            )
                         {
                             self.sender.set_image(now, bytes);
                         }
@@ -173,6 +184,8 @@ impl Association {
                             )
                             .is_ok()
                     {
+                        self.relays.install(image.routes, deadline);
+                        self.relays.step(actor, self.network, now);
                         self.refresh = now.checked_add(REFRESH).unwrap_or(now);
                         self.live_until = now.checked_add(LIVENESS).unwrap_or(now);
                     }

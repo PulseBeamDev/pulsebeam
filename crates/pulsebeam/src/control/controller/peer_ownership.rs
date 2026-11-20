@@ -1,4 +1,5 @@
 pub(crate) mod provisioned;
+pub(in crate::control) mod relay;
 pub(super) mod transfer;
 
 use std::{collections::BTreeSet, num::NonZeroU64, time::Duration};

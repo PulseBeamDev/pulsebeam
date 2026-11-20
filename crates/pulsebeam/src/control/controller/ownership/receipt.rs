@@ -74,8 +74,8 @@ pub(in crate::control) trait PeerTrust {
     fn eligible_key(&self, issuer: Issuer) -> Option<ApiPublicKey>;
 }
 
-/// Signing-key eligibility alone is not authority to recover a lineage.
-/// Implementations must deny recovery without sufficiently fresh retirement state.
+/// Verifies lineage proof coverage in addition to issuer eligibility.
+/// A validated receipt does not grant admission without `Authority::ready`.
 pub(in crate::control) trait LineageTrust: PeerTrust + Send {
     fn record_issuance(
         &mut self,

@@ -91,9 +91,10 @@ impl RelayNode {
         }
     }
 
-    pub(crate) fn unknown_label(self, link: NetworkId, label: NodeRouteKey) {
+    pub(crate) fn unknown_label(self, peer: Option<NodeId>, link: NetworkId, label: NodeRouteKey) {
         tracing::info!(target: "pulsebeam::incident::unattributed", event = "relay_unknown_label",
-            node = %self.node, incarnation = self.incarnation, epoch = link.epoch(),
+            node = %self.node, incarnation = self.incarnation,
+            peer = peer.as_ref().map(tracing::field::display), epoch = link.epoch(),
             label = u32::from_be_bytes(label.to_bytes()));
     }
 }

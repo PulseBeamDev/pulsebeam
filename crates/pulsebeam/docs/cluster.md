@@ -1,10 +1,10 @@
 # Cluster topology and ownership
 
-**Status:** proposed cluster architecture. The single-node placement and
-compiled forwarding behavior described below exist; cross-node room
-coordination, membership, snapshot exchange, and media transport are not yet
-implemented. This document defines their intended boundaries, not an
-availability guarantee.
+**Status:** broader cluster coordination and the room coordinator described
+here are proposed. The server implements local partition placement, gossip
+observations, and an optional [two-node Native ownership Link](../README.md#provision-a-two-node-native-ownership-link).
+The provisioned Link does not elect a coordinator or learn ownership from
+gossip. This design is not an availability guarantee.
 
 The goal is to let one logical room span nodes while keeping WebRTC
 connections and packet processing locally owned. Clients reconstruct desired
@@ -21,7 +21,7 @@ forwarding topology.
 | **Shard** (`ShardId`) | Node-local dataplane state owner and packet executor. Hosts partitions from many rooms. A worker may execute multiple shards; workers are *not* owners. |
 | **Node** (`NodeId`) | Process owning its own connections, room shards, and execution shards. |
 | **RoomCoordinator** | Rendezvous-selected node maintaining an eventually consistent *derived* view of a room's RoomShards and coordinating cross-node topology. It does not own remote connections or their desired state. |
-| **Publication** | One live room-scoped track with a publisher and `TrackId`; applies to audio, video, and data. A data-channel **topic** is a label used by subscription selectors, not a cluster routing authority or another RoomShard. |
+| **Publication** | One live incarnation of a publisher's named audio, video, or data track, identified by a server-issued `PublicationId`. A subscription selector uses the application `TrackId` (the topic name for data), not a routing label or another RoomShard. |
 
 The word *shard* without a qualifier means the execution `Shard` in
 [the dataplane contract](shard-owned-dataplane.md). Never use *room shard* for
