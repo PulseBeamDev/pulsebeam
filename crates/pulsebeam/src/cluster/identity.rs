@@ -1,6 +1,7 @@
 //! Linux host-owned incarnation allocation. Never called from shard execution.
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::num::NonZeroU64;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -27,11 +28,19 @@ pub(super) struct Identity {
 
 impl Identity {
     pub fn allocate(directory: &Path) -> Result<Self> {
-        Self::allocate_with_sync(directory, File::sync_all)
+        Self::allocate_with_sync(directory, None, File::sync_all)
+    }
+
+    pub(super) fn allocate_provisioned(
+        directory: &Path,
+        expected: (NodeId, NonZeroU64),
+    ) -> Result<Self> {
+        Self::allocate_with_sync(directory, Some(expected), File::sync_all)
     }
 
     fn allocate_with_sync(
         directory: &Path,
+        expected: Option<(NodeId, NonZeroU64)>,
         sync: impl Fn(&File) -> std::io::Result<()>,
     ) -> Result<Self> {
         create_directory(directory)?;
@@ -80,6 +89,12 @@ impl Identity {
             .generation
             .checked_add(1)
             .context("membership generation exhausted")?;
+        ensure!(
+            expected
+                .is_none_or(|(node, generation)| node == state.node_id
+                    && generation.get() == state.generation),
+            "provisioned ownership identity does not match the node's next membership incarnation"
+        );
         let next = directory.join(NEXT);
         match fs::remove_file(&next) {
             Ok(()) => {}
@@ -142,6 +157,26 @@ mod tests {
         drop(second);
         let third = Identity::allocate(dir.path()).unwrap();
         assert_eq!(third.generation, 3);
+    }
+
+    #[test]
+    fn provisioned_identity_must_match_the_next_committed_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Identity::allocate(dir.path()).unwrap();
+        let id = first.node_id;
+        drop(first);
+
+        let next = NonZeroU64::new(2).unwrap();
+        assert!(Identity::allocate_provisioned(dir.path(), (id, NonZeroU64::MIN)).is_err());
+        assert!(Identity::allocate_provisioned(dir.path(), (NodeId::new(), next)).is_err());
+        let second = Identity::allocate_provisioned(dir.path(), (id, next)).unwrap();
+        assert_eq!((second.node_id, second.generation), (id, 2));
+        drop(second);
+        assert!(Identity::allocate_provisioned(dir.path(), (id, next)).is_err());
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(Identity::allocate_provisioned(empty.path(), (id, NonZeroU64::MIN)).is_err());
+        assert!(!empty.path().join(STATE).exists());
     }
 
     #[test]
@@ -247,7 +282,7 @@ mod tests {
             drop(first);
             let calls = Cell::new(0);
             assert!(
-                Identity::allocate_with_sync(dir.path(), |file| {
+                Identity::allocate_with_sync(dir.path(), None, |file| {
                     calls.set(calls.get() + 1);
                     if calls.get() == failure {
                         Err(std::io::Error::other("injected sync failure"))

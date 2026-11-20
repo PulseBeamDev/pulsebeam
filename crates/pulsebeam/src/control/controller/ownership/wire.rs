@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     ClaimRank,
     observations::{EndpointFact, Error, PublicationFact, Snapshot, validate_publications},
+    receipt::epoch::Checkpoint,
 };
 use crate::{
     control::controller::peer_ownership::{
@@ -23,7 +24,14 @@ use crate::{
 #[serde(deny_unknown_fields)]
 struct Image {
     revision: NonZeroU64,
+    authority: Checkpoint,
     endpoints: Box<[EndpointImage]>,
+}
+
+pub(in crate::control) struct Decoded {
+    pub revision: NonZeroU64,
+    pub authority: Checkpoint,
+    pub endpoints: Snapshot,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -134,7 +142,11 @@ fn parse_rid(input: Option<&str>) -> Result<Option<Rid>, Error> {
     input.map(Rid::new).transpose().map_err(|_| Error::Invalid)
 }
 
-pub(crate) fn encode(revision: NonZeroU64, snapshot: &Snapshot) -> Result<Vec<u8>, Error> {
+pub(in crate::control) fn encode(
+    revision: NonZeroU64,
+    authority: Checkpoint,
+    snapshot: &Snapshot,
+) -> Result<Vec<u8>, Error> {
     validate(snapshot)?;
     let endpoints = snapshot
         .iter()
@@ -157,6 +169,7 @@ pub(crate) fn encode(revision: NonZeroU64, snapshot: &Snapshot) -> Result<Vec<u8
         &mut bytes,
         &Image {
             revision,
+            authority,
             endpoints,
         },
     )
@@ -186,7 +199,7 @@ impl std::io::Write for ImageWriter {
     }
 }
 
-pub(crate) fn decode(data: &[u8]) -> Result<(NonZeroU64, Snapshot), Error> {
+pub(in crate::control) fn decode(data: &[u8]) -> Result<Decoded, Error> {
     if data.len() > MAX_IMAGE_BYTES {
         return Err(Error::Capacity);
     }
@@ -230,7 +243,11 @@ pub(crate) fn decode(data: &[u8]) -> Result<(NonZeroU64, Snapshot), Error> {
         })
         .collect::<Result<Snapshot, Error>>()?;
     validate(&snapshot)?;
-    Ok((image.revision, snapshot))
+    Ok(Decoded {
+        revision: image.revision,
+        authority: image.authority,
+        endpoints: snapshot,
+    })
 }
 
 fn validate(snapshot: &Snapshot) -> Result<(), Error> {
@@ -252,7 +269,29 @@ fn validate(snapshot: &Snapshot) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsebeam_core::{auth::ApiSigningKey, identity::NodeId};
     use pulsebeam_proto::state::{CodecFormat, VideoTrack, track};
+
+    fn authority() -> Checkpoint {
+        use super::super::receipt::{Issuer, epoch::Trust};
+        let issuer = Issuer {
+            trust_domain: [1; 16],
+            node: NodeId::new(),
+            incarnation: NonZeroU64::MIN,
+        };
+        let remote = Issuer {
+            node: NodeId::new(),
+            ..issuer
+        };
+        Trust::new(
+            issuer,
+            ApiSigningKey::from_seed([1; 32]),
+            remote,
+            ApiSigningKey::from_seed([2; 32]).public_key(),
+        )
+        .unwrap()
+        .checkpoint()
+    }
 
     fn snapshot() -> Snapshot {
         let participant = ParticipantId::new("sender").unwrap();
@@ -301,25 +340,42 @@ mod tests {
     #[test]
     fn complete_snapshot_round_trips_with_exact_publication_and_encoding_identity() {
         let snapshot = snapshot();
-        let bytes = encode(NonZeroU64::MIN, &snapshot).unwrap();
-        assert_eq!(decode(&bytes).unwrap(), (NonZeroU64::MIN, snapshot));
-        assert_eq!(
+        let bytes = encode(NonZeroU64::MIN, authority(), &snapshot).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.revision, NonZeroU64::MIN);
+        assert_eq!(decoded.endpoints, snapshot);
+        assert!(matches!(
             decode(bytes.get(..bytes.len().saturating_sub(1)).unwrap()),
             Err(Error::Invalid)
-        );
+        ));
+    }
+
+    #[test]
+    fn claims_without_an_authority_checkpoint_are_not_a_complete_image() {
+        let data = encode(NonZeroU64::MIN, authority(), &snapshot()).unwrap();
+        let mut fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&data).unwrap();
+        assert!(fields.remove("authority").is_some());
+        assert!(matches!(
+            decode(&serde_json::to_vec(&fields).unwrap()),
+            Err(Error::Invalid)
+        ));
     }
 
     #[test]
     fn invalid_scope_or_rank_cannot_enter_a_peer_snapshot() {
-        let data = encode(NonZeroU64::MIN, &snapshot()).unwrap();
+        let data = encode(NonZeroU64::MIN, authority(), &snapshot()).unwrap();
         let mut image: Image = serde_json::from_slice(&data).unwrap();
         image.endpoints.first_mut().unwrap().position = 0;
-        assert_eq!(
+        assert!(matches!(
             decode(&serde_json::to_vec(&image).unwrap()),
             Err(Error::Invalid)
-        );
+        ));
         let mut snapshot = snapshot();
         snapshot.first_mut().unwrap().0.participant = ParticipantId::new("wrong").unwrap();
-        assert_eq!(encode(NonZeroU64::MIN, &snapshot), Err(Error::Invalid));
+        assert_eq!(
+            encode(NonZeroU64::MIN, authority(), &snapshot),
+            Err(Error::Invalid)
+        );
     }
 }

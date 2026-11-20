@@ -20,6 +20,44 @@ const SIGNATURE_BYTES: usize = 64;
 const MAX_LINEAGES: usize = 4096;
 const SIGNING_DOMAIN: &[u8] = b"pulsebeam.joined.successor.v1\0";
 
+pub(in crate::control) mod epoch;
+
+pub(in crate::control) enum Authority {
+    Local(Box<dyn LineageTrust>),
+    Provisioned(Box<epoch::Trust>),
+}
+
+impl Authority {
+    pub(in crate::control) fn ready(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Provisioned(trust) => {
+                trust.admission_ready(pulsebeam_runtime::time::Instant::now())
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for Authority {
+    type Target = dyn LineageTrust;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Local(trust) => trust.as_ref(),
+            Self::Provisioned(trust) => trust.as_ref(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for Authority {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Local(trust) => trust.as_mut(),
+            Self::Provisioned(trust) => trust.as_mut(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::control) struct Issuer {
@@ -51,6 +89,7 @@ pub(in crate::control) trait LineageTrust: PeerTrust + Send {
         issuer: Issuer,
         endpoint: EndpointKey,
         rank: ClaimRank,
+        expires_at: u64,
         now: u64,
     ) -> Result<(), Error>;
     fn retire(&mut self, endpoint: EndpointKey, rank: ClaimRank);
@@ -81,7 +120,9 @@ pub(in crate::control) fn validate_successor(
         endpoint,
         connection,
         now,
-        |issuer, endpoint, rank| trust.check_recovery(issuer, endpoint, rank, now),
+        |issuer, endpoint, rank, expires_at| {
+            trust.check_recovery(issuer, endpoint, rank, expires_at, now)
+        },
     )
 }
 
@@ -166,6 +207,7 @@ impl LineageTrust for StandaloneTrust {
         issuer: Issuer,
         endpoint: EndpointKey,
         rank: ClaimRank,
+        expires_at: u64,
         now: u64,
     ) -> Result<(), Error> {
         if issuer != self.issuer {
@@ -177,6 +219,9 @@ impl LineageTrust for StandaloneTrust {
             .ok_or(Error::NoAuthority)?;
         if lineage.retired {
             return Err(Error::Retired);
+        }
+        if expires_at > lineage.expires_at {
+            return Err(Error::NoAuthority);
         }
         if now > eligible_through(lineage.expires_at) {
             return Err(Error::Expired);
@@ -242,6 +287,7 @@ pub(in crate::control) enum Error {
     Scope,
     Expired,
     Retired,
+    Unfresh,
     NoAuthority,
 }
 
@@ -281,7 +327,7 @@ fn successor(
     endpoint: EndpointKey,
     connection: ConnectionId,
     now: u64,
-    check_retirement: impl FnOnce(Issuer, EndpointKey, ClaimRank) -> Result<(), Error>,
+    check_retirement: impl FnOnce(Issuer, EndpointKey, ClaimRank, u64) -> Result<(), Error>,
 ) -> Result<ClaimRank, Error> {
     if receipt.len() > MAX_SUCCESSOR_RECEIPT_BYTES {
         return Err(Error::Invalid);
@@ -311,7 +357,7 @@ fn successor(
         return Err(Error::Expired);
     }
     let rank = claims.rank();
-    check_retirement(claims.issuer, endpoint, rank)?;
+    check_retirement(claims.issuer, endpoint, rank, claims.expires_at)?;
     rank.successor(connection).ok_or(Error::Invalid)
 }
 
@@ -353,6 +399,7 @@ pub(in crate::control::controller) mod tests {
             issuer: Issuer,
             endpoint: EndpointKey,
             rank: ClaimRank,
+            _expires_at: u64,
             now: u64,
         ) -> Result<(), Error> {
             let fact = self
@@ -515,7 +562,8 @@ pub(in crate::control::controller) mod tests {
                 scope,
                 candidate,
                 now,
-                |verified_issuer, key, rank| {
+                |verified_issuer, key, rank, expires_at| {
+                    assert_eq!(expires_at, 1300);
                     assert!(verified_issuer == issuer);
                     assert_eq!(key, endpoint);
                     assert_eq!(rank, predecessor);
@@ -561,9 +609,14 @@ pub(in crate::control::controller) mod tests {
         };
         assert_eq!(check(&receipt, other, 1000), Err(Error::Scope));
         assert_eq!(
-            successor(&remote, &receipt, endpoint, candidate, 1000, |_, _, _| Err(
-                Error::Retired
-            )),
+            successor(
+                &remote,
+                &receipt,
+                endpoint,
+                candidate,
+                1000,
+                |_, _, _, _| Err(Error::Retired)
+            ),
             Err(Error::Retired)
         );
         let mut corrupt = receipt.clone();
@@ -581,7 +634,7 @@ pub(in crate::control::controller) mod tests {
                 endpoint,
                 candidate,
                 1000,
-                |_, _, _| Ok(())
+                |_, _, _, _| Ok(())
             ),
             Err(Error::Invalid)
         );
@@ -599,7 +652,7 @@ pub(in crate::control::controller) mod tests {
                 endpoint,
                 candidate,
                 1000,
-                |_, _, _| Ok(())
+                |_, _, _, _| Ok(())
             ),
             Err(Error::Invalid)
         );

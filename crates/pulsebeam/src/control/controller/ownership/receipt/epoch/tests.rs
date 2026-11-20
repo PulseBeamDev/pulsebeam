@@ -1,0 +1,158 @@
+use std::time::Duration;
+
+use super::*;
+use crate::control::controller::ownership::receipt::{issue_accepted, validate_successor};
+use pulsebeam_core::identity::NodeId;
+
+const LEASE: Duration = Duration::from_secs(10);
+
+impl Trust {
+    fn apply(
+        &mut self,
+        rev: NonZeroU64,
+        checkpoint: Checkpoint,
+        now: Instant,
+        deadline: Instant,
+    ) -> Result<Vec<Key>, Error> {
+        let checkpoint = self.validate_checkpoint(rev, checkpoint, now, deadline)?;
+        Ok(self.install_checkpoint(checkpoint))
+    }
+}
+
+fn pair() -> (Trust, Trust) {
+    let a = Issuer {
+        trust_domain: [23; 16],
+        node: NodeId::new(),
+        incarnation: NonZeroU64::MIN,
+    };
+    let b = Issuer {
+        node: NodeId::new(),
+        ..a
+    };
+    let a_key = ApiSigningKey::from_seed([31; 32]);
+    let b_key = ApiSigningKey::from_seed([32; 32]);
+    let a_pub = a_key.public_key();
+    let b_pub = b_key.public_key();
+    (
+        Trust::new(a, a_key, b, b_pub).unwrap(),
+        Trust::new(b, b_key, a, a_pub).unwrap(),
+    )
+}
+
+fn endpoint() -> EndpointKey {
+    EndpointKey {
+        room: ProjectRoomKey::fixture(RoomId::new("stage").unwrap()),
+        participant: ParticipantId::new("sender").unwrap(),
+    }
+}
+
+fn rev(value: u64) -> NonZeroU64 {
+    NonZeroU64::new(value).unwrap()
+}
+
+#[test]
+fn idle_peer_is_eligible_and_a_covered_receipt_remains_usable_until_the_original_deadline() {
+    let (mut a, mut b) = pair();
+    let key = endpoint();
+    let rank = ClaimRank::root(ConnectionId::new());
+    let candidate = ConnectionId::new();
+    let now = Instant::now();
+    let deadline = now + LEASE;
+    assert!(a.eligible_key(b.issuer()).is_some());
+    assert_eq!(
+        issue_accepted(&mut a, key, rank, 1000).err(),
+        Some(Error::Unfresh)
+    );
+    a.apply(rev(1), b.checkpoint(), now, deadline).unwrap();
+    let issued = issue_accepted(&mut a, key, rank, 1000).unwrap();
+    assert_eq!(
+        validate_successor(&b, &issued.proof, key, candidate, 1000),
+        Err(Error::Unfresh)
+    );
+    b.apply(rev(1), a.checkpoint(), now, deadline).unwrap();
+    assert_eq!(
+        validate_successor(&b, &issued.proof, key, candidate, 1000),
+        rank.successor(candidate).ok_or(Error::Invalid)
+    );
+    let lineage = (key, rank.lineage());
+    assert_eq!(b.recover_at(a.issuer(), lineage, 1300, now), Ok(()));
+    assert_eq!(
+        b.recover_at(a.issuer(), lineage, 1301, now),
+        Err(Error::Unfresh)
+    );
+    assert_eq!(
+        b.recover_at(a.issuer(), lineage, 1300, deadline),
+        Err(Error::Unfresh)
+    );
+    assert!(b.eligible_key(a.issuer()).is_some());
+}
+
+#[test]
+fn retirement_cannot_be_forgotten_on_expiry_or_epoch_mismatch() {
+    let (mut a, mut b) = pair();
+    let endpoint = endpoint();
+    let rank = ClaimRank::root(ConnectionId::new());
+    let now = Instant::now();
+    let deadline = now + LEASE;
+    a.apply(rev(1), b.checkpoint(), now, deadline).unwrap();
+    let issued = issue_accepted(&mut a, endpoint, rank, 1000).unwrap();
+    let old = b.checkpoint();
+    b.retire(endpoint, rank);
+    assert_eq!(
+        a.apply(rev(2), b.checkpoint(), deadline, deadline),
+        Err(Error::Unfresh)
+    );
+    let learned = a.apply(rev(2), b.checkpoint(), now, deadline).unwrap();
+    assert_eq!(learned, [(endpoint, rank.lineage())]);
+    assert_eq!(a.apply(rev(3), old, now, deadline), Err(Error::Invalid));
+    assert_eq!(
+        a.recover_at(a.issuer(), (endpoint, rank.lineage()), 1300, deadline),
+        Err(Error::Retired)
+    );
+    assert_eq!(
+        issue_accepted(&mut a, endpoint, rank, 1001).err(),
+        Some(Error::Retired)
+    );
+    let (_, fresh_epoch) = pair();
+    assert_eq!(
+        validate_successor(
+            &fresh_epoch,
+            &issued.proof,
+            endpoint,
+            ConnectionId::new(),
+            1001
+        ),
+        Err(Error::Invalid)
+    );
+}
+
+#[test]
+fn saturation_reserves_existing_fences_and_blocks_if_a_new_terminal_fact_cannot_fit() {
+    let (mut a, mut b) = pair();
+    let now = Instant::now();
+    let deadline = now + LEASE;
+    let endpoint = endpoint();
+    a.apply(rev(1), b.checkpoint(), now, deadline).unwrap();
+    let issued_rank = ClaimRank::root(ConnectionId::new());
+    issue_accepted(&mut a, endpoint, issued_rank, 1000).unwrap();
+    for _ in 1..CAPACITY {
+        a.retire(endpoint, ClaimRank::root(ConnectionId::new()));
+    }
+    let overflow = ClaimRank::root(ConnectionId::new());
+    assert_eq!(
+        issue_accepted(&mut a, endpoint, overflow, 1000).err(),
+        Some(Error::NoAuthority)
+    );
+    a.retire(endpoint, issued_rank);
+    assert!(a.is_retired(endpoint, issued_rank));
+    assert!(!a.checkpoint().blocked);
+    a.retire(endpoint, overflow);
+    assert!(a.checkpoint().blocked);
+    let retired = b.apply(rev(1), a.checkpoint(), now, deadline).unwrap();
+    assert_eq!(retired.len(), CAPACITY);
+    assert_eq!(
+        issue_accepted(&mut b, endpoint, ClaimRank::root(ConnectionId::new()), 1000).err(),
+        Some(Error::NoAuthority)
+    );
+    assert!(b.is_retired(endpoint, issued_rank));
+}

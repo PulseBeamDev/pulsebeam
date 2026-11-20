@@ -39,6 +39,14 @@ impl PeerControl {
             })
     }
 
+    pub fn try_recv(&mut self) -> Option<Box<[u8]>> {
+        if self.is_closed() {
+            return None;
+        }
+        let bytes = self.inbound.try_recv().ok()?;
+        (!self.is_closed()).then_some(bytes)
+    }
+
     pub async fn recv(&mut self) -> Option<Box<[u8]>> {
         if self.is_closed() {
             return None;

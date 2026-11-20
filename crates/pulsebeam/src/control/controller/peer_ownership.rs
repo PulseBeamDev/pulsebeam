@@ -1,3 +1,4 @@
+pub(crate) mod provisioned;
 pub(super) mod transfer;
 
 use std::{collections::BTreeSet, num::NonZeroU64, time::Duration};
@@ -13,6 +14,7 @@ use crate::entity::EndpointKey;
 use ownership::{
     ClaimRank,
     observations::{EndpointFact, Error, Observations, PublicationFact, Session, Snapshot},
+    receipt::{Authority as ReceiptAuthority, epoch::Checkpoint},
 };
 
 const MAX_ORIGINS: usize = 64;
@@ -148,6 +150,10 @@ pub(super) fn new_observations() -> Observations {
 
 impl ControllerActor {
     pub(super) fn process_peer_ownership(&mut self, Command(action): Command) {
+        if matches!(self.receipt_trust, Some(ReceiptAuthority::Provisioned(_))) {
+            // A provisioned peer has only one input: its authenticated Link.
+            return;
+        }
         match *action {
             Action::Open(node, incarnation, network, reply) => {
                 let _ = reply.send(self.open_ownership_peer(node, incarnation, network));
@@ -164,6 +170,7 @@ impl ControllerActor {
                     revision,
                     endpoints,
                     fresh_until,
+                    None,
                 ));
             }
             Action::RejectOversized(session, revision, fresh_until, reply) => {
@@ -228,20 +235,27 @@ impl ControllerActor {
     }
 
     pub(super) fn expire_peer_sources(&mut self, now: Instant) {
-        for endpoint in self
-            .peer_ownership
-            .expire(now)
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-        {
+        for endpoint in self.peer_ownership.expire(now) {
             self.reconcile_peer_sources(endpoint, now);
         }
     }
 
-    pub(super) fn detach_peer_sources(&mut self, network: NetworkId) {
+    pub(super) fn close_link_peer(&mut self, network: NetworkId) {
+        let plans = self
+            .links
+            .as_mut()
+            .map(|links| links.close_peer(network))
+            .unwrap_or_default();
         let now = Instant::now();
-        for endpoint in self.peer_ownership.detach_network(network) {
+        for endpoint in self.peer_ownership.close_network(network) {
             self.reconcile_peer_sources(endpoint, now);
+        }
+        if !plans.is_empty() {
+            let generation = self.lifecycle.next_generation();
+            for (shard, plan) in plans {
+                self.stage_plans_at(shard, generation, vec![plan]);
+            }
+            self.publish_staged();
         }
     }
 
@@ -313,24 +327,42 @@ impl ControllerActor {
         &mut self,
         session: Session,
         revision: NonZeroU64,
-        endpoints: Snapshot,
+        mut endpoints: Snapshot,
         fresh_until: Instant,
+        checkpoint: Option<Checkpoint>,
     ) -> Result<(), Error> {
         let now = Instant::now();
+        let deadline = locally_bounded_deadline(now, fresh_until);
+        let checkpoint = match self.receipt_trust.as_mut() {
+            Some(ReceiptAuthority::Provisioned(trust)) => {
+                let image = checkpoint.ok_or(Error::Invalid)?;
+                let validated = trust
+                    .validate_checkpoint(revision, image, now, deadline)
+                    .map_err(|_| Error::Invalid)?;
+                if validated.blocked() {
+                    endpoints = Box::new([]);
+                }
+                Some((trust, validated))
+            }
+            _ if checkpoint.is_some() => return Err(Error::Invalid),
+            _ => None,
+        };
         let claims: Vec<_> = endpoints
             .iter()
             .map(|(endpoint, fact)| (*endpoint, fact.claim))
             .collect();
         let mut affected: BTreeSet<_> =
             self.peer_ownership.endpoints_for_session(session).collect();
-        let result = self.peer_ownership.snapshot(
-            session,
-            revision,
-            endpoints,
-            now,
-            locally_bounded_deadline(now, fresh_until),
-        );
+        let result = self
+            .peer_ownership
+            .snapshot(session, revision, endpoints, now, deadline);
         if result.is_ok() {
+            if let Some((trust, checkpoint)) = checkpoint {
+                for (endpoint, lineage) in trust.install_checkpoint(checkpoint) {
+                    affected.insert(endpoint);
+                    self.apply_remote_retirement(endpoint, lineage);
+                }
+            }
             for (endpoint, claim) in claims {
                 affected.insert(endpoint);
                 self.apply_remote_defeat(endpoint, claim);
@@ -350,16 +382,15 @@ impl ControllerActor {
         change: (EndpointKey, Option<EndpointFact>),
         fresh_until: Instant,
     ) -> Result<(), Error> {
-        let (endpoint, fact) = change;
-        let claim = fact.as_ref().map(|fact| fact.claim);
+        let endpoint = change.0;
+        let claim = change.1.as_ref().map(|fact| fact.claim);
         let now = Instant::now();
         let before: Vec<_> = self.peer_ownership.endpoints_for_session(session).collect();
         let result = self.peer_ownership.delta(
             session,
             base,
             revision,
-            endpoint,
-            fact,
+            change,
             now,
             locally_bounded_deadline(now, fresh_until),
         );
@@ -379,7 +410,7 @@ impl ControllerActor {
     fn local_endpoint_snapshot(&self) -> Result<Snapshot, Error> {
         let wall_now = SystemTime::now();
         let mut endpoints = Vec::new();
-        let mut publication_count = 0;
+        let mut publication_count = 0usize;
         for meta in self.core.registry.connections() {
             let (Some(endpoint), Some(rank), Some(lease)) =
                 (meta.endpoint(), meta.claim, meta.authorization.as_ref())
@@ -388,6 +419,7 @@ impl ControllerActor {
             };
             if lease.is_expired_at(wall_now)
                 || !lease.allows_current_room()
+                || self.peer_lineage_retired(endpoint, rank)
                 || self
                     .core
                     .registry
@@ -410,7 +442,7 @@ impl ControllerActor {
                         if publication_count == MAX_PUBLICATIONS_PER_ORIGIN {
                             return Err(Error::Capacity);
                         }
-                        publication_count += 1;
+                        publication_count = publication_count.saturating_add(1);
                         publications.push(fact);
                     }
                 }
@@ -436,6 +468,33 @@ impl ControllerActor {
         self.receipt_trust
             .as_deref()
             .is_some_and(|trust| trust.is_retired(endpoint, rank))
+    }
+
+    fn apply_remote_retirement(
+        &mut self,
+        endpoint: EndpointKey,
+        lineage: crate::entity::ConnectionId,
+    ) {
+        for work in &mut self.materializations {
+            if work.pending.endpoint() == Some(endpoint) && work.pending.claim.lineage() == lineage
+            {
+                work.superseded = true;
+            }
+        }
+        if let Some(previous) = self
+            .core
+            .registry
+            .get_endpoint(endpoint)
+            .filter(|meta| meta.claim.is_some_and(|claim| claim.lineage() == lineage))
+            .cloned()
+        {
+            self.terminate_incarnation(
+                endpoint.participant,
+                previous,
+                true,
+                ConnectionEnd::Replaced(None),
+            );
+        }
     }
 
     fn apply_remote_defeat(&mut self, endpoint: EndpointKey, winner: ClaimRank) {

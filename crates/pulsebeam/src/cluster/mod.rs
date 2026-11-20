@@ -3,7 +3,7 @@
 mod config;
 mod identity;
 
-pub use config::{Options, ServerConfig, Topology};
+pub use config::{Options, ProvisionedPeer, ServerConfig, Topology};
 
 use anyhow::{Context, Result};
 use chitchat::transport::Socket;
@@ -55,8 +55,10 @@ impl Service {
             "multi-node gossip requires an explicit simulation transport"
         );
         let data_dir = options.data_dir.clone();
-        let identity = pulsebeam_runtime::task::spawn_blocking(move || {
-            identity::Identity::allocate(&data_dir)
+        let expected = options.ownership_peer.as_ref().map(|peer| peer.local);
+        let identity = pulsebeam_runtime::task::spawn_blocking(move || match expected {
+            Some(expected) => identity::Identity::allocate_provisioned(&data_dir, expected),
+            None => identity::Identity::allocate(&data_dir),
         })
         .await
         .context("membership identity worker failed")??;
@@ -237,6 +239,7 @@ mod tests {
                 advertise: listen,
                 seeds: vec![seed],
                 data_dir: dir.path().to_owned(),
+                ownership_peer: None,
             };
             let socket = ProbeSocket {
                 inner: socket,

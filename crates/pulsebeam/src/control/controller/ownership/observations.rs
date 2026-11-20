@@ -299,8 +299,7 @@ impl Observations {
         session: Session,
         base: NonZeroU64,
         revision: NonZeroU64,
-        endpoint: EndpointKey,
-        fact: Option<EndpointFact>,
+        (endpoint, fact): (EndpointKey, Option<EndpointFact>),
         now: Instant,
         fresh_until: Instant,
     ) -> Result<(), Error> {
@@ -393,8 +392,8 @@ impl Observations {
             .min()
     }
 
-    pub(crate) fn expire(&mut self, now: Instant) -> Vec<EndpointKey> {
-        let mut endpoints = Vec::new();
+    pub(crate) fn expire(&mut self, now: Instant) -> BTreeSet<EndpointKey> {
+        let mut endpoints = BTreeSet::new();
         for origin in self.origins.values_mut() {
             if origin.fresh_until.is_some_and(|deadline| deadline <= now) {
                 endpoints.extend(origin.endpoints.keys().copied());
@@ -404,16 +403,19 @@ impl Observations {
         endpoints
     }
 
-    pub(crate) fn detach_network(&mut self, network: NetworkId) -> Vec<EndpointKey> {
-        let Some(origin) = self
+    pub(crate) fn close_network(&mut self, network: NetworkId) -> Vec<EndpointKey> {
+        let mut endpoints = BTreeSet::new();
+        for origin in self
             .origins
             .values_mut()
-            .find(|origin| origin.network == Some(network))
-        else {
-            return Vec::new();
-        };
-        origin.network = None;
-        origin.endpoints.keys().copied().collect()
+            .filter(|origin| origin.network == Some(network))
+        {
+            endpoints.extend(origin.endpoints.keys().copied());
+            origin.session = None;
+            origin.network = None;
+            origin.withdraw();
+        }
+        endpoints.into_iter().collect()
     }
 
     pub(crate) fn ingress(
@@ -573,8 +575,7 @@ mod tests {
             session,
             revision(1),
             revision(2),
-            alice,
-            Some(fact(rank(1), [])),
+            (alice, Some(fact(rank(1), []))),
             now,
             deadline,
         )
@@ -722,6 +723,57 @@ mod tests {
     }
 
     #[test]
+    fn link_loss_withdraws_claims_and_fences_a_previously_sampled_image() {
+        use pulsebeam_link::{
+            LinkControl, LinkTime, NetworkClass, NetworkPeer, PeerRole, SecretCredential,
+        };
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let mut link = LinkControl::new(|| LinkTime(0)).unwrap();
+        let peer = NetworkPeer {
+            endpoint: "127.0.0.1:4000".parse().unwrap(),
+            credential: SecretCredential::generate().unwrap(),
+            expected_peer: SecretCredential::generate().unwrap().fingerprint(),
+            role: PeerRole::Initiator,
+            class: NetworkClass::Lan,
+        };
+        let codec = || crate::link::ShardCodec { origin: now };
+        let network = link.open_network(peer.clone(), codec()).unwrap();
+        let mut view = Observations::new(2, 1, 2);
+        let remote = NodeId::new();
+        let alice = endpoint("alice");
+        let session = view.open(remote, revision(1), Some(network)).unwrap();
+        let install = |view: &mut Observations, session, sequence| {
+            view.snapshot(
+                session,
+                revision(sequence),
+                claims(&[(alice, rank(1))]),
+                now,
+                deadline,
+            )
+        };
+        install(&mut view, session, 2).unwrap();
+        assert_eq!(view.highest(alice, now, |_| true), Some(rank(1)));
+        assert_eq!(
+            view.ingress(alice, now, |_| true).map(|(id, _)| id),
+            Some(network)
+        );
+        link.close_network(network);
+        assert_eq!(view.close_network(network), vec![alice]);
+        assert_eq!(view.highest(alice, now, |_| true), None);
+        assert!(view.ingress(alice, now, |_| true).is_none());
+        assert_eq!(install(&mut view, session, 3), Err(Error::Stale));
+        let next_network = link.open_network(peer, codec()).unwrap();
+        let next_session = view.open(remote, revision(1), Some(next_network)).unwrap();
+        assert_eq!(install(&mut view, next_session, 2), Err(Error::Stale));
+        install(&mut view, next_session, 3).unwrap();
+        assert_eq!(
+            view.ingress(alice, now, |_| true).map(|(id, _)| id),
+            Some(next_network)
+        );
+    }
+
+    #[test]
     fn gaps_and_reconnect_require_a_current_complete_snapshot_without_evicting_watermarks() {
         let now = Instant::now();
         let deadline = now + Duration::from_secs(1);
@@ -743,8 +795,7 @@ mod tests {
                 session,
                 revision(2),
                 revision(3),
-                bob,
-                Some(fact(rank(2), [])),
+                (bob, Some(fact(rank(2), []))),
                 now,
                 deadline
             ),
@@ -776,7 +827,14 @@ mod tests {
             Err(Error::Capacity)
         );
         assert_eq!(
-            view.delta(resumed, revision(3), revision(4), bob, None, now, deadline),
+            view.delta(
+                resumed,
+                revision(3),
+                revision(4),
+                (bob, None),
+                now,
+                deadline
+            ),
             Err(Error::NeedsSnapshot)
         );
         assert_eq!(
@@ -797,8 +855,15 @@ mod tests {
             deadline,
         )
         .unwrap();
-        view.delta(resumed, revision(4), revision(5), bob, None, now, deadline)
-            .unwrap();
+        view.delta(
+            resumed,
+            revision(4),
+            revision(5),
+            (bob, None),
+            now,
+            deadline,
+        )
+        .unwrap();
         assert_eq!(view.highest(bob, now, |_| true), None);
         assert_eq!(
             view.snapshot(

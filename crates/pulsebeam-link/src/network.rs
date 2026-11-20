@@ -44,11 +44,18 @@ impl SecretCredential {
             .map_err(|_| LinkError::Security)
     }
 
+    pub fn from_der(certificate: Vec<u8>, private_key: Vec<u8>) -> Result<Self, LinkError> {
+        pulsebeam_transport::Credential::from_der(certificate, private_key)
+            .map(Self)
+            .map_err(|_| LinkError::Security)
+    }
+
     pub fn fingerprint(&self) -> PeerFingerprint {
         self.0.fingerprint()
     }
 }
 
+#[derive(Clone)]
 pub struct NetworkPeer {
     pub endpoint: SocketAddr,
     pub credential: SecretCredential,

@@ -111,7 +111,7 @@ rust_test(
         "@crates//:anyhow", "@crates//:chitchat", "@crates//:serde",
         "@crates//:serde_json", "@crates//:tempfile",
         "@crates//:toml", "@crates//:tracing",
-        "//crates/pulsebeam-membership", "//crates/pulsebeam-runtime",
+        "//crates/pulsebeam-core", "//crates/pulsebeam-link", "//crates/pulsebeam-membership", "//crates/pulsebeam-runtime",
     ],
     proc_macro_deps = ["@crates//:async-trait"],
 )

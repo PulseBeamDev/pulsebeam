@@ -653,8 +653,9 @@ pub struct ControllerActor {
     deletion_bytes: usize,
     ownership: ownership::Authority,
     peer_ownership: ownership::observations::Observations,
+    provisioned_peer: Option<peer_ownership::provisioned::Peer>,
     ownership_entropy: pulsebeam_runtime::rand::Rng,
-    receipt_trust: Option<Box<dyn ownership::receipt::LineageTrust>>,
+    receipt_trust: Option<ownership::receipt::Authority>,
     delivery_budget: creation::DeliveryBudget,
     steering: Option<Box<dyn Steering>>,
     materializations: VecDeque<MaterializationWork>,
@@ -730,6 +731,7 @@ impl ControllerActor {
             deletion_bytes: 0,
             ownership: ownership::Authority::default(),
             peer_ownership: peer_ownership::new_observations(),
+            provisioned_peer: None,
             ownership_entropy,
             receipt_trust: None,
             delivery_budget: creation::DeliveryBudget::new(),
@@ -747,14 +749,14 @@ impl ControllerActor {
 
     #[cfg(feature = "sim")]
     pub(crate) fn set_sim_ownership_peer(&mut self, peer: ownership::sim::SimOwnershipPeer) {
-        self.receipt_trust = Some(peer.trust());
+        self.receipt_trust = Some(ownership::receipt::Authority::Local(peer.trust()));
     }
 
     pub(crate) fn set_ownership_mode(&mut self, mode: OwnershipMode) {
         self.receipt_trust = match mode {
             OwnershipMode::Unavailable => None,
-            OwnershipMode::Standalone => Some(Box::new(ownership::receipt::StandaloneTrust::new(
-                &mut self.ownership_entropy,
+            OwnershipMode::Standalone => Some(ownership::receipt::Authority::Local(Box::new(
+                ownership::receipt::StandaloneTrust::new(&mut self.ownership_entropy),
             ))),
         };
     }
@@ -839,6 +841,11 @@ impl ControllerActor {
                 .into_iter()
                 .chain(self.native_deadlines.first().map(|(deadline, _)| *deadline))
                 .chain(self.peer_ownership.deadline())
+                .chain(
+                    self.provisioned_peer
+                        .as_ref()
+                        .map(peer_ownership::provisioned::Peer::deadline),
+                )
                 .min();
             let maintenance_due = if self.has_ready_egress() {
                 false
@@ -888,6 +895,7 @@ impl ControllerActor {
         }
         self.expire_authorizations(started, SystemTime::now());
         self.expire_peer_sources(started);
+        self.drive_provisioned_peer(started);
         self.advance_materializations();
         if let Some(links) = &mut self.links {
             links.reap();
@@ -1053,19 +1061,7 @@ impl ControllerActor {
                 None
             }
             ControllerCommand::CloseLink(peer) => {
-                self.detach_peer_sources(peer);
-                let plans = self
-                    .links
-                    .as_mut()
-                    .map(|links| links.close_peer(peer))
-                    .unwrap_or_default();
-                if !plans.is_empty() {
-                    let generation = self.lifecycle.next_generation();
-                    for (shard, plan) in plans {
-                        self.stage_plans_at(shard, generation, vec![plan]);
-                    }
-                    self.publish_staged();
-                }
+                self.close_link_peer(peer);
                 None
             }
             ControllerCommand::Admission(command) => {
@@ -1245,7 +1241,11 @@ impl ControllerActor {
         room: Option<RoomId>,
         wall_now: SystemTime,
     ) -> Result<ownership::Proof, ControllerError> {
-        if self.receipt_trust.is_none() {
+        if !self
+            .receipt_trust
+            .as_ref()
+            .is_some_and(ownership::receipt::Authority::ready)
+        {
             return Err(ControllerError::ServiceUnavailable);
         }
         let unix_now = wall_now
@@ -1316,7 +1316,11 @@ impl ControllerActor {
         attempt: OwnershipAttempt,
         wall_now: SystemTime,
     ) -> Result<OwnedPreparation, OwnedAdmissionError> {
-        if self.receipt_trust.is_none() {
+        if !self
+            .receipt_trust
+            .as_ref()
+            .is_some_and(ownership::receipt::Authority::ready)
+        {
             return Err(ControllerError::ServiceUnavailable.into());
         }
         let state = &message.state;
@@ -1530,6 +1534,7 @@ impl ControllerActor {
             |error| {
                 match error {
                     Error::Invalid | Error::Scope => ownership::Error::InvalidProof,
+                    Error::Unfresh => return ControllerError::ServiceUnavailable.into(),
                     Error::Expired | Error::NoAuthority => {
                         return ControllerError::RecoveryUnavailable.into();
                     }
@@ -1546,6 +1551,14 @@ impl ControllerActor {
         owned: Option<&OwnedMaterialization>,
         wall_now: SystemTime,
     ) -> Result<(), ControllerError> {
+        if owned.is_some()
+            && !self
+                .receipt_trust
+                .as_ref()
+                .is_some_and(ownership::receipt::Authority::ready)
+        {
+            return Err(ControllerError::ServiceUnavailable);
+        }
         let Some(proof) = owned.and_then(|owned| owned.successor_receipt.as_deref()) else {
             return Ok(());
         };
@@ -3536,11 +3549,13 @@ impl ControllerActor {
     }
 
     fn candidate_is_newer(&self, endpoint: EndpointKey, claim: ownership::ClaimRank) -> bool {
-        self.peer_ownership
-            .highest(endpoint, pulsebeam_runtime::time::Instant::now(), |rank| {
-                !self.peer_lineage_retired(endpoint, rank)
-            })
-            .is_none_or(|remote| claim > remote)
+        !self.peer_lineage_retired(endpoint, claim)
+            && self
+                .peer_ownership
+                .highest(endpoint, pulsebeam_runtime::time::Instant::now(), |rank| {
+                    !self.peer_lineage_retired(endpoint, rank)
+                })
+                .is_none_or(|remote| claim > remote)
             && self
                 .core
                 .registry
@@ -3929,6 +3944,7 @@ mod replacement_tests {
                 deletion_bytes: 0,
                 ownership: ownership::Authority::default(),
                 peer_ownership: peer_ownership::new_observations(),
+                provisioned_peer: None,
                 ownership_entropy: pulsebeam_runtime::rand::seeded_rng(19),
                 receipt_trust: None,
                 delivery_budget: creation::DeliveryBudget::new(),
@@ -7183,7 +7199,7 @@ mod replacement_tests {
         let mut issuer = actor();
         let mut receiver = actor();
         receiver.ownership_entropy = pulsebeam_runtime::rand::seeded_rng(43);
-        receiver.receipt_trust = Some(receiving_trust);
+        receiver.receipt_trust = Some(ownership::receipt::Authority::Local(receiving_trust));
         receiver.negotiator = Negotiator::new(vec![pulsebeam_rtc::LocalCandidate::Udp(
             "127.0.0.1:6000".parse().unwrap(),
         )]);

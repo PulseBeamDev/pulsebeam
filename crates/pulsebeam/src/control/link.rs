@@ -147,7 +147,28 @@ impl Links {
         &mut self,
         peer: impl Into<pulsebeam_link::PeerConfig>,
     ) -> Result<pulsebeam_link::NetworkId, pulsebeam_link::LinkError> {
-        let peer = peer.into();
+        self.open_association(peer.into(), |control, peer, codec| {
+            control.open_network(peer, codec).map(|id| (id, ()))
+        })
+        .map(|(id, ())| id)
+    }
+
+    pub(super) fn open_control_peer(
+        &mut self,
+        peer: pulsebeam_link::NetworkPeer,
+    ) -> Result<(NetworkId, pulsebeam_link::PeerControl), pulsebeam_link::LinkError> {
+        self.open_association(peer.into(), LinkControl::open_network_with_control)
+    }
+
+    fn open_association<T>(
+        &mut self,
+        peer: pulsebeam_link::PeerConfig,
+        open: impl FnOnce(
+            &mut LinkControl<ShardFrame>,
+            pulsebeam_link::PeerConfig,
+            crate::link::ShardCodec,
+        ) -> Result<(NetworkId, T), pulsebeam_link::LinkError>,
+    ) -> Result<(NetworkId, T), pulsebeam_link::LinkError> {
         let host = self
             .host
             .as_ref()
@@ -163,7 +184,8 @@ impl Links {
             return Err(pulsebeam_link::LinkError::Capacity);
         }
         let endpoint = peer.endpoint();
-        let id = self.control.open_network(
+        let (id, lane) = open(
+            &mut self.control,
             peer,
             crate::link::ShardCodec {
                 origin: self.clock_origin,
@@ -188,7 +210,11 @@ impl Links {
             return Err(pulsebeam_link::LinkError::Capacity);
         }
         self.peers.insert(id, endpoint);
-        Ok(id)
+        Ok((id, lane))
+    }
+
+    pub(super) fn clock_origin(&self) -> Instant {
+        self.clock_origin
     }
 
     pub(super) fn close_peer(

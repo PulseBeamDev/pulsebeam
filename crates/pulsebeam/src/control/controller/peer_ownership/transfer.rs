@@ -181,6 +181,12 @@ impl Reader {
         true
     }
 
+    pub(super) fn pending(&self, now: Instant) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| now < active.deadline)
+    }
+
     pub(super) fn pull(&self, now: Instant) -> Option<Box<[u8]>> {
         let active = self
             .active

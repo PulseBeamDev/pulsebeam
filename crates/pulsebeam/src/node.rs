@@ -25,6 +25,7 @@ use pulsebeam_runtime::task::JoinSet;
 use tower_http::compression::CompressionLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 
+use crate::cluster::ProvisionedPeer;
 use crate::control::api;
 use crate::control::controller::ControllerActor;
 #[cfg(feature = "sim")]
@@ -87,6 +88,7 @@ pub struct NodeBuilder {
 
     // Services
     cluster: Option<crate::cluster::Options>,
+    provisioned_peer: Option<ProvisionedPeer>,
     link_listen: Option<SocketAddr>,
     link_control: Option<pulsebeam_runtime::sync::oneshot::Sender<crate::link::Control>>,
     http_api: Option<ListenerSource>,
@@ -135,6 +137,7 @@ impl NodeBuilder {
             rng: None,
             udp_mode: UdpMode::Batch,
             cluster: None,
+            provisioned_peer: None,
             link_listen: None,
             link_control: None,
             http_api: None,
@@ -421,6 +424,15 @@ impl NodeBuilder {
             Topology::SingleNode => OwnershipMode::Standalone,
             Topology::MultiNode => OwnershipMode::Unavailable,
         };
+        if let Some(peer) = &options.ownership_peer {
+            anyhow::ensure!(
+                self.link_listen
+                    .is_none_or(|address| address == peer.listen),
+                "ownership peer must use the node's Link listener"
+            );
+            self.link_listen = Some(peer.listen);
+        }
+        self.provisioned_peer = options.ownership_peer.clone();
         let membership = crate::cluster::Service::start(options).await?;
         let relay_node = crate::log::RelayNode {
             node: membership.incarnation().node_id,
@@ -784,6 +796,9 @@ impl NodeBuilder {
             control_tasks.spawn_local(task);
             #[cfg(not(feature = "sim"))]
             control_tasks.spawn(task);
+        }
+        if let Some(peer) = self.provisioned_peer {
+            controller.set_provisioned_peer(peer)?;
         }
         controller.set_execution(shard_executor.migration_handle());
         controller.set_steering(steering);

@@ -1,9 +1,38 @@
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use pulsebeam_core::auth::{ApiPublicKey, ApiSigningKey};
+use pulsebeam_link::{NetworkClass, NetworkPeer, PeerFingerprint, PeerRole, SecretCredential};
+use pulsebeam_membership::NodeId;
 use serde::Deserialize;
+
+/// Identities pinned for a single two-node ownership Link. Never reuse a DTLS
+/// private key across committed incarnations or between nodes.
+#[derive(Clone)]
+pub struct ProvisionedPeer {
+    pub listen: SocketAddr,
+    pub local: (NodeId, NonZeroU64),
+    pub remote: (NodeId, NonZeroU64),
+    pub transport: NetworkPeer,
+    pub authority_epoch: [u8; 16],
+    pub receipt_key: ApiSigningKey,
+    pub peer_receipt_key: ApiPublicKey,
+}
+
+impl std::fmt::Debug for ProvisionedPeer {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("ProvisionedPeer")
+            .field("listen", &self.listen)
+            .field("local", &self.local)
+            .field("remote", &self.remote)
+            .field("endpoint", &self.transport.endpoint)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +102,20 @@ impl ServerConfig {
             );
             seeds.insert(resolved);
         }
+        let ownership_peer = match cluster.ownership_peer {
+            Some(peer) => {
+                ensure!(
+                    cluster.topology == Topology::MultiNode,
+                    "[cluster.ownership_peer] requires multi_node topology"
+                );
+                Some(
+                    pulsebeam_runtime::task::spawn_blocking(move || peer.resolve())
+                        .await
+                        .context("ownership peer credential worker failed")??,
+                )
+            }
+            None => None,
+        };
         let options = Options {
             cluster_id: cluster.id,
             topology: cluster.topology,
@@ -80,6 +123,7 @@ impl ServerConfig {
             advertise,
             seeds: seeds.into_iter().collect(),
             data_dir,
+            ownership_peer,
         };
         options.validate_topology()?;
         Ok(Some(options))
@@ -97,6 +141,101 @@ pub struct ClusterConfig {
     seeds: Vec<String>,
     #[serde(default)]
     gossip: GossipConfig,
+    ownership_peer: Option<PeerConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PeerConfig {
+    listen: SocketAddr,
+    local_node: NodeId,
+    local_generation: NonZeroU64,
+    certificate_der: PathBuf,
+    key_pkcs8_der: PathBuf,
+    peer_node: NodeId,
+    peer_generation: NonZeroU64,
+    peer_endpoint: SocketAddr,
+    peer_sha256: String,
+    authority_epoch: String,
+    receipt_key_file: PathBuf,
+    peer_receipt_key: ApiPublicKey,
+}
+
+impl PeerConfig {
+    fn resolve(self) -> Result<ProvisionedPeer> {
+        let expected_peer = parse_hex(&self.peer_sha256)
+            .map(PeerFingerprint::from_bytes)
+            .context("cluster.ownership_peer.peer_sha256 must be 64 hexadecimal digits")?;
+        let authority_epoch = parse_hex(&self.authority_epoch)
+            .context("cluster.ownership_peer.authority_epoch must be 32 hexadecimal digits")?;
+        let signing_key =
+            read_identity_file(&self.receipt_key_file).context("reading receipt signing key")?;
+        let receipt_key = std::str::from_utf8(&signing_key)
+            .ok()
+            .and_then(|key| key.trim().parse().ok())
+            .context("receipt signing key must be base64url PKCS#8")?;
+        let certificate =
+            read_identity_file(&self.certificate_der).context("reading Link certificate")?;
+        let key = read_identity_file(&self.key_pkcs8_der).context("reading Link private key")?;
+        let credential = SecretCredential::from_der(certificate, key)
+            .map_err(|_| anyhow::anyhow!("invalid Link certificate or PKCS#8 key"))?;
+        let peer = ProvisionedPeer {
+            listen: self.listen,
+            local: (self.local_node, self.local_generation),
+            remote: (self.peer_node, self.peer_generation),
+            authority_epoch,
+            receipt_key,
+            peer_receipt_key: self.peer_receipt_key,
+            transport: NetworkPeer {
+                endpoint: self.peer_endpoint,
+                credential,
+                expected_peer,
+                role: if self.local_node < self.peer_node {
+                    PeerRole::Initiator
+                } else {
+                    PeerRole::Responder
+                },
+                class: NetworkClass::Wan,
+            },
+        };
+        Ok(peer)
+    }
+}
+
+fn parse_hex<const N: usize>(input: &str) -> Option<[u8; N]> {
+    let mut bytes = [0; N];
+    if input.len() != bytes.len().saturating_mul(2) {
+        return None;
+    }
+    for (byte, hex) in bytes.iter_mut().zip(input.as_bytes().chunks_exact(2)) {
+        let hex = std::str::from_utf8(hex).ok()?;
+        if !hex.bytes().all(|part| part.is_ascii_hexdigit()) {
+            return None;
+        }
+        *byte = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(bytes)
+}
+
+fn read_identity_file(path: &Path) -> Result<Vec<u8>> {
+    const MAX_DER_BYTES: u64 = 16 * 1024;
+    ensure!(
+        path.is_absolute(),
+        "Link identity files require absolute paths"
+    );
+    ensure!(
+        std::fs::metadata(path)?.is_file(),
+        "Link identity must be a regular file"
+    );
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_DER_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        u64::try_from(bytes.len())? <= MAX_DER_BYTES,
+        "Link identity exceeds the DER size limit"
+    );
+    Ok(bytes)
 }
 
 #[derive(Deserialize)]
@@ -134,6 +273,7 @@ pub struct Options {
     pub advertise: SocketAddr,
     pub seeds: Vec<SocketAddr>,
     pub data_dir: PathBuf,
+    pub ownership_peer: Option<ProvisionedPeer>,
 }
 
 impl Options {
@@ -146,6 +286,44 @@ impl Options {
             ensure!(
                 self.listen.ip().is_loopback() && self.listen == self.advertise,
                 "cluster.topology = 'single_node' requires identical loopback listen and advertise endpoints"
+            );
+        }
+        if let Some(peer) = &self.ownership_peer {
+            ensure!(
+                self.topology == Topology::MultiNode,
+                "[cluster.ownership_peer] requires multi_node topology"
+            );
+            ensure!(
+                peer.local.0 != peer.remote.0,
+                "peer node must be different from the local node"
+            );
+            ensure!(
+                peer.listen.port() != 0
+                    && !peer.listen.ip().is_multicast()
+                    && !matches!(peer.listen.ip(), IpAddr::V4(ip) if ip.is_broadcast()),
+                "ownership Link must listen on a fixed unicast or wildcard address"
+            );
+            let remote = unique_endpoint(std::iter::once(peer.transport.endpoint))
+                .context("invalid ownership peer endpoint")?;
+            ensure!(
+                remote.is_ipv4() == peer.listen.is_ipv4(),
+                "ownership Link endpoints must use the same address family"
+            );
+            ensure!(
+                remote != peer.listen,
+                "ownership peer endpoint must differ from the local listener"
+            );
+            ensure!(
+                peer.transport.expected_peer != peer.transport.credential.fingerprint(),
+                "peer and local DTLS pins must differ"
+            );
+            ensure!(
+                peer.authority_epoch != [0; 16],
+                "ownership authority epoch must be nonzero"
+            );
+            ensure!(
+                peer.receipt_key.public_key() != peer.peer_receipt_key,
+                "peer and local receipt keys must differ"
             );
         }
         Ok(())
@@ -178,10 +356,10 @@ fn unique_endpoint(endpoints: impl Iterator<Item = SocketAddr>) -> Result<Socket
         "endpoint must be a peer-reachable unicast address with a nonzero port"
     );
     match addr.ip() {
-        IpAddr::V4(ip) => ensure!(!ip.is_broadcast(), "broadcast is not a gossip endpoint"),
+        IpAddr::V4(ip) => ensure!(!ip.is_broadcast(), "broadcast endpoints are unsupported"),
         IpAddr::V6(ip) => ensure!(
             !ip.is_unicast_link_local(),
-            "link-local gossip endpoints without a scope are unsupported"
+            "link-local endpoints without a scope are unsupported"
         ),
     }
     Ok(addr)
@@ -232,6 +410,34 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
+    async fn ownership_peer_requires_an_exact_pin_and_multi_node_topology() {
+        let local = NodeId::new();
+        let remote = NodeId::new();
+        let receipt_public = ApiSigningKey::from_seed([27; 32]).public_key();
+        let config = |topology: &str, fingerprint: &str| {
+            toml::from_str::<ServerConfig>(&format!(
+                "[cluster]\nid='test'\ntopology='{topology}'\nadvertise_host='127.0.0.1'\n\
+                 [cluster.gossip]\nlisten='127.0.0.1:7946'\n\
+                 [cluster.ownership_peer]\nlisten='127.0.0.1:9000'\n\
+                 local_node='{local}'\nlocal_generation=2\npeer_node='{remote}'\npeer_generation=2\n\
+                 peer_endpoint='127.0.0.1:9001'\npeer_sha256='{fingerprint}'\n\
+                 certificate_der='unused'\nkey_pkcs8_der='unused'\n\
+                 authority_epoch='0123456789abcdef0123456789abcdef'\n\
+                 receipt_key_file='unused'\npeer_receipt_key='{receipt_public}'"
+            ))
+            .unwrap()
+            .resolve(Some("state".into()))
+        };
+        let valid = "aB".repeat(32);
+        assert_eq!(parse_hex::<32>(&valid).unwrap(), [0xab; 32]);
+        assert!(parse_hex::<32>(&"+a".repeat(32)).is_none());
+        let err = config("multi_node", "invalid").await.unwrap_err();
+        assert!(format!("{err:#}").contains("peer_sha256"));
+        let err = config("single_node", &valid).await.unwrap_err();
+        assert!(format!("{err:#}").contains("requires multi_node"));
     }
 
     #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]

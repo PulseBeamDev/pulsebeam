@@ -55,6 +55,16 @@ impl Credential {
             .map_err(|_| Error::Security)
     }
 
+    #[allow(
+        clippy::disallowed_types,
+        reason = "cold-path immutable certificate provisioning"
+    )]
+    pub fn from_der(certificate: Vec<u8>, private_key: Vec<u8>) -> Result<Self, Error> {
+        pulsebeam_dtls::LocalIdentity::from_der(certificate, private_key)
+            .map(|identity| Self(std::sync::Arc::new(identity)))
+            .map_err(|_| Error::Security)
+    }
+
     pub fn fingerprint(&self) -> PeerFingerprint {
         PeerFingerprint(self.0.fingerprint().to_bytes())
     }

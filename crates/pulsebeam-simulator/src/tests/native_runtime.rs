@@ -683,6 +683,7 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
                 DEFAULT_SIM_SHARDS,
             )
             .with_cluster(pulsebeam::cluster::Options {
+                ownership_peer: None,
                 cluster_id: "native-reconnect".into(),
                 topology: pulsebeam::cluster::Topology::SingleNode,
                 listen: gossip,
