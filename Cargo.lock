@@ -3905,6 +3905,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulsebeam-clock"
+version = "0.3.2"
+
+[[package]]
 name = "pulsebeam-core"
 version = "0.3.2"
 dependencies = [

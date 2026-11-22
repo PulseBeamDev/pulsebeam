@@ -7,6 +7,7 @@ members = [
   "crates/pulsebeam-core",
   "crates/pulsebeam-membership",
   "crates/pulsebeam-feedback",
+  "crates/pulsebeam-clock",
   "crates/pulsebeam-dtls",
   "crates/pulsebeam-proto",
   "crates/pulsebeam-steer",

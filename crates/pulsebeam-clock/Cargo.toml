@@ -1,0 +1,13 @@
+[package]
+name = "pulsebeam-clock"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Caller-clocked media timeline estimation and time arithmetic"
+
+[lints]
+workspace = true
