@@ -88,6 +88,7 @@ fn spec(enabled: bool, stream: u32) -> wire::ResourceSpec {
             wire::PublicationSpec {
                 track_id: "updates".into(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
+                    capture_clock: None,
                     delivery: wire::DataDelivery::Ordered as i32,
                     binding: Some(binding(stream)),
                 })),
@@ -130,6 +131,7 @@ fn live(revision: u64, spec: wire::ResourceSpec) -> wire::ConfirmedState {
                     room_id: "room".into(),
                     track_id: "updates".into(),
                     kind: Some(wire::track::Kind::Data(wire::DataTrack {
+                        capture_clock: None,
                         delivery: wire::DataDelivery::Ordered as i32,
                     })),
                 }),

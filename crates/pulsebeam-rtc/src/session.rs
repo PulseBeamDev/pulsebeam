@@ -160,6 +160,7 @@ pub struct InboundMediaInfo {
     /// Offered primary SSRCs, excluding FID repair members. These are signaling
     /// facts, not authenticated encoding discovery or an SSRC-to-RID binding.
     pub primary_ssrcs: Arc<[u32]>,
+    pub receives_dependency_descriptor: bool,
     pub codecs: Arc<[CodecInfo]>,
 }
 

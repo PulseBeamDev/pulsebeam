@@ -50,6 +50,7 @@ fn records(
                 room_id: "room".into(),
                 track_id: format!("track-{index:030}"),
                 kind: Some(wire::track::Kind::Data(wire::DataTrack {
+                    capture_clock: None,
                     delivery: wire::DataDelivery::Latest as i32,
                 })),
             })
@@ -338,6 +339,7 @@ fn raw_catalog_commands_share_resource_budgets_and_reconnect_reissues_pinned_sco
                         wire::PublicationSpec {
                             track_id: label,
                             kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
+                                capture_clock: None,
                                 delivery: wire::DataDelivery::Latest as i32,
                                 binding: Some(wire::TrackBinding {
                                     transport: Some(wire::track_binding::Transport::Sctp(

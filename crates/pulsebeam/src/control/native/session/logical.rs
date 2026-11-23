@@ -153,12 +153,24 @@ impl NativeSession {
         resolved: Option<(wire::Track, Option<std::num::NonZeroU64>)>,
         branches: &DataBranchIds,
     ) -> Result<(), OutputError> {
+        let capture_clock = resolved.as_ref().and_then(|(track, source)| {
+            source.and_then(|_| match &track.kind {
+                Some(wire::track::Kind::Data(data)) => data.capture_clock.as_ref(),
+                _ => None,
+            })
+        });
         let changed = state.source.as_ref().map(|track| &track.publication_id)
             != resolved.as_ref().map(|(track, _)| &track.publication_id)
             || state.data_v1.as_ref().map(|offer| offer.source)
                 != resolved
                     .as_ref()
-                    .and_then(|(_, source)| source.map(std::num::NonZeroU64::get));
+                    .and_then(|(_, source)| source.map(std::num::NonZeroU64::get))
+            || state
+                .data_v1
+                .as_ref()
+                .and_then(|offer| offer.capture_clock.as_ref())
+                != capture_clock;
+        let capture_clock = capture_clock.cloned();
         if changed && self.request_logical_retirement(reference) {
             return set_logical_source(state, None, None);
         }
@@ -170,7 +182,7 @@ impl NativeSession {
                 Some(wire::DataV1ReceiverOffer {
                     source: source.get(),
                     branch: branches.allocate()?,
-                    capture_clock: None,
+                    capture_clock,
                 })
             } else {
                 None

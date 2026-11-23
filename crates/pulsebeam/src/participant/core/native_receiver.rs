@@ -871,6 +871,10 @@ impl Connection {
             source: receiver.source,
             endpoint: fabric.endpoint,
             prepared: data_fabric::PreparedSctp::from_negotiation(fabric.parameters, installation)?,
+            capture_clock: match &source.track {
+                Track::Data(track) => track.capture_clock.clone(),
+                _ => return None,
+            },
         })
     }
 

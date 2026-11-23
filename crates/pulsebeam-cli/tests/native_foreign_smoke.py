@@ -323,9 +323,26 @@ async def publish_live(endpoint, token, room, package):
     microphone = await agent.create_audio_input()
     audio = agent.audio("microphone").publish()
     _audio_pipe = microphone.pipe_to(audio)
-    data = agent.data("frame-events").publish()
+    capture_clock = core.CaptureClock(id="frame-events", epoch=1)
+    data = agent.data("frame-events").publish(core.DataPublishOptions(capture_clock=capture_clock))
     agent.join(room)
-    await asyncio.gather(admitted_publication(core, publication), admitted_publication(core, audio))
+
+    async def installed_data():
+        updates = data.updates()
+        try:
+            while True:
+                state = await updates.next()
+                assert state is not None and not state.closed, "DATA publication closed before installation"
+                assert state.admission != core.PublicationAdmissionStatus.REJECTED, state.error
+                assert state.execution != core.PublicationExecution.FAILED, state.execution_error
+                if state.execution == core.PublicationExecution.INSTALLED:
+                    return
+        finally:
+            updates.close()
+
+    await asyncio.gather(
+        admitted_publication(core, publication), admitted_publication(core, audio), installed_data(),
+    )
 
     async def tone():
         sample_rate = 48_000
@@ -347,11 +364,10 @@ async def publish_live(endpoint, token, room, package):
                 + bytes([180]) * (80 * 48), rotation_degrees=0,
             )))
             options = core.DataSendOptions(captured_at=core.CaptureTimestamp(
-                clock=core.CaptureClock.PUBLICATION,
-                nanoseconds=-9_007_199_254_740_993 + sequence,
-                uncertainty_nanoseconds=0,
+                clock=capture_clock,
+                nanos=-9_007_199_254_740_993 + sequence,
+                uncertainty_ns=0,
             ))
-            assert options.recipients is None
             await data.send(bytes([0, 255, 128]) + sequence.to_bytes(8, "little"), options)
             sequence += 1
             # Live source cadence, not a retry of an accepted frame or payload.

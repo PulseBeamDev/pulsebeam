@@ -49,6 +49,7 @@ fn logical_receiver_reports_follow_the_owned_offer_not_the_publication() {
                             participant_id: selector.participant_id.clone(),
                             track_id: selector.track_id.clone(),
                             kind: Some(wire::track::Kind::Data(wire::DataTrack {
+                                capture_clock: None,
                                 delivery: wire::DataDelivery::Ordered as i32,
                             })),
                         }),

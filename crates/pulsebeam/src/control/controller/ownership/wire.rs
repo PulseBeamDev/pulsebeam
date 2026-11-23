@@ -941,6 +941,7 @@ mod tests {
             .first_mut()
             .unwrap();
         fact.descriptor.kind = Some(track::Kind::Data(DataTrack {
+            capture_clock: None,
             delivery: DataDelivery::Ordered as i32,
         }));
         fact.layers = Box::new([]);

@@ -89,9 +89,8 @@ def main():
         ),
         core: (
             "`capturedAt`: CaptureTimestamp? = null",
-            "`recipients`: List<kotlin.String>? = null",
-            "`nanoseconds`: kotlin.Long",
-            "`uncertaintyNanoseconds`: kotlin.UInt? = null",
+            "`nanos`: kotlin.Long",
+            "`uncertaintyNs`: kotlin.UInt? = null",
         ),
         output / "PulseBeamAgent.swift": (
             "publish(options: DataPublishOptions? = nil)",
@@ -99,8 +98,8 @@ def main():
             "send(data: Data, options: DataSendOptions? = nil)",
         ),
         output / "pulsebeam_agent_core.swift": (
-            "init(capturedAt: CaptureTimestamp? = nil, recipients: [String]? = nil)",
-            "init(clock: CaptureClock, nanoseconds: Int64, uncertaintyNanoseconds: UInt32? = nil)",
+            "init(capturedAt: CaptureTimestamp? = nil)",
+            "init(clock: CaptureClock, nanos: Int64, uncertaintyNs: UInt32? = nil)",
         ),
     }
     for source, expected in signatures.items():

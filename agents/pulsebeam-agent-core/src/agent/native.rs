@@ -151,11 +151,21 @@ impl PayloadChannel {
         let (binding, channel) =
             self.prepared_publisher(generation, channel_id, live, prepared, control.is_some())?;
         if self.data_v1_sender.is_none() {
+            let state::track::Kind::Data(track) = live.track.as_ref()?.kind.as_ref()? else {
+                return None;
+            };
+            let clock = track
+                .capture_clock
+                .as_ref()
+                .map(|clock| crate::ffi::CaptureClock {
+                    id: clock.id.clone(),
+                    epoch: clock.epoch,
+                });
             let sender = if binding.format.delivery() == Delivery::Reliable {
                 let (owned, signaling) = control?;
-                crate::data_v1::SendChannel::new_reliable(channel, None, 0, owned, signaling)
+                crate::data_v1::SendChannel::new_reliable(channel, clock, 0, owned, signaling)
             } else {
-                crate::data_v1::SendChannel::new(channel, None, 0)
+                crate::data_v1::SendChannel::new(channel, clock, 0)
             }
             .ok()?;
             self.data_v1_sender = Some(Box::new(sender));
@@ -832,6 +842,7 @@ pub(super) fn reconcile(
     session: &mut Session,
     logs: &mut crate::logging::LogBuffer,
     desired: &DesiredState,
+    resources: &crate::track::TrackResources,
     ids: &mut IdGenerator,
     effects: &mut VecDeque<Effect>,
 ) -> Result<(), SignalingError> {
@@ -1201,6 +1212,7 @@ pub(super) fn reconcile(
                     state::publication_spec::Kind::Data(state::DataPublication {
                         delivery: publisher.mode.delivery() as i32,
                         binding: Some(binding),
+                        capture_clock: resources.data_capture_clock(&publisher.topic).cloned(),
                     }),
                 ),
             );

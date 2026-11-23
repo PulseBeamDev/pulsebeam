@@ -211,6 +211,7 @@ fn declaration() -> wire::ResourceSpec {
             wire::PublicationSpec {
                 track_id: "camera-updates".into(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
+                    capture_clock: None,
                     delivery: wire::DataDelivery::Latest as i32,
                     binding: Some(wire::TrackBinding {
                         transport: Some(wire::track_binding::Transport::SctpDataV1(

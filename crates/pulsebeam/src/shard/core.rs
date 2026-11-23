@@ -1136,11 +1136,7 @@ impl ShardExecution {
         meta.apply(effect, track_handle);
         let ingress = fabric_rtp.and_then(|(publication, track)| {
             meta.prepare_local_rtp_ingress(publication, track)
-                .or_else(|| {
-                    self.local_rtp_v1
-                        .then(|| meta.prepare_whip_opus_ingress(publication, track))
-                        .flatten()
-                })
+                .or_else(|| meta.prepare_whip_rtp_ingress(publication, track))
                 .map(|prepared| (track, prepared))
         });
         let simulcast = fabric_rtp.and_then(|(publication, track)| {
@@ -1301,7 +1297,7 @@ impl ShardExecution {
                 continue;
             };
             if let Some(profile) = whole_profile
-                && let Some((mid, primary)) = receiver.whep_rtp_output(publication)
+                && let Some((mid, primary)) = receiver.whep_rtp_output(publication, profile)
             {
                 self.bind_ready_fabric_rtp(destination, track, mid, primary, profile);
                 continue;
@@ -1602,33 +1598,40 @@ impl ShardExecution {
             // Imported candidates can bind their SCTP channels before the peer receive route.
             return;
         };
-        let branch = (|| {
-            if self.runtime.fabric_incarnation(source) != Some(prepared.endpoint.source) {
-                return None;
-            }
-            let install_branch = if let Some(publisher) = self.runtime.source_origin(track) {
-                if !self.fabric_publisher_authorized(publisher, source) {
+        let branch =
+            (|| {
+                if self.runtime.fabric_incarnation(source) != Some(prepared.endpoint.source) {
                     return None;
                 }
-                true
-            } else {
-                self.runtime.is_shard_fabric_source(source)
-            };
-            let branch = if install_branch {
-                self.install_fabric_branch(track, source, receiver, Emission::DATA)?
-            } else {
-                self.runtime.remote_fabric_branch(source, receiver)?
-            };
-            let binding = prepared
-                .prepared
-                .bind(Endpoint::Subscriber(prepared.endpoint));
-            if self.attach_fabric_data_egress(branch, receiver, binding, None) {
-                Some(branch)
-            } else {
-                self.runtime.retire_fabric_branch(branch, receiver);
-                None
-            }
-        })();
+                let install_branch = if let Some(publisher) = self.runtime.source_origin(track) {
+                    if !self.fabric_publisher_authorized(publisher, source) {
+                        return None;
+                    }
+                    true
+                } else {
+                    self.runtime.is_shard_fabric_source(source)
+                };
+                let branch = if install_branch {
+                    self.install_fabric_branch(track, source, receiver, Emission::DATA)?
+                } else {
+                    self.runtime.remote_fabric_branch(source, receiver)?
+                };
+                let binding = prepared
+                    .prepared
+                    .bind(Endpoint::Subscriber(prepared.endpoint));
+                let clock = prepared.capture_clock.as_ref().map(|clock| {
+                    pulsebeam_proto::data_record::Clock {
+                        id: &clock.id,
+                        epoch: clock.epoch,
+                    }
+                });
+                if self.attach_fabric_data_egress(branch, receiver, binding, clock) {
+                    Some(branch)
+                } else {
+                    self.runtime.retire_fabric_branch(branch, receiver);
+                    None
+                }
+            })();
         let completed = if let Some(owner) = self.registry.resolve_mut(receiver) {
             let mut sink =
                 self.pipeline
@@ -1679,9 +1682,10 @@ impl ShardExecution {
         let prepared = self
             .registry
             .resolve_mut(publisher)
-            .and_then(|owner| owner.prepared_native_fabric_publisher(work, publication));
+            .and_then(|owner| owner.prepared_native_fabric_publisher(work, publication))
+            .map(|(prepared, clock)| (prepared, clock.cloned()));
         let mut reserved = false;
-        let source = prepared.and_then(|prepared| {
+        let source = prepared.and_then(|(prepared, clock)| {
             if self.runtime.track_handle(publication).is_some() {
                 return None;
             }
@@ -1689,7 +1693,13 @@ impl ShardExecution {
                 .runtime
                 .install_track(publication, None, Some(publisher), None);
             reserved = true;
-            self.stage_fabric_data_publisher(track, publisher, prepared, None)
+            let clock = clock
+                .as_ref()
+                .map(|clock| pulsebeam_proto::data_record::Clock {
+                    id: &clock.id,
+                    epoch: clock.epoch,
+                });
+            self.stage_fabric_data_publisher(track, publisher, prepared, clock)
                 .map(|(_, incarnation)| incarnation)
         });
         let completed = if let Some(owner) = self.registry.resolve_mut(publisher) {
@@ -2022,7 +2032,18 @@ impl ShardExecution {
         let Some(receiver) = self.registry.resolve_mut(destination) else {
             return;
         };
-        let selected = receiver.selected_fabric_video_encoding(mid, track);
+        let whole = self
+            .runtime
+            .fabric_source_for_track(track)
+            .filter(|&source| {
+                self.runtime
+                    .fabric_emission(source)
+                    .is_some_and(|emission| !emission.selects_dd_encoding())
+            });
+        let selected = whole
+            .is_none()
+            .then(|| receiver.selected_fabric_video_encoding(mid, track))
+            .flatten();
         let mut committed = None;
         if let Some((bound, active)) = receiver.fabric_rtp_output_branches(mid) {
             let live = |branch| {

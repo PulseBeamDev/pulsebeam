@@ -670,6 +670,10 @@ fn negotiate_inner(
                 kind,
                 mid: Arc::from(section.facts.mid.as_str()),
                 codecs: Arc::from(section.facts.codecs.as_ref()),
+                receives_dependency_descriptor: section.facts.extensions.iter().any(|extension| {
+                    extension.direction.allows_receive()
+                        && DEPENDENCY_URIS.contains(&extension.uri.as_str())
+                }),
                 primary_ssrcs: section
                     .facts
                     .ssrcs

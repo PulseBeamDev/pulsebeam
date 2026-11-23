@@ -36,6 +36,8 @@ use crate::entity::{ParticipantId, PublicationKey};
 /// TODO: get these clocks from SDP instead.
 pub const VIDEO_FREQUENCY: Frequency = Frequency::NINETY_KHZ;
 pub const AUDIO_FREQUENCY: Frequency = Frequency::FORTY_EIGHT_KHZ;
+pub(crate) const PLAYOUT_DELAY_URI: &str =
+    "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
 
 #[derive(Debug, Clone, Copy)]
 pub enum Codec {
@@ -164,7 +166,7 @@ impl RtpPacket {
                         .map(i8::saturating_neg);
                     opaque.push(extension);
                 }
-                "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay" => {}
+                PLAYOUT_DELAY_URI => {}
                 _ => opaque.push(extension),
             }
         }

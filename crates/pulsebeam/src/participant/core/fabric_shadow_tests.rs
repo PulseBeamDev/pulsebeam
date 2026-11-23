@@ -532,6 +532,7 @@ fn exercise_native_data_v1(delivery: pulsebeam_proto::state::DataV1Delivery) {
             wire::PublicationSpec {
                 track_id: "cursor".into(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
+                    capture_clock: None,
                     delivery: if reliable {
                         wire::DataDelivery::Ordered
                     } else {
@@ -1395,7 +1396,7 @@ fn authenticated_opus_shadow_uses_observed_clock_without_a_second_delivery() {
     assert!(
         connection
             .transport
-            .whip_opus_receive_binding(mid)
+            .sdp_fabric_receive_binding(mid)
             .is_none()
     );
     let wall = pair.clock.wall;
@@ -1454,14 +1455,14 @@ fn authenticated_opus_shadow_uses_observed_clock_without_a_second_delivery() {
     assert_eq!(sink.publish_track_packet_calls, [fanout]);
     assert!(
         connection
-            .prepare_whip_opus_ingress(publication_id, fanout)
+            .prepare_whip_rtp_ingress(publication_id, fanout)
             .is_none()
     );
     connection.authorization_expiry = Some(
         pulsebeam_core::auth::AuthorizationExpiry::from_unix_seconds(native_data::unix_now() + 60),
     );
     let (authorized, qualified) = connection
-        .prepare_whip_opus_ingress(publication_id, fanout)
+        .prepare_whip_rtp_ingress(publication_id, fanout)
         .unwrap();
     assert_eq!(authorized.id, publication_id);
     let ingress = ingress.unwrap();

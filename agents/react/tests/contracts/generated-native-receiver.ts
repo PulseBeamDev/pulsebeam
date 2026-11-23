@@ -2,7 +2,6 @@ import {
   Agent,
   AgentError,
   AgentStatus,
-  CaptureClock,
   DataDelivery,
   DataEvent,
   DataPublishOptions,
@@ -342,9 +341,9 @@ export async function receiveGenerated(config: {
           new Uint8Array([0, 255]),
           DataSendOptions.create({
             capturedAt: {
-              clock: CaptureClock.Publication,
-              nanoseconds: -(1n << 63n),
-              uncertaintyNanoseconds: 0,
+              clock: { id: "pending-data", epoch: 1n },
+              nanos: -(1n << 63n),
+              uncertaintyNs: 0,
             },
           }),
         );
@@ -597,9 +596,10 @@ export async function receiveGenerated(config: {
         data.byteLength,
       ).getBigUint64(3, true);
       if (
-        capturedAt?.clock !== CaptureClock.Publication ||
-        capturedAt.nanoseconds !== -9007199254740993n + sourceSequence ||
-        capturedAt.uncertaintyNanoseconds !== 0
+        capturedAt?.clock.id !== "frame-events" ||
+        capturedAt.clock.epoch !== 1n ||
+        capturedAt.nanos !== -9007199254740993n + sourceSequence ||
+        capturedAt.uncertaintyNs !== 0
       ) {
         throw new Error(
           "generated data lost capture timestamp precision or clock attribution",

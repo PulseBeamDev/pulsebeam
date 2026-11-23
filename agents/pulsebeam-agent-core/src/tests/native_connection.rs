@@ -124,6 +124,9 @@ fn lookup_record(
             ))),
         }),
         state::TrackKind::Data => state::track::Kind::Data(state::DataTrack {
+            capture_clock: data_v1
+                .as_ref()
+                .and_then(|offer| offer.capture_clock.clone()),
             delivery: mode.unwrap_or(TopicMode::Ordered).delivery() as i32,
         }),
         _ => panic!("unsupported lookup kind"),
@@ -1414,6 +1417,7 @@ pub(crate) fn confirm_publication(
                     room_id: participant.room_id,
                     track_id: declaration.track_id.clone(),
                     kind: Some(state::track::Kind::Data(state::DataTrack {
+                        capture_clock: data.capture_clock.clone(),
                         delivery: data.delivery,
                     })),
                 }),

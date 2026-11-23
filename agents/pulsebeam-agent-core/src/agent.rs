@@ -537,13 +537,17 @@ impl Agent {
                     after_generation,
                 }
             }
-            ResourceCommand::DeclareDataPublication { spec } => {
+            ResourceCommand::DeclareDataPublication {
+                spec,
+                capture_clock,
+            } => {
                 self.resources.validate_data_publication_claim(&spec)?;
                 let mut owned = self.resources.registrations();
                 owned.publishers.push(spec.publisher()?);
                 self.merged_topics(owned)?;
                 let owner = self.resources.new_owner()?;
-                self.resources.declare_data_publication(owner, &spec)?;
+                self.resources
+                    .declare_data_publication(owner, &spec, capture_clock)?;
                 ResourceResult::Owned { owner: owner.id() }
             }
             ResourceCommand::UpdatePublication { owner, present } => {
@@ -3010,6 +3014,7 @@ impl Agent {
                 active,
                 &mut self.logs,
                 &self.desired,
+                &self.resources,
                 &mut self.ids,
                 &mut self.effects,
             ) {

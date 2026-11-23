@@ -6271,10 +6271,6 @@ impl LocalNodeSim {
         }
         let planned_topics = initial_topic_registrations(&plan, &endpoints)
             .expect("topic declarations name configured participants");
-        let local_data_v1 = !planned_topics.is_empty()
-            || plan
-                .iter()
-                .any(|step| matches!(step, Step::IntentHistory { .. }));
         let initial_topics = if self.predeclare_topics {
             planned_topics.clone()
         } else {
@@ -6288,9 +6284,6 @@ impl LocalNodeSim {
             async move {
                 let rng = pulsebeam_runtime::rand::seeded_rng(seed);
                 let mut builder = sfu_node_builder(server_ip, rng, num_shards);
-                if local_data_v1 {
-                    builder = builder.with_local_data_v1();
-                }
                 if local_rtp_v1 {
                     builder = builder.with_local_rtp_v1();
                 }

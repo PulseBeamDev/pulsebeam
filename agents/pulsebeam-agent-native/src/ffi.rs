@@ -327,12 +327,11 @@ impl LocalDataTrack {
         &self,
         options: Option<core_ffi::DataPublishOptions>,
     ) -> Result<Arc<DataPublication>, NativeError> {
+        let options = options.unwrap_or_default();
         Ok(Arc::new(DataPublication {
-            runtime: self.runtime.publish_with_delivery(
-                options
-                    .and_then(|value| value.delivery)
-                    .unwrap_or_default()
-                    .into(),
+            runtime: self.runtime.publish_with_options(
+                options.delivery.unwrap_or_default().into(),
+                options.capture_clock,
             )?,
         }))
     }

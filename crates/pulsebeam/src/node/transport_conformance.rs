@@ -1,6 +1,5 @@
 //! Real dual-stack UDP and isolated ICE-TCP SDK/application witnesses.
 use super::*;
-use crate::control::native::DataProfile;
 use anyhow::{anyhow, bail, ensure};
 use pulsebeam_agent_native::agent_core::{
     AgentConfig, ConnectionState, DataEvent, DataUpdate, Generation, TopicMode,
@@ -68,13 +67,6 @@ impl DataWitness {
         match self {
             Self::LiveUdp { .. } | Self::LiveTcp => TopicMode::Latest,
             Self::ReliableUdp { .. } => TopicMode::Ordered,
-        }
-    }
-
-    fn profile(self) -> DataProfile {
-        match self {
-            Self::LiveUdp { .. } | Self::LiveTcp => DataProfile::FabricLive,
-            Self::ReliableUdp { .. } => DataProfile::FabricReliable,
         }
     }
 }
@@ -198,13 +190,15 @@ impl AsyncHttpClient for FamilyHttp {
                 .get("data_delivery")
                 .and_then(Value::as_array)
                 .context("native DATA delivery advertisement missing")?;
-            let ordered = deliveries
-                .iter()
-                .any(|mode| mode.as_str() == Some("ORDERED"));
-            if ordered != (self.witness.topic_mode() == TopicMode::Ordered) {
-                return Err(
-                    "native DATA advertisement does not match the conformance profile".into(),
-                );
+            let expected = ["LATEST", "LOSSY", "ORDERED"];
+            if deliveries.len() != expected.len()
+                || !expected.into_iter().all(|expected| {
+                    deliveries
+                        .iter()
+                        .any(|mode| mode.as_str() == Some(expected))
+                })
+            {
+                return Err("native DATA must advertise all three default delivery modes".into());
             }
             let answer = body
                 .get("answer")
@@ -744,7 +738,6 @@ async fn run(candidate: DataWitness) -> Result<()> {
                 public_key: *DEVELOPMENT_API_PUBLIC_KEY,
             }],
         )?);
-    builder.data_profile = candidate.profile();
     let runtime_control = if candidate.needs_migration() {
         builder = builder.with_runtime_control(control);
         Some(runtime_control)

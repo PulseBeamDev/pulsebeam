@@ -119,10 +119,16 @@ impl NegotiatedResources {
                 .iter()
                 .find(|section| section.media_index == media.media_index)
                 .ok_or(NegotiatorError::InvalidResources)?;
-            let codecs = &session
+            let inbound = session
                 .inbound_for_sender_index(media.media_index)
-                .ok_or(NegotiatorError::InvalidResources)?
-                .codecs;
+                .ok_or(NegotiatorError::InvalidResources)?;
+            if media.kind == MediaKind::Video
+                && (inbound.rids.len() > 1 || inbound.primary_ssrcs.len() > 1)
+                && !inbound.receives_dependency_descriptor
+            {
+                return Err(NegotiatorError::InvalidResources);
+            }
+            let codecs = &inbound.codecs;
             media.publish_codec = codecs.first().copied().filter(|codec| {
                 super::sdp::codec_format(*codec).is_some_and(|format| {
                     codecs
@@ -539,6 +545,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn whip_rejects_negotiated_simulcast_without_dependency_descriptors() {
+        let offer = chrome_like_offer(Direction::SendOnly)
+            .split_inclusive('\n')
+            .filter(|line| !line.contains(pulsebeam_core::dd::URI))
+            .collect::<String>()
+            .replace(
+                "a=sendonly\r\n",
+                "a=sendonly\r\na=rid:q send\r\na=rid:f send\r\na=simulcast:send q;f\r\n",
+            );
+        let (rtc, _, mut resources) = negotiator()
+            .create_answer(offer, test_credentials(), ReceiveTime::now(), None)
+            .unwrap();
+        let [video] = rtc.session.inbound_media.as_ref() else {
+            panic!("expected one negotiated video section");
+        };
+        assert_eq!(video.rids.len(), 2);
+        assert!(!video.receives_dependency_descriptor);
+        assert!(matches!(
+            resources.name_whip_tracks(&rtc.session, &Default::default()),
+            Err(NegotiatorError::InvalidResources)
+        ));
     }
 
     #[test]

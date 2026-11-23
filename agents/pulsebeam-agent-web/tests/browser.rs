@@ -32,7 +32,7 @@ fn authorization_expiry() -> TestResult<u64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn native_platform_smoke() -> TestResult<()> {
-    let destination = DestinationServer::start().await?;
+    let destination = DestinationServer::start_observed().await?;
     let server = StaticServer::start(root()).await?;
     let room = RoomId::new("public-web-contract")?;
     let expires_at = authorization_expiry()?;
@@ -78,6 +78,7 @@ async fn native_platform_smoke() -> TestResult<()> {
         )
         .await?;
         assert_eq!(rejections, 0, "connected-media: unhandled completion");
+        destination.wait_for_fabric_rtp_admissions().await?;
         let source_room = RoomId::new("react-native-source")?;
         let publisher_token = mint_development_token(
             &source_room,

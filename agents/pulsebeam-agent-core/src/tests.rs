@@ -5302,6 +5302,7 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
     let mut agent = Agent::new(config()).unwrap();
     assert_eq!(
         agent.resource(ResourceCommand::DeclareDataPublication {
+            capture_clock: None,
             spec: TrackSpec::Video {
                 track_id: "not-data".into(),
             },
@@ -5313,7 +5314,10 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
         delivery: TopicMode::Ordered,
     };
     let ResourceResult::Owned { owner } = agent
-        .resource(ResourceCommand::DeclareDataPublication { spec: first })
+        .resource(ResourceCommand::DeclareDataPublication {
+            spec: first,
+            capture_clock: None,
+        })
         .unwrap()
     else {
         panic!("data publication")
@@ -5321,6 +5325,7 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
     assert_eq!(owner, 1);
     assert_eq!(
         agent.resource(ResourceCommand::DeclareDataPublication {
+            capture_clock: None,
             spec: TrackSpec::Data {
                 track_id: "same-label".into(),
                 delivery: TopicMode::Latest,
@@ -5332,6 +5337,7 @@ fn owned_data_declaration_rejects_duplicate_modes_before_allocating_an_owner() {
     );
     let ResourceResult::Owned { owner: next } = agent
         .resource(ResourceCommand::DeclareDataPublication {
+            capture_clock: None,
             spec: TrackSpec::Data {
                 track_id: "another-label".into(),
                 delivery: TopicMode::Latest,
@@ -5373,7 +5379,10 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
             delivery: TopicMode::Ordered,
         };
         let ResourceResult::Owned { owner } = agent
-            .resource(ResourceCommand::DeclareDataPublication { spec })
+            .resource(ResourceCommand::DeclareDataPublication {
+                spec,
+                capture_clock: None,
+            })
             .unwrap()
         else {
             panic!("data publication")
@@ -5396,6 +5405,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
     };
     assert_eq!(
         agent.resource(ResourceCommand::DeclareDataPublication {
+            capture_clock: None,
             spec: rejected.clone()
         }),
         Err(AgentError::InvalidResource(
@@ -5408,7 +5418,10 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
         })
         .unwrap();
     let ResourceResult::Owned { owner: replacement } = agent
-        .resource(ResourceCommand::DeclareDataPublication { spec: rejected })
+        .resource(ResourceCommand::DeclareDataPublication {
+            spec: rejected,
+            capture_clock: None,
+        })
         .unwrap()
     else {
         panic!("replacement data publication")
@@ -5426,6 +5439,7 @@ fn owned_publication_budget_is_shared_and_rejections_do_not_allocate_owners() {
         .unwrap();
     let ResourceResult::Owned { owner: next } = agent
         .resource(ResourceCommand::DeclareDataPublication {
+            capture_clock: None,
             spec: TrackSpec::Data {
                 track_id: "after-stale-release".into(),
                 delivery: TopicMode::Lossy,
@@ -5755,6 +5769,7 @@ fn logical_payload_replacement_preserves_receivers_and_waits_for_reset_to_reuse_
                         room_id: right_subscriber.room.clone(),
                         track_id: right_subscriber.topic.clone(),
                         kind: Some(state::track::Kind::Data(state::DataTrack {
+                            capture_clock: None,
                             delivery: TopicMode::Lossy.delivery() as i32,
                         })),
                     }),

@@ -65,14 +65,10 @@
   };
   const synchronize = async () => {
     await wait(
-      sender,
-      (snapshot) =>
-        snapshot.topics.publishers.some(
-          (publisher) =>
-            publisher.name === "chat" &&
-            publisher.connected &&
-            typeof publisher.publicationId === "string",
-        ),
+      publisher,
+      (state) =>
+        state.trackId === "chat" &&
+        state.execution === window.pulsebeam.PublicationExecution.Installed,
       "installed lossy publisher",
     );
     const nonce = ++probe;

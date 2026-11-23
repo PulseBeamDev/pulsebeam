@@ -142,7 +142,7 @@ impl NodeBuilder {
             provisioned_peers: Vec::new(),
             link_listen: None,
             link_control: None,
-            data_profile: crate::control::native::DataProfile::Legacy,
+            data_profile: crate::control::native::DataProfile::default(),
             local_rtp_v1: false,
             http_api: None,
             key_registry: None,

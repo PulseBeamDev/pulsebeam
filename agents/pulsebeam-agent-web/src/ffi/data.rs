@@ -42,10 +42,11 @@ impl LocalDataTrack {
     ) -> Result<Arc<DataPublication>, WebAgentError> {
         #[cfg(target_arch = "wasm32")]
         {
-            let (owner, observer) = self.agent.runtime.claim_data_publication(track_spec(
-                self.label.clone(),
-                options.and_then(|value| value.delivery).unwrap_or_default(),
-            ))?;
+            let options = options.unwrap_or_default();
+            let (owner, observer) = self.agent.runtime.claim_data_publication(
+                track_spec(self.label.clone(), options.delivery.unwrap_or_default()),
+                options.capture_clock,
+            )?;
             Ok(Arc::new(DataPublication {
                 agent: self.agent.clone(),
                 owner,

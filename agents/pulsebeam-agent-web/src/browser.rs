@@ -564,12 +564,16 @@ impl BrowserRuntime {
     pub(crate) fn claim_data_publication(
         &self,
         spec: agent_core::TrackSpec,
+        capture_clock: Option<agent_core::ffi::CaptureClock>,
     ) -> Result<
         (u64, Rc<agent_core::observer::DataPublicationStateObserver>),
         agent_core::ffi::ErrorInfo,
     > {
         self.claim_observed_resource(
-            agent_core::ResourceCommand::DeclareDataPublication { spec },
+            agent_core::ResourceCommand::DeclareDataPublication {
+                spec,
+                capture_clock,
+            },
             |owner| self.data_publication_state_observer(owner),
         )
     }

@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    sdp::{connect_sdp_peer, wait_sdp_dtls},
+    *,
+};
 use pulsebeam_agent_core::client_sdp as client;
 use pulsebeam_rtc_simulation::{
     EncodedAudioSource, OpusAudioLevel, OpusInputFrame, RtpTransceiverDirection,
@@ -181,101 +184,6 @@ async fn silence(
         !received(),
         "gated source delivered at end of receive window"
     );
-    Ok(())
-}
-
-async fn operation(
-    peer: &PeerConnection,
-    operation: OperationId,
-    gathered: &mut bool,
-) -> anyhow::Result<Option<SessionDescription>> {
-    loop {
-        while let Some(event) = peer.try_next_event() {
-            match event {
-                PeerConnectionEvent::OperationComplete(completion) => {
-                    anyhow::ensure!(
-                        completion.operation_id == operation,
-                        "unexpected receiver operation"
-                    );
-                    return Ok(completion.result?);
-                }
-                PeerConnectionEvent::IceGatheringStateChanged(IceGatheringState::Complete) => {
-                    *gathered = true;
-                }
-                _ => {}
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-}
-
-async fn sdp_audio_session(
-    peer: &PeerConnection,
-    server: IpAddr,
-    endpoint: &str,
-    identity: &str,
-    permissions: &[&str],
-) -> anyhow::Result<()> {
-    let expiry = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs()
-        + 60;
-    let token = pulsebeam_server::sign_participant_token(
-        &pulsebeam_server::insecure_dev_api_key()?,
-        &serde_json::from_value(
-            serde_json::json!([{"rooms":["native-state-wire"],"allow":permissions}]),
-        )?,
-        identity,
-        expiry,
-    )?
-    .token;
-    let mut gathered = false;
-    let offer = operation(peer, peer.create_offer()?, &mut gathered)
-        .await?
-        .context("RTP offer")?;
-    operation(peer, peer.set_local_description(offer)?, &mut gathered).await?;
-    while !gathered {
-        while let Some(event) = peer.try_next_event() {
-            if matches!(
-                event,
-                PeerConnectionEvent::IceGatheringStateChanged(IceGatheringState::Complete)
-            ) {
-                gathered = true;
-            }
-        }
-        if !gathered {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    }
-    let offer = peer
-        .descriptions()?
-        .pending_local
-        .context("gathered RTP offer")?;
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("http://{server}:7070/api/v1/{endpoint}"))
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/sdp")
-        .body(offer.sdp.into_bytes())?;
-    let response = create_http_client()
-        .execute(request)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    anyhow::ensure!(
-        response.status() == http::StatusCode::CREATED,
-        "{endpoint} bootstrap {} {}",
-        response.status(),
-        String::from_utf8_lossy(response.body())
-    );
-    operation(
-        peer,
-        peer.set_remote_description(SessionDescription {
-            kind: SessionDescriptionType::Answer,
-            sdp: String::from_utf8(response.body().to_vec())?,
-        })?,
-        &mut gathered,
-    )
-    .await?;
     Ok(())
 }
 
@@ -514,7 +422,7 @@ impl WirePeer {
             .create_encoded_audio_track("untransmitted-listener", &receiver_source)?;
         let receive = receiver
             .add_audio_transceiver(&receiver_track, RtpTransceiverDirection::ReceiveOnly)?;
-        sdp_audio_session(
+        connect_sdp_peer(
             &receiver,
             server,
             &format!("whep?track=native-state-wire.{participant}.audio.microphone"),
@@ -633,7 +541,7 @@ impl WirePeer {
         server: IpAddr,
         cross_shard: bool,
     ) -> anyhow::Result<()> {
-        use pulsebeam_rtc_simulation::{CryptoOptions, DtlsTransportState, RtcConfiguration};
+        use pulsebeam_rtc_simulation::{CryptoOptions, RtcConfiguration};
 
         let peer_config = || {
             let mut config: RtcConfiguration = PeerConfiguration::default().into();
@@ -660,12 +568,17 @@ impl WirePeer {
             })
             .context("WHIP Opus capability")?;
         sender.set_audio_codec_preferences(&[opus])?;
-        sdp_audio_session(
+        connect_sdp_peer(
             &publisher,
             server,
             "whip?room=native-state-wire&track=audio.whip-opus",
             "whip-speaker",
             &["join", "publish"],
+        )
+        .await?;
+        wait_sdp_dtls(
+            &publisher,
+            sender.mid().context("WHIP negotiated MID")?.as_bytes(),
         )
         .await?;
         push(&source, 20).await?;
@@ -681,7 +594,7 @@ impl WirePeer {
             .add_audio_transceiver(&receiver_track, RtpTransceiverDirection::ReceiveOnly)?;
         let counter = || pulsebeam::sim_metrics::routing_counter("fabric_whep_rtp_enqueued");
         let before = counter();
-        sdp_audio_session(
+        connect_sdp_peer(
             &receiver,
             server,
             "whep?track=native-state-wire.whip-speaker.audio.whip-opus",
@@ -690,17 +603,11 @@ impl WirePeer {
         )
         .await?;
         let sink = receive.receiver().attach_encoded_audio_sink()?;
-        let mid = receive.mid().context("WHEP negotiated MID")?;
-        let transport = receiver
-            .dtls_transport_by_mid(mid.as_bytes())
-            .context("WHEP media transport")?;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while transport.information().state() != DtlsTransportState::Connected {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .context("WHEP DTLS connection deadline")?;
+        wait_sdp_dtls(
+            &receiver,
+            receive.mid().context("WHEP negotiated MID")?.as_bytes(),
+        )
+        .await?;
         let udp = self._host.observe_udp_rtp(server);
         push(&source, 20).await?;
         let udp = udp.peaks();

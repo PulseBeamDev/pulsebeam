@@ -1,12 +1,13 @@
 use super::support::TestResult;
-use std::error::Error;
+use std::{error::Error, net::SocketAddr, time::Duration};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
 pub struct DestinationServer {
-    address: std::net::SocketAddr,
+    address: SocketAddr,
+    metrics_address: Option<SocketAddr>,
     shutdown: tokio_util::sync::CancellationToken,
     thread: Option<std::thread::JoinHandle<TestResult<()>>>,
 }
@@ -16,7 +17,20 @@ impl DestinationServer {
         Self::bind("127.0.0.1:0".parse()?).await
     }
 
-    pub async fn bind(address: std::net::SocketAddr) -> TestResult<Self> {
+    pub async fn start_observed() -> TestResult<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        Self::bind_with_metrics("127.0.0.1:0".parse()?, Some(listener)).await
+    }
+
+    pub async fn bind(address: SocketAddr) -> TestResult<Self> {
+        Self::bind_with_metrics(address, None).await
+    }
+
+    async fn bind_with_metrics(
+        address: SocketAddr,
+        metrics: Option<std::net::TcpListener>,
+    ) -> TestResult<Self> {
         use pulsebeam_core::auth::{
             DEVELOPMENT_API_KEY_ID, DEVELOPMENT_API_PUBLIC_KEY, DEVELOPMENT_PROJECT_ID,
             KeyRegistry, KeyRegistryEntry,
@@ -27,6 +41,10 @@ impl DestinationServer {
         let listener = socket.listen(128)?;
         let address = listener.local_addr()?;
         let listener = listener.into_std()?;
+        let metrics_address = metrics
+            .as_ref()
+            .map(std::net::TcpListener::local_addr)
+            .transpose()?;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let cancellation = shutdown.clone();
         let thread = std::thread::spawn(move || -> TestResult<()> {
@@ -35,12 +53,9 @@ impl DestinationServer {
                 .build()?;
             tokio::task::LocalSet::new().block_on(&runtime, async move {
                 let listener = TcpListener::from_std(listener)?;
-                // Metrics installs a process-global recorder; the executable-startup
-                // contract owns that boundary, not these restartable in-process nodes.
-                pulsebeam::node::NodeBuilder::new()
+                let mut node = pulsebeam::node::NodeBuilder::new()
                     .workers(1)
                     .work_stealing(1)
-                    .with_reliable_data_v1()
                     .local_addr("127.0.0.1:0".parse()?)
                     .advertise_bound_udp()
                     .rng(pulsebeam_runtime::rand::os_rng())
@@ -51,14 +66,19 @@ impl DestinationServer {
                             key_id: *DEVELOPMENT_API_KEY_ID,
                             public_key: *DEVELOPMENT_API_PUBLIC_KEY,
                         }],
-                    )?)
-                    .run(cancellation)
-                    .await?;
+                    )?);
+                // Only the admission witness opens this listener. Restartable nodes
+                // do not install the process-global exporter again.
+                if let Some(metrics) = metrics {
+                    node = node.with_internal_metrics_listener(TcpListener::from_std(metrics)?);
+                }
+                node.run(cancellation).await?;
                 Ok(())
             })
         });
         let mut server = Self {
             address,
+            metrics_address,
             shutdown,
             thread: Some(thread),
         };
@@ -93,7 +113,41 @@ impl DestinationServer {
         Ok(server)
     }
 
-    pub fn address(&self) -> std::net::SocketAddr {
+    pub async fn wait_for_fabric_rtp_admissions(&self) -> TestResult<()> {
+        let address = self
+            .metrics_address
+            .ok_or("no destination metrics listener")?;
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                let mut stream = TcpStream::connect(address).await?;
+                stream
+                    .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                    .await?;
+                let mut response = String::new();
+                stream.read_to_string(&mut response).await?;
+                let admitted = |prefix: &str| {
+                    response.lines().any(|line| {
+                        line.strip_prefix(prefix)
+                            .and_then(|value| value.trim().parse::<u64>().ok())
+                            .is_some_and(|count| count > 0)
+                    })
+                };
+                if admitted("pulsebeam_shard_fabric_rtp_branch_admissions{profile=\"h264\"}")
+                    && admitted("pulsebeam_shard_fabric_rtp_branch_admissions{profile=\"opus\"}")
+                {
+                    return Ok::<_, Box<dyn Error + Send + Sync>>(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(
+            |_| "no committed H.264 and Opus Fabric RTP branches in the connected browser smoke",
+        )??;
+        Ok(())
+    }
+
+    pub fn address(&self) -> SocketAddr {
         self.address
     }
     pub fn endpoint(&self) -> String {

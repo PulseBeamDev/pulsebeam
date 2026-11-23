@@ -26,7 +26,10 @@ fn publication() -> (
 ) {
     let (mut agent, generation, channel) = connected(Default::default());
     let ResourceResult::Owned { owner } = agent
-        .resource(ResourceCommand::DeclareDataPublication { spec: data_spec() })
+        .resource(ResourceCommand::DeclareDataPublication {
+            spec: data_spec(),
+            capture_clock: None,
+        })
         .unwrap()
     else {
         panic!("publication owner")

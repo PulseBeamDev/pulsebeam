@@ -454,6 +454,7 @@ pub enum ResourceCommand {
     },
     DeclareDataPublication {
         spec: TrackSpec,
+        capture_clock: Option<crate::ffi::CaptureClock>,
     },
     UpdatePublication {
         owner: u64,
@@ -569,7 +570,7 @@ pub enum ResourceResult {
 pub struct TrackResources {
     next_owner: u64,
     publications: BTreeMap<TrackSpec, PublicationOwner>,
-    data_publications: BTreeMap<String, (TrackOwner, TopicMode)>,
+    data_publications: BTreeMap<String, OwnedDataPublication>,
     audio: Option<TrackOwner>,
     audio_views: BTreeMap<TrackOwner, AudioView>,
     video: BTreeMap<TrackOwner, VideoView>,
@@ -578,6 +579,12 @@ pub struct TrackResources {
     producers: BTreeSet<TopicPublisher>,
     receivers: BTreeMap<TrackOwner, DataReceiver>,
     intent_revisions: BTreeMap<TrackOwner, u64>,
+}
+
+struct OwnedDataPublication {
+    owner: TrackOwner,
+    delivery: TopicMode,
+    capture_clock: Option<pulsebeam_proto::state::DataV1CaptureClock>,
 }
 
 impl TrackResources {
@@ -618,9 +625,16 @@ impl TrackResources {
     pub(crate) fn data_publication(&self, owner: TrackOwner) -> Option<(&str, TopicMode)> {
         self.data_publications
             .iter()
-            .find_map(|(track_id, (current, mode))| {
-                (*current == owner).then_some((track_id.as_str(), *mode))
+            .find_map(|(track_id, current)| {
+                (current.owner == owner).then_some((track_id.as_str(), current.delivery))
             })
+    }
+
+    pub(crate) fn data_capture_clock(
+        &self,
+        track_id: &str,
+    ) -> Option<&pulsebeam_proto::state::DataV1CaptureClock> {
+        self.data_publications.get(track_id)?.capture_clock.as_ref()
     }
 
     pub(crate) fn data_receiver(
@@ -725,13 +739,29 @@ impl TrackResources {
         &mut self,
         owner: TrackOwner,
         spec: &TrackSpec,
+        capture_clock: Option<crate::ffi::CaptureClock>,
     ) -> Result<(), TrackResourceError> {
         spec.validate()?;
         let TrackSpec::Data { track_id, delivery } = spec else {
             return Err(TrackResourceError::WrongKind);
         };
-        if let Some((current, mode)) = self.data_publications.get(track_id) {
-            return if *current == owner && *mode == *delivery {
+        let capture_clock = capture_clock.map(|clock| pulsebeam_proto::state::DataV1CaptureClock {
+            id: clock.id,
+            epoch: clock.epoch,
+        });
+        if capture_clock.as_ref().is_some_and(|clock| {
+            !pulsebeam_proto::state::validation::valid_data_capture_clock(clock)
+        }) {
+            return Err(ValidationError::Identifier {
+                field: "capture clock id",
+            }
+            .into());
+        }
+        if let Some(current) = self.data_publications.get(track_id) {
+            return if current.owner == owner
+                && current.delivery == *delivery
+                && current.capture_clock == capture_clock
+            {
                 Ok(())
             } else {
                 Err(TrackResourceError::AlreadyOwned)
@@ -742,13 +772,19 @@ impl TrackResources {
             || self
                 .data_publications
                 .values()
-                .any(|(current, _)| *current == owner)
+                .any(|current| current.owner == owner)
         {
             return Err(TrackResourceError::OwnerInUse);
         }
         self.begin_intent(owner)?;
-        self.data_publications
-            .insert(track_id.clone(), (owner, *delivery));
+        self.data_publications.insert(
+            track_id.clone(),
+            OwnedDataPublication {
+                owner,
+                delivery: *delivery,
+                capture_clock,
+            },
+        );
         Ok(())
     }
 
@@ -1178,7 +1214,7 @@ impl TrackResources {
         self.publications.retain(|_, entry| entry.owner != owner);
         self.intent_revisions.remove(&owner);
         self.data_publications
-            .retain(|_, (current, _)| *current != owner);
+            .retain(|_, current| current.owner != owner);
         self.release_audio(owner);
         self.audio_views.remove(&owner);
         self.release_video(owner);
@@ -1530,8 +1566,8 @@ impl TrackResources {
 
     pub fn retain_producer(&mut self, spec: &TrackSpec) -> Result<(), TrackResourceError> {
         let publisher = spec.publisher()?;
-        if let Some((_, mode)) = self.data_publications.get(spec.track_id()) {
-            if *mode != publisher.mode {
+        if let Some(publication) = self.data_publications.get(spec.track_id()) {
+            if publication.delivery != publisher.mode {
                 return Err(TrackResourceError::AlreadyOwned);
             }
             return Ok(());
@@ -1586,27 +1622,26 @@ impl TrackResources {
     }
 
     pub fn registrations(&self) -> TopicRegistrations {
-        let mut registrations = TopicRegistrations {
-            publishers: self
-                .producers
-                .iter()
-                .cloned()
-                .chain(
-                    self.data_publications
-                        .iter()
-                        .map(|(topic, (_, mode))| TopicPublisher {
+        let mut registrations =
+            TopicRegistrations {
+                publishers: self
+                    .producers
+                    .iter()
+                    .cloned()
+                    .chain(self.data_publications.iter().map(|(topic, publication)| {
+                        TopicPublisher {
                             topic: topic.clone(),
-                            mode: *mode,
-                        }),
-                )
-                .collect(),
-            subscribers: self
-                .receivers
-                .values()
-                .filter(|receiver| receiver.failure.is_none())
-                .map(|receiver| receiver.subscriber.clone())
-                .collect(),
-        };
+                            mode: publication.delivery,
+                        }
+                    }))
+                    .collect(),
+                subscribers: self
+                    .receivers
+                    .values()
+                    .filter(|receiver| receiver.failure.is_none())
+                    .map(|receiver| receiver.subscriber.clone())
+                    .collect(),
+            };
         registrations.normalize();
         registrations.subscribers.dedup();
         registrations

@@ -751,7 +751,7 @@ impl ControllerActor {
             retiring_native: std::collections::HashMap::new(),
             source_lookup_index: native_service::SourceLookupIndex::default(),
             data_branches: super::native::DataBranchIds::default(),
-            data_profile: super::native::DataProfile::Legacy,
+            data_profile: super::native::DataProfile::default(),
             #[cfg(feature = "sim")]
             sim_fabric_relay: None,
             catalog: catalog::CatalogRuntime::default(),

@@ -223,6 +223,17 @@ pub fn validate_spec(spec: &ResourceSpec) -> Result {
                     validate_binding(video.binding.as_ref(), TrackKind::Video, true)
                 }
                 publication_spec::Kind::Data(data) => {
+                    if let Some(clock) = &data.capture_clock
+                        && (!valid_data_capture_clock(clock)
+                            || !matches!(
+                                data.binding
+                                    .as_ref()
+                                    .and_then(|binding| binding.transport.as_ref()),
+                                Some(track_binding::Transport::SctpDataV1(_))
+                            ))
+                    {
+                        return Err(ValidationError::Binding);
+                    }
                     validate_data_binding(data.binding.as_ref(), data.delivery)
                 }
             }
@@ -302,7 +313,15 @@ pub fn validate_track(track: &Track) -> Result {
     match track.kind.as_ref().ok_or(ValidationError::Format)? {
         track::Kind::Audio(audio) => validate_discovery_format(audio.format.as_ref(), true),
         track::Kind::Video(video) => validate_discovery_format(video.format.as_ref(), false),
-        track::Kind::Data(data) if known::<DataDelivery>(data.delivery) => Ok(()),
+        track::Kind::Data(data)
+            if known::<DataDelivery>(data.delivery)
+                && data
+                    .capture_clock
+                    .as_ref()
+                    .is_none_or(valid_data_capture_clock) =>
+        {
+            Ok(())
+        }
         _ => Err(ValidationError::Format),
     }
 }
@@ -353,7 +372,8 @@ pub fn validate_live(live: &LiveResource) -> Result {
                     true
                 }
                 (Some(publication_spec::Kind::Data(data)), Some(track::Kind::Data(source)))
-                    if data.delivery == source.delivery =>
+                    if data.delivery == source.delivery
+                        && data.capture_clock == source.capture_clock =>
                 {
                     false
                 }
@@ -489,11 +509,7 @@ pub fn validate_logical_subscription(subscription: &LogicalSubscriptionState) ->
         if let Some(offer) = &subscription.data_v1
             && (!data_v1_requested
                 || offer.endpoint().is_none()
-                || !matches!(&track.kind, Some(track::Kind::Data(_)))
-                || offer
-                    .capture_clock
-                    .as_ref()
-                    .is_some_and(|clock| !transport_text(&clock.id, 256)))
+                || !matches!(&track.kind, Some(track::Kind::Data(data)) if data.capture_clock == offer.capture_clock))
         {
             return Err(ValidationError::Binding);
         }
@@ -943,6 +959,10 @@ fn payload_type(value: Option<u32>) -> bool {
 fn text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max
 }
+pub fn valid_data_capture_clock(clock: &DataV1CaptureClock) -> bool {
+    transport_text(&clock.id, 256)
+}
+
 fn transport_text(value: &str, max: usize) -> bool {
     text(value, max) && value.chars().all(|c| !c.is_whitespace() && !c.is_control())
 }

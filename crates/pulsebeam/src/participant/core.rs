@@ -1078,7 +1078,14 @@ impl Connection {
         Some((output.branch, output.leg.committed_branch()))
     }
 
-    pub(crate) fn whep_rtp_output(&self, publication: PublicationKey) -> Option<(Mid, u32)> {
+    pub(crate) fn whep_rtp_output(
+        &self,
+        publication: PublicationKey,
+        profile: pulsebeam_core::fabric::Profile,
+    ) -> Option<(Mid, u32)> {
+        if self.signaling_profile != SignalingProtocol::Whep {
+            return None;
+        }
         let kind = match publication.kind() {
             TrackKind::Audio => MediaKind::Audio,
             TrackKind::Video => MediaKind::Video,
@@ -1089,6 +1096,9 @@ impl Connection {
                 && media.kind == kind
                 && media.direction == Direction::SendOnly
         })?;
+        if self.transport.sdp_fabric_send_profile(media.mid) != Some(profile) {
+            return None;
+        }
         Some((media.mid, self.transport.stream_tx_ssrc(media.mid)?.into()))
     }
 
@@ -1225,19 +1235,36 @@ impl Connection {
             Mode::Filtered(index) => Some(index),
             Mode::Whole => None,
         };
-        let replaced = output
-            .leg
-            .committed_branch()
-            .filter(|active| *active != branch);
+        let previous = output.leg.committed_branch();
+        let profile = packet.1.header().profile;
         output.leg.stage_branch(branch);
-        self.transport
-            .queue_fabric_rtp(&mut output.leg, branch, output.source, packet)?;
+        let playout_delay = self.native_receivers.playout_delay(mid);
+        self.transport.queue_fabric_rtp(
+            &mut output.leg,
+            branch,
+            output.source,
+            packet,
+            playout_delay,
+        )?;
+        if previous != Some(branch) {
+            use pulsebeam_core::fabric::Profile;
+            let profile = match profile {
+                Profile::Opus => Some("opus"),
+                Profile::H264 => Some("h264"),
+                Profile::Av1 => Some("av1"),
+                Profile::Data => None,
+            };
+            if let Some(profile) = profile {
+                metrics::counter!("fabric_rtp_branch_admissions", "profile" => profile)
+                    .increment(1);
+            }
+        }
         if let Some((source, target)) = video_source.zip(target) {
             self.downstream
                 .video
                 .note_fabric_admission(mid, branch, source, target);
         }
-        Ok(replaced)
+        Ok(previous.filter(|active| *active != branch))
     }
 
     pub(crate) fn queue_fabric_rtp(
@@ -1249,7 +1276,9 @@ impl Connection {
         now: Instant,
     ) -> Result<(), crate::rtp::fabric_egress::AdmissionError> {
         self.advance_rtc_clock(now, now);
-        self.transport.queue_fabric_rtp(leg, branch, source, packet)
+        let playout_delay = self.native_receivers.playout_delay(leg.output().mid);
+        self.transport
+            .queue_fabric_rtp(leg, branch, source, packet, playout_delay)
     }
 
     pub(crate) fn matches_network_repair(
@@ -1802,13 +1831,12 @@ impl Connection {
         }
     }
 
-    pub(crate) fn prepare_whip_opus_ingress(
+    pub(crate) fn prepare_whip_rtp_ingress(
         &mut self,
         publication: PublicationKey,
         fanout: TrackHandle,
     ) -> Option<(crate::track::TrackMeta, RtpIngressShadow)> {
         if self.signaling_profile != SignalingProtocol::Whip
-            || publication.kind() != TrackKind::Audio
             || self.authorization_expiry.is_none()
             || !self.fabric_io_authorized()
             || self.upstream.track_fanout(publication) != Some(fanout)
@@ -1816,12 +1844,11 @@ impl Connection {
             return None;
         }
         let mid = self.upstream.mid_for_track_id(publication)?;
-        let binding = self.transport.whip_opus_receive_binding(mid)?;
+        let (profile, binding) = self.transport.sdp_fabric_receive_binding(mid)?;
         if self.media_ingress.contains_key(&binding.primary_ssrc) {
             return None;
         }
-        let ingress =
-            RtpIngressShadow::bind_local_endpoint(pulsebeam_core::fabric::Profile::Opus, binding)?;
+        let ingress = RtpIngressShadow::bind_local_endpoint(profile, binding)?;
         let (track, announced) = self.upstream.announce_state_mut(mid)?;
         (*announced && track.id() == publication).then(|| (track.meta().clone(), ingress))
     }

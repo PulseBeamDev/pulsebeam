@@ -313,6 +313,7 @@ fn publication(label: &str, enabled: bool) -> wire::ResourceSpec {
             wire::PublicationSpec {
                 track_id: label.to_owned(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
+                    capture_clock: None,
                     delivery: wire::DataDelivery::Ordered as i32,
                     binding: Some(wire::TrackBinding {
                         transport: Some(wire::track_binding::Transport::Sctp(
@@ -356,7 +357,7 @@ fn data_v1_publication_keeps_its_exact_transport_in_the_execution_plan() {
     else {
         panic!("DATA execution plan")
     };
-    assert!(*data.parameters == parameters);
+    assert!(data.parameters == parameters);
     assert!(matches!(
         crate::control::native::publication(&spec(wire::DataDelivery::Latest), None),
         Err(wire::FailureCode::InvalidConfiguration)
@@ -377,7 +378,7 @@ fn data_v1_publication_keeps_its_exact_transport_in_the_execution_plan() {
     assert!(
         matches!(session.compile_execution(&work, None, |_| None).unwrap().into_action(),
         ExecutionAction::Prepare { resource: crate::control::native::PreparedResource::Publication(Publication::Data(data)), .. }
-            if *data.parameters == parameters)
+            if data.parameters == parameters)
     );
 }
 
@@ -452,6 +453,7 @@ fn source(reference: u64, label: &str) -> wire::Track {
         room_id: "room".into(),
         track_id: label.into(),
         kind: Some(wire::track::Kind::Data(wire::DataTrack {
+            capture_clock: None,
             delivery: wire::DataDelivery::Ordered as i32,
         })),
     }
@@ -465,6 +467,7 @@ fn live(session: &NativeSession, work: &Preparation) -> wire::LiveResource {
     let mut track = source(work.reference, &publication.track_id);
     if let Some(wire::publication_spec::Kind::Data(data)) = &publication.kind {
         track.kind = Some(wire::track::Kind::Data(wire::DataTrack {
+            capture_clock: data.capture_clock.clone(),
             delivery: data.delivery,
         }));
     }
@@ -1609,6 +1612,7 @@ fn data_projection_uses_actual_metadata_without_a_payload_format_or_activity_cla
         assert_eq!(
             observed.kind,
             Some(wire::track::Kind::Data(wire::DataTrack {
+                capture_clock: None,
                 delivery: expected as i32
             }))
         );
@@ -2391,7 +2395,15 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
         track_id: Some(TrackId::new("cursor").unwrap()),
     };
     let fabric = |source| {
-        Track::native_data_publication(meta.clone(), DataLane::Latest, NonZeroU64::new(source))
+        Track::native_data_publication(
+            meta.clone(),
+            DataLane::Latest,
+            NonZeroU64::new(source),
+            NonZeroU64::new(source).map(|_| wire::DataV1CaptureClock {
+                id: "source-clock".into(),
+                epoch: source,
+            }),
+        )
     };
     let first = fabric(10);
     let legacy = fabric(0);
@@ -2429,6 +2441,15 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
             panic!("logical subscription");
         };
         assert_eq!(state.source.is_some(), state.data_v1.is_some());
+        if let Some(offer) = &state.data_v1 {
+            assert_eq!(
+                offer.capture_clock,
+                Some(wire::DataV1CaptureClock {
+                    id: "source-clock".into(),
+                    epoch: offer.source
+                })
+            );
+        }
         (
             state.source_revision,
             state
@@ -2440,7 +2461,7 @@ fn fabric_receiver_offers_are_versioned_and_rotate_with_the_authenticated_source
     assert_eq!(offer(&mut model, &first), (0, None));
     model.enable_data_v1();
     let reliable =
-        Track::native_data_publication(meta.clone(), DataLane::Ordered, NonZeroU64::new(12));
+        Track::native_data_publication(meta.clone(), DataLane::Ordered, NonZeroU64::new(12), None);
     assert_eq!(offer(&mut model, &reliable), (0, None));
     assert_eq!(offer(&mut model, &legacy), (0, None));
     assert_eq!(offer(&mut model, &first), (1, Some((10, 1))));
@@ -2578,6 +2599,7 @@ fn logical_subscription_keeps_one_reservation_across_scoped_receiver_replacement
             },
             DataLane::Latest,
             std::num::NonZeroU64::new(source_ids.get()),
+            None,
         )
     };
     let assert_state =

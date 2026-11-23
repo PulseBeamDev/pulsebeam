@@ -749,6 +749,7 @@ fn active_control_declares_only_prepared_payloads_and_retries_the_exact_serializ
                     room_id: "room".into(),
                     track_id: publisher.topic.clone(),
                     kind: Some(state::track::Kind::Data(state::DataTrack {
+                        capture_clock: None,
                         delivery: state::DataDelivery::Ordered as i32,
                     })),
                 }),
@@ -1385,6 +1386,7 @@ fn received_resource_state_projects_prejoin_and_owner_local_intent() {
 
     let crate::ResourceResult::Owned { owner: publication } = agent
         .resource(crate::ResourceCommand::DeclareDataPublication {
+            capture_clock: None,
             spec: crate::TrackSpec::Data {
                 track_id: "events".into(),
                 delivery: crate::TopicMode::Ordered,

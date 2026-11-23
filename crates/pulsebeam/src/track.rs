@@ -733,6 +733,7 @@ pub struct VideoTrack {
 pub struct DataTrack {
     pub meta: TrackMeta,
     pub(crate) fabric_source: Option<std::num::NonZeroU64>,
+    pub(crate) capture_clock: Option<pulsebeam_proto::state::DataV1CaptureClock>,
     pub topic: Option<crate::track::Topic>,
     pub lane: crate::track::DataLane,
     pub reverse: Option<crate::route::NodeRouteAddress>,
@@ -834,24 +835,27 @@ impl Track {
             meta,
             topic: Some(topic),
             fabric_source: None,
+            capture_clock: None,
             lane,
             reverse,
         })
     }
 
     pub(crate) fn data_publication(meta: TrackMeta, lane: DataLane) -> Self {
-        Self::native_data_publication(meta, lane, None)
+        Self::native_data_publication(meta, lane, None, None)
     }
 
     pub(crate) fn native_data_publication(
         meta: TrackMeta,
         lane: DataLane,
         fabric_source: Option<std::num::NonZeroU64>,
+        capture_clock: Option<pulsebeam_proto::state::DataV1CaptureClock>,
     ) -> Self {
         Self::Data(DataTrack {
             meta,
             topic: None,
             fabric_source,
+            capture_clock,
             lane,
             reverse: None,
         })

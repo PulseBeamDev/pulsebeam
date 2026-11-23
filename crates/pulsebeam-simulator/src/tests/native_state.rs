@@ -22,6 +22,7 @@ use super::common::{
 
 mod audio;
 mod av1;
+mod sdp;
 
 struct WirePeer {
     media: Option<pulsebeam_agent_core::client_sdp::Context>,
@@ -501,6 +502,7 @@ fn publication(channel: u32, enabled: bool) -> wire::ResourceSpec {
             wire::PublicationSpec {
                 track_id: "camera-updates".into(),
                 kind: Some(wire::publication_spec::Kind::Data(wire::DataPublication {
+                    capture_clock: None,
                     delivery: wire::DataDelivery::Latest as i32,
                     binding: Some(payload_binding(channel)),
                 })),
@@ -536,6 +538,7 @@ fn live(value: wire::ConfirmedState, spec: &wire::ResourceSpec, participant: &st
     assert_eq!(
         track.kind,
         Some(wire::track::Kind::Data(wire::DataTrack {
+            capture_clock: None,
             delivery: wire::DataDelivery::Latest as i32
         }))
     );
@@ -688,6 +691,9 @@ async fn run_publisher(
     peer.prove_whip_whep_opus(server, cross_shard)
         .await
         .context("real WHIP-to-WHEP Opus over Fabric")?;
+    peer.prove_whip_whep_h264(server)
+        .await
+        .context("real WHIP-to-WHEP H.264 over Fabric")?;
     peer.peer.close()?;
     Ok(())
 }
@@ -789,8 +795,6 @@ fn prove_native_state_data_lifetimes(shards: usize) {
     let server = subnet_ip(subnet, 1);
     sim.host(server, move || async move {
         sfu_node_builder(server, pulsebeam_runtime::rand::seeded_rng(seed), shards)
-            .with_local_data_v1()
-            .with_local_rtp_v1()
             .run(tokio_util::sync::CancellationToken::new())
             .await
             .map_err(Into::into)

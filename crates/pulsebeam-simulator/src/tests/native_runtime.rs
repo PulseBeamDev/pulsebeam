@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use pulsebeam_agent_core::ffi as core_ffi;
+use pulsebeam_agent_core::{DataEvent, ffi as core_ffi};
 use pulsebeam_agent_native::ffi::{
     Agent, AudioSubscription, EventUpdate, NativeEvent, SnapshotUpdate, VideoSubscription,
 };
@@ -520,8 +520,11 @@ impl OwnedData {
             .room(room.as_str().into())?
             .participant(remote.clone())?
             .data("owned-bytes".into())?;
-        let room = source.subscribe(None)?;
-        let participant = source.subscribe(None)?;
+        let options = Some(core_ffi::DataSubscribeOptions {
+            delivery: Some(core_ffi::DataDelivery::Unreliable),
+        });
+        let room = source.subscribe(options.clone())?;
+        let participant = source.subscribe(options)?;
         Ok(Self {
             sender,
             room,
@@ -559,10 +562,14 @@ impl OwnedData {
         }
     }
 
-    async fn exchange(&self, barrier: &tokio::sync::Barrier, round: u8) -> anyhow::Result<()> {
+    async fn exchange(
+        &self,
+        barrier: &tokio::sync::Barrier,
+        round: u8,
+    ) -> anyhow::Result<DataEvent> {
         barrier.wait().await;
         let payload = vec![0, 255, 128, round];
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
             // Both cursors must have a live DATA v1 branch before the marker.
             let setup = vec![0, 255, 128, 0];
             let ready = async {
@@ -584,12 +591,12 @@ impl OwnedData {
             let room = self.message(&self.room, &payload).await?;
             let participant = self.message(&self.participant, &payload).await?;
             anyhow::ensure!(room == participant, "independent data cursors diverged");
-            anyhow::Ok(())
+            anyhow::Ok(room)
         })
         .await??;
         // Neither peer may replace its graph until the other has consumed this round.
         barrier.wait().await;
-        Ok(())
+        Ok(received)
     }
 }
 
@@ -624,7 +631,6 @@ fn native_agents_prove_media_topics_reconnect_and_close() {
                 pulsebeam_runtime::rand::seeded_rng(seed),
                 DEFAULT_SIM_SHARDS,
             )
-            .with_local_data_v1()
             .with_cluster(pulsebeam::cluster::Options {
                 ownership_peers: Vec::new(),
                 cluster_id: "native-reconnect".into(),
@@ -1215,7 +1221,6 @@ fn native_roomless_reception_survives_join_and_leave() {
             pulsebeam_runtime::rand::seeded_rng(seed),
             DEFAULT_SIM_SHARDS,
         )
-        .with_local_data_v1()
         .run(tokio_util::sync::CancellationToken::new())
         .await
         .map_err(Into::into)
@@ -1940,7 +1945,7 @@ async fn run_peer(
         &mut frame_cursor,
     )
     .await?;
-    owned_data.exchange(&barriers.before_reconnect, 2).await?;
+    let original_owned = owned_data.exchange(&barriers.before_reconnect, 2).await?;
     let same_peer_expected = same_peer.retained.clone();
     anyhow::ensure!(
         agent.snapshot().generation == Some(first_generation)
@@ -2126,34 +2131,61 @@ async fn run_peer(
         &mut frame_cursor,
     )
     .await?;
-    let owned_data = if reconnect {
+    if reconnect {
         owned_data.exchange(&barriers.before_close, 2).await?;
-        owned_data
     } else {
         let replacement =
             OwnedData::with_sender(&agent, &room, remote.into(), owned_data.sender.clone())?;
-        replacement.exchange(&barriers.before_close, 2).await?;
-        for retired in [&owned_data.room, &owned_data.participant] {
+        let fresh = replacement.exchange(&barriers.before_close, 2).await?;
+        let (
+            DataEvent::Message {
+                publication_id: previous,
+                ..
+            },
+            DataEvent::Message {
+                publication_id: current,
+                ..
+            },
+        ) = (&original_owned, &fresh)
+        else {
+            anyhow::bail!("expected message evidence for both DATA source incarnations");
+        };
+        anyhow::ensure!(
+            previous != current,
+            "reconnect reused the retired Lossy source"
+        );
+        let expected_change = DataEvent::Discontinuity {
+            participant_id: remote.into(),
+            previous_publication_id: previous.clone(),
+            publication_id: current.clone(),
+        };
+        for retained in [&owned_data.room, &owned_data.participant] {
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
-                    match retired.next().await {
-                        Err(pulsebeam_agent_native::ffi::NativeError::Operation { info })
-                            if info.code == core_ffi::ErrorCode::ContinuityLost =>
-                        {
-                            return Ok(());
-                        }
-                        Ok(Some(pulsebeam_agent_core::DataEvent::Message { data, .. }))
-                            if data == [0, 255, 128, 0] => {}
-                        other => {
-                            anyhow::bail!("retired reliable cursor unexpectedly returned {other:?}")
-                        }
+                    match retained.next().await? {
+                        Some(event) if event == expected_change => break,
+                        Some(DataEvent::Message {
+                            publication_id,
+                            data,
+                            ..
+                        }) if publication_id == *previous && data == [0, 255, 128, 0] => {}
+                        other => anyhow::bail!(
+                            "Lossy source changed without its discontinuity: {other:?}"
+                        ),
                     }
                 }
+                let received = owned_data.message(retained, &[0, 255, 128, 2]).await?;
+                anyhow::ensure!(
+                    received == fresh,
+                    "retained Lossy cursor missed the replacement message"
+                );
+                anyhow::Ok(())
             })
             .await??;
         }
-        replacement
-    };
+        replacement.room.close().await?;
+        replacement.participant.close().await?;
+    }
     let second_expected = second.retained.clone();
     runtime.disconnect().await?;
     anyhow::ensure!(

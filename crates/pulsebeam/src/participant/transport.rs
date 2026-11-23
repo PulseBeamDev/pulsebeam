@@ -78,10 +78,42 @@ pub(super) fn fabric_data_config(
     })
 }
 
+fn sdp_fabric_profile(
+    codec: pulsebeam_rtc::CodecProfile,
+) -> Option<pulsebeam_core::fabric::Profile> {
+    use pulsebeam_core::fabric::Profile;
+    use pulsebeam_rtc::CodecProfile;
+    match codec {
+        CodecProfile::Opus => Some(Profile::Opus),
+        CodecProfile::H264 {
+            packetization_mode: 1,
+            ..
+        } => Some(Profile::H264),
+        _ => None,
+    }
+}
+
 fn tcp_frame_payload(frame: &[u8]) -> Option<&[u8]> {
     let length = u16::from_be_bytes(frame.get(..2)?.try_into().ok()?);
     let payload = frame.get(2..)?;
     (usize::from(length) == payload.len()).then_some(payload)
+}
+
+fn playout_delay_extension(
+    (min, max): (MediaTime, MediaTime),
+) -> Result<RtpExtension, pulsebeam_rtc::WriteError> {
+    let millis = |time: MediaTime| {
+        time.numer()
+            .saturating_mul(1000)
+            .checked_div(u64::from(time.frequency().get()))
+            .ok_or(pulsebeam_rtc::WriteError::InvalidRtp)
+    };
+    let delay = pulsebeam_rtc::PlayoutDelay::from_millis(millis(min)?, millis(max)?)
+        .map_err(|_| pulsebeam_rtc::WriteError::InvalidRtp)?;
+    Ok(RtpExtension {
+        uri: crate::rtp::PLAYOUT_DELAY_URI.into(),
+        value: rtc_bytes(&delay.to_bytes()),
+    })
 }
 
 fn egress_extensions(
@@ -106,7 +138,7 @@ fn egress_extensions(
                     | pulsebeam_core::vla::URI
                     | pulsebeam_core::dd::URI
                     | "http://www.webrtc.org/experiments/rtp-hdrext/video-dependency-descriptor"
-                    | "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
+                    | crate::rtp::PLAYOUT_DELAY_URI
             )
         })
         .collect::<Vec<_>>();
@@ -128,19 +160,8 @@ fn egress_extensions(
             });
         }
     }
-    if let Some((min, max)) = playout_delay {
-        let millis = |time: MediaTime| {
-            time.numer()
-                .saturating_mul(1000)
-                .checked_div(u64::from(time.frequency().get()))
-                .ok_or(pulsebeam_rtc::WriteError::InvalidRtp)
-        };
-        let delay = pulsebeam_rtc::PlayoutDelay::from_millis(millis(min)?, millis(max)?)
-            .map_err(|_| pulsebeam_rtc::WriteError::InvalidRtp)?;
-        extensions.push(RtpExtension {
-            uri: "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay".into(),
-            value: rtc_bytes(&delay.to_bytes()),
-        });
+    if let Some(delay) = playout_delay {
+        extensions.push(playout_delay_extension(delay)?);
     }
     Ok(extensions)
 }
@@ -952,10 +973,13 @@ impl RtcDriver {
         self.rtc.rtp_receive_binding(primary)
     }
 
-    pub(super) fn whip_opus_receive_binding(
+    pub(super) fn sdp_fabric_receive_binding(
         &self,
         mid: Mid,
-    ) -> Option<pulsebeam_rtc::RtpReceiveBinding<'_>> {
+    ) -> Option<(
+        pulsebeam_core::fabric::Profile,
+        pulsebeam_rtc::RtpReceiveBinding<'_>,
+    )> {
         let media = self
             .session
             .inbound_media
@@ -967,14 +991,31 @@ impl RtcDriver {
         let [codec] = media.codecs.as_ref() else {
             return None;
         };
-        if !media.rids.is_empty() || codec.profile != pulsebeam_rtc::CodecProfile::Opus {
+        if !media.rids.is_empty() {
             return None;
         }
         let binding = self.rtc.sdp_receive_binding(*primary)?;
+        let profile = sdp_fabric_profile(codec.profile)?;
+        if profile == pulsebeam_core::fabric::Profile::H264 && media.receives_dependency_descriptor
+        {
+            return None;
+        }
         (binding.mid == mid.as_str()
             && binding.rid.is_none()
             && binding.primary_codec.payload_type == codec.payload_type)
-            .then_some(binding)
+            .then_some((profile, binding))
+    }
+
+    pub(super) fn sdp_fabric_send_profile(
+        &self,
+        mid: Mid,
+    ) -> Option<pulsebeam_core::fabric::Profile> {
+        let sender = self
+            .session
+            .senders
+            .iter()
+            .find(|sender| sender.mid.as_ref() == mid.as_str())?;
+        sdp_fabric_profile(sender.codec.profile)
     }
 
     pub(super) fn local_rtp_output_form(
@@ -1038,15 +1079,37 @@ impl RtcDriver {
         branch: crate::shard::router::FabricLocalBranch,
         source: crate::rtp::fabric_egress::SourceMetadata,
         packet: crate::rtp::fabric_egress::CandidatePacket<'_, '_>,
+        playout_delay: Option<(MediaTime, MediaTime)>,
     ) -> Result<(), crate::rtp::fabric_egress::AdmissionError> {
+        use crate::rtp::fabric_egress::AdmissionError;
+
         // Let already protected UDP datagrams cross the adapter before
         // committing a cut. At this point they cannot be scoped by sender.
         if leg.cut_pending() && !self.udp_packets.is_empty() {
-            return Err(crate::rtp::fabric_egress::AdmissionError::Rtc(
-                pulsebeam_rtc::WriteError::WouldBlock,
-            ));
+            return Err(AdmissionError::Rtc(pulsebeam_rtc::WriteError::WouldBlock));
         }
-        leg.admit(&mut self.rtc, self.rtc_clock.into(), branch, source, packet)?;
+        let output = leg.output();
+        let playout = playout_delay
+            .filter(|_| {
+                self.rtc
+                    .rtp_egress_extension_id(
+                        output.mid.as_str(),
+                        output.primary,
+                        crate::rtp::PLAYOUT_DELAY_URI,
+                    )
+                    .is_some()
+            })
+            .map(playout_delay_extension)
+            .transpose()
+            .map_err(AdmissionError::Rtc)?;
+        leg.admit(
+            &mut self.rtc,
+            self.rtc_clock.into(),
+            branch,
+            source,
+            packet,
+            playout.as_ref(),
+        )?;
         self.rtc_needs_drain = true;
         Ok(())
     }

@@ -7,7 +7,6 @@ use crate::control::native::{
     ExecutionDeferral, Preparation, PreparedResource, Publication, ResourceExecution,
 };
 use crate::participant::policy::{ExecutionFailure, ExecutionFailureKind, ExecutionScope};
-#[cfg(test)]
 use pulsebeam_proto::state as wire;
 
 #[cfg(test)]
@@ -83,7 +82,8 @@ enum DataPublicationState {
 }
 
 struct FabricPublisher {
-    parameters: Box<pulsebeam_proto::state::SctpDataV1Parameters>,
+    parameters: wire::SctpDataV1Parameters,
+    capture_clock: Option<wire::DataV1CaptureClock>,
     candidate: Option<PublicationKey>,
     source: Option<NonZeroU64>,
 }
@@ -415,7 +415,7 @@ impl Connection {
         events: &mut impl ParticipantSink,
     ) {
         let plan = match command {
-            PreparedResource::Publication(Publication::Data(plan)) => plan,
+            PreparedResource::Publication(Publication::Data(plan)) => *plan,
             PreparedResource::Publication(Publication::Rtp(plan)) => {
                 self.prepare_native_rtp(work, *plan, events);
                 return;
@@ -433,16 +433,18 @@ impl Connection {
             track_id,
             lane,
             parameters,
+            capture_clock,
             enabled,
         } = plan;
         let Some(channel) =
-            super::super::transport::fabric_data_config(*parameters).and_then(|config| config.id)
+            super::super::transport::fabric_data_config(parameters).and_then(|config| config.id)
         else {
             self.complete_native_preparation(work, Err(ExecutionFailureKind::Invalid.into()));
             return;
         };
         let fabric = Some(FabricPublisher {
             parameters,
+            capture_clock,
             candidate: None,
             source: None,
         });
@@ -475,7 +477,7 @@ impl Connection {
         }
         let installation = match if let Some(fabric) = &fabric {
             self.transport
-                .install_fabric_data(*fabric.parameters)
+                .install_fabric_data(fabric.parameters)
                 .map_err(|reason| match reason {
                     pulsebeam_rtc::WriteError::WouldBlock => ExecutionFailureKind::Capacity,
                     _ => ExecutionFailureKind::Conflict,
@@ -543,7 +545,7 @@ impl Connection {
             return;
         }
         let expected = if let Some(fabric) = &publication.fabric {
-            super::super::transport::fabric_data_config(*fabric.parameters).filter(|_| {
+            super::super::transport::fabric_data_config(fabric.parameters).filter(|_| {
                 self.transport
                     .supports_fabric_data(publication.installation)
             })
@@ -593,7 +595,7 @@ impl Connection {
         &self,
         work: Preparation,
         id: PublicationKey,
-    ) -> Option<data_fabric::PreparedSctp> {
+    ) -> Option<(data_fabric::PreparedSctp, Option<&wire::DataV1CaptureClock>)> {
         self.native_preparation_time(work)?;
         let publication = self.native_data.publications.get(&work.reference)?;
         let fabric = publication.fabric.as_ref()?;
@@ -607,7 +609,13 @@ impl Connection {
         {
             return None;
         }
-        data_fabric::PreparedSctp::from_negotiation(*fabric.parameters, publication.installation)
+        Some((
+            data_fabric::PreparedSctp::from_negotiation(
+                fabric.parameters,
+                publication.installation,
+            )?,
+            fabric.capture_clock.as_ref(),
+        ))
     }
 
     pub(crate) fn complete_native_fabric_publisher(
@@ -681,8 +689,16 @@ impl Connection {
             return false;
         };
         let data_v1_source = publication.fabric.as_ref().and_then(|fabric| fabric.source);
-        let track =
-            Track::native_data_publication(admitted.meta.clone(), publication.lane, data_v1_source);
+        let capture_clock = publication
+            .fabric
+            .as_ref()
+            .and_then(|fabric| fabric.capture_clock.clone());
+        let track = Track::native_data_publication(
+            admitted.meta.clone(),
+            publication.lane,
+            data_v1_source,
+            capture_clock,
+        );
         if first_admission {
             events.publish_track(track.clone());
         }

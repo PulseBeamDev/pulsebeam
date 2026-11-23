@@ -369,6 +369,8 @@ message VideoTrack {
 message DataTrack {
   // Required transport delivery mode. No application message format is implied.
   DataDelivery delivery = 1;
+  // The immutable source clock for timestamped DATA records, when declared.
+  DataV1CaptureClock capture_clock = 2;
 }
 
 enum DataDelivery {
@@ -464,6 +466,9 @@ message DataPublication {
 
   // Required prepared SCTP payload channel, never a reserved control ID.
   TrackBinding binding = 2;
+
+  // Optional immutable source clock for DATA v1. It cannot change in place.
+  DataV1CaptureClock capture_clock = 3;
 }
 
 // Exact source and independently prepared receiver binding for one lifetime.

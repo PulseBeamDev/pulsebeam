@@ -55,6 +55,7 @@ pub(crate) struct ReceiverStage {
     pub(crate) source: crate::entity::PublicationKey,
     pub(crate) endpoint: pulsebeam_proto::data_control::SubscriberBinding,
     pub(crate) prepared: PreparedSctp,
+    pub(crate) capture_clock: Option<pulsebeam_proto::state::DataV1CaptureClock>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

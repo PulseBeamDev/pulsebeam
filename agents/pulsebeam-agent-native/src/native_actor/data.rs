@@ -69,17 +69,25 @@ pub struct LocalDataTrack {
 }
 
 impl LocalDataTrack {
-    pub(crate) fn publish_with_delivery(
+    pub(crate) fn publish_with_options(
         &self,
         delivery: TopicMode,
+        capture_clock: Option<agent_core::ffi::CaptureClock>,
     ) -> Result<DataPublication, Error> {
         Self {
             address: self.address.with_delivery(delivery),
         }
-        .publish()
+        .publish_with_clock(capture_clock)
     }
 
     pub fn publish(&self) -> Result<DataPublication, Error> {
+        self.publish_with_clock(None)
+    }
+
+    fn publish_with_clock(
+        &self,
+        capture_clock: Option<agent_core::ffi::CaptureClock>,
+    ) -> Result<DataPublication, Error> {
         if self.address.closed.is_closed() || self.address.finished.is_closed() {
             return Err(Error::Closed);
         }
@@ -88,6 +96,7 @@ impl LocalDataTrack {
                 .core
                 .resource(ResourceCommand::DeclareDataPublication {
                     spec: self.address.spec.clone(),
+                    capture_clock,
                 })?
         else {
             return Err(Error::Rtc("Core did not reserve a data publication".into()));

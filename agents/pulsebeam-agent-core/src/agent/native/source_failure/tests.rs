@@ -209,6 +209,7 @@ fn delivery_mismatch_fails_only_incompatible_receivers_and_revocation_keeps_the_
                         room_id: "room".into(),
                         track_id: "events".into(),
                         kind: Some(state::track::Kind::Data(state::DataTrack {
+                            capture_clock: None,
                             delivery: state::DataDelivery::Ordered as i32,
                         })),
                     }),
@@ -332,6 +333,7 @@ fn resolved_source_description_does_not_claim_data_receiver_execution() {
                         room_id: "room".into(),
                         track_id: "events".into(),
                         kind: Some(state::track::Kind::Data(state::DataTrack {
+                            capture_clock: None,
                             delivery: state::DataDelivery::Ordered as i32,
                         })),
                     }),

@@ -67,7 +67,6 @@ fn local_ordered_cross_shard_delivery_and_repair() -> anyhow::Result<()> {
         .build();
     sim.host(node_ip, move || async move {
         sfu_node_builder(node_ip, pulsebeam_runtime::rand::seeded_rng(seed), 2)
-            .with_reliable_data_v1()
             .run(tokio_util::sync::CancellationToken::new())
             .await
             .map_err(Into::into)
@@ -506,6 +505,24 @@ async fn prove_payload(
             initial_payload,
         )
         .await?;
+        let (denied, _) = agent_for(
+            viewer_ip,
+            token("denied-local-viewer", &["join"], 3600_u64)?.token,
+        )?;
+        let refused = prove_reliable_subscription_denied(&denied, ROOM, TRACK, PUBLISHER).await?;
+        let events = origin.events();
+        prove_reliable_sdk_unit(
+            &events,
+            &publication,
+            &replacement,
+            (TRACK, PUBLISHER, &pub_id),
+            b"authorized delivery after a default-profile denial",
+        )
+        .await?;
+        assert_denied_data_stays_uninstalled(&refused).await?;
+        events.close().await;
+        denied.close().await?;
+        late.close().await?;
         viewer.close().await?;
         origin.close().await?;
         return Ok(Value::Null);
@@ -771,44 +788,10 @@ async fn prove_reliable_subscription_boundary(
     (room, track, publisher, source): (&str, &str, &str, &str),
 ) -> anyhow::Result<()> {
     late.join(room.into())?;
-    denied.join(room.into())?;
-    tokio::try_join!(
+    let (_, refused) = tokio::try_join!(
         wait_connected_when(late, None, |_| true),
-        wait_connected_when(denied, None, |_| true)
+        prove_reliable_subscription_denied(denied, room, track, publisher)
     )?;
-    let subscribe = |agent: &Agent| {
-        agent
-            .room(room.into())?
-            .participant(publisher.into())?
-            .data(track.into())?
-            .subscribe(Some(core_ffi::DataSubscribeOptions {
-                delivery: Some(core_ffi::DataDelivery::Reliable),
-            }))
-    };
-    let refused = subscribe(denied)?;
-    let updates = refused.updates()?;
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while let Some(state) = updates.next().await? {
-            if let Some(error) = state.terminal_error {
-                anyhow::ensure!(error.code == core_ffi::ErrorCode::PermissionDenied);
-                anyhow::ensure!(
-                    state.source_status == core_ffi::SubscriptionSourceStatus::Rejected
-                        && state.accepted_revision.is_none()
-                        && state.source_track_id.is_none()
-                        && state.execution != core_ffi::PublicationExecution::Installed
-                );
-                return anyhow::Ok(());
-            }
-        }
-        anyhow::bail!("denied branch closed before rejection")
-    })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "subscription without Subscribe permission was not rejected: {:?}",
-            refused.state()
-        )
-    })??;
 
     let events = origin.events();
     let admitted_at = tokio::time::Instant::now();
@@ -821,7 +804,7 @@ async fn prove_reliable_subscription_boundary(
     )
     .await?;
     events.close().await;
-    let late_feed = subscribe(late)?;
+    let late_feed = subscribe_reliable(late, room, track, publisher)?;
     let updates = late_feed.updates()?;
     tokio::time::timeout_at(admitted_at + Duration::from_millis(1500), async {
         while let Some(state) = updates.next().await? {
@@ -852,6 +835,67 @@ async fn prove_reliable_subscription_boundary(
         new_unit > old_unit,
         "late branch did not advance past the prior Reliable unit"
     );
+    assert_denied_data_stays_uninstalled(&refused).await?;
+    events.close().await;
+    late.close().await?;
+    denied.close().await?;
+    Ok(())
+}
+
+fn subscribe_reliable(
+    agent: &Agent,
+    room: &str,
+    track: &str,
+    publisher: &str,
+) -> anyhow::Result<std::sync::Arc<pulsebeam_agent_native::ffi::DataSubscription>> {
+    Ok(agent
+        .room(room.into())?
+        .participant(publisher.into())?
+        .data(track.into())?
+        .subscribe(Some(core_ffi::DataSubscribeOptions {
+            delivery: Some(core_ffi::DataDelivery::Reliable),
+        }))?)
+}
+
+async fn prove_reliable_subscription_denied(
+    denied: &Agent,
+    room: &str,
+    track: &str,
+    publisher: &str,
+) -> anyhow::Result<std::sync::Arc<pulsebeam_agent_native::ffi::DataSubscription>> {
+    denied.join(room.into())?;
+    wait_connected_when(denied, None, |_| true).await?;
+    let refused = subscribe_reliable(denied, room, track, publisher)?;
+    let updates = refused.updates()?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(state) = updates.next().await? {
+            if let Some(error) = state.terminal_error {
+                anyhow::ensure!(error.code == core_ffi::ErrorCode::PermissionDenied);
+                anyhow::ensure!(
+                    state.source_status == core_ffi::SubscriptionSourceStatus::Rejected
+                        && state.accepted_revision.is_none()
+                        && state.source_track_id.is_none()
+                        && state.execution != core_ffi::PublicationExecution::Installed
+                );
+                return anyhow::Ok(());
+            }
+        }
+        anyhow::bail!("denied branch closed before rejection")
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "subscription without Subscribe permission was not rejected: {:?}",
+            refused.state()
+        )
+    })??;
+
+    Ok(refused)
+}
+
+async fn assert_denied_data_stays_uninstalled(
+    refused: &pulsebeam_agent_native::ffi::DataSubscription,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         refused.state().source_track_id.is_none()
             && refused.state().execution != core_ffi::PublicationExecution::Installed
@@ -859,9 +903,6 @@ async fn prove_reliable_subscription_boundary(
     if let Ok(Ok(Some(_))) = tokio::time::timeout(Duration::from_millis(50), refused.next()).await {
         anyhow::bail!("denied subscription received a DATA event");
     }
-    events.close().await;
-    late.close().await?;
-    denied.close().await?;
     Ok(())
 }
 

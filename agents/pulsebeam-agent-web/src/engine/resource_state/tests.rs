@@ -54,7 +54,10 @@ fn named_resources_project_their_own_prejoin_configuration() {
     };
     let publication = owner(
         &mut agent,
-        ResourceCommand::DeclareDataPublication { spec: data.clone() },
+        ResourceCommand::DeclareDataPublication {
+            spec: data.clone(),
+            capture_clock: None,
+        },
     );
     let subscription = owner(
         &mut agent,
@@ -265,6 +268,7 @@ fn queued_owned_data_send_cannot_outlive_its_owner_or_join() {
         let handle = actor.handle(sender);
         let ResourceResult::Owned { owner } = handle
             .resource_now(ResourceCommand::DeclareDataPublication {
+                capture_clock: None,
                 spec: TrackSpec::Data {
                     track_id: "chat".into(),
                     delivery: TopicMode::Ordered,

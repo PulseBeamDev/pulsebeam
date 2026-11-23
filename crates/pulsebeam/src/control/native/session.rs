@@ -2720,6 +2720,7 @@ pub(crate) fn track_descriptor(track: &crate::track::Track) -> Option<wire::Trac
             format: Some(video.format.clone()?),
         }),
         Track::Data(data) => wire::track::Kind::Data(wire::DataTrack {
+            capture_clock: data.capture_clock.clone(),
             delivery: match data.lane {
                 DataLane::Latest => wire::DataDelivery::Latest,
                 DataLane::Lossy => wire::DataDelivery::Lossy,

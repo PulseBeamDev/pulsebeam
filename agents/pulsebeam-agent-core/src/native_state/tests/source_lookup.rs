@@ -49,6 +49,7 @@ fn confirmation(
                     room_id: "room".into(),
                     track_id: "updates".into(),
                     kind: Some(wire::track::Kind::Data(wire::DataTrack {
+                        capture_clock: None,
                         delivery: wire::DataDelivery::Ordered as i32,
                     })),
                 }),

@@ -123,6 +123,10 @@ fn describe_shard_metrics() {
         "recoverable packet or topology drops by lane, stage, and origin"
     );
     metrics::describe_counter!(
+        "fabric_rtp_branch_admissions",
+        "Fabric RTP branches committed by their first successful bounded RTC enqueue"
+    );
+    metrics::describe_counter!(
         "shard_wrong_owner_drop",
         "packets received by a shard that does not own their transport route"
     );

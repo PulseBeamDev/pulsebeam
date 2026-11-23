@@ -28,6 +28,7 @@ fn publication(revision: u64) -> ClientStateBatch {
                             PublicationSpec {
                                 track_id: String::from("cursor"),
                                 kind: Some(publication_spec::Kind::Data(DataPublication {
+                                    capture_clock: None,
                                     delivery: DataDelivery::Lossy as i32,
                                     binding: Some(TrackBinding {
                                         transport: Some(track_binding::Transport::Sctp(
@@ -282,6 +283,7 @@ fn lookup_state(enabled: bool, paired: bool) -> SourceLookupState {
             room_id: String::from("room"),
             track_id: String::from("cursor"),
             kind: Some(track::Kind::Data(DataTrack {
+                capture_clock: None,
                 delivery: DataDelivery::Lossy as i32,
             })),
         }),
@@ -405,10 +407,24 @@ fn logical_subscription_accepts_only_an_enabled_exact_source_offer() {
         opt_in(&mut data_v1);
         assert_eq!(
             validation::validate_logical_subscription(&data_v1),
+            Err(ValidationError::Binding),
+            "a receiver offer cannot change the source clock",
+        );
+        let Some(track::Kind::Data(track)) = data_v1
+            .source
+            .as_mut()
+            .and_then(|source| source.kind.as_mut())
+        else {
+            panic!("DATA source")
+        };
+        track.capture_clock = data_v1.data_v1.as_ref().unwrap().capture_clock.clone();
+        assert_eq!(
+            validation::validate_logical_subscription(&data_v1),
             expected
         );
         let mut legacy = subscription.clone();
         opt_in(&mut legacy);
+        legacy.source = data_v1.source.take();
         legacy.data_v1 = data_v1.data_v1.take();
         assert_eq!(
             validation::validate_logical_subscription(&legacy),
@@ -571,6 +587,7 @@ fn source_lookup_is_a_bounded_owned_nonforwarding_observation() {
         declaration: Some(resource_spec::Declaration::Publication(PublicationSpec {
             track_id: String::from("cursor"),
             kind: Some(publication_spec::Kind::Data(DataPublication {
+                capture_clock: None,
                 delivery: DataDelivery::Lossy as i32,
                 binding: Some(TrackBinding {
                     transport: Some(track_binding::Transport::Sctp(SctpParameters {
@@ -1064,6 +1081,7 @@ fn owned_confirmation_is_self_contained_and_execution_failure_is_not_rejection()
             room_id: String::from("room"),
             track_id: String::from("cursor"),
             kind: Some(track::Kind::Data(DataTrack {
+                capture_clock: None,
                 delivery: DataDelivery::Lossy as i32,
             })),
         }),

@@ -110,7 +110,12 @@ impl PublicationFact {
                     wire::DataDelivery::Lossy => DataLane::Lossy,
                     wire::DataDelivery::Unspecified => return None,
                 };
-                MediaTrack::native_data_publication(meta, lane, self.fabric_data_source)
+                MediaTrack::native_data_publication(
+                    meta,
+                    lane,
+                    self.fabric_data_source,
+                    data.capture_clock.clone(),
+                )
             }
         })
     }
@@ -617,6 +622,7 @@ mod tests {
             participant_id: alice.participant.to_string(),
             track_id: "events".into(),
             kind: Some(track::Kind::Data(pulsebeam_proto::state::DataTrack {
+                capture_clock: None,
                 delivery: pulsebeam_proto::state::DataDelivery::Lossy as i32,
             })),
         };
@@ -891,6 +897,7 @@ mod tests {
                     participant_id: alice.participant.to_string(),
                     track_id: "conflict".into(),
                     kind: Some(track::Kind::Data(pulsebeam_proto::state::DataTrack {
+                        capture_clock: None,
                         delivery: pulsebeam_proto::state::DataDelivery::Latest as i32,
                     })),
                 },

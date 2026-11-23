@@ -469,7 +469,18 @@
       }, "current ordered payload delivery");
       await reading;
     };
+    const sendOrdered = async (publisher, iterator, value) => {
+      await publisher.send(Uint8Array.of(value));
+      await receiveValue(iterator, value);
+    };
     const warmOrdered = async (publisher, iterator, value) => {
+      const installed = pulsebeam.PublicationExecution.Installed;
+      await until(
+        () =>
+          publisher.state().execution === installed &&
+          iterator.state().execution === installed,
+        "ordered publisher and subscriber installation",
+      );
       let received = false;
       let failure;
       const delivery = receiveValue(iterator, value).then(
@@ -496,8 +507,7 @@
       .data("reuse-steady")
       .subscribe();
     await warmOrdered(steadyPublisher, steadyIterator, 0);
-    await steadyPublisher.send(Uint8Array.of(1));
-    await receiveValue(steadyIterator, 1);
+    await sendOrdered(steadyPublisher, steadyIterator, 1);
     const steadyChannels = payloadChannels.filter(
       ({ channel }) => channel.readyState === "open",
     );
@@ -515,8 +525,7 @@
         .subscribe();
       // Witness each fresh subscription's live frontier before the assertion send.
       await warmOrdered(cyclingPublisher, cyclingIterator, lifetime * 2);
-      await cyclingPublisher.send(Uint8Array.of(lifetime * 2 + 1));
-      await receiveValue(cyclingIterator, lifetime * 2 + 1);
+      await sendOrdered(cyclingPublisher, cyclingIterator, lifetime * 2 + 1);
       const live = payloadChannels.filter(
         ({ channel }) => channel.readyState === "open",
       );
@@ -569,12 +578,7 @@
           receiver.state().connectionId === receiverConnection,
         "payload reuse does not reconnect either peer",
       );
-      await sendOrdered(
-        steadyPublisher,
-        steadyIterator,
-        lifetime + 2,
-        "reuse-steady",
-      );
+      await sendOrdered(steadyPublisher, steadyIterator, lifetime + 2);
     }
     discoveryWatch = receiver.room("public-web-contract").watch();
     await until(
@@ -648,7 +652,7 @@
       );
     };
     const deliverDuringView = async (value) => {
-      await sendOrdered(steadyPublisher, steadyIterator, value, "reuse-steady");
+      await sendOrdered(steadyPublisher, steadyIterator, value);
     };
     video.style.cssText =
       "position:fixed;left:30px;top:20px;width:220px;height:160px";
@@ -1141,6 +1145,15 @@
       "SDK stops owned media, not caller capture",
     );
     return true;
+  } catch (error) {
+    const info = error?.inner?.info;
+    if (info) {
+      const { code, message } = info;
+      throw new Error(`Web Agent operation failed (${code}): ${message}`, {
+        cause: error,
+      });
+    }
+    throw error;
   } finally {
     RTCRtpSender.prototype.replaceTrack = originalReplaceTrack;
     MediaStreamTrack.prototype.clone = originalClone;

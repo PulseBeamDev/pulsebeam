@@ -559,6 +559,7 @@ mod tests {
                     room_id: "room".into(),
                     track_id: format!("track-{i:030}"),
                     kind: Some(track::Kind::Data(crate::state::DataTrack {
+                        capture_clock: None,
                         delivery: DataDelivery::Ordered as i32,
                     })),
                 })

@@ -80,6 +80,15 @@ pub struct OutputLeg {
     pub replace_queued: bool,
 }
 
+struct WriteLayout<'a> {
+    leg: OutputLeg,
+    scope: pulsebeam_rtc::MediaScope,
+    dd: Option<&'a [u8]>,
+    answer_fid: Option<[u32; 2]>,
+    max_primary_wire_bytes: Option<usize>,
+    playout: Option<&'a pulsebeam_rtc::RtpExtension>,
+}
+
 /// Candidate state for a single negotiated output sender.
 pub struct SenderLeg<B> {
     output: OutputLeg,
@@ -154,6 +163,7 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
         branch: crate::shard::router::FabricLocalBranch,
         source: SourceMetadata,
         (sequence, packet, evidence): CandidatePacket<'_, '_>,
+        playout: Option<&pulsebeam_rtc::RtpExtension>,
     ) -> Result<(), AdmissionError> {
         let OutputLeg {
             mid,
@@ -239,7 +249,14 @@ impl SenderLeg<crate::shard::router::FabricLocalBranch> {
             self.hints.queue_rtp(
                 rtc,
                 at,
-                (leg, scope, dd, self.answer_fid, max_primary_wire_bytes),
+                WriteLayout {
+                    leg,
+                    scope,
+                    dd,
+                    answer_fid: self.answer_fid,
+                    max_primary_wire_bytes,
+                    playout,
+                },
                 source,
                 output,
                 packet,
@@ -455,13 +472,14 @@ impl EndpointHints {
         &self,
         rtc: &mut pulsebeam_rtc::RtcConnection,
         at: std::time::Instant,
-        (leg, scope, dd, answer_fid, max_primary_wire_bytes): (
-            OutputLeg,
-            pulsebeam_rtc::MediaScope,
-            Option<&[u8]>,
-            Option<[u32; 2]>,
-            Option<usize>,
-        ),
+        WriteLayout {
+            leg,
+            scope,
+            dd,
+            answer_fid,
+            max_primary_wire_bytes,
+            playout,
+        }: WriteLayout<'_>,
         source: SourceMetadata,
         output: timeline::Projected,
         packet: &FabricPacket<P, E>,
@@ -487,7 +505,8 @@ impl EndpointHints {
             projected
                 .values
                 .len()
-                .saturating_add(usize::from(dd.is_some())),
+                .saturating_add(usize::from(dd.is_some()))
+                .saturating_add(usize::from(playout.is_some())),
         );
         if let Some(value) = dd {
             let hint = self
@@ -507,6 +526,9 @@ impl EndpointHints {
                 .iter()
                 .find(|hint| hint.id == id)
                 .ok_or(WriteError::InvalidRtp)?;
+            if hint.kind == ExtensionKind::PlayoutDelay && playout.is_some() {
+                continue;
+            }
             if rtc.rtp_egress_extension_id(mid, leg.primary, &hint.uri) != Some(id) {
                 return Err(WriteError::InvalidRtp);
             }
@@ -515,6 +537,7 @@ impl EndpointHints {
                 value: bytes::Bytes::copy_from_slice(value),
             });
         }
+        extensions.extend(playout.cloned());
         let clock = RtpClockAnchor {
             timestamp: output.anchor_timestamp,
             wallclock: output.wallclock,

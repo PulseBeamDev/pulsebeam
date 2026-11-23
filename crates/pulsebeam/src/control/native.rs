@@ -26,9 +26,9 @@ pub(crate) use session::{
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum DataProfile {
-    #[default]
     Legacy,
     FabricLive,
+    #[default]
     FabricReliable,
 }
 
@@ -301,7 +301,8 @@ pub(crate) fn receiver_policy(
 pub(crate) struct DataPublication {
     pub(crate) track_id: TrackId,
     pub(crate) lane: DataLane,
-    pub(crate) parameters: Box<wire::SctpDataV1Parameters>,
+    pub(crate) parameters: wire::SctpDataV1Parameters,
+    pub(crate) capture_clock: Option<wire::DataV1CaptureClock>,
     pub(crate) enabled: bool,
 }
 
@@ -315,14 +316,19 @@ pub(crate) struct RtpPublication {
 }
 
 pub(crate) enum Publication {
-    Data(DataPublication),
+    Data(Box<DataPublication>),
     Rtp(Box<RtpPublication>),
 }
 
 impl Publication {
     pub(crate) fn execution_bytes(&self, spec_bytes: usize) -> usize {
         match self {
-            Self::Data(data) => Connection::native_data_execution_bytes(data.track_id.as_str()),
+            Self::Data(data) => Connection::native_data_execution_bytes(data.track_id.as_str())
+                .saturating_add(
+                    data.capture_clock
+                        .as_ref()
+                        .map_or(0, |clock| clock.id.len().saturating_mul(4)),
+                ),
             Self::Rtp(rtp) => Connection::native_rtp_execution_bytes(
                 spec_bytes,
                 rtp.binding.description().encodings.len(),
@@ -362,17 +368,18 @@ pub(crate) fn publication(
                     ) {
                         return Err(wire::FailureCode::InvalidConfiguration);
                     }
-                    Box::new(*binding)
+                    *binding
                 }
                 _ => return Err(wire::FailureCode::Unsupported),
             };
-            Publication::Data(DataPublication {
+            Publication::Data(Box::new(DataPublication {
                 track_id: TrackId::new(&declaration.track_id)
                     .map_err(|_| wire::FailureCode::InvalidConfiguration)?,
                 lane,
                 parameters,
+                capture_clock: data.capture_clock.clone(),
                 enabled,
-            })
+            }))
         }
         _ => {
             let capabilities = capabilities.ok_or(wire::FailureCode::Unsupported)?;

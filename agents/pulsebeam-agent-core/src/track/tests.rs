@@ -115,8 +115,18 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
     let owner = resources.new_owner().unwrap();
     let spec = data(TopicMode::Ordered);
     assert!(resources.is_empty());
-    resources.declare_data_publication(owner, &spec).unwrap();
+    resources
+        .declare_data_publication(owner, &spec, None)
+        .unwrap();
     assert!(!resources.is_empty());
+    let capture_clock = crate::ffi::CaptureClock {
+        id: "events-clock".into(),
+        epoch: 1,
+    };
+    assert_eq!(
+        resources.declare_data_publication(owner, &spec, Some(capture_clock.clone())),
+        Err(TrackResourceError::AlreadyOwned)
+    );
     let media_owner = resources.new_owner().unwrap();
     resources
         .claim_publication(media_owner, video("events"), &BTreeSet::new())
@@ -127,9 +137,11 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
         resources.retain_producer(&data(TopicMode::Latest)),
         Err(TrackResourceError::AlreadyOwned)
     );
-    resources.declare_data_publication(owner, &spec).unwrap();
+    resources
+        .declare_data_publication(owner, &spec, None)
+        .unwrap();
     assert_eq!(
-        resources.declare_data_publication(owner, &data(TopicMode::Latest)),
+        resources.declare_data_publication(owner, &data(TopicMode::Latest), None),
         Err(TrackResourceError::AlreadyOwned)
     );
     assert_eq!(
@@ -141,7 +153,7 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
     );
     let other = resources.new_owner().unwrap();
     assert_eq!(
-        resources.declare_data_publication(other, &data(TopicMode::Latest)),
+        resources.declare_data_publication(other, &data(TopicMode::Latest), None),
         Err(TrackResourceError::AlreadyOwned)
     );
     resources.release(owner);
@@ -149,8 +161,14 @@ fn owned_data_declarations_are_label_unique_mode_sensitive_and_reclaimable() {
     resources.release(media_owner);
     assert!(resources.is_empty());
     resources
-        .declare_data_publication(other, &data(TopicMode::Latest))
+        .declare_data_publication(other, &data(TopicMode::Latest), Some(capture_clock))
         .unwrap();
+    assert_eq!(
+        resources
+            .data_capture_clock("events")
+            .map(|clock| (clock.id.as_str(), clock.epoch)),
+        Some(("events-clock", 1))
+    );
     assert_eq!(
         resources.registrations().publishers,
         vec![TopicPublisher {
