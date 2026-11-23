@@ -60,16 +60,50 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
 
         catalog_agent.join(room)
         first_page = await catalog_page(lambda participants: any(
-            participant.id == "publisher" and any(
+            participant.id() == "publisher" and any(
                 publication.track_id == "production-camera" and publication.kind.is_VIDEO()
-                for publication in participant.publications
+                for publication in participant.tracks()
             ) for participant in participants
         ) and any(
-            participant.id == "foreign-catalog" and not participant.publications
+            participant.id() == "foreign-catalog" and not participant.tracks()
             for participant in participants
         ))
         assert not first_page.has_more() and not first_page.next_cursor()
-        assert all(participant.id != "foreign" for participant in first_page.participants())
+        assert all(participant.id() != "foreign" for participant in first_page.participants())
+        publisher_entry = next(entry for entry in first_page.participants() if entry.id() == "publisher")
+
+        async def settled_page(view):
+            updates = view.updates()
+            try:
+                while True:
+                    state = await updates.next()
+                    assert state is not None
+                    if state.status != core.WatchStatus.LOADING:
+                        return state
+            finally:
+                updates.close()
+                view.close()
+
+        catalog_room = catalog_agent.room(room)
+        head = await asyncio.wait_for(settled_page(catalog_room.watch(core.WatchConfig(
+            limit=1, cursor=b"",
+        ))), timeout=5)
+        assert head.status == core.WatchStatus.LIVE and head.page.has_more()
+        assert len(head.page.participants()) == 1
+        cursor = bytes(head.page.next_cursor())
+        assert cursor and head.page.cursor_expires_at_unix_seconds() > 0
+        tail, wrong_scope = await asyncio.wait_for(asyncio.gather(
+            settled_page(catalog_room.watch(core.WatchConfig(limit=1, cursor=cursor))),
+            settled_page(catalog_room.watch(core.WatchConfig(limit=2, cursor=cursor))),
+        ), timeout=5)
+        assert tail.status == core.WatchStatus.LIVE and len(tail.page.participants()) == 1
+        assert not tail.page.has_more() and not tail.page.next_cursor()
+        assert {head.page.participants()[0].id(), tail.page.participants()[0].id()} == {
+            "foreign-catalog", "publisher",
+        }
+        assert wrong_scope.status == core.WatchStatus.FAILED and wrong_scope.page is None
+        assert wrong_scope.error.code == core.ErrorCode.INVALID_ARGUMENT
+
         async def joined(owner):
             updates = owner.updates()
             try:
@@ -101,17 +135,21 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         agent.join(room)
         await asyncio.gather(joined(agent), joined(reader))
         changed_page = await catalog_page(lambda participants: any(
-            participant.id == "foreign" and
-            {publication.track_id for publication in participant.publications} == {"foreign-camera", "foreign-bytes"}
+            participant.id() == "foreign" and
+            {publication.track_id for publication in participant.tracks()} == {"foreign-camera", "foreign-bytes"}
             for participant in participants
         ))
         assert changed_page.revision() > first_page.revision()
-        assert all(participant.id != "foreign" for participant in first_page.participants())
+        assert all(participant.id() != "foreign" for participant in first_page.participants())
         watch.close()
         final_watch = await watch_updates.next()
         assert final_watch.status == core.WatchStatus.CLOSED and final_watch.page is None
         assert await watch_updates.next() is None
         watch_updates.close()
+        address = publisher_entry.video("production-camera").subscribe()
+        selector = address.state().selector
+        assert (selector.room, selector.participant_id, selector.track_id) == (room, "publisher", "production-camera")
+        await address.close()
         # The independent data subscriptions below must keep working after watch close.
         setup = bytes([0, 255, 128, 0])
 

@@ -2,10 +2,11 @@
 
 Headless load and benchmark client for a running PulseBeam server. The current
 `bench` creates rooms of `pulsebeam-agent-native` peers, publishes the embedded
-encoded fixtures, automatically subscribes each peer to remote video, and
-records latency and transport snapshots as CSV. It retains its selected named
-video interests for the benchmark session, including through discovery absence
-or reconstruction, and acquires a fresh physical observation after retirement.
+encoded fixtures, and records latency and transport snapshots as CSV. Each peer
+selects up to seven remote camera tracks from the first live catalog page,
+requested with a limit of 500 participants. It does not scan subsequent pages.
+The benchmark retains its selected subscriptions when tracks disappear from the
+catalog and acquires a fresh physical observation when a source returns.
 
 ## Production keys
 

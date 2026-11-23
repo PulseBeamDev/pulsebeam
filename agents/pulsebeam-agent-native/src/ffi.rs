@@ -367,6 +367,7 @@ impl RoomRef {
     #[uniffi::method(default(config = None))]
     pub fn watch(&self, config: Option<core_ffi::WatchConfig>) -> Result<Arc<Watch>, NativeError> {
         Ok(Arc::new(Watch {
+            room: self.runtime.clone(),
             runtime: self
                 .runtime
                 .watch(config.unwrap_or_default())
@@ -388,15 +389,17 @@ impl RoomRef {
 #[derive(uniffi::Object)]
 pub struct Watch {
     runtime: crate::Watch,
+    room: crate::RoomRef,
 }
 
 #[uniffi::export]
 impl Watch {
-    pub fn state(&self) -> core_ffi::WatchState {
-        self.runtime.state()
+    pub fn state(&self) -> CatalogWatchState {
+        CatalogWatchState::new(self.runtime.state(), &self.room)
     }
     pub fn updates(&self) -> Result<Arc<WatchUpdates>, NativeError> {
         Ok(Arc::new(WatchUpdates {
+            room: self.room.clone(),
             runtime: self
                 .runtime
                 .updates()
@@ -405,6 +408,108 @@ impl Watch {
     }
     pub fn close(&self) {
         self.runtime.close();
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct CatalogWatchState {
+    pub observation_revision: u64,
+    pub room: String,
+    pub limit: u32,
+    pub cursor: Vec<u8>,
+    pub status: core_ffi::WatchStatus,
+    pub page: Option<Arc<NativeCatalogPage>>,
+    pub error: Option<core_ffi::ErrorInfo>,
+}
+
+impl CatalogWatchState {
+    fn new(state: core_ffi::WatchState, room: &crate::RoomRef) -> Self {
+        Self {
+            observation_revision: state.observation_revision,
+            room: state.room,
+            limit: state.limit,
+            cursor: state.cursor,
+            status: state.status,
+            page: state.page.map(|page| {
+                Arc::new(NativeCatalogPage {
+                    page,
+                    room: room.clone(),
+                })
+            }),
+            error: state.error,
+        }
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct NativeCatalogPage {
+    page: Arc<core_ffi::CatalogPage>,
+    room: crate::RoomRef,
+}
+
+#[derive(uniffi::Object)]
+pub struct CatalogParticipant {
+    tracks: Vec<core_ffi::CatalogPublicationInfo>,
+    reference: Arc<Participant>,
+}
+
+#[uniffi::export]
+impl CatalogParticipant {
+    pub fn id(&self) -> String {
+        self.reference.id().into()
+    }
+
+    pub fn tracks(&self) -> Vec<core_ffi::CatalogPublicationInfo> {
+        self.tracks.clone()
+    }
+
+    pub fn video(&self, label: String) -> Result<Arc<media::RemoteVideoTrack>, NativeError> {
+        self.reference.video(label)
+    }
+
+    pub fn audio(&self, label: String) -> Result<Arc<media::RemoteAudioTrack>, NativeError> {
+        self.reference.audio(label)
+    }
+
+    pub fn data(
+        &self,
+        label: String,
+        delivery: core_ffi::TopicMode,
+    ) -> Result<Arc<RemoteDataTrack>, NativeError> {
+        self.reference.data(label, delivery)
+    }
+}
+
+#[uniffi::export]
+impl NativeCatalogPage {
+    pub fn revision(&self) -> u64 {
+        self.page.revision()
+    }
+
+    pub fn participants(&self) -> Result<Vec<Arc<CatalogParticipant>>, NativeError> {
+        self.page
+            .participants()
+            .into_iter()
+            .map(|entry| {
+                let runtime = self.room.participant(entry.id.clone())?;
+                Ok(Arc::new(CatalogParticipant {
+                    tracks: entry.publications,
+                    reference: Arc::new(Participant { runtime }),
+                }))
+            })
+            .collect()
+    }
+
+    pub fn has_more(&self) -> bool {
+        self.page.has_more()
+    }
+
+    pub fn next_cursor(&self) -> Vec<u8> {
+        self.page.next_cursor()
+    }
+
+    pub fn cursor_expires_at_unix_seconds(&self) -> i64 {
+        self.page.cursor_expires_at_unix_seconds()
     }
 }
 

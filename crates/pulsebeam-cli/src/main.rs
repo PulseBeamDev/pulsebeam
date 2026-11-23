@@ -263,7 +263,6 @@ struct AgentContext {
     api_url: String,
     room_id: usize,
     agent_id: usize,
-    users_per_room: usize,
     logger: Logger,
     assets: VideoAssets,
 }
@@ -510,7 +509,6 @@ async fn spawn_room(
             api_url: api_url.to_string(),
             room_id,
             agent_id: benchmark_agent_id(room_id, user_id),
-            users_per_room: config.users_per_room,
             logger: logger.clone(),
             assets: assets.clone(),
         };
@@ -572,14 +570,15 @@ async fn spawn_agent(
 
     let (received_video_tx, received_video) = watch::channel(false);
     let mut interests = BTreeSet::new();
-    subscribe_remote_videos(
-        &agent,
-        &mut interests,
-        &mut media_tasks,
-        &ctx,
-        &received_video_tx,
-    )
-    .await?;
+    let room = agent.room(format!("bench-room-{}", ctx.room_id))?;
+    let catalog = room.watch(pulsebeam_agent_native::agent_core::ffi::WatchConfig {
+        limit: 500,
+        ..Default::default()
+    })?;
+    let catalog_updates = catalog
+        .updates()
+        .map_err(|_| anyhow::anyhow!("catalog observer capacity exceeded"))?;
+    let self_id = format!("bench-{}", ctx.agent_id);
     let statistics = agent.statistics();
     let mut stats_interval = tokio::time::interval(Duration::from_secs(5));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -615,17 +614,29 @@ async fn spawn_agent(
                         .map_or_else(|| "native agent failed".to_owned(), |failure| failure.message);
                     anyhow::bail!(failure);
                 }
-                subscribe_remote_videos(
-                    &agent,
-                    &mut interests,
-                    &mut media_tasks,
-                    &ctx,
-                    &received_video_tx,
-                ).await?;
+            }
+            state = async {
+                let next = catalog_updates.next().map_err(|_| anyhow::anyhow!("overlapping catalog read"))?;
+                Ok::<_, anyhow::Error>(next.await)
+            } => {
+                let state = state?.ok_or_else(|| anyhow::anyhow!("benchmark catalog ended"))?;
+                if let Some(error) = state.error {
+                    anyhow::bail!("benchmark catalog failed: {}", error.message);
+                }
+                if let Some(page) = state.page {
+                    for selector in video_subscriptions(room.name(), &self_id, page.participants(), &interests) {
+                        let subscription = room.participant(selector.participant_id.clone())?
+                            .video(selector.track_id.clone())?
+                            .subscribe(VideoObservation { visible: true, height: 720, ..Default::default() })?;
+                        interests.insert(selector);
+                        media_tasks.spawn(handle_receiving(subscription, ctx.clone(), received_video_tx.clone()));
+                    }
+                }
             }
         }
     }
 
+    catalog.close();
     agent.close().await?;
     media_tasks.shutdown().await;
     if !interests.is_empty() && !*received_video.borrow() {
@@ -725,68 +736,37 @@ async fn wait_until_connected(snapshots: &mut watch::Receiver<Snapshot>) -> Resu
     }
 }
 
-async fn subscribe_remote_videos(
-    agent: &Agent,
-    interests: &mut BTreeSet<TrackSelector>,
-    tasks: &mut JoinSet<()>,
-    ctx: &AgentContext,
-    received_video: &watch::Sender<bool>,
-) -> Result<()> {
-    for selector in video_subscriptions(ctx.room_id, ctx.agent_id, ctx.users_per_room, interests) {
-        let subscription = agent
-            .room(selector.room.clone())?
-            .participant(selector.participant_id.clone())?
-            .video(selector.track_id.clone())?
-            .subscribe(VideoObservation {
-                visible: true,
-                height: 720,
-                ..Default::default()
-            })?;
-        interests.insert(selector);
-        tasks.spawn(handle_receiving(
-            subscription,
-            ctx.clone(),
-            received_video.clone(),
-        ));
-    }
-    Ok(())
-}
-
 fn benchmark_agent_id(room_id: usize, user_id: usize) -> usize {
     room_id.saturating_mul(1000).saturating_add(user_id)
 }
 
 fn video_subscriptions(
-    room_id: usize,
-    agent_id: usize,
-    users_per_room: usize,
+    room: &str,
+    self_id: &str,
+    participants: Vec<pulsebeam_agent_native::agent_core::ffi::CatalogParticipantInfo>,
     interests: &BTreeSet<TrackSelector>,
 ) -> Vec<TrackSelector> {
-    let mut participants: BTreeSet<_> = interests
-        .iter()
-        .map(|selector| selector.participant_id.clone())
-        .collect();
+    use pulsebeam_agent_native::agent_core::ffi::CatalogPublicationKind;
     let remaining = usize::from(REMOTE_VIDEO_SLOTS).saturating_sub(interests.len());
-    let mut subscriptions = Vec::new();
-    for user_id in 0..users_per_room {
-        if subscriptions.len() == remaining {
-            break;
-        }
-        let peer_id = benchmark_agent_id(room_id, user_id);
-        if peer_id == agent_id {
-            continue;
-        }
-        let participant_id = format!("bench-{peer_id}");
-        if !participants.insert(participant_id.clone()) {
-            continue;
-        }
-        subscriptions.push(TrackSelector {
-            room: format!("bench-room-{room_id}"),
-            participant_id,
-            track_id: "camera".into(),
-        });
-    }
-    subscriptions
+    participants
+        .into_iter()
+        .filter(|entry| entry.id != self_id)
+        .filter_map(|entry| {
+            entry
+                .publications
+                .into_iter()
+                .find(|track| {
+                    track.track_id == "camera" && track.kind == CatalogPublicationKind::Video
+                })
+                .map(|track| TrackSelector {
+                    room: room.into(),
+                    participant_id: entry.id,
+                    track_id: track.track_id,
+                })
+        })
+        .filter(|selector| !interests.contains(selector))
+        .take(remaining)
+        .collect()
 }
 
 async fn latency_writer_task(
@@ -1301,37 +1281,32 @@ mod tests {
     }
 
     #[test]
-    fn video_policy_uses_configured_peers_without_discovery() {
-        for users_per_room in [0_usize, 1, 2, 8, 10] {
-            let subscriptions = video_subscriptions(1, 1000, users_per_room, &BTreeSet::new());
-            assert_eq!(
-                subscriptions.len(),
-                users_per_room
-                    .saturating_sub(1)
-                    .min(usize::from(REMOTE_VIDEO_SLOTS))
-            );
-            assert!(subscriptions.iter().all(|selector| {
-                selector.room == "bench-room-1"
-                    && selector.track_id == "camera"
-                    && selector.participant_id != "bench-1000"
-            }));
-            let interests: BTreeSet<_> = subscriptions.into_iter().collect();
-            assert!(video_subscriptions(1, 1000, users_per_room, &interests).is_empty());
-        }
-
-        let subscriptions = video_subscriptions(1, 1002, 4, &BTreeSet::new());
-        assert_eq!(
-            subscriptions
-                .iter()
-                .map(|selector| selector.participant_id.as_str())
-                .collect::<Vec<_>>(),
-            ["bench-1000", "bench-1001", "bench-1003"]
-        );
+    fn video_policy_uses_catalog_tracks_and_retains_existing_interests() {
+        use pulsebeam_agent_native::agent_core::ffi::{
+            CatalogParticipantInfo, CatalogPublicationInfo, CatalogPublicationKind,
+        };
+        let page: Vec<_> = (0..10)
+            .map(|index| CatalogParticipantInfo {
+                id: format!("bench-{index}"),
+                publications: if index == 1 {
+                    vec![]
+                } else {
+                    vec![CatalogPublicationInfo {
+                        id: format!("publication-{index}"),
+                        track_id: "camera".into(),
+                        kind: CatalogPublicationKind::Video,
+                    }]
+                },
+            })
+            .collect();
+        let subscriptions =
+            video_subscriptions("bench-room-1", "bench-0", page.clone(), &BTreeSet::new());
+        assert_eq!(subscriptions.len(), usize::from(REMOTE_VIDEO_SLOTS));
+        assert_eq!(subscriptions[0].participant_id, "bench-2");
+        assert_eq!(subscriptions[0].room, "bench-room-1");
         let retained = subscriptions[0].clone();
-        let remaining = video_subscriptions(1, 1002, 4, &BTreeSet::from([retained.clone()]));
+        let remaining =
+            video_subscriptions("bench-room-1", "bench-0", page, &BTreeSet::from([retained]));
         assert_eq!(remaining, subscriptions[1..]);
-        assert_eq!(retained.room, "bench-room-1");
-        assert_eq!(retained.participant_id, "bench-1000");
-        assert_eq!(retained.track_id, "camera");
     }
 }

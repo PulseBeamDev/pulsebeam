@@ -74,12 +74,12 @@ if (watchState.page) {
   const page: CatalogPage = watchState.page;
   const participant: CatalogParticipantInfo | undefined = page.participants[0];
   const publication: CatalogPublicationInfo | undefined =
-    participant?.publications[0];
+    participant?.tracks[0];
   const kind: CatalogPublicationKind | undefined = publication?.kind;
   // @ts-expect-error A retained page cannot mutate its participants.
   page.participants.push(participant!);
   // @ts-expect-error Participant publications are immutable too.
-  participant?.publications.push(publication!);
+  participant?.tracks.push(publication!);
   if (publication?.kind.tag === "Data") {
     // @ts-expect-error Nested generated payload enum fields are immutable.
     publication.kind.inner.delivery = 0;

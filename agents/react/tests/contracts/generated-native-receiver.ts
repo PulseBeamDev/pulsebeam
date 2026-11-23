@@ -54,6 +54,7 @@ export async function receiveGenerated(config: {
   token: string;
   room: string;
   sourceRoom: string;
+  catalogToken: string;
 }): Promise<boolean> {
   const agent = new Agent({ endpoint: config.endpoint, token: config.token });
   if (!Agent.instanceOf(agent)) throw new Error("expected a generated Agent");
@@ -348,6 +349,61 @@ export async function receiveGenerated(config: {
       await listening.close();
       listening.uniffiDestroy();
       microphone.uniffiDestroy();
+    }
+    const viewer = new Agent({
+      endpoint: config.endpoint,
+      token: config.catalogToken,
+    });
+    const rosterRoom = viewer.room(config.sourceRoom);
+    const roster = rosterRoom.watch();
+    const rosterUpdates = roster.updates();
+    try {
+      viewer.join(config.sourceRoom);
+      while (true) {
+        const state = await rosterUpdates.next();
+        if (!state || state.error)
+          throw new Error("generated catalog did not synchronize");
+        if (!state.page) continue;
+        const entries = state.page.participants();
+        const publisher = entries.find(
+          (entry) => entry.id() === "native-publisher",
+        );
+        try {
+          if (!publisher?.tracks().some((track) => track.trackId === "camera"))
+            continue;
+          await roster.close();
+          const cameraRef = publisher.video("camera");
+          const interest = cameraRef.subscribe();
+          try {
+            const { selector } = interest.state();
+            if (
+              selector.room !== config.sourceRoom ||
+              selector.participantId !== publisher.id() ||
+              selector.trackId !== "camera"
+            ) {
+              throw new Error(
+                "generated catalog entry did not retain its exact track address",
+              );
+            }
+          } finally {
+            await interest.close();
+            interest.uniffiDestroy();
+            cameraRef.uniffiDestroy();
+          }
+          break;
+        } finally {
+          for (const entry of entries) entry.uniffiDestroy();
+          state.page.uniffiDestroy();
+        }
+      }
+    } finally {
+      rosterUpdates.close();
+      await roster.close();
+      rosterUpdates.uniffiDestroy();
+      roster.uniffiDestroy();
+      rosterRoom.uniffiDestroy();
+      await viewer.close();
+      viewer.uniffiDestroy();
     }
     await reception.close();
     await agent.close();

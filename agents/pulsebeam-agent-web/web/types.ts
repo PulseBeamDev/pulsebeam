@@ -242,8 +242,8 @@ export type CatalogParticipantInfo = Omit<
   CoreCatalogParticipantInfo,
   "publications"
 > & {
-  readonly publications: readonly CatalogPublicationInfo[];
-};
+  readonly tracks: readonly CatalogPublicationInfo[];
+} & Pick<RemoteParticipant, "video" | "audio" | "data">;
 
 export interface CatalogPage {
   readonly revision: bigint;

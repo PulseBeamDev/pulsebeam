@@ -205,30 +205,22 @@ function ActiveRoom({
       };
     for (const participant of page?.participants ?? []) {
       if (participant.id === agent.participantId) continue;
-      for (const track of participant.publications) {
+      for (const track of participant.tracks) {
         if (track.kind.tag === "Video")
-          videos.push(
-            pinnedRoom.participant(participant.id).video(track.trackId),
-          );
+          videos.push(participant.video(track.trackId));
         if (track.kind.tag === "Audio")
-          audios.push(
-            pinnedRoom.participant(participant.id).audio(track.trackId),
-          );
+          audios.push(participant.audio(track.trackId));
         if (track.kind.tag !== "Data") continue;
         if (
           track.trackId === "chat" &&
           track.kind.inner.delivery === CatalogDelivery.Ordered
         )
-          chats.push(
-            pinnedRoom.participant(participant.id).data("chat", "ordered"),
-          );
+          chats.push(participant.data("chat", "ordered"));
         if (
           track.trackId === "reactions" &&
           track.kind.inner.delivery === CatalogDelivery.Lossy
         )
-          reactions.push(
-            pinnedRoom.participant(participant.id).data("reactions", "lossy"),
-          );
+          reactions.push(participant.data("reactions", "lossy"));
       }
     }
     return {
@@ -237,7 +229,7 @@ function ActiveRoom({
       remoteChatTracks: chats,
       remoteReactionTracks: reactions,
     };
-  }, [agent, room, agent.roomId, agent.participantId, pinnedRoom, page]);
+  }, [agent, room, agent.roomId, agent.participantId, page]);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(remoteVideoTracks);
   const connect = useCallback(() => {
     try {

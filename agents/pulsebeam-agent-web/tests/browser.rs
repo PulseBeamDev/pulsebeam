@@ -165,6 +165,7 @@ async fn native_platform_smoke() -> TestResult<()> {
             "token": receiver_token.token,
             "room": "react-native-receiver",
             "sourceRoom": source_room.as_str(),
+            "catalogToken": catalog_token.token,
         });
         let received = async {
             navigate(&bidi, &context, react.url("index.html")).await?;

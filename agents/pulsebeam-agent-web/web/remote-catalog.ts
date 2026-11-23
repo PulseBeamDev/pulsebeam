@@ -58,6 +58,7 @@ export function watchCatalog(
   },
   room: string,
   config: WatchConfig = {},
+  participant: (id: string) => RemoteParticipant,
 ): Watch {
   const invalid = () =>
     new OperationError({
@@ -79,8 +80,36 @@ export function watchCatalog(
   const cursor = Uint8Array.from(bytes);
   try {
     const native = runtime.catalog_watch(room, limit, cursor);
-    // BrowserRuntime freezes the complete projection, including the shared page.
-    const observation = new ResourceObservation<WatchState>((value) => value);
+    type Page = NonNullable<WatchState["page"]>;
+    type RawPage = Omit<Page, "participants"> & {
+      readonly participants: readonly import("./schema.js").CatalogParticipantInfo[];
+    };
+    const pages = new WeakMap<RawPage, Page>();
+    const observation = new ResourceObservation<WatchState>((value) => {
+      if (!value.page) return value;
+      const rawPage = value.page as unknown as RawPage;
+      let page = pages.get(rawPage);
+      if (!page) {
+        page = Object.freeze({
+          ...rawPage,
+          participants: Object.freeze(
+            rawPage.participants.map((entry) => {
+              const reference = participant(entry.id);
+              return Object.freeze({
+                id: entry.id,
+                tracks: entry.publications,
+                video: (label: string) => reference.video(label),
+                audio: (label: string) => reference.audio(label),
+                data: <D extends Delivery>(label: string, delivery: D) =>
+                  reference.data(label, delivery),
+              });
+            }),
+          ),
+        });
+        pages.set(rawPage, page);
+      }
+      return Object.freeze({ ...value, page });
+    });
     observation.bind(native);
     return Object.freeze({
       state: () => observation.state(),

@@ -346,7 +346,7 @@
     discoveryWatch
       ?.state()
       .page?.participants.find((participant) => participant.id === "web-sender")
-      ?.publications ?? [];
+      ?.tracks ?? [];
   let handoffAttachment;
   let handoffVideo;
   let videoPublication;
@@ -1037,7 +1037,7 @@
         (participant) => participant.id === "web-sender",
       );
       assert(
-        metadata?.publications.some(
+        metadata?.tracks.some(
           (publication) => publication.trackId === "camera",
         ),
         "catalog contains real publication metadata",
@@ -1046,7 +1046,7 @@
         (participant) => participant.id === "web-catalog-observer",
       );
       assert(
-        presence?.publications.length === 0,
+        presence?.tracks.length === 0,
         "Discover-only observer has presence without publication",
       );
       const frozen = (value) =>
@@ -1065,7 +1065,7 @@
           catalogWatch
             .state()
             .page?.participants.some((participant) =>
-              participant.publications.some(
+              participant.tracks.some(
                 (publication) => publication.trackId === "catalog-metadata",
               ),
             ),

@@ -39,6 +39,10 @@ pub struct Participant {
 
 #[uniffi::export]
 impl Participant {
+    pub fn id(&self) -> String {
+        self.id.clone()
+    }
+
     pub fn video(&self, label: String) -> Result<Arc<RemoteVideoTrack>, WebAgentError> {
         RemoteVideoTrack::new(self, label)
     }

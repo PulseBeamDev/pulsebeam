@@ -46,7 +46,10 @@ function fixture() {
   };
 }
 test("watch facade preserves the runtime shared page across revisions and cursors", async () => {
-  const page = Object.freeze({ participants: Object.freeze([]) });
+  const reference = fixture().catalog.room("pinned").participant("alice");
+  const page = Object.freeze({
+    participants: Object.freeze([{ id: "alice", publications: [] }]),
+  });
   let state = Object.freeze({ observationRevision: 1n, room: "pinned", page });
   let closed = false;
   const runtime = {
@@ -63,18 +66,25 @@ test("watch facade preserves the runtime shared page across revisions and cursor
       };
     },
   };
-  const watch = watchCatalog(runtime, "pinned");
+  const watch = watchCatalog(runtime, "pinned", undefined, (id) => {
+    assert.equal(id, "alice");
+    return reference;
+  });
   const first = watch.updates();
   const second = watch.updates();
-  assert.equal(watch.state(), state);
-  assert.equal(await first.next(), state);
-  assert.equal((await second.next()).page, page);
+  const initial = watch.state();
+  const projected = initial.page;
+  const entry = projected.participants[0];
+  assert.equal(entry.video("camera"), reference.video("camera"));
+  assert.equal(await first.next(), initial);
+  assert.equal((await second.next()).page, projected);
   state = Object.freeze({ ...state, observationRevision: 2n });
-  assert.equal(watch.state().page, page);
-  assert.equal((await first.next()).page, page);
+  assert.equal(watch.state().page, projected);
+  assert.equal((await first.next()).page, projected);
   const closing = watch.close();
   assert.equal(closed, true, "close fences synchronously");
   await closing;
+  assert.equal(entry.audio("microphone"), reference.audio("microphone"));
 });
 
 const alice = { participantId: "alice" };

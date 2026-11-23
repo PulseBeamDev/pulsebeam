@@ -166,7 +166,9 @@ class AgentFacade implements AgentApi {
               ? "Agent is closed"
               : "Watch runtime is inactive",
           });
-        return watchCatalog(this.#runtime, room, config);
+        return watchCatalog(this.#runtime, room, config, (id) =>
+          this.#remote.room(room).participant(id),
+        );
       },
     );
     this.#topics = new TopicRegistry(

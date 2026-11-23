@@ -35,7 +35,30 @@ macro_rules! updates {
     };
 }
 
-updates!(WatchUpdates, WatchState);
+#[derive(uniffi::Object)]
+pub struct WatchUpdates {
+    pub(super) runtime: agent_core::observer::WatchUpdates,
+    pub(super) room: crate::RoomRef,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WatchUpdates {
+    pub async fn next(&self) -> Result<Option<CatalogWatchState>, NativeError> {
+        let next = self.runtime.next().map_err(|_| NativeError::Operation {
+            info: core_ffi::ErrorInfo::new(
+                core_ffi::ErrorCode::Conflict,
+                "An observation read is already pending",
+            ),
+        })?;
+        Ok(next
+            .await
+            .map(|state| CatalogWatchState::new(state, &self.room)))
+    }
+
+    pub fn close(&self) {
+        self.runtime.close();
+    }
+}
 updates!(VideoSubscriptionUpdates, VideoSubscriptionState);
 updates!(AudioSubscriptionUpdates, AudioSubscriptionState);
 updates!(DataSubscriptionUpdates, DataSubscriptionState);

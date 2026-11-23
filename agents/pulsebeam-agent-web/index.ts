@@ -15,7 +15,9 @@ export {
   AudioSubscription,
   AudioSubscriptionUpdates,
   Catalog,
+  CatalogParticipant,
   CatalogUpdates,
+  CatalogWatchState as WatchState,
   DataPublication,
   DataPublicationUpdates,
   DataSubscription,
@@ -38,6 +40,7 @@ export {
   WebAgentConfig as AgentConfig,
   WebAgentError as AgentError,
   WebAudioOutput,
+  WebCatalogPage,
   WebVideoOutput,
 } from "./generated/bindings/pulsebeam_agent_web.js";
 export {
@@ -56,6 +59,5 @@ export {
   PublicationState,
   VideoSubscriptionState,
   WatchConfig,
-  WatchState,
   WatchStatus,
 } from "./generated/bindings/pulsebeam_agent_core.js";

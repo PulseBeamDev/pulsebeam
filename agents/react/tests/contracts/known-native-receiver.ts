@@ -44,7 +44,7 @@ export async function observeCatalog(config: {
       state?.error?.message ??
         state?.page?.participants
           .flatMap((participant) =>
-            participant.publications.map(
+            participant.tracks.map(
               (publication) => `${participant.id}/${publication.trackId}`,
             ),
           )
