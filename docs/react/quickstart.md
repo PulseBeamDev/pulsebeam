@@ -97,6 +97,7 @@ your application's backend.
 ```tsx
 import { useState } from "react";
 import {
+  AgentStatus,
   Audio,
   usePublish,
   useSubscribe,
@@ -135,6 +136,7 @@ function Room({ token, media }: { token: string; media: CaptureResult }) {
 }
 
 function ActiveRoom({ agent, media }: { agent: Agent; media: CaptureResult }) {
+  const state = agent.state();
   const [error, setError] = useState("");
   const [peer, setPeer] = useState("");
   const participant = peer ? agent.room("demo").participant(peer) : null;
@@ -158,8 +160,8 @@ function ActiveRoom({ agent, media }: { agent: Agent; media: CaptureResult }) {
         Join room
       </button>
       {error && <p role="alert">{error}</p>}
-      <p>Connection: {agent.connection}</p>
-      {agent.error && <p role="alert">{agent.error.message}</p>}
+      <p>Connection: {AgentStatus[state.status]}</p>
+      {state.error && <p role="alert">{state.error.message}</p>}
       <label>
         Other participant ID
         <input value={peer} onChange={(event) => setPeer(event.target.value)} />

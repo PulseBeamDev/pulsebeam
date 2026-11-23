@@ -1,29 +1,29 @@
-import { useLayoutEffect, useMemo, useState } from "react";
-import { DataDelivery } from "@pulsebeam/web";
-import type {
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
   AudioPublication,
   AudioSource,
   AudioSubscription,
-  AudioSubscriptionConfig,
-  DataPublication,
-  DataSubscription,
-  DataPublishOptions,
-  DataSubscribeOptions,
+  DataDelivery,
   LocalAudioTrack,
   LocalDataTrack,
   LocalVideoTrack,
-  Pipe,
-  PublicationConfig,
   RemoteAudioTrack,
   RemoteDataTrack,
   RemoteVideoTrack,
-  RoomRef,
-  Watch,
-  WatchConfig,
-  VideoObservation,
   VideoPublication,
   VideoSource,
   VideoSubscription,
+  type AudioSubscriptionConfig,
+  type Catalog,
+  type DataPublication,
+  type DataPublishOptions,
+  type DataSubscribeOptions,
+  type DataSubscription,
+  type Pipe,
+  type PublicationConfig,
+  type RoomRef,
+  type VideoObservation,
+  type WatchConfig,
 } from "@pulsebeam/web";
 import { useCommittedRef } from "./committed-ref.js";
 import { useResource } from "./resource.js";
@@ -46,23 +46,19 @@ type Subscription = VideoSubscription | AudioSubscription | DataSubscription;
 
 export function useWatch(
   room: RoomRef | null,
-  config?: WatchConfig,
-): Watch | null {
-  const limit = config?.limit ?? 100;
-  const cursor = Array.from(config?.cursor ?? []);
+  options?: Partial<WatchConfig>,
+): Catalog | null {
+  const limit = options?.limit ?? 100;
+  const cursor = Array.from(options?.cursor ?? []);
   const scope = JSON.stringify([limit, cursor]);
   const target = useMemo(
     () =>
       room
-        ? {
-            room,
-            config: Object.freeze({ limit, cursor: Object.freeze(cursor) }),
-          }
+        ? { room, config: { limit, cursor: Uint8Array.from(cursor) } }
         : null,
     [room, scope],
   );
-  return useResource<Watch>(target, () => target!.room.watch(target!.config))
-    .value;
+  return useResource(target, () => target!.room.watch(target!.config)).value;
 }
 
 export function usePublication(
@@ -71,32 +67,35 @@ export function usePublication(
   options?: PublicationConfig | DataPublishOptions,
 ) {
   const mode =
-    track?.kind === "data"
+    track instanceof LocalDataTrack
       ? ((options as DataPublishOptions | undefined)?.delivery ??
         DataDelivery.Reliable)
       : undefined;
-  const target = useMemo(
-    () => (track?.kind === "data" ? { track, mode } : track),
-    [track, mode],
-  );
-  const committed = useCommittedRef({ track, source, options });
+  const target = useMemo(() => track && { track, mode }, [track, mode]);
   const publication = useResource<Publication>(target, () => {
-    const view = committed.current;
-    return view.track!.kind === "data"
-      ? view.track!.publish(view.options as DataPublishOptions | undefined)
-      : view.track!.publish(view.options as PublicationConfig | undefined);
+    if (track instanceof LocalDataTrack)
+      return track.publish(options as DataPublishOptions | undefined);
+    if (track instanceof LocalVideoTrack || track instanceof LocalAudioTrack)
+      return track.publish(options as PublicationConfig | undefined);
+    throw new TypeError("Expected an SDK local track");
   });
   const owner = publication.value;
   const enabled = (options as PublicationConfig | undefined)?.enabled ?? true;
   useLayoutEffect(() => {
-    if (owner && track?.kind !== "data") {
-      try {
-        (owner as VideoPublication | AudioPublication).configure({ enabled });
-      } catch (error) {
-        publication.fail(error);
-      }
+    if (
+      !(owner instanceof VideoPublication) &&
+      !(owner instanceof AudioPublication)
+    )
+      return;
+    try {
+      if (owner.state().configuration.enabled !== enabled)
+        owner.configure({ enabled });
+    } catch (error) {
+      publication.fail(error);
     }
   }, [owner, enabled]);
+
+  const cleanup = useRef(Promise.resolve());
   const [input, setInput] = useState<{
     owner: Publication;
     source: Source;
@@ -104,30 +103,45 @@ export function usePublication(
   } | null>(null);
   useLayoutEffect(() => {
     if (!owner || !source) return;
-    let pipe: Pipe;
-    try {
-      const input =
-        "pipeTo" in source
-          ? source
-          : publicationTrack(source, track!.kind as "video" | "audio");
-      pipe =
-        track!.kind === "video"
-          ? (input as VideoSource).pipeTo(owner as VideoPublication)
-          : (input as AudioSource).pipeTo(owner as AudioPublication);
-      setInput({ owner, source, pipe });
-    } catch (error) {
-      publication.fail(error);
-      return;
-    }
+    let active = true;
+    let pipe: Pipe | undefined;
+    void cleanup.current.then(() => {
+      if (!active) return;
+      try {
+        const input =
+          "pipeTo" in source ? source : publicationTrack(source, source.kind);
+        if (input instanceof VideoSource && owner instanceof VideoPublication)
+          pipe = input.pipeTo(owner);
+        else if (
+          input instanceof AudioSource &&
+          owner instanceof AudioPublication
+        )
+          pipe = input.pipeTo(owner);
+        else
+          throw new TypeError(
+            "Source and publication media kinds do not match",
+          );
+        setInput({ owner, source, pipe });
+      } catch (error) {
+        publication.fail(error);
+      }
+    });
     return () => {
-      void pipe.close().catch((error: unknown) => {
-        console.error("PulseBeam pipe cleanup failed", error);
-      });
+      active = false;
+      const prior = pipe;
+      if (prior)
+        cleanup.current = cleanup.current
+          .then(() => prior.close())
+          .catch((error: unknown) => {
+            console.error("PulseBeam pipe cleanup failed", error);
+          });
     };
   }, [owner, source]);
-  useObservation(
-    input?.owner === owner && input.source === source ? input.pipe : null,
-  );
+  const pipe =
+    input?.owner === owner && input.source === source ? input.pipe : null;
+  useObservation(pipe, (observed, error) => {
+    if (observed === pipe) publication.fail(error);
+  });
   return publication;
 }
 
@@ -171,40 +185,41 @@ export function useSubscribe(
   options?: VideoObservation | AudioSubscriptionConfig | DataSubscribeOptions,
 ): Subscription | null {
   const mode =
-    track?.kind === "data"
+    track instanceof RemoteDataTrack
       ? ((options as DataSubscribeOptions | undefined)?.delivery ??
         DataDelivery.Reliable)
       : undefined;
-  const target = useMemo(
-    () => (track?.kind === "data" ? { track, mode } : track),
-    [track, mode],
-  );
-  const committed = useCommittedRef({ track, options });
+  const target = useMemo(() => track && { track, mode }, [track, mode]);
+  const committed = useCommittedRef(options);
+  const applied = useRef(new WeakMap<Subscription, string>());
+  const key = JSON.stringify(options ?? null);
   const subscription = useResource<Subscription>(target, () => {
-    const view = committed.current;
-    if (view.track!.kind === "data")
-      return view.track!.subscribe(
-        view.options as DataSubscribeOptions | undefined,
-      );
-    return view.track!.kind === "video"
-      ? view.track!.subscribe(view.options as VideoObservation | undefined)
-      : view.track!.subscribe(
-          view.options as AudioSubscriptionConfig | undefined,
-        );
+    const owner =
+      track instanceof RemoteDataTrack
+        ? track.subscribe(options as DataSubscribeOptions | undefined)
+        : track instanceof RemoteVideoTrack
+          ? track.subscribe(options as VideoObservation | undefined)
+          : track instanceof RemoteAudioTrack
+            ? track.subscribe(options as AudioSubscriptionConfig | undefined)
+            : undefined;
+    if (!owner) throw new TypeError("Expected an SDK remote track");
+    applied.current.set(owner, key);
+    return owner;
   });
   const owner = subscription.value;
-  const key = JSON.stringify(options ?? null);
   useLayoutEffect(() => {
-    if (!owner || track?.kind === "data") return;
-    const updating =
-      track?.kind === "video"
-        ? (owner as VideoSubscription).configure(
-            committed.current.options as VideoObservation | undefined,
-          )
-        : (owner as AudioSubscription).configure(
-            committed.current.options as AudioSubscriptionConfig | undefined,
-          );
-    void updating.catch(subscription.fail);
+    if (!owner || applied.current.get(owner) === key) return;
+    try {
+      if (owner instanceof VideoSubscription)
+        owner.configure(committed.current as VideoObservation | undefined);
+      if (owner instanceof AudioSubscription)
+        owner.configure(
+          committed.current as AudioSubscriptionConfig | undefined,
+        );
+      applied.current.set(owner, key);
+    } catch (error) {
+      subscription.fail(error);
+    }
   }, [owner, key]);
   return owner;
 }

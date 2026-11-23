@@ -30,7 +30,7 @@ mod logger;
 mod ffi;
 
 #[cfg(target_arch = "wasm32")]
-pub use browser::BrowserRuntime;
+pub(crate) use browser::BrowserRuntime;
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();

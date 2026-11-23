@@ -6,12 +6,6 @@ const [output, entry = "quickstart_source/main.tsx", installed] =
   process.argv.slice(2);
 await mkdir(output, { recursive: true });
 await cp("quickstart_source/index.html", `${output}/index.html`);
-if (!installed) {
-  await cp(
-    "../pulsebeam-agent-web/package/dist/wasm/pulsebeam_agent_web_bg.wasm",
-    `${output}/pulsebeam_agent_web_bg.wasm`,
-  );
-}
 await build({
   entryPoints: [entry],
   bundle: true,
@@ -24,14 +18,17 @@ await build({
         {
           name: "installed-sdk",
           setup(build) {
-            build.onResolve({ filter: /^@pulsebeam\/web$/ }, (args) => {
-              if (args.pluginData === "installed-sdk") return;
-              return build.resolve(args.path, {
-                kind: args.kind,
-                resolveDir: resolve(installed),
-                pluginData: "installed-sdk",
-              });
-            });
+            build.onResolve(
+              { filter: /^@pulsebeam\/web(?:\/internal\/react)?$/ },
+              (args) => {
+                if (args.pluginData === "installed-sdk") return;
+                return build.resolve(args.path, {
+                  kind: args.kind,
+                  resolveDir: resolve(installed),
+                  pluginData: "installed-sdk",
+                });
+              },
+            );
           },
         },
       ]
@@ -40,8 +37,5 @@ await build({
     ? undefined
     : {
         "@pulsebeam/react": "./package/dist/index.js",
-        "@pulsebeam/web/internal/react":
-          "../pulsebeam-agent-web/package/dist/internal/react.js",
-        "@pulsebeam/web": "../pulsebeam-agent-web/package/dist/index.js",
       },
 });

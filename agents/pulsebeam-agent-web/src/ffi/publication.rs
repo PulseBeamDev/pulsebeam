@@ -7,7 +7,6 @@ macro_rules! media_publication {
         pub struct $track {
             #[cfg(target_arch = "wasm32")]
             agent: Arc<Agent>,
-            #[cfg(target_arch = "wasm32")]
             spec: TrackSpec,
         }
 
@@ -25,7 +24,6 @@ macro_rules! media_publication {
                 Ok(Arc::new(Self {
                     #[cfg(target_arch = "wasm32")]
                     agent,
-                    #[cfg(target_arch = "wasm32")]
                     spec,
                 }))
             }
@@ -33,6 +31,10 @@ macro_rules! media_publication {
 
         #[uniffi::export]
         impl $track {
+            pub fn track_id(&self) -> String {
+                self.spec.track_id().to_owned()
+            }
+
             #[uniffi::method(default(options = None))]
             pub fn publish(
                 &self,
@@ -67,6 +69,21 @@ macro_rules! media_publication {
 
         #[uniffi::export]
         impl $publication {
+            pub fn configure(&self, options: ffi::PublicationConfig) -> Result<(), WebAgentError> {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.agent
+                        .runtime
+                        .configure_publication_state(self.owner, options.enabled)?;
+                    Ok(())
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = options;
+                    Err(super::browser_required())
+                }
+            }
+
             pub fn state(&self) -> Result<ffi::PublicationState, WebAgentError> {
                 #[cfg(target_arch = "wasm32")]
                 {

@@ -1,7 +1,14 @@
 [bindings.typescript]
 strictTypeChecking = true
+strictObjectTypes = true
 strictByteArrays = true
 revisionedSnapshots = ["Agent.state", "VideoSubscription.state", "AudioSubscription.state", "VideoPublication.state", "AudioPublication.state", "Pipe.state", "Catalog.state", "DataPublication.state", "DataSubscription.state"]
+stableLookups = [
+  "Agent.room", "Agent.video", "Agent.audio", "Agent.data",
+  "RoomRef.participant",
+  "Participant.video", "Participant.audio", "Participant.data",
+  "CatalogParticipant.video", "CatalogParticipant.audio", "CatalogParticipant.data",
+]
 
 [bindings.typescript.customTypes.WebInputTrack]
 typeName = "MediaStreamTrack"

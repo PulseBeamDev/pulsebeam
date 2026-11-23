@@ -22,7 +22,7 @@ build_test(
     targets = [
         "//crates/pulsebeam:server", "//crates/pulsebeam-cli:pulsebeam-cli",
         "//agents/pulsebeam-agent-native:native", "//agents/pulsebeam-agent-native:node_package.pack", "//agents/pulsebeam-agent-native:python_wheel", "//agents/pulsebeam-agent-web:package",
-        "//agents/pulsebeam-agent-web:uniffi_proof", "//agents/react:package",
+        "//agents/react:package",
         "//apps/meet:export", "//docs:site",
         "//server/typescript:package.pack", "//server/go:package", "//server/python:package", "//server/rust:package",
         "//crates/pulsebeam-simulator:replay", "//crates/pulsebeam-simulator:sweep",

@@ -1,25 +1,55 @@
 import assert from "node:assert/strict";
 import { startTransition, Suspense, useLayoutEffect } from "react";
 import { createRoot } from "react-dom/client";
-import { Audio, Data, Video, useAgent, useSubscribe } from "../../src/index.js";
-import { Publication as Publish } from "./publication.js";
-import { runtimes } from "./runtime.js";
+import {
+  Audio,
+  Data,
+  Video,
+  useAgent,
+  usePublish,
+  useSubscribe,
+} from "../../src/index.js";
 import { useCapture, type CaptureResult } from "../../src/index.js";
-import { VideoSource } from "@pulsebeam/web";
+import {
+  LocalVideoTrack,
+  RemoteVideoTrack,
+  RemoteAudioTrack,
+  RemoteDataTrack,
+  VideoSource,
+} from "@pulsebeam/web";
 import { publishableVideoSource } from "../../src/sources.js";
 import { captures, deferred, flush, stream } from "./platform.js";
 
 export async function concurrentRender() {
   const preview = stream();
   const acquired = stream();
+  const publish = LocalVideoTrack.prototype.publish;
+  const videoSubscribe = RemoteVideoTrack.prototype.subscribe;
+  const audioSubscribe = RemoteAudioTrack.prototype.subscribe;
+  const dataSubscribe = RemoteDataTrack.prototype.subscribe;
+  let claims = 0;
+  LocalVideoTrack.prototype.publish = function (...args) {
+    claims++;
+    return publish.call(this, ...args);
+  };
+  RemoteVideoTrack.prototype.subscribe = function (...args) {
+    claims++;
+    return videoSubscribe.call(this, ...args);
+  };
+  RemoteAudioTrack.prototype.subscribe = function (...args) {
+    claims++;
+    return audioSubscribe.call(this, ...args);
+  };
+  RemoteDataTrack.prototype.subscribe = function (...args) {
+    claims++;
+    return dataSubscribe.call(this, ...args);
+  };
   const playback = deferred<void>();
   const never = new Promise<void>(() => {});
-  const source = publishableVideoSource(
-    { kind: "video" },
-    VideoSource.fromTrack(
-      preview.getVideoTracks()[0] as unknown as MediaStreamTrack,
-    ),
+  const input = VideoSource.fromTrack(
+    preview.getVideoTracks()[0] as unknown as MediaStreamTrack,
   );
+  const source = publishableVideoSource({ kind: "video" }, input);
   let current: CaptureResult;
   let suspended = false;
   let committedFailures = 0;
@@ -46,7 +76,7 @@ export async function concurrentRender() {
     agent: NonNullable<ReturnType<typeof useAgent>>;
     speculative: boolean;
   }) {
-    const camera = agent.video("camera");
+    usePublish(speculative ? agent.video("camera") : null, source);
     const messages = agent
       .room("selected-room")
       .participant("alice")
@@ -79,7 +109,6 @@ export async function concurrentRender() {
         />
         {speculative && (
           <>
-            <Publish track={camera} source={source} />
             <Audio source={audio} />
             <Data
               track={messages}
@@ -124,11 +153,7 @@ export async function concurrentRender() {
       true,
       "speculative render actually reached suspension",
     );
-    assert.deepEqual(
-      runtimes.at(-1)!.resourceCommands,
-      [],
-      "lookup and abandoned owners acquire no resources",
-    );
+    assert.equal(claims, 0, "lookup and abandoned owners acquire no resources");
     await flush(() => {
       pending.resolve(acquired);
       playback.reject(new DOMException("blocked", "NotAllowedError"));
@@ -152,6 +177,11 @@ export async function concurrentRender() {
     assert.ok(
       acquired.getTracks().every((track) => track.readyState === "ended"),
     );
+    await input.close();
+    LocalVideoTrack.prototype.publish = publish;
+    RemoteVideoTrack.prototype.subscribe = videoSubscribe;
+    RemoteAudioTrack.prototype.subscribe = audioSubscribe;
+    RemoteDataTrack.prototype.subscribe = dataSubscribe;
     HTMLMediaElement.prototype.play = originalPlay;
     host.remove();
   }

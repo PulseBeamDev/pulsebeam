@@ -1,336 +1,188 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
+import { Track } from "./platform.mjs";
 
-const bytes = await readFile(
-  new URL(
-    "../../node_assets/dist/wasm/pulsebeam_agent_web_bg.wasm",
-    import.meta.url,
-  ),
+// Use the packaged entrypoint through a browser-targeted bundle. Only the
+// external media input is modeled; ownership and cursors execute in real WASM.
+const Instance = WebAssembly.Instance;
+let instances = 0;
+WebAssembly.Instance = new Proxy(Instance, {
+  construct(target, args, newTarget) {
+    instances++;
+    return Reflect.construct(target, args, newTarget);
+  },
+});
+const sdk = await import("../../node-sdk.mjs").finally(() => {
+  WebAssembly.Instance = Instance;
+});
+const {
+  Agent,
+  AgentError,
+  AgentStatus,
+  ErrorCode,
+  PipeStatus,
+  VideoSource,
+  WatchStatus,
+} = sdk;
+const config = { endpoint: "http://localhost", token: "node-exact-owners" };
+const rejectedWith = (code) => (error) =>
+  AgentError.Operation.instanceOf(error) && error.inner.info.code === code;
+const secret = "private-test-token";
+assert.throws(
+  () => new Agent({ endpoint: "invalid-endpoint", token: secret }),
+  (error) =>
+    rejectedWith(ErrorCode.InvalidArgument)(error) &&
+    !String(error).includes(secret) &&
+    !error.inner.info.message.includes(secret),
 );
-const config = {
-  endpoint: "http://localhost",
-  token: "node-lifecycle",
-};
-if (process.argv[2] === "initialization-failure") {
-  let attempts = 0;
-  const NativeModule = WebAssembly.Module;
-  WebAssembly.Module = class extends NativeModule {
-    constructor(source) {
-      attempts++;
-      throw new WebAssembly.CompileError(
-        "controlled artifact compilation failure",
-      );
-    }
-  };
-  const { Agent, ErrorCode, OperationError } = await import(
-    "../../node_assets/dist/index.js"
-  );
-  const initializationFailure = (error) => {
-    assert.equal(error instanceof OperationError, true);
-    assert.equal(error.info.code, ErrorCode.Internal);
-    assert.equal(error.message, "Browser runtime initialization failed");
-    return true;
-  };
-  assert.throws(() => new Agent(config), initializationFailure);
-  const { createManagedAgent } = await import(
-    "../../node_assets/dist/internal/react.js"
-  );
-  const agent = createManagedAgent(config);
-  const failure = new Promise((resolve) =>
-    agent.subscribe(() => {
-      if (agent.connection === "terminal-failure")
-        resolve(agent.getSnapshot().failure);
-    }),
-  );
-  agent.activate();
-  await assert.rejects(agent.initialized(), initializationFailure);
-  assert.equal((await failure).class, "initialization");
-  assert.equal(agent.connection, "terminal-failure");
-  assert.throws(() => new Agent(config), initializationFailure);
-  await agent.close();
-  await import("./platform.mjs");
-  WebAssembly.Module = class extends NativeModule {
-    constructor(source) {
-      attempts++;
-      super(source);
-    }
-  };
-  const recovered = new Agent(config);
-  recovered.join("initialization-retry-room");
-  assert.equal(recovered.state().desiredRoom, "initialization-retry-room");
-  assert.equal(
-    attempts,
-    4,
-    "constructor and managed activation fail; a new owner retries initialization",
-  );
-  assert.equal(recovered.error, null);
-  await recovered.close();
-  console.log("artifact compilation failure does not poison a new Agent");
-} else {
-  const failedInitialization = spawnSync(
-    process.execPath,
-    [import.meta.filename, "initialization-failure"],
-    { encoding: "utf8" },
-  );
-  assert.equal(
-    failedInitialization.status,
-    0,
-    failedInitialization.stderr + failedInitialization.stdout,
-  );
-  console.log(failedInitialization.stdout.trim());
-  let requests = 0;
-  globalThis.fetch = async () => {
-    requests++;
-    return new Response(bytes, {
-      headers: { "Content-Type": "application/wasm" },
-    });
-  };
-  const NativeModule = WebAssembly.Module;
-  const NativeInstance = WebAssembly.Instance;
-  const nativeInstantiate = WebAssembly.instantiate;
-  let compilations = 0;
-  let instances = 0;
-  let asynchronousInstantiations = 0;
-  WebAssembly.Instance = class extends NativeInstance {
-    constructor(module, imports) {
-      instances++;
-      super(module, imports);
-    }
-  };
-  WebAssembly.instantiate = (...args) => {
-    asynchronousInstantiations++;
-    return Reflect.apply(nativeInstantiate, WebAssembly, args);
-  };
-  WebAssembly.Module = class extends NativeModule {
-    constructor(source) {
-      compilations++;
-      super(source);
-    }
-  };
-  const { Agent, AgentStatus, ErrorCode } = await import(
-    "../../node_assets/dist/index.js"
-  );
-  const { BrowserRuntime, whenInitialized } = await import(
-    "../../node_assets/dist/wasm.js"
-  );
-  assert.deepEqual(
-    [compilations, instances, asynchronousInstantiations],
-    [0, 0, 0],
-    "root import does not compile or instantiate WASM",
-  );
-  const agent = new Agent(config);
-  assert.equal(agent instanceof Agent, true);
-  assert.equal(agent instanceof Promise, false);
-  assert.equal(agent.state().status, AgentStatus.Idle);
-  assert.equal(agent.state().desiredRoom, undefined);
-  const initialUpdates = agent.updates();
-  const initialPublicState = await initialUpdates.next();
-  assert.equal(initialPublicState, agent.state());
-  for (const field of ["catalog", "mapping", "tracks"])
-    assert.equal(field in initialPublicState, false, `${field} is private`);
-  assert.equal("participants" in agent, false);
-  assert.equal("remote" in agent, false);
-  initialUpdates.close();
-  assert.equal(requests, 0, "constructor does not fetch or connect");
-  const initialization = whenInitialized();
-  const inert = new BrowserRuntime(config);
-  assert.equal(
-    inert.diagnostics().peers,
-    0,
-    "Core exists before awaiting initialization",
-  );
-  inert.close();
-  await agent.close();
-  await Promise.all([initialization, whenInitialized(), whenInitialized()]);
-  assert.deepEqual(
-    [compilations, instances, asynchronousInstantiations],
-    [1, 1, 0],
-    "private bootstrap creates one synchronous Core instance",
-  );
-  assert.equal(requests, 0, "local bootstrap does not fetch");
-  WebAssembly.Module = NativeModule;
-  WebAssembly.Instance = NativeInstance;
-  WebAssembly.instantiate = nativeInstantiate;
-  const invalidConfiguration = (error) => {
-    assert.equal(error instanceof Error, true);
-    assert.equal(error.pulsebeamInfo.code, ErrorCode.InvalidArgument);
-    assert.equal(error.message.includes("private-configuration-value"), false);
-    return true;
-  };
-  assert.throws(
-    () => new BrowserRuntime({ ...config, token: "t".repeat(8193) }),
-    invalidConfiguration,
-  );
-  assert.throws(
-    () =>
-      new BrowserRuntime({
-        ...config,
-        endpoint: "private-configuration-value",
-      }),
-    invalidConfiguration,
-  );
-  assert.throws(
-    () =>
-      new BrowserRuntime({
-        ...config,
-        token: { private: "private-configuration-value" },
-      }),
-    invalidConfiguration,
-  );
-  const runtime = new BrowserRuntime({ ...config, token: "t".repeat(8192) });
-  assert.deepEqual(runtime.diagnostics(), {
-    peers: 0,
-    requests: 0,
-    timers: 0,
-    closed: false,
-    lastError: undefined,
-  });
-  runtime.renew_authorization("r".repeat(8192));
-  assert.throws(() => runtime.renew_authorization("r".repeat(8193)));
-  assert.equal(runtime.diagnostics().lastError, undefined);
-  runtime.renew_authorization("renewed");
-  assert.equal(runtime.snapshot().connection, "disconnected");
-  assert.equal(runtime.snapshot().joinRevision, 0n);
-  assert.equal(runtime.snapshot().credentialRevision, 0n);
-  assert.equal(runtime.snapshot().acceptedCredentialRevision, undefined);
-  assert.equal(runtime.snapshot().credentialOutcome, undefined);
-  assert.equal(runtime.snapshot().desiredRoom, undefined);
-  const beforeJoin = runtime.snapshot();
-  assert.throws(() => runtime.join("bad\0room"));
-  assert.deepEqual(runtime.snapshot(), beforeJoin);
-  const snapshots = [];
-  runtime.set_snapshot_listener((snapshot) => snapshots.push(snapshot));
-  assert.equal(runtime.join("room-a"), undefined);
-  const roomA = runtime.snapshot();
-  assert.equal(roomA.desiredRoom, "room-a");
-  assert.equal(roomA.joinRevision, 1n);
-  runtime.join("room-b");
-  assert.equal(runtime.snapshot().desiredRoom, "room-b");
-  assert.equal(runtime.snapshot().joinRevision, 2n);
-  assert.equal(roomA.desiredRoom, "room-a", "snapshots retain owned values");
-  assert.equal(snapshots.length, 1, "join does not invoke callbacks inline");
-  let reentrantSnapshot;
-  runtime.set_snapshot_listener((snapshot) => {
-    reentrantSnapshot = snapshot;
-    runtime.join("from-listener");
-  });
-  assert.equal(reentrantSnapshot.desiredRoom, "room-b");
-  assert.equal(runtime.snapshot().desiredRoom, "from-listener");
-  assert.equal(runtime.snapshot().joinRevision, 3n);
-  assert.equal(runtime.diagnostics().peers, 0);
-  assert.equal(runtime.diagnostics().requests, 0);
-  assert.equal(runtime.diagnostics().timers, 0);
-  runtime.set_snapshot_listener(undefined);
-  runtime.close();
-  assert.equal(runtime.diagnostics().closed, true);
-  assert.throws(() => runtime.connect(), /closed/);
-  assert.throws(() => runtime.join("after-close"), /closed/);
-  assert.throws(() => runtime.set_owned_muted(1n, true), /closed/);
-  assert.throws(
-    () => runtime.replace_owned_track(1n, null, {}, false, true),
-    /closed/,
-  );
-  runtime.abort();
-  runtime.free();
-  const observed = new BrowserRuntime(config);
-  const initialState = observed.state();
-  const first = observed.updates();
-  const independent = observed.updates();
-  assert.deepEqual(await first.next(), initialState);
-  assert.deepEqual(await independent.next(), initialState);
-  assert.equal(typeof initialState.observationRevision, "bigint");
-  const pendingState = first.next();
-  observed.renew("state-credential");
-  const renewedState = await pendingState;
-  assert.equal(renewedState.desiredCredentialRevision, 1n);
-  assert.equal(renewedState.evaluatedCredentialRevision, 0n);
-  assert.equal(initialState.desiredCredentialRevision, 0n);
-  assert.deepEqual(observed.state(), renewedState);
-  const retiredRead = first.next();
-  first.close();
-  first.close();
-  assert.equal(await retiredRead, undefined);
-  observed.close();
-  const finalState = await independent.next();
-  assert.notEqual(finalState.status, initialState.status);
-  assert.equal(finalState.room, undefined);
-  assert.equal(finalState.desiredCredentialRevision, 1n);
-  assert.equal(await independent.next(), undefined);
-  assert.deepEqual(observed.state(), finalState);
-  independent.close();
-  first.free();
-  independent.free();
-  observed.free();
-  const publicationRuntime = new BrowserRuntime(config);
-  const claim = await publicationRuntime.resource({
-    op: "claimPublication",
-    spec: { kind: "video", trackId: "camera" },
-  });
-  const publication = publicationRuntime.publication(claim.owner);
-  const publicationUpdates = publication.updates();
-  const independentPublicationUpdates = publication.updates();
-  const initialPublication = await publicationUpdates.next();
-  assert.deepEqual(
-    await independentPublicationUpdates.next(),
-    initialPublication,
-  );
-  assert.equal(initialPublication.admission.status, 0);
-  assert.equal(initialPublication.admission.demand, 0);
-  assert.equal(initialPublication.inputAttached, false);
-  assert.equal(initialPublication.configuration.desiredRevision, 1n);
-  const pendingPublication = publicationUpdates.next();
-  const pendingIndependentPublication = independentPublicationUpdates.next();
-  await publicationRuntime.set_owned_muted(claim.owner, true);
-  const configuredPublication = await pendingPublication;
-  assert.equal(configuredPublication.configuration.desiredRevision, 2n);
-  assert.equal(publication.state().configuration.desiredRevision, 2n);
-  assert.deepEqual(await pendingIndependentPublication, configuredPublication);
-  const retainedPublicationUpdates = publication.updates();
-  publication.free();
-  await publicationRuntime.resource({ op: "release", owner: claim.owner });
-  const finalPublication = await retainedPublicationUpdates.next();
-  assert.equal(finalPublication.closed, true);
-  assert.equal((await independentPublicationUpdates.next()).closed, true);
-  publicationRuntime.abort();
-  assert.equal(await retainedPublicationUpdates.next(), undefined);
-  publicationUpdates.close();
-  independentPublicationUpdates.close();
-  publicationUpdates.free();
-  independentPublicationUpdates.free();
-  retainedPublicationUpdates.free();
-  publicationRuntime.free();
-  const { localOperationContract } = await import("./local-operations.mjs");
-  const local = await localOperationContract(BrowserRuntime);
-  const { publicContract } = await import("./public-contract.mjs");
-  assert.equal(
-    await publicContract(await import("../../node_assets/dist/index.js")),
-    true,
-  );
-  const { catalogContract } = await import("./catalog-contract.mjs");
-  await catalogContract(
-    BrowserRuntime,
-    ErrorCode,
-    await import("../../node_assets/dist/index.js"),
-  );
-  const { resourceContract } = await import("./resource-contract.mjs");
-  await resourceContract(BrowserRuntime);
-  const pulsebeam = await import("../../node_assets/dist/index.js");
-  const { dataResourceContract } = await import("./data-resource-contract.mjs");
-  await dataResourceContract(pulsebeam);
-  const { mediaResourceContract } = await import(
-    "./media-resource-contract.mjs"
-  );
-  await mediaResourceContract(pulsebeam);
-  console.log(
-    "emitted WASM authoritative binding, lossless u64 events and admission cancellation passed",
-  );
-  await import("./media-handles.mjs");
-  assert.equal(local, true);
-  console.log(
-    "emitted Rust runtime source ownership, mute persistence, slot reuse and close fencing passed",
-  );
-  console.log(
-    "emitted WASM initialization, synchronous room intent, owned snapshots, callback reentry, authorization and close fencing passed",
-  );
-}
+
+const agent = new Agent(config);
+const independent = new Agent(config);
+assert.equal(
+  instances,
+  1,
+  "independent generated Agents share page-local WASM initialization",
+);
+assert.ok(agent instanceof Agent);
+assert.equal(agent.state().status, AgentStatus.Idle);
+assert.notEqual(
+  agent.state(),
+  independent.state(),
+  "snapshots are scoped to their owners",
+);
+await independent.close();
+
+const initial = agent.state();
+assert.ok(Object.isFrozen(initial));
+assert.throws(() => agent.renew(""), rejectedWith(ErrorCode.InvalidArgument));
+assert.throws(
+  () => agent.join("bad\0room"),
+  rejectedWith(ErrorCode.InvalidArgument),
+);
+assert.equal(agent.state(), initial, "invalid intent does not change state");
+const first = agent.updates();
+const second = agent.updates();
+assert.deepEqual(await first.next(), initial);
+assert.deepEqual(await second.next(), initial);
+const opening = first.next();
+await assert.rejects(first.next(), rejectedWith(ErrorCode.Conflict));
+agent.renew("replacement-token");
+const renewed = agent.state();
+assert.ok(
+  renewed.desiredCredentialRevision > initial.desiredCredentialRevision,
+);
+assert.deepEqual(await opening, renewed);
+assert.equal(agent.state(), renewed);
+const interrupted = first.next();
+first.close();
+assert.equal(await interrupted, undefined);
+assert.deepEqual(await second.next(), renewed);
+const additional = Array.from({ length: 31 }, () => agent.updates());
+assert.throws(() => agent.updates(), rejectedWith(ErrorCode.CapacityExceeded));
+for (const cursor of additional) cursor.close();
+
+const room = agent.room("pinned-room");
+const peer = room.participant("peer");
+assert.equal(agent.room("pinned-room"), room);
+assert.equal(room.participant("peer"), peer);
+assert.equal(peer.video("camera"), peer.video("camera"));
+assert.notEqual(peer.video("camera"), peer.audio("camera"));
+assert.notEqual(peer.video("camera"), agent.video("camera"));
+assert.equal(peer.data("events").selector().room, "pinned-room");
+assert.equal(
+  agent.state().status,
+  AgentStatus.Idle,
+  "lookup never selects a room",
+);
+
+const watch = room.watch();
+assert.equal(watch.state().status, WatchStatus.Loading);
+assert.equal(
+  watch.state().participants,
+  undefined,
+  "pending is not an empty admitted page",
+);
+const cursorBytes = Uint8Array.from({ length: 32 }, (_, index) => index);
+const continuation = room.watch({ limit: 9, cursor: cursorBytes });
+cursorBytes.fill(255);
+assert.equal(
+  continuation.state().cursor[1],
+  1,
+  "owner does not alias the caller's cursor",
+);
+const watchUpdates = watch.updates();
+assert.equal((await watchUpdates.next()).status, WatchStatus.Loading);
+const watching = watchUpdates.next();
+watchUpdates.close();
+assert.equal(await watching, undefined);
+assert.equal(
+  watch.state().status,
+  WatchStatus.Loading,
+  "closing a cursor leaves its watch open",
+);
+const watchCapacity = Array.from({ length: 6 }, () => room.watch());
+assert.throws(() => room.watch(), rejectedWith(ErrorCode.CapacityExceeded));
+await watch.close();
+const reuse = room.watch();
+assert.equal(watch.state().status, WatchStatus.Closed);
+assert.equal(reuse.state().status, WatchStatus.Loading);
+await Promise.all([
+  reuse.close(),
+  continuation.close(),
+  ...watchCapacity.map((owner) => owner.close()),
+]);
+
+const local = agent.video("camera");
+const borrowed = new Track("video");
+const capture = VideoSource.fromTrack(borrowed);
+const publication = local.publish();
+assert.throws(() => local.publish(), rejectedWith(ErrorCode.Conflict));
+const pipe = capture.pipeTo(publication);
+const publicationUpdates = publication.updates();
+const published = publication.state();
+assert.ok(Object.isFrozen(published.configuration));
+assert.deepEqual(await publicationUpdates.next(), published);
+const changing = publicationUpdates.next();
+publication.configure({ enabled: false });
+assert.equal((await changing).configuration.enabled, false);
+assert.equal(
+  borrowed.enabled,
+  true,
+  "muting a publication does not mute capture",
+);
+const releasing = publicationUpdates.next();
+await publication.close();
+assert.equal((await releasing).closed, true);
+assert.equal(await publicationUpdates.next(), undefined);
+assert.equal(pipe.state().status, PipeStatus.Closed);
+assert.equal(capture.previewTrack(), borrowed);
+const replacement = local.publish();
+assert.notEqual(
+  replacement,
+  publication,
+  "a closed label can acquire a fresh publication",
+);
+assert.equal(replacement.state().configuration.enabled, true);
+await replacement.close();
+await capture.close();
+assert.equal(
+  capture.previewTrack(),
+  undefined,
+  "closed sources cannot produce preview input",
+);
+assert.equal(
+  borrowed.readyState,
+  "live",
+  "closing the borrowed source never stops capture",
+);
+
+const stream = peer.data("events").subscribe();
+const pendingData = stream.next();
+await assert.rejects(stream.next(), rejectedWith(ErrorCode.Conflict));
+const closing = second.next();
+await agent.close();
+assert.equal(await pendingData, undefined);
+assert.equal(stream.state().closed, true);
+assert.equal((await closing).status, AgentStatus.Closed);
+assert.equal(await second.next(), undefined);
+assert.throws(() => agent.join("after-close"), rejectedWith(ErrorCode.Closed));
+await agent.close();

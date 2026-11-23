@@ -60,6 +60,7 @@ export function useResource<T extends Resource>(
       if (!lifetime.active) return;
       try {
         lifetime.value = committed.current();
+        lifetime.value.state();
         setOwned(lifetime);
       } catch (error) {
         fail(lifetime, error);
@@ -73,7 +74,10 @@ export function useResource<T extends Resource>(
   const current =
     owned?.target === target && owned.active && !owned.failed ? owned : null;
   const value = current?.value ?? null;
-  useObservation(value);
+  useObservation(value, (observed, error) => {
+    const lifetime = context.current;
+    if (lifetime?.value === observed) fail(lifetime, error);
+  });
   if (
     failure?.lifetime === context.current &&
     failure.lifetime.target === target

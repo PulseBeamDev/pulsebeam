@@ -3,6 +3,7 @@ import { cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { build } from "esbuild";
 import ts from "typescript";
 
 const [directory, react, types, runtime, source] = process.argv
@@ -24,11 +25,19 @@ function install(path) {
 }
 for (const path of [react, types, runtime]) install(path);
 writeFileSync(join(directory, "package.json"), '{"type":"module"}');
-writeFileSync(
-  join(directory, "consumer.mjs"),
-  'export * from "@pulsebeam/react";',
-);
-const sdk = await import(pathToFileURL(join(directory, "consumer.mjs")));
+const bundle = join(directory, "consumer.mjs");
+await build({
+  stdin: {
+    contents:
+      'export * from "@pulsebeam/react"; export * as web from "@pulsebeam/web";',
+    resolveDir: directory,
+  },
+  outfile: bundle,
+  bundle: true,
+  platform: "browser",
+  format: "esm",
+});
+const { web, ...sdk } = await import(pathToFileURL(bundle));
 for (const name of [
   "useAgent",
   "useDevices",
@@ -48,9 +57,6 @@ assert.equal(
   "createAgent" in sdk,
   false,
   "React has only hook-owned Agent construction",
-);
-const web = await import(
-  pathToFileURL(join(directory, "node_modules/@pulsebeam/web/dist/index.js"))
 );
 assert.equal(typeof web.Agent, "function");
 assert.equal("createAgent" in web, false);
@@ -73,13 +79,17 @@ assert.equal(
   "managed lifecycle is not a public entrypoint",
 );
 assert.equal("createWebAgent" in web, false);
-const wasm = readFileSync(
-  join(
-    directory,
-    "node_modules/@pulsebeam/web/dist/wasm/pulsebeam_agent_web_bg.wasm",
-  ),
+const agent = new web.Agent({
+  endpoint: "http://localhost:7070",
+  token: "inert",
+});
+assert.ok(web.Agent.instanceOf(agent));
+assert.equal(
+  agent.state(),
+  agent.state(),
+  "unchanged generated snapshot identity",
 );
-await WebAssembly.compile(wasm);
+await agent.close();
 const consumer = join(directory, "consumer.ts");
 cpSync(source, consumer);
 const program = ts.createProgram([consumer], {

@@ -1,6 +1,7 @@
 """Manifest-versioned npm plans, local login, and explicit SDK publication."""
 
 import argparse
+import base64
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -121,9 +122,14 @@ def validate_archive(path, expected):
             if any(marker in requirement for marker in ("link:", "workspace:", "file:")):
                 raise ValueError("public dependencies cannot use local workspace paths")
     if manifest["name"] == "@pulsebeam/web":
-        wasm = [body for name, body in files.items() if name.endswith(".wasm")]
-        if not wasm or not all(body.startswith(b"\0asm\x01\0\0\0") for body in wasm):
-            raise ValueError("web package is missing its compiled WASM runtime")
+        module = files.get("package/dist/web/wasm-bytes.js", b"")
+        encoded = re.search(rb'^let encoded = "([A-Za-z0-9+/=]+)";$', module, re.MULTILINE)
+        try:
+            wasm = base64.b64decode(encoded[1], validate=True) if encoded else b""
+        except ValueError as error:
+            raise ValueError("web package contains invalid embedded WASM bytes") from error
+        if not wasm.startswith(b"\0asm\x01\0\0\0") or len(wasm) > 8 * 1024 * 1024:
+            raise ValueError("web package is missing a valid embedded WASM runtime")
     return manifest
 
 

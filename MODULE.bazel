@@ -74,7 +74,7 @@ npm.npm_translate_lock(name = "meet_npm", pnpm_lock = "//apps/meet:pnpm-lock.yam
 # Preserve pnpm's compatibility hoist using the existing locked version.
 npm.npm_translate_lock(name = "docs_npm", pnpm_lock = "//docs:pnpm-lock.yaml", public_hoist_packages = {"vscode-languageserver-types": ["docs"], "vscode-languageserver-protocol": ["docs"], "vscode-jsonrpc": ["docs"], "@chevrotain/regexp-to-ast": ["docs"], "@chevrotain/types": ["docs"]})
 npm.npm_translate_lock(name = "server_npm", pnpm_lock = "//server/typescript:pnpm-lock.yaml", npm_package_target_name = "package")
-use_repo(npm, "web_npm", "native_agent_npm", "react_npm", "consumer_npm", "meet_npm", "docs_npm", "server_npm")
+use_repo(npm, "web_npm", "native_agent_npm", "react_npm", "consumer_npm", "meet_npm", "docs_npm", "server_npm", ubrn_core = "web_npm__at_ubjs_core__0.31.0-5")
 
 browsers = use_extension("//tools:browsers.bzl", "browsers")
 use_repo(browsers, "browser_chrome", "browser_chromedriver", "browser_firefox", "browser_geckodriver")

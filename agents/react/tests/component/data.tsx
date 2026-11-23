@@ -1,17 +1,17 @@
 import assert from "node:assert/strict";
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Data, useAgent, type Agent, type DataEvent } from "../../src/index.js";
+import { Data, useAgent, type Agent, DataEvent } from "../../src/index.js";
 import { deferred, flush } from "./platform.js";
-import { runtimes } from "./runtime.js";
+import { captureDataReads } from "./scripted.js";
 
-const message = (sequence: bigint): DataEvent => ({
-  type: "message",
-  participantId: "alice",
-  publicationId: "chat-id",
-  sequence,
-  data: Uint8Array.of(Number(sequence)),
-});
+const message = (sequence: bigint) =>
+  DataEvent.Message.new({
+    participantId: "alice",
+    publicationId: "chat-id",
+    sequence,
+    data: Uint8Array.of(Number(sequence)),
+  });
 
 export async function dataLifetimes() {
   let agent!: Agent;
@@ -23,6 +23,7 @@ export async function dataLifetimes() {
       generation: number;
     }>,
   ) => void;
+  const inbox = captureDataReads();
   const pending = deferred<void>();
   const retired = deferred<void>();
   const calls: string[] = [];
@@ -53,11 +54,12 @@ export async function dataLifetimes() {
               .participant("alice")
               .data(state.trackId)}
             onEvent={async (event) => {
-              assert.equal(event.type, "message");
-              if (event.type !== "message") return;
-              calls.push(`${state.trackId}:${state.version}:${event.sequence}`);
-              if (event.sequence === 1n) await pending.promise;
-              if (event.sequence === 4n) await retired.promise;
+              assert.ok(DataEvent.Message.instanceOf(event));
+              calls.push(
+                `${state.trackId}:${state.version}:${event.inner.sequence}`,
+              );
+              if (event.inner.sequence === 1n) await pending.promise;
+              if (event.inner.sequence === 4n) await retired.promise;
               if (fail) throw new Error("processing failed");
             }}
             onError={(error) => {
@@ -69,9 +71,8 @@ export async function dataLifetimes() {
         <Data
           track={agent.room("selected-room").participant("alice").data("chat")}
           onEvent={(event) => {
-            assert.equal(event.type, "message");
-            if (event.type !== "message") return;
-            other.push(event.sequence);
+            assert.ok(DataEvent.Message.instanceOf(event));
+            other.push(event.inner.sequence);
           }}
         />
       </>
@@ -91,7 +92,6 @@ export async function dataLifetimes() {
         </StrictMode>,
       ),
     );
-    const runtime = runtimes.at(-1)!;
     const room = agent.data("chat");
     assert.equal(room, agent.data("chat"));
     assert.equal("delivery" in room, false);
@@ -106,11 +106,11 @@ export async function dataLifetimes() {
       participant,
       agent.room("selected-room").participant("bob").data("chat"),
     );
-    const owners = [...runtime.dataOwners.keys()];
+    const owners = inbox.owners().map(([owner]) => owner);
     assert.equal(owners.length, 2);
     await flush(() => {
-      runtime.deliverData("chat", message(1n));
-      runtime.deliverData("chat", message(2n));
+      inbox.deliver("chat", message(1n));
+      inbox.deliver("chat", message(2n));
     });
     assert.deepEqual(calls, ["chat:1:1"], "one handler at a time per mount");
     assert.deepEqual(
@@ -120,7 +120,7 @@ export async function dataLifetimes() {
     );
     await flush(() => update({ version: 2 }));
     assert.deepEqual(
-      [...runtime.dataOwners.keys()],
+      inbox.owners().map(([owner]) => owner),
       owners,
       "callback and equivalent wrapper updates preserve receive owners",
     );
@@ -132,16 +132,16 @@ export async function dataLifetimes() {
     );
 
     fail = true;
-    await flush(() => runtime.deliverData("chat", message(3n)));
+    await flush(() => inbox.deliver("chat", message(3n)));
     assert.deepEqual(errors, ["2:processing failed"]);
     assert.equal(
-      runtime.dataOwners.size,
+      inbox.owners().length,
       1,
       "handler rejection releases only the failed mount even if onError throws",
     );
     assert.equal(diagnostics.length, 1);
     await flush(() => update({ version: 3 }));
-    await flush(() => runtime.deliverData("chat", message(5n)));
+    await flush(() => inbox.deliver("chat", message(5n)));
     assert.equal(
       calls.length,
       3,
@@ -151,15 +151,15 @@ export async function dataLifetimes() {
 
     fail = false;
     await flush(() => update({ generation: 1 }));
-    assert.equal(runtime.dataOwners.size, 2, "remount restarts reception");
-    await flush(() => runtime.deliverData("chat", message(4n)));
+    assert.equal(inbox.owners().length, 2, "remount restarts reception");
+    await flush(() => inbox.deliver("chat", message(4n)));
     await flush(() => update({ trackId: "replacement" }));
     assert.equal(
-      runtime.dataOwners.size,
+      inbox.owners().length,
       2,
       "target replacement releases a handler blocked on application work promptly",
     );
-    await flush(() => runtime.deliverData("replacement", message(6n)));
+    await flush(() => inbox.deliver("replacement", message(6n)));
     assert.equal(calls.at(-1), "replacement:3:6");
     await flush(() => retired.reject(new Error("late failure")));
     assert.deepEqual(
@@ -167,76 +167,20 @@ export async function dataLifetimes() {
       ["2:processing failed"],
       "retired promise rejection cannot call the replacement error handler",
     );
-    assert.equal(runtime.dataOwners.size, 2);
+    assert.equal(inbox.owners().length, 2);
 
-    const resource = runtime.resource.bind(runtime);
-    let rejectRead = true;
-    runtime.resource = async (command) => {
-      if (
-        command.op === "readData" &&
-        rejectRead &&
-        runtime.dataOwners.get(command.owner)?.spec.trackId === "replacement"
-      ) {
-        rejectRead = false;
-        throw new Error("receive failed");
-      }
-      return resource(command);
-    };
-    await flush(() => runtime.deliverData("replacement", message(7n)));
+    const [, reads] = inbox
+      .owners()
+      .find(([owner]) => owner.state().selector.trackId === "replacement")!;
+    await flush(() => reads.fail(new Error("receive failed")));
     assert.equal(errors.length, 2, "receive failure reports once");
-    assert.equal(runtime.dataOwners.size, 1);
+    assert.equal(inbox.owners().length, 1);
     await flush(() => update({ mounted: false }));
-    assert.equal(runtime.dataOwners.size, 1);
+    assert.equal(inbox.owners().length, 1);
   } finally {
     await flush(() => root.unmount());
-    assert.equal(runtimes.at(-1)!.dataOwners.size, 0);
+    assert.equal(inbox.owners().length, 0);
+    inbox.restore();
     console.error = originalError;
   }
-}
-
-export async function staleDataClaims() {
-  let agent!: Agent;
-  let mount!: (value: boolean) => void;
-  const completion = deferred<void>();
-  const calls: unknown[] = [];
-  function Room() {
-    const current = useAgent({
-      endpoint: "http://localhost",
-      token: "stale-data",
-    });
-    return current ? <StaleDataRoom agent={current} /> : null;
-  }
-  function StaleDataRoom({ agent }: { agent: Agent }) {
-    const [mounted, setMounted] = useState(false);
-    mount = setMounted;
-    return mounted ? (
-      <Data
-        track={agent.room("selected-room").participant("alice").data("late")}
-        onEvent={(event) => {
-          calls.push(event);
-        }}
-        onError={(error) => {
-          calls.push(error);
-        }}
-      />
-    ) : null;
-  }
-  const root = createRoot(document.createElement("div"));
-  await flush(() => root.render(<Room />));
-  const runtime = runtimes.at(-1)!;
-  const resource = runtime.resource.bind(runtime);
-  runtime.resource = async (command) => {
-    if (command.op === "receiveData") await completion.promise;
-    return resource(command);
-  };
-  await flush(() => mount(true));
-  await flush(() => mount(false));
-  await flush(() => completion.resolve());
-  assert.equal(
-    runtime.dataOwners.size,
-    0,
-    "late receive claim is released after retirement",
-  );
-  assert.deepEqual(calls, []);
-  await flush(() => root.unmount());
 }

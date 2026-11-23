@@ -1,6 +1,27 @@
 (async () => {
+  const { AgentError, ErrorCode } = window.pulsebeam;
+  const terminal = (failure) =>
+    failure != null &&
+    AgentError.Operation.instanceOf(failure) &&
+    failure.inner.info.code === ErrorCode.ConnectionFailed;
   const { sender, receiver, stream, pumping, wait } =
     globalThis.__serverRestart;
+  const bounded = async (work, label) => {
+    let timer;
+    try {
+      return await Promise.race([
+        work,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Timed out: ${label}`)),
+            5000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   try {
     await Promise.all(
       [sender, receiver].map((agent) =>
@@ -11,26 +32,26 @@
         ),
       ),
     );
-    const failure = await pumping;
-    if (
-      !(failure instanceof window.pulsebeam.OperationError) ||
-      failure.info.code !== window.pulsebeam.ErrorCode.ConnectionFailed
-    ) {
+    const failure = await bounded(
+      pumping,
+      "pending data read after terminal Agent state",
+    );
+    if (!terminal(failure)) {
       throw new Error(
         "expired ownership did not terminate reception with its shared cause",
       );
     }
-    await stream.close();
+    await bounded(stream.close(), "terminal data subscription close");
     try {
-      await stream.next();
+      await bounded(stream.next(), "post-close terminal data read");
       throw new Error("close erased the terminal receive failure");
     } catch (error) {
-      if (error !== failure) throw error;
+      if (!terminal(error)) throw error;
     }
     for (const agent of [sender, receiver]) {
       const state = agent.state();
       if (
-        state.error?.code !== window.pulsebeam.ErrorCode.ConnectionFailed ||
+        state.error?.code !== ErrorCode.ConnectionFailed ||
         state.room !== undefined ||
         state.connectionId !== undefined
       ) {
@@ -41,9 +62,13 @@
     }
     return true;
   } finally {
-    await stream.close();
-    await pumping;
-    await Promise.all([sender.close(), receiver.close()]);
-    delete globalThis.__serverRestart;
+    try {
+      await bounded(
+        Promise.all([sender.close(), receiver.close(), stream.close()]),
+        "restart fixture cleanup",
+      );
+    } finally {
+      delete globalThis.__serverRestart;
+    }
   }
 })();

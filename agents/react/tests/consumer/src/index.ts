@@ -1,4 +1,4 @@
-import { DataDelivery } from "@pulsebeam/react";
+import { DataDelivery, DataEvent } from "@pulsebeam/react";
 import {
   Audio,
   Data,
@@ -41,10 +41,10 @@ Data({
   track: messages,
   options: { delivery: DataDelivery.Unreliable },
   async onEvent(event) {
-    if (event.type !== "message") return;
-    const bytes: Uint8Array = event.data;
-    // @ts-expect-error Lossy events cannot contain a gap.
-    event.from;
+    if (!DataEvent.Message.instanceOf(event)) return;
+    const bytes: Uint8Array = event.inner.data;
+    // @ts-expect-error Messages do not carry gap bounds.
+    event.inner.from;
     await Promise.resolve(bytes);
   },
 });
@@ -55,8 +55,8 @@ agent.data("messages", "lossy");
 Data({
   track: agent.room("selected-room").participant("alice").data("chat"),
   onEvent(event) {
-    if (event.type === "discontinuity") {
-      const from: string = event.previousPublicationId;
+    if (DataEvent.Discontinuity.instanceOf(event)) {
+      const from: string = event.inner.previousPublicationId;
       void from;
     }
   },

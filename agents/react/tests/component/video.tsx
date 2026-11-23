@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
 import { createRoot } from "react-dom/client";
-import { AudioSource, VideoSource } from "@pulsebeam/web";
+import {
+  AudioSource,
+  VideoSource,
+  type AudioSubscription,
+  type VideoSubscription,
+  type WebAudioOutput,
+  type WebVideoOutput,
+} from "@pulsebeam/web";
 import { Audio, Video, useAgent, type Agent } from "../../src/index.js";
 import { deferred, flush, Track } from "./platform.js";
-import { runtimes } from "./runtime.js";
 
 // This entry point is shared by the component lifecycle runner.
-export async function videoPreferences() {
+export async function playbackLifetimes() {
   let agent!: Agent;
   function Room() {
     const current = useAgent({
@@ -18,7 +24,6 @@ export async function videoPreferences() {
   }
   const ownerRoot = createRoot(document.createElement("div"));
   await flush(() => ownerRoot.render(<Room />));
-  const runtime = runtimes.at(-1)!;
   const remote = agent.room("room").participant("alice");
   const video = remote.video("camera").subscribe();
   const audio = remote.audio("microphone").subscribe();
@@ -26,23 +31,18 @@ export async function videoPreferences() {
 
   // Control only the physical observation boundary, not Core admission policy.
   const requests: {
-    owner: bigint;
     signal?: AbortSignal;
-    result: ReturnType<typeof deferred<any>>;
+    result: ReturnType<typeof deferred<WebAudioOutput | WebVideoOutput>>;
   }[] = [];
-  const boundary = runtime as typeof runtime & {
-    observe_media: (
-      owner: bigint,
-      source?: string,
-      signal?: AbortSignal,
-    ) => Promise<any>;
-  };
-  const previous = boundary.observe_media;
-  boundary.observe_media = (owner, _source, signal) => {
-    const result = deferred<any>();
-    requests.push({ owner, signal, result });
-    return result.promise;
-  };
+  function intercept(subscription: AudioSubscription | VideoSubscription) {
+    subscription.playbackOutput = ((options?: { signal: AbortSignal }) => {
+      const result = deferred<WebAudioOutput | WebVideoOutput>();
+      requests.push({ signal: options?.signal, result });
+      return result.promise;
+    }) as typeof subscription.playbackOutput;
+  }
+  intercept(video);
+  intercept(audio);
   function complete(
     request: (typeof requests)[number],
     kind: "video" | "audio",
@@ -51,14 +51,13 @@ export async function videoPreferences() {
     let closed = false;
     let closes = 0;
     request.result.resolve({
-      track: () => track,
-      is_closed: () => closed,
+      track: () =>
+        closed ? undefined : (track as unknown as MediaStreamTrack),
       close: async () => {
         closed = true;
         closes++;
       },
-      free: () => {},
-    });
+    } as WebAudioOutput);
     return {
       track,
       get closes() {
@@ -95,7 +94,6 @@ export async function videoPreferences() {
           </>
         );
       const start = requests.length;
-      const commands = runtime.resourceCommands.length;
       await flush(() => root.render(render(2)));
       assert.equal(
         requests.length - start,
@@ -126,23 +124,10 @@ export async function videoPreferences() {
       await flush(() => root.render(null));
       assert.equal(first.closes, 1);
       assert.equal(
-        subscription.isClosed(),
+        subscription.state().closed,
         false,
         `${kind}: caller retains subscription`,
       );
-      assert.equal(
-        runtime.resourceCommands
-          .slice(commands)
-          .some(
-            (c: any) =>
-              c.op === "claimVideo" ||
-              c.op === "claimAudioSubscription" ||
-              c.op === "release",
-          ),
-        false,
-        `${kind}: playback neither claims nor releases a receive owner`,
-      );
-
       const pending = requests.length;
       await flush(() => root.render(render(1)));
       assert.equal(requests.length, pending + 1);
@@ -155,12 +140,13 @@ export async function videoPreferences() {
       const late = complete(requests[pending]!, kind);
       await flush();
       assert.equal(late.closes, 1, `${kind}: late clone is closed`);
-      assert.equal(subscription.isClosed(), false);
+      assert.equal(subscription.state().closed, false);
 
       const replacement =
         kind === "video"
           ? remote.video("other-camera").subscribe()
           : remote.audio("other-microphone").subscribe();
+      intercept(replacement);
       await flush();
       const renderSource = (next: boolean) =>
         kind === "video" ? (
@@ -200,7 +186,7 @@ export async function videoPreferences() {
       );
       await flush(() => root.render(null));
       assert.equal(current.closes, 1);
-      assert.equal(replacement.isClosed(), false);
+      assert.equal(replacement.state().closed, false);
       await replacement.close();
     }
 
@@ -276,9 +262,24 @@ export async function videoPreferences() {
     await flush(() => root.render(null));
     assert.equal(capturedVideo.stopped, 0);
     assert.equal(capturedAudio.stopped, 0);
-    assert.equal(videoSource.isClosed(), false);
-    assert.equal(audioSource.isClosed(), false);
-    await videoSource.close();
+    assert.equal(videoSource.previewTrack(), capturedVideo);
+    assert.equal(audioSource.previewTrack(), capturedAudio);
+    await flush(() =>
+      root.render(<Video source={videoSource} autoPlay={false} />),
+    );
+    const preview = host.querySelector("video")!;
+    assert.notEqual(preview.srcObject, null);
+    await flush(() => videoSource.close());
+    assert.equal(
+      preview.srcObject,
+      null,
+      "closing a source withdraws its preview",
+    );
+    assert.equal(
+      capturedVideo.readyState,
+      "live",
+      "the supplied browser track remains caller-owned",
+    );
     await audioSource.close();
   } finally {
     HTMLMediaElement.prototype.play = play;
@@ -286,12 +287,9 @@ export async function videoPreferences() {
     for (const request of requests)
       request.result.resolve({
         track: () => undefined,
-        is_closed: () => false,
         close: async () => {},
-        free: () => {},
-      });
+      } as WebAudioOutput);
     await flush();
-    boundary.observe_media = previous;
     await video.close();
     await audio.close();
     await flush(() => ownerRoot.unmount());

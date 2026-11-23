@@ -1,5 +1,4 @@
 import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -13,6 +12,7 @@ const { Window } = await import(
 const window = new Window({ url: "http://localhost/" });
 for (const name of [
   "window",
+  "Window",
   "document",
   "navigator",
   "Node",
@@ -67,11 +67,6 @@ await build({
   },
   alias: {
     "@pulsebeam/react": join(root, "agents/react/src/index.ts"),
-    "@pulsebeam/web/internal/react": join(
-      root,
-      "agents/pulsebeam-agent-web/web/internal/react.ts",
-    ),
-    "@pulsebeam/web": join(root, "agents/pulsebeam-agent-web/web/index.ts"),
   },
   plugins: [
     {
@@ -81,21 +76,17 @@ await build({
           path: require.resolve(args.path),
           external: true,
         }));
-        build.onResolve({ filter: /(?:wasm\.js|runtime(?:\.js)?)$/ }, (args) =>
-          (args.path === "./wasm.js" &&
-            args.resolveDir.endsWith("/pulsebeam-agent-web/web")) ||
-          args.resolveDir.endsWith("/tests/component") ||
-          args.path.endsWith("/tests/component/runtime")
-            ? {
-                path: join(root, "agents/react/tests/component/runtime.ts"),
-                namespace: "runtime-model",
-              }
-            : undefined,
+        build.onResolve(
+          { filter: /^@pulsebeam\/web(?:\/internal\/react)?$/ },
+          (args) => {
+            if (args.pluginData === "shared-web") return;
+            return build.resolve(args.path, {
+              kind: args.kind,
+              resolveDir: owner,
+              pluginData: "shared-web",
+            });
+          },
         );
-        build.onLoad({ filter: /.*/, namespace: "runtime-model" }, (args) => ({
-          contents: readFileSync(args.path, "utf8"),
-          loader: "ts",
-        }));
       },
     },
   ],

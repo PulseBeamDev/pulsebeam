@@ -54,8 +54,8 @@ cursor. State starts Loading, not as a successful empty page.
 
 A Live state's page contains participant IDs, application external IDs and
 publication metadata, including participants with no publications. In generated
-Python, read `state.page.participants()`, `has_more()`, `next_cursor()` and
-`cursor_expires_at_unix_seconds()`; Node uses the corresponding camelCase methods.
+Python, read `state.participants`, `state.has_more`, `state.next_cursor` and
+`state.cursor_expires_at_unix_seconds`; Node uses the corresponding camelCase methods.
 Retained page values stay stable across updates. The SDK retains one current page
 per watch, not a history or every continuation.
 

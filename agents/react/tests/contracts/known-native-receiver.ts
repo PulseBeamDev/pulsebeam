@@ -7,7 +7,8 @@ import {
   useSubscribe,
   useWatch,
   WatchStatus,
-  type Watch,
+  type Catalog,
+  DataEvent,
   type Agent,
 } from "@pulsebeam/react";
 
@@ -26,7 +27,7 @@ export async function observeCatalog(config: {
   publisherToken: string;
   room: string;
 }): Promise<boolean> {
-  let ownedWatch: Watch | undefined;
+  let ownedWatch: Catalog | undefined;
   function Catalog() {
     const agent = useAgent({ endpoint: config.endpoint, token: config.token });
     useEffect(() => {
@@ -42,11 +43,13 @@ export async function observeCatalog(config: {
       "output",
       { id: "catalog", "data-status": state?.status },
       state?.error?.message ??
-        state?.page?.participants
-          .flatMap((participant) =>
-            participant.tracks.map(
-              (publication) => `${participant.id}/${publication.trackId}`,
-            ),
+        state?.participants
+          ?.flatMap((participant) =>
+            participant
+              .tracks()
+              .map(
+                (publication) => `${participant.id()}/${publication.trackId}`,
+              ),
           )
           .join(","),
     );
@@ -114,6 +117,7 @@ export async function receiveNative(config: Config): Promise<{
   let fail!: (reason: unknown) => void;
   let previous: bigint | undefined;
   let messages = 0;
+  let generatedAgent = false;
   const video = new Promise<void>((resolve) => {
     videoReady = resolve;
   });
@@ -172,21 +176,23 @@ export async function receiveNative(config: Config): Promise<{
         track: bytes,
         onError: fail,
         onEvent: (event) => {
+          if (!DataEvent.Message.instanceOf(event))
+            throw new Error("Expected a known-source message");
+          const { participantId, publicationId, data } = event.inner;
           if (
-            event.type !== "message" ||
-            event.participantId !== "native-publisher" ||
-            !event.publicationId ||
-            event.data.length !== 11 ||
-            event.data[0] !== 0 ||
-            event.data[1] !== 255 ||
-            event.data[2] !== 128
+            participantId !== "native-publisher" ||
+            !publicationId ||
+            data.length !== 11 ||
+            data[0] !== 0 ||
+            data[1] !== 255 ||
+            data[2] !== 128
           ) {
             throw new Error("wrong known-source data or binary payload");
           }
           const sequence = new DataView(
-            event.data.buffer,
-            event.data.byteOffset,
-            event.data.byteLength,
+            data.buffer,
+            data.byteOffset,
+            data.byteLength,
           ).getBigUint64(3, true);
           if (previous !== undefined && sequence <= previous) {
             throw new Error("native live data duplicated or moved backwards");
@@ -201,7 +207,9 @@ export async function receiveNative(config: Config): Promise<{
   function App() {
     const agent = useAgent({ endpoint: config.endpoint, token: config.token });
     useEffect(() => {
-      agent?.join(config.room);
+      if (!agent) return;
+      generatedAgent = WebAgent.instanceOf(agent);
+      agent.join(config.room);
     }, [agent]);
     return agent ? createElement(Receiver, { agent }) : null;
   }
@@ -209,22 +217,11 @@ export async function receiveNative(config: Config): Promise<{
   const container = document.getElementById("root");
   if (!container) throw new Error("missing React fixture root");
   const root = createRoot(container);
-  const originalInstance = WebAssembly.Instance;
-  let instances = 0;
-  // The package embeds WASM, so observe real instantiation rather than HTTP.
-  WebAssembly.Instance = new Proxy(originalInstance, {
-    construct(target, args, newTarget) {
-      const instance = Reflect.construct(target, args, newTarget);
-      instances++;
-      return instance;
-    },
-  });
   try {
     root.render(createElement(App));
     await Promise.race([Promise.all([video, data]), failure]);
-    return { video: true, data: true, wasm: instances > 0 };
+    return { video: true, data: true, wasm: generatedAgent };
   } finally {
-    WebAssembly.Instance = originalInstance;
     window.clearTimeout(timeout);
     root.unmount();
   }

@@ -8,13 +8,37 @@ import {
   DataPublishOptions,
   DataSendOptions,
   ErrorCode,
+  LogLevel,
   PipeStatus,
+  PlayoutDelay,
   PublicationAdmissionStatus,
   VideoSource,
   WatchStatus,
 } from "@pulsebeam/web";
-import { createElement } from "react";
+import type { RemoteVideoTrack, VideoSubscription } from "@pulsebeam/web";
+import {
+  attachMedia,
+  type BorrowedMediaAttachment,
+} from "@pulsebeam/web/internal/react";
+import { createElement, useLayoutEffect, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import { useResource } from "../../src/resource.js";
+
+function ReceiveVideo({
+  camera,
+  onOwner,
+  children,
+}: {
+  camera: RemoteVideoTrack;
+  onOwner: (owner: VideoSubscription) => void;
+  children?: ReactNode;
+}) {
+  const { value: owner } = useResource(camera, () => camera.subscribe());
+  useLayoutEffect(() => {
+    if (owner) onOwner(owner);
+  }, [owner, onOwner]);
+  return children ?? null;
+}
 
 async function expectDecodedTone(track: MediaStreamTrack): Promise<void> {
   const stream = new MediaStream([track]);
@@ -61,7 +85,12 @@ export async function receiveGenerated(config: {
   sourceRoom: string;
   catalogToken: string;
 }): Promise<boolean> {
-  const agent = new Agent({ endpoint: config.endpoint, token: config.token });
+  const agent = new Agent({
+    endpoint: config.endpoint,
+    token: config.token,
+    logLevel: LogLevel.Off,
+  });
+  agent.setLogging(LogLevel.Warn);
   if (!Agent.instanceOf(agent)) throw new Error("expected a generated Agent");
   const state = agent.state();
   if (state.status !== AgentStatus.Idle || agent.state() !== state) {
@@ -70,11 +99,63 @@ export async function receiveGenerated(config: {
   const room = agent.room(config.sourceRoom);
   const participant = room.participant("native-publisher");
   const camera = participant.video("camera");
-  const reception = camera.subscribe();
+  const localData = agent.data("local-events");
+  try {
+    const address = camera.selector();
+    if (
+      room.name() !== config.sourceRoom ||
+      address.room !== config.sourceRoom ||
+      address.participantId !== "native-publisher" ||
+      address.trackId !== "camera" ||
+      localData.trackId() !== "local-events"
+    ) {
+      throw new Error(
+        "Generated logical handles lost their addresses before admission",
+      );
+    }
+    if (
+      agent.room(config.sourceRoom) !== room ||
+      room.participant("native-publisher") !== participant ||
+      participant.video("camera") !== camera ||
+      agent.data("local-events") !== localData ||
+      agent.state() !== state
+    ) {
+      throw new Error(
+        "Equivalent generated lookups must stay inert and stable",
+      );
+    }
+  } finally {
+    localData.uniffiDestroy();
+  }
+  const replacementData = agent.data("local-events");
+  try {
+    if (replacementData === localData) {
+      throw new Error("Generated lookup reused a destroyed reference");
+    }
+  } finally {
+    replacementData.uniffiDestroy();
+  }
   const container = document.getElementById("root");
   if (!container) throw new Error("missing React fixture root");
   const root = createRoot(container);
+  let reception: VideoSubscription | undefined;
   try {
+    reception = await new Promise<VideoSubscription>((resolve) => {
+      root.render(createElement(ReceiveVideo, { camera, onOwner: resolve }));
+    });
+    const videoConfiguration = reception.state().configuration;
+    reception.configure({ ...videoConfiguration, visible: false });
+    if (reception.state().configuration.visible) {
+      throw new Error(
+        "Generated video reconfiguration did not reach the same owner",
+      );
+    }
+    reception.configure();
+    if (!reception.state().configuration.visible) {
+      throw new Error(
+        "Generated video reconfiguration did not restore default visibility",
+      );
+    }
     const updates = agent.updates();
     try {
       const first = await updates.next();
@@ -141,6 +222,15 @@ export async function receiveGenerated(config: {
     const audio = remoteAudio.subscribe();
     const audioUpdates = audio.updates();
     try {
+      audio.configure({
+        playoutDelay: PlayoutDelay.Fixed.new({ minMs: 10, maxMs: 20 }),
+      });
+      if (!PlayoutDelay.Fixed.instanceOf(audio.state().playoutDelay)) {
+        throw new Error(
+          "Generated audio reconfiguration did not update playout delay",
+        );
+      }
+      audio.configure();
       const initialAudio = audio.state();
       if (
         initialAudio.closed ||
@@ -287,11 +377,49 @@ export async function receiveGenerated(config: {
       ) {
         throw new Error("packed publication has no coherent pending state");
       }
+      publication.configure({ enabled: false });
+      if (
+        publication.state().configuration.enabled ||
+        publication.state().closed
+      ) {
+        throw new Error(
+          "Generated publication reconfiguration replaced or left the owner enabled",
+        );
+      }
+      publication.configure({ enabled: true });
       const track = document
         .createElement("canvas")
         .captureStream(5)
         .getVideoTracks()[0];
       const source = VideoSource.fromTrack(track);
+      const previewElement = document.createElement("video");
+      const failPreview = (error: unknown) => {
+        throw error;
+      };
+      const preview = attachMedia(
+        source,
+        "video",
+        previewElement,
+        false,
+        failPreview,
+        failPreview,
+      );
+      const mirror = VideoSource.fromTrack(track);
+      try {
+        if (mirror.previewTrack() !== track)
+          throw new Error("Generated source preview copied the borrowed track");
+      } finally {
+        mirror.uniffiDestroy();
+      }
+      const previewStream = previewElement.srcObject;
+      if (
+        !(previewStream instanceof MediaStream) ||
+        previewStream.getVideoTracks()[0] !== track ||
+        source.previewTrack() !== track
+      )
+        throw new Error(
+          "Closing another source's lease detached the borrowed preview",
+        );
       const pipe = source.pipeTo(publication);
       const pipeUpdates = pipe.updates();
       try {
@@ -308,9 +436,18 @@ export async function receiveGenerated(config: {
         ) {
           throw new Error("packed pipe close did not isolate borrowed capture");
         }
+        await source.close();
+        if (
+          previewElement.srcObject !== null ||
+          source.previewTrack() !== undefined
+        )
+          throw new Error(
+            "Closing a generated source did not detach its preview",
+          );
       } finally {
         pipeUpdates.close();
         await pipe.close();
+        await preview.close();
         await source.close();
         pipeUpdates.uniffiDestroy();
         pipe.uniffiDestroy();
@@ -330,53 +467,105 @@ export async function receiveGenerated(config: {
       publication.uniffiDestroy();
       local.uniffiDestroy();
     }
+    const cancellation = new AbortController();
+    let settled = false;
+    const pendingPlayback = reception
+      .playbackOutput({ signal: cancellation.signal })
+      .then(
+        async (output) => {
+          settled = true;
+          await output.close();
+          output.uniffiDestroy();
+          return true;
+        },
+        () => {
+          settled = true;
+          return false;
+        },
+      );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (settled)
+      throw new Error("Playback acquisition was not waiting before join");
+    cancellation.abort();
+    if ((await pendingPlayback) || reception.state().closed)
+      throw new Error("Cancelling playback must leave the subscription open");
     agent.join(config.room);
-    const output = await reception.playbackOutput();
+    const videoSubscription = reception;
+    let attachment: BorrowedMediaAttachment | undefined;
     try {
-      const track = output.track();
-      if (!track) throw new Error("missing generated video track");
-      const stream = new MediaStream([track]);
-      await new Promise<void>((resolve, reject) => {
+      const track = await new Promise<MediaStreamTrack>((resolve, reject) => {
         root.render(
-          createElement("video", {
-            muted: true,
-            autoPlay: true,
-            playsInline: true,
-            ref(element: HTMLVideoElement | null) {
-              if (element) element.srcObject = stream;
+          createElement(
+            ReceiveVideo,
+            {
+              camera: participant.video("camera"),
+              onOwner(owner) {
+                if (owner !== reception)
+                  reject(
+                    new Error(
+                      "A React rerender replaced an equivalent generated track",
+                    ),
+                  );
+              },
             },
-            onError: () => reject(new Error("generated video playback failed")),
-            onLoadedData(event: { currentTarget: HTMLVideoElement }) {
-              try {
-                const video = event.currentTarget;
-                const canvas = document.createElement("canvas");
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                const context = canvas.getContext("2d");
-                if (!context || canvas.width !== 160 || canvas.height !== 96) {
-                  throw new Error("missing expected decoded video geometry");
-                }
-                context.drawImage(video, 0, 0);
-                const pixel = context.getImageData(80, 48, 1, 1).data;
-                if (pixel[0] < 150 || pixel[1] < 50 || pixel[3] !== 255) {
-                  throw new Error(
-                    "generated output did not decode native pixels",
+            createElement("video", {
+              muted: true,
+              autoPlay: true,
+              playsInline: true,
+              ref(element: HTMLVideoElement | null) {
+                if (element) {
+                  attachment = attachMedia(
+                    videoSubscription,
+                    "video",
+                    element,
+                    true,
+                    reject,
+                    reject,
                   );
                 }
-                resolve();
-              } catch (error) {
-                reject(error);
-              }
-            },
-          }),
+              },
+              onError: () =>
+                reject(new Error("generated video playback failed")),
+              onLoadedData(event: { currentTarget: HTMLVideoElement }) {
+                try {
+                  const video = event.currentTarget;
+                  const canvas = document.createElement("canvas");
+                  canvas.width = video.videoWidth;
+                  canvas.height = video.videoHeight;
+                  const context = canvas.getContext("2d");
+                  if (
+                    !context ||
+                    canvas.width !== 160 ||
+                    canvas.height !== 96
+                  ) {
+                    throw new Error("missing expected decoded video geometry");
+                  }
+                  context.drawImage(video, 0, 0);
+                  const pixel = context.getImageData(80, 48, 1, 1).data;
+                  if (pixel[0] < 150 || pixel[1] < 50 || pixel[3] !== 255) {
+                    throw new Error(
+                      "generated output did not decode native pixels",
+                    );
+                  }
+                  const stream = video.srcObject;
+                  const track =
+                    stream instanceof MediaStream && stream.getVideoTracks()[0];
+                  if (!track)
+                    throw new Error("Decoded video has no borrowed track");
+                  resolve(track);
+                } catch (error) {
+                  reject(error);
+                }
+              },
+            }),
+          ),
         );
       });
-      await output.close();
+      await attachment?.close();
       if (track.readyState !== "ended" || reception.state().closed)
         return false;
     } finally {
-      await output.close();
-      output.uniffiDestroy();
+      await attachment?.close();
     }
     const events = participant.data("frame-events");
     const stream = events.subscribe();
@@ -458,8 +647,8 @@ export async function receiveGenerated(config: {
         const state = await rosterUpdates.next();
         if (!state || state.error)
           throw new Error("generated catalog did not synchronize");
-        if (!state.page) continue;
-        const entries = state.page.participants();
+        if (!state.participants) continue;
+        const entries = state.participants;
         const publisher = entries.find(
           (entry) => entry.id() === "native-publisher",
         );
@@ -488,7 +677,6 @@ export async function receiveGenerated(config: {
           break;
         } finally {
           for (const entry of entries) entry.uniffiDestroy();
-          state.page.uniffiDestroy();
         }
       }
     } finally {
@@ -500,16 +688,38 @@ export async function receiveGenerated(config: {
       await viewer.close();
       viewer.uniffiDestroy();
     }
-    await reception.close();
+    const lifecycle = reception.updates();
+    try {
+      await lifecycle.next();
+      const closed = lifecycle.next();
+      root.unmount();
+      if (!(await closed)?.closed || (await lifecycle.next()) !== undefined)
+        throw new Error(
+          "React unmount did not release the generated subscription",
+        );
+    } finally {
+      lifecycle.close();
+      lifecycle.uniffiDestroy();
+    }
     await agent.close();
+    try {
+      agent.setLogging(LogLevel.Off);
+      throw new Error("A closed generated Agent accepted a logging update");
+    } catch (error) {
+      if (
+        !AgentError.Operation.instanceOf(error) ||
+        error.inner.info.code !== ErrorCode.Closed
+      )
+        throw error;
+    }
     return (
       reception.state().closed && agent.state().status === AgentStatus.Closed
     );
   } finally {
     root.unmount();
-    await reception.close();
+    await reception?.close();
     await agent.close();
-    reception.uniffiDestroy();
+    reception?.uniffiDestroy();
     camera.uniffiDestroy();
     participant.uniffiDestroy();
     room.uniffiDestroy();

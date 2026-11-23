@@ -19,14 +19,14 @@
   let observedProbe = 0;
   const pumping = (async () => {
     while (true) {
-      const update = await stream.next();
-      if (update.type === "closed") return;
-      const event = update.event;
-      if (event.type === "message") {
-        if (event.data.length === 2 && event.data[0] === 0) {
-          observedProbe = Math.max(observedProbe, event.data[1]);
+      const event = await stream.next();
+      if (event === undefined) return;
+      if (window.pulsebeam.DataEvent.Message.instanceOf(event)) {
+        const { data, sequence } = event.inner;
+        if (data.length === 2 && data[0] === 0) {
+          observedProbe = Math.max(observedProbe, data[1]);
         } else {
-          events.push({ sequence: event.sequence, payload: [...event.data] });
+          events.push({ sequence, payload: [...data] });
         }
       }
     }

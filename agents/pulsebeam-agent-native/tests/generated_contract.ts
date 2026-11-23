@@ -101,12 +101,13 @@ const watchState = watch.state();
 const watchUpdates = watch.updates();
 if (!Watch.instanceOf(watch) || !WatchUpdates.instanceOf(watchUpdates) ||
     watchState.room !== "room" || watchState.limit !== 100 ||
-    watchState.status !== WatchStatus.Loading || watchState.page !== undefined ||
+    watchState.status !== WatchStatus.Loading || watchState.participants !== undefined ||
+    watchState.hasMore !== undefined || watchState.nextCursor !== undefined ||
     (await watchUpdates.next())?.observationRevision !== watchState.observationRevision) {
   throw new Error("missing concrete default catalog watch state");
 }
-watch.close();
-watch.close();
+await watch.close();
+await watch.close();
 if ((await watchUpdates.next())?.status !== WatchStatus.Closed ||
     await watchUpdates.next() !== undefined) {
   throw new Error("watch close did not expose one final state");
@@ -115,7 +116,7 @@ watchUpdates.close();
 const scopedWatch = room.watch(WatchConfig.create({ limit: 3, cursor: new Uint8Array([7, 8]) }));
 if (scopedWatch.state().limit !== 3 || scopedWatch.state().cursor[0] !== 7 ||
     scopedWatch.state().cursor[1] !== 8) throw new Error("watch scope was not retained");
-scopedWatch.close();
+await scopedWatch.close();
 const participant = room.participant("remote");
 const remoteData = participant.data("control");
 const localVideo = agent.video("camera");

@@ -54,9 +54,9 @@ your application's names, not opaque connection IDs. The `camera` and `microphon
 strings are track IDs chosen by your application. Keep IDs stable so logical
 track handles can follow media across temporary absence or replacement.
 
-For live application messages, pass `agent.data(trackId, delivery)` to `usePublish`.
+For live application messages, pass `agent.data(trackId)` to `usePublish`.
 To receive from one participant, pass
-`agent.room(room).participant(id).data(trackId, delivery)` to `useSubscribe` and read
+`agent.room(room).participant(id).data(trackId)` to `useSubscribe` and read
 its typed events. Data payloads are bytes; your application owns encoding,
 decoding, validation, and malformed-payload policy. It is not
 durable message storage. See [data tracks](/react/guides#data-tracks) for
@@ -66,8 +66,9 @@ publication, subscription cleanup, and recovery limits.
 
 - **Authorization:** authenticate users and issue scoped participant tokens on
   your backend. Never expose signing keys to the browser.
-- **Session identity:** use one Agent per room/participant identity. Renew the
-  token for the same session; replace the Agent when identity changes.
+- **Session identity:** use one Agent per logical participant session. Call `join(room)`
+  to change rooms. Renew the token for the same session; replace the Agent when
+  participant identity changes.
 - **Media lifecycle:** disconnecting stops sending and receiving, but capture
   can remain active. Stop capture on leave or unmount its owning hooks.
 - **Capacity:** topology is optional; the default reserves 2 local videos,

@@ -1,4 +1,4 @@
-import { DataDelivery } from "@pulsebeam/react";
+import { DataDelivery, DataEvent } from "@pulsebeam/react";
 import {
   Audio,
   Data,
@@ -23,13 +23,15 @@ import {
   type DataSubscription,
   type VideoSource,
   type AudioSource,
-  type Watch as WebWatch,
+  type Catalog as WebCatalog,
+  LogLevel,
+  PlayoutDelay,
 } from "@pulsebeam/web";
 import {
   usePublish,
   useSubscribe,
   useWatch,
-  type Watch,
+  type Catalog,
   type WatchConfig,
 } from "@pulsebeam/react";
 import { createElement } from "react";
@@ -52,7 +54,7 @@ import { useMediaDevices } from "@pulsebeam/react";
 const config: AgentConfig = {
   endpoint: "https://pulsebeam.example",
   token: "opaque-token",
-  logging: { level: "info" },
+  logLevel: LogLevel.Info,
 };
 const nullableAgent: Agent | null = useAgent(config);
 const agent: Agent = nullableAgent!;
@@ -67,17 +69,17 @@ type AgentIdentity = Expect<
 >;
 const actualAgent: WebAgent = nullableAgent!;
 type WatchIdentity = Expect<
-  Equal<ReturnType<typeof useWatch>, WebWatch | null>
+  Equal<ReturnType<typeof useWatch>, WebCatalog | null>
 >;
 const watchConfig: WatchConfig = { limit: 7, cursor: Uint8Array.of(1) };
-const watch: Watch | null = useWatch(
+const watch: Catalog | null = useWatch(
   actualAgent.room("pinned-room"),
   watchConfig,
 );
-const absentWatch: WebWatch | null = useWatch(null);
+const absentWatch: WebCatalog | null = useWatch(null);
 void [watch, absentWatch];
-const videoSource = null as VideoSource | null;
-const audioSource = null as AudioSource | null;
+declare const videoSource: VideoSource;
+declare const audioSource: AudioSource;
 const videoPublication = usePublish(actualAgent.video("video"), videoSource);
 const audioPublication = usePublish(actualAgent.audio("audio"), audioSource, {
   enabled: true,
@@ -167,15 +169,13 @@ import type { DataTrackSpec } from "@pulsebeam/react";
 const localVideo = agent.video("camera");
 const localAudio = agent.audio("microphone");
 const chat = agent.data("chat");
-usePublish(localVideo, capture.video, { enabled: false })?.configureSender({
-  contentHint: "detail",
+usePublish(localVideo, capture.video, { enabled: false })?.configure({
+  enabled: true,
 });
-usePublish(localAudio, capture.audio)?.configureSender({
-  contentHint: "music",
-});
+usePublish(localAudio, capture.audio);
 // @ts-expect-error Audio source cannot bind a video publication.
 usePublish(localVideo, capture.audio);
-// @ts-expect-error Publication content is kind-specific.
+// @ts-expect-error Browser sender-specific options are not publication options.
 videoPublication?.configureSender({ contentHint: "speech" });
 // @ts-expect-error No normal imperative publication setter.
 localVideo.setSource(capture.video);
@@ -202,10 +202,10 @@ Data({
   track: participant.data("live"),
   options: { delivery: DataDelivery.Unreliable },
   async onEvent(event) {
-    if (event.type !== "message") return;
-    const bytes: Uint8Array = event.data;
-    // @ts-expect-error Lossy delivery cannot emit a gap.
-    event.from;
+    if (!DataEvent.Message.instanceOf(event)) return;
+    const bytes: Uint8Array = event.inner.data;
+    // @ts-expect-error Messages do not carry gap bounds.
+    event.inner.from;
     await Promise.resolve(bytes);
   },
 });
@@ -213,8 +213,8 @@ Data({
   track: participant.data("state"),
   options: { delivery: DataDelivery.Latest },
   onEvent(event) {
-    const message: "message" | "discontinuity" = event.type;
-    void message;
+    if (DataEvent.Discontinuity.instanceOf(event))
+      void event.inner.previousPublicationId;
   },
 });
 createElement(Video, {
@@ -224,7 +224,7 @@ createElement(Video, {
     minHeight: 360,
     minFps: 15,
     priority: 1,
-    playoutDelay: { mode: "fixed", minMs: 0, maxMs: 100 },
+    playoutDelay: PlayoutDelay.Fixed.new({ minMs: 0, maxMs: 100 }),
   }),
 });
 // @ts-expect-error Playback cannot create an implicit reception owner.
@@ -243,14 +243,14 @@ createElement(Audio, {
 createElement(Data, {
   track: remoteChat,
   onEvent(event) {
-    const participantId: string = event.participantId;
-    const publicationId: string = event.publicationId;
-    if (event.type === "message") {
-      const bytes: Uint8Array = event.data;
-      const sequence: bigint = event.sequence;
+    const participantId: string = event.inner.participantId;
+    const publicationId: string = event.inner.publicationId;
+    if (DataEvent.Message.instanceOf(event)) {
+      const bytes: Uint8Array = event.inner.data;
+      const sequence: bigint = event.inner.sequence;
       void [bytes, sequence];
-    } else {
-      const previous: string = event.previousPublicationId;
+    } else if (DataEvent.Discontinuity.instanceOf(event)) {
+      const previous: string = event.inner.previousPublicationId;
       void previous;
     }
     void [participantId, publicationId];

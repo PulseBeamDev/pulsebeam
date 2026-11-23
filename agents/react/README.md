@@ -34,13 +34,14 @@ Import from `@pulsebeam/react`. `useAgent` returns `null` until its committed
 effect has created and initialized the Agent; render a mounted child component
 for Agent-dependent hooks. React owns the runtime lifecycle. Use a React `key` to
 replace logical sessions.
-Capture hooks own the devices: disconnecting an Agent does not stop capture.
+Capture hooks own the devices: closing an Agent does not stop borrowed capture.
 Look up local handles with `agent.video(trackId)`, `agent.audio(trackId)`, or
-`agent.data(trackId, delivery)`. Look up a room-pinned remote handle with
+`agent.data(trackId)`. Look up a room-pinned remote handle with
 `agent.room(room).participant(id).video(trackId)`, `.audio(trackId)`, or
-`.data(trackId, delivery)`. The room and participant ID are fixed
+`.data(trackId)`. The room and participant ID are fixed
 by that reference and do not follow Agent room changes. Lookup is inert.
-`usePublish` owns publication; `useSubscribe` owns reception. Pass the resulting
+`usePublish` owns publication; `useSubscribe` owns reception. Data owners default
+to Reliable delivery. Select another mode through their options, not lookup. Pass the resulting
 subscription to `Video` or `Audio` through `source`. Playback owns only its
 observation clone, never the independent subscription. Configure receive hints
 through `useSubscribe`, not playback props. `useCapture` accepts typed exact devices
@@ -71,7 +72,7 @@ APIs. Keep signing keys on your backend.
 ## Discover a bounded roster
 
 Use `useWatch` on a memoized `agent.room(name)` reference. It returns the actual
-owned Watch or null until committed, and observes `state()` internally. Its
+owned Catalog handle or null until committed, and observes `state()` internally. Its
 immutable scope is room, limit and cursor bytes; equivalent configs do not churn
 ownership. Unmount releases the watch, not independent subscriptions.
 

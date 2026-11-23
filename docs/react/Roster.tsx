@@ -9,8 +9,11 @@ export function Roster({
   roomName: string;
 }) {
   const room = useMemo(() => agent.room(roomName), [agent, roomName]);
-  const [cursor, setCursor] = useState<readonly number[]>();
-  const watch = useWatch(room, { limit: 100, cursor });
+  const [cursor, setCursor] = useState<Uint8Array>();
+  const watch = useWatch(room, {
+    limit: 100,
+    cursor: cursor ?? new Uint8Array(),
+  });
   const state = watch?.state();
   const first = () => setCursor(undefined);
   if (!state || state.status === WatchStatus.Loading)
@@ -23,28 +26,28 @@ export function Roster({
       </section>
     );
   }
-  const page = state.page;
-  if (!page) return <p>Roster closed</p>;
+  const { participants, hasMore, nextCursor } = state;
+  if (!participants) return <p>Roster closed</p>;
   return (
     <section>
-      {page.participants.length === 0 && <p>No participants on this page.</p>}
+      {participants.length === 0 && <p>No participants on this page.</p>}
       <ul>
-        {page.participants.map((participant) => (
-          <li key={participant.id}>
-            {participant.id}
-            {participant.publications.length === 0
+        {participants.map((participant) => (
+          <li key={participant.id()}>
+            {participant.id()}
+            {participant.tracks().length === 0
               ? " · present, no publications"
-              : ` · ${participant.publications.map((publication) => publication.trackId).join(", ")}`}
+              : ` · ${participant
+                  .tracks()
+                  .map((track) => track.trackId)
+                  .join(", ")}`}
           </li>
         ))}
       </ul>
       <button onClick={first} disabled={!cursor}>
         First page
       </button>
-      <button
-        disabled={!page.hasMore}
-        onClick={() => setCursor(page.nextCursor)}
-      >
+      <button disabled={!hasMore} onClick={() => setCursor(nextCursor)}>
         Next page
       </button>
     </section>

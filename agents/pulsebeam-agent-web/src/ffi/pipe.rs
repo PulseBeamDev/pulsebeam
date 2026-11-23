@@ -29,6 +29,15 @@ macro_rules! capture_source {
                 }
             }
 
+            pub fn preview_track(&self) -> Result<Option<super::WebMediaTrack>, WebAgentError> {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.input.preview_track()
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                Err(super::browser_required())
+            }
+
             pub fn pipe_to(
                 &self,
                 publication: Arc<super::publication::$publication>,
@@ -98,8 +107,16 @@ state_cursor!(PipeUpdates, PipeState);
 #[cfg(target_arch = "wasm32")]
 mod platform {
     use super::{Arc, ErrorCode, ErrorInfo, Pipe, WebAgentError, WebInputTrack, ffi};
-    use crate::{BrowserRuntime, browser::input_is_live, sender_config::SenderConfig};
-    use std::{cell::RefCell, sync::Weak};
+    use crate::{
+        BrowserRuntime,
+        browser::input_is_live,
+        ffi::{WebMediaTrack, retained_track::RetainedTrack},
+        sender_config::SenderConfig,
+    };
+    use std::{
+        cell::{Cell, RefCell},
+        sync::Weak,
+    };
     use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
     use web_sys::MediaStreamTrack;
 
@@ -111,6 +128,8 @@ mod platform {
 
     pub(super) struct Input {
         track: MediaStreamTrack,
+        closed: Cell<bool>,
+        preview: RefCell<Option<RetainedTrack>>,
         pipes: RefCell<Vec<Weak<Pipe>>>,
     }
 
@@ -125,8 +144,26 @@ mod platform {
                 })?;
             Ok(Self {
                 track,
+                closed: Cell::new(false),
+                preview: RefCell::default(),
                 pipes: RefCell::default(),
             })
+        }
+
+        fn is_live(&self) -> bool {
+            !self.closed.get() && input_is_live(&self.track)
+        }
+
+        pub(super) fn preview_track(&self) -> Result<Option<WebMediaTrack>, WebAgentError> {
+            if !self.is_live() {
+                self.preview.take();
+                return Ok(None);
+            }
+            let mut preview = self.preview.borrow_mut();
+            if preview.is_none() {
+                *preview = Some(RetainedTrack::new(&self.track)?);
+            }
+            Ok(preview.as_ref().map(RetainedTrack::handle))
         }
 
         pub(super) fn attach(
@@ -135,7 +172,7 @@ mod platform {
             owner: u64,
             hint: &str,
         ) -> Result<Arc<Pipe>, WebAgentError> {
-            if !input_is_live(&self.track) {
+            if !self.is_live() {
                 return Err(ErrorInfo::new(ErrorCode::Closed, "Capture source is closed").into());
             }
             let pipe = Arc::new(Pipe {
@@ -150,8 +187,14 @@ mod platform {
             pipes.push(Arc::downgrade(&pipe));
             drop(pipes);
             let track = Clone::clone(&self.track);
+            let content_hint =
+                js_sys::Reflect::get(track.as_ref(), &JsValue::from_str("contentHint"))
+                    .ok()
+                    .and_then(|value| value.as_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| hint.into());
             let config = SenderConfig {
-                content_hint: hint.into(),
+                content_hint,
                 degradation_preference: None,
                 encodings: Vec::new(),
             };
@@ -171,7 +214,8 @@ mod platform {
         }
 
         pub(super) async fn close(&self) -> Result<(), WebAgentError> {
-            self.track.stop();
+            self.closed.set(true);
+            self.preview.take();
             let pipes = std::mem::take(&mut *self.pipes.borrow_mut());
             let mut result = Ok(());
             for pipe in pipes.into_iter().filter_map(|pipe| pipe.upgrade()) {

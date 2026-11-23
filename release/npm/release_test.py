@@ -173,6 +173,26 @@ class ReleaseContract(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "public export"):
                 release.validate_archive(path, MANIFESTS["@pulsebeam/server"])
 
+    def test_rejects_invalid_web_runtime(self):
+        manifest = MANIFESTS["@pulsebeam/web"]
+        files = {
+            "package/package.json": json.dumps(manifest).encode(),
+            "package/README.md": b"readme",
+            "package/LICENSE": b"license",
+            **{"package/" + entry[2:]: b"entry" for entry in manifest["exports"]["."].values()},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.tgz"
+            for module in (b"", b'let encoded = "YmFk";', b'let encoded = "===";'):
+                with self.subTest(module=module):
+                    with tarfile.open(path, "w:gz") as archive:
+                        for name, body in {**files, "package/dist/web/wasm-bytes.js": module}.items():
+                            member = tarfile.TarInfo(name)
+                            member.size = len(body)
+                            archive.addfile(member, io.BytesIO(body))
+                    with self.assertRaisesRegex(ValueError, "embedded WASM"):
+                        release.validate_archive(path, manifest)
+
     def test_publication_requires_oidc(self):
         with patch.dict(os.environ, {}, clear=True), patch("subprocess.run") as command:
             with self.assertRaisesRegex(ValueError, "OIDC"):

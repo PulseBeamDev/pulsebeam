@@ -5,7 +5,6 @@ import type {
   VideoSource as WebVideoSource,
   AudioSubscription,
   VideoSubscription,
-  MediaObservation,
 } from "@pulsebeam/web";
 import {
   attachMedia,
@@ -23,16 +22,8 @@ export interface PlaybackError {
   readonly retry: () => Promise<void>;
 }
 type PlaybackErrorCallback = (failure: PlaybackError) => void;
-type VideoInput =
-  | VideoSource
-  | WebVideoSource
-  | VideoSubscription
-  | MediaObservation;
-type AudioInput =
-  | AudioSource
-  | WebAudioSource
-  | AudioSubscription
-  | MediaObservation;
+type VideoInput = VideoSource | WebVideoSource | VideoSubscription;
+type AudioInput = AudioSource | WebAudioSource | AudioSubscription;
 type Input = VideoInput | AudioInput;
 type Playback = BorrowedMediaAttachment;
 
@@ -54,7 +45,7 @@ function usePlayback(
     if (!element.current || !source) return;
     let active = true;
     const binding = attachMedia(
-      "observe" in source || "track" in source
+      "playbackOutput" in source || "previewTrack" in source
         ? source
         : playbackTrack(source, kind),
       kind,

@@ -20,6 +20,10 @@ impl RoomRef {
 
 #[uniffi::export]
 impl RoomRef {
+    pub fn name(&self) -> String {
+        self.room.clone()
+    }
+
     pub fn participant(&self, id: String) -> Result<Arc<Participant>, WebAgentError> {
         agent_core::validate_participant_id(&id).map_err(|_| invalid_address())?;
         Ok(Arc::new(Participant {
@@ -69,24 +73,20 @@ impl Participant {
 
 macro_rules! subscription {
     ($track:ident, $subscription:ident, $state:ident, $observer:ident, $cursor:ident,
-     $options:ident, $claim:ident, $configuration:expr) => {
+     $options:ident, $claim:ident, $configure:ident, $configuration:expr) => {
         #[derive(uniffi::Object)]
         pub struct $track {
             #[cfg(target_arch = "wasm32")]
             agent: Arc<Agent>,
-            #[cfg(target_arch = "wasm32")]
             selector: agent_core::TrackSelector,
         }
 
         impl $track {
             fn new(participant: &Participant, label: String) -> Result<Arc<Self>, WebAgentError> {
                 let selector = participant.selector(label)?;
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = selector;
                 Ok(Arc::new(Self {
                     #[cfg(target_arch = "wasm32")]
                     agent: participant.agent.clone(),
-                    #[cfg(target_arch = "wasm32")]
                     selector,
                 }))
             }
@@ -94,6 +94,10 @@ macro_rules! subscription {
 
         #[uniffi::export]
         impl $track {
+            pub fn selector(&self) -> ffi::TrackSelector {
+                self.selector.clone().into()
+            }
+
             #[uniffi::method(default(options = None))]
             pub fn subscribe(
                 &self,
@@ -131,6 +135,22 @@ macro_rules! subscription {
 
         #[uniffi::export]
         impl $subscription {
+            #[uniffi::method(default(options = None))]
+            pub fn configure(&self, options: Option<ffi::$options>) -> Result<(), WebAgentError> {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.agent
+                        .runtime
+                        .$configure(self.owner, ($configuration)(options))?;
+                    Ok(())
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = options;
+                    Err(super::browser_required())
+                }
+            }
+
             pub fn state(&self) -> Result<ffi::$state, WebAgentError> {
                 #[cfg(target_arch = "wasm32")]
                 {
@@ -173,6 +193,7 @@ subscription!(
     VideoSubscriptionUpdates,
     VideoObservation,
     claim_video,
+    configure_owned_video,
     |options: Option<ffi::VideoObservation>| options
         .unwrap_or_else(|| ffi::VideoObservation {
             visible: true,
@@ -188,6 +209,7 @@ subscription!(
     AudioSubscriptionUpdates,
     AudioSubscriptionConfig,
     claim_audio,
+    configure_owned_audio,
     |options: Option<ffi::AudioSubscriptionConfig>| options
         .unwrap_or_default()
         .playout_delay
@@ -197,22 +219,14 @@ subscription!(
 #[cfg(target_arch = "wasm32")]
 mod playback {
     use super::{ErrorCode, ErrorInfo, WebAgentError};
-    use crate::browser::media_observation::BrowserMediaObservation;
-    use std::cell::Cell;
-    use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
-    use web_sys::MediaStreamTrack;
-
-    #[wasm_bindgen]
-    extern "C" {
-        #[wasm_bindgen(catch, js_namespace = ["globalThis", "__pulsebeamMediaRegistry"], js_name = retain)]
-        fn retain(track: &MediaStreamTrack, kind: &str) -> Result<u64, JsValue>;
-        #[wasm_bindgen(catch, js_namespace = ["globalThis", "__pulsebeamMediaRegistry"], js_name = release)]
-        fn release(handle: u64, kind: &str) -> Result<bool, JsValue>;
-    }
+    use crate::{
+        browser::media_observation::BrowserMediaObservation, ffi::retained_track::RetainedTrack,
+    };
+    use std::cell::RefCell;
 
     pub(super) struct Output {
         observation: BrowserMediaObservation,
-        handle: Cell<Option<u64>>,
+        handle: RefCell<Option<RetainedTrack>>,
     }
 
     impl Output {
@@ -220,40 +234,23 @@ mod playback {
             let track = observation
                 .track()
                 .ok_or_else(|| ErrorInfo::new(ErrorCode::Closed, "Playback output is closed"))?;
-            let handle = retain(&track, "track").map_err(|_| {
-                ErrorInfo::new(
-                    ErrorCode::Internal,
-                    "Could not register browser playback output",
-                )
-            })?;
+            let handle = RetainedTrack::new(&track)?;
             Ok(Self {
                 observation,
-                handle: Cell::new(Some(handle)),
+                handle: RefCell::new(Some(handle)),
             })
         }
 
         pub(super) fn track(&self) -> Option<crate::ffi::WebMediaTrack> {
             if self.observation.is_closed() {
-                self.release_handle();
+                self.handle.take();
             }
-            self.handle.get().map(crate::ffi::WebMediaTrack)
+            self.handle.borrow().as_ref().map(RetainedTrack::handle)
         }
 
         pub(super) async fn close(&self) {
-            self.release_handle();
+            self.handle.take();
             self.observation.close_local().await;
-        }
-
-        fn release_handle(&self) {
-            if let Some(handle) = self.handle.take() {
-                let _ = release(handle, "track");
-            }
-        }
-    }
-
-    impl Drop for Output {
-        fn drop(&mut self) {
-            self.release_handle();
         }
     }
 }

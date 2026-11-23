@@ -1441,7 +1441,7 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
         );
         anyhow::ensure!(first_source.as_ref() != Some(&id));
         first_source = Some(id);
-        source.close()?;
+        source.close().await?;
         anyhow::ensure!(await_source(false).await?.is_none());
         anyhow::ensure!(!replacement_receiver.is_closed());
         anyhow::ensure!(replacement_viewer.snapshot().generation == replacement_generation);
@@ -1523,21 +1523,21 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
                     .next()
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("watch closed"))?;
-                if let Some(page) = state.page {
-                    let participants = page.participants()?;
-                    if participants.iter().any(|entry| {
-                        entry.id() == "present-publisher"
-                            && entry
-                                .tracks()
-                                .iter()
-                                .any(|track| track.track_id == "events")
-                    }) {
-                        anyhow::ensure!(
-                            participants.len() == 1,
-                            "viewer leaked presence into the source room"
-                        );
-                        break anyhow::Ok(());
-                    }
+                let Some(participants) = state.participants else {
+                    continue;
+                };
+                if participants.iter().any(|entry| {
+                    entry.id() == "present-publisher"
+                        && entry
+                            .tracks()
+                            .iter()
+                            .any(|track| track.track_id == "events")
+                }) {
+                    anyhow::ensure!(
+                        participants.len() == 1,
+                        "viewer leaked presence into the source room"
+                    );
+                    break anyhow::Ok(());
                 }
             }
         })
@@ -2284,10 +2284,7 @@ async fn run_peer(
                             return Ok(());
                         }
                         Ok(Some(pulsebeam_agent_core::DataEvent::Message { data, .. }))
-                            if data == [0, 255, 128, 0] =>
-                        {
-                            ()
-                        }
+                            if data == [0, 255, 128, 0] => {}
                         other => {
                             anyhow::bail!("retired reliable cursor unexpectedly returned {other:?}")
                         }

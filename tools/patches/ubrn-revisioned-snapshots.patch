@@ -1,31 +1,35 @@
 diff --git a/src/bindings/gen_typescript/config.rs b/src/bindings/gen_typescript/config.rs
 --- a/src/bindings/gen_typescript/config.rs
 +++ b/src/bindings/gen_typescript/config.rs
-@@ -33,6 +33,9 @@
+@@ -33,6 +33,12 @@
      /// thread.
      #[serde(default)]
      pub(crate) force_async: ForceAsync,
 +    /// Zero-argument synchronous methods returning immutable observation records.
 +    #[serde(default)]
 +    pub(crate) revisioned_snapshots: Vec<String>,
++    /// Synchronous inert logical references cached by their single string key.
++    #[serde(default)]
++    pub(crate) stable_lookups: Vec<String>,
  }
  
  #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 diff --git a/src/bindings/gen_typescript/api_module/nodes.rs b/src/bindings/gen_typescript/api_module/nodes.rs
 --- a/src/bindings/gen_typescript/api_module/nodes.rs
 +++ b/src/bindings/gen_typescript/api_module/nodes.rs
-@@ -219,6 +219,7 @@
+@@ -219,6 +219,8 @@
  // ---------------------------------------------------------------------------
  
  pub(crate) struct TsObject {
 +    pub revisioned_snapshots: Vec<String>,
++    pub stable_lookups: Vec<String>,
      pub ts_name: String,
      pub decl_type_name: String,
      pub impl_class_name: String,
 diff --git a/src/bindings/gen_typescript/api_module/builders.rs b/src/bindings/gen_typescript/api_module/builders.rs
 --- a/src/bindings/gen_typescript/api_module/builders.rs
 +++ b/src/bindings/gen_typescript/api_module/builders.rs
-@@ -656,6 +656,18 @@
+@@ -656,6 +656,31 @@
          .map(|m| build_method_callable(config, m, &ffi_clone, flavor, force_async))
          .collect();
  
@@ -41,21 +45,35 @@ diff --git a/src/bindings/gen_typescript/api_module/builders.rs b/src/bindings/g
 +        })
 +        .collect();
 +
++    let stable_lookups = methods
++        .iter()
++        .filter_map(|method| {
++            let name = &method.name;
++            if !config.stable_lookups.contains(&format!("{class_name}.{name}")) {
++                return None;
++            }
++            assert!(!method.renders_async());
++            assert!(matches!(method.arguments.as_slice(), [arg] if arg.ts_type == "string"));
++            Some(name.clone())
++        })
++        .collect();
++
      let uniffi_traits = build_uniffi_traits(
          config,
          &interface.uniffi_trait_methods,
-@@ -688,6 +700,7 @@
+@@ -688,6 +713,8 @@
          primary_constructor,
          alternate_constructors,
          methods,
 +        revisioned_snapshots,
++        stable_lookups,
          uniffi_traits,
          ffi_bless_pointer,
          ffi_clone,
 diff --git a/src/bindings/gen_typescript/templates/ObjectTemplate.ts b/src/bindings/gen_typescript/templates/ObjectTemplate.ts
 --- a/src/bindings/gen_typescript/templates/ObjectTemplate.ts
 +++ b/src/bindings/gen_typescript/templates/ObjectTemplate.ts
-@@ -102,6 +102,11 @@
+@@ -102,6 +102,18 @@
      {%- endif %}
  }
  
@@ -64,10 +82,17 @@ diff --git a/src/bindings/gen_typescript/templates/ObjectTemplate.ts b/src/bindi
 +const {{ obj.impl_class_name }}_{{ name }}_snapshots = new WeakMap<{{ obj.impl_class_name }}, ReturnType<{{ obj.impl_class_name }}["{{ name }}"]>>();
 +{%- endfor %}
 +
++{%- for name in obj.stable_lookups %}
++const {{ obj.impl_class_name }}_{{ name }}_lookups = new WeakMap<{{ obj.impl_class_name }}, Map<string, WeakRef<ReturnType<{{ obj.impl_class_name }}["{{ name }}"]>>>>();
++const {{ obj.impl_class_name }}_{{ name }}_lookupParents = new WeakMap<ReturnType<{{ obj.impl_class_name }}["{{ name }}"]>, {{ obj.impl_class_name }}>();
++const {{ obj.impl_class_name }}_{{ name }}_lookupCleanup = typeof FinalizationRegistry === "function" && typeof WeakRef === "function"
++    ? new FinalizationRegistry<() => void>(remove => remove()) : undefined;
++{%- endfor %}
++
  const {{ obj.obj_factory }}: UniffiObjectFactory<{{ obj.protocol_name }}> = (() => {
      {% if obj.supports_finalization_registry %}
      /// <reference lib="es2021" />
-@@ -210,7 +215,24 @@
+@@ -210,7 +222,48 @@
      {%- call cb::arg_list_decl(callable) -%}): {# space #}
      {%- call cb::return_type(callable) %}
      {%- call cb::throws_kw(callable) %} {
@@ -89,6 +114,30 @@ diff --git a/src/bindings/gen_typescript/templates/ObjectTemplate.ts b/src/bindi
 +        freezeRecord(current);
 +        cache.set(this, current);
 +        return current;
++    {%- else if obj.stable_lookups.contains(&callable.name) %}
++        const lookup = () => {
++            {%- call cb::call_body_method(callable, obj.obj_factory) %}
++        };
++        const cleanup = {{ obj.impl_class_name }}_{{ callable.name }}_lookupCleanup;
++        const key = {{ callable.arguments[0].name }};
++        if (!cleanup || typeof key !== "string" || (this as any)[destructorGuardSymbol] === undefined) return lookup();
++        const cache = {{ obj.impl_class_name }}_{{ callable.name }}_lookups;
++        let entries = cache.get(this);
++        if (!entries) {
++            entries = new Map();
++            cache.set(this, entries);
++        }
++        const current = entries.get(key)?.deref();
++        if (current && (current as any)[destructorGuardSymbol] !== undefined) return current;
++        const next = lookup();
++        const reference = new WeakRef(next);
++        entries.set(key, reference);
++        {{ obj.impl_class_name }}_{{ callable.name }}_lookupParents.set(next, this);
++        const slots = entries;
++        cleanup.register(next, () => {
++            if (slots.get(key) === reference) slots.delete(key);
++        });
++        return next;
 +    {%- else if callable.receiver.is_some() %}
      {%- call cb::call_body_method(callable, obj.obj_factory) %}
      {%- else %}

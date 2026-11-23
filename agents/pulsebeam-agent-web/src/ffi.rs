@@ -50,6 +50,8 @@ mod catalog;
 mod data;
 mod pipe;
 mod publication;
+#[cfg(target_arch = "wasm32")]
+mod retained_track;
 mod video;
 use publication::{LocalAudioTrack, LocalVideoTrack};
 use video::RoomRef;
@@ -58,6 +60,8 @@ use video::RoomRef;
 pub struct WebAgentConfig {
     pub endpoint: String,
     pub token: String,
+    #[uniffi(default = None)]
+    pub log_level: Option<agent_core::ffi::LogLevel>,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -92,7 +96,7 @@ impl Agent {
             let runtime = crate::BrowserRuntime::start(
                 config.endpoint,
                 config.token,
-                crate::logger::LogLevel::Warn,
+                config.log_level.unwrap_or_default().into(),
             )?;
             Ok(Arc::new(Self { runtime }))
         }
@@ -123,6 +127,20 @@ impl Agent {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = token;
+            Err(browser_required())
+        }
+    }
+
+    pub fn set_logging(&self, level: agent_core::ffi::LogLevel) -> Result<(), WebAgentError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.runtime
+                .configure_logging(level.into())
+                .map_err(Into::into)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = level;
             Err(browser_required())
         }
     }

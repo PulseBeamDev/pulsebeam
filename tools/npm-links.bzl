@@ -15,3 +15,14 @@ def link_web_for_react_consumers(name, prod = True, dev = True):
         src = Label("//agents/pulsebeam-agent-web:package"),
     )
     return [link], {"@pulsebeam": [link]}
+
+
+def link_web_binding_runtime(name, prod = True, dev = True):
+    # Independent lock roots do not translate transitive dependencies of link: packages.
+    if not prod:
+        return [], {}
+    link = npm_link_package(
+        name = name + "/@ubjs/core",
+        src = Label("@ubrn_core//:pkg"),
+    )
+    return [link], {"@ubjs": [link]}

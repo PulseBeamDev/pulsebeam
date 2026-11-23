@@ -12,7 +12,6 @@ fn track_spec(label: String, delivery: ffi::DataDelivery) -> TrackSpec {
 pub struct LocalDataTrack {
     #[cfg(target_arch = "wasm32")]
     agent: Arc<Agent>,
-    #[cfg(target_arch = "wasm32")]
     label: String,
 }
 
@@ -25,7 +24,6 @@ impl Agent {
         Ok(Arc::new(LocalDataTrack {
             #[cfg(target_arch = "wasm32")]
             agent: self,
-            #[cfg(target_arch = "wasm32")]
             label,
         }))
     }
@@ -33,6 +31,10 @@ impl Agent {
 
 #[uniffi::export]
 impl LocalDataTrack {
+    pub fn track_id(&self) -> String {
+        self.label.clone()
+    }
+
     #[uniffi::method(default(options = None))]
     pub fn publish(
         &self,
@@ -62,7 +64,6 @@ impl LocalDataTrack {
 pub struct RemoteDataTrack {
     #[cfg(target_arch = "wasm32")]
     agent: Arc<Agent>,
-    #[cfg(target_arch = "wasm32")]
     selector: agent_core::TrackSelector,
 }
 
@@ -70,12 +71,9 @@ pub struct RemoteDataTrack {
 impl Participant {
     pub fn data(&self, label: String) -> Result<Arc<RemoteDataTrack>, WebAgentError> {
         let selector = self.selector(label)?;
-        #[cfg(not(target_arch = "wasm32"))]
-        let _ = selector;
         Ok(Arc::new(RemoteDataTrack {
             #[cfg(target_arch = "wasm32")]
             agent: self.agent.clone(),
-            #[cfg(target_arch = "wasm32")]
             selector,
         }))
     }
@@ -83,6 +81,10 @@ impl Participant {
 
 #[uniffi::export]
 impl RemoteDataTrack {
+    pub fn selector(&self) -> ffi::TrackSelector {
+        self.selector.clone().into()
+    }
+
     #[uniffi::method(default(options = None))]
     pub fn subscribe(
         &self,

@@ -61,52 +61,23 @@ async fn native_platform_smoke() -> TestResult<()> {
         .replace("__RENEWED_SENDER_TOKEN__", &renewed_sender);
     let mut browser = capabilities()?;
     browser.add_arg("--autoplay-policy=no-user-gesture-required")?;
-    browser.add_arg("--force-device-scale-factor=2")?;
     let fixture = &server;
     run_browser_test(managed_driver(browser), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
-        for (name, script, report) in [
-            (
-                "physical-layout",
-                include_str!("contracts/remote-catalog-contract.js"),
-                true,
-            ),
-            (
-                "decoded-audio-replacement",
-                include_str!("contracts/remote-audio-contract.js"),
-                false,
-            ),
-            ("connected-media", live.as_str(), false),
-        ] {
-            // Full navigation gives every case fresh globals, module state and native resources.
-            navigate(
-                &bidi,
-                &context,
-                fixture.url(&format!("tests/fixture.html?case={name}")),
-            )
-            .await?;
-            let _: () = evaluate_json(&bidi, &context, LOAD).await?;
-            let expression = if report {
-                format!(
-                    "({}).then(result => Object.values(result).every(value => value === true))",
-                    script.trim().trim_end_matches(';')
-                )
-            } else {
-                script.to_owned()
-            };
-            let passed: bool = evaluate_json(&bidi, &context, &expression)
-                .await
-                .map_err(|error| format!("{name}: {error}"))?;
-            assert!(passed, "{name}");
-            let rejections: usize = evaluate_json(
-                &bidi,
-                &context,
-                include_str!("contracts/unhandled-rejections.js"),
-            )
-            .await?;
-            assert_eq!(rejections, 0, "{name}: unhandled completion");
-        }
+        navigate(&bidi, &context, fixture.url("tests/uniffi-fixture.html")).await?;
+        let _: () = evaluate_json(&bidi, &context, LOAD).await?;
+        let connected: bool = evaluate_json(&bidi, &context, &live)
+            .await
+            .map_err(|error| format!("connected-media: {error}"))?;
+        assert!(connected);
+        let rejections: usize = evaluate_json(
+            &bidi,
+            &context,
+            include_str!("contracts/unhandled-rejections.js"),
+        )
+        .await?;
+        assert_eq!(rejections, 0, "connected-media: unhandled completion");
         let source_room = RoomId::new("react-native-source")?;
         let publisher_token = mint_development_token(
             &source_room,
@@ -213,9 +184,11 @@ async fn native_platform_smoke() -> TestResult<()> {
             )
             .await?;
             for field in [
+                "wasmLoaded",
                 "initialState",
                 "stableState",
                 "pendingReadClosed",
+                "pendingDataReadsClosed",
                 "joinedAndClosed",
                 "exactVideoOwner",
                 "trackIdentity",
@@ -243,76 +216,39 @@ async fn native_platform_smoke() -> TestResult<()> {
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     })
     .await?;
-    assert!(
-        server.wasm_requests() > 0,
-        "packaged WASM was actually loaded"
-    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn gesture_before_media_smoke() -> TestResult<()> {
-    let server = StaticServer::start(root()).await?;
-    let mut browser = capabilities()?;
-    browser.add_arg("--autoplay-policy=document-user-activation-required")?;
-    run_browser_test(managed_driver(browser), |driver| async move {
-        let bidi = driver.bidi().await?;
-        let context = bidi.browsing_context().top_level().await?;
-        navigate(&bidi, &context, server.url("tests/fixture.html")).await?;
-        let _: () = evaluate_json(&bidi, &context, LOAD).await?;
-        let started: bool = evaluate_json(
-            &bidi,
-            &context,
-            include_str!("contracts/early-audio-start.js"),
-        )
-        .await?;
-        assert!(started);
-        driver
-            .find(thirtyfour::By::Id("early-audio"))
-            .await?
-            .click()
-            .await?;
-        let passed: bool = evaluate_json(
-            &bidi,
-            &context,
-            include_str!("contracts/early-audio-finish.js"),
-        )
-        .await?;
-        assert!(passed);
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-    })
-    .await?;
-    Ok(())
+    audio_gesture("before-media").await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn gesture_required_audio_smoke() -> TestResult<()> {
+    audio_gesture("after-block").await
+}
+
+async fn audio_gesture(order: &str) -> TestResult<()> {
     let server = StaticServer::start(root()).await?;
     let mut browser = capabilities()?;
     browser.add_arg("--autoplay-policy=document-user-activation-required")?;
+    let start =
+        include_str!("contracts/audio-gesture-start.js").replace("__GESTURE_ORDER__", order);
     run_browser_test(managed_driver(browser), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
-        navigate(&bidi, &context, server.url("tests/fixture.html")).await?;
+        navigate(&bidi, &context, server.url("tests/uniffi-fixture.html")).await?;
         let _: () = evaluate_json(&bidi, &context, LOAD).await?;
-        let started: bool = evaluate_json(
-            &bidi,
-            &context,
-            include_str!("contracts/remote-audio-recovery-start.js"),
-        )
-        .await?;
+        let started: bool = evaluate_json(&bidi, &context, &start).await?;
         assert!(started);
         driver
-            .find(thirtyfour::By::Id("resume-audio"))
+            .find(thirtyfour::By::Id("enable-audio"))
             .await?
             .click()
             .await?;
-        let passed: bool = evaluate_json(
-            &bidi,
-            &context,
-            include_str!("contracts/remote-audio-recovery-finish.js"),
-        )
-        .await?;
+        let passed: bool =
+            evaluate_json(&bidi, &context, "globalThis.__finishAudioGesture()").await?;
         assert!(passed);
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     })
@@ -336,7 +272,7 @@ async fn server_restart_fences_old_agents() -> TestResult<()> {
     run_browser_test(managed_driver(capabilities()?), |driver| async move {
         let bidi = driver.bidi().await?;
         let context = bidi.browsing_context().top_level().await?;
-        navigate(&bidi, &context, server.url("tests/fixture.html")).await?;
+        navigate(&bidi, &context, server.url("tests/uniffi-fixture.html")).await?;
         let _: () = evaluate_json(&bidi, &context, LOAD).await?;
         let before: serde_json::Value = evaluate_json(&bidi, &context, &start).await?;
         assert_eq!(before["initial"], serde_json::json!([1]));

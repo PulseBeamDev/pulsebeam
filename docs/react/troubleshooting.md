@@ -36,17 +36,17 @@ as permission denial; codes vary by browser.
 
 ## Admission and connection
 
-Read `agent.connection`, `agent.error`, admitted room and participant IDs, and expiry directly.
-`useAgent` keeps those properties reactive; calling `connect()` is intent, not proof of admission.
+Read `agent.state()` for status, error, and the admitted room and participant ID.
+`useAgent` keeps those properties reactive; calling `join(room)` records intent, not proof of admission.
 
 | Symptom | Check |
 | --- | --- |
 | Can't join | Base endpoint, matching server/SDK version, unexpired token, same room, distinct participant credentials |
 | HTTP request fails | TLS, mixed content, and CORS |
 | Joined, but transport stalls | Advertised media address and reachable ports in [deployment](/deployment) |
-| Temporary retry state | Runtime retries while connection is desired; disconnect cancels it |
+| Temporary retry state | Runtime retries while join intent remains; closing the Agent ends it |
 | `terminal-failure` | Fix the reported assets/configuration/authorization/protocol cause before creating a fresh Agent |
-| Renewal fails | Backend token must keep the same room and participant |
+| Renewal fails | Backend token must keep the same participant identity and allow the intended room |
 
 For more detail, enable `logging: {level: "debug"}` and Chrome's Verbose console
 level. Changing logging updates a hook-owned Agent in place. **Never log bearer tokens.**
@@ -102,7 +102,7 @@ participant ID, kind, and track ID.
 | Participant without publications | Presence-only participants are valid. Do not invent subscriptions or hide the participant because the publication list is empty. |
 | Media continues after watch close | Expected for an independently held subscription. Close the receive owner separately when it is no longer needed. |
 
-Use `page.hasMore` to enable Next page. Do not retry expired continuations in a
+Use `state.hasMore` to enable Next page. Do not retry expired continuations in a
 loop or traverse all pages to reconstruct a global roster. See the
 [bounded roster example](/react/guides#remote-discovery-and-video-receive-policy).
 
@@ -135,7 +135,7 @@ See [the quickstart](/react/quickstart) to retry a minimal integration.
 ## Data failures
 
 Catch `DataPublication.send()` rejection and provide `onError` on mounted `Data`
-owners. Read `agent.connection` and `agent.error` directly in React. Decode and
+owners. Read `agent.state().status` and `agent.state().error` in React. Decode and
 validate payloads inside `onEvent`; malformed application payloads should be
 ignored or reported by the application without ending the SDK event stream.
 

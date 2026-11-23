@@ -313,6 +313,7 @@ pub struct AgentState {
     pub desired_credential_revision: u64,
     pub evaluated_credential_revision: u64,
     pub room: Option<String>,
+    pub participant_id: Option<String>,
     pub desired_room: Option<String>,
     pub connection_id: Option<String>,
     pub status: AgentStatus,
@@ -346,6 +347,7 @@ impl From<&model::Snapshot> for AgentState {
                 .as_ref()
                 .map_or(0, |outcome| outcome.revision),
             room: value.room_id.clone(),
+            participant_id: value.participant_id.clone(),
             desired_room: value.desired_room.clone(),
             connection_id: value.connection_id.as_ref().map(|id| id.as_str().into()),
             status,

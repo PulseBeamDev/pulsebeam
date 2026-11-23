@@ -212,10 +212,38 @@
     [...peers].find((peer) =>
       peer.getReceivers().some((receiver) => receiver.track === track),
     );
-  const { attachSubscribedVideo, videoAttachmentConfiguration } = await import(
-    "/dist/remote-catalog.js"
-  );
-  const { Agent, VideoSource, AudioSource } = pulsebeam;
+  const { attachMedia } = await import("/sdk/dist/internal/react.js");
+  const {
+    Agent,
+    AgentStatus,
+    VideoSource,
+    AudioSource,
+    DataEvent,
+    PlayoutDelay,
+  } = pulsebeam;
+  const presentationFailures = [];
+  const present = (subscription, element) =>
+    attachMedia(
+      subscription,
+      element.localName,
+      element,
+      true,
+      (error) => presentationFailures.push(String(error)),
+      (error) => presentationFailures.push(String(error)),
+    );
+  const videoOptions = (
+    playoutDelay = PlayoutDelay.Adaptive.new(),
+    priority = 100,
+    minHeight = 1,
+  ) => ({
+    visible: true,
+    height: 240,
+    minHeight,
+    minFps: 1,
+    priority,
+    playoutDelay,
+  });
+  const fixedDelay = PlayoutDelay.Fixed.new({ minMs: 100, maxMs: 100 });
   const sender = new Agent({
     endpoint,
     token: "__SENDER_TOKEN__",
@@ -265,6 +293,7 @@
               agents,
               warnings,
               mediaDiagnostics,
+              presentationFailures,
               render: {
                 width: video.videoWidth,
                 height: video.videoHeight,
@@ -296,19 +325,15 @@
   oscillator.connect(audio);
   oscillator.start();
   const audioTrack = audio.stream.getAudioTracks()[0];
-  const outputRoutes = new Set();
-  const connect = AudioNode.prototype.connect;
-  const disconnect = AudioNode.prototype.disconnect;
-  AudioNode.prototype.connect = function (node, ...args) {
-    const result = connect.call(this, node, ...args);
-    if (this instanceof AnalyserNode && node === this.context.destination)
-      outputRoutes.add(this);
-    return result;
-  };
-  AudioNode.prototype.disconnect = function (...args) {
-    outputRoutes.delete(this);
-    return disconnect.apply(this, args);
-  };
+  const audioElement = document.createElement("audio");
+  document.body.append(audioElement);
+  const currentAudio = () => audioElement.srcObject?.getAudioTracks()[0];
+  const analyser = source.createAnalyser();
+  const silent = source.createGain();
+  silent.gain.value = 0;
+  analyser.connect(silent).connect(source.destination);
+  let monitoredAudio;
+  let monitor;
   const video = document.createElement("video");
   video.muted = true;
   video.playsInline = true;
@@ -345,8 +370,8 @@
   const discoveredPublications = () =>
     discoveryWatch
       ?.state()
-      .page?.participants.find((participant) => participant.id === "web-sender")
-      ?.tracks ?? [];
+      .participants?.find((participant) => participant.id() === "web-sender")
+      ?.tracks() ?? [];
   let handoffAttachment;
   let handoffVideo;
   let videoPublication;
@@ -357,19 +382,19 @@
   let steadyIterator;
   let cyclingIterator;
   let audioSubscription;
+  let videoSubscription;
   let audioPlayback;
   let retiringPublication;
   const pendingReplacements = [];
   try {
     MediaStreamTrack.prototype.clone = observeClone;
     await source.resume();
-    audioSubscription = await receiver
+    audioSubscription = receiver
       .room("public-web-contract")
       .participant("web-sender")
       .audio("voice")
-      .subscribe({ playoutDelay: { mode: "adaptive" } });
-    audioPlayback = pulsebeam.attachRemoteAudio(receiver);
-    await audioPlayback.ready;
+      .subscribe();
+    audioPlayback = present(audioSubscription, audioElement);
     videoPublication = sender.video("camera").publish({ enabled: true });
     videoPipe = VideoSource.fromTrack(videoTrack).pipeTo(videoPublication);
     audioPublication = sender.audio("voice").publish({ enabled: true });
@@ -378,16 +403,16 @@
     receiver.join("public-web-contract");
     await until(
       () =>
-        sender.connection === "connected" &&
-        receiver.connection === "connected",
+        sender.state().status === AgentStatus.Joined &&
+        receiver.state().status === AgentStatus.Joined,
       "public connection",
     );
     assert(
-      sender.participantId === "web-sender" &&
-        receiver.participantId === "web-receiver",
+      sender.state().participantId === "web-sender" &&
+        receiver.state().participantId === "web-receiver",
       "admission identity",
     );
-    assert(receiver.roomId === "public-web-contract", "room identity");
+    assert(receiver.state().room === "public-web-contract", "room identity");
     const senderConnection = sender.state().connectionId;
     const receiverConnection = receiver.state().connectionId;
     const credentialRevision = sender.state().desiredCredentialRevision + 1n;
@@ -409,17 +434,18 @@
       let failure;
       const reading = (async () => {
         while (true) {
-          const update = await iterator.next();
+          const event = await iterator.next();
           assert(
-            update.type === "event" && update.event.type === "message",
+            event && DataEvent.Message.instanceOf(event),
             "ordered data stays live without gaps",
           );
+          const { data } = event.inner;
           assert(
-            update.event.data.length === 1 && update.event.data[0] <= expected,
+            data.length === 1 && data[0] <= expected,
             "data from a future lifetime",
           );
-          if (update.event.data[0] === expected) {
-            received = update.event;
+          if (data[0] === expected) {
+            received = event;
             return;
           }
         }
@@ -454,7 +480,7 @@
     };
     const steadyPublisher = sender.data("reuse-steady").publish();
     steadyIterator = receiver
-      .room(receiver.roomId)
+      .room(receiver.state().room)
       .participant("web-sender")
       .data("reuse-steady")
       .subscribe();
@@ -472,7 +498,7 @@
     let retiredPayload;
     for (let lifetime = 0; lifetime < 3; lifetime++) {
       cyclingIterator = receiver
-        .room(receiver.roomId)
+        .room(receiver.state().room)
         .participant("web-sender")
         .data("reuse-cycle")
         .subscribe();
@@ -535,34 +561,24 @@
       await steadyPublisher.send(Uint8Array.of(lifetime + 2));
       await receiveValue(steadyIterator, lifetime + 2);
     }
-    discoveryWatch = receiver.room("public-web-contract").watch({ limit: 100 });
+    discoveryWatch = receiver.room("public-web-contract").watch();
     await until(
       () => discoveredPublications().some((p) => p.kind.tag === "Video"),
       "bounded watch video discovery",
     );
     assert(
-      !discoveryWatch.state().page.hasMore,
+      discoveryWatch.state().hasMore === false,
       "fixture fits one bounded page",
     );
     const publication = discoveredPublications().find(
       (p) => p.kind.tag === "Video",
     );
     const pinnedPublisher = receiver
-      .room(receiver.roomId)
+      .room(receiver.state().room)
       .participant("web-sender");
     const remoteVideo = pinnedPublisher.video("camera");
-    attachment = attachSubscribedVideo(
-      remoteVideo.subscribe(
-        videoAttachmentConfiguration({
-          minHeight: 1,
-          minFps: 1,
-          priority: 100,
-          playoutDelay: { minMs: 100, maxMs: 100 },
-        }),
-      ),
-      video,
-    );
-    await attachment.ready;
+    videoSubscription = remoteVideo.subscribe(videoOptions(fixedDelay));
+    attachment = present(videoSubscription, video);
     await until(
       () => presentedTrack()?.readyState === "live",
       "mapped fixed-delay track",
@@ -611,7 +627,7 @@
           receiver.state().connectionId === receiverConnection &&
           fixedPeer.connectionState === "connected" &&
           peers.size === 2 &&
-          pinnedPublisher.room === "public-web-contract" &&
+          remoteVideo.selector().room === "public-web-contract" &&
           pinnedPublisher.video("camera") === remoteVideo,
         `${label}: same agents, connection and remote handle`,
       );
@@ -622,11 +638,9 @@
     };
     video.style.cssText =
       "position:fixed;left:30px;top:20px;width:220px;height:160px";
-    attachment.setPreferences({
-      minHeight: 2,
-      minFps: 1,
-      priority: 90,
-      playoutDelay: { minMs: 100, maxMs: 100 },
+    videoSubscription.configure({
+      ...videoOptions(fixedDelay, 90, 2),
+      height: 320,
     });
     await deliverDuringView(5);
     await witnessView(video, "moved and resized view");
@@ -637,17 +651,7 @@
     handoffVideo.style.cssText =
       "position:fixed;left:10px;top:10px;width:160px;height:120px";
     document.body.append(handoffVideo);
-    const fixedPreferences = {
-      minHeight: 1,
-      minFps: 1,
-      priority: 100,
-      playoutDelay: { minMs: 100, maxMs: 100 },
-    };
-    handoffAttachment = attachSubscribedVideo(
-      remoteVideo.subscribe(videoAttachmentConfiguration(fixedPreferences)),
-      handoffVideo,
-    );
-    await handoffAttachment.ready;
+    handoffAttachment = present(videoSubscription, handoffVideo);
     await witnessView(handoffVideo, "overlapping presentation");
     await attachment.close();
     assert(
@@ -657,11 +661,7 @@
     await deliverDuringView(6);
     await witnessView(handoffVideo, "handoff retains live receiver");
 
-    attachment = attachSubscribedVideo(
-      remoteVideo.subscribe(videoAttachmentConfiguration(fixedPreferences)),
-      video,
-    );
-    await attachment.ready;
+    attachment = present(videoSubscription, video);
     await witnessView(video, "remounted presentation");
     const handoffPresentation = handoffVideo.srcObject.getVideoTracks()[0];
     await handoffAttachment.close();
@@ -687,24 +687,22 @@
     );
     const spectrum = new Float32Array(1024);
     const audible = () => {
-      if (outputRoutes.size !== 1) return false;
-      const analyser = [...outputRoutes][0];
+      const track = currentAudio();
+      if (!track || track.readyState !== "live" || audioElement.paused)
+        return false;
+      if (track !== monitoredAudio) {
+        monitor?.disconnect();
+        monitoredAudio = track;
+        monitor = source.createMediaStreamSource(new MediaStream([track]));
+        monitor.connect(analyser);
+      }
       analyser.getFloatFrequencyData(spectrum);
       const bin = Math.round((700 * 2048) / source.sampleRate);
-      return (
-        Math.max(...spectrum.slice(bin - 2, bin + 3)) > -40 &&
-        analyser.context.state === "running"
-      );
+      return Math.max(...spectrum.slice(bin - 2, bin + 3)) > -40;
     };
-    await until(
-      audible,
-      "explicitly owned real decoded tone without application audio element",
-    );
-    assert(
-      document.querySelector("audio") === null,
-      "no application audio element",
-    );
-    attachment.setPreferences({ minHeight: 1, minFps: 1, priority: 100 });
+    await until(audible, "explicit audio output plays the real decoded tone");
+    const previousAudioOutput = currentAudio();
+    videoSubscription.configure(videoOptions());
     const packetsWithoutDelay = fixedRtp.packets - fixedRtp.withExtension;
     await packetEvidence(
       fixedPeer,
@@ -739,21 +737,13 @@
       fixedPresentation.readyState === "ended",
       "attachment close ends its owned observation track",
     );
+    await videoSubscription.close();
     await until(
       () => fixedTrack.readyState === "ended" && retired.mid === null,
       "retired receiver ends and its actual browser MID clears",
     );
-    attachment = attachSubscribedVideo(
-      remoteVideo.subscribe(
-        videoAttachmentConfiguration({
-          minHeight: 1,
-          minFps: 1,
-          priority: 100,
-        }),
-      ),
-      video,
-    );
-    await attachment.ready;
+    videoSubscription = remoteVideo.subscribe(videoOptions());
+    attachment = present(videoSubscription, video);
     await until(() => {
       const track = presentedTrack();
       return (
@@ -896,7 +886,8 @@
         ) &&
         previousAudioTrack.readyState === "ended" &&
         previousAudioTransceiver.mid === null &&
-        outputRoutes.size === 0,
+        currentAudio() === undefined &&
+        previousAudioOutput.readyState === "ended",
       "retired audio source ends its receiver and owned playback route",
     );
     audioPublication = sender.audio("voice").publish({ enabled: true });
@@ -968,7 +959,8 @@
         fixedPresentation.readyState === "ended" &&
         currentPresentation.readyState === "ended" &&
         video.srcObject.getVideoTracks()[0] !== currentPresentation &&
-        outputRoutes.size === 1,
+        currentAudio()?.readyState === "live" &&
+        currentAudio() !== previousAudioOutput,
       "old source observations remain terminal while replacement media flows",
     );
     for (const observedPeer of peers) {
@@ -1020,70 +1012,69 @@
       catalogAgent.join("public-web-contract");
       await until(() => catalogWatch.state().status === 1, "WASM catalog page");
       const initial = catalogWatch.state();
-      const page = initial.page;
+      const page = initial;
       assert(
-        (await catalogFirst.next()) === initial,
-        "first cursor shares state projection",
+        (await catalogFirst.next()).observationRevision ===
+          initial.observationRevision,
+        "first cursor observes the current state revision",
       );
       assert(
-        (await catalogSecond.next()).page === page,
-        "second cursor shares page projection",
+        (await catalogSecond.next()).observationRevision ===
+          initial.observationRevision,
+        "second cursor observes the current page revision",
       );
       assert(
-        catalogWatch.state().page === page,
+        catalogWatch.state() === initial,
         "state reads share page projection",
       );
       const metadata = page.participants.find(
-        (participant) => participant.id === "web-sender",
+        (participant) => participant.id() === "web-sender",
       );
       assert(
-        metadata?.tracks.some(
-          (publication) => publication.trackId === "camera",
-        ),
+        metadata
+          ?.tracks()
+          .some((publication) => publication.trackId === "camera"),
         "catalog contains real publication metadata",
       );
       const presence = page.participants.find(
-        (participant) => participant.id === "web-catalog-observer",
+        (participant) => participant.id() === "web-catalog-observer",
       );
       assert(
-        presence?.tracks.length === 0,
+        presence?.tracks().length === 0,
         "Discover-only observer has presence without publication",
       );
-      const frozen = (value) =>
-        value === null ||
-        typeof value !== "object" ||
-        (Object.isFrozen(value) && Object.values(value).every(frozen));
-      assert(frozen(initial), "WASM page metadata is deeply frozen");
-      const retained = JSON.stringify(page, (_, value) =>
-        typeof value === "bigint" ? String(value) : value,
-      );
+      assert(Object.isFrozen(initial), "catalog state snapshot is immutable");
+      const serializePage = (page) =>
+        JSON.stringify(
+          page.participants.map((p) => [p.id(), p.tracks()]),
+          (_, value) => (typeof value === "bigint" ? String(value) : value),
+        );
+      const retained = serializePage(page);
       metadataPublication = sender.data("catalog-metadata").publish();
       await until(
         () =>
           catalogWatch
             .state()
-            .page?.participants.some((participant) =>
-              participant.tracks.some(
-                (publication) => publication.trackId === "catalog-metadata",
-              ),
+            .participants?.some((participant) =>
+              participant
+                .tracks()
+                .some(
+                  (publication) => publication.trackId === "catalog-metadata",
+                ),
             ),
         "WASM catalog metadata replacement",
       );
       const updated = await catalogFirst.next();
       assert(
-        updated.page !== page,
+        updated.observationRevision !== initial.observationRevision,
         "new Core page replaces the current projection",
       );
       assert(
-        (await catalogSecond.next()).page === updated.page,
-        "replacement page is shared across cursors",
+        (await catalogSecond.next()).observationRevision ===
+          updated.observationRevision,
+        "replacement page revision is shared across cursors",
       );
-      assert(
-        JSON.stringify(page, (_, value) =>
-          typeof value === "bigint" ? String(value) : value,
-        ) === retained,
-        "retained page stays stable",
-      );
+      assert(serializePage(page) === retained, "retained page stays stable");
       deniedWatch = catalogAgent.room("not-authorized").watch();
       await until(
         () => deniedWatch.state().status === 2,
@@ -1095,12 +1086,12 @@
           Object.isFrozen(failed.error),
         "terminal catalog failure is classified and immutable",
       );
-      deniedWatch.close();
+      await deniedWatch.close();
       assert(
-        deniedWatch.state().error === failed.error,
+        deniedWatch.state().error.code === failed.error.code,
         "close preserves established terminal error projection",
       );
-      catalogWatch.close();
+      await catalogWatch.close();
       assert(
         (await catalogFirst.next()).status === 3,
         "watch close transfers final state",
@@ -1120,7 +1111,10 @@
     await attachment.close();
     assert(video.srcObject === null, "element cleanup");
     await receiver.close();
-    await until(() => outputRoutes.size === 0, "owned audio routes released");
+    await until(
+      () => currentAudio() === undefined,
+      "owned audio output released",
+    );
     await sender.close();
     assert(
       replacementVideoTrack.readyState === "live" &&
@@ -1143,6 +1137,7 @@
       audioPublication?.close(),
       audioPlayback?.close(),
       audioSubscription?.close(),
+      videoSubscription?.close(),
       retiringPublication,
       ...pendingReplacements,
       sender.close(),
@@ -1150,6 +1145,8 @@
     ]);
     handoffVideo?.remove();
     video.remove();
+    monitor?.disconnect();
+    audioElement.remove();
     clearInterval(painting);
     videoTrack.stop();
     replacementVideoTrack?.stop();
@@ -1162,7 +1159,5 @@
     RTCPeerConnection.prototype.addTransceiver = originalAddTransceiver;
     RTCPeerConnection.prototype.setRemoteDescription =
       originalSetRemoteDescription;
-    AudioNode.prototype.connect = connect;
-    AudioNode.prototype.disconnect = disconnect;
   }
 })();

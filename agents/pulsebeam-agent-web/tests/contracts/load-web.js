@@ -15,6 +15,6 @@
     }
     return response;
   };
-  globalThis.pulsebeam = await import("/dist/index.js");
+  globalThis.pulsebeam = await import("/sdk/dist/index.js");
   return null;
 })();

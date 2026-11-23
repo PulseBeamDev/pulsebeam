@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AgentStatus,
+  LogLevel,
+  PlayoutDelay,
   Audio,
   Data,
   usePublish,
@@ -96,7 +99,7 @@ export function Room(props: {
   const agent = useAgent({
     endpoint: props.endpoint,
     token: props.token,
-    logging: { level: "debug" },
+    logLevel: LogLevel.Debug,
   });
   const displayCapture = useCapture("display", {
     video: { width: 1920, height: 1080, frameRate: 30 },
@@ -104,20 +107,21 @@ export function Room(props: {
   });
   if (!agent) return <Typography role="status">Preparing session…</Typography>;
   return (
-    <ActiveRoom {...props} agent={agent} displayCapture={displayCapture} />
+    <ActiveRoom
+      room={props.room}
+      onLeave={props.onLeave}
+      agent={agent}
+      displayCapture={displayCapture}
+    />
   );
 }
 
 function ActiveRoom({
-  token,
-  endpoint,
   room,
   onLeave,
   agent,
   displayCapture,
 }: {
-  token: string;
-  endpoint: string;
   room: string;
   onLeave(): void;
   agent: Agent;
@@ -130,6 +134,12 @@ function ActiveRoom({
     stop: stopShare,
     request: requestShare,
   } = displayCapture;
+  const agentState = agent.state();
+  const { room: admittedRoom, participantId } = agentState;
+  const connection =
+    agentState.status === AgentStatus.Joined
+      ? "connected"
+      : AgentStatus[agentState.status].toLowerCase();
   const Camera = agent.video("camera");
   const Microphone = agent.audio("microphone");
   const Screen = agent.video("screen");
@@ -144,35 +154,26 @@ function ActiveRoom({
   const [failure, setFailure] = useState<string | null>(null);
   const playbackRetry = useRef<(() => Promise<void>) | null>(null);
   const joinedRoom = useRef<string | null>(null);
-  const [catalogScope, setCatalogScope] = useState({
+  const [catalogScope, setCatalogScope] = useState<{
+    room: string;
+    cursor: Uint8Array;
+  }>({
     room,
-    cursor: [] as readonly number[],
-    retry: 0,
+    cursor: new Uint8Array(),
   });
-  const pinnedRoom = useMemo(
-    () => agent.room(room),
-    [agent, room, catalogScope.retry],
-  );
-  const cursor = catalogScope.room === room ? catalogScope.cursor : [];
+  const pinnedRoom = agent.room(room);
+  const cursor = catalogScope.room === room ? catalogScope.cursor : undefined;
   const watch = useWatch(pinnedRoom, { limit: 100, cursor });
   const catalogState = watch?.state();
   const page =
-    catalogState?.status === WatchStatus.Live ? catalogState.page : undefined;
-  const firstPage = () =>
-    setCatalogScope((scope) => ({ room, cursor: [], retry: scope.retry + 1 }));
+    catalogState?.status === WatchStatus.Live ? catalogState : undefined;
+  const participants = useMemo(() => page?.participants ?? [], [page]);
+  const firstPage = () => {
+    setCatalogScope({ room, cursor: new Uint8Array() });
+  };
   usePublish(Camera, capture.video, { enabled: cameraOn });
   usePublish(Microphone, capture.audio, { enabled: micOn });
-  const screenPublication = usePublish(Screen, screen);
-  useEffect(() => {
-    if (!screenPublication) return;
-    void screenPublication
-      .configureSender({ contentHint: "detail" })
-      .catch((error: unknown) => {
-        setFailure(
-          `Screen share: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
-  }, [screenPublication]);
+  usePublish(Screen, screen);
   const {
     messages,
     error: chatError,
@@ -197,31 +198,33 @@ function ActiveRoom({
     const audios: RemoteAudioTrack[] = [];
     const chats: RemoteDataTrack[] = [];
     const reactions: RemoteDataTrack[] = [];
-    if (agent.roomId !== room)
+    if (admittedRoom !== room)
       return {
         remoteVideoTracks: videos,
         remoteAudioTracks: audios,
         remoteChatTracks: chats,
         remoteReactionTracks: reactions,
       };
-    for (const participant of page?.participants ?? []) {
-      if (participant.id === agent.participantId) continue;
-      for (const track of participant.tracks) {
+    for (const participant of participants) {
+      const id = participant.id();
+      if (id === participantId) continue;
+      const reference = pinnedRoom.participant(id);
+      for (const track of participant.tracks()) {
         if (track.kind.tag === "Video")
-          videos.push(participant.video(track.trackId));
+          videos.push(reference.video(track.trackId));
         if (track.kind.tag === "Audio")
-          audios.push(participant.audio(track.trackId));
+          audios.push(reference.audio(track.trackId));
         if (track.kind.tag !== "Data") continue;
         if (
           track.trackId === "chat" &&
           track.kind.inner.delivery === CatalogDelivery.Ordered
         )
-          chats.push(participant.data("chat"));
+          chats.push(reference.data("chat"));
         if (
           track.trackId === "reactions" &&
           track.kind.inner.delivery === CatalogDelivery.Lossy
         )
-          reactions.push(participant.data("reactions"));
+          reactions.push(reference.data("reactions"));
       }
     }
     return {
@@ -230,7 +233,7 @@ function ActiveRoom({
       remoteChatTracks: chats,
       remoteReactionTracks: reactions,
     };
-  }, [agent, room, agent.roomId, agent.participantId, page]);
+  }, [room, admittedRoom, participantId, participants, pinnedRoom]);
   const { remoteTracks, spotlight, setPin } = useVideoLayout(remoteVideoTracks);
   const connect = useCallback(() => {
     try {
@@ -304,8 +307,8 @@ function ActiveRoom({
               minFps: 15,
               priority: track === spotlight ? 200 : 10,
               playoutDelay: latencyModes[latencyMode]
-                ? { mode: "fixed", ...latencyModes[latencyMode]! }
-                : { mode: "adaptive" },
+                ? PlayoutDelay.Fixed.new(latencyModes[latencyMode]!)
+                : PlayoutDelay.Adaptive.new(),
             }
           : undefined
       }
@@ -320,8 +323,12 @@ function ActiveRoom({
   const tile = (track: RemoteVideoTrack | null) => (
     <Box
       component="button"
-      key={track ? `${track.participantId}:${track.trackId}` : "local"}
-      aria-label={`Spotlight ${track?.participantId ?? "your camera"}`}
+      key={
+        track
+          ? `${track.selector().participantId}:${track.selector().trackId}`
+          : "local"
+      }
+      aria-label={`Spotlight ${track?.selector().participantId ?? "your camera"}`}
       onClick={() => setPin(track ?? "local")}
       className="relative aspect-video w-36 shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 border-transparent bg-slate-900 p-0 hover:border-blue-500 focus-visible:border-blue-500 lg:w-full"
     >
@@ -330,7 +337,7 @@ function ActiveRoom({
         variant="caption"
         className="absolute bottom-1 left-1.5 max-w-[90%] truncate rounded bg-slate-950/80 px-1.5 text-white!"
       >
-        {track?.participantId ?? "You"}
+        {track?.selector().participantId ?? "You"}
       </Typography>
     </Box>
   );
@@ -342,14 +349,14 @@ function ActiveRoom({
     >
       {remoteAudioTracks.map((track) => (
         <RoomAudio
-          key={`${room}:${track.participantId}:${track.trackId}`}
+          key={`${room}:${track.selector().participantId}:${track.selector().trackId}`}
           track={track}
           onPlaybackError={playbackError}
         />
       ))}
       {remoteChatTracks.map((track) => (
         <Data
-          key={`${track.room}:${track.participantId}:${track.trackId}`}
+          key={`${track.selector().room}:${track.selector().participantId}:${track.selector().trackId}`}
           track={track}
           onEvent={receiveChat}
           onError={onChatError}
@@ -357,7 +364,7 @@ function ActiveRoom({
       ))}
       {remoteReactionTracks.map((track) => (
         <Data
-          key={`${track.room}:${track.participantId}:${track.trackId}`}
+          key={`${track.selector().room}:${track.selector().participantId}:${track.selector().trackId}`}
           track={track}
           options={{ delivery: DataDelivery.Unreliable }}
           onEvent={receiveReaction}
@@ -376,8 +383,8 @@ function ActiveRoom({
         >
           <Chip
             size="small"
-            color={agent.connection === "connected" ? "success" : "warning"}
-            label={agent.participantId ?? "Joining…"}
+            color={connection === "connected" ? "success" : "warning"}
+            label={participantId ?? "Joining…"}
             className="max-w-24 sm:max-w-65"
           />
           <Typography
@@ -385,8 +392,8 @@ function ActiveRoom({
             color="text.secondary"
             sx={{ display: { xs: "none", sm: "block" } }}
           >
-            {agent.roomId ? `Room ${agent.roomId} · ` : ""}
-            {agent.connection}
+            {admittedRoom ? `Room ${admittedRoom} · ` : ""}
+            {connection}
           </Typography>
         </Stack>
         <Stack
@@ -470,9 +477,9 @@ function ActiveRoom({
           {(capture.error || devices.error)?.message}
         </Alert>
       )}
-      {(failure || agent.error) && (
+      {(failure || agentState.error) && (
         <Alert severity="error" onClose={closeAlert}>
-          {failure ?? agent.error?.message}
+          {failure ?? agentState.error?.message}
         </Alert>
       )}
       <Box
@@ -488,7 +495,7 @@ function ActiveRoom({
             {spotlight && (
               <Chip
                 size="small"
-                label={spotlight.participantId}
+                label={spotlight.selector().participantId}
                 className="absolute! top-3 left-3 max-w-[80%]"
                 sx={{ bgcolor: "#15233a", color: "white" }}
               />
@@ -568,28 +575,18 @@ function ActiveRoom({
           className="h-[180px] min-h-0 w-full shrink-0 lg:h-full lg:w-52"
         >
           <Typography variant="overline" color="text.secondary">
-            Participants on this page · {page?.participants.length ?? "…"}
+            Participants on this page · {page ? participants.length : "…"}
           </Typography>
           <Stack direction="row" spacing={1}>
-            <Button
-              size="small"
-              onClick={firstPage}
-              disabled={
-                !cursor.length && catalogState?.status !== WatchStatus.Failed
-              }
-            >
+            <Button size="small" onClick={firstPage} disabled={!cursor?.length}>
               First page
             </Button>
             <Button
               size="small"
               disabled={!page?.hasMore}
               onClick={() => {
-                if (page?.hasMore)
-                  setCatalogScope((scope) => ({
-                    ...scope,
-                    room,
-                    cursor: [...page.nextCursor],
-                  }));
+                if (page?.hasMore && page.nextCursor)
+                  setCatalogScope({ room, cursor: page.nextCursor });
               }}
             >
               Next page
@@ -600,9 +597,9 @@ function ActiveRoom({
           ) : null}
           {catalogState?.status === WatchStatus.Failed && (
             <Alert severity="error">
-              {cursor.length
+              {cursor?.length
                 ? "This continuation is invalid or expired. Return to the First page."
-                : "Unable to load participants."}{" "}
+                : "Unable to load participants. Leave and rejoin to try again."}{" "}
               {catalogState.error?.message}
             </Alert>
           )}
@@ -618,14 +615,14 @@ function ActiveRoom({
             spacing={1}
             sx={{ overflow: "auto", flex: 1, minHeight: 0 }}
           >
-            {page?.participants.map((participant) => (
+            {participants.map((participant) => (
               <Chip
-                key={participant.id}
+                key={participant.id()}
                 size="small"
                 label={
-                  participant.id === agent.participantId
-                    ? `${participant.id} (you)`
-                    : participant.id
+                  participant.id() === participantId
+                    ? `${participant.id()} (you)`
+                    : participant.id()
                 }
               />
             ))}
@@ -675,16 +672,16 @@ function ActiveRoom({
                       ? message.key
                       : `${message.publicationId}:${message.sequence}`
                   }
-                  className={`max-w-[90%] ${message.participantId === agent.participantId ? "self-end" : "self-start"}`}
+                  className={`max-w-[90%] ${message.participantId === participantId ? "self-end" : "self-start"}`}
                 >
                   <Typography variant="caption" color="text.secondary">
-                    {message.participantId === agent.participantId
+                    {message.participantId === participantId
                       ? "You"
                       : message.participantId}
                   </Typography>
                   <Paper
                     elevation={0}
-                    className={`break-words px-3 py-2 ${message.participantId === agent.participantId ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
+                    className={`break-words px-3 py-2 ${message.participantId === participantId ? "bg-blue-700! text-white!" : "bg-slate-100!"}`}
                   >
                     {message.value}
                   </Paper>
@@ -712,7 +709,7 @@ function ActiveRoom({
                 type="submit"
                 color="primary"
                 aria-label="Send message"
-                disabled={!draft.trim() || sending || !agent.participantId}
+                disabled={!draft.trim() || sending || !participantId}
               >
                 <Icons.Send size={20} />
               </IconButton>

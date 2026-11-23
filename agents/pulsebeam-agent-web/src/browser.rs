@@ -5,19 +5,14 @@ use std::{
 };
 
 use agent_core::{
-    AgentConfig, AudioSubscription, ChannelId, ConnectionState, DataChannelBinding,
-    DataChannelEffect, DataChannelEvent, DataChannelReliability, DataChannelSpec, DesiredState,
-    Effect, Failure, FailureClass, Generation, HostEvent, HttpEffect, HttpEvent, HttpHeader,
-    HttpMethod, HttpResponse, MediaKind, MediaSlot, Notification, OfferResources, OperationId,
-    PlayoutDelay, PublicationIntent, RetryPolicy, RtcEffect, RtcEvent, TimerEffect, TimerEvent,
-    TopicChannel, TopicDropReason, TopicMode, TopicNotification, TopicPublisher,
-    TopicRegistrations, TopicSend, TopicSubscriber, TrackSelector, VideoSubscription,
+    AgentConfig, ChannelId, DataChannelBinding, DataChannelEffect, DataChannelEvent,
+    DataChannelReliability, DataChannelSpec, Effect, Failure, Generation, HostEvent, HttpEffect,
+    HttpEvent, HttpHeader, HttpMethod, HttpResponse, MediaKind, MediaSlot, OfferResources,
+    OperationId, RetryPolicy, RtcEffect, RtcEvent, TimerEffect, TimerEvent,
 };
-use futures_channel::oneshot;
-use js_sys::{Array, BigInt, Function, Object, Reflect, Uint8Array};
-use serde::Deserialize;
-use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
-use wasm_bindgen_futures::{JsFuture, future_to_promise, spawn_local};
+use js_sys::{Array, Function, Object, Reflect, Uint8Array};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     AbortController, Event, Headers, MediaStreamTrack, MessageEvent, Request, RequestInit,
     Response, RtcBundlePolicy, RtcConfiguration, RtcDataChannel, RtcDataChannelInit,
@@ -38,11 +33,8 @@ pub(crate) mod media_observation;
 mod preparation;
 pub(crate) mod publication;
 mod resource_state;
-pub use publication::{
-    BrowserPipe, BrowserPipeUpdates, BrowserPublicationObserver, BrowserPublicationUpdates,
-};
+use publication::BrowserPipe;
 use resource_state::ResourceObserver;
-mod resources;
 
 const SIGNALING_LABEL: &str = "v1/sys/signaling";
 const LOG_TARGET: &str = "pulsebeam_agent_web::browser";
@@ -59,132 +51,6 @@ pub(crate) fn input_is_live(track: &MediaStreamTrack) -> bool {
         .and_then(|value| value.as_string())
         .as_deref()
         == Some("live")
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RuntimeConfig {
-    endpoint: String,
-    token: String,
-    #[serde(default)]
-    log_level: LogLevel,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct TopicRegistrationConfig {
-    name: String,
-    mode: TopicModeConfig,
-    #[serde(default)]
-    publish: bool,
-    #[serde(default)]
-    subscribe: bool,
-    source: Option<TrackSelectorConfig>,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum TopicModeConfig {
-    Latest,
-    Lossy,
-    Ordered,
-}
-
-impl From<TopicModeConfig> for TopicMode {
-    fn from(value: TopicModeConfig) -> Self {
-        match value {
-            TopicModeConfig::Latest => Self::Latest,
-            TopicModeConfig::Lossy => Self::Lossy,
-            TopicModeConfig::Ordered => Self::Ordered,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DesiredConfig {
-    connected: bool,
-    #[serde(default)]
-    publications: Vec<PublicationIntent>,
-    #[serde(default)]
-    video: Vec<VideoSubscriptionConfig>,
-    #[serde(default)]
-    audio: AudioDemandConfig,
-    #[serde(default)]
-    topics: Vec<TopicRegistrationConfig>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct VideoSubscriptionConfig {
-    slot: u32,
-    #[serde(default)]
-    publication_id: String,
-    selector: Option<TrackSelectorConfig>,
-    height: u32,
-    min_height: u32,
-    min_fps: u32,
-    priority: u32,
-    #[serde(default)]
-    playout_delay: PlayoutDelayConfig,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AudioDemandConfig {
-    #[serde(default)]
-    pinned: Vec<String>,
-    #[serde(default)]
-    selected: Vec<TrackSelectorConfig>,
-    #[serde(default)]
-    playout_delays: Vec<AudioTrackDelayConfig>,
-    #[serde(default)]
-    selector_delays: Vec<SelectorDelayConfig>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct TrackSelectorConfig {
-    room: String,
-    participant_id: String,
-    track_id: String,
-}
-
-impl From<TrackSelectorConfig> for TrackSelector {
-    fn from(value: TrackSelectorConfig) -> Self {
-        Self {
-            room: value.room,
-            participant_id: value.participant_id,
-            track_id: value.track_id,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SelectorDelayConfig {
-    selector: TrackSelectorConfig,
-    playout_delay: PlayoutDelayConfig,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AudioTrackDelayConfig {
-    publication_id: String,
-    playout_delay: PlayoutDelayConfig,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
-enum PlayoutDelayConfig {
-    #[default]
-    Adaptive,
-    Fixed {
-        #[serde(rename = "minMs")]
-        min_ms: u32,
-        #[serde(rename = "maxMs")]
-        max_ms: u32,
-    },
 }
 
 struct LocalOperationError {
@@ -278,60 +144,6 @@ impl Drop for LocalSlotOperations {
             .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
         {
             gates.remove(&self.slot);
-        }
-    }
-}
-
-impl DesiredConfig {
-    fn into_core(self) -> Result<DesiredState, JsValue> {
-        Ok(DesiredState {
-            revision: 0,
-            connected: self.connected,
-            publications: self.publications,
-            video: self
-                .video
-                .into_iter()
-                .map(|video| VideoSubscription {
-                    slot: video.slot,
-                    publication_id: video.publication_id,
-                    selector: video.selector.map(Into::into),
-                    height: video.height,
-                    min_height: video.min_height,
-                    min_fps: video.min_fps,
-                    priority: video.priority,
-                    playout_delay: video.playout_delay.into(),
-                })
-                .collect(),
-            audio: self.audio.into(),
-            topics: topic_registrations(&self.topics)?,
-        })
-    }
-}
-
-impl From<PlayoutDelayConfig> for PlayoutDelay {
-    fn from(value: PlayoutDelayConfig) -> Self {
-        match value {
-            PlayoutDelayConfig::Adaptive => Self::Adaptive,
-            PlayoutDelayConfig::Fixed { min_ms, max_ms } => Self::Fixed { min_ms, max_ms },
-        }
-    }
-}
-
-impl From<AudioDemandConfig> for AudioSubscription {
-    fn from(value: AudioDemandConfig) -> Self {
-        Self {
-            pinned: value.pinned,
-            selected: value.selected.into_iter().map(Into::into).collect(),
-            playout_delays: value
-                .playout_delays
-                .into_iter()
-                .map(|entry| (entry.publication_id, entry.playout_delay.into()))
-                .collect(),
-            selector_delays: value
-                .selector_delays
-                .into_iter()
-                .map(|entry| (entry.selector.into(), entry.playout_delay.into()))
-                .collect(),
         }
     }
 }
@@ -600,31 +412,13 @@ struct RuntimeInner {
     peers: RefCell<BTreeMap<u64, Peer>>,
     requests: RefCell<BTreeMap<u64, AbortController>>,
     timers: RefCell<BTreeMap<u64, TimerHandle>>,
-    snapshot_listener: RefCell<Option<Function>>,
-    event_listener: RefCell<Option<Function>>,
-    error_listener: RefCell<Option<Function>>,
-    last_error: RefCell<Option<String>>,
+
     closing: Cell<bool>,
     closed: Cell<bool>,
 }
 
-#[wasm_bindgen]
-pub struct BrowserRuntime {
+pub(crate) struct BrowserRuntime {
     inner: Rc<RuntimeInner>,
-}
-
-#[wasm_bindgen]
-impl BrowserRuntime {
-    #[wasm_bindgen(constructor)]
-    pub fn new(config: JsValue) -> Result<BrowserRuntime, JsValue> {
-        let config: RuntimeConfig = serde_wasm_bindgen::from_value(config).map_err(|_| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::InvalidArgument,
-                "Invalid Agent configuration",
-            ))
-        })?;
-        Self::start(config.endpoint, config.token, config.log_level).map_err(operation_error_value)
-    }
 }
 
 impl BrowserRuntime {
@@ -659,10 +453,7 @@ impl BrowserRuntime {
             peers: RefCell::new(BTreeMap::new()),
             requests: RefCell::new(BTreeMap::new()),
             timers: RefCell::new(BTreeMap::new()),
-            snapshot_listener: RefCell::new(None),
-            event_listener: RefCell::new(None),
-            error_listener: RefCell::new(None),
-            last_error: RefCell::new(None),
+
             closing: Cell::new(false),
             closed: Cell::new(false),
         });
@@ -686,7 +477,6 @@ impl BrowserRuntime {
         Ok(())
     }
 
-    #[cfg(feature = "uniffi")]
     pub(crate) fn close_locally(&self) {
         self.inner.shutdown();
         let actor = self.inner.actor.borrow_mut().take();
@@ -709,7 +499,7 @@ impl BrowserRuntime {
     > {
         use agent_core::ResourceCommand;
         self.claim_observed_resource(ResourceCommand::ClaimVideo { selector }, |owner| {
-            self.apply_resource(ResourceCommand::ObserveVideo { owner, observation })?;
+            self.configure_owned_video(owner, observation)?;
             self.video_state_observer(owner)
         })
     }
@@ -730,13 +520,33 @@ impl BrowserRuntime {
         self.claim_observed_resource(
             ResourceCommand::ClaimAudioSubscription { selector },
             |owner| {
-                self.apply_resource(ResourceCommand::ConfigureAudio {
-                    owner,
-                    playout_delay,
-                })?;
+                self.configure_owned_audio(owner, playout_delay)?;
                 self.audio_state_observer(owner)
             },
         )
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn configure_owned_video(
+        &self,
+        owner: u64,
+        observation: agent_core::VideoObservation,
+    ) -> Result<(), agent_core::ffi::ErrorInfo> {
+        self.apply_resource(agent_core::ResourceCommand::ObserveVideo { owner, observation })?;
+        Ok(())
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn configure_owned_audio(
+        &self,
+        owner: u64,
+        playout_delay: agent_core::PlayoutDelay,
+    ) -> Result<(), agent_core::ffi::ErrorInfo> {
+        self.apply_resource(agent_core::ResourceCommand::ConfigureAudio {
+            owner,
+            playout_delay,
+        })?;
+        Ok(())
     }
 
     #[cfg(feature = "uniffi")]
@@ -793,7 +603,7 @@ impl BrowserRuntime {
         &self,
         owner: u64,
     ) -> Result<media_observation::BrowserMediaObservation, JsValue> {
-        self.inner.observe_owned(owner, None, None).await
+        self.inner.observe_cancellable(owner).await
     }
 
     #[cfg(feature = "uniffi")]
@@ -818,77 +628,22 @@ impl BrowserRuntime {
     }
 }
 
-#[wasm_bindgen]
 impl BrowserRuntime {
-    pub fn set_snapshot_listener(&self, listener: Option<Function>) {
-        *self.inner.snapshot_listener.borrow_mut() = listener;
-        let listener = self.inner.snapshot_listener.borrow().clone();
-        if let Some(listener) = listener {
-            let snapshot = snapshot_value(&self.inner.snapshot());
-            call_listener(&listener, &snapshot, "snapshot");
-        }
-    }
-
-    pub fn set_event_listener(&self, listener: Option<Function>) {
-        *self.inner.event_listener.borrow_mut() = listener;
-    }
-
-    pub fn set_error_listener(&self, listener: Option<Function>) {
-        *self.inner.error_listener.borrow_mut() = listener;
-    }
-
-    pub fn set_log_level(&self, level: JsValue) -> Result<(), JsValue> {
-        self.inner.ensure_open()?;
-        let level: LogLevel = serde_wasm_bindgen::from_value(level)
-            .map_err(|error| js_error(format!("invalid log level: {error}")))?;
-        let actor = self.inner.actor.borrow();
-        let actor = actor
-            .as_ref()
-            .ok_or_else(|| js_error("runtime actor not initialized"))?;
-        actor
+    pub(crate) fn configure_logging(
+        &self,
+        level: LogLevel,
+    ) -> Result<(), agent_core::ffi::ErrorInfo> {
+        use agent_core::ffi::{ErrorCode, ErrorInfo};
+        self.inner
+            .intent_actor()?
             .send_public(PublicCommand::SetLogLevel(level.into()))
-            .map_err(js_error)?;
+            .map_err(|_| {
+                ErrorInfo::new(ErrorCode::CapacityExceeded, "Log update mailbox is full")
+            })?;
         self.inner.logger.set_level(level);
         Ok(())
     }
 
-    pub fn replace_desired(&self, desired: JsValue) -> Result<(), JsValue> {
-        self.inner.ensure_open()?;
-        let desired: DesiredConfig = serde_wasm_bindgen::from_value(desired).map_err(|error| {
-            LocalOperationError::validation(format!("invalid desired state: {error}")).into_js()
-        })?;
-        self.inner
-            .replace_desired(desired.into_core()?)
-            .map_err(js_error)?;
-        Ok(())
-    }
-
-    pub fn claim_owned_publication(&self, spec: JsValue) -> Result<JsValue, JsValue> {
-        self.claim_publication_spec(resources::publication_spec(spec)?)
-    }
-
-    pub fn configure_publication(&self, owner: u64, enabled: bool) -> Result<(), JsValue> {
-        self.configure_publication_state(owner, enabled)
-            .map_err(operation_error_value)
-    }
-
-    pub fn resource_now(&self, command: JsValue) -> Result<JsValue, JsValue> {
-        let command = resources::command(command).map_err(|_| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::InvalidArgument,
-                "Invalid resource command",
-            ))
-        })?;
-        if let agent_core::ResourceCommand::ClaimPublication { spec } = command {
-            return self.claim_publication_spec(spec);
-        }
-        self.apply_resource(command)
-            .map(resources::result)
-            .map_err(operation_error_value)
-    }
-}
-
-impl BrowserRuntime {
     fn apply_resource(
         &self,
         command: agent_core::ResourceCommand,
@@ -938,302 +693,6 @@ impl BrowserRuntime {
     }
 }
 
-#[wasm_bindgen]
-impl BrowserRuntime {
-    #[wasm_bindgen(unchecked_return_type = "Promise<any>")]
-    pub fn resource(&self, command: JsValue) -> Result<js_sys::Promise, JsValue> {
-        self.inner.ensure_open()?;
-        let command = resources::command(command)?;
-        let actor = self
-            .inner
-            .actor
-            .borrow()
-            .clone()
-            .ok_or_else(|| js_error("runtime actor not initialized"))?;
-        let inner = Rc::downgrade(&self.inner);
-        Ok(future_to_promise(async move {
-            let completion = actor.send_resource(command).await.map_err(js_error)?;
-            let result = completion
-                .await
-                .map_err(|_| js_error("resource operation was canceled"))?;
-            inner
-                .upgrade()
-                .ok_or_else(|| js_error("runtime is closed"))?
-                .ensure_open()?;
-            result.map(resources::result).map_err(resources::error)
-        }))
-    }
-
-    #[wasm_bindgen(unchecked_return_type = "Promise<BrowserMediaObservation>")]
-    pub fn observe_media(
-        &self,
-        owner: u64,
-        source: Option<String>,
-        signal: Option<web_sys::AbortSignal>,
-    ) -> Result<js_sys::Promise, JsValue> {
-        self.inner.ensure_open()?;
-        Ok(self.inner.begin_observation(owner, source, signal))
-    }
-
-    pub fn renew(&self, token: String) -> Result<(), JsValue> {
-        self.renew_token(token).map_err(operation_error_value)
-    }
-
-    pub fn renew_authorization(&self, token: String) -> Result<(), JsValue> {
-        self.inner.ensure_open()?;
-        self.inner.renew_authorization(token).map_err(js_error)
-    }
-
-    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
-    pub fn replace_owned_track(
-        &self,
-        owner: u64,
-        track: Option<MediaStreamTrack>,
-        config: JsValue,
-        muted: bool,
-        replace_input: bool,
-    ) -> Result<js_sys::Promise, JsValue> {
-        self.inner.ensure_open()?;
-        self.inner.publication_slot(owner)?;
-        let config: SenderConfig = serde_wasm_bindgen::from_value(config).map_err(|error| {
-            LocalOperationError::validation(format!("invalid sender configuration: {error}"))
-                .into_js()
-        })?;
-        let inner = Rc::downgrade(&self.inner);
-        Ok(future_to_promise(async move {
-            let inner = inner
-                .upgrade()
-                .ok_or_else(|| js_error("runtime is closed"))?;
-            let result = inner
-                .replace_owned_input(
-                    track,
-                    config,
-                    PublicationInputRequest {
-                        owner,
-                        muted: Some(muted),
-                        intent: if replace_input {
-                            agent_core::PublicationInputIntent::Replace
-                        } else {
-                            agent_core::PublicationInputIntent::ConfigureCurrent
-                        },
-                    },
-                )
-                .await;
-            inner.ensure_open()?;
-            result.map_err(LocalOperationError::into_js)?;
-            Ok(JsValue::UNDEFINED)
-        }))
-    }
-
-    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
-    pub fn set_owned_muted(&self, owner: u64, muted: bool) -> Result<js_sys::Promise, JsValue> {
-        self.inner.ensure_open()?;
-        self.inner.publication_slot(owner)?;
-        let inner = Rc::downgrade(&self.inner);
-        Ok(future_to_promise(async move {
-            let inner = inner
-                .upgrade()
-                .ok_or_else(|| js_error("runtime is closed"))?;
-            inner
-                .input_resource(agent_core::ResourceCommand::SetPublicationMuted { owner, muted })
-                .await
-                .map_err(LocalOperationError::into_js)?;
-            inner.ensure_open()?;
-            Ok(JsValue::UNDEFINED)
-        }))
-    }
-
-    pub fn remote_track(&self, receiver_index: u32) -> Option<MediaStreamTrack> {
-        let generation = self.inner.snapshot().generation?;
-        self.inner
-            .peers
-            .borrow()
-            .get(&generation.get())
-            .and_then(|peer| {
-                peer.receiver_mids
-                    .get(&receiver_index)
-                    .and_then(|mid| peer.remote_tracks.get(mid))
-            })
-            .map(|state| Clone::clone(&state.track))
-    }
-
-    pub async fn statistics(&self) -> Result<JsValue, JsValue> {
-        self.inner.ensure_open()?;
-        self.inner.statistics().await.map_err(js_error)
-    }
-
-    pub fn join(&self, room: String) -> Result<(), JsValue> {
-        self.join_room(room).map_err(operation_error_value)
-    }
-
-    pub fn leave_room(&self) -> Result<(), JsValue> {
-        self.inner.ensure_open()?;
-        let actor = self
-            .inner
-            .actor
-            .borrow()
-            .clone()
-            .ok_or_else(|| js_error("runtime actor not initialized"))?;
-        actor.leave_room().map_err(operation_error_value)?;
-        self.inner.agent_state();
-        Ok(())
-    }
-
-    pub fn connect(&self) -> Result<(), JsValue> {
-        self.inner.ensure_open()?;
-        self.inner
-            .replace_connection_desired(true)
-            .map_err(js_error)?;
-        Ok(())
-    }
-
-    pub fn force_reconnect(&self) -> Result<(), JsValue> {
-        self.inner.ensure_open()?;
-        let actor = self.inner.actor.borrow();
-        let Some(actor) = actor.as_ref() else {
-            return Err(js_error("runtime actor not initialized"));
-        };
-        actor
-            .send_public(PublicCommand::Reconnect)
-            .map_err(js_error)
-    }
-
-    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
-    pub fn send_owned_data(
-        &self,
-        owner: u64,
-        payload: &[u8],
-        recipients: Option<js_sys::Array>,
-        capture_nanoseconds: Option<i64>,
-        uncertainty_nanoseconds: Option<u32>,
-    ) -> Result<js_sys::Promise, JsValue> {
-        use agent_core::ffi::{
-            CaptureClock, CaptureTimestamp, DataSendOptions, ErrorCode, ErrorInfo,
-        };
-        let recipients = recipients
-            .map(|values| {
-                let invalid = || {
-                    operation_error_value(ErrorInfo::new(
-                        ErrorCode::InvalidArgument,
-                        "Invalid data recipients",
-                    ))
-                };
-                let length = usize::try_from(values.length()).map_err(|_| invalid())?;
-                if length == 0 || length > agent_core::MAX_TOPIC_RECIPIENTS {
-                    return Err(invalid());
-                }
-                values
-                    .iter()
-                    .map(|id| id.as_string().ok_or_else(invalid))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
-        let captured_at = capture_nanoseconds.map(|nanoseconds| CaptureTimestamp {
-            clock: CaptureClock::Publication,
-            nanoseconds,
-            uncertainty_nanoseconds,
-        });
-        Ok(data_send_promise(
-            self.admit_owned_data(
-                owner,
-                payload.to_vec(),
-                Some(DataSendOptions {
-                    captured_at,
-                    recipients,
-                }),
-            )
-            .map_err(operation_error_value)?,
-        ))
-    }
-
-    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
-    pub fn send_topic(
-        &self,
-        name: &str,
-        mode: &str,
-        payload: &[u8],
-        expected_generation: u64,
-        expected_data_track_id: &str,
-    ) -> Result<js_sys::Promise, JsValue> {
-        self.inner.ensure_open()?;
-        let mode = parse_topic_mode(mode)?;
-        let completion = self
-            .inner
-            .send_topic(
-                TopicSend {
-                    publisher: TopicPublisher {
-                        topic: name.to_owned(),
-                        mode,
-                    },
-                    payload: payload.to_vec(),
-                },
-                expected_generation,
-                expected_data_track_id.to_owned(),
-            )
-            .map_err(js_error)?;
-        Ok(future_to_promise(async move {
-            completion
-                .await
-                .map_err(|_| js_error("topic admission was canceled"))?
-                .map_err(js_error)?;
-            Ok(JsValue::UNDEFINED)
-        }))
-    }
-
-    pub fn close(&self) {
-        if self.inner.is_closed() {
-            return;
-        }
-        self.inner.request_close();
-    }
-
-    pub fn abort(&self) {
-        self.inner.request_abort();
-    }
-
-    pub fn state(&self) -> JsValue {
-        agent_state_value(&self.inner.agent_state())
-    }
-
-    pub fn updates(&self) -> Result<BrowserAgentUpdates, JsValue> {
-        self.inner.agent_state();
-        agent_updates(&self.inner.agent_state)
-    }
-
-    pub fn observer(&self) -> BrowserAgentObserver {
-        self.inner.agent_state();
-        BrowserAgentObserver {
-            observer: self.inner.agent_state.clone(),
-        }
-    }
-
-    pub fn publication(&self, owner: u64) -> Result<BrowserPublicationObserver, JsValue> {
-        let observer = self
-            .publication_state_observer(owner)
-            .map_err(operation_error_value)?;
-        Ok(BrowserPublicationObserver { observer })
-    }
-
-    pub fn create_owned_publication_pipe(&self, owner: u64) -> Result<BrowserPipe, JsValue> {
-        self.attach_publication_pipe(owner)
-            .map_err(operation_error_value)
-    }
-
-    pub fn snapshot(&self) -> JsValue {
-        snapshot_value(&self.inner.snapshot())
-    }
-
-    pub fn diagnostics(&self) -> JsValue {
-        let value = Object::new();
-        set(&value, "peers", self.inner.peers.borrow().len());
-        set(&value, "requests", self.inner.requests.borrow().len());
-        set(&value, "timers", self.inner.timers.borrow().len());
-        set(&value, "closed", self.inner.is_closed());
-        set(&value, "lastError", self.inner.last_error.borrow().clone());
-        value.into()
-    }
-}
-
 impl BrowserRuntime {
     pub(crate) fn attach_publication_pipe(
         &self,
@@ -1275,12 +734,6 @@ impl BrowserRuntime {
             notification.notify();
         }
         Ok(pipe)
-    }
-
-    fn claim_publication_spec(&self, spec: agent_core::TrackSpec) -> Result<JsValue, JsValue> {
-        self.claim_media_publication(spec)
-            .map(resources::result)
-            .map_err(operation_error_value)
     }
 
     pub(crate) fn configure_publication_state(
@@ -1353,66 +806,9 @@ impl BrowserRuntime {
     }
 }
 
-#[wasm_bindgen]
-pub struct BrowserAgentObserver {
-    observer: Rc<agent_core::observer::AgentStateObserver>,
-}
-
-#[wasm_bindgen]
-impl BrowserAgentObserver {
-    pub fn state(&self) -> JsValue {
-        agent_state_value(&self.observer.state())
-    }
-
-    pub fn updates(&self) -> Result<BrowserAgentUpdates, JsValue> {
-        agent_updates(&self.observer)
-    }
-}
-
-fn agent_updates(
-    observer: &agent_core::observer::AgentStateObserver,
-) -> Result<BrowserAgentUpdates, JsValue> {
-    observer
-        .updates()
-        .map(|updates| BrowserAgentUpdates { updates })
-        .map_err(|_| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::CapacityExceeded,
-                "Observer capacity exceeded",
-            ))
-        })
-}
-
-#[wasm_bindgen]
-pub struct BrowserAgentUpdates {
-    updates: agent_core::observer::AgentUpdates,
-}
-
-#[wasm_bindgen]
-impl BrowserAgentUpdates {
-    pub async fn next(&self) -> Result<JsValue, JsValue> {
-        let next = self.updates.next().map_err(|_| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::Conflict,
-                "An observation read is already pending",
-            ))
-        })?;
-        Ok(next
-            .await
-            .as_ref()
-            .map_or(JsValue::UNDEFINED, agent_state_value))
-    }
-
-    pub fn close(&self) {
-        self.updates.close();
-    }
-}
-
 impl Drop for BrowserRuntime {
     fn drop(&mut self) {
-        self.inner.request_abort();
-        // The actor holds a weak host reference and cannot finish teardown after free.
-        self.inner.shutdown();
+        self.close_locally();
     }
 }
 
@@ -1460,44 +856,6 @@ impl RuntimeInner {
         }
     }
 
-    fn send_topic(
-        &self,
-        send: TopicSend,
-        expected_generation: u64,
-        expected_data_track_id: String,
-    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
-        let actor = self.actor.borrow();
-        let Some(actor) = actor.as_ref() else {
-            return Err("runtime actor not initialized".to_owned());
-        };
-        actor.send_topic(send, expected_generation, expected_data_track_id)
-    }
-
-    fn replace_desired(self: &Rc<Self>, desired: DesiredState) -> Result<(), String> {
-        let actor = self.actor.borrow();
-        let Some(actor) = actor.as_ref() else {
-            return Err("runtime actor not initialized".to_owned());
-        };
-        actor.send_public(PublicCommand::ReplaceDesired(desired))
-    }
-
-    fn renew_authorization(&self, token: String) -> Result<(), String> {
-        agent_core::validate_authorization_token(&token).map_err(|error| error.to_string())?;
-        let actor = self.actor.borrow();
-        let Some(actor) = actor.as_ref() else {
-            return Err("runtime actor not initialized".to_owned());
-        };
-        actor.send_public(PublicCommand::RenewAuthorization(token))
-    }
-
-    fn replace_connection_desired(self: &Rc<Self>, connected: bool) -> Result<(), String> {
-        let actor = self.actor.borrow();
-        let Some(actor) = actor.as_ref() else {
-            return Err("runtime actor not initialized".to_owned());
-        };
-        actor.send_public(PublicCommand::SetConnected(connected))
-    }
-
     fn register_publication(
         self: &Rc<Self>,
         owner: u64,
@@ -1515,40 +873,6 @@ impl RuntimeInner {
                 after_generation,
             },
         );
-    }
-
-    fn request_close(&self) {
-        self.closing.set(true);
-        self.close_publication_observers();
-        self.close_agent_state();
-        self.close_observations();
-        self.stop_local_sources();
-        let actor = self.actor.borrow();
-        let Some(actor) = actor.as_ref() else {
-            return;
-        };
-        if let Err(error) = actor.request_close() {
-            self.report_error(format!("runtime actor message failure: {error}"));
-        }
-    }
-
-    fn request_abort(&self) {
-        self.closing.set(true);
-        #[cfg(feature = "uniffi")]
-        self.wake_data_reads();
-        self.close_publication_observers();
-        self.close_agent_state();
-        self.close_observations();
-        self.stop_local_sources();
-        let actor = self.actor.borrow();
-        let Some(actor) = actor.as_ref() else {
-            self.shutdown();
-            return;
-        };
-        if let Err(error) = actor.abort() {
-            self.report_error(format!("runtime actor message failure: {error}"));
-            self.shutdown();
-        }
     }
 
     fn snapshot(&self) -> agent_core::Snapshot {
@@ -1608,6 +932,8 @@ impl RuntimeInner {
             notification();
         }
         self.notify_prepared_pipe_states();
+        #[cfg(feature = "uniffi")]
+        self.wake_data_reads();
     }
 
     fn prepare_pipe_state(&self, input_state: &agent_core::PublicationInputState) {
@@ -1750,12 +1076,6 @@ impl RuntimeInner {
         Ok(())
     }
 
-    fn close_agent_state(&self) {
-        let mut state = self.agent_state();
-        state.room = None;
-        let _ = self.agent_state.close(state);
-    }
-
     async fn input_resource(
         &self,
         command: agent_core::ResourceCommand,
@@ -1795,18 +1115,6 @@ impl RuntimeInner {
         {
             inputs.remove(operation.slot()).unwrap().track.stop();
         }
-    }
-
-    fn publication_slot(&self, owner: u64) -> Result<String, JsValue> {
-        self.publication_slots
-            .borrow()
-            .get(&owner)
-            .map(|binding| binding.slot.clone())
-            .ok_or_else(|| {
-                resources::error(agent_core::AgentError::InvalidResource(
-                    agent_core::TrackResourceError::Released,
-                ))
-            })
     }
 
     fn local_operations(self: &Rc<Self>, slot: &str) -> Rc<LocalSlotOperations> {
@@ -2032,71 +1340,6 @@ impl RuntimeInner {
         Ok(())
     }
 
-    async fn statistics(&self) -> Result<JsValue, String> {
-        let generation = self
-            .snapshot()
-            .generation
-            .ok_or_else(|| "statistics are unavailable before a transport exists".to_owned())?;
-        let (connection, senders) = {
-            let peers = self.peers.borrow();
-            let peer = peers
-                .get(&generation.get())
-                .ok_or_else(|| "active transport is unavailable".to_owned())?;
-            let senders = peer
-                .transceivers
-                .iter()
-                .filter_map(|(slot, transceiver)| match slot {
-                    MediaSlot::LocalVideo(name) => {
-                        Some((name.clone(), "video", transceiver.sender()))
-                    }
-                    MediaSlot::LocalAudio(name) => {
-                        Some((name.clone(), "audio", transceiver.sender()))
-                    }
-                    MediaSlot::RemoteVideo(_) | MediaSlot::RemoteAudio(_) => None,
-                })
-                .collect::<Vec<_>>();
-            (peer.connection.clone(), senders)
-        };
-        let report = JsFuture::from(connection.get_stats())
-            .await
-            .map_err(js_message)?;
-        let value = Object::new();
-        set(
-            &value,
-            "connection",
-            connection_name_from_browser(&connection),
-        );
-        set(&value, "report", report);
-        let sender_values = Array::new();
-        for (slot, kind, sender) in senders {
-            let sender_value = Object::new();
-            set(&sender_value, "slot", slot.clone());
-            set(&sender_value, "kind", kind);
-            set(
-                &sender_value,
-                "publicationId",
-                sender.track().map(|track| track.id()),
-            );
-            set(
-                &sender_value,
-                "enabled",
-                sender.track().map(|track| track.enabled()),
-            );
-            set(
-                &sender_value,
-                "sourceTrackId",
-                self.local_tracks
-                    .borrow()
-                    .get(&slot)
-                    .map(|state| state.source_id.clone()),
-            );
-            set(&sender_value, "parameters", sender.get_parameters());
-            sender_values.push(&sender_value);
-        }
-        set(&value, "senders", sender_values);
-        Ok(value.into())
-    }
-
     fn release_resource(self: &Rc<Self>, owner: u64) {
         #[cfg(feature = "uniffi")]
         {
@@ -2179,35 +1422,7 @@ impl RuntimeInner {
                 TurnErrorSource::Command => "validation",
                 TurnErrorSource::HostEvent => "protocol",
             };
-            self.report_classified_error(LocalOperationError {
-                class,
-                message: format!("core rejected input: {error}"),
-            });
-        }
-        let snapshot_listener = self.snapshot_listener.borrow().clone();
-        if turn.snapshot.is_some()
-            && let Some(listener) = snapshot_listener
-        {
-            // Effects and error callbacks may already have replaced room intent.
-            call_listener(&listener, &snapshot_value(&self.snapshot()), "snapshot");
-        }
-        let event_listener = self.event_listener.borrow().clone();
-        if let Some(listener) = event_listener {
-            for notification in &turn.notifications {
-                if self.closed.get() {
-                    break;
-                }
-                call_listener(&listener, &notification_value(notification), "event");
-            }
-        }
-    }
-
-    fn publish_current_snapshot(&self) {
-        self.agent_state();
-        let listener = self.snapshot_listener.borrow().clone();
-        if let Some(listener) = listener {
-            let snapshot = snapshot_value(&self.snapshot());
-            call_listener(&listener, &snapshot, "snapshot");
+            self.report_error(format!("core rejected {class} input: {error}"));
         }
     }
 
@@ -2408,7 +1623,7 @@ impl RuntimeInner {
                 if let Some(removed) = removed {
                     removed.close();
                     inner.retire_observation_tracks();
-                    inner.publish_current_snapshot();
+                    inner.agent_state();
                 }
             }) as Box<dyn FnMut(Event)>);
             if let Err(error) = remote_track
@@ -2440,7 +1655,7 @@ impl RuntimeInner {
             }
             if inserted {
                 inner.retire_observation_tracks();
-                inner.publish_current_snapshot();
+                inner.agent_state();
             }
         }) as Box<dyn FnMut(RtcTrackEvent)>);
         connection.set_ontrack(Some(track.as_ref().unchecked_ref()));
@@ -3017,20 +2232,6 @@ impl RuntimeInner {
 
     fn report_error(&self, message: String) {
         self.logger.warn(LOG_TARGET, &message);
-        *self.last_error.borrow_mut() = Some(message.clone());
-        let listener = self.error_listener.borrow().clone();
-        if let Some(listener) = listener {
-            call_listener(&listener, &JsValue::from_str(&message), "error");
-        }
-    }
-
-    fn report_classified_error(&self, error: LocalOperationError) {
-        self.logger.warn(LOG_TARGET, &error.message);
-        *self.last_error.borrow_mut() = Some(error.message.clone());
-        let listener = self.error_listener.borrow().clone();
-        if let Some(listener) = listener {
-            call_listener(&listener, &error.into_js(), "error");
-        }
     }
 
     fn stop_local_sources(&self) {
@@ -3046,7 +2247,6 @@ impl RuntimeInner {
             return;
         }
         self.close_publication_observers();
-        self.close_agent_state();
         self.close_observations();
         self.stop_local_sources();
         for (_, peer) in std::mem::take(&mut *self.peers.borrow_mut()) {
@@ -3062,42 +2262,9 @@ impl RuntimeInner {
         } else {
             self.timers.borrow_mut().clear();
         }
-        self.snapshot_listener.borrow_mut().take();
-        self.event_listener.borrow_mut().take();
-        self.error_listener.borrow_mut().take();
         self.logger
             .info(LOG_TARGET, "browser agent runtime aborted");
     }
-}
-
-fn topic_registrations(topics: &[TopicRegistrationConfig]) -> Result<TopicRegistrations, JsValue> {
-    let mut registrations = TopicRegistrations::default();
-    for topic in topics {
-        let mode = topic.mode.into();
-        if topic.publish {
-            registrations.publishers.push(TopicPublisher {
-                topic: topic.name.clone(),
-                mode,
-            });
-        }
-        if topic.subscribe {
-            let source = topic
-                .source
-                .as_ref()
-                .filter(|source| source.track_id == topic.name)
-                .ok_or_else(|| {
-                    LocalOperationError::validation("data reception requires an exact source")
-                        .into_js()
-                })?;
-            registrations.subscribers.push(TopicSubscriber {
-                room: source.room.clone(),
-                participant_id: source.participant_id.clone(),
-                topic: topic.name.clone(),
-                mode,
-            });
-        }
-    }
-    Ok(registrations)
 }
 
 impl BrowserRuntime {
@@ -3198,27 +2365,17 @@ async fn complete_data_send(
                 "Data send was closed",
             )
         })?
-        .map_err(resources::send_error_info)
-}
-
-fn data_send_promise(
-    completion: futures_channel::oneshot::Receiver<Result<(), crate::engine::DataSendError>>,
-) -> js_sys::Promise {
-    future_to_promise(async move {
-        complete_data_send(completion)
-            .await
-            .map_err(operation_error_value)?;
-        Ok(JsValue::UNDEFINED)
-    })
-}
-
-fn parse_topic_mode(mode: &str) -> Result<TopicMode, JsValue> {
-    match mode {
-        "latest" => Ok(TopicMode::Latest),
-        "lossy" => Ok(TopicMode::Lossy),
-        "ordered" => Ok(TopicMode::Ordered),
-        _ => Err(js_error("topic mode must be latest, lossy, or ordered")),
-    }
+        .map_err(|error| {
+            use crate::engine::DataSendError;
+            use agent_core::ffi::{ErrorCode, ErrorInfo};
+            match error {
+                DataSendError::Admission(error) => ErrorInfo::from(&error),
+                DataSendError::Closed => {
+                    ErrorInfo::new(ErrorCode::Closed, "Data runtime is closed")
+                }
+                DataSendError::Delivery(failure) => ErrorInfo::from(&failure),
+            }
+        })
 }
 
 fn add_transceiver(
@@ -3368,18 +2525,6 @@ fn set_property(object: &JsValue, name: &str, value: &JsValue) -> Result<(), Str
         })
 }
 
-fn connection_name_from_browser(connection: &RtcPeerConnection) -> &'static str {
-    match connection.connection_state() {
-        RtcPeerConnectionState::New => "new",
-        RtcPeerConnectionState::Connecting => "connecting",
-        RtcPeerConnectionState::Connected => "connected",
-        RtcPeerConnectionState::Disconnected => "disconnected",
-        RtcPeerConnectionState::Failed => "failed",
-        RtcPeerConnectionState::Closed => "closed",
-        _ => "unknown",
-    }
-}
-
 fn browser_request(
     request: &agent_core::HttpRequest,
     controller: &AbortController,
@@ -3433,36 +2578,6 @@ async fn fetch(request: Request) -> Result<HttpResponse, String> {
     })
 }
 
-fn agent_state_value(state: &agent_core::ffi::AgentState) -> JsValue {
-    let value = Object::new();
-    set(&value, "observationRevision", state.observation_revision);
-    set(&value, "desiredJoinRevision", state.desired_join_revision);
-    set(
-        &value,
-        "evaluatedJoinRevision",
-        state.evaluated_join_revision,
-    );
-    set(
-        &value,
-        "desiredCredentialRevision",
-        state.desired_credential_revision,
-    );
-    set(
-        &value,
-        "evaluatedCredentialRevision",
-        state.evaluated_credential_revision,
-    );
-    set(&value, "room", state.room.clone());
-    set(&value, "desiredRoom", state.desired_room.clone());
-    set(&value, "connectionId", state.connection_id.clone());
-    // UBRN simple enums use their zero-based declaration order.
-    set(&value, "status", state.status as u32);
-    if let Some(error) = &state.error {
-        set(&value, "error", error_info_value(error));
-    }
-    value.into()
-}
-
 fn error_info_value(info: &agent_core::ffi::ErrorInfo) -> JsValue {
     let value = Object::new();
     set(&value, "code", info.code as u32);
@@ -3478,301 +2593,6 @@ fn operation_error_value(info: agent_core::ffi::ErrorInfo) -> JsValue {
         &error_info_value(&info),
     );
     error.into()
-}
-
-fn snapshot_value(snapshot: &agent_core::Snapshot) -> JsValue {
-    let value = Object::new();
-    set(&value, "version", snapshot.version);
-    set(&value, "desiredRevision", snapshot.desired_revision);
-    set(&value, "joinRevision", snapshot.join_revision);
-    set(&value, "credentialRevision", snapshot.credential_revision);
-    set(
-        &value,
-        "acceptedCredentialRevision",
-        snapshot.accepted_credential_revision,
-    );
-    if let Some(outcome) = &snapshot.credential_outcome {
-        let item = Object::new();
-        set(&item, "revision", outcome.revision);
-        set(
-            &item,
-            "status",
-            match outcome.status {
-                agent_core::CredentialStatus::Accepted => "accepted",
-                agent_core::CredentialStatus::Rejected => "rejected",
-                agent_core::CredentialStatus::Uncertain => "uncertain",
-            },
-        );
-        if let Some(error) = &outcome.error {
-            set(&item, "error", failure_value(error));
-        }
-        set(&value, "credentialOutcome", item);
-    }
-    set(&value, "desiredRoom", snapshot.desired_room.clone());
-    set(&value, "connection", connection_name(&snapshot.connection));
-    set(
-        &value,
-        "generation",
-        snapshot.generation.map(Generation::get),
-    );
-    set(&value, "participantId", snapshot.participant_id.clone());
-    set(&value, "roomId", snapshot.room_id.clone());
-    set(
-        &value,
-        "authorizationExpiresAt",
-        snapshot.authorization_expires_at,
-    );
-    let participants = Array::new();
-    for participant in snapshot.participants.values() {
-        let item = Object::new();
-        set(&item, "participantId", participant.id.clone());
-        participants.push(&item);
-    }
-    set(&value, "participants", participants.clone());
-    let publications = Array::new();
-    for publication in snapshot.publications.values() {
-        let Some(owner) = snapshot.participants.get(&publication.participant_id) else {
-            continue;
-        };
-        let item = Object::new();
-        set(&item, "id", publication.id.clone());
-        set(&item, "participantId", owner.id.clone());
-        set(&item, "kind", media_kind_name(publication.kind));
-        set(&item, "trackId", publication.track_id.clone());
-        publications.push(&item);
-    }
-    set(&value, "publications", publications.clone());
-    let catalog = Object::new();
-    set(&catalog, "revision", snapshot.catalog_revision);
-    set(&catalog, "participants", participants);
-    set(&catalog, "publications", publications);
-    let tracks = Array::new();
-    for track in snapshot.remote_tracks.values() {
-        let item = Object::new();
-        set(&item, "id", track.id.clone());
-        set(&item, "participantId", track.participant_id.clone());
-        set(&item, "trackId", track.spec.track_id());
-        match &track.spec {
-            agent_core::TrackSpec::Video { .. } => set(&item, "kind", "video"),
-            agent_core::TrackSpec::Audio { .. } => set(&item, "kind", "audio"),
-            agent_core::TrackSpec::Data { delivery, .. } => {
-                set(&item, "kind", "data");
-                set(&item, "delivery", topic_mode_name(*delivery));
-            }
-        }
-        tracks.push(&item);
-    }
-    set(&catalog, "tracks", tracks);
-    set(&value, "catalog", catalog);
-    let mapping = Object::new();
-    set(
-        &mapping,
-        "acceptedIntentRevision",
-        snapshot.accepted_intent_revision,
-    );
-    for (name, entries) in [
-        ("video", &snapshot.video_mapping),
-        ("audio", &snapshot.audio_mapping),
-    ] {
-        let tracks = Array::new();
-        for (&receiver_index, publication_id) in entries {
-            let item = Object::new();
-            set(&item, "receiverIndex", receiver_index);
-            set(&item, "publicationId", publication_id.clone());
-            tracks.push(&item);
-        }
-        set(&mapping, name, tracks);
-    }
-    set(&value, "mapping", mapping);
-    set(&value, "topics", topic_snapshot_value(&snapshot.topics));
-    set(
-        &value,
-        "failure",
-        snapshot.terminal_failure.as_ref().map(failure_value),
-    );
-    value.into()
-}
-
-fn topic_snapshot_value(snapshot: &agent_core::TopicSnapshot) -> JsValue {
-    let value = Object::new();
-    let publishers = Array::new();
-    for status in &snapshot.publishers {
-        let item = Object::new();
-        set(&item, "name", status.registration.topic.clone());
-        set(&item, "mode", topic_mode_name(status.registration.mode));
-        set(&item, "connected", status.channel.is_some());
-        set(&item, "publicationId", status.publication_id.clone());
-        set(&item, "nextSequence", BigInt::from(status.next_sequence));
-        set(&item, "acceptedHistory", status.accepted_history);
-        set(&item, "queued", status.queued_messages);
-        set(&item, "sendPending", status.send_pending);
-        publishers.push(&item);
-    }
-    set(&value, "publishers", publishers);
-    let subscribers = Array::new();
-    for status in &snapshot.subscribers {
-        let item = Object::new();
-        set(&item, "name", status.registration.topic.clone());
-        set(&item, "mode", topic_mode_name(status.registration.mode));
-        set(&item, "connected", status.channel.is_some());
-        set(&item, "publishers", status.publishers);
-        set(&item, "buffered", status.buffered_messages);
-        subscribers.push(&item);
-    }
-    set(&value, "subscribers", subscribers);
-    set(&value, "acceptedSends", snapshot.accepted_sends);
-    set(&value, "droppedSends", snapshot.dropped_sends);
-    set(&value, "deliveredMessages", snapshot.delivered_messages);
-    set(&value, "channelFailures", snapshot.channel_failures);
-    value.into()
-}
-
-fn failure_value(failure: &agent_core::Failure) -> JsValue {
-    let value = Object::new();
-    set(&value, "class", failure_class_name(failure.class));
-    set(&value, "message", failure.message.clone());
-    value.into()
-}
-
-fn notification_value(notification: &Notification) -> JsValue {
-    let value = Object::new();
-    match notification {
-        Notification::DataReady { owners } => return resources::ready(owners).into(),
-        Notification::Topic(TopicNotification::Message(message)) => {
-            set(&value, "type", "topic-message");
-            set(&value, "mode", topic_mode_name(message.mode));
-            set(&value, "topic", &message.topic);
-            set(&value, "participantId", &message.participant_id);
-            set(&value, "publicationId", &message.publication_id);
-            set(&value, "sequence", BigInt::from(message.sequence));
-            set(
-                &value,
-                "payload",
-                Uint8Array::from(message.payload.as_slice()),
-            );
-        }
-        Notification::Topic(TopicNotification::RecoveryGap {
-            subscriber,
-            publication_id,
-            participant_id,
-            expected_sequence,
-            available_sequence,
-        }) => {
-            set(&value, "type", "topic-recovery-gap");
-            set(&value, "topic", &subscriber.topic);
-            set(&value, "participantId", participant_id);
-            set(&value, "publicationId", publication_id);
-            set(&value, "expectedSequence", BigInt::from(*expected_sequence));
-            set(
-                &value,
-                "availableSequence",
-                BigInt::from(*available_sequence),
-            );
-        }
-        Notification::Topic(TopicNotification::SendAdmitted {
-            publisher,
-            operation,
-            publication_id,
-            sequence,
-        }) => {
-            set(&value, "type", "topic-send-admitted");
-            set(&value, "topic", &publisher.topic);
-            set(&value, "mode", topic_mode_name(publisher.mode));
-            set(&value, "operation", operation.get());
-            set(&value, "publicationId", publication_id);
-            set(&value, "sequence", BigInt::from(*sequence));
-        }
-        Notification::Topic(TopicNotification::SendDropped { publisher, reason }) => {
-            set(&value, "type", "topic-send-dropped");
-            set(&value, "topic", publisher.topic.clone());
-            set(&value, "mode", topic_mode_name(publisher.mode));
-            set(&value, "reason", topic_drop_reason_name(*reason));
-        }
-        Notification::Topic(TopicNotification::ChannelFailed { channel, message }) => {
-            set(&value, "type", "topic-channel-failed");
-            match channel {
-                TopicChannel::Publisher(publisher) => {
-                    set(&value, "direction", "publish");
-                    set(&value, "topic", publisher.topic.clone());
-                    set(&value, "mode", topic_mode_name(publisher.mode));
-                }
-                TopicChannel::Subscriber(subscriber) => {
-                    set(&value, "direction", "subscribe");
-                    set(&value, "topic", subscriber.topic.clone());
-                    set(&value, "mode", topic_mode_name(subscriber.mode));
-                }
-            }
-            set(&value, "message", message.clone());
-        }
-        Notification::Failure(failure) => {
-            set(&value, "type", "failure");
-            set(&value, "message", &failure.message);
-            set(&value, "class", failure_class_name(failure.class));
-        }
-        _ => {
-            set(&value, "type", "state-change");
-        }
-    }
-    value.into()
-}
-
-fn connection_name(state: &ConnectionState) -> String {
-    match state {
-        ConnectionState::Disconnected => "disconnected".into(),
-        ConnectionState::CreatingOffer => "creating-offer".into(),
-        ConnectionState::Joining => "joining".into(),
-        ConnectionState::ApplyingAnswer => "applying-answer".into(),
-        ConnectionState::WaitingForTransport => "waiting-for-transport".into(),
-        ConnectionState::WaitingForSignaling => "waiting-for-signaling".into(),
-        ConnectionState::Connected => "connected".into(),
-        ConnectionState::Reconnecting => "reconnecting".into(),
-        ConnectionState::RetryWaiting { attempt, .. } => format!("retry-waiting:{attempt}"),
-        ConnectionState::Closing => "closing".into(),
-        ConnectionState::TerminalFailure => "terminal-failure".into(),
-    }
-}
-
-fn topic_mode_name(mode: TopicMode) -> &'static str {
-    match mode {
-        TopicMode::Latest => "latest",
-        TopicMode::Lossy => "lossy",
-        TopicMode::Ordered => "ordered",
-    }
-}
-
-fn failure_class_name(class: FailureClass) -> &'static str {
-    match class {
-        FailureClass::InvalidConfiguration => "invalid-configuration",
-        FailureClass::Authorization => "authorization",
-        FailureClass::ParticipantSuperseded => "participant-superseded",
-        FailureClass::Protocol => "protocol",
-        FailureClass::Transient => "transient",
-        FailureClass::ResourceExpired => "resource-expired",
-        FailureClass::RetryExhausted => "retry-exhausted",
-    }
-}
-
-fn topic_drop_reason_name(reason: TopicDropReason) -> &'static str {
-    match reason {
-        TopicDropReason::InvalidPayload => "invalid-payload",
-        TopicDropReason::NotRegistered => "not-registered",
-        TopicDropReason::ChannelUnavailable => "channel-unavailable",
-        TopicDropReason::QueueFull => "queue-full",
-        TopicDropReason::Superseded => "superseded",
-        TopicDropReason::HostRejected => "host-rejected",
-        TopicDropReason::ChannelClosed => "channel-closed",
-        TopicDropReason::TransportReplaced => "transport-replaced",
-        TopicDropReason::SequenceExhausted => "sequence-exhausted",
-    }
-}
-
-fn call_listener(listener: &Function, value: &JsValue, kind: &str) {
-    if let Err(error) = listener.call1(&JsValue::UNDEFINED, value) {
-        web_sys::console::error_2(
-            &JsValue::from_str(&format!("browser {kind} listener threw")),
-            &error,
-        );
-    }
 }
 
 fn set(object: &Object, name: &str, value: impl Into<JsValue>) {

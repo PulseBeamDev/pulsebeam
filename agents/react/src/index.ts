@@ -1,61 +1,59 @@
-import { useEffect, useRef, useState } from "react";
-import { Agent, type AgentConfig } from "@pulsebeam/web";
+import { useEffect, useMemo, useRef } from "react";
+import { Agent, LogLevel, type AgentConfig } from "@pulsebeam/web";
 import { sessionKey } from "./session-key.js";
-import { useObservation } from "./observation.js";
+import { useResource } from "./resource.js";
 
 export { usePublish, useSubscribe, useWatch } from "./hooks.js";
-export { WatchStatus, CatalogDelivery, DataDelivery } from "@pulsebeam/web";
+export {
+  AgentStatus,
+  WatchStatus,
+  CatalogDelivery,
+  DataDelivery,
+  DataEvent,
+  ErrorCode,
+  LogLevel,
+  PlayoutDelay,
+} from "@pulsebeam/web";
 export type {
   Agent,
   AgentConfig,
   AgentState,
   AgentUpdates,
-  AudioDemand,
   AgentError,
-  AgentLogging,
-  ConnectionState,
-  DataEvent,
-  DataDiscontinuity,
-  DataPublishOptions,
-  DataSubscribeOptions,
-  DataMessage,
-  DataUpdate,
-  Delivery,
-  FailureClass,
-  LogLevel,
-  PlaybackFailure,
-  ReceiveOptions,
   ErrorInfo,
-  LocalAudioTrack,
-  LocalVideoTrack,
-  LocalDataTrack,
-  RemoteAudioTrack,
-  RemoteDataTrack,
-  RemoteParticipant,
-  RoomRef,
-  Watch,
-  WatchConfig,
-  WatchState,
-  WatchUpdates,
-  CatalogPage,
-  CatalogParticipantInfo,
+  AudioSubscriptionConfig,
   CatalogPublicationInfo,
   CatalogPublicationKind,
-  RemoteVideoTrack,
-  AudioPublication,
-  VideoPublication,
-  DataPublication,
-  AudioSubscription,
-  VideoSubscription,
-  DataSubscription,
+  DataPublishOptions,
+  DataSendOptions,
+  DataSubscribeOptions,
   PublicationConfig,
-  VideoObservation,
-  AudioSubscriptionConfig,
   PublicationState,
+  TrackSelector,
+  VideoObservation,
   VideoSubscriptionState,
   AudioSubscriptionState,
   DataPublicationState,
   DataSubscriptionState,
+  LocalAudioTrack,
+  LocalVideoTrack,
+  LocalDataTrack,
+  RemoteAudioTrack,
+  RemoteVideoTrack,
+  RemoteDataTrack,
+  Participant as RemoteParticipant,
+  RoomRef,
+  Catalog,
+  CatalogUpdates,
+  CatalogParticipant,
+  WatchConfig,
+  WatchState,
+  VideoPublication,
+  AudioPublication,
+  DataPublication,
+  VideoSubscription,
+  AudioSubscription,
+  DataSubscription,
   PublicationUpdates,
   VideoSubscriptionUpdates,
   AudioSubscriptionUpdates,
@@ -84,66 +82,31 @@ export type {
 /** React owns activation and release. Key the component for a different logical participant. */
 export function useAgent(config: AgentConfig): Agent | null {
   const key = sessionKey(config);
-  const [owned, setOwned] = useState<{
-    key: string;
-    lifetime: number;
-    agent: Agent;
-  } | null>(null);
-  const [failure, setFailure] = useState<{
-    key: string;
-    lifetime: number;
-    error: unknown;
-  } | null>(null);
-  const generation = useRef(0);
-  const cleanup = useRef<Promise<void>>(Promise.resolve());
-  const current =
-    owned?.key === key && owned.lifetime === generation.current ? owned : null;
+  const target = useMemo(() => ({ key }), [key]);
+  const applied = useRef(new WeakMap<Agent, string>());
+  const owner = useResource(target, () => {
+    const agent = new Agent(config);
+    applied.current.set(agent, config.token);
+    return agent;
+  });
+  const agent = owner.value;
 
   useEffect(() => {
-    const lifetime = ++generation.current;
-    let active = true;
-    let agent: Agent | undefined;
-    const reportCleanup = (error: unknown) => {
-      console.error("PulseBeam Agent cleanup failed", error);
-    };
-    void (async () => {
-      await cleanup.current;
-      if (!active || generation.current !== lifetime) return;
-      try {
-        agent = new Agent(config);
-        setOwned({ key, lifetime, agent });
-      } catch (error) {
-        if (active && generation.current === lifetime)
-          setFailure({ key, lifetime, error });
-      }
-    })();
-    return () => {
-      active = false;
-      if (generation.current === lifetime) ++generation.current;
-      if (agent) {
-        const closing = agent.close();
-        agent = undefined;
-        cleanup.current = Promise.all([cleanup.current, closing])
-          .then(() => {})
-          .catch(reportCleanup);
-      }
-    };
-  }, [key]);
-
-  useEffect(() => {
-    if (!current) return;
+    if (!agent || applied.current.get(agent) === config.token) return;
     try {
-      current.agent.renew(config.token);
+      agent.renew(config.token);
+      applied.current.set(agent, config.token);
     } catch (error) {
-      setFailure({ key, lifetime: generation.current, error });
+      owner.fail(error);
     }
-  }, [current?.agent, config.token, key]);
+  }, [agent, config.token]);
   useEffect(() => {
-    current?.agent.setLogging(config.logging?.level ?? "warn");
-  }, [current?.agent, config.logging?.level]);
+    try {
+      agent?.setLogging(config.logLevel ?? LogLevel.Warn);
+    } catch (error) {
+      owner.fail(error);
+    }
+  }, [agent, config.logLevel]);
 
-  useObservation(current?.agent ?? null);
-  if (failure?.key === key && failure.lifetime === generation.current)
-    throw failure.error;
-  return current?.agent ?? null;
+  return agent;
 }

@@ -46,16 +46,16 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
     assert reader.state().room is None and reader.state().desired_room is None
     try:
         initial = await watch_updates.next()
-        assert initial.status == core.WatchStatus.LOADING and initial.page is None
+        assert initial.status == core.WatchStatus.LOADING and initial.participants is None
 
         async def catalog_page(predicate):
             async def matching_page():
                 while True:
                     state = await watch_updates.next()
                     assert state is not None and state.error is None, state
-                    if state.page is not None and predicate(state.page.participants()):
+                    if state.participants is not None and predicate(state.participants):
                         assert state.status == core.WatchStatus.LIVE
-                        return state.page
+                        return state
             return await asyncio.wait_for(matching_page(), timeout=5)
 
         catalog_agent.join(room)
@@ -68,9 +68,9 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
             participant.id() == "foreign-catalog" and not participant.tracks()
             for participant in participants
         ))
-        assert not first_page.has_more() and not first_page.next_cursor()
-        assert all(participant.id() != "foreign" for participant in first_page.participants())
-        publisher_entry = next(entry for entry in first_page.participants() if entry.id() == "publisher")
+        assert not first_page.has_more and not first_page.next_cursor
+        assert all(participant.id() != "foreign" for participant in first_page.participants)
+        publisher_entry = next(entry for entry in first_page.participants if entry.id() == "publisher")
 
         async def settled_page(view):
             updates = view.updates()
@@ -82,26 +82,26 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
                         return state
             finally:
                 updates.close()
-                view.close()
+                await view.close()
 
         catalog_room = catalog_agent.room(room)
         head = await asyncio.wait_for(settled_page(catalog_room.watch(core.WatchConfig(
             limit=1, cursor=b"",
         ))), timeout=5)
-        assert head.status == core.WatchStatus.LIVE and head.page.has_more()
-        assert len(head.page.participants()) == 1
-        cursor = bytes(head.page.next_cursor())
-        assert cursor and head.page.cursor_expires_at_unix_seconds() > 0
+        assert head.status == core.WatchStatus.LIVE and head.has_more
+        assert len(head.participants) == 1
+        cursor = bytes(head.next_cursor)
+        assert cursor and head.cursor_expires_at_unix_seconds > 0
         tail, wrong_scope = await asyncio.wait_for(asyncio.gather(
             settled_page(catalog_room.watch(core.WatchConfig(limit=1, cursor=cursor))),
             settled_page(catalog_room.watch(core.WatchConfig(limit=2, cursor=cursor))),
         ), timeout=5)
-        assert tail.status == core.WatchStatus.LIVE and len(tail.page.participants()) == 1
-        assert not tail.page.has_more() and not tail.page.next_cursor()
-        assert {head.page.participants()[0].id(), tail.page.participants()[0].id()} == {
+        assert tail.status == core.WatchStatus.LIVE and len(tail.participants) == 1
+        assert not tail.has_more and not tail.next_cursor
+        assert {head.participants[0].id(), tail.participants[0].id()} == {
             "foreign-catalog", "publisher",
         }
-        assert wrong_scope.status == core.WatchStatus.FAILED and wrong_scope.page is None
+        assert wrong_scope.status == core.WatchStatus.FAILED and wrong_scope.participants is None
         assert wrong_scope.error.code == core.ErrorCode.INVALID_ARGUMENT
 
         async def joined(owner):
@@ -137,11 +137,11 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
             {publication.track_id for publication in participant.tracks()} == {"foreign-camera", "foreign-bytes"}
             for participant in participants
         ))
-        assert changed_page.revision() > first_page.revision()
-        assert all(participant.id() != "foreign" for participant in first_page.participants())
-        watch.close()
+        assert changed_page.observation_revision > first_page.observation_revision
+        assert all(participant.id() != "foreign" for participant in first_page.participants)
+        await watch.close()
         final_watch = await watch_updates.next()
-        assert final_watch.status == core.WatchStatus.CLOSED and final_watch.page is None
+        assert final_watch.status == core.WatchStatus.CLOSED and final_watch.participants is None
         assert await watch_updates.next() is None
         watch_updates.close()
         address = publisher_entry.video("production-camera").subscribe()
@@ -278,7 +278,7 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         assert agent.statistics() is None, "foreign native graph not retired"
         print("installed Python synchronous Agent/dynamic RTC/real SFU/live catalog/owned binary data/independent source/named media close PASS")
     finally:
-        watch.close()
+        await watch.close()
         watch_updates.close()
         await asyncio.wait_for(asyncio.gather(agent.close(), reader.close(), catalog_agent.close()), timeout=3)
 

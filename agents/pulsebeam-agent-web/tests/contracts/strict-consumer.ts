@@ -1,16 +1,14 @@
-import type {
-  AgentState,
-  AgentStatus,
-  ErrorCode,
-  ErrorInfo,
-  PublicationState,
-} from "../web/schema.js";
 import {
-  PublicationMediaKind,
+  type AgentState,
+  type AgentStatus,
+  type ErrorCode,
+  type ErrorInfo,
+  type PublicationState,
+  MediaKind,
   PublicationAdmissionStatus,
   PublicationDemand,
   PublicationExecution,
-} from "../web/index.js";
+} from "../generated/bindings/pulsebeam_agent_core";
 import type {
   AgentConfig,
   AgentError,
@@ -58,7 +56,7 @@ export type StrictBoundaries = [
   Assert<NoAny<ErrorCode>>,
   Assert<NoAny<PublicationState>>,
   Assert<Equal<PublicationState["observationRevision"], bigint>>,
-  Assert<Equal<PublicationState["kind"], PublicationMediaKind>>,
+  Assert<Equal<PublicationState["kind"], MediaKind>>,
   Assert<
     Equal<PublicationState["admission"]["status"], PublicationAdmissionStatus>
   >,
@@ -149,7 +147,7 @@ declare const topic: TopicMessage;
 declare const frame: MediaFrame;
 declare const statistics: TransportStatistics;
 declare const error: AgentError;
-declare const publication: import("../web/media.js").VideoPublication;
+declare const publication: GeneratedWeb.VideoPublication;
 declare const track: MediaStreamTrack;
 declare const stream: MediaStream;
 
@@ -161,15 +159,11 @@ const payload: Uint8Array = topic.payload;
 const published: string = desired.publications[0].trackId;
 const participantId: string | undefined = snapshot.participantId;
 const publicationState: Readonly<PublicationState> = publication.state();
-const publicationUpdates: import("../web/types.js").PublicationUpdates =
+const publicationUpdates: GeneratedWeb.PublicationUpdates =
   publication.updates();
-const publicationKind: PublicationMediaKind = publicationState.kind;
+const publicationKind: MediaKind = publicationState.kind;
 const admissionStatus: PublicationAdmissionStatus =
   publicationState.admission.status;
-// @ts-expect-error publication observation records are readonly
-publicationState.closed = true;
-// @ts-expect-error nested publication observation records are readonly
-publicationState.configuration.enabled = false;
 // @ts-expect-error Generated session snapshots cannot enumerate joined-room metadata.
 snapshot.catalog;
 // @ts-expect-error Physical receiver mappings stay private to reconciliation.

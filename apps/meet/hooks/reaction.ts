@@ -3,7 +3,7 @@ import {
   DataDelivery,
   usePublish,
   type Agent,
-  type DataEvent,
+  DataEvent,
 } from "@pulsebeam/react";
 import { decodeText, encodeText } from "@/lib/data-codec";
 
@@ -24,10 +24,13 @@ export function useReaction(agent: Agent) {
     Reactions,
     reactions,
     onEvent(event: DataEvent) {
-      if (event.type !== "message") return;
-      const emoji = decodeText(event.data);
+      if (!DataEvent.Message.instanceOf(event)) return;
+      const emoji = decodeText(event.inner.data);
       if (emoji !== null && reactionEmojis.includes(emoji)) {
-        add({ key: `${event.publicationId}:${event.sequence}`, emoji });
+        add({
+          key: `${event.inner.publicationId}:${event.inner.sequence}`,
+          emoji,
+        });
       }
     },
     dismiss(key: string) {
@@ -35,7 +38,7 @@ export function useReaction(agent: Agent) {
     },
     send(emoji: string) {
       if (
-        !agent.participantId ||
+        !agent.state().participantId ||
         !publication ||
         !reactionEmojis.includes(emoji)
       )

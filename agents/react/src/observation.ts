@@ -1,4 +1,5 @@
 import { useMemo, useSyncExternalStore } from "react";
+import { useCommittedRef } from "./committed-ref.js";
 
 export interface ObservableHandle {
   state(): object;
@@ -8,17 +9,23 @@ export interface ObservableHandle {
   };
 }
 
-export function useObservation(handle: ObservableHandle | null): void {
-  const store = useMemo(() => {
-    let failure: { error: unknown } | undefined;
-    return {
-      snapshot: () => {
-        if (failure) throw failure.error;
-        return handle?.state() ?? null;
-      },
+export function useObservation(
+  handle: ObservableHandle | null,
+  onFailure: (handle: ObservableHandle, error: unknown) => void,
+): void {
+  const failure = useCommittedRef(onFailure);
+  const store = useMemo(
+    () => ({
+      snapshot: () => handle?.state() ?? null,
       subscribe: (changed: () => void) => {
         if (!handle) return () => {};
-        const cursor = handle.updates();
+        let cursor: ReturnType<ObservableHandle["updates"]>;
+        try {
+          cursor = handle.updates();
+        } catch (error) {
+          failure.current(handle, error);
+          return () => {};
+        }
         let active = true;
         void (async () => {
           while (active) {
@@ -27,16 +34,19 @@ export function useObservation(handle: ObservableHandle | null): void {
             changed();
           }
         })().catch((error: unknown) => {
-          if (!active) return;
-          failure = { error };
-          changed();
+          if (active) failure.current(handle, error);
         });
         return () => {
           active = false;
-          cursor.close();
+          try {
+            cursor.close();
+          } catch (error) {
+            console.error("PulseBeam observation cleanup failed", error);
+          }
         };
       },
-    };
-  }, [handle]);
+    }),
+    [handle, failure],
+  );
   useSyncExternalStore(store.subscribe, store.snapshot, store.snapshot);
 }

@@ -27,9 +27,9 @@ export function Data({ track, options, onEvent, onError }: DataProps): null {
     void (async () => {
       try {
         while (active) {
-          const next = await receiver.next();
-          if (!active || next.type === "closed") break;
-          await callbacks.current.onEvent(next.event);
+          const event = await receiver.next();
+          if (!active || event === undefined) break;
+          await callbacks.current.onEvent(event);
         }
       } catch (error) {
         if (!active) return;

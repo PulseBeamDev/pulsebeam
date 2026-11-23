@@ -1,362 +1,123 @@
 import {
-  AudioSource,
-  VideoSource,
   Agent,
-  attachRemoteAudio,
-  ResourceOwnershipError,
   AgentStatus,
-  ErrorCode,
-  OperationError,
+  Catalog,
+  DataDelivery,
+  DataEvent,
+  PlayoutDelay,
+  VideoSource,
   WatchStatus,
-  type Watch,
-  type WatchConfig,
-  type WatchState,
-  type WatchUpdates,
-  type CatalogPage,
-  type CatalogParticipantInfo,
-  type CatalogPublicationInfo,
-  type CatalogPublicationKind,
-  type AgentState,
-  type SupportReport,
-  type AgentUpdates,
-  type VideoSubscriptionState,
-  type AudioSubscriptionState,
-  type VideoSubscriptionUpdates,
-  type AudioSubscriptionUpdates,
-  type ErrorInfo,
-  type AgentError,
-  type DataEvent,
-  type DataUpdate,
-  type DataPublication,
-  type DataSubscription,
-  type DataPublicationState,
-  type DataSubscriptionState,
-  type DataPublicationUpdates,
-  type DataSubscriptionUpdates,
-  type RemoteAudioTrack,
-  type RemoteVideoTrack,
-} from "../../web/index.js";
+  type AgentConfig,
+  type DataSendOptions,
+  type VideoObservation,
+} from "@pulsebeam/web";
 
-// @ts-expect-error Managed activation is an internal React lifecycle.
-import { createManagedAgent } from "../../web/index.js";
-// @ts-expect-error There is one public constructor spelling.
-import { createWebAgent } from "../../web/index.js";
-// @ts-expect-error Descriptors are not a parallel public lookup path.
-import { track } from "../../web/index.js";
-// @ts-expect-error Desired-state mutation is not a normal public API.
-import type { DesiredState } from "../../web/index.js";
-// @ts-expect-error Joined/global catalog snapshots are private reconciliation data.
-import type { CatalogSnapshot } from "../../web/index.js";
-// @ts-expect-error Flat catalog tracks are not a second discovery API.
-import type { CatalogTrack } from "../../web/index.js";
-// @ts-expect-error JSON topic registration is not required for binary data.
-import type { Topic } from "../../web/index.js";
-
-const agent = new Agent({
-  endpoint: "https://pulsebeam.example",
+const config: AgentConfig = {
+  endpoint: "https://media.example",
   token: "opaque",
-});
-agent.join("explicit-room");
-// @ts-expect-error Agent does not leave while retaining its session.
-agent.leaveRoom();
-const watchConfig: WatchConfig = { limit: 7, cursor: Uint8Array.of(1) };
-const watch: Watch = agent.room("pinned-room").watch(watchConfig);
-const watchState: WatchState = watch.state();
-const watchStatus: WatchStatus = watchState.status;
-const watchUpdates: WatchUpdates = watch.updates();
-const watchNext: Promise<WatchState | undefined> = watchUpdates.next();
-const watchTyped: NoAny<ReturnType<typeof watch.state>> = true;
-// @ts-expect-error The watch has immutable room scope.
-watchState.room = "changed";
-// @ts-expect-error Cursor bytes are immutable, not a shared mutable buffer.
-watchState.cursor.push(5);
-if (watchState.page) {
-  const page: CatalogPage = watchState.page;
-  const participant: CatalogParticipantInfo | undefined = page.participants[0];
-  const publication: CatalogPublicationInfo | undefined =
-    participant?.tracks[0];
-  const kind: CatalogPublicationKind | undefined = publication?.kind;
-  // @ts-expect-error A retained page cannot mutate its participants.
-  page.participants.push(participant!);
-  // @ts-expect-error Participant publications are immutable too.
-  participant?.tracks.push(publication!);
-  if (publication?.kind.tag === "Data") {
-    // @ts-expect-error Nested generated payload enum fields are immutable.
-    publication.kind.inner.delivery = 0;
-  }
-  void kind;
-}
-watchUpdates.close();
-const watchClosed: Promise<void> = watch.close();
-void [watchStatus, watchNext, watchTyped, watchClosed];
-const currentState: AgentState = agent.state();
-const support: Readonly<SupportReport> = agent.supportReport();
-void support;
-const stateCursor: AgentUpdates = agent.updates();
-const nextState: Promise<AgentState | undefined> = stateCursor.next();
-const stateRevision: bigint = currentState.observationRevision;
-const desiredJoinRevision: bigint = currentState.desiredJoinRevision;
-const observedRoom: string | undefined = currentState.room;
-const status: AgentStatus = currentState.status;
-const operation = new OperationError({
-  code: ErrorCode.Conflict,
-  message: "Pending observation read",
-});
-const info: ErrorInfo = operation.info;
-type NoAny<T> = 0 extends 1 & T ? false : true;
-const stateTyped: NoAny<ReturnType<typeof agent.state>> = true;
-const updateTyped: NoAny<Awaited<ReturnType<AgentUpdates["next"]>>> = true;
-// @ts-expect-error State views are immutable generated values.
-currentState.desiredRoom = "overwrite";
-if (currentState.error) {
-  // @ts-expect-error Nested error information is immutable too.
-  currentState.error.message = "overwrite";
-}
-// @ts-expect-error Concrete cursors do not expose the foreign backend.
-stateCursor.cursor;
-stateCursor.close();
-void [
-  nextState,
-  stateRevision,
-  desiredJoinRevision,
-  observedRoom,
-  status,
-  info,
-  stateTyped,
-  updateTyped,
-];
-const renewed: void = agent.renew("opaque-renewed");
-void renewed;
-// @ts-expect-error Only join requests admission.
-agent.connect();
-// @ts-expect-error Close is the explicit session shutdown operation.
-agent.disconnect();
-// @ts-expect-error Credential replacement is synchronous renew().
-agent.renewAuthorization("renewed");
-agent.setLogging("info");
-const snapshot: AgentState = agent.state();
-// @ts-expect-error Metadata discovery requires an owned bounded Watch.
-snapshot.catalog;
-// @ts-expect-error Physical transport mappings are private to the runtime.
-snapshot.mapping;
-// @ts-expect-error Physical media is observed through a subscription owner.
-snapshot.tracks;
-// @ts-expect-error Agent-wide participant enumeration has no owned scope.
-agent.participants;
-// @ts-expect-error There is no global media discovery facade.
-agent.remote;
-const joinRevision: bigint = snapshot.desiredJoinRevision;
-const desiredRoom: string | undefined = snapshot.desiredRoom;
-const error: AgentError | null = agent.error;
-void [snapshot, error, joinRevision, desiredRoom];
-// @ts-expect-error Agent observation uses state().
-agent.snapshot();
-// @ts-expect-error Agent observation uses updates().
-agent.snapshots();
-// @ts-expect-error Agent does not expose an event history.
-agent.events();
-// @ts-expect-error Observation is an owned cursor, not a callback alias.
-agent.subscribe(() => {});
-// @ts-expect-error Current snapshot has one common spelling.
-agent.getSnapshot();
-// @ts-expect-error Agent-wide participant lookup is not room-pinned.
-agent.participant("alice");
+};
+const agent = new Agent(config);
+const joined: AgentStatus = agent.state().status;
+const observationRevision: bigint = agent.state().observationRevision;
+const admittedParticipant: string | undefined = agent.state().participantId;
+agent.join("demo");
+agent.renew("renewed");
 
-// @ts-expect-error Delivery belongs on the publication or subscription.
-agent.data("chat", "ordered");
-const binary = agent.data("chat");
-// @ts-expect-error Sending requires an owned publication.
-binary.send(new Uint8Array([0, 255]));
-// @ts-expect-error Reception requires a pinned remote subscription.
-binary.receive();
-const participant = agent.room("meeting").participant("alice");
-// @ts-expect-error A pinned reference is not an unbounded publication listing.
-participant.tracks;
-// @ts-expect-error Logical references do not expose their reconciliation host.
-participant.catalog;
-const participantId: string = participant.id();
-const remoteBinary = participant.data("chat");
-const dataPublication: DataPublication = binary.publish();
-const dataSubscription: DataSubscription = remoteBinary.subscribe();
-const dataPublicationState: DataPublicationState = dataPublication.state();
-const dataSubscriptionState: DataSubscriptionState = dataSubscription.state();
-const dataPublicationUpdates: DataPublicationUpdates =
-  dataPublication.updates();
-const dataSubscriptionUpdates: DataSubscriptionUpdates =
-  dataSubscription.updates();
-const nextPublicationState: Promise<DataPublicationState | undefined> =
-  dataPublicationUpdates.next();
-const nextSubscriptionState: Promise<DataSubscriptionState | undefined> =
-  dataSubscriptionUpdates.next();
-const dataSend: Promise<void> = dataPublication.send(new Uint8Array([0, 255]));
-const subscriptionNext: Promise<DataUpdate> = dataSubscription.next();
-const publicationTyped: NoAny<ReturnType<typeof binary.publish>> = true;
-const subscriptionTyped: NoAny<ReturnType<typeof remoteBinary.subscribe>> =
-  true;
-const dataNextTyped: NoAny<Awaited<ReturnType<typeof dataSubscription.next>>> =
-  true;
-const publicationStateTyped: NoAny<ReturnType<typeof dataPublication.state>> =
-  true;
-const subscriptionStateTyped: NoAny<ReturnType<typeof dataSubscription.state>> =
-  true;
-// @ts-expect-error Owned declarations are synchronous.
-const deferredDataPublication: Promise<unknown> = dataPublication;
-// @ts-expect-error Owned subscriptions are synchronous.
-const deferredDataSubscription: Promise<unknown> = dataSubscription;
-// @ts-expect-error Payloads remain binary.
-dataPublication.send("text");
-// @ts-expect-error Core selectors are readonly.
-dataSubscriptionState.selector.trackId = "other";
-dataPublicationUpdates.close();
-dataSubscriptionUpdates.close();
-await dataPublication.close();
-await dataSubscription.close();
-void [
-  dataPublicationState,
-  nextPublicationState,
-  nextSubscriptionState,
-  dataSend,
-  subscriptionNext,
-  publicationTyped,
-  subscriptionTyped,
-  dataNextTyped,
-  publicationStateTyped,
-  subscriptionStateTyped,
-  deferredDataPublication,
-  deferredDataSubscription,
-];
-// @ts-expect-error Reception is created synchronously with subscribe.
-remoteBinary.receive();
-const remoteReceiver = remoteBinary.subscribe();
-const next: Promise<DataUpdate> = remoteReceiver.next();
-await remoteReceiver.close();
-void [next, participantId];
-// @ts-expect-error Binary payloads do not have an implicit string codec.
-dataPublication.send("text");
-// @ts-expect-error Remote data handles are receive-only.
-remoteBinary.send(new Uint8Array());
-// @ts-expect-error Explicit next/close cursors replace automatic iterators.
-binary.events();
-declare const orderedEvent: DataEvent;
-if (orderedEvent.type === "message") {
-  const sequence: bigint = orderedEvent.sequence;
-  const payload: Uint8Array = orderedEvent.data;
-  void [sequence, payload];
-} else {
-  const previous: string = orderedEvent.previousPublicationId;
-  void previous;
-}
-
-declare const videoMediaTrack: MediaStreamTrack;
-declare const audioMediaTrack: MediaStreamTrack;
-const videoSource = VideoSource.fromTrack(videoMediaTrack);
-const audioSource = AudioSource.fromTrack(audioMediaTrack);
-const localVideo = agent.video("camera");
-const localAudio = agent.audio("microphone");
-const videoOwner = localVideo.publish({ enabled: false });
-const audioOwner = localAudio.publish();
-const videoPipe = videoSource.pipeTo(videoOwner);
-const audioPipe = audioSource.pipeTo(audioOwner);
-// @ts-expect-error Publication intent is not a Promise.
-const deferredPublication: Promise<unknown> = videoOwner;
-// @ts-expect-error Input attachment is not a Promise.
-const deferredPipe: Promise<unknown> = videoPipe;
-void [deferredPublication, deferredPipe];
-videoOwner.configure({ enabled: true });
-await videoOwner.configureSender({ contentHint: "text" });
-await audioOwner.configureSender({ contentHint: "music" });
-await videoPipe.close();
-await audioPipe.close();
-// @ts-expect-error Pipe requires the matching concrete publication kind.
-audioSource.pipeTo(videoOwner);
-// @ts-expect-error Publication does not accept an implicit source.
-localAudio.publish(audioSource);
-// @ts-expect-error Input lifetime belongs to a separate Pipe.
-videoOwner.setSource(null);
-// @ts-expect-error Video sender configuration rejects audio content hints.
-videoOwner.configureSender({ contentHint: "speech" });
-const ownershipError: Error = new ResourceOwnershipError("already owned");
-void ownershipError;
-
-const remoteVideo: RemoteVideoTrack = participant.video("camera");
-const remoteAudio: RemoteAudioTrack = participant.audio("microphone");
-const subscription = remoteVideo.subscribe({
+const room = agent.room("demo");
+const watch: Catalog = room.watch({ limit: 10, cursor: new Uint8Array() });
+const page = watch.state();
+const participant = page.participants?.[0];
+const participants =
+  watch.state().status === WatchStatus.Live ? page.participants : undefined;
+const recipient = participant?.dataRecipientId();
+const cursor: Uint8Array | undefined = page.nextCursor;
+const local = agent.video("camera");
+declare const media: MediaStreamTrack;
+const source = VideoSource.fromTrack(media);
+const publication = local.publish({ enabled: true });
+const input = source.pipeTo(publication);
+publication.configure({ enabled: false });
+const remote = room.participant("peer");
+const videoOptions: VideoObservation = {
   visible: true,
-  height: 720,
-  minHeight: 360,
+  height: 360,
+  minHeight: 0,
   minFps: 15,
-  priority: 1,
-  playoutDelay: { mode: "fixed", minMs: 0, maxMs: 100 },
-});
-const videoState: VideoSubscriptionState = subscription.state();
-const videoUpdates: VideoSubscriptionUpdates = subscription.updates();
-const nextVideoState: Promise<VideoSubscriptionState | undefined> =
-  videoUpdates.next();
-const videoStateTyped: NoAny<ReturnType<typeof subscription.state>> = true;
-const videoUpdateTyped: NoAny<
-  Awaited<ReturnType<VideoSubscriptionUpdates["next"]>>
-> = true;
-// @ts-expect-error Core selector values are readonly.
-videoState.selector.trackId = "other";
-// @ts-expect-error The concrete cursor does not expose the foreign backend.
-videoUpdates.cursor;
-videoUpdates.close();
-void [videoState, nextVideoState, videoStateTyped, videoUpdateTyped];
-// @ts-expect-error Local subscription intent is not a Promise.
-const deferredSubscription: Promise<unknown> = subscription;
-void deferredSubscription;
-const observation = await subscription.observe();
-const observedTrack: MediaStreamTrack | null = observation.track();
-await observation.close();
-await subscription.close();
-const playback = attachRemoteAudio(agent);
-await playback.ready;
-await playback.close();
+  priority: 10,
+  playoutDelay: PlayoutDelay.Fixed.new({ minMs: 100, maxMs: 200 }),
+};
+const reception = remote.video("camera").subscribe(videoOptions);
+const output = await reception.playbackOutput();
+const received: MediaStreamTrack | undefined = output.track();
+const data = agent.data("data").publish({ delivery: DataDelivery.Reliable });
+const sends: DataSendOptions | undefined = recipient
+  ? { recipients: [recipient] }
+  : undefined;
+await data.send(Uint8Array.of(0, 255), sends);
+const messages = remote.data("data").subscribe();
+const event = await messages.next();
+if (event && DataEvent.Message.instanceOf(event)) {
+  const bytes: Uint8Array = event.inner.data;
+  const sequence: bigint = event.inner.sequence;
+  void [bytes, sequence];
+}
+const updates = agent.updates();
+await updates.next();
+updates.close();
+await Promise.all([
+  input.close(),
+  output.close(),
+  reception.close(),
+  publication.close(),
+  watch.close(),
+  source.close(),
+  messages.close(),
+  data.close(),
+]);
+await agent.close();
+void [
+  joined,
+  observationRevision,
+  admittedParticipant,
+  participants,
+  cursor,
+  received,
+];
 
-const audioSubscription = remoteAudio.subscribe({
-  playoutDelay: { mode: "adaptive" },
-});
-const audioState: AudioSubscriptionState = audioSubscription.state();
-const audioUpdates: AudioSubscriptionUpdates = audioSubscription.updates();
-const nextAudioState: Promise<AudioSubscriptionState | undefined> =
-  audioUpdates.next();
-const audioStateTyped: NoAny<ReturnType<typeof audioSubscription.state>> = true;
-const audioUpdateTyped: NoAny<
-  Awaited<ReturnType<AudioSubscriptionUpdates["next"]>>
-> = true;
-// @ts-expect-error Core selector values are readonly.
-audioState.selector.trackId = "other";
-// @ts-expect-error The concrete cursor does not expose the foreign backend.
-audioUpdates.cursor;
-audioUpdates.close();
-void [audioState, nextAudioState, audioStateTyped, audioUpdateTyped];
-// @ts-expect-error Local audio subscription intent is not a Promise.
-const deferredAudioSubscription: Promise<unknown> = audioSubscription;
-void deferredAudioSubscription;
-await audioSubscription.close();
-// @ts-expect-error Audio demand must identify an exact remote track.
-agent.selectAudio({ pinned: [] });
-void observedTrack;
-// @ts-expect-error Receive ownership is not a reactive callback subscription.
-remoteVideo.subscribe(() => {});
-// @ts-expect-error Kind-agnostic descriptor lookup was removed.
-participant.track({ kind: "video", trackId: "camera" });
-// @ts-expect-error Local descriptor lookup was removed.
-agent.track({ kind: "video", trackId: "camera" });
-// @ts-expect-error The removed Agent.remote alias cannot bypass room pinning.
-agent.remote.participant("alice");
-// @ts-expect-error Raw desired state cannot override owned resources.
-agent.setState({ connected: true });
-// @ts-expect-error Public callers do not control physical receiver slots.
-remoteVideo.setReceiveOptions({});
-// @ts-expect-error JSON topic registration is not a normal data path.
-agent.topic("chat", { mode: "ordered" });
-await videoOwner.close();
-await audioOwner.close();
-const producerClosed: boolean = videoSource.isClosed();
-await videoSource.close();
-await audioSource.close();
-const closed: Promise<void> = agent.close();
-await closed;
-const terminal: boolean = agent.isClosed();
-void [producerClosed, terminal];
+// @ts-expect-error No handwritten factory.
+import { createAgent } from "@pulsebeam/web";
+// @ts-expect-error Low-level transport runtime is not public.
+import { BrowserRuntime } from "@pulsebeam/web";
+// @ts-expect-error Removed descriptor factory.
+import { track } from "@pulsebeam/web";
+// @ts-expect-error No handwritten Watch alias.
+import type { Watch } from "@pulsebeam/web";
+// @ts-expect-error No implicit reconnect without explicit join intent.
+agent.reconnect();
+// @ts-expect-error No unpinned participant lookup.
+agent.participant("peer");
+// @ts-expect-error Use state().status.
+agent.connection;
+// @ts-expect-error Session config has no room.
+new Agent({ ...config, roomId: "demo" });
+// @ts-expect-error Catalog metadata is only available through watch ownership.
+agent.state().catalog;
+// @ts-expect-error Physical receiver mapping is private.
+agent.state().mapping;
+// @ts-expect-error Publish owns input association through a separate pipe.
+local.publish(source);
+// @ts-expect-error Source replacement belongs to pipes.
+publication.setSource(source);
+// @ts-expect-error Browser sender settings are not publication options.
+publication.configureSender({ contentHint: "text" });
+// @ts-expect-error Playback output acquisition belongs to an owned subscription.
+remote.video("camera").playbackOutput();
+// @ts-expect-error Remote endpoints cannot publish.
+remote.data("data").publish();
+// @ts-expect-error Local endpoints cannot subscribe.
+agent.data("data").subscribe();
+// @ts-expect-error Data must be bytes, not an implicit JSON codec.
+await data.send({ test: true });
+
+// @ts-expect-error Catalog metadata and continuation are fields on the snapshot itself.
+watch.state().page;

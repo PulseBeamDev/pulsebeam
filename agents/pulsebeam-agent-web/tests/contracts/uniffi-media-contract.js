@@ -1,33 +1,27 @@
 (async () => {
-  const wasm = await import(
-    "/dist/uniffi-proof/generated/bindings/wasm-bindgen/index.js"
-  );
-  await wasm.default({
-    module_or_path:
-      "/dist/uniffi-proof/generated/bindings/wasm-bindgen/index_bg.wasm",
+  let wasmInstances = 0;
+  const Instance = WebAssembly.Instance;
+  WebAssembly.Instance = new Proxy(Instance, {
+    construct(target, args, newTarget) {
+      wasmInstances++;
+      return Reflect.construct(target, args, newTarget);
+    },
   });
-  const {
-    default: web,
-    Agent,
-    WebAgentError,
-  } = await import(
-    "/dist/uniffi-proof/generated/bindings/pulsebeam_agent_web.js"
+  const { Agent, AgentStatus, AgentError, ErrorCode } = await import(
+    "/sdk/dist/index.js"
+  ).finally(() => {
+    WebAssembly.Instance = Instance;
+  });
+  const { default: web } = await import(
+    "/sdk/dist/generated/bindings/pulsebeam_agent_web.js"
   );
-  const {
-    default: core,
-    AgentStatus,
-    ErrorCode,
-  } = await import(
-    "/dist/uniffi-proof/generated/bindings/pulsebeam_agent_core.js"
-  );
-  const registry = await import("/dist/uniffi-proof/web/media-registry.js");
-  core.initialize();
-  web.initialize();
+  const registry = await import("/sdk/dist/web/media-registry.js");
   const agent = new Agent(config);
   const cursor = agent.updates();
   let initialState;
   let stableState;
   let pendingReadClosed;
+  let pendingDataReadsClosed;
   let joinedAndClosed;
   let exactVideoOwner;
   try {
@@ -43,7 +37,27 @@
         Object.isFrozen(current) &&
         agent.state() === current &&
         other.state() !== current;
+      const peer = other
+        .room(config.sourceRoom)
+        .participant("native-publisher");
+      const direct = peer.data("close-reader").subscribe();
+      const throughAgent = peer.data("close-agent").subscribe();
+      const firstRead = direct.next();
+      const secondRead = throughAgent.next();
+      const duplicate = await throughAgent.next().then(
+        () => false,
+        (error) =>
+          AgentError.Operation.instanceOf(error) &&
+          error.inner.info.code === ErrorCode.Conflict,
+      );
+      await direct.close();
+      await other.close();
+      pendingDataReadsClosed =
+        duplicate &&
+        (await firstRead) === undefined &&
+        (await secondRead) === undefined;
     } finally {
+      await other.close();
       other.uniffiDestroy();
     }
     const pending = cursor.next();
@@ -95,7 +109,7 @@
         agent.renew("");
       } catch (error) {
         invalidRejected =
-          WebAgentError.Operation.instanceOf(error) &&
+          AgentError.Operation.instanceOf(error) &&
           error.inner.info.code === ErrorCode.InvalidArgument;
       }
       if (!invalidRejected || agent.state() !== before) {
@@ -161,9 +175,11 @@
     const tracks = web.converters.FfiConverterTypeWebMediaTrack;
     const streams = web.converters.FfiConverterTypeWebMediaStream;
     return {
+      wasmLoaded: wasmInstances === 1,
       initialState,
       stableState,
       pendingReadClosed,
+      pendingDataReadsClosed,
       joinedAndClosed,
       exactVideoOwner,
       trackIdentity: tracks.lift(tracks.lower(track)) === track,

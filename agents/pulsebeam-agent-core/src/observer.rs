@@ -668,6 +668,7 @@ mod tests {
             desired_credential_revision: 0,
             evaluated_credential_revision: 0,
             room: None,
+            participant_id: None,
             desired_room: None,
             connection_id: None,
             status: AgentStatus::Idle,

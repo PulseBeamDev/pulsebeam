@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  AgentStatus,
   Audio,
   usePublish,
   useSubscribe,
@@ -40,6 +41,7 @@ function ActiveRoom({
   room: string;
   onLeave(): void;
 }) {
+  const state = agent.state();
   const [error, setError] = useState("");
   const [videoPlayback, setVideoPlayback] = useState<PlaybackError | null>(
     null,
@@ -65,8 +67,8 @@ function ActiveRoom({
       <Audio source={audio} onPlaybackError={setAudioPlayback} />
       <h1>PulseBeam React room</h1>
       <p role="status">
-        Connection: {agent.connection}; participant:{" "}
-        {agent.participantId ?? "not admitted"}
+        Connection: {AgentStatus[state.status]}; participant:{" "}
+        {state.participantId ?? "not admitted"}
       </p>
       <p>Capture: {capture.state}</p>
       <button
@@ -125,9 +127,9 @@ function ActiveRoom({
           Retry video playback
         </button>
       )}
-      {(error || capture.error || agent.error) && (
+      {(error || capture.error || state.error) && (
         <p role="alert">
-          {error || capture.error?.message || agent.error?.message}
+          {error || capture.error?.message || state.error?.message}
         </p>
       )}
     </main>

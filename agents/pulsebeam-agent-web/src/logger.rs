@@ -84,6 +84,21 @@ impl log::Log for CoreConsoleLogger {
     fn flush(&self) {}
 }
 
+#[cfg(feature = "uniffi")]
+impl From<agent_core::ffi::LogLevel> for LogLevel {
+    fn from(value: agent_core::ffi::LogLevel) -> Self {
+        use agent_core::ffi::LogLevel as Level;
+        match value {
+            Level::Off => Self::Off,
+            Level::Error => Self::Error,
+            Level::Warn => Self::Warn,
+            Level::Info => Self::Info,
+            Level::Debug => Self::Debug,
+            Level::Trace => Self::Trace,
+        }
+    }
+}
+
 impl From<LogLevel> for agent_core::LogLevel {
     fn from(value: LogLevel) -> Self {
         match value {

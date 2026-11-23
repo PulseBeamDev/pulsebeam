@@ -10,7 +10,7 @@ load("@bazel_lib//lib:copy_file.bzl", "copy_file")
 load("@bazel_lib//lib:output_files.bzl", "output_files")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("@web_npm//agents/pulsebeam-agent-web:typescript-language-server/package_json.bzl", tsls = "bin")
-load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test", "js_library")
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
 load("@web_npm//:defs.bzl", "npm_link_all_packages")
 load("@web_npm//agents/pulsebeam-agent-web:typescript/package_json.bzl", typescript = "bin")
@@ -23,29 +23,26 @@ filegroup(name = "destination_test_support", testonly = True, srcs = ["tests/sup
 
 npm_link_all_packages(name = "node_modules")
 typescript.tsc_binary(name = "tsc")
-js_library(name = "component_sources", srcs = glob(["web/**"]) + [":web_core_types"])
-
-# Compile only the DOM-free facade boundary, not the SDK/WASM package.
 js_run_binary(
     name = "unit_javascript",
     tool = ":tsc",
-    srcs = [":node_modules", ":web_core_types", ":dist/wasm", "web/schema.ts", "web/topic.ts", "web/types.ts", "web/track.ts", "web/data.ts", "web/capture-source.ts", "web/agent-state.ts", "web/reconciliation-snapshot.ts", "web/agent-observation.ts", "web/media.ts", "web/publication-observation.ts", "web/resource-observation.ts", "web/wasm.ts", "web/wasm-bytes.d.ts", "web/resources.ts", "web/reception.ts", "web/remote-catalog.ts", "web/remote-media.ts", "web/remote-audio.ts", "web/media-attachment.ts", "web/video-geometry.ts"],
-    args = ["--strict", "--target", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--lib", "ES2022,DOM,DOM.Iterable,ESNext.Disposable", "--rootDir", "web", "--outDir", "unit-javascript", "web/topic.ts", "web/remote-catalog.ts", "web/agent-state.ts", "web/media.ts"],
+    srcs = ["web/media-registry.ts"],
+    args = ["--strict", "--target", "ES2022", "--module", "ESNext", "--rootDir", "web", "--outDir", "unit-javascript", "web/media-registry.ts"],
     chdir = package_name(),
     out_dirs = ["unit-javascript"],
 )
 
 js_test(
     name = "js_unit_tests",
-    entry_point = "tests/unit/run.mjs",
-    data = [":unit_javascript", "package.json"] + glob(["tests/unit/*.mjs"]),
+    entry_point = "tests/unit/media-registry.mjs",
+    data = [":unit_javascript", "package.json", "tests/node/platform.mjs"],
 )
 
 typescript.tsc_test(
     name = "public_contract",
     args = ["-p", "tsconfig.public-contract.json"],
     chdir = package_name(),
-    data = [":typescript", ":dist/wasm", ":web_core_types", ":node_modules"] + glob(["web/**", "tests/contracts/**", "tsconfig*.json"]),
+    data = [":package", ":node_modules/@ubjs/core", "tests/contracts/public-strict-consumer.ts", "tsconfig.public-contract.json"],
 )
 
 copy_to_directory(
@@ -89,44 +86,9 @@ rust_test(
     
 )
 
-rust_shared_library(
-    name = "wasm_library",
-    target_compatible_with = ["@platforms//cpu:wasm32"],
-    crate_name = "pulsebeam_agent_web",
-    crate_root = "src/lib.rs",
-    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
-    compile_data = ["Cargo.toml", "//:Cargo.toml"],
-    edition = crate_edition(),
-    rustc_env_files = [":cargo_env"],
-    lint_config = ":lints",
-    aliases = aliases() | {"//agents/pulsebeam-agent-core:pulsebeam-agent-core": "agent_core"},
-    deps = all_crate_deps(normal = True) + ["//agents/pulsebeam-agent-core"],
-    proc_macro_deps = all_crate_deps(proc_macro = True),
-)
-
-rust_wasm_bindgen(
-    name = "dist/wasm",
-    wasm_file = ":wasm_library",
-    target = "web",
-    out_name = "pulsebeam_agent_web",
-    # Chromium limits synchronous compilation to 8 MiB, including debug names.
-    bindgen_flags = ["--remove-name-section"],
-)
-
-alias(name = "wasm", actual = ":dist/wasm")
-
 js_binary(
     name = "wasm_bytes_codegen",
     entry_point = "scripts/wasm-bytes.mjs",
-)
-
-js_run_binary(
-    name = "wasm_bytes",
-    tool = ":wasm_bytes_codegen",
-    srcs = [":dist/wasm"],
-    args = ["dist/wasm/pulsebeam_agent_web_bg.wasm", "dist/wasm-bytes.js"],
-    chdir = package_name(),
-    outs = ["dist/wasm-bytes.js"],
 )
 
 rust_shared_library(
@@ -214,29 +176,6 @@ copy_to_directory(
     replace_prefixes = {"uniffi/bindings/": "", "uniffi-wasm-bindgen/": "wasm-bindgen/"},
 )
 
-js_binary(
-    name = "core_schema_codegen",
-    entry_point = "scripts/core-schema.mjs",
-    data = [":node_modules/typescript"],
-)
-
-js_run_binary(
-    name = "web_core_types",
-    tool = ":core_schema_codegen",
-    srcs = [":typescript_bindings"],
-    args = [
-        "uniffi/bindings/pulsebeam_agent_core.ts",
-        "web/generated/schema.ts",
-        "AgentState", "AgentStatus", "SupportReport", "ErrorCode", "ErrorInfo", "PublicationState", "PipeState",
-        "VideoSubscriptionState", "AudioSubscriptionState", "DataPublicationState", "DataSubscriptionState",
-        "MediaKind", "PublicationAdmissionStatus", "PublicationDemand", "PublicationExecution",
-        "WatchStatus", "CatalogParticipantInfo", "CatalogPublicationInfo", "CatalogPublicationKind",
-        "DataDelivery", "DataPublishOptions", "DataSubscribeOptions",
-    ],
-    chdir = package_name(),
-    outs = ["web/generated/schema.ts"],
-)
-
 output_files(
     name = "uniffi_wasm_file",
     target = ":uniffi-wasm-bindgen",
@@ -253,34 +192,24 @@ js_run_binary(
 )
 
 js_run_binary(
-    name = "generated_package_typescript",
+    name = "typescript",
     tool = ":tsc",
-    srcs = [":bindings_dir", ":node_modules", "index.ts", "tsconfig.generated-package.json", "tsconfig.uniffi.browser.json", "tsconfig.uniffi.json", "web/media-registry.ts", "web/wasm-bytes.d.ts"],
-    args = ["-p", "tsconfig.generated-package.json", "--outDir", "generated-package-typescript"],
+    srcs = [":bindings_dir", ":node_modules", "index.ts", "internal/react.ts", "tsconfig.json", "web/media-registry.ts", "web/platform-playback.ts", "web/wasm-bytes.d.ts"],
+    args = ["-p", "tsconfig.json", "--outDir", "typescript"],
     chdir = package_name(),
-    out_dirs = ["generated-package-typescript"],
+    out_dirs = ["typescript"],
 )
 
-# Package-qualification candidate; the default distribution stays intact until its consumers migrate.
 npm_package(
-    name = "generated_package",
-    srcs = ["package.json", "LICENSE", ":generated_package_typescript", ":generated_wasm_bytes", ":uniffi-wasm-bindgen"],
+    name = "package",
+    srcs = ["package.json", "README.md", "LICENSE", ":typescript", ":generated_wasm_bytes", ":uniffi-wasm-bindgen"],
     exclude_srcs_patterns = ["**/node_modules/**", "**/index_bg.wasm"],
     replace_prefixes = {
-        "generated-package-typescript": "dist",
+        "typescript": "dist",
         "generated-package-assets": "dist",
         "uniffi-wasm-bindgen": "dist/generated/bindings/wasm-bindgen",
     },
     packable = True,
-)
-
-js_run_binary(
-    name = "uniffi_proof",
-    tool = ":tsc",
-    srcs = [":uniffi_bindings", ":bindings_dir", ":node_modules", "tsconfig.uniffi.json", "tsconfig.uniffi.browser.json"] + glob(["web/**"]),
-    args = ["-p", "tsconfig.uniffi.browser.json", "--outDir", "uniffi-proof"],
-    chdir = package_name(),
-    out_dirs = ["uniffi-proof"],
 )
 
 copy_file(
@@ -293,45 +222,35 @@ typescript.tsc_test(
     name = "uniffi_types",
     args = ["--strict", "--noEmit", "--target", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--lib", "ES2022,DOM,DOM.Iterable,ESNext.Disposable", "--allowJs", "web/assets.d.ts", "target/uniffi-strict-consumer.ts"],
     chdir = package_name(),
-    data = [":uniffi_bindings", ":bindings_dir", ":dist/wasm", ":web_core_types", ":strict_consumer_source", ":node_modules"] + glob(["web/**"]),
+    data = [":uniffi_bindings", ":bindings_dir", ":strict_consumer_source", ":node_modules", "web/assets.d.ts", "web/media-registry.ts"],
+)
+
+js_binary(
+    name = "artifact_bundler",
+    entry_point = "tests/bundle-artifact.mjs",
+    data = ["//agents/react:node_modules/esbuild"],
 )
 
 js_run_binary(
-    name = "typescript",
-    tool = ":tsc",
-    srcs = ["tsconfig.json", ":dist/wasm", ":web_core_types", ":node_modules"] + glob(["web/**"]),
-    args = ["-p", "tsconfig.json", "--outDir", "typescript"],
+    name = "node_sdk",
+    tool = ":artifact_bundler",
+    srcs = [":package", ":node_modules/@ubjs/core"],
     chdir = package_name(),
-    out_dirs = ["typescript"],
-)
-
-npm_package(
-    name = "package",
-    srcs = ["package.json", "README.md", "LICENSE", ":typescript", ":dist/wasm", ":wasm_bytes"],
-    replace_prefixes = {"typescript": "dist"},
-    packable = True,
-)
-
-copy_to_directory(
-    name = "node_assets",
-    srcs = [":package"],
-    replace_prefixes = {"package/": ""},
+    outs = ["node-sdk.mjs"],
 )
 
 js_test(
     name = "node_runtime_tests",
     entry_point = "tests/node/runtime.mjs",
     chdir = package_name(),
-    data = [":node_assets", "package.json"] + glob(["tests/node/**"]),
+    data = [":node_sdk", "tests/node/platform.mjs"],
 )
 
 copy_to_directory(
     name = "browser_assets",
-    srcs = [":package", ":uniffi_proof", ":uniffi-wasm-bindgen", ":node_modules/@ubjs/core/dir"] + glob(["tests/*.html", "tests/contracts/*.js"]),
+    srcs = [":package", ":node_modules/@ubjs/core/dir"] + glob(["tests/*.html", "tests/contracts/*.js"]),
     replace_prefixes = {
-        "package/": "",
-        "uniffi-proof/": "dist/uniffi-proof/",
-        "uniffi-wasm-bindgen/": "dist/uniffi-proof/generated/bindings/wasm-bindgen/",
+        "package/": "sdk/",
         "node_modules/.aspect_rules_js/*/node_modules/": "node_modules/",
     },
 )

@@ -3,13 +3,18 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "ESNext.Disposable"],
     "strict": true,
     "declaration": true,
     "outDir": "dist",
-    "rootDir": "web",
-    "skipLibCheck": true,
+    "rootDir": ".",
     "verbatimModuleSyntax": true
   },
-  "include": ["web/**/*.ts"]
+  "include": [
+    "index.ts",
+    "internal/react.ts",
+    "generated/bindings/**/*.ts",
+    "web/media-registry.ts",
+    "web/wasm-bytes.d.ts"
+  ]
 }

@@ -9,9 +9,10 @@ use std::{
 
 use agent_core::{MediaObservationControl, MediaObservationId, ResourceCommand, ResourceResult};
 use futures_channel::oneshot;
-use js_sys::Promise;
-use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
-use wasm_bindgen_futures::{future_to_promise, spawn_local};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen_futures::spawn_local;
+#[cfg(feature = "uniffi")]
+use web_sys::AbortController;
 use web_sys::{AbortSignal, MediaStreamTrack, RtcPeerConnectionState};
 
 use super::{LocalOperationError, RuntimeInner, input_is_live, same_js_object};
@@ -90,28 +91,17 @@ impl Lease {
     }
 }
 
-#[wasm_bindgen]
-pub struct BrowserMediaObservation {
+pub(crate) struct BrowserMediaObservation {
     lease: Rc<Lease>,
 }
 
-#[wasm_bindgen]
 impl BrowserMediaObservation {
-    pub fn track(&self) -> Option<MediaStreamTrack> {
+    pub(crate) fn track(&self) -> Option<MediaStreamTrack> {
         (!self.lease.closed.get()).then(|| Clone::clone(&self.lease.track))
     }
 
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.lease.closed.get()
-    }
-
-    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
-    pub fn close(&self) -> Promise {
-        let close = self.close_local();
-        future_to_promise(async move {
-            close.await;
-            Ok(JsValue::UNDEFINED)
-        })
     }
 }
 
@@ -135,24 +125,39 @@ impl Drop for BrowserMediaObservation {
 }
 
 fn closed_error() -> JsValue {
-    super::resources::coded_error("closed", "media observation is closed")
+    super::js_error("media observation is closed")
+}
+
+#[cfg(feature = "uniffi")]
+struct AbortObservationOnDrop(AbortController);
+
+#[cfg(feature = "uniffi")]
+impl Drop for AbortObservationOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl RuntimeInner {
-    pub(super) fn begin_observation(
+    #[cfg(feature = "uniffi")]
+    pub(super) async fn observe_cancellable(
         self: &Rc<Self>,
         owner: u64,
-        source: Option<String>,
-        signal: Option<AbortSignal>,
-    ) -> Promise {
-        let observation = self.observe_owned(owner, source, signal);
-        future_to_promise(async move { observation.await.map(JsValue::from) })
+    ) -> Result<BrowserMediaObservation, JsValue> {
+        let cancellation = AbortObservationOnDrop(AbortController::new()?);
+        let observation = self.observe_owned(owner, Some(cancellation.0.signal()));
+        let (send, receive) = oneshot::channel();
+        // UniFFI can drop the caller future while Core is allocating the request.
+        // Let the observation finish cancellation so Core can retire that request.
+        spawn_local(async move {
+            let _ = send.send(observation.await);
+        });
+        receive.await.map_err(|_| closed_error())?
     }
 
     pub(super) fn observe_owned(
         self: &Rc<Self>,
         owner: u64,
-        source: Option<String>,
         signal: Option<AbortSignal>,
     ) -> impl Future<Output = Result<BrowserMediaObservation, JsValue>> + use<> {
         let weak = Rc::downgrade(self);
@@ -162,11 +167,9 @@ impl RuntimeInner {
                 return Err(closed_error());
             }
             inner.observations.borrow_mut().beginning += 1;
-            let command = match source {
-                Some(source) => ResourceCommand::BeginAudioSourceObservation { owner, source },
-                None => ResourceCommand::BeginMediaObservation { owner },
-            };
-            let result = inner.input_resource(command).await;
+            let result = inner
+                .input_resource(ResourceCommand::BeginMediaObservation { owner })
+                .await;
             let (sender, mut receiver) = oneshot::channel();
             let mut observations = inner.observations.borrow_mut();
             observations.beginning -= 1;

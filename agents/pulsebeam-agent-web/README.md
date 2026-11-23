@@ -3,7 +3,7 @@
 `@pulsebeam/web` is the caller-owned browser SDK. Use typed logical handles and
 explicit resources for publication, reception, playback, data, and observation.
 React applications should use [`@pulsebeam/react`](../react/README.md), whose
-components own these lifetimes.
+hooks own these lifetimes.
 
 ## Create and connect
 
@@ -58,21 +58,21 @@ These APIs describe the current source build. Use matching SDK and server
 artifacts; compatibility with a released package/server pair is not qualified by
 this README.
 
-`const watch = room.watch({ limit: 100 })` owns one bounded live page. Read
+`const watch = room.watch()` owns one bounded live page. Read
 `watch.state()` and observe its current-first, coalesced `watch.updates()` cursor.
 Distinguish `WatchStatus.Loading`, `Live`, `Failed` and `Closed`; loading is not an
-empty result. A Live `state.page` contains immutable participant metadata with
-application `id` and `publications`, including presence-only entries.
+empty result. A Live snapshot exposes `state.participants` with
+application identity from `id()` and metadata from `tracks()`, including presence-only entries.
 
 The default limit is 100, maximum 500, with eight pending/live watches per Agent.
-Use `page.hasMore` and `page.nextCursor` to explicitly replace the watch for the
+Use `state.hasMore` and `state.nextCursor` to explicitly replace the watch for the
 next page with the same room and limit. Do not automatically accumulate every
 page. Continuations expire after 60 seconds; invalid/expired/wrong-scope cursors
 fail explicitly. Offer a first-page restart without a cursor. Retained page
 values stay stable while the SDK retains only its current page.
 
 Discover and Subscribe are independent permissions. Convert selected metadata to
-pinned references using `room.participant(info.id)` and the publication's
+pinned references using `room.participant(info.id())` and the publication's
 kind and label; lookup does not subscribe. Known-address reception does not need
 Discover. Skip self when creating receive owners. There is no global participant
 collection, participant publication listing, or catalog/mapping/media field in
@@ -91,16 +91,14 @@ import { VideoSource } from "@pulsebeam/web";
 
 const capture = await navigator.mediaDevices.getUserMedia({ video: true });
 const source = VideoSource.fromTrack(capture.getVideoTracks()[0]!);
-const publication = await camera.publish(source, { enabled: true });
-await publication.configure({ enabled: false });
-await publication.configureSender({ contentHint: "text" });
+const publication = camera.publish({ enabled: true });
+const pipe = source.pipeTo(publication);
+publication.configure({ enabled: false });
 ```
 
-Use `AudioSource.fromTrack(track)` with an audio handle. The source kind must
-match the handle. Ordinary configuration and sender configuration are separate:
-`configure({ enabled })` controls mute, while `configureSender(...)` controls
-sender settings. Use `await publication.setSource(replacementSource)` to replace
-the producer without changing the publication's logical name.
+Use `AudioSource.fromTrack(track)` with an audio publication. To change input,
+close the prior pipe before piping the replacement source into the same
+publication. Configuring `enabled` changes mute without releasing the publication.
 
 Sources and publications have separate lifetimes. Closing a publication releases
 that binding, not its source. Closing a source makes that producer terminal;
@@ -109,6 +107,7 @@ capture tracks passed to `fromTrack`. Stop those caller-owned tracks yourself
 when capture is no longer needed:
 
 ```ts
+await pipe.close();
 await publication.close();
 await source.close();
 for (const track of capture.getTracks()) track.stop();
@@ -119,16 +118,18 @@ for (const track of capture.getTracks()) track.stop();
 Subscribe to the exact remote track before attaching playback:
 
 ```ts
+import { PlayoutDelay } from "@pulsebeam/web";
+
 const subscription = remoteCamera.subscribe({
   visible: true,
   height: 720,
   minHeight: 360,
   minFps: 15,
   priority: 100,
-  playoutDelay: { mode: "fixed", minMs: 100, maxMs: 200 },
+  playoutDelay: PlayoutDelay.Fixed.new({ minMs: 100, maxMs: 200 }),
 });
-const observation = await subscription.observe();
-const receivedTrack = observation.track();
+const output = await subscription.playbackOutput();
+const receivedTrack = output.track();
 const element = document.querySelector("video")!;
 if (receivedTrack) {
   element.srcObject = new MediaStream([receivedTrack]);
@@ -136,10 +137,10 @@ if (receivedTrack) {
 }
 ```
 
-An observation follows one physical receiver incarnation, not every future track
-for that name. Reacquire an observation after source retirement. Closing an
-observation releases that observation, not its subscription. Await
-`observation.close()` and `subscription.close()` when their respective owners end.
+An output follows one physical receiver incarnation, not every future track
+for that name. Reacquire an output after source retirement. Closing it does not
+close its subscription. Await `output.close()` and `subscription.close()` when
+their respective owners end.
 Clear the element’s `srcObject` when detaching playback. If the browser blocks
 `play()`, offer a user gesture to retry.
 
@@ -150,14 +151,15 @@ policy. Local data handles create owned publications; room-pinned participant
 data handles create independent subscriptions.
 
 ```ts
+import { DataEvent } from "@pulsebeam/web";
+
 const publication = chat.publish();
 const messages = remoteChat.subscribe();
 const reading = (async () => {
   while (true) {
-    const update = await messages.next();
-    if (update.type === "closed") return;
-    const event = update.event;
-    if (event.type === "message") handleBytes(event.data);
+    const event = await messages.next();
+    if (event === undefined) return;
+    if (DataEvent.Message.instanceOf(event)) handleBytes(event.inner.data);
   }
 })();
 await publication.send(new TextEncoder().encode("hello"));
@@ -177,7 +179,7 @@ participant, and has a `bigint` sequence and binary data. Source replacement may
 produce a discontinuity; an unrecoverable Reliable gap rejects `next()` and
 ends only that subscription. Read one event at a time.
 
-`send(bytes, { recipients })` accepts server-issued `dataRecipientId` values
+`send(bytes, { recipients })` accepts server-issued `dataRecipientId()` values
 from the catalog. Recipients must already be authorized subscribers. Omit the
 list to address all current authorized subscribers. A successful send is local
 admission, not a receipt. Transport is live and finite, not durable storage.
@@ -210,15 +212,11 @@ Run from a build-ready repository root:
 ./bazel test //agents/pulsebeam-agent-web:web_runtime_browser
 ```
 
-Direct JavaScript tests exercise production data, catalog, immutable-state, and
-local-resource modules without a DOM. Typed consumers check public and generated
-contracts. Deterministic native/SFU simulation owns delivery, identity,
-publication replacement, Reliable continuity loss, and late-subscription proof.
-
-Pinned-Node artifact tests instantiate emitted WASM and exercise initialization,
-resource ownership, cancellation, validation, and generation fences. Their
-controlled outcomes do not establish browser compatibility, decoded media,
-failed transceiver-stop repair, or application support for Node.
+The JavaScript unit test exercises the media-handle registry without WASM.
+Pinned-Node artifact tests instantiate the shipped bindings and check validation,
+state cursors, resource ownership, and close. Node is a test host, not a supported
+application platform. Deterministic native/SFU simulation owns delivery,
+identity, publication replacement, and Reliable continuity loss.
 
 The browser adapter prepares receivers through the existing Peer/executor before
 Core requests server admission. Successful description completion, correlated to
@@ -228,10 +226,11 @@ exhaustive parameter readback are not configuration gates. Server acceptance is
 still required for application-visible subscription readiness. See
 [Core's receive flow](../pulsebeam-agent-core/README.md#prepared-reception).
 
-Run the browser owner for shipped-SDK media through a local SFU, native-track
-handoff, decoded receiver replacement, SCTP incarnation reuse, layout, and
-trusted-gesture playback recovery. It does not build Meet or a React acceptance
-fixture. See the [client QA boundaries](../../docs/build.md#client-qa-boundaries),
+Run the browser owner for shipped Web-to-Web media, SCTP incarnation reuse,
+trusted-gesture audio playback, and the Native Python producer to packed React
+receiver workflow. It does not build Meet. See the
+[client QA boundaries](../../docs/build.md#client-qa-boundaries),
 [testing contract](../../docs/build.md#testing-contract), and
 [editor setup](../../docs/ide.md).
-`./bazel run //:web_dev` serves the repository example, not an installed npm consumer.
+`./bazel run //:web_dev` serves test fixtures. To try a session in a browser, use
+[the React quickstart](../../docs/react/quickstart.md).

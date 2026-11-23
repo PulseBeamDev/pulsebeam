@@ -75,27 +75,28 @@ async def witness():
         assert core.DataPublishOptions().delivery is None
         latest = local.publish(core.DataPublishOptions(delivery=core.DataDelivery.LATEST))
         assert latest.state().delivery == core.TopicMode.LATEST
-        latest.close()
+        await latest.close()
         default_publication = local.publish(core.DataPublishOptions())
         assert default_publication.state().delivery == core.TopicMode.ORDERED
-        default_publication.close()
+        await default_publication.close()
         room = agent.room("room")
         assert isinstance(room, native.RoomRef) and room.name() == "room"
         watch = room.watch()
         assert isinstance(watch, native.Watch) and not inspect.isawaitable(watch)
         watch_state = watch.state()
         assert watch_state.room == "room" and watch_state.limit == 100
-        assert watch_state.status == core.WatchStatus.LOADING and watch_state.page is None
+        assert watch_state.status == core.WatchStatus.LOADING and watch_state.participants is None
+        assert watch_state.has_more is None and watch_state.next_cursor is None
         watch_updates = watch.updates()
         assert isinstance(watch_updates, native.WatchUpdates)
         assert (await watch_updates.next()).observation_revision == watch_state.observation_revision
-        assert watch.close() is None and watch.close() is None
+        assert (await watch.close()) is None and (await watch.close()) is None
         assert (await watch_updates.next()).status == core.WatchStatus.CLOSED
         assert await watch_updates.next() is None
         watch_updates.close()
         scoped_watch = room.watch(core.WatchConfig(limit=3, cursor=bytes([7, 8])))
         assert scoped_watch.state().limit == 3 and bytes(scoped_watch.state().cursor) == bytes([7, 8])
-        scoped_watch.close()
+        await scoped_watch.close()
         assert not hasattr(agent, "participant") and not hasattr(local, "receive")
         participant = room.participant("remote")
         remote = participant.data("control")
@@ -157,7 +158,7 @@ async def witness():
         assert isinstance(initial_pipe.status, core.PipeStatus)
         assert (await pipe_updates.next()).observation_revision >= initial_pipe.observation_revision
         unrelated_data = local.publish()
-        unrelated_data.close()
+        await unrelated_data.close()
         assert unrelated_data.state().closed
         assert pipe.state().status != core.PipeStatus.CLOSED
         assert not video_publication.state().closed and video_publication.state().input_attached
@@ -295,7 +296,7 @@ async def witness():
             assert error.info.code == core.ErrorCode.NOT_READY
         else:
             raise AssertionError("disconnected data send was admitted")
-        data_publication.close()
+        await data_publication.close()
         assert data_publication.state().closed
         assert (await sibling_data_updates.next()).closed
         assert await sibling_data_updates.next() is None
@@ -307,7 +308,7 @@ async def witness():
         else:
             raise AssertionError("closed data publication accepted a send")
         replacement_data = local.publish()
-        replacement_data.close()
+        await replacement_data.close()
         closed_cursor = remote.subscribe()
         independent_cursor = remote.subscribe()
         participant_cursor = remote.subscribe()

@@ -2,43 +2,12 @@ use std::rc::Rc;
 
 use crate::engine::ActorHandle;
 
-use js_sys::{BigInt, Object};
-use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+use wasm_bindgen::JsValue;
 
-use super::{operation_error_value, set};
+use super::operation_error_value;
 use agent_core::{PublicationInputId, ffi, observer};
 
-#[wasm_bindgen]
-pub struct BrowserPublicationObserver {
-    pub(super) observer: Rc<observer::PublicationStateObserver>,
-}
-
-#[wasm_bindgen]
-impl BrowserPublicationObserver {
-    pub fn state(&self) -> JsValue {
-        publication_state_value(&self.observer.state())
-    }
-
-    pub fn updates(&self) -> Result<BrowserPublicationUpdates, JsValue> {
-        self.observer
-            .updates()
-            .map(|updates| BrowserPublicationUpdates { updates })
-            .map_err(|_| {
-                operation_error_value(ffi::ErrorInfo::new(
-                    ffi::ErrorCode::CapacityExceeded,
-                    "Publication observer capacity exceeded",
-                ))
-            })
-    }
-}
-
-#[wasm_bindgen]
-pub struct BrowserPublicationUpdates {
-    updates: observer::PublicationUpdates,
-}
-
-#[wasm_bindgen]
-pub struct BrowserPipe {
+pub(crate) struct BrowserPipe {
     pub(super) actor: ActorHandle,
     pub(super) input: PublicationInputId,
     pub(super) observer: Rc<observer::PipeStateObserver>,
@@ -47,23 +16,6 @@ pub struct BrowserPipe {
     pub(super) slot: String,
     pub(super) inner: std::rc::Weak<super::RuntimeInner>,
     pub(super) closing: std::cell::RefCell<Option<js_sys::Promise>>,
-}
-
-#[wasm_bindgen]
-impl BrowserPipe {
-    pub async fn install_track(
-        &self,
-        track: web_sys::MediaStreamTrack,
-        config: JsValue,
-    ) -> Result<(), JsValue> {
-        let config: super::SenderConfig = serde_wasm_bindgen::from_value(config).map_err(|_| {
-            operation_error_value(ffi::ErrorInfo::new(
-                ffi::ErrorCode::InvalidArgument,
-                "Invalid sender configuration",
-            ))
-        })?;
-        self.install_input(track, config).await
-    }
 }
 
 impl BrowserPipe {
@@ -108,24 +60,6 @@ impl BrowserPipe {
             }
         }
         Ok(())
-    }
-}
-
-#[wasm_bindgen]
-impl BrowserPipe {
-    pub fn state(&self) -> JsValue {
-        pipe_state_value(&self.current_state())
-    }
-
-    pub fn updates(&self) -> Result<BrowserPipeUpdates, JsValue> {
-        self.open_updates()
-            .map(|updates| BrowserPipeUpdates { updates })
-            .map_err(operation_error_value)
-    }
-
-    #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
-    pub fn close(&self) -> Result<js_sys::Promise, JsValue> {
-        self.close_pipe().map_err(operation_error_value)
     }
 }
 
@@ -207,174 +141,6 @@ impl BrowserPipe {
     }
 }
 
-#[wasm_bindgen]
-pub struct BrowserPipeUpdates {
-    updates: observer::PipeUpdates,
-}
-
-#[wasm_bindgen]
-impl BrowserPipeUpdates {
-    pub async fn next(&self) -> Result<JsValue, JsValue> {
-        let next = self.updates.next().map_err(|_| {
-            operation_error_value(ffi::ErrorInfo::new(
-                ffi::ErrorCode::Conflict,
-                "An observation read is already pending",
-            ))
-        })?;
-        Ok(next
-            .await
-            .as_ref()
-            .map_or(JsValue::UNDEFINED, pipe_state_value))
-    }
-
-    pub fn close(&self) {
-        self.updates.close();
-    }
-}
-
 fn ffi_resource_detach(input: PublicationInputId) -> agent_core::ResourceCommand {
     agent_core::ResourceCommand::DetachPublicationInput { input }
-}
-
-fn pipe_state_value(state: &ffi::PipeState) -> JsValue {
-    let value = Object::new();
-    set(&value, "observationRevision", state.observation_revision);
-    set(&value, "status", state.status as u32);
-    set(
-        &value,
-        "error",
-        state
-            .error
-            .as_ref()
-            .map(error_value)
-            .unwrap_or(JsValue::UNDEFINED),
-    );
-    value.into()
-}
-
-#[wasm_bindgen]
-impl BrowserPublicationUpdates {
-    pub async fn next(&self) -> Result<JsValue, JsValue> {
-        let next = self.updates.next().map_err(|_| {
-            operation_error_value(ffi::ErrorInfo::new(
-                ffi::ErrorCode::Conflict,
-                "An observation read is already pending",
-            ))
-        })?;
-        Ok(next
-            .await
-            .as_ref()
-            .map_or(JsValue::UNDEFINED, publication_state_value))
-    }
-
-    pub fn close(&self) {
-        self.updates.close();
-    }
-}
-
-fn publication_state_value(state: &ffi::PublicationState) -> JsValue {
-    let value = Object::new();
-    set(&value, "observationRevision", state.observation_revision);
-    set(&value, "kind", state.kind as u32);
-    set(&value, "trackId", state.track_id.clone());
-    set(&value, "closed", state.closed);
-    let configuration = Object::new();
-    set(
-        &configuration,
-        "desiredRevision",
-        state.configuration.desired_revision,
-    );
-    set(
-        &configuration,
-        "evaluatedRevision",
-        state.configuration.evaluated_revision,
-    );
-    set(
-        &configuration,
-        "acceptedRevision",
-        state.configuration.accepted_revision,
-    );
-    set(&configuration, "enabled", state.configuration.enabled);
-    set(
-        &configuration,
-        "acceptedEnabled",
-        state.configuration.accepted_enabled,
-    );
-    set(
-        &configuration,
-        "rejectedRevision",
-        optional(state.configuration.rejected_revision),
-    );
-    set(
-        &configuration,
-        "error",
-        state
-            .configuration
-            .error
-            .as_ref()
-            .map(error_value)
-            .unwrap_or(JsValue::UNDEFINED),
-    );
-    set(&value, "configuration", configuration);
-    let admission = Object::new();
-    set(&admission, "status", state.admission.status as u32);
-    set(
-        &admission,
-        "connectionGeneration",
-        optional(state.admission.connection_generation),
-    );
-    set(
-        &admission,
-        "publicationId",
-        state
-            .admission
-            .publication_id
-            .clone()
-            .map(JsValue::from)
-            .unwrap_or(JsValue::UNDEFINED),
-    );
-    set(
-        &admission,
-        "evaluationPending",
-        state.admission.evaluation_pending,
-    );
-    set(
-        &admission,
-        "error",
-        state
-            .admission
-            .error
-            .as_ref()
-            .map(error_value)
-            .unwrap_or(JsValue::UNDEFINED),
-    );
-    set(&admission, "execution", state.admission.execution as u32);
-    set(
-        &admission,
-        "executionError",
-        state
-            .admission
-            .execution_error
-            .as_ref()
-            .map(error_value)
-            .unwrap_or(JsValue::UNDEFINED),
-    );
-    set(&admission, "demand", state.admission.demand as u32);
-    set(&value, "admission", admission);
-    set(&value, "inputAttached", state.input_attached);
-    set(&value, "forwardingRequested", state.forwarding_requested);
-    value.into()
-}
-
-pub(super) fn optional(value: Option<u64>) -> JsValue {
-    value
-        .map(|value| BigInt::from(value).into())
-        .unwrap_or(JsValue::UNDEFINED)
-}
-
-pub(super) fn error_value(info: &ffi::ErrorInfo) -> JsValue {
-    let value = Object::new();
-    set(&value, "code", info.code as u32);
-    set(&value, "message", info.message.clone());
-    value.into()
 }

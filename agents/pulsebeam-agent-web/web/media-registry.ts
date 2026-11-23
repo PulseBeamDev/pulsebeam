@@ -8,6 +8,7 @@ interface Entry {
 
 interface Registry {
   retain(value: MediaValue, kind: MediaKind): bigint;
+  retainTrackLease(value: MediaStreamTrack): bigint;
   get(handle: bigint, kind: MediaKind): MediaValue | undefined;
   release(handle: bigint, kind: MediaKind): boolean;
   size(): bigint;
@@ -16,6 +17,7 @@ interface Registry {
 const MAX_HANDLE = (1n << 64n) - 1n;
 const values = new Map<bigint, Entry>();
 const handles = new WeakMap<MediaValue, bigint>();
+const trackLeaseListeners = new WeakMap<MediaStreamTrack, Set<() => void>>();
 let nextHandle = 1n;
 let pendingInput:
   | { readonly id: bigint; readonly track: MediaStreamTrack }
@@ -27,6 +29,14 @@ function matches(value: unknown, kind: MediaKind): value is MediaValue {
     : value instanceof MediaStream;
 }
 
+function allocate(value: MediaValue, kind: MediaKind): bigint {
+  if (nextHandle > MAX_HANDLE)
+    throw new RangeError("browser media handle space exhausted");
+  const handle = nextHandle++;
+  values.set(handle, { kind, value });
+  return handle;
+}
+
 const registry: Registry = Object.freeze({
   retain(value: MediaValue, kind: MediaKind) {
     if (!matches(value, kind))
@@ -35,13 +45,14 @@ const registry: Registry = Object.freeze({
       );
     const current = handles.get(value);
     if (current !== undefined && values.has(current)) return current;
-    if (nextHandle > MAX_HANDLE)
-      throw new RangeError("browser media handle space exhausted");
-    const handle = nextHandle;
-    nextHandle += 1n;
-    values.set(handle, { kind, value });
+    const handle = allocate(value, kind);
     handles.set(value, handle);
     return handle;
+  },
+  retainTrackLease(value: MediaStreamTrack) {
+    if (!(value instanceof MediaStreamTrack))
+      throw new TypeError("expected a MediaStreamTrack");
+    return allocate(value, "track");
   },
   get(handle: bigint, kind: MediaKind) {
     const entry = values.get(handle);
@@ -51,7 +62,13 @@ const registry: Registry = Object.freeze({
     const entry = values.get(handle);
     if (entry === undefined || entry.kind !== kind) return false;
     values.delete(handle);
-    handles.delete(entry.value);
+    if (handles.get(entry.value) === handle) handles.delete(entry.value);
+    if (entry.value instanceof MediaStreamTrack) {
+      const listeners = trackLeaseListeners.get(entry.value);
+      if (entry.value.readyState === "ended")
+        trackLeaseListeners.delete(entry.value);
+      for (const listener of listeners ?? []) listener();
+    }
     return true;
   },
   size() {
@@ -86,6 +103,19 @@ export function lowerInputTrack(track: MediaStreamTrack): bigint {
     if (pendingInput === input) pendingInput = undefined;
   });
   return input.id;
+}
+
+export function watchTrackLease(
+  track: MediaStreamTrack,
+  listener: () => void,
+): () => void {
+  let listeners = trackLeaseListeners.get(track);
+  if (!listeners) {
+    listeners = new Set();
+    trackLeaseListeners.set(track, listeners);
+  }
+  listeners.add(listener);
+  return () => listeners.delete(listener);
 }
 
 export function lowerMediaStreamTrack(value: MediaStreamTrack): bigint {

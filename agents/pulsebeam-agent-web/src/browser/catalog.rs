@@ -1,99 +1,35 @@
-use super::publication::error_value;
 use super::*;
 use crate::engine::ResourceNotification;
 use agent_core::{ffi, observer};
 
 pub(super) struct CatalogObserver {
     observer: observer::WatchStateObserver,
-    projection: RefCell<Option<(ffi::WatchState, JsValue)>>,
 }
 
 impl CatalogObserver {
     fn new(state: ffi::WatchState) -> Self {
         Self {
             observer: observer::WatchStateObserver::new(state),
-            projection: RefCell::new(None),
         }
     }
 
     fn prepare(&self, state: ffi::WatchState, closing: bool) -> Option<ResourceNotification> {
         let notification = self.observer.prepare(state, closing).ok()?;
-        // Retire the old projection before delivery, even when no cursor reads again.
-        self.value();
         Some(Box::new(move || {
             let _ = notification.notify();
         }))
     }
-
-    fn value(&self) -> JsValue {
-        let state = self.observer.state();
-        let mut projection = self.projection.borrow_mut();
-        if let Some((previous, value)) = projection.as_ref()
-            && previous.observation_revision == state.observation_revision
-        {
-            return value.clone();
-        }
-        let page = state.page.as_ref().map_or(JsValue::UNDEFINED, |page| {
-            if let Some((previous, value)) = projection.as_ref()
-                && previous
-                    .page
-                    .as_ref()
-                    .is_some_and(|previous| std::ptr::eq(previous.as_ref(), page.as_ref()))
-            {
-                return Reflect::get(value, &"page".into()).unwrap_or(JsValue::UNDEFINED);
-            }
-            page_value(page)
-        });
-        let value = Object::new();
-        set(&value, "observationRevision", state.observation_revision);
-        set(&value, "room", state.room.clone());
-        set(&value, "limit", state.limit);
-        set(&value, "cursor", bytes_value(&state.cursor));
-        set(&value, "status", state.status as u32);
-        set(&value, "page", page);
-        set(
-            &value,
-            "error",
-            state.error.as_ref().map_or(JsValue::UNDEFINED, |error| {
-                let value: Object = error_value(error).unchecked_into();
-                Object::freeze(&value).into()
-            }),
-        );
-        let value: JsValue = Object::freeze(&value).into();
-        *projection = Some((state, value.clone()));
-        value
-    }
 }
 
-#[wasm_bindgen]
-pub struct BrowserCatalogWatch {
+pub(crate) struct BrowserCatalogWatch {
     owner: u64,
     runtime: Weak<RuntimeInner>,
     shared: Rc<CatalogObserver>,
     closed: Cell<bool>,
 }
 
-#[wasm_bindgen]
 impl BrowserCatalogWatch {
-    pub fn state(&self) -> JsValue {
-        self.refresh();
-        self.shared.value()
-    }
-
-    pub fn updates(&self) -> Result<BrowserCatalogUpdates, JsValue> {
-        let updates = self.shared.observer.updates().map_err(|_| {
-            operation_error_value(ffi::ErrorInfo::new(
-                ffi::ErrorCode::CapacityExceeded,
-                "Watch observer capacity exceeded",
-            ))
-        })?;
-        Ok(BrowserCatalogUpdates {
-            shared: self.shared.clone(),
-            updates,
-        })
-    }
-
-    pub fn close(&self) {
+    pub(crate) fn close(&self) {
         if self.closed.replace(true) {
             return;
         }
@@ -145,45 +81,6 @@ impl BrowserCatalogWatch {
 impl Drop for BrowserCatalogWatch {
     fn drop(&mut self) {
         self.close();
-    }
-}
-
-#[wasm_bindgen]
-pub struct BrowserCatalogUpdates {
-    shared: Rc<CatalogObserver>,
-    updates: observer::WatchUpdates,
-}
-
-#[wasm_bindgen]
-impl BrowserCatalogUpdates {
-    pub async fn next(&self) -> Result<JsValue, JsValue> {
-        let next = self.updates.next().map_err(|_| {
-            operation_error_value(ffi::ErrorInfo::new(
-                ffi::ErrorCode::Conflict,
-                "A watch-state read is already pending",
-            ))
-        })?;
-        Ok(if next.await.is_some() {
-            self.shared.value()
-        } else {
-            JsValue::UNDEFINED
-        })
-    }
-    pub fn close(&self) {
-        self.updates.close();
-    }
-}
-
-#[wasm_bindgen]
-impl BrowserRuntime {
-    pub fn catalog_watch(
-        &self,
-        room: String,
-        limit: u32,
-        cursor: Vec<u8>,
-    ) -> Result<BrowserCatalogWatch, JsValue> {
-        self.open_watch(room, ffi::WatchConfig { limit, cursor })
-            .map_err(operation_error_value)
     }
 }
 
@@ -257,55 +154,4 @@ impl RuntimeInner {
             })
             .collect()
     }
-}
-
-fn bytes_value(bytes: &[u8]) -> JsValue {
-    let array = Array::new();
-    for byte in bytes {
-        array.push(&JsValue::from(*byte));
-    }
-    Object::freeze(&array).into()
-}
-
-fn page_value(page: &ffi::CatalogPage) -> JsValue {
-    let value = Object::new();
-    set(&value, "revision", page.revision());
-    let participants = Array::new();
-    for participant in page.participants() {
-        let value = Object::new();
-        set(&value, "id", participant.id);
-        if let Some(id) = participant.data_recipient_id {
-            set(&value, "dataRecipientId", id);
-        }
-        let publications = Array::new();
-        for publication in participant.publications {
-            let value = Object::new();
-            set(&value, "id", publication.id);
-            set(&value, "trackId", publication.track_id);
-            let kind = Object::new();
-            match publication.kind {
-                ffi::CatalogPublicationKind::Audio => set(&kind, "tag", "Audio"),
-                ffi::CatalogPublicationKind::Video => set(&kind, "tag", "Video"),
-                ffi::CatalogPublicationKind::Data { delivery } => {
-                    set(&kind, "tag", "Data");
-                    let inner = Object::new();
-                    set(&inner, "delivery", delivery as u32);
-                    set(&kind, "inner", Object::freeze(&inner));
-                }
-            }
-            set(&value, "kind", Object::freeze(&kind));
-            publications.push(&Object::freeze(&value));
-        }
-        set(&value, "publications", Object::freeze(&publications));
-        participants.push(&Object::freeze(&value));
-    }
-    set(&value, "participants", Object::freeze(&participants));
-    set(&value, "hasMore", page.has_more());
-    set(&value, "nextCursor", bytes_value(&page.next_cursor()));
-    set(
-        &value,
-        "cursorExpiresAtUnixSeconds",
-        page.cursor_expires_at_unix_seconds(),
-    );
-    Object::freeze(&value).into()
 }

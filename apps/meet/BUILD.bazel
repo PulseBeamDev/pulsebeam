@@ -1,4 +1,4 @@
-load("//tools:npm-links.bzl", "link_web_for_react_consumers")
+load("//tools:npm-links.bzl", "link_web_binding_runtime", "link_web_for_react_consumers")
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test")
 load("@bazel_lib//lib:output_files.bzl", "output_files")
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
@@ -14,7 +14,7 @@ package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
 
-npm_link_all_packages(name = "node_modules", imported_links = [link_web_for_react_consumers])
+npm_link_all_packages(name = "node_modules", imported_links = [link_web_for_react_consumers, link_web_binding_runtime])
 
 js_test(
     name = "component_tests",
@@ -23,11 +23,7 @@ js_test(
     chdir = package_name(),
     data = [
         "//agents/react:component_support", "//agents/react:component_sources",
-        "//agents/pulsebeam-agent-web:component_sources",
-        ":node_modules/react", ":node_modules/react-dom", ":node_modules/happy-dom",
-        ":node_modules/esbuild", ":node_modules/@mui/material", ":node_modules/lucide-react",
-        ":node_modules/@emotion/react", ":node_modules/@emotion/styled",
-        "package.json",
+        ":node_modules", "package.json",
     ] + glob(["tests/**", "components/**", "hooks/**", "lib/**"]),
 )
 

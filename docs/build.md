@@ -214,19 +214,18 @@ explicit migration removes their obsolete proof.
 | System policy: loss, recovery, ordering, history and cross-shard behavior | Deterministic native/SFU simulation | Component models do not replace the integrated system oracles. |
 | Supported emitted JS/WASM ABI and lifecycle paths | Web owner's pinned-Node artifact tests | Instantiate real emitted WASM and call generated exports. Controlled sender completions exercise ownership and cancellation, not negotiated RTC, codecs or browser compatibility. Node is a QA host, not a supported browser substitute for applications. |
 | React lifecycle, capture and playback policy; Meet join, identity, topics, credentials and Leave | Owner component tests in pinned Node with real React and Happy DOM | Render production hooks and component trees with effects, subscriptions, events and unmounts. Only external runtime snapshots, capture, geometry and playback outcomes are modeled. No real layout, decoding, autoplay security or connected-media claim. Credential observation covers exercised flows, including transient effects, not every possible application path. |
-| Irreducible Web-platform glue | Required Web browser owner | Shipped SDK with a real local SFU and fresh decoded media, adapter reconnect, real-track generated handoff, element/observer/device-pixel plumbing and isolated early/late autoplay premises. |
+| Irreducible Web-platform glue | Required Web browser owner | Shipped SDK with a local SFU, fresh decoded media, restart fencing, real-track handoff and playback before or after a real user gesture. |
 
 Put a new behavioral test in the narrowest faithful owner above. Admit a browser
 assertion only when it names a unique **PulseBeam platform regression** that
 narrower proof cannot catch; testing the browser's general API conformance is not
 the goal. Keep policy and lifetime matrices out of browser sessions.
 
-Root `//:fast` includes cheap Web facade/decision and React/Meet component tests
-without distribution assembly, Meet export or browser provisioning. Artifact,
-package-consumer and browser proof remain required in `//:test`, not optional
-because they cost more. Executable owner targets define exact membership. The
-Web browser owner needs pinned tooling, built Web artifacts and owned local
-SFU/assets, but no Meet export or React acceptance fixture.
+Root `//:fast` includes Web registry tests and React/Meet component tests.
+Component tests exercise generated Web handles without a Meet production
+export, package installation or browser provisioning. Artifact, package-consumer
+and browser proof remain required in `//:test`. The browser owner uses pinned
+tooling, shipped artifacts, an owned local SFU and a packed React fixture.
 
 ### Required Linux transport host
 

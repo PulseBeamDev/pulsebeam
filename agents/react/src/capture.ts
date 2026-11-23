@@ -497,6 +497,8 @@ function useCaptureImpl(
             kind,
           );
       }
+      if (display && video?.readyState === "live" && "contentHint" in video)
+        video.contentHint = "detail";
       const next: CaptureSnapshot = {
         video:
           video?.readyState === "live"

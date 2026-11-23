@@ -17,19 +17,13 @@ useAgent(config: AgentConfig): Agent | null
 The hook returns null until a committed effect creates the actual Web SDK Agent.
 It never joins implicitly. React observes that handle, renews authorization when
 `token` changes, and closes it on unmount. Key the owning component when endpoint,
-identity, or topology changes.
+or participant identity changes.
 
 ```ts
 interface AgentConfig {
   endpoint: string;
   token: string;
-  topology?: {
-    localVideos?: number;
-    localAudios?: number;
-    remoteVideos?: number;
-    remoteAudios?: number;
-  };
-  logging?: { level?: LogLevel };
+  logLevel?: LogLevel;
 }
 ```
 
@@ -66,7 +60,7 @@ Data publication takes no source and returns `DataPublication`.
 refs. Media options are the SDK's complete `VideoObservation` or
 `AudioSubscriptionConfig`, not partial playback hints. Omit options to use SDK
 defaults. Changes configure the existing subscription; omitting options restores its SDK
-defaults. Data returns `DataSubscription<D>` with its typed `next()` event API.
+defaults. Data returns `DataSubscription` with its typed `next()` event API.
 Changed target scope closes the old handle and returns null until its replacement
 exists. Unmount and Strict Mode replay close owned resources and cursors.
 
@@ -80,7 +74,7 @@ const Chat = agent.data("chat");
 
 Track IDs are application-defined names. Lookup returns a stable logical
 handle but does not reserve capacity, publish, subscribe, or play media. Local
-refs expose `kind`, `trackId`, and `publish()`. Remote refs expose `subscribe()`.
+refs expose `trackId()` and `publish()`. Remote refs expose `selector()` and `subscribe()`.
 Data publications send bytes.
 
 Equivalent SDK-issued handles within an Agent identify the same logical target.
@@ -188,7 +182,7 @@ const watch = useWatch(room, { limit: 100, cursor });
 const state = watch?.state();
 ```
 
-`useWatch(roomRef | null, config?)` returns the actual owned Web `Watch`, or
+`useWatch(roomRef | null, config?)` returns the actual owned Web `Catalog`, or
 `null` until committed ownership. It observes updates internally, so reading
 `watch.state()` in render rerenders when the state changes. A null room acquires
 nothing. Unmount closes this watch, not independently owned subscriptions.
@@ -200,14 +194,14 @@ are copied and compared by value. Omit the cursor for the first page.
 | Value | Contract |
 | --- | --- |
 | `WatchStatus.Loading` | No complete page yet; not a successful empty result. |
-| `WatchStatus.Live` | `state.page` is one complete immutable page. An empty participant array is valid. |
+| `WatchStatus.Live` | `state.participants` is the participant list for one complete immutable page. An empty participant array is valid. |
 | `WatchStatus.Failed` | Inspect `state.error`; correct the cause and create a new watch. |
 | `WatchStatus.Closed` | Final healthy close state; its page is cleared. A prior failure remains a failure on close. |
-| `page.participants` | Ordered participant metadata: application `id` and `publications`. Presence-only participants have no publications. |
+| `state.participants` | Ordered participant metadata: application `id()` and `tracks()`. Presence-only participants have no publications. |
 | `publication.trackId`, `publication.id` | Application track name and exact admitted publication ID, respectively. Use `trackId` for logical lookup. |
 | `publication.kind.tag` | `Video`, `Audio`, or `Data`; data also carries `kind.inner.delivery`. |
-| `page.hasMore`, `page.nextCursor` | Explicit continuation. Replace the watch to request the next page; do not append every page automatically. |
-| `page.cursorExpiresAtUnixSeconds` | Continuation expiry. Invalid, expired or wrong-scope cursors fail explicitly; offer a first-page restart. |
+| `state.hasMore`, `state.nextCursor` | Explicit continuation. Replace the watch to request the next page; do not append every page automatically. |
+| `state.cursorExpiresAtUnixSeconds` | Continuation expiry. Invalid, expired or wrong-scope cursors fail explicitly; offer a first-page restart. |
 
 The default limit is 100 participants, with a maximum of 500. An Agent owns at
 most eight pending/live watches. Each watch retains one current page and allows
@@ -233,7 +227,7 @@ participant.data(trackId): RemoteDataTrack
 ```
 
 Lookup is inert. Use an application-known address or a publication from the
-current Watch page, passing the participant's `id` and the publication's `trackId`.
+current Watch page, passing the participant's `id()` and the publication's `trackId`.
 These logical handles survive temporary absence and replacement but stay pinned
 to their literal room. They do not enumerate participants or publications:
 `agent.participants`, `participant.tracks` and global snapshot catalog/mapping/media
@@ -269,24 +263,10 @@ async function send(payload: Uint8Array) {
 The hook returns null until its effect creates the publication, then closes it
 on unmount. Handle send failures at the application action.
 
-Events are discriminated by `type`:
-
-```ts
-type DataMessage = {
-  readonly type: "message";
-  readonly publicationId: string;
-  readonly participantId: string;
-  readonly sequence: bigint;
-  readonly data: Uint8Array;
-};
-
-type DataDiscontinuity = {
-  readonly type: "discontinuity";
-  readonly participantId: string;
-  readonly previousPublicationId: string;
-  readonly publicationId: string;
-};
-```
+Use `DataEvent.Message.instanceOf(event)` to narrow to a message. Read the
+message's `participantId`, `publicationId`, `sequence` and `data` from
+`event.inner`. `DataEvent.Discontinuity.instanceOf(event)` narrows to a source
+change with `previousPublicationId` and `publicationId`.
 
 A discontinuity reports source replacement on a stream that can continue.
 Reliable subscriptions report unrecoverable continuity loss through `onError`.
@@ -324,18 +304,14 @@ cannot be forcibly cancelled, and its side effects cannot be undone.
 
 ## Connection and errors
 
-`connection` reports the detailed lifecycle, including `disconnected`, setup,
-connected, reconnecting, retry-waiting, closing, and terminal-failure states.
-`connect()` records desired connection; `disconnect()` clears it. Surviving
-component declarations and desired state remain through disconnect and transient
-loss. Unmount and session replacement release their owners. Final Agent
-disposal cannot be reversed. `AgentError`
-contains a stable failure `class` and `message`. Present errors to users without
-logging credentials.
+Read `agent.state().status` for the `AgentStatus` lifecycle and `state.error`
+for an `ErrorInfo` with a stable `code` and a `message`. `join(room)` records the
+intended room; `state.room` identifies the admitted room. Transient transport
+loss does not release logical owners. Unmount and session replacement release
+their owners. Closing an Agent is final. Present errors without logging credentials.
 
 ## Capacity
 
-Topology counts reserve fixed media sender and receiver resources when the Agent
-is created. They are track slot counts, not participant limits. Publication and
-receive owners arbitrate those resources; logical lookup itself consumes no
-capacity. Replace the Agent to change topology.
+Catalog watches, publications and subscriptions have independent resource limits.
+Inspect their state for admission or execution errors. Close unused owners rather
+than creating speculative receive demand.

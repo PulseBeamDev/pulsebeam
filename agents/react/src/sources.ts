@@ -1,6 +1,8 @@
-import type {
-  AudioSource as WebAudioSource,
-  VideoSource as WebVideoSource,
+import {
+  AudioSource as GeneratedAudioSource,
+  VideoSource as GeneratedVideoSource,
+  type AudioSource as WebAudioSource,
+  type VideoSource as WebVideoSource,
 } from "@pulsebeam/web";
 
 const sourceBrand = Symbol("PulseBeam source");
@@ -54,13 +56,24 @@ export function playbackTrack(
   value: VideoSource | AudioSource | WebVideoSource | WebAudioSource,
   kind: "video" | "audio",
 ) {
-  const track = tracks.get(value) ?? ("pipeTo" in value ? value : undefined);
-  if (!track || track.kind !== kind)
+  const track =
+    tracks.get(value) ?? ("previewTrack" in value ? value : undefined);
+  if (
+    kind === "video"
+      ? !(track instanceof GeneratedVideoSource)
+      : !(track instanceof GeneratedAudioSource)
+  )
     throw new TypeError(`invalid ${kind} source`);
-  return track;
+  return track!;
 }
 export function releasePublicationSource(
   value: PublishableVideoSource | PublishableAudioSource | null,
 ): void {
-  if (value) void tracks.get(value)?.close();
+  if (value)
+    void tracks
+      .get(value)
+      ?.close()
+      .catch((error: unknown) => {
+        console.error("PulseBeam capture source cleanup failed", error);
+      });
 }

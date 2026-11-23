@@ -5,6 +5,8 @@
 mod rtp_relay;
 
 use pulsebeam_core::identity::{ParticipantId, RoomId};
+use rtp_relay::Relays;
+use serde::de::DeserializeOwned;
 use std::env;
 use std::error::Error;
 use std::io;
@@ -14,14 +16,6 @@ use std::path::{Component, Path, PathBuf};
     reason = "owned live HTTP fixture shares its state across handler tasks"
 )]
 use std::sync::Arc;
-#[allow(
-    clippy::disallowed_types,
-    reason = "independent fixture WASM request counter, not a multi-atomic snapshot"
-)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use rtp_relay::Relays;
-use serde::de::DeserializeOwned;
 use thirtyfour::ChromeCapabilities;
 use thirtyfour::bidi::BrowsingContextId;
 use thirtyfour::bidi::modules::browsing_context::ReadinessState;
@@ -47,26 +41,19 @@ pub fn mint_development_token(
     )?.token)
 }
 
-#[allow(
-    clippy::disallowed_types,
-    reason = "owned HTTP fixture shares relay state and one independent request counter across handler tasks"
-)]
 pub struct StaticServer {
     address: String,
     task: JoinHandle<()>,
-    wasm_requests: Arc<AtomicUsize>,
 }
 #[allow(
     clippy::disallowed_types,
-    reason = "owned HTTP fixture shares relay state and one independent request counter across handler tasks"
+    reason = "owned HTTP fixture shares relay state across handler tasks"
 )]
 impl StaticServer {
     pub async fn start(root: impl Into<PathBuf>) -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?.to_string();
         let root = root.into();
-        let wasm_requests = Arc::new(AtomicUsize::new(0));
-        let request_count = Arc::clone(&wasm_requests);
         let relays = Arc::new(Mutex::new(Relays::default()));
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
@@ -75,27 +62,19 @@ impl StaticServer {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
                         let root = root.clone();
-                        let request_count = Arc::clone(&request_count);
                         let relays = Arc::clone(&relays);
                         connections.spawn(async move {
-                            let _ = serve(stream, &root, &request_count, &relays).await;
+                            let _ = serve(stream, &root, &relays).await;
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
         });
-        Ok(Self {
-            address,
-            task,
-            wasm_requests,
-        })
+        Ok(Self { address, task })
     }
     pub fn url(&self, path: &str) -> String {
         format!("http://{}/{path}", self.address)
-    }
-    pub fn wasm_requests(&self) -> usize {
-        self.wasm_requests.load(Ordering::Relaxed)
     }
 }
 impl Drop for StaticServer {
@@ -231,12 +210,7 @@ fn remote_value(value: &serde_json::Value) -> serde_json::Value {
     clippy::disallowed_types,
     reason = "borrows the fixture's independent WASM request counter"
 )]
-async fn serve(
-    mut stream: TcpStream,
-    root: &Path,
-    wasm_requests: &AtomicUsize,
-    relays: &Mutex<Relays>,
-) -> io::Result<()> {
+async fn serve(mut stream: TcpStream, root: &Path, relays: &Mutex<Relays>) -> io::Result<()> {
     let mut request = [0_u8; 16 * 1024];
     let length = stream.read(&mut request).await?;
     let received = request.get(..length).ok_or_else(|| {
@@ -246,9 +220,6 @@ async fn serve(
     let mut parts = head.lines().next().unwrap_or_default().split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
-    if target.ends_with(".wasm") {
-        wasm_requests.fetch_add(1, Ordering::Relaxed);
-    }
     if method != "GET" && method != "HEAD" {
         if target.contains("/rooms/sender-stats/") {
             let mut byte = [0_u8; 1];

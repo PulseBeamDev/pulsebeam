@@ -1,52 +1,62 @@
-import { nativeSourceTrack, watchSource } from "./capture-source.js";
-import type { AudioSource, VideoSource } from "./capture-source.js";
-import {
-  bindVideoView,
-  type AudioSubscription,
-  type VideoSubscription,
-  type MediaObservation,
-} from "./reception.js";
+export interface PlaybackLease {
+  track(): MediaStreamTrack | null;
+  isClosed(): boolean;
+  close(): Promise<void>;
+}
 
-export interface MediaReceiver {
-  observe(signal?: AbortSignal): Promise<MediaObservation>;
+export interface PlaybackReceiver {
+  observe(signal: AbortSignal): Promise<PlaybackLease>;
   isClosed(): boolean;
   updates(): {
     next(): Promise<unknown | undefined>;
     close(): void;
   };
 }
-export type MediaInput =
-  | AudioSource
-  | VideoSource
-  | AudioSubscription
-  | VideoSubscription
-  | MediaReceiver
-  | MediaObservation;
+
+export type PlaybackInput =
+  | PlaybackReceiver
+  | {
+      track(): MediaStreamTrack | null;
+      watch?(listener: () => void): () => void;
+    };
+
 export interface BorrowedMediaAttachment {
   setAutoPlay(value: boolean): void;
   retryPlayback(): Promise<void>;
   close(): Promise<void>;
 }
 
-export function attachMedia(
-  source: MediaInput,
-  kind: "video" | "audio",
-  element: HTMLMediaElement,
-  autoPlay: boolean,
-  blocked: (error: unknown, retry: () => Promise<void>) => void,
-  failed: (error: unknown) => void,
-  ready?: Promise<void>,
-): BorrowedMediaAttachment {
+export interface PlaybackTarget {
+  source: PlaybackInput;
+  kind: "video" | "audio";
+  element: HTMLMediaElement;
+  autoPlay: boolean;
+  blocked(error: unknown, retry: () => Promise<void>): void;
+  failed(error: unknown): void;
+  ready?: Promise<void> | undefined;
+  bindView?(failed: (error: unknown) => void): () => void;
+}
+
+export function attachPlayback({
+  source,
+  kind,
+  element,
+  autoPlay,
+  blocked,
+  failed,
+  ready,
+  bindView,
+}: PlaybackTarget): BorrowedMediaAttachment {
   let live = true;
   let playing = autoPlay;
   let attempt = 0;
   let revision = 0;
   const stream = new MediaStream();
   element.srcObject = stream;
-  let observation: MediaObservation | undefined;
+  let observation: PlaybackLease | undefined;
   let pending: Promise<void> | undefined;
   let controller: AbortController | undefined;
-  let cursor: ReturnType<MediaReceiver["updates"]> | undefined;
+  let cursor: ReturnType<PlaybackReceiver["updates"]> | undefined;
   let unwatch = () => {};
   let unlisten = () => {};
   let unview = () => {};
@@ -156,10 +166,11 @@ export function attachMedia(
   };
   const initialize = () => {
     try {
-      if (kind === "video")
-        unview = bindVideoView(source, element as HTMLVideoElement, (error) => {
+      if (bindView) {
+        unview = bindView((error) => {
           if (live) failed(error);
         });
+      }
       if ("observe" in source) {
         cursor = source.updates();
         void (async () => {
@@ -172,11 +183,10 @@ export function attachMedia(
         })().catch((error: unknown) => {
           if (live) failed(error);
         });
-      } else if ("track" in source) {
-        present(source.track());
       } else {
-        unwatch = watchSource(source, () => present(null));
-        present(nativeSourceTrack(source, kind));
+        const update = () => present(source.track());
+        unwatch = source.watch?.(update) ?? unwatch;
+        update();
       }
     } catch (error) {
       failed(error);

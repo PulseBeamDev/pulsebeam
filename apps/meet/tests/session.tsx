@@ -2,15 +2,22 @@ import assert from "node:assert/strict";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { MeetApp } from "../components/MeetApp";
-import { WatchStatus, CatalogDelivery } from "@pulsebeam/react";
-import { ErrorCode } from "@pulsebeam/web";
+import {
+  AgentStatus,
+  WatchStatus,
+  CatalogDelivery,
+  PlayoutDelay,
+} from "@pulsebeam/react";
+import { AgentError, ErrorCode, type CatalogParticipant } from "@pulsebeam/web";
 import {
   captures,
   displays,
   flush,
   stream,
 } from "../../../agents/react/tests/component/platform";
-import { runtimes } from "../../../agents/react/tests/component/runtime";
+import { scriptSdk } from "./sdk";
+
+const sdk = scriptSdk();
 
 // Observe effects before entry, including writes removed before the final check.
 const token = "component-secret-" + crypto.randomUUID();
@@ -153,7 +160,7 @@ await flush(() =>
     .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })),
 );
 assert.equal(
-  runtimes.length,
+  sdk.agents.length,
   0,
   "form submission cannot bypass required capture",
 );
@@ -188,7 +195,7 @@ await flush(() =>
     new Event("submit", { bubbles: true, cancelable: true }),
   ),
 );
-assert.equal(runtimes.length, 0, "invalid room never starts an Agent");
+assert.equal(sdk.agents.length, 0, "invalid room never starts an Agent");
 await input(roomField, "selected-room");
 assert.equal(button("Join room").disabled, false);
 await click("Mute microphone");
@@ -203,20 +210,23 @@ HTMLMediaElement.prototype.play = async () => {
   throw new DOMException("blocked", "NotAllowedError");
 };
 await click("Join room");
-assert.equal(runtimes.filter((runtime) => !runtime.closed).length, 1);
-const runtime = runtimes.at(-1)!;
-const deliver = (event: unknown) => runtime.deliverData("chat", event);
-assert.deepEqual(runtime.joins, ["selected-room"]);
+assert.equal(
+  sdk.agents.filter((agent) => agent.state().status !== AgentStatus.Closed)
+    .length,
+  1,
+);
+const agent = sdk.agents.at(-1)!;
+const deliver = (event: Parameters<typeof sdk.deliver>[1]) =>
+  sdk.deliver("chat", event);
+assert.deepEqual(sdk.joins, ["selected-room"]);
 await flush(() =>
-  runtime.emit({
-    connection: "connected",
+  sdk.changeAgent({
+    status: AgentStatus.Joined,
     participantId: "admitted-alice",
-    roomId: "admitted-room",
-    generation: 1n,
+    room: "admitted-room",
   }),
 );
-const activeWatch = () =>
-  [...runtime.catalogWatches].find(([, scope]) => !scope.closed)!;
+const activeWatch = () => sdk.watches().at(-1)!;
 const firstParticipants = [
   {
     id: "admitted-alice",
@@ -255,24 +265,21 @@ const continuation = Object.freeze(
 );
 const page = (participants = firstParticipants, hasMore = true) =>
   flush(() => {
-    const [owner] = activeWatch();
-    const current = runtime.observer(owner).state() as any;
-    runtime.setObservation(owner, {
-      ...current,
-      observationRevision: current.observationRevision + 1n,
+    const watch = activeWatch();
+    watch.change({
       status: WatchStatus.Live,
-      page: Object.freeze({
-        revision: current.observationRevision,
-        participants,
-        hasMore,
-        nextCursor: hasMore ? continuation : [],
-        cursorExpiresAtUnixSeconds: 1000n,
-      }),
+      participants: participants.map((participant) => ({
+        id: () => participant.id,
+        tracks: () => participant.publications,
+      })) as unknown as CatalogParticipant[],
+      hasMore,
+      nextCursor: Uint8Array.from(hasMore ? continuation : []),
+      cursorExpiresAtUnixSeconds: 1000n,
     });
   });
 assert.match(document.body.textContent!, /Loading participants/);
-assert.equal(activeWatch()[1].limit, 100);
-assert.deepEqual(activeWatch()[1].cursor, []);
+assert.equal(activeWatch().state().limit, 100);
+assert.deepEqual(Array.from(activeWatch().state().cursor), []);
 await page();
 assert.match(
   document.body.textContent!,
@@ -285,23 +292,24 @@ assert.match(
   document.querySelector("header")!.textContent!,
   /Room admitted-room/,
 );
-await flush(() => runtime.emit({ roomId: "selected-room" }));
+await flush(() => sdk.changeAgent({ room: "selected-room" }));
 assert.equal(
-  runtime.dataOwners.size,
+  sdk.dataOwners().length,
   2,
   "room-pinned chat and reaction tracks attach for each discovered endpoint",
 );
 assert.deepEqual(
-  [...runtime.audioSubscriptions.values()],
+  sdk.audios().map(({ selector }) => selector),
   [{ room: "selected-room", participantId: "bob", trackId: "microphone" }],
 );
 assert.deepEqual(
-  [...runtime.videoOwners.values()]
-    .map(({ selector, observation }) => ({
+  sdk
+    .videos()
+    .map(({ selector, configuration }) => ({
       selector,
-      minFps: observation.minFps,
-      priority: observation.priority,
-      playoutDelay: observation.playoutDelay,
+      minFps: configuration.minFps,
+      priority: configuration.priority,
+      playoutDelay: configuration.playoutDelay,
     }))
     .sort((a, b) => a.selector.trackId.localeCompare(b.selector.trackId)),
   [
@@ -313,7 +321,7 @@ assert.deepEqual(
       },
       minFps: 15,
       priority: 200,
-      playoutDelay: { mode: "adaptive" },
+      playoutDelay: PlayoutDelay.Adaptive.new(),
     },
     {
       selector: {
@@ -323,28 +331,28 @@ assert.deepEqual(
       },
       minFps: 15,
       priority: 10,
-      playoutDelay: { mode: "adaptive" },
+      playoutDelay: PlayoutDelay.Adaptive.new(),
     },
   ],
   "page-derived remote videos preserve spotlight/FPS/playout policy and exclude self",
 );
-const initialWatch = activeWatch()[1];
+const initialWatch = activeWatch();
 await click("Next page");
-assert.equal(initialWatch.closed, true);
-assert.deepEqual(activeWatch()[1].cursor, continuation);
+assert.equal(initialWatch.state().status, WatchStatus.Closed);
+assert.deepEqual(Array.from(activeWatch().state().cursor), continuation);
 assert.match(document.body.textContent!, /Loading participants/);
 assert.equal(
-  runtime.dataOwners.size,
+  sdk.dataOwners().length,
   0,
   "page replacement releases UI-owned subscriptions",
 );
 assert.equal(
-  runtime.videoOwners.size,
+  sdk.videos().length,
   0,
   "page replacement releases UI-owned video reception",
 );
 assert.equal(
-  runtime.audioSubscriptions.size,
+  sdk.audios().length,
   0,
   "page replacement releases UI-owned audio reception",
 );
@@ -353,33 +361,31 @@ assert.match(document.body.textContent!, /last-presence/);
 assert.doesNotMatch(document.body.textContent!, /quiet-observer/);
 assert.equal(button("Next page").disabled, true);
 assert.equal(
-  [...runtime.catalogWatches.values()].filter((scope) => !scope.closed).length,
+  sdk.watches().length,
   1,
   "Meet retains one bounded page, not an all-page traversal",
 );
 await click("First page");
-assert.deepEqual(activeWatch()[1].cursor, []);
+assert.deepEqual(Array.from(activeWatch().state().cursor), []);
 await page();
 await click("Next page");
 await flush(() => {
-  const [owner] = activeWatch();
-  const current = runtime.observer(owner).state() as any;
-  runtime.setObservation(owner, {
-    ...current,
-    observationRevision: current.observationRevision + 1n,
+  activeWatch().change({
     status: WatchStatus.Failed,
     error: { code: 0, message: "Catalog cursor expired" },
-    page: undefined,
+    participants: undefined,
+    hasMore: undefined,
+    nextCursor: undefined,
   });
 });
 assert.match(document.body.textContent!, /continuation is invalid or expired/);
 assert.equal(button("Next page").disabled, true);
 assert.equal(button("First page").disabled, false);
 await click("First page");
-assert.deepEqual(activeWatch()[1].cursor, []);
+assert.deepEqual(Array.from(activeWatch().state().cursor), []);
 await page();
 assert.equal(
-  runtime.dataOwners.size,
+  sdk.dataOwners().length,
   2,
   "First-page recovery restores only non-self UI subscriptions",
 );
@@ -418,7 +424,6 @@ assert.ok(
 const payload = "delivered through production data tracks";
 await flush(() =>
   deliver({
-    type: "message",
     publicationId: "remote-chat",
     participantId: "bob",
     sequence: 0n,
@@ -431,7 +436,6 @@ assert.match(
 );
 const remoteChat = (publicationId: string, sequence: bigint) =>
   deliver({
-    type: "message",
     participantId: "bob",
     publicationId,
     sequence,
@@ -451,7 +455,6 @@ const transcript = document.querySelector(
 assert.ok(transcript, "chat owns an inline transcript");
 await flush(() =>
   deliver({
-    type: "message",
     participantId: "bob",
     publicationId: "remote-chat",
     sequence: 4n,
@@ -465,14 +468,12 @@ await flush(() => {
     new TextEncoder().encode("42"),
   ]) {
     deliver({
-      type: "message",
       publicationId: "remote-chat",
       participantId: "bob",
       sequence: 5n,
       data,
     });
-    runtime.deliverData("reactions", {
-      type: "message",
+    sdk.deliver("reactions", {
       publicationId: "remote-reactions",
       participantId: "bob",
       sequence: 5n,
@@ -500,18 +501,18 @@ const chat =
 assert.ok(chat, "chat composer is rendered");
 await input(chat, "hello from component");
 let completeSend!: () => void;
-runtime.sendCompletion = new Promise((resolve) => (completeSend = resolve));
+sdk.setSendCompletion(new Promise((resolve) => (completeSend = resolve)));
 await click("Send message");
-assert.equal(runtime.sent.length, 0, "send waits for runtime completion");
+assert.equal(sdk.sent.length, 0, "send waits for runtime completion");
 assert.doesNotMatch(
   transcript.textContent!,
   /hello from component/,
   "local chat appears only after the send succeeds",
 );
 await flush(() => completeSend());
-runtime.sendCompletion = Promise.resolve();
+sdk.setSendCompletion(Promise.resolve());
 assert.ok(
-  runtime.sent.some(
+  sdk.sent.some(
     (message) =>
       message.name === "chat" &&
       new TextDecoder()
@@ -525,39 +526,35 @@ const updatedTranscript = document.querySelector(
 )!;
 assert.match(updatedTranscript.textContent!, /hello from component/);
 assert.doesNotMatch(updatedTranscript.textContent!, /Sending…/);
-const sentChat = runtime.sent.find((message) => message.name === "chat")!;
-assert.equal(sentChat.mode, "ordered");
+const sentChat = sdk.sent.find((message) => message.name === "chat")!;
+assert.equal(sentChat.mode, CatalogDelivery.Ordered);
 assert.equal(
   JSON.parse(new TextDecoder().decode(sentChat.payload)),
   "hello from component",
 );
-const chatOwners = [...runtime.dataOwners].filter(
-  ([, receiver]) => receiver.spec.trackId === "chat",
-);
+const chatOwners = sdk
+  .dataOwners()
+  .filter(([owner]) => owner.state().selector.trackId === "chat");
 assert.equal(chatOwners.length, 1);
-const [[chatOwner]] = chatOwners;
-await flush(() => {
-  runtime.setObservation(chatOwner, {
-    observationRevision: 2n,
-    terminalError: {
-      code: ErrorCode.ContinuityLost,
-      message: "Reliable data continuity was lost",
-    },
-  });
-});
-assert.equal(
-  runtime.dataOwners.has(chatOwner),
-  false,
-  "the broken Reliable owner is released",
+const [[chatOwner, chatReads]] = chatOwners;
+await flush(() =>
+  chatReads.fail(
+    AgentError.Operation.new({
+      info: {
+        code: ErrorCode.ContinuityLost,
+        message: "Reliable data continuity was lost",
+      },
+    }),
+  ),
 );
+assert.ok(chatOwner.state().closed, "the broken Reliable owner is released");
 assert.match(
   updatedTranscript.closest("aside")!.textContent!,
   /Chat is unavailable/,
 );
 privateSoFar();
 await flush(() =>
-  runtime.deliverData("reactions", {
-    type: "message",
+  sdk.deliver("reactions", {
     publicationId: "remote-reactions",
     participantId: "bob",
     sequence: 0n,
@@ -575,17 +572,15 @@ const reaction = document.querySelector<HTMLElement>(
 assert.ok(reaction, "incoming reaction is rendered");
 await flush(() => reaction.click());
 assert.ok(
-  runtime.sent.some(
+  sdk.sent.some(
     (message) =>
       message.name === "reactions" &&
       new TextDecoder().decode(message.payload).includes("👍"),
   ),
   "reaction interaction sends through the production data handle",
 );
-const sentReaction = runtime.sent.find(
-  (message) => message.name === "reactions",
-)!;
-assert.equal(sentReaction.mode, "lossy");
+const sentReaction = sdk.sent.find((message) => message.name === "reactions")!;
+assert.equal(sentReaction.mode, CatalogDelivery.Lossy);
 assert.equal(JSON.parse(new TextDecoder().decode(sentReaction.payload)), "👍");
 const visibleReaction =
   document.querySelector<HTMLElement>('[aria-label="👍"]')!;
@@ -616,7 +611,7 @@ const sharedOnLeave = stream();
 await flush(() => displays.at(-1)!.resolve(sharedOnLeave));
 
 await click("Leave");
-assert.equal(runtime.closed, true);
+assert.equal(agent.state().status, AgentStatus.Closed);
 assert.ok(
   sharedOnLeave.getTracks().every((track) => track.readyState === "ended"),
   "Leave also releases display capture",
@@ -652,7 +647,7 @@ assert.ok(
   "late capture is retired",
 );
 assert.ok(
-  runtimes.every((runtime) => runtime.closed),
+  sdk.agents.every((agent) => agent.state().status === AgentStatus.Closed),
   "all runtimes close on unmount",
 );
 privateSoFar();

@@ -1,3 +1,4 @@
+load("//tools:npm-links.bzl", "link_web_binding_runtime")
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test", "js_library")
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
@@ -12,7 +13,7 @@ package(default_visibility = ["//visibility:public"])
 filegroup(name = "workflow_inputs", srcs = glob(["*.md", "docs/**/*.md", "Justfile", "*.json", "*.yaml", "scripts/*.sh"], allow_empty = True))
 exports_files(["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
 
-npm_link_all_packages(name = "node_modules")
+npm_link_all_packages(name = "node_modules", imported_links = [link_web_binding_runtime])
 typescript.tsc_binary(name = "tsc")
 
 js_library(name = "component_support", srcs = glob(["tests/component/**"]))
@@ -21,14 +22,9 @@ js_library(name = "component_sources", srcs = glob(["src/**"]))
 js_test(
     name = "component_tests",
     entry_point = "tests/component/run.mjs",
-    args = ["tests/component/lifecycle.tsx"],
+    args = ["tests/component/generated.tsx"],
     chdir = package_name(),
-    data = [
-        ":component_support", ":component_sources", "package.json",
-        ":node_modules/react", ":node_modules/react-dom",
-        ":node_modules/happy-dom", ":node_modules/esbuild",
-        "//agents/pulsebeam-agent-web:component_sources",
-    ],
+    data = [":component_support", ":component_sources", "package.json", ":node_modules"],
 )
 
 
@@ -160,9 +156,9 @@ py_binary(
 run_binary(
     name = "installed_generated_web",
     tool = ":unpack_sdk",
-    srcs = ["//agents/pulsebeam-agent-web:generated_package.pack", "//agents/pulsebeam-agent-web:node_modules/@ubjs/core/dir"],
+    srcs = ["//agents/pulsebeam-agent-web:package.pack", "//agents/pulsebeam-agent-web:node_modules/@ubjs/core/dir"],
     args = [
-        "$(execpath //agents/pulsebeam-agent-web:generated_package.pack)",
+        "$(execpath //agents/pulsebeam-agent-web:package.pack)",
         "$(execpath //agents/pulsebeam-agent-web:node_modules/@ubjs/core/dir)",
         "$(RULEDIR)/installed-generated-web",
     ],
@@ -172,7 +168,7 @@ run_binary(
 js_run_binary(
     name = "generated_native_receiver",
     tool = ":quickstart_builder",
-    srcs = [":quickstart_source", ":installed_generated_web", ":node_modules", "tests/contracts/generated-native-receiver.ts"],
+    srcs = [":quickstart_source", ":component_sources", ":installed_generated_web", ":node_modules", "tests/contracts/generated-native-receiver.ts"],
     args = ["generated_native_receiver", "tests/contracts/generated-native-receiver.ts", "installed-generated-web"],
     chdir = package_name(),
     out_dirs = ["generated_native_receiver"],

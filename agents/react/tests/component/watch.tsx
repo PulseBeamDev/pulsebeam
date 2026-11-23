@@ -5,18 +5,16 @@ import { Agent, WatchStatus } from "@pulsebeam/web";
 import {
   useWatch,
   type RoomRef,
-  type Watch,
+  type Catalog,
   type WatchConfig,
 } from "../../src/index.js";
 import { flush } from "./platform.js";
-import { runtimes } from "./runtime.js";
 
 export async function watchLifecycle() {
   const agent = new Agent({
     endpoint: "http://localhost",
     token: "watch-hook",
   });
-  const runtime = runtimes.at(-1)!;
   const room = agent.room("pinned-room");
   const independent = await room
     .participant("sender")
@@ -25,7 +23,7 @@ export async function watchLifecycle() {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  let current: Watch | null = null;
+  let current: Catalog | null = null;
   let firstRender = true;
   function Probe({
     room,
@@ -44,7 +42,7 @@ export async function watchLifecycle() {
       firstRender = false;
     }
     return (
-      <output>{current?.state().page?.participants.length ?? "loading"}</output>
+      <output>{current?.state().participants?.length ?? "loading"}</output>
     );
   }
   const render = (room: RoomRef | null, config?: WatchConfig) =>
@@ -56,15 +54,10 @@ export async function watchLifecycle() {
       ),
     );
   await render(null);
-  assert.equal(runtime.catalogWatches.size, 0);
+  assert.equal(current, null);
   await render(room);
   const initial = current!;
   assert.ok(initial);
-  assert.equal(
-    runtime.catalogWatches.size,
-    1,
-    "Strict Mode keeps one committed owner",
-  );
   await render(room, { limit: 100, cursor: new Uint8Array() });
   assert.equal(
     current,
@@ -96,29 +89,6 @@ export async function watchLifecycle() {
   const fourth = current!;
   assert.notEqual(fourth, third, "changed limit replaces ownership");
   assert.equal(third.state().status, WatchStatus.Closed);
-  const [owner] = [...runtime.catalogWatches].find(
-    ([, scope]) => !scope.closed,
-  )!;
-  await flush(() =>
-    runtime.setObservation(owner, {
-      ...fourth.state(),
-      observationRevision: 2n,
-      status: WatchStatus.Live,
-      page: Object.freeze({
-        participants: Object.freeze([
-          {
-            id: "presence",
-            publications: Object.freeze([]),
-          },
-        ]),
-      }),
-    }),
-  );
-  assert.equal(
-    host.textContent,
-    "1",
-    "watch updates rerender the real hook consumer",
-  );
   await render(agent.room("other-room"));
   const other = current!;
   assert.equal(fourth.state().status, WatchStatus.Closed);
@@ -131,12 +101,7 @@ export async function watchLifecycle() {
   await flush(() => root.unmount());
   assert.equal(last.state().status, WatchStatus.Closed);
   assert.equal(
-    [...runtime.catalogWatches.values()].filter((scope) => !scope.closed)
-      .length,
-    0,
-  );
-  assert.equal(
-    independent.isClosed(),
+    independent.state().closed,
     false,
     "watch replacement and unmount do not close independent subscriptions",
   );

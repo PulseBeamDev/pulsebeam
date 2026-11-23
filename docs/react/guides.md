@@ -92,8 +92,8 @@ than treating failure as an empty page. Old application-retained pages stay
 stable; the SDK retains only its current page.
 
 Select publications only from the displayed page. A `Video` metadata entry maps
-to `room.participant(info.id).video(publication.trackId)`; use `.audio` or
-`.data` for the other kinds. Skip `info.id === agent.participantId` before
+to `room.participant(info.id()).video(publication.trackId)`; use `.audio` or
+`.data` for the other kinds. Skip `info.id() === agent.state().participantId` before
 creating receive owners. Presence-only entries still belong in the roster.
 Keep each selected handle stable in a mounted child with `useMemo`.
 
@@ -103,13 +103,15 @@ component that called `useSubscribe` closes that subscription. Replacing a Watch
 page does not close subscriptions held independently outside those UI mounts.
 
 ```tsx
+import { PlayoutDelay } from "@pulsebeam/react";
+
 const subscription = useSubscribe(remote, {
   visible: true,
   height: 360,
   minHeight: 180,
   priority: pinned ? 200 : 10,
   minFps: 15,
-  playoutDelay: { mode: "fixed", minMs: 100, maxMs: 200 },
+  playoutDelay: PlayoutDelay.Fixed.new({ minMs: 100, maxMs: 200 }),
 });
 
 <Video
@@ -138,19 +140,19 @@ const audio = useSubscribe(agent.room(room).participant(peer).audio("microphone"
 
 ## Connection, renewal, and errors
 
-`connect()` records connection intent. `disconnect()` clears it. Transient
-transport failures retry while connection is desired. After correcting a
-terminal failure, call `connect()` again.
+`join(room)` records the desired room. Read `agent.state()` to distinguish that
+intent from the admitted room. Transient transport failures retry while joined
+intent remains. After correcting a join denial, retry `join(room)`.
 
-`useAgent` renews authorization when only `config.token` changes. Key the owning
-component when room, participant identity, endpoint, or topology changes so
-React replaces the Agent.
+`useAgent` renews authorization when `config.token` changes. Do not also renew
+the same token imperatively. Use a new component key for a different participant
+identity. To move rooms in the same session, call `join()` with the new room.
 
 ```tsx
-<Room key={`${roomId}:${participantId}`} token={token} />
+<Room key={participantId} token={token} />
 ```
 
-Render `agent.connection` and `agent.error` for user-visible status. Do not put
+Render `agent.state().status` and `agent.state().error` for user-visible status. Do not put
 credentials in URLs, storage, or logs.
 
 ## Data tracks
@@ -159,6 +161,8 @@ PulseBeam data tracks carry bytes. The application owns its wire format,
 validation, versioning, and malformed-payload policy.
 
 ```tsx
+import { DataEvent } from "@pulsebeam/react";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -177,9 +181,9 @@ function Chat({ agent }: { agent: Agent }) {
       <Data
       track={incoming}
       onEvent={(event) => {
-        if (event.type !== "message") return;
+        if (!DataEvent.Message.instanceOf(event)) return;
         try {
-          const value: unknown = JSON.parse(decoder.decode(event.data));
+          const value: unknown = JSON.parse(decoder.decode(event.inner.data));
           if (typeof value === "string") showMessage(value);
         } catch {
           // Ignore malformed application payloads without ending the stream.

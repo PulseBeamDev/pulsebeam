@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { usePublish, type Agent, type DataEvent } from "@pulsebeam/react";
+import { usePublish, type Agent, DataEvent } from "@pulsebeam/react";
 import { decodeText, encodeText } from "@/lib/data-codec";
 
 type LocalMessage = {
@@ -16,7 +16,7 @@ type RemoteMessage = {
   value: string;
 };
 export function useChat(agent: Agent) {
-  const { participantId } = agent;
+  const { participantId } = agent.state();
   const Chat = agent.data("chat");
   const publication = usePublish(Chat);
   const [messages, setMessages] = useState<(RemoteMessage | LocalMessage)[]>(
@@ -31,16 +31,16 @@ export function useChat(agent: Agent) {
     error,
     clearError: () => setError(null),
     onEvent(event: DataEvent) {
-      if (event.type !== "message") return;
-      const value = decodeText(event.data);
+      if (!DataEvent.Message.instanceOf(event)) return;
+      const value = decodeText(event.inner.data);
       if (value === null) return;
       setMessages((current) => [
         ...current,
         {
           type: "message",
-          publicationId: event.publicationId,
-          sequence: event.sequence,
-          participantId: event.participantId,
+          publicationId: event.inner.publicationId,
+          sequence: event.inner.sequence,
+          participantId: event.inner.participantId,
           value,
         },
       ]);

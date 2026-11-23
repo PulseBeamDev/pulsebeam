@@ -1,5 +1,3 @@
-// External completion controls only. There is no SDP, RTP, decoding or browser
-// compatibility implementation here: negotiation intentionally never completes.
 export class Track extends EventTarget {
   id = crypto.randomUUID();
   enabled = true;
@@ -15,49 +13,6 @@ export class Track extends EventTarget {
     this.readyState = "ended";
   }
 }
-class Sender {
-  track = null;
-  constructor(encodings) {
-    this.encodings = encodings;
-  }
-  async replaceTrack(track) {
-    this.track = track;
-  }
-  getParameters() {
-    return { encodings: this.encodings.map((encoding) => ({ ...encoding })) };
-  }
-  async setParameters(parameters) {
-    this.encodings = parameters.encodings;
-  }
-}
-class Transceiver {
-  constructor(sender) {
-    this.sender = sender;
-  }
-}
-class Peer {
-  connectionState = "new";
-  addTransceiver(kind, init) {
-    return new Transceiver(new Sender(init.sendEncodings ?? [{}]));
-  }
-  createDataChannel(label, init = {}) {
-    return {
-      label,
-      id: init.id ?? null,
-      negotiated: init.negotiated ?? false,
-      ordered: init.ordered ?? true,
-      maxRetransmits: init.maxRetransmits ?? null,
-      maxPacketLifeTime: init.maxPacketLifeTime ?? null,
-      close() {},
-    };
-  }
-  createOffer() {
-    return new Promise(() => {});
-  }
-  close() {
-    this.connectionState = "closed";
-  }
-}
 export class Stream {
   constructor(tracks = []) {
     this.tracks = tracks;
@@ -66,10 +21,4 @@ export class Stream {
     return this.tracks;
   }
 }
-Object.assign(globalThis, {
-  MediaStream: Stream,
-  RTCPeerConnection: Peer,
-  RTCRtpTransceiver: Transceiver,
-  RTCRtpSender: Sender,
-  MediaStreamTrack: Track,
-});
+Object.assign(globalThis, { MediaStreamTrack: Track, MediaStream: Stream });
