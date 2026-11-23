@@ -167,14 +167,11 @@ impl ShardCore {
         ingress: pulsebeam_link::FabricIngress,
         now: Instant,
         arrival: Instant,
-        image: impl Into<crate::route::fabric::NetworkPacket>,
+        image: crate::route::fabric::NetworkPacket,
     ) {
-        use crate::route::fabric::NetworkPacket;
-        let image = image.into();
         let repair = ingress.purpose == pulsebeam_link::FabricPurpose::RepairOnly;
         let (ingress, image) = if repair {
-            if matches!(&image, NetworkPacket::Wan { window, .. } if window.profile() != pulsebeam_core::fabric::Profile::Data)
-            {
+            if image.window.profile() != pulsebeam_core::fabric::Profile::Data {
                 let Some(repaired) = self
                     .execution
                     .runtime
@@ -191,21 +188,11 @@ impl ShardCore {
         } else {
             (ingress, image)
         };
-        let profile = match &image {
-            NetworkPacket::Legacy(packet) | NetworkPacket::Wan { packet, .. } => {
-                packet.header().profile
-            }
-        };
+        let profile = image.packet.header().profile;
         let data = profile == pulsebeam_core::fabric::Profile::Data;
         #[cfg(feature = "sim")]
-        let wan_protected_bytes = match &image {
-            NetworkPacket::Wan { packet, .. } => packet.wan_received_bytes(),
-            _ => None,
-        };
-        let media_position = match &image {
-            NetworkPacket::Wan { position, .. } if !data => Some(*position),
-            _ => None,
-        };
+        let wan_protected_bytes = image.packet.wan_received_bytes();
+        let position = image.position;
         let result = self
             .execution
             .runtime
@@ -222,9 +209,7 @@ impl ShardCore {
                     }
                 }
                 #[cfg(feature = "sim")]
-                if profile == pulsebeam_core::fabric::Profile::Opus
-                    && let Some(position) = media_position
-                {
+                if profile == pulsebeam_core::fabric::Profile::Opus {
                     crate::sim_metrics::wan_repair::admitted(
                         ingress.association,
                         position,
@@ -232,11 +217,10 @@ impl ShardCore {
                         report.enqueued,
                     );
                 }
-                if let Some(position) = media_position
-                    && let Some(interest) = self
-                        .execution
-                        .runtime
-                        .observe_network_media_position(address, ingress, position, now)
+                if let Some(interest) = self
+                    .execution
+                    .runtime
+                    .observe_network_media_position(address, ingress, position, now)
                 {
                     self.execution.pipeline.push_network_media_repair(interest);
                 }
@@ -474,10 +458,7 @@ impl ShardExecution {
             LiveRelayChange::Install(relay) => {
                 self.runtime.install_live_relay(Instant::now(), relay)
             }
-            LiveRelayChange::Retire(relay, retirement) => {
-                self.runtime
-                    .retire_live_relay(&relay, retirement, Instant::now())
-            }
+            LiveRelayChange::Retire(relay) => self.runtime.retire_live_relay(&relay),
         }
     }
 
@@ -516,20 +497,6 @@ impl ShardExecution {
                     self.dirty.mark(*member, receiver);
                 }
             }
-        }
-    }
-
-    pub(super) fn observe_relay_data_expectation(
-        &mut self,
-        observation: crate::route::fabric::relay::RelayObservation,
-    ) {
-        if self.runtime.observe_relay_data_expectation(
-            &observation.route,
-            observation.unit,
-            observation.outcome,
-            Instant::now(),
-        ) {
-            self.record_relay_data_outcome(observation.outcome);
         }
     }
 
@@ -664,9 +631,8 @@ impl ShardExecution {
                 };
                 #[cfg(feature = "sim")]
                 let wan_data = (identity.emission.profile()
-                    == pulsebeam_core::fabric::Profile::Data
-                    && route.tx.is_wan())
-                .then(|| (identity.publication.to_string(), lifetime.clone()));
+                    == pulsebeam_core::fabric::Profile::Data)
+                    .then(|| (identity.publication.to_string(), lifetime.clone()));
                 let installed = self.fabric_publisher_authorized(publisher, source)
                     && self
                         .runtime
@@ -719,11 +685,6 @@ impl ShardExecution {
             PeerRepairLookup::Media(lookup) => {
                 let located = self.locate_peer_media_repair(lookup, now);
                 let _ = request.result.send(located);
-            }
-            PeerRepairLookup::Relay(lookup) => {
-                let _ = request
-                    .result
-                    .send(self.runtime.locate_relay_repair(&lookup, now));
             }
             PeerRepairLookup::Publisher(lookup) => {
                 if self.pending_publisher_lookups.len() >= PUBLISHER_LOOKUP_LIMIT {
@@ -878,7 +839,6 @@ impl ShardExecution {
                     MediaRepairParent::Relay(_) => (None, None),
                 }
             }
-            PeerRepairLookup::Relay(_) => (None, None),
             PeerRepairLookup::Publisher(lookup) => {
                 let Some((publisher, source)) = lookup
                     .route
@@ -3057,7 +3017,7 @@ impl ShardExecution {
                     },
                 );
             }
-            ShardFrame::FabricImage(_) | ShardFrame::FabricWanImage { .. } => {}
+            ShardFrame::FabricWanImage { .. } => {}
             ShardFrame::Reverse { address, packet } => self.on_reverse_frame(address, packet, now),
         }
     }
@@ -3252,11 +3212,6 @@ impl ShardExecution {
                     .next_publisher_data_expectation()
                     .map(|(deadline, _)| deadline),
             )
-            .chain(
-                self.runtime
-                    .next_relay_data_expectation()
-                    .map(|(deadline, _)| deadline),
-            )
             .min()
     }
 
@@ -3398,27 +3353,6 @@ impl ShardExecution {
         }
     }
 
-    fn advance_relay_data_expectations(&mut self, now: Instant) {
-        use crate::route::fabric::relay::RelayExpectationStep;
-        for _ in 0..FABRIC_CONTROL_TURN_BUDGET {
-            let Some((deadline, source)) = self.runtime.next_relay_data_expectation() else {
-                break;
-            };
-            if now < deadline {
-                break;
-            }
-            match self.runtime.tick_relay_data_expectation(source, now) {
-                Some(RelayExpectationStep::Send(expectation)) => {
-                    self.pipeline.push_relay_data_expectation(expectation);
-                }
-                Some(RelayExpectationStep::Settled(outcome)) => {
-                    self.record_relay_data_outcome(outcome);
-                }
-                None => break,
-            }
-        }
-    }
-
     fn advance_publisher_data_expectations(&mut self, now: Instant) {
         use crate::route::fabric::PublisherExpectationStep;
         for _ in 0..FABRIC_CONTROL_TURN_BUDGET {
@@ -3466,7 +3400,6 @@ impl ShardExecution {
         self.retry_publisher_lookups(now);
         self.expire_network_repairs(now);
         self.advance_fabric_repairs(now, &send);
-        self.advance_relay_data_expectations(now);
         use crate::{
             route::fabric::local::{ExpectationWrite, PropagationOutcome, PropagationStep},
             shard::router::{FabricDeliveryTarget, FabricOwner},
@@ -3634,8 +3567,6 @@ impl ShardExecution {
 mod fabric_tests;
 #[cfg(test)]
 pub(crate) use fabric_tests::FabricRtpFixture;
-#[cfg(all(test, feature = "sim"))]
-pub(crate) use fabric_tests::LiveNetworkFixture;
 
 #[cfg(test)]
 mod wrong_owner_tests {

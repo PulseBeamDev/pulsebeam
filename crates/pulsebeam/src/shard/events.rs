@@ -158,16 +158,6 @@ impl EventPipeline {
         true
     }
 
-    pub(super) fn push_relay_data_expectation(
-        &mut self,
-        expectation: crate::route::fabric::relay::RelayExpectation,
-    ) {
-        if self.shard_events.len() < self.packet_capacity {
-            self.shard_events
-                .push_back(ShardEvent::RelayDataExpectation(expectation));
-        }
-    }
-
     pub(super) fn push_publisher_data_expectation(
         &mut self,
         expectation: crate::route::fabric::PublisherExpectation,

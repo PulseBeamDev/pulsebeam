@@ -133,9 +133,6 @@ impl ShardUpdateApplication {
             for observation in delta.publisher_observations.drain(..) {
                 execution.observe_publisher_data_expectation(observation);
             }
-            for observation in delta.relay_observations.drain(..) {
-                execution.observe_relay_data_expectation(observation);
-            }
             for expectation in delta.data_expectations.drain(..) {
                 let _ = expectation
                     .result

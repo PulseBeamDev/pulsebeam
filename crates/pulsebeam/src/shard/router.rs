@@ -171,7 +171,7 @@ impl FabricSource {
             .iter()
             .map(|hop| &hop.route)
             .filter(|route| route.expires_at > now && route.tx.is_live())
-            .filter(|route| !route.tx.is_wan() || wan_peers.insert(route.next.peer));
+            .filter(|route| wan_peers.insert(route.next.peer));
         if !data_expectations
             .get_or_insert_with(Box::default)
             .seed(now, (), unit, expires, routes)
@@ -187,12 +187,14 @@ impl FabricSource {
         now: pulsebeam_runtime::time::Instant,
     ) -> Option<LiveNetworkChild> {
         let FabricIngress::Network {
-            children, relays, ..
+            children,
+            expected_parents,
+            ..
         } = &self.ingress
         else {
             return None;
         };
-        let parent = relays.repair_parent(request.fragment, now)?;
+        let parent = expected_parents.as_deref()?.parent(request.fragment, now)?;
         children
             .iter()
             .any(|child| child.spec == parent && child.lifetime.is_live())
@@ -282,6 +284,9 @@ enum FabricIngress {
         members: Vec<ParticipantHandle>,
         wan_transit: bool,
         relays: LiveRelays,
+        expected_parents: Option<
+            Box<crate::route::fabric::hop_expectations::ExpectedUnits<LiveNetworkChild, ()>>,
+        >,
     },
 }
 
@@ -373,14 +378,14 @@ const MAX_TRACK_FABRIC_SOURCES: usize = crate::track::MAX_SIMULCAST_LAYERS;
 type TrackFabricSources = arrayvec::ArrayVec<FabricSourceHandle, MAX_TRACK_FABRIC_SOURCES>;
 
 enum TrackMedia {
-    Legacy,
+    Legacy(Option<TrackStreamCache>),
     Fabric(TrackFabricSources),
 }
 
 impl TrackMedia {
     fn sources(&self) -> &[FabricSourceHandle] {
         match self {
-            Self::Legacy => &[],
+            Self::Legacy(_) => &[],
             Self::Fabric(sources) => sources,
         }
     }
@@ -394,7 +399,7 @@ impl TrackMedia {
 
     fn insert_fabric(&mut self, source: FabricSourceHandle) {
         match self {
-            Self::Legacy => {
+            Self::Legacy(_) => {
                 let mut sources = TrackFabricSources::new();
                 sources.push(source);
                 *self = Self::Fabric(sources);
@@ -414,7 +419,6 @@ struct TrackRuntime {
     id: crate::entity::PublicationKey,
     media: TrackMedia,
     origin: Option<ParticipantHandle>,
-    cache: Option<TrackStreamCache>,
     publisher: Option<ParticipantHandle>,
 }
 
@@ -938,6 +942,7 @@ impl ShardRuntime {
                     members: plan.local.clone(),
                     wan_transit: plan.wan_transit,
                     relays: LiveRelays::default(),
+                    expected_parents: None,
                 },
                 fanout,
                 reliable_installation: None,
@@ -1168,12 +1173,7 @@ impl ShardRuntime {
         relays.install(now, compiled)
     }
 
-    pub(super) fn retire_live_relay(
-        &mut self,
-        relay: &CompiledLiveRelay,
-        retirement: crate::route::fabric::RelayRetirement,
-        now: pulsebeam_runtime::time::Instant,
-    ) -> bool {
+    pub(super) fn retire_live_relay(&mut self, relay: &CompiledLiveRelay) -> bool {
         if relay.tx.is_live() {
             return false;
         }
@@ -1181,7 +1181,7 @@ impl ShardRuntime {
             && let Some(bound) = self.fabric_sources.get_mut(source)
             && let FabricIngress::Network { relays, .. } = &mut bound.ingress
         {
-            relays.retire(relay, retirement, now);
+            relays.retire(relay);
         }
         true
     }
@@ -1327,14 +1327,11 @@ impl ShardRuntime {
         image: NetworkPacket,
         now: pulsebeam_runtime::time::Instant,
     ) -> Option<(pulsebeam_link::FabricIngress, NetworkPacket)> {
-        let NetworkPacket::Wan {
+        let NetworkPacket {
             window,
             position,
             packet,
-        } = image
-        else {
-            return None;
-        };
+        } = image;
         let source = self.network_fabric_source(address)?;
         let FabricIngress::Network {
             children,
@@ -1359,7 +1356,7 @@ impl ShardRuntime {
         let parent = repair.child.parent;
         Some((
             parent.ingress,
-            NetworkPacket::Wan {
+            NetworkPacket {
                 window: parent.window?,
                 position,
                 packet,
@@ -1401,7 +1398,7 @@ impl ShardRuntime {
         ingress: pulsebeam_link::FabricIngress,
         now: pulsebeam_runtime::time::Instant,
         arrival: pulsebeam_runtime::time::Instant,
-        image: impl Into<NetworkPacket>,
+        image: NetworkPacket,
     ) -> Result<Offers, Rejection> {
         let source = self
             .network_fabric_source(address)
@@ -1434,32 +1431,19 @@ impl ShardRuntime {
         if members.is_empty() && !(*wan_transit && input.window.is_some()) {
             return Err(Rejection::Binding);
         }
-        let (hops, admission) = match (input.window, image.into()) {
-            (None, NetworkPacket::Legacy(packet)) => (
-                packet.remaining_hops(),
-                bound.fanout.offer_network(
-                    now,
-                    arrival,
-                    input.sequence_anchor,
-                    child.ingress,
-                    packet,
-                ),
-            ),
-            (
-                Some(expected),
-                NetworkPacket::Wan {
-                    window,
-                    position,
-                    packet,
-                },
-            ) if expected == window && window.contains(position) => (
-                packet.remaining_hops(),
-                bound
-                    .fanout
-                    .offer_bound_network(now, arrival, position, child.ingress, packet),
-            ),
-            _ => return Err(Rejection::Binding),
-        };
+        let NetworkPacket {
+            window,
+            position,
+            packet,
+        } = image;
+        if input.window != Some(window) || !window.contains(position) {
+            return Err(Rejection::Binding);
+        }
+        let hops = packet.remaining_hops();
+        let admission =
+            bound
+                .fanout
+                .offer_bound_network(now, arrival, position, child.ingress, packet);
         let (sequence, mut report) = match admission {
             Ok(admitted) => admitted,
             Err(error) => {
@@ -1993,9 +1977,9 @@ impl ShardRuntime {
         if *participant != publisher {
             return Err(Rejection::Binding);
         }
-        let peer_repair = publisher_sends.iter().any(|hop| {
-            now < hop.route.expires_at && hop.route.tx.is_wan() && hop.route.tx.is_live()
-        });
+        let peer_repair = publisher_sends
+            .iter()
+            .any(|hop| now < hop.route.expires_at && hop.route.tx.is_live());
         let Some((sequence, hops, mut report)) =
             bound.fanout.offer_endpoint_media(now, input, peer_repair)?
         else {
@@ -2202,8 +2186,7 @@ impl ShardRuntime {
         else {
             return false;
         };
-        route.tx.is_wan()
-            && route.tx.covers(position)
+        route.tx.covers(position)
             && Self::publisher_path_live(publisher_sends, route, now)
             && refresh.request(now, request)
     }
@@ -2497,7 +2480,9 @@ impl ShardRuntime {
             return false;
         };
         let FabricIngress::Network {
-            children, relays, ..
+            children,
+            expected_parents,
+            ..
         } = &mut bound.ingress
         else {
             return false;
@@ -2515,8 +2500,12 @@ impl ShardRuntime {
             notice.unit,
             |branch, destination| eligible(FabricLocalBranch { source, branch }, destination),
         ) {
-            Ok(ExpectationAdmission::First) => relays.seed_expectation(now, notice),
-            Ok(ExpectationAdmission::Replay) => relays.has_expectation(notice, now),
+            Ok(ExpectationAdmission::First) => expected_parents
+                .get_or_insert_with(Box::default)
+                .admit(now, parent, notice.unit, notice.expires, || ()),
+            Ok(ExpectationAdmission::Replay) => expected_parents
+                .as_deref()
+                .is_some_and(|units| units.contains(parent, notice.unit, now)),
             Err(_) => false,
         }
     }
@@ -2594,108 +2583,6 @@ impl ShardRuntime {
                     observation.outcome,
                 )
             })
-    }
-
-    pub(super) fn next_relay_data_expectation(
-        &self,
-    ) -> Option<(pulsebeam_runtime::time::Instant, FabricSourceHandle)> {
-        self.fabric_sources
-            .iter()
-            .filter_map(|(source, bound)| {
-                let FabricIngress::Network { relays, .. } = &bound.ingress else {
-                    return None;
-                };
-                Some((relays.expectation_deadline()?, source))
-            })
-            .min()
-    }
-
-    pub(super) fn tick_relay_data_expectation(
-        &mut self,
-        source: FabricSourceHandle,
-        now: pulsebeam_runtime::time::Instant,
-    ) -> Option<crate::route::fabric::relay::RelayExpectationStep> {
-        let FabricIngress::Network { relays, .. } =
-            &mut self.fabric_sources.get_mut(source)?.ingress
-        else {
-            return None;
-        };
-        relays.tick_expectation(now)
-    }
-
-    pub(super) fn observe_relay_data_expectation(
-        &mut self,
-        route: &CompiledLiveRelay,
-        unit: crate::route::fabric::local::DataExpectation,
-        outcome: crate::route::fabric::local::PropagationOutcome,
-        now: pulsebeam_runtime::time::Instant,
-    ) -> bool {
-        let Some(source) = self
-            .network_fabric_source(route.input.destination)
-            .and_then(|source| self.fabric_sources.get_mut(source))
-        else {
-            return false;
-        };
-        let FabricIngress::Network {
-            relays, children, ..
-        } = &mut source.ingress
-        else {
-            return false;
-        };
-        children
-            .iter()
-            .any(|child| child.spec == route.input && child.lifetime.is_live())
-            && relays.observe_expectation(now, route, unit, outcome)
-    }
-
-    fn relay_repair_window(
-        &self,
-        lookup: &crate::route::fabric::relay::RelayRepairLookup,
-        now: pulsebeam_runtime::time::Instant,
-    ) -> Option<(pulsebeam_runtime::time::Instant, u16, std::num::NonZeroU64)> {
-        let source = self.network_fabric_source(lookup.route.input.destination)?;
-        let FabricIngress::Network {
-            relays, children, ..
-        } = &self.fabric_sources.get(source)?.ingress
-        else {
-            return None;
-        };
-        let child = children
-            .iter()
-            .find(|child| child.spec == lookup.route.input && child.lifetime.is_live())?;
-        let (expires, count) = relays.repair_window(&lookup.route, lookup.request.fragment, now)?;
-        Some((expires, count, child.ingress))
-    }
-
-    #[cfg(all(test, feature = "sim"))]
-    pub(super) fn relay_repair_deadline(
-        &self,
-        lookup: &crate::route::fabric::relay::RelayRepairLookup,
-        now: pulsebeam_runtime::time::Instant,
-    ) -> Option<pulsebeam_runtime::time::Instant> {
-        self.relay_repair_window(lookup, now)
-            .map(|(deadline, _, _)| deadline)
-    }
-
-    pub(super) fn locate_relay_repair(
-        &self,
-        lookup: &crate::route::fabric::relay::RelayRepairLookup,
-        now: pulsebeam_runtime::time::Instant,
-    ) -> Option<crate::route::fabric::relay::LocatedRepair> {
-        let (expires, count, ingress) = self.relay_repair_window(lookup, now)?;
-        let source = self.network_fabric_source(lookup.route.input.destination)?;
-        let sequence = self
-            .fabric_sources
-            .get(source)?
-            .fanout
-            .cached_data_position(lookup.request.fragment, count, Some(ingress), now)?;
-        Some(crate::route::fabric::relay::LocatedRepair {
-            lookup: Box::new(crate::route::fabric::relay::PeerRepairLookup::Relay(
-                lookup.clone(),
-            )),
-            sequence,
-            expires,
-        })
     }
 
     pub(super) fn publisher_repair_window(
@@ -2791,7 +2678,6 @@ impl ShardRuntime {
                     .input
                     .window
                     .is_some_and(|window| window.contains(lookup.position))
-                    || !route.tx.is_wan()
                     || !route.tx.covers(lookup.position)
                     || !relays.has_live_path(route, now)
                 {
@@ -2810,8 +2696,7 @@ impl ShardRuntime {
                 else {
                     return None;
                 };
-                if !route.tx.is_wan()
-                    || !route.tx.covers(lookup.position)
+                if !route.tx.covers(lookup.position)
                     || !Self::publisher_path_live(publisher_sends, route, now)
                 {
                     return None;
@@ -2850,10 +2735,9 @@ impl ShardRuntime {
     ) {
         use crate::route::fabric::relay::PeerRepairLookup;
         let located = &handoff.located;
-        let (source, window, count, ingress, fragment) = match located.lookup.as_ref() {
+        let (source, window, count, fragment) = match located.lookup.as_ref() {
             PeerRepairLookup::Media(lookup) => {
-                if handoff.tx.is_wan()
-                    && lookup.position == located.sequence
+                if lookup.position == located.sequence
                     && let Some((cached, expires)) =
                         self.media_repair_cache(lookup, publisher_source, now)
                 {
@@ -2866,22 +2750,6 @@ impl ShardRuntime {
                 }
                 return;
             }
-            PeerRepairLookup::Relay(lookup) => {
-                let Some((window, count, ingress)) = self.relay_repair_window(lookup, now) else {
-                    return;
-                };
-                let Some(source) = self.network_fabric_source(lookup.route.input.destination)
-                else {
-                    return;
-                };
-                (
-                    source,
-                    window,
-                    count,
-                    Some(ingress),
-                    lookup.request.fragment,
-                )
-            }
             PeerRepairLookup::Publisher(lookup) => {
                 let Some(source) = publisher_source else {
                     return;
@@ -2890,7 +2758,7 @@ impl ShardRuntime {
                 else {
                     return;
                 };
-                (source, window, count, None, lookup.request.fragment)
+                (source, window, count, lookup.request.fragment)
             }
         };
         let Some(bound) = self.fabric_sources.get(source) else {
@@ -2905,7 +2773,7 @@ impl ShardRuntime {
             }
             _ => bound
                 .fanout
-                .cached_peer_data(located.sequence, fragment, count, ingress, now),
+                .cached_peer_data(located.sequence, fragment, count, None, now),
         };
         let Some((packet, cached_until)) = cached else {
             return;
@@ -3190,12 +3058,6 @@ impl ShardRuntime {
         origin: Option<ParticipantHandle>,
         publisher: Option<ParticipantHandle>,
     ) -> TrackHandle {
-        let cache = descriptor
-            .filter(|descriptor| descriptor.kind == crate::entity::TrackKind::Video)
-            .map(|descriptor| {
-                debug_assert!(descriptor.encodings.len() <= 3);
-                TrackStreamCache::with_encodings(&descriptor.encodings)
-            });
         if let Some(handle) = self.track_handles.get(&publication_id).copied() {
             let Some(runtime) = self.tracks.get_mut(handle) else {
                 debug_assert!(false, "a track identity must resolve to its shard handle");
@@ -3216,11 +3078,16 @@ impl ShardRuntime {
             runtime.publisher = publisher;
             return handle;
         }
+        let cache = descriptor
+            .filter(|descriptor| descriptor.kind == crate::entity::TrackKind::Video)
+            .map(|descriptor| {
+                debug_assert!(descriptor.encodings.len() <= 3);
+                TrackStreamCache::with_encodings(&descriptor.encodings)
+            });
         let handle = self.tracks.insert(TrackRuntime {
             id: publication_id,
-            media: TrackMedia::Legacy,
+            media: TrackMedia::Legacy(cache),
             origin,
-            cache,
             publisher,
         });
         self.track_handles.insert(publication_id, handle);
@@ -3240,12 +3107,12 @@ impl ShardRuntime {
             debug_assert!(false, "an RTP packet must resolve to a live track");
             return;
         };
-        if !matches!(runtime.media, TrackMedia::Legacy) {
+        let TrackMedia::Legacy(cache) = &mut runtime.media else {
             return;
-        }
+        };
         let seq = pkt.seq_no;
         let too_old;
-        let (packet, cache) = if let Some(track_cache) = runtime.cache.as_mut() {
+        let (packet, cache) = if let Some(track_cache) = cache.as_mut() {
             let Some(encoding) = track_cache.source(&pkt) else {
                 return;
             };
@@ -3521,7 +3388,10 @@ mod tests {
         );
 
         assert_eq!(runtime.tracks.get(key).unwrap().origin, origin_before);
-        assert!(runtime.tracks.get(key).unwrap().cache.is_some());
+        assert!(matches!(
+            runtime.tracks.get(key).unwrap().media,
+            TrackMedia::Legacy(Some(_))
+        ));
     }
 
     #[test]
@@ -3547,7 +3417,7 @@ mod tests {
             runtime
                 .tracks
                 .get(key)
-                .is_some_and(|track| track.cache.is_some())
+                .is_some_and(|track| matches!(track.media, TrackMedia::Legacy(Some(_))))
         );
     }
 
@@ -3574,7 +3444,7 @@ mod tests {
             runtime
                 .tracks
                 .get(key)
-                .is_some_and(|track| track.cache.is_none())
+                .is_some_and(|track| matches!(track.media, TrackMedia::Legacy(None)))
         );
     }
 
@@ -3733,14 +3603,35 @@ mod tests {
     }
 
     #[test]
-    fn reinserting_a_live_data_runtime_preserves_cache_state() {
+    fn reinserting_a_fenced_fabric_track_does_not_restore_legacy_forwarding() {
+        let _rng = pulsebeam_runtime::rand::seeded_rng(1);
         let mut runtime = ShardRuntime::new(ShardId::new(0));
-        let publication_id = publication_id(crate::entity::TrackKind::Data, "data");
-        let key = runtime.install_track(publication_id, None, None, None);
-        runtime.tracks.get_mut(key).unwrap().cache = Some(TrackStreamCache::new());
-        assert_eq!(runtime.install_track(publication_id, None, None, None), key);
+        let publisher = SlotMap::<ParticipantHandle, ()>::with_key().insert(());
+        let descriptor = crate::shard_update::TrackDescriptor {
+            origin: crate::entity::ConnectionId::new(),
+            kind: crate::entity::TrackKind::Video,
+            encodings: Vec::new(),
+        };
+        let publication_id = publication_id(crate::entity::TrackKind::Video, "video");
+        let key = runtime.install_track(publication_id, Some(&descriptor), Some(publisher), None);
+        assert!(matches!(
+            runtime.tracks.get(key).unwrap().media,
+            TrackMedia::Legacy(Some(_))
+        ));
+        let emission = Emission::new(pulsebeam_core::fabric::Profile::H264, &[]).unwrap();
+        let source = runtime
+            .install_fabric_source(key, publisher, emission, None, None)
+            .unwrap();
+        assert!(runtime.retire_fabric_source(source));
+        assert_eq!(
+            runtime.install_track(publication_id, Some(&descriptor), Some(publisher), None),
+            key
+        );
 
-        assert!(runtime.tracks.get(key).unwrap().cache.is_some());
+        assert!(matches!(
+            runtime.tracks.get(key).unwrap().media,
+            TrackMedia::Fabric(ref sources) if sources.is_empty()
+        ));
     }
 
     #[test]

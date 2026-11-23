@@ -1,15 +1,13 @@
 use pulsebeam_core::fabric::Profile;
-use pulsebeam_link::{
-    FabricPath, LinkControl, NetworkClass, NodeRouteKey, PeerRole, SecretCredential,
-};
+use pulsebeam_link::{LinkControl, NetworkClass, NodeRouteKey, PeerRole, SecretCredential};
 use pulsebeam_runtime::time::Duration;
 
-use crate::link::{fabric_codec::FabricWireCodec, host};
+use crate::link::{ReverseCodec, host};
 
 use super::*;
 
 #[pulsebeam_runtime::test(crate = "pulsebeam_runtime::__harness")]
-async fn provisioned_legacy_and_wan_sockets_cannot_activate_either_carrier() {
+async fn provisioned_reverse_and_wan_sockets_cannot_activate_either_carrier() {
     for (wan_role, legacy_role) in [
         (PeerRole::Initiator, PeerRole::Responder),
         (PeerRole::Responder, PeerRole::Initiator),
@@ -36,15 +34,7 @@ async fn provisioned_legacy_and_wan_sockets_cannot_activate_either_carrier() {
             class: NetworkClass::Wan,
         };
         let legacy_endpoint = old.endpoint;
-        let (old_id, mut legacy_lane) = links
-            .open_fabric_network_with_control(
-                old.with_fabric_path(FabricPath {
-                    udp_payload_limit: 1200,
-                    additional_overhead: 0,
-                }),
-                FabricWireCodec,
-            )
-            .unwrap();
+        let (old_id, mut legacy_lane) = links.open_network_with_control(old, ReverseCodec).unwrap();
         assert!(
             control
                 .try_send(host::Command::Install(Box::new(host::Install {

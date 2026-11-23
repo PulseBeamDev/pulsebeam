@@ -117,14 +117,37 @@ enum RepairLookupPhase {
     Silent,
 }
 
+#[cfg(test)]
+mod tests;
+
 impl RepairLookups {
-    fn same_branch(left: fabric_data::RepairFrame, right: fabric_data::RepairFrame) -> bool {
-        left.scope == right.scope && left.branch == right.branch
+    fn entry(
+        &mut self,
+        scope: fabric_data::Scope,
+        branch: NonZeroU64,
+        request: NonZeroU64,
+    ) -> Option<&mut PendingRepairLookup> {
+        self.pending.iter_mut().find(|entry| {
+            entry.frame.scope == scope
+                && entry.frame.branch == branch
+                && entry.frame.request.id == request
+        })
     }
 
-    fn entry(&mut self, frame: fabric_data::RepairFrame) -> Option<&mut PendingRepairLookup> {
-        self.pending.iter_mut().find(|entry| {
-            Self::same_branch(entry.frame, frame) && entry.frame.request.id == frame.request.id
+    fn outside_reorder_window(&self, frame: fabric_data::RepairFrame) -> bool {
+        // Independent fragment lookups can arrive out of order on the DTLS lane.
+        // Keep exact replay state in pending and allow reordering within one unit's burst.
+        let width = u64::from(pulsebeam_proto::data_record::MAX_FRAGMENTS);
+        self.pending.iter().any(|entry| {
+            entry.frame.scope == frame.scope
+                && entry.frame.branch == frame.branch
+                && entry
+                    .frame
+                    .request
+                    .id
+                    .get()
+                    .saturating_sub(frame.request.id.get())
+                    >= width
         })
     }
 
@@ -134,7 +157,7 @@ impl RepairLookups {
         now: Instant,
         stage: impl FnOnce() -> Vec<LocationReceipt>,
     ) {
-        if let Some(entry) = self.entry(frame) {
+        if let Some(entry) = self.entry(frame.scope, frame.branch, frame.request.id) {
             if entry.frame == frame
                 && now < entry.expires
                 && let RepairLookupPhase::Reply { repeat, .. } = &mut entry.phase
@@ -145,9 +168,7 @@ impl RepairLookups {
         }
         if self.paused_until.is_some_and(|limit| now < limit)
             || self.pending.len() >= REPAIR_LOOKUP_BUDGET
-            || self.pending.iter().any(|entry| {
-                Self::same_branch(entry.frame, frame) && entry.frame.request.id >= frame.request.id
-            })
+            || self.outside_reorder_window(frame)
         {
             return;
         }
@@ -191,7 +212,7 @@ impl RepairLookups {
         now: Instant,
     ) -> Option<pulsebeam_link::BindingId> {
         let expires = now.checked_add(MAX_REPAIR_LIFETIME)?;
-        if let Some(entry) = self.entry(frame) {
+        if let Some(entry) = self.entry(frame.scope, frame.branch, frame.request.id) {
             if entry.frame.request != frame.request {
                 return None;
             }
@@ -214,34 +235,16 @@ impl RepairLookups {
         None
     }
 
-    pub(in crate::control) fn ready(
-        &mut self,
-        frame: fabric_data::RepairFrame,
-        now: Instant,
-        handoff: impl FnOnce(
-            LocatedRepair,
-            pulsebeam_link::NodeRouteKey,
-        ) -> Option<pulsebeam_link::BindingId>,
-    ) {
-        self.ready_matching(frame, now, |_| true, handoff);
-    }
-
     fn ready_matching(
         &mut self,
-        frame: fabric_data::RepairFrame,
+        ready: fabric_data::WanRepairReady,
         now: Instant,
         matches_location: impl FnOnce(&LocatedRepair) -> bool,
-        handoff: impl FnOnce(
-            LocatedRepair,
-            pulsebeam_link::NodeRouteKey,
-        ) -> Option<pulsebeam_link::BindingId>,
+        handoff: impl FnOnce(LocatedRepair) -> Option<pulsebeam_link::BindingId>,
     ) {
-        let fabric_data::RepairAction::Ready { sequence, label } = frame.action else {
-            return;
-        };
         let Some(entry) = self
-            .entry(frame)
-            .filter(|entry| entry.frame.request == frame.request && now < entry.expires)
+            .entry(ready.scope, ready.branch, ready.request.id)
+            .filter(|entry| entry.frame.request == ready.request && now < entry.expires)
         else {
             return;
         };
@@ -254,11 +257,11 @@ impl RepairLookups {
             return;
         };
         if found.as_ref().is_some_and(|found| {
-            now < found.expires && sequence == found.sequence && matches_location(found)
+            now < found.expires && ready.sequence == found.sequence && matches_location(found)
         }) && let Some(mut located) = found.take()
         {
             located.expires = located.expires.min(entry.expires);
-            entry.phase = RepairLookupPhase::Consumed(handoff(located, label));
+            entry.phase = RepairLookupPhase::Consumed(handoff(located));
         }
     }
 }
@@ -325,26 +328,13 @@ impl PendingRepairLookup {
     }
 }
 
-type RepairReceipt =
-    oneshot::Receiver<Result<crate::link::ReceiveRoute, pulsebeam_link::BindError>>;
-
 struct RepairInterest {
     interest: Interest,
     state: RepairInterestState,
 }
 
 enum RepairInterestState {
-    Lookup {
-        sent: bool,
-    },
-    Installing {
-        sequence: u64,
-        receipt: RepairReceipt,
-    },
-    Ready {
-        sequence: u64,
-        route: crate::link::ReceiveRoute,
-    },
+    Lookup { sent: bool },
     WanRepair(crate::route::fabric::network_repair::RepairChild),
     Cancelled,
 }
@@ -453,20 +443,6 @@ impl Peer {
         self.association
             .as_ref()
             .is_some_and(|assoc| assoc.network == peer)
-    }
-
-    pub(in crate::control) fn send_relay_data_expectation(
-        &self,
-        expectation: crate::route::fabric::relay::RelayExpectation,
-        now: Instant,
-    ) {
-        self.send_data_expectation(
-            expectation.route.next,
-            expectation.route.input.incarnation,
-            expectation.unit,
-            expectation.expires,
-            now,
-        );
     }
 
     pub(in crate::control) fn allows_wan_data_expectation(
@@ -819,24 +795,13 @@ impl Association {
         match frame.action {
             RepairAction::Cancel => {
                 if let Some(binding) = self.repair_lookups.cancel(frame, now) {
-                    if self.is_wan {
-                        self.wan_repairs.cancel(actor, binding);
-                    } else {
-                        actor.cancel_relay_repair_send(binding);
-                    }
+                    self.wan_repairs.cancel(actor, binding);
                 }
             }
             RepairAction::Lookup => {
-                let network = self.network;
-                if self.is_wan {
-                    if let Some(lookup) = self.wan_publishers.repair_lookup(network, frame, now) {
-                        self.repair_lookups
-                            .lookup(frame, now, || actor.stage_repair_lookups(vec![lookup]));
-                    }
-                } else {
-                    self.repair_lookups.lookup(frame, now, || {
-                        actor.stage_peer_repair_lookup(network, frame, now)
-                    });
+                if let Some(lookup) = self.wan_publishers.repair_lookup(self.network, frame, now) {
+                    self.repair_lookups
+                        .lookup(frame, now, || actor.stage_repair_lookups(vec![lookup]));
                 }
             }
             RepairAction::Located { sequence } => {
@@ -845,20 +810,12 @@ impl Association {
                     .iter_mut()
                     .find(|pending| pending.accepts_lookup_reply(frame, now))
                 {
-                    pending.state = if self.is_wan {
-                        actor
-                            .stage_wan_repair_receive(now, pending.interest, sequence)
-                            .map_or(
-                                RepairInterestState::Cancelled,
-                                RepairInterestState::WanRepair,
-                            )
-                    } else {
-                        actor
-                            .stage_located_repair_receive(pending.interest, sequence)
-                            .map_or(RepairInterestState::Cancelled, |receipt| {
-                                RepairInterestState::Installing { sequence, receipt }
-                            })
-                    };
+                    pending.state = actor
+                        .stage_wan_repair_receive(now, pending.interest, sequence)
+                        .map_or(
+                            RepairInterestState::Cancelled,
+                            RepairInterestState::WanRepair,
+                        );
                 }
             }
             RepairAction::Unavailable => {
@@ -871,12 +828,6 @@ impl Association {
                     actor.stage_unavailable_network_repair(pending.interest, now);
                 }
             }
-            RepairAction::Ready { .. } if !self.is_wan => {
-                self.repair_lookups.ready(frame, now, |located, label| {
-                    actor.stage_relay_repair_handoff(located, label, now)
-                });
-            }
-            _ => {}
         }
     }
 
@@ -930,21 +881,10 @@ impl Association {
         {
             return;
         }
-        let frame = fabric_data::RepairFrame {
-            scope: ready.scope,
-            branch: ready.branch,
-            request: ready.request,
-            action: fabric_data::RepairAction::Ready {
-                sequence: ready.sequence,
-                label: pulsebeam_link::NodeRouteKey::from_bytes(
-                    ready.window.ssrc().get().to_be_bytes(),
-                ),
-            },
-        };
-        self.repair_lookups.ready_matching(frame, now, |located| {
+        self.repair_lookups.ready_matching(ready, now, |located| {
             matches!(located.lookup.as_ref(), PeerRepairLookup::Publisher(lookup)
                 if lookup.route.matches(route) && lookup.branch == ready.branch && lookup.request == ready.request)
-        }, |mut located, _| {
+        }, |mut located| {
             located.expires = located.expires.min(route.expires_at);
             self.wan_repairs.start(actor, self.network, parent, ready, located, now)
         });
@@ -963,18 +903,6 @@ impl Association {
                 actor.cancel_peer_repair_receive(pending.interest);
                 return false;
             }
-            if let RepairInterestState::Installing { sequence, receipt } = &mut pending.state {
-                pending.state = match receipt.try_recv() {
-                    Ok(Ok(route)) => RepairInterestState::Ready {
-                        sequence: *sequence,
-                        route,
-                    },
-                    Err(oneshot::error::TryRecvError::Empty) => return true,
-                    Ok(Err(_)) | Err(oneshot::error::TryRecvError::Closed) => {
-                        RepairInterestState::Cancelled
-                    }
-                };
-            }
             let demand_ttl = pending
                 .interest
                 .expires
@@ -984,16 +912,6 @@ impl Association {
             ));
             let action = match &pending.state {
                 RepairInterestState::Lookup { .. } => RepairAction::Lookup,
-                RepairInterestState::Ready { sequence, route } => {
-                    if !actor.peer_repair_receive_live(*route, now) {
-                        pending.state = RepairInterestState::Cancelled;
-                        return true;
-                    }
-                    RepairAction::Ready {
-                        sequence: *sequence,
-                        label: route.address,
-                    }
-                }
                 RepairInterestState::Cancelled => {
                     actor.cancel_peer_repair_receive(pending.interest);
                     RepairAction::Cancel
@@ -1024,7 +942,6 @@ impl Association {
                     }
                     return true;
                 }
-                RepairInterestState::Installing { .. } => return true,
             };
             let sent = pending
                 .frame(action)
@@ -1295,30 +1212,26 @@ impl Association {
                 self.receive_wan_repair_ready(actor, scope, &bytes, now);
                 continue;
             }
-            let repair = if self.is_wan {
-                fabric_data::decode_wan_repair_control(&bytes)
-            } else {
-                fabric_data::RepairFrame::decode(&bytes)
-            };
-            if let Some(frame) = repair {
+            if self.is_wan
+                && let Some(frame) = fabric_data::RepairFrame::decode(&bytes)
+            {
                 self.receive_repair_control(actor, frame, now);
                 continue;
             }
-            if let Some(frame) = fabric_data::Frame::decode(&bytes) {
+            if self.is_wan
+                && let Some(frame) = fabric_data::Frame::decode(&bytes)
+            {
                 match frame.action {
                     fabric_data::Action::Expect { .. } => {
                         self.receive_data_expectation(actor, frame, now);
                     }
-                    fabric_data::Action::Observed(_) if self.is_wan => {
+                    fabric_data::Action::Observed(_) => {
                         if let Some(observation) =
                             self.wan_publishers
                                 .data_observation(self.network, frame, now)
                         {
-                            actor.stage_data_observations(Vec::new(), vec![observation]);
+                            actor.stage_publisher_data_observations(vec![observation]);
                         }
-                    }
-                    fabric_data::Action::Observed(_) => {
-                        actor.stage_peer_data_observation(self.network, frame, now);
                     }
                 }
                 continue;
@@ -1385,13 +1298,7 @@ impl Association {
                             );
                             self.remote_wan = Some((deadline, wan));
                         } else {
-                            self.relays.install(
-                                image.routes,
-                                Box::default(),
-                                wire::DataAnchors::new(),
-                                None,
-                                deadline,
-                            );
+                            self.relays.install(image.routes, deadline);
                             self.relays.step(actor, self.network, now);
                         }
                         self.refresh = now.checked_add(REFRESH).unwrap_or(now);

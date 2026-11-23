@@ -4,7 +4,7 @@ use pulsebeam_core::fabric::{
     self,
     wan::{FEEDBACK_SSRC, Window},
 };
-use pulsebeam_link::{BindingCutoff, LinkTx};
+use pulsebeam_link::{BindError, BindingCutoff, FabricIngress, LinkTx};
 
 use super::*;
 use crate::{
@@ -12,7 +12,12 @@ use crate::{
         fabric::WanLiveRouteAck, wan_source::WanSourceWindow,
     },
     link::wan_host::{self, ChildInstall, Commands, ReceiveCommand},
-    route::fabric::network_repair::{MAX_REPAIR_LIFETIME, MediaRepairChild},
+    route::fabric::{
+        LiveNetworkChild,
+        network_repair::{
+            Demand, Interest, MAX_REPAIR_LIFETIME, MediaRepairChild, RepairChild, RepairRoute,
+        },
+    },
 };
 
 const RECEIVE_LIMIT: usize = crate::control::controller::peer_ownership::relay::LIMIT;
@@ -79,6 +84,14 @@ struct LiveAdvertisement {
 }
 
 impl Receive {
+    fn record_removal(&self) {
+        if self.pending.is_none()
+            && let Some(evidence) = self.live.as_ref().and_then(|live| live.evidence)
+        {
+            evidence.record("relay_removed", 0);
+        }
+    }
+
     fn reap(&mut self, now: Instant) -> bool {
         if let Some(report) = &mut self.pending {
             match report.try_recv() {
@@ -125,6 +138,7 @@ impl WanPeer {
 
     pub(super) fn retire(self, control: &mut LinkControl<ShardFrame>) {
         for receive in self.receives.into_values() {
+            receive.record_removal();
             unbind(control, receive.bindings);
         }
     }
@@ -143,7 +157,12 @@ impl WanPeer {
                     false
                 }
             });
-            !receive.bindings.is_empty()
+            if receive.bindings.is_empty() {
+                receive.record_removal();
+                false
+            } else {
+                true
+            }
         });
     }
 }
@@ -426,7 +445,10 @@ impl Links {
         &mut self,
         now: Instant,
         spec: WanLiveReceiveSpec,
-        mut stage_child: impl FnMut(LiveNetworkChild, BindingCutoff) -> ChildReceipt,
+        mut stage_child: impl FnMut(
+            LiveNetworkChild,
+            BindingCutoff,
+        ) -> oneshot::Receiver<Option<LiveNetworkChild>>,
     ) -> Result<Window, BindError> {
         self.reap();
         let live = spec.live;
@@ -577,6 +599,7 @@ impl Links {
                 .is_some_and(|receive| receive.live.is_some())
                 && let Some(receive) = peer.receives.remove(&label)
             {
+                receive.record_removal();
                 unbind(&mut self.control, receive.bindings);
                 changed = true;
             }
@@ -601,6 +624,7 @@ impl Links {
             {
                 true
             } else {
+                receive.record_removal();
                 unbind(&mut self.control, std::mem::take(&mut receive.bindings));
                 false
             }
@@ -643,7 +667,7 @@ impl Links {
             .map(|(receive, _)| receive.expires)
     }
 
-    pub(super) fn wan_data_expectations(
+    pub(in crate::control) fn wan_data_expectations(
         &self,
         peer: NetworkId,
         frame: crate::control::controller::peer_ownership::fabric_data::Frame,
@@ -819,7 +843,11 @@ impl Links {
         .then_some(receive.expires)
     }
 
-    pub(super) fn allows_wan_repair_interest(&self, interest: Interest, now: Instant) -> bool {
+    pub(in crate::control) fn allows_wan_repair_interest(
+        &self,
+        interest: Interest,
+        now: Instant,
+    ) -> bool {
         now < interest.expires
             && self
                 .wan_repair_parent_deadline(interest.parent, now)

@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 
 use pulsebeam_core::fabric::{FabricPacket, Header, Profile};
-use pulsebeam_link::{Destination as LinkDestination, LinkControl, NodeRouteKey, PeerControl};
+use pulsebeam_link::{Destination as LinkDestination, LinkControl, NodeRouteKey};
 use pulsebeam_runtime::{sync::oneshot, time::Duration};
 
 use super::*;
@@ -352,7 +352,7 @@ async fn protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_wind
         let frame = frames.pop().unwrap();
         assert_eq!(frame.tag, delivery_tag(address));
         assert!(
-            matches!(frame.packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket::Wan { window: bound, position: received, packet } }
+            matches!(frame.packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket { window: bound, position: received, packet } }
             if ingress == child.ingress && bound == window && received == position && packet.same_content(&original))
         );
     }
@@ -430,7 +430,7 @@ async fn protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_wind
     let mut frames = Vec::new();
     assert_eq!(rx.try_recv_batch(&mut frames, 2), 1);
     assert!(matches!(frames.pop().unwrap().packet,
-        ShardFrame::FabricWanImage { ingress, image: NetworkPacket::Wan { window: bound, position: received, packet } }
+        ShardFrame::FabricWanImage { ingress, image: NetworkPacket { window: bound, position: received, packet } }
         if ingress == repair.ingress() && bound == repair_window && received == position && packet.same_content(&original)));
     left.driver.retire(repair_send);
     repair_cutoff.fence();
@@ -509,7 +509,7 @@ async fn protected_boundary_datagrams_reach_only_exactly_acknowledged_shard_wind
     .unwrap();
     for ((_, wanted, position, _), frame) in positions.into_iter().zip(frames) {
         assert!(
-            matches!(frame.packet, ShardFrame::FabricWanImage { image: NetworkPacket::Wan { window, position: received, .. }, .. }
+            matches!(frame.packet, ShardFrame::FabricWanImage { image: NetworkPacket { window, position: received, .. }, .. }
             if window == wanted && received == position)
         );
     }
@@ -733,7 +733,6 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
         panic!("exact WAN send receipt required")
     };
     let send_cutoff = sender.cutoff();
-    let sender = crate::link::fabric_tx::FabricTx::Wan(sender);
     let fragment = child.demand.request.fragment;
     let raw = maximum_dd_bytes(fragment);
     #[cfg(feature = "transport-conformance")]
@@ -766,11 +765,6 @@ async fn sparse_repair_requires_exact_receipt_and_live_parent() {
         panic!("expected WAN repair")
     };
     assert_eq!(ingress, child.route.ingress);
-    assert!(
-        child
-            .accept_image(NetworkPacket::Legacy(original.clone()))
-            .is_none()
-    );
     assert!(wrong.accept_image(image.clone()).is_none());
     let repaired = child.accept_image(image).unwrap();
     assert!(repaired.same_content(&original));

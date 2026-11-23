@@ -97,17 +97,20 @@ struct ScopedTestUdp {
 
 #[cfg(feature = "transport-conformance")]
 impl ScopedTestUdp {
-    fn deliver(
+    fn flush(
         &mut self,
-        offered: &[pulsebeam_udp::SendDatagram<'_>],
-        mut receive: impl FnMut(&[u8]),
-    ) -> usize {
-        let report = self.local.try_send_batch(offered);
+        shard: &mut crate::shard::core::FabricRtpFixture,
+        receive: impl FnMut(&[u8]),
+    ) {
+        let accepted = shard.flush_receiver_udp(&mut self.local);
         assert_eq!(
-            report.accepted,
-            offered.len(),
-            "bounded socket rejected a scoped handoff: {report:?}"
+            accepted,
+            self.receive(receive) != 0,
+            "the production writer and selected socket disagree"
         );
+    }
+
+    fn receive(&mut self, mut receive: impl FnMut(&[u8])) -> usize {
         let cap = usize::from(
             self.local
                 .nonfragmenting_max_datagram_bytes()
@@ -115,17 +118,16 @@ impl ScopedTestUdp {
                 .get(),
         );
         let mut udp = vec![0; cap + 1];
-        for datagram in offered {
-            assert!(datagram.gso_segment_size.is_none());
-            assert_eq!(datagram.destination, self.remote.local_addr().unwrap());
-            let (len, source) = self
-                .remote
-                .recv_from(&mut udp)
-                .expect("loopback handoff reached the selected socket");
-            let received = udp.get(..len).expect("bounded datagram");
+        let mut count = 0;
+        loop {
+            let (len, source) = match self.remote.recv_from(&mut udp) {
+                Ok(received) => received,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("selected loopback socket failed: {error}"),
+            };
             assert_eq!(source, self.local.local_addr());
-            assert_eq!(received, datagram.payload);
             assert!((1..=cap).contains(&len));
+            let received = &udp[..len];
             self.peak = self.peak.max(len);
             if let Some((ssrc, _)) = fixture_rtp(received) {
                 assert!(
@@ -137,8 +139,9 @@ impl ScopedTestUdp {
                 }
             }
             receive(received);
+            count += 1;
         }
-        report.accepted
+        count
     }
 }
 
@@ -158,17 +161,17 @@ impl Pair {
         let now = self.clock.monotonic;
         let (receiver, mut sink) = shard.receiver_with_sink();
         self.step_with_sink(receiver, None, &mut sink);
+        #[cfg(feature = "transport-conformance")]
+        if let Some(udp) = self.udp.as_mut() {
+            udp.flush(shard, |bytes| {
+                let received = Receive::new(Protocol::Udp, self.local, self.remote, bytes).unwrap();
+                self.peer
+                    .handle_input(str0m::Input::Receive(now.into(), received))
+                    .unwrap();
+            });
+            return;
+        }
         shard.submit_receiver(|offered| {
-            #[cfg(feature = "transport-conformance")]
-            if let Some(udp) = self.udp.as_mut() {
-                return udp.deliver(offered, |bytes| {
-                    let received =
-                        Receive::new(Protocol::Udp, self.local, self.remote, bytes).unwrap();
-                    self.peer
-                        .handle_input(str0m::Input::Receive(now.into(), received))
-                        .unwrap();
-                });
-            }
             for datagram in offered {
                 assert_eq!(datagram.destination, self.remote);
                 assert!(datagram.gso_segment_size.is_none());
@@ -2986,10 +2989,8 @@ impl NativeParticipantUdp {
                 | TransportPollOutput::Timeout(_) => break,
             }
         }
-        self.shard.submit_receiver(|offered| {
-            self.udp
-                .deliver(offered, |bytes| deliver(&self.native, bytes))
-        });
+        self.udp
+            .flush(&mut self.shard, |bytes| deliver(&self.native, bytes));
         self.now = self.now.checked_add(Duration::from_millis(1)).unwrap();
     }
 }
@@ -3455,6 +3456,14 @@ fn prove_filtered_dd_switch(
     }
     rx.stage_receiver_handoff(&mut shard);
     shard.reset_output();
+    #[cfg(feature = "transport-conformance")]
+    if let Some(udp) = rx.udp.as_mut() {
+        assert!(!shard.flush_receiver_udp(&mut udp.local));
+        assert_eq!(
+            udp.receive(|_| panic!("pre-reset RTP reached the selected socket")),
+            0
+        );
+    }
     shard.submit_receiver(|_| panic!("pre-reset RTP crossed the final handoff"));
     for _ in 0..60 {
         rx.step_receiver(&mut shard);

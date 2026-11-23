@@ -91,19 +91,10 @@ pub(crate) struct LiveNetworkChild {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum NetworkPacket {
-    Legacy(local::OwnedPacket),
-    Wan {
-        window: pulsebeam_core::fabric::wan::Window,
-        position: u64,
-        packet: local::OwnedPacket,
-    },
-}
-
-impl From<local::OwnedPacket> for NetworkPacket {
-    fn from(packet: local::OwnedPacket) -> Self {
-        Self::Legacy(packet)
-    }
+pub(crate) struct NetworkPacket {
+    pub(crate) window: pulsebeam_core::fabric::wan::Window,
+    pub(crate) position: u64,
+    pub(crate) packet: local::OwnedPacket,
 }
 
 impl From<pulsebeam_link::wan::Received<local::OwnedPacket, pulsebeam_core::fabric::wan::Window>>
@@ -115,7 +106,7 @@ impl From<pulsebeam_link::wan::Received<local::OwnedPacket, pulsebeam_core::fabr
             pulsebeam_core::fabric::wan::Window,
         >,
     ) -> Self {
-        Self::Wan {
+        Self {
             window: input.route.descriptor(),
             position: input.position,
             packet: input.packet,
@@ -142,7 +133,7 @@ pub(crate) struct CompiledPublisherSend {
     pub shard: crate::id::ShardId,
     pub next: LiveNextHop,
     pub expires_at: Instant,
-    pub tx: crate::link::fabric_tx::FabricTx,
+    pub tx: crate::link::wan_host::WanTx,
 }
 
 impl hop_expectations::Path for CompiledPublisherSend {
@@ -190,25 +181,19 @@ pub(crate) struct CompiledLiveRelay {
     pub input: LiveNetworkChild,
     pub next: LiveNextHop,
     pub expires_at: Instant,
-    pub tx: crate::link::fabric_tx::FabricTx,
+    pub tx: crate::link::wan_host::WanTx,
 }
 
 #[derive(Debug)]
 pub(crate) enum LiveRelayChange {
     Install(CompiledLiveRelay),
-    Retire(CompiledLiveRelay, RelayRetirement),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RelayRetirement {
-    Revoked,
-    Unconfirmed,
+    Retire(CompiledLiveRelay),
 }
 
 impl LiveRelayChange {
     pub(crate) fn route(&self) -> &CompiledLiveRelay {
         match self {
-            Self::Install(route) | Self::Retire(route, _) => route,
+            Self::Install(route) | Self::Retire(route) => route,
         }
     }
 }

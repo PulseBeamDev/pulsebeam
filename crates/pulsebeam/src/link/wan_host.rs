@@ -32,6 +32,8 @@ use super::{delivery_tag, fabric_codec::FabricWanCodec};
 mod egress;
 mod installation;
 mod service;
+#[cfg(test)]
+pub(crate) use egress::SendFixture;
 pub(crate) use egress::{ParentSend, PendingTx, SendParent, WanTx};
 pub(crate) use installation::{ChildInstall, Commands, ReceiveCommand};
 use installation::{Command, Pending};

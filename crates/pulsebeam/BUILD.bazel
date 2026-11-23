@@ -91,6 +91,7 @@ rust_test(
     args = [
         "node::transport_conformance::",
         "sparse_repair_requires_exact_receipt_and_live_parent",
+        "provisioned_reverse_and_wan_sockets_cannot_activate_either_carrier",
         "filtered_fabric_dd_switch_on_installed_fid_and_nonfragmenting_socket",
         "dd_free_h264_repairs_at_exact_protected_ceiling_on_participant_udp",
         "maximum_native_data_record_crosses_capped_dtls13_udp",

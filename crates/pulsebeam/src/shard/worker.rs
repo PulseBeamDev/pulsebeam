@@ -215,7 +215,6 @@ pub(crate) enum ShardFrame {
     FabricDataRepair(crate::route::fabric::ShardDataRepair),
     FabricDataRepairImage(crate::route::fabric::ShardDataRepairImage),
     FabricRefresh(crate::route::fabric::ShardBinding),
-    FabricImage(crate::route::fabric::local::OwnedPacket),
     FabricWanImage {
         ingress: pulsebeam_link::FabricIngress,
         image: crate::route::fabric::NetworkPacket,
@@ -247,7 +246,6 @@ pub(crate) enum ShardEvent {
         emission: crate::route::fabric::local::Emission,
     },
     ShardDataReceiverReady(crate::route::fabric::ShardDataReady),
-    RelayDataExpectation(crate::route::fabric::relay::RelayExpectation),
     PublisherDataExpectation(crate::route::fabric::PublisherExpectation),
     NetworkDataRepair(Box<crate::route::fabric::network_repair::InterestEvent>),
     NetworkMediaRepair(Box<crate::route::fabric::network_repair::MediaInterest>),
@@ -372,7 +370,7 @@ pub(crate) fn send_link_frame(
             }
             (Instant::now(), None)
         }
-        ShardFrame::FabricImage(_) | ShardFrame::FabricWanImage { .. } => return false,
+        ShardFrame::FabricWanImage { .. } => return false,
         ShardFrame::Reverse { .. } | ShardFrame::FabricRefresh(_) => (Instant::now(), None),
     };
     let received_at = pulsebeam_link::ReceiveTime {
@@ -426,7 +424,7 @@ pub(super) fn bind_received_frame(
                 && binding.destination.shard() != shard
                 && received.tag == shard_tag(shard)
         }
-        ShardFrame::FabricImage(_) | ShardFrame::FabricWanImage { .. } => false,
+        ShardFrame::FabricWanImage { .. } => false,
         ShardFrame::Reverse { address, .. } => {
             let Some(destination) = tagged_route() else {
                 return false;
@@ -730,12 +728,6 @@ impl ShardWorker {
                 }
             };
             match received.packet {
-                ShardFrame::FabricImage(packet) => {
-                    if let Some(ingress) = received.fabric {
-                        deliver_fabric(ingress, packet.into());
-                    }
-                    continue;
-                }
                 ShardFrame::FabricWanImage { ingress, image } => {
                     deliver_fabric(ingress, image);
                     continue;

@@ -13,13 +13,8 @@ use crate::{
         ownership::{observations::EndpointFact, receipt::Authority},
     },
     entity::EndpointKey,
-    link::{
-        fabric_tx::FabricTx,
-        wan_host::{MAX_EPOCH_WINDOWS, PendingTx},
-    },
-    route::fabric::{
-        CompiledLiveRelay, LiveNetworkChild, LiveNextHop, LiveRelayChange, RelayRetirement,
-    },
+    link::wan_host::{MAX_EPOCH_WINDOWS, PendingTx},
+    route::fabric::{CompiledLiveRelay, LiveNetworkChild, LiveNextHop, LiveRelayChange},
 };
 
 use super::{fabric::WanLiveRouteAck, wan_source::WanSourceWindow};
@@ -180,7 +175,7 @@ impl Entry {
                             ),
                         },
                         expires_at: self.expires,
-                        tx: FabricTx::Wan(tx),
+                        tx: tx,
                     };
                     let Some(receipt) =
                         actor.stage_fabric_relay_change(LiveRelayChange::Install(route.clone()))
@@ -209,10 +204,7 @@ impl Entry {
             links.retire_wan_send(&self.cutoff);
         }
         if let Phase::Shard(route, _) | Phase::Active(route) = &self.phase {
-            let _ = actor.stage_fabric_relay_change(LiveRelayChange::Retire(
-                route.clone(),
-                RelayRetirement::Revoked,
-            ));
+            let _ = actor.stage_fabric_relay_change(LiveRelayChange::Retire(route.clone()));
         }
     }
 }

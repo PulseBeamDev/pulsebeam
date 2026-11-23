@@ -91,68 +91,29 @@ fn local_ordered_cross_shard_delivery_and_repair() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("two-shard Ordered simulation failed: {error:#}"))
 }
 
-fn prove_provisioned_cluster(
-    nodes: u8,
+pub(super) fn install_provisioned_nodes(
+    sim: &mut turmoil::Sim<'_>,
+    root: &std::path::Path,
+    ips: &[IpAddr],
     edges: &[(usize, usize)],
-    mode: core_ffi::TopicMode,
+    seed: u64,
     exercise_media_repair: bool,
-) -> anyhow::Result<()> {
-    let seed = std::env::var("PULSEBEAM_SIM_SEED")
-        .map(|value| value.parse::<u64>())
-        .unwrap_or(Ok(NATIVE_RUNTIME_SEED))?;
-    let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
-    crate::sim_rand::set_thread_rng(seed);
-    fastrand::seed(seed);
-    let subnet = reserve_subnet();
-    let client_ip = subnet_ip(subnet, nodes + 1);
-    let root = tempfile::tempdir()?;
-    let nodes: Vec<_> = (1..=nodes)
-        .map(|host| {
-            let data_dir = root.path().join(host.to_string());
+) -> anyhow::Result<Vec<(NodeId, NonZeroU64)>> {
+    let nodes: Vec<_> = ips
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, ip)| {
+            let host = u8::try_from(index + 1)?;
+            let data_dir = root.join(host.to_string());
             let identity = prepare_provisioned_fixture(&data_dir)?;
             let transport = SecretCredential::generate().map_err(relay_error)?;
             let receipts = ApiSigningKey::from_seed([60 + host; 32]);
-            anyhow::Ok((
-                subnet_ip(subnet, host),
-                data_dir,
-                identity,
-                transport,
-                receipts,
-            ))
+            anyhow::Ok((ip, data_dir, identity, transport, receipts))
         })
         .collect::<anyhow::Result<_>>()?;
-    let (publisher_ip, _, left_id, _, _) = &nodes[0];
-    let (viewer_ip, _, right_id, _, _) = nodes.last().unwrap();
-    let (publisher_ip, viewer_ip, left_id, right_id) =
-        (*publisher_ip, *viewer_ip, *left_id, *right_id);
-    let relays = (nodes.len() == 4).then(|| [nodes[1].0, nodes[2].0]);
+    let left_id = nodes[0].2;
     let viewer_index = nodes.len().saturating_sub(1);
-    let repair_edges: Vec<_> = if exercise_media_repair {
-        edges
-            .iter()
-            .enumerate()
-            .map(|(i, &(from, to))| {
-                let port = 7443 + u16::try_from(i).unwrap();
-                (
-                    SocketAddr::from((nodes[from].0, port)),
-                    SocketAddr::from((nodes[to].0, port)),
-                )
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut sim = turmoil::Builder::new()
-        .simulation_duration(Duration::from_secs(
-            if relays.is_some() || exercise_media_repair {
-                40
-            } else {
-                25
-            },
-        ))
-        .rng_seed(seed)
-        .build();
-
     for (index, (ip, data_dir, identity, credential, receipt_key)) in nodes.iter().enumerate() {
         let ip = *ip;
         let gossip = (ip, 7946).into();
@@ -204,11 +165,6 @@ fn prove_provisioned_cluster(
             async move {
                 let builder = sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(seed), 1)
                     .with_cluster(options);
-                let builder = if mode == core_ffi::TopicMode::Ordered {
-                    builder.with_reliable_data_v1()
-                } else {
-                    builder.with_local_data_v1()
-                };
                 let builder = if exercise_media_repair {
                     builder.with_local_rtp_v1()
                 } else {
@@ -221,6 +177,69 @@ fn prove_provisioned_cluster(
             }
         });
     }
+    Ok(nodes
+        .into_iter()
+        .map(|(_, _, identity, _, _)| identity)
+        .collect())
+}
+
+fn prove_provisioned_cluster(
+    nodes: u8,
+    edges: &[(usize, usize)],
+    mode: core_ffi::TopicMode,
+    exercise_media_repair: bool,
+) -> anyhow::Result<()> {
+    let seed = std::env::var("PULSEBEAM_SIM_SEED")
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(NATIVE_RUNTIME_SEED))?;
+    let _sim_clocks = crate::sim_clock::SimClocksGuard::init();
+    crate::sim_rand::set_thread_rng(seed);
+    fastrand::seed(seed);
+    let subnet = reserve_subnet();
+    let client_ip = subnet_ip(subnet, nodes + 1);
+    let root = tempfile::tempdir()?;
+    let ips = (1..=nodes)
+        .map(|host| subnet_ip(subnet, host))
+        .collect::<Vec<_>>();
+    let publisher_ip = ips[0];
+    let viewer_ip = ips[ips.len() - 1];
+    let relays = (ips.len() == 4).then(|| [ips[1], ips[2]]);
+    let repair_edges: Vec<_> = if exercise_media_repair {
+        edges
+            .iter()
+            .enumerate()
+            .map(|(i, &(from, to))| {
+                let port = 7443 + u16::try_from(i).unwrap();
+                (
+                    SocketAddr::from((ips[from], port)),
+                    SocketAddr::from((ips[to], port)),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(
+            if relays.is_some() || exercise_media_repair {
+                40
+            } else {
+                25
+            },
+        ))
+        .rng_seed(seed)
+        .build();
+
+    let identities = install_provisioned_nodes(
+        &mut sim,
+        root.path(),
+        &ips,
+        edges,
+        seed,
+        exercise_media_repair,
+    )?;
+    let left_id = identities[0];
+    let right_id = identities[identities.len() - 1];
     let witness = Arc::new(Mutex::new(None));
     let capture = witness.clone();
     let verify_subscriptions = edges == [(0, 1)];

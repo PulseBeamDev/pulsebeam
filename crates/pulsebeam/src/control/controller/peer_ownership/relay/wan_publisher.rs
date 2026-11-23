@@ -12,10 +12,7 @@ use crate::{
         ControllerActor, ownership::receipt::Authority, peer_ownership::fabric_data,
     },
     id::ShardId,
-    link::{
-        fabric_tx::FabricTx,
-        wan_host::{MAX_EPOCH_WINDOWS, ParentSend, PendingTx},
-    },
+    link::wan_host::{MAX_EPOCH_WINDOWS, ParentSend, PendingTx},
     route::fabric::{
         CompiledPublisherSend, LiveNextHop, PublisherExpectation, PublisherObservation,
         PublisherSendChange,
@@ -268,7 +265,7 @@ impl Entry {
                             ),
                         },
                         expires_at: self.expires,
-                        tx: FabricTx::Wan(tx),
+                        tx: tx,
                     };
                     let change = PublisherSendChange::Install {
                         route: route.clone(),

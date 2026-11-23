@@ -5,10 +5,7 @@ use pulsebeam_runtime::time::Instant;
 
 use crate::{
     control::{controller::ControllerActor, link::wan::RepairSendPermit},
-    link::{
-        fabric_tx::FabricTx,
-        wan_host::{ParentSend, PendingTx},
-    },
+    link::wan_host::{ParentSend, PendingTx},
     route::fabric::relay::{LocatedRepair, PeerRepairHandoff},
 };
 
@@ -109,7 +106,7 @@ impl Flight {
             }
             Poll::Ready(Some(tx)) => actor.stage_wan_repair_handoff(PeerRepairHandoff {
                 located: staged.located,
-                tx: FabricTx::Wan(tx),
+                tx: tx,
             }),
             Poll::Ready(None) => false,
         }

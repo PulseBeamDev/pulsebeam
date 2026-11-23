@@ -1652,6 +1652,7 @@ impl SourceFanout {
             .map(|offers| (sequence, offers))
     }
 
+    #[cfg(test)]
     pub(crate) fn offer_network(
         &mut self,
         now: Instant,

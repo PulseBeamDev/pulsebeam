@@ -95,18 +95,8 @@ impl RepairChild {
         self,
         image: super::NetworkPacket,
     ) -> Option<super::local::OwnedPacket> {
-        match (self.window, image) {
-            (None, super::NetworkPacket::Legacy(packet)) => Some(packet),
-            (
-                Some(expected),
-                super::NetworkPacket::Wan {
-                    window,
-                    position,
-                    packet,
-                },
-            ) if expected == window && position == self.demand.sequence => Some(packet),
-            _ => None,
-        }
+        (self.window == Some(image.window) && image.position == self.demand.sequence)
+            .then_some(image.packet)
     }
 }
 

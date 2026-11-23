@@ -250,7 +250,6 @@ pub(crate) struct ShardUpdate {
     pub media_repair_children:
         Vec<InstallNetworkChild<crate::route::fabric::network_repair::MediaRepairChild>>,
     pub data_expectations: Vec<ObserveNetworkDataExpectation>,
-    pub relay_observations: Vec<crate::route::fabric::relay::RelayObservation>,
     pub publisher_observations: Vec<crate::route::fabric::PublisherObservation>,
     pub source_anchors: Vec<SamplePublisherAnchor>,
     pub repair_lookups: Vec<LocateRelayRepair>,
@@ -274,7 +273,6 @@ impl ShardUpdate {
             repair_children: Vec::new(),
             media_repair_children: Vec::new(),
             data_expectations: Vec::new(),
-            relay_observations: Vec::new(),
             publisher_observations: Vec::new(),
             source_anchors: Vec::new(),
             repair_lookups: Vec::new(),
@@ -295,7 +293,6 @@ impl ShardUpdate {
             && self.repair_children.is_empty()
             && self.media_repair_children.is_empty()
             && self.data_expectations.is_empty()
-            && self.relay_observations.is_empty()
             && self.publisher_observations.is_empty()
             && self.source_anchors.is_empty()
             && self.repair_lookups.is_empty()
@@ -327,10 +324,6 @@ impl ShardUpdate {
                 .data_expectations
                 .iter()
                 .all(|record| record.notice.parent.destination.shard() == shard)
-            && self
-                .relay_observations
-                .iter()
-                .all(|record| record.route.input.destination.shard() == shard)
             && self
                 .publisher_observations
                 .iter()
@@ -553,22 +546,6 @@ impl ShardUpdateWriter {
             );
         }
         commit.publisher_observations.push(observation);
-    }
-
-    pub(crate) fn stage_relay_data_observation(
-        &mut self,
-        generation: u64,
-        observation: crate::route::fabric::relay::RelayObservation,
-    ) {
-        let commit = self
-            .staged
-            .get_or_insert_with(|| Box::new(ShardUpdate::new(self.shard, generation)));
-        if commit.generation != generation
-            || observation.route.input.destination.shard() != self.shard
-        {
-            pulsebeam_runtime::fatal!("a relay DATA observation must target its shard generation");
-        }
-        commit.relay_observations.push(observation);
     }
 
     pub(crate) fn stage_network_data_expectation(

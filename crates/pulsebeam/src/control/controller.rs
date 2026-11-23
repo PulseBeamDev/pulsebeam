@@ -664,8 +664,6 @@ pub struct ControllerActor {
     source_lookup_index: native_service::SourceLookupIndex,
     data_branches: super::native::DataBranchIds,
     data_profile: super::native::DataProfile,
-    #[cfg(feature = "sim")]
-    sim_fabric_relay: Option<peer_ownership::SimFabricRelay>,
     catalog: catalog::CatalogRuntime,
     native_ready_tx: mailbox::Sender<ConnectionId>,
     native_ready_rx: mailbox::Receiver<ConnectionId>,
@@ -752,8 +750,6 @@ impl ControllerActor {
             source_lookup_index: native_service::SourceLookupIndex::default(),
             data_branches: super::native::DataBranchIds::default(),
             data_profile: super::native::DataProfile::default(),
-            #[cfg(feature = "sim")]
-            sim_fabric_relay: None,
             catalog: catalog::CatalogRuntime::default(),
             native_ready_tx,
             native_ready_rx,
@@ -2023,7 +2019,7 @@ impl ControllerActor {
                     InterestEvent::Request(interest)
                         if interest.parent.destination.shard() == shard
                             && self.links.as_ref().is_some_and(|links| {
-                                links.allows_repair_interest(interest, now)
+                                links.allows_wan_repair_interest(interest, now)
                             }) =>
                     {
                         peer.request_repair(interest, now);
@@ -2042,26 +2038,9 @@ impl ControllerActor {
                     .provisioned_peers
                     .iter()
                     .find(|peer| peer.matches_network(expectation.route.next.peer))
-                    && (peer.allows_wan_data_expectation(&expectation, now)
-                        || self.links.as_ref().is_some_and(|links| {
-                            links.allows_publisher_data_expectation(&expectation, now)
-                        }))
+                    && peer.allows_wan_data_expectation(&expectation, now)
                 {
                     peer.send_publisher_data_expectation(expectation, now);
-                }
-            }
-            ShardEvent::RelayDataExpectation(expectation) => {
-                let now = pulsebeam_runtime::time::Instant::now();
-                if self
-                    .links
-                    .as_ref()
-                    .is_some_and(|links| links.allows_relay_data_expectation(&expectation, now))
-                    && let Some(peer) = self
-                        .provisioned_peers
-                        .iter()
-                        .find(|peer| peer.matches_network(expectation.route.next.peer))
-                {
-                    peer.send_relay_data_expectation(expectation, now);
                 }
             }
             ShardEvent::LocalFabricRtpSourceReady {
@@ -3021,40 +3000,14 @@ impl ControllerActor {
         self.publish_staged();
     }
 
-    fn stage_peer_data_observation(
+    fn stage_publisher_data_observations(
         &mut self,
-        peer: pulsebeam_link::NetworkId,
-        frame: peer_ownership::fabric_data::Frame,
-        now: pulsebeam_runtime::time::Instant,
-    ) {
-        let Some(links) = &self.links else {
-            return;
-        };
-        let observations = links.peer_data_observations(peer, frame, now);
-        let publisher_observations = links.peer_publisher_data_observations(peer, frame, now);
-        self.stage_data_observations(observations, publisher_observations);
-    }
-
-    fn stage_data_observations(
-        &mut self,
-        observations: Vec<crate::route::fabric::relay::RelayObservation>,
         publisher_observations: Vec<crate::route::fabric::PublisherObservation>,
     ) {
-        if observations.is_empty() && publisher_observations.is_empty() {
+        if publisher_observations.is_empty() {
             return;
         }
         let generation = self.lifecycle.next_generation();
-        for observation in observations {
-            let shard = observation.route.input.destination.shard();
-            if let Some(writer) = self
-                .updates
-                .get_mut(shard.index())
-                .filter(|writer| !writer.is_closed())
-            {
-                writer.stage_relay_data_observation(generation, observation);
-                self.mark_update_touched(shard);
-            }
-        }
         for observation in publisher_observations {
             let shard = observation.route.shard;
             if let Some(writer) = self
@@ -3067,13 +3020,6 @@ impl ControllerActor {
             }
         }
         self.publish_staged();
-    }
-
-    fn stage_peer_live_receive(
-        &mut self,
-        spec: super::link::LiveReceiveSpec,
-    ) -> Option<super::link::StagedLiveReceive> {
-        self.stage_live_children(|links, stage| links.stage_live_receive(spec, stage).ok())
     }
 
     fn stage_peer_wan_live_receive(
@@ -3118,36 +3064,6 @@ impl ControllerActor {
         }
         self.publish_staged();
         receive
-    }
-
-    fn sample_data_publisher_anchors(
-        &mut self,
-        snapshot: &ownership::observations::Snapshot,
-    ) -> Vec<(
-        crate::route::fabric::DataPublisher,
-        oneshot::Receiver<Option<u64>>,
-    )> {
-        let candidates = snapshot
-            .iter()
-            .flat_map(|(endpoint, fact)| {
-                fact.publications.iter().filter_map(|publication| {
-                    Some((
-                        endpoint.room,
-                        publication.data_publisher(fact.claim.connection())?,
-                    ))
-                })
-            })
-            .take(peer_ownership::relay::LIMIT)
-            .filter_map(|(room, publisher)| {
-                let (shard, anchor) = self.lifecycle.network_publisher_anchor(
-                    room,
-                    publisher.publication,
-                    &self.core.registry,
-                )?;
-                (anchor == publisher.into()).then_some((shard, anchor, publisher))
-            })
-            .collect::<Vec<_>>();
-        self.stage_anchor_samples(candidates)
     }
 
     fn sample_wan_publisher_anchors(
@@ -3215,7 +3131,7 @@ impl ControllerActor {
         if !self
             .links
             .as_ref()
-            .is_some_and(|links| links.allows_repair_interest(interest, now))
+            .is_some_and(|links| links.allows_wan_repair_interest(interest, now))
         {
             return;
         }
@@ -3231,29 +3147,6 @@ impl ControllerActor {
         writer.stage_unavailable_network_repair(generation, interest);
         self.mark_update_touched(shard);
         self.publish_staged();
-    }
-
-    fn stage_located_repair_receive(
-        &mut self,
-        interest: crate::route::fabric::network_repair::Interest,
-        sequence: u64,
-    ) -> Option<oneshot::Receiver<Result<crate::link::ReceiveRoute, pulsebeam_link::BindError>>>
-    {
-        let shard = interest.parent.destination.shard();
-        let links = self.links.as_mut()?;
-        let writer = self
-            .updates
-            .get_mut(shard.index())
-            .filter(|writer| !writer.is_closed())?;
-        let generation = self.lifecycle.next_generation();
-        let receipt = links
-            .stage_located_repair_receive(interest, sequence, |child, lifetime| {
-                writer.stage_repair_network_child(generation, child, lifetime)
-            })
-            .ok()?;
-        self.mark_update_touched(shard);
-        self.publish_staged();
-        Some(receipt)
     }
 
     fn stage_wan_repair_receive(
@@ -3303,50 +3196,13 @@ impl ControllerActor {
         receipt.ok()
     }
 
-    fn peer_repair_receive_live(
-        &self,
-        route: crate::link::ReceiveRoute,
-        now: pulsebeam_runtime::time::Instant,
-    ) -> bool {
-        self.links
-            .as_ref()
-            .is_some_and(|links| links.repair_receive_live(route, now))
-    }
-
     fn cancel_peer_repair_receive(
         &mut self,
         interest: crate::route::fabric::network_repair::Interest,
     ) {
         if let Some(links) = &mut self.links {
-            if interest.parent.window.is_some() {
-                links.cancel_wan_repair(interest);
-            } else {
-                links.cancel_repair_receive(interest);
-            }
+            links.cancel_wan_repair(interest);
         }
-    }
-
-    fn stage_relay_repair_handoff(
-        &mut self,
-        located: crate::route::fabric::relay::LocatedRepair,
-        label: pulsebeam_link::NodeRouteKey,
-        now: pulsebeam_runtime::time::Instant,
-    ) -> Option<pulsebeam_link::BindingId> {
-        let shard = located.lookup.shard();
-        let writer = self
-            .updates
-            .get_mut(shard.index())
-            .filter(|writer| !writer.is_closed())?;
-        let generation = self.lifecycle.next_generation();
-        let (binding, handoff) = self
-            .links
-            .as_mut()?
-            .bind_peer_repair_send(located, label, now)
-            .ok()?;
-        writer.stage_relay_repair_handoff(generation, handoff);
-        self.mark_update_touched(shard);
-        self.publish_staged();
-        Some(binding)
     }
 
     fn stage_wan_repair_handoff(
@@ -3366,39 +3222,6 @@ impl ControllerActor {
         self.mark_update_touched(shard);
         self.publish_staged();
         true
-    }
-
-    fn cancel_relay_repair_send(&mut self, binding: pulsebeam_link::BindingId) {
-        if let Some(links) = &mut self.links {
-            links.cancel_relay_repair_send(binding);
-        }
-    }
-
-    fn stage_peer_repair_lookup(
-        &mut self,
-        peer: pulsebeam_link::NetworkId,
-        frame: peer_ownership::fabric_data::RepairFrame,
-        now: pulsebeam_runtime::time::Instant,
-    ) -> Vec<
-        pulsebeam_runtime::sync::oneshot::Receiver<
-            Option<crate::route::fabric::relay::LocatedRepair>,
-        >,
-    > {
-        let Some(links) = &self.links else {
-            return Vec::new();
-        };
-        use crate::route::fabric::relay::PeerRepairLookup;
-        let lookups: Vec<_> = links
-            .peer_repair_lookups(peer, frame, now)
-            .into_iter()
-            .map(PeerRepairLookup::Relay)
-            .chain(
-                links
-                    .peer_publisher_repair_lookups(peer, frame, now)
-                    .map(PeerRepairLookup::Publisher),
-            )
-            .collect();
-        self.stage_repair_lookups(lookups)
     }
 
     fn stage_repair_lookups(
@@ -3434,7 +3257,7 @@ impl ControllerActor {
         let notices = self
             .links
             .as_ref()?
-            .peer_data_expectations(peer, frame, now)?;
+            .wan_data_expectations(peer, frame, now)?;
         if notices.is_empty()
             || notices.iter().any(|notice| {
                 self.updates
@@ -3472,17 +3295,6 @@ impl ControllerActor {
         Some(receipt)
     }
 
-    fn stage_publisher_retirement(
-        &mut self,
-        binding: pulsebeam_link::BindingId,
-        change: crate::route::fabric::PublisherSendChange,
-    ) {
-        let receipt = self.stage_publisher_send(change);
-        if let Some(links) = &mut self.links {
-            links.record_fabric_retirement(binding, receipt);
-        }
-    }
-
     fn stage_fabric_relay_change(
         &mut self,
         change: crate::route::fabric::LiveRelayChange,
@@ -3496,17 +3308,6 @@ impl ControllerActor {
         self.mark_update_touched(shard);
         self.publish_staged();
         Some(receipt)
-    }
-
-    fn stage_fabric_relay_retirement(
-        &mut self,
-        binding: pulsebeam_link::BindingId,
-        change: crate::route::fabric::LiveRelayChange,
-    ) {
-        let receipt = self.stage_fabric_relay_change(change);
-        if let Some(links) = &mut self.links {
-            links.record_fabric_retirement(binding, receipt);
-        }
     }
 
     fn stage_participant_at(
@@ -4589,8 +4390,6 @@ mod replacement_tests {
                 source_lookup_index: native_service::SourceLookupIndex::default(),
                 data_branches: crate::control::native::DataBranchIds::default(),
                 data_profile: crate::control::native::DataProfile::Legacy,
-                #[cfg(feature = "sim")]
-                sim_fabric_relay: None,
                 catalog: catalog::CatalogRuntime::default(),
                 native_ready_tx,
                 native_ready_rx,

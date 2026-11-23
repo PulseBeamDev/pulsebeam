@@ -10,16 +10,7 @@ use crate::{
 };
 
 #[test]
-fn network_child_receipt_requires_the_installed_plan_and_exact_incarnation() {
-    exercise_network_child_receipt(false);
-}
-
-#[test]
-fn wan_child_receipt_pins_the_window_and_delivers_the_full_position() {
-    exercise_network_child_receipt(true);
-}
-
-fn exercise_network_child_receipt(wan: bool) {
+fn wan_child_receipt_requires_the_installed_plan_and_exact_window() {
     use crate::route::fabric::{LiveNetworkChild, NetworkPacket};
     use crate::route::{NodeRouteAddress, RouteId};
     use crate::shard::updates::ShardUpdateApplication;
@@ -62,11 +53,9 @@ fn exercise_network_child_receipt(wan: bool) {
     let (binding, _) = link
         .bind_receive(association, &[(port, DeliveryTag::from_raw(1))])
         .unwrap();
-    let adjacent = wan.then(|| {
-        link.bind_receive(association, &[(port, DeliveryTag::from_raw(1))])
-            .unwrap()
-            .0
-    });
+    let (adjacent, _) = link
+        .bind_receive(association, &[(port, DeliveryTag::from_raw(1))])
+        .unwrap();
     let lifetime = || link.receive_port_cutoff(binding, port).unwrap();
     let window = pulsebeam_core::fabric::wan::Window::new(
         Profile::Opus,
@@ -89,7 +78,7 @@ fn exercise_network_child_receipt(wan: bool) {
         revision: 0,
         sequence_anchor: 0,
         emission: Emission::new(Profile::Opus, &[]).unwrap(),
-        window: wan.then_some(window),
+        window: Some(window),
     };
     let (mut writer, rx) = new_shard_update(shard);
     let mut updates = ShardUpdateApplication::new(shard, rx);
@@ -145,7 +134,7 @@ fn exercise_network_child_receipt(wan: bool) {
             Header {
                 profile: Profile::Opus,
                 marker: false,
-                sequence: if wan { 0x7fff } else { 1 },
+                sequence: 0x7fff,
                 timestamp: 0,
                 ingress_ntp32: 0,
             },
@@ -154,47 +143,21 @@ fn exercise_network_child_receipt(wan: bool) {
         )
         .unwrap()
     };
-    let position = if wan { (1 << 32) | 0x7fff } else { 1 };
-    let image = || {
-        if wan {
-            NetworkPacket::Wan {
-                window,
-                position,
-                packet: packet(),
-            }
-        } else {
-            NetworkPacket::Legacy(packet())
-        }
+    let position = (1 << 32) | 0x7fff;
+    let image = || NetworkPacket {
+        window,
+        position,
+        packet: packet(),
     };
-    if wan {
-        for wrong in [
-            NetworkPacket::Legacy(packet()),
-            NetworkPacket::Wan {
-                window,
-                position: 1,
-                packet: packet(),
-            },
-        ] {
-            assert_eq!(
-                execution
-                    .runtime
-                    .offer_live_network(destination, child.ingress, now, now, wrong),
-                Err(crate::route::fabric::local::Rejection::Binding)
-            );
-        }
-    } else {
+    for wrong in [NetworkPacket {
+        window,
+        position: 1,
+        packet: packet(),
+    }] {
         assert_eq!(
-            execution.runtime.offer_live_network(
-                destination,
-                child.ingress,
-                now,
-                now,
-                NetworkPacket::Wan {
-                    window,
-                    position,
-                    packet: packet()
-                }
-            ),
+            execution
+                .runtime
+                .offer_live_network(destination, child.ingress, now, now, wrong),
             Err(crate::route::fabric::local::Rejection::Binding)
         );
     }
@@ -218,83 +181,76 @@ fn exercise_network_child_receipt(wan: bool) {
             .offer_live_network(destination, repair_ingress, now, now, image()),
         Err(crate::route::fabric::local::Rejection::Binding)
     );
-    if wan {
-        let next_ssrc = std::num::NonZeroU32::new(0x0200_0000).unwrap();
-        let next_start = window.start() + pulsebeam_core::fabric::wan::WINDOW_SPAN;
-        let next_window =
-            pulsebeam_core::fabric::wan::Window::new(Profile::Opus, next_start, 0, next_ssrc, 0)
-                .unwrap();
-        let next = LiveNetworkChild {
-            ingress: FabricIngress {
-                key: NodeRouteKey::from_bytes(next_ssrc.get().to_be_bytes()),
-                ..child.ingress
+    let next_ssrc = std::num::NonZeroU32::new(0x0200_0000).unwrap();
+    let next_start = window.start() + pulsebeam_core::fabric::wan::WINDOW_SPAN;
+    let next_window =
+        pulsebeam_core::fabric::wan::Window::new(Profile::Opus, next_start, 0, next_ssrc, 0)
+            .unwrap();
+    let next = LiveNetworkChild {
+        ingress: FabricIngress {
+            key: NodeRouteKey::from_bytes(next_ssrc.get().to_be_bytes()),
+            ..child.ingress
+        },
+        window: Some(next_window),
+        ..child
+    };
+    let next_image = |position, sequence| NetworkPacket {
+        window: next_window,
+        position,
+        packet: FabricPacket::new(
+            Header {
+                sequence,
+                ..packet().header()
             },
-            window: Some(next_window),
-            ..child
-        };
-        let next_image = |position, sequence| NetworkPacket::Wan {
-            window: next_window,
-            position,
-            packet: FabricPacket::new(
-                Header {
-                    sequence,
-                    ..packet().header()
-                },
-                &[],
-                Box::<[u8]>::from([2]),
-            )
-            .unwrap(),
-        };
-        let mut receipt = writer.stage_live_network_child(
-            3,
-            next,
-            link.receive_port_cutoff(adjacent.unwrap(), port).unwrap(),
-        );
-        assert_eq!(
-            execution.runtime.offer_live_network(
+            &[],
+            Box::<[u8]>::from([2]),
+        )
+        .unwrap(),
+    };
+    let mut receipt =
+        writer.stage_live_network_child(3, next, link.receive_port_cutoff(adjacent, port).unwrap());
+    assert_eq!(
+        execution.runtime.offer_live_network(
+            destination,
+            next.ingress,
+            now,
+            now,
+            next_image(next_start, 0x8000)
+        ),
+        Err(crate::route::fabric::local::Rejection::Binding)
+    );
+    writer.publish().unwrap();
+    assert_eq!(updates.apply(&mut execution, 1), 1);
+    assert_eq!(receipt.try_recv(), Ok(Some(next)));
+    assert!(
+        execution
+            .runtime
+            .offer_live_network(
                 destination,
                 next.ingress,
                 now,
                 now,
                 next_image(next_start, 0x8000)
-            ),
-            Err(crate::route::fabric::local::Rejection::Binding)
-        );
-        writer.publish().unwrap();
-        assert_eq!(updates.apply(&mut execution, 1), 1);
-        assert_eq!(receipt.try_recv(), Ok(Some(next)));
-        assert!(
-            execution
-                .runtime
-                .offer_live_network(
-                    destination,
-                    next.ingress,
-                    now,
-                    now,
-                    next_image(next_start, 0x8000)
-                )
-                .is_ok()
-        );
-        assert_eq!(
-            execution.runtime.fabric_sequence_anchor(source, now),
-            Some(next_start)
-        );
-        lifetime().fence();
-        assert!(
-            execution
-                .runtime
-                .offer_live_network(
-                    destination,
-                    next.ingress,
-                    now,
-                    now,
-                    next_image(next_start + 1, 0x8001)
-                )
-                .is_ok()
-        );
-    } else {
-        lifetime().fence();
-    }
+            )
+            .is_ok()
+    );
+    assert_eq!(
+        execution.runtime.fabric_sequence_anchor(source, now),
+        Some(next_start)
+    );
+    lifetime().fence();
+    assert!(
+        execution
+            .runtime
+            .offer_live_network(
+                destination,
+                next.ingress,
+                now,
+                now,
+                next_image(next_start + 1, 0x8001)
+            )
+            .is_ok()
+    );
     assert_eq!(
         execution
             .runtime
@@ -312,580 +268,6 @@ fn exercise_network_child_receipt(wan: bool) {
     writer.publish().unwrap();
     assert_eq!(updates.apply(&mut execution, 1), 1);
     assert_eq!(delayed.try_recv(), Ok(None));
-}
-
-#[cfg(feature = "sim")]
-pub(crate) struct LiveNetworkFixture {
-    execution: ShardExecution,
-    writer: crate::shard_update::ShardUpdateWriter,
-    updates: crate::shard::updates::ShardUpdateApplication,
-    receiver: ParticipantHandle,
-    publication: crate::entity::PublicationKey,
-    generation: u64,
-    origin: Instant,
-    branch: Option<FabricLocalBranch>,
-}
-
-#[cfg(feature = "sim")]
-impl LiveNetworkFixture {
-    pub(crate) fn new(
-        shard: ShardId,
-        publication: crate::entity::PublicationKey,
-        origin: Instant,
-    ) -> Self {
-        let mut execution = ShardExecution::new(
-            shard,
-            8,
-            1,
-            WallAnchor::new(std::time::SystemTime::UNIX_EPOCH, origin),
-        );
-        let (connection, _, receiver) = participant(&mut execution, 1, "fabric-network-subscriber");
-        execution
-            .runtime
-            .install_track(publication, None, None, None);
-        execution.apply_plan(&TrackPlanUpdate {
-            publication_id: publication,
-            plan: Some(TrackPlan::new([connection], [], None)),
-        });
-        let (writer, updates) = crate::shard_update::new_shard_update(shard);
-        Self {
-            execution,
-            writer,
-            updates: crate::shard::updates::ShardUpdateApplication::new(shard, updates),
-            receiver,
-            publication,
-            generation: 0,
-            origin,
-            branch: None,
-        }
-    }
-
-    pub(crate) fn send_as_data_publisher(
-        route: crate::route::fabric::CompiledPublisherSend,
-        lifetime: pulsebeam_link::BindingCutoff,
-        packet: OwnedPacket,
-        now: Instant,
-    ) -> (crate::shard::router::ShardRuntime, FabricSourceHandle) {
-        let mut runtime = crate::shard::router::ShardRuntime::new(route.shard);
-        let mut participants = slotmap::SlotMap::<ParticipantHandle, ()>::with_key();
-        let publisher = participants.insert(());
-        let track = runtime.install_track(route.publisher.publication, None, Some(publisher), None);
-        let emission = Emission::new(pulsebeam_core::fabric::Profile::Data, &[]).unwrap();
-        let source = runtime
-            .install_fabric_source(track, publisher, emission, None, None)
-            .unwrap();
-        assert_eq!(
-            runtime.fabric_incarnation(source),
-            Some(route.publisher.incarnation)
-        );
-        assert!(!runtime.retire_publisher_send(&route));
-        assert!(runtime.install_publisher_send(source, route, lifetime, now));
-        let sequence = u64::from(packet.header().sequence);
-        assert_eq!(
-            runtime
-                .offer_fabric(source, publisher, now, now, sequence, packet.clone())
-                .unwrap()
-                .enqueued,
-            1
-        );
-        assert_eq!(
-            runtime
-                .offer_fabric(source, publisher, now, now, sequence, packet)
-                .unwrap()
-                .duplicates,
-            1
-        );
-        (runtime, source)
-    }
-
-    pub(crate) fn locate_as_data_publisher(
-        runtime: &mut crate::shard::router::ShardRuntime,
-        source: FabricSourceHandle,
-        lookup: &crate::route::fabric::relay::PublisherRepairLookup,
-        observation: crate::route::fabric::PublisherObservation,
-        now: Instant,
-    ) -> crate::route::fabric::relay::LocatedRepair {
-        let unit = observation.unit;
-        runtime.freeze_publisher_expectation_fixture(source, unit, lookup.route.expires_at, now);
-        assert!(
-            runtime
-                .locate_publisher_repair(source, lookup, now)
-                .is_none()
-        );
-        assert!(
-            matches!(runtime.tick_publisher_data_expectation(source, now), Some(crate::route::fabric::PublisherExpectationStep::Send(notice)) if notice.unit == unit && notice.route.tx == lookup.route.tx)
-        );
-        assert!(runtime.observe_publisher_data_expectation(source, observation, now));
-        runtime
-            .locate_publisher_repair(source, lookup, now)
-            .unwrap()
-    }
-
-    pub(crate) fn send_publisher_repair(
-        runtime: &crate::shard::router::ShardRuntime,
-        source: FabricSourceHandle,
-        handoff: crate::route::fabric::relay::PeerRepairHandoff,
-        now: Instant,
-    ) {
-        runtime.send_peer_repair(now, handoff, Some(source), None);
-    }
-
-    pub(crate) fn add_spectator(&mut self) -> ParticipantHandle {
-        let first = self.receiver_connection();
-        let (connection, _, spectator) =
-            participant(&mut self.execution, 2, "fabric-network-spectator");
-        self.execution.apply_plan(&TrackPlanUpdate {
-            publication_id: self.publication,
-            plan: Some(TrackPlan::new([first, connection], [], None)),
-        });
-        spectator
-    }
-
-    pub(crate) fn install_route(
-        &mut self,
-        address: crate::route::NodeRouteAddress,
-    ) -> pulsebeam_runtime::sync::oneshot::Receiver<()> {
-        self.generation = self.generation.checked_add(1).unwrap();
-        self.writer.stage(
-            self.generation,
-            ShardUpdateOp::InstallRoute {
-                address,
-                action: crate::shard_update::TrackRouteAction::Forward {
-                    publication_id: self.publication,
-                },
-            },
-        );
-        let receipt = self.writer.stage_cutoff(self.generation);
-        self.apply();
-        receipt
-    }
-
-    pub(crate) fn retire_route(&mut self, address: crate::route::NodeRouteAddress) {
-        self.generation = self.generation.checked_add(1).unwrap();
-        self.writer
-            .stage(self.generation, ShardUpdateOp::RetireRoute { address });
-        self.apply();
-    }
-
-    pub(crate) fn stage_child(
-        &mut self,
-        child: crate::route::fabric::LiveNetworkChild,
-        lifetime: pulsebeam_link::BindingCutoff,
-    ) -> pulsebeam_runtime::sync::oneshot::Receiver<Option<crate::route::fabric::LiveNetworkChild>>
-    {
-        self.generation = self.generation.checked_add(1).unwrap();
-        self.writer
-            .stage_live_network_child(self.generation, child, lifetime)
-    }
-
-    pub(crate) fn apply(&mut self) {
-        self.writer.publish().unwrap();
-        assert_eq!(self.updates.apply(&mut self.execution, 1), 1);
-    }
-
-    pub(crate) fn next_relay_data_expectation(&self) -> Option<Instant> {
-        self.execution
-            .runtime
-            .next_relay_data_expectation()
-            .map(|(deadline, _)| deadline)
-    }
-
-    pub(crate) fn tick_relay_data_expectation(
-        &mut self,
-        now: Instant,
-    ) -> Option<crate::route::fabric::relay::RelayExpectationStep> {
-        let (_, source) = self.execution.runtime.next_relay_data_expectation()?;
-        self.execution
-            .runtime
-            .tick_relay_data_expectation(source, now)
-    }
-
-    pub(crate) fn observe_relay_data_expectation(
-        &mut self,
-        now: Instant,
-        route: &crate::route::fabric::CompiledLiveRelay,
-        unit: crate::route::fabric::local::DataExpectation,
-    ) -> bool {
-        self.execution.runtime.observe_relay_data_expectation(
-            route,
-            unit,
-            crate::route::fabric::local::PropagationOutcome::Confirmed,
-            now,
-        )
-    }
-
-    pub(crate) fn locate_relay_repair(
-        &self,
-        lookup: &crate::route::fabric::relay::RelayRepairLookup,
-        now: Instant,
-    ) -> Option<crate::route::fabric::relay::LocatedRepair> {
-        self.execution.runtime.locate_relay_repair(lookup, now)
-    }
-
-    pub(crate) fn stage_relay_repair_lookups(
-        &mut self,
-        lookups: Vec<crate::route::fabric::relay::RelayRepairLookup>,
-    ) -> Vec<
-        pulsebeam_runtime::sync::oneshot::Receiver<
-            Option<crate::route::fabric::relay::LocatedRepair>,
-        >,
-    > {
-        self.generation = self.generation.checked_add(1).unwrap();
-        lookups
-            .into_iter()
-            .map(|lookup| {
-                self.writer.stage_relay_repair_lookup(
-                    self.generation,
-                    crate::route::fabric::relay::PeerRepairLookup::Relay(lookup),
-                )
-            })
-            .collect()
-    }
-
-    pub(crate) fn stage_relay_repair_handoff(
-        &mut self,
-        handoff: crate::route::fabric::relay::PeerRepairHandoff,
-    ) {
-        self.generation = self.generation.checked_add(1).unwrap();
-        self.writer
-            .stage_relay_repair_handoff(self.generation, handoff);
-    }
-
-    pub(crate) fn relay_repair_deadline(
-        &self,
-        lookup: &crate::route::fabric::relay::RelayRepairLookup,
-        now: Instant,
-    ) -> Option<Instant> {
-        self.execution.runtime.relay_repair_deadline(lookup, now)
-    }
-
-    pub(crate) fn stage_relay_data_observation(
-        &mut self,
-        observation: crate::route::fabric::relay::RelayObservation,
-    ) {
-        self.generation = self.generation.checked_add(1).unwrap();
-        self.writer
-            .stage_relay_data_observation(self.generation, observation);
-    }
-
-    pub(crate) fn stage_data_expectation(
-        &mut self,
-        notice: crate::route::fabric::NetworkDataExpectation,
-    ) -> pulsebeam_runtime::sync::oneshot::Receiver<bool> {
-        self.generation = self.generation.checked_add(1).unwrap();
-        self.writer
-            .stage_network_data_expectation(self.generation, notice)
-    }
-
-    pub(crate) fn seed_repairable_expectation(
-        &mut self,
-        notice: crate::route::fabric::NetworkDataExpectation,
-        now: Instant,
-    ) {
-        use crate::route::fabric::local::{ExpectationWrite, PropagationOutcome};
-        let branch = self.branch.unwrap();
-        let receiver = self.receiver;
-        let runtime = &mut self.execution.runtime;
-        assert!(
-            runtime.accept_network_data_expectation(notice, now, |candidate, destination| {
-                (candidate == branch && destination == receiver)
-                    .then_some(std::num::NonZeroU64::MIN)
-            })
-        );
-        runtime
-            .tick_fabric_data_propagation(branch.source(), now, |_, _, _, _| {
-                ExpectationWrite::Queued
-            })
-            .unwrap();
-        assert!(runtime.settle_fabric_data_propagation(
-            receiver,
-            branch,
-            notice.unit,
-            PropagationOutcome::Confirmed,
-            now
-        ));
-        assert!(matches!(
-            runtime.tick_fabric_data_propagation(branch.source(), now, |_, _, _, _| ExpectationWrite::Queued),
-            Some(crate::route::fabric::local::PropagationStep::Settled { unit, outcome: PropagationOutcome::Confirmed, .. }) if unit == notice.unit
-        ));
-    }
-
-    pub(crate) fn request_repair(
-        &mut self,
-        request: crate::route::fabric::local::RepairRequest,
-        now: Instant,
-    ) -> crate::route::fabric::network_repair::Interest {
-        let branch = self.branch.unwrap();
-        let connection = self.receiver_connection();
-        let target = branch.repair_target(self.receiver, std::num::NonZeroU64::MIN);
-        self.execution
-            .runtime
-            .request_network_repair(branch.source(), target, connection, request, now)
-            .unwrap()
-    }
-
-    pub(crate) fn settle_unavailable_repair(
-        &mut self,
-        interest: crate::route::fabric::network_repair::Interest,
-        now: Instant,
-    ) -> bool {
-        let branch = self.branch.unwrap();
-        let target = branch.repair_target(self.receiver, std::num::NonZeroU64::MIN);
-        self.execution.runtime.settle_unavailable_network_repair(
-            branch.source(),
-            target,
-            interest,
-            now,
-        )
-    }
-
-    pub(crate) fn install_repair_for_branch(
-        &mut self,
-        child: crate::route::fabric::network_repair::RepairChild,
-        lifetime: pulsebeam_link::BindingCutoff,
-    ) -> Option<crate::route::fabric::network_repair::RepairChild> {
-        assert_eq!(child.receiver, self.receiver_connection());
-        let target = self
-            .branch
-            .unwrap()
-            .repair_target(self.receiver, std::num::NonZeroU64::MIN);
-        self.execution
-            .runtime
-            .install_network_repair(child, target, lifetime, Instant::now())
-    }
-
-    pub(crate) fn admit_repair_for_branch(
-        &mut self,
-        frame: pulsebeam_link::Received<ShardFrame>,
-        expected: crate::route::fabric::local::RepairRequest,
-        now: Instant,
-    ) {
-        let address = crate::link::delivery_address(frame.tag).unwrap();
-        let ingress = frame.fabric.unwrap();
-        let ShardFrame::FabricImage(packet) = frame.packet else {
-            panic!("expected repair image");
-        };
-        let runtime = &mut self.execution.runtime;
-        let (child, branch, destination) = runtime
-            .network_repair_target(address, ingress, now)
-            .unwrap();
-        assert_eq!(destination, self.receiver);
-        let sequence = child.demand.sequence;
-        assert!(runtime.offer_network_repair(child, now, packet.clone()));
-        let admitted = runtime
-            .admit_fabric_data(
-                branch,
-                destination,
-                now,
-                Some(child.route.branch),
-                |written, handed_off, claim| {
-                    assert_eq!(written, sequence);
-                    assert!(handed_off.same_content(&packet.arrival_view(0).unwrap()));
-                    assert_eq!(claim, Some(expected));
-                    true
-                },
-            )
-            .unwrap();
-        assert_eq!(admitted.completed, Some(expected));
-        assert!(
-            runtime
-                .network_repair_target(address, ingress, now)
-                .is_none()
-        );
-        assert!(!runtime.offer_network_repair(child, now, packet));
-    }
-
-    pub(crate) fn exercise_repair_interest(
-        &mut self,
-        mut notice: crate::route::fabric::NetworkDataExpectation,
-        now: Instant,
-    ) {
-        use crate::route::fabric::local::{
-            ExpectationWrite, PropagationOutcome, RepairAdmission, RepairFragment, RepairRequest,
-        };
-        use std::num::NonZeroU64;
-
-        notice.unit.unit_seq = notice.unit.unit_seq.checked_add(1).unwrap();
-        let branch = self.branch.unwrap();
-        let connection = self.receiver_connection();
-        let receiver = self.receiver;
-        let source = branch.source();
-        let token = NonZeroU64::MIN;
-        let target = branch.repair_target(receiver, token);
-        let request = |id| RepairRequest {
-            fragment: RepairFragment {
-                unit_seq: notice.unit.unit_seq,
-                index: 1,
-            },
-            id,
-        };
-        let one = request(NonZeroU64::MIN);
-        let two = request(NonZeroU64::new(2).unwrap());
-        let runtime = &mut self.execution.runtime;
-        assert!(
-            runtime.accept_network_data_expectation(notice, now, |candidate, destination| {
-                (candidate == branch && destination == receiver).then_some(token)
-            })
-        );
-        assert_eq!(
-            runtime.request_network_repair(source, target, connection, one, now),
-            Err(RepairAdmission::Ineligible)
-        );
-        runtime
-            .tick_fabric_data_propagation(source, now, |_, _, _, _| ExpectationWrite::Queued)
-            .unwrap();
-        assert!(runtime.settle_fabric_data_propagation(
-            receiver,
-            branch,
-            notice.unit,
-            PropagationOutcome::Confirmed,
-            now
-        ));
-        let wrong_branch = branch.repair_target(receiver, two.id);
-        assert_eq!(
-            runtime.request_network_repair(source, wrong_branch, connection, one, now),
-            Err(RepairAdmission::Ineligible)
-        );
-        let interest = runtime
-            .request_network_repair(source, target, connection, one, now)
-            .unwrap();
-        assert_eq!(interest.parent, notice.parent);
-        assert_eq!(interest.expires, notice.expires);
-        assert_eq!(
-            runtime.request_network_repair(source, target, connection, one, now),
-            Ok(interest)
-        );
-        assert_eq!(
-            runtime.cancel_network_repair(source, target, Some(connection), two, now),
-            None
-        );
-        assert_eq!(
-            runtime.cancel_network_repair(source, target, Some(connection), one, now),
-            Some(interest)
-        );
-        assert_eq!(
-            runtime.request_network_repair(source, target, connection, one, now),
-            Err(RepairAdmission::Replay)
-        );
-        let replacement = runtime
-            .request_network_repair(source, target, connection, two, now)
-            .unwrap();
-        assert!(!runtime.settle_unavailable_network_repair(source, target, interest, now));
-        let mut wrong_parent = replacement;
-        wrong_parent.parent.incarnation = NonZeroU64::MAX;
-        assert!(!runtime.settle_unavailable_network_repair(source, target, wrong_parent, now));
-        assert!(!runtime.settle_unavailable_network_repair(source, wrong_branch, replacement, now));
-        assert_eq!(
-            runtime.next_network_repair_expiry(),
-            Some((replacement.expires, source, target, two))
-        );
-        assert!(runtime.settle_unavailable_network_repair(source, target, replacement, now));
-        assert!(!runtime.settle_unavailable_network_repair(source, target, replacement, now));
-        let three = request(NonZeroU64::new(3).unwrap());
-        assert!(
-            runtime
-                .request_network_repair(source, target, connection, three, now)
-                .is_ok()
-        );
-        self.execution.expire_network_repairs(interest.expires);
-        assert_eq!(self.execution.runtime.next_network_repair_expiry(), None);
-    }
-
-    pub(crate) fn stage_repair_child(
-        &mut self,
-        child: crate::route::fabric::network_repair::RepairChild,
-        lifetime: pulsebeam_link::BindingCutoff,
-    ) -> pulsebeam_runtime::sync::oneshot::Receiver<
-        Option<crate::route::fabric::network_repair::RepairChild>,
-    > {
-        self.generation = self.generation.checked_add(1).unwrap();
-        self.writer
-            .stage_repair_network_child(self.generation, child, lifetime)
-    }
-
-    pub(crate) fn receiver_connection(&mut self) -> ConnectionId {
-        self.execution
-            .registry
-            .resolve_mut(self.receiver)
-            .unwrap()
-            .connection_id
-    }
-
-    pub(crate) fn stage_relay_update(
-        &mut self,
-        change: crate::route::fabric::LiveRelayChange,
-    ) -> pulsebeam_runtime::sync::oneshot::Receiver<bool> {
-        self.generation = self.generation.checked_add(1).unwrap();
-        self.writer.stage_live_relay(self.generation, change)
-    }
-
-    pub(crate) fn update_relay(&mut self, change: crate::route::fabric::LiveRelayChange) -> bool {
-        let mut receipt = self.stage_relay_update(change);
-        self.apply();
-        receipt.try_recv().unwrap()
-    }
-
-    pub(crate) fn select_branch(&mut self, address: crate::route::NodeRouteAddress) {
-        self.branch = Some(
-            self.execution
-                .runtime
-                .network_fabric_branch(address, self.receiver)
-                .unwrap(),
-        );
-    }
-
-    pub(crate) fn offer(
-        &mut self,
-        frame: pulsebeam_link::Received<ShardFrame>,
-        now: Instant,
-    ) -> crate::route::fabric::local::Offers {
-        let ShardFrame::FabricImage(packet) = frame.packet else {
-            panic!("expected a network Fabric image")
-        };
-        let address = crate::link::delivery_address(frame.tag).unwrap();
-        let arrival = self
-            .origin
-            .checked_add(pulsebeam_runtime::time::Duration::from_nanos(
-                frame.received_at.monotonic.as_nanos(),
-            ))
-            .unwrap();
-        self.execution
-            .runtime
-            .offer_live_network(address, frame.fabric.unwrap(), now, arrival, packet)
-            .unwrap()
-    }
-
-    pub(crate) fn take(&mut self, now: Instant) -> Option<u32> {
-        self.take_from(self.branch.unwrap(), self.receiver, now)
-    }
-
-    pub(crate) fn take_spectator(
-        &mut self,
-        address: crate::route::NodeRouteAddress,
-        spectator: ParticipantHandle,
-        now: Instant,
-    ) -> Option<u32> {
-        let branch = self
-            .execution
-            .runtime
-            .network_fabric_branch(address, spectator)
-            .unwrap();
-        self.take_from(branch, spectator, now)
-    }
-
-    fn take_from(
-        &mut self,
-        branch: FabricLocalBranch,
-        destination: ParticipantHandle,
-        now: Instant,
-    ) -> Option<u32> {
-        self.execution
-            .runtime
-            .admit_fabric(branch, destination, now, |_, packet, _| {
-                Ok::<_, std::convert::Infallible>(packet.header().sequence)
-            })
-            .unwrap()
-    }
 }
 
 #[cfg(feature = "transport-conformance")]
@@ -1171,44 +553,26 @@ impl FabricRtpFixture {
         publisher: crate::route::fabric::DataPublisher,
         now: Instant,
     ) -> (
-        pulsebeam_link::LinkControl<ShardFrame>,
+        crate::link::wan_host::SendFixture,
         crate::route::fabric::CompiledPublisherSend,
     ) {
         use crate::route::fabric::{CompiledPublisherSend, LiveNextHop, PublisherSendChange};
-        use pulsebeam_link::{
-            Destination, FabricPath, LinkControl, LinkTime, NetworkClass, NetworkPeer,
-            NodeRouteKey, PeerRole, SecretCredential,
-        };
-        let mut links = LinkControl::new(|| LinkTime::from_nanos(0)).unwrap();
-        let credential = SecretCredential::generate().unwrap();
-        let peer = links
-            .open_fabric_network(
-                NetworkPeer {
-                    endpoint: "127.0.0.1:5100".parse().unwrap(),
-                    expected_peer: credential.fingerprint(),
-                    credential,
-                    role: PeerRole::Initiator,
-                    class: NetworkClass::Lan,
-                }
-                .with_fabric_path(FabricPath {
-                    udp_payload_limit: 1200,
-                    additional_overhead: 0,
-                }),
-                crate::link::fabric_codec::FabricWireCodec,
-            )
-            .unwrap();
-        let key = NodeRouteKey::from_bytes([1, 0, 0, 1]);
-        let (binding, tx) = links
-            .bind_send(Destination::Network { peer, address: key })
-            .unwrap();
+        use pulsebeam_core::fabric::wan::Window;
+        let ssrc = std::num::NonZeroU32::MIN;
+        let window = Window::new(Profile::Data, 0, 0, ssrc, 0).unwrap();
+        let expires_at = now + std::time::Duration::from_secs(2);
+        let (fixture, peer, tx) = crate::link::wan_host::SendFixture::new(window, expires_at);
+        let lifetime = tx.cutoff();
         let route = CompiledPublisherSend {
             publisher: publisher.into(),
             shard: self.execution.shard_id,
-            next: LiveNextHop { peer, key },
-            expires_at: now + std::time::Duration::from_secs(2),
-            tx: crate::link::fabric_tx::FabricTx::legacy(tx, now),
+            next: LiveNextHop {
+                peer,
+                key: pulsebeam_link::NodeRouteKey::from_bytes(ssrc.get().to_be_bytes()),
+            },
+            expires_at,
+            tx: tx,
         };
-        let lifetime = links.fabric_send_cutoff(binding).unwrap();
         assert!(
             self.execution
                 .update_publisher_send(PublisherSendChange::Install {
@@ -1216,7 +580,7 @@ impl FabricRtpFixture {
                     lifetime
                 })
         );
-        (links, route)
+        (fixture, route)
     }
 
     pub(crate) fn probe_peer_publisher_lookup(
@@ -1650,6 +1014,12 @@ impl FabricRtpFixture {
         let receiver = execution.registry.resolve_mut(self.receiver).unwrap();
         receiver.drain_network(&mut egress);
         assert!(!receiver.network_pending());
+    }
+
+    #[cfg(feature = "transport-conformance")]
+    pub(crate) fn flush_receiver_udp(&mut self, socket: &mut pulsebeam_udp::UdpSocket) -> bool {
+        self.queue_receiver_datagrams();
+        self.execution.flush_udp(socket)
     }
 
     pub(crate) fn submit_receiver(
@@ -2613,7 +1983,7 @@ async fn wan_publisher_cache_miss_refreshes_only_a_live_exact_route_within_budge
             key: NodeRouteKey::from_bytes(window.ssrc().get().to_be_bytes()),
         },
         expires_at,
-        tx: crate::link::fabric_tx::FabricTx::Wan(tx),
+        tx: tx,
     };
     let lookup = MediaRepairLookup {
         parent: MediaRepairParent::Publisher(route.clone()),

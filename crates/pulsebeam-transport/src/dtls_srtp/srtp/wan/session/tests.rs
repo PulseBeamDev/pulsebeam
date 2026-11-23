@@ -320,6 +320,111 @@ fn srtcp_accounts_for_accepted_loss_not_unsent_holes() {
 }
 
 #[test]
+fn retired_repair_keeps_feedback_without_reopening_media() {
+    use crate::dtls_srtp::wan::{Direction, handoff::Submission};
+    use std::num::NonZeroU32;
+
+    let now = Instant::now();
+    let client_id = LocalIdentity::generate().unwrap();
+    let server_id = LocalIdentity::generate().unwrap();
+    let mut client = session(Role::Client, &client_id, &server_id, now);
+    let mut server = session(Role::Server, &server_id, &client_id, now);
+    let mut wire = Wire::default();
+    client.tick(now, &mut wire.send(false)).unwrap();
+    server.tick(now, &mut wire.send(true)).unwrap();
+    wire.deliver(now, &mut client, &mut server);
+
+    let position = 0x18000;
+    let live = WindowSpec {
+        authority: NonZeroU64::MIN,
+        start: position,
+        ssrc: NonZeroU32::MIN,
+        direction: Direction::Send,
+        purpose: Purpose::Live,
+        expires: now + Duration::from_secs(4),
+    };
+    let repair = WindowSpec {
+        ssrc: NonZeroU32::new(2).unwrap(),
+        purpose: Purpose::Repair { position },
+        expires: now + Duration::from_secs(1),
+        ..live
+    };
+    let live_tx = client.stage_window(now, binding(true), live).unwrap();
+    let repair_tx = client.stage_window(now, binding(true), repair).unwrap();
+    let repair_rx = server
+        .stage_window(
+            now,
+            binding(false),
+            WindowSpec {
+                direction: Direction::Receive,
+                ..repair
+            },
+        )
+        .unwrap();
+    client.activate_window(now, live_tx).unwrap();
+    client.activate_window(now, repair_tx).unwrap();
+    server.activate_window(now, repair_rx).unwrap();
+
+    let mut payload = [0x80, 0xe6, 0x80, 0, 1, 2, 3, 4, 0, 0, 0, 1, 1];
+    let prepared = client
+        .prepare_media(now, live_tx, position, &payload)
+        .unwrap();
+    assert!(matches!(
+        client.submit_media(now, prepared, &mut |_, bytes| {
+            SocketOutcome::Accepted { bytes: bytes.len() }
+        }),
+        Submission::Accepted { .. }
+    ));
+
+    let at = now + Duration::from_millis(50);
+    payload[11] = 2;
+    let prepared = client
+        .prepare_media(at, repair_tx, position, &payload)
+        .unwrap();
+    assert!(matches!(
+        client.submit_media(at, prepared, &mut |_, bytes| {
+            assert_eq!(
+                server
+                    .open_media(at, binding(false), bytes)
+                    .unwrap()
+                    .position,
+                position
+            );
+            SocketOutcome::Accepted { bytes: bytes.len() }
+        }),
+        Submission::Accepted { .. }
+    ));
+    assert!(server.retire_window(repair_rx));
+    assert!(client.retire_window(repair_tx));
+    assert!(server.activate_window(at, repair_rx).is_err());
+    assert!(client.activate_window(at, repair_tx).is_err());
+    assert!(
+        client
+            .prepare_media(at, repair_tx, position, &payload)
+            .is_err()
+    );
+
+    let report_at = at + Duration::from_millis(10);
+    let feedback = feedback_wire(&mut server, report_at);
+    client
+        .receive_feedback(report_at, binding(true), &feedback)
+        .unwrap();
+    assert!(client.history.send.observations().fresh_network_feedback);
+    assert!(
+        client
+            .feedback_window(Direction::Send, repair.ssrc, repair.expires)
+            .is_none()
+    );
+    client
+        .tick(now + Duration::from_secs(2), &mut wire.send(false))
+        .unwrap();
+    assert!(
+        !client.is_closed(),
+        "repair feedback counts as fresh path progress"
+    );
+}
+
+#[test]
 fn feedback_timeout_tracks_only_authorized_send_windows() {
     use crate::dtls_srtp::wan::{Direction, handoff::Submission};
     use std::num::NonZeroU32;

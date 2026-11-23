@@ -138,7 +138,6 @@ mod tests {
     use crate::{
         entity::{ConnectionId, TrackKind},
         id::ShardId,
-        link::fabric_tx::FabricTx,
         route::fabric::{
             CompiledPublisherSend, LiveNextHop,
             local::Emission,
@@ -147,23 +146,13 @@ mod tests {
         shard_update::PublisherAnchor,
     };
     use pulsebeam_core::fabric::{Profile, wan::Window};
-    use pulsebeam_link::{DeliveryTag, Destination, LinkControl, LinkTime, NodeRouteKey};
+    use pulsebeam_link::NodeRouteKey;
     use pulsebeam_runtime::time::Duration;
 
     #[test]
     fn media_ready_requires_a_live_single_use_demand_even_after_timeout() {
         let now = Instant::now();
         let expires = now + Duration::from_secs(5);
-        let mut links = LinkControl::new(|| LinkTime::from_nanos(0)).unwrap();
-        let peer = links.reserve_network_id().unwrap();
-        let (port, _mailbox) = links.create_port().unwrap();
-        let (_, tx) = links
-            .bind_send(Destination::Local {
-                port,
-                tag: DeliveryTag::from_raw(1),
-            })
-            .unwrap();
-        let cutoff = tx.local_cutoff().unwrap();
         let demand = Demand {
             live: NonZeroU32::MIN,
             source: NonZeroU64::MIN,
@@ -172,6 +161,8 @@ mod tests {
             position: 0x18001,
         };
         let live = Window::new(Profile::H264, 0x18000, 0, demand.live, 0).unwrap();
+        let (_fixture, peer, tx) = crate::link::wan_host::SendFixture::new(live, expires);
+        let cutoff = tx.cutoff();
         let repair = live
             .repair_window(demand.position, NonZeroU32::new(2).unwrap())
             .unwrap();
@@ -190,7 +181,7 @@ mod tests {
                     key: NodeRouteKey::from_bytes(demand.live.get().to_be_bytes()),
                 },
                 expires_at: expires,
-                tx: FabricTx::legacy(tx.clone(), now),
+                tx: tx.clone(),
             }),
             parent: ParentSend {
                 cutoff: cutoff.clone(),

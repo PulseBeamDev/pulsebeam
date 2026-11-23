@@ -2,10 +2,7 @@ use std::collections::BTreeMap;
 
 use pulsebeam_runtime::time::{Duration, Instant};
 
-use super::{
-    RelayRetirement,
-    local::{DataExpectation, PropagationOutcome, RepairFragment},
-};
+use super::local::{DataExpectation, PropagationOutcome, RepairFragment};
 
 const LIMIT: usize = 64;
 const WINDOW: u64 = 512;
@@ -16,11 +13,11 @@ pub(crate) trait Path: Clone {
     fn deadline(&self) -> Instant;
 }
 
-pub(crate) struct HopExpectations<P, R> {
-    entries: BTreeMap<u64, Unit<P, R>>,
+pub(crate) struct ExpectedUnits<P, V> {
+    entries: BTreeMap<u64, Unit<P, V>>,
 }
 
-impl<P, R> Default for HopExpectations<P, R> {
+impl<P, V> Default for ExpectedUnits<P, V> {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -28,11 +25,70 @@ impl<P, R> Default for HopExpectations<P, R> {
     }
 }
 
-struct Unit<P, R> {
+struct Unit<P, V> {
     parent: P,
     data: DataExpectation,
     expires: Instant,
-    hops: Vec<Hop<R>>,
+    value: V,
+}
+
+impl<P: Copy + Eq, V> ExpectedUnits<P, V> {
+    pub(crate) fn admit(
+        &mut self,
+        now: Instant,
+        parent: P,
+        data: DataExpectation,
+        expires: Instant,
+        value: impl FnOnce() -> V,
+    ) -> bool {
+        let seq = data.unit_seq;
+        if self.entries.contains_key(&seq) {
+            return self.contains(parent, data, now);
+        }
+        let high = self
+            .entries
+            .last_key_value()
+            .map_or(seq, |(&high, _)| high.max(seq));
+        let floor = high.saturating_sub(WINDOW - 1);
+        self.entries
+            .retain(|&key, unit| key >= floor && now < unit.expires);
+        if self.entries.len() >= LIMIT || now >= expires || seq < floor {
+            return false;
+        }
+        self.entries.insert(
+            seq,
+            Unit {
+                parent,
+                data,
+                expires,
+                value: value(),
+            },
+        );
+        true
+    }
+
+    pub(crate) fn contains(&self, parent: P, data: DataExpectation, now: Instant) -> bool {
+        self.entries.get(&data.unit_seq).is_some_and(|entry| {
+            entry.parent == parent && entry.data == data && now < entry.expires
+        })
+    }
+
+    pub(crate) fn parent(&self, fragment: RepairFragment, now: Instant) -> Option<P> {
+        let entry = self.entries.get(&fragment.unit_seq)?;
+        (fragment.index < entry.data.fragment_count && now < entry.expires).then_some(entry.parent)
+    }
+}
+
+pub(crate) struct HopExpectations<P, R> {
+    units: ExpectedUnits<P, Vec<Hop<R>>>,
+}
+
+impl<P, R> Default for HopExpectations<P, R> {
+    fn default() -> Self {
+        Self {
+            units: ExpectedUnits::default(),
+        }
+    }
 }
 
 struct Hop<R> {
@@ -41,7 +97,6 @@ struct Hop<R> {
     attempt: Option<Instant>,
     attempted: bool,
     outcome: Option<PropagationOutcome>,
-    retirement: Option<RelayRetirement>,
 }
 
 #[derive(Debug)]
@@ -69,68 +124,24 @@ impl<P: Copy + Eq, R: Path> HopExpectations<P, R> {
     where
         R: 'a,
     {
-        let seq = data.unit_seq;
-        if self.entries.contains_key(&seq) {
-            return self.contains(parent, data, now);
-        }
-        let high = self
-            .entries
-            .last_key_value()
-            .map_or(seq, |(&high, _)| high.max(seq));
-        let floor = high.saturating_sub(WINDOW - 1);
-        self.entries
-            .retain(|&key, unit| key >= floor && now < unit.expires);
-        if self.entries.len() >= LIMIT || now >= expires || seq < floor {
-            return false;
-        }
-        let hops = routes
-            .map(|route| Hop {
-                route: route.clone(),
-                expires: expires.min(route.deadline()),
-                attempt: Some(now),
-                attempted: false,
-                outcome: None,
-                retirement: None,
-            })
-            .collect();
-        self.entries.insert(
-            seq,
-            Unit {
-                parent,
-                data,
-                expires,
-                hops,
-            },
-        );
-        true
-    }
-
-    pub(crate) fn contains(&self, parent: P, data: DataExpectation, now: Instant) -> bool {
-        self.entries.get(&data.unit_seq).is_some_and(|entry| {
-            entry.parent == parent && entry.data == data && now < entry.expires
+        self.units.admit(now, parent, data, expires, || {
+            routes
+                .map(|route| Hop {
+                    route: route.clone(),
+                    expires: expires.min(route.deadline()),
+                    attempt: Some(now),
+                    attempted: false,
+                    outcome: None,
+                })
+                .collect()
         })
     }
 
-    pub(crate) fn parent(&self, fragment: RepairFragment, now: Instant) -> Option<P> {
-        let entry = self.entries.get(&fragment.unit_seq)?;
-        (fragment.index < entry.data.fragment_count && now < entry.expires).then_some(entry.parent)
-    }
-
-    pub(crate) fn retire(&mut self, route: &R, reason: RelayRetirement, now: Instant) {
-        for unit in self.entries.values_mut() {
-            for hop in &mut unit.hops {
-                if hop.route.matches(route) && hop.attempt.is_some() {
-                    hop.retirement = Some(reason);
-                    hop.attempt = Some(now);
-                }
-            }
-        }
-    }
-
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.entries
+        self.units
+            .entries
             .values()
-            .flat_map(|unit| unit.hops.iter().filter_map(|hop| hop.attempt))
+            .flat_map(|unit| unit.value.iter().filter_map(|hop| hop.attempt))
             .min()
     }
 
@@ -140,11 +151,12 @@ impl<P: Copy + Eq, R: Path> HopExpectations<P, R> {
         is_live: impl FnOnce(&R) -> bool,
     ) -> Option<Step<R>> {
         let (unit, index, _) = self
+            .units
             .entries
             .values_mut()
             .filter_map(|unit| {
                 let (index, due) = unit
-                    .hops
+                    .value
                     .iter()
                     .enumerate()
                     .filter_map(|(index, hop)| Some((index, hop.attempt?)))
@@ -152,14 +164,9 @@ impl<P: Copy + Eq, R: Path> HopExpectations<P, R> {
                 (now >= due).then_some((unit, index, due))
             })
             .min_by_key(|(unit, _, due)| (*due, unit.data.unit_seq))?;
-        let hop = unit.hops.get_mut(index)?;
+        let hop = unit.value.get_mut(index)?;
         let outcome = if now >= hop.expires {
             PropagationOutcome::Unknown
-        } else if let Some(retirement) = hop.retirement {
-            match retirement {
-                RelayRetirement::Revoked => PropagationOutcome::Failed,
-                RelayRetirement::Unconfirmed => PropagationOutcome::Unknown,
-            }
         } else if !is_live(&hop.route) {
             hop.attempt = Some(hop.expires);
             return None;
@@ -189,13 +196,14 @@ impl<P: Copy + Eq, R: Path> HopExpectations<P, R> {
         outcome: PropagationOutcome,
     ) -> bool {
         let Some(unit) = self
+            .units
             .entries
             .get_mut(&data.unit_seq)
             .filter(|unit| unit.data == data)
         else {
             return false;
         };
-        let Some(hop) = unit.hops.iter_mut().find(|hop| {
+        let Some(hop) = unit.value.iter_mut().find(|hop| {
             hop.route.matches(route) && hop.attempt.is_some() && hop.attempted && now < hop.expires
         }) else {
             return false;
@@ -211,11 +219,11 @@ impl<P: Copy + Eq, R: Path> HopExpectations<P, R> {
         fragment: RepairFragment,
         now: Instant,
     ) -> Option<(Instant, u16)> {
-        let unit = self.entries.get(&fragment.unit_seq)?;
+        let unit = self.units.entries.get(&fragment.unit_seq)?;
         if fragment.index >= unit.data.fragment_count {
             return None;
         }
-        unit.hops
+        unit.value
             .iter()
             .find(|hop| {
                 hop.route.matches(route)

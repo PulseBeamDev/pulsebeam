@@ -620,21 +620,16 @@ async fn witness(
         }
         let max_a = [0x5a; pulsebeam_proto::data_record::FRAGMENT_BYTES];
         let max_b = [0xa5; pulsebeam_proto::data_record::FRAGMENT_BYTES];
-        let (after_a, after_b): (&[u8], &[u8]) = match protocol {
-            Protocol::Udp => (&max_a, &max_b),
-            Protocol::Tcp => (
-                b"IPv4 application delivery after completed shard move",
-                b"IPv6 application delivery after completed shard move",
-            ),
-        };
         pulsebeam_runtime::try_join!(
-            data_a.sender.send(after_a.to_vec()),
-            data_b.sender.send(after_b.to_vec()),
-        )?;
+            data_a.sender.send(max_a.to_vec()),
+            data_b.sender.send(max_b.to_vec()),
+        )
+        .context("send maximum-fragment DATA on the selected pair")?;
         pulsebeam_runtime::try_join!(
-            received(&data_b.receiver, &sender_a, after_a),
-            received(&data_a.receiver, &sender_b, after_b)
-        )?;
+            received(&data_b.receiver, &sender_a, &max_a),
+            received(&data_a.receiver, &sender_b, &max_b)
+        )
+        .context("receive maximum-fragment DATA on both families")?;
         if let Some((leg_a, leg_b)) = &lossy {
             pulsebeam_runtime::try_join!(
                 leg_a.sender.send(max_a.to_vec()),

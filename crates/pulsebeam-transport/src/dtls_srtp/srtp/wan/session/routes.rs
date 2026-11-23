@@ -58,9 +58,16 @@ impl WindowTicket {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowPhase {
+    Staged,
+    Active,
+    FeedbackOnly,
+}
+
 struct WindowState {
     ticket: WindowTicket,
-    active: bool,
+    phase: WindowPhase,
 }
 
 #[derive(Default)]
@@ -101,7 +108,7 @@ impl Session {
         let ticket = WindowTicket { lease, spec };
         let key = (spec.direction, spec.ssrc);
         if let Some(state) = self.windows.0.get(&key) {
-            return if state.ticket == ticket {
+            return if state.ticket == ticket && state.phase != WindowPhase::FeedbackOnly {
                 Ok(ticket)
             } else {
                 Err(Error::Window)
@@ -116,7 +123,7 @@ impl Session {
             key,
             WindowState {
                 ticket,
-                active: false,
+                phase: WindowPhase::Staged,
             },
         );
         Ok(ticket)
@@ -130,24 +137,32 @@ impl Session {
             .0
             .get_mut(&(ticket.spec.direction, ticket.spec.ssrc))
             .ok_or(Error::Window)?;
-        if state.ticket != ticket {
+        if state.ticket != ticket || state.phase == WindowPhase::FeedbackOnly {
             return Err(Error::Window);
         }
-        state.active = true;
+        state.phase = WindowPhase::Active;
         Ok(())
     }
 
     pub fn retire_window(&mut self, ticket: WindowTicket) -> bool {
         let key = (ticket.spec.direction, ticket.spec.ssrc);
-        if self
+        let Some(state) = self
             .windows
             .0
-            .get(&key)
-            .is_none_or(|state| state.ticket != ticket)
-        {
+            .get_mut(&key)
+            .filter(|state| state.ticket == ticket && state.phase != WindowPhase::FeedbackOnly)
+        else {
             return false;
+        };
+        if state.phase == WindowPhase::Active
+            && matches!(ticket.spec.purpose, Purpose::Repair { .. })
+        {
+            // A one-shot repair can be freed by the application before its paced
+            // RTCP receipt arrives. Preserve only feedback for media already sent.
+            state.phase = WindowPhase::FeedbackOnly;
+        } else {
+            self.windows.0.remove(&key);
         }
-        self.windows.0.remove(&key);
         if ticket.spec.direction == Direction::Send {
             self.history.retire_send(ticket.spec.ssrc);
         }
@@ -326,8 +341,12 @@ impl Session {
         ssrc: NonZeroU32,
         now: Instant,
     ) -> Option<WindowSpec> {
-        let ticket = self.windows.0.get(&(direction, ssrc))?.ticket;
-        self.active(ticket, now).then_some(ticket.spec)
+        let state = self.windows.0.get(&(direction, ssrc))?;
+        let ticket = state.ticket;
+        (state.phase != WindowPhase::Staged
+            && now < ticket.spec.expires
+            && self.lease(now) == Some(ticket.lease))
+        .then_some(ticket.spec)
     }
 
     fn active(&self, ticket: WindowTicket, now: Instant) -> bool {
@@ -337,7 +356,7 @@ impl Session {
                 .windows
                 .0
                 .get(&(ticket.spec.direction, ticket.spec.ssrc))
-                .is_some_and(|state| state.active && state.ticket == ticket)
+                .is_some_and(|state| state.phase == WindowPhase::Active && state.ticket == ticket)
     }
 
     pub(super) fn prune_windows(&mut self) -> Result<(), Error> {

@@ -116,6 +116,37 @@ impl fmt::Debug for WanTx {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct SendFixture {
+    _links: pulsebeam_link::LinkControl<ShardFrame>,
+    _receiver: pulsebeam_queue::Receiver<Media>,
+}
+
+#[cfg(test)]
+impl SendFixture {
+    pub(crate) fn new(window: Window, expires: Instant) -> (Self, NetworkId, WanTx) {
+        let mut links = pulsebeam_link::LinkControl::new(|| LinkTime::from_nanos(0)).unwrap();
+        let peer = links.reserve_network_id().unwrap();
+        let (sender, receiver) = pulsebeam_queue::bounded(NonZeroUsize::MIN);
+        let tx = WanTx {
+            cutoff: links.reserve_wan_send(peer).unwrap(),
+            parent: None,
+            window,
+            purpose: Purpose::Live,
+            expires,
+            sender,
+        };
+        (
+            Self {
+                _links: links,
+                _receiver: receiver,
+            },
+            peer,
+            tx,
+        )
+    }
+}
+
 impl WanTx {
     pub(crate) fn is_live(&self) -> bool {
         self.cutoff.is_live() && self.parent.as_ref().is_none_or(BindingCutoff::is_live)

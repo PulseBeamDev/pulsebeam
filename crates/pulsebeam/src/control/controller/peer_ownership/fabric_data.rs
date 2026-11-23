@@ -19,12 +19,10 @@ const FRAME_BYTES: usize = 26;
 const MAX_LEASE_MS: u16 = 2_000;
 const LOOKUP: u8 = 5;
 const LOCATED: u8 = 6;
-const READY: u8 = 7;
 const CANCEL: u8 = 8;
 const UNAVAILABLE: u8 = 9;
 const REPAIR_BYTES: usize = 40;
 const LOCATED_BYTES: usize = 48;
-const READY_BYTES: usize = 52;
 const WAN_READY: u8 = 11;
 const WAN_READY_BYTES: usize = LOCATED_BYTES + WINDOW_TUPLE_BYTES;
 
@@ -125,7 +123,6 @@ impl Frame {
 pub(in crate::control) enum RepairAction {
     Lookup,
     Located { sequence: u64 },
-    Ready { sequence: u64, label: NodeRouteKey },
     Cancel,
     Unavailable,
 }
@@ -139,36 +136,20 @@ pub(in crate::control) struct RepairFrame {
 }
 
 impl RepairFrame {
-    fn valid(self) -> bool {
-        valid_repair_scope(self.scope, self.request)
-            && match self.action {
-                RepairAction::Ready { label, .. } => {
-                    label.to_bytes() != [0; 4] && label != self.scope.key
-                }
-                _ => true,
-            }
-    }
-
     pub(in crate::control) fn encode(self) -> Option<Box<[u8]>> {
-        if !self.valid() {
+        if !valid_repair_scope(self.scope, self.request) {
             return None;
         }
         let (tag, size) = match self.action {
             RepairAction::Lookup => (LOOKUP, REPAIR_BYTES),
             RepairAction::Located { .. } => (LOCATED, LOCATED_BYTES),
-            RepairAction::Ready { .. } => (READY, READY_BYTES),
             RepairAction::Cancel => (CANCEL, REPAIR_BYTES),
             RepairAction::Unavailable => (UNAVAILABLE, REPAIR_BYTES),
         };
         let mut bytes = Vec::with_capacity(size);
         write_repair_prefix(&mut bytes, tag, self.scope, self.branch, self.request);
-        match self.action {
-            RepairAction::Ready { sequence, label } => {
-                bytes.extend(sequence.to_be_bytes());
-                bytes.extend(label.to_bytes());
-            }
-            RepairAction::Located { sequence } => bytes.extend(sequence.to_be_bytes()),
-            _ => {}
+        if let RepairAction::Located { sequence } = self.action {
+            bytes.extend(sequence.to_be_bytes());
         }
         Some(bytes.into_boxed_slice())
     }
@@ -185,32 +166,18 @@ impl RepairFrame {
             (LOCATED, LOCATED_BYTES) => RepairAction::Located {
                 sequence: value(40..48)?,
             },
-            (READY, READY_BYTES) => RepairAction::Ready {
-                sequence: value(40..48)?,
-                label: NodeRouteKey::from_bytes(bytes.get(48..52)?.try_into().ok()?),
-            },
             (CANCEL, REPAIR_BYTES) => RepairAction::Cancel,
             (UNAVAILABLE, REPAIR_BYTES) => RepairAction::Unavailable,
             _ => return None,
         };
         let (scope, branch, request) = read_repair_prefix(bytes)?;
-        let frame = Self {
+        valid_repair_scope(scope, request).then_some(Self {
             scope,
             branch,
             request,
             action,
-        };
-        frame.valid().then_some(frame)
+        })
     }
-}
-
-/// The selected WAN exchange shares lookup, location and cancel framing,
-/// but never admits the legacy label-only Ready.
-pub(in crate::control) fn decode_wan_repair_control(bytes: &[u8]) -> Option<RepairFrame> {
-    if bytes.get(1) == Some(&READY) {
-        return None;
-    }
-    RepairFrame::decode(bytes)
 }
 
 fn write_repair_prefix(
@@ -355,19 +322,12 @@ mod tests {
         assert_eq!(ready.window.ssrc().get(), 0x05060709);
         assert_eq!(ready.encode().as_deref(), Some(&WIRE[..]));
         assert!(RepairFrame::decode(&WIRE).is_none());
-        let legacy = RepairFrame {
-            scope: ready.scope,
-            branch: ready.branch,
-            request: ready.request,
-            action: RepairAction::Ready {
-                sequence: ready.sequence,
-                label: NodeRouteKey::from_bytes([5, 6, 7, 9]),
-            },
-        }
-        .encode()
-        .unwrap();
+        let mut legacy = [0; 52];
+        legacy[..48].copy_from_slice(&WIRE[..48]);
+        legacy[1] = 7;
+        legacy[48..].copy_from_slice(&ready.window.ssrc().get().to_be_bytes());
         assert!(WanRepairReady::decode(&legacy, 0).is_none());
-        assert!(decode_wan_repair_control(&legacy).is_none());
+        assert!(RepairFrame::decode(&legacy).is_none());
         for (offset, byte) in [(47, 0), (59, 1), (51, 2), (60, 4), (64, 8)] {
             let mut bad = WIRE;
             bad[offset] = byte;
@@ -381,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_repair_has_exact_framing_and_requires_a_distinct_ready_label() {
+    fn repair_control_requires_exact_framing() {
         let scope = Scope {
             key: NodeRouteKey::from_bytes([1, 7, 0, 5]),
             source: NonZeroU64::MIN,
@@ -401,13 +361,6 @@ mod tests {
         for (action, length) in [
             (RepairAction::Lookup, REPAIR_BYTES),
             (RepairAction::Located { sequence: u64::MAX }, LOCATED_BYTES),
-            (
-                RepairAction::Ready {
-                    sequence: u64::MAX,
-                    label: NodeRouteKey::from_bytes([1, 7, 0, 6]),
-                },
-                READY_BYTES,
-            ),
             (RepairAction::Cancel, REPAIR_BYTES),
             (RepairAction::Unavailable, REPAIR_BYTES),
         ] {
@@ -419,17 +372,6 @@ mod tests {
             assert!(super::super::transfer::Frame::decode(&bytes).is_none());
             assert!(RepairFrame::decode(bytes.get(..length - 1).unwrap()).is_none());
         }
-        assert!(
-            RepairFrame {
-                action: RepairAction::Ready {
-                    sequence: 0,
-                    label: scope.key
-                },
-                ..base
-            }
-            .encode()
-            .is_none()
-        );
         let mut invalid = base.encode().unwrap();
         invalid.get_mut(32..40).unwrap().fill(0);
         assert!(RepairFrame::decode(&invalid).is_none());

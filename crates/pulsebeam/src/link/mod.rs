@@ -3,7 +3,6 @@
 mod codec;
 mod control;
 pub(crate) mod fabric_codec;
-pub(crate) mod fabric_tx;
 pub use control::Control;
 pub(crate) mod host;
 #[cfg(test)]

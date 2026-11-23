@@ -4,9 +4,6 @@
     reason = "simulation fixture helpers fail immediately on invalid setup or missing progress"
 )]
 
-#[path = "link_simulation/fabric.rs"]
-mod fabric;
-
 use super::*;
 use crate::clock::WallAnchor;
 use crate::link::{HostHealth, host::Host};

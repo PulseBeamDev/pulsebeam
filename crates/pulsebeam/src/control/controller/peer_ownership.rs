@@ -72,21 +72,6 @@ pub(in crate::control) async fn transfer_fixture_snapshot(
     }
 }
 
-#[cfg(feature = "sim")]
-type AnchorSamples = Vec<(
-    crate::route::fabric::DataPublisher,
-    oneshot::Receiver<Option<u64>>,
-)>;
-
-#[cfg(feature = "sim")]
-type FabricRoutes = Box<[relay::fabric::LiveRouteAck]>;
-
-#[cfg(feature = "sim")]
-pub(super) struct SimFabricRelay {
-    network: NetworkId,
-    relays: relay::Relays,
-}
-
 #[derive(Debug)]
 pub struct Command(Box<Action>);
 
@@ -95,16 +80,6 @@ enum Action {
     Open(NodeId, NonZeroU64, Option<NetworkId>, Reply<Session>),
     Close(Session, Reply<()>),
     Read(Reply<Snapshot>),
-    #[cfg(feature = "sim")]
-    SampleData(Reply<AnchorSamples>),
-    #[cfg(feature = "sim")]
-    FabricImage(
-        NetworkId,
-        FabricRoutes,
-        ownership::wire::DataAnchors,
-        Instant,
-        Reply<FabricRoutes>,
-    ),
     Snapshot(Session, NonZeroU64, Snapshot, Instant, Reply<()>),
     RejectOversized(Session, NonZeroU64, Instant, Reply<()>),
     Delta(
@@ -165,29 +140,6 @@ impl Control {
 
     pub(crate) async fn read(&self) -> Result<Snapshot, Error> {
         self.exchange(Action::Read).await
-    }
-
-    #[cfg(feature = "sim")]
-    pub(super) async fn sample_data(&self) -> Result<ownership::wire::DataAnchors, Error> {
-        let mut anchors = ownership::wire::DataAnchors::new();
-        for (publisher, sample) in self.exchange(Action::SampleData).await? {
-            if let Ok(Some(sequence)) = sample.await {
-                anchors.insert(publisher.publication, (publisher, sequence));
-            }
-        }
-        Ok(anchors)
-    }
-
-    #[cfg(feature = "sim")]
-    pub(super) async fn fabric_image(
-        &self,
-        peer: NetworkId,
-        routes: FabricRoutes,
-        anchors: ownership::wire::DataAnchors,
-        until: Instant,
-    ) -> Result<FabricRoutes, Error> {
-        self.exchange(|reply| Action::FabricImage(peer, routes, anchors, until, reply))
-            .await
     }
 
     pub(crate) async fn snapshot(
@@ -261,17 +213,6 @@ impl ControllerActor {
             Action::Read(reply) => {
                 let _ = reply.send(self.local_endpoint_snapshot());
             }
-            #[cfg(feature = "sim")]
-            Action::SampleData(reply) => {
-                let samples = self
-                    .local_endpoint_snapshot()
-                    .map(|snapshot| self.sample_data_publisher_anchors(&snapshot));
-                let _ = reply.send(samples);
-            }
-            #[cfg(feature = "sim")]
-            Action::FabricImage(network, routes, anchors, until, reply) => {
-                let _ = reply.send(self.apply_sim_fabric_image(network, routes, anchors, until));
-            }
             Action::Snapshot(session, revision, endpoints, fresh_until, reply) => {
                 let _ = reply.send(self.apply_ownership_snapshot(
                     session,
@@ -305,44 +246,6 @@ impl ControllerActor {
                 ));
             }
         }
-    }
-
-    #[cfg(feature = "sim")]
-    fn apply_sim_fabric_image(
-        &mut self,
-        network: NetworkId,
-        routes: FabricRoutes,
-        anchors: ownership::wire::DataAnchors,
-        until: Instant,
-    ) -> Result<FabricRoutes, Error> {
-        if self
-            .links
-            .as_ref()
-            .is_none_or(|links| !links.fabric_peer(network))
-        {
-            return Err(Error::Closed);
-        }
-        let now = Instant::now();
-        let mut relay = self
-            .sim_fabric_relay
-            .take()
-            .filter(|relay| relay.network == network)
-            .unwrap_or_else(|| SimFabricRelay {
-                network,
-                relays: relay::Relays::default(),
-            });
-        relay.relays.install(
-            relay::Offers::new(),
-            routes,
-            anchors,
-            None,
-            locally_bounded_deadline(now, until),
-        );
-        relay.relays.step(self, network, now);
-        self.sim_fabric_relay = Some(relay);
-        let links = self.links.as_mut().ok_or(Error::Closed)?;
-        links.reap();
-        relay::fabric::decode(links.fabric_offers(network).into_boxed_slice()).ok_or(Error::Closed)
     }
 
     fn open_ownership_peer(
@@ -402,13 +305,6 @@ impl ControllerActor {
                 self.stage_plans_at(shard, generation, vec![plan]);
             }
             self.publish_staged();
-        }
-        let retirements = self
-            .links
-            .as_mut()
-            .map_or_else(Vec::new, |links| links.take_fabric_retirements(network));
-        for (binding, change) in retirements {
-            self.stage_fabric_relay_retirement(binding, change);
         }
     }
 

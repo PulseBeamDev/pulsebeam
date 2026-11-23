@@ -728,43 +728,21 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
     let issuer_ip = subnet_ip(subnet, 1);
     let receiver_ip = subnet_ip(subnet, 2);
     let client_ip = subnet_ip(subnet, 3);
-    let (issuer, receiver) = pulsebeam::node::SimOwnershipPeer::pair();
-    let (issuer_tx, issuer_link) = pulsebeam_runtime::sync::oneshot::channel();
-    let (receiver_tx, receiver_link) = pulsebeam_runtime::sync::oneshot::channel();
-    for (ip, peer, node_seed, link) in [
-        (issuer_ip, issuer.clone(), seed, issuer_tx),
-        (receiver_ip, receiver.clone(), !seed, receiver_tx),
-    ] {
-        let link = Arc::new(Mutex::new(Some(link)));
-        sim.host(ip, move || {
-            let peer = peer.clone();
-            let link = link.clone();
-            async move {
-                let link = link.lock().unwrap().take().unwrap();
-                sfu_node_builder(ip, pulsebeam_runtime::rand::seeded_rng(node_seed), 1)
-                    .with_sim_ownership_peer(peer)
-                    .with_local_data_v1()
-                    .with_link_control((ip, 0).into(), link)
-                    .run(tokio_util::sync::CancellationToken::new())
-                    .await
-                    .map_err(Into::into)
-            }
-        });
-    }
+    let root = tempfile::tempdir().unwrap();
+    provisioned::install_provisioned_nodes(
+        &mut sim,
+        root.path(),
+        &[issuer_ip, receiver_ip],
+        &[(0, 1)],
+        seed,
+        false,
+    )
+    .unwrap();
     let witness = Arc::new(Mutex::new(None));
     let client_witness = witness.clone();
     sim.client(client_ip, async move {
-        *client_witness.lock().unwrap() = Some(
-            prove_joined_recovery(
-                client_ip,
-                issuer_ip,
-                receiver_ip,
-                issuer,
-                receiver,
-                [issuer_link.await?, receiver_link.await?],
-            )
-            .await?,
-        );
+        let keys = prove_joined_recovery(client_ip, issuer_ip, receiver_ip).await?;
+        *client_witness.lock().unwrap() = Some(keys);
         Ok(())
     });
     use std::io::{Read, Seek};
@@ -781,7 +759,7 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
             })),
     );
     tracing::subscriber::with_default(subscriber, || {
-        run_sim_or_timeout(&mut sim, Duration::from_secs(20))
+        run_sim_or_timeout(&mut sim, Duration::from_secs(35))
     })
     .unwrap();
     logs.rewind().unwrap();
@@ -810,6 +788,21 @@ fn native_joined_recovery_moves_to_a_distinct_controller_attempt() {
     assert!(matching("publication_admitted", "pub", &keys["pub"]));
     assert!(matching("relay_installed", "pub", &keys["pub"]));
     assert!(matching("relay_removed", "pub", &keys["pub"]));
+    let acknowledged_routes = records
+        .iter()
+        .map(|record| &record["fields"])
+        .filter(|fields| fields["event"] == "relay_installed" && fields["pub"] == keys["pub"])
+        .map(|fields| {
+            (
+                fields["epoch"].as_u64().unwrap(),
+                fields["label"].as_u64().unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        acknowledged_routes.len() >= 2,
+        "withdrawn WAN route must not be reused"
+    );
     assert!(matching("subscription_waiting", "conn", &keys["conn"]));
     assert!(matching("subscription_bound", "pub", &keys["pub"]));
     assert!(matching("credential_renewed", "jti", &keys["jti"]));
@@ -823,9 +816,6 @@ async fn prove_joined_recovery(
     client_ip: IpAddr,
     issuer_ip: IpAddr,
     receiver_ip: IpAddr,
-    issuer: pulsebeam::node::SimOwnershipPeer,
-    receiver: pulsebeam::node::SimOwnershipPeer,
-    [issuer_link, receiver_link]: [pulsebeam::link::Control; 2],
 ) -> anyhow::Result<serde_json::Value> {
     let room = "native-failover";
     let same_project = pulsebeam::entity::ProjectRoomKey {
@@ -955,6 +945,14 @@ async fn prove_joined_recovery(
         let feed = &feed;
         async move {
             tokio::time::timeout(Duration::from_secs(5), async {
+                let updates = publisher.updates()?;
+                loop {
+                    let state = updates.next().await?.context("publisher closed before probe")?;
+                    anyhow::ensure!(state.error.is_none() && state.execution_error.is_none(), "DATA publication failed: {state:?}");
+                    if state.execution == core_ffi::PublicationExecution::Installed {
+                        break;
+                    }
+                }
                 let mut ticks = tokio::time::interval(Duration::from_millis(25));
                 loop {
                     tokio::select! {
@@ -974,12 +972,13 @@ async fn prove_joined_recovery(
                     }
                 }
             }).await.map_err(|_| anyhow::anyhow!(
-                "did not receive payload for {expected_id}; subscription: {:?}", feed.state()
+                "did not receive payload for {expected_id}; publication: {:?}; subscription: {:?}", publisher.state(), feed.state()
             ))?
         }
     };
-    receive_payload(b"before".as_slice(), initial_id.as_str()).await?;
-    issuer.deliver_receipt_facts(unix_now() + 20);
+    receive_payload(b"before".as_slice(), initial_id.as_str())
+        .await
+        .context("initial local DATA probe")?;
     runtime.reconnect().await?;
     let recovered = wait_connected_when(&agent, first.generation, |_| true).await?;
     let recovered_support = agent.support_report();
@@ -998,7 +997,9 @@ async fn prove_joined_recovery(
         let evidence = evidence.lock().unwrap();
         let created = http::StatusCode::CREATED;
         anyhow::ensure!(
-            evidence.statuses == [created, created, http::StatusCode::GONE, created],
+            matches!(evidence.statuses.as_slice(), [first, lost, wrong_target, retry @ .., accepted]
+                if *first == created && *lost == created && *wrong_target == http::StatusCode::GONE
+                    && *accepted == created && retry.iter().all(|status| *status == http::StatusCode::SERVICE_UNAVAILABLE)),
             "unexpected admission sequence: {:?}",
             evidence.statuses
         );
@@ -1010,11 +1011,19 @@ async fn prove_joined_recovery(
             evidence.requests[2].1 != evidence.requests[3].1,
             "receiving controller reused the issuer attempt"
         );
+        anyhow::ensure!(
+            evidence.requests[3..]
+                .iter()
+                .all(|request| *request == evidence.requests[3]),
+            "authority retry changed the successor attempt or receipt"
+        );
         let source = issuer_ip.to_string();
         let destination = receiver_ip.to_string();
         anyhow::ensure!(
             evidence.posts[1].uri().host() == Some(source.as_str())
-                && evidence.posts[2].uri().host() == Some(destination.as_str())
+                && evidence.posts[2..]
+                    .iter()
+                    .all(|request| request.uri().host() == Some(destination.as_str()))
         );
         let receipt = |body: &[u8]| {
             serde_json::from_slice::<serde_json::Value>(body).unwrap()["successor_receipt"].clone()
@@ -1022,21 +1031,30 @@ async fn prove_joined_recovery(
         anyhow::ensure!(!receipt(&evidence.requests[1].0).is_null());
         anyhow::ensure!(receipt(&evidence.requests[1].0) == receipt(&evidence.requests[3].0));
     }
-    anyhow::ensure!(
-        issuer.local_claim_count().await? == 1 && receiver.local_claim_count().await? == 1
-    );
-    let [ingress, egress] = link_recovery_peers(&issuer_link, &receiver_link).await?;
-    let until = pulsebeam_runtime::time::Instant::now() + Duration::from_secs(4);
-    let (replacement, first_label) = receiver
-        .relay_fabric_data(egress, ingress, recovered_connection, until)
-        .await?;
-    let recovered_id = replacement.as_str();
-    anyhow::ensure!(recovered_id != initial_id);
-    receive_payload(b"after".as_slice(), recovered_id.as_str()).await?;
+    let recovered_id = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let state = feed_updates
+                .next()
+                .await?
+                .context("feed closed before WAN rebind")?;
+            if state.execution == core_ffi::PublicationExecution::Installed
+                && let Some(id) = state.source_track_id
+                && id != initial_id
+            {
+                return anyhow::Ok(id);
+            }
+        }
+    })
+    .await
+    .context("replacement DATA did not install over provisioned WAN")??;
+    receive_payload(b"after".as_slice(), recovered_id.as_str())
+        .await
+        .context("successor WAN DATA probe")?;
+    turmoil::partition(issuer_ip, receiver_ip);
     let bound = feed.state();
     anyhow::ensure!(bound.source_track_id.as_deref() == Some(recovered_id.as_str()));
 
-    tokio::time::timeout_at(until + Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(17), async {
         loop {
             let state = feed_updates
                 .next()
@@ -1061,28 +1079,28 @@ async fn prove_joined_recovery(
             feed.state()
         )
     })??;
-    let withdrawn = issuer_link.destinations(same_project, replacement).await;
-    anyhow::ensure!(
-        matches!(withdrawn, Err(pulsebeam_link::BindError::Closed)),
-        "expired publication is still visible to Link: {withdrawn:?}"
-    );
-    let (refreshed, new_label) = receiver
-        .relay_fabric_data(
-            egress,
-            ingress,
-            recovered_connection,
-            pulsebeam_runtime::time::Instant::now() + Duration::from_secs(10),
-        )
-        .await?;
-    anyhow::ensure!(refreshed == replacement && first_label != new_label);
-    receive_payload(b"refreshed".as_slice(), recovered_id.as_str()).await?;
+    turmoil::repair(issuer_ip, receiver_ip);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let state = feed_updates
+                .next()
+                .await?
+                .context("feed closed during WAN route repair")?;
+            if state.execution == core_ffi::PublicationExecution::Installed
+                && state.source_track_id.as_deref() == Some(recovered_id.as_str())
+            {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await
+    .context("WAN rebind did not restore the current DATA publication")??;
+    receive_payload(b"refreshed".as_slice(), recovered_id.as_str())
+        .await
+        .context("restored WAN DATA probe")?;
     anyhow::ensure!(feed.state().accepted_revision == bound.accepted_revision);
     anyhow::ensure!(viewer.snapshot().generation == viewer_generation && !feed.is_closed());
     anyhow::ensure!(viewer.support_report() == viewer_support);
-    anyhow::ensure!(
-        issuer.local_claim_count().await? == 0 && receiver.local_claim_count().await? == 1,
-        "sibling claims did not converge"
-    );
     anyhow::ensure!(
         agent.snapshot().generation == recovered.generation
             && agent.snapshot().connection == core_ffi::ConnectionState::Connected
@@ -1122,81 +1140,6 @@ async fn prove_joined_recovery(
 
 fn relay_error(error: impl std::fmt::Debug) -> anyhow::Error {
     anyhow::anyhow!("Link relay provisioning: {error:?}")
-}
-
-async fn link_recovery_peers(
-    issuer: &pulsebeam::link::Control,
-    receiver: &pulsebeam::link::Control,
-) -> anyhow::Result<[pulsebeam_link::NetworkId; 2]> {
-    use pulsebeam_link::{FabricPath, NetworkClass, NetworkPeer, PeerRole, SecretCredential};
-    let path = FabricPath {
-        udp_payload_limit: 1200,
-        additional_overhead: 0,
-    };
-    let left = SecretCredential::generate().map_err(relay_error)?;
-    let right = SecretCredential::generate().map_err(relay_error)?;
-    let left_fingerprint = left.fingerprint();
-    let right_fingerprint = right.fingerprint();
-    let local = issuer.health().await.map_err(relay_error)?.local_addr;
-    let remote = receiver.health().await.map_err(relay_error)?.local_addr;
-    let egress = receiver
-        .open_peer(
-            NetworkPeer {
-                endpoint: local,
-                credential: right,
-                expected_peer: left_fingerprint,
-                role: PeerRole::Responder,
-                class: NetworkClass::Lan,
-            }
-            .with_fabric_path(path),
-        )
-        .await
-        .map_err(relay_error)?;
-    let installed = receiver.health().await.map_err(relay_error)?;
-    anyhow::ensure!(
-        installed
-            .peers
-            .iter()
-            .any(|peer| peer.peer == egress && peer.failure.is_none()),
-        "relay responder was not installed"
-    );
-    let ingress = issuer
-        .open_peer(
-            NetworkPeer {
-                endpoint: remote,
-                credential: left,
-                expected_peer: right_fingerprint,
-                role: PeerRole::Initiator,
-                class: NetworkClass::Lan,
-            }
-            .with_fabric_path(path),
-        )
-        .await
-        .map_err(relay_error)?;
-    tokio::time::timeout(Duration::from_secs(4), async {
-        loop {
-            let mut ready = true;
-            for (node, id) in [(issuer, ingress), (receiver, egress)] {
-                let health = node.health().await.map_err(relay_error)?;
-                if let Some(peer) = health.peers.iter().find(|peer| peer.peer == id) {
-                    anyhow::ensure!(
-                        peer.failure.is_none(),
-                        "relay peer failed: {:?}",
-                        peer.failure
-                    );
-                    ready &= peer.transport.ready;
-                } else {
-                    ready = false;
-                }
-            }
-            if ready {
-                return anyhow::Ok([ingress, egress]);
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("authenticated Link peers did not become ready"))?
 }
 
 #[test]

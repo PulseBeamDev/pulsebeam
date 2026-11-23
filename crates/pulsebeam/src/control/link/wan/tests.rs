@@ -127,8 +127,10 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         Err(BindError::Closed)
     ));
     committed.send(()).unwrap();
+    let mut wrong_ingress = spec();
+    wrong_ingress.canonical_ingress = sender_peer;
     assert!(matches!(
-        links.stage_live_receive(spec().live, |_, _| panic!("wrong carrier")),
+        links.stage_wan_live_receive(now, wrong_ingress, |_, _| panic!("wrong ingress")),
         Err(BindError::Closed)
     ));
     let mut gate = None;
@@ -155,7 +157,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     };
     assert!(
         links
-            .peer_data_expectations(peer, expectation, now)
+            .wan_data_expectations(peer, expectation, now)
             .is_none()
     );
     installed.send(Some(child)).unwrap();
@@ -195,13 +197,13 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     let expect = fabric_data::Frame::decode(&wire).unwrap();
     assert_eq!(expect, expectation);
     let clipped = now + Duration::from_millis(1_500);
-    let notices = links.peer_data_expectations(peer, expect, clipped).unwrap();
+    let notices = links.wan_data_expectations(peer, expect, clipped).unwrap();
     assert!(
         matches!(notices.as_slice(), [notice] if notice.parent == child && notice.unit == expect.unit && notice.expires == now + Duration::from_secs(2))
     );
     assert!(
         links
-            .peer_data_expectations(sender_peer, expect, now)
+            .wan_data_expectations(sender_peer, expect, now)
             .is_none()
     );
     let wrong = fabric_data::Frame {
@@ -211,7 +213,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
         },
         ..expect
     };
-    assert!(links.peer_data_expectations(peer, wrong, now).is_none());
+    assert!(links.wan_data_expectations(peer, wrong, now).is_none());
     let source = WanSourceWindow {
         room,
         publisher: PublisherAnchor {
@@ -277,7 +279,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     let mut frames = Vec::new();
     assert_eq!(mailbox.try_recv_batch(&mut frames, 1), 1);
     assert!(
-        matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket::Wan { window, position, packet: received } }
+        matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket { window, position, packet: received } }
         if ingress == child.ingress && window == live_window && position == start && received.same_content(&packet))
     );
 
@@ -391,7 +393,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     );
     assert_eq!(mailbox.try_recv_batch(&mut frames, 1), 1);
     assert!(
-        matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket::Wan { window, position: full, packet } }
+        matches!(frames.pop().unwrap().packet, ShardFrame::FabricWanImage { ingress, image: NetworkPacket { window, position: full, packet } }
         if ingress == repair.route.ingress && window == repair_window && full == position && packet.same_content(&repaired))
     );
     assert_ne!(live_window.ssrc(), repair_window.ssrc());
@@ -460,7 +462,7 @@ async fn wan_host_receives_only_controller_scoped_commits_and_fences_on_peer_clo
     links.close_peer(peer);
     assert!(!relay_tx.try_send(Instant::now(), deadline, start, packet));
     assert!(links.wan_offers(peer).is_empty());
-    assert!(links.peer_data_expectations(peer, expect, now).is_none());
+    assert!(links.wan_data_expectations(peer, expect, now).is_none());
     assert_eq!(
         links.wan_repair_receive_state(interest, repair, now),
         Poll::Ready(None)
