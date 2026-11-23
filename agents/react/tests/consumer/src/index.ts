@@ -78,5 +78,5 @@ Video({ source: remote.video("camera") });
 // @ts-expect-error No agent-wide implicit audio playback.
 Audio({ agent });
 void settings;
-agent.connect();
-agent.disconnect();
+agent.join("explicit-room");
+agent.renew("replacement-token");

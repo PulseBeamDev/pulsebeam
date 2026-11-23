@@ -228,11 +228,7 @@
     const deadline = Date.now() + 20000;
     while (!(await predicate())) {
       if (Date.now() > deadline) {
-        const agents = [sender, receiver].map((agent) => {
-          const { connection, generation, failure, mapping, topics } =
-            agent.snapshot();
-          return { connection, generation, failure, mapping, topics };
-        });
+        const agents = [sender.state(), receiver.state()];
         const physical = await Promise.all(
           [...peers].map(async (peer) => ({
             connection: peer.connectionState,
@@ -377,8 +373,6 @@
     audioPipe = AudioSource.fromTrack(audioTrack).pipeTo(audioPublication);
     sender.join("public-web-contract");
     receiver.join("public-web-contract");
-    await sender.connect();
-    await receiver.connect();
     await until(
       () =>
         sender.connection === "connected" &&
@@ -391,21 +385,20 @@
       "admission identity",
     );
     assert(receiver.roomId === "public-web-contract", "room identity");
-    const senderGeneration = sender.snapshot().generation;
-    const receiverGeneration = receiver.snapshot().generation;
-    const credentialRevision = sender.snapshot().credentialRevision + 1n;
-    await sender.renewAuthorization("__RENEWED_SENDER_TOKEN__");
+    const senderConnection = sender.state().connectionId;
+    const receiverConnection = receiver.state().connectionId;
+    const credentialRevision = sender.state().desiredCredentialRevision + 1n;
+    sender.renew("__RENEWED_SENDER_TOKEN__");
     await until(() => {
-      const snapshot = sender.snapshot();
+      const state = sender.state();
       return (
-        snapshot.credentialRevision === credentialRevision &&
-        snapshot.acceptedCredentialRevision === credentialRevision &&
-        snapshot.credentialOutcome?.revision === credentialRevision &&
-        snapshot.credentialOutcome.status === "accepted"
+        state.desiredCredentialRevision === credentialRevision &&
+        state.evaluatedCredentialRevision === credentialRevision &&
+        state.error === undefined
       );
     }, "browser fetch renewal acknowledgement and ordered grant");
     assert(
-      sender.snapshot().generation === senderGeneration,
+      sender.state().connectionId === senderConnection,
       "renewal preserves the admitted connection",
     );
     const receiveValue = async (iterator, expected) => {
@@ -436,31 +429,7 @@
       }, "current ordered payload delivery");
       await reading;
     };
-    const dataReady = async (name) => {
-      await until(
-        () =>
-          sender
-            .snapshot()
-            .topics.publishers.some(
-              (publisher) =>
-                publisher.name === name &&
-                publisher.mode === "ordered" &&
-                publisher.connected &&
-                typeof publisher.publicationId === "string",
-            ) &&
-          receiver
-            .snapshot()
-            .topics.subscribers.some(
-              (subscriber) =>
-                subscriber.name === name &&
-                subscriber.mode === "ordered" &&
-                subscriber.connected &&
-                subscriber.publishers > 0,
-            ),
-        "accepted named-data bindings",
-      );
-    };
-    const warmOrdered = async (publisher, iterator, value, name) => {
+    const warmOrdered = async (publisher, iterator, value) => {
       let received = false;
       let failure;
       const delivery = receiveValue(iterator, value).then(
@@ -479,7 +448,6 @@
         return received;
       }, "ordered live-frontier rendezvous");
       await delivery;
-      await dataReady(name);
     };
     const steadyPublisher = sender.data("reuse-steady", "ordered").publish();
     steadyIterator = receiver
@@ -487,7 +455,7 @@
       .participant("web-sender")
       .data("reuse-steady", "ordered")
       .subscribe();
-    await warmOrdered(steadyPublisher, steadyIterator, 0, "reuse-steady");
+    await warmOrdered(steadyPublisher, steadyIterator, 0);
     await steadyPublisher.send(Uint8Array.of(1));
     await receiveValue(steadyIterator, 1);
     const steadyChannels = payloadChannels.filter(
@@ -506,12 +474,7 @@
         .data("reuse-cycle", "ordered")
         .subscribe();
       // Witness each fresh subscription's live frontier before the assertion send.
-      await warmOrdered(
-        cyclingPublisher,
-        cyclingIterator,
-        lifetime * 2,
-        "reuse-cycle",
-      );
+      await warmOrdered(cyclingPublisher, cyclingIterator, lifetime * 2);
       await cyclingPublisher.send(Uint8Array.of(lifetime * 2 + 1));
       await receiveValue(cyclingIterator, lifetime * 2 + 1);
       const live = payloadChannels.filter(
@@ -562,8 +525,8 @@
         "continuing ordered bindings are not replaced",
       );
       assert(
-        sender.snapshot().generation === senderGeneration &&
-          receiver.snapshot().generation === receiverGeneration,
+        sender.state().connectionId === senderConnection &&
+          receiver.state().connectionId === receiverConnection,
         "payload reuse does not reconnect either peer",
       );
       await steadyPublisher.send(Uint8Array.of(lifetime + 2));
@@ -638,8 +601,8 @@
         label,
       );
       assert(
-        sender.snapshot().generation === senderGeneration &&
-          receiver.snapshot().generation === receiverGeneration &&
+        sender.state().connectionId === senderConnection &&
+          receiver.state().connectionId === receiverConnection &&
           fixedPeer.connectionState === "connected" &&
           peers.size === 2 &&
           pinnedPublisher.room === "public-web-contract" &&
@@ -795,7 +758,7 @@
     const rtpReceiver = peer.getReceivers().find((r) => r.track === current);
     assert(
       peer === fixedPeer && fixedPeer.signalingState !== "closed",
-      `physical receiver retirement preserves the connection; warnings: ${warnings.join("; ")}; sender generation: ${sender.snapshot().generation}; receiver generation: ${receiver.snapshot().generation}; old peer: ${fixedPeer.connectionState}/${fixedPeer.signalingState}; new peer: ${peer.connectionState}/${peer.signalingState}; transport: ${JSON.stringify({ actual: transportLines(fixedPeer.localDescription), offers: localOffers.get(fixedPeer), applied: appliedAnswers.get(fixedPeer)?.map((answer) => answer.transport) })}`,
+      `physical receiver retirement preserves the connection; warnings: ${warnings.join("; ")}; sender connection: ${sender.state().connectionId}; receiver connection: ${receiver.state().connectionId}; old peer: ${fixedPeer.connectionState}/${fixedPeer.signalingState}; new peer: ${peer.connectionState}/${peer.signalingState}; transport: ${JSON.stringify({ actual: transportLines(fixedPeer.localDescription), offers: localOffers.get(fixedPeer), applied: appliedAnswers.get(fixedPeer)?.map((answer) => answer.transport) })}`,
     );
     const baseline = await decoded(rtpReceiver);
     await until(
@@ -967,8 +930,8 @@
           peer.getSenders().some((sender) => sender.track === handoffClones[1]),
         ) === publishingPeer &&
         peers.size === 2 &&
-        sender.snapshot().generation === senderGeneration &&
-        receiver.snapshot().generation === receiverGeneration,
+        sender.state().connectionId === senderConnection &&
+        receiver.state().connectionId === receiverConnection,
       "publication churn creates fresh source-bound objects on the same two actual peers",
     );
     const freshReceiver = fixedPeer

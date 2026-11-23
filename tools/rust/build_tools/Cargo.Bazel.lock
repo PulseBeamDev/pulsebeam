@@ -3,7 +3,7 @@
     "uniffi-bindgen-react-native 0.31.0-5",
     "wasm-bindgen-cli 0.2.127"
   ],
-  "checksum": "fb3f8f4381306abf8331c190ce862b18bca8e1055e0a06dbfc627b152a8c6aa4",
+  "checksum": "2b4458422b8fc5d4f926caee609b072b741bffe93c013219b1866aceb6eb81ad",
   "conditions": {
     "aarch64-pc-windows-gnullvm": [],
     "aarch64-unknown-linux-gnu": [
@@ -9472,7 +9472,8 @@
             "-p1"
           ],
           "patches": [
-            "@@//tools:patches/ubrn-napi-colocated-esm.patch"
+            "@@//tools:patches/ubrn-napi-colocated-esm.patch",
+            "@@//tools:patches/ubrn-revisioned-snapshots.patch"
           ],
           "remote": "https://github.com/jhugman/uniffi-bindgen-react-native.git",
           "strip_prefix": "crates/ubrn_bindgen"

@@ -26,7 +26,6 @@ import {
   type AudioSubscriptionUpdates,
   type ErrorInfo,
   type AgentError,
-  type AgentSnapshot,
   type DataEvent,
   type DataUpdate,
   type DataPublication,
@@ -35,8 +34,6 @@ import {
   type DataSubscriptionState,
   type DataPublicationUpdates,
   type DataSubscriptionUpdates,
-  type SnapshotUpdate,
-  type EventUpdate,
   type RemoteAudioTrack,
   type RemoteVideoTrack,
 } from "../../web/index.js";
@@ -61,6 +58,7 @@ const agent = new Agent({
   token: "opaque",
 });
 agent.join("explicit-room");
+// @ts-expect-error Agent does not leave while retaining its session.
 agent.leaveRoom();
 const watchConfig: WatchConfig = { limit: 7, cursor: Uint8Array.of(1) };
 const watch: Watch = agent.room("pinned-room").watch(watchConfig);
@@ -130,12 +128,14 @@ void [
 ];
 const renewed: void = agent.renew("opaque-renewed");
 void renewed;
-const connected: Promise<void> = agent.connect();
-await connected;
-await agent.disconnect();
-await agent.renewAuthorization("renewed");
+// @ts-expect-error Only join requests admission.
+agent.connect();
+// @ts-expect-error Close is the explicit session shutdown operation.
+agent.disconnect();
+// @ts-expect-error Credential replacement is synchronous renew().
+agent.renewAuthorization("renewed");
 agent.setLogging("info");
-const snapshot: AgentSnapshot = agent.snapshot();
+const snapshot: AgentState = agent.state();
 // @ts-expect-error Metadata discovery requires an owned bounded Watch.
 snapshot.catalog;
 // @ts-expect-error Physical transport mappings are private to the runtime.
@@ -146,21 +146,16 @@ snapshot.tracks;
 agent.participants;
 // @ts-expect-error There is no global media discovery facade.
 agent.remote;
-const joinRevision: bigint = snapshot.joinRevision;
-const desiredRoom: string | null = snapshot.desiredRoom;
-void joinRevision;
-void desiredRoom;
+const joinRevision: bigint = snapshot.desiredJoinRevision;
+const desiredRoom: string | undefined = snapshot.desiredRoom;
 const error: AgentError | null = agent.error;
-const snapshots = agent.snapshots();
-const events = agent.events();
-const observedSnapshot: SnapshotUpdate = await snapshots.next();
-const observedEvent: Promise<EventUpdate> = events.next();
-await snapshots.close();
-await events.close();
-const observationsClosed: boolean = snapshots.isClosed() && events.isClosed();
-void [snapshot, error, observedSnapshot, observedEvent, observationsClosed];
-// @ts-expect-error Snapshot cursors do not expose their writable channel.
-snapshots.observation;
+void [snapshot, error, joinRevision, desiredRoom];
+// @ts-expect-error Agent observation uses state().
+agent.snapshot();
+// @ts-expect-error Agent observation uses updates().
+agent.snapshots();
+// @ts-expect-error Agent does not expose an event history.
+agent.events();
 // @ts-expect-error Observation is an owned cursor, not a callback alias.
 agent.subscribe(() => {});
 // @ts-expect-error Current snapshot has one common spelling.

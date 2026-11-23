@@ -8,13 +8,6 @@ export async function dataResourceContract(pulsebeam) {
     logging: { level: "off" },
   };
   const agent = new pulsebeam.Agent(config);
-  const until = async (condition, label) => {
-    for (let step = 0; step < 1000; step++) {
-      if (condition()) return;
-      await setImmediate();
-    }
-    assert.fail(label);
-  };
   try {
     const local = agent.data("events", "ordered");
     assert.equal(Object.isFrozen(local), true);
@@ -49,8 +42,6 @@ export async function dataResourceContract(pulsebeam) {
     assert.notEqual(alice, bob);
     assert.equal(alice.id, null);
     assert.equal(alice.active, false);
-    assert.deepEqual(agent.snapshot().topics.publishers, []);
-    assert.deepEqual(agent.snapshot().topics.subscribers, []);
     const publication = local.publish();
     await assert.rejects(publication.send(Uint8Array.of(255)), (error) => {
       assert.ok(error instanceof pulsebeam.OperationError);
@@ -81,11 +72,6 @@ export async function dataResourceContract(pulsebeam) {
         },
       );
     }
-    await until(
-      () => agent.snapshot().topics.subscribers.length === 0,
-      "validation failures and closed receivers release their interest",
-    );
-
     const all = await agent
       .room("room")
       .participant("carol")
@@ -93,10 +79,9 @@ export async function dataResourceContract(pulsebeam) {
       .subscribe();
     const scoped = alice.subscribe();
     const unrelated = bob.subscribe();
-    await until(
-      () => agent.snapshot().topics.subscribers.length === 3,
-      "distinct pinned sources retain separate Core-owned interests",
-    );
+    assert.equal(all.state().selector.participantId, "carol");
+    assert.equal(scoped.state().selector.participantId, "alice");
+    assert.equal(unrelated.state().selector.participantId, "bob");
     let allResolved = false;
     const allRead = all.next().then((value) => {
       allResolved = true;
@@ -114,7 +99,6 @@ export async function dataResourceContract(pulsebeam) {
     assert.equal(all.isClosed(), false);
     assert.equal(unrelated.isClosed(), false);
     assert.equal(agent.isClosed(), false);
-    assert.equal(agent.snapshot().topics.subscribers.length, 2);
     await unrelated.close();
     assert.deepEqual(await unrelatedRead, { type: "closed" });
     await agent.close();

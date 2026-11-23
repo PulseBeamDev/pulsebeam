@@ -69,8 +69,18 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         ))
         assert not first_page.has_more() and not first_page.next_cursor()
         assert all(participant.id != "foreign" for participant in first_page.participants())
-        updates = agent.snapshots()
-        reader_updates = reader.snapshots()
+        async def joined(owner):
+            updates = owner.updates()
+            try:
+                while True:
+                    state = await updates.next()
+                    assert state is not None, "Agent closed before admission"
+                    assert state.status != core.AgentStatus.FAILED, state.error
+                    if state.status == core.AgentStatus.JOINED:
+                        assert state.room == room
+                        return
+            finally:
+                updates.close()
         data = agent.data("foreign-bytes", core.TopicMode.ORDERED).publish()
         room_cursor = reader.room(room).participant("foreign").data(
             "foreign-bytes", core.TopicMode.ORDERED,
@@ -88,20 +98,7 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         publication = agent.video("foreign-camera").publish()
         await publication.set_source(camera)
         agent.join(room)
-        while True:
-            update = await updates.next()
-            assert update.is_SNAPSHOT(), f"lost foreign snapshot observation: {update}"
-            snapshot = update.snapshot
-            assert not snapshot.connection.is_TERMINAL_FAILURE(), snapshot.failure
-            if snapshot.connection.is_CONNECTED() and snapshot.participant_id:
-                break
-        assert snapshot.generation is not None
-        while True:
-            update = await reader_updates.next()
-            assert update.is_SNAPSHOT(), f"lost reader observation: {update}"
-            assert not update.snapshot.connection.is_TERMINAL_FAILURE()
-            if update.snapshot.connection.is_CONNECTED():
-                break
+        await asyncio.gather(joined(agent), joined(reader))
         changed_page = await catalog_page(lambda participants: any(
             participant.id == "foreign" and
             {publication.track_id for publication in participant.publications} == {"foreign-camera", "foreign-bytes"}
@@ -157,7 +154,7 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
         await data.send(payload[::-1])
         assert (await message(participant_cursor, payload[::-1])).data == payload[::-1]
         await participant_cursor.close()
-        await publication.ready()
+        await admitted_publication(core, publication)
         exchange = agent.data("foreign-exchange", core.TopicMode.ORDERED).publish()
         replies = agent.room(room).participant("publisher").data(
             "foreign-exchange", core.TopicMode.ORDERED,
@@ -250,25 +247,31 @@ async def witness(endpoint, token, reader_token, catalog_token, room, package):
             )
         )
         # Submission proves ABI/native admission, not encode or remote delivery.
-        await asyncio.wait_for(agent.disconnect(), timeout=5)
-        assert agent.snapshot().connection.is_DISCONNECTED()
-        assert agent.statistics() is None, "foreign native graph not retired"
-        assert not camera.is_closed(), "graph retirement ended the logical input"
-        try:
-            await camera.capture_time_us()
-        except native.NativeError.NotReady:
-            pass
-        else:
-            raise AssertionError("retired native target still admitted clock reads")
         await publication.close()
         assert publication.is_closed() and not camera.is_closed(), "publication close stopped producer"
         await camera.close()
         assert camera.is_closed(), "producer close did not retire input"
+        await asyncio.wait_for(agent.close(), timeout=5)
+        assert agent.state().status == core.AgentStatus.CLOSED
+        assert agent.statistics() is None, "foreign native graph not retired"
         print("installed Python synchronous Agent/dynamic RTC/real SFU/live catalog/owned binary data/independent source/named media close PASS")
     finally:
         watch.close()
         watch_updates.close()
         await asyncio.wait_for(asyncio.gather(agent.close(), reader.close(), catalog_agent.close()), timeout=3)
+
+
+async def admitted_publication(core, publication):
+    updates = publication.updates()
+    try:
+        while True:
+            state = await updates.next()
+            assert state is not None and not state.closed, "publication closed before admission"
+            assert state.admission.status != core.PublicationAdmissionStatus.REJECTED, state.admission
+            if state.admission.status == core.PublicationAdmissionStatus.ADMITTED:
+                return
+    finally:
+        updates.close()
 
 
 async def publish_live(endpoint, token, room, package):
@@ -290,7 +293,7 @@ async def publish_live(endpoint, token, room, package):
     await publication.set_source(camera)
     data = agent.data("frame-events", core.TopicMode.ORDERED).publish()
     agent.join(room)
-    await publication.ready()
+    await admitted_publication(core, publication)
 
     async def frames():
         sequence = 0

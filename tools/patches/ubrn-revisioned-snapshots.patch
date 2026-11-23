@@ -1,0 +1,95 @@
+diff --git a/src/bindings/gen_typescript/config.rs b/src/bindings/gen_typescript/config.rs
+--- a/src/bindings/gen_typescript/config.rs
++++ b/src/bindings/gen_typescript/config.rs
+@@ -33,6 +33,9 @@
+     /// thread.
+     #[serde(default)]
+     pub(crate) force_async: ForceAsync,
++    /// Zero-argument synchronous methods returning immutable observation records.
++    #[serde(default)]
++    pub(crate) revisioned_snapshots: Vec<String>,
+ }
+ 
+ #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+diff --git a/src/bindings/gen_typescript/api_module/nodes.rs b/src/bindings/gen_typescript/api_module/nodes.rs
+--- a/src/bindings/gen_typescript/api_module/nodes.rs
++++ b/src/bindings/gen_typescript/api_module/nodes.rs
+@@ -219,6 +219,7 @@
+ // ---------------------------------------------------------------------------
+ 
+ pub(crate) struct TsObject {
++    pub revisioned_snapshots: Vec<String>,
+     pub ts_name: String,
+     pub decl_type_name: String,
+     pub impl_class_name: String,
+diff --git a/src/bindings/gen_typescript/api_module/builders.rs b/src/bindings/gen_typescript/api_module/builders.rs
+--- a/src/bindings/gen_typescript/api_module/builders.rs
++++ b/src/bindings/gen_typescript/api_module/builders.rs
+@@ -656,6 +656,18 @@
+         .map(|m| build_method_callable(config, m, &ffi_clone, flavor, force_async))
+         .collect();
+ 
++    let revisioned_snapshots = methods
++        .iter()
++        .filter_map(|method| {
++            let name = &method.name;
++            if !config.revisioned_snapshots.contains(&format!("{class_name}.{name}")) {
++                return None;
++            }
++            assert!(!method.renders_async() && method.arguments.is_empty());
++            Some(name.clone())
++        })
++        .collect();
++
+     let uniffi_traits = build_uniffi_traits(
+         config,
+         &interface.uniffi_trait_methods,
+@@ -688,6 +700,7 @@
+         primary_constructor,
+         alternate_constructors,
+         methods,
++        revisioned_snapshots,
+         uniffi_traits,
+         ffi_bless_pointer,
+         ffi_clone,
+diff --git a/src/bindings/gen_typescript/templates/ObjectTemplate.ts b/src/bindings/gen_typescript/templates/ObjectTemplate.ts
+--- a/src/bindings/gen_typescript/templates/ObjectTemplate.ts
++++ b/src/bindings/gen_typescript/templates/ObjectTemplate.ts
+@@ -102,6 +102,11 @@
+     {%- endif %}
+ }
+ 
++{%- for name in obj.revisioned_snapshots %}
++// A single immutable value per live JS handle, not a revision history.
++const {{ obj.impl_class_name }}_{{ name }}_snapshots = new WeakMap<{{ obj.impl_class_name }}, ReturnType<{{ obj.impl_class_name }}["{{ name }}"]>>();
++{%- endfor %}
++
+ const {{ obj.obj_factory }}: UniffiObjectFactory<{{ obj.protocol_name }}> = (() => {
+     {% if obj.supports_finalization_registry %}
+     /// <reference lib="es2021" />
+@@ -210,7 +215,24 @@
+     {%- call cb::arg_list_decl(callable) -%}): {# space #}
+     {%- call cb::return_type(callable) %}
+     {%- call cb::throws_kw(callable) %} {
+-    {%- if callable.receiver.is_some() %}
++    {%- if obj.revisioned_snapshots.contains(&callable.name) %}
++        const current = (() => {
++            {%- call cb::call_body_method(callable, obj.obj_factory) %}
++        })();
++        const cache = {{ obj.impl_class_name }}_{{ callable.name }}_snapshots;
++        const previous = cache.get(this);
++        if (previous && previous.observationRevision === current.observationRevision) return previous;
++        const freezeRecord = (value: unknown): void => {
++            if (value === null || typeof value !== "object") return;
++            const prototype = Object.getPrototypeOf(value);
++            if (prototype !== Object.prototype && !Array.isArray(value)) return;
++            for (const item of Object.values(value)) freezeRecord(item);
++            Object.freeze(value);
++        };
++        freezeRecord(current);
++        cache.set(this, current);
++        return current;
++    {%- else if callable.receiver.is_some() %}
+     {%- call cb::call_body_method(callable, obj.obj_factory) %}
+     {%- else %}
+     {%- call cb::call_body_function(callable) %}

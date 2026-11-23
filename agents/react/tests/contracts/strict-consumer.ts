@@ -123,7 +123,7 @@ void [
   dataSubscription,
 ];
 const direct = new WebAgent(config);
-await direct.connect();
+direct.join("explicit-room");
 await direct.close();
 // @ts-expect-error Required ownership configuration.
 useAgent();
@@ -279,7 +279,7 @@ participant.audioTracks;
 agent.local;
 // @ts-expect-error Typed JSON topics were removed.
 agent.topic("chat", { mode: "ordered" });
-// @ts-expect-error Retry is connect(), not a second session operation.
+// @ts-expect-error Retry is join(room), not a second session operation.
 agent.reconnect();
 // The returned handle is the SDK Agent, including its terminal close operation.
 agent.close();
@@ -293,5 +293,7 @@ void [videoSettings, audioSettings, remoteAudio];
 participant.tracks;
 // @ts-expect-error Flat publication collection aliases are not re-exported by React.
 import type { RemotePublishedTrack } from "../../src/index.js";
+// @ts-expect-error Only join requests admission.
 agent.connect();
+// @ts-expect-error Close is the explicit session shutdown operation.
 agent.disconnect();

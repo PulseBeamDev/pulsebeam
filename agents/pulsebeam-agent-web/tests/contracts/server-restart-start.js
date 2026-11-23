@@ -34,27 +34,24 @@
     (error) => error,
   );
   const wait = async (agent, predicate, label) => {
-    const snapshots = agent.snapshots();
+    const updates = agent.updates();
     let timeout;
     try {
       return await new Promise((resolve, reject) => {
         timeout = setTimeout(() => {
-          void snapshots.close();
+          updates.close();
           reject(
             new Error(
-              `timeout waiting for ${label}: ${JSON.stringify(agent.snapshot(), (_, value) => (typeof value === "bigint" ? value.toString() : value))}`,
+              `timeout waiting for ${label}: ${JSON.stringify(agent.state(), (_, value) => (typeof value === "bigint" ? value.toString() : value))}`,
             ),
           );
         }, 60000);
         void (async () => {
           while (true) {
-            const update = await snapshots.next();
-            if (update.type === "closed")
-              throw new Error(`closed while waiting for ${label}`);
-            const snapshot =
-              update.type === "snapshot" ? update.snapshot : agent.snapshot();
-            if (predicate(snapshot)) {
-              resolve(snapshot);
+            const state = await updates.next();
+            if (!state) throw new Error(`closed while waiting for ${label}`);
+            if (predicate(state)) {
+              resolve(state);
               return;
             }
           }
@@ -62,7 +59,7 @@
       });
     } finally {
       clearTimeout(timeout);
-      await snapshots.close();
+      updates.close();
     }
   };
   const synchronize = async () => {
@@ -74,18 +71,16 @@
       if (observedProbe >= nonce) break;
       if (Date.now() > deadline)
         throw new Error(
-          `lossy application synchronization missing: ${JSON.stringify({ sender: sender.snapshot(), receiver: receiver.snapshot() }, (_, value) => (typeof value === "bigint" ? value.toString() : value))}`,
+          `lossy application synchronization missing: ${JSON.stringify({ sender: sender.state(), receiver: receiver.state() }, (_, value) => (typeof value === "bigint" ? value.toString() : value))}`,
         );
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   };
   sender.join("web-adapter-restart");
   receiver.join("web-adapter-restart");
-  await sender.connect();
-  await receiver.connect();
-  const before = await wait(
+  await wait(
     receiver,
-    (snapshot) => snapshot.connection === "connected",
+    (state) => state.status === window.pulsebeam.AgentStatus.Joined,
     "subscriber",
   );
   await synchronize();
@@ -112,5 +107,5 @@
     wait,
     synchronize,
   };
-  return { initial: events[0].payload, generation: Number(before.generation) };
+  return { initial: events[0].payload };
 })();

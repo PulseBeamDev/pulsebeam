@@ -152,7 +152,7 @@ async fn prove_payload(
         )
     };
     let client = NativeHost::bind(client_ip)?;
-    let agent_for = |ip, token| -> anyhow::Result<Arc<Agent>> {
+    let agent_for = |ip, token| -> anyhow::Result<_> {
         let host = client.clone();
         let (runtime, task) = RuntimeAgent::managed_with_services(
             Config::new(pulsebeam_agent_core::AgentConfig {
@@ -165,16 +165,17 @@ async fn prove_payload(
             move || host.runtime(),
         )?;
         tokio::task::spawn_local(task);
-        Ok(Agent::from_runtime(runtime))
+        Ok((Agent::from_runtime(runtime.clone()), runtime))
     };
-    let viewer = agent_for(viewer_ip, token(VIEWER, &["subscribe"], 3600_u64)?.token)?;
+    let (viewer, viewer_transport) =
+        agent_for(viewer_ip, token(VIEWER, &["subscribe"], 3600_u64)?.token)?;
     let feed = viewer
         .room(ROOM.into())?
         .participant(PUBLISHER.into())?
         .data(TRACK.into(), core_ffi::TopicMode::Latest)?
         .subscribe()?;
     let changes = feed.updates()?;
-    viewer.connect().await?;
+    viewer_transport.connect().await?;
     tokio::time::timeout(Duration::from_secs(7), async {
         while let Some(state) = changes.next().await? {
             if state.admission == core_ffi::PublicationAdmissionStatus::Admitted
@@ -193,7 +194,7 @@ async fn prove_payload(
     .map_err(|_| anyhow::anyhow!("provisioned subscriber never acquired fresh authority"))??;
     anyhow::ensure!(viewer.snapshot().room_id.is_none());
     let support = viewer.support_report();
-    let origin = agent_for(
+    let (origin, _) = agent_for(
         publisher_ip,
         token(PUBLISHER, &["join", "publish"], 3600_u64)?.token,
     )?;
@@ -230,7 +231,7 @@ async fn prove_payload(
     let before = viewer.snapshot().accepted_credential_revision;
     let snapshots = viewer.snapshots();
     let renewed = token(VIEWER, &["subscribe"], 7200_u64)?;
-    viewer.renew_authorization(renewed.token).await?;
+    viewer.renew(renewed.token)?;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {

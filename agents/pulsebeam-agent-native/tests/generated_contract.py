@@ -60,21 +60,17 @@ async def witness():
         assert initial_state.room is None and initial_state.desired_room is None
         assert isinstance(initial_state.observation_revision, int)
         assert (await state_updates.next()).observation_revision == initial_state.observation_revision
-        snapshot = agent.snapshot()
-        assert not hasattr(snapshot, "catalog") and not hasattr(snapshot, "mapping")
+        assert not hasattr(initial_state, "catalog") and not hasattr(initial_state, "mapping")
         for obsolete in ["CatalogSnapshot", "ParticipantInfo", "Publication", "RemoteTrack", "TrackSpec", "MappingSnapshot", "TrackMapping"]:
             assert not hasattr(core, obsolete), obsolete
-        revision = snapshot.desired_revision
-        assert agent.snapshot().join_revision == 0
-        assert isinstance(agent.snapshot().join_revision, int)
-        assert agent.snapshot().desired_room is None
-        assert agent.snapshot().credential_revision == 0
-        assert isinstance(agent.snapshot().credential_revision, int)
-        assert agent.snapshot().accepted_credential_revision is None
-        assert agent.snapshot().credential_outcome is None
+        assert initial_state.desired_join_revision == initial_state.evaluated_join_revision == 0
+        assert initial_state.desired_credential_revision == initial_state.evaluated_credential_revision == 0
         assert agent.renew("renewed-token") is None
-        assert agent.snapshot().credential_revision == 1
-        assert agent.snapshot().desired_room is None
+        renewed_state = agent.state()
+        assert renewed_state.desired_credential_revision == 1
+        assert renewed_state.evaluated_credential_revision == 0
+        assert renewed_state.desired_room is None
+        revision = renewed_state.observation_revision
         local = agent.data("control", core.TopicMode.ORDERED)
         room = agent.room("room")
         assert isinstance(room, native.RoomRef) and room.name() == "room"
@@ -102,7 +98,7 @@ async def witness():
         remote_video = participant.video("camera")
         remote_audio = participant.audio("microphone")
         assert participant.id() == "remote"
-        assert agent.snapshot().desired_revision == revision, "lookup acquired demand"
+        assert agent.state().observation_revision == revision, "lookup changed Agent state"
         video_source = await agent.create_video_input(native.VideoSourceConfig(
             encodings=[native.Encoding(
                 rid=None, scale_down_by=1, max_bitrate_bps=None,
@@ -112,7 +108,7 @@ async def witness():
         audio_source = await agent.create_audio_input()
         assert isinstance(video_source, native.VideoSource)
         assert isinstance(audio_source, native.AudioSource)
-        assert agent.snapshot().desired_revision == revision, "source creation published"
+        assert agent.state().observation_revision == revision, "source creation changed Agent state"
         configuration = core.PublicationConfig(enabled=True)
         video_publication = local_video.publish()
         assert not inspect.isawaitable(video_publication)
@@ -124,7 +120,7 @@ async def witness():
         initial_pipe = pipe.state()
         assert isinstance(pipe_updates, native.PipeUpdates)
         assert isinstance(initial_pipe.status, core.PipeStatus)
-        assert (await pipe_updates.next()).observation_revision == initial_pipe.observation_revision
+        assert (await pipe_updates.next()).observation_revision >= initial_pipe.observation_revision
         publication_updates = video_publication.updates()
         initial_publication = video_publication.state()
         assert isinstance(publication_updates, native.PublicationUpdates)
@@ -165,18 +161,13 @@ async def witness():
         assert await pipe_updates.next() is None
         pipe_updates.close()
         assert not video_source.is_closed(), "pipe close stopped borrowed producer"
-        pending_bound = asyncio.create_task(video_publication.ready())
+        assert not hasattr(video_publication, "ready")
+        assert not hasattr(video_source, "ready")
         await video_publication.close()
         assert video_publication.state().closed
         assert (await publication_updates.next()).closed is True
         assert (await publication_updates.next()) is None
         publication_updates.close()
-        try:
-            await pending_bound
-        except native.NativeError.Closed:
-            pass
-        else:
-            raise AssertionError("publication without a native binding became ready")
         assert not video_source.is_closed(), "publication close stopped producer"
         video_replacement = same_video.publish(configuration)
         await video_replacement.set_source(video_source)
@@ -334,25 +325,33 @@ async def witness():
         assert not participant_cursor.is_closed()
         pending_independent = asyncio.create_task(independent_cursor.next())
         pending_participant = asyncio.create_task(participant_cursor.next())
-        snapshots = agent.snapshots()
-        events = agent.events()
-        assert (await snapshots.next()).is_SNAPSHOT()
-        retired_snapshots = agent.snapshots()
-        retired_events = agent.events()
-        assert (await retired_snapshots.next()).is_SNAPSHOT()
-        pending_retired_snapshot = asyncio.create_task(retired_snapshots.next())
-        await retired_snapshots.close()
-        await retired_snapshots.close()
-        await retired_events.close()
-        await retired_events.close()
-        assert retired_snapshots.is_closed() and retired_events.is_closed()
-        assert (await pending_retired_snapshot).is_CLOSED()
-        assert (await retired_events.next()).is_CLOSED()
-        assert not snapshots.is_closed() and not events.is_closed() and not agent.is_closed()
-        pending_snapshot = asyncio.create_task(snapshots.next())
-        pending_event = asyncio.create_task(events.next())
-        await agent.disconnect()
-        assert not agent.is_closed(), "disconnect was terminal"
+        retiring = agent.updates()
+        assert (await retiring.next()).observation_revision == agent.state().observation_revision
+        pending_retired = asyncio.create_task(retiring.next())
+        await asyncio.sleep(0)
+        retiring.close()
+        retiring.close()
+        assert await pending_retired is None
+        assert await retiring.next() is None
+        assert agent.state().status == core.AgentStatus.IDLE
+        observers = [agent.updates() for _ in range(31)]
+        try:
+            try:
+                agent.updates()
+            except native.NativeError.Operation as error:
+                assert error.info.code == core.ErrorCode.CAPACITY_EXCEEDED
+            else:
+                raise AssertionError("Agent admitted an observer past capacity")
+            observers.pop().close()
+            agent.updates().close()
+        finally:
+            for observer in observers:
+                observer.close()
+        for removed in (
+            "connect", "connect_roomless", "disconnect", "reconnect", "leave_room",
+            "renew_authorization", "snapshot", "snapshots", "events",
+        ):
+            assert not hasattr(agent, removed), removed
         assert not independent_cursor.is_closed()
         assert not participant_cursor.is_closed()
         await agent.close()
@@ -370,8 +369,6 @@ async def witness():
             pass
         else:
             raise AssertionError("terminal close did not end pending media acquisition")
-        assert (await pending_snapshot).is_CLOSED()
-        assert (await pending_event).is_CLOSED()
         assert (await pending_independent).is_CLOSED()
         assert (await pending_participant).is_CLOSED()
         try:
@@ -391,7 +388,7 @@ async def witness():
         audio_publication_updates.close()
         final_state = await state_updates.next()
         assert final_state.status == core.AgentStatus.CLOSED
-        assert final_state.desired_credential_revision == agent.snapshot().credential_revision
+        assert final_state.desired_credential_revision == renewed_state.desired_credential_revision
         assert initial_state.status == core.AgentStatus.IDLE
         assert (await state_updates.next()) is None
         assert agent.state().observation_revision == final_state.observation_revision

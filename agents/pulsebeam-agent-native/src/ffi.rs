@@ -2,6 +2,7 @@
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use agent_core::ffi as core_ffi;
+#[cfg(any(test, feature = "sim"))]
 use tokio::sync::Mutex;
 
 mod media;
@@ -11,11 +12,14 @@ pub use frames::*;
 mod resource_state;
 pub use resource_state::*;
 
+#[cfg(any(test, feature = "sim"))]
+use crate::AgentEvent as RuntimeEvent;
+
 use crate::{
-    Agent as RuntimeAgent, AgentEvent as RuntimeEvent, Config, EncodingLimits, EncodingState,
-    Error as RuntimeError, Host, InputFrame, MediaConfig, MediaStreamUpdate, NativeStatistics,
-    ObservationStream, ProducerFeedback, Publication as RuntimePublication, ReceiveMode,
-    RemoteMedia, SourceIdentity, StreamUpdate, Subscription as RuntimeSubscription,
+    Agent as RuntimeAgent, Config, EncodingLimits, EncodingState, Error as RuntimeError, Host,
+    InputFrame, MediaConfig, MediaStreamUpdate, NativeStatistics, ObservationStream,
+    ProducerFeedback, Publication as RuntimePublication, ReceiveMode, RemoteMedia, SourceIdentity,
+    StreamUpdate, Subscription as RuntimeSubscription,
 };
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -80,7 +84,8 @@ impl From<RuntimeError> for NativeError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+#[cfg(any(test, feature = "sim"))]
+#[derive(Clone, Debug, PartialEq)]
 pub enum NativeEvent {
     Core {
         notification: core_ffi::Notification,
@@ -101,10 +106,11 @@ pub enum NativeEvent {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+#[cfg(any(test, feature = "sim"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(
     clippy::large_enum_variant,
-    reason = "UniFFI outcomes carry portable snapshots by value"
+    reason = "Simulation diagnostic outcomes carry snapshots by value"
 )]
 pub enum SnapshotUpdate {
     Snapshot { snapshot: core_ffi::Snapshot },
@@ -112,7 +118,8 @@ pub enum SnapshotUpdate {
     Closed,
 }
 
-#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+#[cfg(any(test, feature = "sim"))]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EventUpdate {
     Event { event: NativeEvent },
     Lagged { skipped: u64 },
@@ -228,12 +235,6 @@ impl Agent {
                 ),
             })
     }
-    pub async fn renew_authorization(&self, token: String) -> Result<(), NativeError> {
-        self.runtime
-            .renew_authorization(token)
-            .await
-            .map_err(Into::into)
-    }
     pub fn data(
         &self,
         track_id: String,
@@ -248,6 +249,23 @@ impl Agent {
             runtime: self.runtime.room(name)?,
         }))
     }
+    pub fn statistics(&self) -> Option<NativeStatistics> {
+        self.runtime.statistics().borrow().clone()
+    }
+    pub fn is_closed(&self) -> bool {
+        self.runtime.is_closed()
+    }
+    pub fn join(&self, room: String) -> Result<(), NativeError> {
+        self.runtime.join(room).map_err(operation_error)
+    }
+
+    pub async fn close(&self) -> Result<(), NativeError> {
+        self.runtime.close().await.map_err(Into::into)
+    }
+}
+
+#[cfg(any(test, feature = "sim"))]
+impl Agent {
     pub fn snapshot(&self) -> core_ffi::Snapshot {
         (&self.runtime.snapshot()).into()
     }
@@ -262,32 +280,6 @@ impl Agent {
         Arc::new(EventStream {
             updates: self.runtime.events(),
         })
-    }
-    pub fn statistics(&self) -> Option<NativeStatistics> {
-        self.runtime.statistics().borrow().clone()
-    }
-    pub fn is_closed(&self) -> bool {
-        self.runtime.is_closed()
-    }
-    pub fn join(&self, room: String) -> Result<(), NativeError> {
-        self.runtime.join(room).map_err(operation_error)
-    }
-
-    pub fn leave_room(&self) -> Result<(), NativeError> {
-        self.runtime.leave_room().map_err(operation_error)
-    }
-
-    pub async fn connect(&self) -> Result<(), NativeError> {
-        self.runtime.connect().await.map_err(Into::into)
-    }
-    pub async fn disconnect(&self) -> Result<(), NativeError> {
-        self.runtime.disconnect().await.map_err(Into::into)
-    }
-    pub async fn reconnect(&self) -> Result<(), NativeError> {
-        self.runtime.reconnect().await.map_err(Into::into)
-    }
-    pub async fn close(&self) -> Result<(), NativeError> {
-        self.runtime.close().await.map_err(Into::into)
     }
 }
 
@@ -507,12 +499,12 @@ impl RemoteMediaReceiver {
     }
 }
 
-#[derive(uniffi::Object)]
+#[cfg(any(test, feature = "sim"))]
 pub struct SnapshotStream {
     initial: Mutex<Option<agent_core::Snapshot>>,
     updates: ObservationStream<agent_core::Snapshot>,
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg(any(test, feature = "sim"))]
 impl SnapshotStream {
     pub fn is_closed(&self) -> bool {
         self.updates.is_closed()
@@ -541,11 +533,11 @@ impl SnapshotStream {
     }
 }
 
-#[derive(uniffi::Object)]
+#[cfg(any(test, feature = "sim"))]
 pub struct EventStream {
     updates: ObservationStream<RuntimeEvent>,
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[cfg(any(test, feature = "sim"))]
 impl EventStream {
     pub fn is_closed(&self) -> bool {
         self.updates.is_closed()
@@ -646,7 +638,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(agent.snapshot().desired_revision, 1);
-        agent.disconnect().await.unwrap();
         agent
             .runtime
             .replace_foreign_desired(disconnected())
@@ -658,7 +649,10 @@ mod tests {
         agent.close().await.unwrap();
         agent.close().await.unwrap();
         assert!(agent.is_closed());
-        assert!(matches!(agent.connect().await, Err(NativeError::Closed)));
+        assert!(matches!(
+            agent.join("room".into()),
+            Err(NativeError::Operation { info }) if info.code == core_ffi::ErrorCode::Closed
+        ));
         assert!(
             agent
                 .runtime

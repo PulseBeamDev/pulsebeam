@@ -2548,6 +2548,8 @@ impl Agent {
                 }));
             }
             self.snapshot.connection_id = None;
+            self.snapshot.room_id = None;
+            self.snapshot.accepted_join_revision = None;
             self.clear_observed_state();
         }
         self.notify_failure(failure.clone());

@@ -79,20 +79,25 @@ export async function publicContract(pulsebeam) {
     endpoint: "http://localhost",
     token: "recover-during-activation-failure",
   });
-  recoveredActivation.setState({
-    connected: false,
-    topics: [{ name: "chat", mode: "invalid", publish: true }],
-  });
+  const { BrowserRuntime } = await import("../../node_assets/dist/wasm.js");
+  const replaceDesired = BrowserRuntime.prototype.replace_desired;
+  BrowserRuntime.prototype.replace_desired = () => {
+    BrowserRuntime.prototype.replace_desired = replaceDesired;
+    throw new Error("injected initial runtime replay failure");
+  };
   let recovered = false;
   recoveredActivation.subscribe(() => {
     if (recovered || recoveredActivation.connection !== "terminal-failure")
       return;
     recovered = true;
     recoveredActivation.deactivate();
-    recoveredActivation.setState({ connected: false });
     recoveredActivation.activate();
   });
-  recoveredActivation.activate();
+  try {
+    recoveredActivation.activate();
+  } finally {
+    BrowserRuntime.prototype.replace_desired = replaceDesired;
+  }
   assert.equal(recovered, true);
   assert.doesNotThrow(
     () => recoveredActivation.renew("reopened-credential"),
@@ -360,103 +365,45 @@ export async function publicContract(pulsebeam) {
     publicationUpdates.close();
     subscriptionUpdates.close();
     await unrelatedData.close();
-    const revision = agent.snapshot().desiredRevision;
-    assert.equal(agent.snapshot().joinRevision, 0n);
-    assert.equal(agent.snapshot().credentialRevision, 0n);
-    assert.equal(agent.snapshot().acceptedCredentialRevision, null);
-    assert.equal(agent.snapshot().credentialOutcome, null);
-    assert.equal(agent.snapshot().desiredRoom, null);
-    const snapshots = agent.snapshots();
-    const sibling = agent.snapshots();
-    const events = agent.events();
-    const siblingEvents = agent.events();
-    assert.equal((await snapshots.next()).type, "snapshot");
-    assert.equal((await sibling.next()).type, "snapshot");
-    assert.equal(
-      agent.snapshot().desiredRevision,
-      revision,
-      "state observation is inert",
-    );
-    const pendingSnapshot = snapshots.next();
-    const queuedSnapshot = snapshots.next();
-    const pendingEvent = events.next();
-    await snapshots.close();
-    await events.close();
-    assert.equal((await pendingSnapshot).type, "closed");
-    assert.equal((await queuedSnapshot).type, "closed");
-    assert.equal((await pendingEvent).type, "closed");
-    assert.equal(sibling.isClosed(), false);
-    assert.equal(siblingEvents.isClosed(), false);
-    const joinUpdates = agent.snapshots();
+    const joinUpdates = agent.updates();
+    assert.equal(await joinUpdates.next(), agent.state());
+    const pendingJoin = joinUpdates.next();
     agent.join("public-contract-room");
     const joinIntent = agent.state();
     assert.equal(joinIntent.desiredJoinRevision, 1n);
-    assert.equal(joinIntent.desiredRoom, "public-contract-room");
+    assert.equal((await pendingJoin).desiredRoom, "public-contract-room");
     assert.equal(initialState.desiredJoinRevision, 0n);
     assert.equal(agent.state(), joinIntent);
-    while (true) {
-      const update = await joinUpdates.next();
-      assert.notEqual(update.type, "closed");
-      const current =
-        update.type === "snapshot" ? update.snapshot : agent.snapshot();
-      if (
-        current?.desiredRoom === "public-contract-room" &&
-        current.joinRevision === 1n
-      )
-        break;
-    }
-    await joinUpdates.close();
-    assert.equal(agent.snapshot().desiredRoom, "public-contract-room");
-    assert.equal(agent.snapshot().joinRevision, 1n);
-    const joinedRevision = agent.snapshot().desiredRevision;
-    const disconnectUpdates = agent.snapshots();
-    await agent.disconnect();
-    // Renewal is queued after disconnect and provides an observable actor barrier.
-    await agent.renewAuthorization("public-smoke-renewed");
-    while (true) {
-      const update = await disconnectUpdates.next();
-      assert.notEqual(update.type, "closed");
-      const current =
-        update.type === "snapshot" ? update.snapshot : agent.snapshot();
-      if (current?.credentialRevision === 1n) break;
-    }
-    await disconnectUpdates.close();
-    const disconnectedRevision = agent.snapshot().desiredRevision;
-    assert.ok(
-      disconnectedRevision > joinedRevision,
-      `disconnect after join must advance Core intent: ${joinedRevision} -> ${disconnectedRevision}`,
-    );
-    const renewedUpdates = agent.snapshots();
+    joinUpdates.close();
+    const renewedUpdates = agent.updates();
+    await renewedUpdates.next();
+    const pendingRenew = renewedUpdates.next();
     assert.equal(agent.renew("synchronous-renewed"), undefined);
-    while (true) {
-      const update = await renewedUpdates.next();
-      assert.notEqual(update.type, "closed");
-      const current =
-        update.type === "snapshot" ? update.snapshot : agent.snapshot();
-      if (current?.credentialRevision === 2n) break;
-    }
-    await renewedUpdates.close();
-    await agent.connect();
-    await agent.disconnect();
-    assert.equal(agent.isClosed(), false, "disconnect is not terminal");
-    const beforeRoomLookup = agent.snapshot();
+    assert.equal((await pendingRenew).desiredCredentialRevision, 1n);
+    renewedUpdates.close();
+    assert.equal(agent.state().desiredRoom, "public-contract-room");
+    const beforeRoomLookup = agent.state();
     const room = agent.room("conference-42");
     const pinnedParticipant = room.participant("alice");
     assert.equal(room.name, "conference-42");
     assert.equal(pinnedParticipant.room, "conference-42");
     assert.equal(pinnedParticipant.participantId, "alice");
-    assert.deepEqual(
-      agent.snapshot(),
-      beforeRoomLookup,
-      "room lookup is inert",
-    );
+    assert.deepEqual(agent.state(), beforeRoomLookup, "room lookup is inert");
     const camera = agent.video("camera");
     assert.equal(agent.video("camera"), camera);
     for (const removed of [
       "local",
       "topic",
       "setState",
+      "snapshot",
+      "snapshots",
+      "events",
+      "connect",
+      "connectRoomless",
+      "disconnect",
       "reconnect",
+      "leaveRoom",
+      "renewAuthorization",
       "track",
       "remote",
       "participant",
@@ -484,19 +431,11 @@ export async function publicContract(pulsebeam) {
       .data("chat", "ordered")
       .subscribe();
     const pending = data.next();
-    const pendingSiblingSnapshot = sibling.next();
-    const pendingSiblingEvent = siblingEvents.next();
     const closing = agent.close();
     assert.equal(agent.close(), closing);
     await closing;
     assert.equal((await pending).type, "closed");
     assert.equal(data.isClosed(), true);
-    assert.equal((await pendingSiblingSnapshot).type, "closed");
-    assert.equal((await pendingSiblingEvent).type, "closed");
-    assert.equal(sibling.isClosed(), true);
-    assert.equal(siblingEvents.isClosed(), true);
-    assert.equal((await agent.snapshots().next()).type, "closed");
-    assert.equal((await agent.events().next()).type, "closed");
     assert.equal(agent.isClosed(), true);
     const finalState = await independentState.next();
     assert.equal(finalState.status, AgentStatus.Closed);
@@ -508,10 +447,10 @@ export async function publicContract(pulsebeam) {
     assert.equal(await terminalUpdates.next(), finalState);
     assert.equal(await terminalUpdates.next(), undefined);
     terminalUpdates.close();
-    const terminal = agent.snapshot();
+    const terminal = agent.state();
     await agent.close();
-    assert.equal(agent.snapshot(), terminal);
-    await assert.rejects(agent.connect(), { code: "closed" });
+    assert.equal(agent.state(), terminal);
+    assert.throws(() => agent.join("after-close"), { code: "closed" });
     const unobserved = new Agent({
       endpoint: "http://localhost",
       token: "close-before-observation",

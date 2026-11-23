@@ -26,11 +26,12 @@ state is available immediately through `agent.state()`, without an initializatio
 Promise.
 `join(room)` selects the room and records connection intent. Use a token with
 Join permission for that room. The call does not acknowledge admission or
-media readiness. `disconnect()` clears that intent without closing the Agent or
-its resources. The Agent retries transient failures while connection is desired.
-Call `join(otherRoom)` to change rooms when the token grants access.
-Replace the Agent to change endpoint or participant identity. Use `await agent.renewAuthorization(token)` only for the same logical
-session. `await agent.close()` is terminal and releases its resources.
+media readiness. The Agent retries transient failures. Call `join(room)` again
+for an explicit retry after admission is denied, or `join(otherRoom)` to move
+when the token grants access. Use `agent.renew(token)` to replace credential
+intent for the same participant, and read `agent.state()` for the result.
+Replace the Agent to change endpoint or participant identity.
+`await agent.close()` ends the session and releases its resources.
 
 ## Look up handles without acquiring resources
 
@@ -220,13 +221,14 @@ acknowledgments.
 
 ## Observe state and release ownership
 
-`agent.snapshot()` returns current immutable state. `agent.snapshots()` yields an
-initial snapshot followed by updates; `agent.events()` yields future events.
-Each cursor has `next()`, `close()`, and `isClosed()`. Reads return discriminated
-`snapshot` or `event` values, `lagged` with a `bigint` skipped count, or `closed`.
-Updates are bounded; observation is not durable history. These cursors do not
-acquire media or connection intent. Closing a cursor is independent of closing
-the Agent, and parent closure retires pending reads.
+`agent.state()` returns the current immutable state. Each call to
+`agent.updates()` opens an independent cursor. Await `cursor.next()` for the
+current state and then for changes. Intermediate revisions may coalesce; this
+is not an event history. Use one pending read per cursor.
+
+Call `cursor.close()` to end observation and wake a pending read with
+`undefined`. Closing a cursor leaves the Agent running. When the Agent closes,
+open cursors return its final closed state, then `undefined`.
 
 Stop application loops by closing their cursors, close playback and receive
 resources, close publications and sources, then await `agent.close()`. Finally,

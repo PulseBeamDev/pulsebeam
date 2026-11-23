@@ -59,7 +59,7 @@ export async function catalogContract(BrowserRuntime, ErrorCode, pulsebeam) {
   assert.equal(defaultWatch instanceof Promise, false);
   assert.equal(defaultWatch.state().limit, 100);
   assert.equal(defaultWatch.state().status, WatchStatus.Loading);
-  assert.equal(agent.snapshot().desiredRoom, null);
+  assert.equal(agent.state().desiredRoom, undefined);
   const bytes = Uint8Array.from({ length: 32 }, (_, i) => i);
   const watch = room.watch({ limit: 7, cursor: bytes });
   bytes.fill(255);

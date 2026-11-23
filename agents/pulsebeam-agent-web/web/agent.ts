@@ -10,7 +10,6 @@ import {
 import { DataRegistry, type LocalDataTrack } from "./data.js";
 import { track, type Delivery } from "./track.js";
 import { selectAudio } from "./reception.js";
-import { observeSnapshots, observeEvents } from "./observation.js";
 import {
   AgentObservation,
   OperationError,
@@ -50,7 +49,6 @@ import {
   desiredValue,
   emptySnapshot,
   freezeTopicSnapshot,
-  validatePlayoutDelay,
   validateToken,
   type RuntimeConfig,
 } from "./agent-state.js";
@@ -118,8 +116,6 @@ class AgentFacade implements AgentApi {
   #publicSnapshot: AgentSnapshot = publicSnapshot(this.#snapshot);
   #listeners = new Set<() => void>();
   #eventListeners = new Set<(event: AgentEvent) => void>();
-  readonly #snapshots = new Set<ReturnType<typeof observeSnapshots>>();
-  readonly #events = new Set<ReturnType<typeof observeEvents>>();
   #state: DesiredState = copyState({ connected: false });
   #runtime: Runtime | undefined;
   #observation: AgentObservation | undefined;
@@ -247,10 +243,8 @@ class AgentFacade implements AgentApi {
       current.set_snapshot_listener((snapshot: RuntimeSnapshot) => {
         if (active()) this.#runtimeSnapshot(current, snapshot);
       });
-      if (active() && this.#state.connected) {
-        if (this.#desiredRoom !== undefined) current.join(this.#desiredRoom);
-        else current.connect();
-      }
+      if (active() && this.#state.connected && this.#desiredRoom !== undefined)
+        current.join(this.#desiredRoom);
     } catch (error) {
       try {
         if (active() && this.#snapshot.connection !== "terminal-failure")
@@ -371,26 +365,6 @@ class AgentFacade implements AgentApi {
     return this.#observation.updates();
   }
 
-  snapshot(): AgentSnapshot {
-    return this.#publicSnapshot;
-  }
-  snapshots() {
-    const observation = observeSnapshots(
-      this.#publicSnapshot,
-      this.#closed,
-      () => this.#snapshots.delete(observation),
-    );
-    if (!this.#closed) this.#snapshots.add(observation);
-    return observation.stream;
-  }
-  events() {
-    const observation = observeEvents(this.#closed, () =>
-      this.#events.delete(observation),
-    );
-    if (!this.#closed) this.#events.add(observation);
-    return observation.stream;
-  }
-
   readonly getSnapshot = (): AgentSnapshot => this.#publicSnapshot;
 
   readonly subscribe = (listener: () => void): (() => void) => {
@@ -435,43 +409,6 @@ class AgentFacade implements AgentApi {
       }
       throw error;
     }
-  }
-
-  leaveRoom(): void {
-    if (this.#closed) throw new ResourceError("closed", "agent is closed");
-    const previousRoom = this.#desiredRoom;
-    this.#desiredRoom = undefined;
-    try {
-      this.#runtime?.leave_room();
-    } catch (error) {
-      if (this.#desiredRoom === undefined) this.#desiredRoom = previousRoom;
-      throw error;
-    }
-  }
-
-  async connect(): Promise<void> {
-    if (this.#closed) throw new ResourceError("closed", "agent is closed");
-    if (this.#snapshot.connection === "terminal-failure" && !this.#runtime) {
-      this.deactivate();
-      this.activate();
-    }
-    if (!this.#state.connected)
-      this.#applyState({ ...this.#state, connected: true });
-    this.#runtime?.connect();
-    await this.#ready;
-  }
-
-  async disconnect(): Promise<void> {
-    if (this.#closed) throw new ResourceError("closed", "agent is closed");
-    if (this.#state.connected)
-      this.#applyState({ ...this.#state, connected: false });
-    await this.#ready;
-  }
-
-  setState(state: DesiredState): void {
-    if (this.#closed) return;
-    validatePlayoutDelay(state);
-    this.#applyState(copyState(state));
   }
 
   #effectiveState(state: DesiredState): DesiredState {
@@ -519,10 +456,6 @@ class AgentFacade implements AgentApi {
     }
   }
 
-  reconnect(): void {
-    this.#requireRuntime().force_reconnect();
-  }
-
   renew(token: string): void {
     if (this.#closed) throw new ResourceError("closed", "agent is closed");
     validateToken(token);
@@ -535,13 +468,6 @@ class AgentFacade implements AgentApi {
       if (this.#runtimeConfig === next) this.#runtimeConfig = previous;
       throw error;
     }
-  }
-
-  async renewAuthorization(token: string): Promise<void> {
-    if (this.#closed) throw new ResourceError("closed", "agent is closed");
-    validateToken(token);
-    this.#runtime?.renew_authorization(token);
-    this.#runtimeConfig = { ...this.#runtimeConfig, token };
   }
 
   setLogging(level: LogLevel): void {
@@ -568,8 +494,6 @@ class AgentFacade implements AgentApi {
       reject = failed;
     });
     this.#closed = true;
-    for (const observation of this.#snapshots) observation.close();
-    for (const observation of this.#events) observation.close();
     this.deactivate();
     this.#media.close();
     const released = [this.#resources.close(), this.#data.close()];
@@ -837,14 +761,11 @@ class AgentFacade implements AgentApi {
     if (snapshot === this.#snapshot) return;
     this.#snapshot = snapshot;
     this.#publicSnapshot = publicSnapshot(snapshot);
-    for (const observation of this.#snapshots)
-      observation.publish(this.#publicSnapshot);
     this.#remote.update(snapshot);
     for (const listener of [...this.#listeners]) listener();
   }
 
   #emit(event: AgentEvent): void {
-    for (const observation of this.#events) observation.publish(event);
     for (const listener of [...this.#eventListeners]) listener(event);
   }
 }
@@ -895,18 +816,10 @@ export class Agent implements AgentApi {
     this.#raw.selectAudio(policy);
   readonly isClosed = () => this.#raw.isClosed();
   readonly join = (room: string) => this.#raw.join(room);
-  readonly leaveRoom = () => this.#raw.leaveRoom();
   readonly renew = (token: string) => this.#raw.renew(token);
-  readonly connect = () => this.#raw.connect();
-  readonly disconnect = () => this.#raw.disconnect();
-  readonly renewAuthorization = (token: string) =>
-    this.#raw.renewAuthorization(token);
   readonly setLogging = (level: LogLevel) => this.#raw.setLogging(level);
   readonly state = () => this.#raw.state();
   readonly supportReport = () => this.#raw.supportReport();
   readonly updates = () => this.#raw.updates();
-  readonly snapshot = () => this.#raw.snapshot();
-  readonly snapshots = () => this.#raw.snapshots();
-  readonly events = () => this.#raw.events();
   readonly close = () => this.#raw.close();
 }

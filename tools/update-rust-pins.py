@@ -268,7 +268,7 @@ crate.annotation(crate = "uniffi-bindgen-react-native", gen_binaries = ["uniffi-
 # Library-mode metadata needs workspace namespace configs, not dependency resolution.
 crate.annotation(crate = "ubrn_common", patches = ["//tools:patches/ubrn-offline-workspace-metadata.patch"], patch_args = ["-p1"], repositories = ["build_tools"])
 # N-API must load the actual multi-namespace cdylib and emit resolvable ESM imports.
-crate.annotation(crate = "ubrn_bindgen", patches = ["//tools:patches/ubrn-napi-colocated-esm.patch"], patch_args = ["-p1"], repositories = ["build_tools"])
+crate.annotation(crate = "ubrn_bindgen", patches = ["//tools:patches/ubrn-napi-colocated-esm.patch", "//tools:patches/ubrn-revisioned-snapshots.patch"], patch_args = ["-p1"], repositories = ["build_tools"])
 crate.from_specs(
     name = "build_tools",
     cargo_lockfile = "//tools:rust/build_tools/Cargo.lock",

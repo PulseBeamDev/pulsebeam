@@ -1,4 +1,3 @@
-import type { EventStream, SnapshotStream } from "./observation.js";
 import type {
   AgentState as ObservedAgentState,
   SupportReport,
@@ -487,19 +486,12 @@ export interface Agent {
   selectAudio(policy: AudioDemand): Promise<AudioSelection>;
   /** Synchronously replace the desired room; Core owns admission and recovery. */
   join(room: string): void;
-  leaveRoom(): void;
   renew(token: string): void;
-  connect(): Promise<void>;
-  disconnect(): Promise<void>;
-  renewAuthorization(token: string): Promise<void>;
   isClosed(): boolean;
   setLogging(level: LogLevel): void;
   state(): Readonly<ObservedAgentState>;
   supportReport(): Readonly<SupportReport>;
   updates(): AgentUpdates;
-  snapshot(): AgentSnapshot;
-  snapshots(): SnapshotStream;
-  events(): EventStream;
   close(): Promise<void>;
 }
 

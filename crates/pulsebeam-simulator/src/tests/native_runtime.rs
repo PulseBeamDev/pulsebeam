@@ -928,14 +928,14 @@ async fn prove_joined_recovery(
         move || subscriber_host.runtime(),
     )?;
     tokio::task::spawn_local(task);
-    let viewer = Agent::from_runtime(subscriber);
+    let viewer = Agent::from_runtime(subscriber.clone());
     let feed = viewer
         .room(room.into())?
         .participant("alice".into())?
         .data("feed".into(), core_ffi::TopicMode::Latest)?
         .subscribe()?;
     let feed_updates = feed.updates()?;
-    viewer.connect().await?;
+    subscriber.connect().await?;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let state = feed_updates
@@ -974,7 +974,7 @@ async fn prove_joined_recovery(
         move || host.runtime(),
     )?;
     tokio::task::spawn_local(actor);
-    let agent = Agent::from_runtime(runtime);
+    let agent = Agent::from_runtime(runtime.clone());
     let publisher = agent
         .data("feed".into(), core_ffi::TopicMode::Latest)?
         .publish()?;
@@ -1021,7 +1021,7 @@ async fn prove_joined_recovery(
     };
     receive_payload(b"before".as_slice(), initial_id).await?;
     issuer.deliver_receipt_facts(unix_now() + 20);
-    agent.reconnect().await?;
+    runtime.reconnect().await?;
     let recovered = wait_connected(&agent, first.generation).await?;
     let recovered_support = agent.support_report();
     let recovered_connection: pulsebeam_core::identity::ConnectionId = recovered_support
@@ -1189,7 +1189,7 @@ async fn prove_joined_recovery(
     )?;
     let previous_credential = viewer.snapshot().accepted_credential_revision;
     let snapshots = viewer.snapshots();
-    viewer.renew_authorization(renewal.token).await?;
+    viewer.renew(renewal.token)?;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let SnapshotUpdate::Snapshot { snapshot } = snapshots.next().await else {
@@ -1321,7 +1321,7 @@ fn native_roomless_reception_survives_join_and_leave() {
 async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> anyhow::Result<()> {
     use core_ffi::{ConnectionState, PublicationAdmissionStatus as Admission, TopicMode};
     let host = NativeHost::bind(client_ip)?;
-    let make_agent = |participant: &str, grants: serde_json::Value| -> anyhow::Result<Arc<Agent>> {
+    let make_agent = |participant: &str, grants: serde_json::Value| -> anyhow::Result<_> {
         let key = pulsebeam_server::insecure_dev_api_key().unwrap();
         let expiry = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -1347,13 +1347,13 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
             move || host.runtime(),
         )?;
         tokio::task::spawn_local(actor);
-        Ok(Agent::from_runtime(runtime))
+        Ok((Agent::from_runtime(runtime.clone()), runtime))
     };
-    let publisher = make_agent(
+    let (publisher, _) = make_agent(
         "present-publisher",
         serde_json::json!([{"rooms":["stage"],"allow":["join","publish"]}]),
     )?;
-    let viewer = make_agent(
+    let (viewer, viewer_transport) = make_agent(
         "presence-viewer",
         serde_json::json!([
             {"rooms":["stage"],"allow":["discover","subscribe"]},
@@ -1361,7 +1361,7 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
             {"rooms":["listen"],"allow":["join"]}
         ]),
     )?;
-    let replacement_viewer = make_agent(
+    let (replacement_viewer, replacement_transport) = make_agent(
         "known-address-viewer",
         serde_json::json!([{"rooms":["stage"],"allow":["subscribe"]}]),
     )?;
@@ -1370,7 +1370,7 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
         .participant("present-publisher".into())?
         .data("replacement".into(), TopicMode::Lossy)?
         .subscribe()?;
-    replacement_viewer.connect().await?;
+    replacement_transport.connect().await?;
     let updates = &replacement_receiver.updates()?;
     let await_source = |present| async move {
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1437,7 +1437,7 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
         .audio("microphone".into())?
         .publish(Default::default())?;
     let local_updates = local.updates()?;
-    viewer.connect().await?;
+    viewer_transport.connect().await?;
     let mut previous = None;
     let mut source = None;
     let mut local_id = None;
@@ -1452,7 +1452,7 @@ async fn roomless_presence_scenario(client_ip: IpAddr, server_ip: IpAddr) -> any
             if let Some(room) = room {
                 viewer.join(room.into())?;
             } else {
-                viewer.leave_room()?;
+                viewer_transport.leave_room()?;
             }
             anyhow::ensure!(
                 viewer.snapshot().room_id.is_none(),
@@ -2105,7 +2105,7 @@ async fn run_peer(
         "returned owning frames changed across same-peer re-addition"
     );
     let (final_generation, replacement) = if reconnect {
-        agent.reconnect().await?;
+        runtime.reconnect().await?;
         let connected = wait_connected(&agent, Some(first_generation)).await?;
         let generation = connected
             .generation
@@ -2245,7 +2245,7 @@ async fn run_peer(
     drop(events);
     owned_data.exchange(&barriers.before_close, 2).await?;
     let second_expected = second.retained.clone();
-    agent.disconnect().await?;
+    runtime.disconnect().await?;
     anyhow::ensure!(
         runtime.snapshot().connection == pulsebeam_agent_core::ConnectionState::Disconnected,
         "graceful close did not disconnect"
@@ -2392,7 +2392,7 @@ async fn prove_takeover(config: Config, host: NativeHost, room: &str) -> anyhow:
     let first = wait_connected(&old, None).await?;
     let updates = publication.updates()?;
     wait_publication_admitted(&updates).await?;
-    old.reconnect().await?;
+    predecessor.reconnect().await?;
     wait_connected(&old, first.generation).await?;
     publication.ready().await?;
 

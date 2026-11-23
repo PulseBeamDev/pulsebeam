@@ -2,6 +2,7 @@ load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_run_binary", "js_test", "
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@aspect_rules_js//npm:defs.bzl", "npm_package")
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@bazel_lib//lib:run_binary.bzl", "run_binary")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("@react_npm//:defs.bzl", "npm_link_all_packages")
 load("@react_npm//agents/react:typescript/package_json.bzl", typescript = "bin")
@@ -148,6 +149,33 @@ js_run_binary(
     args = ["known_native_receiver", "tests/contracts/known-native-receiver.ts"],
     chdir = package_name(),
     out_dirs = ["known_native_receiver"],
+)
+
+py_binary(
+    name = "unpack_sdk",
+    srcs = ["tests/unpack-sdk.py"],
+    main = "tests/unpack-sdk.py",
+)
+
+run_binary(
+    name = "installed_generated_web",
+    tool = ":unpack_sdk",
+    srcs = ["//agents/pulsebeam-agent-web:generated_package.pack", "//agents/pulsebeam-agent-web:node_modules/@ubjs/core/dir"],
+    args = [
+        "$(execpath //agents/pulsebeam-agent-web:generated_package.pack)",
+        "$(execpath //agents/pulsebeam-agent-web:node_modules/@ubjs/core/dir)",
+        "$(RULEDIR)/installed-generated-web",
+    ],
+    out_dirs = ["installed-generated-web"],
+)
+
+js_run_binary(
+    name = "generated_native_receiver",
+    tool = ":quickstart_builder",
+    srcs = [":quickstart_source", ":installed_generated_web", ":node_modules", "tests/contracts/generated-native-receiver.ts"],
+    args = ["generated_native_receiver", "tests/contracts/generated-native-receiver.ts", "installed-generated-web"],
+    chdir = package_name(),
+    out_dirs = ["generated_native_receiver"],
 )
 
 py_binary(

@@ -34,7 +34,7 @@ use crate::sender_config::{
 };
 
 mod catalog;
-mod media_observation;
+pub(crate) mod media_observation;
 mod preparation;
 mod publication;
 mod resource_state;
@@ -621,11 +621,21 @@ impl BrowserRuntime {
                 "Invalid Agent configuration",
             ))
         })?;
+        Self::start(config.endpoint, config.token, config.log_level).map_err(operation_error_value)
+    }
+}
+
+impl BrowserRuntime {
+    pub(crate) fn start(
+        endpoint: String,
+        token: String,
+        log_level: LogLevel,
+    ) -> Result<Self, agent_core::ffi::ErrorInfo> {
         let core_config = AgentConfig {
-            endpoint: config.endpoint,
-            token: config.token,
+            endpoint,
+            token,
             retry: RetryPolicy::default(),
-            log_level: config.log_level.into(),
+            log_level: log_level.into(),
         };
         let inner = Rc::new(RuntimeInner {
             actor: RefCell::new(None),
@@ -637,7 +647,7 @@ impl BrowserRuntime {
             catalog_observers: RefCell::new(BTreeMap::new()),
             pipe_observers: RefCell::new(Vec::new()),
             pending_pipe_notifications: RefCell::new(Vec::new()),
-            logger: BrowserLogger::new(config.log_level),
+            logger: BrowserLogger::new(log_level),
             local_operation_gates: RefCell::new(BTreeMap::new()),
             local_tracks: RefCell::new(BTreeMap::new()),
             publication_slots: RefCell::new(BTreeMap::new()),
@@ -653,11 +663,96 @@ impl BrowserRuntime {
             closed: Cell::new(false),
         });
         let actor = spawn_actor(core_config, BrowserHost::new(&inner))
-            .map_err(|error| operation_error_value((&error).into()))?;
+            .map_err(|error| agent_core::ffi::ErrorInfo::from(&error))?;
         *inner.actor.borrow_mut() = Some(actor);
         Ok(Self { inner })
     }
 
+    pub(crate) fn join_room(&self, room: String) -> Result<(), agent_core::ffi::ErrorInfo> {
+        let actor = self.inner.intent_actor()?;
+        actor.join(room)?;
+        self.inner.agent_state();
+        Ok(())
+    }
+
+    pub(crate) fn renew_token(&self, token: String) -> Result<(), agent_core::ffi::ErrorInfo> {
+        let actor = self.inner.intent_actor()?;
+        actor.renew(token)?;
+        self.inner.agent_state();
+        Ok(())
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn close_locally(&self) {
+        self.inner.shutdown();
+        let actor = self.inner.actor.borrow_mut().take();
+        if let Some(actor) = actor {
+            let _ = actor.abort();
+        }
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn claim_video(
+        &self,
+        selector: agent_core::TrackSelector,
+        observation: agent_core::VideoObservation,
+    ) -> Result<
+        (
+            u64,
+            Rc<agent_core::observer::VideoSubscriptionStateObserver>,
+        ),
+        agent_core::ffi::ErrorInfo,
+    > {
+        use agent_core::{ResourceCommand, ResourceResult, ffi};
+        let ResourceResult::Owned { owner } =
+            self.apply_resource(ResourceCommand::ClaimVideo { selector })?
+        else {
+            return Err(ffi::ErrorInfo::new(
+                ffi::ErrorCode::Internal,
+                "Unexpected video subscription declaration result",
+            ));
+        };
+        let result = self
+            .apply_resource(ResourceCommand::ObserveVideo { owner, observation })
+            .and_then(|_| self.video_state_observer(owner));
+        if result.is_err() {
+            let _ = self.apply_resource(ResourceCommand::Release { owner });
+        }
+        result.map(|observer| (owner, observer))
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) async fn observe_video(
+        &self,
+        owner: u64,
+    ) -> Result<media_observation::BrowserMediaObservation, JsValue> {
+        self.inner.observe_owned(owner, None, None).await
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn close_video(&self, owner: u64) -> Result<(), agent_core::ffi::ErrorInfo> {
+        if !self.inner.is_closed() {
+            self.apply_resource(agent_core::ResourceCommand::Release { owner })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn current_state(&self) -> agent_core::ffi::AgentState {
+        self.inner.agent_state()
+    }
+
+    #[cfg(feature = "uniffi")]
+    pub(crate) fn open_updates(
+        &self,
+    ) -> Result<agent_core::observer::AgentUpdates, agent_core::observer::ObserverLimit> {
+        self.inner.agent_state();
+        self.inner.agent_state.updates()
+    }
+}
+
+#[wasm_bindgen]
+impl BrowserRuntime {
     pub fn set_snapshot_listener(&self, listener: Option<Function>) {
         *self.inner.snapshot_listener.borrow_mut() = listener;
         let listener = self.inner.snapshot_listener.borrow().clone();
@@ -739,18 +834,18 @@ impl BrowserRuntime {
         if let agent_core::ResourceCommand::ClaimPublication { spec } = command {
             return self.claim_publication_spec(spec);
         }
-        self.inner.ensure_open().map_err(|_| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::Closed,
-                "Browser runtime is closed",
-            ))
-        })?;
-        let actor = self.inner.actor.borrow().clone().ok_or_else(|| {
-            operation_error_value(agent_core::ffi::ErrorInfo::new(
-                agent_core::ffi::ErrorCode::Closed,
-                "Browser runtime is closed",
-            ))
-        })?;
+        self.apply_resource(command)
+            .map(resources::result)
+            .map_err(operation_error_value)
+    }
+}
+
+impl BrowserRuntime {
+    fn apply_resource(
+        &self,
+        command: agent_core::ResourceCommand,
+    ) -> Result<agent_core::ResourceResult, agent_core::ffi::ErrorInfo> {
+        let actor = self.inner.intent_actor()?;
         let release = match &command {
             agent_core::ResourceCommand::Release { owner } => Some(*owner),
             _ => None,
@@ -791,9 +886,12 @@ impl BrowserRuntime {
             notification();
         }
         self.inner.notify_prepared_pipe_states();
-        result.map(resources::result).map_err(operation_error_value)
+        result
     }
+}
 
+#[wasm_bindgen]
+impl BrowserRuntime {
     #[wasm_bindgen(unchecked_return_type = "Promise<any>")]
     pub fn resource(&self, command: JsValue) -> Result<js_sys::Promise, JsValue> {
         self.inner.ensure_open()?;
@@ -830,16 +928,7 @@ impl BrowserRuntime {
     }
 
     pub fn renew(&self, token: String) -> Result<(), JsValue> {
-        self.inner.ensure_open()?;
-        let actor = self
-            .inner
-            .actor
-            .borrow()
-            .clone()
-            .ok_or_else(|| js_error("runtime actor not initialized"))?;
-        actor.renew(token).map_err(js_error)?;
-        self.inner.agent_state();
-        Ok(())
+        self.renew_token(token).map_err(operation_error_value)
     }
 
     pub fn renew_authorization(&self, token: String) -> Result<(), JsValue> {
@@ -926,16 +1015,7 @@ impl BrowserRuntime {
     }
 
     pub fn join(&self, room: String) -> Result<(), JsValue> {
-        self.inner.ensure_open()?;
-        let actor = self
-            .inner
-            .actor
-            .borrow()
-            .clone()
-            .ok_or_else(|| js_error("runtime actor not initialized"))?;
-        actor.join(room).map_err(js_error)?;
-        self.inner.agent_state();
-        Ok(())
+        self.join_room(room).map_err(operation_error_value)
     }
 
     pub fn leave_room(&self) -> Result<(), JsValue> {
@@ -946,7 +1026,7 @@ impl BrowserRuntime {
             .borrow()
             .clone()
             .ok_or_else(|| js_error("runtime actor not initialized"))?;
-        actor.leave_room().map_err(js_error)?;
+        actor.leave_room().map_err(operation_error_value)?;
         self.inner.agent_state();
         Ok(())
     }
@@ -1246,6 +1326,19 @@ impl RuntimeInner {
         } else {
             Ok(())
         }
+    }
+
+    fn intent_actor(&self) -> Result<ActorHandle, agent_core::ffi::ErrorInfo> {
+        let closed = || {
+            agent_core::ffi::ErrorInfo::new(
+                agent_core::ffi::ErrorCode::Closed,
+                "Browser runtime is closed",
+            )
+        };
+        if self.is_closed() {
+            return Err(closed());
+        }
+        self.actor.borrow().clone().ok_or_else(closed)
     }
 
     fn ensure_local_operation_open(&self) -> Result<(), LocalOperationError> {

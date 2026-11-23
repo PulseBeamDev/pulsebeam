@@ -15,7 +15,7 @@ assert.equal(agent.state().status, AgentStatus.Idle);
 assert.equal(agent.state().room, undefined);
 assert.equal(agent.state().desiredRoom, undefined);
 try {
-  const updates = agent.snapshots();
+  const updates = agent.updates();
   const exchange = agent.data("foreign-exchange", TopicMode.Ordered).publish();
   const replies = agent.room(room).participant("publisher").data("foreign-exchange", TopicMode.Ordered).subscribe();
   const camera = await agent.createVideoInput({
@@ -31,18 +31,20 @@ try {
   assert.equal(pendingPublication.admission.demand, PublicationDemand.Unknown);
   assert.equal((await publicationUpdates.next()).observationRevision, pendingPublication.observationRevision);
   agent.join(room);
-  while (true) {
-    const update = await updates.next();
-    assert.equal(update.tag, "Snapshot");
-    const snapshot = update.inner.snapshot;
-    assert.notEqual(snapshot.connection.tag, "TerminalFailure");
-    if (snapshot.connection.tag === "Connected" && snapshot.participantId) {
-      assert.equal(typeof snapshot.generation, "bigint");
-      break;
+  try {
+    while (true) {
+      const state = await updates.next();
+      assert(state, "Agent closed before admission");
+      assert.notEqual(state.status, AgentStatus.Failed, state.error?.message);
+      if (state.status === AgentStatus.Joined) {
+        assert.equal(state.room, room);
+        break;
+      }
     }
+  } finally {
+    updates.close();
   }
   console.log("installed Node RTC connected");
-  await publication.ready();
   let admittedPublication = publication.state();
   while (admittedPublication.admission.status !== PublicationAdmissionStatus.Admitted) {
     admittedPublication = await publicationUpdates.next();
@@ -50,7 +52,7 @@ try {
   }
   assert.equal(admittedPublication.admission.demand, PublicationDemand.Idle);
   assert.equal(typeof admittedPublication.admission.publicationId, "string");
-  assert.equal(admittedPublication.admission.connectionGeneration, agent.snapshot().generation);
+  assert.equal(typeof admittedPublication.admission.connectionGeneration, "bigint");
   const timestampUs = await camera.captureTimeUs();
   assert.equal(typeof timestampUs, "bigint");
   assert(timestampUs > 0n);
@@ -111,12 +113,6 @@ try {
   await receiver.close();
   await interest.close();
   assert.deepEqual(new Uint8Array(pixels.data), retained);
-  await agent.disconnect();
-  assert.equal(agent.snapshot().connection.tag, "Disconnected");
-  assert.equal(agent.isClosed(), false);
-  assert.equal(agent.statistics(), undefined);
-  assert.equal(camera.isClosed(), false);
-  await assert.rejects(camera.captureTimeUs(), (error) => NativeError.NotReady.instanceOf(error));
   await publication.close();
   assert.equal(publication.state().closed, true);
   assert.equal((await publicationUpdates.next()).closed, true);
@@ -127,6 +123,7 @@ try {
   assert(camera.isClosed());
   await agent.close();
   assert(agent.isClosed());
+  assert.equal(agent.statistics(), undefined);
   assert.throws(() => agent.join(room), (error) =>
     NativeError.Operation.instanceOf(error) && error.inner.info.code === ErrorCode.Closed,
   );

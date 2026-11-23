@@ -107,15 +107,24 @@ impl BrowserMediaObservation {
 
     #[wasm_bindgen(unchecked_return_type = "Promise<void>")]
     pub fn close(&self) -> Promise {
+        let close = self.close_local();
+        future_to_promise(async move {
+            close.await;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+}
+
+impl BrowserMediaObservation {
+    pub(crate) fn close_local(&self) -> impl Future<Output = ()> + use<> {
         let first = self.lease.stop();
         let inner = self.lease.inner.clone();
         let control = self.lease.control.clone();
-        future_to_promise(async move {
+        async move {
             if first && let Some(inner) = inner.upgrade() {
                 inner.release_observation(control).await;
             }
-            Ok(JsValue::UNDEFINED)
-        })
+        }
     }
 }
 
@@ -136,13 +145,23 @@ impl RuntimeInner {
         source: Option<String>,
         signal: Option<AbortSignal>,
     ) -> Promise {
-        if signal.as_ref().is_some_and(AbortSignal::aborted) {
-            return Promise::reject(&closed_error());
-        }
-        self.observations.borrow_mut().beginning += 1;
+        let observation = self.observe_owned(owner, source, signal);
+        future_to_promise(async move { observation.await.map(JsValue::from) })
+    }
+
+    pub(super) fn observe_owned(
+        self: &Rc<Self>,
+        owner: u64,
+        source: Option<String>,
+        signal: Option<AbortSignal>,
+    ) -> impl Future<Output = Result<BrowserMediaObservation, JsValue>> + use<> {
         let weak = Rc::downgrade(self);
-        future_to_promise(async move {
+        async move {
             let inner = weak.upgrade().ok_or_else(closed_error)?;
+            if inner.is_closed() || signal.as_ref().is_some_and(AbortSignal::aborted) {
+                return Err(closed_error());
+            }
+            inner.observations.borrow_mut().beginning += 1;
             let command = match source {
                 Some(source) => ResourceCommand::BeginAudioSourceObservation { owner, source },
                 None => ResourceCommand::BeginMediaObservation { owner },
@@ -238,8 +257,8 @@ impl RuntimeInner {
             } else {
                 receiver.await
             };
-            Ok(JsValue::from(result.map_err(|_| closed_error())??))
-        })
+            result.map_err(|_| closed_error())?
+        }
     }
 
     pub(super) fn observation_control(self: &Rc<Self>, control: MediaObservationControl) {

@@ -12,9 +12,6 @@ macro_rules! source {
             pub fn is_closed(&self) -> bool {
                 self.runtime.is_closed()
             }
-            pub async fn ready(&self) -> Result<(), NativeError> {
-                self.runtime.ready().await.map_err(Into::into)
-            }
             pub async fn submit(&self, frame: InputFrame) -> Result<(), NativeError> {
                 self.runtime.submit(frame).await.map_err(Into::into)
             }
@@ -76,9 +73,6 @@ macro_rules! publication {
                 })?;
                 Ok(Arc::new(PublicationUpdates { runtime: updates }))
             }
-            pub async fn ready(&self) -> Result<(), NativeError> {
-                self.runtime.ready().await.map_err(Into::into)
-            }
             pub async fn set_source(
                 &self,
                 source: Option<Arc<$source>>,
@@ -99,6 +93,13 @@ macro_rules! publication {
             }
             pub async fn close(&self) -> Result<(), NativeError> {
                 self.runtime.close().await.map_err(Into::into)
+            }
+        }
+
+        #[cfg(feature = "sim")]
+        impl $name {
+            pub async fn ready(&self) -> Result<(), NativeError> {
+                self.runtime.ready().await.map_err(Into::into)
             }
         }
     };

@@ -553,7 +553,7 @@ async fn spawn_agent(
         .publish(Default::default())?;
     microphone_owner.set_source(Some(&microphone)).await?;
     let mut snapshots = agent.snapshots();
-    agent.connect().await?;
+    agent.join(room_name)?;
     wait_until_connected(&mut snapshots).await?;
 
     let mut media_tasks = JoinSet::new();
@@ -626,7 +626,6 @@ async fn spawn_agent(
         }
     }
 
-    agent.disconnect().await?;
     agent.close().await?;
     media_tasks.shutdown().await;
     if !interests.is_empty() && !*received_video.borrow() {

@@ -44,13 +44,11 @@ if (process.argv[2] === "initialization-failure") {
     }),
   );
   agent.activate();
-  agent.join("initialization-retry-room");
-  await assert.rejects(agent.connect(), initializationFailure);
+  await assert.rejects(agent.initialized(), initializationFailure);
   assert.equal((await failure).class, "initialization");
-  const observed = agent.getSnapshot().failure;
-  await assert.rejects(agent.disconnect(), initializationFailure);
-  assert.equal(agent.getSnapshot().failure, observed);
   assert.equal(agent.connection, "terminal-failure");
+  assert.throws(() => new Agent(config), initializationFailure);
+  await agent.close();
   await import("./platform.mjs");
   WebAssembly.Module = class extends NativeModule {
     constructor(source) {
@@ -58,28 +56,17 @@ if (process.argv[2] === "initialization-failure") {
       super(source);
     }
   };
-  const recovered = new Promise((resolve) => {
-    const unsubscribe = agent.subscribe(() => {
-      if (agent.getSnapshot().desiredRevision > 0) {
-        unsubscribe();
-        resolve();
-      }
-    });
-  });
-  agent.join("initialization-retry-room");
-  await agent.connect();
-  await recovered;
-  assert.equal(agent.snapshot().desiredRoom, "initialization-retry-room");
+  const recovered = new Agent(config);
+  recovered.join("initialization-retry-room");
+  assert.equal(recovered.state().desiredRoom, "initialization-retry-room");
   assert.equal(
     attempts,
     4,
-    "constructor and managed activation fail synchronously; explicit connects retry initialization",
+    "constructor and managed activation fail; a new owner retries initialization",
   );
-  assert.equal(agent.error, null);
-  await agent.close();
-  console.log(
-    "artifact compilation failure persists through state updates and explicit connect retries initialization",
-  );
+  assert.equal(recovered.error, null);
+  await recovered.close();
+  console.log("artifact compilation failure does not poison a new Agent");
 } else {
   const failedInitialization = spawnSync(
     process.execPath,
@@ -136,18 +123,15 @@ if (process.argv[2] === "initialization-failure") {
   assert.equal(agent instanceof Agent, true);
   assert.equal(agent instanceof Promise, false);
   assert.equal(agent.state().status, AgentStatus.Idle);
-  assert.equal(agent.snapshot().desiredRoom, null);
-  assert.equal(agent.snapshot().connection, "disconnected");
+  assert.equal(agent.state().desiredRoom, undefined);
+  const initialUpdates = agent.updates();
+  const initialPublicState = await initialUpdates.next();
+  assert.equal(initialPublicState, agent.state());
   for (const field of ["catalog", "mapping", "tracks"])
-    assert.equal(field in agent.snapshot(), false, `${field} is private`);
+    assert.equal(field in initialPublicState, false, `${field} is private`);
   assert.equal("participants" in agent, false);
   assert.equal("remote" in agent, false);
-  const publicSnapshots = agent.snapshots();
-  const initialSnapshot = (await publicSnapshots.next()).snapshot;
-  assert.equal(initialSnapshot, agent.snapshot());
-  for (const field of ["catalog", "mapping", "tracks"])
-    assert.equal(field in initialSnapshot, false);
-  await publicSnapshots.close();
+  initialUpdates.close();
   assert.equal(requests, 0, "constructor does not fetch or connect");
   const initialization = whenInitialized();
   const inert = new BrowserRuntime(config);

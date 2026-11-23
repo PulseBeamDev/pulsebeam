@@ -29,7 +29,7 @@ js_library(name = "component_sources", srcs = glob(["web/**"]) + [":web_core_typ
 js_run_binary(
     name = "unit_javascript",
     tool = ":tsc",
-    srcs = [":node_modules", ":web_core_types", ":dist/wasm", "web/schema.ts", "web/topic.ts", "web/types.ts", "web/track.ts", "web/data.ts", "web/capture-source.ts", "web/agent-state.ts", "web/reconciliation-snapshot.ts", "web/observation.ts", "web/agent-observation.ts", "web/media.ts", "web/publication-observation.ts", "web/resource-observation.ts", "web/wasm.ts", "web/wasm-bytes.d.ts", "web/resources.ts", "web/reception.ts", "web/remote-catalog.ts", "web/remote-media.ts", "web/remote-audio.ts", "web/media-attachment.ts", "web/video-geometry.ts"],
+    srcs = [":node_modules", ":web_core_types", ":dist/wasm", "web/schema.ts", "web/topic.ts", "web/types.ts", "web/track.ts", "web/data.ts", "web/capture-source.ts", "web/agent-state.ts", "web/reconciliation-snapshot.ts", "web/agent-observation.ts", "web/media.ts", "web/publication-observation.ts", "web/resource-observation.ts", "web/wasm.ts", "web/wasm-bytes.d.ts", "web/resources.ts", "web/reception.ts", "web/remote-catalog.ts", "web/remote-media.ts", "web/remote-audio.ts", "web/media-attachment.ts", "web/video-geometry.ts"],
     args = ["--strict", "--target", "ES2022", "--module", "ESNext", "--moduleResolution", "Bundler", "--lib", "ES2022,DOM,DOM.Iterable,ESNext.Disposable", "--rootDir", "web", "--outDir", "unit-javascript", "web/topic.ts", "web/remote-catalog.ts", "web/agent-state.ts", "web/media.ts"],
     chdir = package_name(),
     out_dirs = ["unit-javascript"],
@@ -50,14 +50,14 @@ typescript.tsc_test(
 
 copy_to_directory(
     name = "format_sources",
-    srcs = glob(["web/**", "tests/**", "*.json", "*.mjs", "ubrn.config.yaml", "pnpm-workspace.yaml"], allow_empty = True),
+    srcs = glob(["web/**", "tests/**", "*.json", "*.mjs", "*.ts", "ubrn.config.yaml", "pnpm-workspace.yaml"], allow_empty = True),
 )
 
 py_test(
     name = "js_format",
     srcs = ["//tools:check-js-format.py"],
     main = "//tools:check-js-format.py",
-    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "web/**/*.ts", "tests/**/*.{js,mjs,ts}", "*.{json,mjs}", "ubrn.config.yaml", "pnpm-workspace.yaml"],
+    args = ["--formatter", "$(rootpath :prettier)", "--source", "$(rootpath :format_sources)", "--", "web/**/*.ts", "tests/**/*.{js,mjs,ts}", "*.{json,mjs,ts}", "ubrn.config.yaml", "pnpm-workspace.yaml"],
     data = [":prettier", ":format_sources"],
 )
 filegroup(name = "cargo_metadata_inputs", srcs = glob(["Cargo.toml", "uniffi.toml", "src/**/*.rs", "benches/**/*.rs", "examples/**/*.rs"], allow_empty = True))
@@ -204,7 +204,7 @@ rust_wasm_bindgen(
     wasm_file = ":uniffi_wasm_library",
     target = "web",
     out_name = "index",
-    bindgen_flags = ["--omit-default-module-path"],
+    bindgen_flags = ["--omit-default-module-path", "--remove-name-section"],
 )
 
 copy_to_directory(
@@ -240,6 +240,37 @@ output_files(
     name = "uniffi_wasm_file",
     target = ":uniffi-wasm-bindgen",
     paths = [package_name() + "/uniffi-wasm-bindgen/index_bg.wasm"],
+)
+
+js_run_binary(
+    name = "generated_wasm_bytes",
+    tool = ":wasm_bytes_codegen",
+    srcs = [":uniffi_wasm_file"],
+    args = ["uniffi-wasm-bindgen/index_bg.wasm", "generated-package-assets/web/wasm-bytes.js"],
+    chdir = package_name(),
+    outs = ["generated-package-assets/web/wasm-bytes.js"],
+)
+
+js_run_binary(
+    name = "generated_package_typescript",
+    tool = ":tsc",
+    srcs = [":bindings_dir", ":node_modules", "index.ts", "tsconfig.generated-package.json", "tsconfig.uniffi.browser.json", "tsconfig.uniffi.json", "web/media-registry.ts", "web/wasm-bytes.d.ts"],
+    args = ["-p", "tsconfig.generated-package.json", "--outDir", "generated-package-typescript"],
+    chdir = package_name(),
+    out_dirs = ["generated-package-typescript"],
+)
+
+# Package-qualification candidate; the default distribution stays intact until its consumers migrate.
+npm_package(
+    name = "generated_package",
+    srcs = ["package.json", "LICENSE", ":generated_package_typescript", ":generated_wasm_bytes", ":uniffi-wasm-bindgen"],
+    exclude_srcs_patterns = ["**/node_modules/**", "**/index_bg.wasm"],
+    replace_prefixes = {
+        "generated-package-typescript": "dist",
+        "generated-package-assets": "dist",
+        "uniffi-wasm-bindgen": "dist/generated/bindings/wasm-bindgen",
+    },
+    packable = True,
 )
 
 js_run_binary(
@@ -317,10 +348,11 @@ browser_test(
     source = "tests/browser.rs",
     features = ["browser-tests"],
     contracts = glob(["tests/contracts/*.js"]),
-    assets = [":browser_assets", "//agents/react:known_native_receiver", "//crates/pulsebeam-cli:native_foreign_smoke", "//agents/pulsebeam-agent-native:python_wheel"],
+    assets = [":browser_assets", "//agents/react:known_native_receiver", "//agents/react:generated_native_receiver", "//crates/pulsebeam-cli:native_foreign_smoke", "//agents/pulsebeam-agent-native:python_wheel"],
     env = {
         "PULSEBEAM_WEB_FIXTURE_ROOT": "$(rootpath :browser_assets)",
         "PULSEBEAM_REACT_FIXTURE_ROOT": "$(rootpath //agents/react:known_native_receiver)",
+        "PULSEBEAM_GENERATED_REACT_FIXTURE_ROOT": "$(rootpath //agents/react:generated_native_receiver)",
         "PULSEBEAM_FOREIGN_SMOKE": "$(rootpath //crates/pulsebeam-cli:native_foreign_smoke)",
         "PULSEBEAM_NATIVE_WHEEL": "$(rootpath //agents/pulsebeam-agent-native:python_wheel)",
     },

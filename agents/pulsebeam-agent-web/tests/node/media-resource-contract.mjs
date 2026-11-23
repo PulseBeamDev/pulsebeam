@@ -11,7 +11,7 @@ export async function mediaResourceContract(pulsebeam) {
   const borrowed = new Track("video");
   const source = pulsebeam.VideoSource.fromTrack(borrowed);
   try {
-    const beforeLookup = agent.snapshot().desiredRevision;
+    const beforeLookup = agent.state().observationRevision;
     const local = agent.video("camera");
     assert.equal(agent.video("camera"), local);
     const other = new pulsebeam.Agent({
@@ -22,7 +22,7 @@ export async function mediaResourceContract(pulsebeam) {
     assert.notEqual(other.video("camera"), local);
     await other.close();
     assert.equal(
-      agent.snapshot().desiredRevision,
+      agent.state().observationRevision,
       beforeLookup,
       "inert lookup cannot claim a sender",
     );

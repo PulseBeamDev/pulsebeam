@@ -143,6 +143,11 @@ async fn native_platform_smoke() -> TestResult<()> {
                 .ok_or("missing React fixture assets")?,
         )
         .await?;
+        let generated_react = StaticServer::start(
+            std::env::var_os("PULSEBEAM_GENERATED_REACT_FIXTURE_ROOT")
+                .ok_or("missing generated React fixture assets")?,
+        )
+        .await?;
         let mut producer = tokio::process::Command::new(
             std::env::var_os("PULSEBEAM_FOREIGN_SMOKE").ok_or("missing Python producer fixture")?,
         )
@@ -187,6 +192,36 @@ async fn native_platform_smoke() -> TestResult<()> {
             )
             .await?;
             assert!(catalog, "real React catalog consumer and final state");
+            navigate(&bidi, &context, generated_react.url("index.html")).await?;
+            let decoded: bool = evaluate_json(
+                &bidi,
+                &context,
+                &format!("import('./main.js').then(module => module.receiveGenerated({config}))"),
+            )
+            .await?;
+            assert!(
+                decoded,
+                "packed generated Web handles decoded Native video in React"
+            );
+            navigate(&bidi, &context, fixture.url("tests/uniffi-fixture.html")).await?;
+            let generated_contract = include_str!("contracts/uniffi-media-contract.js");
+            let ffi: serde_json::Value = evaluate_json(
+                &bidi,
+                &context,
+                &format!("((config) => {{ return {generated_contract} }})({config})"),
+            )
+            .await?;
+            for field in [
+                "initialState",
+                "stableState",
+                "pendingReadClosed",
+                "joinedAndClosed",
+                "exactVideoOwner",
+                "trackIdentity",
+                "streamIdentity",
+            ] {
+                assert_eq!(ffi[field], true, "generated browser ABI: {field}");
+            }
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         }
         .await;
@@ -204,16 +239,6 @@ async fn native_platform_smoke() -> TestResult<()> {
             stopped.success(),
             "installed Python producer failed: {stopped}"
         );
-        navigate(&bidi, &context, fixture.url("tests/uniffi-fixture.html")).await?;
-        let ffi: serde_json::Value = evaluate_json(
-            &bidi,
-            &context,
-            include_str!("contracts/uniffi-media-contract.js"),
-        )
-        .await?;
-        for field in ["trackIdentity", "streamIdentity"] {
-            assert_eq!(ffi[field], true, "generated real media handoff: {field}");
-        }
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     })
     .await?;

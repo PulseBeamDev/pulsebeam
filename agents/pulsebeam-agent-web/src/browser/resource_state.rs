@@ -4,7 +4,7 @@ use crate::engine::{ResourceKind, ResourceNotification, ResourceState};
 use agent_core::{ffi, observer};
 
 macro_rules! resource_observations {
-    ($($kind:ident => ($state:ident, $observer:ident, $updates:ident, $browser:ident, $cursor:ident, $method:ident, $value:ident)),+ $(,)?) => {
+    ($($kind:ident => ($state:ident, $observer:ident, $updates:ident, $browser:ident, $cursor:ident, $method:ident, $typed:ident, $value:ident)),+ $(,)?) => {
         pub(super) enum ResourceObserver {
             $($kind(Rc<observer::$observer>)),+
         }
@@ -61,27 +61,32 @@ macro_rules! resource_observations {
         #[wasm_bindgen]
         impl BrowserRuntime {
             pub fn $method(&self, owner: u64) -> Result<$browser, JsValue> {
-                self.inner.ensure_open()?;
-                let state = self.inner.actor.borrow().as_ref()
-                    .and_then(|actor| actor.observe_resource(owner, ResourceKind::$kind))
-                    .ok_or_else(|| operation_error_value(ffi::ErrorInfo::new(ffi::ErrorCode::Closed, "Resource owner is not active")))?;
+                self.$typed(owner).map(|observer| $browser { observer }).map_err(operation_error_value)
+            }
+        }
+
+        impl BrowserRuntime {
+            pub(super) fn $typed(&self, owner: u64) -> Result<Rc<observer::$observer>, ffi::ErrorInfo> {
+                let actor = self.inner.intent_actor()?;
+                let state = actor.observe_resource(owner, ResourceKind::$kind)
+                    .ok_or_else(|| ffi::ErrorInfo::new(ffi::ErrorCode::Closed, "Resource owner is not active"))?;
                 let notification = self.inner.prepare_resource_state(owner, &state, false);
                 let observer = match self.inner.resource_observers.borrow().get(&owner) {
                     Some(ResourceObserver::$kind(observer)) => observer.clone(),
-                    _ => return Err(operation_error_value(ffi::ErrorInfo::new(ffi::ErrorCode::Conflict, "Resource kind does not match"))),
+                    _ => return Err(ffi::ErrorInfo::new(ffi::ErrorCode::Conflict, "Resource kind does not match")),
                 };
                 if let Some(notification) = notification { notification(); }
-                Ok($browser { observer })
+                Ok(observer)
             }
         })+
     };
 }
 
 resource_observations! {
-    Video => (VideoSubscriptionState, VideoSubscriptionStateObserver, VideoSubscriptionUpdates, BrowserVideoSubscriptionObserver, BrowserVideoSubscriptionUpdates, video_subscription, video_value),
-    Audio => (AudioSubscriptionState, AudioSubscriptionStateObserver, AudioSubscriptionUpdates, BrowserAudioSubscriptionObserver, BrowserAudioSubscriptionUpdates, audio_subscription, audio_value),
-    DataPublication => (DataPublicationState, DataPublicationStateObserver, DataPublicationUpdates, BrowserDataPublicationObserver, BrowserDataPublicationUpdates, data_publication, data_publication_value),
-    DataSubscription => (DataSubscriptionState, DataSubscriptionStateObserver, DataSubscriptionUpdates, BrowserDataSubscriptionObserver, BrowserDataSubscriptionUpdates, data_subscription, data_subscription_value),
+    Video => (VideoSubscriptionState, VideoSubscriptionStateObserver, VideoSubscriptionUpdates, BrowserVideoSubscriptionObserver, BrowserVideoSubscriptionUpdates, video_subscription, video_state_observer, video_value),
+    Audio => (AudioSubscriptionState, AudioSubscriptionStateObserver, AudioSubscriptionUpdates, BrowserAudioSubscriptionObserver, BrowserAudioSubscriptionUpdates, audio_subscription, audio_state_observer, audio_value),
+    DataPublication => (DataPublicationState, DataPublicationStateObserver, DataPublicationUpdates, BrowserDataPublicationObserver, BrowserDataPublicationUpdates, data_publication, data_publication_state_observer, data_publication_value),
+    DataSubscription => (DataSubscriptionState, DataSubscriptionStateObserver, DataSubscriptionUpdates, BrowserDataSubscriptionObserver, BrowserDataSubscriptionUpdates, data_subscription, data_subscription_state_observer, data_subscription_value),
 }
 
 impl RuntimeInner {

@@ -26,16 +26,12 @@ import {
   AudioFrames,
   VideoFrames,
   Encoding,
-  EventStream,
   FeedbackStream,
   FeedbackUpdate,
   InputFrame,
   PcmFrame,
   ReceiveMode,
-  EventUpdate,
   NativeError,
-  SnapshotStream,
-  SnapshotUpdate,
   VideoSource,
   VideoSourceConfig,
 } from "../node_assets/index.js";
@@ -83,31 +79,18 @@ if (!AgentUpdates.instanceOf(stateUpdates) ||
     (await stateUpdates.next())?.observationRevision !== initialState.observationRevision) {
   throw new Error("missing initial concrete Agent state");
 }
-if ("catalog" in agent.snapshot() || "mapping" in agent.snapshot()) {
-  throw new Error("snapshot retained joined-room discovery metadata");
+if ("catalog" in initialState || "mapping" in initialState) {
+  throw new Error("Agent state includes private discovery or reconciliation data");
 }
-if (false) {
-  // @ts-expect-error Discovery is available only through an owned room watch.
-  agent.snapshot().catalog;
-  // @ts-expect-error Receiver mappings are private runtime reconciliation state.
-  agent.snapshot().mapping;
-}
-const revision = agent.snapshot().desiredRevision;
-const joinRevision: bigint = agent.snapshot().joinRevision;
-const credentialRevision: bigint = agent.snapshot().credentialRevision;
-const acceptedCredentialRevision: bigint | undefined = agent.snapshot().acceptedCredentialRevision;
-if (agent.snapshot().credentialOutcome !== undefined) {
-  throw new Error("inert agent evaluated credentials");
-}
-if (credentialRevision !== 0n || acceptedCredentialRevision !== undefined) {
-  throw new Error("inert agent acquired accepted credentials");
-}
-const desiredRoom: string | undefined = agent.snapshot().desiredRoom;
-if (joinRevision !== 0n || desiredRoom !== undefined) {
-  throw new Error("inert agent acquired room intent");
+if (initialState.desiredJoinRevision !== 0n || initialState.evaluatedJoinRevision !== 0n ||
+    initialState.desiredCredentialRevision !== 0n || initialState.evaluatedCredentialRevision !== 0n) {
+  throw new Error("inert Agent has connection or credential intent");
 }
 const renewed: void = agent.renew("renewed-token");
-if (renewed !== undefined || agent.snapshot().credentialRevision !== 1n || agent.snapshot().desiredRoom !== undefined) {
+const renewedState = agent.state();
+const revision = renewedState.observationRevision;
+if (renewed !== undefined || renewedState.desiredCredentialRevision !== 1n ||
+    renewedState.evaluatedCredentialRevision !== 0n || renewedState.desiredRoom !== undefined) {
   throw new Error("renew did not synchronously commit inert credential intent");
 }
 const localData = agent.data("control", TopicMode.Ordered);
@@ -144,7 +127,7 @@ const remoteVideo = participant.video("camera");
 const remoteAudio = participant.audio("microphone");
 if (
   participant.id() !== "remote" ||
-  agent.snapshot().desiredRevision !== revision
+  agent.state().observationRevision !== revision
 ) {
   throw new Error("logical lookup acquired transport demand");
 }
@@ -157,7 +140,7 @@ const videoSource = await agent.createVideoInput(VideoSourceConfig.create({
 }));
 const audioSource = await agent.createAudioInput();
 if (!VideoSource.instanceOf(videoSource) || !AudioSource.instanceOf(audioSource) ||
-    agent.snapshot().desiredRevision !== revision) {
+    agent.state().observationRevision !== revision) {
   throw new Error("source construction acquired publication intent");
 }
 const publicationConfig = PublicationConfig.create({ enabled: true });
@@ -207,12 +190,11 @@ await videoPublication.configure(PublicationConfig.create({ enabled: false }));
 if (videoPublication.state().configuration.enabled) throw new Error("latest configuration setter was lost");
 await videoPublication.setSource(undefined);
 await videoPublication.setSource(videoSource);
-const pendingBound = videoPublication.ready().then(
-  () => { throw new Error("publication without a native binding became ready"); },
-  (error: unknown) => error,
-);
+if ("ready" in videoPublication || "ready" in videoSource) {
+  throw new Error("legacy readiness alias is still exported");
+}
 await videoPublication.close();
-if (!NativeError.Closed.instanceOf(await pendingBound) || videoSource.isClosed() ||
+if (videoSource.isClosed() ||
     !videoPublication.state().closed || (await publicationUpdates.next())?.closed !== true ||
     (await publicationUpdates.next()) !== undefined) {
   throw new Error("publication close transferred producer ownership");
@@ -405,39 +387,30 @@ if (independentCursor.isClosed() || participantCursor.isClosed()) {
 }
 const pendingIndependent = independentCursor.next();
 const pendingParticipant = participantCursor.next();
-const snapshots = agent.snapshots();
-const events = agent.events();
-if (
-  !Agent.instanceOf(agent) ||
-  !SnapshotStream.instanceOf(snapshots) ||
-  !EventStream.instanceOf(events)
-) {
-  throw new Error("generated factory did not return concrete objects");
+const retiring = agent.updates();
+if ((await retiring.next())?.observationRevision !== agent.state().observationRevision) {
+  throw new Error("independent cursor missed the initial revision");
 }
-if (!SnapshotUpdate.Snapshot.instanceOf(await snapshots.next())) {
-  throw new Error("missing initial generated snapshot");
+const pendingRetired = retiring.next();
+try {
+  await retiring.next();
+  throw new Error("overlapping state read succeeded");
+} catch (error) {
+  if (!NativeError.Operation.instanceOf(error) || error.inner.info.code !== ErrorCode.Conflict) throw error;
+} finally {
+  retiring.close();
+  retiring.close();
 }
-const retiredSnapshots = agent.snapshots();
-const retiredEvents = agent.events();
-await retiredSnapshots.next();
-const pendingRetiredSnapshot = retiredSnapshots.next();
-await retiredSnapshots.close();
-await retiredSnapshots.close();
-await retiredEvents.close();
-await retiredEvents.close();
-if (!retiredSnapshots.isClosed() || !retiredEvents.isClosed() ||
-    !SnapshotUpdate.Closed.instanceOf(await pendingRetiredSnapshot) ||
-    !EventUpdate.Closed.instanceOf(await retiredEvents.next()) ||
-    snapshots.isClosed() || events.isClosed() || agent.isClosed()) {
+if (await pendingRetired !== undefined || await retiring.next() !== undefined ||
+    agent.state().status !== AgentStatus.Idle) {
   throw new Error("observation cursor retirement affected an independent owner");
 }
-retiredSnapshots.uniffiDestroy();
-retiredEvents.uniffiDestroy();
-const pendingSnapshot = snapshots.next();
-const pendingEvent = events.next();
-await agent.disconnect();
-if (agent.isClosed() || independentCursor.isClosed() || participantCursor.isClosed()) {
-  throw new Error("disconnect was terminal");
+retiring.uniffiDestroy();
+for (const removed of [
+  "connect", "connectRoomless", "disconnect", "reconnect", "leaveRoom", "renewAuthorization",
+  "snapshot", "snapshots", "events",
+]) {
+  if (removed in agent) throw new Error(`legacy Agent API: ${removed}`);
 }
 await agent.close();
 await agent.close();
@@ -453,12 +426,6 @@ if (!audioSource.isClosed() || !audioPublication.isClosed() ||
     !NativeError.Closed.instanceOf(await pendingMedia)) {
   throw new Error("terminal close did not retire media owners and pending acquisition");
 }
-if (!SnapshotUpdate.Closed.instanceOf(await pendingSnapshot)) {
-  throw new Error("terminal close did not finish a pending snapshot read");
-}
-if (!EventUpdate.Closed.instanceOf(await pendingEvent)) {
-  throw new Error("terminal close did not finish a pending event read");
-}
 if (
   !DataUpdate.Closed.instanceOf(await pendingIndependent) ||
   !DataUpdate.Closed.instanceOf(await pendingParticipant)
@@ -467,8 +434,6 @@ if (
 }
 try {
   const joined: void = agent.join("room");
-  const left: void = agent.leaveRoom();
-  void left;
   void joined;
   throw new Error("closed Agent revived");
 } catch (error) {
@@ -496,7 +461,7 @@ if (!finalAudioPublication?.closed || await audioPublicationUpdates.next() !== u
 audioPublicationUpdates.close();
 const finalState = await stateUpdates.next();
 if (finalState?.status !== AgentStatus.Closed ||
-    finalState.desiredCredentialRevision !== agent.snapshot().credentialRevision ||
+    finalState.desiredCredentialRevision !== renewedState.desiredCredentialRevision ||
     initialState.status !== AgentStatus.Idle ||
     (await stateUpdates.next()) !== undefined ||
     agent.state().observationRevision !== finalState.observationRevision) {
@@ -524,7 +489,5 @@ participantCursor.uniffiDestroy();
 remoteData.uniffiDestroy();
 participant.uniffiDestroy();
 localData.uniffiDestroy();
-events.uniffiDestroy();
-snapshots.uniffiDestroy();
 agent.uniffiDestroy();
 console.log("generated Node lifecycle contract PASS");

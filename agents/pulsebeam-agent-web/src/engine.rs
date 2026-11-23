@@ -7,6 +7,7 @@ use futures_channel::oneshot;
 
 use crate::channel::{self, mpsc, mpsc::TrySendError as MpscTrySendError, watch};
 
+use agent_core::ffi::{ErrorCode, ErrorInfo};
 use agent_core::{
     Agent, AgentCommand, AgentConfig, AgentError, DesiredState, Effect, Failure, Generation,
     HostEvent, Notification, Snapshot, TimerEffect, TimerEvent, TimerId, TopicSend,
@@ -403,28 +404,31 @@ impl ActorHandle {
         self.control.agent.borrow().snapshot().clone()
     }
 
-    pub(crate) fn join(&self, room: String) -> Result<(), String> {
+    pub(crate) fn join(&self, room: String) -> Result<(), ErrorInfo> {
         self.intent(AgentCommand::Join(room))
     }
 
-    pub(crate) fn leave_room(&self) -> Result<(), String> {
+    pub(crate) fn leave_room(&self) -> Result<(), ErrorInfo> {
         self.intent(AgentCommand::LeaveRoom)
     }
 
-    pub(crate) fn renew(&self, token: String) -> Result<(), String> {
+    pub(crate) fn renew(&self, token: String) -> Result<(), ErrorInfo> {
         self.intent(AgentCommand::RenewAuthorization(token))
     }
 
-    fn intent(&self, command: AgentCommand) -> Result<(), String> {
+    fn intent(&self, command: AgentCommand) -> Result<(), ErrorInfo> {
         if !self.control.accepting.get() || self.sender.is_closed() {
-            return Err("actor is not running".into());
+            return Err(ErrorInfo::new(
+                ErrorCode::Closed,
+                "Browser runtime is closed",
+            ));
         }
         self.control
             .agent
             .borrow_mut()
             .command(command)
-            .map_err(|error| error.to_string())?;
-        self.schedule_core_change().map_err(|error| error.message)
+            .map_err(|error| ErrorInfo::from(&error))?;
+        self.schedule_core_change()
     }
 
     pub(crate) fn snapshots(&self) -> watch::Receiver<Snapshot> {

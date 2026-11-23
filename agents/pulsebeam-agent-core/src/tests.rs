@@ -2673,6 +2673,48 @@ fn selecting_a_room_during_roomless_bootstrap_retires_the_old_peer_first() {
 }
 
 #[test]
+fn overlapping_moves_only_bootstrap_the_latest_room() {
+    let mut agent = Agent::new(config()).unwrap();
+    assert!(agent.next_effect_after_turn().is_none());
+    agent.command(AgentCommand::Join("main".into())).unwrap();
+    let Effect::Rtc(RtcEffect::CreateOffer { generation, .. }) = next_effect(&mut agent) else {
+        panic!("first room offer");
+    };
+    agent
+        .command(AgentCommand::Join("breakout".into()))
+        .unwrap();
+    agent.command(AgentCommand::Join("main".into())).unwrap();
+    assert_eq!(agent.snapshot().join_revision, 3);
+    assert_eq!(agent.snapshot().desired_room.as_deref(), Some("main"));
+    assert_eq!(agent.snapshot().room_id, None);
+    assert_eq!(
+        next_effect(&mut agent),
+        Effect::Rtc(RtcEffect::Close { generation })
+    );
+    assert!(agent.next_effect_after_turn().is_none());
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::Closed { generation }))
+        .unwrap();
+    let Effect::Rtc(RtcEffect::CreateOffer {
+        generation: latest, ..
+    }) = next_effect(&mut agent)
+    else {
+        panic!("latest room offer");
+    };
+    assert_ne!(latest, generation);
+    agent
+        .handle(HostEvent::Rtc(RtcEvent::OfferCreated {
+            generation: latest,
+            offer: offer(),
+            resources: resources(channel(12)),
+        }))
+        .unwrap();
+    let (_, request) = native_request(&mut agent, latest);
+    let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(request["room"], "main");
+}
+
+#[test]
 fn explicit_disconnect_preserves_resource_owners_and_declared_intent() {
     let mut agent = Agent::new(config()).unwrap();
     let spec = TrackSpec::Audio {
@@ -2795,7 +2837,11 @@ fn admission_denial_is_latched_across_incidental_updates() {
         agent.snapshot().terminal_failure.as_ref().unwrap().class,
         FailureClass::Authorization
     );
-    agent.command(AgentCommand::Reconnect).unwrap();
+    let rejected_revision = agent.snapshot().join_revision;
+    assert_eq!(agent.snapshot().evaluated_join_revision, rejected_revision);
+    agent.command(AgentCommand::Join("room".into())).unwrap();
+    let retry_revision = agent.snapshot().join_revision;
+    assert!(retry_revision > rejected_revision);
     assert!(matches!(
         next_effect(&mut agent),
         Effect::Rtc(RtcEffect::CreateOffer { generation, .. })
@@ -2803,6 +2849,9 @@ fn admission_denial_is_latched_across_incidental_updates() {
     ));
     assert_eq!(agent.snapshot().connection, ConnectionState::CreatingOffer);
     assert_eq!(agent.snapshot().terminal_failure, None);
+    agent.command(AgentCommand::Join("room".into())).unwrap();
+    assert_eq!(agent.snapshot().join_revision, retry_revision);
+    assert!(agent.next_effect_after_turn().is_none());
 }
 
 #[test]

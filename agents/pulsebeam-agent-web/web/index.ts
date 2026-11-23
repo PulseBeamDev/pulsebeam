@@ -23,12 +23,6 @@ export type {
   DataPublicationState,
   DataSubscriptionState,
 } from "./schema.js";
-export type {
-  SnapshotStream,
-  SnapshotUpdate,
-  EventStream,
-  EventUpdate,
-} from "./observation.js";
 export type { Delivery } from "./track.js";
 export { DataError } from "./data.js";
 export type {
@@ -60,9 +54,7 @@ export { ResourceError, ResourceOwnershipError } from "./resources.js";
 export type {
   AgentConfig,
   AgentError,
-  AgentEvent,
   AgentLogging,
-  AgentSnapshot,
   AgentUpdates,
   AudioDemand,
   AudioSenderConfig,

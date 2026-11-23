@@ -1,6 +1,7 @@
 [bindings.typescript]
 strictTypeChecking = true
 strictByteArrays = true
+revisionedSnapshots = ["Agent.state", "VideoSubscription.state"]
 
 [bindings.typescript.customTypes.WebMediaTrack]
 typeName = "MediaStreamTrack"

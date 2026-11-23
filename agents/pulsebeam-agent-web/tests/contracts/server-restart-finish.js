@@ -6,7 +6,7 @@
       [sender, receiver].map((agent) =>
         wait(
           agent,
-          (snapshot) => snapshot.connection === "terminal-failure",
+          (state) => state.status === window.pulsebeam.AgentStatus.Failed,
           "expired ownership after SFU restart",
         ),
       ),
@@ -27,11 +27,19 @@
     } catch (error) {
       if (error !== failure) throw error;
     }
-    return [sender, receiver].every(
-      (agent) =>
-        agent.error?.class === "resource-expired" &&
-        agent.snapshot().credentialOutcome.status === "uncertain",
-    );
+    for (const agent of [sender, receiver]) {
+      const state = agent.state();
+      if (
+        state.error?.code !== window.pulsebeam.ErrorCode.ConnectionFailed ||
+        state.room !== undefined ||
+        state.connectionId !== undefined
+      ) {
+        throw new Error(
+          `expired owner retained admission: code=${state.error?.code} room=${state.room} connection=${state.connectionId}`,
+        );
+      }
+    }
+    return true;
   } finally {
     await stream.close();
     await pumping;
